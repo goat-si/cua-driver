@@ -63,6 +63,17 @@ pub enum CheckedState {
     Mixed,
 }
 
+impl CheckedState {
+    /// The `toggle_state` value on the wire and the `toggle=` attribute in the tree.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::On => "on",
+            Self::Off => "off",
+            Self::Mixed => "mixed",
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct UiaNode {
     pub element_index: Option<usize>,
@@ -1162,6 +1173,14 @@ pub(crate) fn format_node_line(node: &UiaNode) -> String {
         }
         if let Some(h) = &node.help_text {
             attrs.push(format!("help=\"{}\"", h));
+        }
+        // States are part of the row so a state-only change shows up in incremental reads,
+        // which compare rows.
+        if let Some(checked) = node.checked {
+            attrs.push(format!("toggle={}", checked.as_str()));
+        }
+        if let Some(expanded) = node.expanded {
+            attrs.push(format!("expanded={}", expanded));
         }
         if !node.actions.is_empty() {
             attrs.push(format!("actions=[{}]", node.actions.join(",")));

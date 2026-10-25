@@ -1147,11 +1147,7 @@ fn build_element_entry(
         entry["selected"] = json!(selected);
     }
     if let Some(checked) = n.checked {
-        entry["checked"] = match checked {
-            crate::uia::CheckedState::On => json!(true),
-            crate::uia::CheckedState::Off => json!(false),
-            crate::uia::CheckedState::Mixed => json!("mixed"),
-        };
+        entry["toggle_state"] = json!(checked.as_str());
     }
     if let Some(expanded) = n.expanded {
         entry["expanded"] = json!(expanded);
