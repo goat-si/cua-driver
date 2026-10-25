@@ -1453,21 +1453,24 @@ mod tests {
         // Use a separately-redirected HOME so any config file present on
         // the developer's machine can't influence the result.
         with_isolated_home(|_| {
-            assert!(!is_enabled(), "explicit false env var must disable");
+            assert!(
+                !is_enabled_for("0.37.0"),
+                "explicit false env var must disable"
+            );
         });
 
         unsafe {
             std::env::set_var(ENV_UPDATE_CHECK, "0");
         }
         with_isolated_home(|_| {
-            assert!(!is_enabled(), "0 must disable");
+            assert!(!is_enabled_for("0.37.0"), "0 must disable");
         });
 
         unsafe {
             std::env::set_var(ENV_UPDATE_CHECK, "off");
         }
         with_isolated_home(|_| {
-            assert!(!is_enabled(), "off must disable");
+            assert!(!is_enabled_for("0.37.0"), "off must disable");
         });
 
         // Restore.
@@ -1499,11 +1502,10 @@ mod tests {
             )
             .unwrap();
 
-            // Build version is a normal release (this crate's pkg version
-            // ships as "0.1.3", a stable release — see workspace Cargo.toml).
+            // A stable version, so the prerelease rule cannot mask the result.
             // The env var is unset, so the config flag is the only signal.
             assert!(
-                !is_enabled(),
+                !is_enabled_for("0.37.0"),
                 "persisted update_check_enabled=false must disable the check"
             );
         });
