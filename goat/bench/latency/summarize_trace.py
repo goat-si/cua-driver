@@ -9,14 +9,20 @@ import sys
 path, mode = sys.argv[1:]
 assert mode in {'DIRECT', 'BATCH', 'COLD'}
 rows = []
+preflight_counts = []
 with open(path) as stream:
     for line in stream:
-        if line.startswith('cua_goat_latency '):
+        if line.startswith('ws13_latency '):
+            fields = dict(item.split('=', 1) for item in line.split()[1:])
+            preflight_counts.append(int(fields['preflight_clicks']))
+        elif line.startswith('cua_goat_latency '):
             fields = dict(item.split('=', 1) for item in line.split()[1:])
             if fields['tool'] == 'click':
                 rows.append(fields)
+assert preflight_counts == [1], 'Expected one ws13_latency preflight_clicks=1 marker; rerun measure.mjs'
 warmup = {'DIRECT': 5, 'BATCH': 15, 'COLD': 0}[mode]
-rows = rows[warmup:]
+# The marker declares a count, not a stream boundary: helper stdout/stderr can arrive out of order.
+rows = rows[preflight_counts[0] + warmup:]
 expected = 150 if mode == 'BATCH' else 50
 assert len(rows) == expected, f'Expected {expected} measured clicks, got {len(rows)}'
 assert all(row['outcome'] == 'ok' for row in rows)

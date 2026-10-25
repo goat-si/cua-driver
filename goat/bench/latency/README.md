@@ -1,6 +1,6 @@
 WS13 measurement procedure — goat-si/goat#1593 option (A)
 
-No latency measurements were performed on the implementation Mac: it has no Accessibility or Screen Recording TCC grants. The harness below has passed `node --check`, but has not been exercised against a granted helper.
+No latency measurements were performed on the implementation Mac: it has no Accessibility or Screen Recording TCC grants. The harness below has passed syntax checks and fake MCP helper checks, but has not been exercised against a granted helper.
 
 1. On the TCC-granted WS13 Mac, record hardware, macOS, power mode, display count, load averages, helper identity/version and both driver SHAs. Use the same signed dev helper identity that has the grants from the original #1593 measurements. Keep the user idle with Terminal (or another fixed app) frontmost. Open one English Calculator window in Basic mode, press Escape to expose “All Clear”, then leave Calculator behind the user's app. Do not front Calculator during the samples. Record human HID input and discard/re-run an affected run. Keep the same cursor settings in before/after runs.
 
@@ -60,7 +60,7 @@ allow:
 
 `GOAT Computer Use --mcp --capability-manifest /absolute/manifest.yaml`
 
-It initializes MCP, obtains Calculator's pid/window, reads the AX elements without a screenshot, finds the All Clear button token, performs five warmups, then runs N=50 sequential background `click(action:press, element_token:...)` calls with no result check/capture. It requires successful AX (`path:ax` / `route:accessibility`) and `effect:unverifiable`. The batch variant repeats three identical clicks per `run_steps`, omitting `observe`, wait_for and expect. It rejects refusals/failed steps. The token stays valid because no new snapshot is requested during the run. Each measurement covers the call over helper stdio (relay + driver, excluding lease proxy/model); warmup and verification are outside the timed interval.
+It initializes MCP, obtains Calculator's pid/window, reads the AX elements without a screenshot, finds the All Clear button token, performs one direct preflight click, performs five warmup calls, then runs N=50 sequential background `click(action:press, element_token:...)` calls with no result check/capture. The preflight and every direct-mode call require successful AX (`path:ax` / `route:accessibility`) and `effect:unverifiable`. The batch variant repeats three identical clicks per `run_steps`, including each warmup call, omitting `observe`, wait_for and expect. It rejects refusals/failed steps and reported recovery/fallback (see Batch validity below). The token stays valid because no new snapshot is requested during the run. Each measurement covers the call over helper stdio (relay + driver, excluding lease proxy/model); preflight, warmup and verification are outside the timed interval.
 
 ```sh
 unset CUA_DRIVER_GOAT_LATENCY_TRACE CUA_DRIVER_WINDOW_CHANGE_TIMEOUT_MS CUA_DRIVER_WINDOW_CHANGE_POLL_MS
@@ -80,11 +80,11 @@ CUA_DRIVER_GOAT_LATENCY_TRACE=1 node goat/bench/latency/measure.mjs "$TRACE_APP/
 WS13_COLD=1 CUA_DRIVER_GOAT_LATENCY_TRACE=1 node goat/bench/latency/measure.mjs "$TRACE_APP/Contents/MacOS/GOAT Computer Use" "$WS13_ROOT/manifest.yaml" 50 direct "$WS13_ROOT/after-trace-cold"
 ```
 
-The warm direct file should contain 55 click records including five warmups; discard the first five. The warm batch file should contain 165 click records; discard the first 15, then group the remaining sequential records in threes. Cold mode omits warmups and idles 5 s outside each timed call, beyond the existing key-focus tap idle teardown (3 s tail + 1 s teardown delay); label it “idle-cooled taps”, not “fresh process”. To characterize true process-cold startup, separately take one first click from each of 50 fresh helper processes, excluding initialization/AX snapshot from the timed interval. Do not mix those samples with warm results.
+For N=50, the warm direct file should contain 56 click records: one preflight, five warmups and 50 measured clicks. The warm batch file should contain 166 click records: one direct preflight, 15 warmup clicks and 150 measured clicks; group the measured records in threes. The cold direct file should contain 51 click records: one preflight and 50 measured clicks. The harness writes one `ws13_latency preflight_clicks=1` marker to each `.stderr` file. The parser requires that marker and discards the first click plus the mode's warmups; the marker declares a count rather than a boundary between independently delivered stdout/stderr streams. Rerun older unmarked traces. Cold mode omits warmups and idles 5 s outside each timed call, beyond the existing key-focus tap idle teardown (3 s tail + 1 s teardown delay); label it “idle-cooled taps”, not “fresh process”. To characterize true process-cold startup, separately take one first click from each of 50 fresh helper processes, excluding initialization/AX snapshot from the timed interval. Do not mix those samples with warm results.
 
 For each retained record report median/p95 in microseconds divided by 1000 for: snapshot_us, ax_resolve_us, protect_us, focus_settle_us, action_guarded_us, action_blocking_us, lease_drop_us, detector_us, detector_sleep_us, detector_enumeration_us, other_us, and detector_enumerations. Tabulate detector_exit and tail counts. request_id is generated per platform invocation, not the wire JSON-RPC id; sequential calls and the recorded call order provide the mapping. Three batch steps get three ids. Never log element tokens, typed text or window contents into the timing report.
 
-Use the supplied parser for the three trace files (syntax checked only):
+Use the supplied parser for the three trace files (verified with fake-helper traces):
 
 ```sh
 python3 goat/bench/latency/summarize_trace.py "$WS13_ROOT/after-trace-direct.stderr" DIRECT
@@ -98,9 +98,10 @@ Stage columns are inclusive and overlap: do not sum them. `measured_us` is their
 
 7. Optional WS15 semantic matrix: on both variants, N>=50 each for quiet, a same-process layer-0 window appearing at 250 ms, and an other-process layer-0 window appearing at 250 ms; repeat with a 450 ms appearance to exercise deferred reporting on the next result. Use an actual fixture whose trigger schedules the window, not arbitrary harness sleeps to guess state. Record current-result versus next-result delivery exactly once and verify that no early exit was introduced. Cover direct and batch positions 1/2/3 (100/100/300 ms reporting). No such fixtures were run on the implementation Mac.
 
-NOT RUN: helper launch against TCC, the supplied measurement harness beyond syntax check, N=50 timings, live trace segments, cold/warm measurements, delayed same/other-process fixtures, lease proxy/model overhead. No speedup number is claimed by this implementation.
+NOT RUN: helper launch against TCC, N=50 timings against a real helper, live trace segments, cold/warm measurements, delayed same/other-process fixtures, lease proxy/model overhead. No speedup number is claimed by this implementation.
 
 ## Batch validity
 
-`run_steps` reports only each step's first message line, not the raw route/effect. `measure.mjs` therefore proves the AX route with one direct click before timing batches, and accepts a batch only when it returns exactly three steps, every step succeeded, and no step reports recovery, a no-op or a skip.
+`run_steps` reports only each step's first message line and omits structured effect. The click's suspected-no-op warning appears after that first line, so per-step suspected no-ops cannot be detected through `run_steps`. The direct AX preflight verifies only the first click's route/effect; direct mode checks every call. Batch checks reject visible no-op/skip messages but cannot establish each step's effect.
 
+`measure.mjs` accepts a batch only when it returns exactly three successful steps without reported recovery/fallback or skips. The step report's recovery/fallback fields in `batch_tools.rs` are `refound` (a note string for stale-target retries or menu-bar rerouting) and `delivery_fallback` (`"foreground"` for a foreground retry); either field's presence is rejected, including `refound:true`. It also rejects `recovered:true`, a `recovery` field, `skipped:true`, and messages reporting recovery, no-ops or skips. Failed steps are rejected through `ok`; their `code`, `phase`, `hint` and `next_call` describe the failure or suggested recovery, rather than a successful recovery.

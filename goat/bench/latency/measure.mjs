@@ -64,8 +64,10 @@ try {
   const clear = elements.filter(e => e.role === 'AXButton' && /^(All Clear|AC)$/i.test(e.label ?? ''));
   if (clear.length !== 1 || !clear[0].element_token) throw new Error('Set Calculator to English Basic mode, press Escape, and verify one All Clear AXButton');
   const args = {pid,window_id,element_token:clear[0].element_token,action:'press',delivery_mode:'background'};
-  // run_steps reports only each step's first message line, not the raw route/effect, so prove the
-  // AX route once with a direct click before timing batches, then check every batch strictly.
+  // run_steps omits structured effect and truncates the message before the suspected-no-op
+  // warning, so per-step no-op detection is unavailable. Preflight verifies the first click's
+  // AX route/effect; direct mode verifies every call. Batch checks cover only reported signals.
+  stderr.write('ws13_latency preflight_clicks=1\n');
   const preflight = (await tool('click',args)).structuredContent;
   if (!(preflight?.path === 'ax' || preflight?.route === 'accessibility') || preflight?.effect !== 'unverifiable') {
     throw new Error('Preflight click did not take the AX route: inspect the response before measuring');
@@ -75,8 +77,10 @@ try {
     if (structured?.ok !== true || !Array.isArray(steps) || steps.length !== 3) throw new Error('Batch did not return three steps');
     for (const step of steps) {
       const raw = JSON.stringify(step).toLowerCase();
-      if (step.ok !== true || step.recovered === true || 'recovery' in step || /no-?op|skipped|recover/.test(raw)) {
-        throw new Error('Batch step failed, recovered or did nothing: ' + JSON.stringify(step));
+      // batch_tools sets refound (a note string) for stale-target/menu retries and
+      // delivery_fallback for foreground retries. Either field invalidates the sample.
+      if (step.ok !== true || 'refound' in step || 'delivery_fallback' in step || step.recovered === true || 'recovery' in step || step.skipped === true || /no-?op|skipped|recover/.test(raw)) {
+        throw new Error('Batch step failed, recovered, fell back, skipped or reported a no-op: ' + JSON.stringify(step));
       }
     }
   };
