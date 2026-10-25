@@ -1,0 +1,7 @@
+{
+  "comment": "Intentional protocol changes, each keyed by the name check_protocol.py prints and valued with the reason and the GOAT change that adopts it. Keep empty unless GOAT has adopted the change.",
+  "mcp": {},
+  "tools": {},
+  "manifest": {},
+  "subcommands": {}
+}

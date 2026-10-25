@@ -1,0 +1,70 @@
+{
+  "comment": "The Cua Driver build GOAT ships today (goat-si/goat packages/shared/src/cuaDriverRelease.ts). The fork must stay protocol-compatible with it; change this only together with GOAT's pin.",
+  "version": "0.37.0",
+  "baseUrl": "https://github.com/trycua/cua/releases/download/cua-driver-rs-v0.37.0/",
+  "archives": {
+    "darwin-universal": {
+      "name": "cua-driver-rs-0.37.0-darwin-universal-binary.tar.gz",
+      "bytes": 53254204,
+      "sha256": "7d491f67f54be5f3b380ffd85c64b242eaefd05dad6df78012cde227c95aee2a"
+    },
+    "linux-x86_64": {
+      "name": "cua-driver-rs-0.37.0-linux-x86_64-binary.tar.gz",
+      "bytes": 36941258,
+      "sha256": "c7ac376b10da7c207e510b2d90b88a9588bec9852a237962c273fe81b9cd5623"
+    },
+    "linux-arm64": {
+      "name": "cua-driver-rs-0.37.0-linux-arm64-binary.tar.gz",
+      "bytes": 36518124,
+      "sha256": "879e8040a4ce24caeee34b2e4ac6119be01661082202919db1bcc1ab0b97e4c8"
+    },
+    "windows-x86_64": {
+      "name": "cua-driver-rs-0.37.0-windows-x86_64-binary.zip",
+      "bytes": 35838756,
+      "sha256": "40481b55073f1225b0010235b30217bd640ef1f323e982aec0a5f6131d3e4a99"
+    },
+    "windows-arm64": {
+      "name": "cua-driver-rs-0.37.0-windows-arm64-binary.zip",
+      "bytes": 33606104,
+      "sha256": "0fce682b251775e25fd76bf29ff856f7f5ab5aae5759d6b76a40f8312a194a5a"
+    }
+  },
+  "goatToolsComment": "CUA_DRIVER_ALLOWED_TOOLS in goat-si/goat packages/shared/src/cuaDriverManifest.ts: both builds must list all of them.",
+  "goatTools": [
+    "check_permissions",
+    "health_report",
+    "get_guide",
+    "list_apps",
+    "list_windows",
+    "get_accessibility_tree",
+    "get_window_state",
+    "get_screen_size",
+    "get_cursor_position",
+    "verify_state",
+    "zoom",
+    "click",
+    "double_click",
+    "right_click",
+    "drag",
+    "scroll",
+    "move_cursor",
+    "type_text",
+    "press_key",
+    "hotkey",
+    "set_value",
+    "invoke_menu",
+    "bring_to_front",
+    "launch_app",
+    "set_window_frame",
+    "run_steps",
+    "run_script",
+    "start_session",
+    "end_session",
+    "get_session",
+    "list_sessions",
+    "get_agent_cursor_state",
+    "set_agent_cursor_enabled",
+    "set_agent_cursor_motion",
+    "set_agent_cursor_theme"
+  ]
+}
