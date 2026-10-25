@@ -266,9 +266,411 @@ jobs:
           path: rust/release/*-binary.tar.gz
           if-no-files-found: error
 
+  # Unit and hermetic tests: upstream's per-platform "unit" jobs (trycua/cua
+  # .github/workflows/ci-rust-{linux,macos,windows}.yml at cua-driver-rs-v0.37.0), ported verbatim
+  # apart from paths, action pins and caching. Tests needing a logged-in, TCC-authorized desktop or
+  # real apps are #[ignore] upstream and run in its desktop harnesses, not here. goat-si/cua-driver#12.
+  test-linux:
+    needs: version
+    name: Rust Linux unit and compile
+    runs-on: ubuntu-latest
+    # Upstream's 30 assumes a warm cache; this fork often builds cold.
+    timeout-minutes: 60
+    env:
+      # Dozens of debug test binaries: line tables keep backtraces useful
+      # without full debug info filling the runner disk at link time.
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - name: Free runner disk
+        run: |
+          df -h / | tail -1
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /usr/local/.ghcup /opt/hostedtoolcache/CodeQL /usr/local/share/boost \
+            /usr/share/swift /usr/local/julia* /opt/az /usr/local/share/powershell
+          sudo docker image prune --all --force >/dev/null 2>&1 || true
+          df -h / | tail -1
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "22"
+      - name: Verify shared fixture scroll journal
+        run: node --test tests/fixtures/shared/web/journal.test.cjs
+      - uses: dtolnay/rust-toolchain@4716b85f2fac3e324e64fa2810f6b5c3905760a5 # 1.97.1
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            rust/target
+          key: goat-test-linux-${{ hashFiles('rust/Cargo.lock', 'rust/**/Cargo.toml', 'vendor/**/Cargo.toml') }}
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            clang pkg-config libdbus-1-dev libpipewire-0.3-dev libspa-0.2-dev \
+            libei-dev libxkbcommon-dev libx11-dev libxi-dev libxtst-dev libxext-dev \
+            imagemagick xvfb xauth x11-utils ffmpeg dbus-daemon
+      - name: Prove the AT-SPI connection graph excludes peer-to-peer
+        working-directory: rust
+        run: |
+          set -euo pipefail
+          graph=$(cargo tree --locked -p cua-driver -e features -i atspi-connection --prefix none)
+          if grep -q '^atspi-connection feature "p2p"' <<<"$graph"; then
+            echo "::error::cua-driver resolves atspi-connection with its p2p feature; see the atspi-connection entry in crates/platform-linux/Cargo.toml"
+            exit 1
+          fi
+      - name: Run Linux Rust tests
+        working-directory: rust
+        env:
+          CUA_TEST_REQUIRE_DRIVER_BIN: "1"
+        run: cargo test -p cua-driver -p cua-driver-e2e -p cua-driver-contract -p cua-driver-core -p cua-driver-testkit -p cursor-overlay -p cursor-theme-cli -p platform-linux --all-targets --locked
+      - name: Run cua-cursor-motion tests (lab parity, golden trajectories)
+        working-directory: rust
+        run: cargo test -p cua-cursor-motion --all-features --all-targets --locked
+      - name: Compile and link an async-io embedded host
+        working-directory: rust
+        run: cargo test -p cua-driver-sdk --test async_io_embedding --locked
+      - name: Verify final-frame extraction without a desktop
+        working-directory: rust
+        run: |
+          cargo test -p cua-driver-e2e --test e2e_environment_preflight_test --locked -- \
+            --ignored --exact last_frame_extraction_handles_long_final_duration_and_invalid_input --nocapture
+      - name: Run X11 click delivery and timing regressions
+        working-directory: rust
+        run: |
+          xvfb-run -a --server-args="-screen 0 640x480x24 -noreset" \
+            cargo test -p platform-linux --test click_input_x11 --locked -- \
+              --ignored --nocapture --test-threads=1
+      - name: Run X11 keyboard tap timing regression
+        working-directory: rust
+        run: |
+          xvfb-run -a cargo test -p platform-linux --test key_input_x11 \
+            --locked -- --ignored --nocapture --test-threads=1
+      - name: Run X11 overlay click-through regression
+        working-directory: rust
+        run: |
+          xvfb-run -a --server-args="-screen 0 1920x1080x24" \
+            cargo test -p platform-linux \
+            x11_overlay_input_shape_stays_empty_and_clicks_pass_through_after_resize \
+            --locked -- --ignored --nocapture
+          xvfb-run -a --server-args="-screen 0 1920x1080x24" \
+            cargo test -p platform-linux \
+            x11_overlay_owner_stays_click_through_across_cursor_lifecycle_and_randr \
+            --locked -- --ignored --nocapture
+      - name: Run X11 desktop capture overlay-exclusion regression
+        working-directory: rust
+        run: |
+          xvfb-run -a --server-args="-screen 0 1920x1080x24" \
+            cargo test -p platform-linux \
+            x11_desktop_capture_hides_the_resting_overlay_and_restores_it \
+            --locked -- --ignored --nocapture
+      - name: Run X11 clipboard round-trip regression
+        working-directory: rust
+        run: |
+          xvfb-run -a cargo test -p platform-linux --lib \
+            clipboard::tests::native_clipboard_round_trips_text_on_x11 \
+            --locked -- --ignored --exact --nocapture
+      - name: Run X11 MIT-SHM capture correctness and performance regression
+        working-directory: rust
+        run: |
+          set -euo pipefail
+          Xvfb :98 -screen 0 1920x1080x24 -ac -noreset -nolisten tcp >xvfb-98.log 2>&1 &
+          xvfb_primary=$!
+          Xvfb :99 -screen 0 1920x1080x24 -ac -noreset -nolisten tcp >xvfb-99.log 2>&1 &
+          xvfb_secondary=$!
+          # DirectColor is visual class 5; the usual Xvfb default is TrueColor.
+          Xvfb :100 -screen 0 1920x1080x24 -cc 5 -ac -noreset -nolisten tcp >xvfb-100.log 2>&1 &
+          xvfb_directcolor=$!
+          trap 'kill "$xvfb_primary" "$xvfb_secondary" "$xvfb_directcolor" 2>/dev/null || true' EXIT
+          for display in :98 :99 :100; do
+            ready=false
+            for _ in $(seq 1 50); do
+              if DISPLAY="$display" xdpyinfo >/dev/null 2>&1; then
+                ready=true
+                break
+              fi
+              sleep 0.1
+            done
+            if [ "$ready" != true ]; then
+              echo "Xvfb failed to become ready on $display" >&2
+              exit 1
+            fi
+          done
+          source_sha=$(git rev-parse HEAD)
+          {
+            echo "source_sha=$source_sha"
+            DISPLAY=:98 CUA_X11_SECOND_DISPLAY=:99 CUA_X11_RESTART_DISPLAY=:101 \
+              cargo test -p platform-linux \
+              capture::tests::live_xshm_matches_xgetimage_across_resize_reconnect_and_repetition \
+              --locked -- --ignored --exact --nocapture --test-threads=1
+            DISPLAY=:100 cargo test -p platform-linux \
+              capture::tests::live_directcolor_capture_tracks_window_colormap \
+              --locked -- --ignored --exact --nocapture --test-threads=1
+          } 2>&1 | tee x11-capture-evidence.log
+          kill "$xvfb_primary" "$xvfb_secondary" "$xvfb_directcolor" 2>/dev/null || true
+          wait "$xvfb_primary" "$xvfb_secondary" "$xvfb_directcolor" || true
+          trap - EXIT
+          sha256sum x11-capture-evidence.log xvfb-98.log xvfb-99.log xvfb-100.log >x11-capture-evidence.sha256
+      - name: Upload X11 capture evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: x11-capture-evidence
+          if-no-files-found: error
+          path: |
+            rust/x11-capture-evidence.log
+            rust/x11-capture-evidence.sha256
+            rust/xvfb-98.log
+            rust/xvfb-99.log
+            rust/xvfb-100.log
+      - name: Run real uinput device-name regression
+        working-directory: rust
+        run: |
+          sudo modprobe uinput
+          test -c /dev/uinput
+          sudo chmod a+rw /dev/uinput
+          cargo test -p platform-linux real_uinput_accepts_normalized_overlong_multibyte_name --locked -- --ignored --nocapture
+      - name: SDK library tests (GOAT addition; upstream runs them only on Windows)
+        working-directory: rust
+        run: cargo test -p cua-driver-sdk --lib --locked
+      - name: Compile portable GNOME/KDE portal input
+        working-directory: rust
+        run: cargo check -p cua-driver --features portal-input --locked
+
+  test-macos:
+    needs: version
+    name: Rust macOS unit
+    runs-on: macos-26
+    # Upstream's 30 assumes a warm cache; this fork often builds cold.
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: dtolnay/rust-toolchain@4716b85f2fac3e324e64fa2810f6b5c3905760a5 # 1.97.1
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            rust/target
+          key: goat-test-macos-${{ hashFiles('rust/Cargo.lock', 'rust/**/Cargo.toml', 'vendor/**/Cargo.toml') }}
+      # Run each crate's whole inline suite so new test modules cannot be
+      # silently left out by a hand-maintained filter list. Tests that need a
+      # logged-in, TCC-authorized desktop are #[ignore] and belong to the Lume
+      # harness (tests/runners/macos-lume/run-all.sh).
+      - name: Run platform-macos unit tests
+        working-directory: rust
+        env:
+          # The hosted runner's pasteboard is disposable; opt in to the native
+          # clipboard round trip that would clobber a developer's clipboard.
+          CUA_TEST_ALLOW_CLIPBOARD: "1"
+        run: cargo test --locked -p platform-macos --lib
+      - name: Run cua-driver-core unit tests on macOS
+        working-directory: rust
+        run: cargo test --locked -p cua-driver-core --lib
+      - name: Run macOS protocol schema and status pid-file contracts
+        working-directory: rust
+        env:
+          CUA_TEST_REQUIRE_DRIVER_BIN: "1"
+          CUA_TEST_DRIVER_STDERR: "1"
+        run: |
+          cargo build --locked -p cua-driver
+          cargo test --locked -p cua-driver --test protocol_schema_test --test status_pid_file_cli_test
+      - name: SDK library tests (GOAT addition; upstream runs them only on Windows)
+        working-directory: rust
+        env:
+          # Short socket paths: the runner's default TMPDIR is long enough to exceed sun_path.
+          TMPDIR: /tmp
+        # quarantine: goat-si/cua-driver#8 - these nine daemon-transport tests fail intermittently on
+        # macOS with EINVAL (fixed upstream by trycua/cua#5558, not yet backported). --exact makes each
+        # --skip match one full test name; libtest's plain --skip matches substrings.
+        run: >-
+          cargo test -p cua-driver-sdk --lib --locked -- --exact
+          --skip tests::daemon_version_mismatch_is_refused_before_action_dispatch
+          --skip tests::native_windows::typed_click_returns_action_facts_and_flat_native_arguments
+          --skip tests::native_windows::typed_discovery_requests_use_the_existing_daemon_transport
+          --skip tests::native_windows::typed_snapshot_request_forwards_an_explicit_tree_shape
+          --skip tests::native_windows::typed_snapshot_request_preserves_target_and_session
+          --skip tests::session_method_returns_the_canonical_typed_output
+          --skip tests::tool_discovery_uses_the_shared_direct_daemon_protocol
+          --skip tests::typed_desktop_call_serializes_contract_and_normalizes_result
+          --skip tests::visual_parse_call_preserves_success_and_error_dtos
+      # Desktop E2E suites are #[ignore] and run in the Lume harness. Their
+      # hermetic oracle and parser tests run here as a whole crate, including
+      # the macOS-gated ones that have no other runner: the harness's FIFO
+      # backpressure self-tests and the standalone-browser command builders.
+      - name: Run hermetic cua-driver-e2e tests on macOS
+        working-directory: rust
+        run: cargo test --locked -p cua-driver-e2e
+
+  test-windows:
+    needs: version
+    name: Rust Windows unit and compile
+    runs-on: windows-latest
+    # The suite below has been running within a hair of this budget for months:
+    # the last green run on `main` (359fad56) took 28m31s of 30m. The tests this
+    # branch adds push it past the line, and the failure mode is silent -- every
+    # step passes and the job is killed partway through, so `Run Windows
+    # protocol schema contract` (the last step) simply never executes and the
+    # run is reported as `cancelled`, not failed. Raising the ceiling makes more
+    # of the gate run, not less; no test or assertion is skipped or relaxed.
+    # workflow_dispatch proxy-idle runs keep upstream's 90-minute budget.
+    # A warm Rust cache runs in about 15 minutes (trycua/cua); the cache is
+    # saved only from main, so a repository without one builds cold, where
+    # the first test step alone took 22 minutes and the job passed 45.
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: dtolnay/rust-toolchain@4716b85f2fac3e324e64fa2810f6b5c3905760a5 # 1.97.1
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            rust/target
+          key: goat-test-windows-${{ hashFiles('rust/Cargo.lock', 'rust/**/Cargo.toml', 'vendor/**/Cargo.toml') }}
+      - name: Record Windows runner session
+        id: runner-session
+        shell: pwsh
+        run: |
+          $sessionId = (Get-Process -Id $PID).SessionId
+          "session_id=$sessionId" >> $env:GITHUB_OUTPUT
+          "Windows runner process session id: $sessionId"
+      - name: Run Windows Rust tests
+        working-directory: rust
+        # Compile every Rust target without executing desktop-dependent integration
+        # tests; interactive behavior belongs in e2e-rust-windows.yml.
+        run: cargo test -p cua-driver -p cua-driver-e2e -p cua-driver-core -p cua-driver-sdk -p cua-driver-testkit -p cursor-overlay -p cursor-theme-cli -p platform-windows -p cua-driver-uia --all-targets --no-run --locked
+      - name: Run complete desktop-independent core tests
+        working-directory: rust
+        run: cargo test -p cua-driver-core --lib --test recording_shutdown_errors --locked
+      - name: Run driver state isolation regressions
+        working-directory: rust
+        env:
+          CUA_TEST_REQUIRE_DRIVER_BIN: "1"
+        run: |
+          cargo test -p cua-driver --test testkit_host_state_isolation_test --locked
+          if ($LASTEXITCODE -ne 0) { throw "driver state isolation tests failed with exit $LASTEXITCODE" }
+      - name: Run extension manager security regressions
+        working-directory: rust
+        run: |
+          $tests = @(
+            "extension_manager::tests::hardens_a_precreated_extension_root_with_a_broad_acl",
+            "extension_manager::tests::acl_hardening_reopens_directory_and_file_handles",
+            "extension_manager::tests::recursive_acl_hardening_removes_package_access_from_staged_tree",
+            "extension_manager::tests::recursive_acl_hardening_reasserts_root_after_descendant_walk",
+            "extension_manager::tests::staged_install_verification_survives_acl_drift_during_recursive_hardening",
+            "extension_manager::tests::post_hook_acl_grant_is_removed_before_staged_version_is_placed",
+            "extension_manager::tests::health_hook_acl_grant_is_removed_before_status_returns_healthy",
+            "extension_manager::tests::acl_identity_check_rejects_a_different_object",
+            "extension_manager::tests::rejects_windows_junctions_and_broad_acl_entries"
+          )
+          foreach ($test in $tests) {
+            cargo test -p cua-driver --bin cua-driver $test --locked -- --exact
+            if ($LASTEXITCODE -ne 0) { throw "Extension manager security regression $test failed with exit $LASTEXITCODE" }
+          }
+      # Run the whole inline suite so new platform-windows test modules cannot
+      # be silently left out by a hand-maintained module filter list.
+      - name: Run platform-windows unit tests
+        working-directory: rust
+        env:
+          # The hosted runner's clipboard is disposable; opt in to the native
+          # clipboard round trip that would clobber a developer's clipboard.
+          CUA_TEST_ALLOW_CLIPBOARD: "1"
+        run: cargo test --locked -p platform-windows --lib
+      - name: Run MCP proxy lifecycle regressions
+        working-directory: rust
+        run: "cargo test -p cua-driver --bin cua-driver proxy::tests:: --locked"
+      - name: Run real MCP proxy recovery regression
+        working-directory: rust
+        env:
+          CUA_PROXY_RECOVERY_IDLE_SECONDS: "1"
+        run: cargo test -p cua-driver --test protocol_proxy_recovery_test --locked -- --nocapture
+      - name: Test sentinel setup barrier
+        run: node --test tests/fixtures/apps/cross-platform/electron/preload.test.js
+      - name: Run named-pipe readiness regression
+        working-directory: rust
+        run: cargo test -p cua-driver-testkit stalled_pipe_attempt_is_bounded_and_does_not_block_the_next_probe --lib --locked
+      - name: Run named-pipe instance recovery and status pid-file regressions
+        working-directory: rust
+        run: cargo test -p cua-driver --test named_pipe_instance_recovery_test --test status_pid_file_cli_test --locked -- --nocapture
+      - name: Run cross-platform cursor renderer unit tests
+        working-directory: rust
+        run: |
+          cargo test -p cursor-overlay --lib --locked
+          if ($LASTEXITCODE -ne 0) { throw "cursor renderer tests failed with exit $LASTEXITCODE" }
+          cargo test -p cursor-theme-cli --locked
+          if ($LASTEXITCODE -ne 0) { throw "cursor theme compiler tests failed with exit $LASTEXITCODE" }
+      - name: Validate Windows Computer History uninstall ordering
+        run: .\scripts\tests\uninstall-windows-history-regression.ps1
+      - name: Run autostart registration and self-elevation tests
+        # The elevation tests drive the shipped PowerShell against a stubbed
+        # Start-Process, so they prove the exit-code contract (a declined UAC
+        # prompt must not exit 0 — trycua/cua#3179) without any real UAC
+        # prompt or an interactive desktop.
+        working-directory: rust
+        run: "cargo test -p cua-driver --bin cua-driver autostart::tests:: --locked"
+      - name: Prove unknown app launch stays bounded and responsive
+        working-directory: rust
+        env:
+          CUA_TEST_REQUIRE_DRIVER_BIN: "1"
+        run: "cargo test -p cua-driver --test protocol_tools_call_test launch_unknown_app_is_bounded_and_keeps_mcp_session_responsive --locked -- --exact --nocapture"
+      - name: Validate desktop AppsFolder launch with Microsoft Edge
+        working-directory: rust
+        env:
+          CUA_TEST_REQUIRE_DRIVER_BIN: "1"
+        run: "cargo test -p cua-driver --test protocol_tools_call_test launch_edge_from_apps_folder_registration --locked -- --ignored --exact --nocapture"
+      - name: Prove an elevated Driver launches apps with a standard-user token
+        working-directory: rust
+        env:
+          CUA_TEST_REQUIRE_DRIVER_BIN: "1"
+        run: cargo test -p cua-driver --test launch_app_standard_user_test --locked -- --ignored --nocapture
+      - name: Run transport-independent authorization and SDK tests
+        working-directory: rust
+        run: |
+          cargo test -p cua-driver-core session_authorization::tests:: --lib --locked
+          if ($LASTEXITCODE -ne 0) { throw "session authorization tests failed with exit $LASTEXITCODE" }
+          cargo test -p cua-driver-sdk abi::tests:: --lib --locked
+          if ($LASTEXITCODE -ne 0) { throw "SDK ABI tests failed with exit $LASTEXITCODE" }
+          cargo test -p cua-driver-sdk remote_ --lib --locked
+          if ($LASTEXITCODE -ne 0) { throw "remote SDK tests failed with exit $LASTEXITCODE" }
+          cargo test -p cua-driver-sdk driver_state_root_is_inherited_and_overridable --lib --locked
+          if ($LASTEXITCODE -ne 0) { throw "SDK driver state root tests failed with exit $LASTEXITCODE" }
+          cargo test -p cua-driver --bin cua-driver named_pipe_authentication_tests:: --locked
+          if ($LASTEXITCODE -ne 0) { throw "named-pipe authentication tests failed with exit $LASTEXITCODE" }
+          # The production binary embeds uiAccess=true and Windows correctly
+          # refuses to launch it unelevated. Run the same pure security policy
+          # from the manifest-free library test target.
+          cargo test -p cua-driver-uia --lib authorization_tests:: --locked
+          if ($LASTEXITCODE -ne 0) { throw "UIAccess authorization tests failed with exit $LASTEXITCODE" }
+      - name: Run full SDK unit suite in an interactive runner session
+        if: steps.runner-session.outputs.session_id != '0'
+        working-directory: rust
+        run: cargo test -p cua-driver-sdk --lib --locked -- --test-threads=1
+      - name: Prove Session 0 refusal
+        if: steps.runner-session.outputs.session_id == '0'
+        working-directory: rust
+        shell: pwsh
+        run: |
+          cargo test -p cua-driver-sdk session_zero_refuses_runtime_creation_before_platform_dispatch --lib --locked | Tee-Object -Variable sessionZeroLog
+          if ($LASTEXITCODE -ne 0) { throw "Session 0 refusal test failed with exit $LASTEXITCODE" }
+          if (-not ($sessionZeroLog -match 'test result: ok\. 1 passed')) { throw "Session 0 refusal filter matched no test" }
+      - name: Prove metadata commands remain desktop-free
+        working-directory: rust
+        run: |
+          cargo run -p cua-driver --locked -- list-tools | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw "list-tools failed with exit $LASTEXITCODE" }
+          cargo run -p cua-driver --locked -- describe click | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw "describe failed with exit $LASTEXITCODE" }
+          cargo run -p cua-driver --locked -- dump-docs --type cli | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw "dump-docs failed with exit $LASTEXITCODE" }
+      - name: Run Windows protocol schema contract
+        if: steps.runner-session.outputs.session_id != '0'
+        working-directory: rust
+        run: cargo test -p cua-driver --test protocol_schema_test --locked
+
   release:
     if: startsWith(github.ref, 'refs/tags/cua-driver-rs-v')
-    needs: [version, deny, linux, windows, macos]
+    needs: [version, deny, test-linux, test-macos, test-windows, linux, windows, macos]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -278,6 +680,8 @@ jobs:
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           path: dist
+          # Only the five build archives; test jobs upload evidence (x11-capture-evidence) too.
+          pattern: "{darwin-universal,linux-x86_64,linux-arm64,windows-x86_64,windows-arm64}"
           merge-multiple: true
       - name: Checksums
         working-directory: dist
