@@ -1,0 +1,48 @@
+# License/ban/source gate for the shipped graphs; from the goat-si/goat#1589 audit (cargo-deny 0.20.2).
+[graph]
+targets = [
+  "aarch64-apple-darwin", "x86_64-apple-darwin",
+  "x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu",
+  "x86_64-pc-windows-msvc", "aarch64-pc-windows-msvc",
+]
+all-features = false
+no-default-features = false
+features = ["cua-driver/portal-input"]
+
+[licenses]
+allow = [
+  "MIT", "MIT-0", "Apache-2.0", "Apache-2.0 WITH LLVM-exception",
+  "BSD-2-Clause", "BSD-3-Clause", "ISC", "Zlib", "BSL-1.0",
+  "Unicode-3.0", "CDLA-Permissive-2.0",
+]
+confidence-threshold = 0.95
+exceptions = [
+  { crate = "cbindgen@0.29.4", allow = ["MPL-2.0"] },
+  { crate = "option-ext@0.2.0", allow = ["MPL-2.0"] },
+  { crate = "uniffi@0.31.0", allow = ["MPL-2.0"] },
+  { crate = "uniffi_core@0.31.0", allow = ["MPL-2.0"] },
+  { crate = "uniffi_pipeline@0.31.0", allow = ["MPL-2.0"] },
+  { crate = "uniffi_bindgen@0.31.0", allow = ["MPL-2.0"] },
+  { crate = "uniffi_internal_macros@0.31.0", allow = ["MPL-2.0"] },
+  { crate = "uniffi_macros@0.31.0", allow = ["MPL-2.0"] },
+  { crate = "uniffi_meta@0.31.0", allow = ["MPL-2.0"] },
+  { crate = "uniffi_udl@0.31.0", allow = ["MPL-2.0"] },
+]
+[licenses.private]
+ignore = false
+
+[bans]
+multiple-versions = "warn"
+# Upstream publishes some path-dependent packages without publish=false/version bounds.
+# Keep this advisory until those manifests are corrected; --locked pins registry inputs.
+wildcards = "warn"
+allow-wildcard-paths = true
+highlight = "all"
+# Dependency introductions remain gated by the license allow-list above.
+deny = []
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []
