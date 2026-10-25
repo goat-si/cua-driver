@@ -1,0 +1,5 @@
+# The monorepo's root .gitignore covered these before the subtree split.
+target/
+node_modules/
+__pycache__/
+.DS_Store

@@ -34,7 +34,7 @@ ureq = { version = "3", features = ["json"] }
 # The switches shared by every Cua program (DO_NOT_TRACK, CUA_TELEMETRY,
 # `[telemetry] enabled` in $CUA_HOME/config.toml). Only its config reader
 # is used; no sender.
-cua-telemetry = { path = "../../../../cua/crates/cua-telemetry", default-features = false }
+cua-telemetry = { path = "../../../vendor/cua/crates/cua-telemetry", default-features = false }
 # Strict semver comparison for the startup update-available banner so that
 # pre-release tags (`-dev`, `-rc.1`) sort below their corresponding release
 # and we never recommend a pre-release as an "update".
