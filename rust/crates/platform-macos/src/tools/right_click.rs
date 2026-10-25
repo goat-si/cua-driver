@@ -1,3 +1,5 @@
+use crate::goat::action_latency as latency;
+
 use async_trait::async_trait;
 use cua_driver_core::{
     protocol::ToolResult,
@@ -94,7 +96,7 @@ impl Tool for RightClickTool {
         let cursor_key = super::cursor_tools::resolve_cursor_key(&args);
 
         let window_id_arg = args.opt_u64("window_id");
-        let resolved = match self.state.snapshots.resolve(pid, &args) {
+        let resolved = match latency::resolve(|| self.state.snapshots.resolve(pid, &args)) {
             Ok(r) => r,
             Err(e) => return e,
         };
@@ -141,8 +143,9 @@ impl Tool for RightClickTool {
 
             // The context menu steals key focus from the user's app when the
             // target is in the background; the guard hands it back.
-            let result = tokio::task::spawn_blocking(move || {
+            let result = latency::spawn_blocking(move || {
                 let _key_focus = crate::key_focus_guard::protect(pid);
+                let _action = latency::span(latency::Stage::ActionBlocking);
                 ax_show_menu(element_guard.as_ptr(), idx, pid, wid)
             })
             .await;
@@ -240,10 +243,11 @@ impl Tool for RightClickTool {
             Ok(route) => route,
             Err(refusal) => return refusal,
         };
-        let result = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+        let result = latency::spawn_blocking(move || -> anyhow::Result<()> {
             let _key_focus = (!fg)
                 .then(|| crate::key_focus_guard::protect(pid))
                 .flatten();
+            let _action = latency::span(latency::Stage::ActionBlocking);
             let do_it = move || -> anyhow::Result<()> {
                 let m: Vec<&str> = modifiers.iter().map(String::as_str).collect();
                 if route == super::pixel_route::PixelClickRoute::ForegroundHid {

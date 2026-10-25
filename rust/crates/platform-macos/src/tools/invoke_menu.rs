@@ -1,3 +1,5 @@
+use crate::goat::action_latency as latency;
+
 use async_trait::async_trait;
 use core_foundation::base::{CFRelease, CFTypeRef};
 use cua_driver_contract::InvokeMenuInput;
@@ -777,7 +779,7 @@ pub(super) async fn run_in_background(
     request: MenuRequest,
 ) -> ToolResult {
     let _mutation = super::acquire_background_mutation(pid).await;
-    let document = tokio::task::spawn_blocking(move || document_path_of_window(pid, window_id))
+    let document = latency::spawn_action_blocking(move || document_path_of_window(pid, window_id))
         .await
         .ok()
         .flatten();
@@ -785,8 +787,9 @@ pub(super) async fn run_in_background(
         .as_deref()
         .and_then(crate::apple_events::modified_time);
     let press_path = path.clone();
-    let outcome = tokio::task::spawn_blocking(move || {
+    let outcome = latency::spawn_blocking(move || {
         let _key_focus = crate::key_focus_guard::protect(pid);
+        let _action = latency::span(latency::Stage::ActionBlocking);
         unsafe { invoke_path_in_background(pid, window_id, &press_path) }
     })
     .await;
@@ -794,7 +797,7 @@ pub(super) async fn run_in_background(
     match outcome {
         Ok(Ok(PressedItem { is_save: true })) if document.is_some() => {
             let file = document.clone().expect("checked");
-            let written = tokio::task::spawn_blocking(move || {
+            let written = latency::spawn_action_blocking(move || {
                 crate::apple_events::wait_for_new_mtime(&file, before, Duration::from_secs(2))
             })
             .await
@@ -848,7 +851,7 @@ pub(super) async fn run_in_background(
                 crate::apps::get_app_name_for_pid(pid).unwrap_or_else(|| "the app".into());
             let save_file = file.clone();
             let save_app = app_name.clone();
-            let saved = tokio::task::spawn_blocking(move || {
+            let saved = latency::spawn_action_blocking(move || {
                 crate::apple_events::save_document(&bundle_id, &save_app, &save_file)
             })
             .await;
@@ -964,7 +967,7 @@ impl Tool for InvokeMenuTool {
         // A background target: invoke the item without activating the app or
         // raising its window. When macOS keeps the item unavailable to a
         // background app, refuse and say so instead of activating it.
-        let target_in_front = tokio::task::spawn_blocking(move || {
+        let target_in_front = latency::spawn_action_blocking(move || {
             live_frontmost_app().or_else(crate::apps::frontmost_pid) == Some(pid)
         })
         .await
@@ -973,7 +976,7 @@ impl Tool for InvokeMenuTool {
             return run_in_background(pid, window_id, path, MenuRequest::Path).await;
         }
 
-        let outcome = tokio::task::spawn_blocking(move || {
+        let outcome = latency::spawn_action_blocking(move || {
             let prior_frontmost = live_frontmost_app().or_else(crate::apps::frontmost_pid);
             let prior_frontmost_window =
                 prior_frontmost.and_then(crate::ax::bindings::focused_window_id_of_pid);

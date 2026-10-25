@@ -36,6 +36,8 @@
 //! also drops the lease before returning — the lease's `Drop` is
 //! idempotent so explicit-detect + later-drop is safe.
 
+use crate::goat::action_latency as latency;
+
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
@@ -342,6 +344,7 @@ impl WindowChangeDetector {
         suppress_focus: bool,
         allowed_pid: Option<i32>,
     ) -> Snapshot {
+        let _latency = latency::span(latency::Stage::Snapshot);
         // A new action supersedes the previous action's detached observation.
         end_tail();
         let window_ids: HashSet<u32> = host_windows().into_iter().map(|w| w.window_id).collect();
@@ -439,8 +442,10 @@ impl Snapshot {
         report_window: Duration,
         observe: impl FnMut() -> (Vec<WindowInfo>, Option<i32>) + Send + 'static,
     ) -> Changes {
+        let _latency = latency::span(latency::Stage::Detector);
         let earlier = self.earlier.take();
         if bounds.skips_observation() {
+            latency::detector_exit("skipped");
             drop(self);
             return Changes::not_polled().with_earlier(earlier);
         }
@@ -448,8 +453,16 @@ impl Snapshot {
         let report = report_window.min(bounds.timeout);
         let mut observe = observe;
         let changes = match self.poll_until(started + report, bounds.poll, &mut observe) {
-            Ok(changes) => changes,
+            Ok(changes) => {
+                latency::detector_exit("change");
+                changes
+            }
             Err(quiet) => {
+                latency::detector_exit(if report < bounds.timeout {
+                    "report_window"
+                } else {
+                    "timeout"
+                });
                 quiet.continue_detached(started + bounds.timeout, bounds.poll, observe);
                 Changes::no_change()
             }
@@ -468,11 +481,14 @@ impl Snapshot {
         let report_window = cua_driver_core::step_pacing::report_window(REPORT_WINDOW);
         // Move the Snapshot (and its embedded lease) onto the blocking
         // thread; the lease's Drop runs there when detect_with returns.
-        tokio::task::spawn_blocking(move || {
+        latency::spawn_blocking(move || {
             self.detect_bounded_reporting(host_observation_bounds(), report_window, observe_host)
         })
         .await
-        .unwrap_or_else(|_| Changes::not_polled())
+        .unwrap_or_else(|_| {
+            latency::detector_exit("join_error");
+            Changes::not_polled()
+        })
     }
 
     /// One observation against the snapshot: the change it shows, if any.
@@ -504,7 +520,7 @@ impl Snapshot {
         observe: &mut impl FnMut() -> (Vec<WindowInfo>, Option<i32>),
     ) -> Result<Changes, Self> {
         loop {
-            std::thread::sleep(poll_interval);
+            latency::detector_sleep(poll_interval);
             if let Some(changes) = self.observe_once(observe) {
                 return Ok(changes);
             }
@@ -567,6 +583,7 @@ impl Snapshot {
                     tail.take();
                 }
             });
+        latency::tail_spawned(spawned.is_ok());
         if spawned.is_err() {
             // No thread: release the lease now rather than holding it forever.
             end_tail();
@@ -608,15 +625,12 @@ impl Snapshot {
 
 /// The host's visible layer-0 windows.
 fn host_windows() -> Vec<WindowInfo> {
-    windows::visible_windows()
-        .into_iter()
-        .filter(|w| w.layer == 0)
-        .collect()
+    windows::visible_windows_without_spaces()
 }
 
 /// One live observation for the poll loop: layer-0 windows and the frontmost pid.
 fn observe_host() -> (Vec<WindowInfo>, Option<i32>) {
-    (host_windows(), apps::frontmost_pid())
+    (latency::enumerate(host_windows), apps::frontmost_pid())
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────

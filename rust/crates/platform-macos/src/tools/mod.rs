@@ -1,5 +1,7 @@
 //! MCP tool implementations for macOS.
 
+use crate::goat::action_latency as latency;
+
 mod bring_to_front;
 mod capture_binding;
 mod click;
@@ -997,6 +999,7 @@ pub fn register_all(
     host_owns_permission_ux: bool,
     host_bundle_id: Option<String>,
 ) {
+    let registry = &mut latency::Registry::new(registry);
     let state = Arc::new(ToolState::new_with_capture_service(
         registry.capture_service(),
         cursor_overlay_available,

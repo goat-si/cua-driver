@@ -1,3 +1,5 @@
+use crate::goat::action_latency as latency;
+
 use async_trait::async_trait;
 use core_foundation::base::{CFRelease, CFTypeRef};
 use cua_driver_contract::{ScrollBy, ScrollDirection, ScrollInput};
@@ -151,7 +153,7 @@ impl Tool for ScrollTool {
             {
                 return refusal;
             }
-            let result = tokio::task::spawn_blocking(move || {
+            let result = latency::spawn_action_blocking(move || {
                 crate::input::mouse::scroll_wheel_desktop(x, y, delta_y, delta_x, amount)
             })
             .await;
@@ -188,7 +190,7 @@ impl Tool for ScrollTool {
         let by = args.str_or("by", "line");
         let amount = clamp_amount(args.u64_or("amount", 3));
         let window_id_arg = args.opt_u64("window_id");
-        let resolved = match self.state.snapshots.resolve(pid, &args) {
+        let resolved = match latency::resolve(|| self.state.snapshots.resolve(pid, &args)) {
             Ok(r) => r,
             Err(e) => return e,
         };
@@ -236,7 +238,7 @@ impl Tool for ScrollTool {
                 let by_for_ax = by.clone();
                 let foreground = delivery_mode.is_foreground();
                 let ax_result =
-                    tokio::task::spawn_blocking(move || -> anyhow::Result<(bool, bool)> {
+                    latency::spawn_action_blocking(move || -> anyhow::Result<(bool, bool)> {
                         if foreground {
                             let mut delivered = false;
                             let fronted = crate::input::skylight::with_foreground_assist(
@@ -366,7 +368,7 @@ impl Tool for ScrollTool {
             // Retina scaling is needed here.
             let wid = window_id;
             let target_guard = pre_focus_guard.clone();
-            let target_task = tokio::task::spawn_blocking(move || {
+            let target_task = latency::spawn_action_blocking(move || {
                 let _target_guard = target_guard;
                 // Web content can be present in AX while its frame is below
                 // the outer page viewport. Ask the accessibility hierarchy to
@@ -544,7 +546,7 @@ impl Tool for ScrollTool {
                 prior_front,
                 "scroll.CGScrollWheel",
                 || async move {
-                    tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+                    latency::spawn_action_blocking(move || -> anyhow::Result<()> {
                         let do_it = move || -> anyhow::Result<()> {
                             crate::input::mouse::scroll_wheel_at_xy(
                                 pid,
@@ -655,14 +657,14 @@ impl Tool for ScrollTool {
                 // Pre-focus the element under suppression so its
                 // side-effects are captured by the snapshot + lease.
                 if let Some(guard) = pre_focus_guard {
-                    let _ = tokio::task::spawn_blocking(move || {
+                    let _ = latency::spawn_action_blocking(move || {
                         crate::input::ax_actions::focus_element(guard.as_ptr())
                     })
                     .await;
                     tokio::time::sleep(std::time::Duration::from_millis(30)).await;
                 }
 
-                tokio::task::spawn_blocking(move || {
+                latency::spawn_action_blocking(move || {
                     for _ in 0..amount {
                         crate::input::keyboard::press_key(pid, &key, &[])?;
                         std::thread::sleep(std::time::Duration::from_millis(50));
@@ -744,7 +746,7 @@ async fn electron_reveal_scroll(
     }
     let window_rect = window.map(|b| [b.x, b.y, b.width, b.height]);
     let direction_owned = direction.to_owned();
-    let outcome = tokio::task::spawn_blocking(move || unsafe {
+    let outcome = latency::spawn_action_blocking(move || unsafe {
         crate::ax::reveal_scroll::reveal_scroll(pid, point, window_rect, &direction_owned, distance)
     })
     .await;

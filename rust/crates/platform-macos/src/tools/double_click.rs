@@ -1,3 +1,5 @@
+use crate::goat::action_latency as latency;
+
 use async_trait::async_trait;
 use cua_driver_core::{
     protocol::ToolResult,
@@ -83,7 +85,7 @@ impl Tool for DoubleClickTool {
         let delivery_mode = super::DeliveryMode::parse(args.opt_str("delivery_mode").as_deref());
         let cursor_key = super::cursor_tools::resolve_cursor_key(&args);
         let window_id_arg = args.opt_u64("window_id");
-        let resolved = match self.state.snapshots.resolve(pid, &args) {
+        let resolved = match latency::resolve(|| self.state.snapshots.resolve(pid, &args)) {
             Ok(r) => r,
             Err(e) => return e,
         };
@@ -104,7 +106,7 @@ impl Tool for DoubleClickTool {
             // elements require the stricter routed-pointer proof. Do not let a
             // failed AXOpen silently cross into an ungated pointer fallback.
             let probe_guard = element_guard.clone();
-            let has_ax_open = tokio::task::spawn_blocking(move || unsafe {
+            let has_ax_open = latency::spawn_action_blocking(move || unsafe {
                 copy_action_names(probe_guard.as_ptr() as AXUIElementRef)
                     .iter()
                     .any(|action| action == "AXOpen")
@@ -143,7 +145,7 @@ impl Tool for DoubleClickTool {
                 prior_front,
                 "double_click.ax",
                 || async move {
-                    tokio::task::spawn_blocking(move || {
+                    latency::spawn_action_blocking(move || {
                         ax_double_click(
                             pid,
                             wid,

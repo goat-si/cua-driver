@@ -38,6 +38,8 @@
 //! notice. So the guard also taps each guarded target and drops the notices
 //! whose thief is the driver itself; the menu stays open through the lookup.
 
+use crate::goat::action_latency as latency;
+
 use std::collections::HashMap;
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -436,6 +438,7 @@ pub struct Lease {
 
 impl Drop for Lease {
     fn drop(&mut self) {
+        let _latency = latency::span(latency::Stage::LeaseDrop);
         if self.epoch == crate::window_change_detector::intentional_epoch() {
             revert_self_activation(self.pid, self.front);
         }
@@ -458,6 +461,7 @@ impl Drop for Lease {
 /// when there is no other frontmost app, or when the SPIs or the event tap are
 /// unavailable; the action then runs exactly as before.
 pub fn protect(target_pid: i32) -> Option<Lease> {
+    let _latency = latency::span(latency::Stage::Protect);
     if std::env::var_os("CUA_DRIVER_DISABLE_KEY_FOCUS_GUARD").is_some() {
         return None;
     }
