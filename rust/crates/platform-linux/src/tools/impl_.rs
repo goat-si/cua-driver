@@ -1,5 +1,8 @@
 //! Real Linux tool implementations (compiled only on Linux).
 
+#[path = "goat_launch_lifetime.rs"]
+mod goat_launch_lifetime;
+
 use async_trait::async_trait;
 use cua_driver_contract::{
     ClickButton, DragInput, GetCursorPositionInput, GetDesktopStateInput, GetScreenSizeInput,
@@ -1915,7 +1918,7 @@ fn spawn_launch_command(cmd: &str, additional_arguments: &[String]) -> std::io::
     {
         launch.arg("--force-renderer-accessibility");
     }
-    let child = launch.spawn()?;
+    let child = goat_launch_lifetime::detach_user_app(&mut launch).spawn()?;
     let pid = child.id();
     reap_in_background(child);
     Ok(pid)
@@ -2074,7 +2077,10 @@ impl Tool for LaunchAppTool {
                     for url in &urls {
                         children.push((
                             url.clone(),
-                            std::process::Command::new("xdg-open").arg(url).spawn()?,
+                            goat_launch_lifetime::detach_user_app(
+                                std::process::Command::new("xdg-open").arg(url),
+                            )
+                            .spawn()?,
                         ));
                     }
                     for (url, child) in children {
@@ -2139,7 +2145,10 @@ impl Tool for LaunchAppTool {
                                      round-trip its launch_path."
                                 );
                             }
-                            let child = std::process::Command::new("xdg-open").arg(cmd).spawn()?;
+                            let child = goat_launch_lifetime::detach_user_app(
+                                std::process::Command::new("xdg-open").arg(cmd),
+                            )
+                            .spawn()?;
                             if let Some(reason) = xdg_open_failure(child) {
                                 anyhow::bail!("could not open '{cmd}': {reason}");
                             }
