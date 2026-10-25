@@ -1,3 +1,5 @@
+use crate::goat::action_latency as latency;
+
 use async_trait::async_trait;
 use core_foundation::base::CFRelease;
 use cua_driver_contract::PressKeyInput;
@@ -266,7 +268,7 @@ impl Tool for PressKeyTool {
             let key = input.key;
             let modifiers = input.modifiers.unwrap_or_default();
             let key_for_input = key.clone();
-            let result = tokio::task::spawn_blocking(move || {
+            let result = latency::spawn_action_blocking(move || {
                 let modifier_refs: Vec<&str> = modifiers.iter().map(String::as_str).collect();
                 crate::input::keyboard::press_key_global(&key_for_input, &modifier_refs)
             })
@@ -292,7 +294,7 @@ impl Tool for PressKeyTool {
         };
         let mut modifiers: Vec<String> = args.str_array("modifiers");
         let window_id_arg = args.opt_u64("window_id");
-        let resolved = match self.state.snapshots.resolve(pid, &args) {
+        let resolved = match latency::resolve(|| self.state.snapshots.resolve(pid, &args)) {
             Ok(r) => r,
             Err(e) => return e,
         };
@@ -407,7 +409,7 @@ impl Tool for PressKeyTool {
         // or the window centre, so a keyboard-first session stays visible.
         if !px_focus {
             let element_center = match pre_focus_guard.clone() {
-                Some(guard) => tokio::task::spawn_blocking(move || unsafe {
+                Some(guard) => latency::spawn_action_blocking(move || unsafe {
                     crate::ax::bindings::element_screen_center(
                         guard.as_ptr() as crate::ax::bindings::AXUIElementRef
                     )
@@ -442,7 +444,7 @@ impl Tool for PressKeyTool {
             prior_front,
             "press_key.CGEvent",
             || async move {
-                tokio::task::spawn_blocking(move || {
+                latency::spawn_action_blocking(move || {
                     let pre_focus_ptr = pre_focus_guard.as_ref().map(|guard| guard.as_ptr());
                     let m: Vec<&str> = modifiers.iter().map(String::as_str).collect();
                     // Foreground rung: keep the exact target frontmost through a genuine

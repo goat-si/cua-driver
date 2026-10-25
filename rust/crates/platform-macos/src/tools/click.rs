@@ -14,6 +14,8 @@
 //!   the target pid.  `from_zoom=true` translates zoom-crop pixel coordinates back
 //!   to full-window space using the most recent `zoom` context stored per-pid.
 
+use crate::goat::action_latency as latency;
+
 use async_trait::async_trait;
 use cua_driver_contract::ClickButton;
 use cua_driver_core::{
@@ -272,7 +274,7 @@ pub(super) async fn restore_user_focus_after_background_pixel(
             previous_pid,
         );
         if key_moved && apps::frontmost_pid() == Some(previous_pid) {
-            let _ = tokio::task::spawn_blocking(move || {
+            let _ = latency::spawn_action_blocking(move || {
                 crate::input::skylight::restore_focus_after_without_raise(
                     previous_pid,
                     prior_key_wid,
@@ -476,7 +478,7 @@ impl Tool for ClickTool {
 
             let btn = button.clone();
             let desktop_modifiers: Vec<String> = args.str_array("modifier");
-            let result = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+            let result = latency::spawn_action_blocking(move || -> anyhow::Result<()> {
                 // Desktop scope is explicitly foreground and vision-driven: post
                 // at the global HID tap so WindowServer delivers to the window
                 // actually visible at this point. PID-posting here would silently
@@ -518,7 +520,7 @@ impl Tool for ClickTool {
         let cursor_key = super::cursor_tools::resolve_cursor_key(&args);
 
         let window_id_arg = args.opt_u64("window_id");
-        let resolved = match self.state.snapshots.resolve(pid, &args) {
+        let resolved = match latency::resolve(|| self.state.snapshots.resolve(pid, &args)) {
             Ok(r) => r,
             Err(e) => return e,
         };
@@ -631,7 +633,7 @@ impl Tool for ClickTool {
                 && matches!(effective_action.as_str(), "press" | "show_menu")
             {
                 let select_guard = element_guard.clone();
-                let refusal = tokio::task::spawn_blocking(move || {
+                let refusal = latency::spawn_action_blocking(move || {
                     let element = select_guard.as_ptr() as AXUIElementRef;
                     super::set_value::is_chromium_web_select(pid, wid, element).then(|| {
                         super::set_value::chromium_select_open_refusal(pid, wid, Some(idx), element)
@@ -650,7 +652,7 @@ impl Tool for ClickTool {
             let center_guard = element_guard.clone();
             // The element's screen rect rides along on the glide so motion
             // styles can time by target size and highlight the target.
-            let (center, target_rect) = tokio::task::spawn_blocking(move || unsafe {
+            let (center, target_rect) = latency::spawn_action_blocking(move || unsafe {
                 let el = center_guard.as_ptr() as AXUIElementRef;
                 (
                     crate::ax::bindings::element_screen_center(el),
@@ -693,7 +695,7 @@ impl Tool for ClickTool {
 
                 let mods_owned = modifiers.clone();
                 let foreground = delivery_mode.is_foreground();
-                let result = tokio::task::spawn_blocking(move || {
+                let result = latency::spawn_action_blocking(move || {
                     let m: Vec<&str> = mods_owned.iter().map(String::as_str).collect();
                     if foreground && !m.is_empty() {
                         crate::input::skylight::with_foreground_hid_activation(
@@ -750,7 +752,7 @@ impl Tool for ClickTool {
             // rung internally and confirm the result by AX read-back.
             let selection_center = if effective_action == "press" {
                 let selection_guard = element_guard.clone();
-                tokio::task::spawn_blocking(move || {
+                latency::spawn_action_blocking(move || {
                     crate::input::ax_actions::nearest_container_selection_state(
                         selection_guard.as_ptr(),
                     )
@@ -820,7 +822,7 @@ impl Tool for ClickTool {
                 prior_front,
                 "click.AXPress",
                 || async move {
-                    tokio::task::spawn_blocking(move || {
+                    latency::spawn_action_blocking(move || {
                         let element_ptr = element_guard.as_ptr();
                         if foreground {
                             let mut outcome = None;
@@ -975,7 +977,7 @@ impl Tool for ClickTool {
                             &self.state.config.read().unwrap(),
                         );
                         let dbg_path_c = dbg_path.clone();
-                        let dbg_result = tokio::task::spawn_blocking(move || {
+                        let dbg_result = latency::spawn_action_blocking(move || {
                             let png = crate::capture::screenshot_window_bytes(wid)?;
                             let png = crate::capture::resize_png_if_needed(&png, max_dim)?;
                             crate::capture::write_crosshair_png(&png, cx, cy, &dbg_path_c)
@@ -1124,7 +1126,7 @@ impl Tool for ClickTool {
             // A background pixel click on a Chromium <select> would open its
             // menu and raise the browser window (CUA-1795).
             if let Some(select_wid) = window_id.filter(|_| !delivery_mode.is_foreground()) {
-                let refusal = tokio::task::spawn_blocking(move || unsafe {
+                let refusal = latency::spawn_action_blocking(move || unsafe {
                     let element = element_at_screen_position(pid, screen_x, screen_y)?;
                     let refusal = (crate::ax::exact_target::element_window_id(element)
                         == Some(select_wid)
@@ -1164,7 +1166,7 @@ impl Tool for ClickTool {
                     && modifiers.is_empty()
             }) {
                 let focus_only = action == "focus";
-                let ax_result = tokio::task::spawn_blocking(move || unsafe {
+                let ax_result = latency::spawn_action_blocking(move || unsafe {
                     let Some(element) = element_at_screen_position(pid, screen_x, screen_y) else {
                         return Ok::<bool, anyhow::Error>(false);
                     };
@@ -1274,7 +1276,7 @@ impl Tool for ClickTool {
             let _key_focus = if fg {
                 None
             } else {
-                tokio::task::spawn_blocking(move || crate::key_focus_guard::protect(pid))
+                latency::spawn_blocking(move || crate::key_focus_guard::protect(pid))
                     .await
                     .ok()
                     .flatten()
@@ -1287,7 +1289,7 @@ impl Tool for ClickTool {
                     if activation_policy == PixelActivationPolicy::AllowTargetWithoutRaise
                         && prior != pid =>
                 {
-                    tokio::task::spawn_blocking(move || {
+                    latency::spawn_action_blocking(move || {
                         crate::input::skylight::key_window_of_pid(prior)
                     })
                     .await
@@ -1307,7 +1309,7 @@ impl Tool for ClickTool {
                 == PixelActivationPolicy::AllowTargetWithoutRaise
             {
                 let wid = window_id.expect("activation policy requires window_id");
-                match tokio::task::spawn_blocking(move || {
+                match latency::spawn_action_blocking(move || {
                     crate::input::mouse::prepare_background_pixel_click(pid, wid)
                 })
                 .await
@@ -1356,7 +1358,7 @@ impl Tool for ClickTool {
                 prior_front,
                 "click.pixel",
                 || async move {
-                    tokio::task::spawn_blocking(move || {
+                    latency::spawn_action_blocking(move || {
                         let do_click = move || -> anyhow::Result<()> {
                             let m: Vec<&str> = mods_owned.iter().map(String::as_str).collect();
                             if route == PixelClickRoute::ForegroundHid {

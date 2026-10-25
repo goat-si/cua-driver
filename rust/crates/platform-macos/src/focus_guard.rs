@@ -48,6 +48,8 @@
 //!    string like `"click.AXPress"` so leaked leases / late-firing
 //!    observers can be traced back to the caller.
 
+use crate::goat::action_latency as latency;
+
 use std::time::Duration;
 
 use crate::apps;
@@ -111,7 +113,7 @@ where
     // (popup, select, context menu) while it is in the background.
     let _key_focus = match target_pid {
         Some(tp) if prior_frontmost != Some(tp) => {
-            tokio::task::spawn_blocking(move || crate::key_focus_guard::protect(tp))
+            latency::spawn_blocking(move || crate::key_focus_guard::protect(tp))
                 .await
                 .ok()
                 .flatten()
@@ -119,13 +121,17 @@ where
         _ => None,
     };
 
-    let result = f().await;
+    let result = latency::timed(latency::Stage::Action, f()).await;
 
     // Post-action settle — give the reactive observer time to fire on
     // any side-effect activation before we drop the lease. Matches
     // Swift's 50ms sleep in `FocusGuard.withFocusSuppressed`.
     if _lease.is_some() {
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        latency::timed(
+            latency::Stage::Settle,
+            tokio::time::sleep(Duration::from_millis(50)),
+        )
+        .await;
     }
 
     // _lease drops here (RAII end_suppression).

@@ -55,6 +55,8 @@
 //! background `NSOperationQueue` sidesteps that — the block runs on the
 //! queue's own thread regardless of run-loop state.
 
+use crate::goat::action_latency as latency;
+
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -225,6 +227,7 @@ impl SuppressionLease {
 
 impl Drop for SuppressionLease {
     fn drop(&mut self) {
+        let _latency = latency::span(latency::Stage::LeaseDrop);
         if !self.released {
             self.dispatcher.remove(self.handle);
         }

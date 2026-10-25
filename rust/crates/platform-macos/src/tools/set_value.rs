@@ -12,6 +12,8 @@
 //! * **Everything else**: Write `AXValue` directly (sliders, steppers, native
 //!   text fields that expose a settable AXValue).
 
+use crate::goat::action_latency as latency;
+
 use async_trait::async_trait;
 use cua_driver_core::{
     protocol::ToolResult,
@@ -92,7 +94,7 @@ impl Tool for SetValueTool {
         };
 
         let (element_index, window_id, element_guard) =
-            match self.state.snapshots.resolve(pid, &args) {
+            match latency::resolve(|| self.state.snapshots.resolve(pid, &args)) {
                 Ok(cua_driver_core::element_token::ResolvedElement::None) => {
                     return ToolResult::error(
                         "set_value requires element_token to address the target element.",
@@ -134,7 +136,7 @@ impl Tool for SetValueTool {
         // instead, with Finder left in the background, and read back from
         // disk.
         let name_guard = element_guard.clone();
-        let name_target = tokio::task::spawn_blocking(move || unsafe {
+        let name_target = latency::spawn_action_blocking(move || unsafe {
             let element = name_guard.as_ptr() as AXUIElementRef;
             if file_name_cell(element) {
                 let finder =
@@ -162,7 +164,7 @@ impl Tool for SetValueTool {
             Some(NameTarget::FinderItem(path)) => {
                 let new_name = value.clone();
                 let rename_path = path.clone();
-                let renamed = tokio::task::spawn_blocking(move || {
+                let renamed = latency::spawn_action_blocking(move || {
                     crate::apple_events::finder_rename(&rename_path, &new_name)
                 })
                 .await;
@@ -174,7 +176,7 @@ impl Tool for SetValueTool {
         let cursor_key = super::cursor_tools::resolve_cursor_key(&args);
         let center_guard = element_guard.clone();
         if let Ok((Some((screen_x, screen_y)), target_rect)) =
-            tokio::task::spawn_blocking(move || unsafe {
+            latency::spawn_action_blocking(move || unsafe {
                 let el = center_guard.as_ptr() as AXUIElementRef;
                 (
                     crate::ax::bindings::element_screen_center(el),
@@ -221,7 +223,7 @@ impl Tool for SetValueTool {
             prior_front,
             "set_value.AXValue",
             || async move {
-                tokio::task::spawn_blocking(move || {
+                latency::spawn_action_blocking(move || {
                     set_value_blocking(
                         element_guard.as_ptr(),
                         element_index,
