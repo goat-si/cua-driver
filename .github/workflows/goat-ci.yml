@@ -55,7 +55,9 @@ jobs:
       - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2
         with:
           tool: cargo-deny@0.20.2
-      - name: Licenses, bans and sources (rust/deny.toml)
+      # Covers the rust/ workspace (driver, cursor theme, SDK, UIA). The Node runtime is built from a
+      # separate, unlocked Cargo project that this does not see; goat-si/cua-driver#4.
+      - name: Licenses, bans and sources of the rust/ workspace (rust/deny.toml)
         working-directory: rust
         run: cargo deny --locked --exclude-dev check --show-stats licenses bans sources
 
@@ -119,7 +121,7 @@ jobs:
           cp THIRD_PARTY_NOTICES.md "release/$STAGE/"
           tar -czf "release/$STAGE-binary.tar.gz" -C "release/$STAGE" .
       - name: Protocol compatibility with GOAT's pinned release
-        run: python3 goat/compat/check_protocol.py --candidate "rust/release/$STAGE/cua-driver" --baseline-key linux-${{ matrix.arch }}
+        run: python3 goat/compat/check_protocol.py --candidate "rust/release/$STAGE/cua-driver" --candidate-version "${{ needs.version.outputs.version }}" --baseline-key linux-${{ matrix.arch }}
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: linux-${{ matrix.arch }}
@@ -197,7 +199,7 @@ jobs:
       - name: Protocol compatibility with GOAT's pinned release
         if: matrix.runnable
         shell: bash
-        run: python goat/compat/check_protocol.py --candidate "rust/release/$STAGE/cua-driver.exe" --baseline-key windows-${{ matrix.arch }}
+        run: python goat/compat/check_protocol.py --candidate "rust/release/$STAGE/cua-driver.exe" --candidate-version "${{ needs.version.outputs.version }}" --baseline-key windows-${{ matrix.arch }}
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: windows-${{ matrix.arch }}
@@ -257,7 +259,7 @@ jobs:
           cp ../LICENSE.md "release/$STAGE/LICENSE"
           tar -czf "release/$STAGE-binary.tar.gz" -C "release/$STAGE" .
       - name: Protocol compatibility with GOAT's pinned release
-        run: python3 goat/compat/check_protocol.py --candidate "rust/release/$STAGE/cua-driver" --baseline-key darwin-universal
+        run: python3 goat/compat/check_protocol.py --candidate "rust/release/$STAGE/cua-driver" --candidate-version "${{ needs.version.outputs.version }}" --baseline-key darwin-universal
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: darwin-universal
