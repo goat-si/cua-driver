@@ -41,6 +41,11 @@ are detached from cleanup. Perception keeps its existing OS containment.
 Sentinels require waitable SIGCHLD and exclusive reaping; embedded startup
 rejects inherited SIGCHLD auto-reaping.
 
+Parent death ends the group at once with SIGKILL, unlike the graceful stdin EOF
+shutdown, so nothing in flight is finalized: an active recording is left
+incomplete. A host that records should stop the recording, or close the
+driver's stdin, before it exits.
+
 Windows hosts must assign the driver to a Job Object with
 `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` and retain the job handle for the desired
 lifetime. This fork does not create or validate that host-owned job; without
