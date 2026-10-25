@@ -106,6 +106,12 @@ jobs:
       - name: Build
         working-directory: rust
         run: cargo build --locked -p cua-driver -p cursor-theme-cli -p cua-driver-sdk --release --features cua-driver/portal-input --target ${{ matrix.target }}
+      - name: Headless embedded process lifetime
+        run: |
+          python3 goat/lifetime/test_parent_death.py "rust/target/${{ matrix.target }}/release/cua-driver"
+          cd rust
+          cargo test --locked -p cua-driver-core --lib --release --target ${{ matrix.target }} goat_process_group::tests
+          cargo test --locked -p platform-linux --lib --release --target ${{ matrix.target }} goat_launch_lifetime
       - name: Build Electron-compatible Node runtime
         run: |
           npm --prefix typescript ci --ignore-scripts
@@ -260,6 +266,11 @@ jobs:
           tar -czf "release/$STAGE-binary.tar.gz" -C "release/$STAGE" .
       - name: Protocol compatibility with GOAT's pinned release
         run: python3 goat/compat/check_protocol.py --candidate "rust/release/$STAGE/cua-driver" --candidate-version "${{ needs.version.outputs.version }}" --baseline-key darwin-universal
+      - name: Headless embedded process lifetime
+        run: |
+          python3 goat/lifetime/test_parent_death.py "rust/release/$STAGE/cua-driver"
+          cd rust
+          cargo test --locked -p cua-driver-core --lib goat_process_group::tests
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: darwin-universal

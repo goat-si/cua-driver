@@ -299,6 +299,8 @@ struct PreparedProfile {
 
 pub(crate) struct ManagedBrowser {
     child: Box<dyn IsolatedBrowserProcess>,
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    _host_lifetime: Option<crate::goat_process_group::ProcessGroupLifetime>,
     owned_pid: i64,
     profile: PathBuf,
     delete_profile: bool,
@@ -873,11 +875,45 @@ impl BrowserEngine {
             self.platform.isolated_browser_executable()?
         };
         let prepared_profile = prepare_profile(profile_request)?;
-        let command = isolated_browser_command(&executable, &prepared_profile.path);
+        let mut command = isolated_browser_command(&executable, &prepared_profile.path);
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        let pending_lifetime = if crate::embedded_mode() {
+            Some(
+                crate::goat_process_group::PreparedProcessGroup::prepare(&mut command).map_err(
+                    |error| {
+                        cleanup_created_profile(&prepared_profile);
+                        refusal(
+                            BrowserRefusalCode::BrowserRouteUnavailable,
+                            format!("could not prepare owned browser containment: {error}"),
+                        )
+                    },
+                )?,
+            )
+        } else {
+            None
+        };
         let mut child = self
             .platform
             .spawn_isolated_browser(command, &prepared_profile.path)
             .inspect_err(|_| cleanup_created_profile(&prepared_profile))?;
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        let host_lifetime = if let Some(pending) = pending_lifetime {
+            match pending.finish() {
+                Ok(lifetime) => Some(lifetime),
+                Err(error) => {
+                    unsafe {
+                        libc::kill(-(child.id() as libc::pid_t), libc::SIGKILL);
+                    }
+                    cleanup_created_profile_as_browser(child.as_mut(), &prepared_profile);
+                    return Err(refusal(
+                        BrowserRefusalCode::BrowserRouteUnavailable,
+                        format!("could not contain owned browser: {error}"),
+                    ));
+                }
+            }
+        } else {
+            None
+        };
         let endpoint = match wait_for_spawned_endpoint(child.as_mut(), &prepared_profile.path).await
         {
             Ok(endpoint) => {
@@ -909,6 +945,8 @@ impl BrowserEngine {
         }
         self.managed_browsers.lock().unwrap().push(ManagedBrowser {
             child,
+            #[cfg(any(target_os = "macos", target_os = "linux"))]
+            _host_lifetime: host_lifetime,
             owned_pid: prepared_pid,
             profile: prepared_profile.path,
             delete_profile: prepared_profile.delete_on_cleanup,

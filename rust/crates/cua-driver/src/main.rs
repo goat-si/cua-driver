@@ -27,6 +27,7 @@ mod driver_service_http;
 #[cfg(any(target_os = "macos", all(test, unix)))]
 mod duplicate_copies;
 mod extension_manager;
+mod goat_host_lifetime;
 mod history_runtime;
 mod mcp_envelope;
 mod mcp_http;
@@ -491,6 +492,7 @@ mod mcp_runtime_selection_tests {
 
 #[cfg(target_os = "macos")]
 fn main() {
+    let startup_parent = goat_host_lifetime::StartupParent::capture();
     cua_driver_core::build_info::init(env!("CUA_DRIVER_GIT_SHA"));
     cua_driver_sdk::configure_perception_client_resolver(
         extension_manager::perception_client_resolver(),
@@ -543,6 +545,10 @@ fn main() {
     // Handled before AppKit init so `list-tools` / `describe` / `call` exit
     // cleanly without starting the overlay or NSApplication.
     let command = cli::parse_command();
+    if let Err(error) = startup_parent.install(&command) {
+        eprintln!("cua-driver: cannot supervise embedded runtime: {error}");
+        std::process::exit(1);
+    }
     if !telemetry::is_wrapped_cli_child() && !matches!(&command, cli::Command::Telemetry(_)) {
         telemetry::spawn_first_run_registration_worker();
     }
@@ -924,6 +930,7 @@ fn main() {
 
 #[cfg(not(target_os = "macos"))]
 fn main() -> anyhow::Result<()> {
+    let startup_parent = goat_host_lifetime::StartupParent::capture();
     cua_driver_core::build_info::init(env!("CUA_DRIVER_GIT_SHA"));
     // An elevated Driver runs shell launches through this executable with a
     // standard-user token (#3607). Checked first so the helper does no other
@@ -961,6 +968,7 @@ fn main() -> anyhow::Result<()> {
     // run on a plain OS thread — not inside a #[tokio::main] context which
     // would cause nested block_on panics.
     let command = cli::parse_command();
+    startup_parent.install(&command)?;
     if !telemetry::is_wrapped_cli_child() && !matches!(&command, cli::Command::Telemetry(_)) {
         telemetry::spawn_first_run_registration_worker();
     }

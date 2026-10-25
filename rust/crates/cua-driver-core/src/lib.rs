@@ -10,6 +10,8 @@
 // here would churn every adapter's call sites for no runtime gain.
 #![allow(clippy::result_large_err)]
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+pub mod goat_process_group;
 pub mod guide;
 pub mod mcp_skills;
 pub mod mcp_wire;
