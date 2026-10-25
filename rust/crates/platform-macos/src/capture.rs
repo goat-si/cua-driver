@@ -20,6 +20,12 @@
 //! Compatibility fallback: `screencapture -l <windowID> -x -o <file>` when
 //! the native path errors or returns empty bytes.
 //!
+//! `screencapture` always runs from `/usr/sbin`, never through `PATH`. It
+//! is a separate Apple tool entitled to record audio whose privacy access
+//! macOS judges against the host app, so it can raise prompts the in-process
+//! path never does (#5938). A host sets `CUA_DRIVER_DISABLE_SCREENCAPTURE=1`
+//! to keep the driver from starting it at all.
+//!
 //! ## Windows on another Space (CUA-1351)
 //!
 //! ScreenCaptureKit and `screencapture -l` return no content for a window
@@ -37,7 +43,10 @@
 //! desktop capture instead uses a ScreenCaptureKit display filter that leaves
 //! the Driver's cursor overlay window out
 //! ([`screenshot_display_bytes_excluding_overlay`]); `screencapture` remains
-//! its fallback and reports that it could not exclude the overlay.
+//! its fallback and reports that it could not exclude the overlay. With
+//! `screencapture` disabled, every display capture, recording snapshots
+//! included, goes through ScreenCaptureKit with nothing excluded, the same
+//! image `screencapture -x` takes.
 
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use objc2::rc::autoreleasepool;
@@ -246,7 +255,7 @@ fn screenshot_window_bytes_shell(window_id: u32) -> anyhow::Result<Vec<u8>> {
     let capture = SecureCapturePath::new("window.png")?;
     let tmp_path = capture.file.to_string_lossy().into_owned();
 
-    let output = Command::new("screencapture")
+    let output = screencapture_command(screencapture_disabled())?
         .args([
             "-l",
             &window_id.to_string(),
@@ -894,6 +903,29 @@ fn unpremultiply_rgba(rgba: &mut [u8]) -> bool {
     visible
 }
 
+/// The system screenshot tool, by absolute path so an inherited `PATH` cannot
+/// pick another program.
+const SCREENCAPTURE: &str = "/usr/sbin/screencapture";
+
+/// Set to `1` by a host that must never have the driver start `screencapture`.
+pub const DISABLE_SCREENCAPTURE_ENV: &str = "CUA_DRIVER_DISABLE_SCREENCAPTURE";
+
+fn screencapture_disabled_by(value: Option<&std::ffi::OsStr>) -> bool {
+    value.is_some_and(|value| value == "1")
+}
+
+fn screencapture_disabled() -> bool {
+    screencapture_disabled_by(std::env::var_os(DISABLE_SCREENCAPTURE_ENV).as_deref())
+}
+
+/// The command for `screencapture`, or an error when the host turned it off.
+fn screencapture_command(disabled: bool) -> anyhow::Result<Command> {
+    if disabled {
+        anyhow::bail!("the host turned off screencapture ({DISABLE_SCREENCAPTURE_ENV}=1)");
+    }
+    Ok(Command::new(SCREENCAPTURE))
+}
+
 /// Capture a window by its `window_id` (CGWindowID).
 /// Returns (base64-encoded PNG, width, height) or an error.
 pub fn screenshot_window(window_id: u32) -> anyhow::Result<(String, u32, u32)> {
@@ -907,10 +939,38 @@ pub fn screenshot_window(window_id: u32) -> anyhow::Result<(String, u32, u32)> {
 /// Returns raw PNG bytes or an error.
 pub fn screenshot_display_bytes() -> anyhow::Result<Vec<u8>> {
     refuse_without_direct_capture_consent()?;
+    display_capture_with(
+        screencapture_disabled(),
+        screenshot_display_bytes_tool,
+        || {
+            run_native_capture_worker(
+                display_capture_gate(),
+                DISPLAY_CAPTURE_NATIVE_TIMEOUT,
+                || screenshot_main_display_sck_excluding(None),
+            )
+        },
+    )
+}
+
+/// Picks how to capture the whole display: `screencapture`, or ScreenCaptureKit
+/// when the host turned the tool off.
+fn display_capture_with<T, N>(disabled: bool, tool: T, native: N) -> anyhow::Result<Vec<u8>>
+where
+    T: FnOnce() -> anyhow::Result<Vec<u8>>,
+    N: FnOnce() -> anyhow::Result<Vec<u8>>,
+{
+    if disabled {
+        native()
+    } else {
+        tool()
+    }
+}
+
+fn screenshot_display_bytes_tool() -> anyhow::Result<Vec<u8>> {
     let capture = SecureCapturePath::new("display.png")?;
     let tmp_path = capture.file.to_string_lossy().into_owned();
 
-    let output = Command::new("/usr/sbin/screencapture")
+    let output = screencapture_command(false)?
         .args(["-x", &tmp_path])
         .output()?;
 
@@ -994,7 +1054,7 @@ pub fn screenshot_display_bytes_excluding_overlay() -> anyhow::Result<(
         match run_native_capture_worker(
             display_capture_gate(),
             DISPLAY_CAPTURE_NATIVE_TIMEOUT,
-            move || screenshot_main_display_sck_excluding(overlay_window_id),
+            move || screenshot_main_display_sck_excluding(Some(overlay_window_id)),
         ) {
             Ok(bytes) => Ok((bytes, ResidualCheck::Clean)),
             Err(error) => {
@@ -1007,7 +1067,7 @@ pub fn screenshot_display_bytes_excluding_overlay() -> anyhow::Result<(
                     ResidualCheck::Residual {
                         reason: format!(
                             "ScreenCaptureKit could not capture the display without the \
-                             overlay window ({error:#}); the screencapture fallback includes \
+                             overlay window ({error:#}); the full-display fallback includes \
                              every on-screen window"
                         ),
                     },
@@ -1017,10 +1077,12 @@ pub fn screenshot_display_bytes_excluding_overlay() -> anyhow::Result<(
     })
 }
 
-/// Main display at native pixel size through ScreenCaptureKit, with one
-/// window (the overlay) excluded. Requires macOS 14 for
+/// Main display at native pixel size through ScreenCaptureKit, with at most
+/// one window (the overlay) excluded. Requires macOS 14 for
 /// `SCScreenshotManager`.
-fn screenshot_main_display_sck_excluding(excluded_window_id: u32) -> anyhow::Result<Vec<u8>> {
+fn screenshot_main_display_sck_excluding(
+    excluded_window_id: Option<u32>,
+) -> anyhow::Result<Vec<u8>> {
     use core_graphics::display::CGMainDisplayID;
     use screencapturekit::prelude::{SCContentFilter, SCShareableContent, SCStreamConfiguration};
     use screencapturekit::screenshot_manager::SCScreenshotManager;
@@ -1037,18 +1099,21 @@ fn screenshot_main_display_sck_excluding(excluded_window_id: u32) -> anyhow::Res
             anyhow::anyhow!("ScreenCaptureKit does not list the main display {main_display_id}")
         })?;
     let windows = content.windows();
-    let excluded = windows
-        .iter()
-        .find(|window| window.window_id() == excluded_window_id)
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "ScreenCaptureKit does not list the overlay window {excluded_window_id}"
-            )
-        })?;
+    let excluded: Vec<_> = match excluded_window_id {
+        None => Vec::new(),
+        Some(excluded_window_id) => vec![windows
+            .iter()
+            .find(|window| window.window_id() == excluded_window_id)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "ScreenCaptureKit does not list the overlay window {excluded_window_id}"
+                )
+            })?],
+    };
 
     let mut filter = SCContentFilter::create()
         .with_display(&display)
-        .with_excluding_windows(&[excluded])
+        .with_excluding_windows(&excluded)
         .build();
     // `screencapture` includes the menu bar; keep the same image.
     filter.set_include_menu_bar(true);
@@ -1160,6 +1225,41 @@ mod tests {
     use std::cell::Cell;
     use std::rc::Rc;
     use std::sync::Arc;
+
+    /// #5938: a person's `PATH` must not decide which program runs as `screencapture`.
+    #[test]
+    fn screencapture_runs_only_from_its_absolute_path() {
+        let command = screencapture_command(false).expect("enabled by default");
+        assert_eq!(command.get_program(), "/usr/sbin/screencapture");
+    }
+
+    /// #5938: a host that turns `screencapture` off gets an error, never the tool.
+    #[test]
+    fn a_host_can_turn_screencapture_off() {
+        let error = screencapture_command(true).expect_err("turned off");
+        assert!(error.to_string().contains(DISABLE_SCREENCAPTURE_ENV));
+        assert!(screencapture_disabled_by(Some(std::ffi::OsStr::new("1"))));
+        for value in [None, Some(""), Some("0"), Some("true")] {
+            assert!(
+                !screencapture_disabled_by(value.map(std::ffi::OsStr::new)),
+                "{value:?} keeps screencapture on"
+            );
+        }
+    }
+
+    /// #5938: with the tool off, whole-display captures (recording snapshots,
+    /// picture-in-picture) still get an image, through ScreenCaptureKit.
+    #[test]
+    fn display_capture_without_the_tool_uses_screencapturekit() {
+        let native = display_capture_with(
+            true,
+            || panic!("screencapture must not run when the host turned it off"),
+            || Ok(vec![1]),
+        );
+        assert_eq!(native.expect("native capture"), vec![1]);
+        let tool = display_capture_with(false, || Ok(vec![2]), || panic!("tool path expected"));
+        assert_eq!(tool.expect("tool capture"), vec![2]);
+    }
 
     /// Regression for trycua/cua#5476: with the pointer outside the window,
     /// a pointer-showing window capture came back scaled and offset while
