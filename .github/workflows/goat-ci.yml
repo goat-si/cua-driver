@@ -1,0 +1,294 @@
+# GOAT's build of Cua Driver: every platform GOAT ships, unsigned (GOAT signs inside its helper app),
+# the license/source gate, the protocol-compatibility check against the release GOAT pins, and on a
+# release tag, provenance attestations and a GitHub release. No secrets: nothing here signs or notarizes.
+name: goat-ci
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+    tags: ["cua-driver-rs-v*-goat.*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: goat-ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  CUA_DRIVER_RS_TELEMETRY_ENABLED: "false"
+  CUA_TELEMETRY_ENABLED: "false"
+  CUA_DRIVER_RS_UPDATE_CHECK: "false"
+  DO_NOT_TRACK: "1"
+
+jobs:
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - name: Determine version
+        id: version
+        run: |
+          VERSION=$(python3 -c 'import tomllib; print(tomllib.load(open("rust/Cargo.toml","rb"))["workspace"]["package"]["version"])')
+          if [[ "$GITHUB_REF" == refs/tags/cua-driver-rs-v* ]]; then
+            TAGGED="${GITHUB_REF#refs/tags/cua-driver-rs-v}"
+            if [[ "$TAGGED" != "$VERSION" ]]; then
+              echo "::error::Tag says $TAGGED but rust/Cargo.toml says $VERSION; the binary would report the wrong version to GOAT."
+              exit 1
+            fi
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+      - name: Protocol checker tests
+        working-directory: goat/compat
+        run: python3 -m unittest -v test_check_protocol
+
+  deny:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2
+        with:
+          tool: cargo-deny@0.20.2
+      # Covers the rust/ workspace (driver, cursor theme, SDK, UIA). The Node runtime is built from a
+      # separate, unlocked Cargo project that this does not see; goat-si/cua-driver#4.
+      - name: Licenses, bans and sources of the rust/ workspace (rust/deny.toml)
+        working-directory: rust
+        run: cargo deny --locked --exclude-dev check --show-stats licenses bans sources
+
+  linux:
+    name: linux-${{ matrix.arch }}
+    needs: version
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { arch: x86_64, target: x86_64-unknown-linux-gnu, runner: ubuntu-latest }
+          - { arch: arm64, target: aarch64-unknown-linux-gnu, runner: ubuntu-24.04-arm }
+    # Same floor as upstream's release build: linking against Debian 11's glibc 2.31 keeps the
+    # binary running on Debian 11+, Ubuntu 20.04+ and RHEL 8+.
+    container:
+      image: debian:11
+    env:
+      STAGE: cua-driver-rs-${{ needs.version.outputs.version }}-linux-${{ matrix.arch }}
+    steps:
+      - name: Install build tooling
+        run: |
+          cat > /etc/apt/sources.list <<'EOF'
+          deb [check-valid-until=no signed-by=/usr/share/keyrings/debian-archive-keyring.gpg] http://snapshot.debian.org/archive/debian/20260901T000000Z/ bullseye main
+          deb [check-valid-until=no signed-by=/usr/share/keyrings/debian-archive-keyring.gpg] http://snapshot.debian.org/archive/debian/20260901T000000Z/ bullseye-updates main
+          deb [check-valid-until=no signed-by=/usr/share/keyrings/debian-archive-keyring.gpg] http://snapshot.debian.org/archive/debian-security/20260901T000000Z/ bullseye-security main
+          EOF
+          apt-get -o Dir::Etc::sourceparts=- -o Acquire::Retries=5 update
+          apt-get -o Dir::Etc::sourceparts=- -o Acquire::Retries=5 install -y --no-install-recommends \
+            git ca-certificates curl python3 build-essential pkg-config \
+            libx11-dev libxi-dev libxtst-dev libxext-dev libwayland-dev libxkbcommon-dev
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "22"
+      - uses: dtolnay/rust-toolchain@4716b85f2fac3e324e64fa2810f6b5c3905760a5 # 1.97.1
+        with:
+          targets: ${{ matrix.target }}
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            rust/target
+          key: goat-linux-${{ matrix.arch }}-${{ hashFiles('rust/Cargo.lock', 'rust/**/Cargo.toml', 'vendor/**/Cargo.toml') }}
+      - name: Build
+        working-directory: rust
+        run: cargo build --locked -p cua-driver -p cursor-theme-cli -p cua-driver-sdk --release --features cua-driver/portal-input --target ${{ matrix.target }}
+      - name: Build Electron-compatible Node runtime
+        run: |
+          npm --prefix typescript ci --ignore-scripts
+          node scripts/build-node-runtime.mjs --target ${{ matrix.target }} --output rust/target/${{ matrix.target }}/release/cua_driver_node_runtime.node
+      - name: Package
+        working-directory: rust
+        run: |
+          OUT="target/${{ matrix.target }}/release"
+          mkdir -p "release/$STAGE"
+          cp "$OUT/cua-driver" "$OUT/cua-cursor-theme" "$OUT/libcua_driver_sdk.so" "$OUT/cua_driver_node_runtime.node" include/cua_driver_abi.h "release/$STAGE/"
+          cp -R ../wayland-helper "release/$STAGE/wayland-helper"
+          cp ../LICENSE.md "release/$STAGE/LICENSE"
+          cp THIRD_PARTY_NOTICES.md "release/$STAGE/"
+          tar -czf "release/$STAGE-binary.tar.gz" -C "release/$STAGE" .
+      - name: Protocol compatibility with GOAT's pinned release
+        run: python3 goat/compat/check_protocol.py --candidate "rust/release/$STAGE/cua-driver" --candidate-version "${{ needs.version.outputs.version }}" --baseline-key linux-${{ matrix.arch }}
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: linux-${{ matrix.arch }}
+          path: rust/release/*-binary.tar.gz
+          if-no-files-found: error
+
+  windows:
+    name: windows-${{ matrix.arch }}
+    needs: version
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { arch: x86_64, target: x86_64-pc-windows-msvc, runnable: true }
+          # Cross-compiled on x64; the protocol check needs a binary the runner can execute.
+          - { arch: arm64, target: aarch64-pc-windows-msvc, runnable: false }
+    env:
+      STAGE: cua-driver-rs-${{ needs.version.outputs.version }}-windows-${{ matrix.arch }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "22"
+      - uses: dtolnay/rust-toolchain@4716b85f2fac3e324e64fa2810f6b5c3905760a5 # 1.97.1
+        with:
+          targets: ${{ matrix.target }}
+      - name: Ensure Rust target is installed
+        working-directory: rust
+        shell: bash
+        run: |
+          rustup target add "${{ matrix.target }}"
+          rustup target list --installed | grep -Fx "${{ matrix.target }}"
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            rust/target
+          key: goat-windows-${{ matrix.arch }}-${{ hashFiles('rust/Cargo.lock', 'rust/**/Cargo.toml', 'vendor/**/Cargo.toml') }}
+      - name: Build
+        working-directory: rust
+        run: cargo build --locked -p cua-driver -p cursor-theme-cli -p cua-driver-uia -p cua-driver-sdk --release --target ${{ matrix.target }}
+      - name: Build Electron-compatible Node runtime
+        shell: bash
+        run: |
+          npm --prefix typescript ci --ignore-scripts
+          node scripts/build-node-runtime.mjs --target ${{ matrix.target }} --output rust/target/${{ matrix.target }}/release/cua_driver_node_runtime.node
+      - name: Node runtime has no dynamic CRT dependency
+        shell: pwsh
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $installation = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if (-not $installation) { throw "Visual Studio Build Tools were not found" }
+          $dumpbin = Get-ChildItem "$installation\VC\Tools\MSVC\*\bin\Hostx64\x64\dumpbin.exe" | Sort-Object FullName | Select-Object -Last 1 -ExpandProperty FullName
+          $imports = & $dumpbin /DEPENDENTS "rust/target/${{ matrix.target }}/release/cua_driver_node_runtime.node" 2>&1
+          if ($LASTEXITCODE -ne 0) { throw "dumpbin failed with exit $LASTEXITCODE" }
+          $imports | Write-Host
+          $dynamic = $imports | Select-String -Pattern '(?i)\b(?:VCRUNTIME|MSVCP|CONCRT|UCRTBASE|api-ms-win-crt-)[^\s]*\.dll\b'
+          if ($dynamic) { throw "Node runtime has a dynamic VC/UCRT dependency: $($dynamic -join ', ')" }
+      - name: Package
+        working-directory: rust
+        shell: pwsh
+        run: |
+          $out = "target/${{ matrix.target }}/release"
+          $stage = "release/$env:STAGE"
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+          foreach ($file in "cua-driver.exe", "cua-cursor-theme.exe", "cua-driver-uia.exe", "cua_driver_sdk.dll", "cua_driver_node_runtime.node") {
+            Copy-Item "$out/$file" "$stage/" -ErrorAction Stop
+          }
+          Copy-Item "include/cua_driver_abi.h" "$stage/" -ErrorAction Stop
+          Copy-Item "../LICENSE.md" "$stage/LICENSE" -ErrorAction Stop
+          Copy-Item "THIRD_PARTY_NOTICES.md" "$stage/" -ErrorAction Stop
+          Compress-Archive -Path "$stage/*" -DestinationPath "release/$env:STAGE-binary.zip" -Force
+      - name: Protocol compatibility with GOAT's pinned release
+        if: matrix.runnable
+        shell: bash
+        run: python goat/compat/check_protocol.py --candidate "rust/release/$STAGE/cua-driver.exe" --candidate-version "${{ needs.version.outputs.version }}" --baseline-key windows-${{ matrix.arch }}
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: windows-${{ matrix.arch }}
+          path: rust/release/*-binary.zip
+          if-no-files-found: error
+
+  macos:
+    name: darwin-universal
+    needs: version
+    runs-on: macos-26
+    env:
+      MACOSX_DEPLOYMENT_TARGET: "13.0"
+      STAGE: cua-driver-rs-${{ needs.version.outputs.version }}-darwin-universal
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "22"
+      - uses: dtolnay/rust-toolchain@4716b85f2fac3e324e64fa2810f6b5c3905760a5 # 1.97.1
+        with:
+          targets: aarch64-apple-darwin, x86_64-apple-darwin
+      - name: Ensure Rust targets are installed
+        working-directory: rust
+        run: |
+          rustup target add aarch64-apple-darwin x86_64-apple-darwin
+          rustup target list --installed | grep -Fx aarch64-apple-darwin
+          rustup target list --installed | grep -Fx x86_64-apple-darwin
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            rust/target
+          key: goat-darwin-universal-${{ hashFiles('rust/Cargo.lock', 'rust/**/Cargo.toml', 'vendor/**/Cargo.toml') }}
+      - name: Build arm64 and x86_64
+        working-directory: rust
+        run: |
+          for target in aarch64-apple-darwin x86_64-apple-darwin; do
+            cargo build --locked -p cua-driver -p cursor-theme-cli -p cua-driver-sdk --release --target "$target"
+          done
+      - name: Build Electron-compatible Node runtimes
+        run: |
+          npm --prefix typescript ci --ignore-scripts
+          for target in aarch64-apple-darwin x86_64-apple-darwin; do
+            node scripts/build-node-runtime.mjs --target "$target" --output "rust/target/$target/release/cua_driver_node_runtime.node"
+          done
+      - name: Universal binaries and package
+        working-directory: rust
+        run: |
+          mkdir -p "release/$STAGE"
+          for file in cua-driver cua-cursor-theme libcua_driver_sdk.dylib cua_driver_node_runtime.node; do
+            lipo -create "target/aarch64-apple-darwin/release/$file" "target/x86_64-apple-darwin/release/$file" -output "release/$STAGE/$file"
+            lipo -info "release/$STAGE/$file"
+          done
+          test "$(otool -D "release/$STAGE/libcua_driver_sdk.dylib" | tail -n 1)" = '@rpath/libcua_driver_sdk.dylib'
+          cp include/cua_driver_abi.h THIRD_PARTY_NOTICES.md "release/$STAGE/"
+          cp ../LICENSE.md "release/$STAGE/LICENSE"
+          tar -czf "release/$STAGE-binary.tar.gz" -C "release/$STAGE" .
+      - name: Protocol compatibility with GOAT's pinned release
+        run: python3 goat/compat/check_protocol.py --candidate "rust/release/$STAGE/cua-driver" --candidate-version "${{ needs.version.outputs.version }}" --baseline-key darwin-universal
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: darwin-universal
+          path: rust/release/*-binary.tar.gz
+          if-no-files-found: error
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/cua-driver-rs-v')
+    needs: [version, deny, linux, windows, macos]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Checksums
+        working-directory: dist
+        run: sha256sum -- * | tee SHA256SUMS
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: dist/*-binary.*
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          gh release create "$TAG" dist/* --repo "$GITHUB_REPOSITORY" --title "$TAG" \
+            --notes "Unsigned Cua Driver ${{ needs.version.outputs.version }} built from $GITHUB_SHA by GOAT's fork. GOAT signs it inside its helper app. Verify with: gh attestation verify <file> --repo $GITHUB_REPOSITORY"
