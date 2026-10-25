@@ -9,6 +9,7 @@ records the change with a reason. Additions pass and are listed. Standard librar
 """
 
 import argparse
+import contextlib
 import hashlib
 import json
 import os
@@ -69,6 +70,27 @@ def fetch_baseline(spec, key, into):
     return found[0]
 
 
+def within(seconds, what, function):
+    """Run function with an absolute deadline. A blocking read that outlives it is abandoned on
+    a daemon thread; failing then kills the child process, which unblocks that read."""
+    result, error = [], []
+
+    def run():
+        try:
+            result.append(function())
+        except BaseException as exc:  # noqa: BLE001 - re-raised on the caller's thread
+            error.append(exc)
+
+    worker = threading.Thread(target=run, daemon=True)
+    worker.start()
+    worker.join(max(0.0, seconds))
+    if worker.is_alive():
+        raise TimeoutError(f"{what} took longer than {seconds:.0f}s")
+    if error:
+        raise error[0]
+    return result[0]
+
+
 class Child:
     """A driver subprocess whose stdout lines and stderr are drained by threads, so no pipe can
     fill and block the driver, and every read has a deadline."""
@@ -84,9 +106,11 @@ class Child:
         )
         self.lines = queue.Queue()
         self.stderr = bytearray()
-        threading.Thread(target=self._drain_stderr, daemon=True).start()
+        self.readers = [threading.Thread(target=self._drain_stderr, daemon=True)]
         if stdout:
-            threading.Thread(target=self._read_stdout, daemon=True).start()
+            self.readers.append(threading.Thread(target=self._read_stdout, daemon=True))
+        for reader in self.readers:
+            reader.start()
 
     def _drain_stderr(self):
         for chunk in iter(lambda: self.proc.stderr.read1(65536), b""):
@@ -121,32 +145,27 @@ class Child:
                 return message["result"]
 
     def close(self, require_exit=False):
-        """Close stdin; with require_exit the child must then exit on its own."""
-        try:
+        """Close stdin and reap the child; with require_exit it must exit on its own."""
+        with contextlib.suppress(OSError):
             self.proc.stdin.close()
-        except OSError:
-            pass
+        exited = True
         try:
-            code = self.proc.wait(timeout=EXIT_SECONDS)
+            self.proc.wait(timeout=EXIT_SECONDS)
         except subprocess.TimeoutExpired:
+            exited = False
             self.proc.kill()
             self.proc.wait(timeout=EXIT_SECONDS)
-            if require_exit:
-                fail(self.describe_failure(f"did not exit within {EXIT_SECONDS}s after its parent pipe closed"))
-            return None
-        return code
+        for reader in self.readers:
+            reader.join(timeout=EXIT_SECONDS)
+        for stream in (self.proc.stdout, self.proc.stderr):
+            if stream:
+                stream.close()
+        if require_exit and not exited:
+            fail(self.describe_failure(f"did not exit within {EXIT_SECONDS}s after its parent pipe closed"))
 
 
-def mcp_argv(binary):
-    # The forms GOAT launches: macOS through its helper (main.swift, McpRelay.swift), elsewhere as
-    # packages/shared/src/cuaDriverManifest.ts does.
-    if sys.platform == "darwin":
-        return [str(binary), "mcp", "--direct", "--embedded", "--host-bundle-id", HOST_ID]
-    return [str(binary), "mcp"]
-
-
-def mcp_surface(binary):
-    child = Child(mcp_argv(binary))
+def mcp_surface(argv):
+    child = Child(argv)
     try:
         child.send({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "goat-compat", "version": "1"}}})
         init = child.reply(1)
@@ -171,39 +190,48 @@ def mcp_surface(binary):
     return {"protocolVersion": init.get("protocolVersion"), "capabilities": init.get("capabilities", {}), "tools": tools}
 
 
-def daemon_metadata(binary):
-    """Start the embedded daemon the way GOAT's Windows helper does (DriverService.cs), read its
-    metadata like the SDK's embedded startup, and require it to exit when its parent pipe closes."""
-    if sys.platform == "win32":
-        path = rf"\\.\pipe\goat-compat-{os.getpid()}-{time.monotonic_ns()}"
-    else:
-        path = str(Path(tempfile.mkdtemp(prefix="gc", dir="/tmp")) / "s")  # short: sun_path limit
-    child = Child([str(binary), "serve", "--embedded", "--parent-liveness-stdio", "--no-permissions-gate", "--host-bundle-id", HOST_ID, "--socket", path], stdout=False)
-    deadline = time.monotonic() + REPLY_SECONDS
-    response = None
-    try:
-        while response is None:
-            if child.proc.poll() is not None:
-                fail(child.describe_failure(f"exited {child.proc.returncode} before serving metadata"))
-            if time.monotonic() > deadline:
-                fail(child.describe_failure(f"no metadata on {path} within {REPLY_SECONDS}s"))
-            try:
-                response = request_metadata(path)
-            except OSError:
-                time.sleep(0.2)
-    finally:
-        child.close(require_exit=True)
-    if not response.get("ok") or not isinstance(response.get("result"), dict):
-        fail(f"metadata request failed: {response}")
-    return response["result"]
+@contextlib.contextmanager
+def embedded_daemon(binary):
+    """Start the embedded daemon as GOAT's Windows helper does (DriverService.cs) and read its
+    metadata as the SDK's embedded startup does. Yields (endpoint, metadata) while it runs; on
+    exit closes its parent pipe and requires it to shut down."""
+    with tempfile.TemporaryDirectory(prefix="gc", dir=None if sys.platform == "win32" else "/tmp") as tmp:
+        # Unix socket paths must stay under sun_path's ~100 bytes, hence a short /tmp directory.
+        path = rf"\\.\pipe\goat-compat-{os.getpid()}-{time.monotonic_ns()}" if sys.platform == "win32" else str(Path(tmp) / "s")
+        child = Child([str(binary), "serve", "--embedded", "--parent-liveness-stdio", "--no-permissions-gate", "--host-bundle-id", HOST_ID, "--socket", path], stdout=False)
+        failed = False
+        try:
+            deadline = time.monotonic() + REPLY_SECONDS
+            response = None
+            while response is None:
+                if child.proc.poll() is not None:
+                    fail(child.describe_failure(f"exited {child.proc.returncode} before serving metadata"))
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    fail(child.describe_failure(f"no metadata on {path} within {REPLY_SECONDS}s"))
+                try:
+                    response = within(remaining, "metadata request", lambda: request_metadata(path))
+                except TimeoutError as exc:
+                    fail(child.describe_failure(str(exc)))
+                except OSError:
+                    time.sleep(0.2)
+            if not response.get("ok") or not isinstance(response.get("result"), dict):
+                fail(child.describe_failure(f"metadata request failed: {response}"))
+            yield path, response["result"]
+        except BaseException:
+            failed = True
+            raise
+        finally:
+            # Report the first failure; a daemon already being torn down after one is just reaped.
+            child.close(require_exit=not failed)
 
 
 def request_metadata(path):
     request = b'{"method":"metadata"}\n'
+    line = b""
     if sys.platform == "win32":
         with open(path, "r+b", buffering=0) as pipe:
             pipe.write(request)
-            line = b""
             while not line.endswith(b"\n"):
                 chunk = pipe.read(4096)
                 if not chunk:
@@ -211,16 +239,27 @@ def request_metadata(path):
                 line += chunk
     else:
         with socket.socket(socket.AF_UNIX) as conn:
-            conn.settimeout(REPLY_SECONDS)
             conn.connect(path)
             conn.sendall(request)
-            line = conn.makefile("rb").readline()
+            while not line.endswith(b"\n"):
+                chunk = conn.recv(4096)
+                if not chunk:
+                    break
+                line += chunk
     return json.loads(line)
 
 
 def describe(binary):
+    """Every launch form GOAT uses, keyed by name. The embedded proxy is how GOAT reaches the
+    daemon on Windows (ComputerUseHelper.ts) and Linux (the SDK's embedded host); macOS runs
+    the driver directly under its helper (main.swift, McpRelay.swift)."""
     manifest = json.loads(subprocess.run([str(binary), "manifest"], env=dict(os.environ, **QUIET_ENV), check=True, capture_output=True, timeout=60).stdout)
-    return {"manifest": manifest, **mcp_surface(binary), "daemon": daemon_metadata(binary)}
+    forms = {}
+    with embedded_daemon(binary) as (endpoint, metadata):
+        forms["embedded-proxy"] = mcp_surface([str(binary), "mcp", "--embedded", "--socket", endpoint, "--host-bundle-id", HOST_ID])
+    if sys.platform == "darwin":
+        forms["direct-embedded"] = mcp_surface([str(binary), "mcp", "--direct", "--embedded", "--host-bundle-id", HOST_ID])
+    return {"manifest": manifest, "daemon": metadata, "forms": forms}
 
 
 def validate(surface, label, version, required_tools):
@@ -231,11 +270,14 @@ def validate(surface, label, version, required_tools):
         problems.append(f"{label}: manifest has no schema_version or subcommands")
     if manifest.get("binary_version") != version:
         problems.append(f"{label}: manifest binary_version {manifest.get('binary_version')!r}, expected {version!r}")
-    if not surface["protocolVersion"] or not surface["tools"]:
-        problems.append(f"{label}: MCP initialize/tools/list returned no protocol version or no tools")
-    missing = sorted(set(required_tools) - set(surface["tools"]))
-    if missing:
-        problems.append(f"{label}: missing tools GOAT allows agents to use: {', '.join(missing)}")
+    if not surface["forms"]:
+        problems.append(f"{label}: no MCP launch form was probed")
+    for form, mcp in surface["forms"].items():
+        if not mcp["protocolVersion"] or not mcp["tools"]:
+            problems.append(f"{label} {form}: MCP initialize/tools/list returned no protocol version or no tools")
+        missing = sorted(set(required_tools) - set(mcp["tools"]))
+        if missing:
+            problems.append(f"{label} {form}: missing tools GOAT allows agents to use: {', '.join(missing)}")
     daemon = surface["daemon"]
     if daemon.get("driver_version") != version:
         problems.append(f"{label}: daemon driver_version {daemon.get('driver_version')!r}, expected {version!r}")
@@ -264,18 +306,23 @@ def compare(baseline, candidate, allowed):
         if name not in allowed.get(kind, {}):
             problems.append(f"{kind} {name}: {message}")
 
-    if candidate["protocolVersion"] != baseline["protocolVersion"]:
-        check("mcp", "protocolVersion", f"{baseline['protocolVersion']} -> {candidate['protocolVersion']}")
-    for name, value in baseline["capabilities"].items():
-        if name not in candidate["capabilities"]:
-            check("mcp", f"capability:{name}", "removed")
-        elif candidate["capabilities"][name] != value:
-            check("mcp", f"capability:{name}", "changed")
-    for name, schema in baseline["tools"].items():
-        if name not in candidate["tools"]:
-            check("tools", name, "removed")
-        elif candidate["tools"][name] != schema:
-            check("tools", name, "input schema changed")
+    for form, old_mcp in baseline["forms"].items():
+        new_mcp = candidate["forms"].get(form)
+        if new_mcp is None:
+            problems.append(f"form {form}: not probed for the candidate")
+            continue
+        if new_mcp["protocolVersion"] != old_mcp["protocolVersion"]:
+            check("mcp", "protocolVersion", f"{form}: {old_mcp['protocolVersion']} -> {new_mcp['protocolVersion']}")
+        for name, value in old_mcp["capabilities"].items():
+            if name not in new_mcp["capabilities"]:
+                check("mcp", f"capability:{name}", f"{form}: removed")
+            elif new_mcp["capabilities"][name] != value:
+                check("mcp", f"capability:{name}", f"{form}: changed")
+        for name, schema in old_mcp["tools"].items():
+            if name not in new_mcp["tools"]:
+                check("tools", name, f"{form}: removed")
+            elif new_mcp["tools"][name] != schema:
+                check("tools", name, f"{form}: input schema changed")
     old, new = baseline["manifest"], candidate["manifest"]
     for key in sorted(set(old) - set(new)):
         check("manifest", key, "removed")
@@ -314,16 +361,16 @@ def main():
     problems += validate(candidate, "candidate", args.candidate_version, spec["goatTools"])
     if problems:
         fail("\n".join(problems))
-    added = sorted(set(candidate["tools"]) - set(baseline["tools"]))
-    print(f"baseline {spec['version']}: {len(baseline['tools'])} tools, contract {baseline['daemon']['contract_version']}; candidate {args.candidate_version}: {len(candidate['tools'])} tools, contract {candidate['daemon']['contract_version']}")
-    if added:
-        print("added tools: " + ", ".join(added))
+    for form, mcp in candidate["forms"].items():
+        added = sorted(set(mcp["tools"]) - set(baseline["forms"].get(form, {}).get("tools", {})))
+        print(f"{form}: baseline {len(baseline['forms'][form]['tools'])} tools, candidate {len(mcp['tools'])}" + (f"; added: {', '.join(added)}" if added else ""))
+    print(f"daemon contract: baseline {baseline['daemon']['contract_version']}, candidate {candidate['daemon']['contract_version']}")
     problems = compare(baseline, candidate, allowed)
     for problem in problems:
         print("INCOMPATIBLE " + problem)
     if problems:
         fail(f"{len(problems)} incompatible change(s); fix them or record each in goat/compat/allowed-changes.json with a reason")
-    print("protocol-compatible with the baseline; GOAT's launch forms start and the daemon exits when its parent pipe closes")
+    print("protocol-compatible with the baseline in every GOAT launch form; the daemon exits when its parent pipe closes")
 
 
 if __name__ == "__main__":
