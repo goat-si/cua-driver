@@ -339,10 +339,16 @@ jobs:
           cargo test --locked -p cua-driver-e2e
       - name: SDK tests
         working-directory: rust
-        # quarantine: goat-si/cua-driver#8 — the daemon-transport tests in the SDK's tests::
-        # module fail intermittently on macOS with EINVAL (fixed upstream by trycua/cua#5558, not
-        # yet backported). Everything else in the SDK, including embedded::tests, runs.
-        run: "cargo test --locked -p cua-driver-sdk --lib -- --skip tests::"
+        # quarantine: goat-si/cua-driver#8 - on macOS the SDK's top-level tests:: module (daemon
+        # transport over a socket) fails intermittently with EINVAL; fixed upstream by trycua/cua#5558,
+        # not yet backported. libtest's --skip matches substrings and would also drop
+        # embedded::tests:: and every other module, so list the tests and pass all but that module.
+        run: |
+          set -euo pipefail
+          names=$(cargo test --locked -p cua-driver-sdk --lib -- --list --format terse | sed -n 's/: test$//p' | grep -v '^tests::')
+          test -n "$names"
+          # shellcheck disable=SC2086
+          cargo test --locked -p cua-driver-sdk --lib -- --exact $names
 
   test-windows:
     needs: version
