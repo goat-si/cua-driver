@@ -680,6 +680,8 @@ jobs:
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           path: dist
+          # Only the five build archives; test jobs upload evidence (x11-capture-evidence) too.
+          pattern: "{darwin-universal,linux-x86_64,linux-arm64,windows-x86_64,windows-arm64}"
           merge-multiple: true
       - name: Checksums
         working-directory: dist
