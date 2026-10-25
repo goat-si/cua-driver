@@ -21,6 +21,8 @@
 //! Use `type_text_chars` when you explicitly need per-character pacing
 //! (e.g., to trigger live-search debounce handlers).
 
+use crate::goat::action_latency as latency;
+
 use async_trait::async_trait;
 use cua_driver_contract::TypeTextInput;
 use cua_driver_core::{
@@ -149,7 +151,7 @@ impl Tool for TypeTextTool {
             ) {
                 return synthesis_refusal_result("hid", &refusal, AxAttempt::NotAttempted);
             }
-            let result = tokio::task::spawn_blocking(move || {
+            let result = latency::spawn_action_blocking(move || {
                 crate::input::keyboard::type_text_global(&text, delay_ms)
             })
             .await;
@@ -179,7 +181,7 @@ impl Tool for TypeTextTool {
         let text = cua_driver_core::text_sanitize::strip_trailing_agent_protocol_tags(&text_raw)
             .into_owned();
         let window_id_arg = args.opt_u64("window_id");
-        let resolved = match self.state.snapshots.resolve(pid, &args) {
+        let resolved = match latency::resolve(|| self.state.snapshots.resolve(pid, &args)) {
             Ok(r) => r,
             Err(e) => return e,
         };
@@ -308,7 +310,7 @@ impl Tool for TypeTextTool {
         if let (Some((element, _)), Some(wid)) = (element_guard.as_ref(), window_id) {
             let center_guard = element.clone();
             if let Ok((Some((screen_x, screen_y)), target_rect)) =
-                tokio::task::spawn_blocking(move || unsafe {
+                latency::spawn_action_blocking(move || unsafe {
                     let el = center_guard.as_ptr() as AXUIElementRef;
                     (
                         crate::ax::bindings::element_screen_center(el),
@@ -365,7 +367,7 @@ impl Tool for TypeTextTool {
             prior_front,
             "type_text.AXSelectedText",
             || async move {
-                tokio::task::spawn_blocking(move || {
+                latency::spawn_action_blocking(move || {
                     let _native_guard = native_guard;
                     type_text_blocking(
                         pid,
@@ -846,7 +848,7 @@ async fn background_keyboard_policy(
     let lease = super::acquire_background_mutation(pid).await;
     let element_guard =
         element_ptr.map(|ptr| unsafe { crate::ax::snapshot::RetainedElement::retain(ptr) });
-    let facts = match tokio::task::spawn_blocking(move || {
+    let facts = match latency::spawn_action_blocking(move || {
         let element_ptr = element_guard.as_ref().map(|guard| guard.as_ptr());
         crate::ax::exact_target::gather_background_facts(pid, window_id, element_ptr)
     })

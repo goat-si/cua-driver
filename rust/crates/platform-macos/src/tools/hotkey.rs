@@ -1,3 +1,5 @@
+use crate::goat::action_latency as latency;
+
 use async_trait::async_trait;
 use cua_driver_contract::HotkeyInput;
 use cua_driver_core::{
@@ -200,7 +202,7 @@ impl Tool for HotkeyTool {
                 );
             };
             let display = raw_keys.join("+");
-            let result = tokio::task::spawn_blocking(move || {
+            let result = latency::spawn_action_blocking(move || {
                 let modifier_refs: Vec<&str> = modifiers.iter().map(String::as_str).collect();
                 crate::input::keyboard::press_key_global(&key, &modifier_refs)
             })
@@ -254,7 +256,7 @@ impl Tool for HotkeyTool {
         let key = non_modifiers.last().unwrap().clone();
         let key_display = raw_keys.join("+");
         let window_id_arg = args.opt_u64("window_id");
-        let resolved = match self.state.snapshots.resolve(pid, &args) {
+        let resolved = match latency::resolve(|| self.state.snapshots.resolve(pid, &args)) {
             Ok(resolved) => resolved,
             Err(error) => return error,
         };
@@ -302,7 +304,7 @@ impl Tool for HotkeyTool {
                 window_id,
                 super::menu_equivalent::Combo::parse(&modifiers, &key),
             ) {
-                let menu_item = tokio::task::spawn_blocking(move || {
+                let menu_item = latency::spawn_action_blocking(move || {
                     let native = !super::type_text::is_browser_pid(pid)
                         && !crate::browser::electron_js::ElectronJs::is_electron(pid);
                     let in_front = apps::frontmost_pid() == Some(pid);
@@ -326,7 +328,7 @@ impl Tool for HotkeyTool {
                     if let Some(ptr) = element_ptr {
                         // The menu command acts on the focused element.
                         let focused =
-                            tokio::task::spawn_blocking(move || focus_hotkey_element(pid, ptr))
+                            latency::spawn_action_blocking(move || focus_hotkey_element(pid, ptr))
                                 .await;
                         if !matches!(focused, Ok(Ok(()))) {
                             return ToolResult::error(
@@ -359,7 +361,7 @@ impl Tool for HotkeyTool {
         // window's focused field is positively browser chrome.
         if !fg && px.is_none() && element_index.is_none() && is_paste_combo(&modifiers, &key) {
             if let Some(wid) = window_id {
-                let chrome = tokio::task::spawn_blocking(move || {
+                let chrome = latency::spawn_action_blocking(move || {
                     super::type_text::is_browser_pid(pid)
                         && super::type_text::window_focus_is_browser_chrome_field(pid, wid)
                 })
@@ -429,7 +431,7 @@ impl Tool for HotkeyTool {
             (element_guard.clone(), window_id, element_index)
         {
             let web_guard = guard.clone();
-            let is_web = tokio::task::spawn_blocking(move || {
+            let is_web = latency::spawn_action_blocking(move || {
                 super::type_text::target_in_web_area(
                     pid,
                     Some((web_guard.as_ptr(), Some(index))),
@@ -439,7 +441,7 @@ impl Tool for HotkeyTool {
             .await
             .unwrap_or(true);
             if is_web {
-                tokio::task::spawn_blocking(move || unsafe {
+                latency::spawn_action_blocking(move || unsafe {
                     let (screen_x, screen_y) = crate::ax::bindings::element_screen_center(
                         guard.as_ptr() as crate::ax::bindings::AXUIElementRef,
                     )?;
@@ -502,7 +504,7 @@ impl Tool for HotkeyTool {
         // window centre, so a keyboard-first session stays visible.
         if !coordinate_focus {
             let element_center = match element_guard.clone() {
-                Some(guard) => tokio::task::spawn_blocking(move || unsafe {
+                Some(guard) => latency::spawn_action_blocking(move || unsafe {
                     crate::ax::bindings::element_screen_center(
                         guard.as_ptr() as crate::ax::bindings::AXUIElementRef
                     )
@@ -535,7 +537,7 @@ impl Tool for HotkeyTool {
             prior_front,
             "hotkey.CGEvent",
             || async move {
-                tokio::task::spawn_blocking(move || {
+                latency::spawn_action_blocking(move || {
                     let element_ptr = element_guard.as_ref().map(|guard| guard.as_ptr());
                     let m: Vec<&str> = modifiers.iter().map(String::as_str).collect();
                     match (fg, coordinate_focus, window_id, element_ptr) {

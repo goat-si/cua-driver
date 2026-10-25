@@ -7,6 +7,8 @@
 //! `get_window_state` returns). `from_zoom=true` translates from the most
 //! recent zoom crop context, same as click/double_click.
 
+use crate::goat::action_latency as latency;
+
 use async_trait::async_trait;
 use cua_driver_contract::{ClickButton, DragInput};
 use cua_driver_core::{
@@ -169,7 +171,7 @@ impl Tool for DragTool {
                 cursor_key.clone(),
                 cursor_overlay::OverlayCommand::SetPressed(true),
             );
-            let result = tokio::task::spawn_blocking(move || {
+            let result = latency::spawn_action_blocking(move || {
                 let modifier_refs: Vec<&str> = modifiers.iter().map(String::as_str).collect();
                 crate::input::mouse::drag_at_xy_foreground_observed(
                     from_x,
@@ -363,13 +365,13 @@ impl Tool for DragTool {
         let _key_focus = if fg {
             None
         } else {
-            tokio::task::spawn_blocking(move || crate::key_focus_guard::protect(pid))
+            latency::spawn_blocking(move || crate::key_focus_guard::protect(pid))
                 .await
                 .ok()
                 .flatten()
         };
         let prior_key_wid = match prior_front {
-            Some(prior) if !fg && prior != pid => tokio::task::spawn_blocking(move || {
+            Some(prior) if !fg && prior != pid => latency::spawn_action_blocking(move || {
                 crate::input::skylight::key_window_of_pid(prior)
             })
             .await
@@ -380,7 +382,7 @@ impl Tool for DragTool {
         let focus_without_raise = if fg {
             false
         } else {
-            match tokio::task::spawn_blocking(move || {
+            match latency::spawn_action_blocking(move || {
                 crate::input::mouse::prepare_background_pixel_click(pid, wid)
             })
             .await
@@ -419,7 +421,7 @@ impl Tool for DragTool {
             prior_front,
             "drag.CGEvent",
             || async move {
-                tokio::task::spawn_blocking(move || -> anyhow::Result<bool> {
+                latency::spawn_action_blocking(move || -> anyhow::Result<bool> {
                     let m: Vec<&str> = mods_owned.iter().map(String::as_str).collect();
                     let observe = move |x: f64, y: f64| {
                         crate::cursor::overlay::send_command(
@@ -597,7 +599,7 @@ impl DragTool {
         wid: u32,
         prior_front: Option<i32>,
     ) -> ToolResult {
-        let pointer_before = tokio::task::spawn_blocking(pointer_location)
+        let pointer_before = latency::spawn_action_blocking(pointer_location)
             .await
             .ok()
             .flatten();
@@ -616,11 +618,12 @@ impl DragTool {
         // drop has finished, see `await_drag_session_end`); this step promised
         // to hand it back, so put it where the user left it.
         if let Some((x, y)) = pointer_before {
-            let _ =
-                tokio::task::spawn_blocking(move || crate::input::mouse::move_cursor_desktop(x, y))
-                    .await;
+            let _ = latency::spawn_action_blocking(move || {
+                crate::input::mouse::move_cursor_desktop(x, y)
+            })
+            .await;
         }
-        let pointer_after = tokio::task::spawn_blocking(pointer_location)
+        let pointer_after = latency::spawn_action_blocking(pointer_location)
             .await
             .ok()
             .flatten();
