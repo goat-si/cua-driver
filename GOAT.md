@@ -38,6 +38,8 @@ These embedded runtimes own a process group with a pipe sentinel, so even a
 SIGKILL of the driver ends its helpers. Driver-owned isolated browsers retain
 their separate groups with the same containment; user-launched Linux apps
 are detached from cleanup. Perception keeps its existing OS containment.
+Sentinels require waitable SIGCHLD and exclusive reaping; embedded startup
+rejects inherited SIGCHLD auto-reaping.
 
 Windows hosts must assign the driver to a Job Object with
 `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` and retain the job handle for the desired
