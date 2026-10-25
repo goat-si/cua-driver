@@ -125,7 +125,13 @@ jobs:
           cp -R ../wayland-helper "release/$STAGE/wayland-helper"
           cp ../LICENSE.md "release/$STAGE/LICENSE"
           cp THIRD_PARTY_NOTICES.md "release/$STAGE/"
-          tar -czf "release/$STAGE-binary.tar.gz" -C "release/$STAGE" .
+          # Bare member names, as in upstream's *-binary archives: no "./" root entry or prefix,
+          # which strict extractors such as GOAT's server installer reject (goat-si/cua-driver#16).
+          # shellcheck disable=SC2046
+          tar -czf "release/$STAGE-binary.tar.gz" -C "release/$STAGE" $(ls -A "release/$STAGE")
+          if tar -tzf "release/$STAGE-binary.tar.gz" | grep -E '^(\./|/)'; then
+            echo "::error::archive members must be bare relative names"; exit 1
+          fi
       - name: Protocol compatibility with GOAT's pinned release
         run: python3 goat/compat/check_protocol.py --candidate "rust/release/$STAGE/cua-driver" --candidate-version "${{ needs.version.outputs.version }}" --baseline-key linux-${{ matrix.arch }}
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
@@ -263,7 +269,13 @@ jobs:
           test "$(otool -D "release/$STAGE/libcua_driver_sdk.dylib" | tail -n 1)" = '@rpath/libcua_driver_sdk.dylib'
           cp include/cua_driver_abi.h THIRD_PARTY_NOTICES.md "release/$STAGE/"
           cp ../LICENSE.md "release/$STAGE/LICENSE"
-          tar -czf "release/$STAGE-binary.tar.gz" -C "release/$STAGE" .
+          # Bare member names, as in upstream's *-binary archives: no "./" root entry or prefix,
+          # which strict extractors such as GOAT's server installer reject (goat-si/cua-driver#16).
+          # shellcheck disable=SC2046
+          tar -czf "release/$STAGE-binary.tar.gz" -C "release/$STAGE" $(ls -A "release/$STAGE")
+          if tar -tzf "release/$STAGE-binary.tar.gz" | grep -E '^(\./|/)'; then
+            echo "::error::archive members must be bare relative names"; exit 1
+          fi
       - name: Protocol compatibility with GOAT's pinned release
         run: python3 goat/compat/check_protocol.py --candidate "rust/release/$STAGE/cua-driver" --candidate-version "${{ needs.version.outputs.version }}" --baseline-key darwin-universal
       - name: Headless embedded process lifetime
