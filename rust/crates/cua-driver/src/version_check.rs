@@ -541,14 +541,20 @@ fn format_banner(
 /// 2. Persisted config `update_check_enabled` (false → off)
 /// 3. Built `CARGO_PKG_VERSION` is a pre-release (`-dev`, `-rc.1`, …) → off
 fn is_enabled() -> bool {
+    is_enabled_for(env!("CARGO_PKG_VERSION"))
+}
+
+// GOAT fork: the version is a parameter so tests can state the stable case; fork builds report a
+// prerelease (0.37.0-goat.N), which turns the check off.
+fn is_enabled_for(version: &str) -> bool {
     if let Some(false) = parse_env_bool(ENV_UPDATE_CHECK) {
         return false;
     }
     if let Some(false) = read_config_flag() {
         return false;
     }
-    if is_prerelease(env!("CARGO_PKG_VERSION"))
-        && crate::release_channel::ReleaseChannel::from_version(env!("CARGO_PKG_VERSION"))
+    if is_prerelease(version)
+        && crate::release_channel::ReleaseChannel::from_version(version)
             != Some(crate::release_channel::ReleaseChannel::Nightly)
     {
         return false;
@@ -1447,21 +1453,24 @@ mod tests {
         // Use a separately-redirected HOME so any config file present on
         // the developer's machine can't influence the result.
         with_isolated_home(|_| {
-            assert!(!is_enabled(), "explicit false env var must disable");
+            assert!(
+                !is_enabled_for("0.37.0"),
+                "explicit false env var must disable"
+            );
         });
 
         unsafe {
             std::env::set_var(ENV_UPDATE_CHECK, "0");
         }
         with_isolated_home(|_| {
-            assert!(!is_enabled(), "0 must disable");
+            assert!(!is_enabled_for("0.37.0"), "0 must disable");
         });
 
         unsafe {
             std::env::set_var(ENV_UPDATE_CHECK, "off");
         }
         with_isolated_home(|_| {
-            assert!(!is_enabled(), "off must disable");
+            assert!(!is_enabled_for("0.37.0"), "off must disable");
         });
 
         // Restore.
@@ -1493,15 +1502,37 @@ mod tests {
             )
             .unwrap();
 
-            // Build version is a normal release (this crate's pkg version
-            // ships as "0.1.3", a stable release — see workspace Cargo.toml).
+            // A stable version, so the prerelease rule cannot mask the result.
             // The env var is unset, so the config flag is the only signal.
             assert!(
-                !is_enabled(),
+                !is_enabled_for("0.37.0"),
                 "persisted update_check_enabled=false must disable the check"
             );
         });
 
+        match saved {
+            Some(s) => unsafe {
+                std::env::set_var(ENV_UPDATE_CHECK, s);
+            },
+            None => unsafe {
+                std::env::remove_var(ENV_UPDATE_CHECK);
+            },
+        }
+    }
+
+    #[test]
+    fn goat_fork_prerelease_turns_the_check_off() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let saved = std::env::var_os(ENV_UPDATE_CHECK);
+        unsafe {
+            std::env::remove_var(ENV_UPDATE_CHECK);
+        }
+        with_isolated_home(|_| {
+            assert!(
+                !is_enabled_for("0.37.0-goat.1"),
+                "a GOAT fork build never checks upstream for updates"
+            );
+        });
         match saved {
             Some(s) => unsafe {
                 std::env::set_var(ENV_UPDATE_CHECK, s);
@@ -1521,10 +1552,9 @@ mod tests {
         }
 
         with_isolated_home(|home| {
-            // Case A: no config file at all → enabled.
-            // CARGO_PKG_VERSION is "0.1.3" (stable), env unset, no config file.
+            // Case A: no config file at all → enabled for a stable build.
             assert!(
-                is_enabled(),
+                is_enabled_for("0.37.0"),
                 "no config file + stable version + no env opt-out → enabled"
             );
 
@@ -1537,7 +1567,7 @@ mod tests {
             )
             .unwrap();
             assert!(
-                is_enabled(),
+                is_enabled_for("0.37.0"),
                 "explicit update_check_enabled=true must leave check on"
             );
         });

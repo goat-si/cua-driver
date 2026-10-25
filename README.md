@@ -1,3 +1,5 @@
+> GOAT's fork of Cua Driver, maintained by [GOAT](https://github.com/goat-si/goat); not affiliated with or endorsed by Cua AI, Inc. Upstream: [trycua/cua](https://github.com/trycua/cua) `libs/cua-driver`. See [GOAT.md](GOAT.md).
+
 # Cua Driver
 
 Background computer-use driver for any agents. Speaks MCP over stdio; drives native macOS apps without stealing focus.

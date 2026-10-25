@@ -1,5 +1,8 @@
 //! Real Linux tool implementations (compiled only on Linux).
 
+#[path = "goat_launch_lifetime.rs"]
+mod goat_launch_lifetime;
+
 use async_trait::async_trait;
 use cua_driver_contract::{
     ClickButton, DragInput, GetCursorPositionInput, GetDesktopStateInput, GetScreenSizeInput,
@@ -1915,7 +1918,7 @@ fn spawn_launch_command(cmd: &str, additional_arguments: &[String]) -> std::io::
     {
         launch.arg("--force-renderer-accessibility");
     }
-    let child = launch.spawn()?;
+    let child = goat_launch_lifetime::detach_user_app(&mut launch).spawn()?;
     let pid = child.id();
     reap_in_background(child);
     Ok(pid)
@@ -2074,7 +2077,10 @@ impl Tool for LaunchAppTool {
                     for url in &urls {
                         children.push((
                             url.clone(),
-                            std::process::Command::new("xdg-open").arg(url).spawn()?,
+                            goat_launch_lifetime::detach_user_app(
+                                std::process::Command::new("xdg-open").arg(url),
+                            )
+                            .spawn()?,
                         ));
                     }
                     for (url, child) in children {
@@ -2139,7 +2145,10 @@ impl Tool for LaunchAppTool {
                                      round-trip its launch_path."
                                 );
                             }
-                            let child = std::process::Command::new("xdg-open").arg(cmd).spawn()?;
+                            let child = goat_launch_lifetime::detach_user_app(
+                                std::process::Command::new("xdg-open").arg(cmd),
+                            )
+                            .spawn()?;
                             if let Some(reason) = xdg_open_failure(child) {
                                 anyhow::bail!("could not open '{cmd}': {reason}");
                             }
@@ -12478,6 +12487,15 @@ impl Tool for GetScreenSizeTool {
                 // The size and the monitor list come from one snapshot.
                 let (frame, monitors) = crate::wayland::hyprland::screen_report()?;
                 return Ok((frame.width, frame.height, frame.scale, Some(monitors)));
+            }
+            if crate::wayland::is_wayland() && std::env::var_os("DISPLAY").is_none() {
+                // GNOME publishes its monitor layout on D-Bus; consent needs this content-free
+                // geometry for listing calls, which otherwise fail here (trycua/cua#1922). Other
+                // compositors fall through to the X11 read and its error, as before.
+                if let Ok((w, h, scale, monitors)) = crate::wayland::mutter_display::screen_report()
+                {
+                    return Ok((w, h, scale, Some(monitors)));
+                }
             }
             // X11 reports pixel dimensions; scale factor on X11 is not
             // well-defined per-monitor, so report 1.0 (matches DPI-unaware

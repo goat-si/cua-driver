@@ -26,6 +26,32 @@ Release artifacts here are unsigned. GOAT signs the driver when it builds its he
 keeps its existing signing identity and the permissions people granted it. This repository holds no
 signing certificates or secrets.
 
+## Embedded process lifetime
+
+On macOS and Linux, `mcp --direct --embedded` and `serve --embedded` belong to
+their launching process. macOS watches its startup parent with kqueue; Linux
+uses a parent-death SIGTERM and rechecks the parent after arming it. Existing
+MCP stdin EOF and `serve --parent-liveness-stdio` shutdown remain supported.
+Standalone daemons and the app's automatic daemon launch keep their lifetime.
+
+These embedded runtimes own a process group with a pipe sentinel, so even a
+SIGKILL of the driver ends its helpers. Driver-owned isolated browsers retain
+their separate groups with the same containment; user-launched Linux apps
+are detached from cleanup. Perception keeps its existing OS containment.
+Sentinels require waitable SIGCHLD and exclusive reaping; embedded startup
+rejects inherited SIGCHLD auto-reaping.
+
+Parent death ends the group at once with SIGKILL, unlike the graceful stdin EOF
+shutdown, so nothing in flight is finalized: an active recording is left
+incomplete. A host that records should stop the recording, or close the
+driver's stdin, before it exits.
+
+Windows hosts must assign the driver to a Job Object with
+`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` and retain the job handle for the desired
+lifetime. This fork does not create or validate that host-owned job; without
+it, Windows has no equivalent parent-death guarantee. No Windows lifetime code
+is changed by this Unix fix.
+
 ## Syncing upstream
 
 Upstream moves several times a day; we sync deliberately, not continuously.
