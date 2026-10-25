@@ -1146,6 +1146,16 @@ fn build_element_entry(
     if let Some(selected) = n.selected {
         entry["selected"] = json!(selected);
     }
+    if let Some(checked) = n.checked {
+        entry["checked"] = match checked {
+            crate::uia::CheckedState::On => json!(true),
+            crate::uia::CheckedState::Off => json!(false),
+            crate::uia::CheckedState::Mixed => json!("mixed"),
+        };
+    }
+    if let Some(expanded) = n.expanded {
+        entry["expanded"] = json!(expanded);
+    }
     if !n.actions.is_empty() {
         entry["actions"] = json!(n.actions);
     }
