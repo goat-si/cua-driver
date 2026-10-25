@@ -266,9 +266,126 @@ jobs:
           path: rust/release/*-binary.tar.gz
           if-no-files-found: error
 
+  # Unit and hermetic tests, ported from upstream's per-platform "unit" jobs (trycua/cua
+  # .github/workflows/ci-rust-{linux,macos,windows}.yml at cua-driver-rs-v0.37.0). Tests that need a
+  # logged-in desktop, TCC grants, X11/Wayland or a real app are #[ignore] upstream and stay out of
+  # these jobs, as upstream runs them only in its desktop harnesses. goat-si/cua-driver#12.
+  test-linux:
+    needs: version
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
+      CUA_TEST_REQUIRE_DRIVER_BIN: "1"
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            clang pkg-config libdbus-1-dev libpipewire-0.3-dev libspa-0.2-dev \
+            libei-dev libxkbcommon-dev libx11-dev libxi-dev libxtst-dev libxext-dev \
+            libwayland-dev imagemagick xvfb xauth x11-utils ffmpeg dbus-daemon
+      - uses: dtolnay/rust-toolchain@4716b85f2fac3e324e64fa2810f6b5c3905760a5 # 1.97.1
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            rust/target
+          key: goat-test-linux-${{ hashFiles('rust/Cargo.lock', 'rust/**/Cargo.toml', 'vendor/**/Cargo.toml') }}
+      - name: Workspace tests (upstream's Linux unit selection)
+        working-directory: rust
+        run: cargo test --locked -p cua-driver -p cua-driver-e2e -p cua-driver-contract -p cua-driver-core -p cua-driver-testkit -p cursor-overlay -p cursor-theme-cli -p platform-linux --all-targets
+      - name: Cursor motion tests
+        working-directory: rust
+        run: cargo test --locked -p cua-cursor-motion --all-features --all-targets
+      - name: SDK tests
+        working-directory: rust
+        run: |
+          cargo test --locked -p cua-driver-sdk --test async_io_embedding
+          cargo test --locked -p cua-driver-sdk --lib
+
+  test-macos:
+    needs: version
+    runs-on: macos-26
+    timeout-minutes: 60
+    env:
+      CUA_TEST_REQUIRE_DRIVER_BIN: "1"
+      # Short socket paths: the runner's default TMPDIR is long enough to exceed sun_path.
+      TMPDIR: /tmp
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: dtolnay/rust-toolchain@4716b85f2fac3e324e64fa2810f6b5c3905760a5 # 1.97.1
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            rust/target
+          key: goat-test-macos-${{ hashFiles('rust/Cargo.lock', 'rust/**/Cargo.toml', 'vendor/**/Cargo.toml') }}
+      - name: platform-macos unit tests
+        working-directory: rust
+        env:
+          # The hosted runner's pasteboard is disposable (upstream opts in the same way).
+          CUA_TEST_ALLOW_CLIPBOARD: "1"
+        run: cargo test --locked -p platform-macos --lib
+      - name: Core, protocol schema, pid-file and hermetic e2e tests
+        working-directory: rust
+        run: |
+          cargo test --locked -p cua-driver-core --lib
+          cargo build --locked -p cua-driver
+          cargo test --locked -p cua-driver --test protocol_schema_test --test status_pid_file_cli_test
+          cargo test --locked -p cua-driver-e2e
+      - name: SDK tests
+        working-directory: rust
+        # quarantine: goat-si/cua-driver#8 — the daemon-transport tests in the SDK's tests::
+        # module fail intermittently on macOS with EINVAL (fixed upstream by trycua/cua#5558, not
+        # yet backported). Everything else in the SDK, including embedded::tests, runs.
+        run: "cargo test --locked -p cua-driver-sdk --lib -- --skip tests::"
+
+  test-windows:
+    needs: version
+    runs-on: windows-latest
+    timeout-minutes: 75
+    env:
+      CUA_TEST_REQUIRE_DRIVER_BIN: "1"
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: dtolnay/rust-toolchain@4716b85f2fac3e324e64fa2810f6b5c3905760a5 # 1.97.1
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            rust/target
+          key: goat-test-windows-${{ hashFiles('rust/Cargo.lock', 'rust/**/Cargo.toml', 'vendor/**/Cargo.toml') }}
+      - name: Compile every test target
+        working-directory: rust
+        run: cargo test --locked -p cua-driver -p cua-driver-e2e -p cua-driver-core -p cua-driver-sdk -p cua-driver-testkit -p cursor-overlay -p cursor-theme-cli -p platform-windows -p cua-driver-uia --all-targets --no-run
+      - name: Desktop-independent tests (upstream's Windows unit selection)
+        working-directory: rust
+        env:
+          CUA_TEST_ALLOW_CLIPBOARD: "1"
+        shell: pwsh
+        run: |
+          $steps = @(
+            "-p cua-driver-core --lib --test recording_shutdown_errors",
+            "-p platform-windows --lib",
+            "-p cursor-overlay --lib",
+            "-p cursor-theme-cli",
+            "-p cua-driver --test protocol_schema_test",
+            "-p cua-driver-sdk --lib abi::tests::",
+            "-p cua-driver-uia --lib authorization_tests::"
+          )
+          foreach ($step in $steps) {
+            Invoke-Expression "cargo test --locked $step"
+            if ($LASTEXITCODE -ne 0) { throw "cargo test $step failed with exit $LASTEXITCODE" }
+          }
+
   release:
     if: startsWith(github.ref, 'refs/tags/cua-driver-rs-v')
-    needs: [version, deny, linux, windows, macos]
+    needs: [version, deny, test-linux, test-macos, test-windows, linux, windows, macos]
     runs-on: ubuntu-latest
     permissions:
       contents: write
