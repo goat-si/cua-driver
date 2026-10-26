@@ -1,12 +1,78 @@
-use std::{path::Path, sync::Mutex};
+use std::path::Path;
+#[cfg(target_os = "windows")]
+use std::sync::Mutex;
 
+#[cfg(target_os = "windows")]
 use clipboard_rs::{common::RustImage, Clipboard, ClipboardContext, ContentFormat};
+#[cfg(target_os = "windows")]
 use cua_driver_core::clipboard::ClipboardBackend;
 
+/// Windows clipboard format that instructs clipboard monitors and the OS
+/// clipboard service to ignore the current clipboard update.
+pub const EXCLUDE_CLIPBOARD_MONITOR_FORMAT: &str = "ExcludeClipboardContentFromMonitorProcessing";
+
+/// Windows clipboard format (DWORD 0) that prevents the item from appearing
+/// in Win+V clipboard history.
+pub const CAN_INCLUDE_IN_CLIPBOARD_HISTORY_FORMAT: &str = "CanIncludeInClipboardHistory";
+
+/// Windows clipboard format (DWORD 0) that prevents the item from syncing to
+/// cloud clipboard across devices.
+pub const CAN_UPLOAD_TO_CLOUD_CLIPBOARD_FORMAT: &str = "CanUploadToCloudClipboard";
+
+/// Serialized DWORD(0) payload ([0, 0, 0, 0]) used by Windows clipboard
+/// exclusion formats.
+pub const CLIPBOARD_EXCLUSION_DWORD_ZERO: [u8; 4] = 0u32.to_le_bytes();
+
+/// Return the ordered (format_name, dword_payload) pairs required to keep
+/// agent-written clipboard data out of Windows clipboard history and cloud sync.
+pub fn exclusion_format_payloads() -> [(&'static str, [u8; 4]); 3] {
+    [
+        (
+            EXCLUDE_CLIPBOARD_MONITOR_FORMAT,
+            CLIPBOARD_EXCLUSION_DWORD_ZERO,
+        ),
+        (
+            CAN_INCLUDE_IN_CLIPBOARD_HISTORY_FORMAT,
+            CLIPBOARD_EXCLUSION_DWORD_ZERO,
+        ),
+        (
+            CAN_UPLOAD_TO_CLOUD_CLIPBOARD_FORMAT,
+            CLIPBOARD_EXCLUSION_DWORD_ZERO,
+        ),
+    ]
+}
+
+/// Abstraction over registering and setting custom clipboard formats inside an
+/// open clipboard transaction so format registration and payload writing can be
+/// unit-tested on any host OS.
+pub trait ClipboardExclusionSink {
+    fn register_format(&mut self, name: &str) -> Result<u32, String>;
+    fn set_format_dword(&mut self, format_id: u32, payload: [u8; 4]) -> Result<(), String>;
+}
+
+/// Register and write all three Windows clipboard exclusion formats into sink.
+pub fn apply_clipboard_exclusion_formats<S: ClipboardExclusionSink>(
+    sink: &mut S,
+) -> Result<[u32; 3], String> {
+    let specs = exclusion_format_payloads();
+    let mut ids = [0u32; 3];
+    for (idx, (name, payload)) in specs.into_iter().enumerate() {
+        let format_id = sink.register_format(name)?;
+        if format_id == 0 {
+            return Err(format!("RegisterClipboardFormatW returned 0 for {name}"));
+        }
+        sink.set_format_dword(format_id, payload)?;
+        ids[idx] = format_id;
+    }
+    Ok(ids)
+}
+
+#[cfg(target_os = "windows")]
 pub struct WindowsClipboard {
     context: Result<Mutex<ClipboardContext>, String>,
 }
 
+#[cfg(target_os = "windows")]
 impl WindowsClipboard {
     pub fn new() -> Self {
         Self {
@@ -37,6 +103,100 @@ fn absolute_existing_file(path: &str) -> Result<String, String> {
     Ok(canonical.to_string_lossy().into_owned())
 }
 
+#[cfg(target_os = "windows")]
+mod win32_exclusion {
+    use super::{apply_clipboard_exclusion_formats, ClipboardExclusionSink};
+    use windows::core::PCWSTR;
+    use windows::Win32::Foundation::{GlobalFree, HANDLE, HWND};
+    use windows::Win32::System::DataExchange::{
+        CloseClipboard, EmptyClipboard, OpenClipboard, RegisterClipboardFormatW, SetClipboardData,
+    };
+    use windows::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE};
+
+    const CF_UNICODETEXT_ID: u32 = 13;
+
+    struct OpenClipboardGuard;
+
+    impl OpenClipboardGuard {
+        fn open() -> Result<Self, String> {
+            for attempt in 0..5 {
+                if unsafe { OpenClipboard(HWND::default()) }.is_ok() {
+                    return Ok(Self);
+                }
+                if attempt < 4 {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+            }
+            Err("OpenClipboard failed".to_owned())
+        }
+    }
+
+    impl Drop for OpenClipboardGuard {
+        fn drop(&mut self) {
+            let _ = unsafe { CloseClipboard() };
+        }
+    }
+
+    unsafe fn set_global_bytes(format_id: u32, bytes: &[u8]) -> Result<(), String> {
+        let hmem = GlobalAlloc(GMEM_MOVEABLE, bytes.len().max(1))
+            .map_err(|e| format!("GlobalAlloc failed for format {format_id}: {e}"))?;
+        let ptr = GlobalLock(hmem);
+        if ptr.is_null() {
+            let _ = GlobalFree(hmem);
+            return Err(format!("GlobalLock returned null for format {format_id}"));
+        }
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr as *mut u8, bytes.len());
+        let _ = GlobalUnlock(hmem);
+        if let Err(err) = SetClipboardData(format_id, HANDLE(hmem.0)) {
+            let _ = GlobalFree(hmem);
+            return Err(format!(
+                "SetClipboardData failed for format {format_id}: {err}"
+            ));
+        }
+        Ok(())
+    }
+
+    struct Win32ExclusionSink;
+
+    impl ClipboardExclusionSink for Win32ExclusionSink {
+        fn register_format(&mut self, name: &str) -> Result<u32, String> {
+            let wide: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
+            let id = unsafe { RegisterClipboardFormatW(PCWSTR(wide.as_ptr())) };
+            if id == 0 {
+                Err(format!("RegisterClipboardFormatW({name}) returned 0"))
+            } else {
+                Ok(id)
+            }
+        }
+
+        fn set_format_dword(&mut self, format_id: u32, payload: [u8; 4]) -> Result<(), String> {
+            unsafe { set_global_bytes(format_id, &payload) }
+        }
+    }
+
+    pub fn write_text_with_exclusion(text: &str) -> Result<(), String> {
+        let _guard = OpenClipboardGuard::open()?;
+        unsafe {
+            EmptyClipboard().map_err(|e| format!("EmptyClipboard failed: {e}"))?;
+            let utf16: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
+            let byte_len = utf16.len() * std::mem::size_of::<u16>();
+            let bytes = std::slice::from_raw_parts(utf16.as_ptr() as *const u8, byte_len);
+            set_global_bytes(CF_UNICODETEXT_ID, bytes)?;
+        }
+        let mut sink = Win32ExclusionSink;
+        apply_clipboard_exclusion_formats(&mut sink)?;
+        Ok(())
+    }
+
+    pub fn attach_exclusion_formats_to_current_clipboard() -> Result<(), String> {
+        let _guard = OpenClipboardGuard::open()?;
+        let mut sink = Win32ExclusionSink;
+        apply_clipboard_exclusion_formats(&mut sink)?;
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "windows")]
 impl ClipboardBackend for WindowsClipboard {
     fn available_formats(&self) -> Result<Vec<String>, String> {
         self.context()?
@@ -54,20 +214,23 @@ impl ClipboardBackend for WindowsClipboard {
     }
 
     fn write_text(&self, text: String) -> Result<(), String> {
-        self.context()?.set_text(text).map_err(|e| e.to_string())
+        let _guard = self.context()?;
+        win32_exclusion::write_text_with_exclusion(&text)
     }
 
     fn write_image(&self, absolute_path: &str) -> Result<(), String> {
         let path = absolute_existing_file(absolute_path)?;
         let image = clipboard_rs::RustImageData::from_path(&path).map_err(|e| e.to_string())?;
-        self.context()?.set_image(image).map_err(|e| e.to_string())
+        let guard = self.context()?;
+        guard.set_image(image).map_err(|e| e.to_string())?;
+        win32_exclusion::attach_exclusion_formats_to_current_clipboard()
     }
 
     fn write_file_url(&self, absolute_path: &str) -> Result<(), String> {
         let path = absolute_existing_file(absolute_path)?;
-        self.context()?
-            .set_files(vec![path])
-            .map_err(|e| e.to_string())
+        let guard = self.context()?;
+        guard.set_files(vec![path]).map_err(|e| e.to_string())?;
+        win32_exclusion::attach_exclusion_formats_to_current_clipboard()
     }
 }
 
@@ -75,19 +238,85 @@ impl ClipboardBackend for WindowsClipboard {
 mod tests {
     use super::*;
 
+    #[derive(Default)]
+    struct MockExclusionSink {
+        registered: Vec<String>,
+        written: Vec<(u32, [u8; 4])>,
+        fail_on_register: Option<&'static str>,
+        fail_on_set: Option<u32>,
+    }
+
+    impl ClipboardExclusionSink for MockExclusionSink {
+        fn register_format(&mut self, name: &str) -> Result<u32, String> {
+            if self.fail_on_register == Some(name) {
+                return Ok(0);
+            }
+            self.registered.push(name.to_owned());
+            Ok(0xC000 + self.registered.len() as u32)
+        }
+
+        fn set_format_dword(&mut self, format_id: u32, payload: [u8; 4]) -> Result<(), String> {
+            if self.fail_on_set == Some(format_id) {
+                return Err(format!("mock SetClipboardData failure for {format_id}"));
+            }
+            self.written.push((format_id, payload));
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn exclusion_formats_register_and_write_dword_zero_payloads() {
+        let mut sink = MockExclusionSink::default();
+        let ids = apply_clipboard_exclusion_formats(&mut sink).unwrap();
+        assert_eq!(ids, [0xC001, 0xC002, 0xC003]);
+        assert_eq!(
+            sink.registered,
+            vec![
+                "ExcludeClipboardContentFromMonitorProcessing".to_owned(),
+                "CanIncludeInClipboardHistory".to_owned(),
+                "CanUploadToCloudClipboard".to_owned(),
+            ]
+        );
+        assert_eq!(
+            sink.written,
+            vec![
+                (0xC001, [0, 0, 0, 0]),
+                (0xC002, [0, 0, 0, 0]),
+                (0xC003, [0, 0, 0, 0]),
+            ]
+        );
+    }
+
+    #[test]
+    fn exclusion_formats_surface_registration_and_write_errors() {
+        let mut bad_reg = MockExclusionSink {
+            fail_on_register: Some(CAN_INCLUDE_IN_CLIPBOARD_HISTORY_FORMAT),
+            ..Default::default()
+        };
+        assert!(apply_clipboard_exclusion_formats(&mut bad_reg)
+            .unwrap_err()
+            .contains("CanIncludeInClipboardHistory"));
+
+        let mut bad_set = MockExclusionSink {
+            fail_on_set: Some(0xC003),
+            ..Default::default()
+        };
+        assert!(apply_clipboard_exclusion_formats(&mut bad_set)
+            .unwrap_err()
+            .contains("49155"));
+    }
+
     #[test]
     fn rejects_relative_local_paths_before_clipboard_access() {
-        let backend = WindowsClipboard::new();
-        assert!(backend
-            .write_file_url("relative.txt")
+        assert!(absolute_existing_file("relative.txt")
             .unwrap_err()
             .contains("absolute"));
-        assert!(backend
-            .write_image("relative.png")
+        assert!(absolute_existing_file("relative.png")
             .unwrap_err()
             .contains("absolute"));
     }
 
+    #[cfg(target_os = "windows")]
     #[test]
     fn native_clipboard_round_trips_text_when_opted_in() {
         // Overwrites the system clipboard, so it runs only where a job opts
@@ -105,5 +334,16 @@ mod tests {
             backend.read_text().unwrap().as_deref(),
             Some("cua-driver clipboard test")
         );
+        let formats = backend.available_formats().unwrap();
+        for expected in [
+            EXCLUDE_CLIPBOARD_MONITOR_FORMAT,
+            CAN_INCLUDE_IN_CLIPBOARD_HISTORY_FORMAT,
+            CAN_UPLOAD_TO_CLOUD_CLIPBOARD_FORMAT,
+        ] {
+            assert!(
+                formats.iter().any(|f| f == expected),
+                "missing {expected} in {formats:?}"
+            );
+        }
     }
 }

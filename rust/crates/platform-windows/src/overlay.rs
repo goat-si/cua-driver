@@ -1696,6 +1696,7 @@ mod tests {
                 rs.core.trajectory.is_none()
                     && rs.core.click_t.is_none()
                     && rs.core.click_age.is_none()
+                    && !rs.core.session_badge_needs_frame_tick()
             }) {
                 break;
             }
@@ -1801,8 +1802,12 @@ mod tests {
         let rs = &map.cursors["sessA"];
         assert!(rs.core.trajectory.is_none());
         assert_eq!(rs.core.idle_alpha, 1.0);
-        assert!(rs.core.has_resting_motion());
-        assert!(map.needs_frame_tick(), "the resting bob needs frames");
+        assert!(!rs.core.has_resting_motion());
+        assert!(
+            !map.needs_frame_tick(),
+            "settled default cursor parks at TIMER_MS_IDLE during idle_hide_ms countdown"
+        );
+        assert!(rs.in_idle_countdown());
     }
 
     #[test]

@@ -373,9 +373,10 @@ impl RenderStateCore {
             return false;
         }
         match self.theme.as_deref() {
-            // The defensive no-theme fallback paints the embedded default.
-            None => true,
-            Some(theme) if theme.id == crate::DEFAULT_THEME_ID => true,
+            // Default-theme cursors park once settled instead of ticking at
+            // frame cadence through the entire idle-hide delay.
+            None => false,
+            Some(theme) if theme.id == crate::DEFAULT_THEME_ID => false,
             Some(theme) => theme
                 .animation_for_action(self.visual.resolved_action)
                 .is_some_and(|animation| animation.frames.len() > 1),
@@ -1577,7 +1578,7 @@ mod glide_duration_tests {
             core.tick_motion(1.0 / 120.0);
         }
         assert!(core.effect_bounds().is_none());
-        assert!(!core.needs_frame_tick() || core.has_resting_motion());
+        assert!(!core.needs_frame_tick());
     }
 }
 
