@@ -2,10 +2,11 @@
 
 use super::bindings::*;
 use super::snapshot::RetainedElement;
-use super::tree::AXNode;
+use super::tree::{set_messaging_timeout, AXNode};
 use core_foundation::array::CFArray;
 use core_foundation::base::{CFEqual, CFGetTypeID, CFHash, CFTypeRef, TCFType};
 use core_foundation::string::CFString;
+use cua_driver_core::walk_budget::WalkBudget;
 use std::cell::Cell;
 use std::collections::HashMap;
 
@@ -41,10 +42,13 @@ pub(crate) fn plan_children(
     child_count: usize,
     is_row: impl Fn(usize) -> bool,
     visible: Option<&dyn Fn(usize) -> bool>,
+    expired: impl Fn() -> bool,
 ) -> Vec<ChildPlan> {
+    let mut deadline_expired = false;
     (0..child_count)
         .map(|i| {
-            if is_row(i) {
+            deadline_expired = deadline_expired || expired();
+            if deadline_expired || is_row(i) {
                 ChildPlan::Defer {
                     visible: visible.is_none_or(|contains| contains(i)),
                 }
@@ -101,6 +105,7 @@ pub(crate) unsafe fn plan_collection_children(
     element: AXUIElementRef,
     role: &str,
     children: &[AXUIElementRef],
+    budget: &WalkBudget,
 ) -> Vec<ChildPlan> {
     let rows = ElementSet::copy(element, "AXRows");
     let visible = ElementSet::copy(element, "AXVisibleRows")
@@ -112,6 +117,7 @@ pub(crate) unsafe fn plan_collection_children(
             if let Some(rows) = &rows {
                 return rows.contains(children[i]);
             }
+            set_messaging_timeout(children[i]);
             let child_role = copy_string_attr(children[i], "AXRole").unwrap_or_default();
             child_role == "AXRow"
                 || (matches!(role, "AXList" | "AXGrid")
@@ -120,6 +126,7 @@ pub(crate) unsafe fn plan_collection_children(
         visible
             .as_ref()
             .map(|_| &is_visible as &dyn Fn(usize) -> bool),
+        || rows.is_none() && budget.expired(),
     )
 }
 
@@ -315,7 +322,7 @@ mod tests {
     fn rows_yield_to_other_children_and_missing_visibility_keeps_all_rows() {
         let is_row = |i| matches!(i, 0 | 2 | 3);
         assert_eq!(
-            plan_children(4, is_row, Some(&|i| i == 2)),
+            plan_children(4, is_row, Some(&|i| i == 2), || false),
             vec![
                 ChildPlan::Defer { visible: false },
                 ChildPlan::WalkNow,
@@ -324,13 +331,47 @@ mod tests {
             ]
         );
         assert_eq!(
-            plan_children(4, is_row, None),
+            plan_children(4, is_row, None, || false),
             vec![
                 ChildPlan::Defer { visible: true },
                 ChildPlan::WalkNow,
                 ChildPlan::Defer { visible: true },
                 ChildPlan::Defer { visible: true },
             ]
+        );
+    }
+
+    #[test]
+    fn expired_classification_stops_probing_and_defers_every_remaining_child() {
+        let is_visible = |i: usize| i.is_multiple_of(2);
+        let shown = ChildPlan::Defer { visible: true };
+        let hidden = ChildPlan::Defer { visible: false };
+        for (probe_limit, expected) in [
+            (0, [shown, hidden, shown, hidden]),
+            (2, [shown, ChildPlan::WalkNow, shown, hidden]),
+            (4, [shown, ChildPlan::WalkNow, ChildPlan::WalkNow, hidden]),
+        ] {
+            let probes = Cell::new(0);
+            let plan = plan_children(
+                4,
+                |i| {
+                    probes.set(probes.get() + 1);
+                    matches!(i, 0 | 3)
+                },
+                Some(&is_visible),
+                || probes.get() >= probe_limit,
+            );
+            assert_eq!(probes.get(), probe_limit);
+            assert_eq!(plan, expected);
+        }
+        assert_eq!(
+            plan_children(
+                2,
+                |_| panic!("expired children must not be probed"),
+                None,
+                || true
+            ),
+            [shown, shown]
         );
     }
 

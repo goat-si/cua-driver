@@ -49,7 +49,7 @@ pub const DEFAULT_MAX_ELEMENTS: usize = 2_000;
 /// indefinitely.
 const AX_MESSAGING_TIMEOUT_SECONDS: f32 = 2.0;
 
-unsafe fn set_messaging_timeout(element: AXUIElementRef) {
+pub(crate) unsafe fn set_messaging_timeout(element: AXUIElementRef) {
     let _ = AXUIElementSetMessagingTimeout(element, AX_MESSAGING_TIMEOUT_SECONDS);
 }
 
@@ -749,7 +749,7 @@ unsafe fn walk_children(
     let children = copy_children(element);
     let plan = if rows_windowed() && !in_web_content && DENSE_COLLECTION_ROLES.contains(&role) {
         Some(dense_rows::plan_collection_children(
-            element, role, &children,
+            element, role, &children, budget,
         ))
     } else {
         None
