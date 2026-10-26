@@ -873,6 +873,9 @@ fn parse_rows(md: &str) -> Vec<Row> {
 }
 
 fn identity_of(indent: usize, after_index: &str) -> String {
+    if after_index.starts_with('(') && after_index.ends_with(" inactive tabs omitted)") {
+        return format!("{indent}|(inactive_tabs|");
+    }
     let role = after_index.split_whitespace().next().unwrap_or("");
     let id = after_index.find("id=").map(|p| {
         let tail = &after_index[p + 3..];

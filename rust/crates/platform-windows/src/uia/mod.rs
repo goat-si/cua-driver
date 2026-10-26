@@ -9,6 +9,13 @@
 //! (avoids per-property cross-process calls that make Chrome's 5000-node tree
 //!  take >4s when reading each property individually).
 
+use cua_driver_core::snapshot_compaction::{
+    compact_tab_strip, fold_actionless_text_subtrees, format_omitted_tabs_line,
+    is_compaction_summary_line, is_uia_dense_collection, is_uia_offscreen_exempt,
+    plan_uia_collection_children, redact_if_secure, renumber_indexed_tree, splice_deferred_chunks,
+    CompactableNode, DeferredChunk, FieldSecurityMeta, RenumberableNode, TabChildMeta,
+    UiaChildCandidate, UiaChildPlan, TAB_STRIP_COMPACTION_THRESHOLD,
+};
 use cua_driver_core::walk_budget::WalkBudget;
 use windows::core::{Interface, BSTR};
 use windows::Win32::System::Com::{
@@ -120,6 +127,51 @@ pub struct UiaNode {
     /// True when this node is below a UIA Document control. Browser-owned
     /// consent chrome must never match renderer-controlled descendants.
     pub in_web_content: bool,
+}
+
+impl CompactableNode for UiaNode {
+    fn element_index(&self) -> Option<usize> {
+        self.element_index
+    }
+    fn role(&self) -> &str {
+        &self.control_type
+    }
+    fn depth(&self) -> usize {
+        self.depth
+    }
+    fn set_depth(&mut self, depth: usize) {
+        self.depth = depth;
+    }
+    fn title(&self) -> Option<&str> {
+        self.name.as_deref()
+    }
+    fn value(&self) -> Option<&str> {
+        self.value.as_deref()
+    }
+    fn set_value(&mut self, value: Option<String>) {
+        self.value = value;
+    }
+    fn description(&self) -> Option<&str> {
+        self.help_text.as_deref()
+    }
+    fn format_line(&self) -> String {
+        format_node_line(self)
+    }
+}
+
+impl RenumberableNode for UiaNode {
+    fn element_index(&self) -> Option<usize> {
+        self.element_index
+    }
+    fn set_element_index(&mut self, index: Option<usize>) {
+        self.element_index = index;
+    }
+    fn parent_element_index(&self) -> Option<usize> {
+        self.parent_element_index
+    }
+    fn set_parent_element_index(&mut self, parent: Option<usize>) {
+        self.parent_element_index = parent;
+    }
 }
 
 pub struct UiaTreeResult {
@@ -400,8 +452,9 @@ unsafe fn walk_tree_unsafe(
     let mut nodes: Vec<UiaNode> = Vec::new();
     let mut lines: Vec<(usize, String)> = Vec::new();
     let mut counter = 0usize;
+    let search_offscreen = query.is_some_and(|q| !q.trim().is_empty());
 
-    walk_cached_bounded(
+    walk_cached_bounded_with_priority(
         &root_elem,
         0,
         None,
@@ -411,6 +464,7 @@ unsafe fn walk_tree_unsafe(
         &mut counter,
         budget,
         max_depth,
+        search_offscreen,
     );
 
     // Fallback for CoreWindow-class apps (Calculator, Settings, older UWPs).
@@ -476,6 +530,7 @@ unsafe fn walk_tree_unsafe(
                     &mut fallback_counter,
                     budget,
                     max_depth,
+                    search_offscreen,
                 );
 
                 if fallback_nodes.iter().any(|n| n.element_index.is_some()) {
@@ -516,6 +571,8 @@ unsafe fn walk_tree_unsafe(
         }
     }
 
+    fold_actionless_text_subtrees(&mut lines, &mut nodes);
+    nodes.retain(|n| n.control_type != "UiaTabStripSummary");
     let raw_md = render_lines(&lines);
     let tree_markdown = if let Some(q) = query {
         filter_tree(&raw_md, q)
@@ -561,6 +618,7 @@ unsafe fn walk_root_by_pid(
     counter: &mut usize,
     budget: &mut WalkBudget,
     max_depth: usize,
+    search_offscreen: bool,
 ) {
     let root = match automation.GetRootElement() {
         Ok(r) => r,
@@ -618,8 +676,17 @@ unsafe fn walk_root_by_pid(
                 continue;
             }
         };
-        walk_cached_bounded(
-            &cached, 0, None, false, nodes, lines, counter, budget, max_depth,
+        walk_cached_bounded_with_priority(
+            &cached,
+            0,
+            None,
+            false,
+            nodes,
+            lines,
+            counter,
+            budget,
+            max_depth,
+            search_offscreen,
         );
     }
 }
@@ -657,6 +724,102 @@ unsafe fn walk_cached_bounded(
     budget: &mut WalkBudget,
     max_depth: usize,
 ) {
+    walk_cached_bounded_with_priority(
+        element,
+        depth,
+        parent_index,
+        in_web_content,
+        nodes,
+        lines,
+        counter,
+        budget,
+        max_depth,
+        false,
+    );
+}
+
+struct DeferredUiaRow {
+    element: IUIAutomationElement,
+    in_web_content: bool,
+    chunk: DeferredChunk<UiaNode>,
+}
+
+#[allow(clippy::too_many_arguments)]
+unsafe fn walk_cached_bounded_with_priority(
+    element: &IUIAutomationElement,
+    depth: usize,
+    parent_index: Option<usize>,
+    in_web_content: bool,
+    nodes: &mut Vec<UiaNode>,
+    lines: &mut Vec<(usize, String)>,
+    counter: &mut usize,
+    budget: &mut WalkBudget,
+    max_depth: usize,
+    search_offscreen: bool,
+) {
+    let mut deferred: Vec<DeferredUiaRow> = Vec::new();
+    walk_cached_element(
+        element,
+        depth,
+        parent_index,
+        in_web_content,
+        nodes,
+        lines,
+        counter,
+        budget,
+        max_depth,
+        true,
+        &mut deferred,
+    );
+    if !deferred.is_empty() {
+        for visible in [true, false] {
+            if !visible && !search_offscreen {
+                continue;
+            }
+            for row in deferred.iter_mut().filter(|r| r.chunk.visible == visible) {
+                let mut chunk_nodes = Vec::new();
+                let mut chunk_lines = Vec::new();
+                walk_cached_element(
+                    &row.element,
+                    row.chunk.depth,
+                    row.chunk.parent_index,
+                    row.in_web_content,
+                    &mut chunk_nodes,
+                    &mut chunk_lines,
+                    counter,
+                    budget,
+                    max_depth,
+                    false,
+                    &mut Vec::new(),
+                );
+                row.chunk.walked = Some((chunk_lines, chunk_nodes));
+            }
+        }
+        let chunks: Vec<DeferredChunk<UiaNode>> = deferred.into_iter().map(|r| r.chunk).collect();
+        let old_lines = std::mem::take(lines);
+        let old_nodes = std::mem::take(nodes);
+        let (mut spliced_lines, mut spliced_nodes, map) =
+            splice_deferred_chunks(old_lines, old_nodes, chunks);
+        renumber_indexed_tree(&mut spliced_lines, &mut spliced_nodes, &map);
+        *lines = spliced_lines;
+        *nodes = spliced_nodes;
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+unsafe fn walk_cached_element(
+    element: &IUIAutomationElement,
+    depth: usize,
+    parent_index: Option<usize>,
+    in_web_content: bool,
+    nodes: &mut Vec<UiaNode>,
+    lines: &mut Vec<(usize, String)>,
+    counter: &mut usize,
+    budget: &mut WalkBudget,
+    max_depth: usize,
+    defer_dense_rows: bool,
+    deferred: &mut Vec<DeferredUiaRow>,
+) {
     // Node and time budget: a refused node is counted as discovered but not
     // visited, and the walk unwinds with the partial tree it has.
     if depth > max_depth || !budget.admit() {
@@ -672,23 +835,122 @@ unsafe fn walk_cached_bounded(
         lines,
         counter,
     );
+    let next_web = in_web_content || control_type.eq_ignore_ascii_case("Document");
 
     // Recurse using cached children (no additional RPC).
     if let Ok(children) = element.GetCachedChildren() {
         let len = children.Length().unwrap_or(0);
+        let mut child_elems: Vec<IUIAutomationElement> = Vec::with_capacity(len as usize);
         for i in 0..len {
             if let Ok(child) = children.GetElement(i) {
-                walk_cached_bounded(
+                child_elems.push(child);
+            }
+        }
+        let tab_plan = if !next_web && child_elems.len() >= TAB_STRIP_COMPACTION_THRESHOLD {
+            let child_types: Vec<String> =
+                child_elems.iter().map(read_cached_control_type).collect();
+            let child_selected: Vec<Option<bool>> =
+                child_elems.iter().map(read_cached_selected).collect();
+            let child_values: Vec<Option<String>> =
+                child_elems.iter().map(read_cached_bstr_value).collect();
+            let metas: Vec<TabChildMeta<'_>> = (0..child_elems.len())
+                .map(|i| TabChildMeta {
+                    role: &child_types[i],
+                    role_description: None,
+                    title: None,
+                    selected: child_selected[i],
+                    value: child_values[i].as_deref(),
+                    value_state: child_values[i].as_deref(),
+                })
+                .collect();
+            let parent_name = read_cached_bstr_name(element);
+            compact_tab_strip(&control_type, parent_name.as_deref(), None, None, &metas)
+        } else {
+            None
+        };
+
+        let dense_plan = if defer_dense_rows && !next_web && is_uia_dense_collection(&control_type)
+        {
+            let (_, _, parent_rect) = read_cached_bounding_rect_full(element);
+            let child_types: Vec<String> =
+                child_elems.iter().map(read_cached_control_type).collect();
+            let candidates: Vec<UiaChildCandidate<'_>> = child_elems
+                .iter()
+                .enumerate()
+                .map(|(i, c)| {
+                    let is_offscreen = read_cached_bool(c, UIA_IsOffscreenPropertyId);
+                    let (_, _, rect) = read_cached_bounding_rect_full(c);
+                    UiaChildCandidate {
+                        control_type: &child_types[i],
+                        is_offscreen,
+                        rect,
+                    }
+                })
+                .collect();
+            Some(plan_uia_collection_children(parent_rect, &candidates))
+        } else {
+            None
+        };
+
+        for (index, child) in child_elems.into_iter().enumerate() {
+            if let Some(ref tp) = tab_plan {
+                if index == tp.first_omitted_index {
+                    lines.push((depth + 1, format_omitted_tabs_line(tp.omitted_count)));
+                    nodes.push(UiaNode {
+                        element_index: None,
+                        control_type: "UiaTabStripSummary".into(),
+                        name: None,
+                        value: None,
+                        automation_id: None,
+                        help_text: None,
+                        actions: vec![],
+                        enabled: None,
+                        selected: None,
+                        checked: None,
+                        expanded: None,
+                        element_ptr: 0,
+                        center_x: 0,
+                        center_y: 0,
+                        rect: None,
+                        msaa_role: None,
+                        depth: depth + 1,
+                        parent_element_index: emitted_parent,
+                        in_web_content: next_web,
+                    });
+                }
+                if !tp.keep[index] {
+                    continue;
+                }
+            }
+            let action = dense_plan
+                .as_ref()
+                .map_or(UiaChildPlan::WalkNow, |plan| plan[index]);
+            match action {
+                UiaChildPlan::Defer { visible } => deferred.push(DeferredUiaRow {
+                    element: child,
+                    in_web_content: next_web,
+                    chunk: DeferredChunk {
+                        anchor: nodes.len(),
+                        seq: deferred.len(),
+                        depth: depth + 1,
+                        parent_index: emitted_parent,
+                        visible,
+                        walked: None,
+                    },
+                }),
+                UiaChildPlan::WalkNow => walk_cached_element(
                     &child,
                     depth + 1,
                     emitted_parent,
-                    in_web_content || control_type.eq_ignore_ascii_case("Document"),
+                    next_web,
                     nodes,
                     lines,
                     counter,
                     budget,
                     max_depth,
-                );
+                    defer_dense_rows,
+                    deferred,
+                ),
             }
         }
     }
@@ -844,6 +1106,18 @@ fn emit_cached_node(
     let value = read_cached_bstr_value(element);
     let automation_id = read_cached_bstr(element, UIA_AutomationIdPropertyId);
     let help_text = read_cached_bstr(element, UIA_HelpTextPropertyId);
+    let is_offscreen = read_cached_bool(element, UIA_IsOffscreenPropertyId);
+    let security_meta = FieldSecurityMeta {
+        role: &control_type,
+        subrole: None,
+        title: name.as_deref(),
+        description: None,
+        placeholder: None,
+        identifier: automation_id.as_deref(),
+        help: help_text.as_deref(),
+        is_password_flag: false,
+    };
+    let (value, _) = redact_if_secure(&security_meta, value, None);
     let enabled = read_cached_bool(element, UIA_IsEnabledPropertyId);
     // Missing UIA state must remain unknown on the structured observation
     // surface. Action discovery keeps its historical best-effort assumption.
@@ -853,6 +1127,9 @@ fn emit_cached_node(
     let expanded = read_cached_expanded(element);
     let actions = detect_cached_actions(element, &control_type, is_enabled);
     let is_actionable = !actions.is_empty() && is_enabled;
+    if is_offscreen == Some(true) && !is_uia_offscreen_exempt(&control_type) && !is_actionable {
+        return (control_type, parent_index);
+    }
     let has_content = name
         .as_deref()
         .map(|s| !s.trim().is_empty())
@@ -864,11 +1141,10 @@ fn emit_cached_node(
 
     let mut emitted_parent: Option<usize> = parent_index;
     if is_actionable || has_content {
-        let retained: IUIAutomationElement = element.clone();
-        let ptr = retained.as_raw() as usize;
-        std::mem::forget(retained);
-
         let node = if is_actionable {
+            let retained: IUIAutomationElement = element.clone();
+            let ptr = retained.as_raw() as usize;
+            std::mem::forget(retained);
             let idx = *counter;
             *counter += 1;
             let (center_x, center_y, rect) = read_cached_bounding_rect_full(element);
@@ -907,7 +1183,7 @@ fn emit_cached_node(
                 selected,
                 checked,
                 expanded,
-                element_ptr: ptr,
+                element_ptr: 0,
                 center_x: 0,
                 center_y: 0,
                 rect: None,
@@ -1220,6 +1496,9 @@ fn filter_tree(markdown: &str, query: &str) -> String {
     let mut output: Vec<&str> = Vec::new();
 
     for line in &lines {
+        if is_compaction_summary_line(line) {
+            continue;
+        }
         let depth = line.chars().take_while(|c| *c == ' ').count() / 2;
         while ancestors.len() <= depth {
             ancestors.push("");

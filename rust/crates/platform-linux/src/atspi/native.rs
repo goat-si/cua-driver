@@ -23,6 +23,7 @@ use atspi::{CoordType, Interface, State, StateSet};
 use atspi_connection::AccessibilityConnection;
 
 use super::{AtspiIdentity, AtspiNode};
+use cua_driver_core::snapshot_compaction::{redact_if_secure, FieldSecurityMeta};
 
 pub mod hit;
 pub(crate) mod hit_test;
@@ -2126,8 +2127,19 @@ fn render(visited: &[Visited<'_>], only_frame: Option<usize>) -> (String, Vec<At
                     ));
                 }
             }
+            let security_meta = FieldSecurityMeta {
+                role: &v.role,
+                subrole: None,
+                title: (!name.is_empty()).then_some(name.as_str()),
+                description: (!v.description.is_empty()).then_some(v.description.as_str()),
+                placeholder: None,
+                identifier: None,
+                help: None,
+                is_password_flag: role_lower.contains("password"),
+            };
+            let (redacted_value, _) = redact_if_secure(&security_meta, v.value.clone(), None);
             let act_str = v.actions.join(",");
-            let val_part = match &v.value {
+            let val_part = match &redacted_value {
                 Some(val) if !val.is_empty() => format!(" value=\"{val}\""),
                 _ => String::new(),
             };
@@ -2170,7 +2182,7 @@ fn render(visited: &[Visited<'_>], only_frame: Option<usize>) -> (String, Vec<At
                 } else {
                     Some(name)
                 },
-                value: v.value.clone().filter(|s| !s.is_empty()),
+                value: redacted_value.filter(|s| !s.is_empty()),
                 checked: v.checked,
                 enabled: v.enabled,
                 selected: v.selected,
