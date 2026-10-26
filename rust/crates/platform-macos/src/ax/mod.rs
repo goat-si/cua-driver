@@ -17,6 +17,7 @@
 //! - 2-space indent per depth level
 
 pub mod bindings;
+pub mod dense_rows;
 pub mod enablement;
 pub mod exact_target;
 pub mod launch;

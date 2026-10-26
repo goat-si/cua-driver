@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.37.0-goat.3 (2026-10-26)
+
+### Bug Fixes
+
+* **macOS:** read dense native lists and tables after the rest of the window, with visible rows first, so message histories cannot consume the budget before sibling controls are read. Default window reads summarize skipped offscreen rows; a non-empty query also searches them within the budget. Full and observation-only reads keep the complete depth-first walk, and web content is unchanged.
+
 ## [0.37.0](https://github.com/trycua/cua/compare/cua-driver-rs-v0.36.0...cua-driver-rs-v0.37.0) (2026-10-20)
 
 

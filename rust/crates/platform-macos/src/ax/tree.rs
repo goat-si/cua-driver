@@ -9,10 +9,16 @@
 //!   exposes a writable AXValue control surface.
 //! - Non-actionable leaf nodes with a value are rendered as `AXRole = "value"`.
 //! - AXStaticText with no title/value is omitted.
-//! - Tree is walked depth-first; element_index is assigned in DFS order.
+//! - Dense native rows may be read after the rest of the window; deferred chunks
+//!   are spliced back and element indices renumbered to document order.
 
 use super::bindings::*;
+use super::dense_rows::{
+    self, rows_windowed, with_dense_rows_windowed, ChildPlan, Chunk, DeferredRow,
+    DENSE_COLLECTION_ROLES,
+};
 use super::launch::{is_still_launching, LaunchStep, LaunchWait};
+use super::snapshot::RetainedElement;
 use super::window_scope::{decide_window_scope, ScopeDecision, TopLevelCandidate, WindowScope};
 use core_foundation::base::{CFEqual, CFRelease, CFRetain, CFTypeRef};
 use cua_driver_core::walk_budget::{WalkBudget, WalkOutcome};
@@ -241,6 +247,7 @@ fn walk_tree_with_web_content(
     let mut nodes: Vec<AXNode> = Vec::new();
     let mut lines: Vec<(usize, String)> = Vec::new(); // (depth, line)
     let mut index_counter = 0usize;
+    let mut deferred = Vec::new();
     let mut window_scope: Option<WindowScope> = None;
 
     unsafe {
@@ -324,7 +331,43 @@ fn walk_tree_with_web_content(
                 &mut budget,
                 max_depth,
                 include_web_content,
+                &mut deferred,
             );
+        }
+
+        if !deferred.is_empty() {
+            let search_offscreen = query.is_some_and(|q| !q.trim().is_empty());
+            with_dense_rows_windowed(false, || {
+                for visible in [true, false] {
+                    if !visible && !search_offscreen {
+                        continue;
+                    }
+                    for row in deferred.iter_mut().filter(|row| row.visible == visible) {
+                        let mut chunk = Chunk {
+                            lines: Vec::new(),
+                            nodes: Vec::new(),
+                        };
+                        walk_element(
+                            row.element.as_ptr() as AXUIElementRef,
+                            row.depth,
+                            row.parent_index,
+                            row.in_web_content,
+                            &mut chunk.nodes,
+                            &mut chunk.lines,
+                            &mut index_counter,
+                            &mut budget,
+                            max_depth,
+                            include_web_content,
+                            &mut Vec::new(),
+                        );
+                        row.walked = Some(chunk);
+                    }
+                }
+            });
+            let (spliced_lines, spliced_nodes, map) = dense_rows::splice(lines, nodes, deferred);
+            lines = spliced_lines;
+            nodes = spliced_nodes;
+            dense_rows::renumber(&mut lines, &mut nodes, &map);
         }
 
         // Release all top-level elements (copy_children / copy_ax_windows both retain).
@@ -440,6 +483,7 @@ unsafe fn walk_element(
     budget: &mut WalkBudget,
     max_depth: usize,
     include_web_content: bool,
+    deferred: &mut Vec<DeferredRow>,
 ) {
     if depth > max_depth {
         return;
@@ -479,6 +523,7 @@ unsafe fn walk_element(
                 budget,
                 max_depth,
                 include_web_content,
+                deferred,
             );
             CFRelease(child as CFTypeRef);
         }
@@ -533,22 +578,20 @@ unsafe fn walk_element(
     let is_actionable = is_addressable(!actions.is_empty(), value_settable, enabled);
 
     if !is_actionable && !has_content && role != "AXWindow" && role != "AXSheet" {
-        let children = copy_children(element);
-        for child in children {
-            walk_element(
-                child,
-                depth + 1,
-                parent_index,
-                in_web_content,
-                nodes,
-                lines,
-                counter,
-                budget,
-                max_depth,
-                include_web_content,
-            );
-            CFRelease(child as CFTypeRef);
-        }
+        walk_children(
+            element,
+            &role,
+            depth + 1,
+            parent_index,
+            in_web_content,
+            nodes,
+            lines,
+            counter,
+            budget,
+            max_depth,
+            include_web_content,
+            deferred,
+        );
         return;
     }
 
@@ -669,20 +712,75 @@ unsafe fn walk_element(
         return;
     }
 
+    walk_children(
+        element,
+        &role,
+        depth + 1,
+        next_parent,
+        in_web_content,
+        nodes,
+        lines,
+        counter,
+        budget,
+        max_depth,
+        include_web_content,
+        deferred,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+unsafe fn walk_children(
+    element: AXUIElementRef,
+    role: &str,
+    depth: usize,
+    parent_index: Option<usize>,
+    in_web_content: bool,
+    nodes: &mut Vec<AXNode>,
+    lines: &mut Vec<(usize, String)>,
+    counter: &mut usize,
+    budget: &mut WalkBudget,
+    max_depth: usize,
+    include_web_content: bool,
+    deferred: &mut Vec<DeferredRow>,
+) {
+    if depth > max_depth {
+        return;
+    }
     let children = copy_children(element);
-    for child in children {
-        walk_element(
-            child,
-            depth + 1,
-            next_parent,
-            in_web_content,
-            nodes,
-            lines,
-            counter,
-            budget,
-            max_depth,
-            include_web_content,
-        );
+    let plan = if rows_windowed() && !in_web_content && DENSE_COLLECTION_ROLES.contains(&role) {
+        Some(dense_rows::plan_collection_children(
+            element, role, &children,
+        ))
+    } else {
+        None
+    };
+    for (index, child) in children.into_iter().enumerate() {
+        let action = plan.as_ref().map_or(ChildPlan::WalkNow, |plan| plan[index]);
+        match action {
+            ChildPlan::Defer { visible } => deferred.push(DeferredRow {
+                anchor: nodes.len(),
+                seq: deferred.len(),
+                element: RetainedElement::retain(child as usize),
+                depth,
+                parent_index,
+                in_web_content,
+                visible,
+                walked: None,
+            }),
+            ChildPlan::WalkNow => walk_element(
+                child,
+                depth,
+                parent_index,
+                in_web_content,
+                nodes,
+                lines,
+                counter,
+                budget,
+                max_depth,
+                include_web_content,
+                deferred,
+            ),
+        }
         CFRelease(child as CFTypeRef);
     }
 }
@@ -865,6 +963,9 @@ fn filter_tree(markdown: &str, query: &str) -> String {
     let mut output: Vec<&str> = Vec::new();
 
     for line in &lines {
+        if dense_rows::is_summary_line(line) {
+            continue;
+        }
         let depth = leading_indent_depth(line);
 
         while current_ancestor.len() <= depth {
@@ -917,6 +1018,13 @@ fn leading_indent_depth(line: &str) -> usize {
 mod tests {
     use super::*;
     use std::cell::Cell;
+
+    #[test]
+    fn querying_spliced_rows_keeps_ancestors_and_never_matches_offscreen_hints() {
+        let md = "- [0] AXWindow \"Example\"\n  - [1] AXTable \"History\"\n    - (offscreen rows: 2; scroll the list, or pass query to search them)\n    - [2] AXRow \"Message\"\n      - AXStaticText = \"needle\"\n  - [3] AXTextArea \"Compose\"\n";
+        assert_eq!(filter_tree(md, "needle"), "- [0] AXWindow \"Example\"\n  - [1] AXTable \"History\"\n    - [2] AXRow \"Message\"\n      - AXStaticText = \"needle\"\n");
+        assert_eq!(filter_tree(md, "scroll"), "");
+    }
 
     #[test]
     fn writable_value_controls_are_addressable_without_actions() {
