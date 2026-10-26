@@ -176,10 +176,67 @@ fn action_record(confirmed: bool, foreground: bool) -> ActionExecutionRecord {
 #[error("the addressed element did not acquire keyboard focus; no key was dispatched")]
 struct KeyFocusUnconfirmed;
 
+#[derive(Debug, thiserror::Error)]
+enum WindowFocusConflictError {
+    #[error("addressed element does not belong to target window {target_window_id} (resolved: {actual_window_id:?})")]
+    AddressedElementOutsideWindow {
+        pid: i32,
+        target_window_id: u32,
+        actual_window_id: Option<u32>,
+    },
+    #[error("target window {target_window_id} cannot receive process-scoped keys safely because sibling window {sibling_window_id} currently holds focus")]
+    SiblingWindowFocused {
+        pid: i32,
+        target_window_id: u32,
+        sibling_window_id: u32,
+    },
+}
+
+fn map_focus_conflict_to_refusal(
+    pid: i32,
+    conflict: crate::ax::exact_target::WindowFocusConflict,
+) -> Option<WindowFocusConflictError> {
+    match conflict {
+        crate::ax::exact_target::WindowFocusConflict::Clear => None,
+        crate::ax::exact_target::WindowFocusConflict::AddressedElementOutsideWindow {
+            target_window_id,
+            actual_window_id,
+        } => Some(WindowFocusConflictError::AddressedElementOutsideWindow {
+            pid,
+            target_window_id,
+            actual_window_id,
+        }),
+        crate::ax::exact_target::WindowFocusConflict::SiblingWindowFocused {
+            target_window_id,
+            sibling_window_id,
+        } => Some(WindowFocusConflictError::SiblingWindowFocused {
+            pid,
+            target_window_id,
+            sibling_window_id,
+        }),
+    }
+}
+
 fn with_confirmed_key_focus<T>(
     target: Option<usize>,
     mut focus: impl FnMut(usize) -> anyhow::Result<()>,
     mut is_focused: impl FnMut(usize) -> bool,
+    dispatch: impl FnOnce() -> anyhow::Result<T>,
+) -> anyhow::Result<T> {
+    with_confirmed_key_focus_or_fallback(
+        target,
+        &mut focus,
+        &mut is_focused,
+        |_| Ok(false),
+        dispatch,
+    )
+}
+
+fn with_confirmed_key_focus_or_fallback<T>(
+    target: Option<usize>,
+    mut focus: impl FnMut(usize) -> anyhow::Result<()>,
+    mut is_focused: impl FnMut(usize) -> bool,
+    mut fallback_focus: impl FnMut(usize) -> anyhow::Result<bool>,
     dispatch: impl FnOnce() -> anyhow::Result<T>,
 ) -> anyhow::Result<T> {
     if let Some(target) = target {
@@ -190,6 +247,19 @@ fn with_confirmed_key_focus<T>(
                 break;
             }
             if std::time::Instant::now() >= deadline {
+                if fallback_focus(target)? {
+                    let fallback_deadline =
+                        std::time::Instant::now() + std::time::Duration::from_millis(120);
+                    loop {
+                        if is_focused(target) {
+                            return dispatch();
+                        }
+                        if std::time::Instant::now() >= fallback_deadline {
+                            break;
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    }
+                }
                 return Err(KeyFocusUnconfirmed.into());
             }
             std::thread::sleep(std::time::Duration::from_millis(10));
@@ -199,6 +269,36 @@ fn with_confirmed_key_focus<T>(
 }
 
 fn delivery_failed(error: anyhow::Error) -> ToolResult {
+    if let Some(conflict) = error.downcast_ref::<WindowFocusConflictError>() {
+        return match *conflict {
+            WindowFocusConflictError::AddressedElementOutsideWindow {
+                pid,
+                target_window_id,
+                actual_window_id,
+            } => ToolResult::error(conflict.to_string()).with_structured(serde_json::json!({
+                "code": cua_driver_core::background_input::refusal_codes::ELEMENT_OUTSIDE_TARGET_WINDOW,
+                "effect": "refused",
+                "dispatched": false,
+                "pid": pid,
+                "window_id": target_window_id,
+                "actual_window_id": actual_window_id,
+                "message": conflict.to_string(),
+            })),
+            WindowFocusConflictError::SiblingWindowFocused {
+                pid,
+                target_window_id,
+                sibling_window_id,
+            } => ToolResult::error(conflict.to_string()).with_structured(serde_json::json!({
+                "code": cua_driver_core::background_input::refusal_codes::SAME_PID_KEYBOARD_AMBIGUITY,
+                "effect": "refused",
+                "dispatched": false,
+                "pid": pid,
+                "window_id": target_window_id,
+                "sibling_window_id": sibling_window_id,
+                "message": conflict.to_string(),
+            })),
+        };
+    }
     if error.is::<KeyFocusUnconfirmed>() {
         return ToolResult::error(error.to_string()).with_structured(serde_json::json!({
             "code": "target_focus_unconfirmed", "effect": "refused", "dispatched": false,
@@ -337,6 +437,12 @@ impl Tool for PressKeyTool {
 
         let pre_focus_ptr: Option<usize> = pre_focus_guard.as_ref().map(|g| g.as_ptr());
 
+        if fg {
+            if let Err(refusal) = super::gate_foreground_physical_idle(pid, window_id) {
+                return refusal;
+            }
+        }
+
         // ── Exact-target background gate (macOS background input v1) ──
         // A window-addressed background key is process-scoped transport: it
         // must prove exact delivery to the requested window (fresh AXWindows
@@ -372,6 +478,19 @@ impl Tool for PressKeyTool {
             Ok(scope) => scope,
             Err(refusal) => return refusal,
         };
+
+        if !fg {
+            if let Some(wid) = window_id {
+                let conflict = latency::spawn_action_blocking(move || {
+                    crate::ax::exact_target::check_window_focus_conflict(pid, wid, pre_focus_ptr)
+                })
+                .await
+                .unwrap_or(crate::ax::exact_target::WindowFocusConflict::Clear);
+                if let Some(err) = map_focus_conflict_to_refusal(pid, conflict) {
+                    return delivery_failed(err.into());
+                }
+            }
+        }
 
         // px form: pixel-click to focus, then the key goes to the focused element.
         // Reuses click's translation + delivery_mode; after it, deliver via the
@@ -465,13 +584,29 @@ impl Tool for PressKeyTool {
                                 wid,
                                 || {
                                     // Activation may replace the first responder; confirm inside the HID guard.
-                                    with_confirmed_key_focus(
+                                    with_confirmed_key_focus_or_fallback(
                                         pre_focus_ptr,
                                         crate::input::ax_actions::focus_element,
                                         |target| {
-                                            crate::input::ax_actions::element_has_keyboard_focus(
-                                                pid, target,
+                                            crate::input::ax_actions::element_has_keyboard_focus_in_window(
+                                                pid,
+                                                Some(wid),
+                                                target,
                                             )
+                                        },
+                                        |target| {
+                                            if crate::input::ax_actions::element_supports_pointer_focus_fallback(
+                                                pid,
+                                                target,
+                                                Some(wid),
+                                            ) {
+                                                crate::input::ax_actions::click_element_center_for_focus(
+                                                    pid, wid, target, true,
+                                                )?;
+                                                Ok(true)
+                                            } else {
+                                                Ok(false)
+                                            }
                                         },
                                         || crate::input::keyboard::press_key_bare_global(&key, &m),
                                     )
@@ -481,11 +616,38 @@ impl Tool for PressKeyTool {
                     }
                     // background (default): auth-envelope post, no raise.
                     dispatch_with_ax_oracle(pid, window_id, pre_focus_ptr, || {
-                        with_confirmed_key_focus(
+                        if let Some(wid) = window_id {
+                            let conflict = crate::ax::exact_target::check_window_focus_conflict(
+                                pid,
+                                wid,
+                                pre_focus_ptr,
+                            );
+                            if let Some(err) = map_focus_conflict_to_refusal(pid, conflict) {
+                                return Err(err.into());
+                            }
+                        }
+                        with_confirmed_key_focus_or_fallback(
                             pre_focus_ptr,
                             crate::input::ax_actions::focus_element,
                             |target| {
-                                crate::input::ax_actions::element_has_keyboard_focus(pid, target)
+                                crate::input::ax_actions::element_has_keyboard_focus_in_window(
+                                    pid, window_id, target,
+                                )
+                            },
+                            |target| {
+                                if let Some(wid) = window_id {
+                                    if crate::input::ax_actions::element_supports_pointer_focus_fallback(
+                                        pid,
+                                        target,
+                                        Some(wid),
+                                    ) {
+                                        crate::input::ax_actions::click_element_center_for_focus(
+                                            pid, wid, target, false,
+                                        )?;
+                                        return Ok(true);
+                                    }
+                                }
+                                Ok(false)
                             },
                             || crate::input::keyboard::press_key(pid, &key, &m),
                         )
@@ -687,5 +849,78 @@ mod tests {
             failure.structured_content.unwrap()["code"],
             "delivery_failed"
         );
+    }
+
+    #[test]
+    fn web_or_safari_fallback_runs_once_when_ax_focus_fails_to_stick() {
+        use std::cell::Cell;
+        let fallback_calls = Cell::new(0usize);
+        let focused = Cell::new(false);
+        let dispatched = Cell::new(0usize);
+        with_confirmed_key_focus_or_fallback(
+            Some(99),
+            |_| Ok(()),
+            |_| focused.get(),
+            |target| {
+                assert_eq!(target, 99);
+                fallback_calls.set(fallback_calls.get() + 1);
+                focused.set(true);
+                Ok(true)
+            },
+            || {
+                dispatched.set(dispatched.get() + 1);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(fallback_calls.get(), 1);
+        assert_eq!(dispatched.get(), 1);
+    }
+
+    #[test]
+    fn window_focus_conflict_maps_to_refused_structured_result() {
+        let sibling_err = map_focus_conflict_to_refusal(
+            42,
+            crate::ax::exact_target::WindowFocusConflict::SiblingWindowFocused {
+                target_window_id: 700,
+                sibling_window_id: 701,
+            },
+        )
+        .unwrap();
+        let result = delivery_failed(sibling_err.into());
+        let structured = result.structured_content.unwrap();
+        assert_eq!(
+            structured["code"],
+            cua_driver_core::background_input::refusal_codes::SAME_PID_KEYBOARD_AMBIGUITY
+        );
+        assert_eq!(structured["effect"], "refused");
+        assert_eq!(structured["dispatched"], false);
+        assert_eq!(structured["window_id"], 700);
+        assert_eq!(structured["sibling_window_id"], 701);
+    }
+
+    #[test]
+    fn macos_foreground_idle_gate_refuses_active_user_and_allows_idle() {
+        let err = super::super::gate_foreground_physical_idle_with_sample(
+            42,
+            Some(700),
+            Some(120),
+            1_000,
+        )
+        .unwrap_err();
+        let structured = err.structured_content.unwrap();
+        assert_eq!(structured["code"], "foreground_user_active");
+        assert_eq!(structured["effect"], "refused");
+        assert_eq!(structured["dispatched"], false);
+        assert_eq!(structured["pid"], 42);
+        assert_eq!(structured["window_id"], 700);
+
+        assert!(super::super::gate_foreground_physical_idle_with_sample(
+            42,
+            Some(700),
+            Some(1_500),
+            1_000,
+        )
+        .is_ok());
     }
 }

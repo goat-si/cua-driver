@@ -115,6 +115,10 @@ pub mod msaa;
 
 #[cfg(target_os = "windows")]
 pub mod input;
+#[cfg(not(target_os = "windows"))]
+pub mod input {
+    pub mod delivery;
+}
 
 #[cfg(any(target_os = "windows", test))]
 pub mod capture;
