@@ -217,6 +217,7 @@ fn map_focus_conflict_to_refusal(
     }
 }
 
+#[cfg(test)]
 fn with_confirmed_key_focus<T>(
     target: Option<usize>,
     mut focus: impl FnMut(usize) -> anyhow::Result<()>,
