@@ -190,7 +190,7 @@ fn post_click_on(hwnd: HWND, x: i32, y: i32, count: usize, button: &str) -> Resu
     // Posted pointer messages are normally non-activating, but WebView hosts can
     // call SetForegroundWindow from their event handlers. Keep the top-level
     // categorically non-activatable until the complete burst has settled.
-    let _noact = crate::input::NoActivateGuard::arm(hwnd);
+    let _noact = crate::input::NoActivateGuard::arm(hwnd)?;
     let unavailable = |error: Error| anyhow!("target thread: {error}");
     for i in 0..count {
         let press_msg = posted_press_message(down_msg, double_msg, i, wants_double);
@@ -656,7 +656,11 @@ fn send_click_synthesized_mods_impl(
         } else {
             None
         };
-        let noactivate = (!activate).then(|| crate::input::NoActivateGuard::arm(target));
+        let noactivate = if activate {
+            None
+        } else {
+            Some(crate::input::NoActivateGuard::arm(target)?)
+        };
         if !activate {
             let _ = SetWindowPos(
                 target,
@@ -970,7 +974,7 @@ fn send_drag_synthesized_impl(
             // drag lands on the target — same technique as send_click_synthesized.
             // SetForegroundWindow is lock-denied without UIAccess and isn't needed
             // for pointer input; NoActivateGuard keeps the press from activating it.
-            let guard = crate::input::NoActivateGuard::arm(target);
+            let guard = crate::input::NoActivateGuard::arm(target)?;
             let _ = SetWindowPos(
                 target,
                 HWND_TOPMOST,

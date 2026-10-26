@@ -16,7 +16,10 @@
 //!   Putting the proxy here avoids `mcp-server → cua-driver` reverse
 //!   coupling.
 
+use std::collections::HashMap;
+use std::future::Future;
 use std::sync::Arc;
+use std::time::Duration;
 
 use cua_driver_core::mcp_wire::{self, ProtocolSession};
 use cua_driver_core::policy::{authorize_tool_call, validate_configured_policy};
@@ -26,6 +29,7 @@ use cua_driver_core::server::{
     StdioExecutionPath,
 };
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::task::{AbortHandle, JoinSet};
 use tracing::{debug, error, warn};
 
 use crate::serve::{
@@ -55,13 +59,6 @@ pub async fn run_direct(driver: Arc<cua_driver_sdk::CuaDriver>) -> anyhow::Resul
         sdk.shutdown().await.map_err(anyhow::Error::msg)?;
         return result;
     }
-    let stdin = tokio::io::stdin();
-    let stdout = tokio::io::stdout();
-    let mut reader = BufReader::new(stdin);
-    let mut writer = tokio::io::BufWriter::new(stdout);
-    let mut line = String::new();
-    let mut session_observed = false;
-    let mut protocol_session = ProtocolSession::default();
     let transport_session = format!("mcp-{}", uuid::Uuid::new_v4());
     struct DirectTransportCleanup {
         sdk: Arc<crate::sdk_adapter::SdkAdapter>,
@@ -76,92 +73,377 @@ pub async fn run_direct(driver: Arc<cua_driver_sdk::CuaDriver>) -> anyhow::Resul
         sdk: sdk.clone(),
         transport_session: transport_session.clone(),
     };
+    let deadline = tool_call_deadline()?;
+    let direct_sdk = sdk.clone();
+    let direct_handler_sdk = sdk.clone();
+    let direct_session = transport_session.clone();
+    let result = run_concurrent_mcp_io(
+        BufReader::new(tokio::io::stdin()),
+        tokio::io::BufWriter::new(tokio::io::stdout()),
+        deadline,
+        move |request: &Request| {
+            protocol_admission(request, &direct_sdk.tools_list())
+        },
+        move |mut request: Request, id: serde_json::Value| {
+            apply_direct_session_identity(&mut request, &direct_session);
+            let session_context = request.tool_call().ok().and_then(|call| {
+                direct_handler_sdk.begin_tool_call(
+                    &call.name,
+                    &call.args,
+                    cua_driver_core::session::SessionTransport::McpStdio,
+                    cua_driver_core::session::SessionClientKind::Mcp,
+                )
+            });
+            let timer = tool_observation_timer(
+                &request,
+                |name| direct_handler_sdk.is_known_tool(name),
+                StdioExecutionPath::DirectDaemon,
+            );
+            let mut telemetry = ToolCallTelemetry {
+                timer,
+                session_context,
+                id: id.clone(),
+            };
+            let sdk = direct_handler_sdk.clone();
+            let session = direct_session.clone();
+            async move {
+                let response =
+                    cua_driver_core::server::handle_request_with_transport_session(
+                        request,
+                        id,
+                        sdk.as_ref(),
+                        &session,
+                    )
+                    .await;
+                telemetry.finish(&response);
+                response
+            }
+        },
+    )
+    .await;
+    drop(_cleanup);
+    let shutdown = sdk.shutdown().await.map_err(anyhow::Error::msg);
+    result?;
+    shutdown
+}
+
+const TOOL_CALL_DEADLINE_ENV: &str = "CUA_DRIVER_TOOL_CALL_TIMEOUT_SECS";
+const DEFAULT_TOOL_CALL_DEADLINE: Duration = Duration::from_secs(110);
+const MAX_IN_FLIGHT_REQUESTS: usize = 16;
+static DAEMON_FORWARD_PERMITS: tokio::sync::Semaphore =
+    tokio::sync::Semaphore::const_new(MAX_IN_FLIGHT_REQUESTS);
+
+fn tool_call_deadline() -> anyhow::Result<Duration> {
+    let Some(raw) = std::env::var_os(TOOL_CALL_DEADLINE_ENV) else {
+        return Ok(DEFAULT_TOOL_CALL_DEADLINE);
+    };
+    let secs = raw
+        .to_string_lossy()
+        .trim()
+        .parse::<u64>()
+        .map_err(|_| anyhow::anyhow!("{TOOL_CALL_DEADLINE_ENV} must be an integer from 1 to 110"))?;
+    anyhow::ensure!(
+        (1..=110).contains(&secs),
+        "{TOOL_CALL_DEADLINE_ENV} must be an integer from 1 to 110"
+    );
+    Ok(Duration::from_secs(secs))
+}
+
+fn protocol_admission(
+    request: &Request,
+    inventory: &serde_json::Value,
+) -> Result<(), Response> {
+    let era = mcp_wire::classify_request(request)?;
+    if request.method == "tools/call" {
+        mcp_wire::validate_tool_call(
+            request,
+            request.id.clone().unwrap_or_default(),
+            era,
+            inventory,
+        )?;
+    }
+    Ok(())
+}
+
+struct PendingRequest {
+    token: u64,
+    id: serde_json::Value,
+    tool_name: Option<String>,
+    abort: AbortHandle,
+}
+
+struct RequestCompletion {
+    key: String,
+    token: u64,
+    response: Response,
+}
+
+struct ToolCallTelemetry {
+    timer: Option<cua_driver_core::server::ToolObservationTimer>,
+    session_context: Option<cua_driver_core::session::SessionToolContext>,
+    id: serde_json::Value,
+}
+
+impl ToolCallTelemetry {
+    fn finish(&mut self, response: &Response) {
+        if let Some(timer) = self.timer.take() {
+            let outcome = timer.finish(response);
+            if let Some(context) = self.session_context.take() {
+                context.complete(&outcome);
+            }
+            observe_proxy_tool_completed(outcome);
+        }
+    }
+}
+
+impl Drop for ToolCallTelemetry {
+    fn drop(&mut self) {
+        if self.timer.is_some() {
+            let result = cua_driver_core::protocol::ToolResult::error(
+                "tool call was cancelled or abandoned; its effect is unknown. \
+                 Inspect target state before another action.",
+            )
+            .with_structured(serde_json::json!({
+                "code": "tool_call_abandoned",
+                "effect": "unknown",
+            }));
+            let response = Response::ok(
+                self.id.clone(),
+                serde_json::to_value(result).unwrap_or(serde_json::Value::Null),
+            );
+            self.finish(&response);
+        }
+    }
+}
+
+fn cancelled_response(pending: &PendingRequest) -> Response {
+    if let Some(tool) = pending.tool_name.as_deref() {
+        let result = cua_driver_core::protocol::ToolResult::error(format!(
+            "{tool} was cancelled; its effect is unknown. Inspect target state before another action."
+        ))
+        .with_structured(serde_json::json!({
+            "code": "tool_call_cancelled",
+            "effect": "unknown",
+            "tool": tool,
+        }));
+        return Response::ok(
+            pending.id.clone(),
+            serde_json::to_value(result).unwrap_or(serde_json::Value::Null),
+        );
+    }
+    Response::error(pending.id.clone(), -32800, "request cancelled")
+}
+
+fn deadline_response(id: serde_json::Value, tool: Option<&str>, deadline: Duration) -> Response {
+    if let Some(tool) = tool {
+        let result = cua_driver_core::protocol::ToolResult::error(format!(
+            "{tool} did not finish within {}s and was abandoned; its effect is unknown. \
+             Inspect the target state before another action.",
+            deadline.as_secs()
+        ))
+        .with_structured(serde_json::json!({
+            "code": "tool_call_timeout",
+            "effect": "unknown",
+            "tool": tool,
+            "deadline_secs": deadline.as_secs(),
+        }));
+        return Response::ok(
+            id,
+            serde_json::to_value(result).unwrap_or(serde_json::Value::Null),
+        );
+    }
+    Response::error(
+        id,
+        -32603,
+        format!("request exceeded the {}s deadline; effect is unknown", deadline.as_secs()),
+    )
+}
+
+async fn write_response<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    response: Response,
+) -> anyhow::Result<()> {
+    let serialized = serde_json::to_string(&response).unwrap_or_else(|error| {
+        format!(
+            r#"{{"jsonrpc":"2.0","id":null,"error":{{"code":-32603,"message":"serialize error: {error}"}}}}"#
+        )
+    });
+    writer.write_all(serialized.as_bytes()).await?;
+    writer.write_all(b"\n").await?;
+    writer.flush().await?;
+    Ok(())
+}
+
+async fn run_concurrent_mcp_io<R, W, A, F, Fut>(
+    mut reader: R,
+    mut writer: W,
+    deadline: Duration,
+    mut admit: A,
+    handler: F,
+) -> anyhow::Result<()>
+where
+    R: AsyncBufRead + Unpin,
+    W: AsyncWrite + Unpin,
+    A: FnMut(&Request) -> Result<(), Response>,
+    F: Fn(Request, serde_json::Value) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = Response> + Send + 'static,
+{
+    let handler = Arc::new(handler);
+    let mut tasks = JoinSet::<RequestCompletion>::new();
+    let mut pending = HashMap::<String, PendingRequest>::new();
+    let mut line = Vec::new();
+    let mut next_token = 0u64;
+    let mut session_observed = false;
+    let mut protocol_session = ProtocolSession::default();
 
     loop {
-        line.clear();
-        if reader.read_line(&mut line).await? == 0 {
+        let read = if line.contains(&b'\n') {
+            line.len()
+        } else {
+            tokio::select! {
+                biased;
+                joined = tasks.join_next(), if !tasks.is_empty() => {
+                    if let Some(Ok(completion)) = joined {
+                        let should_write = pending
+                            .get(&completion.key)
+                            .is_some_and(|entry| entry.token == completion.token);
+                        if should_write {
+                            pending.remove(&completion.key);
+                            write_response(&mut writer, completion.response).await?;
+                        }
+                    }
+                    continue;
+                }
+                result = reader.read_until(b'\n', &mut line) => result?,
+            }
+        };
+        if read == 0 {
             break;
         }
-        let trimmed = line.trim();
+        let trimmed = String::from_utf8_lossy(&line).trim().to_owned();
+        line.clear();
         if trimmed.is_empty() {
             continue;
         }
-        let response = match serde_json::from_str::<Request>(trimmed) {
+        debug!(raw = %trimmed, "→ MCP request");
+        let request = match serde_json::from_str::<Request>(&trimmed) {
+            Ok(request) => request,
             Err(error) => {
                 error!("JSON parse error: {error}");
-                Response::parse_error()
-            }
-            Ok(request) if request.is_notification() => continue,
-            Ok(mut request) => {
-                let admission = protocol_session.validate(&request).and_then(|era| {
-                    if request.method == "tools/call" {
-                        mcp_wire::validate_tool_call(
-                            &request,
-                            request.id.clone().unwrap_or_default(),
-                            era,
-                            &sdk.tools_list(),
-                        )?;
-                    }
-                    Ok(era)
-                });
-                if let Err(response) = admission {
-                    writer
-                        .write_all(serde_json::to_string(&response)?.as_bytes())
-                        .await?;
-                    writer.write_all(b"\n").await?;
-                    writer.flush().await?;
-                    continue;
-                }
-                apply_direct_session_identity(&mut request, &transport_session);
-                let initialize_metadata = (!session_observed)
-                    .then(|| request.initialize_metadata())
-                    .flatten();
-                let session_context = request.tool_call().ok().and_then(|call| {
-                    sdk.begin_tool_call(
-                        &call.name,
-                        &call.args,
-                        cua_driver_core::session::SessionTransport::McpStdio,
-                        cua_driver_core::session::SessionClientKind::Mcp,
-                    )
-                });
-                let timer = tool_observation_timer(
-                    &request,
-                    |name| sdk.is_known_tool(name),
-                    StdioExecutionPath::DirectDaemon,
-                );
-                let id = request.id.clone().unwrap_or(serde_json::Value::Null);
-                let response = cua_driver_core::server::handle_request_with_transport_session(
-                    request,
-                    id,
-                    sdk.as_ref(),
-                    &transport_session,
-                )
-                .await;
-                if let Some(metadata) = initialize_metadata {
-                    observe_proxy_session_started(metadata);
-                    session_observed = true;
-                }
-                if let Some(timer) = timer {
-                    let outcome = timer.finish(&response);
-                    if let Some(context) = session_context {
-                        context.complete(&outcome);
-                    }
-                    observe_proxy_tool_completed(outcome);
-                }
-                response
+                write_response(&mut writer, Response::parse_error()).await?;
+                continue;
             }
         };
-        let serialized = serde_json::to_string(&response).unwrap_or_else(|error| {
-            format!(
-                r#"{{"jsonrpc":"2.0","id":null,"error":{{"code":-32603,"message":"serialize error: {error}"}}}}"#
+
+        if request.method == "notifications/cancelled" && request.is_notification() {
+            let request_id = request
+                .params
+                .as_ref()
+                .and_then(|params| params.get("requestId"))
+                .cloned();
+            if let Some(request_id) = request_id {
+                let key = request_id.to_string();
+                if let Some(pending_request) = pending.remove(&key) {
+                    pending_request.abort.abort();
+                    write_response(&mut writer, cancelled_response(&pending_request)).await?;
+                }
+            }
+            continue;
+        }
+        if request.is_notification() {
+            continue;
+        }
+
+        let id = request.id.clone().unwrap_or(serde_json::Value::Null);
+        let key = id.to_string();
+        if pending.contains_key(&key) {
+            write_response(
+                &mut writer,
+                Response::error(id, -32600, "duplicate active MCP request ID"),
             )
+            .await?;
+            continue;
+        }
+        if tasks.len() >= MAX_IN_FLIGHT_REQUESTS {
+            write_response(
+                &mut writer,
+                Response::error(id, -32029, "in_flight_limit"),
+            )
+            .await?;
+            continue;
+        }
+        let admission = protocol_session
+            .validate(&request)
+            .and_then(|era| {
+                admit(&request)?;
+                Ok(era)
+            });
+        if let Err(response) = admission {
+            write_response(&mut writer, response).await?;
+            continue;
+        }
+        if !session_observed {
+            if let Some(metadata) = request.initialize_metadata() {
+                observe_proxy_session_started(metadata);
+                session_observed = true;
+            }
+        }
+
+        // Keep initialize ordering deterministic: the first action cannot run
+        // before the initialize response has been written.
+        let metadata_request =
+            mcp_wire::handle_metadata_request(&request, id.clone()).is_some();
+        if request.method == "initialize" || metadata_request {
+            let tool_name = request.tool_call().ok().map(|call| call.name);
+            let response = match tokio::time::timeout(
+                deadline,
+                handler(request, id.clone()),
+            )
+            .await
+            {
+                Ok(response) => response,
+                Err(_) => deadline_response(id, tool_name.as_deref(), deadline),
+            };
+            write_response(&mut writer, response).await?;
+            continue;
+        }
+
+        next_token = next_token.wrapping_add(1);
+        let token = next_token;
+        let tool_name = request.tool_call().ok().map(|call| call.name);
+        let handler = handler.clone();
+        let task_id = id.clone();
+        let task_key = key.clone();
+        let task_tool_name = tool_name.clone();
+        let future = handler(request, task_id.clone());
+        let abort = tasks.spawn(async move {
+            let response = match tokio::time::timeout(deadline, future).await {
+                Ok(response) => response,
+                Err(_) => deadline_response(task_id, task_tool_name.as_deref(), deadline),
+            };
+            RequestCompletion {
+                key: task_key,
+                token,
+                response,
+            }
         });
-        writer.write_all(serialized.as_bytes()).await?;
-        writer.write_all(b"\n").await?;
-        writer.flush().await?;
+        pending.insert(
+            key,
+            PendingRequest {
+                token,
+                id,
+                tool_name,
+                abort,
+            },
+        );
     }
 
-    sdk.shutdown().await.map_err(anyhow::Error::msg)
+    for request in pending.values() {
+        request.abort.abort();
+    }
+    tasks.abort_all();
+    while tasks.join_next().await.is_some() {}
+    Ok(())
 }
 
 pub(crate) fn apply_direct_session_identity(request: &mut Request, transport_session: &str) {
@@ -297,8 +579,8 @@ async fn supervise_control_connection<T>(
 /// persistent control connection, allowing the daemon to reap the MCP session
 /// and its recording, preview, and overlay state (issue #2002).
 async fn run_proxy_io<R, W>(
-    mut reader: R,
-    mut writer: W,
+    reader: R,
+    writer: W,
     socket_path: &str,
     cached_tools_list: &Arc<serde_json::Value>,
     session_id: &str,
@@ -308,121 +590,75 @@ where
     R: AsyncBufRead + Unpin,
     W: AsyncWrite + Unpin,
 {
-    let mut line = String::new();
-    let mut session_observed = false;
-    let mut protocol_session = ProtocolSession::default();
-
-    loop {
-        line.clear();
-        let n = reader.read_line(&mut line).await?;
-        if n == 0 {
-            break; // EOF — MCP client disconnected (stdin closed).
-        }
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        debug!(raw = trimmed, "→ proxy request");
-
-        let response = match serde_json::from_str::<Request>(trimmed) {
-            Err(e) => {
-                error!("JSON parse error: {e}");
-                Response::parse_error()
+    let deadline = tool_call_deadline()?;
+    let inventory = cached_tools_list.clone();
+    let socket = socket_path.to_owned();
+    let session = session_id.to_owned();
+    let handler_inventory = inventory.clone();
+    run_concurrent_mcp_io(
+        reader,
+        writer,
+        deadline,
+        move |request| {
+            let era = mcp_wire::classify_request(request)?;
+            if request.method == "tools/call" {
+                mcp_wire::validate_tool_call(
+                    request,
+                    request.id.clone().unwrap_or_default(),
+                    era,
+                    &inventory,
+                )?;
             }
-            Ok(req) if req.is_notification() => {
-                // Notifications are intentionally dropped by the stdio adapter.
-                continue;
-            }
-            Ok(req) => {
-                let admission = protocol_session.validate(&req).and_then(|era| {
-                    mcp_wire::validate_tool_call(
-                        &req,
-                        req.id.clone().unwrap_or_default(),
-                        era,
-                        cached_tools_list,
-                    )?;
-                    Ok(era)
-                });
-                if let Err(response) = admission {
-                    writer
-                        .write_all(serde_json::to_string(&response)?.as_bytes())
-                        .await?;
-                    writer.write_all(b"\n").await?;
-                    writer.flush().await?;
-                    continue;
-                }
-                let initialize_metadata = (!session_observed)
-                    .then(|| req.initialize_metadata())
-                    .flatten();
-                let session_context = (!daemon_observes_tool_calls)
-                    .then(|| {
-                        req.tool_call().ok().and_then(|call| {
-                            let known_tool = proxy_knows_tool(cached_tools_list, &call.name);
-                            cua_driver_core::session::begin_tool_call(
-                                &call.name,
-                                &call.args,
-                                known_tool,
-                                cua_driver_core::session::SessionTransport::McpStdio,
-                                cua_driver_core::session::SessionClientKind::Mcp,
-                            )
-                        })
-                    })
-                    .flatten();
-                let tool_timer = (!daemon_observes_tool_calls)
-                    .then(|| {
-                        tool_observation_timer(
-                            &req,
-                            |name| proxy_knows_tool(cached_tools_list, name),
-                            StdioExecutionPath::DaemonProxy,
+            Ok(())
+        },
+        move |request, id| {
+            let socket = socket.clone();
+            let session = session.clone();
+            let inventory = handler_inventory.clone();
+            let session_context = (!daemon_observes_tool_calls)
+                .then(|| {
+                    request.tool_call().ok().and_then(|call| {
+                        let known_tool = proxy_knows_tool(&inventory, &call.name);
+                        cua_driver_core::session::begin_tool_call(
+                            &call.name,
+                            &call.args,
+                            known_tool,
+                            cua_driver_core::session::SessionTransport::McpStdio,
+                            cua_driver_core::session::SessionClientKind::Mcp,
                         )
                     })
-                    .flatten();
-                let id = req.id.clone().unwrap_or(serde_json::Value::Null);
+                })
+                .flatten();
+            let timer = (!daemon_observes_tool_calls)
+                .then(|| {
+                    tool_observation_timer(
+                        &request,
+                        |name| proxy_knows_tool(&inventory, name),
+                        StdioExecutionPath::DaemonProxy,
+                    )
+                })
+                .flatten();
+            let mut telemetry = ToolCallTelemetry {
+                timer,
+                session_context,
+                id: id.clone(),
+            };
+            async move {
                 let response = handle_proxy_request(
-                    req,
+                    request,
                     id,
-                    socket_path,
-                    cached_tools_list,
-                    session_id,
+                    &socket,
+                    &inventory,
+                    &session,
                     daemon_observes_tool_calls,
                 )
                 .await;
-                if let Some(metadata) = initialize_metadata {
-                    observe_proxy_session_started(metadata);
-                    session_observed = true;
-                }
-                if let Some(timer) = tool_timer {
-                    let outcome = timer.finish(&response);
-                    if let Some(context) = session_context {
-                        context.complete(&outcome);
-                    }
-                    observe_proxy_tool_completed(outcome);
-                }
+                telemetry.finish(&response);
                 response
             }
-        };
-
-        let serialized = serde_json::to_string(&response).unwrap_or_else(|e| {
-            format!(
-                r#"{{"jsonrpc":"2.0","id":null,"error":{{"code":-32603,"message":"serialize error: {e}"}}}}"#
-            )
-        });
-        debug!(raw = %serialized, "← proxy response");
-
-        writer.write_all(serialized.as_bytes()).await?;
-        writer.write_all(b"\n").await?;
-        writer.flush().await?;
-    }
-
-    // Reached on a clean stdin EOF (the `n == 0` break above) — the normal
-    // "MCP client disconnected" seam. Session teardown is NO LONGER done here:
-    // it's fully subsumed by the persistent control connection spawned at
-    // startup. On any proxy exit — graceful stdin EOF (this path), an I/O
-    // error propagated via `?`, OR a SIGKILL/crash — the kernel closes the
-    // control socket, the daemon's reader hits EOF, and it fires
-    // `session_end(session_id)` once (idempotent). That single path reliably
-    // covers the ungraceful-death case the old best-effort exit hook missed.
-    Ok(())
+        },
+    )
+    .await
 }
 
 fn proxy_knows_tool(cached_tools_list: &serde_json::Value, name: &str) -> bool {
@@ -923,6 +1159,10 @@ async fn forward_tool_call(
     daemon_observes_tool_calls: bool,
     output_schema: Option<serde_json::Value>,
 ) -> Response {
+    let permit = match DAEMON_FORWARD_PERMITS.try_acquire() {
+        Ok(permit) => permit,
+        Err(_) => return Response::error(id, -32029, "in_flight_limit"),
+    };
     cua_driver_core::tool_args::sanitize_reserved_args(&mut args);
     let req = DaemonRequest {
         method: "call".into(),
@@ -938,7 +1178,11 @@ async fn forward_tool_call(
     // `screenshot`, `get_window_state`) does its thing on the daemon
     // side.
     let socket = socket_path.to_owned();
-    let blocking = tokio::task::spawn_blocking(move || send_request(&socket, &req)).await;
+    let blocking = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        send_request(&socket, &req)
+    })
+    .await;
 
     let resp = match blocking {
         Err(join_err) => {
@@ -1018,6 +1262,274 @@ fn daemon_response_to_tool_result(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn modern_request(id: u64, method: &str) -> String {
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": method,
+            "params": {
+                "_meta": {
+                    mcp_wire::PROTOCOL_VERSION_KEY: mcp_wire::MODERN_PROTOCOL_VERSION,
+                    mcp_wire::CLIENT_CAPABILITIES_KEY: {}
+                }
+            }
+        })
+        .to_string()
+            + "\n"
+    }
+
+    fn modern_tool_call(id: u64, name: &str) -> String {
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "tools/call",
+            "params": {
+                "_meta": {
+                    mcp_wire::PROTOCOL_VERSION_KEY: mcp_wire::MODERN_PROTOCOL_VERSION,
+                    mcp_wire::CLIENT_CAPABILITIES_KEY: {}
+                },
+                "name": name,
+                "arguments": {}
+            }
+        })
+        .to_string()
+            + "\n"
+    }
+
+    async fn next_response(
+        reader: &mut BufReader<tokio::io::ReadHalf<tokio::io::DuplexStream>>,
+    ) -> serde_json::Value {
+        let mut line = String::new();
+        let n = tokio::time::timeout(Duration::from_secs(2), reader.read_line(&mut line))
+            .await
+            .expect("response deadline")
+            .expect("read response");
+        assert!(n > 0, "unexpected transport EOF");
+        serde_json::from_str(line.trim()).expect("valid JSON response")
+    }
+
+    #[tokio::test]
+    async fn concurrent_transport_times_out_one_request_without_blocking_the_next() {
+        let (client, server) = tokio::io::duplex(64 * 1024);
+        let (server_read, server_write) = tokio::io::split(server);
+        let run = tokio::spawn(run_concurrent_mcp_io(
+            BufReader::new(server_read),
+            server_write,
+            Duration::from_millis(40),
+            |_| Ok(()),
+            |request, id| async move {
+                if request.method == "tools/call" {
+                    std::future::pending::<()>().await;
+                }
+                Response::ok(id, serde_json::json!({"ok": true}))
+            },
+        ));
+        let (client_read, mut client_write) = tokio::io::split(client);
+        let mut client_read = BufReader::new(client_read);
+        client_write
+            .write_all((modern_tool_call(1, "slow") + &modern_request(2, "fast")).as_bytes())
+            .await
+            .unwrap();
+        let first = next_response(&mut client_read).await;
+        let second = next_response(&mut client_read).await;
+        let replies = [first, second];
+        assert!(replies.iter().any(|reply| reply["id"] == 2));
+        assert!(replies.iter().any(|reply| {
+            reply["id"] == 1
+                && reply["result"]["isError"] == true
+                && reply["result"]["structuredContent"]["effect"] == "unknown"
+        }));
+        client_write.shutdown().await.unwrap();
+        drop(client_write);
+        run.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancelled_request_gets_one_unknown_effect_response_and_followup_runs() {
+        let (client, server) = tokio::io::duplex(64 * 1024);
+        let (server_read, server_write) = tokio::io::split(server);
+        let run = tokio::spawn(run_concurrent_mcp_io(
+            BufReader::new(server_read),
+            server_write,
+            Duration::from_secs(1),
+            |_| Ok(()),
+            |request, id| async move {
+                if request.method == "tools/call" {
+                    std::future::pending::<()>().await;
+                }
+                Response::ok(id, serde_json::json!({"ok": true}))
+            },
+        ));
+        let (client_read, mut client_write) = tokio::io::split(client);
+        let mut client_read = BufReader::new(client_read);
+        client_write
+            .write_all(modern_tool_call(7, "never_finishes").as_bytes())
+            .await
+            .unwrap();
+        client_write
+            .write_all(
+                br#"{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":7}}
+"#,
+            )
+            .await
+            .unwrap();
+        client_write
+            .write_all(modern_request(8, "fast").as_bytes())
+            .await
+            .unwrap();
+        let cancelled = next_response(&mut client_read).await;
+        let followup = next_response(&mut client_read).await;
+        let replies = [cancelled, followup];
+        assert!(replies.iter().any(|reply| {
+            reply["id"] == 7
+                && reply["result"]["isError"] == true
+                && reply["result"]["structuredContent"]["effect"] == "unknown"
+        }));
+        assert!(replies.iter().any(|reply| reply["id"] == 8));
+        let mut unexpected = String::new();
+        assert!(tokio::time::timeout(
+            Duration::from_millis(50),
+            client_read.read_line(&mut unexpected)
+        )
+        .await
+        .is_err());
+        client_write.shutdown().await.unwrap();
+        drop(client_write);
+        run.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn duplicate_pending_request_id_does_not_replace_original() {
+        let (client, server) = tokio::io::duplex(64 * 1024);
+        let (server_read, server_write) = tokio::io::split(server);
+        let started = Arc::new(tokio::sync::Notify::new());
+        let handler_started = started.clone();
+        let run = tokio::spawn(run_concurrent_mcp_io(
+            BufReader::new(server_read),
+            server_write,
+            Duration::from_secs(5),
+            |_| Ok(()),
+            move |request, id| {
+                let handler_started = handler_started.clone();
+                async move {
+                    if request.method == "slow" {
+                        handler_started.notify_one();
+                        std::future::pending::<()>().await;
+                    }
+                    Response::ok(id, serde_json::json!({"ok": true}))
+                }
+            },
+        ));
+        let (client_read, mut client_write) = tokio::io::split(client);
+        let mut client_read = BufReader::new(client_read);
+        let started_signal = started.notified();
+        client_write
+            .write_all(modern_request(10, "slow").as_bytes())
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), started_signal)
+            .await
+            .expect("original request started");
+        client_write
+            .write_all(modern_request(10, "fast").as_bytes())
+            .await
+            .unwrap();
+        let duplicate = next_response(&mut client_read).await;
+        assert_eq!(duplicate["error"]["code"], -32600);
+        assert_eq!(duplicate["id"], 10);
+        client_write
+            .write_all(
+                br#"{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":10}}
+"#,
+            )
+            .await
+            .unwrap();
+        let original = next_response(&mut client_read).await;
+        assert_eq!(original["error"]["code"], -32800);
+        assert_eq!(original["id"], 10);
+        client_write.shutdown().await.unwrap();
+        drop(client_write);
+        run.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn eof_aborts_pending_transport_work() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct DropProbe(Arc<AtomicUsize>);
+        impl Drop for DropProbe {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let drops = Arc::new(AtomicUsize::new(0));
+        let started = Arc::new(tokio::sync::Notify::new());
+        let (client, server) = tokio::io::duplex(64 * 1024);
+        let (server_read, server_write) = tokio::io::split(server);
+        let probe = drops.clone();
+        let handler_started = started.clone();
+        let run = tokio::spawn(run_concurrent_mcp_io(
+            BufReader::new(server_read),
+            server_write,
+            Duration::from_secs(30),
+            |_| Ok(()),
+            move |request, id| {
+                let probe = (request.method == "slow").then(|| DropProbe(probe.clone()));
+                let handler_started = handler_started.clone();
+                async move {
+                    let _probe = probe;
+                    if request.method == "slow" {
+                        handler_started.notify_one();
+                        std::future::pending::<()>().await;
+                    }
+                    Response::ok(id, serde_json::json!({"ok": true}))
+                }
+            },
+        ));
+        let (_client_read, mut client_write) = tokio::io::split(client);
+        let started_signal = started.notified();
+        client_write
+            .write_all(modern_request(9, "slow").as_bytes())
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), started_signal)
+            .await
+            .expect("pending handler started");
+        client_write.shutdown().await.unwrap();
+        drop(client_write);
+        run.await.unwrap().unwrap();
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn concurrent_transport_rejects_requests_over_the_inflight_cap() {
+        let (client, server) = tokio::io::duplex(64 * 1024);
+        let (server_read, server_write) = tokio::io::split(server);
+        let run = tokio::spawn(run_concurrent_mcp_io(
+            BufReader::new(server_read),
+            server_write,
+            Duration::from_secs(30),
+            |_| Ok(()),
+            |_request, _id| async move {
+                std::future::pending::<()>().await;
+                unreachable!()
+            },
+        ));
+        let (client_read, mut client_write) = tokio::io::split(client);
+        let mut client_read = BufReader::new(client_read);
+        let input = (1..=17)
+            .map(|id| modern_request(id, "slow"))
+            .collect::<String>();
+        client_write.write_all(input.as_bytes()).await.unwrap();
+        let response = next_response(&mut client_read).await;
+        assert_eq!(response["id"], 17);
+        assert_eq!(response["error"]["code"], -32029);
+        client_write.shutdown().await.unwrap();
+        drop(client_write);
+        run.await.unwrap().unwrap();
+    }
 
     #[tokio::test]
     async fn modern_proxy_metadata_and_rejections_need_no_daemon_call() {

@@ -29,11 +29,13 @@
 
 use anyhow::{bail, Result};
 use core::ffi::c_void;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpsc::{sync_channel, RecvTimeoutError, SyncSender};
 use std::sync::Mutex;
 use std::thread::sleep;
 use std::time::Duration;
 
-use windows::Win32::Foundation::{HANDLE, HWND, POINT, RECT};
+use windows::Win32::Foundation::{HANDLE, HWND, LPARAM, POINT, RECT, WPARAM};
 use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
 use windows::Win32::UI::Controls::{
     CreateSyntheticPointerDevice, DestroySyntheticPointerDevice, HSYNTHETICPOINTERDEVICE,
@@ -48,9 +50,9 @@ use windows::Win32::UI::Input::Pointer::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     GetAncestor, GetCursorPos, GetForegroundWindow, GetWindowLongPtrW, GetWindowThreadProcessId,
-    IsWindow, LockSetForegroundWindow, SetCursorPos, SetForegroundWindow, SetWindowLongPtrW,
-    WindowFromPoint, GA_ROOT, GWL_EXSTYLE, LSFW_LOCK, LSFW_UNLOCK, PT_PEN, PT_TOUCH,
-    WS_EX_NOACTIVATE,
+    IsHungAppWindow, IsWindow, LockSetForegroundWindow, SendMessageTimeoutW, SetCursorPos,
+    SetForegroundWindow, SetWindowLongPtrW, WindowFromPoint, GA_ROOT, GWL_EXSTYLE, LSFW_LOCK,
+    LSFW_UNLOCK, PT_PEN, PT_TOUCH, SMTO_ABORTIFHUNG, SMTO_BLOCK, WM_NULL, WS_EX_NOACTIVATE,
 };
 
 #[derive(Default)]
@@ -167,38 +169,200 @@ pub(crate) unsafe fn force_foreground_assisted(target: HWND) -> (bool, bool) {
 /// side effects) and reversed on drop. Covers the self-activation that the
 /// EnableWindow/UWP bypass cannot (WPF `UIElement.Focus()`→SetForegroundWindow).
 pub struct NoActivateGuard {
-    // Store the handle as an integer so the guard is `Send` and can be held
-    // across `.await` in the async tools.
-    root_addr: isize,
     applied: bool,
+    release: Option<SyncSender<()>>,
+}
+
+/// Budget for the WM_NULL liveness probe that gates cross-process style writes.
+const STYLE_WRITE_PROBE_TIMEOUT_MS: u32 = 250;
+const STYLE_GUARD_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(1);
+const MAX_STYLE_GUARD_WORKERS: usize = 16;
+static STYLE_GUARD_WORKERS: AtomicUsize = AtomicUsize::new(0);
+
+struct StyleGuardWorkerPermit;
+
+impl Drop for StyleGuardWorkerPermit {
+    fn drop(&mut self) {
+        STYLE_GUARD_WORKERS.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+fn acquire_style_guard_worker() -> anyhow::Result<StyleGuardWorkerPermit> {
+    let mut current = STYLE_GUARD_WORKERS.load(Ordering::Acquire);
+    loop {
+        if current >= MAX_STYLE_GUARD_WORKERS {
+            anyhow::bail!(
+                "target_not_responding: native window-style worker limit reached; \
+                 no input was sent and target effect is unknown"
+            );
+        }
+        match STYLE_GUARD_WORKERS.compare_exchange_weak(
+            current,
+            current + 1,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => return Ok(StyleGuardWorkerPermit),
+            Err(observed) => current = observed,
+        }
+    }
+}
+
+/// Whether `hwnd`'s thread answers a WM_NULL within `timeout_ms`.
+///
+/// `SetWindowLongPtrW(GWL_EXSTYLE)` on another process's window sends
+/// WM_STYLECHANGING/WM_STYLECHANGED synchronously and has no timeout, so it
+/// blocks for as long as the owning thread is hung.
+pub(crate) fn window_thread_responds(hwnd: HWND, timeout_ms: u32) -> bool {
+    unsafe {
+        if IsHungAppWindow(hwnd).as_bool() {
+            return false;
+        }
+        let mut result = 0usize;
+        SendMessageTimeoutW(
+            hwnd,
+            WM_NULL,
+            WPARAM(0),
+            LPARAM(0),
+            SMTO_ABORTIFHUNG | SMTO_BLOCK,
+            timeout_ms,
+            Some(&mut result),
+        )
+        .0 != 0
+    }
 }
 
 impl NoActivateGuard {
     /// Arm on the top-level (GA_ROOT) ancestor of `hwnd`.
-    pub fn arm(hwnd: HWND) -> Self {
-        unsafe {
-            let root = {
-                let r = GetAncestor(hwnd, GA_ROOT);
-                if r.0.is_null() {
-                    hwnd
-                } else {
-                    r
-                }
-            };
-            let prev = GetWindowLongPtrW(root, GWL_EXSTYLE);
-            let want = WS_EX_NOACTIVATE.0 as isize;
-            // Apply WS_EX_NOACTIVATE if not already set (prev can be 0, so don't
-            // gate on it — we just need to check the bit and set it if absent).
-            let applied = (prev & want) == 0 && {
-                SetWindowLongPtrW(root, GWL_EXSTYLE, prev | want);
-                // Confirm it took (cross-process SetWindowLongPtr can be denied
-                // by UIPI on higher-integrity targets).
-                (GetWindowLongPtrW(root, GWL_EXSTYLE) & want) != 0
-            };
-            Self {
-                root_addr: root.0 as isize,
-                applied,
+    ///
+    /// Win32 style writes are unbounded across processes, so arm and restore
+    /// run on a capped native worker. A timed-out arm refuses the action; its
+    /// worker restores the style if the pending call eventually succeeds.
+    pub fn arm(hwnd: HWND) -> anyhow::Result<Self> {
+        let root = unsafe {
+            let ancestor = GetAncestor(hwnd, GA_ROOT);
+            if ancestor.0.is_null() {
+                hwnd
+            } else {
+                ancestor
             }
+        };
+        if root.0.is_null() {
+            anyhow::bail!("target_not_responding: invalid target window; no input was sent");
+        }
+
+        let permit = acquire_style_guard_worker()?;
+        let (ready_tx, ready_rx) = sync_channel(1);
+        let (release_tx, release_rx) = sync_channel(0);
+        let root_addr = root.0 as isize;
+        std::thread::Builder::new()
+            .name("cua-noactivate-guard".into())
+            .spawn(move || {
+                let _permit = permit;
+                let root = HWND(root_addr as *mut _);
+                let result = arm_noactivate_on_worker(root);
+                let (applied, identity) = match result {
+                    Ok(result) => result,
+                    Err(error) => {
+                        let _ = ready_tx.send(Err(error));
+                        return;
+                    }
+                };
+                if ready_tx.send(Ok((applied, identity))).is_err() {
+                    if applied {
+                        restore_noactivate_on_worker(root, identity);
+                    }
+                    return;
+                }
+                if applied {
+                    let _ = release_rx.recv();
+                    restore_noactivate_on_worker(root, identity);
+                }
+            })
+            .map_err(|error| anyhow::anyhow!("could not start bounded window-style worker: {error}"))?;
+
+        match ready_rx.recv_timeout(STYLE_GUARD_HANDSHAKE_TIMEOUT) {
+            Ok(Ok((applied, _))) => Ok(Self {
+                applied,
+                release: applied.then_some(release_tx),
+            }),
+            Ok(Err(error)) => Err(anyhow::anyhow!(error)),
+            Err(RecvTimeoutError::Timeout) => {
+                drop(release_tx);
+                anyhow::bail!(
+                    "target_not_responding: window-style guard did not finish within {} ms; \
+                     no input was sent and target effect is unknown",
+                    STYLE_GUARD_HANDSHAKE_TIMEOUT.as_millis()
+                );
+            }
+            Err(RecvTimeoutError::Disconnected) => {
+                anyhow::bail!(
+                    "target_not_responding: window-style worker exited before confirming the guard; \
+                     no input was sent and target effect is unknown"
+                );
+            }
+        }
+    }
+}
+
+fn root_process_identity(root: HWND) -> Option<(u32, u32)> {
+    unsafe {
+        if !IsWindow(root).as_bool() {
+            return None;
+        }
+        let mut process_id = 0;
+        let thread_id = GetWindowThreadProcessId(root, Some(&mut process_id));
+        (thread_id != 0 && process_id != 0).then_some((process_id, thread_id))
+    }
+}
+
+fn arm_noactivate_on_worker(root: HWND) -> Result<(bool, Option<(u32, u32)>), String> {
+    if !window_thread_responds(root, STYLE_WRITE_PROBE_TIMEOUT_MS) {
+        return Err(format!(
+            "target_not_responding: window 0x{:x} did not answer the liveness probe; \
+             no input was sent and target effect is unknown",
+            root.0 as isize
+        ));
+    }
+    let identity = root_process_identity(root).ok_or_else(|| {
+        "target_not_responding: target window disappeared before guard setup; \
+         no input was sent and target effect is unknown"
+            .to_owned()
+    })?;
+    let previous = unsafe { GetWindowLongPtrW(root, GWL_EXSTYLE) };
+    let noactivate = WS_EX_NOACTIVATE.0 as isize;
+    if previous & noactivate != 0 {
+        return Ok((false, Some(identity)));
+    }
+    unsafe {
+        SetWindowLongPtrW(root, GWL_EXSTYLE, previous | noactivate);
+    }
+    let confirmed = root_process_identity(root) == Some(identity)
+        && unsafe { GetWindowLongPtrW(root, GWL_EXSTYLE) } & noactivate != 0;
+    if !confirmed {
+        restore_noactivate_on_worker(root, Some(identity));
+        return Err(
+            "target_not_responding: could not confirm the no-activate guard; \
+             no input was sent and target effect is unknown"
+                .to_owned(),
+        );
+    }
+    Ok((true, Some(identity)))
+}
+
+fn restore_noactivate_on_worker(root: HWND, identity: Option<(u32, u32)>) {
+    let Some(identity) = identity else {
+        return;
+    };
+    if root_process_identity(root) != Some(identity) {
+        return;
+    }
+    unsafe {
+        let current = GetWindowLongPtrW(root, GWL_EXSTYLE);
+        let noactivate = WS_EX_NOACTIVATE.0 as isize;
+        // Clear only the bit this guard added; preserve unrelated style changes.
+        if current & noactivate != 0 {
+            SetWindowLongPtrW(root, GWL_EXSTYLE, current & !noactivate);
         }
     }
 }
@@ -206,15 +370,7 @@ impl NoActivateGuard {
 impl Drop for NoActivateGuard {
     fn drop(&mut self) {
         if self.applied {
-            unsafe {
-                let root = HWND(self.root_addr as *mut _);
-                let current = GetWindowLongPtrW(root, GWL_EXSTYLE);
-                let noactivate = WS_EX_NOACTIVATE.0 as isize;
-                // Clear only the bit this guard added. Restoring the full
-                // captured value can clobber unrelated style changes the app
-                // made while the background action was in flight.
-                SetWindowLongPtrW(root, GWL_EXSTYLE, current & !noactivate);
-            }
+            drop(self.release.take());
         }
     }
 }
@@ -350,7 +506,7 @@ pub fn inject_click_screen(
     // Make the target non-activatable for the click so click-activation can't
     // steal foreground. No z-order raise.
     let result = {
-        let _noact = NoActivateGuard::arm(target_h);
+        let _noact = NoActivateGuard::arm(target_h)?;
         // One synthetic device does all `count` taps (single/double/triple click).
         pen_taps(sx, sy, barrel, count)
     };
@@ -754,7 +910,7 @@ pub fn inject_drag_screen(
     // Chromium/GTK: pointer-aware, process injection in the background — hold
     // non-activatable (no raise), inject, then re-assert the user's foreground.
     let r = {
-        let _noact = NoActivateGuard::arm(target_h);
+        let _noact = NoActivateGuard::arm(target_h)?;
         stroke(())
     };
     unsafe {
