@@ -5561,6 +5561,12 @@ impl Tool for PressKeyTool {
         // Skipped when px-focus already fronted/clicked the target — the key then
         // goes via the plain background post path below.
         if !px_focus && delivery == DeliveryMode::Foreground {
+            if let Err(refusal) = crate::input::delivery::gate_foreground_physical_idle(
+                hwnd,
+                crate::input::delivery::EventKind::Keystroke,
+            ) {
+                return refusal;
+            }
             let focus_target = elem_idx.map(|idx| {
                 let point = admitted.as_ref().map(|element| element.center);
                 (idx as usize, point)

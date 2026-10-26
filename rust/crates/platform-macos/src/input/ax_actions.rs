@@ -296,6 +296,156 @@ pub fn element_has_keyboard_focus(pid: i32, element_ptr: usize) -> bool {
         || unsafe { copy_bool_attr(element_ptr as AXUIElementRef, "AXFocused") } == Some(true)
 }
 
+const MAX_WEB_ANCESTORS: usize = 40;
+
+/// Pure role/ancestry check: true when a control is a focusable text input
+/// inside a web-content subtree (`AXWebArea`) or a Safari window, where
+/// `AXFocused = true` alone can be ignored by the renderer until a window-local
+/// click places the caret.
+pub fn is_web_or_safari_focus_fallback_candidate(
+    role: Option<&str>,
+    has_web_area_ancestor: bool,
+    is_safari_bundle: bool,
+) -> bool {
+    let is_text_role = matches!(
+        role,
+        Some("AXTextField" | "AXTextArea" | "AXSearchField" | "AXComboBox")
+    );
+    is_text_role && (has_web_area_ancestor || is_safari_bundle)
+}
+
+fn is_safari_bundle_id(bundle_id: &str) -> bool {
+    matches!(
+        bundle_id,
+        "com.apple.Safari" | "com.apple.SafariTechnologyPreview"
+    )
+}
+
+unsafe fn element_has_web_area_ancestor(element: AXUIElementRef) -> bool {
+    let mut current = element;
+    let mut owns_current = false;
+    let mut found = false;
+    for _ in 0..MAX_WEB_ANCESTORS {
+        match copy_string_attr(current, "AXRole").as_deref() {
+            Some("AXWebArea") => {
+                found = true;
+                break;
+            }
+            Some("AXWindow" | "AXApplication") | None => break,
+            _ => {}
+        }
+        let parent = copy_element_attr(current, "AXParent");
+        if owns_current {
+            CFRelease(current as CFTypeRef);
+        }
+        match parent {
+            Some(parent) => {
+                current = parent;
+                owns_current = true;
+            }
+            None => {
+                owns_current = false;
+                break;
+            }
+        }
+    }
+    if owns_current {
+        CFRelease(current as CFTypeRef);
+    }
+    found
+}
+
+/// Whether `element_ptr` is an editable control in a web area or Safari window
+/// that is eligible for a single window-local pointer click when `AXFocused`
+/// write alone does not stick.
+pub fn element_supports_pointer_focus_fallback(
+    pid: i32,
+    element_ptr: usize,
+    window_id: Option<u32>,
+) -> bool {
+    let Some(wid) = window_id else {
+        return false;
+    };
+    let element = element_ptr as AXUIElementRef;
+    if unsafe { crate::ax::exact_target::element_window_id(element) } != Some(wid) {
+        return false;
+    }
+    let role = unsafe { copy_string_attr(element, "AXRole") };
+    let in_web_area = unsafe { element_has_web_area_ancestor(element) };
+    let is_safari = crate::apps::bundle_id_for_pid(pid)
+        .as_deref()
+        .is_some_and(is_safari_bundle_id);
+    is_web_or_safari_focus_fallback_candidate(role.as_deref(), in_web_area, is_safari)
+}
+
+/// Confirm keyboard focus on `element_ptr`, requiring that both the element
+/// and any PID-focused element belong to `window_id` when a window is specified.
+pub fn element_has_keyboard_focus_in_window(
+    pid: i32,
+    window_id: Option<u32>,
+    element_ptr: usize,
+) -> bool {
+    let Some(wid) = window_id else {
+        return element_has_keyboard_focus(pid, element_ptr);
+    };
+    let element = element_ptr as AXUIElementRef;
+    if unsafe { crate::ax::exact_target::element_window_id(element) } != Some(wid) {
+        return false;
+    }
+    unsafe {
+        if let Some(focused) = crate::ax::exact_target::focused_element_in_window(pid, wid) {
+            let same = CFEqual(focused as CFTypeRef, element_ptr as CFTypeRef) != 0;
+            CFRelease(focused as CFTypeRef);
+            if same {
+                return true;
+            }
+        }
+        copy_bool_attr(element, "AXFocused") == Some(true)
+    }
+}
+
+/// Attempt a single bounded window-local pointer click at `element_ptr`'s
+/// screen center inside `window_id` to establish DOM focus when `AXFocused=true`
+/// is ignored by Safari/WebKit/`AXWebArea` text controls.
+pub fn click_element_center_for_focus(
+    pid: i32,
+    window_id: u32,
+    element_ptr: usize,
+    foreground: bool,
+) -> anyhow::Result<()> {
+    let element = element_ptr as AXUIElementRef;
+    if unsafe { crate::ax::exact_target::element_window_id(element) } != Some(window_id) {
+        anyhow::bail!(
+            "refusing pointer focus fallback: element does not belong to window {window_id}"
+        );
+    }
+    let (screen_x, screen_y) = unsafe { element_screen_center(element) }
+        .ok_or_else(|| anyhow::anyhow!("element has no readable screen center"))?;
+    let bounds = crate::windows::window_bounds_by_id(window_id)
+        .ok_or_else(|| anyhow::anyhow!("window {window_id} has no readable bounds"))?;
+    if bounds.width <= 0.0 || bounds.height <= 0.0 {
+        anyhow::bail!("window {window_id} has empty bounds");
+    }
+    let wx = screen_x - bounds.x;
+    let wy = screen_y - bounds.y;
+    if wx < 0.0 || wx >= bounds.width || wy < 0.0 || wy >= bounds.height {
+        anyhow::bail!(
+            "element center ({screen_x:.1}, {screen_y:.1}) lies outside window {window_id}"
+        );
+    }
+    crate::input::mouse::click_at_xy_with_window_local(
+        pid,
+        screen_x,
+        screen_y,
+        wx,
+        wy,
+        window_id,
+        1,
+        &[],
+        crate::input::mouse::WindowClickDelivery::from_foreground(foreground),
+    )
+}
+
 /// Set the AXValue of an element (for dropdowns, text fields, etc.).
 pub fn set_ax_value(element_ptr: usize, value: &str) -> anyhow::Result<()> {
     let err = unsafe { set_string_attr(element_ptr as AXUIElementRef, "AXValue", value) };
@@ -347,6 +497,37 @@ mod tests {
         }
         for role in ["AXButton", "AXTextField", "AXWindow", "AXOutline"] {
             assert!(!is_selectable_container_role(role), "{role}");
+        }
+    }
+
+    #[test]
+    fn web_or_safari_focus_fallback_requires_text_role_and_web_or_safari_context() {
+        for role in ["AXTextField", "AXTextArea", "AXSearchField", "AXComboBox"] {
+            assert!(is_web_or_safari_focus_fallback_candidate(
+                Some(role),
+                true,
+                false
+            ));
+            assert!(is_web_or_safari_focus_fallback_candidate(
+                Some(role),
+                false,
+                true
+            ));
+            assert!(!is_web_or_safari_focus_fallback_candidate(
+                Some(role),
+                false,
+                false
+            ));
+        }
+        for non_text in [
+            Some("AXButton"),
+            Some("AXGroup"),
+            Some("AXStaticText"),
+            None,
+        ] {
+            assert!(!is_web_or_safari_focus_fallback_candidate(
+                non_text, true, true
+            ));
         }
     }
 }
