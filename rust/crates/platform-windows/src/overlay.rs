@@ -1586,7 +1586,8 @@ fn set_capture_excluded(hwnd_isize: isize, excluded: bool) -> Result<(), String>
     unsafe { SetWindowDisplayAffinity(hwnd, affinity) }.map_err(|error| {
         format!(
             "SetWindowDisplayAffinity({}) failed on the agent cursor overlay: {error}; \
-             excluding it from desktop captures requires Windows 10 version 2004 or later",
+             WDA_EXCLUDEFROMCAPTURE needs Windows 10 version 2004 or later, and some builds \
+             also reject it for the overlay's layered window",
             if excluded {
                 "WDA_EXCLUDEFROMCAPTURE"
             } else {

@@ -174,7 +174,7 @@ unsafe fn wgc_capture_impl(hwnd: HWND) -> Result<(Vec<u8>, u32, u32)> {
         anyhow::anyhow!(
             "WGC TryGetNextFrame returned no frame within 1500 ms — \
          DWM may not be compositing this window (cloaked / not actually \
-         rendered). Fall through to screen-region BitBlt."
+         rendered)."
         )
     })?;
 
