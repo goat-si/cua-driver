@@ -107,6 +107,7 @@ pub mod session_authorization;
 pub mod session_manifest;
 pub mod session_tools;
 pub mod single_flight;
+pub mod snapshot_compaction;
 pub mod snapshot_store;
 #[cfg(test)]
 pub(crate) mod snapshot_test_support;
