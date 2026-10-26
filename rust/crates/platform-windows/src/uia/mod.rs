@@ -32,7 +32,8 @@ use windows::Win32::UI::Accessibility::{
     UIA_ControlTypePropertyId, UIA_ExpandCollapseExpandCollapseStatePropertyId,
     UIA_ExpandCollapsePatternId, UIA_HelpTextPropertyId, UIA_InvokePatternId,
     UIA_IsEnabledPropertyId, UIA_IsOffscreenPropertyId, UIA_IsPasswordPropertyId,
-    UIA_NamePropertyId, UIA_ProcessIdPropertyId, UIA_RangeValuePatternId, UIA_ScrollPatternId,
+    UIA_FullDescriptionPropertyId, UIA_LegacyIAccessibleDescriptionPropertyId, UIA_NamePropertyId,
+    UIA_ProcessIdPropertyId, UIA_RangeValuePatternId, UIA_ScrollPatternId,
     UIA_SelectionItemIsSelectedPropertyId, UIA_SelectionItemPatternId, UIA_TextPatternId,
     UIA_TogglePatternId, UIA_ToggleToggleStatePropertyId, UIA_ValuePatternId,
     UIA_ValueValuePropertyId,
@@ -440,6 +441,13 @@ unsafe fn walk_tree_unsafe(
         return crate::msaa::walk_msaa_tree_budgeted(hwnd, budget);
     }
 
+    // A native ListView's bulk subtree cache materializes every row and
+    // pattern before our walk budget can run. Large responsive lists can
+    // therefore fail with UIA_E_TIMEOUT and lose unrelated sibling controls.
+    if contains_native_list_view(hwnd_win) {
+        return walk_list_view_window(&automation, hwnd_win, query, max_depth, budget);
+    }
+
     // Two-call sequence (ElementFromHandle + BuildUpdatedCache) instead of
     // the atomic ElementFromHandleBuildCache. Empirically, the single-call
     // batched variant hangs against SAL even in CLI in-process tests;
@@ -584,6 +592,230 @@ unsafe fn pid_from_hwnd(hwnd: windows::Win32::Foundation::HWND) -> Option<u32> {
     } else {
         Some(pid)
     }
+}
+
+fn native_list_view_class(class: &str) -> bool {
+    class.eq_ignore_ascii_case("SysListView32")
+        || class.to_ascii_lowercase().starts_with("windowsforms10.syslistview32.")
+}
+
+unsafe fn contains_native_list_view(hwnd: windows::Win32::Foundation::HWND) -> bool {
+    use windows::Win32::Foundation::{BOOL, HWND, LPARAM};
+    use windows::Win32::UI::WindowsAndMessaging::{EnumChildWindows, GetClassNameW};
+    unsafe extern "system" fn visit(hwnd: HWND, param: LPARAM) -> BOOL {
+        let mut class = [0u16; 256];
+        let len = GetClassNameW(hwnd, &mut class);
+        if len > 0 && native_list_view_class(&String::from_utf16_lossy(&class[..len as usize])) {
+            *(param.0 as *mut bool) = true;
+            return BOOL(0);
+        }
+        BOOL(1)
+    }
+    let mut found = false;
+    let param = LPARAM(&mut found as *mut bool as isize);
+    let _ = visit(hwnd, param);
+    if !found {
+        let _ = EnumChildWindows(hwnd, Some(visit), param);
+    }
+    found
+}
+
+unsafe fn walk_list_view_window(
+    automation: &IUIAutomation,
+    hwnd: windows::Win32::Foundation::HWND,
+    query: Option<&str>,
+    max_depth: usize,
+    budget: &mut WalkBudget,
+) -> UiaTreeResult {
+    let mut nodes = Vec::new();
+    let mut lines = Vec::new();
+    let mut counter = 0;
+    let mut state = WalkState::new(budget, max_depth);
+    let result = (|| -> windows::core::Result<()> {
+        let (cache, complete) = node_cache_request(automation)?;
+        cache.SetTreeScope(TreeScope_Element)?;
+        cache.SetTreeFilter(&automation.ControlViewCondition()?)?;
+        if !complete {
+            state.mark_incomplete();
+        }
+        let root = automation.ElementFromHandle(hwnd)?.BuildUpdatedCache(&cache)?;
+        walk_list_view_level(
+            automation, &cache, &root, 0, None, false,
+            &mut nodes, &mut lines, &mut counter, &mut state,
+            query.is_some_and(|q| !q.trim().is_empty()),
+        );
+        Ok(())
+    })();
+    if let Err(error) = result {
+        state.mark_incomplete();
+        lines.push((0, format!("UIA shallow cache failed: {error}")));
+    }
+    fold_actionless_text_subtrees(&mut lines, &mut nodes);
+    let raw = render_lines(&lines);
+    UiaTreeResult {
+        tree_markdown: query.map_or_else(|| raw.clone(), |q| filter_tree(&raw, q)),
+        nodes,
+        elements_complete: state.complete,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+unsafe fn walk_list_view_level(
+    automation: &IUIAutomation,
+    cache: &IUIAutomationCacheRequest,
+    element: &IUIAutomationElement,
+    depth: usize,
+    parent: Option<usize>,
+    in_web: bool,
+    nodes: &mut Vec<UiaNode>,
+    lines: &mut Vec<(usize, String)>,
+    counter: &mut usize,
+    state: &mut WalkState<'_>,
+    search_offscreen: bool,
+) {
+    if !state.enter(depth) {
+        return;
+    }
+    let (kind, parent) = emit_cached_node(element, depth, parent, in_web, nodes, lines, counter);
+    let next_web = in_web || kind.eq_ignore_ascii_case("Document");
+    let dense = is_uia_dense_collection(&kind);
+    let native_children = dense.then(|| native_visible_list_rows(automation, cache, element)).flatten();
+    let children = native_children.map(Ok).unwrap_or_else(|| (|| -> windows::core::Result<Vec<IUIAutomationElement>> {
+        let control = automation.ControlViewCondition()?;
+        let condition = if dense {
+            // Filter before fetching patterns/values: offscreen rows must
+            // never enter the expensive bulk cache transaction.
+            let visible = automation.CreatePropertyCondition(
+                UIA_IsOffscreenPropertyId, &windows::core::VARIANT::from(false),
+            )?;
+            state.mark_incomplete();
+            automation.CreateAndCondition(&control, &visible)?
+        } else {
+            control
+        };
+        let children = element.FindAllBuildCache(TreeScope_Children, &condition, cache)?;
+        (0..children.Length()?).map(|i| children.GetElement(i)).collect()
+    })());
+    let children = match children {
+        Ok(children) => children,
+        Err(error) => {
+            state.mark_incomplete();
+            lines.push((depth + 1, format!("(UIA children unavailable: {error})")));
+            return;
+        }
+    };
+    let mut pending = children;
+    // Visit sibling controls (including editors below a list) before rows
+    // consume the remaining budget. Stable ordering within each group.
+    pending.sort_by_key(|child| is_uia_dense_collection(&read_cached_control_type(child)));
+    for child in pending {
+        walk_list_view_level(
+            automation, cache, &child, depth + 1, parent, next_web,
+            nodes, lines, counter, state, search_offscreen,
+        );
+    }
+    if dense {
+        state.mark_incomplete();
+        lines.push((depth + 1, "(offscreen rows omitted by bounded UIA collection read)".into()));
+        if search_offscreen && !state.budget.expired() {
+            // Query mode may inspect offscreen rows too, but only one row's
+            // cache at a time, after visible rows and sibling editors.
+            let walker = (|| -> windows::core::Result<_> {
+                let offscreen = automation.CreatePropertyCondition(
+                    UIA_IsOffscreenPropertyId, &windows::core::VARIANT::from(true),
+                )?;
+                automation.CreateTreeWalker(&automation.CreateAndCondition(
+                    &automation.ControlViewCondition()?, &offscreen,
+                )?)
+            })();
+            if let Ok(walker) = walker {
+                let mut row = walker.GetFirstChildElementBuildCache(element, cache);
+                while let Ok(child) = row {
+                    let outcome = state.budget.outcome();
+                    if state.budget.expired() || outcome.stop.is_some() {
+                        break;
+                    }
+                    walk_list_view_level(
+                        automation, cache, &child, depth + 1, parent, next_web,
+                        nodes, lines, counter, state, false,
+                    );
+                    row = walker.GetNextSiblingElementBuildCache(&child, cache);
+                }
+            }
+        }
+    }
+}
+
+// Native report-view child IDs are one-based item indices. Resolve only the
+// viewport through the MSAA/UIA bridge instead of asking UIA to test the
+// IsOffscreen property of thousands of rows before returning any of them.
+unsafe fn native_visible_list_rows(
+    automation: &IUIAutomation,
+    cache: &IUIAutomationCacheRequest,
+    element: &IUIAutomationElement,
+) -> Option<Vec<IUIAutomationElement>> {
+    use windows::Win32::Foundation::{LPARAM, WPARAM};
+    use windows::Win32::UI::Accessibility::{AccessibleObjectFromWindow, IAccessible};
+    use windows::Win32::UI::Controls::{LVM_GETCOUNTPERPAGE, LVM_GETITEMCOUNT, LVM_GETTOPINDEX};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GetClassNameW, GetWindowLongPtrW, SendMessageTimeoutW, GWL_STYLE,
+        SMTO_ABORTIFHUNG, SMTO_BLOCK,
+    };
+    let hwnd = element.CurrentNativeWindowHandle().ok()?;
+    let mut class = [0u16; 256];
+    let len = GetClassNameW(hwnd, &mut class);
+    if len <= 0 || !native_list_view_class(&String::from_utf16_lossy(&class[..len as usize]))
+        || GetWindowLongPtrW(hwnd, GWL_STYLE) & 3 != 1 // LVS_TYPEMASK / LVS_REPORT
+    {
+        return None;
+    }
+    let read = |message| {
+        let mut value = 0usize;
+        (SendMessageTimeoutW(hwnd, message, WPARAM(0), LPARAM(0),
+            SMTO_ABORTIFHUNG | SMTO_BLOCK, 100, Some(&mut value)).0 != 0).then_some(value)
+    };
+    let count = read(LVM_GETITEMCOUNT)?;
+    let top = read(LVM_GETTOPINDEX)?;
+    let page = read(LVM_GETCOUNTPERPAGE)?;
+    if count == 0 || top >= count || page == 0 || page > DEFAULT_MAX_TOTAL_ELEMENTS {
+        return None;
+    }
+    let mut ptr = std::ptr::null_mut();
+    AccessibleObjectFromWindow(hwnd, 0xFFFF_FFFC, &IAccessible::IID, &mut ptr).ok()?;
+    if ptr.is_null() {
+        return None;
+    }
+    let accessible = IAccessible::from_raw(ptr);
+    let walker = automation.ControlViewWalker().ok()?;
+    let mut children = Vec::new();
+    let mut child = walker.GetFirstChildElementBuildCache(element, cache);
+    // Header/scrollbar siblings precede or follow the contiguous row block.
+    // Never traverse the row block to reach the opposite end.
+    for _ in 0..16 {
+        let current = child.ok()?;
+        if read_cached_control_type(&current) == "ListItem" {
+            break;
+        }
+        child = walker.GetNextSiblingElementBuildCache(&current, cache);
+        children.push(current);
+    }
+    for index in top..count.min(top.saturating_add(page).saturating_add(1)) {
+        children.push(automation.ElementFromIAccessibleBuildCache(
+            &accessible, i32::try_from(index + 1).ok()?, cache,
+        ).ok()?);
+    }
+    let mut tail = Vec::new();
+    let mut child = walker.GetLastChildElementBuildCache(element, cache);
+    for _ in 0..16 {
+        let current = child.ok()?;
+        if read_cached_control_type(&current) == "ListItem" {
+            break;
+        }
+        child = walker.GetPreviousSiblingElementBuildCache(&current, cache);
+        tail.push(current);
+    }
+    children.extend(tail.into_iter().rev());
+    Some(children)
 }
 
 /// Root-walk UIA fallback for apps whose top-level window is a
@@ -982,6 +1214,15 @@ unsafe fn node_cache_request(
     ] {
         complete &= cache_req.AddProperty(*prop).is_ok();
     }
+    // Description text only feeds secure-field detection. FullDescription is
+    // unavailable before Windows 10 1703, so a refusal must not mark the
+    // whole snapshot incomplete.
+    for prop in &[
+        UIA_FullDescriptionPropertyId,
+        UIA_LegacyIAccessibleDescriptionPropertyId,
+    ] {
+        let _ = cache_req.AddProperty(*prop);
+    }
     for pat in &[
         UIA_InvokePatternId,
         UIA_TogglePatternId,
@@ -1122,7 +1363,7 @@ fn emit_cached_node(
         help: help_text.as_deref(),
         is_password_flag: read_cached_bool(element, UIA_IsPasswordPropertyId) == Some(true),
     };
-    let (value, _) = redact_if_secure(&security_meta, value, None);
+    let value = redact_uia_value(security_meta, value, |property| read_cached_bstr(element, property));
     let enabled = read_cached_bool(element, UIA_IsEnabledPropertyId);
     // Missing UIA state must remain unknown on the structured observation
     // surface. Action discovery keeps its historical best-effort assumption.
@@ -1229,6 +1470,21 @@ fn read_cached_bstr_name(element: &IUIAutomationElement) -> Option<String> {
 
 fn read_cached_bstr_value(element: &IUIAutomationElement) -> Option<String> {
     read_cached_bstr(element, UIA_ValueValuePropertyId)
+}
+
+fn redact_uia_value(
+    meta: FieldSecurityMeta<'_>,
+    value: Option<String>,
+    mut read: impl FnMut(windows::Win32::UI::Accessibility::UIA_PROPERTY_ID) -> Option<String>,
+) -> Option<String> {
+    let full = read(UIA_FullDescriptionPropertyId);
+    let legacy = read(UIA_LegacyIAccessibleDescriptionPropertyId);
+    let description = match (full, legacy) {
+        (Some(full), Some(legacy)) if full != legacy => Some(format!("{full} {legacy}")),
+        (full, legacy) => full.or(legacy),
+    };
+    let meta = FieldSecurityMeta { description: description.as_deref(), ..meta };
+    redact_if_secure(&meta, value, None).0
 }
 
 fn read_cached_bstr(
@@ -1541,6 +1797,49 @@ fn filter_tree(markdown: &str, query: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn uia_description_only_otp_is_redacted_before_projection() {
+        for property in [UIA_FullDescriptionPropertyId, UIA_LegacyIAccessibleDescriptionPropertyId] {
+            let meta = FieldSecurityMeta { role: "Edit", title: Some("Code"), ..Default::default() };
+            let value = redact_uia_value(meta, Some("DUMMYDESCOTP666666".into()), |id| {
+                (id == property).then(|| "Enter the 6-digit OTP from your app".into())
+            });
+            assert_eq!(value.as_deref(), Some("[redacted]"));
+        }
+        // An ordinary FullDescription must not hide a sensitive legacy
+        // description by taking precedence over it.
+        let meta = FieldSecurityMeta { role: "Edit", title: Some("Code"), ..Default::default() };
+        assert_eq!(
+            redact_uia_value(meta, Some("DUMMYSECRET".into()), |id| Some(
+                if id == UIA_FullDescriptionPropertyId { "Code" } else { "One-time code" }.into()
+            )).as_deref(),
+            Some("[redacted]")
+        );
+    }
+
+    #[test]
+    fn uia_username_remains_visible_and_name_help_still_redact() {
+        for (name, help, expected) in [
+            ("Username", "Your account name", "DUMMYUSER"),
+            ("OTP", "", "[redacted]"),
+            ("Code", "Enter your passcode", "[redacted]"),
+        ] {
+            let meta = FieldSecurityMeta {
+                role: "Edit", title: Some(name), help: Some(help), ..Default::default()
+            };
+            let value = redact_uia_value(meta, Some("DUMMYUSER".into()), |_| Some("Input text".into()));
+            assert_eq!(value.as_deref(), Some(expected));
+        }
+    }
+
+    #[test]
+    fn native_list_view_detection_does_not_select_listbox() {
+        assert!(native_list_view_class("SysListView32"));
+        assert!(native_list_view_class("WindowsForms10.SysListView32.app.0.34f5582_r7_ad1"));
+        assert!(!native_list_view_class("ListBox"));
+        assert!(!native_list_view_class("WindowsForms10.LISTBOX.app.0.34f5582_r7_ad1"));
+    }
 
     fn star(child_count: usize) -> Vec<Vec<usize>> {
         let mut children = vec![Vec::new(); child_count + 1];
