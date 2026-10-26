@@ -28,6 +28,9 @@ pub type AXUIElementRef = *mut __AXUIElement;
 pub type AXError = c_int;
 pub const kAXErrorSuccess: AXError = 0;
 pub const kAXErrorFailure: AXError = -25200;
+pub const kAXErrorIllegalArgument: AXError = -25201;
+pub const kAXErrorCannotComplete: AXError = -25204;
+pub const kAXErrorNotImplemented: AXError = -25208;
 pub const kAXErrorInvalidUIElement: AXError = -25202;
 pub const kAXErrorAttributeUnsupported: AXError = -25205;
 pub const kAXErrorActionUnsupported: AXError = -25206;
@@ -45,6 +48,7 @@ pub const kAXValueCGPointType: AXValueType = 1;
 pub const kAXValueCGSizeType: AXValueType = 2;
 pub const kAXValueCGRectType: AXValueType = 3;
 pub const kAXValueCFRangeType: AXValueType = 4;
+pub const kAXValueAXErrorType: AXValueType = 5;
 pub const kAXValueIllegalType: AXValueType = 1_000;
 
 // ── Link to AXUIElement functions ────────────────────────────────────────────
@@ -55,6 +59,12 @@ extern "C" {
         element: AXUIElementRef,
         attribute: CFStringRef,
         value: *mut CFTypeRef,
+    ) -> AXError;
+    pub fn AXUIElementCopyMultipleAttributeValues(
+        element: AXUIElementRef,
+        attributes: CFArrayRef,
+        options: u32,
+        values: *mut CFArrayRef,
     ) -> AXError;
     pub fn AXUIElementCopyAttributeNames(
         element: AXUIElementRef,
@@ -125,6 +135,7 @@ pub unsafe fn element_at_screen_position(pid: i32, x: f64, y: f64) -> Option<AXU
 #[link(name = "ApplicationServices", kind = "framework")]
 extern "C" {
     pub fn AXValueCreate(the_type: AXValueType, value_ptr: *const c_void) -> AXValueRef;
+    pub fn AXValueGetTypeID() -> CFTypeID;
     pub fn AXValueGetType(value: AXValueRef) -> AXValueType;
     pub fn AXValueGetValue(
         value: AXValueRef,
@@ -147,7 +158,13 @@ struct CGSizeValue {
 
 // ── Helper functions ──────────────────────────────────────────────────────────
 
-use core_foundation::{array::CFArray, base::TCFType, string::CFString as CFStr};
+use core_foundation::{
+    array::CFArray,
+    base::{FromVoid, TCFType},
+    string::CFString as CFStr,
+};
+
+pub(crate) use super::batch_attrs::copy_attrs_batch;
 
 /// Whether an AX attribute is currently writable on this element.
 ///
@@ -174,13 +191,20 @@ pub unsafe fn copy_string_attr(element: AXUIElementRef, attr_name: &str) -> Opti
     if err != kAXErrorSuccess || value.is_null() {
         return None;
     }
-    let cf_string_type_id = CFStr::type_id();
-    if core_foundation::base::CFGetTypeID(value) != cf_string_type_id {
-        CFRelease(value);
+    let result = string_from_cf(value);
+    CFRelease(value);
+    result
+}
+
+/// Convert a borrowed CFString, preserving its contents exactly.
+///
+/// # Safety
+/// `value` must be a live CF object (or null) for the duration of the call.
+pub(crate) unsafe fn string_from_cf(value: CFTypeRef) -> Option<String> {
+    if value.is_null() || core_foundation::base::CFGetTypeID(value) != CFStr::type_id() {
         return None;
     }
-    let s = CFStr::wrap_under_create_rule(value as _);
-    Some(s.to_string())
+    Some(CFStr::from_void(value).to_string())
 }
 
 /// Copy the `AXURL` attribute (a `CFURL`) as its absolute URL string.
@@ -306,19 +330,22 @@ pub struct StringishAttrValue {
 }
 
 /// Convert a borrowed CF value without taking ownership of it.
-unsafe fn coerce_stringish_value(value: CFTypeRef) -> Option<StringishAttrValue> {
+pub(crate) unsafe fn stringish_from_cf(value: CFTypeRef) -> Option<StringishAttrValue> {
     use core_foundation::boolean::CFBoolean;
     use core_foundation::number::CFNumber;
+    if value.is_null() {
+        return None;
+    }
     let type_id = core_foundation::base::CFGetTypeID(value);
     if type_id == CFStr::type_id() {
-        let string = CFStr::wrap_under_get_rule(value as _).to_string();
+        let string = string_from_cf(value)?;
         return Some(StringishAttrValue {
             string_value: Some(string.clone()),
             state_value: string,
         });
     }
     if type_id == CFNumber::type_id() {
-        let n = CFNumber::wrap_under_get_rule(value as _);
+        let n = CFNumber::from_void(value);
         let f = n.to_f64()?;
         let state_value = if f == f.trunc() && f.abs() < 1e15 {
             format!("{}", f as i64)
@@ -331,10 +358,9 @@ unsafe fn coerce_stringish_value(value: CFTypeRef) -> Option<StringishAttrValue>
         });
     }
     if type_id == CFBoolean::type_id() {
-        let b = CFBoolean::wrap_under_get_rule(value as _);
         return Some(StringishAttrValue {
             string_value: None,
-            state_value: if bool::from(b) {
+            state_value: if value == core_foundation::boolean::kCFBooleanTrue as CFTypeRef {
                 "1".into()
             } else {
                 "0".into()
@@ -365,7 +391,7 @@ pub unsafe fn copy_stringish_attr(
     if err != kAXErrorSuccess || value.is_null() {
         return None;
     }
-    let result = coerce_stringish_value(value);
+    let result = stringish_from_cf(value);
     CFRelease(value);
     result
 }
@@ -1114,24 +1140,57 @@ mod tests {
         let true_value = CFBoolean::true_value();
         let false_value = CFBoolean::false_value();
 
-        let string_result = unsafe { coerce_stringish_value(string.as_CFTypeRef()) }.unwrap();
+        let string_result = unsafe { stringish_from_cf(string.as_CFTypeRef()) }.unwrap();
         assert_eq!(string_result.string_value.as_deref(), Some("Search"));
         assert_eq!(string_result.state_value, "Search");
 
-        let integer_result = unsafe { coerce_stringish_value(integer.as_CFTypeRef()) }.unwrap();
+        let integer_result = unsafe { stringish_from_cf(integer.as_CFTypeRef()) }.unwrap();
         assert_eq!(integer_result.string_value, None);
         assert_eq!(integer_result.state_value, "8");
 
-        let decimal_result = unsafe { coerce_stringish_value(decimal.as_CFTypeRef()) }.unwrap();
+        let decimal_result = unsafe { stringish_from_cf(decimal.as_CFTypeRef()) }.unwrap();
         assert_eq!(decimal_result.string_value, None);
         assert_eq!(decimal_result.state_value, "2.5");
 
-        let true_result = unsafe { coerce_stringish_value(true_value.as_CFTypeRef()) }.unwrap();
+        let true_result = unsafe { stringish_from_cf(true_value.as_CFTypeRef()) }.unwrap();
         assert_eq!(true_result.string_value, None);
         assert_eq!(true_result.state_value, "1");
 
-        let false_result = unsafe { coerce_stringish_value(false_value.as_CFTypeRef()) }.unwrap();
+        let false_result = unsafe { stringish_from_cf(false_value.as_CFTypeRef()) }.unwrap();
         assert_eq!(false_result.string_value, None);
         assert_eq!(false_result.state_value, "0");
+    }
+
+    #[test]
+    fn borrowed_string_converters_preserve_empty_and_surrounding_whitespace() {
+        for text in ["", " \t\n ", "  Search  "] {
+            let value = CFStr::new(text);
+            assert_eq!(
+                unsafe { string_from_cf(value.as_CFTypeRef()) }.as_deref(),
+                Some(text)
+            );
+            let copied = unsafe { stringish_from_cf(value.as_CFTypeRef()) }.unwrap();
+            assert_eq!(copied.string_value.as_deref(), Some(text));
+            assert_eq!(copied.state_value, text);
+        }
+    }
+
+    #[test]
+    fn borrowed_string_converter_rejects_numbers_booleans_and_non_error_ax_values() {
+        let point = CGPointValue { x: 1.0, y: 2.0 };
+        let value = unsafe {
+            core_foundation::base::CFType::wrap_under_create_rule(AXValueCreate(
+                kAXValueCGPointType,
+                &point as *const _ as *const _,
+            ) as CFTypeRef)
+        };
+        for value in [
+            CFNumber::from(8.0).as_CFType(),
+            CFBoolean::true_value().as_CFType(),
+            value.clone(),
+        ] {
+            assert_eq!(unsafe { string_from_cf(value.as_CFTypeRef()) }, None);
+        }
+        assert_eq!(unsafe { stringish_from_cf(value.as_CFTypeRef()) }, None);
     }
 }

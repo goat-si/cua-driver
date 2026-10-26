@@ -13,6 +13,7 @@
 //!   are spliced back and element indices renumbered to document order.
 
 use super::bindings::*;
+use super::content_attrs::{read_content_attrs, ContentAttrs};
 use super::dense_rows::{
     self, rows_windowed, with_dense_rows_windowed, ChildPlan, Chunk, DeferredRow,
     DENSE_COLLECTION_ROLES,
@@ -248,6 +249,7 @@ fn walk_tree_with_web_content(
     let mut lines: Vec<(usize, String)> = Vec::new(); // (depth, line)
     let mut index_counter = 0usize;
     let mut deferred = Vec::new();
+    let mut batching_disabled = false;
     let mut window_scope: Option<WindowScope> = None;
 
     unsafe {
@@ -329,6 +331,7 @@ fn walk_tree_with_web_content(
                 &mut lines,
                 &mut index_counter,
                 &mut budget,
+                &mut batching_disabled,
                 max_depth,
                 include_web_content,
                 &mut deferred,
@@ -356,6 +359,7 @@ fn walk_tree_with_web_content(
                             &mut chunk.lines,
                             &mut index_counter,
                             &mut budget,
+                            &mut batching_disabled,
                             max_depth,
                             include_web_content,
                             &mut Vec::new(),
@@ -481,6 +485,7 @@ unsafe fn walk_element(
     lines: &mut Vec<(usize, String)>,
     counter: &mut usize,
     budget: &mut WalkBudget,
+    batching_disabled: &mut bool,
     max_depth: usize,
     include_web_content: bool,
     deferred: &mut Vec<DeferredRow>,
@@ -521,6 +526,7 @@ unsafe fn walk_element(
                 lines,
                 counter,
                 budget,
+                batching_disabled,
                 max_depth,
                 include_web_content,
                 deferred,
@@ -535,20 +541,20 @@ unsafe fn walk_element(
     // This is critical for Calculator where AXTitle="" but AXDescription="2"
     // (digit buttons). Merging them would produce "2" (quoted) instead of (2)
     // (parens), breaking _find_calc_button which searches for "(2)".
-    let title = copy_string_attr(element, "AXTitle");
-    // Read AXValue once with enough type information to preserve the existing
-    // string-only markdown while also exposing numeric/boolean control state.
-    let copied_value = copy_stringish_attr(element, "AXValue");
-    let value = copied_value
-        .as_ref()
-        .and_then(|copied| copied.string_value.clone());
-    // AXPlaceholderValue as fallback for empty text fields.
-    let value = value
-        .filter(|v| !v.trim().is_empty())
-        .or_else(|| copy_string_attr(element, "AXPlaceholderValue"));
-    let description = copy_string_attr(element, "AXDescription");
-    let identifier = copy_string_attr(element, "AXIdentifier");
-    let help = copy_string_attr(element, "AXHelp").filter(|h| !h.trim().is_empty());
+    let Some(ContentAttrs {
+        title,
+        copied_value,
+        value,
+        description,
+        identifier,
+        help,
+    }) = read_content_attrs(element, budget, batching_disabled)
+    else {
+        let node = role_only_node(role, element as usize, depth, parent_index, in_web_content);
+        lines.push((depth, format_node_line(&node)));
+        nodes.push(node);
+        return;
+    };
     let actions = copy_action_names(element);
 
     let visible_title = title.as_deref().unwrap_or("").trim().to_owned();
@@ -588,6 +594,7 @@ unsafe fn walk_element(
             lines,
             counter,
             budget,
+            batching_disabled,
             max_depth,
             include_web_content,
             deferred,
@@ -722,6 +729,7 @@ unsafe fn walk_element(
         lines,
         counter,
         budget,
+        batching_disabled,
         max_depth,
         include_web_content,
         deferred,
@@ -739,6 +747,7 @@ unsafe fn walk_children(
     lines: &mut Vec<(usize, String)>,
     counter: &mut usize,
     budget: &mut WalkBudget,
+    batching_disabled: &mut bool,
     max_depth: usize,
     include_web_content: bool,
     deferred: &mut Vec<DeferredRow>,
@@ -776,12 +785,43 @@ unsafe fn walk_children(
                 lines,
                 counter,
                 budget,
+                batching_disabled,
                 max_depth,
                 include_web_content,
                 deferred,
             ),
         }
         CFRelease(child as CFTypeRef);
+    }
+}
+
+fn role_only_node(
+    role: String,
+    element_ptr: usize,
+    depth: usize,
+    parent_element_index: Option<usize>,
+    in_web_content: bool,
+) -> AXNode {
+    AXNode {
+        element_index: None,
+        role,
+        title: None,
+        value: None,
+        description: None,
+        identifier: None,
+        help: None,
+        actions: Vec::new(),
+        element_ptr,
+        depth,
+        parent_element_index,
+        frame: None,
+        value_state: None,
+        value_description: None,
+        min_value: None,
+        max_value: None,
+        enabled: None,
+        selected: None,
+        in_web_content,
     }
 }
 
@@ -796,7 +836,18 @@ fn is_web_content_role(role: &str) -> bool {
 
 #[cfg(test)]
 mod web_content_role_tests {
-    use super::is_web_content_role;
+    use super::{format_node_line, is_web_content_role, role_only_node};
+
+    #[test]
+    fn a_timed_out_content_read_emits_an_unaddressable_role_only_node() {
+        let node = role_only_node("AXButton".into(), 0, 2, Some(3), false);
+        assert_eq!(format_node_line(&node), "- AXButton");
+        assert_eq!(node.element_index, None);
+        assert!(node.actions.is_empty());
+        assert_eq!(node.frame, None);
+        assert_eq!(node.depth, 2);
+        assert_eq!(node.parent_element_index, Some(3));
+    }
 
     #[test]
     fn recognizes_native_web_document_roles_without_marking_app_chrome() {

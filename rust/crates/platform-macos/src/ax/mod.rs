@@ -16,7 +16,9 @@
 //! - Non-indexed (no actions, not interesting): `- AXRole = "value"`
 //! - 2-space indent per depth level
 
+mod batch_attrs;
 pub mod bindings;
+mod content_attrs;
 pub mod dense_rows;
 pub mod enablement;
 pub mod exact_target;
