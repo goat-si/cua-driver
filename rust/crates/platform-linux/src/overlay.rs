@@ -4520,9 +4520,11 @@ mod tests {
         let core = &mut map.cursors.get_mut("default").unwrap().core;
         core.pos = (-1.0e9, -1.0e9);
         core.placed = true;
-        assert!(map.needs_frame_tick());
+        assert!(!map.needs_frame_tick());
+        assert!(render_map_needs_z_order_tick(&map));
         map.cursors.get_mut("default").unwrap().core.placed = false;
         assert!(!map.needs_frame_tick());
+        assert!(!render_map_needs_z_order_tick(&map));
     }
 
     #[test]
