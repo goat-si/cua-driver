@@ -5,6 +5,7 @@
     "click": "Upstream #6033 (41591b1b39) adds optional wait_for_window_change?: boolean to action tool inputSchema; additive and backward-compatible with GOAT callers.",
     "double_click": "Upstream #6033 (41591b1b39) adds optional wait_for_window_change?: boolean to action tool inputSchema; additive and backward-compatible with GOAT callers.",
     "drag": "Upstream #6033 (41591b1b39) adds optional wait_for_window_change?: boolean to action tool inputSchema; additive and backward-compatible with GOAT callers.",
+    "get_window_state": "Upstream #5487/#5686 updates Windows get_window_state inputSchema property description metadata; wire parameters and types remain backward-compatible with GOAT callers.",
     "hotkey": "Upstream #6033 (41591b1b39) adds optional wait_for_window_change?: boolean to action tool inputSchema; additive and backward-compatible with GOAT callers.",
     "launch_app": "Upstream #6033 (41591b1b39) adds optional wait_for_window_change?: boolean to action tool inputSchema; additive and backward-compatible with GOAT callers.",
     "press_key": "Upstream #6033 (41591b1b39) adds optional wait_for_window_change?: boolean to action tool inputSchema; additive and backward-compatible with GOAT callers.",

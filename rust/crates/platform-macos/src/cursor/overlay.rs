@@ -1616,7 +1616,8 @@ mod tests {
         let mut map = empty_map();
         let cursor = placed(&mut map, "sessA");
         cursor.core.motion.idle_hide_ms = 20_000.0;
-        assert!(cursor.core.has_resting_motion());
+        assert!(!cursor.core.has_resting_motion());
+        assert!(!cursor.core.needs_frame_tick());
         assert!(map.needs_frame_tick());
 
         let cursor = map.cursors.get_mut("sessA").unwrap();

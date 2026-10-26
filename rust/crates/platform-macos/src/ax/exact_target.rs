@@ -207,6 +207,112 @@ pub unsafe fn focused_element_in_window(pid: i32, window_id: u32) -> Option<AXUI
     }
 }
 
+/// Classification of whether a window-scoped keyboard action conflicts with
+/// the addressed element's window or a competing sibling window's focus.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WindowFocusConflict {
+    /// Neither the addressed element nor the process's focused element/window
+    /// belongs to a different window of the same PID.
+    Clear,
+    /// An explicitly addressed element resolved outside `target_window_id`
+    /// (or its window ancestry could not be proven).
+    AddressedElementOutsideWindow {
+        target_window_id: u32,
+        actual_window_id: Option<u32>,
+    },
+    /// The process's focused element or `AXFocusedWindow` belongs to a
+    /// sibling window (`sibling_window_id != target_window_id`), so a
+    /// process-scoped key event risks landing in that sibling window.
+    SiblingWindowFocused {
+        target_window_id: u32,
+        sibling_window_id: u32,
+    },
+}
+
+/// Pure decision for [`check_window_focus_conflict`].
+pub fn decide_window_focus_conflict(
+    target_window_id: u32,
+    addressed_element_window: Option<Option<u32>>,
+    addressed_in_menu_bar: bool,
+    focused_element_window: Option<u32>,
+    focused_window_id: Option<u32>,
+) -> WindowFocusConflict {
+    if let Some(actual) = addressed_element_window {
+        match actual {
+            Some(wid) if wid == target_window_id => {}
+            None if addressed_in_menu_bar => {}
+            other => {
+                return WindowFocusConflict::AddressedElementOutsideWindow {
+                    target_window_id,
+                    actual_window_id: other,
+                };
+            }
+        }
+    }
+    if let Some(sibling_window_id) = focused_element_window.filter(|&w| w != target_window_id) {
+        return WindowFocusConflict::SiblingWindowFocused {
+            target_window_id,
+            sibling_window_id,
+        };
+    }
+    if let Some(sibling_window_id) = focused_window_id.filter(|&w| w != target_window_id) {
+        return WindowFocusConflict::SiblingWindowFocused {
+            target_window_id,
+            sibling_window_id,
+        };
+    }
+    WindowFocusConflict::Clear
+}
+
+/// Inspect live AX state immediately before a window-scoped keyboard dispatch
+/// to verify that neither the addressed element nor the process's current
+/// focus belongs to a sibling window of `pid`.
+pub fn check_window_focus_conflict(
+    pid: i32,
+    target_window_id: u32,
+    addressed_element_ptr: Option<usize>,
+) -> WindowFocusConflict {
+    unsafe {
+        let app = AXUIElementCreateApplication(pid);
+        if app.is_null() {
+            return match addressed_element_ptr {
+                Some(_) => WindowFocusConflict::AddressedElementOutsideWindow {
+                    target_window_id,
+                    actual_window_id: None,
+                },
+                None => WindowFocusConflict::Clear,
+            };
+        }
+        let (addressed_window, in_menu_bar) = match addressed_element_ptr {
+            Some(ptr) => {
+                let el = ptr as AXUIElementRef;
+                let win = element_window_id(el);
+                let menu = win.is_none() && element_in_app_menu_bar(app, el);
+                (Some(win), menu)
+            }
+            None => (None, false),
+        };
+        let focused_element_window = focused_element_of_pid(pid).and_then(|focused| {
+            let win = element_window_id(focused);
+            CFRelease(focused as CFTypeRef);
+            win
+        });
+        let focused_window_id = copy_element_attr(app, "AXFocusedWindow").and_then(|window| {
+            let wid = ax_get_window_id(window);
+            CFRelease(window as CFTypeRef);
+            wid
+        });
+        CFRelease(app as CFTypeRef);
+        decide_window_focus_conflict(
+            target_window_id,
+            addressed_window,
+            in_menu_bar,
+            focused_element_window,
+            focused_window_id,
+        )
+    }
+}
+
 /// One fresh `AXWindows` row: the mapped CGWindowID plus its minimized state.
 /// `minimized: None` means the attribute could not be read — unknown, not
 /// "not minimized".
@@ -523,6 +629,41 @@ mod tests {
         assert_eq!(
             count_competing_keyboard_destinations(42, 10, rows, &records, true),
             0
+        );
+    }
+
+    #[test]
+    fn window_focus_conflict_detects_sibling_focus_and_foreign_elements() {
+        use super::{decide_window_focus_conflict, WindowFocusConflict};
+
+        assert_eq!(
+            decide_window_focus_conflict(700, Some(Some(700)), false, Some(700), Some(700)),
+            WindowFocusConflict::Clear
+        );
+        assert_eq!(
+            decide_window_focus_conflict(700, Some(None), true, None, Some(700)),
+            WindowFocusConflict::Clear
+        );
+        assert_eq!(
+            decide_window_focus_conflict(700, Some(Some(888)), false, Some(700), Some(700)),
+            WindowFocusConflict::AddressedElementOutsideWindow {
+                target_window_id: 700,
+                actual_window_id: Some(888),
+            }
+        );
+        assert_eq!(
+            decide_window_focus_conflict(700, None, false, Some(888), Some(700)),
+            WindowFocusConflict::SiblingWindowFocused {
+                target_window_id: 700,
+                sibling_window_id: 888,
+            }
+        );
+        assert_eq!(
+            decide_window_focus_conflict(700, None, false, None, Some(888)),
+            WindowFocusConflict::SiblingWindowFocused {
+                target_window_id: 700,
+                sibling_window_id: 888,
+            }
         );
     }
 }

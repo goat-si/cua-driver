@@ -135,6 +135,101 @@ pub fn background_unavailable_result_with_suggestion(
     ToolResult::error(message).with_structured(Value::Object(structured))
 }
 
+/// Default minimum physical-input idle window (in milliseconds) required
+/// before an explicit `delivery_mode:"foreground"` action may front a window
+/// or inject into the global HID/SendInput stream.
+pub const DEFAULT_FOREGROUND_IDLE_THRESHOLD_MS: u64 = 1_000;
+
+/// Optional daemon environment override for `DEFAULT_FOREGROUND_IDLE_THRESHOLD_MS`.
+/// Setting this to `0` disables the foreground physical-idle preflight gate.
+pub const FOREGROUND_IDLE_THRESHOLD_ENV: &str = "CUA_DRIVER_FOREGROUND_IDLE_MS";
+
+/// Stable error code returned when `delivery_mode:"foreground"` is refused
+/// because physical keyboard/mouse input occurred within the idle threshold.
+pub const FOREGROUND_USER_ACTIVE_CODE: &str = "foreground_user_active";
+
+/// Outcome of checking whether physical user input is idle before a foreground
+/// delivery step.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum PhysicalInputIdleGate {
+    /// Physical input has been idle for at least `threshold_ms` (or the
+    /// threshold is disabled / no contradicting sensor reading exists).
+    Idle {
+        idle_ms: Option<u64>,
+        threshold_ms: u64,
+    },
+    /// The user interacted with physical input hardware within `threshold_ms`.
+    UserActive { idle_ms: u64, threshold_ms: u64 },
+}
+
+/// Parse `FOREGROUND_IDLE_THRESHOLD_ENV` or fall back to
+/// `DEFAULT_FOREGROUND_IDLE_THRESHOLD_MS`. Invalid strings keep the default.
+pub fn resolve_foreground_idle_threshold_ms(env_val: Option<&str>) -> u64 {
+    env_val
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(DEFAULT_FOREGROUND_IDLE_THRESHOLD_MS)
+}
+
+/// Read the active foreground idle threshold from the daemon environment.
+pub fn foreground_idle_threshold_ms() -> u64 {
+    resolve_foreground_idle_threshold_ms(
+        std::env::var(FOREGROUND_IDLE_THRESHOLD_ENV).ok().as_deref(),
+    )
+}
+
+/// Compute elapsed milliseconds between two 32-bit OS tick counters
+/// (such as Windows `GetTickCount()` and `LASTINPUTINFO::dwTime`), handling
+/// 49.7-day `u32` wraparound via wrapping subtraction.
+pub fn elapsed_idle_ms_from_ticks(now_ticks: u32, last_input_ticks: u32) -> u64 {
+    u64::from(now_ticks.wrapping_sub(last_input_ticks))
+}
+
+/// Pure decision for whether a foreground action may proceed given an observed
+/// physical-input idle duration in milliseconds.
+pub fn evaluate_physical_input_idle(
+    observed_idle_ms: Option<u64>,
+    threshold_ms: u64,
+) -> PhysicalInputIdleGate {
+    if threshold_ms == 0 {
+        return PhysicalInputIdleGate::Idle {
+            idle_ms: observed_idle_ms,
+            threshold_ms,
+        };
+    }
+    match observed_idle_ms {
+        Some(idle_ms) if idle_ms < threshold_ms => PhysicalInputIdleGate::UserActive {
+            idle_ms,
+            threshold_ms,
+        },
+        idle_ms => PhysicalInputIdleGate::Idle {
+            idle_ms,
+            threshold_ms,
+        },
+    }
+}
+
+/// Build the structured refusal returned when `delivery_mode:"foreground"`
+/// is blocked by recent physical user input.
+pub fn foreground_user_active_result(idle_ms: u64, threshold_ms: u64, fields: Value) -> ToolResult {
+    let mut structured = match fields {
+        Value::Object(fields) => fields,
+        _ => serde_json::Map::new(),
+    };
+    let suggestion = "Wait until physical keyboard/mouse input is idle before retrying delivery_mode:\"foreground\", or use a background-compatible route.";
+    structured.insert("code".to_owned(), json!(FOREGROUND_USER_ACTIVE_CODE));
+    structured.insert("effect".to_owned(), json!("refused"));
+    structured.insert("dispatched".to_owned(), json!(false));
+    structured.insert("idle_ms".to_owned(), json!(idle_ms));
+    structured.insert("required_idle_ms".to_owned(), json!(threshold_ms));
+    structured.insert("suggestion".to_owned(), json!(suggestion));
+    ToolResult::error(format!(
+        "Foreground delivery refused ({FOREGROUND_USER_ACTIVE_CODE}): physical user input was detected {idle_ms} ms ago (requires at least {threshold_ms} ms of idle time). {suggestion}"
+    ))
+    .with_structured(Value::Object(structured))
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
@@ -248,5 +343,71 @@ mod tests {
             }
             _ => panic!("expected text content"),
         }
+    }
+
+    #[test]
+    fn physical_input_idle_gate_refuses_when_user_was_recently_active() {
+        assert_eq!(
+            evaluate_physical_input_idle(Some(250), 1_000),
+            PhysicalInputIdleGate::UserActive {
+                idle_ms: 250,
+                threshold_ms: 1_000,
+            }
+        );
+        assert_eq!(
+            evaluate_physical_input_idle(Some(1_000), 1_000),
+            PhysicalInputIdleGate::Idle {
+                idle_ms: Some(1_000),
+                threshold_ms: 1_000,
+            }
+        );
+        assert_eq!(
+            evaluate_physical_input_idle(None, 1_000),
+            PhysicalInputIdleGate::Idle {
+                idle_ms: None,
+                threshold_ms: 1_000,
+            }
+        );
+        assert_eq!(
+            evaluate_physical_input_idle(Some(10), 0),
+            PhysicalInputIdleGate::Idle {
+                idle_ms: Some(10),
+                threshold_ms: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn foreground_idle_threshold_env_parser_handles_defaults_and_zero() {
+        assert_eq!(
+            resolve_foreground_idle_threshold_ms(None),
+            DEFAULT_FOREGROUND_IDLE_THRESHOLD_MS
+        );
+        assert_eq!(
+            resolve_foreground_idle_threshold_ms(Some("invalid")),
+            DEFAULT_FOREGROUND_IDLE_THRESHOLD_MS
+        );
+        assert_eq!(resolve_foreground_idle_threshold_ms(Some("0")), 0);
+        assert_eq!(resolve_foreground_idle_threshold_ms(Some(" 2500 ")), 2_500);
+    }
+
+    #[test]
+    fn tick_wraparound_computes_exact_elapsed_idle_ms() {
+        assert_eq!(elapsed_idle_ms_from_ticks(5_000, 4_200), 800);
+        assert_eq!(elapsed_idle_ms_from_ticks(100, u32::MAX - 49), 150);
+    }
+
+    #[test]
+    fn foreground_user_active_result_carries_refusal_contract() {
+        let res = foreground_user_active_result(180, 1_000, json!({"pid": 42, "window_id": 7}));
+        assert_eq!(res.is_error, Some(true));
+        let structured = res.structured_content.unwrap();
+        assert_eq!(structured["code"], FOREGROUND_USER_ACTIVE_CODE);
+        assert_eq!(structured["effect"], "refused");
+        assert_eq!(structured["dispatched"], false);
+        assert_eq!(structured["idle_ms"], 180);
+        assert_eq!(structured["required_idle_ms"], 1_000);
+        assert_eq!(structured["pid"], 42);
+        assert_eq!(structured["window_id"], 7);
     }
 }

@@ -7,6 +7,8 @@
 //! same structured fields and the same note on every platform.
 
 use serde_json::{json, Value};
+use std::collections::HashMap;
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 /// Why a walk stopped before it had visited every node it discovered.
@@ -20,6 +22,9 @@ pub enum WalkStop {
     /// accessibility API before `timeout_ms` ran out (still launching, or not
     /// yet registered), so nothing was walked.
     AppLookupTimeout,
+    /// The target repeatedly timed out or stopped answering its accessibility
+    /// API and is inside the hung-target circuit-breaker cooldown window.
+    AppUnresponsive,
 }
 
 impl WalkStop {
@@ -28,6 +33,7 @@ impl WalkStop {
             WalkStop::Timeout => "timeout",
             WalkStop::NodeBudget => "node_budget",
             WalkStop::AppLookupTimeout => "app_lookup_timeout",
+            WalkStop::AppUnresponsive => "app_unresponsive",
         }
     }
 }
@@ -123,6 +129,12 @@ impl WalkBudget {
     /// so the walk visited nothing.
     pub fn stop_for_app_lookup_timeout(&mut self) {
         self.stop.get_or_insert(WalkStop::AppLookupTimeout);
+    }
+
+    /// Record that the target application is inside a hung-target cooldown
+    /// window after a prior accessibility timeout, short-circuiting the walk.
+    pub fn stop_for_app_unresponsive(&mut self) {
+        self.stop.get_or_insert(WalkStop::AppUnresponsive);
     }
 
     pub fn outcome(&self) -> WalkOutcome {
@@ -227,6 +239,122 @@ pub fn truncation_note(
          Every element listed is real; elements after the cut are missing. If the element you \
          need is absent, {remedy} or narrow with query / max_depth."
     )
+}
+
+/// Default short-term cooldown window during which a target that timed out is
+/// short-circuited instead of issuing another blocking accessibility walk.
+pub const DEFAULT_HUNG_TARGET_COOLDOWN: Duration = Duration::from_millis(1_000);
+
+/// Key identifying an accessibility walk target: `(pid, window_id_or_0)`.
+pub type WalkTargetKey = (i32, u64);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct BreakerEntry {
+    tripped_at: Instant,
+    consecutive_timeouts: u32,
+}
+
+/// Short-term circuit breaker that prevents back-to-back accessibility walks
+/// against an unresponsive target from cascading into multi-second stalls.
+#[derive(Debug)]
+pub struct HungTargetCircuitBreaker {
+    cooldown: Duration,
+    entries: Mutex<HashMap<WalkTargetKey, BreakerEntry>>,
+}
+
+impl Default for HungTargetCircuitBreaker {
+    fn default() -> Self {
+        Self::new(DEFAULT_HUNG_TARGET_COOLDOWN)
+    }
+}
+
+impl HungTargetCircuitBreaker {
+    pub fn new(cooldown: Duration) -> Self {
+        Self {
+            cooldown,
+            entries: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Whether `target` is currently inside its cooldown window at `now`.
+    pub fn is_open_at(&self, target: WalkTargetKey, now: Instant) -> bool {
+        let mut map = self
+            .entries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(entry) = map.get(&target).copied() else {
+            return false;
+        };
+        if now.saturating_duration_since(entry.tripped_at) < self.cooldown {
+            true
+        } else {
+            map.remove(&target);
+            false
+        }
+    }
+
+    /// Pre-walk gate: if `target` timed out within `self.cooldown` of `now`,
+    /// trips `budget.stop_for_app_unresponsive()` and returns `false` so the
+    /// caller can short-circuit before issuing blocking accessibility IPC.
+    pub fn preflight_at(
+        &self,
+        target: WalkTargetKey,
+        budget: &mut WalkBudget,
+        now: Instant,
+    ) -> bool {
+        if self.is_open_at(target, now) {
+            budget.stop_for_app_unresponsive();
+            false
+        } else {
+            true
+        }
+    }
+
+    pub fn preflight(&self, target: WalkTargetKey, budget: &mut WalkBudget) -> bool {
+        self.preflight_at(target, budget, Instant::now())
+    }
+
+    /// Post-walk bookkeeper: records `WalkStop::Timeout` /
+    /// `WalkStop::AppUnresponsive` at `now`, or clears the entry when a walk
+    /// completes without an accessibility responsiveness timeout.
+    pub fn record_outcome_at(&self, target: WalkTargetKey, outcome: &WalkOutcome, now: Instant) {
+        let mut map = self
+            .entries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match outcome.stop {
+            Some(WalkStop::Timeout | WalkStop::AppUnresponsive) => {
+                let prev = map.get(&target).map_or(0, |e| e.consecutive_timeouts);
+                map.insert(
+                    target,
+                    BreakerEntry {
+                        tripped_at: now,
+                        consecutive_timeouts: prev.saturating_add(1),
+                    },
+                );
+            }
+            None | Some(WalkStop::NodeBudget) => {
+                map.remove(&target);
+            }
+            Some(WalkStop::AppLookupTimeout) => {}
+        }
+    }
+
+    pub fn record_outcome(&self, target: WalkTargetKey, outcome: &WalkOutcome) {
+        self.record_outcome_at(target, outcome, Instant::now());
+    }
+
+    /// Number of consecutive timeouts recorded for `target` if still active.
+    pub fn consecutive_timeouts_at(&self, target: WalkTargetKey, now: Instant) -> u32 {
+        if !self.is_open_at(target, now) {
+            return 0;
+        }
+        self.entries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&target)
+            .map_or(0, |e| e.consecutive_timeouts)
+    }
 }
 
 #[cfg(test)]
@@ -336,5 +464,66 @@ mod tests {
         assert!(note.contains("still be launching"));
         let note = truncation_note(Some("huge_container"), 1000, 1918, 0);
         assert!(note.contains("not expanded"));
+    }
+
+    #[test]
+    fn hung_target_circuit_breaker_short_circuits_within_cooldown_and_resets_after() {
+        let breaker = HungTargetCircuitBreaker::new(Duration::from_millis(1_000));
+        let target: WalkTargetKey = (4242, 100);
+        let t0 = Instant::now();
+
+        let mut first_budget = WalkBudget::new(1000, 100);
+        assert!(breaker.preflight_at(target, &mut first_budget, t0));
+        first_budget.stop_for_timeout();
+        let timed_out = first_budget.outcome();
+        breaker.record_outcome_at(target, &timed_out, t0);
+        assert_eq!(breaker.consecutive_timeouts_at(target, t0), 1);
+
+        // Within the 1000ms cooldown window: preflight trips AppUnresponsive.
+        let mut second_budget = WalkBudget::new(1000, 100);
+        assert!(!breaker.preflight_at(target, &mut second_budget, t0 + Duration::from_millis(250)));
+        assert!(!second_budget.admit());
+        let short_circuited = second_budget.outcome();
+        assert_eq!(short_circuited.reason(), Some("app_unresponsive"));
+        assert!(short_circuited
+            .note()
+            .unwrap()
+            .contains("stopped answering its accessibility API"));
+
+        // A different window or PID is unaffected.
+        let mut sibling_budget = WalkBudget::new(1000, 100);
+        assert!(breaker.preflight_at(
+            (4242, 101),
+            &mut sibling_budget,
+            t0 + Duration::from_millis(250)
+        ));
+
+        // Once the cooldown expires, preflight permits a new walk.
+        let t_expired = t0 + Duration::from_millis(1_001);
+        let mut third_budget = WalkBudget::new(1000, 100);
+        assert!(breaker.preflight_at(target, &mut third_budget, t_expired));
+        assert_eq!(breaker.consecutive_timeouts_at(target, t_expired), 0);
+    }
+
+    #[test]
+    fn hung_target_circuit_breaker_clears_on_complete_or_node_budget_walk() {
+        let breaker = HungTargetCircuitBreaker::new(Duration::from_millis(1_000));
+        let target: WalkTargetKey = (77, 1);
+        let t0 = Instant::now();
+
+        let timed_out = WalkOutcome::timed_out(1000, Duration::from_millis(1000));
+        breaker.record_outcome_at(target, &timed_out, t0);
+        assert!(breaker.is_open_at(target, t0 + Duration::from_millis(100)));
+
+        // A walk that hits NodeBudget proves the app is responsive again.
+        let mut node_capped = WalkBudget::nodes_only(1);
+        assert!(node_capped.admit());
+        assert!(!node_capped.admit());
+        breaker.record_outcome_at(
+            target,
+            &node_capped.outcome(),
+            t0 + Duration::from_millis(200),
+        );
+        assert!(!breaker.is_open_at(target, t0 + Duration::from_millis(250)));
     }
 }

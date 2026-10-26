@@ -118,11 +118,15 @@ pub mod msaa;
 
 #[cfg(target_os = "windows")]
 pub mod input;
+#[cfg(not(target_os = "windows"))]
+pub mod input {
+    pub mod delivery;
+}
 
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", test))]
 pub mod capture;
 mod capture_admission;
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", test))]
 mod clipboard;
 
 #[cfg(target_os = "windows")]

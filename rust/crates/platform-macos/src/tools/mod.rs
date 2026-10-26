@@ -278,6 +278,78 @@ pub(crate) use health_report::sw_vers_product_version as macos_product_version;
 /// (`element_index` vs `x/y`, which selects AX vs pixel).
 pub use cua_driver_core::delivery::DeliveryMode;
 
+#[link(name = "ApplicationServices", kind = "framework")]
+extern "C" {
+    fn CGEventSourceSecondsSinceLastEventType(state: i32, event_type: u32) -> f64;
+}
+
+/// Query `kCGEventSourceStateHIDSystemState` across physical mouse, keyboard,
+/// modifier, and scroll-wheel event types and return the minimum elapsed time
+/// in milliseconds since the user last touched physical hardware.
+pub(crate) fn physical_input_idle_ms() -> Option<u64> {
+    const HID_SYSTEM_STATE: i32 = 1;
+    const PHYSICAL_EVENT_TYPES: [u32; 11] = [
+        1,  // kCGEventLeftMouseDown
+        2,  // kCGEventLeftMouseUp
+        3,  // kCGEventRightMouseDown
+        4,  // kCGEventRightMouseUp
+        5,  // kCGEventMouseMoved
+        6,  // kCGEventLeftMouseDragged
+        7,  // kCGEventRightMouseDragged
+        10, // kCGEventKeyDown
+        11, // kCGEventKeyUp
+        12, // kCGEventFlagsChanged
+        22, // kCGEventScrollWheel
+    ];
+    PHYSICAL_EVENT_TYPES
+        .into_iter()
+        .filter_map(|kind| {
+            let secs = unsafe { CGEventSourceSecondsSinceLastEventType(HID_SYSTEM_STATE, kind) };
+            (secs.is_finite() && secs >= 0.0).then(|| (secs * 1_000.0) as u64)
+        })
+        .min()
+}
+
+/// Pure preflight evaluation for a macOS foreground delivery request.
+pub(crate) fn gate_foreground_physical_idle_with_sample(
+    pid: i32,
+    window_id: Option<u32>,
+    observed_idle_ms: Option<u64>,
+    threshold_ms: u64,
+) -> Result<(), cua_driver_core::protocol::ToolResult> {
+    use cua_driver_core::delivery::{
+        evaluate_physical_input_idle, foreground_user_active_result, PhysicalInputIdleGate,
+    };
+    match evaluate_physical_input_idle(observed_idle_ms, threshold_ms) {
+        PhysicalInputIdleGate::Idle { .. } => Ok(()),
+        PhysicalInputIdleGate::UserActive {
+            idle_ms,
+            threshold_ms,
+        } => Err(foreground_user_active_result(
+            idle_ms,
+            threshold_ms,
+            serde_json::json!({
+                "pid": pid,
+                "window_id": window_id,
+            }),
+        )),
+    }
+}
+
+/// Refuse `delivery_mode:"foreground"` when the user has generated physical
+/// hardware input within `CUA_DRIVER_FOREGROUND_IDLE_MS` (default 1000 ms).
+pub(crate) fn gate_foreground_physical_idle(
+    pid: i32,
+    window_id: Option<u32>,
+) -> Result<(), cua_driver_core::protocol::ToolResult> {
+    gate_foreground_physical_idle_with_sample(
+        pid,
+        window_id,
+        physical_input_idle_ms(),
+        cua_driver_core::delivery::foreground_idle_threshold_ms(),
+    )
+}
+
 /// Convert a pure background-input refusal into the structured refusal result
 /// shape shared by exact-target tools: `code`, `effect: "refused"`, the
 /// requested target, and the safe next route when one exists. No actuator ran.
@@ -604,6 +676,7 @@ pub(crate) async fn focus_by_pixel(
 
     // Some renderer surfaces do not expose a usable AX focus action. The
     // explicit foreground rung retains its real-click fallback for them.
+    gate_foreground_physical_idle(pid, window_id)?;
     let mut click_args = serde_json::json!({
         "pid": pid, "x": x, "y": y,
         "delivery_mode": "foreground",

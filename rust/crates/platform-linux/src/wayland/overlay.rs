@@ -1730,13 +1730,16 @@ mod tests {
         let mut core = positioned_core();
         core.idle_secs = 0.25;
         core.pos = (-1.0e9, -1.0e9);
-        assert!(needs_frame_tick(&core));
+        assert!(!needs_frame_tick(&core));
         core.placed = false;
         assert!(!needs_frame_tick(&core));
         core.placed = true;
-        assert!(core.has_resting_motion());
+        assert!(!core.has_resting_motion());
         let mut cores = CursorMap::from([("cursor-a".to_owned(), core)]);
-        assert_eq!(next_wait(&cores, false, false), WlWait::Frame);
+        assert_eq!(
+            next_wait(&cores, false, false),
+            WlWait::Deadline(Duration::from_millis(750))
+        );
 
         // Hidden cursors never tick, even with resting motion enabled.
         cores.get_mut("cursor-a").unwrap().visible = false;

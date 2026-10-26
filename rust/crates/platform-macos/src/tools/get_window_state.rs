@@ -20,6 +20,10 @@ impl GetWindowStateTool {
 
 static DEF: std::sync::OnceLock<ToolDef> = std::sync::OnceLock::new();
 
+static HUNG_TARGET_BREAKER: std::sync::LazyLock<
+    cua_driver_core::walk_budget::HungTargetCircuitBreaker,
+> = std::sync::LazyLock::new(cua_driver_core::walk_budget::HungTargetCircuitBreaker::default);
+
 /// Slack past `timeout_ms` before the walk task is abandoned: one in-flight AX
 /// call may still be waiting on its messaging timeout.
 const AX_WALK_BACKSTOP_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
@@ -329,6 +333,22 @@ impl Tool for GetWindowStateTool {
             // for an AX call that ignores the per-element messaging timeout
             // (dropping a spawn_blocking JoinHandle cannot cancel it).
             let walk_future = tokio::task::spawn_blocking(move || {
+                let target_key = (pid, u64::from(window_id));
+                let mut budget =
+                    cua_driver_core::walk_budget::WalkBudget::new(timeout_ms, max_elements);
+                if !HUNG_TARGET_BREAKER.preflight(target_key, &mut budget) {
+                    let walk = budget.outcome();
+                    let tree_markdown = walk.note().unwrap_or_default();
+                    let tree = crate::ax::tree::TreeWalkResult {
+                        tree_markdown,
+                        nodes: Vec::new(),
+                        truncated: true,
+                        walk,
+                        window_scope: Some(crate::ax::window_scope::WindowScope::Matched),
+                    };
+                    let payload = crate::ax::snapshot::AxSnapshot::from_nodes(&tree.nodes);
+                    return (tree, payload);
+                }
                 let tree = crate::ax::tree::with_menus_collapsed(collapse_menus, || {
                     crate::ax::dense_rows::with_dense_rows_windowed(window_dense_rows, || {
                         crate::ax::tree::walk_tree_budgeted(
@@ -336,10 +356,11 @@ impl Tool for GetWindowStateTool {
                             Some(window_id),
                             q.as_deref(),
                             max_depth,
-                            cua_driver_core::walk_budget::WalkBudget::new(timeout_ms, max_elements),
+                            budget,
                         )
                     })
                 });
+                HUNG_TARGET_BREAKER.record_outcome(target_key, &tree.walk);
                 let payload = crate::ax::snapshot::AxSnapshot::from_nodes(&tree.nodes);
                 (tree, payload)
             });
@@ -351,6 +372,10 @@ impl Tool for GetWindowStateTool {
                 Ok(Ok((tree, payload))) => (Some(tree), Some(payload)),
                 Ok(Err(e)) => return ToolResult::error(format!("AX tree walk failed: {e}")),
                 Err(_elapsed) => {
+                    HUNG_TARGET_BREAKER.record_outcome(
+                        (pid, u64::from(window_id)),
+                        &cua_driver_core::walk_budget::WalkOutcome::timed_out(timeout_ms, backstop),
+                    );
                     return ToolResult::error(format!(
                         "AX tree walk for pid={pid} did not return within {} s: an \
                          accessibility call stopped answering past the {timeout_ms} ms \

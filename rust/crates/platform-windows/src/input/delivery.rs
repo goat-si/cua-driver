@@ -98,6 +98,7 @@ pub fn delivery_mode_schema() -> Value {
 ///
 /// Combines the existing `is_chromium_target_window` detector with new GTK
 /// (`gdkWindowToplevel` / `gdkSurfaceToplevel`) detection.
+#[cfg(target_os = "windows")]
 pub fn would_be_silently_dropped(hwnd: u64, kind: EventKind) -> bool {
     use EventKind::*;
     if crate::input::is_chromium_target_window(hwnd) {
@@ -169,6 +170,11 @@ pub fn would_be_silently_dropped(hwnd: u64, kind: EventKind) -> bool {
     false
 }
 
+#[cfg(not(target_os = "windows"))]
+pub fn would_be_silently_dropped(_hwnd: u64, _kind: EventKind) -> bool {
+    false
+}
+
 fn wpf_drops_event(kind: EventKind, target_is_foreground: bool) -> bool {
     matches!(kind, EventKind::MouseClick | EventKind::MouseMove)
         || (!target_is_foreground && matches!(kind, EventKind::Keystroke | EventKind::KeyCombo))
@@ -182,16 +188,24 @@ fn tk_drops_event(kind: EventKind) -> bool {
 }
 
 fn target_is_foreground(hwnd: u64) -> bool {
-    use windows::Win32::Foundation::HWND;
-    use windows::Win32::UI::WindowsAndMessaging::{GetAncestor, GetForegroundWindow, GA_ROOT};
-    if hwnd == 0 {
-        return false;
+    #[cfg(target_os = "windows")]
+    {
+        use windows::Win32::Foundation::HWND;
+        use windows::Win32::UI::WindowsAndMessaging::{GetAncestor, GetForegroundWindow, GA_ROOT};
+        if hwnd == 0 {
+            return false;
+        }
+        unsafe {
+            let target = GetAncestor(HWND(hwnd as *mut _), GA_ROOT);
+            let foreground = GetForegroundWindow();
+            let foreground_root = GetAncestor(foreground, GA_ROOT);
+            !target.0.is_null() && target == foreground_root
+        }
     }
-    unsafe {
-        let target = GetAncestor(HWND(hwnd as *mut _), GA_ROOT);
-        let foreground = GetForegroundWindow();
-        let foreground_root = GetAncestor(foreground, GA_ROOT);
-        !target.0.is_null() && target == foreground_root
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = hwnd;
+        false
     }
 }
 
@@ -203,18 +217,26 @@ fn target_is_foreground(hwnd: u64) -> bool {
 /// `SALTMPSUBFRAME` (transient). The `SAL` prefix is unique enough to
 /// match by leading characters.
 pub fn is_vcl_target_window(hwnd: u64) -> bool {
-    use windows::Win32::Foundation::HWND;
-    use windows::Win32::UI::WindowsAndMessaging::GetClassNameW;
-    if hwnd == 0 {
-        return false;
+    #[cfg(target_os = "windows")]
+    {
+        use windows::Win32::Foundation::HWND;
+        use windows::Win32::UI::WindowsAndMessaging::GetClassNameW;
+        if hwnd == 0 {
+            return false;
+        }
+        let mut buf = [0u16; 64];
+        let n = unsafe { GetClassNameW(HWND(hwnd as *mut _), &mut buf) };
+        if n <= 0 {
+            return false;
+        }
+        let class = String::from_utf16_lossy(&buf[..n as usize]);
+        class.starts_with("SAL")
     }
-    let mut buf = [0u16; 64];
-    let n = unsafe { GetClassNameW(HWND(hwnd as *mut _), &mut buf) };
-    if n <= 0 {
-        return false;
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = hwnd;
+        false
     }
-    let class = String::from_utf16_lossy(&buf[..n as usize]);
-    class.starts_with("SAL")
 }
 
 /// Detect WPF top-level windows. WPF hosts its visual tree in an HWND whose
@@ -261,34 +283,50 @@ pub fn is_winui3_target_window(hwnd: u64) -> bool {
 /// append a suffix the way Chromium does (`Chrome_WidgetWin_0` /
 /// `Chrome_WidgetWin_1`).
 pub fn is_gtk_target_window(hwnd: u64) -> bool {
-    use windows::Win32::Foundation::HWND;
-    use windows::Win32::UI::WindowsAndMessaging::GetClassNameW;
-    if hwnd == 0 {
-        return false;
+    #[cfg(target_os = "windows")]
+    {
+        use windows::Win32::Foundation::HWND;
+        use windows::Win32::UI::WindowsAndMessaging::GetClassNameW;
+        if hwnd == 0 {
+            return false;
+        }
+        let mut buf = [0u16; 64];
+        let n = unsafe { GetClassNameW(HWND(hwnd as *mut _), &mut buf) };
+        if n <= 0 {
+            return false;
+        }
+        let class = String::from_utf16_lossy(&buf[..n as usize]);
+        class.starts_with("gdkWindow") || class.starts_with("gdkSurface")
     }
-    let mut buf = [0u16; 64];
-    let n = unsafe { GetClassNameW(HWND(hwnd as *mut _), &mut buf) };
-    if n <= 0 {
-        return false;
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = hwnd;
+        false
     }
-    let class = String::from_utf16_lossy(&buf[..n as usize]);
-    class.starts_with("gdkWindow") || class.starts_with("gdkSurface")
 }
 
 /// Read a window's class name into an owned String. Best-effort; returns
 /// `"<unknown>"` on any failure so it can drop straight into a diagnostic.
 pub fn read_class_name(hwnd: u64) -> String {
-    use windows::Win32::Foundation::HWND;
-    use windows::Win32::UI::WindowsAndMessaging::GetClassNameW;
-    if hwnd == 0 {
-        return "<unknown>".into();
+    #[cfg(target_os = "windows")]
+    {
+        use windows::Win32::Foundation::HWND;
+        use windows::Win32::UI::WindowsAndMessaging::GetClassNameW;
+        if hwnd == 0 {
+            return "<unknown>".into();
+        }
+        let mut buf = [0u16; 256];
+        let n = unsafe { GetClassNameW(HWND(hwnd as *mut _), &mut buf) };
+        if n <= 0 {
+            return "<unknown>".into();
+        }
+        String::from_utf16_lossy(&buf[..n as usize])
     }
-    let mut buf = [0u16; 256];
-    let n = unsafe { GetClassNameW(HWND(hwnd as *mut _), &mut buf) };
-    if n <= 0 {
-        return "<unknown>".into();
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = hwnd;
+        "<unknown>".into()
     }
-    String::from_utf16_lossy(&buf[..n as usize])
 }
 
 /// Build the structured `background_unavailable` error returned when
@@ -355,6 +393,73 @@ pub fn background_unavailable_error_with_cause(
             "event_kind": kind.name(),
             "cause": cause,
         }),
+    )
+}
+
+/// Query the Win32 `GetLastInputInfo` sensor for the elapsed milliseconds
+/// since the user last generated physical keyboard or mouse input.
+pub fn physical_input_idle_ms() -> Option<u64> {
+    #[cfg(target_os = "windows")]
+    unsafe {
+        use windows::Win32::System::SystemInformation::GetTickCount;
+        use windows::Win32::UI::Input::KeyboardAndMouse::{GetLastInputInfo, LASTINPUTINFO};
+        let mut info = LASTINPUTINFO {
+            cbSize: std::mem::size_of::<LASTINPUTINFO>() as u32,
+            dwTime: 0,
+        };
+        if !GetLastInputInfo(&mut info).as_bool() {
+            return None;
+        }
+        let now_ticks = GetTickCount();
+        Some(cua_driver_core::delivery::elapsed_idle_ms_from_ticks(
+            now_ticks,
+            info.dwTime,
+        ))
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        None
+    }
+}
+
+/// Pure preflight evaluation for a Windows foreground delivery request.
+pub fn gate_foreground_physical_idle_with_sample(
+    hwnd: u64,
+    kind: EventKind,
+    observed_idle_ms: Option<u64>,
+    threshold_ms: u64,
+) -> Result<(), cua_driver_core::protocol::ToolResult> {
+    use cua_driver_core::delivery::{
+        evaluate_physical_input_idle, foreground_user_active_result, PhysicalInputIdleGate,
+    };
+    match evaluate_physical_input_idle(observed_idle_ms, threshold_ms) {
+        PhysicalInputIdleGate::Idle { .. } => Ok(()),
+        PhysicalInputIdleGate::UserActive {
+            idle_ms,
+            threshold_ms,
+        } => Err(foreground_user_active_result(
+            idle_ms,
+            threshold_ms,
+            serde_json::json!({
+                "window_id": hwnd,
+                "event_kind": kind.name(),
+            }),
+        )),
+    }
+}
+
+/// Preflight gate before a `delivery_mode:"foreground"` swap + `SendInput`
+/// on Windows: refuses with `foreground_user_active` when physical user
+/// input occurred within the configured idle threshold.
+pub fn gate_foreground_physical_idle(
+    hwnd: u64,
+    kind: EventKind,
+) -> Result<(), cua_driver_core::protocol::ToolResult> {
+    gate_foreground_physical_idle_with_sample(
+        hwnd,
+        kind,
+        physical_input_idle_ms(),
+        cua_driver_core::delivery::foreground_idle_threshold_ms(),
     )
 }
 
@@ -441,5 +546,30 @@ mod tests {
                 .and_then(|v| v["code"].as_str()),
             Some("background_uipi_blocked")
         );
+    }
+
+    #[test]
+    fn windows_foreground_idle_gate_refuses_active_user_and_allows_idle() {
+        let err = gate_foreground_physical_idle_with_sample(
+            0x1234,
+            EventKind::Keystroke,
+            Some(220),
+            1_000,
+        )
+        .unwrap_err();
+        let structured = err.structured_content.expect("structured");
+        assert_eq!(structured["code"], "foreground_user_active");
+        assert_eq!(structured["effect"], "refused");
+        assert_eq!(structured["dispatched"], false);
+        assert_eq!(structured["window_id"], 0x1234);
+        assert_eq!(structured["event_kind"], "keystroke");
+
+        assert!(gate_foreground_physical_idle_with_sample(
+            0x1234,
+            EventKind::Keystroke,
+            Some(1_200),
+            1_000,
+        )
+        .is_ok());
     }
 }

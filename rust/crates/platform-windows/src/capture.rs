@@ -26,15 +26,23 @@
 //! CUA-542; the screen-region fallback covers the same common
 //! ground at a fraction of the implementation cost.
 
-use anyhow::{bail, Result};
+#[cfg(target_os = "windows")]
+use anyhow::bail;
+use anyhow::Result;
+#[cfg(target_os = "windows")]
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
+#[cfg(target_os = "windows")]
 use windows::Win32::Foundation::HWND;
+#[cfg(target_os = "windows")]
 use windows::Win32::Graphics::Gdi::{
     BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, DeleteObject, GetDC, GetDIBits,
     SelectObject, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, RGBQUAD, SRCCOPY,
 };
+#[cfg(target_os = "windows")]
 use windows::Win32::Graphics::Gdi::{GetWindowDC, ReleaseDC};
+#[cfg(target_os = "windows")]
 use windows::Win32::Storage::Xps::{PrintWindow, PRINT_WINDOW_FLAGS};
+#[cfg(target_os = "windows")]
 const PW_RENDERFULLCONTENT: PRINT_WINDOW_FLAGS = PRINT_WINDOW_FLAGS(2u32);
 
 mod frame_geometry {
@@ -137,6 +145,7 @@ mod frame_geometry {
     }
 }
 
+#[cfg(target_os = "windows")]
 use frame_geometry::FrameGeometry;
 
 /// After GetDIBits we have BGRA bytes from PrintWindow. If essentially every
@@ -173,179 +182,48 @@ fn is_mostly_black_bgra(bgra: &[u8]) -> bool {
     sampled > 0 && (black * 200) >= (sampled * 199)
 }
 
-/// Probe whether `target` is currently obscured by some other window.
-/// Samples `WindowFromPoint` at the target's center + four corners (insetting
-/// 2 px from each corner so we don't catch invisible 1-px frame slop). If any
-/// sample returns a window whose root ancestor isn't `target` itself, we
-/// consider the target occluded. Used by the screen-region BitBlt path to
-/// warn callers that the bitmap they're about to receive does NOT actually
-/// show the target's pixels — it shows whatever's covering it. Without this
-/// signal, the BitBlt result is silently misleading (see the regression
-/// captured during the autonomous-test journal: a backgrounded Notepad
-/// screenshot returned LibreOffice's pixels).
-unsafe fn target_is_obscured(target: HWND) -> bool {
-    use windows::Win32::Foundation::{POINT, RECT};
-    use windows::Win32::UI::WindowsAndMessaging::{
-        GetAncestor, GetWindowRect, WindowFromPoint, GA_ROOT,
-    };
-
-    if target.0.is_null() {
-        return false;
-    }
-    let mut rect = RECT::default();
-    if GetWindowRect(target, &mut rect).is_err() {
-        return false;
-    }
-    let w = rect.right - rect.left;
-    let h = rect.bottom - rect.top;
-    if w <= 4 || h <= 4 {
-        return false;
-    }
-    // 5 sample points: 4 corners (inset 2 px) + center.
-    let pts: [(i32, i32); 5] = [
-        (rect.left + 2, rect.top + 2),
-        (rect.right - 3, rect.top + 2),
-        (rect.left + 2, rect.bottom - 3),
-        (rect.right - 3, rect.bottom - 3),
-        ((rect.left + rect.right) / 2, (rect.top + rect.bottom) / 2),
-    ];
-    let target_root = GetAncestor(target, GA_ROOT);
-    let mut covered_samples = 0;
-    for (x, y) in &pts {
-        let p = POINT { x: *x, y: *y };
-        let owner = WindowFromPoint(p);
-        if owner.0.is_null() {
-            continue;
-        }
-        let owner_root = GetAncestor(owner, GA_ROOT);
-        if owner_root != target_root {
-            covered_samples += 1;
+/// Resolve a window capture attempt with fail-closed Windows.Graphics.Capture
+/// fallback, never falling back to a desktop/screen-region BitBlt that could
+/// leak pixels from an occluding foreground window.
+fn resolve_window_capture_fallback<T, F>(primary: Result<T>, wgc_fallback: F) -> Result<T>
+where
+    F: FnOnce() -> Result<T>,
+{
+    match primary {
+        Ok(capture) => Ok(capture),
+        Err(primary_error) => {
+            if primary_error.to_string().contains("minimized window") {
+                return Err(primary_error);
+            }
+            wgc_fallback().map_err(|wgc_error| {
+                primary_error.context(format!(
+                    "Windows.Graphics.Capture fallback failed: {wgc_error}"
+                ))
+            })
         }
     }
-    // Threshold of 2 of 5: a single corner being "covered" can be a layered
-    // overlay (e.g. the cua-driver agent cursor) that's not actually opaque
-    // over the content; we don't want to false-positive on that. Two or more
-    // sample points missing means real content is being covered.
-    covered_samples >= 2
-}
-
-/// Fallback capture path: BitBlt the desktop DC over the rectangle covered
-/// by `hwnd`'s on-screen bounds. Works for UWP / WinUI3 / DirectComposition
-/// surfaces that PrintWindow can't reach, as long as the window is on-screen
-/// (the daemon's typical case — see module docs).
-unsafe fn screenshot_via_screen_region(hwnd: HWND) -> Result<(Vec<u8>, i32, i32, FrameGeometry)> {
-    use windows::Win32::Foundation::RECT;
-    use windows::Win32::UI::WindowsAndMessaging::GetWindowRect;
-
-    let mut rect = RECT::default();
-    GetWindowRect(hwnd, &mut rect)?;
-
-    // Under Per-Monitor V2 DPI awareness, GetWindowRect already returns
-    // PHYSICAL pixels (coordinate virtualization only applies to
-    // DPI-unaware/system-aware processes), and BitBlt operates in physical
-    // pixels too — use the rect as-is. Scaling by DPI/96 here would shift
-    // and oversize the captured screen region (issue #1879).
-    let physical_left = rect.left;
-    let physical_top = rect.top;
-
-    let geometry = FrameGeometry::from_bounds((rect.left, rect.top, rect.right, rect.bottom))
-        .ok_or_else(|| anyhow::anyhow!("screen-region fallback: invalid window bounds"))?;
-    let w = geometry.width;
-    let h = geometry.height;
-
-    let screen_dc = GetDC(HWND(std::ptr::null_mut())); // NULL HWND → desktop DC
-    if screen_dc.is_invalid() {
-        bail!("screen-region fallback: GetDC(NULL) returned an invalid desktop DC");
-    }
-    let mem_dc = CreateCompatibleDC(screen_dc);
-    if mem_dc.is_invalid() {
-        ReleaseDC(HWND(std::ptr::null_mut()), screen_dc);
-        bail!("screen-region fallback: CreateCompatibleDC returned an invalid memory DC");
-    }
-    let bitmap = CreateCompatibleBitmap(screen_dc, w, h);
-    if bitmap.is_invalid() {
-        let _ = DeleteDC(mem_dc);
-        ReleaseDC(HWND(std::ptr::null_mut()), screen_dc);
-        bail!("screen-region fallback: CreateCompatibleBitmap returned an invalid bitmap");
-    }
-    let old_bitmap = SelectObject(mem_dc, bitmap);
-    if old_bitmap.is_invalid() {
-        let _ = DeleteObject(bitmap);
-        let _ = DeleteDC(mem_dc);
-        ReleaseDC(HWND(std::ptr::null_mut()), screen_dc);
-        bail!("screen-region fallback: SelectObject failed to select the capture bitmap");
-    }
-
-    // Copy from physical screen coords into our memory DC at (0, 0).
-    let blt_ok = BitBlt(
-        mem_dc,
-        0,
-        0,
-        w,
-        h,
-        screen_dc,
-        physical_left,
-        physical_top,
-        SRCCOPY,
-    );
-
-    let mut bmi = BITMAPINFO {
-        bmiHeader: BITMAPINFOHEADER {
-            biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
-            biWidth: w,
-            biHeight: -h, // top-down
-            biPlanes: 1,
-            biBitCount: 32,
-            biCompression: BI_RGB.0,
-            biSizeImage: (w * h * 4) as u32,
-            ..Default::default()
-        },
-        bmiColors: [RGBQUAD::default(); 1],
-    };
-    let pixel_count = (w * h) as usize;
-    let mut pixels = vec![0u8; pixel_count * 4];
-    let ok = GetDIBits(
-        mem_dc,
-        bitmap,
-        0,
-        h as u32,
-        Some(pixels.as_mut_ptr() as *mut _),
-        &mut bmi,
-        DIB_RGB_COLORS,
-    );
-
-    SelectObject(mem_dc, old_bitmap);
-    let _ = DeleteObject(bitmap);
-    let _ = DeleteDC(mem_dc);
-    ReleaseDC(HWND(std::ptr::null_mut()), screen_dc);
-
-    if blt_ok.is_err() {
-        bail!("screen-region fallback: BitBlt failed: {:?}", blt_ok);
-    }
-    if ok == 0 {
-        bail!("screen-region fallback: GetDIBits returned 0");
-    }
-    Ok((pixels, w, h, geometry))
 }
 
 /// Capture a window by HWND, returning raw PNG bytes.
+#[cfg(target_os = "windows")]
 pub fn screenshot_window_bytes(hwnd: u64) -> Result<Vec<u8>> {
     screenshot_window_bytes_with_occlusion(hwnd).map(|(b, _)| b)
 }
 
-/// Capture a window by HWND. Returns `(png_bytes, occluded_flag)` — the
-/// boolean is `true` when the capture had to fall through to the
-/// screen-region BitBlt path AND another window was visibly covering the
-/// target at sample time. In that case the bitmap reflects the COVERING
-/// window's pixels, not the target's. Callers that surface the image to a
-/// user / LLM should attach an explicit warning. See `target_is_obscured`
-/// for the sampling heuristic.
+/// Capture a window by HWND. Returns (png_bytes, occluded_flag).
+///
+/// Window capture uses PrintWindow(PW_RENDERFULLCONTENT) and
+/// Windows.Graphics.Capture only (both read the target window's own
+/// composited surface regardless of z-order) and fails closed if both fail,
+/// so occluded_flag is always false.
+#[cfg(target_os = "windows")]
 pub fn screenshot_window_bytes_with_occlusion(hwnd: u64) -> Result<(Vec<u8>, bool)> {
     screenshot_window_mapped(hwnd).map(|(png, occluded, _)| (png, occluded))
 }
 
 /// Capture the final input point against the exact source frame. WGC supplies
 /// no proven screen origin, so it cannot produce mapped click evidence yet.
+#[cfg(target_os = "windows")]
 pub(crate) fn screenshot_window_click_target(
     hwnd: u64,
     screen_x: i32,
@@ -359,52 +237,23 @@ pub(crate) fn screenshot_window_click_target(
     Some((png, x, y))
 }
 
+#[cfg(target_os = "windows")]
 fn screenshot_window_mapped(hwnd: u64) -> Result<(Vec<u8>, bool, Option<FrameGeometry>)> {
-    match unsafe { screenshot_window_bytes_with_occlusion_unsafe(hwnd) } {
-        Ok(capture) => Ok(capture),
-        Err(primary_error) => {
-            if primary_error.to_string().contains("minimized window") {
-                return Err(primary_error);
-            }
-            // A freshly restored DirectComposition window can temporarily have
-            // no usable GDI surface even though DWM is already rendering it.
-            // WGC reads the compositor-owned frame and is therefore the right
-            // first fallback for this class of capture failure.
-            match crate::wgc::screenshot_window_via_wgc(hwnd) {
-                Ok((pixels, width, height)) => Ok((
-                    cua_driver_core::image_utils::encode_bgra_to_png(&pixels, width, height)?,
-                    false,
-                    None,
-                )),
-                Err(wgc_error) => {
-                    // Headless/virtualized Windows sessions can expose DWM but
-                    // no WGC-compatible hardware device. Once a window is
-                    // visible, a desktop-region crop remains a truthful final
-                    // fallback; report whether another window covered it.
-                    let target = HWND(hwnd as *mut _);
-                    let occluded = unsafe { target_is_obscured(target) };
-                    match unsafe { screenshot_via_screen_region(target) } {
-                        Ok((pixels, width, height, geometry)) => Ok((
-                            cua_driver_core::image_utils::encode_bgra_to_png(
-                                &pixels,
-                                width as u32,
-                                height as u32,
-                            )?,
-                            occluded,
-                            Some(geometry),
-                        )),
-                        Err(screen_error) => Err(primary_error.context(format!(
-                            "Windows.Graphics.Capture fallback failed: {wgc_error}; \
-                             desktop-region fallback failed: {screen_error}"
-                        ))),
-                    }
-                }
-            }
-        }
-    }
+    resolve_window_capture_fallback(
+        unsafe { screenshot_window_bytes_with_occlusion_unsafe(hwnd) },
+        || {
+            let (pixels, width, height) = crate::wgc::screenshot_window_via_wgc(hwnd)?;
+            Ok((
+                cua_driver_core::image_utils::encode_bgra_to_png(&pixels, width, height)?,
+                false,
+                None,
+            ))
+        },
+    )
 }
 
 /// Capture a window by HWND, returning (base64_png, width, height).
+#[cfg(target_os = "windows")]
 pub fn screenshot_window(hwnd: u64) -> Result<(String, u32, u32)> {
     let png_bytes = screenshot_window_bytes(hwnd)?;
     let (w, h) = {
@@ -418,6 +267,7 @@ pub fn screenshot_window(hwnd: u64) -> Result<(String, u32, u32)> {
     Ok((BASE64.encode(&png_bytes), w, h))
 }
 
+#[cfg(target_os = "windows")]
 unsafe fn screenshot_window_bytes_with_occlusion_unsafe(
     hwnd: u64,
 ) -> Result<(Vec<u8>, bool, Option<FrameGeometry>)> {
@@ -457,9 +307,8 @@ unsafe fn screenshot_window_bytes_with_occlusion_unsafe(
     // first — that's the only API that returns the target's actual
     // composited pixels even when it's occluded by another window
     // (the Calculator-behind-terminal regression captured in the
-    // autonomous-test journal). On older Windows / GPU stalls / cloaked
-    // windows WGC may fail; fall back to the screen-region BitBlt
-    // path, then to PrintWindow as a last resort.
+    // autonomous-test journal). On WGC failure, fall through to PrintWindow
+    // (which fails closed below if the surface is mostly-black).
     if crate::input::is_xaml_host_hwnd(hwnd_raw) {
         match crate::wgc::screenshot_window_via_wgc(hwnd_raw) {
             Ok((pixels, w, h)) => {
@@ -473,26 +322,7 @@ unsafe fn screenshot_window_bytes_with_occlusion_unsafe(
                 tracing::warn!(
                     target: "cua-driver",
                     "screenshot: WGC failed for XAML target hwnd 0x{hwnd_raw:x}: {e}; \
-                     falling back to screen-region BitBlt (may be occluded)."
-                );
-            }
-        }
-        let occluded = target_is_obscured(hwnd);
-        match screenshot_via_screen_region(hwnd) {
-            Ok((pixels, w, h, geometry)) => {
-                return Ok((
-                    cua_driver_core::image_utils::encode_bgra_to_png(&pixels, w as u32, h as u32)?,
-                    occluded,
-                    Some(geometry),
-                ));
-            }
-            Err(e) => {
-                // Screen-region failed — fall through and try PrintWindow as a
-                // last resort so the caller at least gets *something*.
-                tracing::warn!(
-                    target: "cua-driver",
-                    "screenshot: XAML target screen-region path failed: {e}; \
-                     falling back to PrintWindow (likely all-black)."
+                     falling back to PrintWindow."
                 );
             }
         }
@@ -531,7 +361,11 @@ unsafe fn screenshot_window_bytes_with_occlusion_unsafe(
 
     let pw_ok = PrintWindow(hwnd, mem_dc, PW_RENDERFULLCONTENT);
     if !pw_ok.as_bool() {
-        BitBlt(mem_dc, 0, 0, w, h, screen_dc, 0, 0, SRCCOPY)?;
+        SelectObject(mem_dc, old_bitmap);
+        let _ = DeleteObject(bitmap);
+        let _ = DeleteDC(mem_dc);
+        ReleaseDC(hwnd, screen_dc);
+        bail!("PrintWindow(PW_RENDERFULLCONTENT) failed for hwnd 0x{hwnd_raw:x}");
     }
 
     // Compute the DWM-extended-frame bounds. On Win10+ the OS draws an
@@ -628,12 +462,9 @@ unsafe fn screenshot_window_bytes_with_occlusion_unsafe(
     };
 
     // CUA-542: detect the all-black bitmap PrintWindow returns for
-    // DirectComposition-backed UWP / WinUI3 surfaces. Recovery order:
-    //   1. WGC (occlusion-immune; works for UWP).
-    //   2. Screen-region BitBlt (works when target is on-screen and
-    //      not covered).
-    // The WGC-first ordering covers backgrounded UWP targets the
-    // screen-region path mishandles (returns covering window's pixels).
+    // DirectComposition-backed UWP / WinUI3 surfaces and recover via WGC
+    // (occlusion-immune). If WGC also fails, fail closed instead of falling
+    // back to a screen-region BitBlt that would capture an occluding window.
     let mostly_black = is_mostly_black_bgra(&pixels);
     if mostly_black {
         match crate::wgc::screenshot_window_via_wgc(hwnd_raw) {
@@ -645,35 +476,9 @@ unsafe fn screenshot_window_bytes_with_occlusion_unsafe(
                 ));
             }
             Err(e) => {
-                tracing::warn!(
-                    target: "cua-driver",
-                    "screenshot: PrintWindow returned black AND WGC failed for hwnd 0x{hwnd_raw:x}: {e}; \
-                     trying screen-region BitBlt next."
-                );
-            }
-        }
-        let occluded = target_is_obscured(hwnd);
-        match screenshot_via_screen_region(hwnd) {
-            Ok((alt_pixels, alt_w, alt_h, geometry)) => {
-                return Ok((
-                    cua_driver_core::image_utils::encode_bgra_to_png(
-                        &alt_pixels,
-                        alt_w as u32,
-                        alt_h as u32,
-                    )?,
-                    occluded,
-                    Some(geometry),
-                ));
-            }
-            Err(e) => {
-                // Screen-region path failed too — return the (black) PrintWindow
-                // result with an explanatory log rather than erroring outright.
-                // Caller still gets an image; the fact that it's black is now
-                // visible in the bytes themselves.
-                tracing::warn!(
-                    target: "cua-driver",
-                    "screenshot: PrintWindow returned a mostly-black bitmap (UWP / \
-                     DirectComposition target?); screen-region fallback failed: {e}"
+                bail!(
+                    "PrintWindow returned a mostly-black bitmap for hwnd 0x{hwnd_raw:x} \
+                     and Windows.Graphics.Capture fallback failed: {e}"
                 );
             }
         }
@@ -709,6 +514,7 @@ unsafe fn screenshot_window_bytes_with_occlusion_unsafe(
 // same code. See `CUA_DRIVER_RS_DEDUP_AUDIT.md` for the full audit.
 
 /// Capture the primary display (full screen), returning raw PNG bytes.
+#[cfg(target_os = "windows")]
 pub fn screenshot_display_bytes() -> Result<Vec<u8>> {
     unsafe {
         use windows::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_CXSCREEN, SM_CYSCREEN};
@@ -787,6 +593,7 @@ pub fn screenshot_display_bytes() -> Result<Vec<u8>> {
 
 /// Capture the primary display for the agent, with the Driver's own cursor
 /// overlay kept out of the pixels, and report how that went.
+#[cfg(target_os = "windows")]
 pub fn screenshot_display_bytes_excluding_overlay() -> Result<(
     Vec<u8>,
     cursor_overlay::capture_exclusion::AgentOverlayCapture,
@@ -798,6 +605,7 @@ pub fn screenshot_display_bytes_excluding_overlay() -> Result<(
 }
 
 /// Capture primary display, returning (base64_png, width, height).
+#[cfg(target_os = "windows")]
 pub fn screenshot_display() -> Result<(String, u32, u32)> {
     let png_bytes = screenshot_display_bytes()?;
     let (w, h) = cua_driver_core::image_utils::png_dimensions(&png_bytes)?;
@@ -834,4 +642,55 @@ pub fn crosshair_png_bytes(png_bytes: &[u8], cx: f64, cy: f64) -> Result<Vec<u8>
 /// the `_pub` export; the public alias is what callers use today.
 pub fn png_dimensions_pub(data: &[u8]) -> Result<(u32, u32)> {
     cua_driver_core::image_utils::png_dimensions(data)
+}
+
+#[cfg(test)]
+mod capture_fallback_tests {
+    use super::{is_mostly_black_bgra, resolve_window_capture_fallback};
+
+    #[test]
+    fn mostly_black_detector_flags_all_zero_bgra_and_keeps_lit_frames() {
+        let black = vec![0u8; 64 * 64 * 4];
+        assert!(is_mostly_black_bgra(&black));
+
+        let mut lit = vec![0u8; 64 * 64 * 4];
+        for pixel in lit.chunks_exact_mut(4).take(128) {
+            pixel[0] = 0x40;
+            pixel[1] = 0x80;
+            pixel[2] = 0xC0;
+            pixel[3] = 0xFF;
+        }
+        assert!(!is_mostly_black_bgra(&lit));
+    }
+
+    #[test]
+    fn window_capture_fallback_fails_closed_when_primary_and_wgc_fail() {
+        let err = resolve_window_capture_fallback::<(Vec<u8>, bool), _>(
+            Err(anyhow::anyhow!(
+                "PrintWindow(PW_RENDERFULLCONTENT) failed for hwnd 0x1234"
+            )),
+            || Err(anyhow::anyhow!("WGC unavailable")),
+        )
+        .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("PrintWindow(PW_RENDERFULLCONTENT) failed"));
+        assert!(msg.contains("Windows.Graphics.Capture fallback failed: WGC unavailable"));
+        assert!(!msg.contains("screen-region"));
+        assert!(!msg.contains("desktop-region"));
+    }
+
+    #[test]
+    fn window_capture_fallback_short_circuits_minimized_windows_without_calling_wgc() {
+        let mut wgc_called = false;
+        let err = resolve_window_capture_fallback::<(Vec<u8>, bool), _>(
+            Err(anyhow::anyhow!("cannot capture minimized window 0x1234")),
+            || {
+                wgc_called = true;
+                Ok((vec![1, 2, 3], false))
+            },
+        )
+        .unwrap_err();
+        assert!(!wgc_called);
+        assert!(err.to_string().contains("minimized window"));
+    }
 }
