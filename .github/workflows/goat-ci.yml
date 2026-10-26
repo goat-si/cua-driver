@@ -10,6 +10,12 @@ on:
     branches: [main]
     tags: ["cua-driver-rs-v*-goat.*"]
   workflow_dispatch:
+    inputs:
+      slow_tests:
+        description: "Run the slow unit and desktop-independent regression jobs"
+        type: boolean
+        default: true
+        required: false
 
 permissions:
   contents: read
@@ -293,7 +299,10 @@ jobs:
   # .github/workflows/ci-rust-{linux,macos,windows}.yml at cua-driver-rs-v0.37.0), ported verbatim
   # apart from paths, action pins and caching. Tests needing a logged-in, TCC-authorized desktop or
   # real apps are #[ignore] upstream and run in its desktop harnesses, not here. goat-si/cua-driver#12.
+  # Slow regression jobs run on main, release tags and manual dispatches, not on every PR.
+  # They are still required for release tags, so the release gate does not get weaker.
   test-linux:
+    if: github.event_name != 'pull_request' && (github.event_name != 'workflow_dispatch' || inputs.slow_tests)
     needs: version
     name: Rust Linux unit and compile
     runs-on: ubuntu-latest
@@ -461,6 +470,7 @@ jobs:
         run: cargo check -p cua-driver --features portal-input --locked
 
   test-macos:
+    if: github.event_name != 'pull_request' && (github.event_name != 'workflow_dispatch' || inputs.slow_tests)
     needs: version
     name: Rust macOS unit
     runs-on: macos-26
@@ -526,6 +536,7 @@ jobs:
         run: cargo test --locked -p cua-driver-e2e
 
   test-windows:
+    if: github.event_name != 'pull_request' && (github.event_name != 'workflow_dispatch' || inputs.slow_tests)
     needs: version
     name: Rust Windows unit and compile
     runs-on: windows-latest
@@ -692,7 +703,7 @@ jobs:
         run: cargo test -p cua-driver --test protocol_schema_test --locked
 
   release:
-    if: startsWith(github.ref, 'refs/tags/cua-driver-rs-v')
+    if: startsWith(github.ref, 'refs/tags/cua-driver-rs-v') && (github.event_name != 'workflow_dispatch' || inputs.slow_tests)
     needs: [version, deny, test-linux, test-macos, test-windows, linux, windows, macos]
     runs-on: ubuntu-latest
     permissions:

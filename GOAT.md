@@ -60,5 +60,9 @@ Upstream moves several times a day; we sync deliberately, not continuously.
    `upstream` here to the result.
 2. Review the `upstream` diff for security and behavior changes.
 3. Merge `upstream` into a branch from `main`, refresh `vendor/`, and run `cargo deny check`.
-4. Open a pull request; CI runs the protocol-compatibility test and builds every platform.
-5. After merge and one live check per OS in GOAT, tag a release and bump GOAT's pin.
+4. Open a pull request; CI runs the protocol-compatibility test and builds every platform. Slow unit
+   and desktop-independent regression jobs run on `main`, release tags and `workflow_dispatch` instead
+   of blocking every PR. A manual dispatch can select `slow_tests: false` for the same fast build-only
+   lane, or `slow_tests: true` (the default) for the full regression lane on any branch.
+5. After merge and one live check per OS in GOAT, tag a release and bump GOAT's pin. Release tags still
+   require the slow regression jobs before publication.
