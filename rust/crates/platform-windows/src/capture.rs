@@ -151,7 +151,7 @@ use frame_geometry::FrameGeometry;
 /// After GetDIBits we have BGRA bytes from PrintWindow. If essentially every
 /// pixel is fully-transparent black or fully-opaque black, treat the capture
 /// as "PrintWindow didn't render this surface" and let the caller fall back
-/// to the screen-region BitBlt path.
+/// to Windows.Graphics.Capture.
 ///
 /// We sample sparsely (every 64th pixel) so the heuristic is cheap even on
 /// 4K windows. The threshold is intentionally aggressive — UWP apps return
@@ -196,9 +196,9 @@ where
                 return Err(primary_error);
             }
             wgc_fallback().map_err(|wgc_error| {
-                primary_error.context(format!(
-                    "Windows.Graphics.Capture fallback failed: {wgc_error}"
-                ))
+                anyhow::anyhow!(
+                    "{primary_error:#}; Windows.Graphics.Capture fallback failed: {wgc_error:#}"
+                )
             })
         }
     }
@@ -475,11 +475,9 @@ unsafe fn screenshot_window_bytes_with_occlusion_unsafe(
                     None,
                 ));
             }
-            Err(e) => {
-                bail!(
-                    "PrintWindow returned a mostly-black bitmap for hwnd 0x{hwnd_raw:x} \
-                     and Windows.Graphics.Capture fallback failed: {e}"
-                );
+            // The caller retries WGC and reports its error alongside this cause.
+            Err(_) => {
+                bail!("PrintWindow returned a mostly-black bitmap for hwnd 0x{hwnd_raw:x}");
             }
         }
     }
@@ -672,11 +670,12 @@ mod capture_fallback_tests {
             || Err(anyhow::anyhow!("WGC unavailable")),
         )
         .unwrap_err();
-        let msg = format!("{err:#}");
-        assert!(msg.contains("PrintWindow(PW_RENDERFULLCONTENT) failed"));
-        assert!(msg.contains("Windows.Graphics.Capture fallback failed: WGC unavailable"));
-        assert!(!msg.contains("screen-region"));
-        assert!(!msg.contains("desktop-region"));
+        for msg in [err.to_string(), format!("{err:#}")] {
+            assert!(msg.contains("PrintWindow(PW_RENDERFULLCONTENT) failed"));
+            assert!(msg.contains("Windows.Graphics.Capture fallback failed: WGC unavailable"));
+            assert!(!msg.contains("screen-region"));
+            assert!(!msg.contains("desktop-region"));
+        }
     }
 
     #[test]
