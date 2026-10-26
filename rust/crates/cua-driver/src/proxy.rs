@@ -303,14 +303,41 @@ where
             tokio::select! {
                 biased;
                 joined = tasks.join_next(), if !tasks.is_empty() => {
-                    if let Some(Ok(completion)) = joined {
-                        let should_write = pending
-                            .get(&completion.key)
-                            .is_some_and(|entry| entry.token == completion.token);
-                        if should_write {
-                            pending.remove(&completion.key);
-                            write_response(&mut writer, completion.response).await?;
+                    match joined {
+                        Some(Ok(completion)) => {
+                            let should_write = pending
+                                .get(&completion.key)
+                                .is_some_and(|entry| entry.token == completion.token);
+                            if should_write {
+                                pending.remove(&completion.key);
+                                write_response(&mut writer, completion.response).await?;
+                            }
                         }
+                        Some(Err(join_error)) => {
+                            let failed_key = pending.iter().find_map(|(key, request)| {
+                                (request.abort.id() == join_error.id()).then(|| key.clone())
+                            });
+                            if let Some(failed_key) = failed_key {
+                                let failed = pending
+                                    .remove(&failed_key)
+                                    .expect("pending request found by task id");
+                                warn!(
+                                    request_id = %failed.id,
+                                    panicked = join_error.is_panic(),
+                                    "MCP request handler task failed"
+                                );
+                                write_response(
+                                    &mut writer,
+                                    Response::error(
+                                        failed.id,
+                                        -32603,
+                                        "request handler failed; effect is unknown",
+                                    ),
+                                )
+                                .await?;
+                            }
+                        }
+                        None => {}
                     }
                     continue;
                 }
@@ -325,7 +352,6 @@ where
         if trimmed.is_empty() {
             continue;
         }
-        debug!(raw = %trimmed, "→ MCP request");
         let request = match serde_json::from_str::<Request>(&trimmed) {
             Ok(request) => request,
             Err(error) => {
@@ -334,6 +360,7 @@ where
                 continue;
             }
         };
+        debug!(method = %request.method, id = ?request.id, "MCP request");
 
         if request.method == "notifications/cancelled" && request.is_notification() {
             let request_id = request
@@ -1448,6 +1475,38 @@ mod tests {
         let original = next_response(&mut client_read).await;
         assert_eq!(original["error"]["code"], -32800);
         assert_eq!(original["id"], 10);
+        client_write.shutdown().await.unwrap();
+        drop(client_write);
+        run.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn panicked_request_gets_one_internal_error_and_followup_runs() {
+        let (client, server) = tokio::io::duplex(64 * 1024);
+        let (server_read, server_write) = tokio::io::split(server);
+        let run = tokio::spawn(run_concurrent_mcp_io(
+            BufReader::new(server_read),
+            server_write,
+            Duration::from_secs(5),
+            |_| Ok(()),
+            |request, id| async move {
+                assert_ne!(request.method, "panic", "handler panic");
+                Response::ok(id, serde_json::json!({"ok": true}))
+            },
+        ));
+        let (client_read, mut client_write) = tokio::io::split(client);
+        let mut client_read = BufReader::new(client_read);
+        client_write
+            .write_all((modern_request(11, "panic") + &modern_request(12, "fast")).as_bytes())
+            .await
+            .unwrap();
+        let first = next_response(&mut client_read).await;
+        let second = next_response(&mut client_read).await;
+        let replies = [first, second];
+        assert!(replies
+            .iter()
+            .any(|reply| { reply["id"] == 11 && reply["error"]["code"] == -32603 }));
+        assert!(replies.iter().any(|reply| reply["id"] == 12));
         client_write.shutdown().await.unwrap();
         drop(client_write);
         run.await.unwrap().unwrap();
