@@ -32,9 +32,9 @@ use core::ffi::c_void;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{sync_channel, RecvTimeoutError, SyncSender};
-use std::sync::{Arc, Mutex, OnceLock, Weak};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
 use std::thread::sleep;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use windows::Win32::Foundation::{HANDLE, HWND, LPARAM, POINT, RECT, WPARAM};
 use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
@@ -179,11 +179,81 @@ const STYLE_GUARD_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(1);
 const MAX_STYLE_GUARD_WORKERS: usize = 16;
 static STYLE_GUARD_WORKERS: AtomicUsize = AtomicUsize::new(0);
 static NEXT_STYLE_GUARD_TOKEN: AtomicUsize = AtomicUsize::new(1);
-static STYLE_GUARD_REGISTRY: OnceLock<Mutex<HashMap<isize, StyleGuardRegistryEntry>>> =
-    OnceLock::new();
+static STYLE_GUARD_REGISTRY: OnceLock<StyleGuardRegistry> = OnceLock::new();
 
-struct StyleGuardLease {
-    _release: SyncSender<()>,
+struct StyleGuardRegistry {
+    entries: Mutex<HashMap<isize, StyleGuardRegistryEntry>>,
+    changed: Condvar,
+}
+
+enum StyleGuardLease {
+    Worker {
+        _release: SyncSender<()>,
+    },
+    Local {
+        root_addr: isize,
+        identity: Option<(u32, u32)>,
+        owner_thread_id: u32,
+        permit: Option<StyleGuardWorkerPermit>,
+        reservation: Option<StyleGuardReservation>,
+    },
+}
+
+impl Drop for StyleGuardLease {
+    fn drop(&mut self) {
+        let StyleGuardLease::Local {
+            root_addr,
+            identity,
+            owner_thread_id,
+            permit,
+            reservation,
+        } = self
+        else {
+            return;
+        };
+
+        let current_thread_id = unsafe { GetCurrentThreadId() };
+        if current_thread_id == *owner_thread_id {
+            restore_noactivate_on_worker(HWND(*root_addr as *mut _), *identity);
+            return;
+        }
+
+        let Some(permit) = permit.take() else {
+            return;
+        };
+        let Some(reservation) = reservation.take() else {
+            drop(permit);
+            return;
+        };
+        let resources = Arc::new(Mutex::new(Some((permit, reservation))));
+        let worker_resources = Arc::clone(&resources);
+        let root = HWND(*root_addr as *mut _);
+        let identity = *identity;
+        if std::thread::Builder::new()
+            .name("cua-noactivate-restore".into())
+            .spawn(move || {
+                let (permit, reservation) = worker_resources
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .take()
+                    .expect("style guard restore resources already taken");
+                let _permit = permit;
+                let _reservation = reservation;
+                restore_noactivate_on_worker(root, identity);
+            })
+            .is_err()
+        {
+            if let Some((_permit, reservation)) = resources
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .take()
+            {
+                // Keep the registry reserved if the fallback worker could not
+                // start; the style remains fail-closed rather than reusable.
+                std::mem::forget(reservation);
+            }
+        }
+    }
 }
 
 enum StyleGuardRegistryEntry {
@@ -206,20 +276,70 @@ struct StyleGuardReservation {
     token: usize,
 }
 
-fn style_guard_registry() -> &'static Mutex<HashMap<isize, StyleGuardRegistryEntry>> {
-    STYLE_GUARD_REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
+fn style_guard_registry() -> &'static StyleGuardRegistry {
+    STYLE_GUARD_REGISTRY.get_or_init(|| StyleGuardRegistry {
+        entries: Mutex::new(HashMap::new()),
+        changed: Condvar::new(),
+    })
 }
 
 fn lock_style_guard_registry(
 ) -> std::sync::MutexGuard<'static, HashMap<isize, StyleGuardRegistryEntry>> {
     style_guard_registry()
+        .entries
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 fn reserve_or_share_style_guard(root_addr: isize) -> anyhow::Result<StyleGuardRegistryAcquire> {
-    let mut registry = lock_style_guard_registry();
-    match registry.get(&root_addr) {
+    reserve_or_share_style_guard_with_timeout(root_addr, STYLE_GUARD_HANDSHAKE_TIMEOUT)
+}
+
+fn reserve_or_share_style_guard_with_timeout(
+    root_addr: isize,
+    timeout: Duration,
+) -> anyhow::Result<StyleGuardRegistryAcquire> {
+    let deadline = Instant::now() + timeout;
+    let registry = style_guard_registry();
+    let mut entries = lock_style_guard_registry();
+    loop {
+        match entries.get(&root_addr) {
+            Some(StyleGuardRegistryEntry::Ready { lease, .. }) => {
+                if let Some(lease) = lease.upgrade() {
+                    return Ok(StyleGuardRegistryAcquire::Shared(lease));
+                }
+            }
+            Some(StyleGuardRegistryEntry::Starting { .. })
+            | Some(StyleGuardRegistryEntry::Ready { .. }) => {}
+            None => {
+                let token = NEXT_STYLE_GUARD_TOKEN.fetch_add(1, Ordering::Relaxed);
+                entries.insert(root_addr, StyleGuardRegistryEntry::Starting { token });
+                return Ok(StyleGuardRegistryAcquire::Reserved(StyleGuardReservation {
+                    root_addr,
+                    token,
+                }));
+            }
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            anyhow::bail!(
+                "target_not_responding: window-style guard is still busy; \
+                 no input was sent and target effect is unknown"
+            );
+        }
+        entries = registry
+            .changed
+            .wait_timeout(entries, remaining)
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .0;
+    }
+}
+
+fn try_reserve_or_share_style_guard(
+    root_addr: isize,
+) -> anyhow::Result<StyleGuardRegistryAcquire> {
+    let mut entries = lock_style_guard_registry();
+    match entries.get(&root_addr) {
         Some(StyleGuardRegistryEntry::Ready { lease, .. }) => {
             if let Some(lease) = lease.upgrade() {
                 return Ok(StyleGuardRegistryAcquire::Shared(lease));
@@ -238,7 +358,7 @@ fn reserve_or_share_style_guard(root_addr: isize) -> anyhow::Result<StyleGuardRe
         None => {}
     }
     let token = NEXT_STYLE_GUARD_TOKEN.fetch_add(1, Ordering::Relaxed);
-    registry.insert(root_addr, StyleGuardRegistryEntry::Starting { token });
+    entries.insert(root_addr, StyleGuardRegistryEntry::Starting { token });
     Ok(StyleGuardRegistryAcquire::Reserved(StyleGuardReservation {
         root_addr,
         token,
@@ -247,10 +367,11 @@ fn reserve_or_share_style_guard(root_addr: isize) -> anyhow::Result<StyleGuardRe
 
 impl StyleGuardReservation {
     fn publish_ready(&self, lease: &Arc<StyleGuardLease>) -> anyhow::Result<()> {
-        let mut registry = lock_style_guard_registry();
-        match registry.get(&self.root_addr) {
+        let registry = style_guard_registry();
+        let mut entries = lock_style_guard_registry();
+        let result = match entries.get(&self.root_addr) {
             Some(StyleGuardRegistryEntry::Starting { token }) if *token == self.token => {
-                registry.insert(
+                entries.insert(
                     self.root_addr,
                     StyleGuardRegistryEntry::Ready {
                         token: self.token,
@@ -260,20 +381,30 @@ impl StyleGuardReservation {
                 Ok(())
             }
             _ => anyhow::bail!("window-style guard registry reservation was lost"),
+        };
+        drop(entries);
+        if result.is_ok() {
+            registry.changed.notify_all();
         }
+        result
     }
 }
 
 impl Drop for StyleGuardReservation {
     fn drop(&mut self) {
-        let mut registry = lock_style_guard_registry();
-        let owns_entry = match registry.get(&self.root_addr) {
+        let registry = style_guard_registry();
+        let mut entries = lock_style_guard_registry();
+        let owns_entry = match entries.get(&self.root_addr) {
             Some(StyleGuardRegistryEntry::Starting { token }) => *token == self.token,
             Some(StyleGuardRegistryEntry::Ready { token, .. }) => *token == self.token,
             None => false,
         };
         if owns_entry {
-            registry.remove(&self.root_addr);
+            entries.remove(&self.root_addr);
+        }
+        drop(entries);
+        if owns_entry {
+            registry.changed.notify_all();
         }
     }
 }
@@ -359,6 +490,25 @@ impl NoActivateGuard {
             }
             StyleGuardRegistryAcquire::Reserved(reservation) => reservation,
         };
+        let owner_thread_id = unsafe { GetWindowThreadProcessId(root, None) };
+        if owner_thread_id != 0 && owner_thread_id == unsafe { GetCurrentThreadId() } {
+            let (applied, identity) = arm_noactivate_on_worker(root)
+                .map_err(|error| anyhow::anyhow!(error))?;
+            if !applied {
+                return Ok(Self { _lease: None });
+            }
+            let permit = acquire_style_guard_worker()?;
+            let lease = Arc::new(StyleGuardLease::Local {
+                root_addr,
+                identity,
+                owner_thread_id,
+                permit: Some(permit),
+                reservation: Some(reservation),
+            });
+            return Ok(Self {
+                _lease: Some(lease),
+            });
+        }
         let permit = acquire_style_guard_worker()?;
         let (ready_tx, ready_rx) = sync_channel(1);
         let (release_tx, release_rx) = sync_channel(0);
@@ -380,7 +530,7 @@ impl NoActivateGuard {
                     let _ = ready_tx.send(Ok(None));
                     return;
                 }
-                let lease = Arc::new(StyleGuardLease {
+                let lease = Arc::new(StyleGuardLease::Worker {
                     _release: release_tx,
                 });
                 if let Err(error) = reservation.publish_ready(&lease) {
@@ -735,7 +885,7 @@ mod noactivate_registry_tests {
             StyleGuardRegistryAcquire::Shared(_) => panic!("unexpected existing guard"),
         };
         let (release, released) = sync_channel(0);
-        let first = Arc::new(StyleGuardLease { _release: release });
+        let first = Arc::new(StyleGuardLease::Worker { _release: release });
         reservation.publish_ready(&first).unwrap();
         let second = match reserve_or_share_style_guard(root).unwrap() {
             StyleGuardRegistryAcquire::Shared(lease) => lease,
@@ -756,21 +906,57 @@ mod noactivate_registry_tests {
             StyleGuardRegistryAcquire::Reserved(reservation) => reservation,
             StyleGuardRegistryAcquire::Shared(_) => panic!("unexpected existing guard"),
         };
-        assert!(reserve_or_share_style_guard(root).is_err());
+        assert!(try_reserve_or_share_style_guard(root).is_err());
 
         let (release, released) = sync_channel(0);
-        let lease = Arc::new(StyleGuardLease { _release: release });
+        let lease = Arc::new(StyleGuardLease::Worker { _release: release });
         reservation.publish_ready(&lease).unwrap();
         drop(lease);
         assert_eq!(released.try_recv(), Err(TryRecvError::Disconnected));
-        assert!(reserve_or_share_style_guard(root).is_err());
+        assert!(try_reserve_or_share_style_guard(root).is_err());
 
         drop(reservation);
-        let replacement = match reserve_or_share_style_guard(root).unwrap() {
+        let replacement = match try_reserve_or_share_style_guard(root).unwrap() {
             StyleGuardRegistryAcquire::Reserved(reservation) => reservation,
             StyleGuardRegistryAcquire::Shared(_) => panic!("stale registry entry"),
         };
         drop(replacement);
+    }
+
+    #[test]
+    fn noactivate_registry_waits_for_starting_entry_within_budget() {
+        let root = unique_root();
+        let reservation = match try_reserve_or_share_style_guard(root).unwrap() {
+            StyleGuardRegistryAcquire::Reserved(reservation) => reservation,
+            StyleGuardRegistryAcquire::Shared(_) => panic!("unexpected existing guard"),
+        };
+        let (started_tx, started_rx) = sync_channel(0);
+        let waiter = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            reserve_or_share_style_guard_with_timeout(root, Duration::from_millis(250))
+        });
+        started_rx.recv().unwrap();
+        std::thread::sleep(Duration::from_millis(10));
+        drop(reservation);
+
+        let replacement = waiter.join().unwrap().unwrap();
+        match replacement {
+            StyleGuardRegistryAcquire::Reserved(reservation) => drop(reservation),
+            StyleGuardRegistryAcquire::Shared(_) => panic!("starting guard was not replaced"),
+        }
+    }
+
+    #[test]
+    fn noactivate_registry_timeout_is_bounded() {
+        let root = unique_root();
+        let reservation = match try_reserve_or_share_style_guard(root).unwrap() {
+            StyleGuardRegistryAcquire::Reserved(reservation) => reservation,
+            StyleGuardRegistryAcquire::Shared(_) => panic!("unexpected existing guard"),
+        };
+        let started = Instant::now();
+        assert!(reserve_or_share_style_guard_with_timeout(root, Duration::from_millis(25)).is_err());
+        assert!(started.elapsed() >= Duration::from_millis(20));
+        drop(reservation);
     }
 }
 
