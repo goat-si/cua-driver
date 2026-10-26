@@ -3631,9 +3631,14 @@ impl Tool for ClickTool {
         // Arm this only after capture admission so stale or mismatched IDs have
         // no native side effect before the click is refused.
         let _noact = match (delivery != DeliveryMode::Foreground, hwnd_opt) {
-            (true, Some(h)) => Some(crate::input::NoActivateGuard::arm(
-                windows::Win32::Foundation::HWND(h as *mut _),
-            )),
+            (true, Some(h)) => {
+                match crate::input::NoActivateGuard::arm(windows::Win32::Foundation::HWND(
+                    h as *mut _,
+                )) {
+                    Ok(guard) => Some(guard),
+                    Err(error) => return ToolResult::error(error.to_string()),
+                }
+            }
             _ => None,
         };
 
@@ -4778,9 +4783,14 @@ impl Tool for TypeTextTool {
         // type_text never uses the SendInput foreground-swap path. No-op for
         // delivery_mode:"foreground" and when no window_id was given.
         let _noact = match (delivery != DeliveryMode::Foreground, hwnd_opt) {
-            (true, Some(h)) => Some(crate::input::NoActivateGuard::arm(
-                windows::Win32::Foundation::HWND(h as *mut _),
-            )),
+            (true, Some(h)) => {
+                match crate::input::NoActivateGuard::arm(windows::Win32::Foundation::HWND(
+                    h as *mut _,
+                )) {
+                    Ok(guard) => Some(guard),
+                    Err(error) => return ToolResult::error(error.to_string()),
+                }
+            }
             _ => None,
         };
         let _delay_ms = args.u64_or("delay_ms", 30);
@@ -5650,9 +5660,12 @@ impl Tool for PressKeyTool {
             && delivery == DeliveryMode::Background
             && crate::input::has_chromium_descendant(hwnd);
         let mut noact = if elem_idx.is_some() && delivery == DeliveryMode::Background {
-            Some(crate::input::NoActivateGuard::arm(
-                windows::Win32::Foundation::HWND(hwnd as *mut _),
-            ))
+            match crate::input::NoActivateGuard::arm(windows::Win32::Foundation::HWND(
+                hwnd as *mut _,
+            )) {
+                Ok(guard) => Some(guard),
+                Err(error) => return ToolResult::error(error.to_string()),
+            }
         } else {
             None
         };
@@ -6255,9 +6268,12 @@ impl Tool for SetValueTool {
         let _noact = if crate::input::delivery::DeliveryMode::from_args(&args)
             != crate::input::delivery::DeliveryMode::Foreground
         {
-            Some(crate::input::NoActivateGuard::arm(
-                windows::Win32::Foundation::HWND(hwnd as *mut _),
-            ))
+            match crate::input::NoActivateGuard::arm(windows::Win32::Foundation::HWND(
+                hwnd as *mut _,
+            )) {
+                Ok(guard) => Some(guard),
+                Err(error) => return ToolResult::error(error.to_string()),
+            }
         } else {
             None
         };
@@ -6645,9 +6661,12 @@ impl Tool for ScrollTool {
                 None
             };
             let _noact = if delivery == DeliveryMode::Background {
-                Some(crate::input::NoActivateGuard::arm(
-                    windows::Win32::Foundation::HWND(hwnd as *mut _),
-                ))
+                match crate::input::NoActivateGuard::arm(windows::Win32::Foundation::HWND(
+                    hwnd as *mut _,
+                )) {
+                    Ok(guard) => Some(guard),
+                    Err(error) => return ToolResult::error(error.to_string()),
+                }
             } else {
                 None
             };
@@ -6966,8 +6985,12 @@ fn winui3_uia_multi_invoke(
     };
     // Hold the frame non-activatable so the XAML Invoke handler's
     // SetFocus()→SetForegroundWindow(self) is refused for the whole burst.
-    let _noact =
-        crate::input::NoActivateGuard::arm(windows::Win32::Foundation::HWND(hwnd as *mut _));
+    let _noact = match crate::input::NoActivateGuard::arm(windows::Win32::Foundation::HWND(
+        hwnd as *mut _,
+    )) {
+        Ok(guard) => guard,
+        Err(error) => return Some(Err(error)),
+    };
     let elem: IUIAutomationElement = unsafe { IUIAutomationElement::from_raw(ptr as *mut _) };
     let outcome: Option<anyhow::Result<()>> = (|| {
         let pattern = unsafe { elem.GetCurrentPattern(UIA_InvokePatternId) }.ok()?;

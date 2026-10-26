@@ -29,11 +29,14 @@
 
 use anyhow::{bail, Result};
 use core::ffi::c_void;
-use std::sync::Mutex;
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpsc::{sync_channel, RecvTimeoutError, SyncSender};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
 use std::thread::sleep;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use windows::Win32::Foundation::{HANDLE, HWND, POINT, RECT};
+use windows::Win32::Foundation::{HANDLE, HWND, LPARAM, POINT, RECT, WPARAM};
 use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
 use windows::Win32::UI::Controls::{
     CreateSyntheticPointerDevice, DestroySyntheticPointerDevice, HSYNTHETICPOINTERDEVICE,
@@ -48,9 +51,9 @@ use windows::Win32::UI::Input::Pointer::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     GetAncestor, GetCursorPos, GetForegroundWindow, GetWindowLongPtrW, GetWindowThreadProcessId,
-    IsWindow, LockSetForegroundWindow, SetCursorPos, SetForegroundWindow, SetWindowLongPtrW,
-    WindowFromPoint, GA_ROOT, GWL_EXSTYLE, LSFW_LOCK, LSFW_UNLOCK, PT_PEN, PT_TOUCH,
-    WS_EX_NOACTIVATE,
+    IsHungAppWindow, IsWindow, LockSetForegroundWindow, SendMessageTimeoutW, SetCursorPos,
+    SetForegroundWindow, SetWindowLongPtrW, WindowFromPoint, GA_ROOT, GWL_EXSTYLE, LSFW_LOCK,
+    LSFW_UNLOCK, PT_PEN, PT_TOUCH, SMTO_ABORTIFHUNG, SMTO_BLOCK, WM_NULL, WS_EX_NOACTIVATE,
 };
 
 #[derive(Default)]
@@ -167,54 +170,462 @@ pub(crate) unsafe fn force_foreground_assisted(target: HWND) -> (bool, bool) {
 /// side effects) and reversed on drop. Covers the self-activation that the
 /// EnableWindow/UWP bypass cannot (WPF `UIElement.Focus()`→SetForegroundWindow).
 pub struct NoActivateGuard {
-    // Store the handle as an integer so the guard is `Send` and can be held
-    // across `.await` in the async tools.
-    root_addr: isize,
-    applied: bool,
+    _lease: Option<Arc<StyleGuardLease>>,
 }
 
-impl NoActivateGuard {
-    /// Arm on the top-level (GA_ROOT) ancestor of `hwnd`.
-    pub fn arm(hwnd: HWND) -> Self {
-        unsafe {
-            let root = {
-                let r = GetAncestor(hwnd, GA_ROOT);
-                if r.0.is_null() {
-                    hwnd
-                } else {
-                    r
-                }
-            };
-            let prev = GetWindowLongPtrW(root, GWL_EXSTYLE);
-            let want = WS_EX_NOACTIVATE.0 as isize;
-            // Apply WS_EX_NOACTIVATE if not already set (prev can be 0, so don't
-            // gate on it — we just need to check the bit and set it if absent).
-            let applied = (prev & want) == 0 && {
-                SetWindowLongPtrW(root, GWL_EXSTYLE, prev | want);
-                // Confirm it took (cross-process SetWindowLongPtr can be denied
-                // by UIPI on higher-integrity targets).
-                (GetWindowLongPtrW(root, GWL_EXSTYLE) & want) != 0
-            };
-            Self {
-                root_addr: root.0 as isize,
-                applied,
+/// Budget for the WM_NULL liveness probe that gates cross-process style writes.
+const STYLE_WRITE_PROBE_TIMEOUT_MS: u32 = 250;
+const STYLE_GUARD_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(1);
+const MAX_STYLE_GUARD_WORKERS: usize = 16;
+static STYLE_GUARD_WORKERS: AtomicUsize = AtomicUsize::new(0);
+static NEXT_STYLE_GUARD_TOKEN: AtomicUsize = AtomicUsize::new(1);
+static STYLE_GUARD_REGISTRY: OnceLock<StyleGuardRegistry> = OnceLock::new();
+
+struct StyleGuardRegistry {
+    entries: Mutex<HashMap<isize, StyleGuardRegistryEntry>>,
+    changed: Condvar,
+}
+
+enum StyleGuardLease {
+    Worker {
+        _release: SyncSender<()>,
+    },
+    Local {
+        root_addr: isize,
+        identity: Option<(u32, u32)>,
+        owner_thread_id: u32,
+        permit: Option<StyleGuardWorkerPermit>,
+        reservation: Option<StyleGuardReservation>,
+    },
+}
+
+impl Drop for StyleGuardLease {
+    fn drop(&mut self) {
+        let StyleGuardLease::Local {
+            root_addr,
+            identity,
+            owner_thread_id,
+            permit,
+            reservation,
+        } = self
+        else {
+            return;
+        };
+
+        let current_thread_id = unsafe { GetCurrentThreadId() };
+        if current_thread_id == *owner_thread_id {
+            restore_noactivate_on_worker(HWND(*root_addr as *mut _), *identity);
+            return;
+        }
+
+        let Some(permit) = permit.take() else {
+            return;
+        };
+        let Some(reservation) = reservation.take() else {
+            drop(permit);
+            return;
+        };
+        let resources = Arc::new(Mutex::new(Some((permit, reservation))));
+        let worker_resources = Arc::clone(&resources);
+        let root_addr = *root_addr;
+        let identity = *identity;
+        if std::thread::Builder::new()
+            .name("cua-noactivate-restore".into())
+            .spawn(move || {
+                let (permit, reservation) = worker_resources
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .take()
+                    .expect("style guard restore resources already taken");
+                let _permit = permit;
+                let _reservation = reservation;
+                restore_noactivate_on_worker(HWND(root_addr as *mut _), identity);
+            })
+            .is_err()
+        {
+            if let Some((_permit, reservation)) = resources
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .take()
+            {
+                // Keep the registry reserved if the fallback worker could not
+                // start; the style remains fail-closed rather than reusable.
+                std::mem::forget(reservation);
             }
         }
     }
 }
 
-impl Drop for NoActivateGuard {
-    fn drop(&mut self) {
-        if self.applied {
-            unsafe {
-                let root = HWND(self.root_addr as *mut _);
-                let current = GetWindowLongPtrW(root, GWL_EXSTYLE);
-                let noactivate = WS_EX_NOACTIVATE.0 as isize;
-                // Clear only the bit this guard added. Restoring the full
-                // captured value can clobber unrelated style changes the app
-                // made while the background action was in flight.
-                SetWindowLongPtrW(root, GWL_EXSTYLE, current & !noactivate);
+enum StyleGuardRegistryEntry {
+    Starting {
+        token: usize,
+    },
+    Ready {
+        token: usize,
+        lease: Weak<StyleGuardLease>,
+    },
+}
+
+enum StyleGuardRegistryAcquire {
+    Shared(Arc<StyleGuardLease>),
+    Reserved(StyleGuardReservation),
+}
+
+struct StyleGuardReservation {
+    root_addr: isize,
+    token: usize,
+}
+
+fn style_guard_registry() -> &'static StyleGuardRegistry {
+    STYLE_GUARD_REGISTRY.get_or_init(|| StyleGuardRegistry {
+        entries: Mutex::new(HashMap::new()),
+        changed: Condvar::new(),
+    })
+}
+
+fn lock_style_guard_registry(
+) -> std::sync::MutexGuard<'static, HashMap<isize, StyleGuardRegistryEntry>> {
+    style_guard_registry()
+        .entries
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn reserve_or_share_style_guard(root_addr: isize) -> anyhow::Result<StyleGuardRegistryAcquire> {
+    reserve_or_share_style_guard_until(root_addr, Instant::now() + STYLE_GUARD_HANDSHAKE_TIMEOUT)
+}
+
+fn reserve_or_share_style_guard_with_timeout(
+    root_addr: isize,
+    timeout: Duration,
+) -> anyhow::Result<StyleGuardRegistryAcquire> {
+    reserve_or_share_style_guard_until(root_addr, Instant::now() + timeout)
+}
+
+fn reserve_or_share_style_guard_until(
+    root_addr: isize,
+    deadline: Instant,
+) -> anyhow::Result<StyleGuardRegistryAcquire> {
+    let registry = style_guard_registry();
+    let mut entries = lock_style_guard_registry();
+    loop {
+        match entries.get(&root_addr) {
+            Some(StyleGuardRegistryEntry::Ready { lease, .. }) => {
+                if let Some(lease) = lease.upgrade() {
+                    return Ok(StyleGuardRegistryAcquire::Shared(lease));
+                }
             }
+            Some(StyleGuardRegistryEntry::Starting { .. }) => {}
+            None => {
+                let token = NEXT_STYLE_GUARD_TOKEN.fetch_add(1, Ordering::Relaxed);
+                entries.insert(root_addr, StyleGuardRegistryEntry::Starting { token });
+                return Ok(StyleGuardRegistryAcquire::Reserved(StyleGuardReservation {
+                    root_addr,
+                    token,
+                }));
+            }
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            anyhow::bail!(
+                "target_not_responding: window-style guard is still busy; \
+                 no input was sent and target effect is unknown"
+            );
+        }
+        entries = registry
+            .changed
+            .wait_timeout(entries, remaining)
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .0;
+    }
+}
+
+fn try_reserve_or_share_style_guard(root_addr: isize) -> anyhow::Result<StyleGuardRegistryAcquire> {
+    let mut entries = lock_style_guard_registry();
+    match entries.get(&root_addr) {
+        Some(StyleGuardRegistryEntry::Ready { lease, .. }) => {
+            if let Some(lease) = lease.upgrade() {
+                return Ok(StyleGuardRegistryAcquire::Shared(lease));
+            }
+            anyhow::bail!(
+                "target_not_responding: window-style guard restore is still in progress; \
+                 no input was sent and target effect is unknown"
+            );
+        }
+        Some(StyleGuardRegistryEntry::Starting { .. }) => {
+            anyhow::bail!(
+                "target_not_responding: window-style guard setup is already in progress; \
+                 no input was sent and target effect is unknown"
+            );
+        }
+        None => {}
+    }
+    let token = NEXT_STYLE_GUARD_TOKEN.fetch_add(1, Ordering::Relaxed);
+    entries.insert(root_addr, StyleGuardRegistryEntry::Starting { token });
+    Ok(StyleGuardRegistryAcquire::Reserved(StyleGuardReservation {
+        root_addr,
+        token,
+    }))
+}
+
+impl StyleGuardReservation {
+    fn publish_ready(&self, lease: &Arc<StyleGuardLease>) -> anyhow::Result<()> {
+        let registry = style_guard_registry();
+        let mut entries = lock_style_guard_registry();
+        let result = match entries.get(&self.root_addr) {
+            Some(StyleGuardRegistryEntry::Starting { token }) if *token == self.token => {
+                entries.insert(
+                    self.root_addr,
+                    StyleGuardRegistryEntry::Ready {
+                        token: self.token,
+                        lease: Arc::downgrade(lease),
+                    },
+                );
+                Ok(())
+            }
+            _ => anyhow::bail!("window-style guard registry reservation was lost"),
+        };
+        drop(entries);
+        if result.is_ok() {
+            registry.changed.notify_all();
+        }
+        result
+    }
+}
+
+impl Drop for StyleGuardReservation {
+    fn drop(&mut self) {
+        let registry = style_guard_registry();
+        let mut entries = lock_style_guard_registry();
+        let owns_entry = match entries.get(&self.root_addr) {
+            Some(StyleGuardRegistryEntry::Starting { token }) => *token == self.token,
+            Some(StyleGuardRegistryEntry::Ready { token, .. }) => *token == self.token,
+            None => false,
+        };
+        if owns_entry {
+            entries.remove(&self.root_addr);
+        }
+        drop(entries);
+        if owns_entry {
+            registry.changed.notify_all();
+        }
+    }
+}
+
+struct StyleGuardWorkerPermit;
+
+impl Drop for StyleGuardWorkerPermit {
+    fn drop(&mut self) {
+        STYLE_GUARD_WORKERS.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+fn acquire_style_guard_worker() -> anyhow::Result<StyleGuardWorkerPermit> {
+    let mut current = STYLE_GUARD_WORKERS.load(Ordering::Acquire);
+    loop {
+        if current >= MAX_STYLE_GUARD_WORKERS {
+            anyhow::bail!(
+                "target_not_responding: native window-style worker limit reached; \
+                 no input was sent and target effect is unknown"
+            );
+        }
+        match STYLE_GUARD_WORKERS.compare_exchange_weak(
+            current,
+            current + 1,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => return Ok(StyleGuardWorkerPermit),
+            Err(observed) => current = observed,
+        }
+    }
+}
+
+/// Whether `hwnd`'s thread answers a WM_NULL within `timeout_ms`.
+///
+/// `SetWindowLongPtrW(GWL_EXSTYLE)` on another process's window sends
+/// WM_STYLECHANGING/WM_STYLECHANGED synchronously and has no timeout, so it
+/// blocks for as long as the owning thread is hung.
+pub(crate) fn window_thread_responds(hwnd: HWND, timeout_ms: u32) -> bool {
+    unsafe {
+        if IsHungAppWindow(hwnd).as_bool() {
+            return false;
+        }
+        let mut result = 0usize;
+        SendMessageTimeoutW(
+            hwnd,
+            WM_NULL,
+            WPARAM(0),
+            LPARAM(0),
+            SMTO_ABORTIFHUNG | SMTO_BLOCK,
+            timeout_ms,
+            Some(&mut result),
+        )
+        .0 != 0
+    }
+}
+
+impl NoActivateGuard {
+    /// Arm on the top-level (GA_ROOT) ancestor of `hwnd`.
+    ///
+    /// Cross-thread Win32 style writes run on a capped native worker. A timed
+    /// out arm refuses the action; its worker restores the style if the
+    /// pending call eventually succeeds.
+    pub fn arm(hwnd: HWND) -> anyhow::Result<Self> {
+        let root = unsafe {
+            let ancestor = GetAncestor(hwnd, GA_ROOT);
+            if ancestor.0.is_null() {
+                hwnd
+            } else {
+                ancestor
+            }
+        };
+        if root.0.is_null() {
+            anyhow::bail!("target_not_responding: invalid target window; no input was sent");
+        }
+
+        let root_addr = root.0 as isize;
+        let deadline = Instant::now() + STYLE_GUARD_HANDSHAKE_TIMEOUT;
+        let reservation = match reserve_or_share_style_guard_until(root_addr, deadline)? {
+            StyleGuardRegistryAcquire::Shared(lease) => {
+                return Ok(Self {
+                    _lease: Some(lease),
+                });
+            }
+            StyleGuardRegistryAcquire::Reserved(reservation) => reservation,
+        };
+        let owner_thread_id = unsafe { GetWindowThreadProcessId(root, None) };
+        if owner_thread_id != 0 && owner_thread_id == unsafe { GetCurrentThreadId() } {
+            let permit = acquire_style_guard_worker()?;
+            let (applied, identity) =
+                arm_noactivate_on_worker(root).map_err(|error| anyhow::anyhow!(error))?;
+            if !applied {
+                return Ok(Self { _lease: None });
+            }
+            let lease = Arc::new(StyleGuardLease::Local {
+                root_addr,
+                identity,
+                owner_thread_id,
+                permit: Some(permit),
+                reservation: Some(reservation),
+            });
+            return Ok(Self {
+                _lease: Some(lease),
+            });
+        }
+        let permit = acquire_style_guard_worker()?;
+        let (ready_tx, ready_rx) = sync_channel(1);
+        let (release_tx, release_rx) = sync_channel(0);
+        std::thread::Builder::new()
+            .name("cua-noactivate-guard".into())
+            .spawn(move || {
+                let _permit = permit;
+                let reservation = reservation;
+                let root = HWND(root_addr as *mut _);
+                let result = arm_noactivate_on_worker(root);
+                let (applied, identity) = match result {
+                    Ok(result) => result,
+                    Err(error) => {
+                        let _ = ready_tx.send(Err(error));
+                        return;
+                    }
+                };
+                if !applied {
+                    let _ = ready_tx.send(Ok(None));
+                    return;
+                }
+                let lease = Arc::new(StyleGuardLease::Worker {
+                    _release: release_tx,
+                });
+                if let Err(error) = reservation.publish_ready(&lease) {
+                    restore_noactivate_on_worker(root, identity);
+                    let _ = ready_tx.send(Err(error.to_string()));
+                    return;
+                }
+                let _ = ready_tx.send(Ok(Some(lease)));
+                let _ = release_rx.recv();
+                restore_noactivate_on_worker(root, identity);
+            })
+            .map_err(|error| {
+                anyhow::anyhow!("could not start bounded window-style worker: {error}")
+            })?;
+
+        match ready_rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+            Ok(Ok(lease)) => Ok(Self { _lease: lease }),
+            Ok(Err(error)) => Err(anyhow::anyhow!(error)),
+            Err(RecvTimeoutError::Timeout) => anyhow::bail!(
+                "target_not_responding: window-style guard did not finish within {} ms; \
+                 no input was sent and target effect is unknown",
+                STYLE_GUARD_HANDSHAKE_TIMEOUT.as_millis()
+            ),
+            Err(RecvTimeoutError::Disconnected) => {
+                anyhow::bail!(
+                    "target_not_responding: window-style worker exited before confirming the guard; \
+                     no input was sent and target effect is unknown"
+                );
+            }
+        }
+    }
+}
+
+fn root_process_identity(root: HWND) -> Option<(u32, u32)> {
+    unsafe {
+        if !IsWindow(root).as_bool() {
+            return None;
+        }
+        let mut process_id = 0;
+        let thread_id = GetWindowThreadProcessId(root, Some(&mut process_id));
+        (thread_id != 0 && process_id != 0).then_some((process_id, thread_id))
+    }
+}
+
+fn arm_noactivate_on_worker(root: HWND) -> Result<(bool, Option<(u32, u32)>), String> {
+    if !window_thread_responds(root, STYLE_WRITE_PROBE_TIMEOUT_MS) {
+        return Err(format!(
+            "target_not_responding: window 0x{:x} did not answer the liveness probe; \
+             no input was sent and target effect is unknown",
+            root.0 as isize
+        ));
+    }
+    let identity = root_process_identity(root).ok_or_else(|| {
+        "target_not_responding: target window disappeared before guard setup; \
+         no input was sent and target effect is unknown"
+            .to_owned()
+    })?;
+    let previous = unsafe { GetWindowLongPtrW(root, GWL_EXSTYLE) };
+    let noactivate = WS_EX_NOACTIVATE.0 as isize;
+    if previous & noactivate != 0 {
+        return Ok((false, Some(identity)));
+    }
+    unsafe {
+        SetWindowLongPtrW(root, GWL_EXSTYLE, previous | noactivate);
+    }
+    let confirmed = root_process_identity(root) == Some(identity)
+        && unsafe { GetWindowLongPtrW(root, GWL_EXSTYLE) } & noactivate != 0;
+    if !confirmed {
+        restore_noactivate_on_worker(root, Some(identity));
+        return Err(
+            "target_not_responding: could not confirm the no-activate guard; \
+             no input was sent and target effect is unknown"
+                .to_owned(),
+        );
+    }
+    Ok((true, Some(identity)))
+}
+
+fn restore_noactivate_on_worker(root: HWND, identity: Option<(u32, u32)>) {
+    let Some(identity) = identity else {
+        return;
+    };
+    if root_process_identity(root) != Some(identity) {
+        return;
+    }
+    unsafe {
+        let current = GetWindowLongPtrW(root, GWL_EXSTYLE);
+        let noactivate = WS_EX_NOACTIVATE.0 as isize;
+        // Clear only the bit this guard added; preserve unrelated style changes.
+        if current & noactivate != 0 {
+            SetWindowLongPtrW(root, GWL_EXSTYLE, current & !noactivate);
         }
     }
 }
@@ -350,7 +761,7 @@ pub fn inject_click_screen(
     // Make the target non-activatable for the click so click-activation can't
     // steal foreground. No z-order raise.
     let result = {
-        let _noact = NoActivateGuard::arm(target_h);
+        let _noact = NoActivateGuard::arm(target_h)?;
         // One synthetic device does all `count` taps (single/double/triple click).
         pen_taps(sx, sy, barrel, count)
     };
@@ -459,6 +870,100 @@ pub fn window_is_iconic(hwnd: u64) -> bool {
         return false;
     }
     unsafe { IsIconic(HWND(hwnd as *mut _)).as_bool() }
+}
+
+#[cfg(test)]
+mod noactivate_registry_tests {
+    use super::*;
+    use std::sync::mpsc::TryRecvError;
+
+    fn unique_root() -> isize {
+        -(NEXT_STYLE_GUARD_TOKEN.fetch_add(1, Ordering::Relaxed) as isize)
+    }
+
+    #[test]
+    fn noactivate_registry_shared_guards_release_after_last_drop() {
+        let root = unique_root();
+        let reservation = match reserve_or_share_style_guard(root).unwrap() {
+            StyleGuardRegistryAcquire::Reserved(reservation) => reservation,
+            StyleGuardRegistryAcquire::Shared(_) => panic!("unexpected existing guard"),
+        };
+        let (release, released) = sync_channel(0);
+        let first = Arc::new(StyleGuardLease::Worker { _release: release });
+        reservation.publish_ready(&first).unwrap();
+        let second = match reserve_or_share_style_guard(root).unwrap() {
+            StyleGuardRegistryAcquire::Shared(lease) => lease,
+            StyleGuardRegistryAcquire::Reserved(_) => panic!("guard was not shared"),
+        };
+
+        drop(first);
+        assert_eq!(released.try_recv(), Err(TryRecvError::Empty));
+        drop(second);
+        assert_eq!(released.try_recv(), Err(TryRecvError::Disconnected));
+        drop(reservation);
+    }
+
+    #[test]
+    fn noactivate_registry_refuses_starting_and_restore_in_progress() {
+        let root = unique_root();
+        let reservation = match reserve_or_share_style_guard(root).unwrap() {
+            StyleGuardRegistryAcquire::Reserved(reservation) => reservation,
+            StyleGuardRegistryAcquire::Shared(_) => panic!("unexpected existing guard"),
+        };
+        assert!(try_reserve_or_share_style_guard(root).is_err());
+
+        let (release, released) = sync_channel(0);
+        let lease = Arc::new(StyleGuardLease::Worker { _release: release });
+        reservation.publish_ready(&lease).unwrap();
+        drop(lease);
+        assert_eq!(released.try_recv(), Err(TryRecvError::Disconnected));
+        assert!(try_reserve_or_share_style_guard(root).is_err());
+
+        drop(reservation);
+        let replacement = match try_reserve_or_share_style_guard(root).unwrap() {
+            StyleGuardRegistryAcquire::Reserved(reservation) => reservation,
+            StyleGuardRegistryAcquire::Shared(_) => panic!("stale registry entry"),
+        };
+        drop(replacement);
+    }
+
+    #[test]
+    fn noactivate_registry_waits_for_starting_entry_within_budget() {
+        let root = unique_root();
+        let reservation = match try_reserve_or_share_style_guard(root).unwrap() {
+            StyleGuardRegistryAcquire::Reserved(reservation) => reservation,
+            StyleGuardRegistryAcquire::Shared(_) => panic!("unexpected existing guard"),
+        };
+        let (started_tx, started_rx) = sync_channel(0);
+        let waiter = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            reserve_or_share_style_guard_with_timeout(root, Duration::from_millis(250))
+        });
+        started_rx.recv().unwrap();
+        std::thread::sleep(Duration::from_millis(10));
+        drop(reservation);
+
+        let replacement = waiter.join().unwrap().unwrap();
+        match replacement {
+            StyleGuardRegistryAcquire::Reserved(reservation) => drop(reservation),
+            StyleGuardRegistryAcquire::Shared(_) => panic!("starting guard was not replaced"),
+        }
+    }
+
+    #[test]
+    fn noactivate_registry_timeout_is_bounded() {
+        let root = unique_root();
+        let reservation = match try_reserve_or_share_style_guard(root).unwrap() {
+            StyleGuardRegistryAcquire::Reserved(reservation) => reservation,
+            StyleGuardRegistryAcquire::Shared(_) => panic!("unexpected existing guard"),
+        };
+        let started = Instant::now();
+        assert!(
+            reserve_or_share_style_guard_with_timeout(root, Duration::from_millis(25)).is_err()
+        );
+        assert!(started.elapsed() >= Duration::from_millis(20));
+        drop(reservation);
+    }
 }
 
 #[cfg(test)]
@@ -754,7 +1259,7 @@ pub fn inject_drag_screen(
     // Chromium/GTK: pointer-aware, process injection in the background — hold
     // non-activatable (no raise), inject, then re-assert the user's foreground.
     let r = {
-        let _noact = NoActivateGuard::arm(target_h);
+        let _noact = NoActivateGuard::arm(target_h)?;
         stroke(())
     };
     unsafe {
