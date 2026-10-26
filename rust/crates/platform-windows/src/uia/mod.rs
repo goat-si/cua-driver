@@ -11,11 +11,11 @@
 
 use cua_driver_core::snapshot_compaction::{
     compact_tab_strip, fold_actionless_text_subtrees, format_omitted_tabs_line,
-    is_compaction_summary_line, is_uia_dense_collection, is_uia_offscreen_exempt,
-    is_secure_text_field, plan_uia_collection_children, redact_if_secure,
-    redact_mirrored_secure_name, renumber_indexed_tree, splice_deferred_chunks,
-    CompactableNode, DeferredChunk, FieldSecurityMeta, RenumberableNode, TabChildMeta,
-    UiaChildCandidate, UiaChildPlan, TAB_STRIP_COMPACTION_THRESHOLD,
+    is_compaction_summary_line, is_secure_text_field, is_uia_dense_collection,
+    is_uia_offscreen_exempt, plan_uia_collection_children, redact_if_secure,
+    redact_mirrored_secure_name, renumber_indexed_tree, splice_deferred_chunks, CompactableNode,
+    DeferredChunk, FieldSecurityMeta, RenumberableNode, TabChildMeta, UiaChildCandidate,
+    UiaChildPlan, TAB_STRIP_COMPACTION_THRESHOLD,
 };
 use cua_driver_core::walk_budget::WalkBudget;
 use windows::core::{Interface, BSTR};
@@ -26,18 +26,17 @@ use windows::Win32::UI::Accessibility::{
     CUIAutomation, ExpandCollapseState_Collapsed, ExpandCollapseState_Expanded,
     ExpandCollapseState_PartiallyExpanded, IUIAutomation, IUIAutomationCacheRequest,
     IUIAutomationElement, IUIAutomationElementArray, IUIAutomationExpandCollapsePattern,
-    IUIAutomationInvokePattern,
-    IUIAutomationSelectionItemPattern, IUIAutomationTogglePattern, ToggleState_Indeterminate,
-    ToggleState_Off, ToggleState_On, TreeScope, TreeScope_Children, TreeScope_Element,
-    TreeScope_Subtree, UIA_AutomationIdPropertyId, UIA_BoundingRectanglePropertyId,
-    UIA_ControlTypePropertyId, UIA_ExpandCollapseExpandCollapseStatePropertyId,
-    UIA_ExpandCollapsePatternId, UIA_FullDescriptionPropertyId, UIA_HelpTextPropertyId,
-    UIA_InvokePatternId, UIA_LegacyIAccessibleDescriptionPropertyId,
+    IUIAutomationInvokePattern, IUIAutomationSelectionItemPattern, IUIAutomationTogglePattern,
+    ToggleState_Indeterminate, ToggleState_Off, ToggleState_On, TreeScope, TreeScope_Children,
+    TreeScope_Element, TreeScope_Subtree, UIA_AutomationIdPropertyId,
+    UIA_BoundingRectanglePropertyId, UIA_ControlTypePropertyId,
+    UIA_ExpandCollapseExpandCollapseStatePropertyId, UIA_ExpandCollapsePatternId,
+    UIA_FullDescriptionPropertyId, UIA_HelpTextPropertyId, UIA_InvokePatternId,
     UIA_IsEnabledPropertyId, UIA_IsOffscreenPropertyId, UIA_IsPasswordPropertyId,
-    UIA_NamePropertyId, UIA_ProcessIdPropertyId, UIA_RangeValuePatternId, UIA_ScrollPatternId,
-    UIA_SelectionItemIsSelectedPropertyId, UIA_SelectionItemPatternId, UIA_TextPatternId,
-    UIA_TogglePatternId, UIA_ToggleToggleStatePropertyId, UIA_ValuePatternId,
-    UIA_ValueValuePropertyId,
+    UIA_LegacyIAccessibleDescriptionPropertyId, UIA_NamePropertyId, UIA_ProcessIdPropertyId,
+    UIA_RangeValuePatternId, UIA_ScrollPatternId, UIA_SelectionItemIsSelectedPropertyId,
+    UIA_SelectionItemPatternId, UIA_TextPatternId, UIA_TogglePatternId,
+    UIA_ToggleToggleStatePropertyId, UIA_ValuePatternId, UIA_ValueValuePropertyId,
 };
 
 pub mod fg_bypass;
@@ -597,7 +596,9 @@ unsafe fn pid_from_hwnd(hwnd: windows::Win32::Foundation::HWND) -> Option<u32> {
 
 fn native_list_view_class(class: &str) -> bool {
     class.eq_ignore_ascii_case("SysListView32")
-        || class.to_ascii_lowercase().starts_with("windowsforms10.syslistview32.")
+        || class
+            .to_ascii_lowercase()
+            .starts_with("windowsforms10.syslistview32.")
 }
 
 unsafe fn contains_native_list_view(hwnd: windows::Win32::Foundation::HWND) -> bool {
@@ -639,10 +640,20 @@ unsafe fn walk_list_view_window(
         if !complete {
             state.mark_incomplete();
         }
-        let root = automation.ElementFromHandle(hwnd)?.BuildUpdatedCache(&cache)?;
+        let root = automation
+            .ElementFromHandle(hwnd)?
+            .BuildUpdatedCache(&cache)?;
         walk_list_view_level(
-            automation, &cache, &root, 0, None, false,
-            &mut nodes, &mut lines, &mut counter, &mut state,
+            automation,
+            &cache,
+            &root,
+            0,
+            None,
+            false,
+            &mut nodes,
+            &mut lines,
+            &mut counter,
+            &mut state,
             query.is_some_and(|q| !q.trim().is_empty()),
         );
         Ok(())
@@ -680,23 +691,30 @@ unsafe fn walk_list_view_level(
     let (kind, parent) = emit_cached_node(element, depth, parent, in_web, nodes, lines, counter);
     let next_web = in_web || kind.eq_ignore_ascii_case("Document");
     let dense = is_uia_dense_collection(&kind);
-    let native_children = dense.then(|| native_visible_list_rows(automation, cache, element)).flatten();
-    let children = native_children.map(Ok).unwrap_or_else(|| (|| -> windows::core::Result<Vec<IUIAutomationElement>> {
-        let control = automation.ControlViewCondition()?;
-        let condition = if dense {
-            // Filter before fetching patterns/values: offscreen rows must
-            // never enter the expensive bulk cache transaction.
-            let visible = automation.CreatePropertyCondition(
-                UIA_IsOffscreenPropertyId, &windows::core::VARIANT::from(false),
-            )?;
-            state.mark_incomplete();
-            automation.CreateAndCondition(&control, &visible)?
-        } else {
-            control
-        };
-        let children = element.FindAllBuildCache(TreeScope_Children, &condition, cache)?;
-        (0..children.Length()?).map(|i| children.GetElement(i)).collect()
-    })());
+    let native_children = dense
+        .then(|| native_visible_list_rows(automation, cache, element))
+        .flatten();
+    let children = native_children.map(Ok).unwrap_or_else(|| {
+        (|| -> windows::core::Result<Vec<IUIAutomationElement>> {
+            let control = automation.ControlViewCondition()?;
+            let condition = if dense {
+                // Filter before fetching patterns/values: offscreen rows must
+                // never enter the expensive bulk cache transaction.
+                let visible = automation.CreatePropertyCondition(
+                    UIA_IsOffscreenPropertyId,
+                    &windows::core::VARIANT::from(false),
+                )?;
+                state.mark_incomplete();
+                automation.CreateAndCondition(&control, &visible)?
+            } else {
+                control
+            };
+            let children = element.FindAllBuildCache(TreeScope_Children, &condition, cache)?;
+            (0..children.Length()?)
+                .map(|i| children.GetElement(i))
+                .collect()
+        })()
+    });
     let children = match children {
         Ok(children) => children,
         Err(error) => {
@@ -711,23 +729,37 @@ unsafe fn walk_list_view_level(
     pending.sort_by_key(|child| is_uia_dense_collection(&read_cached_control_type(child)));
     for child in pending {
         walk_list_view_level(
-            automation, cache, &child, depth + 1, parent, next_web,
-            nodes, lines, counter, state, search_offscreen,
+            automation,
+            cache,
+            &child,
+            depth + 1,
+            parent,
+            next_web,
+            nodes,
+            lines,
+            counter,
+            state,
+            search_offscreen,
         );
     }
     if dense {
         state.mark_incomplete();
-        lines.push((depth + 1, "(offscreen rows omitted by bounded UIA collection read)".into()));
+        lines.push((
+            depth + 1,
+            "(offscreen rows omitted by bounded UIA collection read)".into(),
+        ));
         if search_offscreen && !state.budget.expired() {
             // Query mode may inspect offscreen rows too, but only one row's
             // cache at a time, after visible rows and sibling editors.
             let walker = (|| -> windows::core::Result<_> {
                 let offscreen = automation.CreatePropertyCondition(
-                    UIA_IsOffscreenPropertyId, &windows::core::VARIANT::from(true),
+                    UIA_IsOffscreenPropertyId,
+                    &windows::core::VARIANT::from(true),
                 )?;
-                automation.CreateTreeWalker(&automation.CreateAndCondition(
-                    &automation.ControlViewCondition()?, &offscreen,
-                )?)
+                automation.CreateTreeWalker(
+                    &automation
+                        .CreateAndCondition(&automation.ControlViewCondition()?, &offscreen)?,
+                )
             })();
             if let Ok(walker) = walker {
                 let mut row = walker.GetFirstChildElementBuildCache(element, cache);
@@ -737,8 +769,17 @@ unsafe fn walk_list_view_level(
                         break;
                     }
                     walk_list_view_level(
-                        automation, cache, &child, depth + 1, parent, next_web,
-                        nodes, lines, counter, state, false,
+                        automation,
+                        cache,
+                        &child,
+                        depth + 1,
+                        parent,
+                        next_web,
+                        nodes,
+                        lines,
+                        counter,
+                        state,
+                        false,
                     );
                     row = walker.GetNextSiblingElementBuildCache(&child, cache);
                 }
@@ -759,21 +800,32 @@ unsafe fn native_visible_list_rows(
     use windows::Win32::UI::Accessibility::{AccessibleObjectFromWindow, IAccessible};
     use windows::Win32::UI::Controls::{LVM_GETCOUNTPERPAGE, LVM_GETITEMCOUNT, LVM_GETTOPINDEX};
     use windows::Win32::UI::WindowsAndMessaging::{
-        GetClassNameW, GetWindowLongPtrW, SendMessageTimeoutW, GWL_STYLE,
-        SMTO_ABORTIFHUNG, SMTO_BLOCK,
+        GetClassNameW, GetWindowLongPtrW, SendMessageTimeoutW, GWL_STYLE, SMTO_ABORTIFHUNG,
+        SMTO_BLOCK,
     };
     let hwnd = element.CurrentNativeWindowHandle().ok()?;
     let mut class = [0u16; 256];
     let len = GetClassNameW(hwnd, &mut class);
-    if len <= 0 || !native_list_view_class(&String::from_utf16_lossy(&class[..len as usize]))
-        || GetWindowLongPtrW(hwnd, GWL_STYLE) & 3 != 1 // LVS_TYPEMASK / LVS_REPORT
+    if len <= 0
+        || !native_list_view_class(&String::from_utf16_lossy(&class[..len as usize]))
+        || GetWindowLongPtrW(hwnd, GWL_STYLE) & 3 != 1
+    // LVS_TYPEMASK / LVS_REPORT
     {
         return None;
     }
     let read = |message| {
         let mut value = 0usize;
-        (SendMessageTimeoutW(hwnd, message, WPARAM(0), LPARAM(0),
-            SMTO_ABORTIFHUNG | SMTO_BLOCK, 100, Some(&mut value)).0 != 0).then_some(value)
+        (SendMessageTimeoutW(
+            hwnd,
+            message,
+            WPARAM(0),
+            LPARAM(0),
+            SMTO_ABORTIFHUNG | SMTO_BLOCK,
+            100,
+            Some(&mut value),
+        )
+        .0 != 0)
+            .then_some(value)
     };
     let count = read(LVM_GETITEMCOUNT)?;
     let top = read(LVM_GETTOPINDEX)?;
@@ -801,9 +853,15 @@ unsafe fn native_visible_list_rows(
         children.push(current);
     }
     for index in top..count.min(top.saturating_add(page).saturating_add(1)) {
-        children.push(automation.ElementFromIAccessibleBuildCache(
-            &accessible, i32::try_from(index + 1).ok()?, cache,
-        ).ok()?);
+        children.push(
+            automation
+                .ElementFromIAccessibleBuildCache(
+                    &accessible,
+                    i32::try_from(index + 1).ok()?,
+                    cache,
+                )
+                .ok()?,
+        );
     }
     let mut tail = Vec::new();
     let mut child = walker.GetLastChildElementBuildCache(element, cache);
@@ -1070,112 +1128,109 @@ unsafe fn walk_cached_element(
             Err(_) => walk_state.mark_incomplete(),
         }
     }
-        let tab_plan = if !next_web && child_elems.len() >= TAB_STRIP_COMPACTION_THRESHOLD {
-            let child_types: Vec<String> =
-                child_elems.iter().map(read_cached_control_type).collect();
-            let child_selected: Vec<Option<bool>> =
-                child_elems.iter().map(read_cached_selected).collect();
-            let child_values: Vec<Option<String>> =
-                child_elems.iter().map(read_cached_bstr_value).collect();
-            let metas: Vec<TabChildMeta<'_>> = (0..child_elems.len())
-                .map(|i| TabChildMeta {
-                    role: &child_types[i],
-                    role_description: None,
-                    title: None,
-                    selected: child_selected[i],
-                    value: child_values[i].as_deref(),
-                    value_state: child_values[i].as_deref(),
-                })
-                .collect();
-            let parent_name = read_cached_bstr_name(element);
-            compact_tab_strip(&control_type, parent_name.as_deref(), None, None, &metas)
-        } else {
-            None
-        };
+    let tab_plan = if !next_web && child_elems.len() >= TAB_STRIP_COMPACTION_THRESHOLD {
+        let child_types: Vec<String> = child_elems.iter().map(read_cached_control_type).collect();
+        let child_selected: Vec<Option<bool>> =
+            child_elems.iter().map(read_cached_selected).collect();
+        let child_values: Vec<Option<String>> =
+            child_elems.iter().map(read_cached_bstr_value).collect();
+        let metas: Vec<TabChildMeta<'_>> = (0..child_elems.len())
+            .map(|i| TabChildMeta {
+                role: &child_types[i],
+                role_description: None,
+                title: None,
+                selected: child_selected[i],
+                value: child_values[i].as_deref(),
+                value_state: child_values[i].as_deref(),
+            })
+            .collect();
+        let parent_name = read_cached_bstr_name(element);
+        compact_tab_strip(&control_type, parent_name.as_deref(), None, None, &metas)
+    } else {
+        None
+    };
 
-        let dense_plan = if defer_dense_rows && !next_web && is_uia_dense_collection(&control_type)
-        {
-            let (_, _, parent_rect) = read_cached_bounding_rect_full(element);
-            let child_types: Vec<String> =
-                child_elems.iter().map(read_cached_control_type).collect();
-            let candidates: Vec<UiaChildCandidate<'_>> = child_elems
-                .iter()
-                .enumerate()
-                .map(|(i, c)| {
-                    let is_offscreen = read_cached_bool(c, UIA_IsOffscreenPropertyId);
-                    let (_, _, rect) = read_cached_bounding_rect_full(c);
-                    UiaChildCandidate {
-                        control_type: &child_types[i],
-                        is_offscreen,
-                        rect,
-                    }
-                })
-                .collect();
-            Some(plan_uia_collection_children(parent_rect, &candidates))
-        } else {
-            None
-        };
+    let dense_plan = if defer_dense_rows && !next_web && is_uia_dense_collection(&control_type) {
+        let (_, _, parent_rect) = read_cached_bounding_rect_full(element);
+        let child_types: Vec<String> = child_elems.iter().map(read_cached_control_type).collect();
+        let candidates: Vec<UiaChildCandidate<'_>> = child_elems
+            .iter()
+            .enumerate()
+            .map(|(i, c)| {
+                let is_offscreen = read_cached_bool(c, UIA_IsOffscreenPropertyId);
+                let (_, _, rect) = read_cached_bounding_rect_full(c);
+                UiaChildCandidate {
+                    control_type: &child_types[i],
+                    is_offscreen,
+                    rect,
+                }
+            })
+            .collect();
+        Some(plan_uia_collection_children(parent_rect, &candidates))
+    } else {
+        None
+    };
 
-        for (index, child) in child_elems.into_iter().enumerate() {
-            if let Some(ref tp) = tab_plan {
-                if index == tp.first_omitted_index {
-                    lines.push((depth + 1, format_omitted_tabs_line(tp.omitted_count)));
-                    nodes.push(UiaNode {
-                        element_index: None,
-                        control_type: "UiaTabStripSummary".into(),
-                        name: None,
-                        value: None,
-                        automation_id: None,
-                        help_text: None,
-                        actions: vec![],
-                        enabled: None,
-                        selected: None,
-                        checked: None,
-                        expanded: None,
-                        element_ptr: 0,
-                        center_x: 0,
-                        center_y: 0,
-                        rect: None,
-                        msaa_role: None,
-                        depth: depth + 1,
-                        parent_element_index: emitted_parent,
-                        in_web_content: next_web,
-                    });
-                }
-                if !tp.keep[index] {
-                    continue;
-                }
-            }
-            let action = dense_plan
-                .as_ref()
-                .map_or(UiaChildPlan::WalkNow, |plan| plan[index]);
-            match action {
-                UiaChildPlan::Defer { visible } => deferred.push(DeferredUiaRow {
-                    element: child,
+    for (index, child) in child_elems.into_iter().enumerate() {
+        if let Some(ref tp) = tab_plan {
+            if index == tp.first_omitted_index {
+                lines.push((depth + 1, format_omitted_tabs_line(tp.omitted_count)));
+                nodes.push(UiaNode {
+                    element_index: None,
+                    control_type: "UiaTabStripSummary".into(),
+                    name: None,
+                    value: None,
+                    automation_id: None,
+                    help_text: None,
+                    actions: vec![],
+                    enabled: None,
+                    selected: None,
+                    checked: None,
+                    expanded: None,
+                    element_ptr: 0,
+                    center_x: 0,
+                    center_y: 0,
+                    rect: None,
+                    msaa_role: None,
+                    depth: depth + 1,
+                    parent_element_index: emitted_parent,
                     in_web_content: next_web,
-                    chunk: DeferredChunk {
-                        anchor: nodes.len(),
-                        seq: deferred.len(),
-                        depth: depth + 1,
-                        parent_index: emitted_parent,
-                        visible,
-                        walked: None,
-                    },
-                }),
-                UiaChildPlan::WalkNow => walk_cached_element(
-                    &child,
-                    depth + 1,
-                    emitted_parent,
-                    next_web,
-                    nodes,
-                    lines,
-                    counter,
-                    walk_state,
-                    defer_dense_rows,
-                    deferred,
-                ),
+                });
+            }
+            if !tp.keep[index] {
+                continue;
             }
         }
+        let action = dense_plan
+            .as_ref()
+            .map_or(UiaChildPlan::WalkNow, |plan| plan[index]);
+        match action {
+            UiaChildPlan::Defer { visible } => deferred.push(DeferredUiaRow {
+                element: child,
+                in_web_content: next_web,
+                chunk: DeferredChunk {
+                    anchor: nodes.len(),
+                    seq: deferred.len(),
+                    depth: depth + 1,
+                    parent_index: emitted_parent,
+                    visible,
+                    walked: None,
+                },
+            }),
+            UiaChildPlan::WalkNow => walk_cached_element(
+                &child,
+                depth + 1,
+                emitted_parent,
+                next_web,
+                nodes,
+                lines,
+                counter,
+                walk_state,
+                defer_dense_rows,
+                deferred,
+            ),
+        }
+    }
 }
 
 unsafe fn cached_children(
@@ -1794,9 +1849,13 @@ mod tests {
     #[test]
     fn native_list_view_detection_does_not_select_listbox() {
         assert!(native_list_view_class("SysListView32"));
-        assert!(native_list_view_class("WindowsForms10.SysListView32.app.0.34f5582_r7_ad1"));
+        assert!(native_list_view_class(
+            "WindowsForms10.SysListView32.app.0.34f5582_r7_ad1"
+        ));
         assert!(!native_list_view_class("ListBox"));
-        assert!(!native_list_view_class("WindowsForms10.LISTBOX.app.0.34f5582_r7_ad1"));
+        assert!(!native_list_view_class(
+            "WindowsForms10.LISTBOX.app.0.34f5582_r7_ad1"
+        ));
     }
 
     fn star(child_count: usize) -> Vec<Vec<usize>> {
