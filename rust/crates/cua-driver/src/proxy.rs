@@ -81,9 +81,7 @@ pub async fn run_direct(driver: Arc<cua_driver_sdk::CuaDriver>) -> anyhow::Resul
         BufReader::new(tokio::io::stdin()),
         tokio::io::BufWriter::new(tokio::io::stdout()),
         deadline,
-        move |request: &Request| {
-            protocol_admission(request, &direct_sdk.tools_list())
-        },
+        move |request: &Request| protocol_admission(request, &direct_sdk.tools_list()),
         move |mut request: Request, id: serde_json::Value| {
             apply_direct_session_identity(&mut request, &direct_session);
             let session_context = request.tool_call().ok().and_then(|call| {
@@ -107,14 +105,13 @@ pub async fn run_direct(driver: Arc<cua_driver_sdk::CuaDriver>) -> anyhow::Resul
             let sdk = direct_handler_sdk.clone();
             let session = direct_session.clone();
             async move {
-                let response =
-                    cua_driver_core::server::handle_request_with_transport_session(
-                        request,
-                        id,
-                        sdk.as_ref(),
-                        &session,
-                    )
-                    .await;
+                let response = cua_driver_core::server::handle_request_with_transport_session(
+                    request,
+                    id,
+                    sdk.as_ref(),
+                    &session,
+                )
+                .await;
                 telemetry.finish(&response);
                 response
             }
@@ -137,11 +134,9 @@ fn tool_call_deadline() -> anyhow::Result<Duration> {
     let Some(raw) = std::env::var_os(TOOL_CALL_DEADLINE_ENV) else {
         return Ok(DEFAULT_TOOL_CALL_DEADLINE);
     };
-    let secs = raw
-        .to_string_lossy()
-        .trim()
-        .parse::<u64>()
-        .map_err(|_| anyhow::anyhow!("{TOOL_CALL_DEADLINE_ENV} must be an integer from 1 to 110"))?;
+    let secs = raw.to_string_lossy().trim().parse::<u64>().map_err(|_| {
+        anyhow::anyhow!("{TOOL_CALL_DEADLINE_ENV} must be an integer from 1 to 110")
+    })?;
     anyhow::ensure!(
         (1..=110).contains(&secs),
         "{TOOL_CALL_DEADLINE_ENV} must be an integer from 1 to 110"
@@ -149,10 +144,7 @@ fn tool_call_deadline() -> anyhow::Result<Duration> {
     Ok(Duration::from_secs(secs))
 }
 
-fn protocol_admission(
-    request: &Request,
-    inventory: &serde_json::Value,
-) -> Result<(), Response> {
+fn protocol_admission(request: &Request, inventory: &serde_json::Value) -> Result<(), Response> {
     let era = mcp_wire::classify_request(request)?;
     if request.method == "tools/call" {
         mcp_wire::validate_tool_call(
@@ -255,7 +247,10 @@ fn deadline_response(id: serde_json::Value, tool: Option<&str>, deadline: Durati
     Response::error(
         id,
         -32603,
-        format!("request exceeded the {}s deadline; effect is unknown", deadline.as_secs()),
+        format!(
+            "request exceeded the {}s deadline; effect is unknown",
+            deadline.as_secs()
+        ),
     )
 }
 
@@ -392,19 +387,13 @@ where
             continue;
         }
         if tasks.len() >= MAX_IN_FLIGHT_REQUESTS {
-            write_response(
-                &mut writer,
-                Response::error(id, -32029, "in_flight_limit"),
-            )
-            .await?;
+            write_response(&mut writer, Response::error(id, -32029, "in_flight_limit")).await?;
             continue;
         }
-        let admission = protocol_session
-            .validate(&request)
-            .and_then(|era| {
-                admit(&request)?;
-                Ok(era)
-            });
+        let admission = protocol_session.validate(&request).and_then(|era| {
+            admit(&request)?;
+            Ok(era)
+        });
         if let Err(response) = admission {
             write_response(&mut writer, response).await?;
             continue;
@@ -418,15 +407,10 @@ where
 
         // Keep initialize ordering deterministic: the first action cannot run
         // before the initialize response has been written.
-        let metadata_request =
-            mcp_wire::handle_metadata_request(&request, id.clone()).is_some();
+        let metadata_request = mcp_wire::handle_metadata_request(&request, id.clone()).is_some();
         if request.method == "initialize" || metadata_request {
             let tool_name = request.tool_call().ok().map(|call| call.name);
-            let response = match tokio::time::timeout(
-                deadline,
-                handler(request, id.clone()),
-            )
-            .await
+            let response = match tokio::time::timeout(deadline, handler(request, id.clone())).await
             {
                 Ok(response) => response,
                 Err(_) => deadline_response(id, tool_name.as_deref(), deadline),

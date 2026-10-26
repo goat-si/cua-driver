@@ -3632,9 +3632,9 @@ impl Tool for ClickTool {
         // no native side effect before the click is refused.
         let _noact = match (delivery != DeliveryMode::Foreground, hwnd_opt) {
             (true, Some(h)) => {
-                match crate::input::NoActivateGuard::arm(
-                    windows::Win32::Foundation::HWND(h as *mut _),
-                ) {
+                match crate::input::NoActivateGuard::arm(windows::Win32::Foundation::HWND(
+                    h as *mut _,
+                )) {
                     Ok(guard) => Some(guard),
                     Err(error) => return ToolResult::error(error.to_string()),
                 }
@@ -4784,9 +4784,9 @@ impl Tool for TypeTextTool {
         // delivery_mode:"foreground" and when no window_id was given.
         let _noact = match (delivery != DeliveryMode::Foreground, hwnd_opt) {
             (true, Some(h)) => {
-                match crate::input::NoActivateGuard::arm(
-                    windows::Win32::Foundation::HWND(h as *mut _),
-                ) {
+                match crate::input::NoActivateGuard::arm(windows::Win32::Foundation::HWND(
+                    h as *mut _,
+                )) {
                     Ok(guard) => Some(guard),
                     Err(error) => return ToolResult::error(error.to_string()),
                 }
@@ -5660,9 +5660,9 @@ impl Tool for PressKeyTool {
             && delivery == DeliveryMode::Background
             && crate::input::has_chromium_descendant(hwnd);
         let mut noact = if elem_idx.is_some() && delivery == DeliveryMode::Background {
-            match crate::input::NoActivateGuard::arm(
-                windows::Win32::Foundation::HWND(hwnd as *mut _),
-            ) {
+            match crate::input::NoActivateGuard::arm(windows::Win32::Foundation::HWND(
+                hwnd as *mut _,
+            )) {
                 Ok(guard) => Some(guard),
                 Err(error) => return ToolResult::error(error.to_string()),
             }
@@ -6268,9 +6268,9 @@ impl Tool for SetValueTool {
         let _noact = if crate::input::delivery::DeliveryMode::from_args(&args)
             != crate::input::delivery::DeliveryMode::Foreground
         {
-            match crate::input::NoActivateGuard::arm(
-                windows::Win32::Foundation::HWND(hwnd as *mut _),
-            ) {
+            match crate::input::NoActivateGuard::arm(windows::Win32::Foundation::HWND(
+                hwnd as *mut _,
+            )) {
                 Ok(guard) => Some(guard),
                 Err(error) => return ToolResult::error(error.to_string()),
             }
@@ -6661,9 +6661,9 @@ impl Tool for ScrollTool {
                 None
             };
             let _noact = if delivery == DeliveryMode::Background {
-                match crate::input::NoActivateGuard::arm(
-                    windows::Win32::Foundation::HWND(hwnd as *mut _),
-                ) {
+                match crate::input::NoActivateGuard::arm(windows::Win32::Foundation::HWND(
+                    hwnd as *mut _,
+                )) {
                     Ok(guard) => Some(guard),
                     Err(error) => return ToolResult::error(error.to_string()),
                 }
@@ -6985,9 +6985,9 @@ fn winui3_uia_multi_invoke(
     };
     // Hold the frame non-activatable so the XAML Invoke handler's
     // SetFocus()→SetForegroundWindow(self) is refused for the whole burst.
-    let _noact = match crate::input::NoActivateGuard::arm(
-        windows::Win32::Foundation::HWND(hwnd as *mut _),
-    ) {
+    let _noact = match crate::input::NoActivateGuard::arm(windows::Win32::Foundation::HWND(
+        hwnd as *mut _,
+    )) {
         Ok(guard) => guard,
         Err(error) => return Some(Err(error)),
     };

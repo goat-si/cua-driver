@@ -227,7 +227,7 @@ impl Drop for StyleGuardLease {
         };
         let resources = Arc::new(Mutex::new(Some((permit, reservation))));
         let worker_resources = Arc::clone(&resources);
-        let root = HWND(*root_addr as *mut _);
+        let root_addr = *root_addr;
         let identity = *identity;
         if std::thread::Builder::new()
             .name("cua-noactivate-restore".into())
@@ -239,7 +239,7 @@ impl Drop for StyleGuardLease {
                     .expect("style guard restore resources already taken");
                 let _permit = permit;
                 let _reservation = reservation;
-                restore_noactivate_on_worker(root, identity);
+                restore_noactivate_on_worker(HWND(root_addr as *mut _), identity);
             })
             .is_err()
         {
@@ -292,14 +292,20 @@ fn lock_style_guard_registry(
 }
 
 fn reserve_or_share_style_guard(root_addr: isize) -> anyhow::Result<StyleGuardRegistryAcquire> {
-    reserve_or_share_style_guard_with_timeout(root_addr, STYLE_GUARD_HANDSHAKE_TIMEOUT)
+    reserve_or_share_style_guard_until(root_addr, Instant::now() + STYLE_GUARD_HANDSHAKE_TIMEOUT)
 }
 
 fn reserve_or_share_style_guard_with_timeout(
     root_addr: isize,
     timeout: Duration,
 ) -> anyhow::Result<StyleGuardRegistryAcquire> {
-    let deadline = Instant::now() + timeout;
+    reserve_or_share_style_guard_until(root_addr, Instant::now() + timeout)
+}
+
+fn reserve_or_share_style_guard_until(
+    root_addr: isize,
+    deadline: Instant,
+) -> anyhow::Result<StyleGuardRegistryAcquire> {
     let registry = style_guard_registry();
     let mut entries = lock_style_guard_registry();
     loop {
@@ -309,8 +315,7 @@ fn reserve_or_share_style_guard_with_timeout(
                     return Ok(StyleGuardRegistryAcquire::Shared(lease));
                 }
             }
-            Some(StyleGuardRegistryEntry::Starting { .. })
-            | Some(StyleGuardRegistryEntry::Ready { .. }) => {}
+            Some(StyleGuardRegistryEntry::Starting { .. }) => {}
             None => {
                 let token = NEXT_STYLE_GUARD_TOKEN.fetch_add(1, Ordering::Relaxed);
                 entries.insert(root_addr, StyleGuardRegistryEntry::Starting { token });
@@ -335,9 +340,7 @@ fn reserve_or_share_style_guard_with_timeout(
     }
 }
 
-fn try_reserve_or_share_style_guard(
-    root_addr: isize,
-) -> anyhow::Result<StyleGuardRegistryAcquire> {
+fn try_reserve_or_share_style_guard(root_addr: isize) -> anyhow::Result<StyleGuardRegistryAcquire> {
     let mut entries = lock_style_guard_registry();
     match entries.get(&root_addr) {
         Some(StyleGuardRegistryEntry::Ready { lease, .. }) => {
@@ -465,9 +468,9 @@ pub(crate) fn window_thread_responds(hwnd: HWND, timeout_ms: u32) -> bool {
 impl NoActivateGuard {
     /// Arm on the top-level (GA_ROOT) ancestor of `hwnd`.
     ///
-    /// Win32 style writes are unbounded across processes, so arm and restore
-    /// run on a capped native worker. A timed-out arm refuses the action; its
-    /// worker restores the style if the pending call eventually succeeds.
+    /// Cross-thread Win32 style writes run on a capped native worker. A timed
+    /// out arm refuses the action; its worker restores the style if the
+    /// pending call eventually succeeds.
     pub fn arm(hwnd: HWND) -> anyhow::Result<Self> {
         let root = unsafe {
             let ancestor = GetAncestor(hwnd, GA_ROOT);
@@ -482,7 +485,8 @@ impl NoActivateGuard {
         }
 
         let root_addr = root.0 as isize;
-        let reservation = match reserve_or_share_style_guard(root_addr)? {
+        let deadline = Instant::now() + STYLE_GUARD_HANDSHAKE_TIMEOUT;
+        let reservation = match reserve_or_share_style_guard_until(root_addr, deadline)? {
             StyleGuardRegistryAcquire::Shared(lease) => {
                 return Ok(Self {
                     _lease: Some(lease),
@@ -492,12 +496,12 @@ impl NoActivateGuard {
         };
         let owner_thread_id = unsafe { GetWindowThreadProcessId(root, None) };
         if owner_thread_id != 0 && owner_thread_id == unsafe { GetCurrentThreadId() } {
-            let (applied, identity) = arm_noactivate_on_worker(root)
-                .map_err(|error| anyhow::anyhow!(error))?;
+            let permit = acquire_style_guard_worker()?;
+            let (applied, identity) =
+                arm_noactivate_on_worker(root).map_err(|error| anyhow::anyhow!(error))?;
             if !applied {
                 return Ok(Self { _lease: None });
             }
-            let permit = acquire_style_guard_worker()?;
             let lease = Arc::new(StyleGuardLease::Local {
                 root_addr,
                 identity,
@@ -546,7 +550,7 @@ impl NoActivateGuard {
                 anyhow::anyhow!("could not start bounded window-style worker: {error}")
             })?;
 
-        match ready_rx.recv_timeout(STYLE_GUARD_HANDSHAKE_TIMEOUT) {
+        match ready_rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
             Ok(Ok(lease)) => Ok(Self { _lease: lease }),
             Ok(Err(error)) => Err(anyhow::anyhow!(error)),
             Err(RecvTimeoutError::Timeout) => anyhow::bail!(
@@ -954,7 +958,9 @@ mod noactivate_registry_tests {
             StyleGuardRegistryAcquire::Shared(_) => panic!("unexpected existing guard"),
         };
         let started = Instant::now();
-        assert!(reserve_or_share_style_guard_with_timeout(root, Duration::from_millis(25)).is_err());
+        assert!(
+            reserve_or_share_style_guard_with_timeout(root, Duration::from_millis(25)).is_err()
+        );
         assert!(started.elapsed() >= Duration::from_millis(20));
         drop(reservation);
     }
