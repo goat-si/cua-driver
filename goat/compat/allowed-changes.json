@@ -1,7 +1,18 @@
 {
   "comment": "Intentional protocol changes, each keyed by the name check_protocol.py prints and valued with the reason and the GOAT change that adopts it. Keep empty unless GOAT has adopted the change.",
   "mcp": {},
-  "tools": {},
+  "tools": {
+    "click": "Upstream #6033 (41591b1b39) adds optional wait_for_window_change?: boolean to action tool inputSchema; additive and backward-compatible with GOAT callers.",
+    "double_click": "Upstream #6033 (41591b1b39) adds optional wait_for_window_change?: boolean to action tool inputSchema; additive and backward-compatible with GOAT callers.",
+    "drag": "Upstream #6033 (41591b1b39) adds optional wait_for_window_change?: boolean to action tool inputSchema; additive and backward-compatible with GOAT callers.",
+    "hotkey": "Upstream #6033 (41591b1b39) adds optional wait_for_window_change?: boolean to action tool inputSchema; additive and backward-compatible with GOAT callers.",
+    "launch_app": "Upstream #6033 (41591b1b39) adds optional wait_for_window_change?: boolean to action tool inputSchema; additive and backward-compatible with GOAT callers.",
+    "press_key": "Upstream #6033 (41591b1b39) adds optional wait_for_window_change?: boolean to action tool inputSchema; additive and backward-compatible with GOAT callers.",
+    "right_click": "Upstream #6033 (41591b1b39) adds optional wait_for_window_change?: boolean to action tool inputSchema; additive and backward-compatible with GOAT callers.",
+    "scroll": "Upstream #6033 (41591b1b39) adds optional wait_for_window_change?: boolean to action tool inputSchema; additive and backward-compatible with GOAT callers.",
+    "set_value": "Upstream #6033 (41591b1b39) adds optional wait_for_window_change?: boolean to action tool inputSchema; additive and backward-compatible with GOAT callers.",
+    "type_text": "Upstream #6033 (41591b1b39) adds optional wait_for_window_change?: boolean to action tool inputSchema; additive and backward-compatible with GOAT callers."
+  },
   "manifest": {},
   "subcommands": {}
 }
