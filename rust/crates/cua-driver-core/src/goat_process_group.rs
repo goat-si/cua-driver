@@ -195,7 +195,7 @@ impl ProcessGroupLifetime {
                 }
                 #[cfg(target_os = "macos")]
                 let queue = arm_owner_watch(owner, retained, group);
-                let mut byte = 1u8;
+                let byte = 1u8;
                 if libc::write(ready, (&byte as *const u8).cast(), 1) != 1 {
                     libc::kill(-group, libc::SIGKILL);
                     libc::_exit(1);
@@ -204,10 +204,13 @@ impl ProcessGroupLifetime {
                 #[cfg(target_os = "macos")]
                 wait_for_owner(queue);
                 #[cfg(target_os = "linux")]
-                loop {
-                    let count = libc::read(retained, (&mut byte as *mut u8).cast(), 1);
-                    if count == 0 || (count < 0 && *errno() != libc::EINTR) {
-                        break;
+                {
+                    let mut byte = byte;
+                    loop {
+                        let count = libc::read(retained, (&mut byte as *mut u8).cast(), 1);
+                        if count == 0 || (count < 0 && *errno() != libc::EINTR) {
+                            break;
+                        }
                     }
                 }
                 libc::kill(-group, libc::SIGKILL);
