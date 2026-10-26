@@ -12,7 +12,8 @@
 use cua_driver_core::snapshot_compaction::{
     compact_tab_strip, fold_actionless_text_subtrees, format_omitted_tabs_line,
     is_compaction_summary_line, is_uia_dense_collection, is_uia_offscreen_exempt,
-    plan_uia_collection_children, redact_if_secure, renumber_indexed_tree, splice_deferred_chunks,
+    is_secure_text_field, plan_uia_collection_children, redact_if_secure,
+    redact_mirrored_secure_name, renumber_indexed_tree, splice_deferred_chunks,
     CompactableNode, DeferredChunk, FieldSecurityMeta, RenumberableNode, TabChildMeta,
     UiaChildCandidate, UiaChildPlan, TAB_STRIP_COMPACTION_THRESHOLD,
 };
@@ -30,7 +31,8 @@ use windows::Win32::UI::Accessibility::{
     ToggleState_Off, ToggleState_On, TreeScope, TreeScope_Children, TreeScope_Element,
     TreeScope_Subtree, UIA_AutomationIdPropertyId, UIA_BoundingRectanglePropertyId,
     UIA_ControlTypePropertyId, UIA_ExpandCollapseExpandCollapseStatePropertyId,
-    UIA_ExpandCollapsePatternId, UIA_HelpTextPropertyId, UIA_InvokePatternId,
+    UIA_ExpandCollapsePatternId, UIA_FullDescriptionPropertyId, UIA_HelpTextPropertyId,
+    UIA_InvokePatternId, UIA_LegacyIAccessibleDescriptionPropertyId,
     UIA_IsEnabledPropertyId, UIA_IsOffscreenPropertyId, UIA_IsPasswordPropertyId,
     UIA_NamePropertyId, UIA_ProcessIdPropertyId, UIA_RangeValuePatternId, UIA_ScrollPatternId,
     UIA_SelectionItemIsSelectedPropertyId, UIA_SelectionItemPatternId, UIA_TextPatternId,
@@ -972,6 +974,8 @@ unsafe fn node_cache_request(
         UIA_ValueValuePropertyId,
         UIA_AutomationIdPropertyId,
         UIA_HelpTextPropertyId,
+        UIA_FullDescriptionPropertyId,
+        UIA_LegacyIAccessibleDescriptionPropertyId,
         UIA_IsEnabledPropertyId,
         UIA_IsOffscreenPropertyId,
         UIA_IsPasswordPropertyId,
@@ -1112,17 +1116,31 @@ fn emit_cached_node(
     let automation_id = read_cached_bstr(element, UIA_AutomationIdPropertyId);
     let help_text = read_cached_bstr(element, UIA_HelpTextPropertyId);
     let is_offscreen = read_cached_bool(element, UIA_IsOffscreenPropertyId);
+    // WinForms `AccessibleDescription` reaches UIA only as the MSAA
+    // description (LegacyIAccessible.Description); UIA providers use
+    // FullDescription. Either can be the only hint that a field holds an OTP.
+    let description = [
+        read_cached_bstr(element, UIA_FullDescriptionPropertyId),
+        read_cached_bstr(element, UIA_LegacyIAccessibleDescriptionPropertyId),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>();
+    let description = (!description.is_empty()).then(|| description.join(" "));
     let security_meta = FieldSecurityMeta {
         role: &control_type,
         subrole: None,
         title: name.as_deref(),
-        description: None,
+        description: description.as_deref(),
         placeholder: None,
         identifier: automation_id.as_deref(),
         help: help_text.as_deref(),
         is_password_flag: read_cached_bool(element, UIA_IsPasswordPropertyId) == Some(true),
     };
+    let secure = is_secure_text_field(&security_meta);
+    let raw_value = value.clone();
     let (value, _) = redact_if_secure(&security_meta, value, None);
+    let name = redact_mirrored_secure_name(secure, name, raw_value.as_deref());
     let enabled = read_cached_bool(element, UIA_IsEnabledPropertyId);
     // Missing UIA state must remain unknown on the structured observation
     // surface. Action discovery keeps its historical best-effort assumption.
