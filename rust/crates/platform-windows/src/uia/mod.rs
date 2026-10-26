@@ -30,8 +30,8 @@ use windows::Win32::UI::Accessibility::{
     TreeScope_Subtree, UIA_AutomationIdPropertyId, UIA_BoundingRectanglePropertyId,
     UIA_ControlTypePropertyId, UIA_ExpandCollapseExpandCollapseStatePropertyId,
     UIA_ExpandCollapsePatternId, UIA_HelpTextPropertyId, UIA_InvokePatternId,
-    UIA_IsEnabledPropertyId, UIA_IsOffscreenPropertyId, UIA_NamePropertyId,
-    UIA_ProcessIdPropertyId, UIA_RangeValuePatternId, UIA_ScrollPatternId,
+    UIA_IsEnabledPropertyId, UIA_IsOffscreenPropertyId, UIA_IsPasswordPropertyId,
+    UIA_NamePropertyId, UIA_ProcessIdPropertyId, UIA_RangeValuePatternId, UIA_ScrollPatternId,
     UIA_SelectionItemIsSelectedPropertyId, UIA_SelectionItemPatternId, UIA_TextPatternId,
     UIA_TogglePatternId, UIA_ToggleToggleStatePropertyId, UIA_ValuePatternId,
     UIA_ValueValuePropertyId,
@@ -970,6 +970,7 @@ unsafe fn node_cache_request(
         UIA_HelpTextPropertyId,
         UIA_IsEnabledPropertyId,
         UIA_IsOffscreenPropertyId,
+        UIA_IsPasswordPropertyId,
         UIA_BoundingRectanglePropertyId,
         UIA_ToggleToggleStatePropertyId,
         UIA_SelectionItemIsSelectedPropertyId,
@@ -1115,7 +1116,7 @@ fn emit_cached_node(
         placeholder: None,
         identifier: automation_id.as_deref(),
         help: help_text.as_deref(),
-        is_password_flag: false,
+        is_password_flag: read_cached_bool(element, UIA_IsPasswordPropertyId) == Some(true),
     };
     let (value, _) = redact_if_secure(&security_meta, value, None);
     let enabled = read_cached_bool(element, UIA_IsEnabledPropertyId);

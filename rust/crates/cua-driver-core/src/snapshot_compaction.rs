@@ -685,6 +685,10 @@ pub struct DeferredChunk<N> {
     pub walked: Option<(Vec<(usize, String)>, Vec<N>)>,
 }
 
+/// Spliced rows and nodes, plus each output row's position in the node list
+/// (`None` for a synthetic summary row).
+pub type SplicedTree<N> = (Vec<(usize, String)>, Vec<N>, Vec<Option<usize>>);
+
 /// Splice deferred row chunks back into `(lines, nodes)` at their original document-order anchors,
 /// emitting `- (offscreen rows: N; scroll the list, or pass query to search them)` for unwalked
 /// offscreen runs.
@@ -692,7 +696,7 @@ pub fn splice_deferred_chunks<N>(
     lines: Vec<(usize, String)>,
     nodes: Vec<N>,
     mut deferred: Vec<DeferredChunk<N>>,
-) -> (Vec<(usize, String)>, Vec<N>, Vec<Option<usize>>) {
+) -> SplicedTree<N> {
     debug_assert_eq!(lines.len(), nodes.len());
     deferred.sort_by_key(|row| (row.anchor, row.seq));
     let mut rows = deferred.into_iter().peekable();

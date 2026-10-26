@@ -23,7 +23,9 @@ use atspi::{CoordType, Interface, State, StateSet};
 use atspi_connection::AccessibilityConnection;
 
 use super::{AtspiIdentity, AtspiNode};
-use cua_driver_core::snapshot_compaction::{redact_if_secure, FieldSecurityMeta};
+use cua_driver_core::snapshot_compaction::{
+    compact_tab_strip, format_omitted_tabs_line, redact_if_secure, FieldSecurityMeta, TabChildMeta,
+};
 
 pub mod hit;
 pub(crate) mod hit_test;
@@ -440,6 +442,28 @@ fn editable_text_value(
         return value;
     }
     Some(text_content.to_owned())
+}
+
+/// The display name of a widget whose accessible name is empty: its Text
+/// content, for text widgets. Runs after the `LABELLED_BY` lookup so a
+/// labelled entry is named by its label and its typed text stays in `value`.
+/// A value control (GtkSpinButton implements AtkText with its formatted
+/// number) would otherwise be named after its own value, and a password
+/// field's content is never surfaced.
+fn text_content_name(
+    name: String,
+    role_lower: &str,
+    has_value: bool,
+    text_content: &str,
+) -> String {
+    if name.trim().is_empty()
+        && !text_content.trim().is_empty()
+        && !has_value
+        && !role_lower.contains("password")
+    {
+        return text_content.to_owned();
+    }
+    name
 }
 
 #[cfg(test)]
@@ -1703,14 +1727,6 @@ async fn collect_visited_bounded_opts<'a>(
         let editable_text = has_editable && !role_lower.contains("password");
         value = editable_text_value(editable_text, has_value, value, &text_content);
 
-        // Surface Text content as the display name when the widget has no
-        // name — for text widgets. A value control (GtkSpinButton implements
-        // AtkText with its formatted number) would otherwise be named after
-        // its own value, and four spin buttons then all read "0.0".
-        if name.trim().is_empty() && !text_content.trim().is_empty() && !has_value {
-            name = text_content;
-        }
-
         // AT-SPI `Description` for controls (one `Get` per actionable node,
         // never for passive containers/labels): Qt reports tooltips there.
         let is_control = has_action
@@ -1731,6 +1747,7 @@ async fn collect_visited_bounded_opts<'a>(
                 name = label;
             }
         }
+        let name = text_content_name(name, &role_lower, has_value, &text_content);
 
         // Children inherit web-document context, plus this node's own role.
         let child_in_web_doc = in_web_doc || is_document_role(&role);
@@ -2008,6 +2025,152 @@ fn true_parents(visited: &[Visited<'_>]) -> Vec<Option<usize>> {
     parents
 }
 
+/// What [`tab_strip_omissions`] reads from a walked node.
+struct TabWalkNode<'a> {
+    role: &'a str,
+    name: &'a str,
+    selected: Option<bool>,
+    depth: usize,
+    frame: usize,
+}
+
+/// Inactive tabs of every tab strip with ten or more tabs, with their
+/// subtrees, and the count of omitted tabs to report at each strip's first
+/// omitted position. The selected tab (or the first, when none reports one)
+/// and every non-tab child stay listed.
+fn tab_strip_omissions(
+    nodes: &[TabWalkNode<'_>],
+    parents: &[Option<usize>],
+) -> (Vec<bool>, std::collections::HashMap<usize, usize>) {
+    let mut omitted = vec![false; nodes.len()];
+    let mut summaries = std::collections::HashMap::new();
+    let mut children: std::collections::BTreeMap<usize, Vec<usize>> =
+        std::collections::BTreeMap::new();
+    for (pos, parent) in parents.iter().enumerate() {
+        if let Some(parent) = parent {
+            children.entry(*parent).or_default().push(pos);
+        }
+    }
+    for (parent, kids) in children {
+        let metas: Vec<TabChildMeta<'_>> = kids
+            .iter()
+            .map(|&k| TabChildMeta {
+                role: nodes[k].role,
+                role_description: None,
+                title: None,
+                selected: nodes[k].selected,
+                value: None,
+                value_state: None,
+            })
+            .collect();
+        let parent_name = (!nodes[parent].name.is_empty()).then_some(nodes[parent].name);
+        let Some(plan) = compact_tab_strip(nodes[parent].role, parent_name, None, None, &metas)
+        else {
+            continue;
+        };
+        summaries.insert(kids[plan.first_omitted_index], plan.omitted_count);
+        for (i, &kid) in kids.iter().enumerate() {
+            if plan.keep[i] {
+                continue;
+            }
+            omitted[kid] = true;
+            let (depth, frame) = (nodes[kid].depth, nodes[kid].frame);
+            for (offset, n) in nodes[kid + 1..].iter().enumerate() {
+                if n.frame != frame || n.depth <= depth {
+                    break;
+                }
+                omitted[kid + 1 + offset] = true;
+            }
+        }
+    }
+    (omitted, summaries)
+}
+
+#[cfg(test)]
+mod tab_strip_omission_tests {
+    use super::{tab_strip_omissions, text_content_name, TabWalkNode};
+
+    fn node(role: &str, depth: usize, selected: Option<bool>) -> TabWalkNode<'_> {
+        TabWalkNode {
+            role,
+            name: "",
+            selected,
+            depth,
+            frame: 0,
+        }
+    }
+
+    fn parents_of(nodes: &[TabWalkNode<'_>]) -> Vec<Option<usize>> {
+        let mut chain: Vec<usize> = Vec::new();
+        nodes
+            .iter()
+            .enumerate()
+            .map(|(pos, n)| {
+                chain.truncate(n.depth);
+                let parent = chain.last().copied();
+                chain.push(pos);
+                parent
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_long_tab_strip_keeps_the_selected_tab_and_omits_inactive_tabs_with_their_children() {
+        let mut nodes = vec![node("frame", 0, None), node("page tab list", 1, None)];
+        for i in 0..12 {
+            nodes.push(node("page tab", 2, Some(i == 5)));
+            nodes.push(node("push button", 3, None));
+        }
+        nodes.push(node("push button", 2, None));
+        nodes.push(node("text", 1, None));
+        let parents = parents_of(&nodes);
+        let (omitted, summaries) = tab_strip_omissions(&nodes, &parents);
+
+        let selected_tab = 2 + 5 * 2;
+        assert!(!omitted[selected_tab] && !omitted[selected_tab + 1]);
+        assert!(
+            omitted[2] && omitted[3],
+            "an inactive tab and its close button are omitted"
+        );
+        assert!(!omitted[nodes.len() - 2], "the new-tab button stays");
+        assert!(!omitted[nodes.len() - 1], "content after the strip stays");
+        assert_eq!(omitted.iter().filter(|o| **o).count(), 22);
+        assert_eq!(summaries.get(&2), Some(&11));
+    }
+
+    #[test]
+    fn a_short_tab_strip_is_listed_in_full() {
+        let mut nodes = vec![node("page tab list", 0, None)];
+        for i in 0..9 {
+            nodes.push(node("page tab", 1, Some(i == 0)));
+        }
+        let parents = parents_of(&nodes);
+        let (omitted, summaries) = tab_strip_omissions(&nodes, &parents);
+        assert!(omitted.iter().all(|o| !o));
+        assert!(summaries.is_empty());
+    }
+
+    #[test]
+    fn a_labelled_entry_keeps_its_label_and_a_password_never_shows_its_text() {
+        assert_eq!(
+            text_content_name("Verification code".into(), "entry", false, "482913"),
+            "Verification code"
+        );
+        assert_eq!(
+            text_content_name(String::new(), "password text", false, "hunter2"),
+            ""
+        );
+        assert_eq!(
+            text_content_name(String::new(), "entry", false, "draft"),
+            "draft"
+        );
+        assert_eq!(
+            text_content_name(String::new(), "spin button", true, "0.0"),
+            ""
+        );
+    }
+}
+
 /// For an unnamed value control at `pos`: the nearest preceding sibling
 /// label in the same container (a GTK grid row "Hue:" [spin]) — scanning
 /// stops at another control of the same role, so the second row never
@@ -2080,10 +2243,33 @@ fn render(visited: &[Visited<'_>], only_frame: Option<usize>) -> (String, Vec<At
     // (which parented GIMP's spin buttons to a push button).
     let parents = true_parents(visited);
     let mut index_of: Vec<Option<usize>> = vec![None; visited.len()];
+    let tab_nodes: Vec<TabWalkNode<'_>> = visited
+        .iter()
+        .map(|v| TabWalkNode {
+            role: &v.role,
+            name: &v.name,
+            selected: v.selected,
+            depth: v.depth,
+            frame: v.frame_ordinal,
+        })
+        .collect();
+    let (omitted, omitted_tabs_before) = tab_strip_omissions(&tab_nodes, &parents);
 
     for (pos, v) in visited.iter().enumerate() {
         let emit = only_frame.is_none_or(|frame| frame == v.frame_ordinal);
         let indent = "  ".repeat(v.depth);
+        if let Some(count) = omitted_tabs_before.get(&pos).filter(|_| emit) {
+            md.push_str(&format!("{indent}{}\n", format_omitted_tabs_line(*count)));
+        }
+        if omitted[pos] {
+            // An inactive tab of a long tab strip: its index is consumed so
+            // the application-wide numbering the actuators use is unchanged.
+            if is_indexable(v) {
+                index_of[pos] = Some(idx);
+                idx += 1;
+            }
+            continue;
+        }
         let parent_element_index = {
             let mut cursor = parents[pos];
             let mut found = None;
