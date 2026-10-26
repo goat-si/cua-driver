@@ -22,6 +22,11 @@ use super::launch::{is_still_launching, LaunchStep, LaunchWait};
 use super::snapshot::RetainedElement;
 use super::window_scope::{decide_window_scope, ScopeDecision, TopLevelCandidate, WindowScope};
 use core_foundation::base::{CFEqual, CFRelease, CFRetain, CFTypeRef};
+use cua_driver_core::snapshot_compaction::{
+    compact_tab_strip, fold_actionless_text_subtrees, format_omitted_tabs_line, redact_if_secure,
+    should_probe_secure_text_role, CompactableNode, FieldSecurityMeta, TabChildMeta,
+    TabStripCompaction, TAB_STRIP_COMPACTION_THRESHOLD,
+};
 use cua_driver_core::walk_budget::{WalkBudget, WalkOutcome};
 use std::time::Instant;
 
@@ -130,12 +135,43 @@ fn role_supports_value_addressing(role: &str) -> bool {
         role,
         "AXTextField"
             | "AXTextArea"
+            | "AXSecureTextField"
             | "AXComboBox"
             | "AXSlider"
             | "AXStepper"
             | "AXCheckBox"
             | "AXRadioButton"
     )
+}
+
+impl CompactableNode for AXNode {
+    fn element_index(&self) -> Option<usize> {
+        self.element_index
+    }
+    fn role(&self) -> &str {
+        &self.role
+    }
+    fn depth(&self) -> usize {
+        self.depth
+    }
+    fn set_depth(&mut self, depth: usize) {
+        self.depth = depth;
+    }
+    fn title(&self) -> Option<&str> {
+        self.title.as_deref()
+    }
+    fn value(&self) -> Option<&str> {
+        self.value.as_deref()
+    }
+    fn set_value(&mut self, value: Option<String>) {
+        self.value = value;
+    }
+    fn description(&self) -> Option<&str> {
+        self.description.as_deref()
+    }
+    fn format_line(&self) -> String {
+        format_node_line(self)
+    }
 }
 
 fn is_addressable(actions_present: bool, value_settable: bool, enabled: Option<bool>) -> bool {
@@ -381,6 +417,8 @@ fn walk_tree_with_web_content(
     }
 
     let walk = budget.outcome();
+    fold_actionless_text_subtrees(&mut lines, &mut nodes);
+    nodes.retain(|n| n.role != "AXTabStripSummary");
     prune_echo_text_rows(&mut lines);
     let raw_markdown = render_lines(&lines);
     let mut tree_markdown = if let Some(q) = query {
@@ -515,24 +553,21 @@ unsafe fn walk_element(
         // Still recurse — children may be interesting. Layout containers
         // collapse, so children inherit the parent's depth AND the same
         // parent_index (no actionable node was emitted here).
-        let children = copy_children(element);
-        for child in children {
-            walk_element(
-                child,
-                depth,
-                parent_index,
-                in_web_content,
-                nodes,
-                lines,
-                counter,
-                budget,
-                batching_disabled,
-                max_depth,
-                include_web_content,
-                deferred,
-            );
-            CFRelease(child as CFTypeRef);
-        }
+        walk_children(
+            element,
+            &role,
+            depth,
+            parent_index,
+            in_web_content,
+            nodes,
+            lines,
+            counter,
+            budget,
+            batching_disabled,
+            max_depth,
+            include_web_content,
+            deferred,
+        );
         return;
     }
 
@@ -545,6 +580,7 @@ unsafe fn walk_element(
         title,
         copied_value,
         value,
+        placeholder,
         description,
         identifier,
         help,
@@ -556,6 +592,13 @@ unsafe fn walk_element(
         return;
     };
     let actions = copy_action_names(element);
+    let (subrole, placeholder) = if should_probe_secure_text_role(&role, None) {
+        let subrole = copy_string_attr(element, "AXSubrole");
+        let placeholder = placeholder.or_else(|| copy_string_attr(element, "AXPlaceholderValue"));
+        (subrole, placeholder)
+    } else {
+        (None, placeholder)
+    };
 
     let visible_title = title.as_deref().unwrap_or("").trim().to_owned();
     let visible_description = description.as_deref().unwrap_or("").trim().to_owned();
@@ -621,6 +664,21 @@ unsafe fn walk_element(
         enabled,
         selected: copy_bool_attr(element, "AXSelected"),
     });
+    let security_meta = FieldSecurityMeta {
+        role: &role,
+        subrole: subrole.as_deref(),
+        title: (!visible_title.is_empty()).then_some(visible_title.as_str()),
+        description: (!visible_description.is_empty()).then_some(visible_description.as_str()),
+        placeholder: placeholder.as_deref(),
+        identifier: identifier.as_deref(),
+        help: help.as_deref(),
+        is_password_flag: false,
+    };
+    let (redacted_value, redacted_value_state) = redact_if_secure(
+        &security_meta,
+        (!visible_value.is_empty()).then(|| visible_value.clone()),
+        control_state.value_state.clone(),
+    );
     let node = if is_actionable {
         let idx = *counter;
         *counter += 1;
@@ -635,11 +693,7 @@ unsafe fn walk_element(
             } else {
                 Some(visible_title.clone())
             },
-            value: if visible_value.is_empty() {
-                None
-            } else {
-                Some(visible_value.clone())
-            },
+            value: redacted_value,
             description: if visible_description.is_empty() {
                 None
             } else {
@@ -652,7 +706,7 @@ unsafe fn walk_element(
             depth,
             parent_element_index: parent_index,
             frame,
-            value_state: control_state.value_state.clone(),
+            value_state: redacted_value_state,
             value_description: control_state.value_description.clone(),
             min_value: control_state.min_value,
             max_value: control_state.max_value,
@@ -669,11 +723,7 @@ unsafe fn walk_element(
             } else {
                 Some(visible_title.clone())
             },
-            value: if visible_value.is_empty() {
-                None
-            } else {
-                Some(visible_value.clone())
-            },
+            value: redacted_value,
             description: if visible_description.is_empty() {
                 None
             } else {
@@ -686,7 +736,7 @@ unsafe fn walk_element(
             depth,
             parent_element_index: parent_index,
             frame,
-            value_state: control_state.value_state.clone(),
+            value_state: redacted_value_state,
             value_description: control_state.value_description.clone(),
             min_value: control_state.min_value,
             max_value: control_state.max_value,
@@ -756,6 +806,11 @@ unsafe fn walk_children(
         return;
     }
     let children = copy_children(element);
+    let tab_plan = if !in_web_content && children.len() >= TAB_STRIP_COMPACTION_THRESHOLD {
+        plan_macos_tab_strip(element, role, &children)
+    } else {
+        None
+    };
     let plan = if rows_windowed() && !in_web_content && DENSE_COLLECTION_ROLES.contains(&role) {
         Some(dense_rows::plan_collection_children(
             element, role, &children, budget,
@@ -764,6 +819,22 @@ unsafe fn walk_children(
         None
     };
     for (index, child) in children.into_iter().enumerate() {
+        if let Some(ref tp) = tab_plan {
+            if index == tp.first_omitted_index {
+                lines.push((depth, format_omitted_tabs_line(tp.omitted_count)));
+                nodes.push(role_only_node(
+                    "AXTabStripSummary".into(),
+                    0,
+                    depth,
+                    parent_index,
+                    in_web_content,
+                ));
+            }
+            if !tp.keep[index] {
+                CFRelease(child as CFTypeRef);
+                continue;
+            }
+        }
         let action = plan.as_ref().map_or(ChildPlan::WalkNow, |plan| plan[index]);
         match action {
             ChildPlan::Defer { visible } => deferred.push(DeferredRow {
@@ -793,6 +864,68 @@ unsafe fn walk_children(
         }
         CFRelease(child as CFTypeRef);
     }
+}
+
+unsafe fn plan_macos_tab_strip(
+    parent: AXUIElementRef,
+    parent_role: &str,
+    children: &[AXUIElementRef],
+) -> Option<TabStripCompaction> {
+    if !matches!(
+        parent_role,
+        "AXTabGroup" | "AXGroup" | "AXScrollArea" | "AXToolbar"
+    ) {
+        return None;
+    }
+    let parent_title = copy_string_attr(parent, "AXTitle");
+    let parent_desc = copy_string_attr(parent, "AXDescription");
+    let parent_role_desc = copy_string_attr(parent, "AXRoleDescription");
+
+    let mut child_roles = Vec::with_capacity(children.len());
+    let mut child_role_descs = Vec::with_capacity(children.len());
+    let mut child_selected = Vec::with_capacity(children.len());
+    let mut child_values = Vec::with_capacity(children.len());
+    let mut tab_like_count = 0usize;
+
+    for &child in children {
+        set_messaging_timeout(child);
+        let r = copy_string_attr(child, "AXRole").unwrap_or_default();
+        let rd = if r == "AXTab" || r == "AXRadioButton" {
+            None
+        } else {
+            copy_string_attr(child, "AXRoleDescription")
+        };
+        if cua_driver_core::snapshot_compaction::is_tab_like_child(parent_role, &r, rd.as_deref()) {
+            tab_like_count += 1;
+            child_selected.push(copy_bool_attr(child, "AXSelected"));
+            child_values.push(copy_stringish_attr(child, "AXValue").map(|v| v.state_value));
+        } else {
+            child_selected.push(None);
+            child_values.push(None);
+        }
+        child_roles.push(r);
+        child_role_descs.push(rd);
+    }
+    if tab_like_count < TAB_STRIP_COMPACTION_THRESHOLD {
+        return None;
+    }
+    let metas: Vec<TabChildMeta<'_>> = (0..children.len())
+        .map(|i| TabChildMeta {
+            role: &child_roles[i],
+            role_description: child_role_descs[i].as_deref(),
+            title: None,
+            selected: child_selected[i],
+            value: child_values[i].as_deref(),
+            value_state: child_values[i].as_deref(),
+        })
+        .collect();
+    compact_tab_strip(
+        parent_role,
+        parent_title.as_deref(),
+        parent_desc.as_deref(),
+        parent_role_desc.as_deref(),
+        &metas,
+    )
 }
 
 fn role_only_node(
@@ -1072,9 +1205,10 @@ mod tests {
 
     #[test]
     fn querying_spliced_rows_keeps_ancestors_and_never_matches_offscreen_hints() {
-        let md = "- [0] AXWindow \"Example\"\n  - [1] AXTable \"History\"\n    - (offscreen rows: 2; scroll the list, or pass query to search them)\n    - [2] AXRow \"Message\"\n      - AXStaticText = \"needle\"\n  - [3] AXTextArea \"Compose\"\n";
+        let md = "- [0] AXWindow \"Example\"\n  - [1] AXTable \"History\"\n    - (offscreen rows: 2; scroll the list, or pass query to search them)\n    - (11 inactive tabs omitted)\n    - [2] AXRow \"Message\"\n      - AXStaticText = \"needle\"\n  - [3] AXTextArea \"Compose\"\n";
         assert_eq!(filter_tree(md, "needle"), "- [0] AXWindow \"Example\"\n  - [1] AXTable \"History\"\n    - [2] AXRow \"Message\"\n      - AXStaticText = \"needle\"\n");
         assert_eq!(filter_tree(md, "scroll"), "");
+        assert_eq!(filter_tree(md, "inactive tabs"), "");
     }
 
     #[test]
@@ -1087,6 +1221,7 @@ mod tests {
         for role in [
             "AXTextField",
             "AXTextArea",
+            "AXSecureTextField",
             "AXComboBox",
             "AXSlider",
             "AXStepper",
@@ -1184,5 +1319,126 @@ mod lean_row_tests {
         assert_eq!(lines.len(), 4);
         assert_eq!(echo_text_of("- AXStaticText = \"x\""), Some("x"));
         assert_eq!(echo_text_of("- [2] AXStaticText = \"\""), None);
+    }
+
+    #[test]
+    fn ax_node_compaction_folds_actionless_rows_and_preserves_indexed_elements() {
+        use super::{fold_actionless_text_subtrees, format_node_line, AXNode};
+        let mut nodes = vec![
+            AXNode {
+                element_index: Some(0),
+                role: "AXWindow".into(),
+                title: Some("Messages".into()),
+                value: None,
+                description: None,
+                identifier: None,
+                help: None,
+                actions: vec!["AXRaise".into()],
+                element_ptr: 0,
+                depth: 0,
+                parent_element_index: None,
+                frame: None,
+                value_state: None,
+                value_description: None,
+                min_value: None,
+                max_value: None,
+                enabled: Some(true),
+                selected: None,
+                in_web_content: false,
+            },
+            AXNode {
+                element_index: None,
+                role: "AXRow".into(),
+                title: None,
+                value: None,
+                description: None,
+                identifier: None,
+                help: None,
+                actions: vec![],
+                element_ptr: 0,
+                depth: 1,
+                parent_element_index: Some(0),
+                frame: None,
+                value_state: None,
+                value_description: None,
+                min_value: None,
+                max_value: None,
+                enabled: None,
+                selected: None,
+                in_web_content: false,
+            },
+            AXNode {
+                element_index: None,
+                role: "AXStaticText".into(),
+                title: None,
+                value: Some("Sender".into()),
+                description: None,
+                identifier: None,
+                help: None,
+                actions: vec![],
+                element_ptr: 0,
+                depth: 2,
+                parent_element_index: Some(0),
+                frame: None,
+                value_state: None,
+                value_description: None,
+                min_value: None,
+                max_value: None,
+                enabled: None,
+                selected: None,
+                in_web_content: false,
+            },
+            AXNode {
+                element_index: None,
+                role: "AXStaticText".into(),
+                title: None,
+                value: Some("Message preview".into()),
+                description: None,
+                identifier: None,
+                help: None,
+                actions: vec![],
+                element_ptr: 0,
+                depth: 2,
+                parent_element_index: Some(0),
+                frame: None,
+                value_state: None,
+                value_description: None,
+                min_value: None,
+                max_value: None,
+                enabled: None,
+                selected: None,
+                in_web_content: false,
+            },
+            AXNode {
+                element_index: Some(1),
+                role: "AXTextField".into(),
+                title: Some("Compose".into()),
+                value: Some("[redacted]".into()),
+                description: None,
+                identifier: None,
+                help: None,
+                actions: vec!["AXConfirm".into()],
+                element_ptr: 0,
+                depth: 1,
+                parent_element_index: Some(0),
+                frame: None,
+                value_state: Some("[redacted]".into()),
+                value_description: None,
+                min_value: None,
+                max_value: None,
+                enabled: Some(true),
+                selected: None,
+                in_web_content: false,
+            },
+        ];
+        let mut lines: Vec<(usize, String)> = nodes
+            .iter()
+            .map(|n| (n.depth, format_node_line(n)))
+            .collect();
+        fold_actionless_text_subtrees(&mut lines, &mut nodes);
+        assert_eq!(nodes.len(), 3);
+        assert_eq!(lines[1], (1, "- AXRow = \"Sender Message preview\"".into()));
+        assert_eq!(nodes[2].element_index, Some(1));
+        assert_eq!(nodes[2].value.as_deref(), Some("[redacted]"));
     }
 }

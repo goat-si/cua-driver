@@ -869,6 +869,9 @@ fn filter_tree(markdown: &str, query: &str) -> String {
     let mut output: Vec<&str> = Vec::new();
 
     for line in &lines {
+        if cua_driver_core::snapshot_compaction::is_compaction_summary_line(line) {
+            continue;
+        }
         let depth = line.chars().take_while(|c| *c == ' ').count() / 2;
         while ancestors.len() <= depth {
             ancestors.push("");

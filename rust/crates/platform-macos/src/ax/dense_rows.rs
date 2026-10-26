@@ -148,7 +148,7 @@ pub(crate) struct DeferredRow {
 }
 
 pub(crate) fn is_summary_line(line: &str) -> bool {
-    line.trim_start().starts_with("- (offscreen rows: ")
+    cua_driver_core::snapshot_compaction::is_compaction_summary_line(line)
 }
 
 type Spliced = (Vec<(usize, String)>, Vec<AXNode>, Vec<Option<usize>>);

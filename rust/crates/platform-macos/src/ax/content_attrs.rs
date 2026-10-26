@@ -15,6 +15,7 @@ pub(crate) struct ContentAttrs {
     pub title: Option<String>,
     pub copied_value: Option<StringishAttrValue>,
     pub value: Option<String>,
+    pub placeholder: Option<String>,
     pub description: Option<String>,
     pub identifier: Option<String>,
     pub help: Option<String>,
@@ -33,11 +34,13 @@ fn value_with_placeholder(
 impl ContentAttrs {
     fn from_slots(slots: &BatchSlots) -> Self {
         let copied_value = slots.stringish(1);
-        let value = value_with_placeholder(copied_value.as_ref(), || slots.string(2));
+        let placeholder = slots.string(2);
+        let value = value_with_placeholder(copied_value.as_ref(), || placeholder.clone());
         Self {
             title: slots.string(0),
             copied_value,
             value,
+            placeholder,
             description: slots.string(3),
             identifier: slots.string(4),
             help: slots.string(5).filter(|help| !help.trim().is_empty()),
@@ -47,13 +50,16 @@ impl ContentAttrs {
     unsafe fn from_singles(element: AXUIElementRef) -> Self {
         let title = copy_string_attr(element, "AXTitle");
         let copied_value = copy_stringish_attr(element, "AXValue");
+        let mut placeholder = None;
         let value = value_with_placeholder(copied_value.as_ref(), || {
-            copy_string_attr(element, "AXPlaceholderValue")
+            placeholder = copy_string_attr(element, "AXPlaceholderValue");
+            placeholder.clone()
         });
         Self {
             title,
             copied_value,
             value,
+            placeholder,
             description: copy_string_attr(element, "AXDescription"),
             identifier: copy_string_attr(element, "AXIdentifier"),
             help: copy_string_attr(element, "AXHelp").filter(|help| !help.trim().is_empty()),
