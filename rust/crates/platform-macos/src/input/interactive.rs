@@ -362,12 +362,14 @@ impl NativeInputState {
                 .map_err(|_| native("keyboard down creation failed"))?;
             down.set_string_from_utf16_unchecked(&chunk);
             down.set_flags(CGEventFlags::CGEventFlagNull);
+            super::tag_synthetic_event(&down);
             self.post_keyboard(&down);
 
             let up = CGEvent::new_keyboard_event(self.source.clone(), 0, false)
                 .map_err(|_| native("keyboard up creation failed"))?;
             up.set_string_from_utf16_unchecked(&chunk);
             up.set_flags(CGEventFlags::CGEventFlagNull);
+            super::tag_synthetic_event(&up);
             self.post_keyboard(&up);
         }
         Ok(())
@@ -381,6 +383,7 @@ impl NativeInputState {
                 .map_err(|_| native("keyboard event creation failed"))?;
         event.set_flags(modifier_flags(modifiers));
         event.set_integer_value_field(EventField::KEYBOARD_EVENT_AUTOREPEAT, i64::from(repeat));
+        super::tag_synthetic_event(&event);
         self.post_keyboard(&event);
         Ok(())
     }
@@ -406,6 +409,7 @@ impl NativeInputState {
         let event = CGEvent::new_mouse_event(self.source.clone(), event_type, point, cg_button)
             .map_err(|_| native("pointer event creation failed"))?;
         event.set_flags(modifier_flags(modifiers));
+        super::tag_synthetic_event(&event);
 
         if phase == PointerPhase::Down {
             self.pressed_button = Some(effective_button);
@@ -467,6 +471,7 @@ impl NativeInputState {
             SCROLL_MOMENTUM_PHASE_FIELD,
             momentum_phase_value(momentum_phase),
         );
+        super::tag_synthetic_event(&event);
         unsafe { CGEventSetLocation(event.as_ptr().cast(), point.x, point.y) };
 
         if self.is_foreground() {

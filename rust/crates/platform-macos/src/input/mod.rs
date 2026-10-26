@@ -25,3 +25,20 @@ pub use interactive::{
 };
 pub use keyboard::{hotkey, press_key, type_text};
 pub use mouse::click_at_xy;
+
+/// 64-bit magic marker ("GOATCUA1") stamped onto synthetic CGEvent instances
+/// in kCGEventSourceUserData (field 42) so host event taps can distinguish
+/// driver-synthesized input from physical human input.
+pub const GOAT_CUA_EVENT_USER_DATA: i64 = 0x474F_4154_4355_4131;
+
+/// Stamp GOAT_CUA_EVENT_USER_DATA onto event's EVENT_SOURCE_USER_DATA field.
+#[inline]
+pub fn tag_synthetic_event(
+    event: &core_graphics::event::CGEvent,
+) -> &core_graphics::event::CGEvent {
+    event.set_integer_value_field(
+        core_graphics::event::EventField::EVENT_SOURCE_USER_DATA,
+        GOAT_CUA_EVENT_USER_DATA,
+    );
+    event
+}

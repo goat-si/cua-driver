@@ -1726,9 +1726,12 @@ mod tests {
     fn stable_visible_overlay_keeps_frame_cadence_for_resting_motion() {
         let mut core = positioned_core();
         core.idle_secs = 0.25;
-        assert!(core.has_resting_motion());
+        assert!(!core.has_resting_motion());
         let mut cores = CursorMap::from([("cursor-a".to_owned(), core)]);
-        assert_eq!(next_wait(&cores, false, false), WlWait::Frame);
+        assert_eq!(
+            next_wait(&cores, false, false),
+            WlWait::Deadline(Duration::from_millis(750))
+        );
 
         // Hidden cursors never tick, even with resting motion enabled.
         cores.get_mut("cursor-a").unwrap().visible = false;

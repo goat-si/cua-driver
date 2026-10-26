@@ -647,35 +647,32 @@ mod tests {
         assert!(!map.needs_frame_tick(), "a finished pulse must park");
     }
 
-    // The resting bob is painted by every adapter through `paint_cursor`, so a
-    // visible resting cursor must keep receiving frames on every platform
-    // until its idle fade hides it.
+    // A settled default-theme cursor parks during its opaque idle-hide delay
+    // so the overlay does not keep running at frame cadence while static.
     #[test]
-    fn a_visible_resting_cursor_keeps_ticking_for_its_resting_motion() {
+    fn a_visible_resting_default_cursor_parks_until_idle_fade() {
         let mut map = map();
         let core = placed(&mut map, DEFAULT_CURSOR_KEY);
         core.motion.idle_hide_ms = 20_000.0;
         settle(core);
-        assert!(core.has_resting_motion());
-        assert!(map.needs_frame_tick());
-
-        // The bob actually moves pixels between two resting frames.
-        let paint = |core: &RenderStateCore| {
-            let mut pixmap = tiny_skia::Pixmap::new(200, 200).unwrap();
-            crate::paint_cursor(&mut pixmap, core, 0.0, 0.0, None, 1.0);
-            pixmap.data().to_vec()
-        };
-        let core = &mut map.cursors[DEFAULT_CURSOR_KEY];
-        let before = paint(core);
-        core.tick_motion(0.4);
-        assert_ne!(before, paint(core), "resting frames must differ");
+        assert!(!core.has_resting_motion());
+        assert!(!map.needs_frame_tick());
     }
 
     #[test]
     fn resting_motion_stops_for_reduced_motion_hidden_and_faded_cursors() {
+        let mut looping = (*crate::embedded_default_theme()).clone();
+        looping.id = "example.loop".to_owned();
+        for animation in looping.actions.values_mut() {
+            let first = animation.frames[0].clone();
+            animation.frames = vec![first.clone(), first];
+        }
         let mut map = map();
         let core = placed(&mut map, DEFAULT_CURSOR_KEY);
+        core.theme = Some(std::sync::Arc::new(looping));
         core.motion.idle_hide_ms = 20_000.0;
+        settle(core);
+        assert!(core.has_resting_motion());
         assert!(core.needs_frame_tick());
 
         core.visual.reduced_motion = ReducedMotion::On;

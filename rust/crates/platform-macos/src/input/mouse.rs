@@ -62,6 +62,7 @@ fn skylight_available() -> bool {
 
 /// Hand one stamped event to its transport.
 fn dispatch_mouse_event(route: PostRoute, pid: i32, event: &CGEvent) {
+    super::tag_synthetic_event(event);
     #[cfg(test)]
     if post_sink::record(route, event) {
         return;
@@ -102,6 +103,7 @@ impl WindowClickDelivery {
 /// Control-click (a context menu instead of a click).
 fn set_explicit_flags(event: &CGEvent, flags: CGEventFlags) {
     event.set_flags(flags);
+    super::tag_synthetic_event(event);
 }
 
 /// Left-click at `(x, y)` screen coordinates, posted to `pid`.
@@ -227,6 +229,7 @@ fn click_at_xy_desktop_inner(
             )
             .map_err(|_| anyhow::anyhow!("CGEvent::new_mouse_event(move) failed"))?;
             moved.set_flags(flags);
+            super::tag_synthetic_event(&moved);
             moved.post(CGEventTapLocation::HID);
             std::thread::sleep(std::time::Duration::from_millis(12));
         }
@@ -235,6 +238,7 @@ fn click_at_xy_desktop_inner(
             let down = CGEvent::new_mouse_event(source.clone(), down_ty, point, btn)
                 .map_err(|_| anyhow::anyhow!("CGEvent::new_mouse_event(down) failed"))?;
             down.set_flags(flags);
+            super::tag_synthetic_event(&down);
             down.set_integer_value_field(
                 core_graphics::event::EventField::MOUSE_EVENT_CLICK_STATE,
                 (pair_index + 1) as i64,
@@ -244,6 +248,7 @@ fn click_at_xy_desktop_inner(
             let up = CGEvent::new_mouse_event(source.clone(), up_ty, point, btn)
                 .map_err(|_| anyhow::anyhow!("CGEvent::new_mouse_event(up) failed"))?;
             up.set_flags(flags);
+            super::tag_synthetic_event(&up);
             up.set_integer_value_field(
                 core_graphics::event::EventField::MOUSE_EVENT_CLICK_STATE,
                 (pair_index + 1) as i64,
@@ -337,6 +342,7 @@ pub fn scroll_wheel_desktop(
             return Err(anyhow::anyhow!("CGEventCreateScrollWheelEvent2 failed"));
         }
         let event = unsafe { CGEvent::from_ptr(event_ref) };
+        super::tag_synthetic_event(&event);
         event.post(CGEventTapLocation::HID);
         std::thread::sleep(std::time::Duration::from_millis(30));
     }
@@ -1419,7 +1425,9 @@ fn new_global_mouse_event(
     if event_ref.is_null() {
         Err(())
     } else {
-        Ok(unsafe { CGEvent::from_ptr(event_ref) })
+        let event = unsafe { CGEvent::from_ptr(event_ref) };
+        super::tag_synthetic_event(&event);
+        Ok(event)
     }
 }
 
@@ -1771,6 +1779,7 @@ pub fn scroll_wheel_at_xy(
         let event =
             CGEvent::new_scroll_event(source, ScrollEventUnit::LINE, 2, wheel_y, wheel_x, 0)
                 .map_err(|_| anyhow::anyhow!("CGEvent::new_scroll_event failed"))?;
+        super::tag_synthetic_event(&event);
 
         let event_ptr = event.as_ptr() as *mut std::ffi::c_void;
 
@@ -2552,5 +2561,20 @@ mod explicit_flags_tests {
         assert_eq!(event.get_flags(), CGEventFlags::CGEventFlagNull);
         set_explicit_flags(&event, CGEventFlags::CGEventFlagCommand);
         assert_eq!(event.get_flags(), CGEventFlags::CGEventFlagCommand);
+        assert_eq!(
+            event.get_integer_value_field(core_graphics::event::EventField::EVENT_SOURCE_USER_DATA),
+            crate::input::GOAT_CUA_EVENT_USER_DATA
+        );
+        let global = new_global_mouse_event(
+            CGEventType::MouseMoved,
+            core_graphics::geometry::CGPoint::new(5.0, 5.0),
+            CGMouseButton::Left,
+        )
+        .expect("global mouse event");
+        assert_eq!(
+            global
+                .get_integer_value_field(core_graphics::event::EventField::EVENT_SOURCE_USER_DATA),
+            crate::input::GOAT_CUA_EVENT_USER_DATA
+        );
     }
 }
