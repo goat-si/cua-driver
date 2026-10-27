@@ -902,47 +902,12 @@ impl Tool for ClickTool {
                         tokio::time::sleep(settle).await;
                     }
                     msg.push_str(&changes.result_suffix());
-                    // AX dispatch went through, but AXPerformAction returning
-                    // success does not confirm the on-screen effect (many elements
-                    // no-op silently). A click is never driver-verifiable (no
-                    // read-back) → verified:false stays for back-compat. The
-                    // tri-state `effect` is the richer signal:
-                    //   * suspected_noop — the element didn't advertise the action,
-                    //     so the press likely did nothing → cross to vision/pixel.
-                    //   * unverifiable — dispatched fine, driver just can't confirm;
-                    //     the caller verifies via screenshot.
-                    let mut structured = serde_json::json!({
-                        "path": if selection_via_pixel {
-                            if fronted { "cgevent_fg" } else { "cgevent" }
-                        } else if fronted {
-                            "ax_fg"
-                        } else {
-                            "ax"
-                        },
-                        "verified": selection_verified,
-                        "effect": if selection_verified {
-                            "confirmed"
-                        } else if suspected_noop {
-                            "suspected_noop"
-                        } else {
-                            "unverifiable"
-                        },
-                    });
-                    if selection_verified {
-                        structured["evidence"] = serde_json::json!([
-                            { "kind": "accessibility_readback" }
-                        ]);
-                    }
-                    if suspected_noop {
-                        structured["escalation"] = serde_json::json!({
-                            "recommended": "px",
-                            "reason": "element does not advertise this action — the \
-                                       AX press likely no-op'd. Do an element px \
-                                       action: click by pixel (x,y) off the \
-                                       screenshot from get_window_state."
-                        });
-                    }
-                    ToolResult::text(msg).with_structured(structured)
+                    ToolResult::text(msg).with_structured(ax_click_structured(
+                        selection_via_pixel,
+                        fronted,
+                        selection_verified,
+                        suspected_noop,
+                    ))
                 }
                 Ok(Err(e)) => ToolResult::error(format!("AX action failed: {e}")),
                 Err(e) => ToolResult::error(format!("Task error: {e}")),
@@ -1487,6 +1452,71 @@ impl Tool for ClickTool {
 
 // ── AX click implementation (blocking) ───────────────────────────────────────
 
+/// Structured result of an element click from what `perform_ax_click`
+/// reported.
+///
+/// AX dispatch went through, but AXPerformAction returning success does not
+/// confirm the on-screen effect (many elements no-op silently). A click is
+/// never driver-verifiable (no read-back) → verified:false stays for
+/// back-compat. The tri-state `effect` is the richer signal:
+///   * suspected_noop — the element didn't advertise the action, so the press
+///     likely did nothing → cross to vision/pixel.
+///   * unverifiable — dispatched, the driver just can't confirm; the caller
+///     verifies via screenshot.
+fn ax_click_structured(
+    selection_via_pixel: bool,
+    fronted: bool,
+    selection_verified: bool,
+    suspected_noop: bool,
+) -> serde_json::Value {
+    let mut structured = serde_json::json!({
+        "path": if selection_via_pixel {
+            if fronted { "cgevent_fg" } else { "cgevent" }
+        } else if fronted {
+            "ax_fg"
+        } else {
+            "ax"
+        },
+        "verified": selection_verified,
+        "effect": if selection_verified {
+            "confirmed"
+        } else if suspected_noop {
+            "suspected_noop"
+        } else {
+            "unverifiable"
+        },
+    });
+    if selection_verified {
+        structured["evidence"] = serde_json::json!([
+            { "kind": "accessibility_readback" }
+        ]);
+    }
+    if suspected_noop {
+        structured["escalation"] = serde_json::json!({
+            "recommended": "px",
+            "reason": "element does not advertise this action — the \
+                       AX press likely no-op'd. Do an element px \
+                       action: click by pixel (x,y) off the \
+                       screenshot from get_window_state."
+        });
+    }
+    structured
+}
+
+/// `perform_ax_click`'s outcome: `(summary_text, needs_webkit_delay,
+/// suspected_noop, selection_verified, selection_via_pixel)`.
+type AxClickOutcome = (String, bool, bool, bool, bool);
+
+/// The outcome of an AX action whose perform call returned `err` after it
+/// was sent, when no read-back resolved what happened.
+fn unresolved_perform_error(
+    ax_action: &str,
+    err: crate::ax::bindings::AXError,
+    _element: (usize, &str, &str),
+) -> anyhow::Result<AxClickOutcome> {
+    anyhow::bail!("AXUIElementPerformAction({ax_action}) returned {err}")
+}
+
 /// Returns `(summary_text, needs_webkit_delay, suspected_noop,
 /// selection_verified, selection_via_pixel)`.
 ///
@@ -1577,7 +1607,7 @@ fn perform_ax_click(
     selection_pixel: Option<SelectionPixelTarget>,
     modifiers: &[String],
     foreground: bool,
-) -> anyhow::Result<(String, bool, bool, bool, bool)> {
+) -> anyhow::Result<AxClickOutcome> {
     let (element_ptr, idx) = element;
     let (pid, window_id) = window;
     let ax_action = crate::input::ax_actions::map_action(action_str)?;
@@ -1766,7 +1796,7 @@ fn perform_ax_click(
                 ));
             }
         }
-        anyhow::bail!("AXUIElementPerformAction({ax_action}) returned {err}");
+        return unresolved_perform_error(ax_action, err, (idx, &role, &title));
     }
 
     let mut summary = format!("✅ Performed {ax_action} on [{idx}] {role} \"{title}\".");
@@ -1975,6 +2005,51 @@ mod tests {
             !is_toggle_press("AXPress", "AXRadioButton", &[]),
             "AXPress not advertised"
         );
+    }
+
+    /// cua-driver#21: an AX action that was sent and came back with an error
+    /// may still have acted (Finder opens a row and returns -25205; Apple
+    /// documents that kAXErrorCannotComplete does not mean failure). It must
+    /// report `effect: "unverifiable"` so the caller reads before clicking
+    /// again. Only errors that prove nothing reached the app stay failures.
+    #[test]
+    fn perform_error_after_dispatch_is_unverifiable_unless_nothing_was_sent() {
+        use crate::ax::bindings::{
+            kAXErrorAPIDisabled, kAXErrorActionUnsupported, kAXErrorAttributeUnsupported,
+            kAXErrorCannotComplete, kAXErrorFailure, kAXErrorIllegalArgument,
+            kAXErrorInvalidUIElement, kAXErrorNotImplemented,
+        };
+        for may_have_acted in [
+            kAXErrorCannotComplete,
+            kAXErrorAttributeUnsupported,
+            kAXErrorFailure,
+            kAXErrorActionUnsupported,
+            kAXErrorNotImplemented,
+        ] {
+            let (summary, needs_webkit_delay, suspected_noop, verified, via_pixel) =
+                unresolved_perform_error("AXOpen", may_have_acted, (3, "AXRow", "Desktop"))
+                    .unwrap_or_else(|error| panic!("{may_have_acted} must not fail: {error}"));
+            assert!(
+                summary.contains(&may_have_acted.to_string()),
+                "the AX error stays visible: {summary}"
+            );
+            assert!(!summary.starts_with('✅'), "not a success: {summary}");
+            assert!(!needs_webkit_delay && !suspected_noop && !verified && !via_pixel);
+            let structured = ax_click_structured(via_pixel, false, verified, suspected_noop);
+            assert_eq!(structured["effect"], "unverifiable", "{may_have_acted}");
+            assert_eq!(structured["verified"], false);
+            assert_eq!(structured["path"], "ax");
+            assert!(structured.get("escalation").is_none());
+        }
+        for nothing_sent in [
+            kAXErrorIllegalArgument,
+            kAXErrorInvalidUIElement,
+            kAXErrorAPIDisabled,
+        ] {
+            let error = unresolved_perform_error("AXOpen", nothing_sent, (3, "AXRow", "Desktop"))
+                .expect_err("an error that proves nothing reached the app stays a failure");
+            assert!(error.to_string().contains(&nothing_sent.to_string()));
+        }
     }
 
     /// Only errors an app returns after acting qualify; errors that mean the
