@@ -354,6 +354,17 @@ fn page_rows(tree_markdown: String, require_web_area: bool) -> anyhow::Result<St
     }
 }
 
+/// The page rows of an AX walk. The walk retained every indexed element; no
+/// snapshot takes them over here, so they are released before returning,
+/// whether or not the window has a page.
+fn page_rows_of_walk(
+    result: crate::ax::tree::TreeWalkResult,
+    require_web_area: bool,
+) -> anyhow::Result<String> {
+    let _release = crate::ax::snapshot::AxSnapshot::from_nodes(&result.nodes);
+    page_rows(result.tree_markdown, require_web_area)
+}
+
 /// Extract page text via the AX tree.
 async fn ax_text_fallback(
     pid: i32,
@@ -366,7 +377,7 @@ async fn ax_text_fallback(
         tokio::task::spawn_blocking(move || crate::ax::tree::walk_tree(pid, Some(window_id), None))
             .await
             .map_err(|e| anyhow::anyhow!("AX walk task failed: {e}"))?;
-    let rows = page_rows(result.tree_markdown, require_web_area)?;
+    let rows = page_rows_of_walk(result, require_web_area)?;
     Ok(AXPageReader::extract_text(&rows))
 }
 
@@ -384,7 +395,7 @@ async fn ax_query_fallback(
         tokio::task::spawn_blocking(move || crate::ax::tree::walk_tree(pid, Some(window_id), None))
             .await
             .map_err(|e| anyhow::anyhow!("AX walk task failed: {e}"))?;
-    let rows = page_rows(result.tree_markdown, require_web_area)?;
+    let rows = page_rows_of_walk(result, require_web_area)?;
     Ok(AXPageReader::query(&sel, &rows))
 }
 
@@ -478,9 +489,37 @@ fn required_finite(value: &serde_json::Value, key: &str, raw: &str) -> anyhow::R
 
 #[cfg(test)]
 mod tests {
-    use super::page_rows;
+    use super::{page_rows, page_rows_of_walk};
 
     const MENU_ONLY: &str = "- [0] AXMenuBar\n  - [1] AXMenuBarItem \"Apple\"\n";
+
+    /// The AX text and query fallbacks walked the tree and dropped its
+    /// retained elements without releasing them, leaking one reference per
+    /// indexed element on every read.
+    #[test]
+    fn the_page_fallback_releases_what_the_walk_retained() {
+        use core_foundation::base::{CFGetRetainCount, CFRetain, CFTypeRef, TCFType};
+        let element = core_foundation::string::CFString::new("indexed element");
+        let ptr = element.as_concrete_TypeRef() as usize;
+        let baseline = unsafe { CFGetRetainCount(ptr as CFTypeRef) };
+        for (markdown, require_web_area, ok) in [
+            (MENU_ONLY, true, false),
+            (
+                "- [0] AXWebArea \"page\"\n  - [1] AXLink \"a\"\n",
+                true,
+                true,
+            ),
+        ] {
+            // The walk's own retain on the indexed element.
+            unsafe { CFRetain(ptr as CFTypeRef) };
+            let result = crate::ax::tree::TreeWalkResult::for_test(
+                markdown.to_owned(),
+                vec![crate::ax::tree::AXNode::for_test(Some(0), ptr)],
+            );
+            assert_eq!(page_rows_of_walk(result, require_web_area).is_ok(), ok);
+            assert_eq!(unsafe { CFGetRetainCount(ptr as CFTypeRef) }, baseline);
+        }
+    }
 
     #[test]
     fn browser_read_without_a_web_area_fails_instead_of_returning_the_menu_bar() {
