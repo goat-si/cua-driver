@@ -327,7 +327,7 @@ fn def() -> &'static ToolDef {
             - element_token: AX action path. Tokens are scoped to (pid, window_id) and stale once the window is snapshotted again.\n\
             - x, y: window-local pixels of the get_window_state screenshot, sent as CGEvent mouse events. Needs a visible window. `modifier` takes cmd/shift/option/ctrl.\n\
             \n\
-            `button` defaults to left; on the AX path \"right\" maps to AXShowMenu and \"middle\" falls back to a pixel click at the element center. `action`: press (default), show_menu, pick, confirm, cancel, open, show_alternate_ui, show_default_ui; an element listing showalternateui reveals its hover-only controls with show_alternate_ui, in the background and without the pointer. `from_zoom:true` translates zoom-image pixels after a `zoom` call. Pressing a popup button opens its menu and leaves it open until an item is chosen or it is dismissed; in the background the user's front window keeps key focus meanwhile. To choose an option in one call use `set_value`. In the background a web `<select>` (Chrome, Electron) is not opened, because its menu would raise the browser window: the click is refused with `select_menu_would_raise_window`; use `set_value`.".into(),
+            `button` defaults to left; on the AX path \"right\" maps to AXShowMenu and \"middle\" falls back to a pixel click at the element center. `action`: press (default), show_menu, pick, confirm, cancel, open, show_alternate_ui, show_default_ui, or any action the target element lists (including increment, decrement, and custom actions). AXRaise requires foreground delivery because it fronts the window. An element listing showalternateui reveals its hover-only controls with show_alternate_ui, in the background and without the pointer. `from_zoom:true` translates zoom-image pixels after a `zoom` call. Pressing a popup button opens its menu and leaves it open until an item is chosen or it is dismissed; in the background the user's front window keeps key focus meanwhile. To choose an option in one call use `set_value`. In the background a web `<select>` (Chrome, Electron) is not opened, because its menu would raise the browser window: the click is refused with `select_menu_would_raise_window`; use `set_value`.".into(),
         input_schema: serde_json::json!({
             "type": "object",
             // `pid` is conditionally required — needed for window/element clicks
@@ -907,7 +907,13 @@ impl Tool for ClickTool {
                         suspected_noop,
                     ))
                 }
-                Ok(Err(e)) => ToolResult::error(format!("AX action failed: {e}")),
+                Ok(Err(e)) => {
+                    if let Some(code) = crate::input::ax_actions::element_action_refusal_code(&e) {
+                        super::pre_dispatch_refusal(code, format!("AX action failed: {e}"))
+                    } else {
+                        ToolResult::error(format!("AX action failed: {e}"))
+                    }
+                }
                 Err(e) => ToolResult::error(format!("Task error: {e}")),
             }
         } else if let (Some(mut cx), Some(mut cy)) = (x, y) {
@@ -1650,8 +1656,13 @@ fn perform_ax_click(
 ) -> anyhow::Result<AxClickOutcome> {
     let (element_ptr, idx) = element;
     let (pid, window_id) = window;
-    let ax_action = crate::input::ax_actions::map_action(action_str)?;
     let element = element_ptr as AXUIElementRef;
+
+    // Read live capabilities before dispatch: custom actions and
+    // AXIncrement/AXDecrement are valid only on elements that expose them.
+    let advertised = unsafe { copy_action_names(element) };
+    let ax_action =
+        crate::input::ax_actions::resolve_element_action(action_str, &advertised, foreground)?;
 
     // Check the live value immediately before dispatch. Foreground assist can
     // enable menu items that were disabled in the cached snapshot, while a
@@ -1661,8 +1672,6 @@ fn perform_ax_click(
 
     // Capture advertised actions BEFORE dispatching so we can detect silent no-ops
     // (AX returns success even when the element doesn't advertise the action).
-    let advertised = unsafe { copy_action_names(element) };
-
     let role = unsafe { copy_string_attr(element, "AXRole") }.unwrap_or_default();
     let title = unsafe { copy_string_attr(element, "AXTitle") }.unwrap_or_default();
 
@@ -2027,6 +2036,18 @@ mod tests {
         assert!(validate_click_action("show_alternate_ui", true).is_ok());
         assert!(validate_click_action("focus", true).is_err());
         assert!(validate_click_action("hover", false).is_err());
+    }
+
+    #[tokio::test]
+    async fn an_unknown_action_is_refused_before_dispatch() {
+        let tool = ClickTool::new(Arc::new(ToolState::new(false, false, None)));
+        let result = tool
+            .invoke(serde_json::json!({"pid": 123, "action": "hover"}))
+            .await;
+        let structured = result.structured_content.expect("structured refusal");
+        assert_eq!(structured["code"], "invalid_arguments");
+        assert_eq!(structured["effect"], "refused");
+        assert_eq!(structured["dispatched"], false);
     }
 
     /// #3835: Finder's toolbar view switcher applies an AXPress and returns
