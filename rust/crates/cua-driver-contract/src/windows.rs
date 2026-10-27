@@ -270,6 +270,13 @@ pub enum ToggleState {
     Mixed,
 }
 
+/// `toggle_state` is optional by omission. Its schema is the plain string enum: an
+/// `Option` schema would add `null` to `enum`, which Gemini-compatible clients reject for
+/// the whole tool list (protocol_schema_test).
+fn toggle_state_schema(generator: &mut SchemaGenerator) -> Schema {
+    ToggleState::json_schema(generator)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, uniffi::Record)]
 pub struct WindowElement {
     pub element_index: u64,
@@ -289,6 +296,7 @@ pub struct WindowElement {
     pub selected: Option<bool>,
     /// TogglePattern state, for elements that have one (Windows).
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(schema_with = "toggle_state_schema")]
     pub toggle_state: Option<ToggleState>,
     /// ExpandCollapsePattern state; partly expanded counts as expanded. Absent
     /// for elements that cannot expand (Windows).
