@@ -36,6 +36,83 @@ pub fn should_use_pasteboard_for_text(text: &str) -> bool {
     !text.is_empty() && (!text.is_ascii() || text.chars().count() >= PASTEBOARD_TEXT_CHAR_THRESHOLD)
 }
 
+#[link(name = "Carbon", kind = "framework")]
+extern "C" {
+    fn IsSecureEventInputEnabled() -> u8;
+}
+
+/// Whether text typed now could be a secret: macOS has secure event input on,
+/// or the element that has keyboard focus in `pid` (the frontmost app when
+/// `None`) is a password, passcode or one-time-code field by the same test
+/// the snapshot uses to redact its value.
+///
+/// Such text must not travel through the general pasteboard: every process in
+/// the session can read it there, and the concealed/transient markers only ask
+/// clipboard managers not to record it. Typing it key by key keeps it off the
+/// pasteboard.
+fn text_target_may_be_secret(pid: Option<i32>) -> bool {
+    if unsafe { IsSecureEventInputEnabled() } != 0 {
+        return true;
+    }
+    let Some(pid) = pid.or_else(crate::apps::frontmost_pid) else {
+        return false;
+    };
+    use crate::ax::bindings::{copy_string_attr, focused_element_of_pid};
+    use core_foundation::base::{CFRelease, CFTypeRef};
+    unsafe {
+        let Some(element) = focused_element_of_pid(pid) else {
+            return false;
+        };
+        let read = |attr: &str| copy_string_attr(element, attr).filter(|v| !v.trim().is_empty());
+        let role = read("AXRole").unwrap_or_default();
+        let subrole = read("AXSubrole");
+        let title = read("AXTitle");
+        let description = read("AXDescription");
+        let placeholder = read("AXPlaceholderValue");
+        let identifier = read("AXIdentifier");
+        let help = read("AXHelp");
+        CFRelease(element as CFTypeRef);
+        cua_driver_core::snapshot_compaction::is_secure_text_field(
+            &cua_driver_core::snapshot_compaction::FieldSecurityMeta {
+                role: &role,
+                subrole: subrole.as_deref(),
+                title: title.as_deref(),
+                description: description.as_deref(),
+                placeholder: placeholder.as_deref(),
+                identifier: identifier.as_deref(),
+                help: help.as_deref(),
+                is_password_flag: false,
+            },
+        )
+    }
+}
+
+/// Deliver `text` either as pasteboard runs split around control keys, or,
+/// when the pasteboard route is not wanted or not allowed, as one typed run.
+/// A failed paste falls back to typing that run.
+fn deliver_text_runs(
+    text: &str,
+    pasteboard_allowed: bool,
+    mut paste: impl FnMut(&str) -> anyhow::Result<()>,
+    mut type_run: impl FnMut(&str) -> anyhow::Result<()>,
+    mut control: impl FnMut(char) -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    if !pasteboard_allowed || !should_use_pasteboard_for_text(text) {
+        return type_run(text);
+    }
+    for segment in split_text_delivery_segments(text) {
+        match segment {
+            TextDeliverySegment::Text(run) => {
+                if paste(run).is_err() {
+                    type_run(run)?;
+                }
+            }
+            TextDeliverySegment::Control(ch) => control(ch)?,
+        }
+    }
+    Ok(())
+}
+
 /// A contiguous run of text or a single control key (Return/Tab) within a
 /// typed payload.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -364,28 +441,22 @@ pub fn type_text_with_delay(pid: i32, text: &str, inter_char_delay_ms: u64) -> a
     let source = CGEventSource::new(CGEventSourceStateID::HIDSystemState)
         .map_err(|_| anyhow::anyhow!("CGEventSource::new failed"))?;
 
-    if should_use_pasteboard_for_text(text) {
-        for segment in split_text_delivery_segments(text) {
-            match segment {
-                TextDeliverySegment::Text(run) => {
-                    if paste_text_preserving_clipboard(run, || hotkey(pid, "v", &["cmd"])).is_err()
-                    {
-                        type_text_chars_to_pid(&source, pid, run, inter_char_delay_ms)?;
-                    }
-                }
-                TextDeliverySegment::Control(ch) => {
-                    let (down, up) = char_key_events(&source, ch)?;
-                    post_keyboard_event(pid, &down);
-                    key_gap_sleep();
-                    post_keyboard_event(pid, &up);
-                    key_gap_sleep();
-                }
-            }
-        }
-        return Ok(());
-    }
-
-    type_text_chars_to_pid(&source, pid, text, inter_char_delay_ms)
+    let pasteboard_allowed =
+        should_use_pasteboard_for_text(text) && !text_target_may_be_secret(Some(pid));
+    deliver_text_runs(
+        text,
+        pasteboard_allowed,
+        |run| paste_text_preserving_clipboard(run, || hotkey(pid, "v", &["cmd"])),
+        |run| type_text_chars_to_pid(&source, pid, run, inter_char_delay_ms),
+        |ch| {
+            let (down, up) = char_key_events(&source, ch)?;
+            post_keyboard_event(pid, &down);
+            key_gap_sleep();
+            post_keyboard_event(pid, &up);
+            key_gap_sleep();
+            Ok(())
+        },
+    )
 }
 
 /// Send a key combination (hotkey) to `pid`.
@@ -646,44 +717,33 @@ pub fn type_text_global(text: &str, inter_char_delay_ms: u64) -> anyhow::Result<
 
     let source = CGEventSource::new(CGEventSourceStateID::HIDSystemState)
         .map_err(|_| anyhow::anyhow!("CGEventSource::new failed"))?;
-    if should_use_pasteboard_for_text(text) {
-        for segment in split_text_delivery_segments(text) {
-            match segment {
-                TextDeliverySegment::Text(run) => {
-                    if paste_text_preserving_clipboard(run, || press_key_global("v", &["cmd"]))
-                        .is_err()
-                    {
-                        for ch in run.chars() {
-                            let (down, up) = char_key_events(&source, ch)?;
-                            down.post(CGEventTapLocation::HID);
-                            key_gap_sleep();
-                            up.post(CGEventTapLocation::HID);
-                            std::thread::sleep(
-                                std::time::Duration::from_millis(inter_char_delay_ms)
-                                    .max(key_gap()),
-                            );
-                        }
-                    }
-                }
-                TextDeliverySegment::Control(ch) => {
-                    let (down, up) = char_key_events(&source, ch)?;
-                    down.post(CGEventTapLocation::HID);
-                    key_gap_sleep();
-                    up.post(CGEventTapLocation::HID);
-                    key_gap_sleep();
-                }
+    let pasteboard_allowed =
+        should_use_pasteboard_for_text(text) && !text_target_may_be_secret(None);
+    deliver_text_runs(
+        text,
+        pasteboard_allowed,
+        |run| paste_text_preserving_clipboard(run, || press_key_global("v", &["cmd"])),
+        |run| {
+            for ch in run.chars() {
+                let (down, up) = char_key_events(&source, ch)?;
+                down.post(CGEventTapLocation::HID);
+                key_gap_sleep();
+                up.post(CGEventTapLocation::HID);
+                std::thread::sleep(
+                    std::time::Duration::from_millis(inter_char_delay_ms).max(key_gap()),
+                );
             }
-        }
-        return Ok(());
-    }
-    for ch in text.chars() {
-        let (down, up) = char_key_events(&source, ch)?;
-        down.post(CGEventTapLocation::HID);
-        key_gap_sleep();
-        up.post(CGEventTapLocation::HID);
-        std::thread::sleep(std::time::Duration::from_millis(inter_char_delay_ms).max(key_gap()));
-    }
-    Ok(())
+            Ok(())
+        },
+        |ch| {
+            let (down, up) = char_key_events(&source, ch)?;
+            down.post(CGEventTapLocation::HID);
+            key_gap_sleep();
+            up.post(CGEventTapLocation::HID);
+            key_gap_sleep();
+            Ok(())
+        },
+    )
 }
 
 /// Type ASCII text through the global HID queue as physical US-keyboard
@@ -1602,6 +1662,55 @@ mod tests {
                 TextDeliverySegment::Text("!"),
             ]
         );
+    }
+
+    #[test]
+    fn text_for_a_possible_secret_never_reaches_the_pasteboard() {
+        let secret = "sk-proj-0123456789abcdefghijklmnopqrstuv\n한글";
+        let (mut pasted, mut typed, mut controls) = (Vec::new(), Vec::new(), Vec::new());
+        deliver_text_runs(
+            secret,
+            false,
+            |run| {
+                pasted.push(run.to_owned());
+                Ok(())
+            },
+            |run| {
+                typed.push(run.to_owned());
+                Ok(())
+            },
+            |ch| {
+                controls.push(ch);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert!(pasted.is_empty(), "a secret was pasted: {pasted:?}");
+        assert_eq!(typed, vec![secret.to_owned()]);
+        assert!(controls.is_empty());
+
+        // Otherwise long or non-ASCII runs are pasted around control keys.
+        let (mut pasted, mut typed, mut controls) = (Vec::new(), Vec::new(), Vec::new());
+        deliver_text_runs(
+            "안녕\n세상",
+            true,
+            |run| {
+                pasted.push(run.to_owned());
+                Ok(())
+            },
+            |run| {
+                typed.push(run.to_owned());
+                Ok(())
+            },
+            |ch| {
+                controls.push(ch);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(pasted, vec!["안녕".to_owned(), "세상".to_owned()]);
+        assert!(typed.is_empty());
+        assert_eq!(controls, vec!['\n']);
     }
 
     struct MockPasteboard {
