@@ -272,22 +272,24 @@ impl SessionManifest {
                     .get("driver_owned")
                     .and_then(serde_json::Value::as_bool)
                     .unwrap_or(false);
+                // Process control attests only the pid's OS-read executable,
+                // never a claimed bundle id, so only path identities can
+                // match: an `executable` grant, or a `bundle_id` grant that
+                // is a Windows executable path.
+                let attested_executable = resource
+                    .pointer("/fingerprint/executable")
+                    .and_then(serde_json::Value::as_str);
                 let app_allowed = self.applications.iter().any(|application| {
-                    let identity_matches = application
-                        .executable
-                        .as_deref()
-                        .zip(
-                            resource
-                                .pointer("/fingerprint/executable")
-                                .and_then(serde_json::Value::as_str),
-                        )
-                        .is_some_and(|(allowed, actual)| allowed == actual);
+                    let identity_matches =
+                        application.bundle_id.as_deref().is_some_and(|allowed| {
+                            bundle_grant_matches(allowed, None, attested_executable)
+                        }) || application
+                            .executable
+                            .as_deref()
+                            .zip(attested_executable)
+                            .is_some_and(|(allowed, actual)| allowed == actual);
                     identity_matches
-                        && application.executable_identity_matches(
-                            resource
-                                .pointer("/fingerprint/executable")
-                                .and_then(serde_json::Value::as_str),
-                        )
+                        && application.executable_identity_matches(attested_executable)
                         && match application.terminate {
                             TerminationGrant::Deny => false,
                             TerminationGrant::DriverLaunched => driver_owned,
@@ -2375,6 +2377,59 @@ allow:
                 "{adapter}/{kind}"
             );
         }
+    }
+
+    #[cfg(feature = "yaml")]
+    #[test]
+    fn windows_path_bundle_grant_terminate_scope_covers_kill_app() {
+        let _directory = tempfile::tempdir().unwrap();
+        #[cfg(windows)]
+        let granted = {
+            let path = _directory.path().join("chrome.exe");
+            std::fs::write(&path, b"approved application").unwrap();
+            path.to_string_lossy().into_owned()
+        };
+        #[cfg(not(windows))]
+        let granted = GRANTED_CHROME.to_owned();
+        let load = |terminate: &str| {
+            manifest(&format!(
+                "version: 3\nallow:\n  tools: [kill_app]\nresources:\n  apps:\n    - bundle_id: {}\n      windows: all\n      terminate: {terminate}\n",
+                serde_json::to_string(&granted).unwrap(),
+            ))
+            .unwrap()
+        };
+        // `kill_app` attests only the pid's fingerprint, never a bundle id.
+        let process = |executable: &str, driver_owned: bool| {
+            serde_json::json!({
+                "kind": "process_instance",
+                "driver_owned": driver_owned,
+                "fingerprint": {"pid": 42, "start_time": 1, "executable": executable},
+            })
+        };
+        let verbatim = format!(r"\\?\{}", granted.to_uppercase());
+        let any = load("any");
+        for executable in [granted.as_str(), verbatim.as_str()] {
+            any.authorize_protected_resource("process_control", &process(executable, false))
+                .unwrap();
+        }
+        assert!(any
+            .authorize_protected_resource(
+                "process_control",
+                &process(r"C:\Users\victim\chrome.exe", false)
+            )
+            .is_err());
+
+        let launched = load("driver_launched");
+        launched
+            .authorize_protected_resource("process_control", &process(&granted, true))
+            .unwrap();
+        assert!(launched
+            .authorize_protected_resource("process_control", &process(&granted, false))
+            .is_err());
+
+        assert!(load("deny")
+            .authorize_protected_resource("process_control", &process(&granted, true))
+            .is_err());
     }
 
     #[test]
