@@ -376,36 +376,110 @@ const WINDOW_PLAN_CACHE_CAPACITY: usize = 32;
 /// walk's own 20-second bound. The shell fallback retains its prior behavior.
 const WINDOW_CAPTURE_NATIVE_TIMEOUT: Duration = Duration::from_secs(3);
 
-/// Permit at most one ScreenCaptureKit worker. If an Apple completion callback
-/// never fires, the timed-out worker keeps this permit, and every later request
-/// goes straight to the compatibility fallback instead of leaking more
-/// blocked threads.
+/// Permit at most one live ScreenCaptureKit worker. An Apple completion
+/// callback can fail to fire; the worker that waits on it is then abandoned
+/// when its caller times out, and keeps its thread until the callback comes.
+/// Up to [`MAX_ABANDONED_CAPTURES`] abandoned workers are tolerated so one
+/// stuck callback does not disable native capture for the life of the
+/// driver (every later screenshot then failed while the AX tree still read).
+/// Past that, captures are refused at once with [`CAPTURE_STALLED_MARKER`]
+/// instead of leaking more blocked threads, so the host can restart the
+/// driver.
 struct NativeCaptureGate {
-    active: AtomicBool,
+    state: Mutex<GateState>,
 }
+
+struct GateState {
+    /// Workers whose thread has not returned, abandoned ones included.
+    active: usize,
+    /// Workers whose caller timed out and stopped waiting.
+    abandoned: usize,
+}
+
+/// Abandoned capture workers tolerated before native capture is refused.
+const MAX_ABANDONED_CAPTURES: usize = 2;
+
+/// Text every refusal from a stalled native capture backend carries.
+pub const CAPTURE_STALLED_MARKER: &str = "capture_backend_stalled";
+
+const SLOT_RUNNING: u8 = 0;
+const SLOT_FINISHED: u8 = 1;
+const SLOT_ABANDONED: u8 = 2;
 
 impl NativeCaptureGate {
     const fn new() -> Self {
         Self {
-            active: AtomicBool::new(false),
+            state: Mutex::new(GateState {
+                active: 0,
+                abandoned: 0,
+            }),
         }
     }
 
-    fn try_acquire(&'static self) -> Option<NativeCapturePermit> {
-        self.active
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .ok()
-            .map(|_| NativeCapturePermit { gate: self })
+    fn lock(&self) -> std::sync::MutexGuard<'_, GateState> {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
+
+    fn try_acquire(&'static self) -> Result<NativeCapturePermit, GateRefusal> {
+        let mut state = self.lock();
+        if state.abandoned >= MAX_ABANDONED_CAPTURES {
+            return Err(GateRefusal::Stalled(state.abandoned));
+        }
+        if state.active > state.abandoned {
+            return Err(GateRefusal::InFlight);
+        }
+        state.active += 1;
+        Ok(NativeCapturePermit {
+            gate: self,
+            slot: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(SLOT_RUNNING)),
+        })
+    }
+
+    /// The caller stopped waiting for the worker holding `slot`. A worker
+    /// that already returned is not counted.
+    fn abandon(&self, slot: &std::sync::atomic::AtomicU8) {
+        let mut state = self.lock();
+        if slot
+            .compare_exchange(
+                SLOT_RUNNING,
+                SLOT_ABANDONED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+        {
+            state.abandoned += 1;
+        }
+    }
+
+    #[cfg(test)]
+    fn counts(&self) -> (usize, usize) {
+        let state = self.lock();
+        (state.active, state.abandoned)
+    }
+}
+
+#[derive(Debug, PartialEq)]
+enum GateRefusal {
+    InFlight,
+    Stalled(usize),
 }
 
 struct NativeCapturePermit {
     gate: &'static NativeCaptureGate,
+    slot: std::sync::Arc<std::sync::atomic::AtomicU8>,
 }
 
 impl Drop for NativeCapturePermit {
     fn drop(&mut self) {
-        self.gate.active.store(false, Ordering::Release);
+        let mut state = self.gate.lock();
+        let previous = self.slot.swap(SLOT_FINISHED, Ordering::AcqRel);
+        state.active = state.active.saturating_sub(1);
+        if previous == SLOT_ABANDONED {
+            state.abandoned = state.abandoned.saturating_sub(1);
+        }
     }
 }
 
@@ -423,9 +497,14 @@ where
     T: Send + 'static,
     F: FnOnce() -> anyhow::Result<T> + Send + 'static,
 {
-    let permit = gate
-        .try_acquire()
-        .ok_or_else(|| anyhow::anyhow!("ScreenCaptureKit capture already in flight"))?;
+    let permit = gate.try_acquire().map_err(|refusal| match refusal {
+        GateRefusal::InFlight => anyhow::anyhow!("ScreenCaptureKit capture already in flight"),
+        GateRefusal::Stalled(count) => anyhow::anyhow!(
+            "{CAPTURE_STALLED_MARKER}: {count} earlier native captures never completed, so \
+             native capture is off for this driver process; restart the driver"
+        ),
+    })?;
+    let slot = std::sync::Arc::clone(&permit.slot);
     let (sender, receiver) = mpsc::sync_channel(1);
     std::thread::Builder::new()
         .name("cua-sck-window-capture".into())
@@ -439,6 +518,7 @@ where
     match receiver.recv_timeout(timeout) {
         Ok(result) => result,
         Err(mpsc::RecvTimeoutError::Timeout) => {
+            gate.abandon(&slot);
             anyhow::bail!(
                 "ScreenCaptureKit capture timed out after {} ms",
                 timeout.as_millis()
@@ -839,10 +919,23 @@ where
 
 /// Off-Space capture through `SLSHWCaptureWindowList` (see module docs).
 fn screenshot_window_bytes_skylight(window_id: u32) -> anyhow::Result<Vec<u8>> {
-    let image = crate::input::skylight::hw_capture_window(window_id).ok_or_else(|| {
-        anyhow::anyhow!("SLSHWCaptureWindowList returned no image for window {window_id}")
-    })?;
-    core_cgimage_to_png(&image, &format!("window {window_id}"))
+    // Bounded like the ScreenCaptureKit path: a WindowServer call that does
+    // not return must not hold a screenshot past the observation deadline.
+    run_native_capture_worker(
+        skylight_capture_gate(),
+        WINDOW_CAPTURE_NATIVE_TIMEOUT,
+        move || {
+            let image = crate::input::skylight::hw_capture_window(window_id).ok_or_else(|| {
+                anyhow::anyhow!("SLSHWCaptureWindowList returned no image for window {window_id}")
+            })?;
+            core_cgimage_to_png(&image, &format!("window {window_id}"))
+        },
+    )
+}
+
+fn skylight_capture_gate() -> &'static NativeCaptureGate {
+    static GATE: NativeCaptureGate = NativeCaptureGate::new();
+    &GATE
 }
 
 /// Encode a CoreGraphics image of any pixel layout as an RGBA PNG by drawing
@@ -1692,14 +1785,15 @@ mod tests {
         static GATE: NativeCaptureGate = NativeCaptureGate::new();
 
         let permit = GATE.try_acquire().expect("first worker acquires gate");
-        assert!(
-            GATE.try_acquire().is_none(),
+        assert_eq!(
+            GATE.try_acquire().err(),
+            Some(GateRefusal::InFlight),
             "a second worker must fall back while the first is active"
         );
 
         drop(permit);
         assert!(
-            GATE.try_acquire().is_some(),
+            GATE.try_acquire().is_ok(),
             "gate reopens only when the worker-owned permit drops"
         );
     }
@@ -1722,62 +1816,69 @@ mod tests {
     }
 
     #[test]
-    fn timed_out_native_worker_blocks_replacement_until_original_returns() {
-        use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
-
+    fn a_stuck_capture_is_abandoned_and_replaced_until_the_stall_limit() {
         static GATE: NativeCaptureGate = NativeCaptureGate::new();
-        static SPAWNED_WORK: AtomicUsize = AtomicUsize::new(0);
-        let (started_sender, started_receiver) = mpsc::channel();
-        let (release_sender, release_receiver) = mpsc::channel();
-
-        let first_caller = std::thread::spawn(move || {
-            run_native_capture_worker(&GATE, Duration::from_millis(10), move || {
-                SPAWNED_WORK.fetch_add(1, AtomicOrdering::SeqCst);
-                started_sender.send(()).expect("worker reports it started");
-                release_receiver
-                    .recv()
-                    .expect("test releases stalled worker");
-                Ok(1u8)
-            })
-        });
-        started_receiver
-            .recv()
-            .expect("first worker starts before its timeout is observed");
-        let first = first_caller.join().expect("first caller joins");
-        assert!(first
-            .expect_err("stalled worker times out")
-            .to_string()
-            .contains("timed out"));
-
-        let second = run_native_capture_worker(&GATE, Duration::from_secs(1), || {
-            SPAWNED_WORK.fetch_add(1, AtomicOrdering::SeqCst);
-            Ok(2u8)
-        });
-        assert!(second
-            .expect_err("replacement is refused while original remains blocked")
-            .to_string()
-            .contains("already in flight"));
+        let mut releases = Vec::new();
+        // Each worker blocks until released; its caller gives up after 10 ms.
+        for _ in 0..MAX_ABANDONED_CAPTURES {
+            let (started_sender, started_receiver) = mpsc::channel();
+            let (release_sender, release_receiver) = mpsc::channel::<()>();
+            let caller = std::thread::spawn(move || {
+                run_native_capture_worker(&GATE, Duration::from_millis(10), move || {
+                    started_sender.send(()).expect("worker reports it started");
+                    release_receiver
+                        .recv()
+                        .expect("test releases stalled worker");
+                    Ok(1u8)
+                })
+            });
+            started_receiver.recv().expect("worker starts");
+            let timed_out = caller.join().expect("caller joins");
+            assert!(timed_out
+                .expect_err("stalled worker times out")
+                .to_string()
+                .contains("timed out"));
+            releases.push(release_sender);
+        }
         assert_eq!(
-            SPAWNED_WORK.load(AtomicOrdering::SeqCst),
-            1,
-            "refused replacement must not spawn"
+            GATE.counts(),
+            (MAX_ABANDONED_CAPTURES, MAX_ABANDONED_CAPTURES)
         );
 
-        release_sender.send(()).expect("release original worker");
-        let deadline = Instant::now() + Duration::from_secs(1);
-        while GATE.active.load(AtomicOrdering::Acquire) && Instant::now() < deadline {
-            std::thread::yield_now();
-        }
-        assert!(!GATE.active.load(AtomicOrdering::Acquire));
+        // Past the limit a capture is refused at once, with the stall marker.
+        let refused = run_native_capture_worker(&GATE, Duration::from_secs(1), || Ok(2u8))
+            .expect_err("refused while too many workers are stuck");
+        assert!(
+            refused.to_string().contains(CAPTURE_STALLED_MARKER),
+            "{refused}"
+        );
 
+        // A stuck worker that returns frees its slot, and capture works again.
+        let (done_sender, done_receiver) = mpsc::channel::<()>();
+        releases.remove(0).send(()).expect("release one worker");
+        // Wait for the released worker's permit to drop: its thread owns it.
+        while GATE.counts().1 >= MAX_ABANDONED_CAPTURES {
+            let _ = done_receiver.recv_timeout(Duration::from_millis(1));
+        }
+        drop(done_sender);
         assert_eq!(
-            run_native_capture_worker(&GATE, Duration::from_secs(1), || {
-                SPAWNED_WORK.fetch_add(1, AtomicOrdering::SeqCst);
-                Ok(3u8)
-            })
-            .expect("gate reopens after original worker returns"),
+            run_native_capture_worker(&GATE, Duration::from_secs(1), || Ok(3u8))
+                .expect("capture runs again after a stuck worker returns"),
             3
         );
-        assert_eq!(SPAWNED_WORK.load(AtomicOrdering::SeqCst), 2);
+        for release in releases {
+            release.send(()).expect("release the rest");
+        }
+    }
+
+    #[test]
+    fn a_worker_that_finished_is_never_counted_as_abandoned() {
+        static GATE: NativeCaptureGate = NativeCaptureGate::new();
+        let permit = GATE.try_acquire().expect("acquire");
+        let slot = std::sync::Arc::clone(&permit.slot);
+        drop(permit);
+        // A timeout observed after the worker already returned changes nothing.
+        GATE.abandon(&slot);
+        assert_eq!(GATE.counts(), (0, 0));
     }
 }
