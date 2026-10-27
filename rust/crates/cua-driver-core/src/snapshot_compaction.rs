@@ -188,6 +188,12 @@ pub fn format_omitted_tabs_line(omitted_count: usize) -> String {
     format!("- ({omitted_count} inactive tabs omitted)")
 }
 
+/// Summary line for a list whose offscreen rows were skipped without being
+/// counted (Windows' native ListView viewport read).
+pub fn format_uncounted_offscreen_rows_line() -> String {
+    "- (offscreen rows: not read; scroll the list, or pass query to search them)".to_owned()
+}
+
 /// Whether a rendered markdown line is a synthetic compaction/offscreen summary
 /// that `filter_tree` should ignore when matching queries.
 pub fn is_compaction_summary_line(line: &str) -> bool {
@@ -946,6 +952,16 @@ mod tests {
         );
         assert!(is_compaction_summary_line(&format_omitted_tabs_line(
             plan.omitted_count
+        )));
+    }
+
+    #[test]
+    fn the_windows_list_view_offscreen_line_is_a_summary_line() {
+        // The line Windows' native ListView walk emits for rows it skipped.
+        // A query must not match it as if it were an element.
+        assert!(is_compaction_summary_line(&format!(
+            "    {}",
+            format_uncounted_offscreen_rows_line()
         )));
     }
 

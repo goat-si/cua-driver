@@ -11,11 +11,11 @@
 
 use cua_driver_core::snapshot_compaction::{
     compact_tab_strip, fold_actionless_text_subtrees, format_omitted_tabs_line,
-    is_compaction_summary_line, is_secure_text_field, is_uia_dense_collection,
-    is_uia_offscreen_exempt, plan_uia_collection_children, redact_if_secure,
-    redact_mirrored_secure_name, renumber_indexed_tree, splice_deferred_chunks, CompactableNode,
-    DeferredChunk, FieldSecurityMeta, RenumberableNode, TabChildMeta, UiaChildCandidate,
-    UiaChildPlan, TAB_STRIP_COMPACTION_THRESHOLD,
+    format_uncounted_offscreen_rows_line, is_compaction_summary_line, is_secure_text_field,
+    is_uia_dense_collection, is_uia_offscreen_exempt, plan_uia_collection_children,
+    redact_if_secure, redact_mirrored_secure_name, renumber_indexed_tree, splice_deferred_chunks,
+    CompactableNode, DeferredChunk, FieldSecurityMeta, RenumberableNode, TabChildMeta,
+    UiaChildCandidate, UiaChildPlan, TAB_STRIP_COMPACTION_THRESHOLD,
 };
 use cua_driver_core::walk_budget::WalkBudget;
 use windows::core::{Interface, BSTR};
@@ -744,11 +744,11 @@ unsafe fn walk_list_view_level(
     }
     if dense {
         state.mark_incomplete();
-        lines.push((
-            depth + 1,
-            "(offscreen rows omitted by bounded UIA collection read)".into(),
-        ));
-        if search_offscreen && !state.budget.expired() {
+        let search = search_offscreen && !state.budget.expired();
+        if !search {
+            lines.push((depth + 1, format_uncounted_offscreen_rows_line()));
+        }
+        if search {
             // Query mode may inspect offscreen rows too, but only one row's
             // cache at a time, after visible rows and sibling editors.
             let walker = (|| -> windows::core::Result<_> {
