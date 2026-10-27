@@ -163,7 +163,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@4716b85f2fac3e324e64fa2810f6b5c3905760a5 # 1.97.1
         with:
           targets: ${{ matrix.target }}
-      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+      - name: Restore the Rust build cache
+        id: rust-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: |
             ~/.cargo/registry
@@ -206,6 +208,17 @@ jobs:
           name: linux-${{ matrix.arch }}
           path: rust/release/*-binary.tar.gz
           if-no-files-found: error
+      # PR runs only restore. A PR-scoped copy serves that PR alone, and under the repository's
+      # 10 GB cache quota it evicts main's caches and the Debian package set (goat-si/cua-driver#20).
+      - name: Save the Rust build cache
+        if: github.event_name != 'pull_request' && steps.rust-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            rust/target
+          key: ${{ steps.rust-cache.outputs.cache-primary-key }}
 
   windows:
     name: windows-${{ matrix.arch }}
@@ -234,7 +247,9 @@ jobs:
         run: |
           rustup target add "${{ matrix.target }}"
           rustup target list --installed | grep -Fx "${{ matrix.target }}"
-      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+      - name: Restore the Rust build cache
+        id: rust-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: |
             ~/.cargo/registry
@@ -288,6 +303,17 @@ jobs:
           name: windows-${{ matrix.arch }}
           path: rust/release/*-binary.zip
           if-no-files-found: error
+      # PR runs only restore. A PR-scoped copy serves that PR alone, and under the repository's
+      # 10 GB cache quota it evicts main's caches and the Debian package set (goat-si/cua-driver#20).
+      - name: Save the Rust build cache
+        if: github.event_name != 'pull_request' && steps.rust-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            rust/target
+          key: ${{ steps.rust-cache.outputs.cache-primary-key }}
 
   macos:
     name: darwin-universal
@@ -310,7 +336,9 @@ jobs:
           rustup target add aarch64-apple-darwin x86_64-apple-darwin
           rustup target list --installed | grep -Fx aarch64-apple-darwin
           rustup target list --installed | grep -Fx x86_64-apple-darwin
-      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+      - name: Restore the Rust build cache
+        id: rust-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: |
             ~/.cargo/registry
@@ -362,6 +390,17 @@ jobs:
 
   # Lints the macOS platform crate and the workspace crates it builds on, on every PR
   # (goat-si/cua-driver#9). Runs beside the build jobs, so it adds no time to a PR.
+      # PR runs only restore. A PR-scoped copy serves that PR alone, and under the repository's
+      # 10 GB cache quota it evicts main's caches and the Debian package set (goat-si/cua-driver#20).
+      - name: Save the Rust build cache
+        if: github.event_name != 'pull_request' && steps.rust-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            rust/target
+          key: ${{ steps.rust-cache.outputs.cache-primary-key }}
   clippy-macos:
     name: Clippy macOS
     runs-on: macos-26
@@ -370,7 +409,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@4716b85f2fac3e324e64fa2810f6b5c3905760a5 # 1.97.1
         with:
           components: clippy
-      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+      - name: Restore the Rust build cache
+        id: rust-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: |
             ~/.cargo/registry
@@ -387,6 +428,17 @@ jobs:
   # real apps are #[ignore] upstream and run in its desktop harnesses, not here. goat-si/cua-driver#12.
   # Slow regression jobs run on main, release tags and manual dispatches, not on every PR.
   # They are still required for release tags, so the release gate does not get weaker.
+      # PR runs only restore. A PR-scoped copy serves that PR alone, and under the repository's
+      # 10 GB cache quota it evicts main's caches and the Debian package set (goat-si/cua-driver#20).
+      - name: Save the Rust build cache
+        if: github.event_name != 'pull_request' && steps.rust-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            rust/target
+          key: ${{ steps.rust-cache.outputs.cache-primary-key }}
   test-linux:
     if: github.event_name != 'pull_request' && (github.event_name != 'workflow_dispatch' || inputs.slow_tests)
     needs: version
