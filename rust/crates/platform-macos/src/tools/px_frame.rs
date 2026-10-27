@@ -181,21 +181,24 @@ fn resolve_dimensions(
     {
         return Err(PxFrameError::WindowNotFound { window_id });
     }
-    let dimensions = if let Some(frame) = published.filter(|f| same_bounds(&f.bounds, bounds)) {
-        frame.dimensions
-    } else if let Some(scale) = display_scale().filter(|scale| *scale == 1.0 || *scale == 2.0) {
-        let width = (bounds.width * scale).round();
-        let height = (bounds.height * scale).round();
-        if width < 1.0 || height < 1.0 || width > u32::MAX as f64 || height > u32::MAX as f64 {
-            capture()?
+    let (dimensions, source) =
+        if let Some(frame) = published.filter(|f| same_bounds(&f.bounds, bounds)) {
+            (frame.dimensions, "published")
+        } else if let Some(scale) = display_scale().filter(|scale| *scale == 1.0 || *scale == 2.0) {
+            let width = (bounds.width * scale).round();
+            let height = (bounds.height * scale).round();
+            if width < 1.0 || height < 1.0 || width > u32::MAX as f64 || height > u32::MAX as f64 {
+                (capture()?, "capture")
+            } else {
+                ((width as u32, height as u32), "display")
+            }
         } else {
-            (width as u32, height as u32)
-        }
-    } else {
-        capture()?
-    };
-    validate_capture_frame(window_id, bounds, dimensions.0, dimensions.1)
-        .map(|scale| (scale, dimensions))
+            (capture()?, "capture")
+        };
+    validate_capture_frame(window_id, bounds, dimensions.0, dimensions.1).map(|scale| {
+        tracing::debug!(window_id, source, scale, "resolved window pixel frame");
+        (scale, dimensions)
+    })
 }
 
 /// Select the display containing the largest part of the window. No overlap,
@@ -280,6 +283,11 @@ fn resolve_window_dimensions(window_id: u32) -> Result<(WindowPxFrame, (u32, u32
 /// the last published frame nor the window's display proves its scale.
 pub fn resolve_window_px_frame(window_id: u32) -> Result<WindowPxFrame, PxFrameError> {
     resolve_window_dimensions(window_id).map(|(frame, _)| frame)
+}
+
+/// The capture binding needs exact native dimensions, before image resizing.
+pub(super) fn window_native_dimensions(window_id: u32) -> Result<(u32, u32), PxFrameError> {
+    resolve_window_dimensions(window_id).map(|(_, dimensions)| dimensions)
 }
 
 /// The shared refusal for a pixel action whose window cannot be framed.
@@ -446,6 +454,25 @@ mod tests {
             )
             .unwrap(),
             (2.0, (1000, 1000))
+        );
+    }
+
+    #[test]
+    fn publication_preserves_exact_native_dimensions_for_capture_admission() {
+        let mut prior = published(2);
+        // Capture validation permits small rounding differences. Admission
+        // must compare the original dimensions rather than 500pt * 2x.
+        prior.dimensions = (1001, 1000);
+        assert_eq!(
+            resolve_dimensions(
+                11,
+                &prior.bounds,
+                Some(&prior),
+                || panic!("matching publication"),
+                || panic!("matching publication")
+            )
+            .unwrap(),
+            (2.0, (1001, 1000))
         );
     }
 
