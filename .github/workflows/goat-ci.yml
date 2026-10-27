@@ -423,13 +423,6 @@ jobs:
       - name: Clippy, warnings denied
         working-directory: rust
         run: cargo clippy --locked -p platform-macos --all-targets -- -D warnings
-
-  # Unit and hermetic tests: upstream's per-platform "unit" jobs (trycua/cua
-  # .github/workflows/ci-rust-{linux,macos,windows}.yml at cua-driver-rs-v0.37.0), ported verbatim
-  # apart from paths, action pins and caching. Tests needing a logged-in, TCC-authorized desktop or
-  # real apps are #[ignore] upstream and run in its desktop harnesses, not here. goat-si/cua-driver#12.
-  # Slow regression jobs run on main, release tags and manual dispatches, not on every PR.
-  # They are still required for release tags, so the release gate does not get weaker.
       # PR runs only restore. A PR-scoped copy serves that PR alone, and under the repository's
       # 10 GB cache quota it evicts main's caches and the Debian package set (goat-si/cua-driver#20).
       - name: Save the Rust build cache
@@ -441,6 +434,126 @@ jobs:
             ~/.cargo/git
             rust/target
           key: ${{ steps.rust-cache.outputs.cache-primary-key }}
+
+  # The slow lanes below run on main, release tags and dispatches only, so a PR never ran the
+  # tools/list schema contract or the platform unit suites: goat.4's toggle_state enum, which held a
+  # null, failed only in its tag run. These PR jobs run those parts and restore (never save) the
+  # slow lanes' caches from main.
+  pr-unit-linux:
+    if: github.event_name == 'pull_request'
+    needs: version
+    name: PR Linux schema contract and platform unit
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - name: Free runner disk
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /usr/local/.ghcup /opt/hostedtoolcache/CodeQL /usr/local/share/boost
+          df -h / | tail -1
+      - uses: dtolnay/rust-toolchain@4716b85f2fac3e324e64fa2810f6b5c3905760a5 # 1.97.1
+      - name: Restore the Linux slow-lane cache from main
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            rust/target
+          key: goat-test-linux-${{ hashFiles('rust/Cargo.lock', 'rust/**/Cargo.toml', 'vendor/**/Cargo.toml') }}
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            clang pkg-config libdbus-1-dev libpipewire-0.3-dev libspa-0.2-dev \
+            libei-dev libxkbcommon-dev libx11-dev libxi-dev libxtst-dev libxext-dev
+      # Desktop-independent platform-linux tests, including the GNOME/Mutter, Wayland and X11 units.
+      - name: platform-linux unit tests
+        working-directory: rust
+        run: cargo test --locked -p platform-linux --lib
+      - name: Protocol schema contract
+        working-directory: rust
+        env:
+          CUA_TEST_REQUIRE_DRIVER_BIN: "1"
+        run: |
+          cargo build --locked -p cua-driver
+          cargo test --locked -p cua-driver --test protocol_schema_test
+
+  pr-unit-macos:
+    if: github.event_name == 'pull_request'
+    needs: version
+    name: PR macOS schema contract
+    runs-on: macos-26
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: dtolnay/rust-toolchain@4716b85f2fac3e324e64fa2810f6b5c3905760a5 # 1.97.1
+      - name: Restore the macOS slow-lane cache from main
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            rust/target
+          key: goat-test-macos-${{ hashFiles('rust/Cargo.lock', 'rust/**/Cargo.toml', 'vendor/**/Cargo.toml') }}
+      - name: Protocol schema contract
+        working-directory: rust
+        env:
+          CUA_TEST_REQUIRE_DRIVER_BIN: "1"
+          CUA_TEST_DRIVER_STDERR: "1"
+        run: |
+          cargo build --locked -p cua-driver
+          cargo test --locked -p cua-driver --test protocol_schema_test
+
+  pr-unit-windows:
+    if: github.event_name == 'pull_request'
+    needs: version
+    name: PR Windows schema contract and platform unit
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: dtolnay/rust-toolchain@4716b85f2fac3e324e64fa2810f6b5c3905760a5 # 1.97.1
+      - name: Restore the Windows slow-lane cache from main
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            rust/target
+          key: goat-test-windows-${{ hashFiles('rust/Cargo.lock', 'rust/**/Cargo.toml', 'vendor/**/Cargo.toml') }}
+      - name: Record Windows runner session
+        id: runner-session
+        shell: pwsh
+        run: |
+          $sessionId = (Get-Process -Id $PID).SessionId
+          "session_id=$sessionId" >> $env:GITHUB_OUTPUT
+          "Windows runner process session id: $sessionId"
+      - name: platform-windows unit tests
+        working-directory: rust
+        env:
+          # The hosted runner's clipboard is disposable (as in test-windows).
+          CUA_TEST_ALLOW_CLIPBOARD: "1"
+        run: cargo test --locked -p platform-windows --lib
+      # Same gate as test-windows: the contract needs an interactive session.
+      - name: Protocol schema contract
+        if: steps.runner-session.outputs.session_id != '0'
+        working-directory: rust
+        shell: bash
+        env:
+          CUA_TEST_REQUIRE_DRIVER_BIN: "1"
+        run: |
+          cargo build --locked -p cua-driver
+          cargo test --locked -p cua-driver --test protocol_schema_test
+
+  # Unit and hermetic tests: upstream's per-platform "unit" jobs (trycua/cua
+  # .github/workflows/ci-rust-{linux,macos,windows}.yml at cua-driver-rs-v0.37.0), ported verbatim
+  # apart from paths, action pins and caching. Tests needing a logged-in, TCC-authorized desktop or
+  # real apps are #[ignore] upstream and run in its desktop harnesses, not here. goat-si/cua-driver#12.
+  # Slow regression jobs run on main, release tags and manual dispatches, not on every PR.
+  # They are still required for release tags, so the release gate does not get weaker.
   test-linux:
     if: github.event_name != 'pull_request' && (github.event_name != 'workflow_dispatch' || inputs.slow_tests)
     needs: version
