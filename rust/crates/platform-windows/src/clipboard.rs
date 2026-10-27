@@ -316,6 +316,121 @@ mod tests {
             .contains("absolute"));
     }
 
+    /// Clipboard history and cloud sync read the clipboard when its writer
+    /// closes it. An image or file write must therefore close the clipboard
+    /// once, with the exclusion formats already present. It used to write the
+    /// data, close, then reopen to add them.
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn native_image_and_file_writes_close_the_clipboard_once_with_exclusions() {
+        use std::cell::RefCell;
+        use windows::core::{w, PCWSTR};
+        use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
+        use windows::Win32::System::DataExchange::{
+            AddClipboardFormatListener, IsClipboardFormatAvailable, RegisterClipboardFormatW,
+            RemoveClipboardFormatListener,
+        };
+        use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+        use windows::Win32::UI::WindowsAndMessaging::{
+            CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, PeekMessageW,
+            RegisterClassW, UnregisterClassW, HWND_MESSAGE, MSG, PM_REMOVE, WINDOW_EX_STYLE,
+            WINDOW_STYLE, WM_CLIPBOARDUPDATE, WNDCLASSW,
+        };
+
+        if std::env::var_os("CUA_TEST_ALLOW_CLIPBOARD").as_deref()
+            != Some(std::ffi::OsStr::new("1"))
+        {
+            return;
+        }
+        thread_local! {
+            // One entry per clipboard update: whether the history exclusion
+            // format was on the clipboard when the update was delivered.
+            static UPDATES: RefCell<Vec<bool>> = const { RefCell::new(Vec::new()) };
+        }
+        unsafe extern "system" fn listener(
+            hwnd: HWND,
+            message: u32,
+            wparam: WPARAM,
+            lparam: LPARAM,
+        ) -> LRESULT {
+            if message == WM_CLIPBOARDUPDATE {
+                let name: Vec<u16> = CAN_INCLUDE_IN_CLIPBOARD_HISTORY_FORMAT
+                    .encode_utf16()
+                    .chain(std::iter::once(0))
+                    .collect();
+                let format = RegisterClipboardFormatW(PCWSTR(name.as_ptr()));
+                let excluded = IsClipboardFormatAvailable(format).is_ok();
+                UPDATES.with(|updates| updates.borrow_mut().push(excluded));
+                return LRESULT(0);
+            }
+            DefWindowProcW(hwnd, message, wparam, lparam)
+        }
+        let pump = || {
+            // Updates are queued to this thread; give a late second one time
+            // to arrive, since its absence is what is being checked.
+            let until = std::time::Instant::now() + std::time::Duration::from_secs(1);
+            let mut msg = MSG::default();
+            while std::time::Instant::now() < until {
+                if unsafe { PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE) }.as_bool() {
+                    unsafe { DispatchMessageW(&msg) };
+                } else {
+                    std::thread::yield_now();
+                }
+            }
+            UPDATES.with(|updates| std::mem::take(&mut *updates.borrow_mut()))
+        };
+
+        let directory = tempfile::tempdir().unwrap();
+        let image_path = directory.path().join("pixel.png");
+        image::RgbaImage::from_pixel(2, 2, image::Rgba([10, 20, 30, 255]))
+            .save(&image_path)
+            .unwrap();
+        let image_path = image_path.to_string_lossy().into_owned();
+
+        let backend = WindowsClipboard::new();
+        unsafe {
+            let instance = GetModuleHandleW(None).unwrap();
+            let class = WNDCLASSW {
+                lpfnWndProc: Some(listener),
+                hInstance: instance.into(),
+                lpszClassName: w!("CuaClipboardOnceTestListener"),
+                ..Default::default()
+            };
+            assert_ne!(RegisterClassW(&class), 0);
+            let hwnd = CreateWindowExW(
+                WINDOW_EX_STYLE(0),
+                class.lpszClassName,
+                w!(""),
+                WINDOW_STYLE(0),
+                0,
+                0,
+                0,
+                0,
+                HWND_MESSAGE,
+                None,
+                instance,
+                None,
+            )
+            .unwrap();
+            AddClipboardFormatListener(hwnd).unwrap();
+            pump();
+
+            let image = backend.write_image(&image_path);
+            let image_updates = pump();
+            let file = backend.write_file_url(&image_path);
+            let file_updates = pump();
+
+            let _ = RemoveClipboardFormatListener(hwnd);
+            let _ = DestroyWindow(hwnd);
+            let _ = UnregisterClassW(class.lpszClassName, instance);
+
+            image.unwrap();
+            file.unwrap();
+            assert_eq!(image_updates, [true], "write_image clipboard updates");
+            assert_eq!(file_updates, [true], "write_file_url clipboard updates");
+        }
+    }
+
     #[cfg(target_os = "windows")]
     #[test]
     fn native_clipboard_round_trips_text_when_opted_in() {
