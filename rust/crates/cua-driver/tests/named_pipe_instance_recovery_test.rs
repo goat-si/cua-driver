@@ -302,19 +302,31 @@ fn shutdown_ends_a_call_still_running_on_another_connection() {
     }
     let mut daemon = command.spawn().expect("spawn the daemon");
     // The pipe reads below block. A daemon that accepts and never answers is
-    // killed after this deadline, which ends those reads with an error.
+    // terminated after this deadline, which ends those reads with an error.
+    // The watchdog holds its own handle to this exact process, so it cannot
+    // reach another process that later reuses the pid.
     const TEST_DEADLINE: Duration = Duration::from_secs(120);
     let daemon_pid = daemon.id();
+    let watchdog_process = duplicate_process_handle(&daemon);
     let (finished, watchdog_done) = std::sync::mpsc::channel::<()>();
     let watchdog = std::thread::spawn(move || {
+        use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0};
+        use windows::Win32::System::Threading::{TerminateProcess, WaitForSingleObject};
+        let process = HANDLE(watchdog_process as *mut c_void);
         if watchdog_done.recv_timeout(TEST_DEADLINE)
             == Err(std::sync::mpsc::RecvTimeoutError::Timeout)
         {
-            eprintln!("watchdog: killing daemon {daemon_pid} after {TEST_DEADLINE:?}");
-            let _ = Command::new("taskkill")
-                .args(["/F", "/T", "/PID", &daemon_pid.to_string()])
-                .status();
+            eprintln!("watchdog: terminating daemon {daemon_pid} after {TEST_DEADLINE:?}");
+            unsafe {
+                if let Err(error) = TerminateProcess(process, 1) {
+                    eprintln!("watchdog: TerminateProcess failed: {error}");
+                }
+                if WaitForSingleObject(process, 10_000) != WAIT_OBJECT_0 {
+                    eprintln!("watchdog: daemon {daemon_pid} did not exit");
+                }
+            }
         }
+        let _ = unsafe { CloseHandle(process) };
     });
     struct KillOnDrop<'a>(&'a mut std::process::Child);
     impl Drop for KillOnDrop<'_> {
@@ -357,10 +369,17 @@ fn shutdown_ends_a_call_still_running_on_another_connection() {
         &mut call,
         r#"{"method":"call","name":"run_script","args":{"script":"await cua.sleep(60000); return 'late';","timeout_ms":90000}}"#,
     );
-    // The script cannot signal that it started: it has no filesystem or
-    // network access. Give the connection task time to read the request and
-    // admit the call before the shutdown connection is accepted.
-    std::thread::sleep(Duration::from_secs(2));
+    // The script engine runs on a thread named `cua-run-script`, started
+    // only after the SDK admitted the call. Wait for it, so shutdown cannot
+    // win the race and refuse the call at admission instead.
+    let admission = Instant::now();
+    while !process_has_thread_named(daemon_pid, "cua-run-script") {
+        assert!(
+            admission.elapsed() < RECOVERY_WINDOW,
+            "run_script did not start within {RECOVERY_WINDOW:?}"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
 
     assert!(wait_for_listening_instance(&socket, RECOVERY_WINDOW));
     let mut stop = open(&socket);
@@ -385,4 +404,66 @@ fn shutdown_ends_a_call_still_running_on_another_connection() {
     drop(call);
     let _ = finished.send(());
     let _ = watchdog.join();
+}
+
+/// A handle to `child` the caller owns, as an integer so it can move to
+/// another thread.
+fn duplicate_process_handle(child: &std::process::Child) -> usize {
+    use std::os::windows::io::AsRawHandle;
+    use windows::Win32::Foundation::{DuplicateHandle, DUPLICATE_SAME_ACCESS, HANDLE};
+    use windows::Win32::System::Threading::GetCurrentProcess;
+    let mut duplicate = HANDLE::default();
+    unsafe {
+        DuplicateHandle(
+            GetCurrentProcess(),
+            HANDLE(child.as_raw_handle()),
+            GetCurrentProcess(),
+            &mut duplicate,
+            0,
+            false,
+            DUPLICATE_SAME_ACCESS,
+        )
+    }
+    .expect("duplicate the daemon's process handle");
+    duplicate.0 as usize
+}
+
+/// Whether a thread of process `pid` carries the description `name`.
+/// Rust publishes thread names on Windows through `SetThreadDescription`.
+fn process_has_thread_named(pid: u32, name: &str) -> bool {
+    use windows::Win32::Foundation::{CloseHandle, LocalFree, HLOCAL};
+    use windows::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, Thread32First, Thread32Next, TH32CS_SNAPTHREAD, THREADENTRY32,
+    };
+    use windows::Win32::System::Threading::{
+        GetThreadDescription, OpenThread, THREAD_QUERY_LIMITED_INFORMATION,
+    };
+    unsafe {
+        let Ok(snapshot) = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) else {
+            return false;
+        };
+        let mut entry = THREADENTRY32 {
+            dwSize: std::mem::size_of::<THREADENTRY32>() as u32,
+            ..Default::default()
+        };
+        let mut found = false;
+        let mut more = Thread32First(snapshot, &mut entry).is_ok();
+        while more && !found {
+            if entry.th32OwnerProcessID == pid {
+                if let Ok(thread) =
+                    OpenThread(THREAD_QUERY_LIMITED_INFORMATION, false, entry.th32ThreadID)
+                {
+                    if let Ok(description) = GetThreadDescription(thread) {
+                        found = !description.is_null()
+                            && description.to_string().is_ok_and(|text| text == name);
+                        let _ = LocalFree(Some(HLOCAL(description.0 as *mut c_void)));
+                    }
+                    let _ = CloseHandle(thread);
+                }
+            }
+            more = Thread32Next(snapshot, &mut entry).is_ok();
+        }
+        let _ = CloseHandle(snapshot);
+        found
+    }
 }
