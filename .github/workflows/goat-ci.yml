@@ -76,6 +76,8 @@ jobs:
           node scripts/build-node-runtime.mjs --prepare "$RUNNER_TEMP/node-runtime"
           cargo deny --manifest-path "$RUNNER_TEMP/node-runtime/napi/Cargo.toml" --locked \
             --config scripts/node-runtime/deny.toml check --show-stats licenses bans sources
+      - name: MPL-2.0 source pointers in THIRD_PARTY_NOTICES.md match the locked graph
+        run: python3 goat/notices/check_notices.py
 
   linux:
     name: linux-${{ matrix.arch }}
