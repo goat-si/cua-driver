@@ -159,6 +159,17 @@ class CompareTest(unittest.TestCase):
         self.assertEqual(check({"type": "string", "enum": ["x"]}, {"const": "x"}), [])
         self.assertEqual(check({"type": "string", "enum": ["x"]}, {"const": 1}),
                          ["type ['string'] -> ['integer']", "enum gained 1"])
+        # A true branch admits anything the outer keywords allow; false admits nothing.
+        self.assertEqual(check({"type": "string"}, {"anyOf": [True]}), ["variant 0: type ['string'] -> None"])
+        self.assertEqual(check(split, {"anyOf": [*split["anyOf"], True]}), ["variant 2: type ['string'] -> None"])
+        self.assertEqual(check(split, {"anyOf": [*split["anyOf"], False]}), [])
+        # number includes integers.
+        numbers = {"anyOf": [{"type": ["number", "null"], "enum": [1, None]}]}
+        self.assertEqual(check(numbers, numbers), [])
+        self.assertEqual(check(numbers, {"anyOf": [{"type": ["number", "null"], "enum": [2, None]}]}),
+                         ["variant 1: enum gained 2"])
+        self.assertEqual(check({"type": "number"}, {"type": "integer"}), [])
+        self.assertEqual(check({"type": "integer"}, {"type": "number"}), ["type ['integer'] -> ['number']"])
 
 
 class ValidateTest(unittest.TestCase):

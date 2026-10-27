@@ -335,6 +335,11 @@ def schema_types(schema):
     return sorted({json_type(value) for value in values}) if values is not None else None
 
 
+def type_covers(types, declared):
+    """Whether a value of JSON type declared is admitted by types; "number" includes integers."""
+    return declared in types or (declared == "integer" and "number" in types)
+
+
 UNION_KEYS = ("anyOf", "oneOf")
 OBJECT_KEYS = ("properties", "required", "additionalProperties", "patternProperties")
 
@@ -349,7 +354,7 @@ def for_type(schema, declared):
     values = schema_values(narrowed)
     if values is not None:
         narrowed.pop("const", None)
-        narrowed["enum"] = [value for value in values if json_type(value) == declared]
+        narrowed["enum"] = [value for value in values if type_covers([declared], json_type(value))]
     return narrowed
 
 
@@ -361,7 +366,9 @@ def conjoin(outer, branch):
     if "properties" in outer and "properties" in branch:
         merged["properties"] = {**outer["properties"], **branch["properties"]}
     if "type" in outer and "type" in branch:
-        both = set(schema_types(outer)) & set(schema_types(branch))
+        outer_types, branch_types = schema_types(outer), schema_types(branch)
+        both = {declared for declared in outer_types if type_covers(branch_types, declared)}
+        both |= {declared for declared in branch_types if type_covers(outer_types, declared)}
         merged["type"] = sorted(both) if len(both) != 1 else next(iter(both))
     return merged
 
@@ -379,8 +386,15 @@ def single_shapes(schema):
     key = union_kind(schema)
     if key:
         outer = {name: value for name, value in schema.items() if name != key}
-        return [shape for branch in schema[key] if isinstance(branch, dict)
-                for shape in single_shapes(conjoin(outer, branch))]
+        shapes = []
+        for branch in schema[key]:
+            if branch is False:
+                continue  # admits nothing
+            # true admits anything the outer keywords allow; an unknown branch form is treated
+            # as unconstrained, so a changed one is reported rather than skipped.
+            branch = branch if isinstance(branch, dict) else {}
+            shapes += single_shapes(conjoin(outer, branch))
+        return shapes
     types = schema_types(schema)
     if types is not None and len(types) > 1:
         return [for_type(schema, declared) for declared in types]
@@ -415,7 +429,7 @@ def output_schema_breaks(old, new, where=""):
         return breaks
     breaks = []
     old_types, new_types = schema_types(old), schema_types(new)
-    if old_types is not None and (new_types is None or set(new_types) - set(old_types)):
+    if old_types is not None and (new_types is None or any(not type_covers(old_types, declared) for declared in new_types)):
         breaks.append(f"{label}type {old_types} -> {new_types}")
     old_values, new_values = schema_values(old), schema_values(new)
     if old_values is not None:
