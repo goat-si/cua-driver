@@ -1691,8 +1691,8 @@ fn spawn_daemon_with_state(
     }
     #[cfg(target_os = "windows")]
     {
-        let pid = spawn_detached_windows_daemon(&executable, &arguments)?;
-        Ok(Some(LaunchedDaemon::Process { pid }))
+        let (pid, process) = spawn_detached_windows_daemon(&executable, &arguments)?;
+        Ok(Some(LaunchedDaemon::Process { pid, process }))
     }
     #[cfg(not(any(unix, target_os = "windows")))]
     {
@@ -1705,7 +1705,7 @@ fn spawn_daemon_with_state(
 fn spawn_detached_windows_daemon(
     executable: &std::path::Path,
     arguments: &[String],
-) -> Result<u32, LaunchDaemonError> {
+) -> Result<(u32, OwnedProcess), LaunchDaemonError> {
     use std::os::windows::ffi::OsStrExt as _;
     use windows::core::{PCWSTR, PWSTR};
     use windows::Win32::Foundation::CloseHandle;
@@ -1748,8 +1748,9 @@ fn spawn_detached_windows_daemon(
         message: format!("failed to launch {} serve: {error}", executable.display()),
     })?;
     let _ = unsafe { CloseHandle(process.hThread) };
-    let _ = unsafe { CloseHandle(process.hProcess) };
-    Ok(process.dwProcessId)
+    // Kept open: while this handle exists Windows cannot give the pid to
+    // another process, so cleanup can address the launched daemon by pid.
+    Ok((process.dwProcessId, OwnedProcess(process.hProcess)))
 }
 
 #[cfg(target_os = "windows")]
@@ -2186,7 +2187,40 @@ pub(crate) enum LaunchedDaemon {
         token: AuditToken,
     },
     #[cfg(target_os = "windows")]
-    Process { pid: u32 },
+    Process { pid: u32, process: OwnedProcess },
+}
+
+/// The launched process's handle, held for the whole cleanup: Windows does not
+/// reuse a pid while a handle to that process is open.
+#[cfg(target_os = "windows")]
+pub(crate) struct OwnedProcess(windows::Win32::Foundation::HANDLE);
+
+#[cfg(target_os = "windows")]
+impl OwnedProcess {
+    /// Whether the process exits within `timeout` (zero only polls).
+    fn exits_within(&self, timeout: std::time::Duration) -> bool {
+        use windows::Win32::Foundation::WAIT_OBJECT_0;
+        use windows::Win32::System::Threading::WaitForSingleObject;
+
+        let milliseconds = u32::try_from(timeout.as_millis()).unwrap_or(u32::MAX - 1);
+        // SAFETY: the handle is open for the lifetime of self.
+        unsafe { WaitForSingleObject(self.0, milliseconds) == WAIT_OBJECT_0 }
+    }
+
+    fn terminate(&self) -> Result<(), String> {
+        use windows::Win32::System::Threading::TerminateProcess;
+
+        // SAFETY: the handle is open for the lifetime of self.
+        unsafe { TerminateProcess(self.0, 1) }.map_err(|error| error.to_string())
+    }
+}
+
+#[cfg(target_os = "windows")]
+impl Drop for OwnedProcess {
+    fn drop(&mut self) {
+        // SAFETY: closes the handle CreateProcessW returned, exactly once.
+        let _ = unsafe { windows::Win32::Foundation::CloseHandle(self.0) };
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2194,8 +2228,6 @@ enum Termination {
     AlreadyExited,
     Terminated,
     Killed,
-    #[cfg(target_os = "windows")]
-    ShutdownAcknowledged,
 }
 
 impl LaunchedDaemon {
@@ -2206,7 +2238,7 @@ impl LaunchedDaemon {
             #[cfg(target_os = "macos")]
             Self::Marked { pid, .. } => *pid,
             #[cfg(target_os = "windows")]
-            Self::Process { pid } => *pid,
+            Self::Process { pid, .. } => *pid,
         }
     }
 
@@ -2274,15 +2306,29 @@ impl LaunchedDaemon {
                 }
             }
             #[cfg(target_os = "windows")]
-            Self::Process { pid } => {
-                // Bound to the pid this launch created: a daemon with any
-                // other pid on the pipe refuses it.
+            Self::Process { pid, process } => {
+                if process.exits_within(std::time::Duration::ZERO) {
+                    return Ok(Termination::AlreadyExited);
+                }
+                // The open handle keeps this pid bound to the launched
+                // process, so a daemon with this pid on the pipe is it; any
+                // other daemon refuses the request.
                 let (socket_path, pid) = (socket_path.to_owned(), *pid);
-                within_startup_deadline(deadline, "shutdown request", move || {
+                let asked = within_startup_deadline(deadline, "shutdown request", move || {
                     crate::stop::pid_bound_shutdown(&socket_path, pid)
                         .map_err(|error| error.to_string())
-                })??;
-                Ok(Termination::ShutdownAcknowledged)
+                });
+                if matches!(asked, Ok(Ok(()))) && process.exits_within(deadline) {
+                    return Ok(Termination::Terminated);
+                }
+                process.terminate()?;
+                if process.exits_within(deadline) {
+                    Ok(Termination::Killed)
+                } else {
+                    Err(format!(
+                        "process {pid} did not exit within {deadline:?} of TerminateProcess"
+                    ))
+                }
             }
         }
     }
@@ -2566,17 +2612,16 @@ fn describe_cleanup(
             format!("the process this command launched (pid {pid}) was terminated.")
         }
         Ok(Termination::Killed) => {
-            format!("the process this command launched (pid {pid}) ignored SIGTERM and was killed.")
+            format!(
+                "the process this command launched (pid {pid}) did not stop when asked and was \
+                 killed."
+            )
         }
         Ok(Termination::AlreadyExited) => format!(
             "the process this command launched (pid {pid}) had already exited, so whatever \
              answers on {socket_path} belongs to someone else and was left running. Stop it \
              with `{cli} stop --socket {socket_path}` if it is yours."
         ),
-        #[cfg(target_os = "windows")]
-        Ok(Termination::ShutdownAcknowledged) => {
-            format!("the process this command launched (pid {pid}) acknowledged shutdown.")
-        }
         Err(error) => format!(
             "stopping the process this command launched (pid {pid}) failed ({error}); \
              end it, or run `{cli} stop --socket {socket_path}`."
@@ -3621,6 +3666,75 @@ mod daemon_compatibility_tests {
         assert!(error.to_string().contains("incompatible"), "{error}");
         assert_eq!(startup, Some((McpDaemonStartup::AlreadyRunning, false)));
         assert!(stop_requests(&daemon.stop()).is_empty());
+    }
+}
+
+#[cfg(all(test, target_os = "windows"))]
+mod windows_launch_cleanup_tests {
+    use super::{LaunchedDaemon, OwnedProcess, Termination};
+    use std::process::{Child, Command, Stdio};
+    use std::time::Duration;
+
+    fn handle_for(child: &Child) -> OwnedProcess {
+        use windows::Win32::System::Threading::{
+            OpenProcess, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE,
+        };
+        // SAFETY: opens a handle to a child this test spawned and still holds.
+        let handle =
+            unsafe { OpenProcess(PROCESS_SYNCHRONIZE | PROCESS_TERMINATE, false, child.id()) }
+                .unwrap();
+        OwnedProcess(handle)
+    }
+
+    /// A pipe nobody serves: a shutdown request sent there cannot connect.
+    fn unserved_pipe() -> String {
+        format!(
+            r"\\.\pipe\cua-driver-cleanup-test-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        )
+    }
+
+    #[test]
+    fn exited_launch_is_reported_without_signalling_anything() {
+        let mut child = Command::new("cmd")
+            .args(["/c", "exit", "0"])
+            .spawn()
+            .unwrap();
+        let process = handle_for(&child);
+        child.wait().unwrap();
+        let mut launched = LaunchedDaemon::Process {
+            pid: child.id(),
+            process,
+        };
+
+        let termination = launched
+            .terminate(&unserved_pipe(), Duration::from_secs(1))
+            .unwrap();
+
+        assert_eq!(termination, Termination::AlreadyExited);
+    }
+
+    #[test]
+    fn launch_that_cannot_be_asked_to_stop_is_terminated_through_its_handle() {
+        // Waits on its piped stdin, which this test keeps open.
+        let mut child = Command::new("cmd")
+            .args(["/c", "pause"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .spawn()
+            .unwrap();
+        let mut launched = LaunchedDaemon::Process {
+            pid: child.id(),
+            process: handle_for(&child),
+        };
+
+        let termination = launched
+            .terminate(&unserved_pipe(), Duration::from_secs(1))
+            .unwrap();
+
+        assert_eq!(termination, Termination::Killed);
+        assert!(child.try_wait().unwrap().is_some());
     }
 }
 

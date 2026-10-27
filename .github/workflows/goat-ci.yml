@@ -614,6 +614,9 @@ jobs:
       - name: Run MCP proxy lifecycle regressions
         working-directory: rust
         run: "cargo test -p cua-driver --bin cua-driver proxy::tests:: --locked"
+      - name: Run MCP launched-daemon cleanup regressions
+        working-directory: rust
+        run: "cargo test -p cua-driver --bin cua-driver cli::windows_launch_cleanup_tests:: --locked"
       - name: Run real MCP proxy recovery regression
         working-directory: rust
         env:
