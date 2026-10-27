@@ -517,8 +517,7 @@ pub async fn run_proxy(socket_path: String, on_ready: impl FnOnce()) -> anyhow::
     })
     .await?;
     if crate::mcp_envelope::configured()? {
-        on_ready();
-        return crate::mcp_envelope::proxy(&socket_path).await;
+        return crate::mcp_envelope::proxy(&socket_path, on_ready).await;
     }
 
     // Mint this MCP session's identity once at proxy startup. One proxy process
