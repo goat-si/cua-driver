@@ -1921,6 +1921,15 @@ mod tests {
         )
         .unwrap();
         let unrelated = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        // A listener a parallel test is still creating: macOS has no
+        // SOCK_CLOEXEC, so std marks a new socket close-on-exec only after
+        // socket() returns, and a fork in between inherits it (#25). Clearing
+        // the flag reproduces that window on every run.
+        let stray = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        assert_ne!(
+            unsafe { libc::fcntl(stray.as_raw_fd(), libc::F_SETFD, 0) },
+            -1
+        );
         match case {
             "missing_file" | "non_loopback" | "wrong_port" | "multiple" | "one_valid"
             | "no_valid" => std::fs::remove_file(&active_port).unwrap(),
@@ -1958,12 +1967,25 @@ mod tests {
                 command.arg(format!("--user-data-dir={}", profile.path().display()));
             }
         }
-        // Only the child's explicitly named listeners lose CLOEXEC.
+        // The child keeps exactly its named listeners: they lose CLOEXEC, and
+        // every other inheritable descriptor is closed, such as a parallel
+        // test's socket forked before std marked it close-on-exec (#25).
+        // Descriptors already marked close-on-exec, including std's
+        // exec-status pipe, are left for exec to close.
         unsafe {
             command.pre_exec(move || {
                 for &fd in &descriptors {
                     if libc::fcntl(fd, libc::F_SETFD, 0) == -1 {
                         return Err(std::io::Error::last_os_error());
+                    }
+                }
+                for fd in 3..libc::getdtablesize() {
+                    if descriptors.contains(&fd) {
+                        continue;
+                    }
+                    let flags = libc::fcntl(fd, libc::F_GETFD);
+                    if flags != -1 && flags & libc::FD_CLOEXEC == 0 {
+                        libc::close(fd);
                     }
                 }
                 Ok(())
