@@ -305,7 +305,7 @@ pub(crate) fn physical_input_idle_ms() -> Option<u64> {
         .into_iter()
         .filter_map(|kind| {
             let secs = unsafe { CGEventSourceSecondsSinceLastEventType(HID_SYSTEM_STATE, kind) };
-            (secs.is_finite() && secs >= 0.0).then(|| (secs * 1_000.0) as u64)
+            (secs.is_finite() && secs >= 0.0).then_some((secs * 1_000.0) as u64)
         })
         .min()
 }

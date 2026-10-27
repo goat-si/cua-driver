@@ -345,7 +345,7 @@ fn type_text_chars_to_pid(
     inter_char_delay_ms: u64,
 ) -> anyhow::Result<()> {
     for ch in text.chars() {
-        let (down, up) = char_key_events(&source, ch)?;
+        let (down, up) = char_key_events(source, ch)?;
         post_keyboard_event(pid, &down);
         key_gap_sleep();
         post_keyboard_event(pid, &up);

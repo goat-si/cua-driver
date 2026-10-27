@@ -299,6 +299,27 @@ jobs:
           path: rust/release/*-binary.tar.gz
           if-no-files-found: error
 
+  # Lints the macOS platform crate and the workspace crates it builds on, on every PR
+  # (goat-si/cua-driver#9). Runs beside the build jobs, so it adds no time to a PR.
+  clippy-macos:
+    name: Clippy macOS
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: dtolnay/rust-toolchain@4716b85f2fac3e324e64fa2810f6b5c3905760a5 # 1.97.1
+        with:
+          components: clippy
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            rust/target
+          key: goat-clippy-macos-${{ hashFiles('rust/Cargo.lock', 'rust/**/Cargo.toml', 'vendor/**/Cargo.toml') }}
+      - name: Clippy, warnings denied
+        working-directory: rust
+        run: cargo clippy --locked -p platform-macos --all-targets -- -D warnings
+
   # Unit and hermetic tests: upstream's per-platform "unit" jobs (trycua/cua
   # .github/workflows/ci-rust-{linux,macos,windows}.yml at cua-driver-rs-v0.37.0), ported verbatim
   # apart from paths, action pins and caching. Tests needing a logged-in, TCC-authorized desktop or
@@ -517,20 +538,9 @@ jobs:
         env:
           # Short socket paths: the runner's default TMPDIR is long enough to exceed sun_path.
           TMPDIR: /tmp
-        # quarantine: goat-si/cua-driver#8 - these nine daemon-transport tests fail intermittently on
-        # macOS with EINVAL (fixed upstream by trycua/cua#5558, not yet backported). --exact makes each
-        # --skip match one full test name; libtest's plain --skip matches substrings.
-        run: >-
-          cargo test -p cua-driver-sdk --lib --locked -- --exact
-          --skip tests::daemon_version_mismatch_is_refused_before_action_dispatch
-          --skip tests::native_windows::typed_click_returns_action_facts_and_flat_native_arguments
-          --skip tests::native_windows::typed_discovery_requests_use_the_existing_daemon_transport
-          --skip tests::native_windows::typed_snapshot_request_forwards_an_explicit_tree_shape
-          --skip tests::native_windows::typed_snapshot_request_preserves_target_and_session
-          --skip tests::session_method_returns_the_canonical_typed_output
-          --skip tests::tool_discovery_uses_the_shared_direct_daemon_protocol
-          --skip tests::typed_desktop_call_serializes_contract_and_normalizes_result
-          --skip tests::visual_parse_call_preserves_success_and_error_dtos
+        # The macOS EINVAL in the daemon client (goat-si/cua-driver#8) came in with trycua/cua#5558
+        # in the 0.38.0 sync, so the whole suite runs again.
+        run: cargo test -p cua-driver-sdk --lib --locked
       # Desktop E2E suites are #[ignore] and run in the Lume harness. Their
       # hermetic oracle and parser tests run here as a whole crate, including
       # the macOS-gated ones that have no other runner: the harness's FIFO

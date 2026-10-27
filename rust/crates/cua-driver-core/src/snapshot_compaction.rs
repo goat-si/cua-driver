@@ -699,8 +699,11 @@ pub struct DeferredChunk<N> {
     pub depth: usize,
     pub parent_index: Option<usize>,
     pub visible: bool,
-    pub walked: Option<(Vec<(usize, String)>, Vec<N>)>,
+    pub walked: Option<WalkedRows<N>>,
 }
+
+/// The rows and nodes a deferred chunk's walk produced.
+pub type WalkedRows<N> = (Vec<(usize, String)>, Vec<N>);
 
 /// Spliced rows and nodes, plus each output row's position in the node list
 /// (`None` for a synthetic summary row).
