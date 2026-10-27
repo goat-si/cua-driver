@@ -135,8 +135,11 @@ jobs:
             [ "$CACHED" = "true" ] && echo "::warning::cached package set did not install offline; fetching from the snapshot"
             online_install
           fi
+      # Saved from main, tags and dispatches only: every PR can restore those, and every Linux job
+      # that does keeps the entry recent. A PR-scoped copy is visible to that PR alone, and under the
+      # repository's cache quota it is evicted before anything reads it again.
       - name: Save the pinned package set
-        if: steps.apt-cache.outputs.cache-hit != 'true'
+        if: steps.apt-cache.outputs.cache-hit != 'true' && github.event_name != 'pull_request'
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: |
