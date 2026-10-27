@@ -20,6 +20,8 @@ use anyhow::{anyhow, Context, Result};
 use atspi::proxy::accessible::AccessibleProxy;
 use atspi::proxy::proxy_ext::ProxyExt;
 use atspi::{CoordType, Interface, State, StateSet};
+
+use crate::atspi_text::{editable_text_value, is_password_field, text_content_name};
 use atspi_connection::AccessibilityConnection;
 
 use super::{AtspiIdentity, AtspiNode};
@@ -427,76 +429,6 @@ mod listener_startup_tests {
 
 /// A node discovered during the pre-order walk, with its proxy retained so the
 /// per-index operations can act on it without re-walking the tree.
-/// The `value` of one walked node: its Value-interface value, else, for an
-/// editable text widget without a Value interface, its non-empty Text
-/// content (the typed string). A SpinButton implements Text and Value, so it
-/// keeps its numeric value. Callers pass `has_editable: false` for password
-/// fields.
-fn editable_text_value(
-    has_editable: bool,
-    has_value: bool,
-    value: Option<String>,
-    text_content: &str,
-) -> Option<String> {
-    if value.is_some() || has_value || !has_editable || text_content.is_empty() {
-        return value;
-    }
-    Some(text_content.to_owned())
-}
-
-/// The display name of a widget whose accessible name is empty: its Text
-/// content, for text widgets. Runs after the `LABELLED_BY` lookup so a
-/// labelled entry is named by its label and its typed text stays in `value`.
-/// A value control (GtkSpinButton implements AtkText with its formatted
-/// number) would otherwise be named after its own value, and a password
-/// field's content is never surfaced.
-fn text_content_name(
-    name: String,
-    role_lower: &str,
-    has_value: bool,
-    text_content: &str,
-) -> String {
-    if name.trim().is_empty()
-        && !text_content.trim().is_empty()
-        && !has_value
-        && !role_lower.contains("password")
-    {
-        return text_content.to_owned();
-    }
-    name
-}
-
-#[cfg(test)]
-mod editable_text_value_tests {
-    use super::editable_text_value;
-
-    #[test]
-    fn editable_text_reports_its_content_as_value() {
-        assert_eq!(
-            editable_text_value(true, false, None, "jev-use native note").as_deref(),
-            Some("jev-use native note")
-        );
-    }
-
-    #[test]
-    fn empty_or_non_editable_text_has_no_value() {
-        assert_eq!(editable_text_value(true, false, None, ""), None);
-        assert_eq!(
-            editable_text_value(false, false, None, "static label"),
-            None
-        );
-    }
-
-    #[test]
-    fn value_interface_wins() {
-        assert_eq!(
-            editable_text_value(true, true, Some("3".into()), "3.0").as_deref(),
-            Some("3")
-        );
-        assert_eq!(editable_text_value(true, true, None, "3.0"), None);
-    }
-}
-
 struct Visited<'a> {
     depth: usize,
     role: String,
@@ -526,6 +458,9 @@ struct Visited<'a> {
     /// put ~500 frameless entries ahead of the document).
     collapsed_children: Option<usize>,
     actions: Vec<String>,
+    /// A password field (numeric role 40, or a role name containing
+    /// "password"): its name and value never carry typed text.
+    is_password: bool,
     has_editable: bool,
     has_value: bool,
     has_component: bool,
@@ -1634,6 +1569,18 @@ async fn collect_visited_bounded_opts<'a>(
         };
         let focused = matches!(state_r.as_ref(), Some(Ok(s)) if s.contains(State::Focused));
         let role_lower = role.to_ascii_lowercase();
+        // GTK4 names role 40 (PASSWORD_TEXT) "text box", so a text widget's
+        // numeric role decides whether it is a password field; the role name
+        // stays a fallback. One more round trip, only for text widgets.
+        let role_number = if has_text || has_editable {
+            call(acc.get_role())
+                .await
+                .and_then(|result| result.ok())
+                .map(|role| role as u32)
+        } else {
+            None
+        };
+        let is_password = is_password_field(role_number, &role_lower);
         let checked = if role_lower.contains("check") {
             state_r
                 .as_ref()
@@ -1732,7 +1679,7 @@ async fn collect_visited_bounded_opts<'a>(
         // ValuePattern). Without it a named entry ("Note") hides what it holds
         // from `elements[].value` and `verify_state`.
         // A password field's content is never surfaced.
-        let editable_text = has_editable && !role_lower.contains("password");
+        let editable_text = has_editable && !is_password;
         value = editable_text_value(editable_text, has_value, value, &text_content);
 
         // AT-SPI `Description` for controls (one `Get` per actionable node,
@@ -1755,7 +1702,7 @@ async fn collect_visited_bounded_opts<'a>(
                 name = label;
             }
         }
-        let name = text_content_name(name, &role_lower, has_value, &text_content);
+        let name = text_content_name(name, is_password, has_value, &text_content);
 
         // Children inherit web-document context, plus this node's own role.
         let child_in_web_doc = in_web_doc || is_document_role(&role);
@@ -1894,6 +1841,7 @@ async fn collect_visited_bounded_opts<'a>(
             offscreen,
             collapsed_children,
             actions,
+            is_password,
             has_editable,
             has_value,
             has_component,
@@ -2096,7 +2044,7 @@ fn tab_strip_omissions(
 
 #[cfg(test)]
 mod tab_strip_omission_tests {
-    use super::{tab_strip_omissions, text_content_name, TabWalkNode};
+    use super::{tab_strip_omissions, TabWalkNode};
 
     fn node(role: &str, depth: usize, selected: Option<bool>) -> TabWalkNode<'_> {
         TabWalkNode {
@@ -2156,26 +2104,6 @@ mod tab_strip_omission_tests {
         let (omitted, summaries) = tab_strip_omissions(&nodes, &parents);
         assert!(omitted.iter().all(|o| !o));
         assert!(summaries.is_empty());
-    }
-
-    #[test]
-    fn a_labelled_entry_keeps_its_label_and_a_password_never_shows_its_text() {
-        assert_eq!(
-            text_content_name("Verification code".into(), "entry", false, "482913"),
-            "Verification code"
-        );
-        assert_eq!(
-            text_content_name(String::new(), "password text", false, "hunter2"),
-            ""
-        );
-        assert_eq!(
-            text_content_name(String::new(), "entry", false, "draft"),
-            "draft"
-        );
-        assert_eq!(
-            text_content_name(String::new(), "spin button", true, "0.0"),
-            ""
-        );
     }
 }
 
@@ -2329,7 +2257,7 @@ fn render(visited: &[Visited<'_>], only_frame: Option<usize>) -> (String, Vec<At
                 placeholder: None,
                 identifier: None,
                 help: None,
-                is_password_flag: role_lower.contains("password"),
+                is_password_flag: v.is_password,
             };
             let (redacted_value, _) = redact_if_secure(&security_meta, v.value.clone(), None);
             let act_str = v.actions.join(",");
@@ -5818,7 +5746,8 @@ async fn selected_child_name(
 
 /// Current value of a cached element for read-back after a write: the
 /// `Value` interface's number, else the `Text` content. `None` when the
-/// element exposes neither (or does not answer in time).
+/// element exposes neither (or does not answer in time), and for a password
+/// field, whose typed text a read-back would otherwise echo into the result.
 pub fn read_value_ref(object_ref: &ObjectRef) -> Result<Option<String>> {
     bounded_for(
         REF_ACTION_BUDGET,
@@ -5829,6 +5758,20 @@ pub fn read_value_ref(object_ref: &ObjectRef) -> Result<Option<String>> {
                 Some(Ok(ifaces)) => ifaces,
                 _ => return Ok(None),
             };
+            if ifaces.contains(Interface::Text) || ifaces.contains(Interface::EditableText) {
+                let (role_number, role_name) =
+                    tokio::join!(call(acc.get_role()), call(acc.get_role_name()));
+                let role_number = role_number
+                    .and_then(|result| result.ok())
+                    .map(|role| role as u32);
+                let role_name = role_name
+                    .and_then(|result| result.ok())
+                    .unwrap_or_default()
+                    .to_ascii_lowercase();
+                if is_password_field(role_number, &role_name) {
+                    return Ok(None);
+                }
+            }
             let proxies = match call(acc.proxies()).await {
                 Some(Ok(proxies)) => proxies,
                 _ => return Ok(None),
