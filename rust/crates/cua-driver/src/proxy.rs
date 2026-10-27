@@ -2271,4 +2271,54 @@ mod tests {
             "the daemon connection must close once the proxy drops the call"
         );
     }
+
+    /// Windows counterpart: the forwarded call used to run a synchronous pipe
+    /// read on a blocking thread, which kept the pipe and its in-flight slot
+    /// after the deadline dropped the call.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn a_dropped_forwarded_call_releases_its_daemon_pipe() {
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt};
+        let pipe_name = format!(
+            r"\\.\pipe\cua-driver-proxy-drop-test-{}",
+            std::process::id()
+        );
+        let server = tokio::net::windows::named_pipe::ServerOptions::new()
+            .first_pipe_instance(true)
+            .create(&pipe_name)
+            .unwrap();
+        // A daemon that reads the request and never answers. Returning drops
+        // the server end, which also ends a client read the fix left behind.
+        let daemon = tokio::spawn(async move {
+            server.connect().await.unwrap();
+            let mut reader = tokio::io::BufReader::new(server);
+            let mut request = String::new();
+            reader.read_line(&mut request).await.unwrap();
+            let mut rest = [0_u8; 16];
+            matches!(
+                tokio::time::timeout(std::time::Duration::from_secs(2), reader.read(&mut rest))
+                    .await,
+                Ok(Ok(0)) | Ok(Err(_))
+            )
+        });
+        let call = forward_tool_call(
+            serde_json::json!(1),
+            "list_apps".into(),
+            serde_json::json!({}),
+            &pipe_name,
+            "s",
+            false,
+            None,
+        );
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(300), call)
+                .await
+                .is_err(),
+            "the silent daemon must hold the call past the deadline"
+        );
+        assert!(
+            daemon.await.unwrap(),
+            "the daemon pipe must close once the proxy drops the call"
+        );
+    }
 }
