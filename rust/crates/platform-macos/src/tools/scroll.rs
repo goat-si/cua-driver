@@ -71,7 +71,7 @@ fn def() -> &'static ToolDef {
     DEF.get_or_init(|| ToolDef {
         name: "scroll".into(),
         description: "Scroll the target pid.\n\
-            - Targeted wheel: pass `element_token` (preferred) or window-local `x, y`. Sends a real wheel event at that point, so it scrolls whatever is under it. The only way to scroll nested `overflow:auto` regions in web views.\n\
+            - Targeted: pass `element_token` (preferred; an `AXScrollArea` row or anything inside one) or window-local `x, y`. In a native window the scroll area there is scrolled through its scroll bar first, with no event, and the bar is read back: `effect:\"confirmed\"` with `scroll_position` {before, after} when it moved, `effect:\"suspected_noop\"` with `at_edge:true` when it was already at that end (nothing sent). Otherwise a real wheel event goes to that point, so it scrolls whatever is under it; it is the only way to scroll nested `overflow:auto` regions in web views.\n\
             - Keystroke: no target, just pid + direction. PageDown/PageUp (by='page') or arrows (by='line') on the focused scroller.\n\
             \n\
             Electron/Chromium windows drop background wheel events: there a background scroll reveals the content just past the edge of the scroll container under the target through accessibility (about `amount` notches); `delivery_mode:\"foreground\"` is the fallback.\n\
@@ -463,6 +463,67 @@ impl Tool for ScrollTool {
             .await;
         }
 
+        // Native windows: scroll the scroll area under the target through its
+        // scroll bar, then read the bar back. This needs no event, so it works
+        // where background wheel events are dropped (System Settings), and the
+        // bar value says whether the content moved.
+        let mut bar_before: Option<f64> = None;
+        let bar_probe = wheel_target
+            .as_ref()
+            .map(|target| (target.screen_x, target.screen_y));
+        if let (Some(point), Some(wid), false) =
+            (bar_probe, window_id, delivery_mode.is_foreground())
+        {
+            let gate = match _mutation_lease.as_ref() {
+                Some(lease) => {
+                    lease
+                        .gate_again(
+                            wid,
+                            pre_focus_ptr,
+                            cua_driver_core::background_input::BackgroundAction::AxSemantic,
+                        )
+                        .await
+                }
+                None => super::gate_background_window_action(
+                    pid,
+                    wid,
+                    pre_focus_ptr,
+                    cua_driver_core::background_input::BackgroundAction::AxSemantic,
+                )
+                .await
+                .map(|granted| _mutation_lease = Some(granted)),
+            };
+            if let Err(refusal) = gate {
+                return refusal;
+            }
+            let direction_for_ax = direction.clone();
+            let by_for_ax = by.clone();
+            let element = pre_focus_ptr;
+            let outcome = latency::spawn_action_blocking(move || unsafe {
+                crate::ax::scroll_bar::scroll(
+                    pid,
+                    element,
+                    point,
+                    &direction_for_ax,
+                    &by_for_ax,
+                    amount,
+                )
+            })
+            .await;
+            match outcome {
+                Ok(crate::ax::scroll_bar::AxScroll::Moved { before, after }) => {
+                    return bar_scroll_result(&direction, &by, amount, before, after);
+                }
+                Ok(crate::ax::scroll_bar::AxScroll::AtEdge { value }) => {
+                    return at_edge_result(&direction, value);
+                }
+                Ok(crate::ax::scroll_bar::AxScroll::Unchanged { before }) => {
+                    bar_before = Some(before);
+                }
+                _ => {}
+            }
+        }
+
         if let Some(target) = wheel_target {
             if !delivery_mode.is_foreground() {
                 if let Some(wid) = target.wid {
@@ -583,6 +644,44 @@ impl Tool for ScrollTool {
             } else {
                 ""
             };
+            // Read the scroll area's bar again: a move proves the wheel landed.
+            let bar_after = match (bar_before, result.as_ref()) {
+                (Some(_), Ok(Ok(()))) => {
+                    let direction_for_ax = direction.clone();
+                    let element = pre_focus_ptr;
+                    latency::spawn_action_blocking(move || {
+                        std::thread::sleep(std::time::Duration::from_millis(120));
+                        unsafe {
+                            crate::ax::scroll_bar::position(
+                                pid,
+                                element,
+                                (screen_x, screen_y),
+                                &direction_for_ax,
+                            )
+                        }
+                    })
+                    .await
+                    .ok()
+                    .flatten()
+                }
+                _ => None,
+            };
+            if let (Some(before), Some(after)) = (bar_before, bar_after) {
+                if crate::ax::scroll_bar::moved(before, after) {
+                    return ToolResult::text(format!(
+                        "✅ Scrolled {direction} by {by} × {amount} via pixel wheel at \
+                         ({screen_x:.0}, {screen_y:.0}){mode_label}; the scroll bar moved \
+                         from {before:.3} to {after:.3}.{}",
+                        changes.result_suffix()
+                    ))
+                    .with_structured(serde_json::json!({
+                        "path": if fg { "cgevent_fg" } else { "cgevent" },
+                        "verified": true,
+                        "effect": "confirmed",
+                        "scroll_position": { "before": before, "after": after },
+                    }));
+                }
+            }
             return match result {
                 Ok(Ok(())) => ToolResult::text(format!(
                     "✅ Sent {direction} scroll by {by} × {amount} via pixel wheel at \
@@ -766,6 +865,48 @@ async fn electron_reveal_scroll(
     }
 }
 
+/// A scroll through the scroll bar that moved it.
+fn bar_scroll_result(
+    direction: &str,
+    by: &str,
+    amount: usize,
+    before: f64,
+    after: f64,
+) -> ToolResult {
+    ToolResult::text(format!(
+        "✅ Scrolled {direction} by {by} × {amount} through the scroll area's scroll bar \
+         (background, no event); it moved from {before:.3} to {after:.3}."
+    ))
+    .with_structured(serde_json::json!({
+        "path": "ax_scroll_bar",
+        "verified": true,
+        "effect": "confirmed",
+        "scroll_position": { "before": before, "after": after },
+    }))
+}
+
+/// The scroll area was already at the end the direction scrolls towards.
+fn at_edge_result(direction: &str, value: f64) -> ToolResult {
+    let end = match direction {
+        "down" => "bottom",
+        "up" => "top",
+        "right" => "right edge",
+        _ => "left edge",
+    };
+    ToolResult::text(format!(
+        "The scroll area is already at its {end} (scroll bar {value:.3}), so nothing was sent. \
+         Scroll the other way, or target another scroll area."
+    ))
+    .with_structured(serde_json::json!({
+        "path": "ax_scroll_bar",
+        "verified": true,
+        "effect": "suspected_noop",
+        "at_edge": true,
+        "dispatched": false,
+        "scroll_position": { "before": value, "after": value },
+    }))
+}
+
 unsafe fn scroll_native_text_area(
     element: AXUIElementRef,
     direction: &str,
@@ -844,5 +985,25 @@ mod tests {
         assert_eq!(clamp_amount(1100), AMOUNT_MAX as usize);
         assert_eq!(clamp_amount(0), AMOUNT_MIN as usize);
         assert_eq!(clamp_amount(3), 3);
+    }
+
+    #[test]
+    fn a_scroll_bar_that_moved_is_confirmed_with_both_positions() {
+        let result = bar_scroll_result("down", "line", 3, 0.0, 0.3);
+        assert_ne!(result.is_error, Some(true));
+        let structured = result.structured_content.expect("structured");
+        assert_eq!(structured["effect"], "confirmed");
+        assert_eq!(structured["scroll_position"]["before"], 0.0);
+        assert_eq!(structured["scroll_position"]["after"], 0.3);
+    }
+
+    #[test]
+    fn a_scroll_area_at_its_end_reports_nothing_sent() {
+        let result = at_edge_result("down", 1.0);
+        assert_ne!(result.is_error, Some(true));
+        let structured = result.structured_content.expect("structured");
+        assert_eq!(structured["effect"], "suspected_noop");
+        assert_eq!(structured["dispatched"], false);
+        assert_eq!(structured["at_edge"], true);
     }
 }
