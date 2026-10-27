@@ -1,32 +1,32 @@
 {
-  "comment": "The Cua Driver build GOAT ships today (goat-si/goat packages/shared/src/cuaDriverRelease.ts). The fork must stay protocol-compatible with it; change this only together with GOAT's pin.",
-  "version": "0.37.0",
-  "baseUrl": "https://github.com/trycua/cua/releases/download/cua-driver-rs-v0.37.0/",
+  "comment": "The Cua Driver build GOAT ships today: the archives goat-si/goat packages/shared/src/cuaDriverRelease.ts pins, by name, size and SHA-256. The fork must stay protocol-compatible with it; change this only together with GOAT's pin.",
+  "version": "0.38.0-goat.3",
+  "baseUrl": "https://github.com/goat-si/cua-driver/releases/download/cua-driver-rs-v0.38.0-goat.3/",
   "archives": {
     "darwin-universal": {
-      "name": "cua-driver-rs-0.37.0-darwin-universal-binary.tar.gz",
-      "bytes": 53254204,
-      "sha256": "7d491f67f54be5f3b380ffd85c64b242eaefd05dad6df78012cde227c95aee2a"
+      "name": "cua-driver-rs-0.38.0-goat.3-darwin-universal-binary.tar.gz",
+      "bytes": 53790078,
+      "sha256": "fd39f06ebea61e321e884cd7fc93cd1a064a80615b1b107b28cd41058f224c4e"
     },
     "linux-x86_64": {
-      "name": "cua-driver-rs-0.37.0-linux-x86_64-binary.tar.gz",
-      "bytes": 36941258,
-      "sha256": "c7ac376b10da7c207e510b2d90b88a9588bec9852a237962c273fe81b9cd5623"
+      "name": "cua-driver-rs-0.38.0-goat.3-linux-x86_64-binary.tar.gz",
+      "bytes": 37179458,
+      "sha256": "e56ccd64b6c8d8d8a1c5c6ec9ee4a7bb89c508ae21e86de5e558bc6fb91b453f"
     },
     "linux-arm64": {
-      "name": "cua-driver-rs-0.37.0-linux-arm64-binary.tar.gz",
-      "bytes": 36518124,
-      "sha256": "879e8040a4ce24caeee34b2e4ac6119be01661082202919db1bcc1ab0b97e4c8"
+      "name": "cua-driver-rs-0.38.0-goat.3-linux-arm64-binary.tar.gz",
+      "bytes": 36829132,
+      "sha256": "489cc969705ef04121e3b5591ae2b32cd9aaec59a39e84a1deacaad99f09e0e0"
     },
     "windows-x86_64": {
-      "name": "cua-driver-rs-0.37.0-windows-x86_64-binary.zip",
-      "bytes": 35838756,
-      "sha256": "40481b55073f1225b0010235b30217bd640ef1f323e982aec0a5f6131d3e4a99"
+      "name": "cua-driver-rs-0.38.0-goat.3-windows-x86_64-binary.zip",
+      "bytes": 35683367,
+      "sha256": "872a4505788b0504c3686f2cb1034c7610036d385eb4735ab859d0fe2cfda558"
     },
     "windows-arm64": {
-      "name": "cua-driver-rs-0.37.0-windows-arm64-binary.zip",
-      "bytes": 33606104,
-      "sha256": "0fce682b251775e25fd76bf29ff856f7f5ab5aae5759d6b76a40f8312a194a5a"
+      "name": "cua-driver-rs-0.38.0-goat.3-windows-arm64-binary.zip",
+      "bytes": 33434862,
+      "sha256": "a3d88100d3ba64364db1e5812afba2120344a5e720cc999e1759119c4f66a55b"
     }
   },
   "goatToolsComment": "CUA_DRIVER_ALLOWED_TOOLS in goat-si/goat packages/shared/src/cuaDriverManifest.ts: both builds must list all of them.",
@@ -55,6 +55,7 @@
     "invoke_menu",
     "bring_to_front",
     "launch_app",
+    "kill_app",
     "set_window_frame",
     "run_steps",
     "run_script",
@@ -63,6 +64,7 @@
     "get_session",
     "list_sessions",
     "get_agent_cursor_state",
+    "get_config",
     "set_agent_cursor_enabled",
     "set_agent_cursor_motion",
     "set_agent_cursor_theme"
