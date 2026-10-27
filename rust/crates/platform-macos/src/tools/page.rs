@@ -365,6 +365,16 @@ fn page_rows_of_walk(
     page_rows(result.tree_markdown, require_web_area)
 }
 
+/// Walk on a blocking thread and turn the walk into page rows there, so the
+/// walk's retained elements are released even when the caller stops waiting
+/// (a cancelled page read), not only when it receives the walk.
+fn page_rows_off_thread(
+    walk: impl FnOnce() -> crate::ax::tree::TreeWalkResult + Send + 'static,
+    require_web_area: bool,
+) -> tokio::task::JoinHandle<anyhow::Result<String>> {
+    tokio::task::spawn_blocking(move || page_rows_of_walk(walk(), require_web_area))
+}
+
 /// Extract page text via the AX tree.
 async fn ax_text_fallback(
     pid: i32,
@@ -373,11 +383,12 @@ async fn ax_text_fallback(
 ) -> anyhow::Result<String> {
     let window_id = u32::try_from(window_id)
         .map_err(|_| anyhow::anyhow!("macOS window_id {window_id} is out of u32 range"))?;
-    let result =
-        tokio::task::spawn_blocking(move || crate::ax::tree::walk_tree(pid, Some(window_id), None))
-            .await
-            .map_err(|e| anyhow::anyhow!("AX walk task failed: {e}"))?;
-    let rows = page_rows_of_walk(result, require_web_area)?;
+    let rows = page_rows_off_thread(
+        move || crate::ax::tree::walk_tree(pid, Some(window_id), None),
+        require_web_area,
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("AX walk task failed: {e}"))??;
     Ok(AXPageReader::extract_text(&rows))
 }
 
@@ -391,11 +402,12 @@ async fn ax_query_fallback(
     let window_id = u32::try_from(window_id)
         .map_err(|_| anyhow::anyhow!("macOS window_id {window_id} is out of u32 range"))?;
     let sel = selector.to_owned();
-    let result =
-        tokio::task::spawn_blocking(move || crate::ax::tree::walk_tree(pid, Some(window_id), None))
-            .await
-            .map_err(|e| anyhow::anyhow!("AX walk task failed: {e}"))?;
-    let rows = page_rows_of_walk(result, require_web_area)?;
+    let rows = page_rows_off_thread(
+        move || crate::ax::tree::walk_tree(pid, Some(window_id), None),
+        require_web_area,
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("AX walk task failed: {e}"))??;
     Ok(AXPageReader::query(&sel, &rows))
 }
 
@@ -489,9 +501,46 @@ fn required_finite(value: &serde_json::Value, key: &str, raw: &str) -> anyhow::R
 
 #[cfg(test)]
 mod tests {
-    use super::{page_rows, page_rows_of_walk};
+    use super::{page_rows, page_rows_of_walk, page_rows_off_thread};
 
     const MENU_ONLY: &str = "- [0] AXMenuBar\n  - [1] AXMenuBarItem \"Apple\"\n";
+
+    /// A page read cancelled while its walk runs: the blocking walk finishes
+    /// later with nobody waiting, and must still release what it retained.
+    #[tokio::test]
+    async fn a_cancelled_page_read_still_releases_what_the_walk_retained() {
+        use core_foundation::base::{CFGetRetainCount, CFRetain, CFTypeRef, TCFType};
+        let element = core_foundation::string::CFString::new("indexed element");
+        let ptr = element.as_concrete_TypeRef() as usize;
+        let count = move || unsafe { CFGetRetainCount(ptr as CFTypeRef) };
+        let baseline = count();
+        let (resume, paused) = std::sync::mpsc::channel::<()>();
+        let (finished, walk_done) = std::sync::mpsc::channel::<()>();
+        let read = page_rows_off_thread(
+            move || {
+                paused.recv().expect("test resumes the walk");
+                // The walk's own retain on the indexed element.
+                unsafe { CFRetain(ptr as CFTypeRef) };
+                let _finished = finished;
+                crate::ax::tree::TreeWalkResult::for_test(
+                    MENU_ONLY.to_owned(),
+                    vec![crate::ax::tree::AXNode::for_test(Some(0), ptr)],
+                )
+            },
+            true,
+        );
+        // The caller stops waiting before the walk returns.
+        drop(read);
+        resume.send(()).unwrap();
+        // The walk returned (its sender dropped); the release follows on the
+        // same blocking thread before it ends.
+        assert!(walk_done.recv().is_err());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while count() != baseline && std::time::Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        assert_eq!(count(), baseline);
+    }
 
     /// The AX text and query fallbacks walked the tree and dropped its
     /// retained elements without releasing them, leaking one reference per
