@@ -261,16 +261,25 @@ pub fn advertised_action<'a>(requested: &str, advertised: &'a [String]) -> Optio
         .map(String::as_str)
 }
 
-/// An action name as a tree row shows it: no `AX` prefix, lower case, and
-/// escaped so a custom name cannot split the row. Agents copy this spelling.
+/// An action name as a tree row shows it: no `AX` prefix, lower case, with
+/// control characters, quotes and backslashes escaped so a custom name cannot
+/// split or confuse the row. Other text, Korean included, is shown as is.
+/// Agents copy this spelling.
 pub fn displayed_action(action: &str) -> String {
-    action
+    let mut shown = String::new();
+    for c in action
         .strip_prefix("AX")
         .unwrap_or(action)
         .to_lowercase()
         .chars()
-        .flat_map(char::escape_default)
-        .collect()
+    {
+        if c.is_control() || matches!(c, '"' | '\'' | '\\') {
+            shown.extend(c.escape_default());
+        } else {
+            shown.push(c);
+        }
+    }
+    shown
 }
 
 pub fn background_action_may_front(action: &str) -> bool {
@@ -579,6 +588,18 @@ mod tests {
         let korean = vec!["Name:보관\nTarget:list".to_string()];
         let shown = displayed_action(&korean[0]);
         assert!(shown.contains("\\n"));
+        // Only what could split or confuse a row is escaped: Korean and other
+        // non-ASCII text stays readable, so an agent can copy it back.
+        assert_eq!(shown, "name:보관\\ntarget:list");
+        assert_eq!(
+            displayed_action("Say \"hi\"\\now\t✓"),
+            "say \\\"hi\\\"\\\\now\\t✓"
+        );
+        let quoted = vec!["Say \"hi\"\\now\t✓".to_string()];
+        assert_eq!(
+            resolve_element_action(&displayed_action(&quoted[0]), &quoted, false).unwrap(),
+            quoted[0]
+        );
         assert_eq!(
             resolve_element_action(&shown, &korean, false).unwrap(),
             korean[0]
