@@ -260,6 +260,16 @@ pub struct ElementFrame {
     pub h: f64,
 }
 
+/// A Windows TogglePattern state: a check box or toggle button is on, off, or
+/// mixed (indeterminate, such as a parent of partly checked items).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq, uniffi::Enum)]
+#[serde(rename_all = "snake_case")]
+pub enum ToggleState {
+    On,
+    Off,
+    Mixed,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, uniffi::Record)]
 pub struct WindowElement {
     pub element_index: u64,
@@ -277,6 +287,13 @@ pub struct WindowElement {
     pub enabled: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub selected: Option<bool>,
+    /// TogglePattern state, for elements that have one (Windows).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub toggle_state: Option<ToggleState>,
+    /// ExpandCollapsePattern state; partly expanded counts as expanded. Absent
+    /// for elements that cannot expand (Windows).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expanded: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub in_web_content: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

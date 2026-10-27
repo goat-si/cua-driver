@@ -6321,6 +6321,42 @@ const FfiConverterTypeVisualParseError = (() => {
     return new FFIConverter();
 })();
 
+/**
+ * A Windows TogglePattern state: a check box or toggle button is on, off, or
+ * mixed (indeterminate, such as a parent of partly checked items).
+ */
+export enum ToggleState {
+    On,
+    Off,
+    Mixed
+}
+
+const FfiConverterTypeToggleState = (() => {
+    const ordinalConverter = FfiConverterInt32;
+    type TypeName = ToggleState;
+    class FFIConverter extends AbstractFfiConverterByteArray<TypeName> {
+        read(from: RustBuffer): TypeName {
+            switch (ordinalConverter.read(from)) {
+                case 1: return ToggleState.On;
+                case 2: return ToggleState.Off;
+                case 3: return ToggleState.Mixed;
+                default: throw new UniffiInternalError.UnexpectedEnumCase();
+            }
+        }
+        write(value: TypeName, into: RustBuffer): void {
+            switch (value) {
+                case ToggleState.On: return ordinalConverter.write(1, into);
+                case ToggleState.Off: return ordinalConverter.write(2, into);
+                case ToggleState.Mixed: return ordinalConverter.write(3, into);
+            }
+        }
+        allocationSize(value: TypeName): number {
+            return ordinalConverter.allocationSize(0);
+        }
+    }
+    return new FFIConverter();
+})();
+
 export type WindowElement = {
     elementIndex: bigint,
     role: string,
@@ -6331,6 +6367,15 @@ export type WindowElement = {
     valueDescription?: string,
     enabled?: boolean,
     selected?: boolean,
+    /**
+     * TogglePattern state, for elements that have one (Windows).
+     */
+    toggleState?: ToggleState,
+    /**
+     * ExpandCollapsePattern state; partly expanded counts as expanded. Absent
+     * for elements that cannot expand (Windows).
+     */
+    expanded?: boolean,
     inWebContent?: boolean,
     actions?: Array<string>,
     parentIndex?: bigint,
@@ -6369,6 +6414,8 @@ const FfiConverterTypeWindowElement = (() => {
                 valueDescription: FfiConverterOptionalString.read(from),
                 enabled: FfiConverterOptionalBoolean.read(from),
                 selected: FfiConverterOptionalBoolean.read(from),
+                toggleState: FfiConverterOptionalTypeToggleState.read(from),
+                expanded: FfiConverterOptionalBoolean.read(from),
                 inWebContent: FfiConverterOptionalBoolean.read(from),
                 actions: FfiConverterOptionalSequenceString.read(from),
                 parentIndex: FfiConverterOptionalUInt64.read(from),
@@ -6387,6 +6434,8 @@ const FfiConverterTypeWindowElement = (() => {
             FfiConverterOptionalString.write(value.valueDescription, into);
             FfiConverterOptionalBoolean.write(value.enabled, into);
             FfiConverterOptionalBoolean.write(value.selected, into);
+            FfiConverterOptionalTypeToggleState.write(value.toggleState, into);
+            FfiConverterOptionalBoolean.write(value.expanded, into);
             FfiConverterOptionalBoolean.write(value.inWebContent, into);
             FfiConverterOptionalSequenceString.write(value.actions, into);
             FfiConverterOptionalUInt64.write(value.parentIndex, into);
@@ -6404,6 +6453,8 @@ const FfiConverterTypeWindowElement = (() => {
              FfiConverterOptionalString.allocationSize(value.valueDescription) +
              FfiConverterOptionalBoolean.allocationSize(value.enabled) +
              FfiConverterOptionalBoolean.allocationSize(value.selected) +
+             FfiConverterOptionalTypeToggleState.allocationSize(value.toggleState) +
+             FfiConverterOptionalBoolean.allocationSize(value.expanded) +
              FfiConverterOptionalBoolean.allocationSize(value.inWebContent) +
              FfiConverterOptionalSequenceString.allocationSize(value.actions) +
              FfiConverterOptionalUInt64.allocationSize(value.parentIndex) +
@@ -6752,6 +6803,9 @@ const FfiConverterSequenceTypeStatePredicate = new FfiConverterArray(FfiConverte
 // FfiConverter for Array<PredicateOutcome>
 const FfiConverterSequenceTypePredicateOutcome = new FfiConverterArray(FfiConverterTypePredicateOutcome);
 
+// FfiConverter for ToggleState | undefined
+const FfiConverterOptionalTypeToggleState = new FfiConverterOptional(FfiConverterTypeToggleState);
+
 // FfiConverter for ElementFrame | undefined
 const FfiConverterOptionalTypeElementFrame = new FfiConverterOptional(FfiConverterTypeElementFrame);
 
@@ -6881,6 +6935,7 @@ export default Object.freeze({
     FfiConverterTypeStartSessionInput,
     FfiConverterTypeStartSessionOutput,
     FfiConverterTypeStatePredicate,
+    FfiConverterTypeToggleState,
     FfiConverterTypeTypeTextInput,
     FfiConverterTypeUnknownReason,
     FfiConverterTypeVerificationStatus,

@@ -161,6 +161,40 @@ fn typed_snapshot_preserves_all_images_and_observation_metadata() {
     assert_eq!(output.truncated, Some(true));
 }
 
+// goat-si/cua-driver#15: Windows element entries carry TogglePattern and
+// ExpandCollapsePattern state; the typed path must keep both.
+#[test]
+fn typed_snapshot_keeps_windows_toggle_state_and_expanded() {
+    use cua_driver_contract::ToggleState;
+    let elements = json!([
+        {"element_index":0,"role":"check box","depth":0,"toggle_state":"mixed"},
+        {"element_index":1,"role":"tree item","depth":1,"toggle_state":"on","expanded":true},
+        {"element_index":2,"role":"combo box","depth":1,"toggle_state":"off","expanded":false},
+        {"element_index":3,"role":"button","depth":1}
+    ]);
+    let mut envelope = snapshot_envelope();
+    envelope["structuredContent"]["elements"] = elements.clone();
+    let typed = normalize_result("get_window_state", envelope)
+        .unwrap()
+        .window_state_success()
+        .unwrap()
+        .elements
+        .unwrap();
+    assert_eq!(
+        typed
+            .iter()
+            .map(|element| (element.toggle_state, element.expanded))
+            .collect::<Vec<_>>(),
+        [
+            (Some(ToggleState::Mixed), None),
+            (Some(ToggleState::On), Some(true)),
+            (Some(ToggleState::Off), Some(false)),
+            (None, None),
+        ]
+    );
+    assert_eq!(serde_json::to_value(&typed).unwrap(), elements);
+}
+
 #[test]
 fn typed_snapshot_rejects_dropped_images_and_inconsistent_metadata() {
     for (pointer, value) in [
