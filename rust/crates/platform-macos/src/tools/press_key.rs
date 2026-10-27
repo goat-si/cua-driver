@@ -269,6 +269,17 @@ fn with_confirmed_key_focus_or_fallback<T>(
     dispatch()
 }
 
+/// A key or modifier this driver cannot press, refused before anything is sent.
+pub(super) fn invalid_key(error: anyhow::Error) -> ToolResult {
+    let message = error.to_string();
+    ToolResult::error(&message).with_structured(serde_json::json!({
+        "code": "invalid_arguments",
+        "effect": "refused",
+        "dispatched": false,
+        "message": message,
+    }))
+}
+
 fn delivery_failed(error: anyhow::Error) -> ToolResult {
     if let Some(conflict) = error.downcast_ref::<WindowFocusConflictError>() {
         return match *conflict {
@@ -366,8 +377,13 @@ impl Tool for PressKeyTool {
                 Ok(input) => input,
                 Err(result) => return result,
             };
-            let key = input.key;
-            let modifiers = input.modifiers.unwrap_or_default();
+            let (key, modifiers) = match crate::input::keyboard::resolve_key_press(
+                &input.key,
+                &input.modifiers.unwrap_or_default(),
+            ) {
+                Ok(resolved) => resolved,
+                Err(error) => return invalid_key(error),
+            };
             let key_for_input = key.clone();
             let result = latency::spawn_action_blocking(move || {
                 let modifier_refs: Vec<&str> = modifiers.iter().map(String::as_str).collect();
@@ -393,7 +409,14 @@ impl Tool for PressKeyTool {
             Ok(v) => v,
             Err(e) => return e,
         };
-        let mut modifiers: Vec<String> = args.str_array("modifiers");
+        // Resolve the key first: an unknown name is refused before any
+        // target work, so nothing is focused or sent for it.
+        let (key, modifiers) =
+            match crate::input::keyboard::resolve_key_press(&key_raw, &args.str_array("modifiers"))
+            {
+                Ok(resolved) => resolved,
+                Err(error) => return invalid_key(error),
+            };
         let window_id_arg = args.opt_u64("window_id");
         let resolved = match latency::resolve(|| self.state.snapshots.resolve(pid, &args)) {
             Ok(r) => r,
@@ -408,16 +431,6 @@ impl Tool for PressKeyTool {
         if let Err(error) = validate_post_target(pid) {
             return delivery_failed(error);
         }
-
-        // Remap "+" / "plus" → "=" + Shift (same physical key on US layout).
-        let key = if key_raw == "+" || key_raw == "plus" {
-            if !modifiers.iter().any(|m| m.eq_ignore_ascii_case("shift")) {
-                modifiers.push("shift".to_string());
-            }
-            "=".to_string()
-        } else {
-            key_raw.clone()
-        };
         let display_key = key_raw.clone();
         // delivery_mode gates the raise: background (default) never fronts the
         // window (auth-envelope post, even with window_id); foreground is the
