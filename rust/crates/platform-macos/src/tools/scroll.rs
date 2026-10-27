@@ -410,7 +410,7 @@ impl Tool for ScrollTool {
             // window_id to anchor the window→screen conversion (schema contract).
             // Without one, refuse rather than scrolling at screen-absolute coords.
             if window_id.is_none() {
-                return ToolResult::error(
+                return super::invalid_arguments(
                     "window_id is required when scrolling by window-local x,y pixels.".to_string(),
                 );
             }
@@ -427,7 +427,7 @@ impl Tool for ScrollTool {
             let Some(wid) = window_id else {
                 // Unreachable: the None case refused above. Kept explicit so a
                 // future edit cannot reintroduce the screen-absolute fallback.
-                return ToolResult::error(
+                return super::invalid_arguments(
                     "window_id is required when scrolling by window-local x,y pixels.".to_string(),
                 );
             };
@@ -470,7 +470,7 @@ impl Tool for ScrollTool {
                         (target.win_local, crate::windows::window_bounds_by_id(wid))
                     {
                         if lx < 0.0 || ly < 0.0 || lx > bounds.width || ly > bounds.height {
-                            return ToolResult::error(format!(
+                            return super::invalid_arguments(format!(
                                 "scroll: window-local point ({lx:.1}, {ly:.1}) pt lies outside \
                                  window {wid}'s {:.0}×{:.0} pt frame; background delivery \
                                  refused",
@@ -1055,5 +1055,17 @@ mod tests {
         assert_eq!(clamp_amount(1100), AMOUNT_MAX as usize);
         assert_eq!(clamp_amount(0), AMOUNT_MIN as usize);
         assert_eq!(clamp_amount(3), 3);
+    }
+
+    #[tokio::test]
+    async fn missing_window_id_is_refused_before_a_pixel_scroll() {
+        let tool = ScrollTool::new(Arc::new(ToolState::new(false, false, None)));
+        let result = tool
+            .invoke(serde_json::json!({"pid": 123, "direction": "down", "x": 1, "y": 1}))
+            .await;
+        let structured = result.structured_content.expect("structured refusal");
+        assert_eq!(structured["code"], "invalid_arguments");
+        assert_eq!(structured["effect"], "refused");
+        assert_eq!(structured["dispatched"], false);
     }
 }

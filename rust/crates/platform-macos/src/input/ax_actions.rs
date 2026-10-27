@@ -226,13 +226,8 @@ pub fn perform_ax_action(element_ptr: usize, action: &str) -> anyhow::Result<()>
 /// `AXShowAlternateUI`). An unknown name is an error: falling back to AXPress
 /// would press a control the caller meant only to reveal.
 pub fn map_action(action: &str) -> anyhow::Result<&'static str> {
-    let key: String = action
-        .chars()
-        .filter(|c| *c != '_' && *c != '-')
-        .collect::<String>()
-        .to_lowercase();
-    let key = key.strip_prefix("ax").unwrap_or(&key);
-    Ok(match key {
+    let key = action_key(action);
+    Ok(match key.as_str() {
         "press" | "click" => "AXPress",
         "showmenu" | "rightclick" => "AXShowMenu",
         "pick" => "AXPick",
@@ -241,11 +236,104 @@ pub fn map_action(action: &str) -> anyhow::Result<&'static str> {
         "open" => "AXOpen",
         "showalternateui" => "AXShowAlternateUI",
         "showdefaultui" => "AXShowDefaultUI",
-        _ => anyhow::bail!(
-            "unknown action \"{action}\": use press, show_menu, pick, confirm, cancel, open, \
-             show_alternate_ui or show_default_ui"
-        ),
+        _ => anyhow::bail!("unknown action \"{action}\": use an action the target element lists"),
     })
+}
+
+fn action_key(action: &str) -> String {
+    let key: String = action
+        .chars()
+        .filter(|c| *c != '_' && *c != '-')
+        .collect::<String>()
+        .to_lowercase();
+    key.strip_prefix("ax").unwrap_or(&key).to_owned()
+}
+
+/// Whether `requested` names an action the target currently exposes. Tree rows
+/// omit `AX` and lowercase names; matching that spelling makes custom and
+/// increment/decrement actions callable without guessing their capitalization.
+pub fn advertised_action<'a>(requested: &str, advertised: &'a [String]) -> Option<&'a str> {
+    let key = action_key(requested);
+    let shown = requested.to_lowercase();
+    advertised
+        .iter()
+        .find(|candidate| action_key(candidate) == key || displayed_action(candidate) == shown)
+        .map(String::as_str)
+}
+
+/// An action name as a tree row shows it: no `AX` prefix, lower case, and
+/// escaped so a custom name cannot split the row. Agents copy this spelling.
+pub fn displayed_action(action: &str) -> String {
+    action
+        .strip_prefix("AX")
+        .unwrap_or(action)
+        .to_lowercase()
+        .chars()
+        .flat_map(char::escape_default)
+        .collect()
+}
+
+pub fn background_action_may_front(action: &str) -> bool {
+    action_key(action) == "raise"
+}
+
+#[derive(Debug)]
+pub struct ElementActionRefusal {
+    pub code: &'static str,
+    message: String,
+}
+
+impl std::fmt::Display for ElementActionRefusal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for ElementActionRefusal {}
+
+fn element_action_refusal(code: &'static str, message: String) -> anyhow::Error {
+    anyhow::Error::new(ElementActionRefusal { code, message })
+}
+
+pub fn element_action_refusal_code(error: &anyhow::Error) -> Option<&'static str> {
+    error
+        .downcast_ref::<ElementActionRefusal>()
+        .map(|error| error.code)
+}
+
+/// Resolve an AX action immediately before dispatch. The eight aliases remain
+/// available for AppKit's hollow-press and selection fallbacks; every other
+/// action must be live-advertised by the exact target. Background never raises.
+pub fn resolve_element_action<'a>(
+    requested: &str,
+    advertised: &'a [String],
+    foreground: bool,
+) -> anyhow::Result<&'a str> {
+    if !foreground && background_action_may_front(requested) {
+        return Err(element_action_refusal(
+            "background_unavailable",
+            format!(
+                "refusing {requested}: it fronts the target window. Retry with \
+             delivery_mode:\"foreground\" only if the user allows it"
+            ),
+        ));
+    }
+    if let Some(action) = advertised_action(requested, advertised) {
+        return Ok(action);
+    }
+    match map_action(requested)
+        .map_err(|error| element_action_refusal("invalid_arguments", error.to_string()))?
+    {
+        "AXPress" => Ok("AXPress"),
+        "AXShowMenu" => Ok("AXShowMenu"),
+        "AXPick" => Ok("AXPick"),
+        "AXConfirm" => Ok("AXConfirm"),
+        "AXCancel" => Ok("AXCancel"),
+        "AXOpen" => Ok("AXOpen"),
+        "AXShowAlternateUI" => Ok("AXShowAlternateUI"),
+        "AXShowDefaultUI" => Ok("AXShowDefaultUI"),
+        _ => unreachable!("map_action returns only static aliases"),
+    }
 }
 
 /// Set AXFocused=true on an element (for pre-focusing before key press).
@@ -461,6 +549,53 @@ mod tests {
         assert_eq!(map_action("right_click").unwrap(), "AXShowMenu");
         // An unknown name must not fall back to pressing the control.
         assert!(map_action("hover").is_err());
+    }
+
+    #[test]
+    fn live_advertised_actions_accept_custom_and_increment_names() {
+        let advertised = vec![
+            "AXIncrement".into(),
+            "Name:Reveal \"details\"\nTarget:inspector".into(),
+        ];
+        assert_eq!(
+            resolve_element_action("decrement", &["AXDecrement".into()], false).unwrap(),
+            "AXDecrement"
+        );
+        assert_eq!(
+            resolve_element_action("AXIncrement", &advertised, false).unwrap(),
+            "AXIncrement"
+        );
+        assert_eq!(
+            resolve_element_action(
+                "name:reveal \"details\"\ntarget:inspector",
+                &advertised,
+                false
+            )
+            .unwrap(),
+            advertised[1]
+        );
+        assert!(resolve_element_action("AXDelete", &advertised, false).is_err());
+        // The escaped spelling a tree row shows also names the action.
+        let korean = vec!["Name:보관\nTarget:list".to_string()];
+        let shown = displayed_action(&korean[0]);
+        assert!(shown.contains("\\n"));
+        assert_eq!(
+            resolve_element_action(&shown, &korean, false).unwrap(),
+            korean[0]
+        );
+        assert_eq!(
+            resolve_element_action(&displayed_action(&advertised[1]), &advertised, false).unwrap(),
+            advertised[1]
+        );
+        assert!(resolve_element_action("raise", &["AXRaise".into()], false).is_err());
+        assert_eq!(
+            resolve_element_action("AXRaise", &["AXRaise".into()], true).unwrap(),
+            "AXRaise"
+        );
+        assert_eq!(
+            resolve_element_action("press", &[], false).unwrap(),
+            "AXPress"
+        );
     }
 
     use super::*;

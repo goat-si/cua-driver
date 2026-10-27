@@ -620,7 +620,7 @@ impl Tool for GetWindowStateTool {
                 .unzip(),
         };
         let capture_id = match (snapshot_id, screenshot.as_ref()) {
-            (Some(_), Some((png, _, width, height, native_width, native_height, _, _))) => {
+            (Some(_), Some((png, _, width, height, native_width, native_height, bounds, _))) => {
                 match self.state.capture_bindings.publish_window(
                     &args,
                     pid,
@@ -629,7 +629,15 @@ impl Tool for GetWindowStateTool {
                     (*width, *height),
                     (*native_width, *native_height),
                 ) {
-                    Ok(capture_id) => Some(capture_id),
+                    Ok(capture_id) => {
+                        super::px_frame::remember_published_frame(
+                            window_id,
+                            pid,
+                            bounds.clone(),
+                            (*native_width, *native_height),
+                        );
+                        Some(capture_id)
+                    }
                     Err(error) => return error,
                 }
             }

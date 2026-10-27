@@ -206,7 +206,7 @@ impl Tool for TypeTextTool {
         let px = args.get("x").and_then(|v| v.as_f64());
         let py = args.get("y").and_then(|v| v.as_f64());
         if px.is_some() && py.is_some() && element_index.is_some() {
-            return ToolResult::error(
+            return super::invalid_arguments(
                 "Pass either element_token (ax) or x,y (px) to type_text, not both.",
             );
         }

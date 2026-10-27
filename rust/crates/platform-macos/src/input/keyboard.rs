@@ -1005,9 +1005,141 @@ fn canonical_key_name(key: &str) -> String {
         "bksp" => "backspace",
         "escape" => "escape",
         "kpenter" | "numpadenter" => "enter",
+        "prior" => "pageup",
+        "next" => "pagedown",
         _ => return compact,
     }
     .to_owned()
+}
+
+/// The character an xdotool keysym name stands for ("asterisk" is `*`), or
+/// the key itself when it is not one.
+fn keysym_character(key: &str) -> &str {
+    match key.trim().to_lowercase().as_str() {
+        "exclam" => "!",
+        "at" => "@",
+        "numbersign" => "#",
+        "dollar" => "$",
+        "percent" => "%",
+        "asciicircum" => "^",
+        "ampersand" => "&",
+        "asterisk" => "*",
+        "parenleft" => "(",
+        "parenright" => ")",
+        "underscore" => "_",
+        "plus" => "+",
+        "braceleft" => "{",
+        "braceright" => "}",
+        "bar" => "|",
+        "colon" => ":",
+        "quotedbl" => "\"",
+        "less" => "<",
+        "greater" => ">",
+        "question" => "?",
+        "asciitilde" => "~",
+        "minus" => "-",
+        "equal" => "=",
+        "bracketleft" => "[",
+        "bracketright" => "]",
+        "backslash" => "\\",
+        "semicolon" => ";",
+        "apostrophe" => "'",
+        "comma" => ",",
+        "period" => ".",
+        "slash" => "/",
+        "grave" => "`",
+        _ => key,
+    }
+}
+
+/// A symbol typed with Shift, as the key it shares on the US layout the key
+/// codes in [`key_name_to_code`] follow: `*` is Shift+8.
+fn shifted_symbol_base(symbol: &str) -> Option<&'static str> {
+    Some(match symbol {
+        "!" => "1",
+        "@" => "2",
+        "#" => "3",
+        "$" => "4",
+        "%" => "5",
+        "^" => "6",
+        "&" => "7",
+        "*" => "8",
+        "(" => "9",
+        ")" => "0",
+        "_" => "-",
+        "+" => "=",
+        "{" => "[",
+        "}" => "]",
+        "|" => "\\",
+        ":" => ";",
+        "\"" => "'",
+        "<" => ",",
+        ">" => ".",
+        "?" => "/",
+        "~" => "`",
+        _ => return None,
+    })
+}
+
+/// The canonical modifier name for one a caller may spell differently.
+fn canonical_modifier(name: &str) -> Option<&'static str> {
+    Some(match name.trim().to_lowercase().as_str() {
+        "cmd" | "command" | "super" | "meta" | "win" => "cmd",
+        "shift" => "shift",
+        "option" | "alt" => "option",
+        "ctrl" | "control" => "ctrl",
+        "fn" => "fn",
+        _ => return None,
+    })
+}
+
+/// One key press as the caller asked for it, turned into a key this driver
+/// can post plus its modifiers, before anything is sent. Accepts xdotool
+/// spellings: a combination in the key (`super+c`), keysym names
+/// (`asterisk`, `KP_0`, `Prior`), and symbols typed with Shift (`*` becomes
+/// Shift+8). An unknown key or modifier is an error, so nothing is sent.
+pub(crate) fn resolve_key_press(
+    key: &str,
+    modifiers: &[String],
+) -> anyhow::Result<(String, Vec<String>)> {
+    let mut resolved: Vec<String> = Vec::new();
+    let mut push = |modifier: &str| {
+        if !resolved.iter().any(|seen| seen == modifier) {
+            resolved.push(modifier.to_owned());
+        }
+    };
+    for modifier in modifiers {
+        match canonical_modifier(modifier) {
+            Some(name) => push(name),
+            None => anyhow::bail!(
+                "Unknown modifier: {modifier}. Use cmd (super), shift, option (alt), ctrl or fn."
+            ),
+        }
+    }
+    let trimmed = key.trim();
+    let mut name = trimmed;
+    if trimmed.chars().count() > 1 && trimmed.contains('+') && !trimmed.ends_with('+') {
+        let parts: Vec<&str> = trimmed.split('+').collect();
+        let (prefix, last) = parts.split_at(parts.len() - 1);
+        if prefix.iter().all(|part| canonical_modifier(part).is_some()) {
+            for part in prefix {
+                if let Some(modifier) = canonical_modifier(part) {
+                    push(modifier);
+                }
+            }
+            name = last[0];
+        }
+    }
+    let character = keysym_character(name);
+    let base = match shifted_symbol_base(character) {
+        Some(base) => {
+            push("shift");
+            base
+        }
+        None => character,
+    };
+    key_name_to_code(base)?;
+    Ok((base.to_owned(), resolved))
 }
 
 pub(super) fn key_name_to_code(key: &str) -> anyhow::Result<u16> {
@@ -1044,6 +1176,22 @@ pub(super) fn key_name_to_code(key: &str) -> anyhow::Result<u16> {
         "f10" => 109,
         "f11" => 103,
         "f12" => 111,
+        "kp0" => 82,
+        "kp1" => 83,
+        "kp2" => 84,
+        "kp3" => 85,
+        "kp4" => 86,
+        "kp5" => 87,
+        "kp6" => 88,
+        "kp7" => 89,
+        "kp8" => 91,
+        "kp9" => 92,
+        "kpdecimal" => 65,
+        "kpmultiply" => 67,
+        "kpadd" => 69,
+        "kpsubtract" => 78,
+        "kpdivide" => 75,
+        "kpequal" => 81,
         "a" => 0,
         "s" => 1,
         "d" => 2,
@@ -1117,8 +1265,9 @@ fn unknown_key_message(key: &str) -> String {
     }
     format!(
         "Unknown key name: {key}. Use a key name such as return, tab, escape, space, delete, \
-         left, right, up, down, pageup, pagedown, home, end, f1..f12, or a single letter or \
-         digit; to enter other characters (for example * or $) use type_text."
+         left, right, up, down, pageup, pagedown, home, end, f1..f12, KP_0..KP_9, a single \
+         letter, digit or US-keyboard symbol (* and $ are pressed with shift), or an xdotool \
+         keysym such as asterisk; to enter other text use type_text."
     )
 }
 
@@ -1160,6 +1309,47 @@ mod tests {
         let symbol = key_name_to_code("asterisk").unwrap_err().to_string();
         assert!(symbol.contains("type_text"), "{symbol}");
         assert!(key_name_to_code("shift").is_ok());
+    }
+
+    #[test]
+    fn shifted_symbols_and_keysyms_resolve_before_anything_is_sent() {
+        let press = |key: &str, modifiers: &[&str]| {
+            resolve_key_press(
+                key,
+                &modifiers.iter().map(|m| m.to_string()).collect::<Vec<_>>(),
+            )
+        };
+        assert_eq!(press("*", &[]).unwrap(), ("8".into(), vec!["shift".into()]));
+        assert_eq!(
+            press("asterisk", &["cmd"]).unwrap(),
+            ("8".into(), vec!["cmd".into(), "shift".into()])
+        );
+        assert_eq!(
+            press("?", &["shift"]).unwrap(),
+            ("/".into(), vec!["shift".into()])
+        );
+        assert_eq!(press("minus", &[]).unwrap(), ("-".into(), vec![]));
+        assert_eq!(
+            press("super+c", &[]).unwrap(),
+            ("c".into(), vec!["cmd".into()])
+        );
+        assert_eq!(
+            press("ctrl+shift+Tab", &["alt"]).unwrap(),
+            (
+                "Tab".into(),
+                vec!["option".into(), "ctrl".into(), "shift".into()]
+            )
+        );
+        assert_eq!(press("KP_0", &[]).unwrap(), ("KP_0".into(), vec![]));
+        assert_eq!(key_name_to_code("KP_0").unwrap(), 82);
+        assert_eq!(key_name_to_code("KP_9").unwrap(), 92);
+        assert_eq!(key_name_to_code("Prior").unwrap(), 116);
+        assert_eq!(key_name_to_code("Next").unwrap(), 121);
+        // "+" alone is a symbol, not a combination.
+        assert_eq!(press("+", &[]).unwrap(), ("=".into(), vec!["shift".into()]));
+        assert!(press("hyper+c", &[]).is_err());
+        assert!(press("c", &["hyper"]).is_err());
+        assert!(press("notakey", &[]).is_err());
     }
 
     /// cua-spacesd names the Meta key `super` (the cross-platform name), and

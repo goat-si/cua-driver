@@ -161,7 +161,7 @@ impl MoveCursorTool {
             || local_x > frame.bounds.width
             || local_y > frame.bounds.height
         {
-            return ToolResult::error(format!(
+            return super::invalid_arguments(format!(
                 "move_cursor: window-local point ({local_x:.1}, {local_y:.1}) pt lies outside \
                  window {wid}'s {:.0}×{:.0} pt frame. Re-read coordinates from a fresh \
                  get_window_state screenshot.",

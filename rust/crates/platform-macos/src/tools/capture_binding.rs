@@ -192,16 +192,13 @@ fn live_action_dimensions(target: &CaptureTarget) -> Result<NativeActionDimensio
                     "native window identity changed after capture",
                 ));
             }
-            let png = crate::capture::screenshot_window_bytes(window_id).map_err(|error| {
+            // Capture-bound clicks use the same geometry evidence as the
+            // following pixel dispatch. A live size check must not introduce
+            // another screenshot (or depend on a stalled capture backend).
+            super::px_frame::window_native_dimensions(window_id).map_err(|error| {
                 capture_error(
                     "capture_target_mismatch",
-                    format!("live window capture failed: {error}"),
-                )
-            })?;
-            crate::capture::png_dimensions(&png).map_err(|error| {
-                capture_error(
-                    "capture_target_mismatch",
-                    format!("live window dimensions failed: {error}"),
+                    format!("live window frame unavailable: {error:?}"),
                 )
             })?
         }

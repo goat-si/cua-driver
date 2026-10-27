@@ -327,7 +327,7 @@ fn def() -> &'static ToolDef {
             - element_token: AX action path. Tokens are scoped to (pid, window_id) and stale once the window is snapshotted again.\n\
             - x, y: window-local pixels of the get_window_state screenshot, sent as CGEvent mouse events. Needs a visible window. `modifier` takes cmd/shift/option/ctrl.\n\
             \n\
-            `button` defaults to left; on the AX path \"right\" maps to AXShowMenu and \"middle\" falls back to a pixel click at the element center. `action`: press (default), show_menu, pick, confirm, cancel, open, show_alternate_ui, show_default_ui; an element listing showalternateui reveals its hover-only controls with show_alternate_ui, in the background and without the pointer. `from_zoom:true` translates zoom-image pixels after a `zoom` call. Pressing a popup button opens its menu and leaves it open until an item is chosen or it is dismissed; in the background the user's front window keeps key focus meanwhile. To choose an option in one call use `set_value`. In the background a web `<select>` (Chrome, Electron) is not opened, because its menu would raise the browser window: the click is refused with `select_menu_would_raise_window`; use `set_value`.".into(),
+            `button` defaults to left; on the AX path \"right\" maps to AXShowMenu and \"middle\" falls back to a pixel click at the element center. `action`: press (default), show_menu, pick, confirm, cancel, open, show_alternate_ui, show_default_ui, or any action the target element lists (including increment, decrement, and custom actions). AXRaise requires foreground delivery because it fronts the window. An element listing showalternateui reveals its hover-only controls with show_alternate_ui, in the background and without the pointer. `from_zoom:true` translates zoom-image pixels after a `zoom` call. Pressing a popup button opens its menu and leaves it open until an item is chosen or it is dismissed; in the background the user's front window keeps key focus meanwhile. To choose an option in one call use `set_value`. In the background a web `<select>` (Chrome, Electron) is not opened, because its menu would raise the browser window: the click is refused with `select_menu_would_raise_window`; use `set_value`.".into(),
         input_schema: serde_json::json!({
             "type": "object",
             // `pid` is conditionally required — needed for window/element clicks
@@ -406,26 +406,23 @@ impl Tool for ClickTool {
             && args.get("y").map(|v| v.is_number()).unwrap_or(false);
         let capture_id = args.opt_str("capture_id");
         if capture_id.is_some() && !has_xy {
-            return ToolResult::error("click.capture_id requires pixel coordinates x and y.")
-                .with_structured(serde_json::json!({ "code": "invalid_arguments" }));
+            return super::invalid_arguments(
+                "click.capture_id requires pixel coordinates x and y.",
+            );
         }
         if has_xy && !has_pid && !has_window_id {
             // `scope` is a per-call param now (default "window"); pass
             // scope="desktop" to enable screen-absolute clicks.
             let scope = args.str_or("scope", "window");
             if scope != "desktop" {
-                return ToolResult::error(
+                return super::pre_dispatch_refusal(
+                    "desktop_scope_disabled",
                     "click: x,y given with no pid/window_id, but scope is \"window\". \
                      Screen-absolute clicks require desktop scope. Pass scope=\"desktop\" \
                      (and use get_desktop_state with scope=\"desktop\" to read true \
                      screen pixels) first."
                         .to_string(),
-                )
-                .with_structured(serde_json::json!({
-                    "code": "desktop_scope_disabled",
-                    "scope": scope,
-                    "suggestion": "pass scope=\"desktop\"",
-                }));
+                );
             }
             let input = match parse_legacy_click_input(&args) {
                 Ok(input) => input,
@@ -463,8 +460,7 @@ impl Tool for ClickTool {
             .to_owned();
             let count = input.count.unwrap_or(1) as usize;
             if count == 0 {
-                return ToolResult::error("click.count must be at least 1.")
-                    .with_structured(serde_json::json!({ "code": "invalid_arguments" }));
+                return super::invalid_arguments("click.count must be at least 1.");
             }
             if let Some(refusal) =
                 super::desktop_pointer_guard::check("click", &args, vec![(sx, sy)]).await
@@ -531,10 +527,9 @@ impl Tool for ClickTool {
         };
         let (element_index, window_id, element_guard) = resolved.into_parts(window_id_arg);
         if capture_id.is_some() && element_guard.is_some() {
-            return ToolResult::error(
+            return super::invalid_arguments(
                 "click.capture_id is valid only for the pixel x,y path, not element actions.",
-            )
-            .with_structured(serde_json::json!({ "code": "invalid_arguments" }));
+            );
         }
         let window_id = match super::native_window_id(window_id) {
             Ok(window_id) => window_id,
@@ -548,7 +543,7 @@ impl Tool for ClickTool {
             .or_else(|| args.opt_i64("y").map(|i| i as f64));
         let action = args.str_or("action", "press");
         if let Err(error) = validate_click_action(&action, element_guard.is_some()) {
-            return ToolResult::error(format!("click: {error}"));
+            return super::invalid_arguments(format!("click: {error}"));
         }
         // Surface 5: optional `button` arg, default "left" preserves legacy behaviour.
         // Pixel path: routes to left/right/middle CGEvent primitives.
@@ -562,7 +557,7 @@ impl Tool for ClickTool {
         // Reject unknown buttons explicitly so silent left-click fall-through can't
         // mask a typo. Keep "" → default left for old clients that never sent the field.
         if !matches!(button_str.as_str(), "" | "left" | "right" | "middle") {
-            return ToolResult::error(format!(
+            return super::invalid_arguments(format!(
                 "click: unknown button \"{button_str}\" — expected one of left, right, middle."
             ));
         }
@@ -912,18 +907,23 @@ impl Tool for ClickTool {
                         suspected_noop,
                     ))
                 }
-                Ok(Err(e)) => ToolResult::error(format!("AX action failed: {e}")),
+                Ok(Err(e)) => {
+                    if let Some(code) = crate::input::ax_actions::element_action_refusal_code(&e) {
+                        super::pre_dispatch_refusal(code, format!("AX action failed: {e}"))
+                    } else {
+                        ToolResult::error(format!("AX action failed: {e}"))
+                    }
+                }
                 Err(e) => ToolResult::error(format!("Task error: {e}")),
             }
         } else if let (Some(mut cx), Some(mut cy)) = (x, y) {
             // ── Pixel path ─────────────────────────────────────────────────
 
             if capture_id.is_some() && (from_zoom || debug_image_out.is_some()) {
-                return ToolResult::error(
+                return super::invalid_arguments(
                     "click.capture_id is incompatible with from_zoom and debug_image_out; \
                      pass coordinates from the exact source capture directly.",
-                )
-                .with_structured(serde_json::json!({ "code": "invalid_arguments" }));
+                );
             }
 
             // debug_image_out: capture fresh screenshot, overlay crosshair BEFORE
@@ -931,13 +931,13 @@ impl Tool for ClickTool {
             // space the caller was reasoning in).
             if let Some(ref dbg_path) = debug_image_out {
                 if from_zoom {
-                    return ToolResult::error(
+                    return super::invalid_arguments(
                         "debug_image_out is incompatible with from_zoom — \
                          received (x, y) would be in zoom-crop space, not window-local.",
                     );
                 }
                 match window_id {
-                    None => return ToolResult::error("debug_image_out requires window_id."),
+                    None => return super::invalid_arguments("debug_image_out requires window_id."),
                     Some(wid) => {
                         // Session-effective max dimension so debug_image_out
                         // matches the resize the calling session sees in
@@ -955,14 +955,20 @@ impl Tool for ClickTool {
                         .await;
                         match dbg_result {
                             Err(e) => {
-                                return ToolResult::error(format!(
-                                    "debug_image_out task failed: {e}. Not dispatching click."
-                                ))
+                                return super::pre_dispatch_refusal(
+                                    "px_capture_unavailable",
+                                    format!(
+                                        "debug_image_out task failed: {e}. Not dispatching click."
+                                    ),
+                                );
                             }
                             Ok(Err(e)) => {
-                                return ToolResult::error(format!(
-                                    "debug_image_out write failed: {e}. Not dispatching click."
-                                ))
+                                return super::pre_dispatch_refusal(
+                                    "px_capture_unavailable",
+                                    format!(
+                                        "debug_image_out write failed: {e}. Not dispatching click."
+                                    ),
+                                );
                             }
                             Ok(Ok(())) => {}
                         }
@@ -1036,7 +1042,7 @@ impl Tool for ClickTool {
                                 || lx > frame.bounds.width
                                 || ly > frame.bounds.height)
                         {
-                            return ToolResult::error(format!(
+                            return super::invalid_arguments(format!(
                                 "click: window-local point ({lx:.1}, {ly:.1}) pt lies outside \
                                  window {wid}'s {:.0}×{:.0} pt frame; background delivery \
                                  refused. Re-read coordinates from a fresh get_window_state \
@@ -1448,7 +1454,7 @@ impl Tool for ClickTool {
                 Err(e) => ToolResult::error(format!("Task error: {e}")),
             }
         } else {
-            ToolResult::error("Provide either element_token or (x + y). pid is required for x,y clicks; an element_token carries its own pid.")
+            super::invalid_arguments("Provide either element_token or (x + y). pid is required for x,y clicks; an element_token carries its own pid.")
         }
     }
 }
@@ -1650,8 +1656,13 @@ fn perform_ax_click(
 ) -> anyhow::Result<AxClickOutcome> {
     let (element_ptr, idx) = element;
     let (pid, window_id) = window;
-    let ax_action = crate::input::ax_actions::map_action(action_str)?;
     let element = element_ptr as AXUIElementRef;
+
+    // Read live capabilities before dispatch: custom actions and
+    // AXIncrement/AXDecrement are valid only on elements that expose them.
+    let advertised = unsafe { copy_action_names(element) };
+    let ax_action =
+        crate::input::ax_actions::resolve_element_action(action_str, &advertised, foreground)?;
 
     // Check the live value immediately before dispatch. Foreground assist can
     // enable menu items that were disabled in the cached snapshot, while a
@@ -1661,8 +1672,6 @@ fn perform_ax_click(
 
     // Capture advertised actions BEFORE dispatching so we can detect silent no-ops
     // (AX returns success even when the element doesn't advertise the action).
-    let advertised = unsafe { copy_action_names(element) };
-
     let role = unsafe { copy_string_attr(element, "AXRole") }.unwrap_or_default();
     let title = unsafe { copy_string_attr(element, "AXTitle") }.unwrap_or_default();
 
@@ -2027,6 +2036,18 @@ mod tests {
         assert!(validate_click_action("show_alternate_ui", true).is_ok());
         assert!(validate_click_action("focus", true).is_err());
         assert!(validate_click_action("hover", false).is_err());
+    }
+
+    #[tokio::test]
+    async fn an_unknown_action_is_refused_before_dispatch() {
+        let tool = ClickTool::new(Arc::new(ToolState::new(false, false, None)));
+        let result = tool
+            .invoke(serde_json::json!({"pid": 123, "action": "hover"}))
+            .await;
+        let structured = result.structured_content.expect("structured refusal");
+        assert_eq!(structured["code"], "invalid_arguments");
+        assert_eq!(structured["effect"], "refused");
+        assert_eq!(structured["dispatched"], false);
     }
 
     /// #3835: Finder's toolbar view switcher applies an AXPress and returns

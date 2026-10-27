@@ -112,13 +112,13 @@ impl Tool for RightClickTool {
         let modifiers: Vec<String> = args.str_array("modifier");
 
         if partial_xy {
-            return ToolResult::error("Provide both x and y together, not just one.");
+            return super::invalid_arguments("Provide both x and y together, not just one.");
         }
         if element_index.is_some() && has_xy {
-            return ToolResult::error("Provide either element_token or (x, y), not both.");
+            return super::invalid_arguments("Provide either element_token or (x, y), not both.");
         }
         if element_index.is_none() && !has_xy {
-            return ToolResult::error(
+            return super::invalid_arguments(
                 "Provide element_token or (x, y) to address the right-click target.",
             );
         }
@@ -180,7 +180,7 @@ impl Tool for RightClickTool {
                             || translated.2 > frame.bounds.width
                             || translated.3 > frame.bounds.height)
                     {
-                        return ToolResult::error(format!(
+                        return super::invalid_arguments(format!(
                             "right_click: window-local point ({:.1}, {:.1}) pt lies outside \
                              window {wid}'s {:.0}×{:.0} pt frame; background delivery refused",
                             translated.2, translated.3, frame.bounds.width, frame.bounds.height

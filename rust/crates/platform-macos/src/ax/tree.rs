@@ -983,6 +983,17 @@ mod web_content_role_tests {
     }
 
     #[test]
+    fn custom_action_names_cannot_split_or_escape_a_tree_row() {
+        let mut node = role_only_node("AXButton".into(), 0, 0, None, false);
+        node.element_index = Some(4);
+        node.actions = vec!["Name:Reveal \"details\"\nTarget:inspector".into()];
+        assert_eq!(
+            format_node_line(&node),
+            "- [4] AXButton [actions=[name:reveal \\\"details\\\"\\ntarget:inspector]]"
+        );
+    }
+
+    #[test]
     fn recognizes_native_web_document_roles_without_marking_app_chrome() {
         for role in ["AXWebArea", "AXDocumentWeb", "document"] {
             assert!(is_web_content_role(role), "{role} must start web trust");
@@ -1039,7 +1050,7 @@ fn format_node_line(node: &AXNode) -> String {
             .actions
             .iter()
             .filter(|a| !UNLISTED_ACTIONS.contains(&a.as_str()))
-            .map(|a| a.strip_prefix("AX").unwrap_or(a).to_lowercase())
+            .map(|a| crate::input::ax_actions::displayed_action(a))
             .collect();
         if !shown.is_empty() {
             attrs.push(format!("actions=[{}]", shown.join(",")));

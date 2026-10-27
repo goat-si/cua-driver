@@ -11,6 +11,8 @@
 //! stale window is a refusal.
 
 use cua_driver_core::protocol::ToolResult;
+use std::collections::VecDeque;
+use std::sync::{Mutex, OnceLock};
 
 use crate::windows::WindowBounds;
 
@@ -103,27 +105,189 @@ pub fn validate_capture_frame(
     }
 }
 
-/// Resolve `window_id`'s screen origin and capture scale. Blocking: enumerates
-/// CGWindowList and takes one window capture to measure the scale.
-pub fn resolve_window_px_frame(window_id: u32) -> Result<WindowPxFrame, PxFrameError> {
-    let bounds = crate::windows::window_bounds_by_id(window_id)
-        .filter(|b| b.width > 0.0 && b.height > 0.0)
-        .ok_or(PxFrameError::WindowNotFound { window_id })?;
-    // A window-local point is meaningful only when the current capture proves
-    // the same frame and scale. Never guess 1× on capture failure.
-    let png = crate::capture::screenshot_window_bytes(window_id).map_err(|e| {
-        PxFrameError::CaptureUnavailable {
-            window_id,
-            reason: e.to_string(),
+/// Geometry only: no image bytes, tokens, session bindings or action authority.
+/// Keep a bounded process-wide index because all pixel tools share this resolver.
+#[derive(Clone)]
+struct PublishedWindowFrame {
+    pid: i32,
+    bounds: WindowBounds,
+    dimensions: (u32, u32),
+}
+
+#[derive(Default)]
+struct PublishedFrames(VecDeque<(u32, PublishedWindowFrame)>);
+
+impl PublishedFrames {
+    const CAPACITY: usize = 128;
+
+    fn insert(&mut self, window_id: u32, frame: PublishedWindowFrame) {
+        self.0.retain(|(id, _)| *id != window_id);
+        if self.0.len() == Self::CAPACITY {
+            self.0.pop_front();
         }
-    })?;
-    let (pw, ph) =
-        crate::capture::png_dimensions(&png).map_err(|e| PxFrameError::CaptureUnavailable {
-            window_id,
-            reason: e.to_string(),
-        })?;
-    let scale = validate_capture_frame(window_id, &bounds, pw, ph)?;
-    Ok(WindowPxFrame { bounds, scale })
+        self.0.push_back((window_id, frame));
+    }
+
+    fn get(&self, window_id: u32, pid: i32) -> Option<PublishedWindowFrame> {
+        self.0
+            .iter()
+            .find(|(id, frame)| *id == window_id && frame.pid == pid)
+            .map(|(_, frame)| frame.clone())
+    }
+}
+
+fn published_frames() -> &'static Mutex<PublishedFrames> {
+    static FRAMES: OnceLock<Mutex<PublishedFrames>> = OnceLock::new();
+    FRAMES.get_or_init(|| Mutex::new(PublishedFrames::default()))
+}
+
+/// Record native, pre-resize capture dimensions only after publication succeeds.
+pub(super) fn remember_published_frame(
+    window_id: u32,
+    pid: i32,
+    bounds: WindowBounds,
+    dimensions: (u32, u32),
+) {
+    published_frames().lock().unwrap().insert(
+        window_id,
+        PublishedWindowFrame {
+            pid,
+            bounds,
+            dimensions,
+        },
+    );
+}
+
+fn same_bounds(a: &WindowBounds, b: &WindowBounds) -> bool {
+    a.x == b.x && a.y == b.y && a.width == b.width && a.height == b.height
+}
+
+/// Lazy inputs make the absence of capture a deterministic, testable property.
+/// A matching published frame wins, including an explicit mismatch refusal;
+/// moving or resizing the window invalidates that evidence.
+fn resolve_dimensions(
+    window_id: u32,
+    bounds: &WindowBounds,
+    published: Option<&PublishedWindowFrame>,
+    display_scale: impl FnOnce() -> Option<f64>,
+    capture: impl FnOnce() -> Result<(u32, u32), PxFrameError>,
+) -> Result<(f64, (u32, u32)), PxFrameError> {
+    if !bounds.x.is_finite()
+        || !bounds.y.is_finite()
+        || !bounds.width.is_finite()
+        || !bounds.height.is_finite()
+        || bounds.width <= 0.0
+        || bounds.height <= 0.0
+    {
+        return Err(PxFrameError::WindowNotFound { window_id });
+    }
+    let (dimensions, source) =
+        if let Some(frame) = published.filter(|f| same_bounds(&f.bounds, bounds)) {
+            (frame.dimensions, "published")
+        } else if let Some(scale) = display_scale().filter(|scale| *scale == 1.0 || *scale == 2.0) {
+            let width = (bounds.width * scale).round();
+            let height = (bounds.height * scale).round();
+            if width < 1.0 || height < 1.0 || width > u32::MAX as f64 || height > u32::MAX as f64 {
+                (capture()?, "capture")
+            } else {
+                ((width as u32, height as u32), "display")
+            }
+        } else {
+            (capture()?, "capture")
+        };
+    validate_capture_frame(window_id, bounds, dimensions.0, dimensions.1).map(|scale| {
+        tracing::debug!(window_id, source, scale, "resolved window pixel frame");
+        (scale, dimensions)
+    })
+}
+
+/// Select the display containing the largest part of the window. No overlap,
+/// an ambiguous tie, or unavailable mode metadata is not evidence of a scale.
+fn scale_for_displays(
+    bounds: &WindowBounds,
+    displays: &[(WindowBounds, Option<f64>)],
+) -> Option<f64> {
+    let mut best_area = 0.0;
+    let mut best_scale = None;
+    for (display, scale) in displays {
+        let width = ((bounds.x + bounds.width).min(display.x + display.width)
+            - bounds.x.max(display.x))
+        .max(0.0);
+        let height = ((bounds.y + bounds.height).min(display.y + display.height)
+            - bounds.y.max(display.y))
+        .max(0.0);
+        let area = width * height;
+        if area > best_area {
+            best_area = area;
+            best_scale = *scale;
+        } else if area > 0.0 && area == best_area && best_scale != *scale {
+            best_scale = None;
+        }
+    }
+    best_scale
+}
+
+fn window_display_scale(bounds: &WindowBounds) -> Option<f64> {
+    use core_graphics::display::CGDisplay;
+    let displays = CGDisplay::active_displays().ok()?;
+    let displays: Vec<_> = displays
+        .into_iter()
+        .map(|id| {
+            let display = CGDisplay::new(id);
+            let rect = display.bounds();
+            let scale = display.display_mode().and_then(|mode| {
+                let sx = mode.pixel_width() as f64 / mode.width() as f64;
+                let sy = mode.pixel_height() as f64 / mode.height() as f64;
+                (sx == sy && (sx == 1.0 || sx == 2.0)).then_some(sx)
+            });
+            (
+                WindowBounds {
+                    x: rect.origin.x,
+                    y: rect.origin.y,
+                    width: rect.size.width,
+                    height: rect.size.height,
+                },
+                scale,
+            )
+        })
+        .collect();
+    scale_for_displays(bounds, &displays)
+}
+
+fn resolve_window_dimensions(window_id: u32) -> Result<(WindowPxFrame, (u32, u32)), PxFrameError> {
+    let window = crate::windows::window_info_by_id(window_id)
+        .ok_or(PxFrameError::WindowNotFound { window_id })?;
+    let bounds = window.bounds;
+    let published = published_frames()
+        .lock()
+        .unwrap()
+        .get(window_id, window.pid);
+    let (scale, dimensions) = resolve_dimensions(
+        window_id,
+        &bounds,
+        published.as_ref(),
+        || window_display_scale(&bounds),
+        || {
+            let result = crate::capture::screenshot_window_bytes(window_id)
+                .and_then(|png| crate::capture::png_dimensions(&png));
+            result.map_err(|error| PxFrameError::CaptureUnavailable {
+                window_id,
+                reason: error.to_string(),
+            })
+        },
+    )?;
+    Ok((WindowPxFrame { bounds, scale }, dimensions))
+}
+
+/// Blocking WindowServer/display metadata reads; captures only when neither
+/// the last published frame nor the window's display proves its scale.
+pub fn resolve_window_px_frame(window_id: u32) -> Result<WindowPxFrame, PxFrameError> {
+    resolve_window_dimensions(window_id).map(|(frame, _)| frame)
+}
+
+/// The capture binding needs exact native dimensions, before image resizing.
+pub(super) fn window_native_dimensions(window_id: u32) -> Result<(u32, u32), PxFrameError> {
+    resolve_window_dimensions(window_id).map(|(_, dimensions)| dimensions)
 }
 
 /// The shared refusal for a pixel action whose window cannot be framed.
@@ -219,6 +383,223 @@ pub async fn resolve_or_refuse(window_id: u32) -> Result<WindowPxFrame, ToolResu
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn published(scale: u32) -> PublishedWindowFrame {
+        PublishedWindowFrame {
+            pid: 42,
+            bounds: frame(1.0).bounds,
+            dimensions: (500 * scale, 500 * scale),
+        }
+    }
+
+    #[test]
+    fn published_frame_avoids_display_lookup_and_capture_even_during_stall() {
+        for scale in [1, 2] {
+            let prior = published(scale);
+            let result = resolve_dimensions(
+                11,
+                &prior.bounds,
+                Some(&prior),
+                || panic!("a matching publication is sufficient"),
+                || panic!("a capture stall must not block a published frame"),
+            )
+            .unwrap();
+            assert_eq!(result, (scale as f64, (500 * scale, 500 * scale)));
+        }
+    }
+
+    #[test]
+    fn changed_bounds_use_display_without_capture() {
+        let prior = published(2);
+        for bounds in [
+            WindowBounds {
+                x: -800.0,
+                ..prior.bounds.clone()
+            },
+            WindowBounds {
+                y: -200.0,
+                ..prior.bounds.clone()
+            },
+            WindowBounds {
+                width: 600.0,
+                ..prior.bounds.clone()
+            },
+            WindowBounds {
+                height: 600.0,
+                ..prior.bounds.clone()
+            },
+        ] {
+            let result = resolve_dimensions(
+                11,
+                &bounds,
+                Some(&prior),
+                || Some(1.0),
+                || panic!("a proven display does not need a capture"),
+            )
+            .unwrap();
+            assert_eq!(result, (1.0, (bounds.width as u32, bounds.height as u32)));
+        }
+    }
+
+    #[test]
+    fn uncached_window_uses_retina_display_without_capture() {
+        let bounds = frame(1.0).bounds;
+        assert_eq!(
+            resolve_dimensions(
+                11,
+                &bounds,
+                None,
+                || Some(2.0),
+                || panic!("display metadata must suffice for a cold window")
+            )
+            .unwrap(),
+            (2.0, (1000, 1000))
+        );
+    }
+
+    #[test]
+    fn publication_preserves_exact_native_dimensions_for_capture_admission() {
+        let mut prior = published(2);
+        // Capture validation permits small rounding differences. Admission
+        // must compare the original dimensions rather than 500pt * 2x.
+        prior.dimensions = (1001, 1000);
+        assert_eq!(
+            resolve_dimensions(
+                11,
+                &prior.bounds,
+                Some(&prior),
+                || panic!("matching publication"),
+                || panic!("matching publication")
+            )
+            .unwrap(),
+            (2.0, (1001, 1000))
+        );
+    }
+
+    #[test]
+    fn matching_malformed_publication_refuses_without_hiding_mismatch() {
+        let mut prior = published(2);
+        prior.dimensions = (1920, 960);
+        assert!(matches!(
+            resolve_dimensions(
+                11,
+                &prior.bounds,
+                Some(&prior),
+                || panic!("do not override published evidence"),
+                || panic!("do not recapture to hide the mismatch")
+            ),
+            Err(PxFrameError::FrameMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn no_metadata_captures_once_and_preserves_errors() {
+        let bounds = frame(1.0).bounds;
+        for display in [None, Some(1.5), Some(f64::NAN), Some(0.0)] {
+            let mut captures = 0;
+            let result = resolve_dimensions(
+                11,
+                &bounds,
+                None,
+                || display,
+                || {
+                    captures += 1;
+                    Ok((1000, 1000))
+                },
+            )
+            .unwrap();
+            assert_eq!(result, (2.0, (1000, 1000)));
+            assert_eq!(captures, 1);
+        }
+        let error = PxFrameError::CaptureUnavailable {
+            window_id: 11,
+            reason: "capture_backend_stalled".into(),
+        };
+        assert_eq!(
+            resolve_dimensions(11, &bounds, None, || None, || Err(error.clone())),
+            Err(error)
+        );
+        assert!(matches!(
+            resolve_dimensions(11, &bounds, None, || None, || Ok((250, 250))),
+            Err(PxFrameError::FrameMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn invalid_live_bounds_refuse_before_any_scale_source() {
+        for value in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            let bounds = WindowBounds {
+                width: value,
+                ..frame(1.0).bounds
+            };
+            assert_eq!(
+                resolve_dimensions(
+                    11,
+                    &bounds,
+                    Some(&published(2)),
+                    || panic!("invalid bounds"),
+                    || panic!("invalid bounds")
+                ),
+                Err(PxFrameError::WindowNotFound { window_id: 11 })
+            );
+        }
+    }
+
+    #[test]
+    fn published_index_is_bounded_replaces_and_checks_owner() {
+        let mut frames = PublishedFrames::default();
+        for id in 0..=PublishedFrames::CAPACITY as u32 {
+            frames.insert(id, published(2));
+        }
+        assert_eq!(frames.0.len(), PublishedFrames::CAPACITY);
+        assert!(frames.get(0, 42).is_none());
+        assert!(frames.get(1, 43).is_none());
+        frames.insert(1, published(1));
+        assert_eq!(frames.0.len(), PublishedFrames::CAPACITY);
+        assert_eq!(frames.get(1, 42).unwrap().dimensions, (500, 500));
+    }
+
+    #[test]
+    fn display_selection_uses_largest_overlap_including_negative_origins() {
+        let displays = [
+            (
+                WindowBounds {
+                    x: -1000.0,
+                    y: 0.0,
+                    width: 1000.0,
+                    height: 1000.0,
+                },
+                Some(1.0),
+            ),
+            (
+                WindowBounds {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 1000.0,
+                    height: 1000.0,
+                },
+                Some(2.0),
+            ),
+        ];
+        let mut bounds = WindowBounds {
+            x: -400.0,
+            y: 100.0,
+            width: 500.0,
+            height: 500.0,
+        };
+        assert_eq!(scale_for_displays(&bounds, &displays), Some(1.0));
+        bounds.x = -100.0;
+        assert_eq!(scale_for_displays(&bounds, &displays), Some(2.0));
+        bounds.x = -250.0;
+        assert_eq!(scale_for_displays(&bounds, &displays), None);
+        bounds.x = 2000.0;
+        assert_eq!(scale_for_displays(&bounds, &displays), None);
+        bounds.x = 100.0;
+        assert_eq!(
+            scale_for_displays(&bounds, &[(displays[1].0.clone(), None)]),
+            None
+        );
+    }
 
     fn frame(scale: f64) -> WindowPxFrame {
         WindowPxFrame {
