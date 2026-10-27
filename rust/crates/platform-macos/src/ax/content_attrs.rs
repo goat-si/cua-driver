@@ -213,6 +213,28 @@ mod tests {
     }
 
     #[test]
+    fn a_batch_rejected_after_the_deadline_records_timeout_instead_of_six_single_reads() {
+        use super::super::batch_attrs::{batch_failure_action, BatchFailure};
+        use super::super::bindings::{
+            kAXErrorAttributeUnsupported, kAXErrorIllegalArgument, kAXErrorNotImplemented,
+        };
+        for error in [
+            kAXErrorAttributeUnsupported,
+            kAXErrorNotImplemented,
+            kAXErrorIllegalArgument,
+        ] {
+            let mut budget = WalkBudget::nodes_only(10);
+            let mut disabled = false;
+            let action = batch_failure_action(BatchFailure::WholeCall(error), true, disabled);
+            assert!(
+                !replay_after_failure(action, &mut budget, &mut disabled),
+                "error {error} replayed single reads after the deadline"
+            );
+            assert_eq!(budget.outcome().reason(), Some("timeout"));
+        }
+    }
+
+    #[test]
     fn unsupported_batching_changes_only_the_current_walks_flag() {
         let mut budget = WalkBudget::nodes_only(10);
         let mut disabled = false;
