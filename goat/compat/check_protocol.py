@@ -3,9 +3,10 @@
 
 GOAT starts the driver in the launch forms below and reads its CLI manifest, MCP surface and
 daemon metadata. A fork change that removes or retypes a tool, subcommand or argument, changes a
-tool's input schema or a capability, changes the daemon contract, or stops a launch form from
-starting breaks GOAT without a GOAT change. Those fail unless goat/compat/allowed-changes.json
-records the change with a reason. Additions pass and are listed. Standard library only.
+tool's input schema or a capability, drops or widens what a tool's output schema promises, changes
+the daemon contract, or stops a launch form from starting breaks GOAT without a GOAT change. Those
+fail unless goat/compat/allowed-changes.json records the change with a reason. Additions pass and
+are listed. Standard library only.
 """
 
 import argparse
@@ -170,13 +171,15 @@ def mcp_surface(argv):
         child.send({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "goat-compat", "version": "1"}}})
         init = child.reply(1)
         child.send({"jsonrpc": "2.0", "method": "notifications/initialized"})
-        tools, cursor, seen = {}, None, set()
+        tools, outputs, cursor, seen = {}, {}, None, set()
         for page_number in range(MAX_PAGES):
             request_id = 2 + page_number
             child.send({"jsonrpc": "2.0", "id": request_id, "method": "tools/list", "params": {"cursor": cursor} if cursor else {}})
             page = child.reply(request_id)
             for tool in page["tools"]:
                 tools[tool["name"]] = tool.get("inputSchema")
+                if tool.get("outputSchema") is not None:
+                    outputs[tool["name"]] = tool["outputSchema"]
             cursor = page.get("nextCursor")
             if not cursor:
                 break
@@ -187,7 +190,8 @@ def mcp_surface(argv):
             fail(child.describe_failure(f"tools/list did not finish within {MAX_PAGES} pages"))
     finally:
         child.close()
-    return {"protocolVersion": init.get("protocolVersion"), "capabilities": init.get("capabilities", {}), "tools": tools}
+    return {"protocolVersion": init.get("protocolVersion"), "capabilities": init.get("capabilities", {}),
+            "tools": tools, "outputSchemas": outputs}
 
 
 @contextlib.contextmanager
@@ -299,6 +303,155 @@ def load_allowed(path):
     return allowed
 
 
+def json_type(value):
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "boolean"
+    if isinstance(value, int):
+        return "integer"
+    if isinstance(value, float):
+        return "number"
+    if isinstance(value, str):
+        return "string"
+    return "array" if isinstance(value, list) else "object"
+
+
+def schema_values(schema):
+    if "enum" in schema:
+        return schema["enum"]
+    if "const" in schema:
+        return [schema["const"]]
+    return None
+
+
+def schema_types(schema):
+    """The JSON types a schema admits: its "type", else the types of its enum or const values,
+    else None (any type)."""
+    declared = schema.get("type")
+    if declared is not None:
+        return sorted(declared) if isinstance(declared, list) else [declared]
+    values = schema_values(schema)
+    return sorted({json_type(value) for value in values}) if values is not None else None
+
+
+def type_covers(types, declared):
+    """Whether a value of JSON type declared is admitted by types; "number" includes integers."""
+    return declared in types or (declared == "integer" and "number" in types)
+
+
+UNION_KEYS = ("anyOf", "oneOf")
+OBJECT_KEYS = ("properties", "required", "additionalProperties", "patternProperties")
+
+
+def for_type(schema, declared):
+    """schema narrowed to one of its types, without keywords that only constrain other types."""
+    narrowed = {**schema, "type": declared}
+    for key in OBJECT_KEYS if declared != "object" else ():
+        narrowed.pop(key, None)
+    if declared != "array":
+        narrowed.pop("items", None)
+    values = schema_values(narrowed)
+    if values is not None:
+        narrowed.pop("const", None)
+        narrowed["enum"] = [value for value in values if type_covers([declared], json_type(value))]
+    return narrowed
+
+
+def conjoin(outer, branch):
+    """A union branch together with the keywords beside the union, which apply as well."""
+    merged = {**outer, **branch}
+    if "required" in outer or "required" in branch:
+        merged["required"] = sorted(set(outer.get("required", [])) | set(branch.get("required", [])))
+    if "properties" in outer and "properties" in branch:
+        merged["properties"] = {**outer["properties"], **branch["properties"]}
+    if "type" in outer and "type" in branch:
+        outer_types, branch_types = schema_types(outer), schema_types(branch)
+        both = {declared for declared in outer_types if type_covers(branch_types, declared)}
+        both |= {declared for declared in branch_types if type_covers(outer_types, declared)}
+        merged["type"] = sorted(both) if len(both) != 1 else next(iter(both))
+    return merged
+
+
+def union_kind(schema):
+    return next((key for key in UNION_KEYS if isinstance(schema.get(key), list)), None)
+
+
+def single_shapes(schema):
+    """schema as the list of union-free, single-type shapes it is the union of. The driver
+    advertises {"type": "object", "anyOf": [success, refusal]}, and spells nullable fields both
+    as type lists and as anyOf with a null branch, so both spellings reduce to the same shapes."""
+    if not isinstance(schema, dict):
+        return [schema]
+    key = union_kind(schema)
+    if key:
+        outer = {name: value for name, value in schema.items() if name != key}
+        shapes = []
+        for branch in schema[key]:
+            if branch is False:
+                continue  # admits nothing
+            # true admits anything the outer keywords allow; an unknown branch form is treated
+            # as unconstrained, so a changed one is reported rather than skipped.
+            branch = branch if isinstance(branch, dict) else {}
+            shapes += single_shapes(conjoin(outer, branch))
+        return shapes
+    types = schema_types(schema)
+    if types is not None and len(types) > 1:
+        return [for_type(schema, declared) for declared in types]
+    return [schema]
+
+
+def output_schema_breaks(old, new, where=""):
+    """What GOAT, reading a tool's result, could rely on in old and no longer in new: a property
+    removed or no longer required, or a type, enum or union that now admits more values. New
+    properties and narrower values are compatible."""
+    label = f"property {where} " if where else ""
+    if not isinstance(new, dict):
+        return [f"{label}removed"]
+    if not isinstance(old, dict):
+        return []
+    old_kind, new_kind = union_kind(old), union_kind(new)
+    if old_kind or new_kind:
+        breaks = []
+        if old_kind and new_kind and old_kind != new_kind:
+            # oneOf excludes values two branches share; anyOf does not. Treat a switch as a break.
+            breaks.append(f"{label}union {old_kind} -> {new_kind}")
+        # Every shape new can produce must be one old could: each new shape must fit some old
+        # shape. Removing a shape only narrows the output.
+        old_shapes = single_shapes(old)
+        for index, shape in enumerate(single_shapes(new)):
+            if not old_shapes:
+                breaks.append(f"variant {index}: {label}admits values where none were admitted")
+                continue
+            candidates = [output_schema_breaks(choice, shape, where) for choice in old_shapes]
+            if any(not candidate for candidate in candidates):
+                continue
+            # Report against the shape in the same position, the one it most likely replaced.
+            closest = candidates[index] if index < len(candidates) else min(candidates, key=len)
+            breaks += [f"variant {index}: {detail}" for detail in closest]
+        return breaks
+    breaks = []
+    old_types, new_types = schema_types(old), schema_types(new)
+    if old_types is not None and (new_types is None or any(not type_covers(old_types, declared) for declared in new_types)):
+        breaks.append(f"{label}type {old_types} -> {new_types}")
+    old_values, new_values = schema_values(old), schema_values(new)
+    if old_values is not None:
+        if new_values is None:
+            breaks.append(f"{label}enum removed")
+        else:
+            breaks += [f"{label}enum gained {value!r}" for value in new_values if value not in old_values]
+    prefix = f"{where}." if where else ""
+    for name in old.get("required", []):
+        if name not in new.get("required", []):
+            breaks.append(f"property {prefix}{name} no longer required")
+    new_properties = new.get("properties", {})
+    for name, schema in old.get("properties", {}).items():
+        breaks += output_schema_breaks(schema, new_properties.get(name), f"{prefix}{name}")
+    if isinstance(old.get("items"), dict):
+        breaks += output_schema_breaks(old["items"], new.get("items"), f"{where}[]")
+    return breaks
+
+
 def compare(baseline, candidate, allowed):
     problems = []
 
@@ -323,6 +476,12 @@ def compare(baseline, candidate, allowed):
                 check("tools", name, f"{form}: removed")
             elif new_mcp["tools"][name] != schema:
                 check("tools", name, f"{form}: input schema changed")
+        new_outputs = new_mcp.get("outputSchemas", {})
+        for name, schema in old_mcp.get("outputSchemas", {}).items():
+            if name not in new_mcp["tools"]:
+                continue  # reported above as a removed tool
+            for detail in output_schema_breaks(schema, new_outputs.get(name)):
+                check("tools", f"{name}:outputSchema", f"{form}: output schema {detail}")
     old, new = baseline["manifest"], candidate["manifest"]
     for key in sorted(set(old) - set(new)):
         check("manifest", key, "removed")

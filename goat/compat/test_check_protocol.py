@@ -18,6 +18,11 @@ MCP = {
     "protocolVersion": "2025-06-18",
     "capabilities": {"resources": {}, "tools": {}},
     "tools": {"click": {"type": "object", "properties": {"x": {"type": "number"}}}, "zoom": {"type": "object"}},
+    "outputSchemas": {"click": {"type": "object", "required": ["ok"], "properties": {
+        "ok": {"type": "boolean"},
+        "state": {"type": "string", "enum": ["on", "off"]},
+        "rows": {"type": "array", "items": {"type": "object", "properties": {"id": {"type": "integer"}}}},
+    }}},
 }
 BASE = {
     "manifest": {
@@ -36,8 +41,18 @@ def variant(manifest=None, daemon=None, **mcp_changes):
     return {
         "manifest": manifest or dict(BASE["manifest"]),
         "daemon": daemon or dict(DAEMON),
-        "forms": {"embedded-proxy": {**MCP, "tools": dict(MCP["tools"]), **mcp_changes}},
+        "forms": {"embedded-proxy": {**MCP, "tools": dict(MCP["tools"]), "outputSchemas": dict(MCP["outputSchemas"]), **mcp_changes}},
     }
+
+
+def click_output(**properties):
+    schema = json.loads(json.dumps(MCP["outputSchemas"]["click"]))
+    for name, value in properties.items():
+        if value is None:
+            del schema["properties"][name]
+        else:
+            schema["properties"][name] = value
+    return schema
 
 
 class CompareTest(unittest.TestCase):
@@ -65,6 +80,99 @@ class CompareTest(unittest.TestCase):
     def test_recorded_changes_are_allowed(self):
         allowed = {"tools": {"zoom": "removed upstream; GOAT stopped using it in goat-si/goat#0"}}
         self.assertEqual(compare(BASE, variant(tools={"click": MCP["tools"]["click"]}), allowed), [])
+
+    def test_output_schema_additions_are_compatible(self):
+        widened = click_output(extra={"type": "string"})
+        widened["properties"]["rows"]["items"]["properties"]["name"] = {"type": "string"}
+        narrower = click_output(state={"type": "string", "enum": ["on"]})
+        for outputs in ({"click": widened}, {"click": narrower}, {**MCP["outputSchemas"], "zoom": {"type": "object"}}):
+            self.assertEqual(compare(BASE, variant(outputSchemas=outputs), {}), [])
+
+    def test_output_schema_breaks_are_incompatible(self):
+        cases = [
+            ({}, "removed"),
+            ({"click": click_output(state=None)}, "property state removed"),
+            ({"click": click_output(ok={"type": ["boolean", "null"]})}, "property ok type ['boolean'] -> ['boolean', 'null']"),
+            ({"click": click_output(state={"type": "string", "enum": ["on", "off", "auto"]})}, "property state enum gained 'auto'"),
+            ({"click": {**click_output(), "required": []}}, "property ok no longer required"),
+            ({"click": click_output(rows={"type": "array", "items": {"type": "object", "properties": {}}})}, "property rows[].id removed"),
+        ]
+        for outputs, detail in cases:
+            self.assertEqual(
+                compare(BASE, variant(outputSchemas=outputs), {}),
+                [f"tools click:outputSchema: embedded-proxy: output schema {detail}"],
+                detail,
+            )
+        allowed = {"tools": {"click:outputSchema": "GOAT no longer reads state; goat-si/goat#0"}}
+        self.assertEqual(compare(BASE, variant(outputSchemas={"click": click_output(state=None)}), allowed), [])
+
+    def test_advertised_output_unions_are_compared_by_variant(self):
+        # The driver advertises {"type": "object", "anyOf": [success, refusal]}
+        # (cua-driver-contract outputs.rs advertised_output_schema).
+        def advertised(effect=("confirmed", "refused"), delivery=None, extra=None, required=("effect",)):
+            success = {"type": "object", "additionalProperties": False, "required": list(required), "properties": {
+                "effect": {"type": "string", "enum": list(effect)},
+                "delivery": delivery or {"type": ["object", "null"], "properties": {"mode": {"type": "string"}}},
+                **(extra or {}),
+            }}
+            refusal = {"type": "object", "required": ["error"], "properties": {"error": {"type": "object", "properties": {
+                "code": {"type": "string"}}}, "effect": {"const": "refused"}}}
+            return {"type": "object", "anyOf": [success, refusal]}
+
+        def breaks(new):
+            return compare(variant(outputSchemas={"click": advertised()}), variant(outputSchemas={"click": new}), {})
+
+        self.assertEqual(breaks(advertised()), [])
+        self.assertEqual(breaks(advertised(extra={"note": {"type": "string"}})), [])
+        self.assertEqual(breaks(advertised(effect=("confirmed",))), [])
+        # Nullable spelled as a union instead of a type list is the same output.
+        nullable_union = {"anyOf": [{"type": "object", "properties": {"mode": {"type": "string"}}}, {"type": "null"}]}
+        self.assertEqual(breaks(advertised(delivery=nullable_union)), [])
+        self.assertEqual(compare(variant(outputSchemas={"click": advertised(delivery=nullable_union)}),
+                                 variant(outputSchemas={"click": advertised()}), {}), [])
+
+        gained = breaks(advertised(effect=("confirmed", "refused", "maybe")))
+        self.assertEqual(gained, ["tools click:outputSchema: embedded-proxy: output schema variant 0: property effect enum gained 'maybe'"])
+        unrequired = breaks(advertised(required=()))
+        self.assertEqual(unrequired, ["tools click:outputSchema: embedded-proxy: output schema variant 0: property effect no longer required"])
+        mode_removed = breaks(advertised(delivery={"type": ["object", "null"], "properties": {}}))
+        self.assertTrue(mode_removed and all("property delivery.mode removed" in line for line in mode_removed), mode_removed)
+
+    def test_union_edge_cases(self):
+        def check(old, new):
+            return check_protocol.output_schema_breaks(old, new)
+
+        # Keywords beside a union apply to every branch.
+        outer = {"type": "object", "required": ["id"], "properties": {"id": {"type": "string"}},
+                 "anyOf": [{"required": ["x"]}]}
+        self.assertEqual(check(outer, outer), [])
+        self.assertEqual(check(outer, {**outer, "required": []}), ["variant 0: property id no longer required"])
+        # oneOf excludes shared values that anyOf admits.
+        one_of = {"oneOf": [{"enum": ["a"]}, {"enum": ["a", "b"]}]}
+        self.assertEqual(check(one_of, {"anyOf": one_of["oneOf"]}), ["union oneOf -> anyOf"])
+        # Type lists inside union branches expand like the branches themselves.
+        split = {"anyOf": [{"type": "string"}, {"type": "null"}]}
+        joined = {"anyOf": [{"type": ["string", "null"]}]}
+        self.assertEqual(check(split, joined), [])
+        self.assertEqual(check(joined, split), [])
+        # const and enum imply their type.
+        self.assertEqual(check({"type": "string", "enum": ["x"]}, {"const": "x"}), [])
+        self.assertEqual(check({"type": "string", "enum": ["x"]}, {"const": 1}),
+                         ["type ['string'] -> ['integer']", "enum gained 1"])
+        # A true branch admits anything the outer keywords allow; false admits nothing.
+        self.assertEqual(check({"type": "string"}, {"anyOf": [True]}), ["variant 0: type ['string'] -> None"])
+        self.assertEqual(check(split, {"anyOf": [*split["anyOf"], True]}), ["variant 2: type ['string'] -> None"])
+        self.assertEqual(check(split, {"anyOf": [*split["anyOf"], False]}), [])
+        self.assertEqual(check({"anyOf": [False]}, {"anyOf": [True]}),
+                         ["variant 0: admits values where none were admitted"])
+        self.assertEqual(check({"anyOf": [False]}, {"anyOf": [False]}), [])
+        # number includes integers.
+        numbers = {"anyOf": [{"type": ["number", "null"], "enum": [1, None]}]}
+        self.assertEqual(check(numbers, numbers), [])
+        self.assertEqual(check(numbers, {"anyOf": [{"type": ["number", "null"], "enum": [2, None]}]}),
+                         ["variant 1: enum gained 2"])
+        self.assertEqual(check({"type": "number"}, {"type": "integer"}), [])
+        self.assertEqual(check({"type": "integer"}, {"type": "number"}), ["type ['integer'] -> ['number']"])
 
 
 class ValidateTest(unittest.TestCase):
@@ -117,6 +225,8 @@ FAKE = textwrap.dedent('''\
         if "id" not in msg:
             continue
         result = {"protocolVersion": "2025-06-18", "capabilities": {}} if msg["method"] == "initialize" else {"tools": [{"name": "click", "inputSchema": {}}]}
+        if mode == "output-schema" and msg["method"] == "tools/list":
+            result["tools"][0]["outputSchema"] = {"type": "object"}
         if mode == "repeat-cursor" and msg["method"] == "tools/list":
             result["nextCursor"] = "same"
         print(json.dumps({"jsonrpc": "2.0", "id": msg["id"], "result": result}), flush=True)
@@ -155,6 +265,12 @@ class ChildProcessTest(unittest.TestCase):
     def test_a_driver_flooding_stderr_does_not_hang_the_check(self):
         with self.mode("stderr-flood"):
             self.assertEqual(self.surface()["tools"], {"click": {}})
+
+    def test_tools_list_output_schemas_are_kept(self):
+        with self.mode("output-schema"):
+            surface = self.surface()
+        self.assertEqual(surface["tools"], {"click": {}})
+        self.assertEqual(surface["outputSchemas"], {"click": {"type": "object"}})
 
     def test_a_repeated_cursor_fails_instead_of_looping(self):
         with self.mode("repeat-cursor"), self.assertRaises(SystemExit) as raised:
