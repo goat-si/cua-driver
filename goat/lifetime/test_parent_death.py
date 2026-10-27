@@ -68,12 +68,17 @@ def launcher():
     fd, binary, mode, root = int(sys.argv[2]), sys.argv[3], sys.argv[4], sys.argv[5]
     standalone = mode == "standalone"
     mode = "serve" if standalone else mode
-    args = [binary, mode, "--no-overlay"]
-    if not standalone:
+    if mode == "worker":
+        # The SDK's private worker: host-owned, started without --embedded,
+        # blocked on stdin until the host sends its initialization line.
+        args = [binary, "__private-worker", "--generation", "lifetime-test"]
+    else:
+        args = [binary, mode, "--no-overlay"]
+    if not standalone and mode != "worker":
         args += ["--embedded"]
     if mode == "mcp":
         args += ["--direct"]
-    else:
+    elif mode == "serve":
         args += ["--no-permissions-gate", "--socket", root + "/s",
                  "--pid-file", root + "/pid"]
         if sys.argv[6] == "stdio":
@@ -123,6 +128,10 @@ class ParentDeath(unittest.TestCase):
                 event = ExitEvent(driver_pid)
                 if cause == "startup":
                     pass
+                elif mode == "worker":
+                    # No readiness line before initialization. Killing the
+                    # launcher at any point after exec must end the worker.
+                    pass
                 elif mode == "mcp":
                     request = {"jsonrpc": "2.0", "id": 1, "method": "initialize",
                                "params": {"protocolVersion": "2024-11-05",
@@ -133,7 +142,7 @@ class ParentDeath(unittest.TestCase):
                                json.loads(s).get("id") == 1)
                 else:
                     read_until(parent.stdout, lambda s: "daemon listening on" in s)
-                if mode != "standalone" and cause != "startup":
+                if mode not in {"standalone", "worker"} and cause != "startup":
                     self.assertEqual(os.getpgid(driver_pid), driver_pid,
                                      "embedded driver must own its process group")
                     if sys.platform == "darwin":
@@ -213,6 +222,12 @@ class ParentDeath(unittest.TestCase):
 
     def test_standalone_serve_survives_its_launcher(self):
         self.run_driver("standalone", "parent")
+
+    def test_private_worker_exits_when_parent_is_sigkilled_with_stdin_open(self):
+        self.run_driver("worker", "parent")
+
+    def test_private_worker_parent_already_dead_at_exec(self):
+        self.run_driver("worker", "startup")
 
 
 if __name__ == "__main__":

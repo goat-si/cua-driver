@@ -28,10 +28,13 @@ signing certificates or secrets.
 
 ## Embedded process lifetime
 
-On macOS and Linux, `mcp --direct --embedded` and `serve --embedded` belong to
-their launching process. macOS watches its startup parent with kqueue; Linux
-uses a parent-death SIGTERM and rechecks the parent after arming it. Existing
-MCP stdin EOF and `serve --parent-liveness-stdio` shutdown remain supported.
+On macOS and Linux, `mcp --direct --embedded`, `serve --embedded` and the
+SDK's `__private-worker` belong to their launching process. macOS watches its
+startup parent with kqueue; Linux uses a parent-death SIGTERM and rechecks the
+parent after arming it. Linux delivers that signal when the launching thread
+exits, so a host keeps the thread that created the driver alive while it owns
+it. Existing MCP stdin EOF and `serve --parent-liveness-stdio` shutdown remain
+supported.
 Standalone daemons and the app's automatic daemon launch keep their lifetime.
 
 These embedded runtimes own a process group with a pipe sentinel, so even a

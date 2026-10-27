@@ -873,7 +873,7 @@ impl BrowserEngine {
         let prepared_profile = prepare_profile(profile_request)?;
         let mut command = isolated_browser_command(&executable, &prepared_profile.path);
         #[cfg(any(target_os = "macos", target_os = "linux"))]
-        let pending_lifetime = if crate::embedded_mode() {
+        let pending_lifetime = if crate::host_owned_runtime() {
             Some(
                 crate::goat_process_group::PreparedProcessGroup::prepare(&mut command).map_err(
                     |error| {

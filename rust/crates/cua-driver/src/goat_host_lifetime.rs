@@ -32,6 +32,16 @@ impl StartupParent {
         unix::install(self.pid)?;
         Ok(())
     }
+
+    /// The SDK's `__private-worker` is host-owned although it runs without
+    /// `--embedded`: give it the same private group and parent watch.
+    /// Windows hosts contain it with a kill-on-close Job Object instead.
+    pub fn install_private_worker(self) -> anyhow::Result<()> {
+        cua_driver_core::mark_host_owned_runtime();
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        unix::install(self.pid)?;
+        Ok(())
+    }
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
