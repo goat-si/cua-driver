@@ -183,6 +183,10 @@ jobs:
       - name: Build
         working-directory: rust
         run: cargo build --locked -p cua-driver -p cursor-theme-cli -p cua-driver-uia -p cua-driver-sdk --release --target ${{ matrix.target }}
+      - name: Windows capability manifest regressions
+        if: matrix.runnable
+        working-directory: rust
+        run: "cargo test --locked -p cua-driver-core --lib --release --target ${{ matrix.target }} session_manifest::"
       - name: Build Electron-compatible Node runtime
         shell: bash
         run: |
