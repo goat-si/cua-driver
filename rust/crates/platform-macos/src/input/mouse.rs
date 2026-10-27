@@ -234,25 +234,25 @@ fn click_at_xy_desktop_inner(
             std::thread::sleep(std::time::Duration::from_millis(12));
         }
 
-        for pair_index in 0..count.max(1) {
-            let down = CGEvent::new_mouse_event(source.clone(), down_ty, point, btn)
-                .map_err(|_| anyhow::anyhow!("CGEvent::new_mouse_event(down) failed"))?;
-            down.set_flags(flags);
-            super::tag_synthetic_event(&down);
-            down.set_integer_value_field(
+        // Build every down/up pair before the first is posted, so no failure
+        // can follow a delivered mouse-down.
+        let event = |ty, click_state: usize| -> anyhow::Result<CGEvent> {
+            let event = CGEvent::new_mouse_event(source.clone(), ty, point, btn)
+                .map_err(|_| anyhow::anyhow!("CGEvent::new_mouse_event failed"))?;
+            event.set_flags(flags);
+            super::tag_synthetic_event(&event);
+            event.set_integer_value_field(
                 core_graphics::event::EventField::MOUSE_EVENT_CLICK_STATE,
-                (pair_index + 1) as i64,
+                click_state as i64,
             );
+            Ok(event)
+        };
+        let pairs = (1..=count.max(1))
+            .map(|state| Ok((event(down_ty, state)?, event(up_ty, state)?)))
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        for (down, up) in pairs {
             down.post(CGEventTapLocation::HID);
             std::thread::sleep(std::time::Duration::from_millis(28));
-            let up = CGEvent::new_mouse_event(source.clone(), up_ty, point, btn)
-                .map_err(|_| anyhow::anyhow!("CGEvent::new_mouse_event(up) failed"))?;
-            up.set_flags(flags);
-            super::tag_synthetic_event(&up);
-            up.set_integer_value_field(
-                core_graphics::event::EventField::MOUSE_EVENT_CLICK_STATE,
-                (pair_index + 1) as i64,
-            );
             up.post(CGEventTapLocation::HID);
             if count > 1 {
                 std::thread::sleep(std::time::Duration::from_millis(80));
@@ -441,6 +441,22 @@ fn click_at_xy_inner(
         // mouseMoved so an AppKit NSButton / NSView hit-tests the down at the
         // right point. Without it the synthetic mouseDown on a backgrounded
         // AppKit control is silently ignored.
+        // Build every down/up pair before anything is posted, so no failure
+        // can follow a delivered mouse-down.
+        let event = |ty| -> anyhow::Result<CGEvent> {
+            let event = CGEvent::new_mouse_event(source.clone(), ty, point, CGMouseButton::Left)
+                .map_err(|_| anyhow::anyhow!("CGEvent::new_mouse_event failed"))?;
+            set_explicit_flags(&event, flags);
+            Ok(event)
+        };
+        let pairs = (0..count)
+            .map(|_| {
+                Ok((
+                    event(CGEventType::LeftMouseDown)?,
+                    event(CGEventType::LeftMouseUp)?,
+                ))
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
         post_mouse_moved_primer(
             pid,
             &source,
@@ -452,17 +468,8 @@ fn click_at_xy_inner(
         );
         std::thread::sleep(std::time::Duration::from_millis(12));
 
-        for pair_index in 0..count {
+        for (pair_index, (down, up)) in pairs.into_iter().enumerate() {
             let click_state = (pair_index + 1) as i64;
-
-            let down = CGEvent::new_mouse_event(
-                source.clone(),
-                CGEventType::LeftMouseDown,
-                point,
-                CGMouseButton::Left,
-            )
-            .map_err(|_| anyhow::anyhow!("CGEvent::new_mouse_event(down) failed"))?;
-            set_explicit_flags(&down, flags);
 
             post_mouse_event_with_mode(
                 pid,
@@ -479,15 +486,6 @@ fn click_at_xy_inner(
             // tracking loop that polls for the matching mouseUp; too tight a
             // gap can race the loop's first poll and the click is dropped.
             std::thread::sleep(std::time::Duration::from_millis(28));
-
-            let up = CGEvent::new_mouse_event(
-                source.clone(),
-                CGEventType::LeftMouseUp,
-                point,
-                CGMouseButton::Left,
-            )
-            .map_err(|_| anyhow::anyhow!("CGEvent::new_mouse_event(up) failed"))?;
-            set_explicit_flags(&up, flags);
 
             post_mouse_event_with_mode(
                 pid,
@@ -1461,6 +1459,16 @@ fn right_click_at_xy_inner(
             .subsec_nanos() as i64
     });
 
+    // Build both events before anything is posted: a failure after the
+    // mouse-down was sent would leave the button held and report a click
+    // that reached the app as an ordinary failure.
+    let down = CGEvent::new_mouse_event(source.clone(), down_type, point, button)
+        .map_err(|_| anyhow::anyhow!("mouse down failed"))?;
+    set_explicit_flags(&down, flags);
+    let up = CGEvent::new_mouse_event(source.clone(), up_type, point, button)
+        .map_err(|_| anyhow::anyhow!("mouse up failed"))?;
+    set_explicit_flags(&up, flags);
+
     post_mouse_moved_primer(
         pid,
         &source,
@@ -1472,9 +1480,6 @@ fn right_click_at_xy_inner(
     );
     std::thread::sleep(std::time::Duration::from_millis(12));
 
-    let down = CGEvent::new_mouse_event(source.clone(), down_type, point, button)
-        .map_err(|_| anyhow::anyhow!("mouse down failed"))?;
-    set_explicit_flags(&down, flags);
     post_mouse_event_with_mode(
         pid,
         &down,
@@ -1488,9 +1493,6 @@ fn right_click_at_xy_inner(
     );
     std::thread::sleep(std::time::Duration::from_millis(28));
 
-    let up = CGEvent::new_mouse_event(source, up_type, point, button)
-        .map_err(|_| anyhow::anyhow!("mouse up failed"))?;
-    set_explicit_flags(&up, flags);
     post_mouse_event_with_mode(
         pid,
         &up,
