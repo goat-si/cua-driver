@@ -18,6 +18,11 @@ MCP = {
     "protocolVersion": "2025-06-18",
     "capabilities": {"resources": {}, "tools": {}},
     "tools": {"click": {"type": "object", "properties": {"x": {"type": "number"}}}, "zoom": {"type": "object"}},
+    "outputSchemas": {"click": {"type": "object", "required": ["ok"], "properties": {
+        "ok": {"type": "boolean"},
+        "state": {"type": "string", "enum": ["on", "off"]},
+        "rows": {"type": "array", "items": {"type": "object", "properties": {"id": {"type": "integer"}}}},
+    }}},
 }
 BASE = {
     "manifest": {
@@ -36,8 +41,18 @@ def variant(manifest=None, daemon=None, **mcp_changes):
     return {
         "manifest": manifest or dict(BASE["manifest"]),
         "daemon": daemon or dict(DAEMON),
-        "forms": {"embedded-proxy": {**MCP, "tools": dict(MCP["tools"]), **mcp_changes}},
+        "forms": {"embedded-proxy": {**MCP, "tools": dict(MCP["tools"]), "outputSchemas": dict(MCP["outputSchemas"]), **mcp_changes}},
     }
+
+
+def click_output(**properties):
+    schema = json.loads(json.dumps(MCP["outputSchemas"]["click"]))
+    for name, value in properties.items():
+        if value is None:
+            del schema["properties"][name]
+        else:
+            schema["properties"][name] = value
+    return schema
 
 
 class CompareTest(unittest.TestCase):
@@ -65,6 +80,31 @@ class CompareTest(unittest.TestCase):
     def test_recorded_changes_are_allowed(self):
         allowed = {"tools": {"zoom": "removed upstream; GOAT stopped using it in goat-si/goat#0"}}
         self.assertEqual(compare(BASE, variant(tools={"click": MCP["tools"]["click"]}), allowed), [])
+
+    def test_output_schema_additions_are_compatible(self):
+        widened = click_output(extra={"type": "string"})
+        widened["properties"]["rows"]["items"]["properties"]["name"] = {"type": "string"}
+        narrower = click_output(state={"type": "string", "enum": ["on"]})
+        for outputs in ({"click": widened}, {"click": narrower}, {**MCP["outputSchemas"], "zoom": {"type": "object"}}):
+            self.assertEqual(compare(BASE, variant(outputSchemas=outputs), {}), [])
+
+    def test_output_schema_breaks_are_incompatible(self):
+        cases = [
+            ({}, "removed"),
+            ({"click": click_output(state=None)}, "property state removed"),
+            ({"click": click_output(ok={"type": ["boolean", "null"]})}, "property ok type ['boolean'] -> ['boolean', 'null']"),
+            ({"click": click_output(state={"type": "string", "enum": ["on", "off", "auto"]})}, "property state enum gained 'auto'"),
+            ({"click": {**click_output(), "required": []}}, "property ok no longer required"),
+            ({"click": click_output(rows={"type": "array", "items": {"type": "object", "properties": {}}})}, "property rows[].id removed"),
+        ]
+        for outputs, detail in cases:
+            self.assertEqual(
+                compare(BASE, variant(outputSchemas=outputs), {}),
+                [f"tools click:outputSchema: embedded-proxy: output schema {detail}"],
+                detail,
+            )
+        allowed = {"tools": {"click:outputSchema": "GOAT no longer reads state; goat-si/goat#0"}}
+        self.assertEqual(compare(BASE, variant(outputSchemas={"click": click_output(state=None)}), allowed), [])
 
 
 class ValidateTest(unittest.TestCase):
@@ -117,6 +157,8 @@ FAKE = textwrap.dedent('''\
         if "id" not in msg:
             continue
         result = {"protocolVersion": "2025-06-18", "capabilities": {}} if msg["method"] == "initialize" else {"tools": [{"name": "click", "inputSchema": {}}]}
+        if mode == "output-schema" and msg["method"] == "tools/list":
+            result["tools"][0]["outputSchema"] = {"type": "object"}
         if mode == "repeat-cursor" and msg["method"] == "tools/list":
             result["nextCursor"] = "same"
         print(json.dumps({"jsonrpc": "2.0", "id": msg["id"], "result": result}), flush=True)
@@ -155,6 +197,12 @@ class ChildProcessTest(unittest.TestCase):
     def test_a_driver_flooding_stderr_does_not_hang_the_check(self):
         with self.mode("stderr-flood"):
             self.assertEqual(self.surface()["tools"], {"click": {}})
+
+    def test_tools_list_output_schemas_are_kept(self):
+        with self.mode("output-schema"):
+            surface = self.surface()
+        self.assertEqual(surface["tools"], {"click": {}})
+        self.assertEqual(surface["outputSchemas"], {"click": {"type": "object"}})
 
     def test_a_repeated_cursor_fails_instead_of_looping(self):
         with self.mode("repeat-cursor"), self.assertRaises(SystemExit) as raised:

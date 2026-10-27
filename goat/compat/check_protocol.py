@@ -3,9 +3,10 @@
 
 GOAT starts the driver in the launch forms below and reads its CLI manifest, MCP surface and
 daemon metadata. A fork change that removes or retypes a tool, subcommand or argument, changes a
-tool's input schema or a capability, changes the daemon contract, or stops a launch form from
-starting breaks GOAT without a GOAT change. Those fail unless goat/compat/allowed-changes.json
-records the change with a reason. Additions pass and are listed. Standard library only.
+tool's input schema or a capability, drops or widens what a tool's output schema promises, changes
+the daemon contract, or stops a launch form from starting breaks GOAT without a GOAT change. Those
+fail unless goat/compat/allowed-changes.json records the change with a reason. Additions pass and
+are listed. Standard library only.
 """
 
 import argparse
@@ -170,13 +171,15 @@ def mcp_surface(argv):
         child.send({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "goat-compat", "version": "1"}}})
         init = child.reply(1)
         child.send({"jsonrpc": "2.0", "method": "notifications/initialized"})
-        tools, cursor, seen = {}, None, set()
+        tools, outputs, cursor, seen = {}, {}, None, set()
         for page_number in range(MAX_PAGES):
             request_id = 2 + page_number
             child.send({"jsonrpc": "2.0", "id": request_id, "method": "tools/list", "params": {"cursor": cursor} if cursor else {}})
             page = child.reply(request_id)
             for tool in page["tools"]:
                 tools[tool["name"]] = tool.get("inputSchema")
+                if tool.get("outputSchema") is not None:
+                    outputs[tool["name"]] = tool["outputSchema"]
             cursor = page.get("nextCursor")
             if not cursor:
                 break
@@ -187,7 +190,8 @@ def mcp_surface(argv):
             fail(child.describe_failure(f"tools/list did not finish within {MAX_PAGES} pages"))
     finally:
         child.close()
-    return {"protocolVersion": init.get("protocolVersion"), "capabilities": init.get("capabilities", {}), "tools": tools}
+    return {"protocolVersion": init.get("protocolVersion"), "capabilities": init.get("capabilities", {}),
+            "tools": tools, "outputSchemas": outputs}
 
 
 @contextlib.contextmanager
@@ -299,6 +303,41 @@ def load_allowed(path):
     return allowed
 
 
+def schema_types(schema):
+    declared = schema.get("type")
+    if declared is None:
+        return None
+    return sorted(declared) if isinstance(declared, list) else [declared]
+
+
+def output_schema_breaks(old, new, where=""):
+    """What GOAT, reading a tool's result, could rely on in old and no longer in new: a property
+    removed or no longer required, or a type or enum that now admits more values. New properties
+    and narrower values are compatible."""
+    label = f"property {where} " if where else ""
+    if not isinstance(new, dict):
+        return [f"{label}removed"]
+    breaks = []
+    old_types, new_types = schema_types(old), schema_types(new)
+    if old_types is not None and (new_types is None or set(new_types) - set(old_types)):
+        breaks.append(f"{label}type {old_types} -> {new_types}")
+    if "enum" in old:
+        if "enum" not in new:
+            breaks.append(f"{label}enum removed")
+        else:
+            breaks += [f"{label}enum gained {value!r}" for value in new["enum"] if value not in old["enum"]]
+    prefix = f"{where}." if where else ""
+    for name in old.get("required", []):
+        if name not in new.get("required", []):
+            breaks.append(f"property {prefix}{name} no longer required")
+    new_properties = new.get("properties", {})
+    for name, schema in old.get("properties", {}).items():
+        breaks += output_schema_breaks(schema, new_properties.get(name), f"{prefix}{name}")
+    if isinstance(old.get("items"), dict):
+        breaks += output_schema_breaks(old["items"], new.get("items"), f"{where}[]")
+    return breaks
+
+
 def compare(baseline, candidate, allowed):
     problems = []
 
@@ -323,6 +362,12 @@ def compare(baseline, candidate, allowed):
                 check("tools", name, f"{form}: removed")
             elif new_mcp["tools"][name] != schema:
                 check("tools", name, f"{form}: input schema changed")
+        new_outputs = new_mcp.get("outputSchemas", {})
+        for name, schema in old_mcp.get("outputSchemas", {}).items():
+            if name not in new_mcp["tools"]:
+                continue  # reported above as a removed tool
+            for detail in output_schema_breaks(schema, new_outputs.get(name)):
+                check("tools", f"{name}:outputSchema", f"{form}: output schema {detail}")
     old, new = baseline["manifest"], candidate["manifest"]
     for key in sorted(set(old) - set(new)):
         check("manifest", key, "removed")
