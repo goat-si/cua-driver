@@ -7,6 +7,7 @@ use cua_driver_contract::{
     CAPABILITY_VERSION, CONTRACT_VERSION, MCP_PROTOCOL_VERSION, TOOLS_LIST_SCHEMA_VERSION,
 };
 use cua_driver_core::daemon::{request_daemon_metadata, DaemonMetadata};
+use cua_driver_core::delivery::FOREGROUND_IDLE_THRESHOLD_ENV;
 use cua_driver_core::key_pacing::KEY_GAP_ENV;
 use cua_driver_core::step_pacing::BATCH_PACING_ENV;
 use cua_driver_core::window_observation::{WINDOW_CHANGE_POLL_ENV, WINDOW_CHANGE_TIMEOUT_ENV};
@@ -844,6 +845,7 @@ pub(crate) fn allowed_environment_name(name: &str) -> bool {
         || upper == WINDOW_CHANGE_POLL_ENV
         || upper == KEY_GAP_ENV
         || upper == BATCH_PACING_ENV
+        || upper == FOREGROUND_IDLE_THRESHOLD_ENV
         || matches!(
             upper.as_str(),
             "PATH"
@@ -881,6 +883,7 @@ pub(crate) fn allowed_environment_name(name: &str) -> bool {
                 | "CUA_DRIVER_DISABLE_SCREENCAPTURE"
                 | "CUA_TELEMETRY_ENABLED"
                 | "CUA_DRIVER_RS_UPDATE_CHECK"
+                | "CUA_DRIVER_GOAT_LATENCY_TRACE"
         )
 }
 
@@ -1256,6 +1259,33 @@ mod tests {
             "CUA_DRIVER_WINDOW_CHANGE_TIMEOUT_MS"
         ));
         assert!(allowed_environment_name("CUA_DRIVER_WINDOW_CHANGE_POLL_MS"));
+    }
+
+    #[test]
+    fn daemon_tuning_variables_reach_the_embedded_daemon() {
+        // Both are read by the daemon the SDK spawns: the foreground idle
+        // gate threshold and the macOS action latency trace.
+        for name in [
+            "CUA_DRIVER_FOREGROUND_IDLE_MS",
+            "CUA_DRIVER_GOAT_LATENCY_TRACE",
+        ] {
+            let mut host_options = options(EmbeddedPermissionMode::Standard);
+            host_options.environment = vec![EmbeddedEnvironmentVariable {
+                name: name.into(),
+                value: "1".into(),
+            }];
+            let validated = validate_options(host_options).expect(name);
+            let inherited = [(name.to_owned(), "2".to_owned())];
+            for (overrides, expected) in [(&validated.environment[..], "1"), (&[][..], "2")] {
+                let values = merge_safe_environment(inherited.clone(), overrides);
+                assert!(
+                    values
+                        .iter()
+                        .any(|variable| variable.name == name && variable.value == expected),
+                    "{name}={expected}"
+                );
+            }
+        }
     }
 
     #[test]
