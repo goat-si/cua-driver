@@ -146,7 +146,18 @@ impl PreparedProcessGroup {
     }
 
     pub fn finish(self) -> io::Result<ProcessGroupLifetime> {
-        self.result
+        // Close the owner's gate ends first. After a real spawn the owner
+        // thread has already read the pid (spawn waits for exec, which waits
+        // for release). If the command never ran, this is what lets the
+        // owner thread's read see EOF instead of blocking forever.
+        let Self {
+            _pid_writer,
+            _release_reader,
+            result,
+        } = self;
+        drop(_pid_writer);
+        drop(_release_reader);
+        result
             .recv()
             .map_err(|_| io::Error::other("owned group supervisor exited"))?
     }
@@ -464,6 +475,24 @@ mod tests {
     #[tokio::test]
     async fn owned_helper_exits_when_its_guard_is_dropped() {
         check_group(false, false).await;
+    }
+
+    #[test]
+    fn finishing_a_launch_whose_command_never_ran_fails_instead_of_hanging() {
+        // A platform adapter can return without spawning the prepared command
+        // (the test platform runs a stand-in). The owner thread must then see
+        // gate EOF, and finish must report it.
+        let mut command = Command::new("true");
+        let pending = PreparedProcessGroup::prepare(&mut command).unwrap();
+        drop(command);
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(pending.finish().map(drop));
+        });
+        let outcome = rx
+            .recv_timeout(Duration::from_secs(15))
+            .expect("finish blocked: the gate writer was still open in the owner");
+        assert!(outcome.is_err());
     }
 
     #[tokio::test]
