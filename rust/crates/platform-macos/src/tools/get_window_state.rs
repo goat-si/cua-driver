@@ -372,10 +372,9 @@ impl Tool for GetWindowStateTool {
                 Ok(Ok((tree, payload))) => (Some(tree), Some(payload)),
                 Ok(Err(e)) => return ToolResult::error(format!("AX tree walk failed: {e}")),
                 Err(_elapsed) => {
-                    HUNG_TARGET_BREAKER.record_outcome(
-                        (pid, u64::from(window_id)),
-                        &cua_driver_core::walk_budget::WalkOutcome::timed_out(timeout_ms, backstop),
-                    );
+                    // The walk never returned: an AX call ignored its
+                    // messaging timeout. Only this trips the breaker.
+                    HUNG_TARGET_BREAKER.record_unanswered((pid, u64::from(window_id)));
                     return ToolResult::error(format!(
                         "AX tree walk for pid={pid} did not return within {} s: an \
                          accessibility call stopped answering past the {timeout_ms} ms \
