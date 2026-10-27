@@ -2103,35 +2103,48 @@ mod tests {
         use cua_driver_core::recovery_hint::{annotate, Seed};
 
         let args = serde_json::json!({ "pid": 42, "window_id": 7, "element_token": "s1:3" });
-        for fronted in [false, true] {
-            let (summary, _, suspected_noop, verified, via_pixel) = unresolved_perform_error(
-                "AXOpen",
-                crate::ax::bindings::kAXErrorCannotComplete,
-                (3, "AXRow", "Desktop"),
-            )
-            .expect("an unresolved error after dispatch is not a failure");
-            let structured = ax_click_structured(via_pixel, fronted, verified, suspected_noop);
-            let record = ActionExecutionRecord::from_legacy("click", &args, &structured)
-                .expect("the legacy click payload normalizes");
-            assert_eq!(record.effect, ActionEffect::Unverifiable);
-            let public = serde_json::to_value(record.public_result().expect("projects"))
-                .expect("serializes");
-            assert_eq!(public["effect"], "unverifiable");
-            assert_eq!(public["route"], "accessibility");
-            assert!(public.get("error").is_none());
+        let codes = [
+            crate::ax::bindings::kAXErrorCannotComplete,
+            crate::ax::bindings::kAXErrorNotImplemented,
+            -25299, // a code this driver does not know
+        ];
+        for code in codes {
+            for fronted in [false, true] {
+                let case = format!("code={code} fronted={fronted}");
+                let (summary, _, suspected_noop, verified, via_pixel) =
+                    unresolved_perform_error("AXOpen", code, (3, "AXRow", "Desktop"))
+                        .unwrap_or_else(|error| panic!("{case}: {error}"));
+                let legacy = ax_click_structured(via_pixel, fronted, verified, suspected_noop);
+                let record = ActionExecutionRecord::from_legacy("click", &args, &legacy)
+                    .unwrap_or_else(|| panic!("{case}: the legacy click payload normalizes"));
+                assert_eq!(record.effect, ActionEffect::Unverifiable, "{case}");
 
-            let mut result = ToolResult::text(summary.clone()).with_structured(structured);
-            annotate("click", &Seed::from_args(&args), &mut result);
-            assert_ne!(result.is_error, Some(true), "fronted={fronted}");
-            let hint = result.structured_content.as_ref().expect("structured")["hint"]
-                .as_str()
-                .expect("an unconfirmed click carries a hint")
-                .to_owned();
-            assert!(
-                hint.contains("before clicking again"),
-                "the caller must read before resending: {hint}"
-            );
-            assert!(summary.contains("-25204"));
+                // What the dispatch seam publishes: the projection plus the
+                // producer's text as its summary, then the recovery hint.
+                let mut public = record.public_result().expect("projects");
+                public.summary = Some(summary.clone());
+                let public = serde_json::to_value(public).expect("serializes");
+                let mut result = ToolResult::text(summary.clone()).with_structured(public);
+                annotate("click", &Seed::from_args(&args), &mut result);
+
+                assert_ne!(result.is_error, Some(true), "{case}");
+                let wire = result.structured_content.as_ref().expect("structured");
+                assert_eq!(wire["effect"], "unverifiable", "{case}");
+                assert_eq!(wire["route"], "accessibility", "{case}");
+                assert!(wire.get("error").is_none(), "{case}");
+                let wire_summary = wire["summary"].as_str().expect("summary");
+                assert!(
+                    wire_summary.contains(&code.to_string()),
+                    "{case}: {wire_summary}"
+                );
+                let hint = wire["hint"]
+                    .as_str()
+                    .expect("an unconfirmed click carries a hint");
+                assert!(
+                    hint.contains("before clicking again"),
+                    "{case}: the caller must read before resending: {hint}"
+                );
+            }
         }
     }
 

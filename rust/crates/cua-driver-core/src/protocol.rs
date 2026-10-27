@@ -405,7 +405,7 @@ fn agent_instructions() -> String {
 4. Act through `run_steps({{steps:[{{tool,args}}],observe:{{}}}})`, even for one step: stops at the first failure, returns what changed.{script_line}
 5. Verify at checkpoints, not after every action: `verify_state(pid, window_id, expect)`. `unknown` and `effect:"unverifiable"` are not success.
 
-Use the narrowest semantic route first: `set_window_frame` plus `list_windows` for geometry, typed browser tools for pages. Background: `element_token`, keyboard, pixels; `delivery_mode:"foreground"` (takes the user's pointer) last.
+Use the narrowest semantic route first: `set_window_frame` plus `list_windows` for geometry, typed browser tools for pages. Background: `element_token`, keyboard, pixels; `delivery_mode:"foreground"` (may move the pointer) last.
 
 Chrome/Edge/Brave page: `get_browser_state({{pid, window_id}})`, its `detail.next_call` (`browser_prepare`) if refused, then `browser_click`/`browser_type`/`browser_pointer` (hover, drag); never desktop pointer tools.
 
@@ -508,12 +508,12 @@ mod agent_instruction_tests {
         assert!(instructions.contains("read the result back there"));
         assert!(instructions.contains("narrowest semantic route first"));
         // cua-driver#22: token, keyboard and pixels come before the
-        // foreground, which takes the user's pointer.
+        // foreground, which may move the user's pointer.
         let ladder = &instructions[instructions
             .find("Background: `element_token`")
             .expect("background ladder")..];
         let foreground = ladder
-            .find("`delivery_mode:\"foreground\"` (takes the user's pointer) last")
+            .find("`delivery_mode:\"foreground\"` (may move the pointer) last")
             .expect("foreground rung last");
         assert!(ladder.find("keyboard") < Some(foreground));
         assert!(ladder.find("pixels") < Some(foreground));
