@@ -1017,6 +1017,19 @@ struct DeferredUiaRow {
     chunk: DeferredChunk<UiaNode>,
 }
 
+/// Offscreen deferred rows are walked only when a query searches them;
+/// otherwise they stay a summary row, the element list misses them, and the
+/// walk is not complete.
+fn note_unwalked_offscreen_rows(
+    walk_state: &mut WalkState<'_>,
+    visible: impl IntoIterator<Item = bool>,
+    search_offscreen: bool,
+) {
+    if !search_offscreen && visible.into_iter().any(|visible| !visible) {
+        walk_state.mark_incomplete();
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 unsafe fn walk_cached_bounded_with_priority(
     element: &IUIAutomationElement,
@@ -1043,6 +1056,11 @@ unsafe fn walk_cached_bounded_with_priority(
         &mut deferred,
     );
     if !deferred.is_empty() {
+        note_unwalked_offscreen_rows(
+            walk_state,
+            deferred.iter().map(|row| row.chunk.visible),
+            search_offscreen,
+        );
         for visible in [true, false] {
             if !visible && !search_offscreen {
                 continue;
@@ -1983,5 +2001,26 @@ mod tests {
         assert!(!state.complete);
         assert_eq!(state.budget.outcome().reason(), Some("timeout"));
         assert_eq!(state.budget.outcome().nodes_visited, 0);
+    }
+
+    /// Without a query the generic walk leaves offscreen deferred rows as a
+    /// summary row; the element list then misses them and is not complete.
+    #[test]
+    fn unwalked_offscreen_rows_make_the_walk_incomplete() {
+        for (visible, search_offscreen, complete) in [
+            (vec![true, false], false, false),
+            (vec![false], false, false),
+            (vec![true, true], false, true),
+            (vec![true, false], true, true),
+            (vec![], false, true),
+        ] {
+            let mut budget = WalkBudget::nodes_only(10);
+            let mut state = WalkState::new(&mut budget, DEFAULT_MAX_DEPTH);
+            note_unwalked_offscreen_rows(&mut state, visible.clone(), search_offscreen);
+            assert_eq!(
+                state.complete, complete,
+                "{visible:?} search={search_offscreen}"
+            );
+        }
     }
 }
