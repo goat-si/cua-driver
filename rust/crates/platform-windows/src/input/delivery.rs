@@ -412,10 +412,10 @@ pub fn physical_input_idle_ms() -> Option<u64> {
         }
         let now_ticks = GetTickCount();
         // `GetLastInputInfo` counts the driver's own `SendInput` too.
-        let own_input = *OWN_INPUT_TICKS
+        OWN_INPUT
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        cua_driver_core::delivery::idle_ms_excluding_own_input(now_ticks, info.dwTime, own_input)
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .idle_ms(now_ticks, info.dwTime)
     }
     #[cfg(not(target_os = "windows"))]
     {
@@ -423,10 +423,11 @@ pub fn physical_input_idle_ms() -> Option<u64> {
     }
 }
 
-/// Tick span (start, end) of the driver's latest `SendInput` that inserted
-/// events.
+/// The driver's own `SendInput` spans and the person's latest input seen
+/// outside them.
 #[cfg(target_os = "windows")]
-static OWN_INPUT_TICKS: std::sync::Mutex<Option<(u32, u32)>> = std::sync::Mutex::new(None);
+static OWN_INPUT: std::sync::Mutex<cua_driver_core::delivery::OwnInputTracker> =
+    std::sync::Mutex::new(cua_driver_core::delivery::OwnInputTracker::new());
 
 /// `SendInput` for every driver injection. It records when the driver
 /// injected, so the foreground idle gate does not read the driver's own last
@@ -440,14 +441,25 @@ pub(crate) unsafe fn send_input(
     events: &[windows::Win32::UI::Input::KeyboardAndMouse::INPUT],
 ) -> u32 {
     use windows::Win32::System::SystemInformation::GetTickCount;
-    use windows::Win32::UI::Input::KeyboardAndMouse::{SendInput, INPUT};
+    use windows::Win32::UI::Input::KeyboardAndMouse::{
+        GetLastInputInfo, SendInput, INPUT, LASTINPUTINFO,
+    };
+    let mut tracker = OWN_INPUT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    // Keep the person's latest input before this injection overwrites the
+    // OS's last-input tick.
+    let mut info = LASTINPUTINFO {
+        cbSize: std::mem::size_of::<LASTINPUTINFO>() as u32,
+        dwTime: 0,
+    };
     let start = GetTickCount();
+    if GetLastInputInfo(&mut info).as_bool() {
+        tracker.observe(start, info.dwTime);
+    }
     let sent = SendInput(events, std::mem::size_of::<INPUT>() as i32);
     if sent > 0 {
-        let end = GetTickCount();
-        *OWN_INPUT_TICKS
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((start, end));
+        tracker.record_injection(start, GetTickCount());
     }
     sent
 }

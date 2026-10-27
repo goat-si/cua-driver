@@ -193,25 +193,69 @@ pub const OWN_INPUT_TICK_SLACK_MS: u64 = 50;
 /// Idle time since physical input, from the OS's last-input tick, with the
 /// driver's own injected input set aside. Windows `GetLastInputInfo` also
 /// counts `SendInput`, so the driver's last foreground action would otherwise
-/// look like the person typing and refuse the next one. `own_input` is the
-/// tick span of the driver's latest `SendInput`. When the last input falls
-/// inside it, there is no evidence of physical input and this returns `None`.
-pub fn idle_ms_excluding_own_input(
-    now_ticks: u32,
-    last_input_ticks: u32,
-    own_input: Option<(u32, u32)>,
-) -> Option<u64> {
-    let idle = elapsed_idle_ms_from_ticks(now_ticks, last_input_ticks);
-    if let Some((start, end)) = own_input {
-        let since_start = elapsed_idle_ms_from_ticks(now_ticks, start);
-        let since_end = elapsed_idle_ms_from_ticks(now_ticks, end);
-        if idle <= since_start + OWN_INPUT_TICK_SLACK_MS
-            && idle + OWN_INPUT_TICK_SLACK_MS >= since_end
-        {
-            return None;
+/// look like the person typing and refuse the next one.
+///
+/// The OS keeps only the latest input tick, so a later injection overwrites
+/// the evidence of a person's input between two injections. The tracker
+/// therefore samples the OS tick before every injection and on every idle
+/// read, and keeps the latest tick that fell outside the driver's own spans.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct OwnInputTracker {
+    /// Tick span (start, end) of the driver's latest injection.
+    own: Option<(u32, u32)>,
+    /// Latest OS last-input tick seen outside the driver's own spans.
+    last_physical: Option<u32>,
+}
+
+impl OwnInputTracker {
+    pub const fn new() -> Self {
+        Self {
+            own: None,
+            last_physical: None,
         }
     }
-    Some(idle)
+
+    fn is_own(&self, now_ticks: u32, last_input_ticks: u32) -> bool {
+        let Some((start, end)) = self.own else {
+            return false;
+        };
+        let idle = elapsed_idle_ms_from_ticks(now_ticks, last_input_ticks);
+        let since_start = elapsed_idle_ms_from_ticks(now_ticks, start);
+        let since_end = elapsed_idle_ms_from_ticks(now_ticks, end);
+        idle <= since_start + OWN_INPUT_TICK_SLACK_MS && idle + OWN_INPUT_TICK_SLACK_MS >= since_end
+    }
+
+    /// Note the OS's last-input tick. Call it right before each injection, so
+    /// a person's input since the previous injection is kept before the
+    /// injection overwrites it.
+    pub fn observe(&mut self, now_ticks: u32, last_input_ticks: u32) {
+        if !self.is_own(now_ticks, last_input_ticks) {
+            self.last_physical = Some(last_input_ticks);
+        }
+    }
+
+    /// Record the tick span of an injection that inserted events.
+    pub fn record_injection(&mut self, start_ticks: u32, end_ticks: u32) {
+        self.own = Some((start_ticks, end_ticks));
+    }
+
+    /// Milliseconds since the person's latest input. When the OS's latest
+    /// input is the driver's own, this falls back to the person's input seen
+    /// before that injection, and returns `None` when there is none.
+    pub fn idle_ms(&mut self, now_ticks: u32, last_input_ticks: u32) -> Option<u64> {
+        if !self.is_own(now_ticks, last_input_ticks) {
+            self.last_physical = Some(last_input_ticks);
+            return Some(elapsed_idle_ms_from_ticks(now_ticks, last_input_ticks));
+        }
+        let physical = elapsed_idle_ms_from_ticks(now_ticks, self.last_physical?);
+        // The person's input was seen before the driver's span began. A
+        // shorter elapsed time means the tick counter wrapped since then.
+        let (start, _) = self.own?;
+        if physical + OWN_INPUT_TICK_SLACK_MS < elapsed_idle_ms_from_ticks(now_ticks, start) {
+            return None;
+        }
+        Some(physical)
+    }
 }
 
 /// Pure decision for whether a foreground action may proceed given an observed
@@ -427,24 +471,50 @@ mod tests {
 
     #[test]
     fn the_drivers_own_injected_input_is_not_physical_input() {
-        // Driver injected from tick 10_000 to 10_016; now is 10_200.
-        let own = Some((10_000, 10_016));
-        // Last input inside that span (or just after, as the OS stamps it).
-        assert_eq!(idle_ms_excluding_own_input(10_200, 10_016, own), None);
-        assert_eq!(idle_ms_excluding_own_input(10_200, 10_060, own), None);
-        // Input after the driver's injection is the person's.
-        assert_eq!(idle_ms_excluding_own_input(10_200, 10_150, own), Some(50));
-        // Input well before it predates the driver's and still counts.
-        assert_eq!(idle_ms_excluding_own_input(10_200, 9_000, own), Some(1_200));
+        let mut gate = OwnInputTracker::new();
         // Nothing injected yet: the plain elapsed time.
-        assert_eq!(idle_ms_excluding_own_input(10_200, 10_016, None), Some(184));
+        assert_eq!(gate.idle_ms(10_200, 10_016), Some(184));
+
+        let mut gate = OwnInputTracker::new();
+        // The person last typed at 5_000; the driver injected 10_000..10_016.
+        gate.observe(10_000, 5_000);
+        gate.record_injection(10_000, 10_016);
+        // Last input inside that span (or just after, as the OS stamps it)
+        // is the driver's: the idle time is the person's, from 5_000.
+        assert_eq!(gate.idle_ms(10_200, 10_016), Some(5_200));
+        assert_eq!(gate.idle_ms(10_200, 10_060), Some(5_200));
+        // Input after the driver's injection is the person's.
+        assert_eq!(gate.idle_ms(10_200, 10_150), Some(50));
+
+        // No physical input seen at all: no evidence.
+        let mut gate = OwnInputTracker::new();
+        gate.record_injection(10_000, 10_016);
+        assert_eq!(gate.idle_ms(10_200, 10_016), None);
+
         // Tick wraparound between injection and now.
-        let wrapped = Some((u32::MAX - 20, u32::MAX - 4));
-        assert_eq!(
-            idle_ms_excluding_own_input(100, u32::MAX - 4, wrapped),
-            None
-        );
-        assert_eq!(idle_ms_excluding_own_input(100, 90, wrapped), Some(10));
+        let mut gate = OwnInputTracker::new();
+        gate.record_injection(u32::MAX - 20, u32::MAX - 4);
+        assert_eq!(gate.idle_ms(100, u32::MAX - 4), None);
+        assert_eq!(gate.idle_ms(100, 90), Some(10));
+    }
+
+    #[test]
+    fn a_persons_input_between_two_injections_is_not_lost() {
+        let mut gate = OwnInputTracker::new();
+        // First batch, with no earlier physical input on record.
+        gate.observe(1_000, 0);
+        gate.record_injection(1_000, 1_016);
+        // The person types at 1_200. The next batch at 1_300 overwrites the
+        // OS's last-input tick with its own.
+        gate.observe(1_300, 1_200);
+        gate.record_injection(1_300, 1_316);
+        // At 1_400 the OS reports only the driver's 1_316, but the person
+        // typed 200 ms ago.
+        assert_eq!(gate.idle_ms(1_400, 1_316), Some(200));
+        assert!(matches!(
+            evaluate_physical_input_idle(gate.idle_ms(1_400, 1_316), 1_000),
+            PhysicalInputIdleGate::UserActive { idle_ms: 200, .. }
+        ));
     }
 
     #[test]
