@@ -2177,6 +2177,8 @@ fn ensure_compatible_daemon_within(
 /// a spawned child, the process holding this launch's stdin marker after
 /// `open -n`, or the pid `CreateProcessW` returned.
 pub(crate) enum LaunchedDaemon {
+    // macOS launches through LaunchServices; only its tests spawn children.
+    #[cfg_attr(target_os = "macos", allow(dead_code))]
     #[cfg(unix)]
     Child(std::process::Child),
     #[cfg(target_os = "macos")]
@@ -2226,6 +2228,8 @@ impl Drop for OwnedProcess {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Termination {
     AlreadyExited,
+    // Windows stops its launch only by handle termination.
+    #[cfg_attr(target_os = "windows", allow(dead_code))]
     Terminated,
     Killed,
 }
@@ -2245,11 +2249,7 @@ impl LaunchedDaemon {
     /// Stop this process: SIGTERM, then SIGKILL after `deadline`, each followed by
     /// a bounded wait for it to exit. A process that no longer matches its
     /// launch identity has exited, and its pid is not signalled again.
-    fn terminate(
-        &mut self,
-        #[cfg_attr(unix, allow(unused_variables))] socket_path: &str,
-        deadline: std::time::Duration,
-    ) -> Result<Termination, String> {
+    fn terminate(&mut self, deadline: std::time::Duration) -> Result<Termination, String> {
         match self {
             #[cfg(unix)]
             Self::Child(child) => {
@@ -2310,23 +2310,16 @@ impl LaunchedDaemon {
                 if process.exits_within(std::time::Duration::ZERO) {
                     return Ok(Termination::AlreadyExited);
                 }
-                // The open handle keeps this pid bound to the launched
-                // process, so a daemon with this pid on the pipe is it; any
-                // other daemon refuses the request.
-                let (socket_path, pid) = (socket_path.to_owned(), *pid);
-                let asked = within_startup_deadline(deadline, "shutdown request", move || {
-                    crate::stop::pid_bound_shutdown(&socket_path, pid)
-                        .map_err(|error| error.to_string())
-                });
-                if matches!(asked, Ok(Ok(()))) && process.exits_within(deadline) {
-                    return Ok(Termination::Terminated);
-                }
+                // Only the retained handle is used. A pid-addressed request
+                // could outlive this handle on an abandoned worker and reach
+                // a later process that reuses the pid.
                 process.terminate()?;
                 if process.exits_within(deadline) {
                     Ok(Termination::Killed)
                 } else {
                     Err(format!(
-                        "process {pid} did not exit within {deadline:?} of TerminateProcess"
+                        "process {} did not exit within {deadline:?} of TerminateProcess",
+                        *pid
                     ))
                 }
             }
@@ -2607,7 +2600,7 @@ fn describe_cleanup(
 ) -> String {
     let cli = crate::bundle::cli_name();
     let pid = launched.pid();
-    match launched.terminate(socket_path, deadline) {
+    match launched.terminate(deadline) {
         Ok(Termination::Terminated) => {
             format!("the process this command launched (pid {pid}) was terminated.")
         }
@@ -3512,9 +3505,7 @@ mod daemon_compatibility_tests {
         let pid = child.id();
         let mut launched = LaunchedDaemon::Child(child);
 
-        let termination = launched
-            .terminate("unused", Duration::from_millis(200))
-            .unwrap();
+        let termination = launched.terminate(Duration::from_millis(200)).unwrap();
 
         assert_eq!(termination, super::Termination::Killed);
         assert!(gone(pid));
@@ -3547,14 +3538,14 @@ mod daemon_compatibility_tests {
             "only the launched process holds the marker"
         );
         assert_eq!(
-            launched.terminate("unused", STARTUP).unwrap(),
+            launched.terminate(STARTUP).unwrap(),
             super::Termination::Terminated
         );
         // Exited (even unreaped), it has no audit token, so a second cleanup
         // signals nothing.
         assert_eq!(super::audit_token_for_pid(marked_pid), None);
         assert_eq!(
-            launched.terminate("unused", STARTUP).unwrap(),
+            launched.terminate(STARTUP).unwrap(),
             super::Termination::AlreadyExited
         );
         assert!(!gone(foreign_pid));
@@ -3623,7 +3614,7 @@ mod daemon_compatibility_tests {
         assert_eq!(super::signal_audited(&token, libc::SIGKILL), Ok(false));
         let mut launched = LaunchedDaemon::Marked { pid, token };
         assert_eq!(
-            launched.terminate("unused", STARTUP).unwrap(),
+            launched.terminate(STARTUP).unwrap(),
             super::Termination::AlreadyExited
         );
         assert!(!gone(pid), "a non-matching process must not be signalled");
@@ -3686,17 +3677,8 @@ mod windows_launch_cleanup_tests {
         OwnedProcess(handle)
     }
 
-    /// A pipe nobody serves: a shutdown request sent there cannot connect.
-    fn unserved_pipe() -> String {
-        format!(
-            r"\\.\pipe\cua-driver-cleanup-test-{}-{}",
-            std::process::id(),
-            uuid::Uuid::new_v4()
-        )
-    }
-
     #[test]
-    fn exited_launch_is_reported_without_signalling_anything() {
+    fn exited_launch_is_reported_without_terminating_anything() {
         let mut child = Command::new("cmd")
             .args(["/c", "exit", "0"])
             .spawn()
@@ -3708,15 +3690,13 @@ mod windows_launch_cleanup_tests {
             process,
         };
 
-        let termination = launched
-            .terminate(&unserved_pipe(), Duration::from_secs(1))
-            .unwrap();
+        let termination = launched.terminate(Duration::from_secs(1)).unwrap();
 
         assert_eq!(termination, Termination::AlreadyExited);
     }
 
     #[test]
-    fn launch_that_cannot_be_asked_to_stop_is_terminated_through_its_handle() {
+    fn live_launch_is_terminated_through_its_handle() {
         // Waits on its piped stdin, which this test keeps open.
         let mut child = Command::new("cmd")
             .args(["/c", "pause"])
@@ -3729,9 +3709,7 @@ mod windows_launch_cleanup_tests {
             process: handle_for(&child),
         };
 
-        let termination = launched
-            .terminate(&unserved_pipe(), Duration::from_secs(1))
-            .unwrap();
+        let termination = launched.terminate(Duration::from_secs(1)).unwrap();
 
         assert_eq!(termination, Termination::Killed);
         assert!(child.try_wait().unwrap().is_some());
