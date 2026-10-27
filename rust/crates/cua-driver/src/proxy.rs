@@ -2296,21 +2296,19 @@ mod tests {
             .first_pipe_instance(true)
             .create(&pipe_name)
             .unwrap();
-        // A daemon that reads the request and never answers. Returning drops
-        // the server end, which also ends a client read the fix left behind.
-        let daemon = tokio::spawn(async move {
+        // A daemon that reads the request, reports it, and never answers.
+        // It then waits for the proxy to close its end of the pipe.
+        let (received_tx, received_rx) = tokio::sync::oneshot::channel();
+        let mut daemon = tokio::spawn(async move {
             server.connect().await.unwrap();
             let mut reader = tokio::io::BufReader::new(server);
             let mut request = String::new();
             reader.read_line(&mut request).await.unwrap();
+            let _ = received_tx.send(request);
             let mut rest = [0_u8; 16];
-            matches!(
-                tokio::time::timeout(std::time::Duration::from_secs(2), reader.read(&mut rest))
-                    .await,
-                Ok(Ok(0)) | Ok(Err(_))
-            )
+            matches!(reader.read(&mut rest).await, Ok(0) | Err(_))
         });
-        let call = forward_tool_call(
+        let mut call = Box::pin(forward_tool_call(
             serde_json::json!(1),
             "list_apps".into(),
             serde_json::json!({}),
@@ -2318,15 +2316,28 @@ mod tests {
             "s",
             false,
             None,
-        );
+        ));
+        // Drop the call only once the daemon holds the whole request, so the
+        // proxy is waiting on the reply.
+        let received = tokio::select! {
+            _ = &mut call => None,
+            received = tokio::time::timeout(std::time::Duration::from_secs(10), received_rx) => {
+                received.ok().and_then(Result::ok)
+            }
+        };
+        let Some(request) = received else {
+            // Dropping the server end also ends a blocking client read.
+            daemon.abort();
+            panic!("the daemon must receive the request and hold the call");
+        };
+        assert!(request.contains("list_apps"), "request: {request}");
+        drop(call);
+        let closed = tokio::time::timeout(std::time::Duration::from_secs(5), &mut daemon).await;
+        if closed.is_err() {
+            daemon.abort();
+        }
         assert!(
-            tokio::time::timeout(std::time::Duration::from_millis(300), call)
-                .await
-                .is_err(),
-            "the silent daemon must hold the call past the deadline"
-        );
-        assert!(
-            daemon.await.unwrap(),
+            matches!(closed, Ok(Ok(true))),
             "the daemon pipe must close once the proxy drops the call"
         );
     }
