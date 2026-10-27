@@ -52,6 +52,20 @@ lifetime. This fork does not create or validate that host-owned job; without
 it, Windows has no equivalent parent-death guarantee. No Windows lifetime code
 is changed by this Unix fix.
 
+## Windows executable grants
+
+On Windows, path-based application grants bind to the file at trusted manifest load:
+volume/file ID, size, last-write time, and SHA-256. Each protected application or window
+check re-reads that identity from the OS-attested executable path. A missing or unreadable
+file fails closed, including files unavailable at manifest load. Replacing or modifying an
+executable requires a fresh trusted manifest load; restarting the app alone does not renew
+the grant. This covers `bundle_id` paths as well as `executable` grants (goat-si/goat#1382).
+
+This is a launch-time identity boundary, not a signature requirement or an immutable
+snapshot of an earlier app-listing/approval UI. It does not lock installed applications
+against updates, pin loaded process memory, or make the OS check and subsequent action
+atomic. Package identities, explicit PID/window grants, and non-Windows grants are unchanged.
+
 ## Syncing upstream
 
 Upstream moves several times a day; we sync deliberately, not continuously.
