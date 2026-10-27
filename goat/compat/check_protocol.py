@@ -420,6 +420,9 @@ def output_schema_breaks(old, new, where=""):
         # shape. Removing a shape only narrows the output.
         old_shapes = single_shapes(old)
         for index, shape in enumerate(single_shapes(new)):
+            if not old_shapes:
+                breaks.append(f"variant {index}: {label}admits values where none were admitted")
+                continue
             candidates = [output_schema_breaks(choice, shape, where) for choice in old_shapes]
             if any(not candidate for candidate in candidates):
                 continue

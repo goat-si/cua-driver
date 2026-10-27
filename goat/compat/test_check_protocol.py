@@ -163,6 +163,9 @@ class CompareTest(unittest.TestCase):
         self.assertEqual(check({"type": "string"}, {"anyOf": [True]}), ["variant 0: type ['string'] -> None"])
         self.assertEqual(check(split, {"anyOf": [*split["anyOf"], True]}), ["variant 2: type ['string'] -> None"])
         self.assertEqual(check(split, {"anyOf": [*split["anyOf"], False]}), [])
+        self.assertEqual(check({"anyOf": [False]}, {"anyOf": [True]}),
+                         ["variant 0: admits values where none were admitted"])
+        self.assertEqual(check({"anyOf": [False]}, {"anyOf": [False]}), [])
         # number includes integers.
         numbers = {"anyOf": [{"type": ["number", "null"], "enum": [1, None]}]}
         self.assertEqual(check(numbers, numbers), [])
