@@ -2016,7 +2016,7 @@ where
         }
     }
 
-    let daemon = match start_mcp_daemon(
+    let (daemon, mut launched) = match start_mcp_daemon(
         &socket_path,
         already_running,
         MCP_DAEMON_STARTUP_DEADLINE,
@@ -2035,7 +2035,7 @@ where
             )
         },
     ) {
-        Ok(daemon) => daemon,
+        Ok(started) => started,
         Err((daemon, error)) => {
             if let Some(on_startup) = on_startup.take() {
                 on_startup(daemon, false);
@@ -2047,17 +2047,45 @@ where
     // Startup succeeds only once the proxy is ready to serve `initialize`;
     // a daemon that stops answering during proxy setup is a failed startup.
     let startup = std::cell::RefCell::new(on_startup);
-    let result = run_mcp_runtime(crate::proxy::run_proxy(socket_path, || {
+    let ready = std::cell::Cell::new(false);
+    let result = run_mcp_runtime(crate::proxy::run_proxy(socket_path.clone(), || {
+        ready.set(true);
         if let Some(on_startup) = startup.borrow_mut().take() {
             on_startup(daemon, true);
         }
     }));
+    let result = clean_up_unready_launch(
+        result,
+        ready.get(),
+        launched.as_mut(),
+        &socket_path,
+        MCP_DAEMON_STARTUP_DEADLINE,
+    );
     if result.is_err() {
         if let Some(on_startup) = startup.into_inner() {
             on_startup(daemon, false);
         }
     }
     result
+}
+
+/// A proxy that failed before it was ready leaves no daemon this call
+/// launched. Once ready, the daemon served the session and stays, as a daemon
+/// that was already running would.
+fn clean_up_unready_launch(
+    result: anyhow::Result<()>,
+    ready: bool,
+    launched: Option<&mut LaunchedDaemon>,
+    socket_path: &str,
+    deadline: std::time::Duration,
+) -> anyhow::Result<()> {
+    match (result, launched) {
+        (Err(error), Some(launched)) if !ready => Err(anyhow::anyhow!(
+            "{error}. Cleanup: {}",
+            describe_cleanup(launched, socket_path, deadline)
+        )),
+        (result, _) => result,
+    }
 }
 
 /// Longest `cua-driver mcp` waits for one startup exchange with a daemon.
@@ -2074,10 +2102,10 @@ fn start_mcp_daemon(
     already_running: bool,
     deadline: std::time::Duration,
     launch: impl FnOnce() -> (Option<LaunchedDaemon>, Result<(), LaunchDaemonError>),
-) -> Result<McpDaemonStartup, (McpDaemonStartup, String)> {
+) -> Result<(McpDaemonStartup, Option<LaunchedDaemon>), (McpDaemonStartup, String)> {
     if already_running {
         return admit_mcp_daemon(socket_path, None, deadline)
-            .map(|()| McpDaemonStartup::AlreadyRunning)
+            .map(|()| (McpDaemonStartup::AlreadyRunning, None))
             .map_err(|error| (McpDaemonStartup::AlreadyRunning, error));
     }
     let (mut launched, result) = launch();
@@ -2107,8 +2135,9 @@ fn start_mcp_daemon(
     // Socket readiness proves only that something answers. An older installed
     // app (goat-si/goat#1717) answers but cannot serve this build's protocol.
     admit_mcp_daemon(socket_path, launched.as_mut(), deadline)
-        .map(|()| McpDaemonStartup::Launched)
-        .map_err(|error| (McpDaemonStartup::Launched, error))
+        .map_err(|error| (McpDaemonStartup::Launched, error))?;
+    // Kept until the proxy is ready, so a failure in between still cleans up.
+    Ok((McpDaemonStartup::Launched, launched))
 }
 
 /// Whether anything accepts connections on the endpoint, protocol aside.
@@ -2176,6 +2205,7 @@ fn ensure_compatible_daemon_within(
 /// A daemon process this invocation created, identified by the launch itself:
 /// a spawned child, the process holding this launch's stdin marker after
 /// `open -n`, or the pid `CreateProcessW` returned.
+#[derive(Debug)]
 pub(crate) enum LaunchedDaemon {
     // macOS launches through LaunchServices; only its tests spawn children.
     #[cfg_attr(target_os = "macos", allow(dead_code))]
@@ -2195,6 +2225,7 @@ pub(crate) enum LaunchedDaemon {
 /// The launched process's handle, held for the whole cleanup: Windows does not
 /// reuse a pid while a handle to that process is open.
 #[cfg(target_os = "windows")]
+#[derive(Debug)]
 pub(crate) struct OwnedProcess(windows::Win32::Foundation::HANDLE);
 
 #[cfg(target_os = "windows")]
@@ -3637,6 +3668,55 @@ mod daemon_compatibility_tests {
             error.to_string().contains("nothing was launched"),
             "{error}"
         );
+    }
+
+    #[test]
+    fn proxy_failure_before_ready_terminates_the_launched_daemon_only() {
+        let mut launched = LaunchedDaemon::Child(launched_process());
+        let pid = launched.pid();
+        let foreign = launched_process();
+        let foreign_pid = foreign.id();
+
+        let error = super::clean_up_unready_launch(
+            Err(anyhow::anyhow!("daemon did not answer the listening probe")),
+            false,
+            Some(&mut launched),
+            "unused",
+            STARTUP,
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("did not answer"), "{error}");
+        assert!(error.to_string().contains("was terminated"), "{error}");
+        assert!(gone(pid));
+        assert!(!gone(foreign_pid));
+        drop(foreign);
+        reap(foreign_pid);
+    }
+
+    #[test]
+    fn launched_daemon_that_served_the_session_is_kept() {
+        let mut launched = LaunchedDaemon::Child(launched_process());
+        let pid = launched.pid();
+
+        let after_ready = super::clean_up_unready_launch(
+            Err(anyhow::anyhow!("daemon control session closed")),
+            true,
+            Some(&mut launched),
+            "unused",
+            STARTUP,
+        );
+        let success =
+            super::clean_up_unready_launch(Ok(()), false, Some(&mut launched), "unused", STARTUP);
+
+        assert_eq!(
+            after_ready.unwrap_err().to_string(),
+            "daemon control session closed"
+        );
+        assert!(success.is_ok());
+        assert!(!gone(pid));
+        drop(launched);
+        reap(pid);
     }
 
     #[test]
