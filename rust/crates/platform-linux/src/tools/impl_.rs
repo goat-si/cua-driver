@@ -7659,6 +7659,16 @@ impl Tool for TypeTextTool {
             Ok(token) => token,
             Err(refusal) => return refusal,
         };
+        // Characters a keymap cannot type are named in the result, unless the
+        // target is a password field or unknown (no element_token).
+        let secret = match token.clone() {
+            Some(target) => {
+                tokio::task::spawn_blocking(move || crate::atspi::is_password_token(&target))
+                    .await
+                    .unwrap_or(true)
+            }
+            None => true,
+        };
         let (resolved_elem_idx, resolved_window_id) = match &resolved {
             cua_driver_core::element_token::ResolvedElement::Element {
                 element_index,
@@ -8122,7 +8132,7 @@ impl Tool for TypeTextTool {
             .await;
             return match result {
                 Ok(Ok(("background_unavailable", _))) => background_keyboard_refusal(atspi_up()),
-                Ok(Ok((_, Some(report)))) => type_text_mpx_result(text_len, report),
+                Ok(Ok((_, Some(report)))) => type_text_mpx_result(text_len, report, secret),
                 Ok(Ok((path, None))) => ToolResult::text(format!(
                     "Typed {text_len} character(s) (terminal emulator: pty/XTest key events)."
                 ))
@@ -8205,7 +8215,7 @@ impl Tool for TypeTextTool {
             .await;
             match result {
                 Ok(Ok(Some(KeyRoute::Mpx(report)))) => {
-                    return type_text_mpx_result(text_len, report)
+                    return type_text_mpx_result(text_len, report, secret)
                 }
                 Ok(Err(e)) => return input_error_result(e),
                 Err(e) => return ToolResult::error(format!("Task error: {e}")),
@@ -8251,7 +8261,9 @@ impl Tool for TypeTextTool {
                         "Typed {text_len} character(s) into the focused terminal (pty)."
                     ))
                     .with_structured(type_text_structured("key_events", text_len, false)),
-                    Ok(Ok(Some(KeyRoute::Mpx(report)))) => type_text_mpx_result(text_len, report),
+                    Ok(Ok(Some(KeyRoute::Mpx(report)))) => {
+                        type_text_mpx_result(text_len, report, secret)
+                    }
                     Ok(Ok(_)) => background_keyboard_refusal(atspi_up()),
                     Ok(Err(e)) => input_error_result(e),
                     Err(e) => ToolResult::error(format!("Task error: {e}")),
@@ -8393,7 +8405,7 @@ impl Tool for TypeTextTool {
                 &format!("via X11, delivery_mode={mode_label}"),
             ),
             Ok(Ok(("background_unavailable", _))) => background_keyboard_refusal(atspi_up()),
-            Ok(Ok((_, Some(report)))) => type_text_mpx_result(text_len, report),
+            Ok(Ok((_, Some(report)))) => type_text_mpx_result(text_len, report, secret),
             Ok(Ok((path, None))) => ToolResult::text(format!(
                 "Typed {text_len} character(s) (via X11, delivery_mode={mode_label})."
             ))
@@ -8436,10 +8448,14 @@ fn background_text_route(
 fn type_text_mpx_result(
     text_len: usize,
     report: crate::input::KeyboardDeliveryReport,
+    secret: bool,
 ) -> ToolResult {
     let mut structured = type_text_structured(report.path, text_len, false);
     for (key, value) in report.to_json().as_object().into_iter().flatten() {
         structured[key] = value.clone();
+    }
+    if secret && !report.skipped_characters.is_empty() {
+        structured["skipped_characters"] = json!(crate::atspi_text::REDACTED);
     }
     structured["delivery_mode"] = json!("background");
     let outcome = if report.skipped_characters.is_empty() {
@@ -8453,10 +8469,11 @@ fn type_text_mpx_result(
         report.route_phrase()
     );
     if !report.skipped_characters.is_empty() {
+        let skipped: String = report.skipped_characters.iter().collect();
         text.push_str(&format!(
             " {} character(s) had no keycode in the current keymap and were skipped: {:?}.",
             report.skipped_characters.len(),
-            report.skipped_characters.iter().collect::<String>()
+            crate::atspi_text::echoed_value(&skipped, secret)
         ));
     }
     if !report.virtual_focus_held || !report.delivery_confirmed {
@@ -8489,13 +8506,22 @@ fn mpx_type_text_with_skipped_characters_is_an_error() {
         path: crate::input::MPX_UINPUT_PATH,
         grab_popup: None,
     };
-    assert_eq!(type_text_mpx_result(2, report(Vec::new())).is_error, None);
-    let skipped = type_text_mpx_result(2, report(vec!['約']));
+    assert_eq!(
+        type_text_mpx_result(2, report(Vec::new()), false).is_error,
+        None
+    );
+    let skipped = type_text_mpx_result(2, report(vec!['約']), false);
     assert_eq!(skipped.is_error, Some(true));
     assert!(!format!("{:?}", skipped.content).contains("Typed 2 character(s)"));
     assert_eq!(
         skipped.structured_content.unwrap()["skipped_characters"],
         "約"
+    );
+    let secret = type_text_mpx_result(2, report(vec!['約']), true);
+    assert!(!format!("{:?}", secret.content).contains('約'));
+    assert_eq!(
+        secret.structured_content.unwrap()["skipped_characters"],
+        "[REDACTED]"
     );
 }
 
@@ -9472,11 +9498,14 @@ impl Tool for SetValueTool {
         // 1. Focus-free accessibility write on the exact snapshot object.
         let target = token.clone();
         let ax = spawn_blocking_bounded("set_value", foreground_budget(0), move || {
-            crate::atspi::set_value_token(pid, &target, &value_for_task)
+            crate::atspi::set_value_token_reporting_retarget(pid, &target, &value_for_task)
         })
         .await;
         let ax_error = match ax {
-            Ok(Ok(())) => {
+            Ok(Ok(retargeted)) => {
+                // A write that re-resolved the index may have reached another
+                // element; its secrecy is unknown, so it counts as secret.
+                let secret = secret || retargeted;
                 let target = token.clone();
                 let readback =
                     tokio::task::spawn_blocking(move || crate::atspi::read_value_token(&target))
@@ -9735,6 +9764,8 @@ fn set_value_result(
     });
     let shown = crate::atspi_text::echoed_value(value, secret);
     let mut text = format!("Set value of element [{idx}] to '{shown}' (path={path})");
+    // Verified above against the real read-back; only what is shown is masked.
+    let readback = readback.map(|seen| crate::atspi_text::echoed_value(&seen, secret).to_owned());
     match readback {
         Some(seen) if normalised_path => {
             structured["readback"] = json!(seen);

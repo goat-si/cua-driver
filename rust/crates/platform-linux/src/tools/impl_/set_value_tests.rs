@@ -57,3 +57,22 @@ fn a_password_field_write_does_not_repeat_its_value() {
     let plain = set_value_result(1, "draft", "ax", None, None, false);
     assert!(format!("{:?}", plain.content).contains("draft"));
 }
+
+#[test]
+fn a_password_field_write_masks_its_read_back_too() {
+    for readback in ["set-secret-2", "other-secret"] {
+        let result = set_value_result(1, "set-secret-2", "ax", Some(readback.into()), None, true);
+        let shown = format!("{:?} {:?}", result.content, result.structured_content);
+        assert!(!shown.contains("secret"), "{shown}");
+    }
+    // Verification still uses the real read-back.
+    let matched = set_value_result(
+        1,
+        "set-secret-2",
+        "ax",
+        Some("set-secret-2".into()),
+        None,
+        true,
+    );
+    assert_eq!(matched.structured_content.unwrap()["verified"], true);
+}
