@@ -218,14 +218,24 @@ pub const REPLY_DEADLINE: Duration = Duration::from_millis(crate::tool_schema::T
 /// slow accessibility walks and large screenshots are supported.
 #[cfg(unix)]
 pub fn send_request(socket_path: &str, request: &DaemonRequest) -> anyhow::Result<DaemonResponse> {
+    let stream = std::os::unix::net::UnixStream::connect(socket_path)
+        .map_err(|error| anyhow::anyhow!("connect to {socket_path}: {error}"))?;
+    send_request_on(stream, request)
+}
+
+/// [`send_request`] on a stream the caller already connected, so the caller
+/// can keep a clone and shut the stream down to end a request it abandoned.
+#[cfg(unix)]
+pub fn send_request_on(
+    stream: std::os::unix::net::UnixStream,
+    request: &DaemonRequest,
+) -> anyhow::Result<DaemonResponse> {
     use std::io::Read;
-    use std::os::unix::net::UnixStream;
     use std::time::Instant;
 
     const READ_POLL: Duration = Duration::from_secs(10);
 
-    let mut stream = UnixStream::connect(socket_path)
-        .map_err(|error| anyhow::anyhow!("connect to {socket_path}: {error}"))?;
+    let mut stream = stream;
     // macOS rejects setsockopt with EINVAL once the peer has closed its end,
     // even when the peer's reply is still buffered for us to read. Treat that
     // as "peer already gone": the read below still drains buffered data and
