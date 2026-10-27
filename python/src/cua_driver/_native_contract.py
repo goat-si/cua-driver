@@ -8182,6 +8182,83 @@ class _UniffiFfiConverterTypeVisualParseError(_UniffiConverterRustBuffer):
         _UniffiFfiConverterBoolean.write(value.retryable, buf)
         _UniffiFfiConverterOptionalString.write(value.detail, buf)
 
+
+
+
+
+
+class ToggleState(enum.Enum):
+    """
+    A Windows TogglePattern state: a check box or toggle button is on, off, or
+    mixed (indeterminate, such as a parent of partly checked items).
+"""
+
+    ON = 0
+
+    OFF = 1
+
+    MIXED = 2
+
+
+
+class _UniffiFfiConverterTypeToggleState(_UniffiConverterRustBuffer):
+    @staticmethod
+    def read(buf):
+        variant = buf.read_i32()
+        if variant == 1:
+            return ToggleState.ON
+        if variant == 2:
+            return ToggleState.OFF
+        if variant == 3:
+            return ToggleState.MIXED
+        raise InternalError("Raw enum value doesn't match any cases")
+
+    @staticmethod
+    def check_lower(value):
+        if value == ToggleState.ON:
+            return
+        if value == ToggleState.OFF:
+            return
+        if value == ToggleState.MIXED:
+            return
+        raise ValueError(value)
+
+    @staticmethod
+    def write(value, buf):
+        if value == ToggleState.ON:
+            buf.write_i32(1)
+        if value == ToggleState.OFF:
+            buf.write_i32(2)
+        if value == ToggleState.MIXED:
+            buf.write_i32(3)
+
+
+
+class _UniffiFfiConverterOptionalTypeToggleState(_UniffiConverterRustBuffer):
+    @classmethod
+    def check_lower(cls, value):
+        if value is not None:
+            _UniffiFfiConverterTypeToggleState.check_lower(value)
+
+    @classmethod
+    def write(cls, value, buf):
+        if value is None:
+            buf.write_u8(0)
+            return
+
+        buf.write_u8(1)
+        _UniffiFfiConverterTypeToggleState.write(value, buf)
+
+    @classmethod
+    def read(cls, buf):
+        flag = buf.read_u8()
+        if flag == 0:
+            return None
+        elif flag == 1:
+            return _UniffiFfiConverterTypeToggleState.read(buf)
+        else:
+            raise InternalError("Unexpected flag byte for optional type")
+
 class _UniffiFfiConverterOptionalTypeElementFrame(_UniffiConverterRustBuffer):
     @classmethod
     def check_lower(cls, value):
@@ -8209,7 +8286,7 @@ class _UniffiFfiConverterOptionalTypeElementFrame(_UniffiConverterRustBuffer):
 
 @dataclass
 class WindowElement:
-    def __init__(self, *, element_index:int, role:str, depth:int, element_token:typing.Optional[str], label:typing.Optional[str], value:typing.Optional[str], value_description:typing.Optional[str], enabled:typing.Optional[bool], selected:typing.Optional[bool], in_web_content:typing.Optional[bool], actions:typing.Optional[typing.List[str]], parent_index:typing.Optional[int], frame:typing.Optional[ElementFrame], min:typing.Optional[float], max:typing.Optional[float]):
+    def __init__(self, *, element_index:int, role:str, depth:int, element_token:typing.Optional[str], label:typing.Optional[str], value:typing.Optional[str], value_description:typing.Optional[str], enabled:typing.Optional[bool], selected:typing.Optional[bool], toggle_state:typing.Optional[ToggleState], expanded:typing.Optional[bool], in_web_content:typing.Optional[bool], actions:typing.Optional[typing.List[str]], parent_index:typing.Optional[int], frame:typing.Optional[ElementFrame], min:typing.Optional[float], max:typing.Optional[float]):
         self.element_index = element_index
         self.role = role
         self.depth = depth
@@ -8219,6 +8296,8 @@ class WindowElement:
         self.value_description = value_description
         self.enabled = enabled
         self.selected = selected
+        self.toggle_state = toggle_state
+        self.expanded = expanded
         self.in_web_content = in_web_content
         self.actions = actions
         self.parent_index = parent_index
@@ -8230,7 +8309,7 @@ class WindowElement:
 
 
     def __str__(self):
-        return "WindowElement(element_index={}, role={}, depth={}, element_token={}, label={}, value={}, value_description={}, enabled={}, selected={}, in_web_content={}, actions={}, parent_index={}, frame={}, min={}, max={})".format(self.element_index, self.role, self.depth, self.element_token, self.label, self.value, self.value_description, self.enabled, self.selected, self.in_web_content, self.actions, self.parent_index, self.frame, self.min, self.max)
+        return "WindowElement(element_index={}, role={}, depth={}, element_token={}, label={}, value={}, value_description={}, enabled={}, selected={}, toggle_state={}, expanded={}, in_web_content={}, actions={}, parent_index={}, frame={}, min={}, max={})".format(self.element_index, self.role, self.depth, self.element_token, self.label, self.value, self.value_description, self.enabled, self.selected, self.toggle_state, self.expanded, self.in_web_content, self.actions, self.parent_index, self.frame, self.min, self.max)
     def __eq__(self, other):
         if self.element_index != other.element_index:
             return False
@@ -8249,6 +8328,10 @@ class WindowElement:
         if self.enabled != other.enabled:
             return False
         if self.selected != other.selected:
+            return False
+        if self.toggle_state != other.toggle_state:
+            return False
+        if self.expanded != other.expanded:
             return False
         if self.in_web_content != other.in_web_content:
             return False
@@ -8277,6 +8360,8 @@ class _UniffiFfiConverterTypeWindowElement(_UniffiConverterRustBuffer):
             value_description=_UniffiFfiConverterOptionalString.read(buf),
             enabled=_UniffiFfiConverterOptionalBoolean.read(buf),
             selected=_UniffiFfiConverterOptionalBoolean.read(buf),
+            toggle_state=_UniffiFfiConverterOptionalTypeToggleState.read(buf),
+            expanded=_UniffiFfiConverterOptionalBoolean.read(buf),
             in_web_content=_UniffiFfiConverterOptionalBoolean.read(buf),
             actions=_UniffiFfiConverterOptionalSequenceString.read(buf),
             parent_index=_UniffiFfiConverterOptionalUInt64.read(buf),
@@ -8296,6 +8381,8 @@ class _UniffiFfiConverterTypeWindowElement(_UniffiConverterRustBuffer):
         _UniffiFfiConverterOptionalString.check_lower(value.value_description)
         _UniffiFfiConverterOptionalBoolean.check_lower(value.enabled)
         _UniffiFfiConverterOptionalBoolean.check_lower(value.selected)
+        _UniffiFfiConverterOptionalTypeToggleState.check_lower(value.toggle_state)
+        _UniffiFfiConverterOptionalBoolean.check_lower(value.expanded)
         _UniffiFfiConverterOptionalBoolean.check_lower(value.in_web_content)
         _UniffiFfiConverterOptionalSequenceString.check_lower(value.actions)
         _UniffiFfiConverterOptionalUInt64.check_lower(value.parent_index)
@@ -8314,6 +8401,8 @@ class _UniffiFfiConverterTypeWindowElement(_UniffiConverterRustBuffer):
         _UniffiFfiConverterOptionalString.write(value.value_description, buf)
         _UniffiFfiConverterOptionalBoolean.write(value.enabled, buf)
         _UniffiFfiConverterOptionalBoolean.write(value.selected, buf)
+        _UniffiFfiConverterOptionalTypeToggleState.write(value.toggle_state, buf)
+        _UniffiFfiConverterOptionalBoolean.write(value.expanded, buf)
         _UniffiFfiConverterOptionalBoolean.write(value.in_web_content, buf)
         _UniffiFfiConverterOptionalSequenceString.write(value.actions, buf)
         _UniffiFfiConverterOptionalUInt64.write(value.parent_index, buf)
@@ -8708,6 +8797,7 @@ __all__ = [
     "CaptureScope",
     "EffectiveScope",
     "VisualParseErrorCode",
+    "ToggleState",
     "Platform",
     "ActionDelivery",
     "ActionError",
