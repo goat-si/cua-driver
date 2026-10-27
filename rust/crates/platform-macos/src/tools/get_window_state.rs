@@ -127,6 +127,15 @@ fn verified_capture(
         match validate(raw) {
             Ok(frame) => return Ok(frame),
             Err(e @ PxFrameError::WindowNotFound { .. }) => return Err(e),
+            // The prefetch timed out and left its native worker behind.
+            // Capturing again now would leave a second one, which turns
+            // native capture off for the process after this single read.
+            Err(e @ PxFrameError::CaptureUnavailable { .. })
+                if matches!(&e, PxFrameError::CaptureUnavailable { reason, .. }
+                    if crate::capture::capture_left_a_worker_behind(reason)) =>
+            {
+                return Err(e)
+            }
             Err(_) => {}
         }
     }
@@ -1515,6 +1524,41 @@ mod tests {
                 }
             );
             assert_eq!(calls.get(), 1);
+        }
+    }
+
+    /// A prefetch that timed out left its native worker behind. Capturing
+    /// again in the same read left a second one, and two abandoned workers
+    /// turn native capture off for the driver process after a single read.
+    #[test]
+    fn a_prefetch_that_timed_out_is_not_captured_again_in_the_same_read() {
+        use std::cell::Cell;
+        let bounds = crate::windows::WindowBounds {
+            x: 0.0,
+            y: 0.0,
+            width: 4.0,
+            height: 4.0,
+        };
+        for reason in [
+            "ScreenCaptureKit capture timed out after 3000 ms; SkyLight capture: \
+             SLSHWCaptureWindowList returned no image for window 7",
+            "capture_backend_stalled: 2 earlier native captures never completed",
+        ] {
+            let calls = Cell::new(0);
+            let error =
+                verified_capture(7, Some(Err(anyhow::anyhow!("{reason}"))), &bounds, || {
+                    calls.set(calls.get() + 1);
+                    Err(anyhow::anyhow!("captured again"))
+                })
+                .unwrap_err();
+            assert_eq!(calls.get(), 0, "{reason}");
+            assert_eq!(
+                error,
+                super::super::px_frame::PxFrameError::CaptureUnavailable {
+                    window_id: 7,
+                    reason: reason.into(),
+                }
+            );
         }
     }
 

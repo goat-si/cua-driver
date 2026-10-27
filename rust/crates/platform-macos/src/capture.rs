@@ -402,6 +402,16 @@ const MAX_ABANDONED_CAPTURES: usize = 2;
 /// Text every refusal from a stalled native capture backend carries.
 pub const CAPTURE_STALLED_MARKER: &str = "capture_backend_stalled";
 
+/// Text every native capture that its caller stopped waiting for carries.
+const CAPTURE_TIMED_OUT_MARKER: &str = "capture timed out after";
+
+/// Whether a capture error means a native worker was left behind or capture
+/// is already off. Capturing again at once would leave another worker, and
+/// [`MAX_ABANDONED_CAPTURES`] of them turn native capture off for the process.
+pub fn capture_left_a_worker_behind(reason: &str) -> bool {
+    reason.contains(CAPTURE_TIMED_OUT_MARKER) || reason.contains(CAPTURE_STALLED_MARKER)
+}
+
 const SLOT_RUNNING: u8 = 0;
 const SLOT_FINISHED: u8 = 1;
 const SLOT_ABANDONED: u8 = 2;
@@ -520,7 +530,7 @@ where
         Err(mpsc::RecvTimeoutError::Timeout) => {
             gate.abandon(&slot);
             anyhow::bail!(
-                "ScreenCaptureKit capture timed out after {} ms",
+                "ScreenCaptureKit {CAPTURE_TIMED_OUT_MARKER} {} ms",
                 timeout.as_millis()
             )
         }
@@ -1834,10 +1844,8 @@ mod tests {
             });
             started_receiver.recv().expect("worker starts");
             let timed_out = caller.join().expect("caller joins");
-            assert!(timed_out
-                .expect_err("stalled worker times out")
-                .to_string()
-                .contains("timed out"));
+            let timed_out = timed_out.expect_err("stalled worker times out").to_string();
+            assert!(capture_left_a_worker_behind(&timed_out), "{timed_out}");
             releases.push(release_sender);
         }
         assert_eq!(
@@ -1852,6 +1860,7 @@ mod tests {
             refused.to_string().contains(CAPTURE_STALLED_MARKER),
             "{refused}"
         );
+        assert!(capture_left_a_worker_behind(&refused.to_string()));
 
         // A stuck worker that returns frees its slot, and capture works again.
         let (done_sender, done_receiver) = mpsc::channel::<()>();
