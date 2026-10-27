@@ -106,6 +106,38 @@ class CompareTest(unittest.TestCase):
         allowed = {"tools": {"click:outputSchema": "GOAT no longer reads state; goat-si/goat#0"}}
         self.assertEqual(compare(BASE, variant(outputSchemas={"click": click_output(state=None)}), allowed), [])
 
+    def test_advertised_output_unions_are_compared_by_variant(self):
+        # The driver advertises {"type": "object", "anyOf": [success, refusal]}
+        # (cua-driver-contract outputs.rs advertised_output_schema).
+        def advertised(effect=("confirmed", "refused"), delivery=None, extra=None, required=("effect",)):
+            success = {"type": "object", "additionalProperties": False, "required": list(required), "properties": {
+                "effect": {"type": "string", "enum": list(effect)},
+                "delivery": delivery or {"type": ["object", "null"], "properties": {"mode": {"type": "string"}}},
+                **(extra or {}),
+            }}
+            refusal = {"type": "object", "required": ["error"], "properties": {"error": {"type": "object", "properties": {
+                "code": {"type": "string"}}}, "effect": {"const": "refused"}}}
+            return {"type": "object", "anyOf": [success, refusal]}
+
+        def breaks(new):
+            return compare(variant(outputSchemas={"click": advertised()}), variant(outputSchemas={"click": new}), {})
+
+        self.assertEqual(breaks(advertised()), [])
+        self.assertEqual(breaks(advertised(extra={"note": {"type": "string"}})), [])
+        self.assertEqual(breaks(advertised(effect=("confirmed",))), [])
+        # Nullable spelled as a union instead of a type list is the same output.
+        nullable_union = {"anyOf": [{"type": "object", "properties": {"mode": {"type": "string"}}}, {"type": "null"}]}
+        self.assertEqual(breaks(advertised(delivery=nullable_union)), [])
+        self.assertEqual(compare(variant(outputSchemas={"click": advertised(delivery=nullable_union)}),
+                                 variant(outputSchemas={"click": advertised()}), {}), [])
+
+        gained = breaks(advertised(effect=("confirmed", "refused", "maybe")))
+        self.assertEqual(gained, ["tools click:outputSchema: embedded-proxy: output schema variant 0: property effect enum gained 'maybe'"])
+        unrequired = breaks(advertised(required=()))
+        self.assertEqual(unrequired, ["tools click:outputSchema: embedded-proxy: output schema variant 0: property effect no longer required"])
+        mode_removed = breaks(advertised(delivery={"type": ["object", "null"], "properties": {}}))
+        self.assertTrue(mode_removed and all("property delivery.mode removed" in line for line in mode_removed), mode_removed)
+
 
 class ValidateTest(unittest.TestCase):
     def test_complete_surface_with_the_expected_identity_passes(self):

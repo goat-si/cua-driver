@@ -310,22 +310,75 @@ def schema_types(schema):
     return sorted(declared) if isinstance(declared, list) else [declared]
 
 
+UNION_KEYS = ("anyOf", "oneOf")
+OBJECT_KEYS = ("properties", "required", "additionalProperties", "patternProperties")
+
+
+def for_type(schema, declared):
+    """schema narrowed to one of its types, without keywords that only constrain other types."""
+    narrowed = {**schema, "type": declared}
+    for key in OBJECT_KEYS if declared != "object" else ():
+        narrowed.pop(key, None)
+    if declared != "array":
+        narrowed.pop("items", None)
+    return narrowed
+
+
+def schema_variants(schema):
+    """A union schema as its alternatives, each carrying the keys outside the union, so
+    {"type": "object", "anyOf": [success, refusal]} yields two object schemas. Without a union,
+    a multi-type schema splits per type, so ["string", "null"] and anyOf [string, null] compare
+    equal. Returns None for a schema with a single shape."""
+    for key in UNION_KEYS:
+        if isinstance(schema.get(key), list):
+            outer = {name: value for name, value in schema.items() if name != key}
+            return [{**outer, **branch} if isinstance(branch, dict) else branch for branch in schema[key]]
+    types = schema_types(schema)
+    if types is not None and len(types) > 1:
+        return [for_type(schema, declared) for declared in types]
+    return None
+
+
+def schema_values(schema):
+    if "enum" in schema:
+        return schema["enum"]
+    if "const" in schema:
+        return [schema["const"]]
+    return None
+
+
 def output_schema_breaks(old, new, where=""):
     """What GOAT, reading a tool's result, could rely on in old and no longer in new: a property
-    removed or no longer required, or a type or enum that now admits more values. New properties
-    and narrower values are compatible."""
+    removed or no longer required, or a type, enum or union that now admits more values. New
+    properties and narrower values are compatible."""
     label = f"property {where} " if where else ""
     if not isinstance(new, dict):
         return [f"{label}removed"]
+    if not isinstance(old, dict):
+        return []
+    if any(isinstance(schema.get(key), list) for schema in (old, new) for key in UNION_KEYS):
+        # Every shape new can produce must be one old could: each new variant must fit some old
+        # variant. Removing a variant only narrows the output.
+        old_variants = schema_variants(old) or [old]
+        breaks = []
+        for index, variant in enumerate(schema_variants(new) or [new]):
+            candidates = [output_schema_breaks(choice, variant, where) for choice in old_variants]
+            if any(not candidate for candidate in candidates):
+                continue
+            # Report against the variant in the same position, the one it most likely replaced.
+            closest = candidates[index] if index < len(candidates) else min(candidates, key=len)
+            breaks += [f"variant {index}: {detail}" for detail in closest]
+        return breaks
     breaks = []
     old_types, new_types = schema_types(old), schema_types(new)
     if old_types is not None and (new_types is None or set(new_types) - set(old_types)):
         breaks.append(f"{label}type {old_types} -> {new_types}")
-    if "enum" in old:
-        if "enum" not in new:
+    old_values, new_values = schema_values(old), schema_values(new)
+    if old_values is not None:
+        if new_values is None:
             breaks.append(f"{label}enum removed")
         else:
-            breaks += [f"{label}enum gained {value!r}" for value in new["enum"] if value not in old["enum"]]
+            breaks += [f"{label}enum gained {value!r}" for value in new_values if value not in old_values]
     prefix = f"{where}." if where else ""
     for name in old.get("required", []):
         if name not in new.get("required", []):
