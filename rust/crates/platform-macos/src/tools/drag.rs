@@ -243,19 +243,19 @@ impl Tool for DragTool {
 
         let mut from_x = match coerce("from_x") {
             Some(v) => v,
-            None => return ToolResult::error("Missing required parameter: from_x"),
+            None => return super::invalid_arguments("Missing required parameter: from_x"),
         };
         let mut from_y = match coerce("from_y") {
             Some(v) => v,
-            None => return ToolResult::error("Missing required parameter: from_y"),
+            None => return super::invalid_arguments("Missing required parameter: from_y"),
         };
         let mut to_x = match coerce("to_x") {
             Some(v) => v,
-            None => return ToolResult::error("Missing required parameter: to_x"),
+            None => return super::invalid_arguments("Missing required parameter: to_x"),
         };
         let mut to_y = match coerce("to_y") {
             Some(v) => v,
-            None => return ToolResult::error("Missing required parameter: to_y"),
+            None => return super::invalid_arguments("Missing required parameter: to_y"),
         };
 
         let Some(wid) = args.opt_u64("window_id").map(|v| v as u32) else {
@@ -273,7 +273,7 @@ impl Tool for DragTool {
             "right" => DragButton::Right,
             "middle" => DragButton::Middle,
             other => {
-                return ToolResult::error(format!(
+                return super::invalid_arguments(format!(
                     "Unknown button \"{other}\" — expected left, right, or middle."
                 ))
             }
@@ -883,14 +883,13 @@ fn window_id_required(foreground: bool) -> ToolResult {
     } else {
         "background"
     };
-    ToolResult::error(format!(
-        "A {mode} drag on macOS needs window_id: the gesture is addressed to one exact \
+    super::pre_dispatch_refusal(
+        "window_id_required",
+        format!(
+            "A {mode} drag on macOS needs window_id: the gesture is addressed to one exact \
          window. Read it from list_windows or get_window_state and retry."
-    ))
-    .with_structured(serde_json::json!({
-        "code": "window_id_required",
-        "effect": "refused"
-    }))
+        ),
+    )
 }
 
 #[cfg(test)]

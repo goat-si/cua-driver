@@ -53,16 +53,46 @@ use std::sync::Arc;
 
 use crate::{ax::snapshot::Snapshots, cursor::state::CursorRegistry};
 
+/// An error raised before this tool dispatched any input or AX mutation.
+/// Keep post-dispatch failures on their existing outcome path: they may have acted.
+pub(super) fn pre_dispatch_refusal(
+    code: &str,
+    message: impl Into<String>,
+) -> cua_driver_core::protocol::ToolResult {
+    cua_driver_core::protocol::ToolResult::error(message).with_structured(serde_json::json!({
+        "code": code,
+        "effect": "refused",
+        "dispatched": false,
+    }))
+}
+
+pub(super) fn invalid_arguments(
+    message: impl Into<String>,
+) -> cua_driver_core::protocol::ToolResult {
+    pre_dispatch_refusal("invalid_arguments", message)
+}
+
 fn native_window_id(
     window_id: Option<u64>,
 ) -> Result<Option<u32>, cua_driver_core::protocol::ToolResult> {
-    window_id.map(u32::try_from).transpose().map_err(|_| {
-        cua_driver_core::protocol::ToolResult::error("window_id is out of range for macOS.")
-    })
+    window_id
+        .map(u32::try_from)
+        .transpose()
+        .map_err(|_| invalid_arguments("window_id is out of range for macOS."))
 }
 
 #[cfg(test)]
 mod snapshot_window_id_tests {
+    #[test]
+    fn pre_dispatch_refusals_have_an_explicit_no_send_outcome() {
+        let result = super::invalid_arguments("bad arguments");
+        assert_eq!(result.is_error, Some(true));
+        let structured = result.structured_content.expect("structured refusal");
+        assert_eq!(structured["code"], "invalid_arguments");
+        assert_eq!(structured["effect"], "refused");
+        assert_eq!(structured["dispatched"], false);
+    }
+
     #[test]
     fn native_window_conversion_never_discards_high_bits() {
         assert_eq!(super::native_window_id(None).unwrap(), None);
@@ -1017,7 +1047,7 @@ pub(super) fn target_pid(
     {
         return Err(cua_driver_core::element_token::stale_token_without_pid());
     }
-    Err(cua_driver_core::protocol::ToolResult::error(
+    Err(invalid_arguments(
         "Missing required integer field: pid. Pass pid, or pass an element_token from the \
          current get_window_state (a token names its own pid).",
     ))

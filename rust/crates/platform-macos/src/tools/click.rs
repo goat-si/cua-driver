@@ -406,26 +406,23 @@ impl Tool for ClickTool {
             && args.get("y").map(|v| v.is_number()).unwrap_or(false);
         let capture_id = args.opt_str("capture_id");
         if capture_id.is_some() && !has_xy {
-            return ToolResult::error("click.capture_id requires pixel coordinates x and y.")
-                .with_structured(serde_json::json!({ "code": "invalid_arguments" }));
+            return super::invalid_arguments(
+                "click.capture_id requires pixel coordinates x and y.",
+            );
         }
         if has_xy && !has_pid && !has_window_id {
             // `scope` is a per-call param now (default "window"); pass
             // scope="desktop" to enable screen-absolute clicks.
             let scope = args.str_or("scope", "window");
             if scope != "desktop" {
-                return ToolResult::error(
+                return super::pre_dispatch_refusal(
+                    "desktop_scope_disabled",
                     "click: x,y given with no pid/window_id, but scope is \"window\". \
                      Screen-absolute clicks require desktop scope. Pass scope=\"desktop\" \
                      (and use get_desktop_state with scope=\"desktop\" to read true \
                      screen pixels) first."
                         .to_string(),
-                )
-                .with_structured(serde_json::json!({
-                    "code": "desktop_scope_disabled",
-                    "scope": scope,
-                    "suggestion": "pass scope=\"desktop\"",
-                }));
+                );
             }
             let input = match parse_legacy_click_input(&args) {
                 Ok(input) => input,
@@ -463,8 +460,7 @@ impl Tool for ClickTool {
             .to_owned();
             let count = input.count.unwrap_or(1) as usize;
             if count == 0 {
-                return ToolResult::error("click.count must be at least 1.")
-                    .with_structured(serde_json::json!({ "code": "invalid_arguments" }));
+                return super::invalid_arguments("click.count must be at least 1.");
             }
             if let Some(refusal) =
                 super::desktop_pointer_guard::check("click", &args, vec![(sx, sy)]).await
@@ -531,10 +527,9 @@ impl Tool for ClickTool {
         };
         let (element_index, window_id, element_guard) = resolved.into_parts(window_id_arg);
         if capture_id.is_some() && element_guard.is_some() {
-            return ToolResult::error(
+            return super::invalid_arguments(
                 "click.capture_id is valid only for the pixel x,y path, not element actions.",
-            )
-            .with_structured(serde_json::json!({ "code": "invalid_arguments" }));
+            );
         }
         let window_id = match super::native_window_id(window_id) {
             Ok(window_id) => window_id,
@@ -548,7 +543,7 @@ impl Tool for ClickTool {
             .or_else(|| args.opt_i64("y").map(|i| i as f64));
         let action = args.str_or("action", "press");
         if let Err(error) = validate_click_action(&action, element_guard.is_some()) {
-            return ToolResult::error(format!("click: {error}"));
+            return super::invalid_arguments(format!("click: {error}"));
         }
         // Surface 5: optional `button` arg, default "left" preserves legacy behaviour.
         // Pixel path: routes to left/right/middle CGEvent primitives.
@@ -562,7 +557,7 @@ impl Tool for ClickTool {
         // Reject unknown buttons explicitly so silent left-click fall-through can't
         // mask a typo. Keep "" → default left for old clients that never sent the field.
         if !matches!(button_str.as_str(), "" | "left" | "right" | "middle") {
-            return ToolResult::error(format!(
+            return super::invalid_arguments(format!(
                 "click: unknown button \"{button_str}\" — expected one of left, right, middle."
             ));
         }
@@ -919,11 +914,10 @@ impl Tool for ClickTool {
             // ── Pixel path ─────────────────────────────────────────────────
 
             if capture_id.is_some() && (from_zoom || debug_image_out.is_some()) {
-                return ToolResult::error(
+                return super::invalid_arguments(
                     "click.capture_id is incompatible with from_zoom and debug_image_out; \
                      pass coordinates from the exact source capture directly.",
-                )
-                .with_structured(serde_json::json!({ "code": "invalid_arguments" }));
+                );
             }
 
             // debug_image_out: capture fresh screenshot, overlay crosshair BEFORE
@@ -931,13 +925,13 @@ impl Tool for ClickTool {
             // space the caller was reasoning in).
             if let Some(ref dbg_path) = debug_image_out {
                 if from_zoom {
-                    return ToolResult::error(
+                    return super::invalid_arguments(
                         "debug_image_out is incompatible with from_zoom — \
                          received (x, y) would be in zoom-crop space, not window-local.",
                     );
                 }
                 match window_id {
-                    None => return ToolResult::error("debug_image_out requires window_id."),
+                    None => return super::invalid_arguments("debug_image_out requires window_id."),
                     Some(wid) => {
                         // Session-effective max dimension so debug_image_out
                         // matches the resize the calling session sees in
@@ -955,14 +949,20 @@ impl Tool for ClickTool {
                         .await;
                         match dbg_result {
                             Err(e) => {
-                                return ToolResult::error(format!(
-                                    "debug_image_out task failed: {e}. Not dispatching click."
-                                ))
+                                return super::pre_dispatch_refusal(
+                                    "px_capture_unavailable",
+                                    format!(
+                                        "debug_image_out task failed: {e}. Not dispatching click."
+                                    ),
+                                );
                             }
                             Ok(Err(e)) => {
-                                return ToolResult::error(format!(
-                                    "debug_image_out write failed: {e}. Not dispatching click."
-                                ))
+                                return super::pre_dispatch_refusal(
+                                    "px_capture_unavailable",
+                                    format!(
+                                        "debug_image_out write failed: {e}. Not dispatching click."
+                                    ),
+                                );
                             }
                             Ok(Ok(())) => {}
                         }
@@ -1036,7 +1036,7 @@ impl Tool for ClickTool {
                                 || lx > frame.bounds.width
                                 || ly > frame.bounds.height)
                         {
-                            return ToolResult::error(format!(
+                            return super::invalid_arguments(format!(
                                 "click: window-local point ({lx:.1}, {ly:.1}) pt lies outside \
                                  window {wid}'s {:.0}×{:.0} pt frame; background delivery \
                                  refused. Re-read coordinates from a fresh get_window_state \
@@ -1448,7 +1448,7 @@ impl Tool for ClickTool {
                 Err(e) => ToolResult::error(format!("Task error: {e}")),
             }
         } else {
-            ToolResult::error("Provide either element_token or (x + y). pid is required for x,y clicks; an element_token carries its own pid.")
+            super::invalid_arguments("Provide either element_token or (x + y). pid is required for x,y clicks; an element_token carries its own pid.")
         }
     }
 }

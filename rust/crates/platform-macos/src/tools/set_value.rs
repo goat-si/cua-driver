@@ -93,23 +93,24 @@ impl Tool for SetValueTool {
             Err(e) => return e,
         };
 
-        let (element_index, window_id, element_guard) =
-            match latency::resolve(|| self.state.snapshots.resolve(pid, &args)) {
-                Ok(cua_driver_core::element_token::ResolvedElement::None) => {
-                    return ToolResult::error(
-                        "set_value requires element_token to address the target element.",
-                    )
-                }
-                Ok(cua_driver_core::element_token::ResolvedElement::Element {
-                    window_id,
-                    element_index,
-                    element,
-                }) => match u32::try_from(window_id) {
-                    Ok(window_id) => (element_index, window_id, element),
-                    Err(_) => return ToolResult::error("window_id is out of range for macOS."),
-                },
-                Err(refusal) => return refusal,
-            };
+        let (element_index, window_id, element_guard) = match latency::resolve(|| {
+            self.state.snapshots.resolve(pid, &args)
+        }) {
+            Ok(cua_driver_core::element_token::ResolvedElement::None) => {
+                return super::invalid_arguments(
+                    "set_value requires element_token to address the target element.",
+                )
+            }
+            Ok(cua_driver_core::element_token::ResolvedElement::Element {
+                window_id,
+                element_index,
+                element,
+            }) => match u32::try_from(window_id) {
+                Ok(window_id) => (element_index, window_id, element),
+                Err(_) => return super::invalid_arguments("window_id is out of range for macOS."),
+            },
+            Err(refusal) => return refusal,
+        };
 
         let element_ptr = element_guard.as_ptr();
 

@@ -188,8 +188,7 @@ impl Tool for HotkeyTool {
             };
             let raw_keys = input.keys;
             if raw_keys.len() < 2 {
-                return ToolResult::error("hotkey.keys must contain at least two keys.")
-                    .with_structured(serde_json::json!({ "code": "invalid_arguments" }));
+                return super::invalid_arguments("hotkey.keys must contain at least two keys.");
             }
             let modifiers: Vec<String> = raw_keys
                 .iter()
@@ -197,7 +196,7 @@ impl Tool for HotkeyTool {
                 .cloned()
                 .collect();
             let Some(key) = raw_keys.iter().rev().find(|key| !is_modifier(key)).cloned() else {
-                return ToolResult::error(
+                return super::invalid_arguments(
                     "keys must include at least one non-modifier key for desktop hotkey",
                 );
             };
@@ -225,12 +224,12 @@ impl Tool for HotkeyTool {
         };
 
         if args.get("keys").and_then(|v| v.as_array()).is_none() {
-            return ToolResult::error("Missing required parameter: keys");
+            return super::invalid_arguments("Missing required parameter: keys");
         }
         let raw_keys = args.str_array("keys");
 
         if raw_keys.is_empty() {
-            return ToolResult::error("keys must be a non-empty array of strings.");
+            return super::invalid_arguments("keys must be a non-empty array of strings.");
         }
 
         // Split: modifiers are all entries that are modifier names; base key is everything else.
@@ -247,7 +246,7 @@ impl Tool for HotkeyTool {
             .collect();
 
         if non_modifiers.is_empty() {
-            return ToolResult::error(
+            return super::invalid_arguments(
                 "keys must include at least one non-modifier key (e.g. \"c\" in [\"cmd\", \"c\"]).",
             );
         }
@@ -282,7 +281,7 @@ impl Tool for HotkeyTool {
         let px = args.get("x").and_then(|value| value.as_f64());
         let py = args.get("y").and_then(|value| value.as_f64());
         if px.is_some() && py.is_some() && element_index.is_some() {
-            return ToolResult::error(
+            return super::invalid_arguments(
                 "Pass either element_token (ax) or x,y (px) to hotkey, not both.",
             );
         }
@@ -707,6 +706,16 @@ mod tests {
         assert_eq!(result.is_error, Some(true));
         let structured = result.structured_content.expect("structured refusal");
         assert_eq!(structured["refusal"]["code"], "stale_element_token");
+    }
+
+    #[tokio::test]
+    async fn malformed_keys_are_refused_before_target_lookup_or_dispatch() {
+        let tool = HotkeyTool::new(Arc::new(ToolState::new(false, false, None)));
+        let result = tool.invoke(serde_json::json!({"pid": 123})).await;
+        let structured = result.structured_content.expect("structured refusal");
+        assert_eq!(structured["code"], "invalid_arguments");
+        assert_eq!(structured["effect"], "refused");
+        assert_eq!(structured["dispatched"], false);
     }
 
     #[test]
