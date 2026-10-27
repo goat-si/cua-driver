@@ -2,9 +2,9 @@
   "comment": "Intentional protocol changes, each keyed by the name check_protocol.py prints and valued with the reason and the GOAT change that adopts it. Keep empty unless GOAT has adopted the change.",
   "mcp": {},
   "tools": {
-    "click": "Upstream #6033 (41591b1b39) adds optional wait_for_window_change?: boolean to action tool inputSchema; additive and backward-compatible with GOAT callers.",
+    "click": "Upstream #6033 (41591b1b39) adds optional wait_for_window_change?: boolean to action tool inputSchema; additive and backward-compatible with GOAT callers. cua-driver#22 rewords the delivery_mode description (element_token, keyboard, pixel, foreground last); description text only.",
     "double_click": "Upstream #6033 (41591b1b39) adds optional wait_for_window_change?: boolean to action tool inputSchema; additive and backward-compatible with GOAT callers.",
-    "drag": "Upstream #6033 (41591b1b39) adds optional wait_for_window_change?: boolean to action tool inputSchema; additive and backward-compatible with GOAT callers.",
+    "drag": "Upstream #6033 (41591b1b39) adds optional wait_for_window_change?: boolean to action tool inputSchema; additive and backward-compatible with GOAT callers. cua-driver#22 rewords the delivery_mode description (non-drag element_token or keyboard route before foreground); description text only.",
     "get_window_state": "Upstream #5487/#5686 updates Windows get_window_state inputSchema property description metadata; wire parameters and types remain backward-compatible with GOAT callers.",
     "hotkey": "Upstream #6033 (41591b1b39) adds optional wait_for_window_change?: boolean to action tool inputSchema; additive and backward-compatible with GOAT callers.",
     "launch_app": "Upstream #6033 (41591b1b39) adds optional wait_for_window_change?: boolean to action tool inputSchema; additive and backward-compatible with GOAT callers.",
