@@ -168,12 +168,18 @@ unsafe fn walk(
     let has_content = name.is_some();
 
     if is_actionable || has_content {
-        // Retain the IAccessible pointer for the cache. Mirror what the UIA
-        // walker does: clone, get raw, forget the local — the cache's Drop
-        // releases via IUnknown.
-        let retained: IAccessible = acc.clone();
-        let ptr = retained.as_raw() as usize;
-        std::mem::forget(retained);
+        // Retain the IAccessible pointer for the snapshot cache, which keeps
+        // and later releases only indexed (actionable) nodes. Mirror the UIA
+        // walker: clone, get raw, forget the local. A pointer kept for an
+        // actionless node would never be released.
+        let ptr = if is_actionable {
+            let retained: IAccessible = acc.clone();
+            let ptr = retained.as_raw() as usize;
+            std::mem::forget(retained);
+            ptr
+        } else {
+            0
+        };
 
         let (center_x, center_y) = rect
             .map(|(l, t, r, b)| ((l + r) / 2, (t + b) / 2))
