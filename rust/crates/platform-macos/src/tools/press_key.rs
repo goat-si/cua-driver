@@ -401,10 +401,6 @@ impl Tool for PressKeyTool {
                 Err(error) => ToolResult::error(format!("desktop press_key task failed: {error}")),
             };
         }
-        let pid = match super::target_pid(&self.state, &args) {
-            Ok(v) => v,
-            Err(e) => return e,
-        };
         let key_raw = match args.require_str("key") {
             Ok(v) => v,
             Err(e) => return e,
@@ -417,6 +413,10 @@ impl Tool for PressKeyTool {
                 Ok(resolved) => resolved,
                 Err(error) => return invalid_key(error),
             };
+        let pid = match super::target_pid(&self.state, &args) {
+            Ok(v) => v,
+            Err(e) => return e,
+        };
         let window_id_arg = args.opt_u64("window_id");
         let resolved = match latency::resolve(|| self.state.snapshots.resolve(pid, &args)) {
             Ok(r) => r,
@@ -710,6 +710,28 @@ impl Tool for PressKeyTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn an_unknown_key_is_refused_before_the_target_is_resolved() {
+        let tool = PressKeyTool::new(std::sync::Arc::new(ToolState::new(false, false, None)));
+        for args in [
+            serde_json::json!({"key": "notakey", "element_token": "s7fffffff:0"}),
+            serde_json::json!({"key": "notakey"}),
+        ] {
+            let result = tool.invoke(args.clone()).await;
+            let structured = result.structured_content.expect("structured refusal");
+            assert_eq!(
+                structured["code"], "invalid_arguments",
+                "{args}: {structured}"
+            );
+            assert!(
+                structured["message"]
+                    .as_str()
+                    .is_some_and(|message| message.contains("notakey")),
+                "{args}: {structured}"
+            );
+        }
+    }
 
     #[test]
     fn targeted_key_requires_focus_readback_before_dispatch() {

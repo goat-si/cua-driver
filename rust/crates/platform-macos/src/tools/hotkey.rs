@@ -218,11 +218,6 @@ impl Tool for HotkeyTool {
             };
         }
 
-        let pid = match super::target_pid(&self.state, &args) {
-            Ok(v) => v,
-            Err(e) => return e,
-        };
-
         if args.get("keys").and_then(|v| v.as_array()).is_none() {
             return super::invalid_arguments("Missing required parameter: keys");
         }
@@ -260,6 +255,10 @@ impl Tool for HotkeyTool {
         ) {
             Ok(resolved) => resolved,
             Err(error) => return super::press_key::invalid_key(error),
+        };
+        let pid = match super::target_pid(&self.state, &args) {
+            Ok(v) => v,
+            Err(e) => return e,
         };
         let key_display = raw_keys.join("+");
         let window_id_arg = args.opt_u64("window_id");
@@ -706,6 +705,28 @@ mod tests {
         assert_eq!(result.is_error, Some(true));
         let structured = result.structured_content.expect("structured refusal");
         assert_eq!(structured["refusal"]["code"], "stale_element_token");
+    }
+
+    #[tokio::test]
+    async fn an_unknown_key_is_refused_before_the_target_is_resolved() {
+        let tool = HotkeyTool::new(Arc::new(ToolState::new(false, false, None)));
+        for args in [
+            serde_json::json!({"keys": ["cmd", "notakey"], "element_token": "s7fffffff:0"}),
+            serde_json::json!({"keys": ["cmd", "notakey"]}),
+        ] {
+            let result = tool.invoke(args.clone()).await;
+            let structured = result.structured_content.expect("structured refusal");
+            assert_eq!(
+                structured["code"], "invalid_arguments",
+                "{args}: {structured}"
+            );
+            assert!(
+                structured["message"]
+                    .as_str()
+                    .is_some_and(|message| message.contains("notakey")),
+                "{args}: {structured}"
+            );
+        }
     }
 
     #[tokio::test]
