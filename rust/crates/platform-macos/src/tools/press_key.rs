@@ -176,6 +176,15 @@ fn action_record(confirmed: bool, foreground: bool) -> ActionExecutionRecord {
 #[error("the addressed element did not acquire keyboard focus; no key was dispatched")]
 struct KeyFocusUnconfirmed;
 
+/// The pointer focus fallback clicked the element, and focus still did not
+/// stick. No key was sent, but the click was, and it may have acted.
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "clicked the addressed element to focus it, but it did not acquire keyboard focus; \
+     no key was dispatched, and the click may have acted"
+)]
+struct KeyFocusUnconfirmedAfterClick;
+
 #[derive(Debug, thiserror::Error)]
 enum WindowFocusConflictError {
     #[error("addressed element does not belong to target window {target_window_id} (resolved: {actual_window_id:?})")]
@@ -260,6 +269,7 @@ fn with_confirmed_key_focus_or_fallback<T>(
                         }
                         std::thread::sleep(std::time::Duration::from_millis(10));
                     }
+                    return Err(KeyFocusUnconfirmedAfterClick.into());
                 }
                 return Err(KeyFocusUnconfirmed.into());
             }
@@ -267,6 +277,17 @@ fn with_confirmed_key_focus_or_fallback<T>(
         }
     }
     dispatch()
+}
+
+/// The key a call names, as typed and resolved with its modifiers, or the
+/// refusal for a missing or unknown one. Pure: it reads only the arguments.
+pub(super) fn requested_key(args: &Value) -> Result<(String, String, Vec<String>), ToolResult> {
+    use cua_driver_core::tool_args::ArgsExt;
+    let key_raw = args.require_str("key")?;
+    let (key, modifiers) =
+        crate::input::keyboard::resolve_key_press(&key_raw, &args.str_array("modifiers"))
+            .map_err(invalid_key)?;
+    Ok((key_raw, key, modifiers))
 }
 
 /// A key or modifier this driver cannot press, refused before anything is sent.
@@ -314,6 +335,17 @@ fn delivery_failed(error: anyhow::Error) -> ToolResult {
     if error.is::<KeyFocusUnconfirmed>() {
         return ToolResult::error(error.to_string()).with_structured(serde_json::json!({
             "code": "target_focus_unconfirmed", "effect": "refused", "dispatched": false,
+            "message": error.to_string(),
+        }));
+    }
+    if error.is::<KeyFocusUnconfirmedAfterClick>() {
+        // Not an error: the click was sent and may have acted. The caller
+        // reads the window before sending anything again.
+        return ToolResult::text(format!("⚠️ {error}")).with_structured(serde_json::json!({
+            "code": "target_focus_unconfirmed_after_click",
+            "path": "cgevent",
+            "effect": "unverifiable",
+            "keys_sent": false,
             "message": error.to_string(),
         }));
     }
@@ -401,22 +433,16 @@ impl Tool for PressKeyTool {
                 Err(error) => ToolResult::error(format!("desktop press_key task failed: {error}")),
             };
         }
+        // Resolve the key first: an unknown name is refused before any
+        // target work, so nothing is focused or sent for it.
+        let (key_raw, key, modifiers) = match requested_key(&args) {
+            Ok(requested) => requested,
+            Err(refusal) => return refusal,
+        };
         let pid = match super::target_pid(&self.state, &args) {
             Ok(v) => v,
             Err(e) => return e,
         };
-        let key_raw = match args.require_str("key") {
-            Ok(v) => v,
-            Err(e) => return e,
-        };
-        // Resolve the key first: an unknown name is refused before any
-        // target work, so nothing is focused or sent for it.
-        let (key, modifiers) =
-            match crate::input::keyboard::resolve_key_press(&key_raw, &args.str_array("modifiers"))
-            {
-                Ok(resolved) => resolved,
-                Err(error) => return invalid_key(error),
-            };
         let window_id_arg = args.opt_u64("window_id");
         let resolved = match latency::resolve(|| self.state.snapshots.resolve(pid, &args)) {
             Ok(r) => r,
@@ -711,6 +737,28 @@ impl Tool for PressKeyTool {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn an_unknown_key_is_refused_before_the_target_is_resolved() {
+        let tool = PressKeyTool::new(std::sync::Arc::new(ToolState::new(false, false, None)));
+        for args in [
+            serde_json::json!({"key": "notakey", "element_token": "s7fffffff:0"}),
+            serde_json::json!({"key": "notakey"}),
+        ] {
+            let result = tool.invoke(args.clone()).await;
+            let structured = result.structured_content.expect("structured refusal");
+            assert_eq!(
+                structured["code"], "invalid_arguments",
+                "{args}: {structured}"
+            );
+            assert!(
+                structured["message"]
+                    .as_str()
+                    .is_some_and(|message| message.contains("notakey")),
+                "{args}: {structured}"
+            );
+        }
+    }
+
     #[test]
     fn targeted_key_requires_focus_readback_before_dispatch() {
         use std::cell::RefCell;
@@ -889,6 +937,62 @@ mod tests {
         .unwrap();
         assert_eq!(fallback_calls.get(), 1);
         assert_eq!(dispatched.get(), 1);
+    }
+
+    /// Returns what press_key reports when its pointer focus fallback clicked
+    /// but focus still did not stick, so the test sees the published result.
+    struct ClickedButUnfocusedProbe;
+
+    #[async_trait::async_trait]
+    impl Tool for ClickedButUnfocusedProbe {
+        fn def(&self) -> &ToolDef {
+            def()
+        }
+
+        async fn invoke(&self, _args: serde_json::Value) -> ToolResult {
+            let error = with_confirmed_key_focus_or_fallback(
+                Some(99),
+                |_| Ok(()),
+                |_| false,
+                |_| Ok(true),
+                || -> anyhow::Result<()> { panic!("no key may be sent without focus") },
+            )
+            .unwrap_err();
+            delivery_failed(error)
+        }
+    }
+
+    #[tokio::test]
+    async fn a_fallback_click_without_focus_is_not_reported_as_nothing_sent() {
+        let mut registry = cua_driver_core::tool::ToolRegistry::new();
+        registry.register(Box::new(ClickedButUnfocusedProbe));
+        let result = registry
+            .invoke(
+                "press_key",
+                serde_json::json!({"pid": 123, "window_id": 7, "key": "return"}),
+            )
+            .await;
+        let structured = result.structured_content.expect("published action result");
+        assert_ne!(result.is_error, Some(true), "{structured}");
+        assert_eq!(structured["effect"], "unverifiable", "{structured}");
+        assert_eq!(structured["route"], "synthetic_events", "{structured}");
+        assert!(structured.get("dispatched").is_none(), "{structured}");
+        let summary = structured["summary"].as_str().unwrap_or_default();
+        assert!(
+            summary.contains("no key was dispatched") && summary.contains("click may have acted"),
+            "{structured}"
+        );
+        let hint = structured["hint"]
+            .as_str()
+            .expect("a read-before-repeat hint");
+        assert!(
+            hint.contains("Read what changed") && !hint.contains("The key was sent"),
+            "{structured}"
+        );
+        assert_eq!(
+            structured["next_call"]["tool"], "get_window_state",
+            "{structured}"
+        );
     }
 
     #[test]

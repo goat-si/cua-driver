@@ -1548,7 +1548,7 @@ type AxClickOutcome = (String, bool, bool, bool, bool);
 /// have acted on it; Apple documents that `kAXErrorCannotComplete` (the app
 /// did not answer within the messaging timeout) does not mean the action
 /// failed, and Finder opens a row and returns `kAXErrorAttributeUnsupported`.
-fn perform_error_proves_nothing_was_sent(err: crate::ax::bindings::AXError) -> bool {
+pub(super) fn perform_error_proves_nothing_was_sent(err: crate::ax::bindings::AXError) -> bool {
     use crate::ax::bindings::{
         kAXErrorAPIDisabled, kAXErrorIllegalArgument, kAXErrorInvalidUIElement,
     };
@@ -1558,6 +1558,34 @@ fn perform_error_proves_nothing_was_sent(err: crate::ax::bindings::AXError) -> b
         kAXErrorAPIDisabled,
     ]
     .contains(&err)
+}
+
+/// The outcome of a coordinate selection click that was delivered but whose
+/// AXSelected read-back did not settle. The click reached the app and may
+/// have selected or acted, so this is an unconfirmed click, not a failure.
+fn unconfirmed_selection_click(
+    selected_role: &str,
+    element: (usize, &str, &str),
+    modified: bool,
+    readback: &str,
+) -> AxClickOutcome {
+    let (idx, role, title) = element;
+    let expected = if modified {
+        "a stable AXSelected change that kept the prior selection"
+    } else {
+        "a stable AXSelected change"
+    };
+    (
+        format!(
+            "⚠️ Sent a coordinate click to the nearest {selected_role} for [{idx}] {role} \
+             \"{title}\", but did not read back {expected} ({readback}). It may have selected \
+             or acted: read the window before repeating it."
+        ),
+        false,
+        false,
+        false,
+        true,
+    )
 }
 
 /// The outcome of an AX action whose perform call returned `err` after it
@@ -1802,18 +1830,12 @@ fn perform_ax_click(
                 }
                 std::thread::sleep(SELECTION_READBACK_POLL);
             }
-            if modifiers.is_empty() {
-                anyhow::bail!(
-                    "coordinate click did not produce a stable AXSelected transition; \
-                     last_readback={last_observation:?}; retry after a fresh snapshot"
-                );
-            }
-            anyhow::bail!(
-                "foreground modified coordinate click did not produce a stable AXSelected \
-                 transition while preserving the prior selection; \
-                 before_selected={before}, last_readback={last_observation:?}; \
-                 take a fresh snapshot before retrying"
-            );
+            return Ok(unconfirmed_selection_click(
+                &selected_role,
+                (idx, &role, &title),
+                !modifiers.is_empty(),
+                &format!("before_selected={before}, last_readback={last_observation:?}"),
+            ));
         }
     }
 
@@ -2120,6 +2142,15 @@ mod tests {
     /// again. Only errors that prove nothing reached the app stay failures.
     #[test]
     fn perform_error_after_dispatch_is_unverifiable_unless_nothing_was_sent() {
+        for modified in [false, true] {
+            let (summary, needs_webkit_delay, suspected_noop, verified, via_pixel) =
+                unconfirmed_selection_click("AXRow", (3, "AXCell", "a"), modified, "last=None");
+            assert!(summary.contains("may have selected"), "{summary}");
+            assert!(!needs_webkit_delay && !suspected_noop && !verified && via_pixel);
+            let structured = ax_click_structured(via_pixel, false, verified, suspected_noop);
+            assert_eq!(structured["effect"], "unverifiable");
+            assert_eq!(structured["path"], "cgevent");
+        }
         use crate::ax::bindings::{
             kAXErrorAPIDisabled, kAXErrorActionUnsupported, kAXErrorAttributeUnsupported,
             kAXErrorCannotComplete, kAXErrorFailure, kAXErrorIllegalArgument,
