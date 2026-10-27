@@ -548,6 +548,61 @@ unsafe fn walk_element(
         return;
     }
 
+    // A scroll area that can scroll is a row of its own: it is what scroll
+    // targets, and its bar position tells an agent, and a diff read, whether
+    // a scroll moved anything. One that cannot scroll is layout only.
+    if role == "AXScrollArea" && !in_web_content {
+        let vertical = super::scroll_area::bar_position(element, "down");
+        let horizontal = super::scroll_area::bar_position(element, "right");
+        if let Some(label) = super::scroll_area::position_label(vertical, horizontal) {
+            let idx = *counter;
+            *counter += 1;
+            CFRetain(element as CFTypeRef);
+            let description = copy_string_attr(element, "AXDescription")
+                .map(|d| d.trim().to_owned())
+                .filter(|d| !d.is_empty());
+            let node = AXNode {
+                element_index: Some(idx),
+                role: role.clone(),
+                title: None,
+                value: Some(label),
+                description,
+                identifier: copy_string_attr(element, "AXIdentifier"),
+                help: None,
+                actions: copy_action_names(element),
+                element_ptr: element as usize,
+                depth,
+                parent_element_index: parent_index,
+                frame: element_screen_rect(element),
+                value_state: vertical.or(horizontal).map(|v| format!("{v:.3}")),
+                value_description: None,
+                min_value: Some(0.0),
+                max_value: Some(1.0),
+                enabled: None,
+                selected: None,
+                in_web_content,
+            };
+            lines.push((depth, format_node_line(&node)));
+            nodes.push(node);
+            walk_children(
+                element,
+                &role,
+                depth + 1,
+                Some(idx),
+                in_web_content,
+                nodes,
+                lines,
+                counter,
+                budget,
+                batching_disabled,
+                max_depth,
+                include_web_content,
+                deferred,
+            );
+            return;
+        }
+    }
+
     // Skip pure layout containers that have no interesting content.
     if role == "AXScrollArea" || role == "AXGroup" {
         // Still recurse — children may be interesting. Layout containers

@@ -47,6 +47,35 @@ pub fn moved(before: f64, after: f64) -> bool {
     (after - before).abs() > EPSILON
 }
 
+/// The value, 0 to 1, of `area`'s scroll bar along `direction`'s axis, or
+/// None when it has no bar there.
+///
+/// # Safety
+///
+/// `area` must be a live AX element. Call from a blocking context.
+pub unsafe fn bar_position(area: AXUIElementRef, direction: &str) -> Option<f64> {
+    let bar = copy_element_attr(area, bar_attribute(direction))?;
+    let value = copy_number_attr(bar, "AXValue");
+    CFRelease(bar as CFTypeRef);
+    value.filter(|value| value.is_finite())
+}
+
+/// How a scroll area shows in a tree row: where each of its bars sits. None
+/// without a bar, which means it cannot scroll.
+pub fn position_label(vertical: Option<f64>, horizontal: Option<f64>) -> Option<String> {
+    let percent = |value: f64| (value.clamp(0.0, 1.0) * 100.0).round() as i64;
+    match (vertical, horizontal) {
+        (Some(v), Some(h)) => Some(format!(
+            "scrolled {}% down, {}% right",
+            percent(v),
+            percent(h)
+        )),
+        (Some(v), None) => Some(format!("scrolled {}% down", percent(v))),
+        (None, Some(h)) => Some(format!("scrolled {}% right", percent(h))),
+        (None, None) => None,
+    }
+}
+
 /// Whether `position` already sits at the end `direction` scrolls toward,
 /// so a scroll that changes nothing is expected rather than dropped.
 pub fn at_end(direction: &str, position: f64) -> bool {
@@ -321,6 +350,23 @@ mod tests {
         assert_eq!(page_action("left"), Some("AXScrollLeftByPage"));
         assert_eq!(page_action("right"), Some("AXScrollRightByPage"));
         assert_eq!(page_action("sideways"), None);
+    }
+
+    #[test]
+    fn a_scroll_area_row_names_where_its_bars_sit() {
+        assert_eq!(position_label(None, None), None);
+        assert_eq!(
+            position_label(Some(0.0), None).as_deref(),
+            Some("scrolled 0% down")
+        );
+        assert_eq!(
+            position_label(Some(0.426), Some(1.2)).as_deref(),
+            Some("scrolled 43% down, 100% right")
+        );
+        assert_eq!(
+            position_label(None, Some(0.5)).as_deref(),
+            Some("scrolled 50% right")
+        );
     }
 
     #[test]
