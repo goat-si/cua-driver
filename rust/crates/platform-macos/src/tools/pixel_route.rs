@@ -16,6 +16,16 @@ use cua_driver_core::protocol::ToolResult;
 
 use crate::input::pointer_toolkit::PointerReadingToolkit;
 
+/// What to try after a background pixel click that was refused or changed
+/// nothing, in the order of the Cua action policy and GOAT's `token_first`
+/// refusal: the element's own action, then the keyboard, and the foreground
+/// last, because it moves the user's pointer and brings the window in front
+/// of them (cua-driver#22).
+pub(crate) const POINTER_CLICK_LADDER: &str = "Click the target by element_token if \
+     get_window_state lists it, or use the keyboard (Return, arrows, Tab). Retry with \
+     delivery_mode:\"foreground\" last, only if the user allows it: it moves the user's \
+     pointer and brings the window to the front.";
+
 /// Transport for a pixel click once any background AX hit-test backend has
 /// declined (or was not eligible).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -82,21 +92,20 @@ pub(crate) fn pointer_reading_background_refusal(
 ) -> ToolResult {
     let name = toolkit.name();
     let why = toolkit.why();
-    cua_driver_core::delivery::background_unavailable_result(
+    cua_driver_core::delivery::background_unavailable_result_with_suggestion(
         format!(
             "Background pixel click is not available for pid {pid}: its {name} toolkit \
-             {why}. Retry this action with delivery_mode:\"foreground\"; Cua \
-             Driver will activate the window, move the pointer to the target, and click."
+             {why}. {POINTER_CLICK_LADDER} In the foreground Cua Driver activates the \
+             window, moves the pointer to the target, and clicks."
         ),
         "background_unavailable",
         match toolkit {
             PointerReadingToolkit::Tk => {
                 "the target toolkit reads the hardware pointer position, which background \
-                 PID-routed events cannot move; retry with delivery_mode:\"foreground\"."
+                 PID-routed events cannot move"
             }
             PointerReadingToolkit::Vcl => {
-                "the target toolkit ignores background PID-routed mouse events; retry with \
-                 delivery_mode:\"foreground\"."
+                "the target toolkit ignores background PID-routed mouse events"
             }
         },
         serde_json::json!({
@@ -104,22 +113,24 @@ pub(crate) fn pointer_reading_background_refusal(
             "reason": "pointer_reading_toolkit",
             "toolkit": name,
         }),
+        POINTER_CLICK_LADDER,
     )
 }
 
 /// Human-readable delivery note appended to a successful pixel click result.
-pub(crate) fn delivery_note(route: PixelClickRoute) -> &'static str {
+pub(crate) fn delivery_note(route: PixelClickRoute) -> String {
     match route {
         PixelClickRoute::ForegroundHid => {
             "foreground: exact window activated, hardware pointer moved to the target, \
              HID event tap; not driver-verified — confirm via screenshot"
+                .to_owned()
         }
-        _ => {
+        _ => format!(
             "background CGEvent routed to the pid; the hardware pointer was not moved, \
              so apps that read the pointer position may not receive it at the target; \
-             not driver-verified — confirm via screenshot and retry with \
-             delivery_mode:\"foreground\" if nothing changed"
-        }
+             not driver-verified — confirm via screenshot. If nothing changed: \
+             {POINTER_CLICK_LADDER}"
+        ),
     }
 }
 
@@ -144,8 +155,72 @@ pub(crate) fn foreground_unavailable(action: &str, window_id: u32, cause: &str) 
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+
+    /// Assert that `text` names each rung in order, each after `anchor`, with
+    /// the foreground retry last and its pointer takeover disclosed.
+    pub(crate) fn assert_foreground_last(text: &str, anchor: &str, rungs: &[&str]) {
+        let start = text
+            .find(anchor)
+            .unwrap_or_else(|| panic!("missing {anchor:?} in: {text}"));
+        let tail = &text[start..];
+        let foreground = tail
+            .find("delivery_mode:\"foreground\"")
+            .unwrap_or_else(|| panic!("no foreground rung after {anchor:?}: {text}"));
+        let mut previous = 0;
+        for rung in rungs {
+            let at = tail
+                .find(rung)
+                .unwrap_or_else(|| panic!("missing rung {rung:?} after {anchor:?}: {text}"));
+            assert!(
+                at >= previous && at < foreground,
+                "{rung:?} must come in order and before the foreground retry: {text}"
+            );
+            previous = at;
+        }
+        assert!(
+            tail[foreground..].contains("pointer"),
+            "the foreground rung must say it moves the user's pointer: {text}"
+        );
+    }
+
+    /// cua-driver#22: after a background pixel click, the next steps are the
+    /// element token, then the keyboard, and the foreground last.
+    #[test]
+    fn background_pixel_note_puts_token_and_keyboard_before_foreground() {
+        let note = delivery_note(PixelClickRoute::BackgroundPid);
+        assert_foreground_last(&note, "If nothing changed", &["element_token", "keyboard"]);
+        assert!(
+            !note[..note.find("element_token").unwrap()].contains("foreground"),
+            "nothing before the token rung may point at the foreground: {note}"
+        );
+    }
+
+    /// cua-driver#22: a pointer-reading toolkit refusal keeps its structured
+    /// foreground escalation (run_steps' foreground fallback reads it), but its
+    /// text and suggestion lead with the token and keyboard rungs.
+    #[test]
+    fn pointer_reading_refusal_guides_token_and_keyboard_before_foreground() {
+        for toolkit in [PointerReadingToolkit::Tk, PointerReadingToolkit::Vcl] {
+            let result = pointer_reading_background_refusal(42, toolkit, "mouse_click");
+            let text = match &result.content[0] {
+                cua_driver_core::protocol::Content::Text { text, .. } => text.clone(),
+                other => panic!("text content expected: {other:?}"),
+            };
+            assert_foreground_last(
+                &text,
+                "Background pixel click",
+                &["element_token", "keyboard"],
+            );
+            let structured = result.structured_content.expect("structured refusal");
+            let suggestion = structured["suggestion"].as_str().expect("suggestion");
+            assert_foreground_last(suggestion, "", &["element_token", "keyboard"]);
+            let reason = structured["escalation"]["reason"].as_str().expect("reason");
+            assert!(!reason.contains("retry"), "{reason}");
+            assert_eq!(structured["escalation"]["recommended"], "foreground");
+        }
+    }
 
     /// D-MAC-6: a foreground window pixel click must use the HID tap with a
     /// real pointer move (Tk reads the hardware pointer), background clicks

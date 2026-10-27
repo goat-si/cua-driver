@@ -41,8 +41,17 @@ const DELIVERY_MODE_DESCRIPTION: &str = "Window-scoped drag on macOS: \"backgrou
      posts the press, drag and release to the exact window (window_id required) without moving \
      the pointer, raising the window or taking the user's focus. \"foreground\" briefly fronts \
      the window, drives the physical pointer through the gesture, then restores the prior \
-     frontmost app; use it only when a background drag had no effect. Desktop scope ignores \
-     this field.";
+     frontmost app; use it last, when a background drag had no effect and no element_token \
+     control or keyboard route does the same. Desktop scope ignores this field.";
+
+/// What to try after a background drag that was refused or changed nothing:
+/// a non-drag route by element_token, then the keyboard, and the foreground
+/// last, because it moves the user's pointer and brings the window in front
+/// of them (cua-driver#22).
+const DRAG_LADDER: &str = "Look for a route that is not a drag: a Move control, menu item or \
+     context-menu command by element_token, or the keyboard (a shortcut, cut and paste). Retry \
+     with delivery_mode:\"foreground\" last, only if the user allows it: it moves the user's \
+     pointer and brings the window to the front.";
 
 fn def() -> &'static ToolDef {
     DEF.get_or_init(|| ToolDef {
@@ -73,9 +82,11 @@ fn def() -> &'static ToolDef {
              drag_and_drop_session. For a page in a browser \
              tab already bound with get_browser_state, browser_pointer action:\"drag\" \
              drives the same gesture through CDP with page refs. The result is not \
-             driver-verified: confirm with a screenshot or the accessibility tree, and only \
-             if nothing changed retry with delivery_mode:\"foreground\", which briefly \
-             fronts the window and moves the physical pointer."
+             driver-verified: confirm with a screenshot or the accessibility tree. If \
+             nothing changed, use a route that is not a drag first: a Move control or menu \
+             item by element_token, or the keyboard (a shortcut, cut and paste). Retry with \
+             delivery_mode:\"foreground\" last, only if the user allows it: it briefly \
+             fronts the window and moves the user's physical pointer."
             .into(),
         input_schema: serde_json::json!({
             "type": "object",
@@ -757,17 +768,7 @@ impl DragTool {
                     (_, Err(error)) => error.to_string(),
                     (_, Ok(text)) => format!("unexpected inspector reply: {text}"),
                 };
-                cua_driver_core::delivery::background_unavailable_result(
-                    format!("{ELECTRON_BACKGROUND_DRAG_UNAVAILABLE} ({reason})"),
-                    "background_unavailable",
-                    "the Electron app's main process could not take the drag",
-                    serde_json::json!({
-                        "effect": "refused",
-                        "event_kind": "mouse_drag",
-                        "reason": "electron_main_process_unavailable",
-                        "requires": ["delivery_mode:foreground", "window_id"],
-                    }),
-                )
+                electron_drag_refusal(&reason)
             }
         }
     }
@@ -831,9 +832,22 @@ const DRAGGING_WINDOW_LEVEL: i32 = 500;
 
 const ELECTRON_BACKGROUND_DRAG_UNAVAILABLE: &str = "Background drag is unavailable for this \
      Electron window on macOS: a window-routed drag cannot hold the page's mouse button \
-     (Chromium reads it from the hardware), and the app's main process did not take the drag. \
-     Use the app's own controls (a button, menu item or keyboard route) or, if the user allows \
-     the window to come forward, retry with delivery_mode:\"foreground\".";
+     (Chromium reads it from the hardware), and the app's main process did not take the drag.";
+
+fn electron_drag_refusal(reason: &str) -> ToolResult {
+    cua_driver_core::delivery::background_unavailable_result_with_suggestion(
+        format!("{ELECTRON_BACKGROUND_DRAG_UNAVAILABLE} {DRAG_LADDER} ({reason})"),
+        "background_unavailable",
+        "the Electron app's main process could not take the drag",
+        serde_json::json!({
+            "effect": "refused",
+            "event_kind": "mouse_drag",
+            "reason": "electron_main_process_unavailable",
+            "requires": ["delivery_mode:foreground", "window_id"],
+        }),
+        DRAG_LADDER,
+    )
+}
 
 fn drag_image_windows(pid: i32) -> std::collections::HashSet<u32> {
     crate::windows::pid_on_screen_windows_any_layer(pid)
@@ -844,15 +858,12 @@ fn drag_image_windows(pid: i32) -> std::collections::HashSet<u32> {
 }
 
 fn drag_and_drop_session_result(pid: i32, wid: u32, suffix: String) -> ToolResult {
-    cua_driver_core::delivery::background_unavailable_result(
+    cua_driver_core::delivery::background_unavailable_result_with_suggestion(
         format!(
             "The background drag in pid {pid} window {wid} started a macOS drag-and-drop \
              session (for example reordering a list, moving a file or dragging page content). \
              macOS tracks drag-and-drop with the real pointer, so the drop did not land at the \
-             requested point; the driver released at once. Look for a route that is not a drag \
-             (a Move Up/Down button or menu item, a context-menu command, a keyboard shortcut, \
-             cut and paste). If the drag is the only route and the user allows the window to \
-             come forward, retry with delivery_mode:\"foreground\".{suffix}"
+             requested point; the driver released at once. {DRAG_LADDER}{suffix}"
         ),
         "background_unavailable",
         "drag-and-drop sessions follow the hardware pointer on macOS",
@@ -862,6 +873,7 @@ fn drag_and_drop_session_result(pid: i32, wid: u32, suffix: String) -> ToolResul
             "reason": "drag_and_drop_session",
             "requires": ["delivery_mode:foreground", "window_id"],
         }),
+        DRAG_LADDER,
     )
 }
 
@@ -938,5 +950,51 @@ mod tests {
             .unwrap();
         assert!(mode.contains("\"background\" (default)"));
         assert!(mode.contains("without moving the pointer"));
+    }
+
+    fn text_of(result: &ToolResult) -> String {
+        match &result.content[0] {
+            cua_driver_core::protocol::Content::Text { text, .. } => text.clone(),
+            other => panic!("text content expected: {other:?}"),
+        }
+    }
+
+    /// cua-driver#22: every drag fallback names a non-drag route by
+    /// element_token, then the keyboard, and the foreground last with its
+    /// pointer takeover, in the schema and in the refusals themselves.
+    #[test]
+    fn drag_guidance_puts_token_and_keyboard_before_foreground() {
+        use crate::tools::pixel_route::tests::assert_foreground_last;
+        let rungs = ["element_token", "keyboard"];
+        let def = def();
+        assert_foreground_last(&def.description, "The result is not", &rungs);
+        let mode = def.input_schema["properties"]["delivery_mode"]["description"]
+            .as_str()
+            .unwrap();
+        assert!(mode.contains("use it last"), "{mode}");
+        assert!(
+            mode.find("use it last") < mode.find("element_token"),
+            "{mode}"
+        );
+
+        for (result, anchor) in [
+            (
+                drag_and_drop_session_result(1, 2, String::new()),
+                "drop did not land",
+            ),
+            (
+                electron_drag_refusal("inspector off"),
+                "did not take the drag",
+            ),
+        ] {
+            assert_foreground_last(&text_of(&result), anchor, &rungs);
+            let structured = result.structured_content.expect("structured refusal");
+            assert_foreground_last(
+                structured["suggestion"].as_str().expect("suggestion"),
+                "",
+                &rungs,
+            );
+            assert_eq!(structured["escalation"]["recommended"], "foreground");
+        }
     }
 }
