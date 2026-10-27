@@ -1230,6 +1230,32 @@ async fn forward_tool_call(
     // `screenshot`, `get_window_state`) does its thing on the daemon
     // side.
     let socket = socket_path.to_owned();
+    #[cfg(unix)]
+    let blocking = {
+        // The per-call deadline drops this future; the guard then shuts the
+        // daemon socket so the blocking request ends with it and frees its
+        // in-flight slot, instead of waiting out the daemon client's longer
+        // reply deadline.
+        let abandon = AbandonDaemonCallOnDrop::default();
+        let slot = abandon.0.clone();
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            let stream = std::os::unix::net::UnixStream::connect(&socket)
+                .map_err(|error| anyhow::anyhow!("connect to {socket}: {error}"))?;
+            {
+                let mut slot = slot
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if slot.abandoned {
+                    anyhow::bail!("the call was abandoned before it reached the daemon");
+                }
+                slot.stream = stream.try_clone().ok();
+            }
+            cua_driver_core::daemon::send_request_on(stream, &req)
+        })
+        .await
+    };
+    #[cfg(not(unix))]
     let blocking = tokio::task::spawn_blocking(move || {
         let _permit = permit;
         send_request(&socket, &req)
@@ -1258,6 +1284,34 @@ async fn forward_tool_call(
         id,
         daemon_response_to_tool_result(&name, resp, output_schema.as_ref()),
     )
+}
+
+#[cfg(unix)]
+#[derive(Default)]
+struct DaemonCallSlot {
+    abandoned: bool,
+    stream: Option<std::os::unix::net::UnixStream>,
+}
+
+/// Held by a forwarded call's future. Dropping it, whether the call finished
+/// or the deadline dropped it, marks the call abandoned and shuts its daemon
+/// socket down, which ends a blocking read still waiting for a reply.
+#[cfg(unix)]
+#[derive(Default)]
+struct AbandonDaemonCallOnDrop(Arc<std::sync::Mutex<DaemonCallSlot>>);
+
+#[cfg(unix)]
+impl Drop for AbandonDaemonCallOnDrop {
+    fn drop(&mut self) {
+        let mut slot = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        slot.abandoned = true;
+        if let Some(stream) = slot.stream.take() {
+            let _ = stream.shutdown(std::net::Shutdown::Both);
+        }
+    }
 }
 
 /// Translate one `DaemonResponse` into the `CallTool.Result` the MCP client
@@ -2165,5 +2219,56 @@ mod tests {
         assert!(!daemon_owns_tool_observation(&serde_json::json!({
             "tool_observation_owner": "proxy"
         })));
+    }
+
+    /// When the proxy's per-call deadline drops a forwarded call, the
+    /// blocking daemon request must end with it. Before, it kept its socket
+    /// and an in-flight slot until the daemon client's own reply deadline
+    /// (TIMEOUT_MS_MAX plus overhead), past the proxy's 110 s.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_dropped_forwarded_call_releases_its_daemon_connection() {
+        use std::io::{BufRead, Read};
+        let directory = tempfile::Builder::new()
+            .prefix("px")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let socket = directory.path().join("d.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        // A daemon that reads the request and never answers.
+        let daemon = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut reader = std::io::BufReader::new(stream);
+            let mut request = String::new();
+            reader.read_line(&mut request).unwrap();
+            reader
+                .get_ref()
+                .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+                .unwrap();
+            let mut rest = [0_u8; 16];
+            matches!(reader.read(&mut rest), Ok(0))
+        });
+        let call = forward_tool_call(
+            serde_json::json!(1),
+            "list_apps".into(),
+            serde_json::json!({}),
+            socket.to_str().unwrap(),
+            "s",
+            false,
+            None,
+        );
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(300), call)
+                .await
+                .is_err(),
+            "the silent daemon must hold the call past the deadline"
+        );
+        let closed = tokio::task::spawn_blocking(move || daemon.join().unwrap())
+            .await
+            .unwrap();
+        assert!(
+            closed,
+            "the daemon connection must close once the proxy drops the call"
+        );
     }
 }
