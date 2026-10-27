@@ -311,6 +311,11 @@ impl ClipboardBackend for WindowsClipboard {
 
 #[cfg(test)]
 mod tests {
+    /// The native clipboard tests share the system clipboard, and one counts
+    /// its update notifications, so they must not run at the same time.
+    #[cfg(target_os = "windows")]
+    static NATIVE_CLIPBOARD_TESTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     use super::*;
 
     #[derive(Default)]
@@ -451,6 +456,9 @@ mod tests {
         {
             return;
         }
+        let _serial = NATIVE_CLIPBOARD_TESTS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         thread_local! {
             // One entry per clipboard update: whether the history exclusion
             // format was on the clipboard when the update was delivered.
@@ -524,9 +532,17 @@ mod tests {
             AddClipboardFormatListener(hwnd).unwrap();
             pump();
 
+            let png_name: Vec<u16> = "PNG".encode_utf16().chain(std::iter::once(0)).collect();
+            let png_format = RegisterClipboardFormatW(PCWSTR(png_name.as_ptr()));
             let image = backend.write_image(&image_path);
+            // The data itself landed, not only the update notification.
+            let image_formats = (
+                IsClipboardFormatAvailable(png_format).is_ok(),
+                IsClipboardFormatAvailable(17).is_ok(),
+            );
             let image_updates = pump();
             let file = backend.write_file_url(&image_path);
+            let file_format = IsClipboardFormatAvailable(15).is_ok();
             let file_updates = pump();
 
             let _ = RemoveClipboardFormatListener(hwnd);
@@ -536,8 +552,17 @@ mod tests {
             // The file write first: it succeeds on every build, so its count
             // shows the transaction split even where an image write errors.
             file.unwrap();
+            assert!(
+                file_format,
+                "write_file_url must leave CF_HDROP on the clipboard"
+            );
             assert_eq!(file_updates, [true], "write_file_url clipboard updates");
             image.unwrap();
+            assert_eq!(
+                image_formats,
+                (true, true),
+                "write_image must leave PNG and CF_DIBV5 on the clipboard"
+            );
             assert_eq!(image_updates, [true], "write_image clipboard updates");
         }
     }
@@ -552,6 +577,9 @@ mod tests {
         {
             return;
         }
+        let _serial = NATIVE_CLIPBOARD_TESTS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let backend = WindowsClipboard::new();
         backend
             .write_text("cua-driver clipboard test".into())
