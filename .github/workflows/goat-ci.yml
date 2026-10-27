@@ -83,18 +83,66 @@ jobs:
       image: debian:11
     env:
       STAGE: cua-driver-rs-${{ needs.version.outputs.version }}-linux-${{ matrix.arch }}
+      # The pinned package set. The snapshot never changes, so the lists and .debs it resolves to can
+      # be cached and reused verbatim when snapshot.debian.org is down (goat-si/cua-driver#20).
+      DEBIAN_SNAPSHOT: "20260901T000000Z"
+      DEBIAN_PACKAGES: >-
+        git ca-certificates curl python3 build-essential pkg-config
+        libx11-dev libxi-dev libxtst-dev libxext-dev libwayland-dev libxkbcommon-dev
     steps:
-      - name: Install build tooling
+      - name: Pin the Debian snapshot
+        id: apt-pin
         run: |
-          cat > /etc/apt/sources.list <<'EOF'
-          deb [check-valid-until=no signed-by=/usr/share/keyrings/debian-archive-keyring.gpg] http://snapshot.debian.org/archive/debian/20260901T000000Z/ bullseye main
-          deb [check-valid-until=no signed-by=/usr/share/keyrings/debian-archive-keyring.gpg] http://snapshot.debian.org/archive/debian/20260901T000000Z/ bullseye-updates main
-          deb [check-valid-until=no signed-by=/usr/share/keyrings/debian-archive-keyring.gpg] http://snapshot.debian.org/archive/debian-security/20260901T000000Z/ bullseye-security main
+          cat > /etc/apt/sources.list <<EOF
+          deb [check-valid-until=no signed-by=/usr/share/keyrings/debian-archive-keyring.gpg] http://snapshot.debian.org/archive/debian/$DEBIAN_SNAPSHOT/ bullseye main
+          deb [check-valid-until=no signed-by=/usr/share/keyrings/debian-archive-keyring.gpg] http://snapshot.debian.org/archive/debian/$DEBIAN_SNAPSHOT/ bullseye-updates main
+          deb [check-valid-until=no signed-by=/usr/share/keyrings/debian-archive-keyring.gpg] http://snapshot.debian.org/archive/debian-security/$DEBIAN_SNAPSHOT/ bullseye-security main
           EOF
-          apt-get -o Dir::Etc::sourceparts=- -o Acquire::Retries=5 update
-          apt-get -o Dir::Etc::sourceparts=- -o Acquire::Retries=5 install -y --no-install-recommends \
-            git ca-certificates curl python3 build-essential pkg-config \
-            libx11-dev libxi-dev libxtst-dev libxext-dev libwayland-dev libxkbcommon-dev
+          # The image deletes downloaded .debs after every install; keep them so they can be cached.
+          rm -f /etc/apt/apt.conf.d/docker-clean
+          # Keyed by the sources and the package list, so any change to either starts a new cache.
+          set_hash=$({ cat /etc/apt/sources.list; echo "$DEBIAN_PACKAGES"; } | sha256sum | cut -c1-16)
+          echo "key=goat-apt-debian11-${{ matrix.arch }}-$DEBIAN_SNAPSHOT-$set_hash" >> "$GITHUB_OUTPUT"
+      - name: Restore the pinned package set
+        id: apt-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: |
+            /var/lib/apt/lists
+            /var/cache/apt/archives/*.deb
+          key: ${{ steps.apt-pin.outputs.key }}
+      - name: Install build tooling
+        env:
+          CACHED: ${{ steps.apt-cache.outputs.cache-hit }}
+        run: |
+          apt_get() { apt-get -o Dir::Etc::sourceparts=- -o Acquire::Retries=5 "$@"; }
+          online_install() {
+            # snapshot.debian.org answers 503 during outages; back off and retry the whole fetch.
+            for delay in 0 30 90; do
+              sleep "$delay"
+              # shellcheck disable=SC2086
+              apt_get update && apt_get install -y --no-install-recommends $DEBIAN_PACKAGES && return 0
+              echo "::warning::apt from snapshot.debian.org failed; retrying after a pause"
+            done
+            return 1
+          }
+          # A cache hit holds the lists and every .deb of a completed install of this exact set, so
+          # it installs without touching the network. --no-download makes that a guarantee.
+          # shellcheck disable=SC2086
+          if [ "$CACHED" = "true" ] && apt_get install -y --no-install-recommends --no-download $DEBIAN_PACKAGES; then
+            echo "Installed the pinned package set from the cache, offline."
+          else
+            [ "$CACHED" = "true" ] && echo "::warning::cached package set did not install offline; fetching from the snapshot"
+            online_install
+          fi
+      - name: Save the pinned package set
+        if: steps.apt-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: |
+            /var/lib/apt/lists
+            /var/cache/apt/archives/*.deb
+          key: ${{ steps.apt-pin.outputs.key }}
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
