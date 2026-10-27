@@ -18,6 +18,10 @@ use std::time::Duration;
 use uuid::Uuid;
 
 pub const PRIVATE_WORKER_PROTOCOL_VERSION: u32 = 1;
+/// The host's pid, set on every private worker the SDK spawns. The worker
+/// compares it with its startup parent to tell an orphaned start from a host
+/// that is itself pid 1 (a container's init).
+pub const PRIVATE_WORKER_HOST_PID_ENV: &str = "CUA_DRIVER_PRIVATE_WORKER_HOST_PID";
 const DEFAULT_STARTUP_TIMEOUT_MS: u64 = 10_000;
 const DEFAULT_SHUTDOWN_TIMEOUT_MS: u64 = 2_000;
 
@@ -156,6 +160,7 @@ impl PrivateWorkerClient {
         for variable in safe_environment(&options.environment) {
             command.env(variable.name, variable.value);
         }
+        command.env(PRIVATE_WORKER_HOST_PID_ENV, std::process::id().to_string());
 
         let mut child = command.spawn().map_err(|error| DriverError::Worker {
             reason: format!("spawn private worker {}: {error}", options.binary_path),

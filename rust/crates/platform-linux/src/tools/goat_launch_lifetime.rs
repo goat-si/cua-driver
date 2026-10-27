@@ -5,7 +5,7 @@ use std::os::unix::process::CommandExt;
 use std::process::Command;
 
 pub(super) fn detach_user_app(command: &mut Command) -> &mut Command {
-    configure(command, cua_driver_core::embedded_mode())
+    configure(command, cua_driver_core::host_owned_runtime())
 }
 
 fn configure(command: &mut Command, embedded: bool) -> &mut Command {

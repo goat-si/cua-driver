@@ -510,6 +510,10 @@ fn main() {
         std::process::exit(code);
     }
     if let Some(generation) = private_worker::requested_generation() {
+        if let Err(error) = startup_parent.install_private_worker() {
+            eprintln!("cua-driver private worker: {error}");
+            std::process::exit(1);
+        }
         let (initialized_tx, initialized_rx) = std::sync::mpsc::sync_channel(1);
         std::thread::spawn(move || {
             let code = match private_worker::run(generation, Some(initialized_tx)) {
@@ -949,6 +953,7 @@ fn main() -> anyhow::Result<()> {
     }
     init_logging();
     if let Some(generation) = private_worker::requested_generation() {
+        startup_parent.install_private_worker()?;
         return private_worker::run(generation, None);
     }
     if telemetry::run_cli_completion_worker_if_requested() {

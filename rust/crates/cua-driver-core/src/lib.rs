@@ -44,6 +44,24 @@ pub fn embedded_mode() -> bool {
     std::env::var_os(EMBEDDED_ENV).is_some_and(|v| v == "1")
 }
 
+static HOST_OWNED_RUNTIME: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Mark this process as a runtime an embedding host owns without
+/// `--embedded`: the SDK's `__private-worker`. Set once at startup, before
+/// any tool runs.
+pub fn mark_host_owned_runtime() {
+    HOST_OWNED_RUNTIME.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// True when an embedding host owns this runtime's lifetime: embedded mode,
+/// or a private worker. Such a runtime sits in its own process group that
+/// dies with the host, so owned helpers join that group and user applications
+/// are moved out of it.
+pub fn host_owned_runtime() -> bool {
+    embedded_mode() || HOST_OWNED_RUNTIME.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Parent-EOF shutdown is valid only for a directly embedded daemon. Requiring
 /// both sentinels prevents an ambient variable from changing ordinary
 /// standalone or MCP stdin behavior.
