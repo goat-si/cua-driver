@@ -1435,13 +1435,18 @@ fn wait_for_daemon_listening(socket_path: &str, timeout_secs: u64) -> bool {
 
     // 100ms tick matches Swift's `usleep(100_000)`.
     let deadline = Instant::now() + Duration::from_secs(timeout_secs);
-    while Instant::now() < deadline {
-        if crate::serve::is_daemon_listening(socket_path) {
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return false;
+        }
+        // A launched process that accepts but never answers must not hold
+        // this wait past its own deadline.
+        if probe_daemon_listening(socket_path, remaining).unwrap_or(false) {
             return true;
         }
         std::thread::sleep(Duration::from_millis(100));
     }
-    false
 }
 
 #[cfg(target_os = "macos")]
@@ -1451,6 +1456,17 @@ fn launch_daemon_with_state_and_wait(
     state: &crate::history_runtime::DaemonLaunchState,
     experimental_history: bool,
     _allow_managed_restart: bool,
+) -> Result<(), LaunchDaemonError> {
+    launch_bundle_and_wait(socket_path, timeout_secs, state, experimental_history, None)
+}
+
+#[cfg(target_os = "macos")]
+fn launch_bundle_and_wait(
+    socket_path: &str,
+    timeout_secs: u64,
+    state: &crate::history_runtime::DaemonLaunchState,
+    experimental_history: bool,
+    stdin_marker: Option<&std::path::Path>,
 ) -> Result<(), LaunchDaemonError> {
     use std::process::{Command as Cmd, Stdio};
 
@@ -1469,7 +1485,13 @@ fn launch_daemon_with_state_and_wait(
     // than one copy is registered (for example `/Applications` and
     // `~/Applications`), LaunchServices may otherwise pick a different copy
     // than the one this CLI belongs to, with different TCC grants.
-    let open_args = daemon_launch_arguments(&app_path, socket_path, state, experimental_history);
+    let mut open_args =
+        daemon_launch_arguments(&app_path, socket_path, state, experimental_history);
+    if let Some(marker) = stdin_marker {
+        // Only the process this launch creates receives the marker as its
+        // stdin; the daemon never reads stdin.
+        open_args.splice(0..0, ["--stdin".to_owned(), marker.display().to_string()]);
+    }
     // Thread the Claude-Code compat flag through to the daemon. Without this
     // the proxy-spawned daemon always called build_macos_registry() (compat
     // hardcoded false), so `cua-driver mcp --claude-code-computer-use-compat`
@@ -1537,6 +1559,107 @@ fn launch_daemon_with_state_and_wait(
     experimental_history: bool,
     allow_managed_restart: bool,
 ) -> Result<(), LaunchDaemonError> {
+    launch_daemon_with_state_identified(
+        socket_path,
+        timeout_secs,
+        state,
+        experimental_history,
+        allow_managed_restart,
+    )
+    .1
+}
+
+/// Launch through LaunchServices and identify the process it created.
+///
+/// `open -n` reports no pid, so the launch connects the new process's stdin
+/// to a fresh empty marker file, and the identity is the one process whose
+/// stdin is that file (children it spawns inherit the marker; their parent is
+/// the one taken), recorded by its kernel audit token. No other launch holds
+/// the marker, and signals are delivered through the token, so a process that
+/// later reuses the pid cannot receive them. No match, several matches, or an
+/// unreadable process table leave the launch unidentified, and MCP startup
+/// then stops nothing. Without a marker the launch does not start at all.
+#[cfg(target_os = "macos")]
+fn launch_daemon_with_state_identified(
+    socket_path: &str,
+    timeout_secs: u64,
+    state: &crate::history_runtime::DaemonLaunchState,
+    experimental_history: bool,
+    _allow_managed_restart: bool,
+) -> (Option<LaunchedDaemon>, Result<(), LaunchDaemonError>) {
+    launch_with_marker(LaunchMarker::create, |marker| {
+        launch_bundle_and_wait(
+            socket_path,
+            timeout_secs,
+            state,
+            experimental_history,
+            Some(marker),
+        )
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn launch_with_marker(
+    create: impl FnOnce() -> std::io::Result<LaunchMarker>,
+    launch: impl FnOnce(&std::path::Path) -> Result<(), LaunchDaemonError>,
+) -> (Option<LaunchedDaemon>, Result<(), LaunchDaemonError>) {
+    let marker = match create() {
+        Ok(marker) => marker,
+        Err(error) => {
+            return (
+                None,
+                Err(LaunchDaemonError {
+                    kind: LaunchDaemonErrorKind::Failed,
+                    message: format!(
+                        "could not prepare the marker that identifies the daemon this command \
+                         launches, so nothing was launched: {error}"
+                    ),
+                }),
+            )
+        }
+    };
+    let result = launch(marker.path());
+    (identify_marked_process(marker.path()), result)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn launch_daemon_with_state_identified(
+    socket_path: &str,
+    timeout_secs: u64,
+    state: &crate::history_runtime::DaemonLaunchState,
+    experimental_history: bool,
+    allow_managed_restart: bool,
+) -> (Option<LaunchedDaemon>, Result<(), LaunchDaemonError>) {
+    let launched = match spawn_daemon_with_state(
+        socket_path,
+        state,
+        experimental_history,
+        allow_managed_restart,
+    ) {
+        Ok(launched) => launched,
+        Err(error) => return (None, Err(error)),
+    };
+    if wait_for_daemon_listening(socket_path, timeout_secs) {
+        return (launched, Ok(()));
+    }
+    (
+        launched,
+        Err(LaunchDaemonError {
+            kind: LaunchDaemonErrorKind::Timeout,
+            message: format!("daemon did not appear on {socket_path} within {timeout_secs}s"),
+        }),
+    )
+}
+
+/// Start a daemon process. Returns its identity, or none when a service
+/// manager restarted its own unit; that unit is not this process's to stop.
+#[cfg(not(target_os = "macos"))]
+fn spawn_daemon_with_state(
+    socket_path: &str,
+    state: &crate::history_runtime::DaemonLaunchState,
+    experimental_history: bool,
+    allow_managed_restart: bool,
+) -> Result<Option<LaunchedDaemon>, LaunchDaemonError> {
     let executable = std::env::current_exe().map_err(|error| LaunchDaemonError {
         kind: LaunchDaemonErrorKind::Failed,
         message: format!("current Cua Driver executable is unavailable: {error}"),
@@ -1544,43 +1667,45 @@ fn launch_daemon_with_state_and_wait(
     let managed = allow_managed_restart
         && socket_path == crate::serve::default_socket_path()
         && restart_managed_daemon_if_present(&executable);
-    if !managed {
-        let arguments = daemon_process_arguments(socket_path, state, experimental_history);
-        #[cfg(unix)]
-        {
-            use std::os::unix::process::CommandExt as _;
-            use std::process::{Command as Cmd, Stdio};
-
-            let mut command = Cmd::new(&executable);
-            command
-                .args(&arguments)
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null());
-            command.process_group(0);
-            command.spawn().map_err(|error| LaunchDaemonError {
-                kind: LaunchDaemonErrorKind::Failed,
-                message: format!("failed to launch {} serve: {error}", executable.display()),
-            })?;
-        }
-        #[cfg(target_os = "windows")]
-        spawn_detached_windows_daemon(&executable, &arguments)?;
+    if managed {
+        return Ok(None);
     }
+    let arguments = daemon_process_arguments(socket_path, state, experimental_history);
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt as _;
+        use std::process::{Command as Cmd, Stdio};
 
-    if wait_for_daemon_listening(socket_path, timeout_secs) {
-        return Ok(());
+        let mut command = Cmd::new(&executable);
+        command
+            .args(&arguments)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        command.process_group(0);
+        let child = command.spawn().map_err(|error| LaunchDaemonError {
+            kind: LaunchDaemonErrorKind::Failed,
+            message: format!("failed to launch {} serve: {error}", executable.display()),
+        })?;
+        Ok(Some(LaunchedDaemon::Child(child)))
     }
-    Err(LaunchDaemonError {
-        kind: LaunchDaemonErrorKind::Timeout,
-        message: format!("daemon did not appear on {socket_path} within {timeout_secs}s"),
-    })
+    #[cfg(target_os = "windows")]
+    {
+        let (pid, process) = spawn_detached_windows_daemon(&executable, &arguments)?;
+        Ok(Some(LaunchedDaemon::Process { pid, process }))
+    }
+    #[cfg(not(any(unix, target_os = "windows")))]
+    {
+        let _ = arguments;
+        Ok(None)
+    }
 }
 
 #[cfg(target_os = "windows")]
 fn spawn_detached_windows_daemon(
     executable: &std::path::Path,
     arguments: &[String],
-) -> Result<(), LaunchDaemonError> {
+) -> Result<(u32, OwnedProcess), LaunchDaemonError> {
     use std::os::windows::ffi::OsStrExt as _;
     use windows::core::{PCWSTR, PWSTR};
     use windows::Win32::Foundation::CloseHandle;
@@ -1623,8 +1748,9 @@ fn spawn_detached_windows_daemon(
         message: format!("failed to launch {} serve: {error}", executable.display()),
     })?;
     let _ = unsafe { CloseHandle(process.hThread) };
-    let _ = unsafe { CloseHandle(process.hProcess) };
-    Ok(())
+    // Kept open: while this handle exists Windows cannot give the pid to
+    // another process, so cleanup can address the launched daemon by pid.
+    Ok((process.dwProcessId, OwnedProcess(process.hProcess)))
 }
 
 #[cfg(target_os = "windows")]
@@ -1825,7 +1951,20 @@ where
     // they must never select the helper merely because its pipe exists.
     let socket_path = socket.unwrap_or_else(crate::serve::default_socket_path);
 
-    let already_running = crate::serve::is_daemon_listening(&socket_path);
+    let already_running = match probe_daemon_listening(&socket_path, MCP_DAEMON_STARTUP_DEADLINE) {
+        Ok(listening) => listening,
+        Err(reason) => {
+            if let Some(on_startup) = on_startup.take() {
+                on_startup(McpDaemonStartup::Unreachable, false);
+            }
+            // Something holds the endpoint without speaking the protocol.
+            // Launching another daemon onto the same path cannot succeed.
+            anyhow::bail!(
+                "the endpoint on {socket_path} {reason}; refusing to proxy MCP to it. \
+                 Stop whatever is listening there and retry."
+            );
+        }
+    };
     if already_running && !grants.is_empty() {
         if let Some(on_startup) = on_startup.take() {
             on_startup(McpDaemonStartup::AlreadyRunning, false);
@@ -1834,7 +1973,7 @@ where
             "--grant configures a newly launched runtime and cannot modify the daemon already listening on {socket_path}; restart it with the same --grant option"
         );
     }
-    let mut daemon = McpDaemonStartup::AlreadyRunning;
+    let mut experimental_history = false;
     if !already_running {
         // Never replace an embedded host's TCC identity by launching the
         // standalone CuaDriver.app daemon.
@@ -1849,7 +1988,7 @@ where
             );
         }
         #[cfg(target_os = "macos")]
-        let experimental_history = {
+        {
             let app_name = crate::bundle::app_name();
             eprintln!(
                 "{}: mcp launched without {app_name}.app's TCC grants; \
@@ -1857,10 +1996,10 @@ where
                  and proxying MCP requests through it.",
                 crate::bundle::cli_name()
             );
-            crate::history_runtime::preview_admitted_preference()
-        };
+            experimental_history = crate::history_runtime::preview_admitted_preference();
+        }
         #[cfg(not(target_os = "macos"))]
-        let experimental_history = {
+        {
             if !crate::history_runtime::preview_admitted_preference() {
                 if let Some(on_startup) = on_startup.take() {
                     on_startup(McpDaemonStartup::UnsupportedRelaunch, false);
@@ -1873,35 +2012,674 @@ where
                      Then re-run `cua-driver mcp`."
                 );
             }
-            true
-        };
-        if let Err(error) = launch_daemon_and_wait(
-            &socket_path,
-            10,
-            claude_code_compat,
-            grants,
-            experimental_history,
-        ) {
+            experimental_history = true;
+        }
+    }
+
+    let (daemon, mut launched) = match start_mcp_daemon(
+        &socket_path,
+        already_running,
+        MCP_DAEMON_STARTUP_DEADLINE,
+        || {
+            let state = crate::history_runtime::DaemonLaunchState {
+                claude_code_compat,
+                grants: grants.to_vec(),
+                ..Default::default()
+            };
+            launch_daemon_with_state_identified(
+                &socket_path,
+                10,
+                &state,
+                experimental_history,
+                true,
+            )
+        },
+    ) {
+        Ok(started) => started,
+        Err((daemon, error)) => {
             if let Some(on_startup) = on_startup.take() {
-                on_startup(
-                    if error.kind == LaunchDaemonErrorKind::Timeout {
-                        McpDaemonStartup::LaunchTimeout
-                    } else {
-                        McpDaemonStartup::LaunchFailed
-                    },
-                    false,
+                on_startup(daemon, false);
+            }
+            anyhow::bail!("{error}");
+        }
+    };
+
+    // Startup succeeds only once the proxy is ready to serve `initialize`;
+    // a daemon that stops answering during proxy setup is a failed startup.
+    let startup = std::cell::RefCell::new(on_startup);
+    let ready = std::cell::Cell::new(false);
+    let result = run_mcp_runtime(crate::proxy::run_proxy(socket_path.clone(), || {
+        ready.set(true);
+        if let Some(on_startup) = startup.borrow_mut().take() {
+            on_startup(daemon, true);
+        }
+    }));
+    let result = clean_up_unready_launch(
+        result,
+        ready.get(),
+        launched.as_mut(),
+        &socket_path,
+        MCP_DAEMON_STARTUP_DEADLINE,
+    );
+    if result.is_err() {
+        if let Some(on_startup) = startup.into_inner() {
+            on_startup(daemon, false);
+        }
+    }
+    result
+}
+
+/// A proxy that failed before it was ready leaves no daemon this call
+/// launched. Once ready, the daemon served the session and stays, as a daemon
+/// that was already running would.
+fn clean_up_unready_launch(
+    result: anyhow::Result<()>,
+    ready: bool,
+    launched: Option<&mut LaunchedDaemon>,
+    socket_path: &str,
+    deadline: std::time::Duration,
+) -> anyhow::Result<()> {
+    match (result, launched) {
+        (Err(error), Some(launched)) if !ready => Err(anyhow::anyhow!(
+            "{error}. Cleanup: {}",
+            describe_cleanup(launched, socket_path, deadline)
+        )),
+        (result, _) => result,
+    }
+}
+
+/// Longest `cua-driver mcp` waits for one startup exchange with a daemon.
+const MCP_DAEMON_STARTUP_DEADLINE: std::time::Duration = crate::proxy::DAEMON_STARTUP_DEADLINE;
+
+/// Launch a daemon when none is listening, then admit it for MCP.
+///
+/// Cleanup is limited to the process the launch itself created
+/// ([`LaunchedDaemon`]). It is signalled directly; the endpoint is never asked
+/// which process to stop, so a daemon that was already there, or one that
+/// replaced the launched process on the same path, is left alone.
+fn start_mcp_daemon(
+    socket_path: &str,
+    already_running: bool,
+    deadline: std::time::Duration,
+    launch: impl FnOnce() -> (Option<LaunchedDaemon>, Result<(), LaunchDaemonError>),
+) -> Result<(McpDaemonStartup, Option<LaunchedDaemon>), (McpDaemonStartup, String)> {
+    if already_running {
+        return admit_mcp_daemon(socket_path, None, deadline)
+            .map(|()| (McpDaemonStartup::AlreadyRunning, None))
+            .map_err(|error| (McpDaemonStartup::AlreadyRunning, error));
+    }
+    let (mut launched, result) = launch();
+    if let Err(error) = result {
+        let timed_out = error.kind == LaunchDaemonErrorKind::Timeout;
+        let outcome = if timed_out {
+            McpDaemonStartup::LaunchTimeout
+        } else {
+            McpDaemonStartup::LaunchFailed
+        };
+        let mut message = error.to_string();
+        // A launched process that accepts connections but never becomes ready
+        // would otherwise outlive this failed invocation. One that does not
+        // accept connections yet may be waiting on a first-launch permission
+        // prompt, which the timeout message tells the person to finish.
+        if let Some(launched) = launched.as_mut().filter(|_| timed_out) {
+            if endpoint_accepts_connections(socket_path, deadline) {
+                message = format!(
+                    "{message}. Something accepted connections on {socket_path} without \
+                     becoming ready; {}",
+                    describe_cleanup(launched, socket_path, deadline)
                 );
             }
-            return Err(error.into());
         }
-        daemon = McpDaemonStartup::Launched;
+        return Err((outcome, message));
+    }
+    // Socket readiness proves only that something answers. An older installed
+    // app (goat-si/goat#1717) answers but cannot serve this build's protocol.
+    admit_mcp_daemon(socket_path, launched.as_mut(), deadline)
+        .map_err(|error| (McpDaemonStartup::Launched, error))?;
+    // Kept until the proxy is ready, so a failure in between still cleans up.
+    Ok((McpDaemonStartup::Launched, launched))
+}
+
+/// Whether anything accepts connections on the endpoint, protocol aside.
+fn endpoint_accepts_connections(socket_path: &str, deadline: std::time::Duration) -> bool {
+    let socket_path = socket_path.to_owned();
+    within_startup_deadline(deadline, "connection probe", move || {
+        #[cfg(unix)]
+        {
+            std::os::unix::net::UnixStream::connect(&socket_path).is_ok()
+        }
+        #[cfg(not(unix))]
+        {
+            crate::serve::is_daemon_listening(&socket_path)
+        }
+    })
+    .unwrap_or(true)
+}
+
+/// Run blocking daemon I/O on a helper thread and stop waiting at `deadline`.
+/// A timed-out exchange is abandoned with its thread; callers fail startup,
+/// and process exit closes the abandoned connection.
+fn within_startup_deadline<T: Send + 'static>(
+    deadline: std::time::Duration,
+    exchange: &str,
+    work: impl FnOnce() -> T + Send + 'static,
+) -> Result<T, String> {
+    use std::sync::mpsc::RecvTimeoutError;
+
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    std::thread::Builder::new()
+        .name("cua-mcp-startup".into())
+        .spawn(move || {
+            let _ = sender.send(work());
+        })
+        .map_err(|error| format!("could not start the {exchange}: {error}"))?;
+    match receiver.recv_timeout(deadline) {
+        Ok(value) => Ok(value),
+        Err(RecvTimeoutError::Timeout) => {
+            Err(format!("did not answer the {exchange} within {deadline:?}"))
+        }
+        Err(RecvTimeoutError::Disconnected) => Err(format!("the {exchange} failed unexpectedly")),
+    }
+}
+
+fn probe_daemon_listening(
+    socket_path: &str,
+    deadline: std::time::Duration,
+) -> Result<bool, String> {
+    let socket_path = socket_path.to_owned();
+    within_startup_deadline(deadline, "listening probe", move || {
+        crate::serve::is_daemon_listening(&socket_path)
+    })
+}
+
+fn ensure_compatible_daemon_within(
+    socket_path: &str,
+    deadline: std::time::Duration,
+) -> Result<(), String> {
+    let socket_path = socket_path.to_owned();
+    within_startup_deadline(deadline, "compatibility handshake", move || {
+        ensure_compatible_daemon(&socket_path)
+    })?
+}
+
+/// A daemon process this invocation created, identified by the launch itself:
+/// a spawned child, the process holding this launch's stdin marker after
+/// `open -n`, or the pid `CreateProcessW` returned.
+#[derive(Debug)]
+pub(crate) enum LaunchedDaemon {
+    // macOS launches through LaunchServices; only its tests spawn children.
+    #[cfg_attr(target_os = "macos", allow(dead_code))]
+    #[cfg(unix)]
+    Child(std::process::Child),
+    #[cfg(target_os = "macos")]
+    Marked {
+        pid: u32,
+        /// Kernel audit token (pid and pid version). Signals are delivered
+        /// through it, so a process that later reuses the pid refuses them.
+        token: AuditToken,
+    },
+    #[cfg(target_os = "windows")]
+    Process { pid: u32, process: OwnedProcess },
+}
+
+/// The launched process's handle, held for the whole cleanup: Windows does not
+/// reuse a pid while a handle to that process is open.
+#[cfg(target_os = "windows")]
+#[derive(Debug)]
+pub(crate) struct OwnedProcess(windows::Win32::Foundation::HANDLE);
+
+#[cfg(target_os = "windows")]
+impl OwnedProcess {
+    /// Whether the process exits within `timeout` (zero only polls).
+    fn exits_within(&self, timeout: std::time::Duration) -> bool {
+        use windows::Win32::Foundation::WAIT_OBJECT_0;
+        use windows::Win32::System::Threading::WaitForSingleObject;
+
+        let milliseconds = u32::try_from(timeout.as_millis()).unwrap_or(u32::MAX - 1);
+        // SAFETY: the handle is open for the lifetime of self.
+        unsafe { WaitForSingleObject(self.0, milliseconds) == WAIT_OBJECT_0 }
     }
 
-    if let Some(on_startup) = on_startup.take() {
-        on_startup(daemon, true);
+    fn terminate(&self) -> Result<(), String> {
+        use windows::Win32::System::Threading::TerminateProcess;
+
+        // SAFETY: the handle is open for the lifetime of self.
+        unsafe { TerminateProcess(self.0, 1) }.map_err(|error| error.to_string())
+    }
+}
+
+#[cfg(target_os = "windows")]
+impl Drop for OwnedProcess {
+    fn drop(&mut self) {
+        // SAFETY: closes the handle CreateProcessW returned, exactly once.
+        let _ = unsafe { windows::Win32::Foundation::CloseHandle(self.0) };
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Termination {
+    AlreadyExited,
+    // Windows stops its launch only by handle termination.
+    #[cfg_attr(target_os = "windows", allow(dead_code))]
+    Terminated,
+    Killed,
+}
+
+impl LaunchedDaemon {
+    fn pid(&self) -> u32 {
+        match self {
+            #[cfg(unix)]
+            Self::Child(child) => child.id(),
+            #[cfg(target_os = "macos")]
+            Self::Marked { pid, .. } => *pid,
+            #[cfg(target_os = "windows")]
+            Self::Process { pid, .. } => *pid,
+        }
     }
 
-    run_mcp_runtime(crate::proxy::run_proxy(socket_path))
+    /// Stop this process: SIGTERM, then SIGKILL after `deadline`, each followed by
+    /// a bounded wait for it to exit. A process that no longer matches its
+    /// launch identity has exited, and its pid is not signalled again.
+    fn terminate(&mut self, deadline: std::time::Duration) -> Result<Termination, String> {
+        match self {
+            #[cfg(unix)]
+            Self::Child(child) => {
+                let pid = child.id();
+                let mut poll_error = None;
+                let mut exited = || match child.try_wait() {
+                    Ok(status) => status.is_some(),
+                    Err(error) => {
+                        poll_error = Some(error);
+                        true
+                    }
+                };
+                let termination = if exited() {
+                    Termination::AlreadyExited
+                } else {
+                    signal_process(pid, libc::SIGTERM);
+                    if wait_until(deadline, &mut exited) {
+                        Termination::Terminated
+                    } else {
+                        signal_process(pid, libc::SIGKILL);
+                        if !wait_until(deadline, &mut exited) {
+                            return Err(format!(
+                                "process {pid} did not exit within {deadline:?} of SIGKILL"
+                            ));
+                        }
+                        Termination::Killed
+                    }
+                };
+                match poll_error {
+                    Some(error) => Err(format!("could not confirm process {pid} exited: {error}")),
+                    None => Ok(termination),
+                }
+            }
+            #[cfg(target_os = "macos")]
+            Self::Marked { pid, token } => {
+                let (pid, token) = (*pid, *token);
+                let running = || audit_token_for_pid(pid) == Some(token);
+                if !running() {
+                    return Ok(Termination::AlreadyExited);
+                }
+                if !signal_audited(&token, libc::SIGTERM)? {
+                    return Ok(Termination::AlreadyExited);
+                }
+                if wait_until(deadline, &mut || !running()) {
+                    return Ok(Termination::Terminated);
+                }
+                signal_audited(&token, libc::SIGKILL)?;
+                if wait_until(deadline, &mut || !running()) {
+                    Ok(Termination::Killed)
+                } else {
+                    Err(format!(
+                        "process {pid} did not exit within {deadline:?} of SIGKILL"
+                    ))
+                }
+            }
+            #[cfg(target_os = "windows")]
+            Self::Process { pid, process } => {
+                if process.exits_within(std::time::Duration::ZERO) {
+                    return Ok(Termination::AlreadyExited);
+                }
+                // Only the retained handle is used. A pid-addressed request
+                // could outlive this handle on an abandoned worker and reach
+                // a later process that reuses the pid.
+                process.terminate()?;
+                if process.exits_within(deadline) {
+                    Ok(Termination::Killed)
+                } else {
+                    Err(format!(
+                        "process {} did not exit within {deadline:?} of TerminateProcess",
+                        *pid
+                    ))
+                }
+            }
+        }
+    }
+}
+
+/// Poll `done` until it holds or `deadline` passes.
+#[cfg(unix)]
+fn wait_until(deadline: std::time::Duration, done: &mut dyn FnMut() -> bool) -> bool {
+    let until = std::time::Instant::now() + deadline;
+    loop {
+        if done() {
+            return true;
+        }
+        if std::time::Instant::now() >= until {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
+#[cfg(unix)]
+fn signal_process(pid: u32, signal: libc::c_int) {
+    if let Ok(pid) = libc::pid_t::try_from(pid) {
+        // SAFETY: kill(2) with a positive pid only signals that process.
+        unsafe {
+            libc::kill(pid, signal);
+        }
+    }
+}
+
+/// An empty file in a private directory, handed to the launched process as
+/// its stdin. Removed on drop; the launched process keeps its open handle.
+#[cfg(target_os = "macos")]
+struct LaunchMarker {
+    directory: std::path::PathBuf,
+    path: std::path::PathBuf,
+}
+
+#[cfg(target_os = "macos")]
+impl LaunchMarker {
+    fn create() -> std::io::Result<Self> {
+        use std::os::unix::fs::DirBuilderExt as _;
+
+        let directory =
+            std::env::temp_dir().join(format!("cua-driver-mcp-launch-{}", uuid::Uuid::new_v4()));
+        std::fs::DirBuilder::new().mode(0o700).create(&directory)?;
+        let mut marker = Self {
+            path: directory.join("stdin"),
+            directory,
+        };
+        std::fs::File::create(&marker.path)?;
+        // The kernel reports resolved paths (/private/var, not /var).
+        marker.path = std::fs::canonicalize(&marker.path)?;
+        Ok(marker)
+    }
+
+    fn path(&self) -> &std::path::Path {
+        &self.path
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for LaunchMarker {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+        let _ = std::fs::remove_dir(&self.directory);
+    }
+}
+
+/// The launched process holding `marker` as its stdin, by audit token.
+///
+/// Processes it spawned inherit the marker, so the launched one is the marked
+/// process whose parent is not marked; anything but exactly one such process
+/// leaves the launch unidentified.
+#[cfg(target_os = "macos")]
+fn identify_marked_process(marker: &std::path::Path) -> Option<LaunchedDaemon> {
+    let marked: Vec<u32> = all_process_ids()?
+        .into_iter()
+        .filter(|pid| process_stdin_path(*pid).as_deref() == Some(marker))
+        .collect();
+    let mut roots = marked
+        .iter()
+        .copied()
+        .filter(|pid| process_parent(*pid).is_some_and(|parent| !marked.contains(&parent)));
+    let (Some(pid), None) = (roots.next(), roots.next()) else {
+        return None;
+    };
+    // The token must name the process that holds the marker: read it on
+    // both sides of a marker check, so a pid reused in between is caught.
+    let token = audit_token_for_pid(pid)?;
+    let still_marked = process_stdin_path(pid).as_deref() == Some(marker);
+    (still_marked && audit_token_for_pid(pid) == Some(token))
+        .then_some(LaunchedDaemon::Marked { pid, token })
+}
+
+/// Every pid in the process table, or `None` when it cannot be read in full.
+#[cfg(target_os = "macos")]
+fn all_process_ids() -> Option<Vec<u32>> {
+    // SAFETY: a null buffer asks libproc for the current process count.
+    let count = unsafe { libc::proc_listallpids(std::ptr::null_mut(), 0) };
+    let count = usize::try_from(count).ok().filter(|count| *count > 0)?;
+    // Headroom for processes started between the two calls; a full buffer
+    // means the table may not have fit.
+    let mut pids = vec![0 as libc::pid_t; count + 256];
+    let bytes = libc::c_int::try_from(pids.len() * std::mem::size_of::<libc::pid_t>()).ok()?;
+    // SAFETY: the buffer holds `bytes` bytes of pid_t slots.
+    let filled = unsafe { libc::proc_listallpids(pids.as_mut_ptr().cast(), bytes) };
+    let filled = usize::try_from(filled).ok().filter(|filled| *filled > 0)?;
+    if filled >= pids.len() {
+        return None;
+    }
+    pids.truncate(filled);
+    Some(
+        pids.into_iter()
+            .filter_map(|pid| u32::try_from(pid).ok().filter(|pid| *pid > 0))
+            .collect(),
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn process_parent(pid: u32) -> Option<u32> {
+    let pid = libc::c_int::try_from(pid).ok()?;
+    // SAFETY: proc_bsdinfo is plain data; zero is a valid bit pattern.
+    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+    let size = libc::c_int::try_from(std::mem::size_of::<libc::proc_bsdinfo>()).ok()?;
+    // SAFETY: the kernel writes at most `size` bytes into info.
+    let written = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            (&mut info as *mut libc::proc_bsdinfo).cast(),
+            size,
+        )
+    };
+    (written == size).then_some(info.pbi_ppid)
+}
+
+/// `audit_token_t` from <mach/message.h>: index 5 is the pid, index 7 the pid
+/// version that distinguishes processes reusing a pid.
+#[cfg(target_os = "macos")]
+type AuditToken = [u32; 8];
+
+#[cfg(target_os = "macos")]
+mod mach_identity {
+    extern "C" {
+        pub static mach_task_self_: u32;
+        pub fn task_name_for_pid(target: u32, pid: libc::c_int, name: *mut u32) -> libc::c_int;
+        pub fn task_info(
+            task: u32,
+            flavor: libc::c_int,
+            info: *mut libc::c_int,
+            count: *mut u32,
+        ) -> libc::c_int;
+        pub fn mach_port_deallocate(task: u32, name: u32) -> libc::c_int;
+    }
+    /// <mach/task_info.h> TASK_AUDIT_TOKEN.
+    pub const TASK_AUDIT_TOKEN: libc::c_int = 15;
+}
+
+/// Audit token of the live process `pid`; `None` once it has exited (a zombie
+/// has no task) or when it belongs to another user.
+#[cfg(target_os = "macos")]
+fn audit_token_for_pid(pid: u32) -> Option<AuditToken> {
+    use mach_identity::*;
+
+    let pid = libc::c_int::try_from(pid).ok()?;
+    let mut name = 0_u32;
+    // SAFETY: task_name_for_pid writes one port name for a same-user process.
+    let task_self = unsafe { mach_task_self_ };
+    if unsafe { task_name_for_pid(task_self, pid, &mut name) } != 0 {
+        return None;
+    }
+    let mut token: AuditToken = [0; 8];
+    let mut count = 8_u32;
+    // SAFETY: TASK_AUDIT_TOKEN fills eight natural_t words.
+    let status = unsafe {
+        task_info(
+            name,
+            TASK_AUDIT_TOKEN,
+            token.as_mut_ptr().cast(),
+            &mut count,
+        )
+    };
+    // SAFETY: releases the send right task_name_for_pid returned.
+    unsafe { mach_port_deallocate(task_self, name) };
+    (status == 0 && count == 8 && libc::c_int::try_from(token[5]).ok() == Some(pid))
+        .then_some(token)
+}
+
+/// Deliver `signal` to the process `token` names. The kernel refuses it when
+/// that process has exited, even if its pid now names another process.
+/// `Ok(false)` means it was not delivered for that reason.
+#[cfg(target_os = "macos")]
+fn signal_audited(token: &AuditToken, signal: libc::c_int) -> Result<bool, String> {
+    type SignalWithAuditToken = unsafe extern "C" fn(*mut AuditToken, libc::c_int) -> libc::c_int;
+    // Looked up at run time so a system without it cannot fail to load the
+    // driver; cleanup then reports that it could not stop the process.
+    // SAFETY: dlsym with a NUL-terminated name and the default handle.
+    let symbol =
+        unsafe { libc::dlsym(libc::RTLD_DEFAULT, c"proc_signal_with_audittoken".as_ptr()) };
+    if symbol.is_null() {
+        return Err(
+            "identity-bound signalling (proc_signal_with_audittoken) is unavailable".into(),
+        );
+    }
+    // SAFETY: the symbol has the libproc.h signature above.
+    let signal_with_audit_token: SignalWithAuditToken = unsafe { std::mem::transmute(symbol) };
+    let mut token = *token;
+    // SAFETY: passes a valid eight-word audit token.
+    match unsafe { signal_with_audit_token(&mut token, signal) } {
+        0 => Ok(true),
+        libc::ESRCH => Ok(false),
+        error => Err(format!(
+            "signalling process {} failed: {}",
+            token[5],
+            std::io::Error::from_raw_os_error(error)
+        )),
+    }
+}
+
+/// Path of the file open as the process's stdin, when it is a file.
+#[cfg(target_os = "macos")]
+fn process_stdin_path(pid: u32) -> Option<std::path::PathBuf> {
+    use std::os::unix::ffi::OsStrExt as _;
+
+    // <sys/proc_info.h>: struct proc_fileinfo and vnode_fdinfowithpath.
+    #[repr(C)]
+    struct ProcFileInfo {
+        fi_openflags: u32,
+        fi_status: u32,
+        fi_offset: i64,
+        fi_type: i32,
+        fi_guardflags: u32,
+    }
+    #[repr(C)]
+    struct VnodeFdInfoWithPath {
+        pfi: ProcFileInfo,
+        pvip: libc::vnode_info_path,
+    }
+    const PROC_PIDFDVNODEPATHINFO: libc::c_int = 2;
+
+    let pid = libc::c_int::try_from(pid).ok()?;
+    // SAFETY: plain data; zero is a valid bit pattern.
+    let mut info: VnodeFdInfoWithPath = unsafe { std::mem::zeroed() };
+    let size = libc::c_int::try_from(std::mem::size_of::<VnodeFdInfoWithPath>()).ok()?;
+    // SAFETY: the kernel writes at most `size` bytes into info.
+    let written = unsafe {
+        libc::proc_pidfdinfo(
+            pid,
+            0,
+            PROC_PIDFDVNODEPATHINFO,
+            (&mut info as *mut VnodeFdInfoWithPath).cast(),
+            size,
+        )
+    };
+    if written != size {
+        return None;
+    }
+    let bytes: Vec<u8> = info
+        .pvip
+        .vip_path
+        .iter()
+        .flatten()
+        .map(|byte| *byte as u8)
+        .take_while(|byte| *byte != 0)
+        .collect();
+    (!bytes.is_empty()).then(|| std::ffi::OsStr::from_bytes(&bytes).into())
+}
+
+/// Stop the launched process and say what was observed.
+fn describe_cleanup(
+    launched: &mut LaunchedDaemon,
+    socket_path: &str,
+    deadline: std::time::Duration,
+) -> String {
+    let cli = crate::bundle::cli_name();
+    let pid = launched.pid();
+    match launched.terminate(deadline) {
+        Ok(Termination::Terminated) => {
+            format!("the process this command launched (pid {pid}) was terminated.")
+        }
+        Ok(Termination::Killed) => {
+            format!(
+                "the process this command launched (pid {pid}) did not stop when asked and was \
+                 killed."
+            )
+        }
+        Ok(Termination::AlreadyExited) => format!(
+            "the process this command launched (pid {pid}) had already exited, so whatever \
+             answers on {socket_path} belongs to someone else and was left running. Stop it \
+             with `{cli} stop --socket {socket_path}` if it is yours."
+        ),
+        Err(error) => format!(
+            "stopping the process this command launched (pid {pid}) failed ({error}); \
+             end it, or run `{cli} stop --socket {socket_path}`."
+        ),
+    }
+}
+
+/// Refuse a daemon this build cannot serve MCP through. Only the process this
+/// invocation launched is stopped; anything else on the endpoint is left alone.
+fn admit_mcp_daemon(
+    socket_path: &str,
+    launched: Option<&mut LaunchedDaemon>,
+    deadline: std::time::Duration,
+) -> Result<(), String> {
+    let Err(reason) = ensure_compatible_daemon_within(socket_path, deadline) else {
+        return Ok(());
+    };
+    let cli = crate::bundle::cli_name();
+    let version = env!("CARGO_PKG_VERSION");
+    let refused = format!(
+        "Cua Driver daemon on {socket_path} is incompatible with {cli} {version}: {reason}"
+    );
+    match launched {
+        Some(launched) => Err(format!(
+            "{refused}. Install a Cua Driver app that matches this {cli}, or remove the older \
+             one, and retry. Cleanup: {}",
+            describe_cleanup(launched, socket_path, deadline)
+        )),
+        None => Err(format!(
+            "{refused}. This command did not start it (or could not identify the process it \
+             started), so it was left running; stop it with \
+             `{cli} stop --socket {socket_path}` and retry."
+        )),
+    }
 }
 
 pub(crate) fn run_mcp_runtime<T>(future: impl std::future::Future<Output = T>) -> T {
@@ -2495,6 +3273,526 @@ mod daemon_compatibility_tests {
         let error = ensure_compatible_daemon(socket.to_str().unwrap()).unwrap_err();
         assert!(error.contains("incompatible daemon"), "{error}");
         server.join().unwrap();
+    }
+
+    use super::{
+        admit_mcp_daemon, run_mcp_via_daemon_proxy, start_mcp_daemon, LaunchDaemonError,
+        LaunchDaemonErrorKind, LaunchedDaemon, McpDaemonStartup,
+    };
+    use cua_driver_testkit::{FakeDaemon, FakeEndpoint, FakeReply};
+    use std::process::{Child, Command, Stdio};
+    use std::time::Duration;
+
+    const STARTUP: Duration = Duration::from_secs(5);
+
+    /// An older daemon: it answers the listening probe and honours stop
+    /// requests, but does not know `metadata`.
+    fn legacy_daemon(method: &str) -> FakeReply {
+        match method {
+            "list" => FakeReply::ok(serde_json::json!({ "tools": [] })),
+            "shutdown" | "shutdown_if_pid" => FakeReply::ok(serde_json::json!({})),
+            other => FakeReply::unknown_method(other),
+        }
+    }
+
+    /// Accepts connections but never passes the listening probe.
+    fn unready_daemon(method: &str) -> FakeReply {
+        match method {
+            "list" => FakeReply::unknown_method("list"),
+            other => legacy_daemon(other),
+        }
+    }
+
+    /// A real process standing in for the launched daemon; it runs until it
+    /// is signalled, even after its handle is dropped.
+    fn launched_process() -> Child {
+        Command::new("/bin/sleep")
+            .arg("600")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .spawn()
+            .unwrap()
+    }
+
+    fn reap(pid: u32) {
+        // SAFETY: signals and reaps a child this test spawned.
+        unsafe {
+            libc::kill(pid as libc::pid_t, libc::SIGKILL);
+            libc::waitpid(pid as libc::pid_t, std::ptr::null_mut(), 0);
+        }
+    }
+
+    /// True once the pid no longer names a process (the handle reaped it).
+    fn gone(pid: u32) -> bool {
+        // SAFETY: signal 0 only checks that the pid exists.
+        let result = unsafe { libc::kill(pid as libc::pid_t, 0) };
+        result == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+    }
+
+    fn launch_timeout() -> Result<(), LaunchDaemonError> {
+        Err(LaunchDaemonError {
+            kind: LaunchDaemonErrorKind::Timeout,
+            message: "daemon did not appear".into(),
+        })
+    }
+
+    fn stop_requests(methods: &[String]) -> Vec<&String> {
+        methods
+            .iter()
+            .filter(|method| matches!(method.as_str(), "shutdown" | "shutdown_if_pid"))
+            .collect()
+    }
+
+    #[test]
+    fn incompatible_daemon_launched_by_mcp_is_terminated_by_its_launch_identity() {
+        let endpoint = FakeEndpoint::new();
+        let socket = endpoint.socket().to_owned();
+        let mut fake = None;
+        let child = launched_process();
+        let pid = child.id();
+
+        let (outcome, error) = start_mcp_daemon(&socket, false, STARTUP, || {
+            fake = Some(endpoint.start(legacy_daemon));
+            (Some(LaunchedDaemon::Child(child)), Ok(()))
+        })
+        .unwrap_err();
+
+        assert_eq!(outcome, McpDaemonStartup::Launched);
+        assert!(error.contains("Unknown method: metadata"), "{error}");
+        assert!(
+            error.contains(&format!("(pid {pid}) was terminated")),
+            "{error}"
+        );
+        assert!(gone(pid));
+        let methods = fake.unwrap().stop();
+        assert!(
+            methods.iter().any(|method| method == "metadata"),
+            "{methods:?}"
+        );
+        // Cleanup signals the launched process; it never asks the endpoint,
+        // so a daemon that replaced it there cannot be stopped.
+        assert!(stop_requests(&methods).is_empty(), "{methods:?}");
+    }
+
+    #[test]
+    fn endpoint_owned_by_someone_else_is_left_running_when_mcp_cleans_up() {
+        // The endpoint accepts but fails the listening probe, so MCP
+        // launches; the launched process loses the endpoint to its owner.
+        for launch_succeeds in [true, false] {
+            let daemon = FakeDaemon::start(unready_daemon);
+            let child = launched_process();
+            let pid = child.id();
+
+            let (_, error) = start_mcp_daemon(daemon.socket(), false, STARTUP, || {
+                let result = if launch_succeeds {
+                    Ok(())
+                } else {
+                    launch_timeout()
+                };
+                (Some(LaunchedDaemon::Child(child)), result)
+            })
+            .unwrap_err();
+
+            assert!(error.contains("was terminated"), "{error}");
+            assert!(gone(pid));
+            let methods = daemon.stop();
+            assert!(stop_requests(&methods).is_empty(), "{methods:?}");
+        }
+    }
+
+    #[test]
+    fn launch_timeout_terminates_a_launched_process_that_holds_an_unready_endpoint() {
+        let endpoint = FakeEndpoint::new();
+        let socket = endpoint.socket().to_owned();
+        let mut fake = None;
+        let child = launched_process();
+        let pid = child.id();
+
+        let (outcome, error) = start_mcp_daemon(&socket, false, STARTUP, || {
+            fake = Some(endpoint.start(unready_daemon));
+            (Some(LaunchedDaemon::Child(child)), launch_timeout())
+        })
+        .unwrap_err();
+
+        assert_eq!(outcome, McpDaemonStartup::LaunchTimeout);
+        assert!(error.contains("without becoming ready"), "{error}");
+        assert!(gone(pid));
+        assert!(stop_requests(&fake.unwrap().stop()).is_empty());
+    }
+
+    #[test]
+    fn launch_timeout_without_an_accepting_endpoint_leaves_the_launch_to_finish() {
+        // Nothing listens yet: the launched app may be waiting on a
+        // first-launch permission prompt the error asks the person to answer.
+        let endpoint = FakeEndpoint::new();
+        let child = launched_process();
+        let pid = child.id();
+
+        let (outcome, error) = start_mcp_daemon(endpoint.socket(), false, STARTUP, || {
+            (Some(LaunchedDaemon::Child(child)), launch_timeout())
+        })
+        .unwrap_err();
+
+        assert_eq!(outcome, McpDaemonStartup::LaunchTimeout);
+        assert_eq!(error, "daemon did not appear");
+        assert!(!gone(pid), "the launch must be left to finish");
+        reap(pid);
+    }
+
+    #[test]
+    fn unidentified_launch_stops_nothing() {
+        let endpoint = FakeEndpoint::new();
+        let socket = endpoint.socket().to_owned();
+        let mut fake = None;
+
+        let (_, error) = start_mcp_daemon(&socket, false, STARTUP, || {
+            fake = Some(endpoint.start(legacy_daemon));
+            (None, Ok(()))
+        })
+        .unwrap_err();
+
+        assert!(error.contains("left running"), "{error}");
+        assert!(stop_requests(&fake.unwrap().stop()).is_empty());
+    }
+
+    #[test]
+    fn incompatible_daemon_already_running_is_left_running() {
+        let daemon = FakeDaemon::start(legacy_daemon);
+
+        let (outcome, error) =
+            start_mcp_daemon(daemon.socket(), true, STARTUP, || unreachable!()).unwrap_err();
+
+        assert_eq!(outcome, McpDaemonStartup::AlreadyRunning);
+        assert!(error.contains("left running"), "{error}");
+        assert!(crate::serve::is_daemon_listening(daemon.socket()));
+        let methods = daemon.stop();
+        assert!(
+            methods.iter().any(|method| method == "metadata"),
+            "{methods:?}"
+        );
+        assert!(stop_requests(&methods).is_empty(), "{methods:?}");
+    }
+
+    #[test]
+    fn launched_daemon_that_never_answers_metadata_is_refused_and_terminated() {
+        let daemon = FakeDaemon::start(|method| match method {
+            "metadata" => FakeReply::Silent,
+            other => legacy_daemon(other),
+        });
+        let mut launched = LaunchedDaemon::Child(launched_process());
+        let pid = launched.pid();
+
+        let error = admit_mcp_daemon(
+            daemon.socket(),
+            Some(&mut launched),
+            Duration::from_millis(200),
+        )
+        .unwrap_err();
+
+        assert!(
+            error.contains("did not answer the compatibility handshake"),
+            "{error}"
+        );
+        assert!(error.contains("was terminated"), "{error}");
+        assert!(gone(pid));
+        assert!(stop_requests(&daemon.stop()).is_empty());
+    }
+
+    #[test]
+    fn compatible_launched_daemon_is_admitted_and_kept() {
+        let daemon = FakeDaemon::start(|method| match method {
+            "metadata" => FakeReply::ok(
+                serde_json::to_value(cua_driver_core::daemon::current_daemon_metadata()).unwrap(),
+            ),
+            other => legacy_daemon(other),
+        });
+        let mut launched = LaunchedDaemon::Child(launched_process());
+        let pid = launched.pid();
+
+        admit_mcp_daemon(daemon.socket(), Some(&mut launched), STARTUP).unwrap();
+
+        assert!(!gone(pid));
+        assert!(stop_requests(&daemon.stop()).is_empty());
+        drop(launched);
+        reap(pid);
+    }
+
+    #[test]
+    fn child_that_ignores_sigterm_is_killed_within_the_bound() {
+        use std::io::BufRead as _;
+
+        // The shell ignores TERM, says so, and exec keeps the disposition.
+        let mut child = Command::new("/bin/sh")
+            .args(["-c", "trap '' TERM; echo ready; exec /bin/sleep 600"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut ready = String::new();
+        std::io::BufReader::new(child.stdout.take().unwrap())
+            .read_line(&mut ready)
+            .unwrap();
+        assert_eq!(ready, "ready\n");
+        let pid = child.id();
+        let mut launched = LaunchedDaemon::Child(child);
+
+        let termination = launched.terminate(Duration::from_millis(200)).unwrap();
+
+        assert_eq!(termination, super::Termination::Killed);
+        assert!(gone(pid));
+    }
+
+    #[cfg(target_os = "macos")]
+    fn process_with_stdin(path: &std::path::Path) -> Child {
+        Command::new("/bin/sleep")
+            .arg("600")
+            .stdin(std::fs::File::open(path).unwrap())
+            .spawn()
+            .unwrap()
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn launch_marker_identifies_only_the_process_holding_it_and_terminates_it() {
+        let marker = super::LaunchMarker::create().unwrap();
+        let marked = process_with_stdin(marker.path());
+        // A concurrent launch of the same program without this marker.
+        let foreign = launched_process();
+        let (marked_pid, foreign_pid) = (marked.id(), foreign.id());
+
+        let mut launched = super::identify_marked_process(marker.path()).unwrap();
+
+        assert_eq!(launched.pid(), marked_pid);
+        assert_ne!(
+            super::process_stdin_path(foreign_pid).as_deref(),
+            Some(marker.path()),
+            "only the launched process holds the marker"
+        );
+        assert_eq!(
+            launched.terminate(STARTUP).unwrap(),
+            super::Termination::Terminated
+        );
+        // Exited (even unreaped), it has no audit token, so a second cleanup
+        // signals nothing.
+        assert_eq!(super::audit_token_for_pid(marked_pid), None);
+        assert_eq!(
+            launched.terminate(STARTUP).unwrap(),
+            super::Termination::AlreadyExited
+        );
+        assert!(!gone(foreign_pid));
+        drop((marked, foreign));
+        reap(marked_pid);
+        reap(foreign_pid);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn launch_marker_without_its_process_or_with_two_identifies_nothing() {
+        let marker = super::LaunchMarker::create().unwrap();
+        assert!(super::identify_marked_process(marker.path()).is_none());
+
+        let first = process_with_stdin(marker.path());
+        let second = process_with_stdin(marker.path());
+        assert!(super::identify_marked_process(marker.path()).is_none());
+        let (first_pid, second_pid) = (first.id(), second.id());
+        drop((first, second));
+        reap(first_pid);
+        reap(second_pid);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn launched_process_is_identified_over_children_that_inherit_the_marker() {
+        use std::io::BufRead as _;
+        use std::os::unix::process::CommandExt as _;
+
+        let marker = super::LaunchMarker::create().unwrap();
+        // The background child keeps the marker as stdin explicitly; it has
+        // been forked, holding the marker, before "ready" is printed.
+        let mut parent = Command::new("/bin/sh")
+            .args(["-c", "/bin/sleep 600 <&0 & echo ready; wait"])
+            .stdin(std::fs::File::open(marker.path()).unwrap())
+            .stdout(Stdio::piped())
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let mut ready = String::new();
+        std::io::BufReader::new(parent.stdout.take().unwrap())
+            .read_line(&mut ready)
+            .unwrap();
+        assert_eq!(ready, "ready\n");
+
+        let launched = super::identify_marked_process(marker.path());
+
+        assert_eq!(launched.map(|launched| launched.pid()), Some(parent.id()));
+        // SAFETY: kills the process group this test created.
+        unsafe {
+            libc::kill(-(parent.id() as libc::pid_t), libc::SIGKILL);
+        }
+        parent.wait().unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_token_for_another_process_generation_is_refused_by_the_kernel() {
+        let child = launched_process();
+        let pid = child.id();
+        let mut token = super::audit_token_for_pid(pid).unwrap();
+        // The same pid with any other pid version is a different process:
+        // what a reused pid looks like between validation and signalling.
+        token[7] = token[7].wrapping_add(1);
+
+        assert_eq!(super::signal_audited(&token, libc::SIGKILL), Ok(false));
+        let mut launched = LaunchedDaemon::Marked { pid, token };
+        assert_eq!(
+            launched.terminate(STARTUP).unwrap(),
+            super::Termination::AlreadyExited
+        );
+        assert!(!gone(pid), "a non-matching process must not be signalled");
+        drop(child);
+        reap(pid);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn launch_without_a_marker_is_not_attempted() {
+        let (launched, result) = super::launch_with_marker(
+            || Err(std::io::Error::other("no temp dir")),
+            |_| panic!("an unidentifiable launch must not start"),
+        );
+
+        assert!(launched.is_none());
+        let error = result.unwrap_err();
+        assert_eq!(error.kind, LaunchDaemonErrorKind::Failed);
+        assert!(
+            error.to_string().contains("nothing was launched"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn proxy_failure_before_ready_terminates_the_launched_daemon_only() {
+        let mut launched = LaunchedDaemon::Child(launched_process());
+        let pid = launched.pid();
+        let foreign = launched_process();
+        let foreign_pid = foreign.id();
+
+        let error = super::clean_up_unready_launch(
+            Err(anyhow::anyhow!("daemon did not answer the listening probe")),
+            false,
+            Some(&mut launched),
+            "unused",
+            STARTUP,
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("did not answer"), "{error}");
+        assert!(error.to_string().contains("was terminated"), "{error}");
+        assert!(gone(pid));
+        assert!(!gone(foreign_pid));
+        drop(foreign);
+        reap(foreign_pid);
+    }
+
+    #[test]
+    fn launched_daemon_that_served_the_session_is_kept() {
+        let mut launched = LaunchedDaemon::Child(launched_process());
+        let pid = launched.pid();
+
+        let after_ready = super::clean_up_unready_launch(
+            Err(anyhow::anyhow!("daemon control session closed")),
+            true,
+            Some(&mut launched),
+            "unused",
+            STARTUP,
+        );
+        let success =
+            super::clean_up_unready_launch(Ok(()), false, Some(&mut launched), "unused", STARTUP);
+
+        assert_eq!(
+            after_ready.unwrap_err().to_string(),
+            "daemon control session closed"
+        );
+        assert!(success.is_ok());
+        assert!(!gone(pid));
+        drop(launched);
+        reap(pid);
+    }
+
+    #[test]
+    fn mcp_startup_is_reported_failed_for_an_incompatible_running_daemon() {
+        let daemon = FakeDaemon::start(legacy_daemon);
+        // Without a listening daemon, macOS would launch the installed app.
+        assert!(crate::serve::is_daemon_listening(daemon.socket()));
+        let mut startup = None;
+
+        let error = run_mcp_via_daemon_proxy(
+            Some(daemon.socket().to_owned()),
+            false,
+            &[],
+            |daemon, success| startup = Some((daemon, success)),
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("incompatible"), "{error}");
+        assert_eq!(startup, Some((McpDaemonStartup::AlreadyRunning, false)));
+        assert!(stop_requests(&daemon.stop()).is_empty());
+    }
+}
+
+#[cfg(all(test, target_os = "windows"))]
+mod windows_launch_cleanup_tests {
+    use super::{LaunchedDaemon, OwnedProcess, Termination};
+    use std::process::{Child, Command, Stdio};
+    use std::time::Duration;
+
+    fn handle_for(child: &Child) -> OwnedProcess {
+        use windows::Win32::System::Threading::{
+            OpenProcess, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE,
+        };
+        // SAFETY: opens a handle to a child this test spawned and still holds.
+        let handle =
+            unsafe { OpenProcess(PROCESS_SYNCHRONIZE | PROCESS_TERMINATE, false, child.id()) }
+                .unwrap();
+        OwnedProcess(handle)
+    }
+
+    #[test]
+    fn exited_launch_is_reported_without_terminating_anything() {
+        let mut child = Command::new("cmd")
+            .args(["/c", "exit", "0"])
+            .spawn()
+            .unwrap();
+        let process = handle_for(&child);
+        child.wait().unwrap();
+        let mut launched = LaunchedDaemon::Process {
+            pid: child.id(),
+            process,
+        };
+
+        let termination = launched.terminate(Duration::from_secs(1)).unwrap();
+
+        assert_eq!(termination, Termination::AlreadyExited);
+    }
+
+    #[test]
+    fn live_launch_is_terminated_through_its_handle() {
+        // Waits on its piped stdin, which this test keeps open.
+        let mut child = Command::new("cmd")
+            .args(["/c", "pause"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .spawn()
+            .unwrap();
+        let mut launched = LaunchedDaemon::Process {
+            pid: child.id(),
+            process: handle_for(&child),
+        };
+
+        let termination = launched.terminate(Duration::from_secs(1)).unwrap();
+
+        assert_eq!(termination, Termination::Killed);
+        assert!(child.try_wait().unwrap().is_some());
     }
 }
 

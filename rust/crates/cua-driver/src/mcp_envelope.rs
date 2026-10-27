@@ -338,19 +338,22 @@ where
     run_with_service(sdk, service?, &mut { reader }, writer).await
 }
 
-pub(crate) async fn proxy(socket_path: &str) -> anyhow::Result<()> {
+/// Relay MCP over the daemon's envelope stream. `on_ready` runs once the
+/// daemon has acknowledged the stream, before any client traffic is relayed.
+pub(crate) async fn proxy(socket_path: &str, on_ready: impl FnOnce()) -> anyhow::Result<()> {
     #[cfg(unix)]
     let stream = tokio::net::UnixStream::connect(socket_path).await?;
     #[cfg(windows)]
     let stream = tokio::net::windows::named_pipe::ClientOptions::new().open(socket_path)?;
-    relay(stream).await
+    relay_io(stream, tokio::io::stdin(), tokio::io::stdout(), on_ready).await
 }
 
-async fn relay<S: AsyncRead + AsyncWrite + Unpin>(stream: S) -> anyhow::Result<()> {
-    relay_io(stream, tokio::io::stdin(), tokio::io::stdout()).await
-}
-
-async fn relay_io<S, I, O>(stream: S, mut stdin: I, mut stdout: O) -> anyhow::Result<()>
+async fn relay_io<S, I, O>(
+    stream: S,
+    mut stdin: I,
+    mut stdout: O,
+    on_ready: impl FnOnce(),
+) -> anyhow::Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin,
     I: AsyncRead + Unpin,
@@ -375,6 +378,7 @@ where
         ack["ok"] == true && ack["result"]["mcp_envelope_stream"] == 1,
         "Selected daemon does not support MCP envelopes"
     );
+    on_ready();
     // No reconnect: daemon replacement closes this transport and its handles.
     tokio::select! {
         result = tokio::io::copy(&mut stdin, &mut writer) => { result?; writer.shutdown().await?; }
@@ -839,11 +843,16 @@ mod tests {
             line.clear();
             assert_eq!(read.read_line(&mut line).await.unwrap(), 0);
         });
-        assert!(
-            relay_io(client, &b"must-not-forward\n"[..], tokio::io::sink())
-                .await
-                .is_err()
-        );
+        let mut ready = false;
+        assert!(relay_io(
+            client,
+            &b"must-not-forward\n"[..],
+            tokio::io::sink(),
+            || ready = true
+        )
+        .await
+        .is_err());
+        assert!(!ready, "a refused handshake must not report MCP startup");
         daemon.await.unwrap();
     }
 
@@ -867,7 +876,9 @@ mod tests {
             assert_eq!(line, "synthetic-request\n");
             write.write_all(b"synthetic-response\n").await.unwrap();
         });
-        assert!(relay_io(client, source, sink).await.is_err());
+        let mut ready = 0;
+        assert!(relay_io(client, source, sink, || ready += 1).await.is_err());
+        assert_eq!(ready, 1, "an acknowledged handshake reports readiness once");
         daemon.await.unwrap();
         let mut response = String::new();
         BufReader::new(output)

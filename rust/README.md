@@ -33,6 +33,47 @@ The Python wrapper and install scripts expect the built binary at
 `target/<profile>/cua-driver` (or `cua-driver.exe` on Windows), unless
 `CUA_DRIVER_BINARY` is set.
 
+### Windows prerequisites
+
+A Windows build needs the MSVC Rust toolchain (rustup installs the version
+pinned in `rust-toolchain.toml`) and Visual Studio 2022 or its Build Tools
+with these components:
+
+- the C++ build tools (MSVC compiler) and a Windows SDK;
+- the MSVC Spectre-mitigated libraries for every architecture you build:
+  `Microsoft.VisualStudio.Component.VC.Runtimes.x86.x64.Spectre` for
+  `x86_64-pc-windows-msvc`, and
+  `Microsoft.VisualStudio.Component.VC.Runtimes.ARM64.Spectre` for
+  `aarch64-pc-windows-msvc` (CI cross-compiles arm64 on an x64 runner).
+
+To add the Spectre libraries to an existing installation, open the Visual
+Studio Installer, choose Modify, and select them under Individual components,
+or run the installer from the command line (adjust `--installPath` for your
+edition):
+
+```bat
+"C:\Program Files (x86)\Microsoft Visual Studio\Installer\vs_installer.exe" modify ^
+  --installPath "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools" ^
+  --add Microsoft.VisualStudio.Component.VC.Runtimes.x86.x64.Spectre ^
+  --add Microsoft.VisualStudio.Component.VC.Runtimes.ARM64.Spectre
+```
+
+The libraries are required because the policy engine (`regorus`, enabled by
+`cua-driver-core`'s default `rego` feature) depends on `msvc_spectre_libs`
+with its `error` feature. That build script looks for `lib\spectre\<arch>`
+next to `cl.exe` and fails the build when it is missing. Every crate that
+links `cua-driver-core` is affected, including `cua-driver`, the
+`platform-windows` tests, and the `cua-driver-uia` worker. Without the
+component the build stops with:
+
+```text
+warning: msvc_spectre_libs@0.1.3: No spectre-mitigated libs were found. Please modify the VS Installation to add these.
+error: failed to run custom build command for `msvc_spectre_libs v0.1.3`
+```
+
+GitHub's hosted `windows-latest` images already include both components, so
+the Windows CI jobs need no extra install step.
+
 ## Formatting
 
 The supported Rust toolchain and `rustfmt` component are pinned in
