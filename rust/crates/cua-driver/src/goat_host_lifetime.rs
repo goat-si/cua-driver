@@ -39,7 +39,7 @@ impl StartupParent {
     pub fn install_private_worker(self) -> anyhow::Result<()> {
         cua_driver_core::mark_host_owned_runtime();
         #[cfg(any(target_os = "macos", target_os = "linux"))]
-        unix::install(self.pid)?;
+        unix::install_with(self.pid, unix::ParentWatch::Process)?;
         Ok(())
     }
 }
@@ -56,7 +56,25 @@ mod unix {
     static LIFETIME_GROUP: OnceLock<cua_driver_core::goat_process_group::ProcessGroupLifetime> =
         OnceLock::new();
 
+    /// What ends a host-owned runtime on Linux. macOS always watches the
+    /// parent process with kqueue.
+    #[derive(Clone, Copy)]
+    pub(super) enum ParentWatch {
+        /// `PR_SET_PDEATHSIG`, which fires when the thread that spawned the
+        /// driver exits. Embedded hosts keep that thread for the driver's life.
+        #[cfg_attr(target_os = "macos", allow(dead_code))]
+        CreatingThread,
+        /// The parent process itself (a pidfd). The SDK spawns its private
+        /// worker on whichever thread constructs the driver, which may exit
+        /// while the host and the driver live on.
+        Process,
+    }
+
     pub(super) fn install(parent: libc::pid_t) -> anyhow::Result<()> {
+        install_with(parent, ParentWatch::CreatingThread)
+    }
+
+    pub(super) fn install_with(parent: libc::pid_t, watch: ParentWatch) -> anyhow::Result<()> {
         let pid = unsafe { libc::getpid() };
         if unsafe { libc::setpgid(0, 0) } != 0 && unsafe { libc::getpgrp() } != pid {
             return Err(io::Error::last_os_error().into());
@@ -67,6 +85,17 @@ mod unix {
         if parent <= 1 || unsafe { libc::getppid() } != parent {
             terminate_group();
         }
+        #[cfg(target_os = "linux")]
+        if matches!(watch, ParentWatch::Process) {
+            match watch_parent_process(parent) {
+                Ok(()) => return Ok(()),
+                // Kernels before 5.3 have no pidfd; fall back to the thread signal.
+                Err(error) if error.raw_os_error() == Some(libc::ENOSYS) => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        #[cfg(target_os = "macos")]
+        let _ = watch;
         watch_parent(parent)?;
         Ok(())
     }
@@ -76,6 +105,37 @@ mod unix {
             libc::kill(-libc::getpid(), libc::SIGKILL);
             libc::_exit(1);
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn watch_parent_process(parent: libc::pid_t) -> io::Result<()> {
+        // pidfd_open returns a close-on-exec descriptor that becomes readable
+        // once the process exits.
+        let raw = unsafe { libc::syscall(libc::SYS_pidfd_open, parent, 0) };
+        if raw < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let pidfd = unsafe { OwnedFd::from_raw_fd(raw as libc::c_int) };
+        // The parent may have exited, and its pid been reused, before the open.
+        if unsafe { libc::getppid() } != parent {
+            terminate_group();
+        }
+        std::thread::Builder::new()
+            .name("goat-parent-exit".into())
+            .spawn(move || loop {
+                let mut poll = libc::pollfd {
+                    fd: pidfd.as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                let result = unsafe { libc::poll(&mut poll, 1, -1) };
+                if result < 0 && io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
+                    continue;
+                }
+                // Parent exit, or a failed watch: both are terminal, as on macOS.
+                terminate_group();
+            })?;
+        Ok(())
     }
 
     #[cfg(target_os = "linux")]

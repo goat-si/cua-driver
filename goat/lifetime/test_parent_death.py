@@ -14,6 +14,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 
@@ -98,12 +99,31 @@ def launcher():
         print(f"DRIVER_PID={pid}", flush=True)
         signal.pause()
         return
+    if cause == "thread":
+        # Spawn from a thread that then exits, as an SDK host may when it
+        # constructs the driver on a short-lived thread.
+        spawned = []
+        creator = threading.Thread(target=lambda: spawned.append(
+            subprocess.Popen(args, stdin=fd, stdout=sys.stdout, stderr=sys.stdout)))
+        creator.start()
+        creator.join()
+        print(f"DRIVER_PID={spawned[0].pid}", flush=True)
+        signal.pause()
+        return
     child = subprocess.Popen(args, stdin=fd, stdout=sys.stdout, stderr=sys.stdout)
     print(f"DRIVER_PID={child.pid}", flush=True)
     signal.pause()
 
 
 class ParentDeath(unittest.TestCase):
+    def wait_for_own_group(self, pid):
+        # The worker prints nothing before its host initializes it, so wait
+        # for the group it installs at startup (bounded; no readiness line).
+        deadline = time.monotonic() + TIMEOUT
+        while os.getpgid(pid) != pid:
+            self.assertLess(time.monotonic(), deadline, "worker never took its own group")
+            time.sleep(0.01)
+
     def run_driver(self, mode, cause, stdio=False):
         with tempfile.TemporaryDirectory(prefix="cualife-", dir="/tmp") as root:
             env = dict(os.environ, HOME=root, CUA_DRIVER_RS_HOME=root,
@@ -129,9 +149,7 @@ class ParentDeath(unittest.TestCase):
                 if cause == "startup":
                     pass
                 elif mode == "worker":
-                    # No readiness line before initialization. Killing the
-                    # launcher at any point after exec must end the worker.
-                    pass
+                    self.wait_for_own_group(driver_pid)
                 elif mode == "mcp":
                     request = {"jsonrpc": "2.0", "id": 1, "method": "initialize",
                                "params": {"protocolVersion": "2024-11-05",
@@ -142,7 +160,7 @@ class ParentDeath(unittest.TestCase):
                                json.loads(s).get("id") == 1)
                 else:
                     read_until(parent.stdout, lambda s: "daemon listening on" in s)
-                if mode not in {"standalone", "worker"} and cause != "startup":
+                if mode != "standalone" and cause != "startup":
                     self.assertEqual(os.getpgid(driver_pid), driver_pid,
                                      "embedded driver must own its process group")
                     if sys.platform == "darwin":
@@ -154,7 +172,14 @@ class ParentDeath(unittest.TestCase):
                         pids = Path(f"/proc/{driver_pid}/task/{driver_pid}/children").read_text()
                     children = [ExitEvent(int(pid)) for pid in pids.split()]
                     self.assertTrue(children, "embedded group sentinel must be running")
-                if cause in {"parent", "parent-term", "startup"}:
+                if cause == "thread":
+                    # A worker still alive after its creating thread exited
+                    # answers a wrong-version initialization, then exits.
+                    os.write(write_fd, json.dumps({
+                        "protocol_version": 0, "request_id": 0, "generation": "lifetime-test",
+                        "operation": "initialize"}).encode() + b"\n")
+                    read_until(parent.stdout, lambda s: "invalid_initialization" in s)
+                elif cause in {"parent", "parent-term", "startup"}:
                     parent.kill()
                     parent.wait(timeout=TIMEOUT)
                     if cause == "startup":
@@ -228,6 +253,9 @@ class ParentDeath(unittest.TestCase):
 
     def test_private_worker_parent_already_dead_at_exec(self):
         self.run_driver("worker", "startup")
+
+    def test_private_worker_outlives_the_thread_that_spawned_it(self):
+        self.run_driver("worker", "thread")
 
 
 if __name__ == "__main__":
