@@ -151,7 +151,8 @@ impl Tool for RightClickTool {
             .await;
 
             return match result {
-                Ok(Ok(msg)) => ToolResult::text(msg),
+                Ok(Ok(ElementRightClick::Ax(msg))) => ax_right_click_result(&msg),
+                Ok(Ok(ElementRightClick::Pixel(msg))) => ToolResult::text(msg),
                 Ok(Err(e)) => ToolResult::error(format!("Right-click failed: {e}")),
                 Err(e) => ToolResult::error(format!("Task error: {e}")),
             };
@@ -309,7 +310,56 @@ impl Tool for RightClickTool {
 
 // ── Blocking AX path ─────────────────────────────────────────────────────────
 
-fn ax_show_menu(element_ptr: usize, idx: usize, pid: i32, wid: u32) -> anyhow::Result<String> {
+/// How an element right-click was delivered.
+#[derive(Debug, PartialEq, Eq)]
+enum ElementRightClick {
+    /// AXShowMenu was sent; the message says whether the app reported an error.
+    Ax(String),
+    /// A pixel right-click at the element's center.
+    Pixel(String),
+}
+
+/// A right-click delivered as AXShowMenu. Nothing reads back the menu.
+fn ax_right_click_result(message: &str) -> ToolResult {
+    ToolResult::text(message)
+        .with_structured(serde_json::json!({ "path": "ax", "effect": "unverifiable" }))
+}
+
+/// AXShowMenu when the element advertises it, else a pixel right-click.
+///
+/// An AXShowMenu error that does not prove nothing was sent may have opened
+/// the menu: report that, and never right-click on top of it. Only an error
+/// that proves nothing was sent falls back to the pixel right-click.
+fn right_click_element(
+    label: &str,
+    advertises_show_menu: bool,
+    show_menu: impl FnOnce() -> crate::ax::bindings::AXError,
+    pixel: impl FnOnce() -> anyhow::Result<String>,
+) -> anyhow::Result<ElementRightClick> {
+    if advertises_show_menu {
+        let err = show_menu();
+        if err == kAXErrorSuccess {
+            return Ok(ElementRightClick::Ax(format!(
+                "Shown menu for {label} (AXShowMenu)."
+            )));
+        }
+        if !super::click::perform_error_proves_nothing_was_sent(err) {
+            return Ok(ElementRightClick::Ax(format!(
+                "⚠️ Sent AXShowMenu to {label}, but the app returned AX error {err}, which does \
+                 not mean it failed: the menu may be open. Read the window before repeating it."
+            )));
+        }
+        tracing::debug!("AXShowMenu returned {err} for {label}; falling back to pixel right-click");
+    }
+    pixel().map(ElementRightClick::Pixel)
+}
+
+fn ax_show_menu(
+    element_ptr: usize,
+    idx: usize,
+    pid: i32,
+    wid: u32,
+) -> anyhow::Result<ElementRightClick> {
     let element = element_ptr as AXUIElementRef;
 
     let role = unsafe { copy_string_attr(element, "AXRole") }.unwrap_or_default();
@@ -326,18 +376,22 @@ fn ax_show_menu(element_ptr: usize, idx: usize, pid: i32, wid: u32) -> anyhow::R
     // a user performs, delivered to backgrounded windows via the window-local
     // primitive. This makes "right-click element N" land on any element, not
     // just ones with a native context-menu AX action.
-    if advertised.iter().any(|a| a == "AXShowMenu") {
-        let err = unsafe { perform_action(element, "AXShowMenu") };
-        if err == kAXErrorSuccess {
-            return Ok(format!(
-                "Shown menu for [{idx}] {role} \"{title}\" (AXShowMenu)."
-            ));
-        }
-        // Advertised but the action failed — fall through to the pixel path
-        // rather than erroring out.
-        tracing::debug!("AXShowMenu returned {err} for [{idx}]; falling back to pixel right-click");
-    }
+    right_click_element(
+        &format!("[{idx}] {role} \"{title}\""),
+        advertised.iter().any(|a| a == "AXShowMenu"),
+        || unsafe { perform_action(element, "AXShowMenu") },
+        || pixel_right_click(element, idx, &role, &title, pid, wid),
+    )
+}
 
+fn pixel_right_click(
+    element: AXUIElementRef,
+    idx: usize,
+    role: &str,
+    title: &str,
+    pid: i32,
+    wid: u32,
+) -> anyhow::Result<String> {
     // Pixel right-click at the element's screen-space center.
     let (cx, cy) =
         unsafe { crate::ax::bindings::element_screen_center(element) }.ok_or_else(|| {
@@ -354,4 +408,73 @@ fn ax_show_menu(element_ptr: usize, idx: usize, pid: i32, wid: u32) -> anyhow::R
         "Right-clicked [{idx}] {role} \"{title}\" at element center ({cx:.0}, {cy:.0}) \
          (pixel right-click; element advertises no AXShowMenu)."
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_axshowmenu_error_that_may_have_opened_the_menu_sends_no_pixel_right_click() {
+        use crate::ax::bindings::{
+            kAXErrorActionUnsupported, kAXErrorCannotComplete, kAXErrorIllegalArgument,
+        };
+        for err in [kAXErrorCannotComplete, kAXErrorActionUnsupported] {
+            let outcome = right_click_element(
+                "[4] AXRow \"a\"",
+                true,
+                || err,
+                || panic!("pixel right-click on top of a menu that may be open"),
+            )
+            .expect("reported, not failed");
+            assert!(
+                matches!(&outcome, ElementRightClick::Ax(message) if message.contains("may be open")),
+                "{outcome:?}"
+            );
+        }
+        // Proven unsent, or not advertised: one pixel right-click.
+        for (advertised, err) in [(true, kAXErrorIllegalArgument), (false, kAXErrorSuccess)] {
+            let pixels = std::cell::Cell::new(0);
+            let outcome = right_click_element(
+                "[4]",
+                advertised,
+                || err,
+                || {
+                    pixels.set(pixels.get() + 1);
+                    Ok("pixel".into())
+                },
+            )
+            .unwrap();
+            assert_eq!(outcome, ElementRightClick::Pixel("pixel".into()));
+            assert_eq!(pixels.get(), 1);
+        }
+    }
+
+    struct ShowMenuProbe;
+
+    #[async_trait]
+    impl Tool for ShowMenuProbe {
+        fn def(&self) -> &ToolDef {
+            def()
+        }
+
+        async fn invoke(&self, _args: Value) -> ToolResult {
+            ax_right_click_result("Shown menu for [4] AXRow \"a\" (AXShowMenu).")
+        }
+    }
+
+    #[tokio::test]
+    async fn an_axshowmenu_right_click_is_published_as_accessibility() {
+        let mut registry = cua_driver_core::tool::ToolRegistry::new();
+        registry.register(Box::new(ShowMenuProbe));
+        let result = registry
+            .invoke(
+                "right_click",
+                serde_json::json!({"pid": 1, "window_id": 2, "element_token": "s1:4"}),
+            )
+            .await;
+        let structured = result.structured_content.expect("published action result");
+        assert_eq!(structured["route"], "accessibility", "{structured}");
+        assert_eq!(structured["effect"], "unverifiable", "{structured}");
+    }
 }

@@ -163,7 +163,12 @@ impl Tool for DoubleClickTool {
             let changes = super::finish_window_observation(snapshot).await;
 
             return match result {
-                Ok(Ok(msg)) => ToolResult::text(format!("{msg}{}", changes.result_suffix())),
+                Ok(Ok(ElementDoubleClick::Ax(msg))) => {
+                    ax_double_click_result(&msg, &changes.result_suffix())
+                }
+                Ok(Ok(ElementDoubleClick::Pixel(msg))) => {
+                    ToolResult::text(format!("{msg}{}", changes.result_suffix()))
+                }
                 Ok(Err(e)) => ToolResult::error(format!("double_click failed: {e}")),
                 Err(e) => ToolResult::error(format!("Task error: {e}")),
             };
@@ -195,22 +200,48 @@ impl Tool for DoubleClickTool {
 
 // ── Blocking AX path ─────────────────────────────────────────────────────────
 
-fn ax_double_click(
-    pid: i32,
-    wid: u32,
-    element_ptr: usize,
+/// How an element double-click was delivered.
+#[derive(Debug, PartialEq, Eq)]
+enum ElementDoubleClick {
+    /// AXOpen was sent; the message says whether the app reported an error.
+    Ax(String),
+    /// A pixel double-click at the element's center.
+    Pixel(String),
+}
+
+/// A double-click delivered as AXOpen. Nothing reads back what it opened.
+fn ax_double_click_result(message: &str, suffix: &str) -> ToolResult {
+    ToolResult::text(format!("{message}{suffix}"))
+        .with_structured(serde_json::json!({ "path": "ax", "effect": "unverifiable" }))
+}
+
+/// AXOpen first when the element advertises it, else a pixel double-click.
+///
+/// An AXOpen error that does not prove nothing was sent (Finder opens a row
+/// and still returns an error) may have opened the item: report that, and
+/// never send a pixel double-click after it, which would land in whatever
+/// opened. Only an error that proves nothing was sent falls back to pixels,
+/// and only in the foreground.
+fn double_click_element(
     idx: usize,
-    cursor_key: &str,
     has_ax_open: bool,
     foreground: bool,
-) -> anyhow::Result<String> {
-    let element = element_ptr as AXUIElementRef;
-
-    // Try AXOpen first (Finder items, openable list rows, document cells).
+    open: impl FnOnce() -> crate::ax::bindings::AXError,
+    pixel: impl FnOnce() -> anyhow::Result<String>,
+) -> anyhow::Result<ElementDoubleClick> {
     if has_ax_open {
-        let err = unsafe { perform_action(element, "AXOpen") };
+        let err = open();
         if err == kAXErrorSuccess {
-            return Ok(format!("AXOpen performed on element [{idx}]."));
+            return Ok(ElementDoubleClick::Ax(format!(
+                "AXOpen performed on element [{idx}]."
+            )));
+        }
+        if !super::click::perform_error_proves_nothing_was_sent(err) {
+            return Ok(ElementDoubleClick::Ax(format!(
+                "⚠️ Sent AXOpen to element [{idx}], but the app returned AX error {err}, which \
+                 does not mean it failed: it may have opened. Read the window before repeating \
+                 it."
+            )));
         }
         if !foreground {
             anyhow::bail!(
@@ -222,7 +253,36 @@ fn ax_double_click(
             "AXOpen returned {err} for element [{idx}], falling back to pixel double-click"
         );
     }
+    pixel().map(ElementDoubleClick::Pixel)
+}
 
+fn ax_double_click(
+    pid: i32,
+    wid: u32,
+    element_ptr: usize,
+    idx: usize,
+    cursor_key: &str,
+    has_ax_open: bool,
+    foreground: bool,
+) -> anyhow::Result<ElementDoubleClick> {
+    let element = element_ptr as AXUIElementRef;
+    double_click_element(
+        idx,
+        has_ax_open,
+        foreground,
+        || unsafe { perform_action(element, "AXOpen") },
+        || pixel_double_click(pid, wid, element, idx, cursor_key, foreground),
+    )
+}
+
+fn pixel_double_click(
+    pid: i32,
+    wid: u32,
+    element: AXUIElementRef,
+    idx: usize,
+    cursor_key: &str,
+    foreground: bool,
+) -> anyhow::Result<String> {
     // Resolve screen center and fall back to pixel double-click.
     let (cx, cy) = unsafe { element_screen_center(element) }
         .ok_or_else(|| anyhow::anyhow!("Cannot resolve screen center for element [{idx}]"))?;
@@ -268,6 +328,81 @@ fn ax_double_click(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_axopen_error_that_may_have_opened_sends_no_pixel_double_click() {
+        use crate::ax::bindings::{
+            kAXErrorAttributeUnsupported, kAXErrorCannotComplete, kAXErrorIllegalArgument,
+        };
+        for err in [kAXErrorCannotComplete, kAXErrorAttributeUnsupported] {
+            for foreground in [false, true] {
+                let outcome = double_click_element(
+                    3,
+                    true,
+                    foreground,
+                    || err,
+                    || panic!("pixel double-click after an AXOpen that may have opened"),
+                )
+                .expect("reported, not failed");
+                assert!(
+                    matches!(&outcome, ElementDoubleClick::Ax(message) if message.contains("may have opened")),
+                    "{outcome:?}"
+                );
+            }
+        }
+        // An error that proves nothing was sent: background fails, foreground
+        // falls back to one pixel double-click.
+        assert!(double_click_element(
+            3,
+            true,
+            false,
+            || kAXErrorIllegalArgument,
+            || { panic!("no pointer fallback in the background") }
+        )
+        .is_err());
+        let pixels = std::cell::Cell::new(0);
+        let outcome = double_click_element(
+            3,
+            true,
+            true,
+            || kAXErrorIllegalArgument,
+            || {
+                pixels.set(pixels.get() + 1);
+                Ok("pixel".into())
+            },
+        )
+        .unwrap();
+        assert_eq!(outcome, ElementDoubleClick::Pixel("pixel".into()));
+        assert_eq!(pixels.get(), 1);
+    }
+
+    struct AxOpenProbe;
+
+    #[async_trait]
+    impl Tool for AxOpenProbe {
+        fn def(&self) -> &ToolDef {
+            def()
+        }
+
+        async fn invoke(&self, _args: Value) -> ToolResult {
+            ax_double_click_result("AXOpen performed on element [3].", "")
+        }
+    }
+
+    #[tokio::test]
+    async fn an_axopen_double_click_is_published_as_accessibility() {
+        let mut registry = cua_driver_core::tool::ToolRegistry::new();
+        registry.register(Box::new(AxOpenProbe));
+        let result = registry
+            .invoke(
+                "double_click",
+                serde_json::json!({"pid": 1, "window_id": 2, "element_token": "s1:3"}),
+            )
+            .await;
+        let structured = result.structured_content.expect("published action result");
+        assert_eq!(structured["route"], "accessibility", "{structured}");
+        assert_eq!(structured["effect"], "unverifiable", "{structured}");
+    }
 
     #[test]
     fn background_element_route_does_not_guess_across_actuator_classes() {
