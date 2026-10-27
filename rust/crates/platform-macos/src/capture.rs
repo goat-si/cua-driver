@@ -412,6 +412,13 @@ pub fn capture_left_a_worker_behind(reason: &str) -> bool {
     reason.contains(CAPTURE_TIMED_OUT_MARKER) || reason.contains(CAPTURE_STALLED_MARKER)
 }
 
+/// Native capture workers abandoned and still running, across the
+/// ScreenCaptureKit and SkyLight gates. A read that sees this grow while its
+/// own capture ran left a worker behind, even when a fallback then succeeded.
+pub fn abandoned_native_captures() -> usize {
+    native_capture_gate().abandoned() + skylight_capture_gate().abandoned()
+}
+
 const SLOT_RUNNING: u8 = 0;
 const SLOT_FINISHED: u8 = 1;
 const SLOT_ABANDONED: u8 = 2;
@@ -468,6 +475,10 @@ impl NativeCaptureGate {
     fn counts(&self) -> (usize, usize) {
         let state = self.lock();
         (state.active, state.abandoned)
+    }
+
+    fn abandoned(&self) -> usize {
+        self.lock().abandoned
     }
 }
 
