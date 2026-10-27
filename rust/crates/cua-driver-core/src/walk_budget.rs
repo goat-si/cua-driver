@@ -314,26 +314,20 @@ impl HungTargetCircuitBreaker {
         self.preflight_at(target, budget, Instant::now())
     }
 
-    /// Post-walk bookkeeper: records `WalkStop::Timeout` /
-    /// `WalkStop::AppUnresponsive` at `now`, or clears the entry when a walk
-    /// completes without an accessibility responsiveness timeout.
+    /// Post-walk bookkeeper for a walk that returned. Every node it visited
+    /// answered (or was bounded by the per-element messaging timeout), so a
+    /// walk that finished, hit `max_elements` or spent its own `timeout_ms` on a
+    /// large tree clears the entry. Only `WalkStop::AppUnresponsive` keeps the
+    /// breaker tripped. A walk that never returned is recorded with
+    /// [`Self::record_unanswered_at`].
     pub fn record_outcome_at(&self, target: WalkTargetKey, outcome: &WalkOutcome, now: Instant) {
         let mut map = self
             .entries
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         match outcome.stop {
-            Some(WalkStop::Timeout | WalkStop::AppUnresponsive) => {
-                let prev = map.get(&target).map_or(0, |e| e.consecutive_timeouts);
-                map.insert(
-                    target,
-                    BreakerEntry {
-                        tripped_at: now,
-                        consecutive_timeouts: prev.saturating_add(1),
-                    },
-                );
-            }
-            None | Some(WalkStop::NodeBudget) => {
+            Some(WalkStop::AppUnresponsive) => Self::trip(&mut map, target, now),
+            None | Some(WalkStop::NodeBudget | WalkStop::Timeout) => {
                 map.remove(&target);
             }
             Some(WalkStop::AppLookupTimeout) => {}
@@ -342,6 +336,32 @@ impl HungTargetCircuitBreaker {
 
     pub fn record_outcome(&self, target: WalkTargetKey, outcome: &WalkOutcome) {
         self.record_outcome_at(target, outcome, Instant::now());
+    }
+
+    /// Record a walk that did not return before its backstop: an accessibility
+    /// call ignored the messaging timeout, so the target is treated as hung for
+    /// the cooldown window.
+    pub fn record_unanswered_at(&self, target: WalkTargetKey, now: Instant) {
+        let mut map = self
+            .entries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Self::trip(&mut map, target, now);
+    }
+
+    pub fn record_unanswered(&self, target: WalkTargetKey) {
+        self.record_unanswered_at(target, Instant::now());
+    }
+
+    fn trip(map: &mut HashMap<WalkTargetKey, BreakerEntry>, target: WalkTargetKey, now: Instant) {
+        let prev = map.get(&target).map_or(0, |e| e.consecutive_timeouts);
+        map.insert(
+            target,
+            BreakerEntry {
+                tripped_at: now,
+                consecutive_timeouts: prev.saturating_add(1),
+            },
+        );
     }
 
     /// Number of consecutive timeouts recorded for `target` if still active.
@@ -474,9 +494,7 @@ mod tests {
 
         let mut first_budget = WalkBudget::new(1000, 100);
         assert!(breaker.preflight_at(target, &mut first_budget, t0));
-        first_budget.stop_for_timeout();
-        let timed_out = first_budget.outcome();
-        breaker.record_outcome_at(target, &timed_out, t0);
+        breaker.record_unanswered_at(target, t0);
         assert_eq!(breaker.consecutive_timeouts_at(target, t0), 1);
 
         // Within the 1000ms cooldown window: preflight trips AppUnresponsive.
@@ -511,8 +529,7 @@ mod tests {
         let target: WalkTargetKey = (77, 1);
         let t0 = Instant::now();
 
-        let timed_out = WalkOutcome::timed_out(1000, Duration::from_millis(1000));
-        breaker.record_outcome_at(target, &timed_out, t0);
+        breaker.record_unanswered_at(target, t0);
         assert!(breaker.is_open_at(target, t0 + Duration::from_millis(100)));
 
         // A walk that hits NodeBudget proves the app is responsive again.
@@ -525,5 +542,22 @@ mod tests {
             t0 + Duration::from_millis(200),
         );
         assert!(!breaker.is_open_at(target, t0 + Duration::from_millis(250)));
+    }
+
+    /// A walk that spent its own `timeout_ms` on a large tree returned: the
+    /// application answered. Recording it must not short-circuit the next
+    /// `get_window_state` into an empty `app_unresponsive` tree.
+    #[test]
+    fn a_walk_that_spends_its_own_budget_does_not_trip_the_breaker() {
+        let breaker = HungTargetCircuitBreaker::new(Duration::from_millis(1_000));
+        let target: WalkTargetKey = (91, 3);
+        let t0 = Instant::now();
+        let mut budget = WalkBudget::new(1000, 10_000);
+        assert!(budget.admit());
+        budget.stop_for_timeout();
+        breaker.record_outcome_at(target, &budget.outcome(), t0);
+        let mut next = WalkBudget::new(1000, 10_000);
+        assert!(breaker.preflight_at(target, &mut next, t0 + Duration::from_millis(100)));
+        assert_eq!(next.outcome().stop, None);
     }
 }
