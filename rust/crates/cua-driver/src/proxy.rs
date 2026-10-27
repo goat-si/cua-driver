@@ -1255,7 +1255,16 @@ async fn forward_tool_call(
         })
         .await
     };
-    #[cfg(not(unix))]
+    // The overlapped pipe client lives in this future, so the per-call
+    // deadline dropping it closes the pipe and frees the in-flight slot.
+    #[cfg(windows)]
+    let blocking = {
+        let _permit = permit;
+        Ok::<_, tokio::task::JoinError>(
+            cua_driver_core::daemon::send_request_async(&socket, &req).await,
+        )
+    };
+    #[cfg(not(any(unix, windows)))]
     let blocking = tokio::task::spawn_blocking(move || {
         let _permit = permit;
         send_request(&socket, &req)
