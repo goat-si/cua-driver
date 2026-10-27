@@ -626,6 +626,31 @@ impl Tool for ClickTool {
                 action.clone()
             };
 
+            // Resolve the action against what this element lists right now,
+            // before the cursor glides or the window can be fronted, so a name
+            // it does not offer is refused with nothing sent.
+            {
+                let action_guard = element_guard.clone();
+                let requested = effective_action.clone();
+                let foreground = delivery_mode.is_foreground();
+                let resolved = latency::spawn_action_blocking(move || {
+                    let element = action_guard.as_ptr() as AXUIElementRef;
+                    let advertised = unsafe { copy_action_names(element) };
+                    crate::input::ax_actions::resolve_element_action(
+                        &requested,
+                        &advertised,
+                        foreground,
+                    )
+                    .map(|_| ())
+                })
+                .await;
+                if let Ok(Err(error)) = resolved {
+                    let code = crate::input::ax_actions::element_action_refusal_code(&error)
+                        .unwrap_or("invalid_arguments");
+                    return super::pre_dispatch_refusal(code, format!("click: {error}"));
+                }
+            }
+
             // A background press or show-menu on a Chromium <select> would
             // open its menu and raise the browser window (CUA-1795): steer to
             // set_value before anything is sent.
@@ -2011,13 +2036,22 @@ mod selection_fallback_tests {
 
 // ── Tests ────────────────────────────────────────────────────────────────────
 
-/// Check `click`'s `action` before any dispatch. Element clicks take the
-/// AX action names `map_action` knows. A pixel click also takes `focus`: the
+/// Check `click`'s `action` before any dispatch. An element click takes any
+/// name here: whether the element offers it (increment, decrement, a custom
+/// action) is checked against the live element before anything moves. A pixel
+/// click takes the AX action names `map_action` knows, and also `focus`: the
 /// background focus rung that pixel `type_text`, `press_key` and `scroll`
 /// use to put the keyboard focus on a point (`focus_by_pixel`). It sets
 /// AXFocused on the element under the point instead of pressing it.
 fn validate_click_action(action: &str, element_target: bool) -> anyhow::Result<()> {
-    if !element_target && action == "focus" {
+    if element_target {
+        anyhow::ensure!(
+            !action.trim().is_empty(),
+            "action is empty: use an action the target element lists"
+        );
+        return Ok(());
+    }
+    if action == "focus" {
         return Ok(());
     }
     crate::input::ax_actions::map_action(action).map(|_| ())
@@ -2034,8 +2068,19 @@ mod tests {
         assert!(validate_click_action("focus", false).is_ok());
         assert!(validate_click_action("press", false).is_ok());
         assert!(validate_click_action("show_alternate_ui", true).is_ok());
-        assert!(validate_click_action("focus", true).is_err());
         assert!(validate_click_action("hover", false).is_err());
+    }
+
+    /// Increment, decrement and custom actions are valid only when the
+    /// element lists them, which the click checks against the live element
+    /// before anything moves; the entry check must let their names through.
+    #[test]
+    fn element_clicks_let_listed_action_names_through_the_entry_check() {
+        for action in ["increment", "AXDecrement", "Show Details", "보내기"] {
+            assert!(validate_click_action(action, true).is_ok(), "{action}");
+        }
+        assert!(validate_click_action("", true).is_err());
+        assert!(validate_click_action("increment", false).is_err());
     }
 
     #[tokio::test]
