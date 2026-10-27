@@ -41,73 +41,106 @@ extern "C" {
     fn IsSecureEventInputEnabled() -> u8;
 }
 
-/// Whether text typed now could be a secret: macOS has secure event input on,
-/// or the element that has keyboard focus in `pid` (the frontmost app when
-/// `None`) is a password, passcode or one-time-code field by the same test
-/// the snapshot uses to redact its value.
+/// What the element with keyboard focus says about itself.
+#[derive(Debug, Default)]
+struct FocusedFieldMeta {
+    role: String,
+    subrole: Option<String>,
+    title: Option<String>,
+    description: Option<String>,
+    placeholder: Option<String>,
+    identifier: Option<String>,
+    help: Option<String>,
+}
+
+/// Whether text typed into this focus could be a secret: macOS has secure
+/// event input on; the focused element could not be read (no frontmost app,
+/// no focused element, no role); or it is a password, passcode or
+/// one-time-code field by the same test the snapshot uses to redact values.
+fn focus_may_take_a_secret(secure_event_input: bool, focus: Option<&FocusedFieldMeta>) -> bool {
+    if secure_event_input {
+        return true;
+    }
+    let Some(focus) = focus.filter(|focus| !focus.role.trim().is_empty()) else {
+        return true;
+    };
+    cua_driver_core::snapshot_compaction::is_secure_text_field(
+        &cua_driver_core::snapshot_compaction::FieldSecurityMeta {
+            role: &focus.role,
+            subrole: focus.subrole.as_deref(),
+            title: focus.title.as_deref(),
+            description: focus.description.as_deref(),
+            placeholder: focus.placeholder.as_deref(),
+            identifier: focus.identifier.as_deref(),
+            help: focus.help.as_deref(),
+            is_password_flag: false,
+        },
+    )
+}
+
+/// The focused element of `pid` (the frontmost app when `None`), if readable.
+fn focused_field_meta(pid: Option<i32>) -> Option<FocusedFieldMeta> {
+    use crate::ax::bindings::{copy_string_attr, focused_element_of_pid};
+    use core_foundation::base::{CFRelease, CFTypeRef};
+    let pid = pid.or_else(crate::apps::frontmost_pid)?;
+    unsafe {
+        let element = focused_element_of_pid(pid)?;
+        let read = |attr: &str| copy_string_attr(element, attr).filter(|v| !v.trim().is_empty());
+        let meta = FocusedFieldMeta {
+            role: read("AXRole").unwrap_or_default(),
+            subrole: read("AXSubrole"),
+            title: read("AXTitle"),
+            description: read("AXDescription"),
+            placeholder: read("AXPlaceholderValue"),
+            identifier: read("AXIdentifier"),
+            help: read("AXHelp"),
+        };
+        CFRelease(element as CFTypeRef);
+        Some(meta)
+    }
+}
+
+/// Whether text typed now into `pid` could be a secret; see
+/// [`focus_may_take_a_secret`].
 ///
 /// Such text must not travel through the general pasteboard: every process in
 /// the session can read it there, and the concealed/transient markers only ask
 /// clipboard managers not to record it. Typing it key by key keeps it off the
 /// pasteboard.
 fn text_target_may_be_secret(pid: Option<i32>) -> bool {
-    if unsafe { IsSecureEventInputEnabled() } != 0 {
-        return true;
-    }
-    let Some(pid) = pid.or_else(crate::apps::frontmost_pid) else {
-        return false;
-    };
-    use crate::ax::bindings::{copy_string_attr, focused_element_of_pid};
-    use core_foundation::base::{CFRelease, CFTypeRef};
-    unsafe {
-        let Some(element) = focused_element_of_pid(pid) else {
-            return false;
-        };
-        let read = |attr: &str| copy_string_attr(element, attr).filter(|v| !v.trim().is_empty());
-        let role = read("AXRole").unwrap_or_default();
-        let subrole = read("AXSubrole");
-        let title = read("AXTitle");
-        let description = read("AXDescription");
-        let placeholder = read("AXPlaceholderValue");
-        let identifier = read("AXIdentifier");
-        let help = read("AXHelp");
-        CFRelease(element as CFTypeRef);
-        cua_driver_core::snapshot_compaction::is_secure_text_field(
-            &cua_driver_core::snapshot_compaction::FieldSecurityMeta {
-                role: &role,
-                subrole: subrole.as_deref(),
-                title: title.as_deref(),
-                description: description.as_deref(),
-                placeholder: placeholder.as_deref(),
-                identifier: identifier.as_deref(),
-                help: help.as_deref(),
-                is_password_flag: false,
-            },
-        )
-    }
+    let secure_event_input = unsafe { IsSecureEventInputEnabled() } != 0;
+    secure_event_input || focus_may_take_a_secret(false, focused_field_meta(pid).as_ref())
 }
 
-/// Deliver `text` either as pasteboard runs split around control keys, or,
-/// when the pasteboard route is not wanted or not allowed, as one typed run.
-/// A failed paste falls back to typing that run.
+/// Deliver `text` either as pasteboard runs split around control keys, or as
+/// one typed run when the pasteboard route is not wanted or
+/// `pasteboard_allowed` refuses it. A failed paste falls back to typing that
+/// run. After a Return or Tab every later run is typed: the key can move focus
+/// to a password field (username, Tab, password) before that run would be
+/// pasted, and a check made then would race the app handling the key.
 fn deliver_text_runs(
     text: &str,
-    pasteboard_allowed: bool,
+    pasteboard_allowed: impl FnOnce() -> bool,
     mut paste: impl FnMut(&str) -> anyhow::Result<()>,
     mut type_run: impl FnMut(&str) -> anyhow::Result<()>,
     mut control: impl FnMut(char) -> anyhow::Result<()>,
 ) -> anyhow::Result<()> {
-    if !pasteboard_allowed || !should_use_pasteboard_for_text(text) {
+    if !should_use_pasteboard_for_text(text) || !pasteboard_allowed() {
         return type_run(text);
     }
+    let mut pasting = true;
     for segment in split_text_delivery_segments(text) {
         match segment {
-            TextDeliverySegment::Text(run) => {
+            TextDeliverySegment::Text(run) if pasting => {
                 if paste(run).is_err() {
                     type_run(run)?;
                 }
             }
-            TextDeliverySegment::Control(ch) => control(ch)?,
+            TextDeliverySegment::Text(run) => type_run(run)?,
+            TextDeliverySegment::Control(ch) => {
+                control(ch)?;
+                pasting = false;
+            }
         }
     }
     Ok(())
@@ -441,11 +474,9 @@ pub fn type_text_with_delay(pid: i32, text: &str, inter_char_delay_ms: u64) -> a
     let source = CGEventSource::new(CGEventSourceStateID::HIDSystemState)
         .map_err(|_| anyhow::anyhow!("CGEventSource::new failed"))?;
 
-    let pasteboard_allowed =
-        should_use_pasteboard_for_text(text) && !text_target_may_be_secret(Some(pid));
     deliver_text_runs(
         text,
-        pasteboard_allowed,
+        || !text_target_may_be_secret(Some(pid)),
         |run| paste_text_preserving_clipboard(run, || hotkey(pid, "v", &["cmd"])),
         |run| type_text_chars_to_pid(&source, pid, run, inter_char_delay_ms),
         |ch| {
@@ -717,11 +748,9 @@ pub fn type_text_global(text: &str, inter_char_delay_ms: u64) -> anyhow::Result<
 
     let source = CGEventSource::new(CGEventSourceStateID::HIDSystemState)
         .map_err(|_| anyhow::anyhow!("CGEventSource::new failed"))?;
-    let pasteboard_allowed =
-        should_use_pasteboard_for_text(text) && !text_target_may_be_secret(None);
     deliver_text_runs(
         text,
-        pasteboard_allowed,
+        || !text_target_may_be_secret(None),
         |run| paste_text_preserving_clipboard(run, || press_key_global("v", &["cmd"])),
         |run| {
             for ch in run.chars() {
@@ -1664,13 +1693,12 @@ mod tests {
         );
     }
 
-    #[test]
-    fn text_for_a_possible_secret_never_reaches_the_pasteboard() {
-        let secret = "sk-proj-0123456789abcdefghijklmnopqrstuv\n한글";
+    /// What `deliver_text_runs` sent: (pasted runs, typed runs, control keys).
+    fn delivered(text: &str, allowed: bool) -> (Vec<String>, Vec<String>, Vec<char>) {
         let (mut pasted, mut typed, mut controls) = (Vec::new(), Vec::new(), Vec::new());
         deliver_text_runs(
-            secret,
-            false,
+            text,
+            || allowed,
             |run| {
                 pasted.push(run.to_owned());
                 Ok(())
@@ -1685,32 +1713,59 @@ mod tests {
             },
         )
         .unwrap();
+        (pasted, typed, controls)
+    }
+
+    #[test]
+    fn text_for_a_possible_secret_never_reaches_the_pasteboard() {
+        let secret = "sk-proj-0123456789abcdefghijklmnopqrstuv\n한글";
+        let (pasted, typed, controls) = delivered(secret, false);
         assert!(pasted.is_empty(), "a secret was pasted: {pasted:?}");
         assert_eq!(typed, vec![secret.to_owned()]);
         assert!(controls.is_empty());
 
-        // Otherwise long or non-ASCII runs are pasted around control keys.
-        let (mut pasted, mut typed, mut controls) = (Vec::new(), Vec::new(), Vec::new());
-        deliver_text_runs(
-            "안녕\n세상",
-            true,
-            |run| {
-                pasted.push(run.to_owned());
-                Ok(())
-            },
-            |run| {
-                typed.push(run.to_owned());
-                Ok(())
-            },
-            |ch| {
-                controls.push(ch);
-                Ok(())
-            },
-        )
-        .unwrap();
-        assert_eq!(pasted, vec!["안녕".to_owned(), "세상".to_owned()]);
-        assert!(typed.is_empty());
+        // Username, Tab, password: the Tab can move focus to a password
+        // field, so nothing after it is pasted.
+        let password = "0123456789abcdefghijklmnopqrstuvwxyzABCD";
+        let (pasted, typed, controls) = delivered(&format!("jun@example.com\t{password}"), true);
+        assert_eq!(pasted, vec!["jun@example.com".to_owned()]);
+        assert_eq!(typed, vec![password.to_owned()]);
+        assert_eq!(controls, vec!['\t']);
+
+        // Otherwise a long or non-ASCII run before any control key is pasted.
+        let (pasted, typed, controls) = delivered("안녕하세요 반갑습니다\n세상", true);
+        assert_eq!(pasted, vec!["안녕하세요 반갑습니다".to_owned()]);
+        assert_eq!(typed, vec!["세상".to_owned()]);
         assert_eq!(controls, vec!['\n']);
+    }
+
+    #[test]
+    fn a_focus_that_cannot_be_read_may_take_a_secret() {
+        let field = |role: &str, subrole: Option<&str>| FocusedFieldMeta {
+            role: role.to_owned(),
+            subrole: subrole.map(str::to_owned),
+            ..FocusedFieldMeta::default()
+        };
+        let plain = field("AXTextField", None);
+        assert!(!focus_may_take_a_secret(false, Some(&plain)));
+        assert!(
+            focus_may_take_a_secret(true, Some(&plain)),
+            "secure event input"
+        );
+        assert!(focus_may_take_a_secret(false, None), "no focused element");
+        assert!(
+            focus_may_take_a_secret(false, Some(&field("", None))),
+            "no role"
+        );
+        assert!(focus_may_take_a_secret(
+            false,
+            Some(&field("AXTextField", Some("AXSecureTextField")))
+        ));
+        let otp = FocusedFieldMeta {
+            placeholder: Some("One-time code".to_owned()),
+            ..plain
+        };
+        assert!(focus_may_take_a_secret(false, Some(&otp)));
     }
 
     struct MockPasteboard {
