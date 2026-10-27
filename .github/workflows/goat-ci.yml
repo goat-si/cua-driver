@@ -186,7 +186,7 @@ jobs:
       - name: Windows capability manifest regressions
         if: matrix.runnable
         working-directory: rust
-        run: cargo test --locked -p cua-driver-core --lib --release --target ${{ matrix.target }} session_manifest::
+        run: "cargo test --locked -p cua-driver-core --lib --release --target ${{ matrix.target }} session_manifest::"
       - name: Build Electron-compatible Node runtime
         shell: bash
         run: |
