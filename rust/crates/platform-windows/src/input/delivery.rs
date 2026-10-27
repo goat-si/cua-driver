@@ -572,4 +572,56 @@ mod tests {
         )
         .is_ok());
     }
+
+    /// The foreground idle gate reads `GetLastInputInfo`, which also counts
+    /// `SendInput`. A foreground action right after the driver's own
+    /// injection used to be refused as if the person were typing.
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn the_drivers_own_injection_does_not_trip_the_foreground_idle_gate() {
+        use windows::Win32::UI::Input::KeyboardAndMouse::{
+            GetLastInputInfo, INPUT, INPUT_0, INPUT_MOUSE, LASTINPUTINFO, MOUSEEVENTF_MOVE,
+            MOUSEINPUT,
+        };
+        let last_input = || {
+            let mut info = LASTINPUTINFO {
+                cbSize: std::mem::size_of::<LASTINPUTINFO>() as u32,
+                dwTime: 0,
+            };
+            unsafe { GetLastInputInfo(&mut info) }
+                .as_bool()
+                .then_some(info.dwTime)
+        };
+        // A zero-distance relative move: input the OS counts, with no effect.
+        let nudge = [INPUT {
+            r#type: INPUT_MOUSE,
+            Anonymous: INPUT_0 {
+                mi: MOUSEINPUT {
+                    dwFlags: MOUSEEVENTF_MOVE,
+                    ..Default::default()
+                },
+            },
+        }];
+        let before = last_input();
+        let sent = unsafe {
+            windows::Win32::UI::Input::KeyboardAndMouse::SendInput(
+                &nudge,
+                std::mem::size_of::<INPUT>() as i32,
+            )
+        };
+        let after = last_input();
+        if sent != 1 || after.is_none() || after == before {
+            eprintln!(
+                "skipped: this session has no input desktop (SendInput {sent}, last input {before:?} -> {after:?})"
+            );
+            return;
+        }
+        gate_foreground_physical_idle_with_sample(
+            0,
+            EventKind::Keystroke,
+            physical_input_idle_ms(),
+            1_000,
+        )
+        .expect("the driver's own injection must not count as physical input");
+    }
 }
