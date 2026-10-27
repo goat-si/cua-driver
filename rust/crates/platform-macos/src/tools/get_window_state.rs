@@ -335,7 +335,7 @@ impl Tool for GetWindowStateTool {
         // Start the screenshot grab before the tree walk so the two overlap:
         // ScreenCaptureKit and the accessibility walk use independent system
         // services, and the read otherwise pays for them one after the other.
-        let abandoned_before_prefetch = crate::capture::abandoned_native_captures();
+        let abandon_events_before_prefetch = crate::capture::native_capture_abandon_events();
         let prefetched_capture = prefetch_capture(should_capture, want_tree, move || {
             crate::capture::screenshot_window_bytes(window_id)
         });
@@ -442,7 +442,7 @@ impl Tool for GetWindowStateTool {
             None => None,
         };
         let prefetch_left_worker_behind = prefetched_raw.is_some()
-            && crate::capture::abandoned_native_captures() > abandoned_before_prefetch;
+            && crate::capture::native_capture_abandon_events() > abandon_events_before_prefetch;
         let screenshot = if should_capture {
             let out_file = screenshot_out_file.clone();
             let res = tokio::task::spawn_blocking(move || -> Result<

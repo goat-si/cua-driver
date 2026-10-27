@@ -394,6 +394,8 @@ struct GateState {
     active: usize,
     /// Workers whose caller timed out and stopped waiting.
     abandoned: usize,
+    /// Times a caller stopped waiting; never decremented.
+    abandon_events: u64,
 }
 
 /// Abandoned capture workers tolerated before native capture is refused.
@@ -412,11 +414,12 @@ pub fn capture_left_a_worker_behind(reason: &str) -> bool {
     reason.contains(CAPTURE_TIMED_OUT_MARKER) || reason.contains(CAPTURE_STALLED_MARKER)
 }
 
-/// Native capture workers abandoned and still running, across the
-/// ScreenCaptureKit and SkyLight gates. A read that sees this grow while its
-/// own capture ran left a worker behind, even when a fallback then succeeded.
-pub fn abandoned_native_captures() -> usize {
-    native_capture_gate().abandoned() + skylight_capture_gate().abandoned()
+/// How many native capture workers have ever been abandoned, across the
+/// ScreenCaptureKit and SkyLight gates. It only grows: a read that sees it
+/// grow while its own capture ran may have left a worker behind, even when a
+/// fallback then succeeded and an older abandoned worker finished meanwhile.
+pub fn native_capture_abandon_events() -> u64 {
+    native_capture_gate().abandon_events() + skylight_capture_gate().abandon_events()
 }
 
 const SLOT_RUNNING: u8 = 0;
@@ -429,6 +432,7 @@ impl NativeCaptureGate {
             state: Mutex::new(GateState {
                 active: 0,
                 abandoned: 0,
+                abandon_events: 0,
             }),
         }
     }
@@ -468,6 +472,7 @@ impl NativeCaptureGate {
             .is_ok()
         {
             state.abandoned += 1;
+            state.abandon_events += 1;
         }
     }
 
@@ -477,8 +482,8 @@ impl NativeCaptureGate {
         (state.active, state.abandoned)
     }
 
-    fn abandoned(&self) -> usize {
-        self.lock().abandoned
+    fn abandon_events(&self) -> u64 {
+        self.lock().abandon_events
     }
 }
 
@@ -1863,6 +1868,7 @@ mod tests {
             GATE.counts(),
             (MAX_ABANDONED_CAPTURES, MAX_ABANDONED_CAPTURES)
         );
+        assert_eq!(GATE.abandon_events(), MAX_ABANDONED_CAPTURES as u64);
 
         // Past the limit a capture is refused at once, with the stall marker.
         let refused = run_native_capture_worker(&GATE, Duration::from_secs(1), || Ok(2u8))
@@ -1881,6 +1887,9 @@ mod tests {
             let _ = done_receiver.recv_timeout(Duration::from_millis(1));
         }
         drop(done_sender);
+        // An abandoned worker that returns frees its slot, but the abandonment
+        // stays counted: a read comparing counts still sees that it happened.
+        assert_eq!(GATE.abandon_events(), MAX_ABANDONED_CAPTURES as u64);
         assert_eq!(
             run_native_capture_worker(&GATE, Duration::from_secs(1), || Ok(3u8))
                 .expect("capture runs again after a stuck worker returns"),
