@@ -39,7 +39,14 @@ impl StartupParent {
     pub fn install_private_worker(self) -> anyhow::Result<()> {
         cua_driver_core::mark_host_owned_runtime();
         #[cfg(any(target_os = "macos", target_os = "linux"))]
-        unix::install_with(self.pid, unix::ParentWatch::Process)?;
+        {
+            // The SDK names its own pid, so a host running as pid 1 (a
+            // container's init) is told apart from an orphaned worker.
+            let host = std::env::var(cua_driver_sdk::worker::PRIVATE_WORKER_HOST_PID_ENV)
+                .ok()
+                .and_then(|value| value.parse::<libc::pid_t>().ok());
+            unix::install_with(self.pid, unix::ParentWatch::Process { host })?;
+        }
         Ok(())
     }
 }
@@ -66,8 +73,19 @@ mod unix {
         CreatingThread,
         /// The parent process itself (a pidfd). The SDK spawns its private
         /// worker on whichever thread constructs the driver, which may exit
-        /// while the host and the driver live on.
-        Process,
+        /// while the host and the driver live on. `host` is the pid the SDK
+        /// says spawned the worker.
+        Process { host: Option<libc::pid_t> },
+    }
+
+    /// Whether the startup parent shows the runtime was orphaned before it
+    /// could install its watch. Without a named host, a parent of pid 1 means
+    /// the launcher already died; a named host may itself be pid 1.
+    pub(super) fn orphaned_at_startup(parent: libc::pid_t, host: Option<libc::pid_t>) -> bool {
+        match host {
+            Some(host) => parent != host,
+            None => parent <= 1,
+        }
     }
 
     pub(super) fn install(parent: libc::pid_t) -> anyhow::Result<()> {
@@ -82,17 +100,25 @@ mod unix {
         LIFETIME_GROUP
             .set(cua_driver_core::goat_process_group::ProcessGroupLifetime::new(pid)?)
             .map_err(|_| io::Error::other("embedded lifetime already installed"))?;
-        if parent <= 1 || unsafe { libc::getppid() } != parent {
+        let host = match watch {
+            ParentWatch::Process { host } => host,
+            ParentWatch::CreatingThread => None,
+        };
+        if orphaned_at_startup(parent, host) || unsafe { libc::getppid() } != parent {
             terminate_group();
         }
         #[cfg(target_os = "linux")]
-        if matches!(watch, ParentWatch::Process) {
+        if matches!(watch, ParentWatch::Process { .. }) {
             match watch_parent_process(parent) {
-                Ok(()) => return Ok(()),
-                // Kernels before 5.3 have no pidfd; fall back to the thread signal.
-                Err(error) if error.raw_os_error() == Some(libc::ENOSYS) => {}
+                // Kernels before 5.3 have no pidfd. Still watch the process,
+                // never the spawning thread: poll for reparenting.
+                Err(error) if error.raw_os_error() == Some(libc::ENOSYS) => {
+                    watch_parent_by_polling(parent)?;
+                }
                 Err(error) => return Err(error.into()),
+                Ok(()) => {}
             }
+            return Ok(());
         }
         #[cfg(target_os = "macos")]
         let _ = watch;
@@ -105,6 +131,19 @@ mod unix {
             libc::kill(-libc::getpid(), libc::SIGKILL);
             libc::_exit(1);
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn watch_parent_by_polling(parent: libc::pid_t) -> io::Result<()> {
+        std::thread::Builder::new()
+            .name("goat-parent-exit".into())
+            .spawn(move || loop {
+                if unsafe { libc::getppid() } != parent {
+                    terminate_group();
+                }
+                std::thread::sleep(std::time::Duration::from_millis(250));
+            })?;
+        Ok(())
     }
 
     #[cfg(target_os = "linux")]
@@ -220,5 +259,23 @@ mod unix {
                 }
             })?;
         Ok(())
+    }
+}
+
+#[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
+mod tests {
+    use super::unix::orphaned_at_startup;
+
+    #[test]
+    fn a_named_host_may_be_pid_one_and_an_unnamed_parent_may_not() {
+        // Embedded runtimes and workers from older SDKs name no host.
+        assert!(orphaned_at_startup(1, None));
+        assert!(!orphaned_at_startup(4242, None));
+        // The SDK names its pid; a container init host is pid 1.
+        assert!(!orphaned_at_startup(1, Some(1)));
+        assert!(!orphaned_at_startup(4242, Some(4242)));
+        // Reparented to init (or a subreaper) before startup: orphaned.
+        assert!(orphaned_at_startup(1, Some(4242)));
+        assert!(orphaned_at_startup(77, Some(4242)));
     }
 }

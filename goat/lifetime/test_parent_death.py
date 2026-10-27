@@ -46,6 +46,22 @@ class ExitEvent:
             os.close(self.fd)
 
 
+def child_pids(pid):
+    if sys.platform == "darwin":
+        rows = subprocess.check_output(["/bin/ps", "-axo", "pid=,ppid="], text=True, timeout=TIMEOUT)
+        return [int(row.split()[0]) for row in rows.splitlines() if row.split()[1] == str(pid)]
+    return [int(child) for child in Path(f"/proc/{pid}/task/{pid}/children").read_text().split()]
+
+
+def watch_thread_running(pid):
+    # macOS watches with kqueue registered before install returns; Linux runs a
+    # named pidfd thread (comm is truncated to 15 bytes).
+    if sys.platform == "darwin":
+        return True
+    tasks = Path(f"/proc/{pid}/task")
+    return any((task / "comm").read_text().strip() == "goat-parent-exi" for task in tasks.iterdir())
+
+
 def read_until(pipe, predicate):
     deadline = time.monotonic() + TIMEOUT
     line = b""
@@ -100,14 +116,24 @@ def launcher():
         signal.pause()
         return
     if cause == "thread":
-        # Spawn from a thread that then exits, as an SDK host may when it
+        # Spawn from a thread that exits once the controller has seen the
+        # worker's lifetime installed (SIGUSR1), as an SDK host may when it
         # constructs the driver on a short-lived thread.
-        spawned = []
-        creator = threading.Thread(target=lambda: spawned.append(
-            subprocess.Popen(args, stdin=fd, stdout=sys.stdout, stderr=sys.stdout)))
+        spawned, release = [], threading.Event()
+        signal.signal(signal.SIGUSR1, lambda *_: release.set())
+
+        def create():
+            spawned.append(subprocess.Popen(args, stdin=fd, stdout=sys.stdout, stderr=sys.stdout))
+            release.wait()
+
+        creator = threading.Thread(target=create)
         creator.start()
-        creator.join()
+        while not spawned:
+            time.sleep(0.01)
         print(f"DRIVER_PID={spawned[0].pid}", flush=True)
+        release.wait()
+        creator.join()
+        print("CREATOR_EXITED", flush=True)
         signal.pause()
         return
     child = subprocess.Popen(args, stdin=fd, stdout=sys.stdout, stderr=sys.stdout)
@@ -116,12 +142,13 @@ def launcher():
 
 
 class ParentDeath(unittest.TestCase):
-    def wait_for_own_group(self, pid):
+    def wait_for_installed_lifetime(self, pid):
         # The worker prints nothing before its host initializes it, so wait
-        # for the group it installs at startup (bounded; no readiness line).
+        # (bounded) for what installation leaves behind: its own process
+        # group, the group sentinel, and on Linux the parent-exit watch thread.
         deadline = time.monotonic() + TIMEOUT
-        while os.getpgid(pid) != pid:
-            self.assertLess(time.monotonic(), deadline, "worker never took its own group")
+        while not (os.getpgid(pid) == pid and child_pids(pid) and watch_thread_running(pid)):
+            self.assertLess(time.monotonic(), deadline, "worker never installed its lifetime")
             time.sleep(0.01)
 
     def run_driver(self, mode, cause, stdio=False):
@@ -149,7 +176,7 @@ class ParentDeath(unittest.TestCase):
                 if cause == "startup":
                     pass
                 elif mode == "worker":
-                    self.wait_for_own_group(driver_pid)
+                    self.wait_for_installed_lifetime(driver_pid)
                 elif mode == "mcp":
                     request = {"jsonrpc": "2.0", "id": 1, "method": "initialize",
                                "params": {"protocolVersion": "2024-11-05",
@@ -163,18 +190,15 @@ class ParentDeath(unittest.TestCase):
                 if mode != "standalone" and cause != "startup":
                     self.assertEqual(os.getpgid(driver_pid), driver_pid,
                                      "embedded driver must own its process group")
-                    if sys.platform == "darwin":
-                        rows = subprocess.check_output(
-                            ["/bin/ps", "-axo", "pid=,ppid="], text=True, timeout=TIMEOUT)
-                        pids = " ".join(row.split()[0] for row in rows.splitlines()
-                                        if row.split()[1] == str(driver_pid))
-                    else:
-                        pids = Path(f"/proc/{driver_pid}/task/{driver_pid}/children").read_text()
-                    children = [ExitEvent(int(pid)) for pid in pids.split()]
+                    children = [ExitEvent(pid) for pid in child_pids(driver_pid)]
                     self.assertTrue(children, "embedded group sentinel must be running")
                 if cause == "thread":
-                    # A worker still alive after its creating thread exited
-                    # answers a wrong-version initialization, then exits.
+                    # Release the creating thread only now, after installation,
+                    # so a thread-bound watch would be armed when it exits. A
+                    # worker still alive afterwards answers a wrong-version
+                    # initialization, then exits.
+                    os.kill(parent.pid, signal.SIGUSR1)
+                    read_until(parent.stdout, lambda s: s == "CREATOR_EXITED")
                     os.write(write_fd, json.dumps({
                         "protocol_version": 0, "request_id": 0, "generation": "lifetime-test",
                         "operation": "initialize"}).encode() + b"\n")
