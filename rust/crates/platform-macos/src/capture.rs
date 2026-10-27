@@ -394,6 +394,8 @@ struct GateState {
     active: usize,
     /// Workers whose caller timed out and stopped waiting.
     abandoned: usize,
+    /// Times a caller stopped waiting; never decremented.
+    abandon_events: u64,
 }
 
 /// Abandoned capture workers tolerated before native capture is refused.
@@ -401,6 +403,24 @@ const MAX_ABANDONED_CAPTURES: usize = 2;
 
 /// Text every refusal from a stalled native capture backend carries.
 pub const CAPTURE_STALLED_MARKER: &str = "capture_backend_stalled";
+
+/// Text every native capture that its caller stopped waiting for carries.
+const CAPTURE_TIMED_OUT_MARKER: &str = "capture timed out after";
+
+/// Whether a capture error means a native worker was left behind or capture
+/// is already off. Capturing again at once would leave another worker, and
+/// [`MAX_ABANDONED_CAPTURES`] of them turn native capture off for the process.
+pub fn capture_left_a_worker_behind(reason: &str) -> bool {
+    reason.contains(CAPTURE_TIMED_OUT_MARKER) || reason.contains(CAPTURE_STALLED_MARKER)
+}
+
+/// How many native capture workers have ever been abandoned, across the
+/// ScreenCaptureKit and SkyLight gates. It only grows: a read that sees it
+/// grow while its own capture ran may have left a worker behind, even when a
+/// fallback then succeeded and an older abandoned worker finished meanwhile.
+pub fn native_capture_abandon_events() -> u64 {
+    native_capture_gate().abandon_events() + skylight_capture_gate().abandon_events()
+}
 
 const SLOT_RUNNING: u8 = 0;
 const SLOT_FINISHED: u8 = 1;
@@ -412,6 +432,7 @@ impl NativeCaptureGate {
             state: Mutex::new(GateState {
                 active: 0,
                 abandoned: 0,
+                abandon_events: 0,
             }),
         }
     }
@@ -451,6 +472,7 @@ impl NativeCaptureGate {
             .is_ok()
         {
             state.abandoned += 1;
+            state.abandon_events += 1;
         }
     }
 
@@ -458,6 +480,10 @@ impl NativeCaptureGate {
     fn counts(&self) -> (usize, usize) {
         let state = self.lock();
         (state.active, state.abandoned)
+    }
+
+    fn abandon_events(&self) -> u64 {
+        self.lock().abandon_events
     }
 }
 
@@ -520,7 +546,7 @@ where
         Err(mpsc::RecvTimeoutError::Timeout) => {
             gate.abandon(&slot);
             anyhow::bail!(
-                "ScreenCaptureKit capture timed out after {} ms",
+                "ScreenCaptureKit {CAPTURE_TIMED_OUT_MARKER} {} ms",
                 timeout.as_millis()
             )
         }
@@ -1834,16 +1860,15 @@ mod tests {
             });
             started_receiver.recv().expect("worker starts");
             let timed_out = caller.join().expect("caller joins");
-            assert!(timed_out
-                .expect_err("stalled worker times out")
-                .to_string()
-                .contains("timed out"));
+            let timed_out = timed_out.expect_err("stalled worker times out").to_string();
+            assert!(capture_left_a_worker_behind(&timed_out), "{timed_out}");
             releases.push(release_sender);
         }
         assert_eq!(
             GATE.counts(),
             (MAX_ABANDONED_CAPTURES, MAX_ABANDONED_CAPTURES)
         );
+        assert_eq!(GATE.abandon_events(), MAX_ABANDONED_CAPTURES as u64);
 
         // Past the limit a capture is refused at once, with the stall marker.
         let refused = run_native_capture_worker(&GATE, Duration::from_secs(1), || Ok(2u8))
@@ -1852,6 +1877,7 @@ mod tests {
             refused.to_string().contains(CAPTURE_STALLED_MARKER),
             "{refused}"
         );
+        assert!(capture_left_a_worker_behind(&refused.to_string()));
 
         // A stuck worker that returns frees its slot, and capture works again.
         let (done_sender, done_receiver) = mpsc::channel::<()>();
@@ -1861,6 +1887,9 @@ mod tests {
             let _ = done_receiver.recv_timeout(Duration::from_millis(1));
         }
         drop(done_sender);
+        // An abandoned worker that returns frees its slot, but the abandonment
+        // stays counted: a read comparing counts still sees that it happened.
+        assert_eq!(GATE.abandon_events(), MAX_ABANDONED_CAPTURES as u64);
         assert_eq!(
             run_native_capture_worker(&GATE, Duration::from_secs(1), || Ok(3u8))
                 .expect("capture runs again after a stuck worker returns"),

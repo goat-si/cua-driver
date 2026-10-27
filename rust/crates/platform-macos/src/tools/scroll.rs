@@ -816,6 +816,12 @@ fn keystroke_read_back(
                 "verified": true,
                 "effect": "confirmed",
                 "scroll_position": { "before": before, "after": after },
+                // The dispatch seam keeps "confirmed" only with published
+                // read-back evidence, as for the wheel verdicts below.
+                "evidence": [{
+                    "kind": "accessibility_readback",
+                    "detail": format!("scroll bar {before:.3} -> {after:.3}"),
+                }],
             })),
         );
     }
@@ -1163,6 +1169,44 @@ mod tests {
         // Unmoved mid-range or unreadable afterwards proves nothing either way.
         assert!(keystroke_read_back("down", "line", 3, 0.5, Some(0.5), "").is_none());
         assert!(keystroke_read_back("up", "line", 3, 0.5, None, "").is_none());
+    }
+
+    /// Returns what a keystroke scroll reads back from a moved scroll bar, so
+    /// the test sees that result after the registry publishes it.
+    struct KeystrokeReadBackProbe;
+
+    #[async_trait]
+    impl Tool for KeystrokeReadBackProbe {
+        fn def(&self) -> &ToolDef {
+            def()
+        }
+
+        async fn invoke(&self, _args: Value) -> ToolResult {
+            keystroke_read_back("down", "page", 1, 0.0, Some(0.4), "").unwrap()
+        }
+    }
+
+    #[tokio::test]
+    async fn a_confirmed_keystroke_scroll_stays_confirmed_through_dispatch() {
+        let mut registry = cua_driver_core::tool::ToolRegistry::new();
+        registry.register(Box::new(KeystrokeReadBackProbe));
+        let result = registry
+            .invoke(
+                "scroll",
+                serde_json::json!({"pid": 123, "window_id": 7, "direction": "down", "by": "page"}),
+            )
+            .await;
+        let structured = result.structured_content.expect("published action result");
+        assert_eq!(structured["effect"], "confirmed", "{structured}");
+        // The public contract projects every read-back kind as value_readback.
+        assert_eq!(
+            structured["evidence"][0]["kind"], "value_readback",
+            "{structured}"
+        );
+        assert_eq!(
+            structured["evidence"][0]["detail"], "scroll bar 0.000 -> 0.400",
+            "{structured}"
+        );
     }
 
     #[tokio::test]
