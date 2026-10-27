@@ -266,7 +266,7 @@ pub fn past_edge(frame: Rect, direction: &str, rect: Rect) -> bool {
     }
 }
 
-unsafe fn reveal_in(
+pub(crate) unsafe fn reveal_in(
     container: AXUIElementRef,
     role: &str,
     window: Option<Rect>,
