@@ -301,6 +301,21 @@ fn shutdown_ends_a_call_still_running_on_another_connection() {
         command.env(name, value);
     }
     let mut daemon = command.spawn().expect("spawn the daemon");
+    // The pipe reads below block. A daemon that accepts and never answers is
+    // killed after this deadline, which ends those reads with an error.
+    const TEST_DEADLINE: Duration = Duration::from_secs(120);
+    let daemon_pid = daemon.id();
+    let (finished, watchdog_done) = std::sync::mpsc::channel::<()>();
+    let watchdog = std::thread::spawn(move || {
+        if watchdog_done.recv_timeout(TEST_DEADLINE)
+            == Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        {
+            eprintln!("watchdog: killing daemon {daemon_pid} after {TEST_DEADLINE:?}");
+            let _ = Command::new("taskkill")
+                .args(["/F", "/T", "/PID", &daemon_pid.to_string()])
+                .status();
+        }
+    });
     struct KillOnDrop<'a>(&'a mut std::process::Child);
     impl Drop for KillOnDrop<'_> {
         fn drop(&mut self) {
@@ -342,6 +357,10 @@ fn shutdown_ends_a_call_still_running_on_another_connection() {
         &mut call,
         r#"{"method":"call","name":"run_script","args":{"script":"await cua.sleep(60000); return 'late';","timeout_ms":90000}}"#,
     );
+    // The script cannot signal that it started: it has no filesystem or
+    // network access. Give the connection task time to read the request and
+    // admit the call before the shutdown connection is accepted.
+    std::thread::sleep(Duration::from_secs(2));
 
     assert!(wait_for_listening_instance(&socket, RECOVERY_WINDOW));
     let mut stop = open(&socket);
@@ -364,4 +383,6 @@ fn shutdown_ends_a_call_still_running_on_another_connection() {
          the in-flight run_script call kept it alive"
     );
     drop(call);
+    let _ = finished.send(());
+    let _ = watchdog.join();
 }
