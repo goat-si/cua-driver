@@ -303,11 +303,36 @@ def load_allowed(path):
     return allowed
 
 
+def json_type(value):
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "boolean"
+    if isinstance(value, int):
+        return "integer"
+    if isinstance(value, float):
+        return "number"
+    if isinstance(value, str):
+        return "string"
+    return "array" if isinstance(value, list) else "object"
+
+
+def schema_values(schema):
+    if "enum" in schema:
+        return schema["enum"]
+    if "const" in schema:
+        return [schema["const"]]
+    return None
+
+
 def schema_types(schema):
+    """The JSON types a schema admits: its "type", else the types of its enum or const values,
+    else None (any type)."""
     declared = schema.get("type")
-    if declared is None:
-        return None
-    return sorted(declared) if isinstance(declared, list) else [declared]
+    if declared is not None:
+        return sorted(declared) if isinstance(declared, list) else [declared]
+    values = schema_values(schema)
+    return sorted({json_type(value) for value in values}) if values is not None else None
 
 
 UNION_KEYS = ("anyOf", "oneOf")
@@ -321,30 +346,45 @@ def for_type(schema, declared):
         narrowed.pop(key, None)
     if declared != "array":
         narrowed.pop("items", None)
+    values = schema_values(narrowed)
+    if values is not None:
+        narrowed.pop("const", None)
+        narrowed["enum"] = [value for value in values if json_type(value) == declared]
     return narrowed
 
 
-def schema_variants(schema):
-    """A union schema as its alternatives, each carrying the keys outside the union, so
-    {"type": "object", "anyOf": [success, refusal]} yields two object schemas. Without a union,
-    a multi-type schema splits per type, so ["string", "null"] and anyOf [string, null] compare
-    equal. Returns None for a schema with a single shape."""
-    for key in UNION_KEYS:
-        if isinstance(schema.get(key), list):
-            outer = {name: value for name, value in schema.items() if name != key}
-            return [{**outer, **branch} if isinstance(branch, dict) else branch for branch in schema[key]]
+def conjoin(outer, branch):
+    """A union branch together with the keywords beside the union, which apply as well."""
+    merged = {**outer, **branch}
+    if "required" in outer or "required" in branch:
+        merged["required"] = sorted(set(outer.get("required", [])) | set(branch.get("required", [])))
+    if "properties" in outer and "properties" in branch:
+        merged["properties"] = {**outer["properties"], **branch["properties"]}
+    if "type" in outer and "type" in branch:
+        both = set(schema_types(outer)) & set(schema_types(branch))
+        merged["type"] = sorted(both) if len(both) != 1 else next(iter(both))
+    return merged
+
+
+def union_kind(schema):
+    return next((key for key in UNION_KEYS if isinstance(schema.get(key), list)), None)
+
+
+def single_shapes(schema):
+    """schema as the list of union-free, single-type shapes it is the union of. The driver
+    advertises {"type": "object", "anyOf": [success, refusal]}, and spells nullable fields both
+    as type lists and as anyOf with a null branch, so both spellings reduce to the same shapes."""
+    if not isinstance(schema, dict):
+        return [schema]
+    key = union_kind(schema)
+    if key:
+        outer = {name: value for name, value in schema.items() if name != key}
+        return [shape for branch in schema[key] if isinstance(branch, dict)
+                for shape in single_shapes(conjoin(outer, branch))]
     types = schema_types(schema)
     if types is not None and len(types) > 1:
         return [for_type(schema, declared) for declared in types]
-    return None
-
-
-def schema_values(schema):
-    if "enum" in schema:
-        return schema["enum"]
-    if "const" in schema:
-        return [schema["const"]]
-    return None
+    return [schema]
 
 
 def output_schema_breaks(old, new, where=""):
@@ -356,16 +396,20 @@ def output_schema_breaks(old, new, where=""):
         return [f"{label}removed"]
     if not isinstance(old, dict):
         return []
-    if any(isinstance(schema.get(key), list) for schema in (old, new) for key in UNION_KEYS):
-        # Every shape new can produce must be one old could: each new variant must fit some old
-        # variant. Removing a variant only narrows the output.
-        old_variants = schema_variants(old) or [old]
+    old_kind, new_kind = union_kind(old), union_kind(new)
+    if old_kind or new_kind:
         breaks = []
-        for index, variant in enumerate(schema_variants(new) or [new]):
-            candidates = [output_schema_breaks(choice, variant, where) for choice in old_variants]
+        if old_kind and new_kind and old_kind != new_kind:
+            # oneOf excludes values two branches share; anyOf does not. Treat a switch as a break.
+            breaks.append(f"{label}union {old_kind} -> {new_kind}")
+        # Every shape new can produce must be one old could: each new shape must fit some old
+        # shape. Removing a shape only narrows the output.
+        old_shapes = single_shapes(old)
+        for index, shape in enumerate(single_shapes(new)):
+            candidates = [output_schema_breaks(choice, shape, where) for choice in old_shapes]
             if any(not candidate for candidate in candidates):
                 continue
-            # Report against the variant in the same position, the one it most likely replaced.
+            # Report against the shape in the same position, the one it most likely replaced.
             closest = candidates[index] if index < len(candidates) else min(candidates, key=len)
             breaks += [f"variant {index}: {detail}" for detail in closest]
         return breaks

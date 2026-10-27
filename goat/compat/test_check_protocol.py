@@ -138,6 +138,28 @@ class CompareTest(unittest.TestCase):
         mode_removed = breaks(advertised(delivery={"type": ["object", "null"], "properties": {}}))
         self.assertTrue(mode_removed and all("property delivery.mode removed" in line for line in mode_removed), mode_removed)
 
+    def test_union_edge_cases(self):
+        def check(old, new):
+            return check_protocol.output_schema_breaks(old, new)
+
+        # Keywords beside a union apply to every branch.
+        outer = {"type": "object", "required": ["id"], "properties": {"id": {"type": "string"}},
+                 "anyOf": [{"required": ["x"]}]}
+        self.assertEqual(check(outer, outer), [])
+        self.assertEqual(check(outer, {**outer, "required": []}), ["variant 0: property id no longer required"])
+        # oneOf excludes shared values that anyOf admits.
+        one_of = {"oneOf": [{"enum": ["a"]}, {"enum": ["a", "b"]}]}
+        self.assertEqual(check(one_of, {"anyOf": one_of["oneOf"]}), ["union oneOf -> anyOf"])
+        # Type lists inside union branches expand like the branches themselves.
+        split = {"anyOf": [{"type": "string"}, {"type": "null"}]}
+        joined = {"anyOf": [{"type": ["string", "null"]}]}
+        self.assertEqual(check(split, joined), [])
+        self.assertEqual(check(joined, split), [])
+        # const and enum imply their type.
+        self.assertEqual(check({"type": "string", "enum": ["x"]}, {"const": "x"}), [])
+        self.assertEqual(check({"type": "string", "enum": ["x"]}, {"const": 1}),
+                         ["type ['string'] -> ['integer']", "enum gained 1"])
+
 
 class ValidateTest(unittest.TestCase):
     def test_complete_surface_with_the_expected_identity_passes(self):
