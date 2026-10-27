@@ -491,9 +491,14 @@ pub(crate) fn apply_direct_session_identity(request: &mut Request, transport_ses
 /// clear startup error instead of a "successful" handshake that
 /// advertises zero tools and then errors on every call. Matches
 /// Swift `makeProxy`'s `fetchProxyToolList` pre-check.
-pub async fn run_proxy(socket_path: String) -> anyhow::Result<()> {
+pub async fn run_proxy(socket_path: String, on_ready: impl FnOnce()) -> anyhow::Result<()> {
     validate_configured_policy()?;
-    if !is_daemon_listening(&socket_path) {
+    let probe_path = socket_path.clone();
+    if !startup_step("listening probe", move || {
+        Ok(is_daemon_listening(&probe_path))
+    })
+    .await?
+    {
         anyhow::bail!(
             "cua-driver-rs daemon not reachable on {socket_path}. Start it \
              with `cua-driver permissions grant` and retry."
@@ -502,9 +507,17 @@ pub async fn run_proxy(socket_path: String) -> anyhow::Result<()> {
     // A selected service may outlive the CLI package that launched this
     // proxy. Refuse an incompatible contract before creating the control
     // binding or forwarding any action.
-    let compatibility_client = cua_driver_sdk::CuaDriver::connect(Some(socket_path.clone()))?;
-    compatibility_client.metadata().await?;
+    let compatibility_path = socket_path.clone();
+    startup_step("compatibility handshake", move || {
+        // The client is dropped on this blocking thread: its Drop sends a
+        // synchronous `session_end` that must stay inside the deadline.
+        let client = cua_driver_sdk::CuaDriver::connect(Some(compatibility_path))?;
+        tokio::runtime::Handle::current().block_on(client.metadata())?;
+        Ok(())
+    })
+    .await?;
     if crate::mcp_envelope::configured()? {
+        on_ready();
         return crate::mcp_envelope::proxy(&socket_path).await;
     }
 
@@ -550,9 +563,16 @@ pub async fn run_proxy(socket_path: String) -> anyhow::Result<()> {
     // static for the lifetime of the daemon, so polling on every
     // `tools/list` would waste a round-trip per call. Swift does the
     // same caching in `fetchProxyToolList`.
-    let (cached_tools_list, daemon_observes_tool_calls) =
-        fetch_tools_list_from_daemon(&socket_path, &session_id)?;
+    let (list_path, list_session) = (socket_path.clone(), session_id.clone());
+    let (cached_tools_list, daemon_observes_tool_calls) = supervise_control_connection(
+        &mut control,
+        startup_step("tool list request", move || {
+            fetch_tools_list_from_daemon(&list_path, &list_session)
+        }),
+    )
+    .await?;
     let cached_tools_list = Arc::new(cached_tools_list);
+    on_ready();
 
     let stdin = tokio::io::stdin();
     let stdout = tokio::io::stdout();
@@ -568,6 +588,28 @@ pub async fn run_proxy(socket_path: String) -> anyhow::Result<()> {
         ),
     )
     .await
+}
+
+/// Longest the MCP proxy waits for one daemon exchange before it can answer
+/// `initialize`. The daemon client's reply deadline is sized for tool calls
+/// (minutes); a daemon that stops answering during startup must instead fail
+/// the MCP process promptly.
+pub(crate) const DAEMON_STARTUP_DEADLINE: Duration = Duration::from_secs(5);
+
+/// Run one blocking startup exchange off the async threads, bounded by
+/// [`DAEMON_STARTUP_DEADLINE`]. A timed-out exchange is abandoned; the
+/// runtime is shut down in the background when the proxy fails.
+async fn startup_step<T: Send + 'static>(
+    exchange: &'static str,
+    work: impl FnOnce() -> anyhow::Result<T> + Send + 'static,
+) -> anyhow::Result<T> {
+    match tokio::time::timeout(DAEMON_STARTUP_DEADLINE, tokio::task::spawn_blocking(work)).await {
+        Ok(Ok(result)) => result,
+        Ok(Err(error)) => Err(anyhow::anyhow!("daemon {exchange} failed: {error}")),
+        Err(_) => Err(anyhow::anyhow!(
+            "daemon did not answer the {exchange} within {DAEMON_STARTUP_DEADLINE:?}"
+        )),
+    }
 }
 
 /// Keep the MCP transport alive only while its daemon-owned identity is live.

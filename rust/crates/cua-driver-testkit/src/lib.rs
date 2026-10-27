@@ -62,7 +62,7 @@ pub use browser_fixture::BrowserFixtureServer;
 pub use cli::CliDriver;
 pub use driver::{BehaviorRecording, Driver};
 #[cfg(unix)]
-pub use fake_daemon::{FakeDaemon, FakeReply};
+pub use fake_daemon::{FakeDaemon, FakeEndpoint, FakeReply};
 pub use host_state::{IsolatedStateRoot, SHARE_HOST_STATE};
 pub use journal::FixtureJournal;
 pub use mcp::McpDriver;

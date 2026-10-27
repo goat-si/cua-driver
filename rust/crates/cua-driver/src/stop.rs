@@ -1,6 +1,6 @@
 use cua_driver_core::daemon::{send_request, DaemonRequest};
 
-fn pid_bound_shutdown(socket_path: &str, expected_pid: u32) -> anyhow::Result<()> {
+pub(crate) fn pid_bound_shutdown(socket_path: &str, expected_pid: u32) -> anyhow::Result<()> {
     let response = send_request(
         socket_path,
         &DaemonRequest {

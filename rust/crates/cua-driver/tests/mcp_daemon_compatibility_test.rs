@@ -11,6 +11,7 @@
 use cua_driver_testkit::{FakeDaemon, FakeReply, IsolatedStateRoot};
 use std::io::Read as _;
 use std::process::{Command, ExitStatus, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::time::Duration;
 
@@ -120,5 +121,42 @@ fn socket_that_never_answers_is_refused_without_launching_a_daemon() {
         methods,
         ["list"],
         "only the bounded listening probe may run"
+    );
+}
+
+#[test]
+fn daemon_that_stops_answering_after_admission_fails_proxy_startup_within_the_bound() {
+    // Compatible for the admission handshake, then silent: proxy setup must
+    // not inherit the daemon client's tool-call reply deadline.
+    let admitted = AtomicBool::new(false);
+    let daemon = FakeDaemon::start(move |method| match method {
+        "session_end" => FakeReply::unknown_method(method),
+        _ if admitted.load(Ordering::SeqCst) => FakeReply::Silent,
+        "metadata" => {
+            admitted.store(true, Ordering::SeqCst);
+            FakeReply::ok(
+                serde_json::to_value(cua_driver_core::daemon::current_daemon_metadata()).unwrap(),
+            )
+        }
+        other => legacy_daemon(other),
+    });
+    assert_listening(&daemon);
+
+    let (status, stderr) = run_mcp(daemon.socket());
+
+    assert!(!status.success(), "mcp must fail: {stderr}");
+    assert!(stderr.contains("did not answer"), "{stderr}");
+    let methods = daemon.stop();
+    assert_eq!(
+        methods
+            .iter()
+            .filter(|method| *method == "metadata")
+            .count(),
+        1,
+        "{methods:?}"
+    );
+    assert!(
+        !methods.iter().any(|method| method == "shutdown"),
+        "{methods:?}"
     );
 }

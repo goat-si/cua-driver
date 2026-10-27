@@ -6,8 +6,8 @@
 //! Each accepted connection carries one newline-delimited request, like the
 //! real daemon protocol. The fake records every request method in arrival
 //! order and answers with whatever the test's reply function returns. A
-//! successful `shutdown` reply ends the fake, the same way a real daemon
-//! releases its socket after honouring `cua-driver stop`.
+//! successful `shutdown` or `shutdown_if_pid` reply ends the fake, the same
+//! way a real daemon releases its socket after honouring `cua-driver stop`.
 
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -41,6 +41,52 @@ impl FakeReply {
     }
 }
 
+/// A socket path nothing is bound to yet, for tests that bind the fake only
+/// when a launcher under test "starts" a daemon.
+pub struct FakeEndpoint {
+    socket: String,
+    directory: tempfile::TempDir,
+}
+
+impl FakeEndpoint {
+    pub fn new() -> Self {
+        // macOS limits socket paths to 104 bytes; the per-user temp directory
+        // can exceed that, so bind under /tmp like the other socket tests.
+        let directory = tempfile::Builder::new()
+            .prefix("cua-fake-daemon-")
+            .tempdir_in("/tmp")
+            .expect("fake daemon directory");
+        let socket = directory.path().join("d.sock").display().to_string();
+        Self { socket, directory }
+    }
+
+    pub fn socket(&self) -> &str {
+        &self.socket
+    }
+
+    /// Bind the endpoint and answer each request with `reply(method)`.
+    pub fn start(self, reply: impl Fn(&str) -> FakeReply + Send + 'static) -> FakeDaemon {
+        let listener = UnixListener::bind(&self.socket).expect("bind fake daemon socket");
+        let (methods_tx, methods) = mpsc::channel();
+        let server = std::thread::Builder::new()
+            .name("cua-fake-daemon".into())
+            .spawn(move || serve(listener, reply, methods_tx))
+            .expect("spawn fake daemon");
+        FakeDaemon {
+            socket: self.socket,
+            methods,
+            server: Some(server),
+            _directory: self.directory,
+        }
+    }
+}
+
+impl Default for FakeEndpoint {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// A test-owned daemon endpoint. Dropping it stops the server.
 pub struct FakeDaemon {
     socket: String,
@@ -52,25 +98,7 @@ pub struct FakeDaemon {
 impl FakeDaemon {
     /// Bind a fresh socket and answer each request with `reply(method)`.
     pub fn start(reply: impl Fn(&str) -> FakeReply + Send + 'static) -> Self {
-        // macOS limits socket paths to 104 bytes; the per-user temp directory
-        // can exceed that, so bind under /tmp like the other socket tests.
-        let directory = tempfile::Builder::new()
-            .prefix("cua-fake-daemon-")
-            .tempdir_in("/tmp")
-            .expect("fake daemon directory");
-        let socket = directory.path().join("d.sock");
-        let listener = UnixListener::bind(&socket).expect("bind fake daemon socket");
-        let (methods_tx, methods) = mpsc::channel();
-        let server = std::thread::Builder::new()
-            .name("cua-fake-daemon".into())
-            .spawn(move || serve(listener, reply, methods_tx))
-            .expect("spawn fake daemon");
-        Self {
-            socket: socket.display().to_string(),
-            methods,
-            server: Some(server),
-            _directory: directory,
-        }
+        FakeEndpoint::new().start(reply)
     }
 
     /// Socket path to pass as `--socket`.
@@ -135,7 +163,7 @@ fn serve(listener: UnixListener, reply: impl Fn(&str) -> FakeReply, methods: mps
                 let honoured = response["ok"] == true;
                 let mut writer = stream;
                 let _ = writeln!(writer, "{response}");
-                if method == "shutdown" && honoured {
+                if honoured && matches!(method.as_str(), "shutdown" | "shutdown_if_pid") {
                     break;
                 }
             }

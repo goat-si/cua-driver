@@ -1852,7 +1852,7 @@ where
             "--grant configures a newly launched runtime and cannot modify the daemon already listening on {socket_path}; restart it with the same --grant option"
         );
     }
-    let mut daemon = McpDaemonStartup::AlreadyRunning;
+    let mut experimental_history = false;
     if !already_running {
         // Never replace an embedded host's TCC identity by launching the
         // standalone CuaDriver.app daemon.
@@ -1867,7 +1867,7 @@ where
             );
         }
         #[cfg(target_os = "macos")]
-        let experimental_history = {
+        {
             let app_name = crate::bundle::app_name();
             eprintln!(
                 "{}: mcp launched without {app_name}.app's TCC grants; \
@@ -1875,10 +1875,10 @@ where
                  and proxying MCP requests through it.",
                 crate::bundle::cli_name()
             );
-            crate::history_runtime::preview_admitted_preference()
-        };
+            experimental_history = crate::history_runtime::preview_admitted_preference();
+        }
         #[cfg(not(target_os = "macos"))]
-        let experimental_history = {
+        {
             if !crate::history_runtime::preview_admitted_preference() {
                 if let Some(on_startup) = on_startup.take() {
                     on_startup(McpDaemonStartup::UnsupportedRelaunch, false);
@@ -1891,56 +1891,120 @@ where
                      Then re-run `cua-driver mcp`."
                 );
             }
-            true
-        };
-        if let Err(error) = launch_daemon_and_wait(
-            &socket_path,
-            10,
-            claude_code_compat,
-            grants,
-            experimental_history,
-        ) {
-            if let Some(on_startup) = on_startup.take() {
-                on_startup(
-                    if error.kind == LaunchDaemonErrorKind::Timeout {
-                        McpDaemonStartup::LaunchTimeout
-                    } else {
-                        McpDaemonStartup::LaunchFailed
-                    },
-                    false,
-                );
-            }
-            return Err(error.into());
+            experimental_history = true;
         }
-        daemon = McpDaemonStartup::Launched;
     }
 
-    // Socket readiness proves only that something answers. An older
-    // installed app (goat-si/goat#1717) answers but cannot serve this
-    // build's protocol, so check the contract before reporting startup.
-    if let Err(error) = admit_mcp_daemon(
+    let daemon = match start_mcp_daemon(
         &socket_path,
-        daemon == McpDaemonStartup::Launched,
+        already_running,
         MCP_DAEMON_STARTUP_DEADLINE,
+        || {
+            launch_daemon_and_wait(
+                &socket_path,
+                10,
+                claude_code_compat,
+                grants,
+                experimental_history,
+            )
+        },
     ) {
-        if let Some(on_startup) = on_startup.take() {
+        Ok(daemon) => daemon,
+        Err((daemon, error)) => {
+            if let Some(on_startup) = on_startup.take() {
+                on_startup(daemon, false);
+            }
+            anyhow::bail!("{error}");
+        }
+    };
+
+    // Startup succeeds only once the proxy is ready to serve `initialize`;
+    // a daemon that stops answering during proxy setup is a failed startup.
+    let startup = std::cell::RefCell::new(on_startup);
+    let result = run_mcp_runtime(crate::proxy::run_proxy(socket_path, || {
+        if let Some(on_startup) = startup.borrow_mut().take() {
+            on_startup(daemon, true);
+        }
+    }));
+    if result.is_err() {
+        if let Some(on_startup) = startup.into_inner() {
             on_startup(daemon, false);
         }
-        anyhow::bail!("{error}");
     }
-
-    if let Some(on_startup) = on_startup.take() {
-        on_startup(daemon, true);
-    }
-
-    run_mcp_runtime(crate::proxy::run_proxy(socket_path))
+    result
 }
 
-/// Longest `cua-driver mcp` waits for one startup exchange with a daemon:
-/// the listening probe, the compatibility handshake, or stopping a daemon it
-/// launched. The daemon client's reply deadline is sized for tool calls
-/// (minutes), which would leave an MCP client waiting on `initialize`.
-const MCP_DAEMON_STARTUP_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
+/// Longest `cua-driver mcp` waits for one startup exchange with a daemon.
+const MCP_DAEMON_STARTUP_DEADLINE: std::time::Duration = crate::proxy::DAEMON_STARTUP_DEADLINE;
+
+/// Launch a daemon when none is listening, then admit it for MCP.
+///
+/// Cleanup is limited to a daemon this call owns: one it launched onto an
+/// endpoint that accepted no connections beforehand. An endpoint that already
+/// accepted connections belongs to someone else even when it failed the
+/// listening probe, and is never stopped.
+fn start_mcp_daemon(
+    socket_path: &str,
+    already_running: bool,
+    deadline: std::time::Duration,
+    launch: impl FnOnce() -> Result<(), LaunchDaemonError>,
+) -> Result<McpDaemonStartup, (McpDaemonStartup, String)> {
+    if already_running {
+        return admit_mcp_daemon(socket_path, false, deadline)
+            .map(|()| McpDaemonStartup::AlreadyRunning)
+            .map_err(|error| (McpDaemonStartup::AlreadyRunning, error));
+    }
+    let owned = !endpoint_accepts_connections(socket_path, deadline);
+    if let Err(error) = launch() {
+        let timed_out = error.kind == LaunchDaemonErrorKind::Timeout;
+        let outcome = if timed_out {
+            McpDaemonStartup::LaunchTimeout
+        } else {
+            McpDaemonStartup::LaunchFailed
+        };
+        let mut message = error.to_string();
+        // A launched process that accepts connections but never becomes
+        // ready would otherwise outlive this failed invocation.
+        if owned && timed_out && endpoint_accepts_connections(socket_path, deadline) {
+            let cli = crate::bundle::cli_name();
+            message = match stop_launched_daemon(socket_path, deadline) {
+                Ok(()) => format!(
+                    "{message}. The daemon this command launched accepted connections without \
+                     becoming ready; it acknowledged shutdown and stopped answering."
+                ),
+                Err(stop_error) => format!(
+                    "{message}. The daemon this command launched accepted connections without \
+                     becoming ready, and stopping it failed ({stop_error}); run \
+                     `{cli} stop --socket {socket_path}`."
+                ),
+            };
+        }
+        return Err((outcome, message));
+    }
+    // Socket readiness proves only that something answers. An older installed
+    // app (goat-si/goat#1717) answers but cannot serve this build's protocol.
+    admit_mcp_daemon(socket_path, owned, deadline)
+        .map(|()| McpDaemonStartup::Launched)
+        .map_err(|error| (McpDaemonStartup::Launched, error))
+}
+
+/// Whether anything accepts connections on the endpoint, protocol aside.
+fn endpoint_accepts_connections(socket_path: &str, deadline: std::time::Duration) -> bool {
+    let socket_path = socket_path.to_owned();
+    within_startup_deadline(deadline, "connection probe", move || {
+        #[cfg(unix)]
+        {
+            std::os::unix::net::UnixStream::connect(&socket_path).is_ok()
+        }
+        #[cfg(not(unix))]
+        {
+            // Windows probes pipe availability without sending a request.
+            crate::serve::is_daemon_listening(&socket_path)
+        }
+    })
+    // An endpoint that hangs a bare connect is occupied, not free.
+    .unwrap_or(true)
+}
 
 /// Run blocking daemon I/O on a helper thread and stop waiting at `deadline`.
 /// A timed-out exchange is abandoned with its thread; callers fail startup,
@@ -1988,28 +2052,49 @@ fn ensure_compatible_daemon_within(
     })?
 }
 
-/// Ask a daemon this process launched to exit and wait until its endpoint is
-/// released. Only called for a daemon started by this MCP invocation.
+/// Ask a daemon this process launched to exit and wait until its endpoint
+/// stops answering. Only called for a daemon this MCP invocation owns.
+///
+/// When the daemon still reports metadata (a newer but incompatible build),
+/// the request is bound to the pid it reported, so a replacement on the same
+/// endpoint refuses it. A daemon too old to report metadata can only be
+/// addressed by endpoint; `open -n` gives this process no pid for it.
 fn stop_launched_daemon(socket_path: &str, deadline: std::time::Duration) -> Result<(), String> {
+    let identity = {
+        let socket_path = socket_path.to_owned();
+        within_startup_deadline(deadline, "identity request", move || {
+            cua_driver_core::daemon::request_daemon_metadata(&socket_path)
+                .ok()
+                .map(|metadata| metadata.pid)
+        })
+        .ok()
+        .flatten()
+    };
     let socket_path = socket_path.to_owned();
     within_startup_deadline(deadline, "shutdown request", move || {
         let until = std::time::Instant::now() + deadline;
-        let response = crate::serve::send_request(
-            &socket_path,
-            &crate::serve::DaemonRequest {
-                method: "shutdown".to_owned(),
-                name: None,
-                args: None,
-                session_id: None,
-                observation_origin: None,
-                client_kind: None,
-            },
-        )
-        .map_err(|error| error.to_string())?;
-        if !response.ok {
-            return Err(response
-                .error
-                .unwrap_or_else(|| "daemon refused shutdown".to_owned()));
+        match identity {
+            Some(pid) => crate::stop::pid_bound_shutdown(&socket_path, pid)
+                .map_err(|error| error.to_string())?,
+            None => {
+                let response = crate::serve::send_request(
+                    &socket_path,
+                    &crate::serve::DaemonRequest {
+                        method: "shutdown".to_owned(),
+                        name: None,
+                        args: None,
+                        session_id: None,
+                        observation_origin: None,
+                        client_kind: None,
+                    },
+                )
+                .map_err(|error| error.to_string())?;
+                if !response.ok {
+                    return Err(response
+                        .error
+                        .unwrap_or_else(|| "daemon refused shutdown".to_owned()));
+                }
+            }
         }
         while crate::serve::is_daemon_listening(&socket_path) {
             if std::time::Instant::now() >= until {
@@ -2044,8 +2129,8 @@ fn admit_mcp_daemon(
     match stop_launched_daemon(socket_path, deadline) {
         Ok(()) => Err(format!(
             "the Cua Driver daemon this command launched on {socket_path} is incompatible \
-             with {cli} {version}: {reason}. It was stopped. Install a Cua Driver app that \
-             matches this {cli}, or remove the older one, and retry."
+             with {cli} {version}: {reason}. It acknowledged shutdown and stopped answering. \
+             Install a Cua Driver app that matches this {cli}, or remove the older one, and retry."
         )),
         Err(stop_error) => Err(format!(
             "the Cua Driver daemon this command launched on {socket_path} is incompatible \
@@ -2648,8 +2733,11 @@ mod daemon_compatibility_tests {
         server.join().unwrap();
     }
 
-    use super::{admit_mcp_daemon, run_mcp_via_daemon_proxy, McpDaemonStartup};
-    use cua_driver_testkit::{FakeDaemon, FakeReply};
+    use super::{
+        admit_mcp_daemon, run_mcp_via_daemon_proxy, start_mcp_daemon, LaunchDaemonError,
+        LaunchDaemonErrorKind, McpDaemonStartup,
+    };
+    use cua_driver_testkit::{FakeDaemon, FakeEndpoint, FakeReply};
     use std::time::Duration;
 
     const STARTUP: Duration = Duration::from_secs(5);
@@ -2664,31 +2752,127 @@ mod daemon_compatibility_tests {
         }
     }
 
+    /// Accepts connections but never passes the listening probe.
+    fn unready_daemon(method: &str) -> FakeReply {
+        match method {
+            "list" => FakeReply::unknown_method("list"),
+            other => legacy_daemon(other),
+        }
+    }
+
+    fn incompatible_metadata(pid: u32) -> serde_json::Value {
+        let mut metadata = cua_driver_core::daemon::current_daemon_metadata();
+        metadata.contract_version = "incompatible-test-contract".into();
+        metadata.pid = pid;
+        serde_json::to_value(metadata).unwrap()
+    }
+
+    fn launch_timeout() -> Result<(), LaunchDaemonError> {
+        Err(LaunchDaemonError {
+            kind: LaunchDaemonErrorKind::Timeout,
+            message: "daemon did not appear".into(),
+        })
+    }
+
     fn received(methods: &[String], method: &str) -> bool {
         methods.iter().any(|received| received == method)
     }
 
     #[test]
     fn incompatible_daemon_launched_by_mcp_is_stopped() {
-        let daemon = FakeDaemon::start(legacy_daemon);
+        let endpoint = FakeEndpoint::new();
+        let socket = endpoint.socket().to_owned();
+        let mut launched = None;
 
-        let error = admit_mcp_daemon(daemon.socket(), true, STARTUP).unwrap_err();
+        let (outcome, error) = start_mcp_daemon(&socket, false, STARTUP, || {
+            launched = Some(endpoint.start(legacy_daemon));
+            Ok(())
+        })
+        .unwrap_err();
 
+        assert_eq!(outcome, McpDaemonStartup::Launched);
         assert!(error.contains("Unknown method: metadata"), "{error}");
-        assert!(error.contains("It was stopped"), "{error}");
-        assert!(!crate::serve::is_daemon_listening(daemon.socket()));
-        let methods = daemon.stop();
+        assert!(error.contains("acknowledged shutdown"), "{error}");
+        assert!(!crate::serve::is_daemon_listening(&socket));
+        let methods = launched.unwrap().stop();
         let metadata = methods.iter().position(|method| method == "metadata");
         let shutdown = methods.iter().position(|method| method == "shutdown");
-        assert!(metadata < shutdown && metadata.is_some(), "{methods:?}");
+        assert!(metadata.is_some() && metadata < shutdown, "{methods:?}");
+    }
+
+    #[test]
+    fn launched_daemon_reporting_a_pid_is_stopped_only_by_that_pid() {
+        let endpoint = FakeEndpoint::new();
+        let socket = endpoint.socket().to_owned();
+        let mut launched = None;
+
+        let (_, error) = start_mcp_daemon(&socket, false, STARTUP, || {
+            launched = Some(endpoint.start(|method| match method {
+                "metadata" => FakeReply::ok(incompatible_metadata(4242)),
+                "shutdown_if_pid" => FakeReply::ok(serde_json::json!({})),
+                other => legacy_daemon(other),
+            }));
+            Ok(())
+        })
+        .unwrap_err();
+
+        assert!(error.contains("incompatible-test-contract"), "{error}");
+        assert!(error.contains("acknowledged shutdown"), "{error}");
+        let methods = launched.unwrap().stop();
+        assert!(received(&methods, "shutdown_if_pid"), "{methods:?}");
+        assert!(!received(&methods, "shutdown"), "{methods:?}");
+    }
+
+    #[test]
+    fn launch_timeout_stops_an_owned_daemon_that_never_became_ready() {
+        let endpoint = FakeEndpoint::new();
+        let socket = endpoint.socket().to_owned();
+        let mut launched = None;
+
+        let (outcome, error) = start_mcp_daemon(&socket, false, STARTUP, || {
+            launched = Some(endpoint.start(unready_daemon));
+            launch_timeout()
+        })
+        .unwrap_err();
+
+        assert_eq!(outcome, McpDaemonStartup::LaunchTimeout);
+        assert!(error.contains("without becoming ready"), "{error}");
+        assert!(received(&launched.unwrap().stop(), "shutdown"));
+    }
+
+    #[test]
+    fn endpoint_occupied_before_launch_is_never_stopped() {
+        // It accepts connections but fails the listening probe, so MCP
+        // launches; whatever answers afterwards still belongs to its owner.
+        for launch_succeeds in [false, true] {
+            let daemon = FakeDaemon::start(unready_daemon);
+
+            let (_, error) = start_mcp_daemon(daemon.socket(), false, STARTUP, || {
+                if launch_succeeds {
+                    Ok(())
+                } else {
+                    launch_timeout()
+                }
+            })
+            .unwrap_err();
+
+            if launch_succeeds {
+                assert!(error.contains("left running"), "{error}");
+            }
+            let methods = daemon.stop();
+            assert!(!received(&methods, "shutdown"), "{methods:?}");
+            assert!(!received(&methods, "shutdown_if_pid"), "{methods:?}");
+        }
     }
 
     #[test]
     fn incompatible_daemon_already_running_is_left_running() {
         let daemon = FakeDaemon::start(legacy_daemon);
 
-        let error = admit_mcp_daemon(daemon.socket(), false, STARTUP).unwrap_err();
+        let (outcome, error) =
+            start_mcp_daemon(daemon.socket(), true, STARTUP, || unreachable!()).unwrap_err();
 
+        assert_eq!(outcome, McpDaemonStartup::AlreadyRunning);
         assert!(error.contains("left running"), "{error}");
         assert!(crate::serve::is_daemon_listening(daemon.socket()));
         let methods = daemon.stop();
@@ -2724,7 +2908,7 @@ mod daemon_compatibility_tests {
             error.contains("did not answer the compatibility handshake"),
             "{error}"
         );
-        assert!(error.contains("It was stopped"), "{error}");
+        assert!(error.contains("acknowledged shutdown"), "{error}");
         assert!(received(&daemon.stop(), "shutdown"));
     }
 
