@@ -27,9 +27,6 @@ fn allowed(manifest: &SessionManifest, path: &Path, field: &str, expected: bool)
         ("desktop_input", "application_input"),
         ("process_control", "process"),
     ] {
-        if adapter == "process_control" && field == "bundle_id" {
-            continue;
-        }
         let resource = serde_json::json!({
             "kind": kind,
             "pid": 42,
