@@ -1842,13 +1842,9 @@
                   "enum": [
                     "on",
                     "off",
-                    "mixed",
-                    null
+                    "mixed"
                   ],
-                  "type": [
-                    "string",
-                    "null"
-                  ]
+                  "type": "string"
                 },
                 "value": {
                   "type": [
