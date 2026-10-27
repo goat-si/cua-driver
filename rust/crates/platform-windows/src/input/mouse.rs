@@ -13,10 +13,10 @@ use windows::Win32::Graphics::Gdi::{ClientToScreen, ScreenToClient};
 use windows::Win32::System::Diagnostics::Debug::{self, GetThreadContext, CONTEXT};
 use windows::Win32::System::Threading;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    SendInput, INPUT, INPUT_0, INPUT_MOUSE, MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_HWHEEL,
-    MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP,
-    MOUSEEVENTF_MOVE, MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_VIRTUALDESK,
-    MOUSEEVENTF_WHEEL, MOUSEINPUT,
+    INPUT, INPUT_0, INPUT_MOUSE, MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_HWHEEL, MOUSEEVENTF_LEFTDOWN,
+    MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_MOVE,
+    MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_VIRTUALDESK, MOUSEEVENTF_WHEEL,
+    MOUSEINPUT,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     ChildWindowFromPointEx, GetAncestor, GetClassLongPtrW, GetCursorPos, GetForegroundWindow,
@@ -685,7 +685,7 @@ fn send_click_synthesized_mods_impl(
         let (mod_downs, mod_ups) = crate::input::keyboard::modifier_hold_inputs(modifiers);
         let mut sent_ok = true;
         if !mod_downs.is_empty() {
-            let sent = SendInput(&mod_downs, std::mem::size_of::<INPUT>() as i32);
+            let sent = crate::input::delivery::send_input(&mod_downs);
             sent_ok = sent as usize == mod_downs.len();
             sleep(Duration::from_millis(5));
         }
@@ -699,7 +699,7 @@ fn send_click_synthesized_mods_impl(
             // records act at the current pointer position; adding ABSOLUTE to
             // them can prevent retained-mode controls from seeing the press.
             let events = [move_input, down_input, up_input];
-            let sent = SendInput(&events, std::mem::size_of::<INPUT>() as i32);
+            let sent = crate::input::delivery::send_input(&events);
             if sent as usize != events.len() {
                 sent_ok = false;
                 break;
@@ -711,11 +711,11 @@ fn send_click_synthesized_mods_impl(
 
         // Release any held modifiers (reverse order) before restoring z-order.
         if !mod_ups.is_empty() {
-            let released = SendInput(&mod_ups, std::mem::size_of::<INPUT>() as i32);
+            let released = crate::input::delivery::send_input(&mod_ups);
             if released as usize != mod_ups.len() {
                 // A second release attempt is safe and reduces the chance of a
                 // partially inserted chord leaving system modifier state held.
-                let _ = SendInput(&mod_ups, std::mem::size_of::<INPUT>() as i32);
+                let _ = crate::input::delivery::send_input(&mod_ups);
                 sent_ok = false;
             }
         }
@@ -1015,7 +1015,7 @@ fn send_drag_synthesized_impl(
             make_input(nfx, nfy, MOUSEEVENTF_MOVE),
             make_input(nfx, nfy, down_flag),
         ];
-        let sent = SendInput(&prelude, std::mem::size_of::<INPUT>() as i32);
+        let sent = crate::input::delivery::send_input(&prelude);
         if sent as usize != prelude.len() {
             // Records insert in order, so a short prelude never pressed the button.
             restore(true);
@@ -1040,7 +1040,7 @@ fn send_drag_synthesized_impl(
             let _ = SetCursorPos(x, y);
             cursor_at = (x, y);
             let mv = [make_input(nx, ny, MOUSEEVENTF_MOVE)];
-            if SendInput(&mv, std::mem::size_of::<INPUT>() as i32) != 1 {
+            if crate::input::delivery::send_input(&mv) != 1 {
                 moves_ok = false;
                 break;
             }
@@ -1054,8 +1054,8 @@ fn send_drag_synthesized_impl(
         //    when it lands, the drag completed normally.
         let (ntx, nty) = norm(sx_to, sy_to);
         let release = [make_input(ntx, nty, up_flag)];
-        let released = SendInput(&release, std::mem::size_of::<INPUT>() as i32) == 1
-            || SendInput(&release, std::mem::size_of::<INPUT>() as i32) == 1;
+        let released = crate::input::delivery::send_input(&release) == 1
+            || crate::input::delivery::send_input(&release) == 1;
 
         // Brief settle, then restore z-order (demote target, restack user's
         // window — no activation) and the cursor.
@@ -1137,7 +1137,7 @@ pub fn send_wheel_synthesized(sx: i32, sy: i32, ticks: i32, horizontal: bool) ->
         let _ = SetCursorPos(sx, sy);
 
         let events = [wheel_input];
-        let sent = SendInput(&events, std::mem::size_of::<INPUT>() as i32);
+        let sent = crate::input::delivery::send_input(&events);
         if sent as usize != events.len() {
             let _ = SetCursorPos(prev_cursor.x, prev_cursor.y);
             bail!("SendInput inserted {sent}/{} wheel events", events.len());

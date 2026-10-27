@@ -186,6 +186,34 @@ pub fn elapsed_idle_ms_from_ticks(now_ticks: u32, last_input_ticks: u32) -> u64 
     u64::from(now_ticks.wrapping_sub(last_input_ticks))
 }
 
+/// Slack around the driver's own injection window. Tick counters advance in
+/// steps of about 16 ms, and the OS stamps injected input as it processes it.
+pub const OWN_INPUT_TICK_SLACK_MS: u64 = 50;
+
+/// Idle time since physical input, from the OS's last-input tick, with the
+/// driver's own injected input set aside. Windows `GetLastInputInfo` also
+/// counts `SendInput`, so the driver's last foreground action would otherwise
+/// look like the person typing and refuse the next one. `own_input` is the
+/// tick span of the driver's latest `SendInput`. When the last input falls
+/// inside it, there is no evidence of physical input and this returns `None`.
+pub fn idle_ms_excluding_own_input(
+    now_ticks: u32,
+    last_input_ticks: u32,
+    own_input: Option<(u32, u32)>,
+) -> Option<u64> {
+    let idle = elapsed_idle_ms_from_ticks(now_ticks, last_input_ticks);
+    if let Some((start, end)) = own_input {
+        let since_start = elapsed_idle_ms_from_ticks(now_ticks, start);
+        let since_end = elapsed_idle_ms_from_ticks(now_ticks, end);
+        if idle <= since_start + OWN_INPUT_TICK_SLACK_MS
+            && idle + OWN_INPUT_TICK_SLACK_MS >= since_end
+        {
+            return None;
+        }
+    }
+    Some(idle)
+}
+
 /// Pure decision for whether a foreground action may proceed given an observed
 /// physical-input idle duration in milliseconds.
 pub fn evaluate_physical_input_idle(
@@ -395,6 +423,28 @@ mod tests {
     fn tick_wraparound_computes_exact_elapsed_idle_ms() {
         assert_eq!(elapsed_idle_ms_from_ticks(5_000, 4_200), 800);
         assert_eq!(elapsed_idle_ms_from_ticks(100, u32::MAX - 49), 150);
+    }
+
+    #[test]
+    fn the_drivers_own_injected_input_is_not_physical_input() {
+        // Driver injected from tick 10_000 to 10_016; now is 10_200.
+        let own = Some((10_000, 10_016));
+        // Last input inside that span (or just after, as the OS stamps it).
+        assert_eq!(idle_ms_excluding_own_input(10_200, 10_016, own), None);
+        assert_eq!(idle_ms_excluding_own_input(10_200, 10_060, own), None);
+        // Input after the driver's injection is the person's.
+        assert_eq!(idle_ms_excluding_own_input(10_200, 10_150, own), Some(50));
+        // Input well before it predates the driver's and still counts.
+        assert_eq!(idle_ms_excluding_own_input(10_200, 9_000, own), Some(1_200));
+        // Nothing injected yet: the plain elapsed time.
+        assert_eq!(idle_ms_excluding_own_input(10_200, 10_016, None), Some(184));
+        // Tick wraparound between injection and now.
+        let wrapped = Some((u32::MAX - 20, u32::MAX - 4));
+        assert_eq!(
+            idle_ms_excluding_own_input(100, u32::MAX - 4, wrapped),
+            None
+        );
+        assert_eq!(idle_ms_excluding_own_input(100, 90, wrapped), Some(10));
     }
 
     #[test]

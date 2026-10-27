@@ -20,7 +20,7 @@ use std::thread::sleep;
 use std::time::{Duration, Instant};
 use windows::Win32::Foundation::{BOOL, HWND, LPARAM, TRUE, WPARAM};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    MapVirtualKeyW, SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYBD_EVENT_FLAGS,
+    MapVirtualKeyW, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYBD_EVENT_FLAGS,
     KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE, KEYEVENTF_UNICODE, MAPVK_VK_TO_VSC,
     VIRTUAL_KEY,
 };
@@ -473,7 +473,7 @@ pub fn send_key_synthesized_after_focus(
     }
 
     with_confirmed_foreground(target, "key delivery", focus, |_, _| unsafe {
-        let sent = SendInput(&events, std::mem::size_of::<INPUT>() as i32);
+        let sent = crate::input::delivery::send_input(&events);
         if sent as usize != events.len() {
             bail!(
                 "SendInput inserted only {sent} of {} events. Windows blocked the \
@@ -569,7 +569,7 @@ pub fn send_text_synthesized_after_focus(
         for unit in &units {
             events.extend_from_slice(&unit_events(unit)[..2]);
         }
-        let sent = SendInput(&events, std::mem::size_of::<INPUT>() as i32);
+        let sent = crate::input::delivery::send_input(&events);
         if sent as usize != events.len() {
             bail!(
                 "SendInput inserted only {sent} of {} key events. Windows blocked \
@@ -730,7 +730,7 @@ impl InputQueueAttachment {
         let toggled = || unsafe { GetKeyState(DRAIN_SENTINEL_VK.0 as i32) } & 1;
         let before = toggled();
         let sentinel = [sentinel_key_input(false), sentinel_key_input(true)];
-        let sent = unsafe { SendInput(&sentinel, std::mem::size_of::<INPUT>() as i32) };
+        let sent = unsafe { crate::input::delivery::send_input(&sentinel) };
         if sent as usize != sentinel.len() {
             sleep(Duration::from_millis(40));
             return false;
@@ -755,7 +755,7 @@ impl InputQueueAttachment {
     fn send_and_await_read(&self, events: &[INPUT], timeout: Duration) -> UnitRead {
         use windows::Win32::UI::Input::KeyboardAndMouse::GetKeyState;
         let before = unsafe { GetKeyState(DRAIN_SENTINEL_VK.0 as i32) } & 1;
-        let sent = unsafe { SendInput(events, std::mem::size_of::<INPUT>() as i32) };
+        let sent = unsafe { crate::input::delivery::send_input(events) };
         if (sent as usize) < events.len() {
             return UnitRead::Short(sent);
         }
