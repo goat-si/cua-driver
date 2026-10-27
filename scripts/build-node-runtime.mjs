@@ -11,6 +11,15 @@
  *
  * The patched source remains MPL-2.0 and comes from the exact, pinned
  * uniffi-bindgen-react-native development dependency.
+ *
+ * The runtime is its own Cargo project, outside rust/. Its dependency graph is
+ * locked by scripts/node-runtime/Cargo.lock and built with --locked, so every
+ * build resolves the same crates and CI can check them with cargo-deny
+ * (goat-si/cua-driver#4).
+ *
+ *   --output <path> [--target <triple>]  build the runtime into <path>
+ *   --prepare <directory>                write the patched, locked project only
+ *   --update-lockfile                    re-resolve and rewrite the lockfile
  */
 import { spawnSync } from "node:child_process"
 import {
@@ -30,19 +39,29 @@ import { fileURLToPath } from "node:url"
 const scriptDirectory = dirname(fileURLToPath(import.meta.url))
 const driverRoot = resolve(scriptDirectory, "..")
 const typescriptRoot = join(driverRoot, "typescript")
+const lockfile = join(scriptDirectory, "node-runtime", "Cargo.lock")
 const upstreamRoot = join(
   typescriptRoot,
   "node_modules",
   "uniffi-bindgen-react-native",
 )
-const outputIndex = process.argv.indexOf("--output")
-if (outputIndex < 0 || !process.argv[outputIndex + 1]) {
-  throw new Error("usage: build-node-runtime.mjs --output <path> [--target <triple>]")
+function option(name) {
+  const index = process.argv.indexOf(name)
+  if (index < 0) return undefined
+  const value = process.argv[index + 1]
+  if (!value || value.startsWith("--")) throw new Error(`missing ${name} value`)
+  return value
 }
-const output = resolve(process.argv[outputIndex + 1])
-const targetIndex = process.argv.indexOf("--target")
-const target = targetIndex < 0 ? undefined : process.argv[targetIndex + 1]
-if (targetIndex >= 0 && !target) throw new Error("missing --target value")
+const usage =
+  "usage: build-node-runtime.mjs --output <path> [--target <triple>] | --prepare <directory> | --update-lockfile"
+const outputOption = option("--output")
+const prepareOption = option("--prepare")
+const updateLockfile = process.argv.includes("--update-lockfile")
+if ([outputOption, prepareOption, updateLockfile || undefined].filter(Boolean).length !== 1) {
+  throw new Error(usage)
+}
+const target = option("--target")
+if (target && !outputOption) throw new Error(usage)
 
 function cargoEnvironment() {
   const environment = { ...process.env }
@@ -144,9 +163,30 @@ function patchCall(source) {
   return `${source.slice(0, bodyStart)}${replacement}${source.slice(bodyEnd + bodyEndNeedle.length)}`
 }
 
-const temporaryRoot = mkdtempSync(join(tmpdir(), "cua-driver-node-runtime-"))
-try {
-  const runtimeRoot = join(temporaryRoot, "runtime")
+function patchManifest(source) {
+  // UBRN's napi crate carries no license field; its sources are MPL-2.0 like
+  // the core crate's, and cargo-deny needs the field to check the graph. It is
+  // never published, which lets cargo-deny accept its path dependency.
+  return replaceOnce(
+    source,
+    'edition = "2021"\n',
+    'edition = "2021"\nlicense = "MPL-2.0"\npublish = false\n',
+    "N-API runtime edition line",
+  )
+}
+
+function cargo(args) {
+  const result = spawnSync("cargo", args, {
+    env: cargoEnvironment(),
+    stdio: "inherit",
+  })
+  if (result.error) throw result.error
+  if (result.status !== 0) throw new Error(`cargo exited with status ${result.status}`)
+}
+
+/** Write the patched runtime project to runtimeRoot; returns its manifest path. */
+function prepareRuntime(runtimeRoot, { locked = true } = {}) {
+  if (existsSync(runtimeRoot)) throw new Error(`${runtimeRoot} already exists`)
   cpSync(join(upstreamRoot, "runtimes", "core"), join(runtimeRoot, "core"), {
     recursive: true,
   })
@@ -157,15 +197,30 @@ try {
   writeFileSync(registerPath, patchRegister(readFileSync(registerPath, "utf8")))
   const callPath = join(runtimeRoot, "napi", "src", "call", "mod.rs")
   writeFileSync(callPath, patchCall(readFileSync(callPath, "utf8")))
+  const manifestPath = join(runtimeRoot, "napi", "Cargo.toml")
+  writeFileSync(manifestPath, patchManifest(readFileSync(manifestPath, "utf8")))
+  if (locked) {
+    if (!existsSync(lockfile)) {
+      throw new Error(`missing ${lockfile}; run build-node-runtime.mjs --update-lockfile`)
+    }
+    copyFileSync(lockfile, join(runtimeRoot, "napi", "Cargo.lock"))
+  }
+  return manifestPath
+}
 
-  const args = ["build", "--release", "--manifest-path", join(runtimeRoot, "napi", "Cargo.toml")]
+function writeLockfile(runtimeRoot) {
+  const manifestPath = prepareRuntime(runtimeRoot, { locked: false })
+  cargo(["generate-lockfile", "--manifest-path", manifestPath])
+  mkdirSync(dirname(lockfile), { recursive: true })
+  copyFileSync(join(runtimeRoot, "napi", "Cargo.lock"), lockfile)
+  console.log(`wrote ${lockfile} for UBRN ${actualVersion}`)
+}
+
+function buildRuntime(runtimeRoot) {
+  const manifestPath = prepareRuntime(runtimeRoot)
+  const args = ["build", "--release", "--locked", "--manifest-path", manifestPath]
   if (target) args.push("--target", target)
-  const result = spawnSync("cargo", args, {
-    env: cargoEnvironment(),
-    stdio: "inherit",
-  })
-  if (result.error) throw result.error
-  if (result.status !== 0) throw new Error(`cargo exited with status ${result.status}`)
+  cargo(args)
 
   const targetDirectory = target
     ? join(runtimeRoot, "napi", "target", target, "release")
@@ -177,9 +232,22 @@ try {
   ]
   const built = candidates.map((name) => join(targetDirectory, name)).find(existsSync)
   if (!built) throw new Error(`missing built N-API runtime under ${targetDirectory}`)
+  const output = resolve(outputOption)
   mkdirSync(dirname(output), { recursive: true })
   copyFileSync(built, output)
   console.log(`built ${basename(output)} from UBRN ${actualVersion}`)
-} finally {
-  rmSync(temporaryRoot, { recursive: true, force: true })
+}
+
+if (prepareOption) {
+  const manifestPath = prepareRuntime(resolve(prepareOption))
+  console.log(`prepared ${manifestPath} from UBRN ${actualVersion}`)
+} else {
+  const temporaryRoot = mkdtempSync(join(tmpdir(), "cua-driver-node-runtime-"))
+  try {
+    const runtimeRoot = join(temporaryRoot, "runtime")
+    if (updateLockfile) writeLockfile(runtimeRoot)
+    else buildRuntime(runtimeRoot)
+  } finally {
+    rmSync(temporaryRoot, { recursive: true, force: true })
+  }
 }

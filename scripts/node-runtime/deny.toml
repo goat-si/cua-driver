@@ -1,0 +1,37 @@
+# cargo-deny policy for the Electron-compatible Node runtime, a separate Cargo project that
+# scripts/build-node-runtime.mjs assembles from uniffi-bindgen-react-native and locks with
+# scripts/node-runtime/Cargo.lock (goat-si/cua-driver#4). The allow list is the subset of
+# rust/deny.toml's that this graph uses; widen it here only for a crate that needs it.
+[graph]
+targets = [
+  "aarch64-apple-darwin", "x86_64-apple-darwin",
+  "x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu",
+  "x86_64-pc-windows-msvc", "aarch64-pc-windows-msvc",
+]
+
+[licenses]
+allow = [
+  "MIT", "Apache-2.0", "ISC", "Unicode-3.0",
+]
+confidence-threshold = 0.95
+# The runtime itself: UBRN's MPL-2.0 sources, patched by build-node-runtime.mjs. Its NOTICE
+# (scripts/node-runtime-NOTICE.md) ships with the npm package and the release archives.
+exceptions = [
+  { crate = "uniffi-runtime-core", allow = ["MPL-2.0"] },
+  { crate = "uniffi-runtime-napi", allow = ["MPL-2.0"] },
+]
+
+[licenses.private]
+ignore = false
+
+[bans]
+multiple-versions = "warn"
+wildcards = "warn"
+allow-wildcard-paths = true
+highlight = "all"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

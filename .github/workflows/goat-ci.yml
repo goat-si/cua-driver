@@ -61,11 +61,21 @@ jobs:
       - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2
         with:
           tool: cargo-deny@0.20.2
-      # Covers the rust/ workspace (driver, cursor theme, SDK, UIA). The Node runtime is built from a
-      # separate, unlocked Cargo project that this does not see; goat-si/cua-driver#4.
+      # Covers the rust/ workspace (driver, cursor theme, SDK, UIA).
       - name: Licenses, bans and sources of the rust/ workspace (rust/deny.toml)
         working-directory: rust
         run: cargo deny --locked --exclude-dev check --show-stats licenses bans sources
+      # The Node runtime is a separate Cargo project assembled by scripts/build-node-runtime.mjs and
+      # locked by scripts/node-runtime/Cargo.lock (goat-si/cua-driver#4).
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "22"
+      - name: Licenses, bans and sources of the Node runtime (scripts/node-runtime/deny.toml)
+        run: |
+          npm --prefix typescript ci --ignore-scripts
+          node scripts/build-node-runtime.mjs --prepare "$RUNNER_TEMP/node-runtime"
+          cargo deny --manifest-path "$RUNNER_TEMP/node-runtime/napi/Cargo.toml" --locked \
+            --config scripts/node-runtime/deny.toml check --show-stats licenses bans sources
 
   linux:
     name: linux-${{ matrix.arch }}
