@@ -119,12 +119,13 @@ def launcher():
         # Spawn from a thread that exits once the controller has seen the
         # worker's lifetime installed (SIGUSR1), as an SDK host may when it
         # constructs the driver on a short-lived thread.
-        spawned, release = [], threading.Event()
+        spawned, native, release = [], [], threading.Event()
         # Blocked here, so the creator inherits the mask, and taken below with
         # sigwait: no handler runs while a thread waits on the event's lock.
         signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGUSR1})
 
         def create():
+            native.append(threading.get_native_id())
             spawned.append(subprocess.Popen(args, stdin=fd, stdout=sys.stdout, stderr=sys.stdout))
             release.wait()
 
@@ -136,6 +137,11 @@ def launcher():
         signal.sigwait({signal.SIGUSR1})
         release.set()
         creator.join()
+        # join() returns once Python is done with the thread, before the OS
+        # thread exits; a thread-bound parent-death signal fires only then.
+        task = Path(f"/proc/self/task/{native[0]}")
+        while sys.platform != "darwin" and task.exists():
+            time.sleep(0.001)
         print("CREATOR_EXITED", flush=True)
         signal.pause()
         return
