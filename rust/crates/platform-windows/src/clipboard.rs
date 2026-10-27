@@ -424,10 +424,12 @@ mod tests {
             let _ = DestroyWindow(hwnd);
             let _ = UnregisterClassW(class.lpszClassName, instance);
 
-            image.unwrap();
+            // The file write first: it succeeds on every build, so its count
+            // shows the transaction split even where an image write errors.
             file.unwrap();
-            assert_eq!(image_updates, [true], "write_image clipboard updates");
             assert_eq!(file_updates, [true], "write_file_url clipboard updates");
+            image.unwrap();
+            assert_eq!(image_updates, [true], "write_image clipboard updates");
         }
     }
 
