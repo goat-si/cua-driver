@@ -1457,6 +1457,17 @@ fn launch_daemon_with_state_and_wait(
     experimental_history: bool,
     _allow_managed_restart: bool,
 ) -> Result<(), LaunchDaemonError> {
+    launch_bundle_and_wait(socket_path, timeout_secs, state, experimental_history, None)
+}
+
+#[cfg(target_os = "macos")]
+fn launch_bundle_and_wait(
+    socket_path: &str,
+    timeout_secs: u64,
+    state: &crate::history_runtime::DaemonLaunchState,
+    experimental_history: bool,
+    stdin_marker: Option<&std::path::Path>,
+) -> Result<(), LaunchDaemonError> {
     use std::process::{Command as Cmd, Stdio};
 
     // Forward `--socket <path>` to the relaunched daemon when the caller
@@ -1474,7 +1485,13 @@ fn launch_daemon_with_state_and_wait(
     // than one copy is registered (for example `/Applications` and
     // `~/Applications`), LaunchServices may otherwise pick a different copy
     // than the one this CLI belongs to, with different TCC grants.
-    let open_args = daemon_launch_arguments(&app_path, socket_path, state, experimental_history);
+    let mut open_args =
+        daemon_launch_arguments(&app_path, socket_path, state, experimental_history);
+    if let Some(marker) = stdin_marker {
+        // Only the process this launch creates receives the marker as its
+        // stdin; the daemon never reads stdin.
+        open_args.splice(0..0, ["--stdin".to_owned(), marker.display().to_string()]);
+    }
     // Thread the Claude-Code compat flag through to the daemon. Without this
     // the proxy-spawned daemon always called build_macos_registry() (compat
     // hardcoded false), so `cua-driver mcp --claude-code-computer-use-compat`
@@ -1554,36 +1571,29 @@ fn launch_daemon_with_state_and_wait(
 
 /// Launch through LaunchServices and identify the process it created.
 ///
-/// `open -n` reports no pid, so the launched process is the one new
-/// process running from this bundle across the launch. Zero or several new
-/// processes (a concurrent launch) leave it unidentified, and MCP startup
-/// then stops nothing.
+/// `open -n` reports no pid, so the launch connects the new process's stdin
+/// to a fresh empty marker file, and the identity is the one process whose
+/// stdin is that file, recorded with its start time. No other launch holds the
+/// marker, and a later process reusing the pid has another start time. No
+/// match, several matches, or an unreadable process table leave the launch
+/// unidentified, and MCP startup then stops nothing.
 #[cfg(target_os = "macos")]
 fn launch_daemon_with_state_identified(
     socket_path: &str,
     timeout_secs: u64,
     state: &crate::history_runtime::DaemonLaunchState,
     experimental_history: bool,
-    allow_managed_restart: bool,
+    _allow_managed_restart: bool,
 ) -> (Option<LaunchedDaemon>, Result<(), LaunchDaemonError>) {
-    let executable_dirs = bundle_executable_dirs(&crate::bundle::app_bundle_path());
-    let before = bundle_process_ids(&executable_dirs);
-    let result = launch_daemon_with_state_and_wait(
+    let marker = LaunchMarker::create();
+    let result = launch_bundle_and_wait(
         socket_path,
         timeout_secs,
         state,
         experimental_history,
-        allow_managed_restart,
+        marker.as_ref().map(LaunchMarker::path),
     );
-    let after = bundle_process_ids(&executable_dirs);
-    let mut created = after.difference(&before);
-    let launched = match (created.next(), created.next()) {
-        (Some(&pid), None) => Some(LaunchedDaemon::Bundle {
-            pid,
-            executable_dirs,
-        }),
-        _ => None,
-    };
+    let launched = marker.and_then(|marker| identify_marked_process(marker.path()));
     (launched, result)
 }
 
@@ -2137,16 +2147,18 @@ fn ensure_compatible_daemon_within(
     })?
 }
 
-/// A daemon process this invocation created, identified by the launch itself
-/// (a spawned child, the one new process from the app bundle after
-/// `open -n`, or the pid `CreateProcessW` returned).
+/// A daemon process this invocation created, identified by the launch itself:
+/// a spawned child, the process holding this launch's stdin marker after
+/// `open -n`, or the pid `CreateProcessW` returned.
 pub(crate) enum LaunchedDaemon {
     #[cfg(unix)]
     Child(std::process::Child),
     #[cfg(target_os = "macos")]
-    Bundle {
+    Marked {
         pid: u32,
-        executable_dirs: Vec<std::path::PathBuf>,
+        /// Start time when identified; checked before every signal, so a
+        /// process that later reuses the pid is never signalled.
+        started: ProcessStart,
     },
     #[cfg(target_os = "windows")]
     Process { pid: u32 },
@@ -2167,15 +2179,15 @@ impl LaunchedDaemon {
             #[cfg(unix)]
             Self::Child(child) => child.id(),
             #[cfg(target_os = "macos")]
-            Self::Bundle { pid, .. } => *pid,
+            Self::Marked { pid, .. } => *pid,
             #[cfg(target_os = "windows")]
             Self::Process { pid } => *pid,
         }
     }
 
-    /// Stop this process: SIGTERM, then SIGKILL after `deadline`. Each wait is
-    /// bounded. A process that no longer runs from the launched executable has
-    /// exited, and its pid is never signalled again.
+    /// Stop this process: SIGTERM, then SIGKILL after `deadline`, each followed by
+    /// a bounded wait for it to exit. A process that no longer matches its
+    /// launch identity has exited, and its pid is not signalled again.
     fn terminate(
         &mut self,
         #[cfg_attr(unix, allow(unused_variables))] socket_path: &str,
@@ -2185,27 +2197,39 @@ impl LaunchedDaemon {
             #[cfg(unix)]
             Self::Child(child) => {
                 let pid = child.id();
-                let mut exited = || child.try_wait().ok().flatten().is_some();
-                if exited() {
-                    return Ok(Termination::AlreadyExited);
+                let mut poll_error = None;
+                let mut exited = || match child.try_wait() {
+                    Ok(status) => status.is_some(),
+                    Err(error) => {
+                        poll_error = Some(error);
+                        true
+                    }
+                };
+                let termination = if exited() {
+                    Termination::AlreadyExited
+                } else {
+                    signal_process(pid, libc::SIGTERM);
+                    if wait_until(deadline, &mut exited) {
+                        Termination::Terminated
+                    } else {
+                        signal_process(pid, libc::SIGKILL);
+                        if !wait_until(deadline, &mut exited) {
+                            return Err(format!(
+                                "process {pid} did not exit within {deadline:?} of SIGKILL"
+                            ));
+                        }
+                        Termination::Killed
+                    }
+                };
+                match poll_error {
+                    Some(error) => Err(format!("could not confirm process {pid} exited: {error}")),
+                    None => Ok(termination),
                 }
-                signal_process(pid, libc::SIGTERM);
-                if wait_until(deadline, &mut exited) {
-                    return Ok(Termination::Terminated);
-                }
-                child
-                    .kill()
-                    .and_then(|()| child.wait().map(drop))
-                    .map_err(|error| format!("could not kill process {pid}: {error}"))?;
-                Ok(Termination::Killed)
             }
             #[cfg(target_os = "macos")]
-            Self::Bundle {
-                pid,
-                executable_dirs,
-            } => {
-                let pid = *pid;
-                let running = || process_runs_from(pid, executable_dirs);
+            Self::Marked { pid, started } => {
+                let (pid, started) = (*pid, *started);
+                let running = || process_start(pid) == Some(started);
                 if !running() {
                     return Ok(Termination::AlreadyExited);
                 }
@@ -2219,7 +2243,9 @@ impl LaunchedDaemon {
                 if wait_until(deadline, &mut || !running()) {
                     Ok(Termination::Killed)
                 } else {
-                    Err(format!("process {pid} is still running"))
+                    Err(format!(
+                        "process {pid} did not exit within {deadline:?} of SIGKILL"
+                    ))
                 }
             }
             #[cfg(target_os = "windows")]
@@ -2261,62 +2287,159 @@ fn signal_process(pid: u32, signal: libc::c_int) {
     }
 }
 
-/// Directories the app bundle's executables run from, as launched and as
-/// resolved, since the kernel reports resolved paths.
+/// An empty file in a private directory, handed to the launched process as
+/// its stdin. Removed on drop; the launched process keeps its open handle.
 #[cfg(target_os = "macos")]
-fn bundle_executable_dirs(app_path: &str) -> Vec<std::path::PathBuf> {
-    let dir = std::path::Path::new(app_path)
-        .join("Contents")
-        .join("MacOS");
-    let mut dirs = vec![dir.clone()];
-    if let Ok(resolved) = std::fs::canonicalize(&dir) {
-        if resolved != dir {
-            dirs.push(resolved);
-        }
-    }
-    dirs
+struct LaunchMarker {
+    directory: std::path::PathBuf,
+    path: std::path::PathBuf,
 }
 
 #[cfg(target_os = "macos")]
-fn bundle_process_ids(executable_dirs: &[std::path::PathBuf]) -> std::collections::BTreeSet<u32> {
+impl LaunchMarker {
+    fn create() -> Option<Self> {
+        use std::os::unix::fs::DirBuilderExt as _;
+
+        let directory =
+            std::env::temp_dir().join(format!("cua-driver-mcp-launch-{}", uuid::Uuid::new_v4()));
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&directory)
+            .ok()?;
+        let mut marker = Self {
+            path: directory.join("stdin"),
+            directory,
+        };
+        std::fs::File::create(&marker.path).ok()?;
+        // The kernel reports resolved paths (/private/var, not /var).
+        marker.path = std::fs::canonicalize(&marker.path).ok()?;
+        Some(marker)
+    }
+
+    fn path(&self) -> &std::path::Path {
+        &self.path
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for LaunchMarker {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+        let _ = std::fs::remove_dir(&self.directory);
+    }
+}
+
+/// The one live process whose stdin is `marker`, with its start time.
+#[cfg(target_os = "macos")]
+fn identify_marked_process(marker: &std::path::Path) -> Option<LaunchedDaemon> {
+    let mut pids = all_process_ids()?
+        .into_iter()
+        .filter(|pid| process_stdin_path(*pid).as_deref() == Some(marker));
+    let (Some(pid), None) = (pids.next(), pids.next()) else {
+        return None;
+    };
+    let started = process_start(pid)?;
+    // Still the same process, still holding the marker.
+    (process_stdin_path(pid).as_deref() == Some(marker))
+        .then_some(LaunchedDaemon::Marked { pid, started })
+}
+
+/// Every pid in the process table, or `None` when it cannot be read in full.
+#[cfg(target_os = "macos")]
+fn all_process_ids() -> Option<Vec<u32>> {
     // SAFETY: a null buffer asks libproc for the current process count.
     let count = unsafe { libc::proc_listallpids(std::ptr::null_mut(), 0) };
-    if count <= 0 {
-        return Default::default();
-    }
-    // Headroom for processes started between the two calls.
-    let mut pids = vec![0 as libc::pid_t; count as usize + 64];
-    let bytes = libc::c_int::try_from(pids.len() * std::mem::size_of::<libc::pid_t>())
-        .unwrap_or(libc::c_int::MAX);
+    let count = usize::try_from(count).ok().filter(|count| *count > 0)?;
+    // Headroom for processes started between the two calls; a full buffer
+    // means the table may not have fit.
+    let mut pids = vec![0 as libc::pid_t; count + 256];
+    let bytes = libc::c_int::try_from(pids.len() * std::mem::size_of::<libc::pid_t>()).ok()?;
     // SAFETY: the buffer holds `bytes` bytes of pid_t slots.
     let filled = unsafe { libc::proc_listallpids(pids.as_mut_ptr().cast(), bytes) };
-    pids.truncate(usize::try_from(filled).unwrap_or(0).min(pids.len()));
-    pids.into_iter()
-        .filter_map(|pid| u32::try_from(pid).ok().filter(|pid| *pid > 0))
-        .filter(|pid| process_runs_from(*pid, executable_dirs))
-        .collect()
+    let filled = usize::try_from(filled).ok().filter(|filled| *filled > 0)?;
+    if filled >= pids.len() {
+        return None;
+    }
+    pids.truncate(filled);
+    Some(
+        pids.into_iter()
+            .filter_map(|pid| u32::try_from(pid).ok().filter(|pid| *pid > 0))
+            .collect(),
+    )
 }
 
+/// `(seconds, microseconds)` start time of a live, non-zombie process.
 #[cfg(target_os = "macos")]
-fn process_runs_from(pid: u32, executable_dirs: &[std::path::PathBuf]) -> bool {
-    use std::os::unix::ffi::OsStringExt as _;
+type ProcessStart = (u64, u64);
 
-    let Ok(pid) = libc::c_int::try_from(pid) else {
-        return false;
+#[cfg(target_os = "macos")]
+fn process_start(pid: u32) -> Option<ProcessStart> {
+    const SZOMB: u32 = 5;
+    let pid = libc::c_int::try_from(pid).ok()?;
+    // SAFETY: proc_bsdinfo is plain data; zero is a valid bit pattern.
+    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+    let size = libc::c_int::try_from(std::mem::size_of::<libc::proc_bsdinfo>()).ok()?;
+    // SAFETY: the kernel writes at most `size` bytes into info.
+    let written = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            (&mut info as *mut libc::proc_bsdinfo).cast(),
+            size,
+        )
     };
-    let mut buffer = vec![0_u8; 4096];
-    // SAFETY: proc_pidpath writes at most buffer.len() bytes.
-    let length =
-        unsafe { libc::proc_pidpath(pid, buffer.as_mut_ptr().cast(), buffer.len() as u32) };
-    let Ok(length) = usize::try_from(length) else {
-        return false;
-    };
-    if length == 0 {
-        return false;
+    (written == size && info.pbi_status != SZOMB)
+        .then_some((info.pbi_start_tvsec, info.pbi_start_tvusec))
+}
+
+/// Path of the file open as the process's stdin, when it is a file.
+#[cfg(target_os = "macos")]
+fn process_stdin_path(pid: u32) -> Option<std::path::PathBuf> {
+    use std::os::unix::ffi::OsStrExt as _;
+
+    // <sys/proc_info.h>: struct proc_fileinfo and vnode_fdinfowithpath.
+    #[repr(C)]
+    struct ProcFileInfo {
+        fi_openflags: u32,
+        fi_status: u32,
+        fi_offset: i64,
+        fi_type: i32,
+        fi_guardflags: u32,
     }
-    buffer.truncate(length);
-    let path = std::path::PathBuf::from(std::ffi::OsString::from_vec(buffer));
-    executable_dirs.iter().any(|dir| path.starts_with(dir))
+    #[repr(C)]
+    struct VnodeFdInfoWithPath {
+        pfi: ProcFileInfo,
+        pvip: libc::vnode_info_path,
+    }
+    const PROC_PIDFDVNODEPATHINFO: libc::c_int = 2;
+
+    let pid = libc::c_int::try_from(pid).ok()?;
+    // SAFETY: plain data; zero is a valid bit pattern.
+    let mut info: VnodeFdInfoWithPath = unsafe { std::mem::zeroed() };
+    let size = libc::c_int::try_from(std::mem::size_of::<VnodeFdInfoWithPath>()).ok()?;
+    // SAFETY: the kernel writes at most `size` bytes into info.
+    let written = unsafe {
+        libc::proc_pidfdinfo(
+            pid,
+            0,
+            PROC_PIDFDVNODEPATHINFO,
+            (&mut info as *mut VnodeFdInfoWithPath).cast(),
+            size,
+        )
+    };
+    if written != size {
+        return None;
+    }
+    let bytes: Vec<u8> = info
+        .pvip
+        .vip_path
+        .iter()
+        .flatten()
+        .map(|byte| *byte as u8)
+        .take_while(|byte| *byte != 0)
+        .collect();
+    (!bytes.is_empty()).then(|| std::ffi::OsStr::from_bytes(&bytes).into())
 }
 
 /// Stop the launched process and say what was observed.
@@ -3214,19 +3337,110 @@ mod daemon_compatibility_tests {
         reap(pid);
     }
 
+    #[test]
+    fn child_that_ignores_sigterm_is_killed_within_the_bound() {
+        use std::io::BufRead as _;
+
+        // The shell ignores TERM, says so, and exec keeps the disposition.
+        let mut child = Command::new("/bin/sh")
+            .args(["-c", "trap '' TERM; echo ready; exec /bin/sleep 600"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut ready = String::new();
+        std::io::BufReader::new(child.stdout.take().unwrap())
+            .read_line(&mut ready)
+            .unwrap();
+        assert_eq!(ready, "ready\n");
+        let pid = child.id();
+        let mut launched = LaunchedDaemon::Child(child);
+
+        let termination = launched
+            .terminate("unused", Duration::from_millis(200))
+            .unwrap();
+
+        assert_eq!(termination, super::Termination::Killed);
+        assert!(gone(pid));
+    }
+
+    #[cfg(target_os = "macos")]
+    fn process_with_stdin(path: &std::path::Path) -> Child {
+        Command::new("/bin/sleep")
+            .arg("600")
+            .stdin(std::fs::File::open(path).unwrap())
+            .spawn()
+            .unwrap()
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
-    fn bundle_identity_finds_processes_by_their_executable_directory() {
-        let executable = std::env::current_exe().unwrap();
-        let dirs = vec![executable.parent().unwrap().to_path_buf()];
+    fn launch_marker_identifies_only_the_process_holding_it_and_terminates_it() {
+        let marker = super::LaunchMarker::create().unwrap();
+        let marked = process_with_stdin(marker.path());
+        // A concurrent launch of the same program without this marker.
+        let foreign = launched_process();
+        let (marked_pid, foreign_pid) = (marked.id(), foreign.id());
 
-        let pids = super::bundle_process_ids(&dirs);
+        let mut launched = super::identify_marked_process(marker.path()).unwrap();
 
-        assert!(pids.contains(&std::process::id()), "{pids:?}");
-        assert!(!super::process_runs_from(
-            std::process::id(),
-            &[std::path::PathBuf::from("/nonexistent/Contents/MacOS")]
-        ));
+        assert_eq!(launched.pid(), marked_pid);
+        assert_ne!(
+            super::process_stdin_path(foreign_pid).as_deref(),
+            Some(marker.path()),
+            "only the launched process holds the marker"
+        );
+        assert_eq!(
+            launched.terminate("unused", STARTUP).unwrap(),
+            super::Termination::Terminated
+        );
+        // Exited (even unreaped), it no longer matches its start time, so a
+        // second cleanup signals nothing.
+        assert_eq!(super::process_start(marked_pid), None);
+        assert_eq!(
+            launched.terminate("unused", STARTUP).unwrap(),
+            super::Termination::AlreadyExited
+        );
+        assert!(!gone(foreign_pid));
+        drop((marked, foreign));
+        reap(marked_pid);
+        reap(foreign_pid);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn launch_marker_without_its_process_or_with_two_identifies_nothing() {
+        let marker = super::LaunchMarker::create().unwrap();
+        assert!(super::identify_marked_process(marker.path()).is_none());
+
+        let first = process_with_stdin(marker.path());
+        let second = process_with_stdin(marker.path());
+        assert!(super::identify_marked_process(marker.path()).is_none());
+        let (first_pid, second_pid) = (first.id(), second.id());
+        drop((first, second));
+        reap(first_pid);
+        reap(second_pid);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_reused_pid_does_not_match_the_recorded_start_time() {
+        let child = launched_process();
+        let pid = child.id();
+        let started = super::process_start(pid).unwrap();
+        // The same pid with any other start time is a different process.
+        let mut launched = LaunchedDaemon::Marked {
+            pid,
+            started: (started.0.wrapping_sub(1), started.1),
+        };
+
+        assert_eq!(
+            launched.terminate("unused", STARTUP).unwrap(),
+            super::Termination::AlreadyExited
+        );
+        assert!(!gone(pid), "a non-matching process must not be signalled");
+        drop(child);
+        reap(pid);
     }
 
     #[test]
