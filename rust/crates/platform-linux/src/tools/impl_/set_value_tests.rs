@@ -17,6 +17,7 @@ fn a_file_chooser_keeping_the_basename_counts_as_committed() {
         "ax",
         Some("tone.wav".into()),
         None,
+        false,
     );
     let s = ok.structured_content.unwrap();
     assert_eq!(s["verified"], true);
@@ -34,15 +35,44 @@ fn readback_agreement_is_numeric_aware() {
 
 #[test]
 fn set_value_result_is_verified_only_on_matching_readback() {
-    let ok = set_value_result(3, "40", "click_type_mpx", Some("40.0".into()), None);
+    let ok = set_value_result(3, "40", "click_type_mpx", Some("40.0".into()), None, false);
     let s = ok.structured_content.unwrap();
     assert_eq!(s["verified"], true);
     assert_eq!(s["effect"], "confirmed");
-    let noop = set_value_result(3, "40", "ax", Some("10.0".into()), None);
+    let noop = set_value_result(3, "40", "ax", Some("10.0".into()), None, false);
     let s = noop.structured_content.unwrap();
     assert_eq!(s["verified"], false);
     assert_eq!(s["effect"], "suspected_noop");
     assert_eq!(s["readback"], "10.0");
-    let blind = set_value_result(3, "40", "ax", None, None);
+    let blind = set_value_result(3, "40", "ax", None, None, false);
     assert_eq!(blind.structured_content.unwrap()["effect"], "unverifiable");
+}
+
+#[test]
+fn a_password_field_write_does_not_repeat_its_value() {
+    let result = set_value_result(1, "set-secret-2", "ax", None, None, true);
+    let text = format!("{:?}", result.content);
+    assert!(!text.contains("set-secret-2"), "{text}");
+    assert!(text.contains("[REDACTED]"), "{text}");
+    let plain = set_value_result(1, "draft", "ax", None, None, false);
+    assert!(format!("{:?}", plain.content).contains("draft"));
+}
+
+#[test]
+fn a_password_field_write_masks_its_read_back_too() {
+    for readback in ["set-secret-2", "other-secret"] {
+        let result = set_value_result(1, "set-secret-2", "ax", Some(readback.into()), None, true);
+        let shown = format!("{:?} {:?}", result.content, result.structured_content);
+        assert!(!shown.contains("secret"), "{shown}");
+    }
+    // Verification still uses the real read-back.
+    let matched = set_value_result(
+        1,
+        "set-secret-2",
+        "ax",
+        Some("set-secret-2".into()),
+        None,
+        true,
+    );
+    assert_eq!(matched.structured_content.unwrap()["verified"], true);
 }

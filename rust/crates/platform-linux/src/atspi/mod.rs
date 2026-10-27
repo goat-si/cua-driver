@@ -645,19 +645,32 @@ pub fn type_into_token(pid: u32, token: &TokenElement, text: &str) -> Result<()>
 /// [`native::NO_VALUE_ROUTE`] mean the element has no accessibility write
 /// route at all.
 pub fn set_value_token(pid: u32, token: &TokenElement, value: &str) -> Result<()> {
+    set_value_token_reporting_retarget(pid, token, value).map(|_| ())
+}
+
+/// [`set_value_token`], also saying whether the write re-resolved the index
+/// (the observed object was gone) and so may have reached another element.
+pub fn set_value_token_reporting_retarget(
+    pid: u32,
+    token: &TokenElement,
+    value: &str,
+) -> Result<bool> {
+    let retargeted = std::cell::Cell::new(false);
     token
         .act(
             |object| match native::set_value_ref(object, value) {
-                // A missing value route is the element's own answer, not a
-                // failure to reach it, so it is never re-resolved.
                 Err(error) if native::is_no_value_route(&error) => {
                     Ok(select_option(object, value).unwrap_or(Err(error)))
                 }
                 done => done.map(Ok),
             },
-            |idx| Ok(native::set_value(pid, idx, value)),
+            |idx| {
+                retargeted.set(true);
+                Ok(native::set_value(pid, idx, value))
+            },
         )
-        .and_then(|done| done)
+        .and_then(|done| done)?;
+    Ok(retargeted.get())
 }
 
 /// The open popup of the token's combo box: activate the option `value`
@@ -673,6 +686,12 @@ pub fn activate_option_token(token: &TokenElement, value: &str) -> Result<Option
 /// Whether the popup of the token's combo box is open.
 pub fn options_showing_token(token: &TokenElement) -> bool {
     token.object().is_ok_and(native::options_showing_ref)
+}
+
+/// Whether the token element is a password field (gone or unreadable counts as
+/// one), so a write result does not repeat the value it wrote.
+pub fn is_password_token(token: &TokenElement) -> bool {
+    token.object().map_or(true, native::is_password_ref)
 }
 
 /// Read the token element's current value/text (for the read-back after a
