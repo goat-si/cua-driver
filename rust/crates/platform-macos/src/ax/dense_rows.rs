@@ -48,7 +48,12 @@ pub(crate) fn plan_children(
     (0..child_count)
         .map(|i| {
             deadline_expired = deadline_expired || expired();
-            if deadline_expired || is_row(i) {
+            if deadline_expired {
+                // Unclassified: it may not be a row at all, so it is not
+                // summarized as offscreen. The walker refuses it after the
+                // deadline and counts it as pending.
+                ChildPlan::Defer { visible: true }
+            } else if is_row(i) {
                 ChildPlan::Defer {
                     visible: visible.is_none_or(|contains| contains(i)),
                 }
@@ -346,9 +351,13 @@ mod tests {
         let is_visible = |i: usize| i.is_multiple_of(2);
         let shown = ChildPlan::Defer { visible: true };
         let hidden = ChildPlan::Defer { visible: false };
+        // A child the deadline left unclassified may be a button, not a row:
+        // it is never folded into an "offscreen rows" line. Deferred as
+        // visible, the walker's admission refuses it after the deadline and
+        // counts it as pending, so the read reports the timeout.
         for (probe_limit, expected) in [
-            (0, [shown, hidden, shown, hidden]),
-            (2, [shown, ChildPlan::WalkNow, shown, hidden]),
+            (0, [shown, shown, shown, shown]),
+            (2, [shown, ChildPlan::WalkNow, shown, shown]),
             (4, [shown, ChildPlan::WalkNow, ChildPlan::WalkNow, hidden]),
         ] {
             let probes = Cell::new(0);
