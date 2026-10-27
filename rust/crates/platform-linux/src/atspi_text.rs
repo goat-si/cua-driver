@@ -6,6 +6,20 @@
 /// AT-SPI `ATSPI_ROLE_PASSWORD_TEXT` (atspi-constants.h; `atspi::Role::PasswordText`).
 pub(crate) const ROLE_PASSWORD_TEXT: u32 = 40;
 
+/// What a write result shows in place of a value it must not repeat.
+pub(crate) const REDACTED: &str = "[REDACTED]";
+
+/// The value a write result may repeat back: the requested value, except for
+/// a password field, whose value would otherwise land in the reply and the
+/// transcript.
+pub(crate) fn echoed_value(value: &str, is_password: bool) -> &str {
+    if is_password {
+        REDACTED
+    } else {
+        value
+    }
+}
+
 /// A text widget's numeric AT-SPI role, as far as it could be read.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum RoleRead {
@@ -194,5 +208,11 @@ mod tests {
         assert_eq!(name("Password", false, true, "hunter2"), "Password");
         assert_eq!(name("Password", false, true, ""), "Password");
         assert_eq!(name("Password", true, false, ""), "Password");
+    }
+
+    #[test]
+    fn a_write_result_never_repeats_a_password() {
+        assert_eq!(echoed_value("set-secret-2", true), REDACTED);
+        assert_eq!(echoed_value("draft", false), "draft");
     }
 }

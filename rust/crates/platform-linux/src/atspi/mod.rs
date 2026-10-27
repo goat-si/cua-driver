@@ -675,6 +675,12 @@ pub fn options_showing_token(token: &TokenElement) -> bool {
     token.object().is_ok_and(native::options_showing_ref)
 }
 
+/// Whether the token element is a password field (gone or unreadable counts as
+/// one), so a write result does not repeat the value it wrote.
+pub fn is_password_token(token: &TokenElement) -> bool {
+    token.object().map_or(true, native::is_password_ref)
+}
+
 /// Read the token element's current value/text (for the read-back after a
 /// write). `None` when its object is gone or exposes neither `Value` nor
 /// `Text`.

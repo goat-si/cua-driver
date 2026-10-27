@@ -9448,6 +9448,13 @@ impl Tool for SetValueTool {
             }
         };
         let idx = token.index;
+        // A password field's value never goes back into the reply.
+        let secret = {
+            let target = token.clone();
+            tokio::task::spawn_blocking(move || crate::atspi::is_password_token(&target))
+                .await
+                .unwrap_or(true)
+        };
         let value_for_task = value.clone();
         let xid_opt = Some(xid);
         let delivery = crate::input::delivery::DeliveryMode::from_args(&args);
@@ -9476,7 +9483,7 @@ impl Tool for SetValueTool {
                         .await
                         .ok()
                         .flatten();
-                return set_value_result(idx, &value, "ax", readback, None);
+                return set_value_result(idx, &value, "ax", readback, None, secret);
             }
             Ok(Err(error)) if crate::atspi::native::is_no_value_route(&error) => error,
             Ok(Err(error)) if crate::atspi::native::is_no_such_option(&error) => {
@@ -9593,6 +9600,7 @@ impl Tool for SetValueTool {
                     },
                     readback,
                     guard.as_ref(),
+                    secret,
                 )
             }
             Ok(Err(error)) if crate::atspi::native::is_no_such_option(&error) => {
@@ -9703,13 +9711,15 @@ fn values_agree(wanted: &str, observed: &str) -> bool {
 }
 
 /// `set_value` result with an honest verification: `verified` only when the
-/// element read back the requested value.
+/// element read back the requested value. For a password field (`secret`) the
+/// reply names the value `[REDACTED]`.
 fn set_value_result(
     idx: usize,
     value: &str,
     path: &str,
     readback: Option<String>,
     guard: Option<&crate::input::FocusGuardReport>,
+    secret: bool,
 ) -> ToolResult {
     let normalised_path = readback
         .as_deref()
@@ -9723,7 +9733,8 @@ fn set_value_result(
         "verified": verified,
         "effect": if verified { "confirmed" } else if readback.is_some() { "suspected_noop" } else { "unverifiable" },
     });
-    let mut text = format!("Set value of element [{idx}] to '{value}' (path={path})");
+    let shown = crate::atspi_text::echoed_value(value, secret);
+    let mut text = format!("Set value of element [{idx}] to '{shown}' (path={path})");
     match readback {
         Some(seen) if normalised_path => {
             structured["readback"] = json!(seen);

@@ -5770,6 +5770,31 @@ pub(crate) async fn reportable_name(acc: &AccessibleProxy<'_>, role_lower: &str)
     name.and_then(|result| result.ok()).unwrap_or_default()
 }
 
+/// Whether the element behind `object_ref` is a password field, for keeping a
+/// written value out of a reply. An element that is gone or does not answer
+/// counts as one.
+pub fn is_password_ref(object_ref: &ObjectRef) -> bool {
+    bounded_for(
+        REF_ACTION_BUDGET,
+        async {
+            let conn = shared_connection().await?;
+            let (acc, _) = live_accessible(conn, object_ref).await?;
+            let (number, name) = tokio::join!(call(acc.get_role()), call(acc.get_role_name()));
+            let role_read = match number {
+                Some(Ok(role)) => RoleRead::Known(role as u32),
+                _ => RoleRead::Failed,
+            };
+            let role_name = name
+                .and_then(|result| result.ok())
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+            Ok(is_password_field(role_read, &role_name))
+        },
+        || Ok(true),
+    )
+    .unwrap_or(true)
+}
+
 /// Current value of a cached element for read-back after a write: the
 /// `Value` interface's number, else the `Text` content. `None` when the
 /// element exposes neither (or does not answer in time), and for a password
