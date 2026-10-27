@@ -120,7 +120,9 @@ def launcher():
         # worker's lifetime installed (SIGUSR1), as an SDK host may when it
         # constructs the driver on a short-lived thread.
         spawned, release = [], threading.Event()
-        signal.signal(signal.SIGUSR1, lambda *_: release.set())
+        # Blocked here, so the creator inherits the mask, and taken below with
+        # sigwait: no handler runs while a thread waits on the event's lock.
+        signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGUSR1})
 
         def create():
             spawned.append(subprocess.Popen(args, stdin=fd, stdout=sys.stdout, stderr=sys.stdout))
@@ -131,7 +133,8 @@ def launcher():
         while not spawned:
             time.sleep(0.01)
         print(f"DRIVER_PID={spawned[0].pid}", flush=True)
-        release.wait()
+        signal.sigwait({signal.SIGUSR1})
+        release.set()
         creator.join()
         print("CREATOR_EXITED", flush=True)
         signal.pause()
