@@ -539,6 +539,29 @@ impl Tool for ScrollTool {
                 wid,
                 ..
             } = target;
+            // A background wheel is posted to the pid and can be dropped without
+            // trace (SwiftUI panes of System Settings ignore it). Read the scroll
+            // area's bar first so the result can tell, and fall back to its page
+            // actions when the wheel left it where it was.
+            let probe_direction = direction.clone();
+            let probe_element = pre_focus_ptr;
+            let area_before = if delivery_mode.is_foreground() {
+                None
+            } else {
+                latency::spawn_action_blocking(move || unsafe {
+                    let area = crate::ax::scroll_area::ScrollArea::find(
+                        pid,
+                        probe_element.map(|ptr| ptr as AXUIElementRef),
+                        (screen_x, screen_y),
+                        wid,
+                    )?;
+                    let position = area.position(&probe_direction)?;
+                    Some((area, position))
+                })
+                .await
+                .ok()
+                .flatten()
+            };
             let amount_ticks = amount;
             let fg = delivery_mode.is_foreground() && wid.is_some();
             let result = focus_guard::with_focus_suppressed(
@@ -583,6 +606,34 @@ impl Tool for ScrollTool {
             } else {
                 ""
             };
+            if let (Ok(Ok(())), Some((area, before))) = (&result, area_before) {
+                let wheel_distance = step.unsigned_abs() as f64 * amount as f64;
+                let verdict_direction = direction.clone();
+                let verdict_window = wid
+                    .and_then(crate::windows::window_bounds_by_id)
+                    .map(|b| [b.x, b.y, b.width, b.height]);
+                let verdict = latency::spawn_action_blocking(move || unsafe {
+                    wheel_verdict(
+                        &area,
+                        &verdict_direction,
+                        before,
+                        wheel_distance,
+                        amount,
+                        verdict_window,
+                    )
+                })
+                .await
+                .unwrap_or(WheelVerdict::Unknown);
+                if let Some(result) = verdict.result(
+                    &direction,
+                    &by,
+                    amount,
+                    (screen_x, screen_y),
+                    &changes.result_suffix(),
+                ) {
+                    return result;
+                }
+            }
             return match result {
                 Ok(Ok(())) => ToolResult::text(format!(
                     "✅ Sent {direction} scroll by {by} × {amount} via pixel wheel at \
@@ -763,6 +814,166 @@ async fn electron_reveal_scroll(
             "effect": "unverifiable",
         })),
         _ => unavailable(),
+    }
+}
+
+/// What a background wheel did to the scroll area read before it.
+enum WheelVerdict {
+    /// The bar moved: the wheel landed.
+    Moved { before: f64, after: f64 },
+    /// The bar was already at the end the wheel scrolls toward.
+    AtEnd,
+    /// The wheel left the bar alone; accessibility moved it instead.
+    Accessibility {
+        route: &'static str,
+        before: f64,
+        after: f64,
+    },
+    /// Neither the wheel nor accessibility moved the bar.
+    Dropped { tried_accessibility: bool },
+    /// The area could not be read again.
+    Unknown,
+}
+
+/// Reads the bar after a background wheel and, when it did not move, scrolls
+/// the area through its page actions instead.
+///
+/// # Safety
+///
+/// Performs AX calls; call from a blocking context.
+unsafe fn wheel_verdict(
+    area: &crate::ax::scroll_area::ScrollArea,
+    direction: &str,
+    before: f64,
+    wheel_distance: f64,
+    amount: usize,
+    window: Option<[f64; 4]>,
+) -> WheelVerdict {
+    use crate::ax::scroll_area::{at_end, moved, pages_for};
+    let settle = || std::thread::sleep(std::time::Duration::from_millis(80));
+    // The wheel's last notch was posted 30 ms ago; let the app apply it.
+    settle();
+    let Some(after) = area.position(direction) else {
+        return WheelVerdict::Unknown;
+    };
+    if moved(before, after) {
+        return WheelVerdict::Moved { before, after };
+    }
+    if at_end(direction, before) {
+        return WheelVerdict::AtEnd;
+    }
+    // Revealing content past the edge and setting the bar keep the requested
+    // distance; page actions are the coarse last resort (AppKit scroll views
+    // can advertise them and still refuse them).
+    let mut tried = false;
+    if area.reveal(window, direction, wheel_distance) {
+        tried = true;
+        settle();
+        if let Some(after) = area
+            .position(direction)
+            .filter(|after| moved(before, *after))
+        {
+            return WheelVerdict::Accessibility {
+                route: "AXScrollToVisible",
+                before,
+                after,
+            };
+        }
+    }
+    if area.set_position(direction, wheel_distance) {
+        tried = true;
+        settle();
+        if let Some(after) = area
+            .position(direction)
+            .filter(|after| moved(before, *after))
+        {
+            return WheelVerdict::Accessibility {
+                route: "scroll bar value",
+                before,
+                after,
+            };
+        }
+    }
+    let pages = pages_for(
+        wheel_distance,
+        area.extent(direction).unwrap_or(0.0),
+        amount,
+    );
+    if area.page(direction, pages) {
+        tried = true;
+        settle();
+        if let Some(after) = area
+            .position(direction)
+            .filter(|after| moved(before, *after))
+        {
+            return WheelVerdict::Accessibility {
+                route: "page action",
+                before,
+                after,
+            };
+        }
+    }
+    WheelVerdict::Dropped {
+        tried_accessibility: tried,
+    }
+}
+
+impl WheelVerdict {
+    /// The tool result for this verdict; `None` keeps the unverified wheel
+    /// result as before.
+    fn result(
+        &self,
+        direction: &str,
+        by: &str,
+        amount: usize,
+        (screen_x, screen_y): (f64, f64),
+        suffix: &str,
+    ) -> Option<ToolResult> {
+        let sent = format!(
+            "Sent {direction} scroll by {by} × {amount} via pixel wheel at \
+             ({screen_x:.0}, {screen_y:.0}) (background CGEvent)"
+        );
+        let readback = |before: &f64, after: &f64| {
+            serde_json::json!([{
+                "kind": "accessibility_readback",
+                "detail": format!("scroll bar {before:.3} -> {after:.3}")
+            }])
+        };
+        Some(match self {
+            WheelVerdict::Moved { before, after } => ToolResult::text(format!(
+                "✅ {sent}; the scroll area's position changed.{suffix}"
+            ))
+            .with_structured(serde_json::json!({
+                "path": "cgevent", "verified": true, "effect": "confirmed",
+                "evidence": readback(before, after)
+            })),
+            WheelVerdict::AtEnd => ToolResult::text(format!(
+                "{sent}; the scroll area was already at its {direction} end, so nothing moved.{suffix}"
+            ))
+            .with_structured(serde_json::json!({
+                "path": "cgevent", "verified": true, "effect": "suspected_noop"
+            })),
+            WheelVerdict::Accessibility { route, before, after } => ToolResult::text(format!(
+                "✅ The background wheel did not move this scroll area, so it was scrolled \
+                 {direction} through accessibility ({route}) instead: no event posted, \
+                 nothing fronted.{suffix}"
+            ))
+            .with_structured(serde_json::json!({
+                "path": "ax", "verified": true, "effect": "confirmed",
+                "evidence": readback(before, after)
+            })),
+            WheelVerdict::Dropped { tried_accessibility } => ToolResult::text(format!(
+                "{sent}, but the scroll area did not move{}. This window ignores background \
+                 scrolling; use delivery_mode:foreground if foreground input is allowed.{suffix}",
+                if *tried_accessibility { ", and neither did accessibility scrolling" } else { "" }
+            ))
+            .with_structured(serde_json::json!({
+                "path": if *tried_accessibility { "ax" } else { "cgevent" },
+                "verified": true,
+                "effect": "suspected_noop"
+            })),
+            WheelVerdict::Unknown => return None,
+        })
     }
 }
 
