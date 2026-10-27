@@ -126,7 +126,7 @@ is safe even for apps that normally foreground on media-load
 | Move or resize one exact window       | `set_window_frame({pid, window_id, x, y, width, height})`                              | `osascript` position/size writes or title-bar dragging      |
 | Click / type / scroll / keys          | `click`, `type_text`, `scroll`, `press_key`, `hotkey`                                  | `osascript`, `cliclick`, raw `CGEvent`, `open <url>`        |
 | Loop, branch or retry over app actions | `run_script({script})` (sandboxed JavaScript over the `cua` API, one call); `run_steps` for a fixed list | an AppleScript or shell loop around `osascript` or `cua-driver` calls |
-| Drag / drag-and-drop / marquee select | `drag({pid, window_id, from_x, from_y, to_x, to_y})` in the background (pixel-only: macOS AX has no semantic drag). Verify with a screenshot; `delivery_mode:"foreground"` only if nothing changed. A bound browser tab: `browser_pointer` `action:"drag"` | `cliclick dd:`, `osascript drag`, refusing a drag-only step as "needs the window in front" |
+| Drag / drag-and-drop / marquee select | `drag({pid, window_id, from_x, from_y, to_x, to_y})` in the background (pixel-only: macOS AX has no semantic drag). Verify with a screenshot; if nothing changed, try a Move control or menu item by `element_token` or the keyboard (shortcut, cut and paste), and `delivery_mode:"foreground"` (moves the user's pointer) last. A bound browser tab: `browser_pointer` `action:"drag"` | `cliclick dd:`, `osascript drag`, refusing a drag-only step as "needs the window in front" |
 | Hover (reveal a hover-only control)   | Window-targeted `move_cursor`; its result says whether it hovered (AX alternate UI or an Electron page). A web page in Chrome, Edge or Brave: `browser_pointer` hover after `get_browser_state`. If not, look for the same command elsewhere (menu item, context menu, shortcut, help text in `get_window_state`); only `move_cursor({scope:"desktop", delivery_mode:"foreground"})` (moves the user's pointer) or `bring_to_front` reveals it, and only if the user allows it | assuming a window-targeted `move_cursor` hovered when its result says the app sees no hover; a desktop `move_cursor` over a background browser page |
 | Screenshot                            | `get_window_state` (window) or authorized `get_desktop_state` (desktop)                | `screencapture`                                             |
 | Quit an app                           | ask the user first, then `hotkey({pid, keys:["cmd","q"]})`                             | `kill`, `killall`, `pkill`                                  |
@@ -707,9 +707,12 @@ back to the user's window. The real pointer does not move. It reaches
 controls that follow the drag events: native sliders and canvases, and
 pointer-event sliders, canvases and boards on web pages in Chrome. The
 result is not driver-verified: check the outcome with a screenshot or the
-tree. Only if nothing changed, retry with `delivery_mode:"foreground"`,
-which fronts the window, moves the physical pointer along the path, and
-restores the prior frontmost app.
+tree. If nothing changed, look for a route that is not a drag first: a Move
+control, menu item or context-menu command by `element_token`, or the
+keyboard (a shortcut, cut and paste). Retry with
+`delivery_mode:"foreground"` last, only if the user allows it: it fronts
+the window, moves the user's physical pointer along the path, and restores
+the prior frontmost app.
 
 A native `<input type="range">` in Chrome does not follow a background drag
 (pointer-event widgets do). Use `set_value` on its slider element, or
@@ -803,8 +806,11 @@ There is no backgrounded path that reaches these apps today.
   click returns `background_unavailable` with `reason:
   "pointer_reading_toolkit"`. Other pointer-reading apps cannot be detected
   cheaply; their background result stays "not driver-verified" and says the
-  pointer was not moved. Retry with `delivery_mode:"foreground"`, which moves
-  the pointer first.
+  pointer was not moved. If nothing changed, click the target by
+  `element_token` when `get_window_state` lists it, or use the keyboard
+  (Return, arrows, Tab). Retry with `delivery_mode:"foreground"` last, only
+  if the user allows it: it moves the user's pointer first and brings the
+  window to the front.
 
 - **Chromium `<video>` play/pause**: pixel click is often rejected
   by HTML5's click-to-play handler on some builds. Use keyboard

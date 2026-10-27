@@ -193,9 +193,9 @@ fn a_drag_refused_by_macos_drag_and_drop_names_a_non_drag_route_and_the_foregrou
     );
     assert_eq!(
         hint.hint,
-        "No drop landed: macOS drag-and-drop needs the real pointer. Try a route that is not a drag first \
-         (Move button, menu item, shortcut). Retry with delivery_mode:\"foreground\" \
-         only if the user allows the window to come forward."
+        "No drop landed: drag-and-drop needs the real pointer. Try a Move button or menu item \
+         (element_token) or the keyboard first. Last, only if the user allows the window to come \
+         forward: delivery_mode:\"foreground\" (moves the user's pointer)."
     );
     assert_eq!(
         call_value(&hint),
@@ -204,6 +204,40 @@ fn a_drag_refused_by_macos_drag_and_drop_names_a_non_drag_route_and_the_foregrou
             "arguments": {"pid": 4242, "window_id": 17, "session": "run-1"},
         })
     );
+}
+
+/// cua-driver#22: a refused pointer action names the element_token and the
+/// keyboard before the foreground, and says the foreground moves the user's
+/// pointer.
+#[test]
+fn pointer_refusals_put_token_and_keyboard_before_the_foreground() {
+    for (tool, reason) in [
+        ("drag", "drag_and_drop_session"),
+        ("drag", "electron_main_process_unavailable"),
+        ("click", "pointer_reading_toolkit"),
+    ] {
+        let hint = hint_for(
+            tool,
+            &window_seed(),
+            true,
+            json!({"code": "background_unavailable", "reason": reason}),
+        )
+        .hint;
+        let foreground = hint
+            .find("delivery_mode:\"foreground\"")
+            .unwrap_or_else(|| panic!("{reason}: {hint}"));
+        let token = hint
+            .find("element_token")
+            .unwrap_or_else(|| panic!("{reason}: {hint}"));
+        let keyboard = hint
+            .find("keyboard")
+            .unwrap_or_else(|| panic!("{reason}: {hint}"));
+        assert!(
+            token < foreground && keyboard < foreground,
+            "{reason}: {hint}"
+        );
+        assert!(hint[foreground..].contains("pointer"), "{reason}: {hint}");
+    }
 }
 
 #[test]

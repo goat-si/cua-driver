@@ -143,9 +143,12 @@ fn is_toggle_press(ax_action: &str, role: &str, advertised: &[String]) -> bool {
         && advertised.iter().any(|action| action == "AXPress")
 }
 
-/// AX errors that AppKit apps return from a press they performed (#3835).
-/// Errors that mean the request never reached the app (illegal argument,
-/// invalid element, cannot complete, API disabled) are not among them.
+/// AX errors that AppKit apps return from a press they performed (#3835), so
+/// a toggle's value read-back may confirm the press. Illegal argument,
+/// invalid element and API disabled mean the request never reached the app;
+/// cannot complete means the app did not answer in time, so a short read-back
+/// proves nothing. Neither qualifies; an unresolved error after dispatch is
+/// reported as unverifiable by `unresolved_perform_error`.
 fn press_error_may_have_acted(err: crate::ax::bindings::AXError) -> bool {
     use crate::ax::bindings::{
         kAXErrorActionUnsupported, kAXErrorAttributeUnsupported, kAXErrorFailure,
@@ -364,7 +367,7 @@ fn def() -> &'static ToolDef {
                 "delivery_mode": {
                     "type": "string",
                     "enum": ["background", "foreground"],
-                    "description": "Default \"background\" (no fronting). \"foreground\" briefly fronts the window, acts, then restores the prior app; needs window_id and is required for modified clicks. Escalate in order: AX element_token, background pixel, foreground, checking state between rungs; a click has no read-back except list-row selection."
+                    "description": "Default \"background\" (no fronting). \"foreground\" briefly fronts the window, acts, then restores the prior app; needs window_id and is required for modified clicks. Escalate in order, checking state between rungs: AX element_token, the keyboard (press_key Return, arrows, Tab), background pixel, then delivery_mode:\"foreground\" last and only if the user allows it, because it brings the window to the front and, for pixels, moves the user's pointer. A click has no read-back except list-row selection."
                 },
                 "scope": {
                     "type": "string",
@@ -1507,14 +1510,51 @@ fn ax_click_structured(
 /// suspected_noop, selection_verified, selection_via_pixel)`.
 type AxClickOutcome = (String, bool, bool, bool, bool);
 
+/// Whether a non-success `AXUIElementPerformAction` return proves the app
+/// never received the action. Only the accessibility client's own refusals
+/// do: a bad argument, a dead element reference, or accessibility turned off.
+/// Every other code comes back after the request reached the app, which may
+/// have acted on it; Apple documents that `kAXErrorCannotComplete` (the app
+/// did not answer within the messaging timeout) does not mean the action
+/// failed, and Finder opens a row and returns `kAXErrorAttributeUnsupported`.
+fn perform_error_proves_nothing_was_sent(err: crate::ax::bindings::AXError) -> bool {
+    use crate::ax::bindings::{
+        kAXErrorAPIDisabled, kAXErrorIllegalArgument, kAXErrorInvalidUIElement,
+    };
+    [
+        kAXErrorIllegalArgument,
+        kAXErrorInvalidUIElement,
+        kAXErrorAPIDisabled,
+    ]
+    .contains(&err)
+}
+
 /// The outcome of an AX action whose perform call returned `err` after it
-/// was sent, when no read-back resolved what happened.
+/// was sent, when no read-back resolved what happened. An error that proves
+/// nothing was sent stays a failure the caller may retry. Any other error is
+/// an unconfirmed action (`effect: "unverifiable"`, not an error result), so
+/// the caller reads the window before repeating it instead of sending a
+/// second click (cua-driver#21).
 fn unresolved_perform_error(
     ax_action: &str,
     err: crate::ax::bindings::AXError,
-    _element: (usize, &str, &str),
+    element: (usize, &str, &str),
 ) -> anyhow::Result<AxClickOutcome> {
-    anyhow::bail!("AXUIElementPerformAction({ax_action}) returned {err}")
+    if perform_error_proves_nothing_was_sent(err) {
+        anyhow::bail!("AXUIElementPerformAction({ax_action}) returned {err}");
+    }
+    let (idx, role, title) = element;
+    Ok((
+        format!(
+            "⚠️ Sent {ax_action} to [{idx}] {role} \"{title}\", but the app returned AX error \
+             {err}, which does not mean the action failed: it may have acted. Read the window \
+             before repeating it."
+        ),
+        false,
+        false,
+        false,
+        false,
+    ))
 }
 
 /// Returns `(summary_text, needs_webkit_delay, suspected_noop,
@@ -2025,6 +2065,7 @@ mod tests {
             kAXErrorFailure,
             kAXErrorActionUnsupported,
             kAXErrorNotImplemented,
+            -25299, // a code this driver does not know
         ] {
             let (summary, needs_webkit_delay, suspected_noop, verified, via_pixel) =
                 unresolved_perform_error("AXOpen", may_have_acted, (3, "AXRow", "Desktop"))
@@ -2050,6 +2091,62 @@ mod tests {
                 .expect_err("an error that proves nothing reached the app stays a failure");
             assert!(error.to_string().contains(&nothing_sent.to_string()));
         }
+    }
+
+    /// The unverifiable outcome survives the dispatch seam: it stays a
+    /// non-error, publishes `effect: "unverifiable"` on the accessibility
+    /// route with the AX error in its summary, and gains the read-before-
+    /// repeating hint instead of a refusal's (cua-driver#21).
+    #[test]
+    fn perform_error_after_dispatch_reaches_the_wire_as_an_unconfirmed_click() {
+        use cua_driver_core::action_record::{ActionEffect, ActionExecutionRecord};
+        use cua_driver_core::recovery_hint::{annotate, Seed};
+
+        let args = serde_json::json!({ "pid": 42, "window_id": 7, "element_token": "s1:3" });
+        for fronted in [false, true] {
+            let (summary, _, suspected_noop, verified, via_pixel) = unresolved_perform_error(
+                "AXOpen",
+                crate::ax::bindings::kAXErrorCannotComplete,
+                (3, "AXRow", "Desktop"),
+            )
+            .expect("an unresolved error after dispatch is not a failure");
+            let structured = ax_click_structured(via_pixel, fronted, verified, suspected_noop);
+            let record = ActionExecutionRecord::from_legacy("click", &args, &structured)
+                .expect("the legacy click payload normalizes");
+            assert_eq!(record.effect, ActionEffect::Unverifiable);
+            let public = serde_json::to_value(record.public_result().expect("projects"))
+                .expect("serializes");
+            assert_eq!(public["effect"], "unverifiable");
+            assert_eq!(public["route"], "accessibility");
+            assert!(public.get("error").is_none());
+
+            let mut result = ToolResult::text(summary.clone()).with_structured(structured);
+            annotate("click", &Seed::from_args(&args), &mut result);
+            assert_ne!(result.is_error, Some(true), "fronted={fronted}");
+            let hint = result.structured_content.as_ref().expect("structured")["hint"]
+                .as_str()
+                .expect("an unconfirmed click carries a hint")
+                .to_owned();
+            assert!(
+                hint.contains("before clicking again"),
+                "the caller must read before resending: {hint}"
+            );
+            assert!(summary.contains("-25204"));
+        }
+    }
+
+    /// cua-driver#22: the delivery_mode ladder goes element_token, keyboard,
+    /// background pixel, and the foreground last with its pointer takeover.
+    #[test]
+    fn delivery_mode_ladder_puts_foreground_last() {
+        let mode = def().input_schema["properties"]["delivery_mode"]["description"]
+            .as_str()
+            .expect("delivery_mode description");
+        crate::tools::pixel_route::tests::assert_foreground_last(
+            mode,
+            "Escalate in order",
+            &["element_token", "keyboard", "background pixel"],
+        );
     }
 
     /// Only errors an app returns after acting qualify; errors that mean the

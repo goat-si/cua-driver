@@ -759,6 +759,11 @@ fn background_unavailable(c: &Ctx) -> RecoveryHint {
     // A refusal with a working background route leads with it, then names the
     // foreground retry with its condition.
     let foreground = format!("Retry with delivery_mode:\"foreground\" {FOREGROUND_CONDITION}.");
+    // Pointer routes: element_token and the keyboard come first, and the
+    // foreground says it takes the user's pointer (cua-driver#22).
+    let pointer_last = format!(
+        "Last, {FOREGROUND_CONDITION}: delivery_mode:\"foreground\" (moves the user's pointer)."
+    );
     match (c.tool, c.reason()) {
         _ if c.structured.get("window").is_some() => RecoveryHint::new(
             "That desktop point is over a background app, so the action would use the user's pointer. \
@@ -773,18 +778,18 @@ fn background_unavailable(c: &Ctx) -> RecoveryHint {
         )
         .call(c.look_at_window()),
         (_, Some("drag_and_drop_session")) => RecoveryHint::new(format!(
-            "No drop landed: macOS drag-and-drop needs the real pointer. Try a route that is not a drag \
-             first (Move button, menu item, shortcut). {foreground}"
+            "No drop landed: drag-and-drop needs the real pointer. Try a Move button or menu item \
+             (element_token) or the keyboard first. {pointer_last}"
         ))
         .call(c.read_window()),
         (_, Some("electron_main_process_unavailable")) => RecoveryHint::new(format!(
-            "This Electron window cannot take a background drag. Use the app's own controls (button, \
-             menu item or keyboard route). {foreground}"
+            "This Electron window cannot take a background drag. Use the app's own controls \
+             (element_token) or the keyboard first. {pointer_last}"
         ))
         .call(c.read_window()),
         (_, Some("pointer_reading_toolkit")) => RecoveryHint::new(format!(
-            "This app's toolkit reads the real pointer, so background pixel clicks miss. Act by element \
-             (get_window_state, then element_token) or invoke_menu. {foreground}"
+            "This toolkit reads the real pointer, so background pixel clicks miss. Use element_token, \
+             invoke_menu or the keyboard first. {pointer_last}"
         ))
         .call(c.read_window()),
         (_, Some("windowserver_connection_invalid")) => RecoveryHint::new(
