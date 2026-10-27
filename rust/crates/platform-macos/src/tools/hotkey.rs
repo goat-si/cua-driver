@@ -253,7 +253,15 @@ impl Tool for HotkeyTool {
         }
 
         // Use the last non-modifier key; if there are multiple, treat earlier ones as extra keys.
-        let key = non_modifiers.last().unwrap().clone();
+        // A symbol typed with Shift becomes its key plus shift, and an unknown key or modifier
+        // is refused here, before any menu, focus or key work.
+        let (key, modifiers) = match crate::input::keyboard::resolve_key_press(
+            non_modifiers.last().unwrap(),
+            &modifiers,
+        ) {
+            Ok(resolved) => resolved,
+            Err(error) => return super::press_key::invalid_key(error),
+        };
         let key_display = raw_keys.join("+");
         let window_id_arg = args.opt_u64("window_id");
         let resolved = match latency::resolve(|| self.state.snapshots.resolve(pid, &args)) {
@@ -321,10 +329,12 @@ impl Tool for HotkeyTool {
                     // The menu command acts on the app's key window. Make the
                     // addressed window key first, confirmed, or refuse: never
                     // act on another window (CUA-1767).
-                    match super::acquire_key_scope(pid, Some(wid), false).await {
-                        Ok(scope) => key_scope = scope,
-                        Err(refusal) => return refusal,
-                    }
+                    // Held until the menu route answers.
+                    let _menu_key_scope =
+                        match super::acquire_key_scope(pid, Some(wid), false).await {
+                            Ok(scope) => scope,
+                            Err(refusal) => return refusal,
+                        };
                     if let Some(ptr) = element_ptr {
                         // The menu command acts on the focused element.
                         let focused =
@@ -344,11 +354,10 @@ impl Tool for HotkeyTool {
                         super::invoke_menu::MenuRequest::KeyEquivalent(key_display.clone()),
                     )
                     .await;
-                    // Only unavailable background menus may fall back to keys;
-                    // target-safety refusals must survive this route unchanged.
-                    if !menu_allows_key_fallback(&menu_result) {
-                        return menu_result;
-                    }
+                    // Background key events never reach a native app's menus, so a menu
+                    // that cannot run in the background is refused without sending keys
+                    // that would only look delivered.
+                    return menu_refusal_without_keys(menu_result);
                 }
             }
         }
@@ -618,13 +627,29 @@ impl Tool for HotkeyTool {
     }
 }
 
-fn menu_allows_key_fallback(result: &ToolResult) -> bool {
-    result.is_error == Some(true)
+/// The menu route's answer, with a menu macOS keeps unavailable in the
+/// background marked as a refusal that sent nothing. Keys are not tried
+/// instead: a background key event never reaches a native app's menus, so it
+/// would report delivery and change nothing (a background cmd+[ to Finder).
+fn menu_refusal_without_keys(mut result: ToolResult) -> ToolResult {
+    let unavailable = result.is_error == Some(true)
         && result
             .structured_content
             .as_ref()
             .and_then(|v| v["code"].as_str())
-            == Some("background_unavailable")
+            == Some("background_unavailable");
+    if !unavailable {
+        return result;
+    }
+    if let Some(serde_json::Value::Object(fields)) = result.structured_content.as_mut() {
+        fields.insert("effect".into(), serde_json::json!("refused"));
+        fields.insert("dispatched".into(), serde_json::json!(false));
+        fields.insert("keys_sent".into(), serde_json::json!(false));
+        fields.entry("escalation").or_insert(
+            serde_json::json!({ "recommended": "foreground", "requires": ["window_id"] }),
+        );
+    }
+    result
 }
 
 fn delivered_structured(foreground: bool) -> Value {
@@ -640,17 +665,24 @@ mod tests {
     use super::*;
 
     #[test]
-    fn menu_safety_refusals_do_not_fall_back_to_keys() {
-        for code in ["window_not_key", "background_unavailable"] {
-            let result =
-                ToolResult::error("refused").with_structured(serde_json::json!({ "code": code }));
-            assert_eq!(
-                menu_allows_key_fallback(&result),
-                code == "background_unavailable"
-            );
-        }
-        assert!(!menu_allows_key_fallback(&ToolResult::error("unknown")));
-        assert!(!menu_allows_key_fallback(&ToolResult::text("done")));
+    fn an_unavailable_background_menu_is_refused_without_keys() {
+        let unavailable = menu_refusal_without_keys(
+            ToolResult::error("menu disabled in the background")
+                .with_structured(serde_json::json!({ "code": "background_unavailable" })),
+        );
+        let structured = unavailable.structured_content.expect("structured");
+        assert_eq!(structured["effect"], "refused");
+        assert_eq!(structured["dispatched"], false);
+        assert_eq!(structured["keys_sent"], false);
+        assert_eq!(structured["escalation"]["recommended"], "foreground");
+        // Other menu answers pass through as they are.
+        let other = menu_refusal_without_keys(
+            ToolResult::error("refused")
+                .with_structured(serde_json::json!({ "code": "window_not_key" })),
+        );
+        assert!(other.structured_content.unwrap().get("keys_sent").is_none());
+        let done = menu_refusal_without_keys(ToolResult::text("done"));
+        assert_ne!(done.is_error, Some(true));
     }
 
     #[test]
