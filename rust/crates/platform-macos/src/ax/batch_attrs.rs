@@ -28,6 +28,11 @@ pub(crate) fn batch_failure_action(
     if batching_disabled {
         return BatchFailureAction::Replay;
     }
+    // Past the walk deadline nothing is replayed, whatever the failure: an app
+    // that rejects batching would otherwise get six more blocking reads.
+    if budget_expired {
+        return BatchFailureAction::StopForTimeout;
+    }
     match kind {
         BatchFailure::WholeCall(error)
             if [
@@ -39,7 +44,6 @@ pub(crate) fn batch_failure_action(
         {
             BatchFailureAction::DisableAndReplay
         }
-        _ if budget_expired => BatchFailureAction::StopForTimeout,
         _ => BatchFailureAction::Replay,
     }
 }
@@ -350,18 +354,20 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_whole_calls_disable_batching_and_replay_even_after_expiry() {
+    fn unsupported_whole_calls_disable_batching_and_replay_until_the_deadline() {
         for error in [
             kAXErrorAttributeUnsupported,
             kAXErrorNotImplemented,
             kAXErrorIllegalArgument,
         ] {
-            for expired in [false, true] {
-                assert_eq!(
-                    batch_failure_action(BatchFailure::WholeCall(error), expired, false),
-                    BatchFailureAction::DisableAndReplay
-                );
-            }
+            assert_eq!(
+                batch_failure_action(BatchFailure::WholeCall(error), false, false),
+                BatchFailureAction::DisableAndReplay
+            );
+            assert_eq!(
+                batch_failure_action(BatchFailure::WholeCall(error), true, false),
+                BatchFailureAction::StopForTimeout
+            );
         }
     }
 

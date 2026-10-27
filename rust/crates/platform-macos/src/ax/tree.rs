@@ -196,6 +196,48 @@ pub struct TreeWalkResult {
     pub window_scope: Option<WindowScope>,
 }
 
+#[cfg(test)]
+impl TreeWalkResult {
+    /// A finished walk of `nodes`, for tests of what callers do with it.
+    pub(crate) fn for_test(tree_markdown: String, nodes: Vec<AXNode>) -> Self {
+        Self {
+            tree_markdown,
+            nodes,
+            truncated: false,
+            walk: cua_driver_core::walk_budget::WalkBudget::nodes_only(usize::MAX).outcome(),
+            window_scope: None,
+        }
+    }
+}
+
+#[cfg(test)]
+impl AXNode {
+    /// A bare node holding `element_ptr`, for tests of retain ownership.
+    pub(crate) fn for_test(element_index: Option<usize>, element_ptr: usize) -> Self {
+        Self {
+            element_index,
+            role: "AXLink".into(),
+            title: None,
+            value: None,
+            description: None,
+            identifier: None,
+            help: None,
+            actions: vec![],
+            element_ptr,
+            depth: 0,
+            parent_element_index: None,
+            frame: None,
+            value_state: None,
+            value_description: None,
+            min_value: None,
+            max_value: None,
+            enabled: None,
+            selected: None,
+            in_web_content: false,
+        }
+    }
+}
+
 /// Walk the AX tree of `pid`, optionally filtered to a specific window.
 ///
 /// `window_id` — when Some, only the AXWindow matching that CGWindowID is
