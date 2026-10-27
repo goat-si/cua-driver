@@ -1573,10 +1573,12 @@ fn launch_daemon_with_state_and_wait(
 ///
 /// `open -n` reports no pid, so the launch connects the new process's stdin
 /// to a fresh empty marker file, and the identity is the one process whose
-/// stdin is that file, recorded with its start time. No other launch holds the
-/// marker, and a later process reusing the pid has another start time. No
-/// match, several matches, or an unreadable process table leave the launch
-/// unidentified, and MCP startup then stops nothing.
+/// stdin is that file (children it spawns inherit the marker; their parent is
+/// the one taken), recorded by its kernel audit token. No other launch holds
+/// the marker, and signals are delivered through the token, so a process that
+/// later reuses the pid cannot receive them. No match, several matches, or an
+/// unreadable process table leave the launch unidentified, and MCP startup
+/// then stops nothing. Without a marker the launch does not start at all.
 #[cfg(target_os = "macos")]
 fn launch_daemon_with_state_identified(
     socket_path: &str,
@@ -1585,16 +1587,39 @@ fn launch_daemon_with_state_identified(
     experimental_history: bool,
     _allow_managed_restart: bool,
 ) -> (Option<LaunchedDaemon>, Result<(), LaunchDaemonError>) {
-    let marker = LaunchMarker::create();
-    let result = launch_bundle_and_wait(
-        socket_path,
-        timeout_secs,
-        state,
-        experimental_history,
-        marker.as_ref().map(LaunchMarker::path),
-    );
-    let launched = marker.and_then(|marker| identify_marked_process(marker.path()));
-    (launched, result)
+    launch_with_marker(LaunchMarker::create, |marker| {
+        launch_bundle_and_wait(
+            socket_path,
+            timeout_secs,
+            state,
+            experimental_history,
+            Some(marker),
+        )
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn launch_with_marker(
+    create: impl FnOnce() -> std::io::Result<LaunchMarker>,
+    launch: impl FnOnce(&std::path::Path) -> Result<(), LaunchDaemonError>,
+) -> (Option<LaunchedDaemon>, Result<(), LaunchDaemonError>) {
+    let marker = match create() {
+        Ok(marker) => marker,
+        Err(error) => {
+            return (
+                None,
+                Err(LaunchDaemonError {
+                    kind: LaunchDaemonErrorKind::Failed,
+                    message: format!(
+                        "could not prepare the marker that identifies the daemon this command \
+                         launches, so nothing was launched: {error}"
+                    ),
+                }),
+            )
+        }
+    };
+    let result = launch(marker.path());
+    (identify_marked_process(marker.path()), result)
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -2156,9 +2181,9 @@ pub(crate) enum LaunchedDaemon {
     #[cfg(target_os = "macos")]
     Marked {
         pid: u32,
-        /// Start time when identified; checked before every signal, so a
-        /// process that later reuses the pid is never signalled.
-        started: ProcessStart,
+        /// Kernel audit token (pid and pid version). Signals are delivered
+        /// through it, so a process that later reuses the pid refuses them.
+        token: AuditToken,
     },
     #[cfg(target_os = "windows")]
     Process { pid: u32 },
@@ -2227,19 +2252,19 @@ impl LaunchedDaemon {
                 }
             }
             #[cfg(target_os = "macos")]
-            Self::Marked { pid, started } => {
-                let (pid, started) = (*pid, *started);
-                let running = || process_start(pid) == Some(started);
+            Self::Marked { pid, token } => {
+                let (pid, token) = (*pid, *token);
+                let running = || audit_token_for_pid(pid) == Some(token);
                 if !running() {
                     return Ok(Termination::AlreadyExited);
                 }
-                signal_process(pid, libc::SIGTERM);
+                if !signal_audited(&token, libc::SIGTERM)? {
+                    return Ok(Termination::AlreadyExited);
+                }
                 if wait_until(deadline, &mut || !running()) {
                     return Ok(Termination::Terminated);
                 }
-                if running() {
-                    signal_process(pid, libc::SIGKILL);
-                }
+                signal_audited(&token, libc::SIGKILL)?;
                 if wait_until(deadline, &mut || !running()) {
                     Ok(Termination::Killed)
                 } else {
@@ -2264,6 +2289,7 @@ impl LaunchedDaemon {
 }
 
 /// Poll `done` until it holds or `deadline` passes.
+#[cfg(unix)]
 fn wait_until(deadline: std::time::Duration, done: &mut dyn FnMut() -> bool) -> bool {
     let until = std::time::Instant::now() + deadline;
     loop {
@@ -2297,23 +2323,20 @@ struct LaunchMarker {
 
 #[cfg(target_os = "macos")]
 impl LaunchMarker {
-    fn create() -> Option<Self> {
+    fn create() -> std::io::Result<Self> {
         use std::os::unix::fs::DirBuilderExt as _;
 
         let directory =
             std::env::temp_dir().join(format!("cua-driver-mcp-launch-{}", uuid::Uuid::new_v4()));
-        std::fs::DirBuilder::new()
-            .mode(0o700)
-            .create(&directory)
-            .ok()?;
+        std::fs::DirBuilder::new().mode(0o700).create(&directory)?;
         let mut marker = Self {
             path: directory.join("stdin"),
             directory,
         };
-        std::fs::File::create(&marker.path).ok()?;
+        std::fs::File::create(&marker.path)?;
         // The kernel reports resolved paths (/private/var, not /var).
-        marker.path = std::fs::canonicalize(&marker.path).ok()?;
-        Some(marker)
+        marker.path = std::fs::canonicalize(&marker.path)?;
+        Ok(marker)
     }
 
     fn path(&self) -> &std::path::Path {
@@ -2329,19 +2352,30 @@ impl Drop for LaunchMarker {
     }
 }
 
-/// The one live process whose stdin is `marker`, with its start time.
+/// The launched process holding `marker` as its stdin, by audit token.
+///
+/// Processes it spawned inherit the marker, so the launched one is the marked
+/// process whose parent is not marked; anything but exactly one such process
+/// leaves the launch unidentified.
 #[cfg(target_os = "macos")]
 fn identify_marked_process(marker: &std::path::Path) -> Option<LaunchedDaemon> {
-    let mut pids = all_process_ids()?
+    let marked: Vec<u32> = all_process_ids()?
         .into_iter()
-        .filter(|pid| process_stdin_path(*pid).as_deref() == Some(marker));
-    let (Some(pid), None) = (pids.next(), pids.next()) else {
+        .filter(|pid| process_stdin_path(*pid).as_deref() == Some(marker))
+        .collect();
+    let mut roots = marked
+        .iter()
+        .copied()
+        .filter(|pid| process_parent(*pid).is_some_and(|parent| !marked.contains(&parent)));
+    let (Some(pid), None) = (roots.next(), roots.next()) else {
         return None;
     };
-    let started = process_start(pid)?;
-    // Still the same process, still holding the marker.
-    (process_stdin_path(pid).as_deref() == Some(marker))
-        .then_some(LaunchedDaemon::Marked { pid, started })
+    // The token must name the process that holds the marker: read it on
+    // both sides of a marker check, so a pid reused in between is caught.
+    let token = audit_token_for_pid(pid)?;
+    let still_marked = process_stdin_path(pid).as_deref() == Some(marker);
+    (still_marked && audit_token_for_pid(pid) == Some(token))
+        .then_some(LaunchedDaemon::Marked { pid, token })
 }
 
 /// Every pid in the process table, or `None` when it cannot be read in full.
@@ -2368,13 +2402,8 @@ fn all_process_ids() -> Option<Vec<u32>> {
     )
 }
 
-/// `(seconds, microseconds)` start time of a live, non-zombie process.
 #[cfg(target_os = "macos")]
-type ProcessStart = (u64, u64);
-
-#[cfg(target_os = "macos")]
-fn process_start(pid: u32) -> Option<ProcessStart> {
-    const SZOMB: u32 = 5;
+fn process_parent(pid: u32) -> Option<u32> {
     let pid = libc::c_int::try_from(pid).ok()?;
     // SAFETY: proc_bsdinfo is plain data; zero is a valid bit pattern.
     let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
@@ -2389,8 +2418,90 @@ fn process_start(pid: u32) -> Option<ProcessStart> {
             size,
         )
     };
-    (written == size && info.pbi_status != SZOMB)
-        .then_some((info.pbi_start_tvsec, info.pbi_start_tvusec))
+    (written == size).then_some(info.pbi_ppid)
+}
+
+/// `audit_token_t` from <mach/message.h>: index 5 is the pid, index 7 the pid
+/// version that distinguishes processes reusing a pid.
+#[cfg(target_os = "macos")]
+type AuditToken = [u32; 8];
+
+#[cfg(target_os = "macos")]
+mod mach_identity {
+    extern "C" {
+        pub static mach_task_self_: u32;
+        pub fn task_name_for_pid(target: u32, pid: libc::c_int, name: *mut u32) -> libc::c_int;
+        pub fn task_info(
+            task: u32,
+            flavor: libc::c_int,
+            info: *mut libc::c_int,
+            count: *mut u32,
+        ) -> libc::c_int;
+        pub fn mach_port_deallocate(task: u32, name: u32) -> libc::c_int;
+    }
+    /// <mach/task_info.h> TASK_AUDIT_TOKEN.
+    pub const TASK_AUDIT_TOKEN: libc::c_int = 15;
+}
+
+/// Audit token of the live process `pid`; `None` once it has exited (a zombie
+/// has no task) or when it belongs to another user.
+#[cfg(target_os = "macos")]
+fn audit_token_for_pid(pid: u32) -> Option<AuditToken> {
+    use mach_identity::*;
+
+    let pid = libc::c_int::try_from(pid).ok()?;
+    let mut name = 0_u32;
+    // SAFETY: task_name_for_pid writes one port name for a same-user process.
+    let task_self = unsafe { mach_task_self_ };
+    if unsafe { task_name_for_pid(task_self, pid, &mut name) } != 0 {
+        return None;
+    }
+    let mut token: AuditToken = [0; 8];
+    let mut count = 8_u32;
+    // SAFETY: TASK_AUDIT_TOKEN fills eight natural_t words.
+    let status = unsafe {
+        task_info(
+            name,
+            TASK_AUDIT_TOKEN,
+            token.as_mut_ptr().cast(),
+            &mut count,
+        )
+    };
+    // SAFETY: releases the send right task_name_for_pid returned.
+    unsafe { mach_port_deallocate(task_self, name) };
+    (status == 0 && count == 8 && libc::c_int::try_from(token[5]).ok() == Some(pid))
+        .then_some(token)
+}
+
+/// Deliver `signal` to the process `token` names. The kernel refuses it when
+/// that process has exited, even if its pid now names another process.
+/// `Ok(false)` means it was not delivered for that reason.
+#[cfg(target_os = "macos")]
+fn signal_audited(token: &AuditToken, signal: libc::c_int) -> Result<bool, String> {
+    type SignalWithAuditToken = unsafe extern "C" fn(*mut AuditToken, libc::c_int) -> libc::c_int;
+    // Looked up at run time so a system without it cannot fail to load the
+    // driver; cleanup then reports that it could not stop the process.
+    // SAFETY: dlsym with a NUL-terminated name and the default handle.
+    let symbol =
+        unsafe { libc::dlsym(libc::RTLD_DEFAULT, c"proc_signal_with_audittoken".as_ptr()) };
+    if symbol.is_null() {
+        return Err(
+            "identity-bound signalling (proc_signal_with_audittoken) is unavailable".into(),
+        );
+    }
+    // SAFETY: the symbol has the libproc.h signature above.
+    let signal_with_audit_token: SignalWithAuditToken = unsafe { std::mem::transmute(symbol) };
+    let mut token = *token;
+    // SAFETY: passes a valid eight-word audit token.
+    match unsafe { signal_with_audit_token(&mut token, signal) } {
+        0 => Ok(true),
+        libc::ESRCH => Ok(false),
+        error => Err(format!(
+            "signalling process {} failed: {}",
+            token[5],
+            std::io::Error::from_raw_os_error(error)
+        )),
+    }
 }
 
 /// Path of the file open as the process's stdin, when it is a file.
@@ -3394,9 +3505,9 @@ mod daemon_compatibility_tests {
             launched.terminate("unused", STARTUP).unwrap(),
             super::Termination::Terminated
         );
-        // Exited (even unreaped), it no longer matches its start time, so a
-        // second cleanup signals nothing.
-        assert_eq!(super::process_start(marked_pid), None);
+        // Exited (even unreaped), it has no audit token, so a second cleanup
+        // signals nothing.
+        assert_eq!(super::audit_token_for_pid(marked_pid), None);
         assert_eq!(
             launched.terminate("unused", STARTUP).unwrap(),
             super::Termination::AlreadyExited
@@ -3424,16 +3535,48 @@ mod daemon_compatibility_tests {
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn a_reused_pid_does_not_match_the_recorded_start_time() {
+    fn launched_process_is_identified_over_children_that_inherit_the_marker() {
+        use std::io::BufRead as _;
+        use std::os::unix::process::CommandExt as _;
+
+        let marker = super::LaunchMarker::create().unwrap();
+        // The background child keeps the marker as stdin explicitly; it has
+        // been forked, holding the marker, before "ready" is printed.
+        let mut parent = Command::new("/bin/sh")
+            .args(["-c", "/bin/sleep 600 <&0 & echo ready; wait"])
+            .stdin(std::fs::File::open(marker.path()).unwrap())
+            .stdout(Stdio::piped())
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let mut ready = String::new();
+        std::io::BufReader::new(parent.stdout.take().unwrap())
+            .read_line(&mut ready)
+            .unwrap();
+        assert_eq!(ready, "ready\n");
+
+        let launched = super::identify_marked_process(marker.path());
+
+        assert_eq!(launched.map(|launched| launched.pid()), Some(parent.id()));
+        // SAFETY: kills the process group this test created.
+        unsafe {
+            libc::kill(-(parent.id() as libc::pid_t), libc::SIGKILL);
+        }
+        parent.wait().unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_token_for_another_process_generation_is_refused_by_the_kernel() {
         let child = launched_process();
         let pid = child.id();
-        let started = super::process_start(pid).unwrap();
-        // The same pid with any other start time is a different process.
-        let mut launched = LaunchedDaemon::Marked {
-            pid,
-            started: (started.0.wrapping_sub(1), started.1),
-        };
+        let mut token = super::audit_token_for_pid(pid).unwrap();
+        // The same pid with any other pid version is a different process:
+        // what a reused pid looks like between validation and signalling.
+        token[7] = token[7].wrapping_add(1);
 
+        assert_eq!(super::signal_audited(&token, libc::SIGKILL), Ok(false));
+        let mut launched = LaunchedDaemon::Marked { pid, token };
         assert_eq!(
             launched.terminate("unused", STARTUP).unwrap(),
             super::Termination::AlreadyExited
@@ -3441,6 +3584,23 @@ mod daemon_compatibility_tests {
         assert!(!gone(pid), "a non-matching process must not be signalled");
         drop(child);
         reap(pid);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn launch_without_a_marker_is_not_attempted() {
+        let (launched, result) = super::launch_with_marker(
+            || Err(std::io::Error::other("no temp dir")),
+            |_| panic!("an unidentifiable launch must not start"),
+        );
+
+        assert!(launched.is_none());
+        let error = result.unwrap_err();
+        assert_eq!(error.kind, LaunchDaemonErrorKind::Failed);
+        assert!(
+            error.to_string().contains("nothing was launched"),
+            "{error}"
+        );
     }
 
     #[test]
