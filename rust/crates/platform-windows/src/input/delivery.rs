@@ -609,6 +609,9 @@ mod tests {
     #[cfg(target_os = "windows")]
     #[test]
     fn the_drivers_own_injection_does_not_trip_the_foreground_idle_gate() {
+        let _serial = IDLE_GATE_TESTS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         use windows::Win32::UI::Input::KeyboardAndMouse::{
             GetLastInputInfo, INPUT, INPUT_0, INPUT_MOUSE, LASTINPUTINFO, MOUSEEVENTF_MOVE,
             MOUSEINPUT,
@@ -641,12 +644,81 @@ mod tests {
             );
             return;
         }
-        gate_foreground_physical_idle_with_sample(
-            0,
-            EventKind::Keystroke,
-            physical_input_idle_ms(),
-            1_000,
-        )
-        .expect("the driver's own injection must not count as physical input");
+        // The idle time may not be shorter than the time since the input
+        // before the driver's injection: the injection is not the person's.
+        let idle = physical_input_idle_ms();
+        let since_before = before.map(|tick| {
+            let now = unsafe { windows::Win32::System::SystemInformation::GetTickCount() };
+            cua_driver_core::delivery::elapsed_idle_ms_from_ticks(now, tick)
+        });
+        if let (Some(idle), Some(since_before)) = (idle, since_before) {
+            assert!(
+                idle + cua_driver_core::delivery::OWN_INPUT_TICK_SLACK_MS >= since_before,
+                "the driver's own injection must not count as physical input \
+                 (idle {idle} ms, last earlier input {since_before} ms ago)"
+            );
+        }
+    }
+
+    /// The idle-gate tests share the process-wide injection record and the
+    /// OS's last-input tick.
+    #[cfg(target_os = "windows")]
+    static IDLE_GATE_TESTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// `GetLastInputInfo` keeps only the latest input. A person's input
+    /// between two driver injections must still refuse the next foreground
+    /// action, although the second injection overwrote it.
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn input_between_two_driver_injections_still_trips_the_foreground_idle_gate() {
+        use windows::Win32::UI::Input::KeyboardAndMouse::{
+            GetLastInputInfo, SendInput, INPUT, INPUT_0, INPUT_MOUSE, LASTINPUTINFO,
+            MOUSEEVENTF_MOVE, MOUSEINPUT,
+        };
+        let _serial = IDLE_GATE_TESTS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let last_input = || {
+            let mut info = LASTINPUTINFO {
+                cbSize: std::mem::size_of::<LASTINPUTINFO>() as u32,
+                dwTime: 0,
+            };
+            unsafe { GetLastInputInfo(&mut info) }
+                .as_bool()
+                .then_some(info.dwTime)
+        };
+        // A zero-distance relative move: input the OS counts, with no effect.
+        let nudge = [INPUT {
+            r#type: INPUT_MOUSE,
+            Anonymous: INPUT_0 {
+                mi: MOUSEINPUT {
+                    dwFlags: MOUSEEVENTF_MOVE,
+                    ..Default::default()
+                },
+            },
+        }];
+        let before = last_input();
+        let first = unsafe { send_input(&nudge) };
+        let after = last_input();
+        if first != 1 || after.is_none() || after == before {
+            eprintln!(
+                "skipped: this session has no input desktop (SendInput {first}, last input {before:?} -> {after:?})"
+            );
+            return;
+        }
+        // The person's input: a `SendInput` the driver did not make. Let
+        // the tick counter move past the driver's span first.
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        let person = unsafe { SendInput(&nudge, std::mem::size_of::<INPUT>() as i32) };
+        assert_eq!(person, 1, "the stand-in for physical input must be sent");
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        // The driver's next batch overwrites the OS's last-input tick.
+        assert_eq!(unsafe { send_input(&nudge) }, 1);
+        let idle = physical_input_idle_ms();
+        assert!(
+            gate_foreground_physical_idle_with_sample(0, EventKind::Keystroke, idle, 5_000)
+                .is_err(),
+            "input between the driver's injections must still count (idle {idle:?})"
+        );
     }
 }
