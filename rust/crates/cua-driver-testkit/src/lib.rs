@@ -44,6 +44,8 @@ mod cli;
 mod daemon;
 mod driver;
 pub mod e2e;
+#[cfg(unix)]
+mod fake_daemon;
 mod host_state;
 mod journal;
 mod mcp;
@@ -59,6 +61,8 @@ mod windows_setup;
 pub use browser_fixture::BrowserFixtureServer;
 pub use cli::CliDriver;
 pub use driver::{BehaviorRecording, Driver};
+#[cfg(unix)]
+pub use fake_daemon::{FakeDaemon, FakeReply};
 pub use host_state::{IsolatedStateRoot, SHARE_HOST_STATE};
 pub use journal::FixtureJournal;
 pub use mcp::McpDriver;
