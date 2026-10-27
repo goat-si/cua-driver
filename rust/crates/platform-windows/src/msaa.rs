@@ -379,3 +379,64 @@ fn render_lines(lines: &[(usize, String)]) -> String {
     }
     out
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Snapshots keep, and later release, only the COM pointers of indexed
+    /// (actionable) nodes. A pointer retained for any other node is never
+    /// released. The MSAA walker used to retain one for every named node.
+    #[test]
+    fn only_indexed_nodes_retain_a_com_pointer() {
+        use windows::core::w;
+        use windows::Win32::System::Com::{CoInitializeEx, COINIT_MULTITHREADED};
+        use windows::Win32::UI::WindowsAndMessaging::{
+            CreateWindowExW, DestroyWindow, WINDOW_EX_STYLE, WS_POPUP,
+        };
+        unsafe {
+            let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+            // A static label: MSAA reports named, actionless static text.
+            let hwnd = CreateWindowExW(
+                WINDOW_EX_STYLE(0),
+                w!("STATIC"),
+                w!("cua msaa retention probe"),
+                WS_POPUP,
+                0,
+                0,
+                120,
+                40,
+                None,
+                None,
+                None,
+                None,
+            )
+            .expect("create a static window");
+            let result = walk_msaa_tree(hwnd.0 as u64);
+            let _ = DestroyWindow(hwnd);
+            let retained_unindexed = result
+                .nodes
+                .iter()
+                .filter(|node| node.element_index.is_none() && node.element_ptr != 0)
+                .count();
+            let named_unindexed = result
+                .nodes
+                .iter()
+                .any(|node| node.element_index.is_none() && node.name.is_some());
+            for node in &result.nodes {
+                if node.element_ptr != 0 {
+                    drop(IAccessible::from_raw(node.element_ptr as *mut _));
+                }
+            }
+            assert!(
+                named_unindexed,
+                "the probe window produced no named actionless node: {}",
+                result.tree_markdown
+            );
+            assert_eq!(
+                retained_unindexed, 0,
+                "actionless nodes retained COM pointers no snapshot releases"
+            );
+        }
+    }
+}
