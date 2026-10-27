@@ -1690,6 +1690,7 @@ pub async fn run_serve(
     let shutdown_tx = std::sync::Arc::new(tokio::sync::Mutex::new(Some(shutdown_tx)));
     let trusted_resume_registry: TrustedResumeRegistry =
         std::sync::Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+    let mut connection_tasks = tokio::task::JoinSet::new();
     let parent_liveness = async {
         if cua_driver_core::parent_liveness_stdin_enabled() {
             wait_for_parent_stdin_eof().await;
@@ -1784,6 +1785,7 @@ pub async fn run_serve(
                     continue;
                 }
                 consecutive_failures = 0;
+                reap_finished_connections(&mut connection_tasks);
                 let expected_sid = unsafe { current_user_sid_string() };
                 let client_process_id =
                     unsafe { named_pipe_client_process_id(server.as_raw_handle().cast()) };
@@ -1815,7 +1817,7 @@ pub async fn run_serve(
                 let shutdown_tx2 = shutdown_tx.clone();
                 let trusted_resume_registry = trusted_resume_registry.clone();
 
-                tokio::spawn(async move {
+                connection_tasks.spawn(async move {
                     let (reader, mut writer) = tokio::io::split(server);
                     let mut lines = BufReader::new(reader).lines();
 
@@ -2158,6 +2160,12 @@ pub async fn run_serve(
             }
         }
     }
+
+    // Accepted connections may still own SDK/session state after the
+    // listener stops, and a call they run keeps the SDK from shutting down.
+    // Abort and join them first, as the Unix listener does.
+    connection_tasks.shutdown().await;
+    release_active_proxy_sessions();
 
     if let Some(pid_path) = pid_file_path {
         let _ = std::fs::remove_file(pid_path);
