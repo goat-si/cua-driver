@@ -21,7 +21,7 @@ use atspi::proxy::accessible::AccessibleProxy;
 use atspi::proxy::proxy_ext::ProxyExt;
 use atspi::{CoordType, Interface, State, StateSet};
 
-use crate::atspi_text::{editable_text_value, is_password_field, text_content_name};
+use crate::atspi_text::{editable_text_value, is_password_field, text_content_name, RoleRead};
 use atspi_connection::AccessibilityConnection;
 
 use super::{AtspiIdentity, AtspiNode};
@@ -1572,15 +1572,15 @@ async fn collect_visited_bounded_opts<'a>(
         // GTK4 names role 40 (PASSWORD_TEXT) "text box", so a text widget's
         // numeric role decides whether it is a password field; the role name
         // stays a fallback. One more round trip, only for text widgets.
-        let role_number = if has_text || has_editable {
-            call(acc.get_role())
-                .await
-                .and_then(|result| result.ok())
-                .map(|role| role as u32)
+        let role_read = if has_text || has_editable {
+            match call(acc.get_role()).await {
+                Some(Ok(role)) => RoleRead::Known(role as u32),
+                _ => RoleRead::Failed,
+            }
         } else {
-            None
+            RoleRead::NotRead
         };
-        let is_password = is_password_field(role_number, &role_lower);
+        let is_password = is_password_field(role_read, &role_lower);
         let checked = if role_lower.contains("check") {
             state_r
                 .as_ref()
@@ -1627,6 +1627,9 @@ async fn collect_visited_bounded_opts<'a>(
         let mut actions: Vec<String> = Vec::new();
         let mut value: Option<String> = None;
         let mut text_content = String::new();
+        // Whether `text_content` is the widget's whole text: read without
+        // error and not cut at the read cap.
+        let mut text_complete = false;
         if has_action || has_value || has_text {
             if let Some(Ok(proxies)) = call(acc.proxies()).await {
                 if has_action {
@@ -1659,15 +1662,17 @@ async fn collect_visited_bounded_opts<'a>(
                 // lives; `name` is usually empty for such widgets.
                 if has_text {
                     if let Some(Ok(tp)) = call(proxies.text()).await {
-                        let count = call(tp.character_count())
-                            .await
-                            .and_then(|r| r.ok())
-                            .unwrap_or(0);
-                        if count > 0 {
-                            let end = count.min(4096);
-                            if let Some(Ok(t)) = call(tp.get_text(0, end)).await {
-                                text_content = t;
+                        let count = call(tp.character_count()).await.and_then(|r| r.ok());
+                        match count {
+                            Some(count) if count <= 0 => text_complete = true,
+                            Some(count) => {
+                                let end = count.min(4096);
+                                if let Some(Ok(t)) = call(tp.get_text(0, end)).await {
+                                    text_complete = count <= 4096;
+                                    text_content = t;
+                                }
                             }
+                            None => {}
                         }
                     }
                 }
@@ -1697,12 +1702,21 @@ async fn collect_visited_bounded_opts<'a>(
         // An unnamed value/editable control: its `LABELLED_BY` relation names
         // it (GTK grids, Qt forms with buddies). One relation read plus one
         // name read, only for the controls that need it.
+        let mut labelled = false;
         if name.trim().is_empty() && (has_value || has_editable || is_control_role(&role_lower)) {
             if let Some(label) = labelled_by_name(conn, &acc).await {
                 name = label;
+                labelled = true;
             }
         }
-        let name = text_content_name(name, is_password, has_value, &text_content);
+        let name = text_content_name(
+            name,
+            is_password,
+            labelled,
+            text_complete,
+            has_value,
+            &text_content,
+        );
 
         // Children inherit web-document context, plus this node's own role.
         let child_in_web_doc = in_web_doc || is_document_role(&role);
@@ -4320,10 +4334,7 @@ async fn actuate_chain(
             }
             continue;
         };
-        let name = call(node.acc.name())
-            .await
-            .and_then(|r| r.ok())
-            .unwrap_or_default();
+        let name = reportable_name(&node.acc, &role.to_ascii_lowercase()).await;
         if is_passive_role(&role) {
             if passive_fallback.is_none() {
                 passive_fallback = Some((depth, role.clone(), name, actions.clone()));
@@ -5744,6 +5755,21 @@ async fn selected_child_name(
     call(acc.name()).await?.ok()
 }
 
+/// The accessible name of `acc` for a report or a log. Empty for a password
+/// field, and for a node whose numeric role cannot be read: a toolkit may
+/// mirror a password field's typed text into its name.
+pub(crate) async fn reportable_name(acc: &AccessibleProxy<'_>, role_lower: &str) -> String {
+    let (name, role) = tokio::join!(call(acc.name()), call(acc.get_role()));
+    let role_read = match role {
+        Some(Ok(role)) => RoleRead::Known(role as u32),
+        _ => RoleRead::Failed,
+    };
+    if is_password_field(role_read, role_lower) {
+        return String::new();
+    }
+    name.and_then(|result| result.ok()).unwrap_or_default()
+}
+
 /// Current value of a cached element for read-back after a write: the
 /// `Value` interface's number, else the `Text` content. `None` when the
 /// element exposes neither (or does not answer in time), and for a password
@@ -5761,14 +5787,15 @@ pub fn read_value_ref(object_ref: &ObjectRef) -> Result<Option<String>> {
             if ifaces.contains(Interface::Text) || ifaces.contains(Interface::EditableText) {
                 let (role_number, role_name) =
                     tokio::join!(call(acc.get_role()), call(acc.get_role_name()));
-                let role_number = role_number
-                    .and_then(|result| result.ok())
-                    .map(|role| role as u32);
+                let role_read = match role_number {
+                    Some(Ok(role)) => RoleRead::Known(role as u32),
+                    _ => RoleRead::Failed,
+                };
                 let role_name = role_name
                     .and_then(|result| result.ok())
                     .unwrap_or_default()
                     .to_ascii_lowercase();
-                if is_password_field(role_number, &role_name) {
+                if is_password_field(role_read, &role_name) {
                     return Ok(None);
                 }
             }

@@ -6,12 +6,27 @@
 /// AT-SPI `ATSPI_ROLE_PASSWORD_TEXT` (atspi-constants.h; `atspi::Role::PasswordText`).
 pub(crate) const ROLE_PASSWORD_TEXT: u32 = 40;
 
+/// A text widget's numeric AT-SPI role, as far as it could be read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RoleRead {
+    Known(u32),
+    /// Asked and not answered (error or timeout).
+    Failed,
+    /// Not asked: the node has no Text or EditableText interface.
+    NotRead,
+}
+
 /// Whether a node is a password field. GTK4 names role 40 (`PASSWORD_TEXT`)
-/// "text box", so the role name alone misses it.
-/// The numeric role decides first; the role name (translated, toolkit-chosen)
-/// still counts when the number is unavailable or says otherwise.
-pub(crate) fn is_password_field(role: Option<u32>, role_lower: &str) -> bool {
-    role == Some(ROLE_PASSWORD_TEXT) || role_lower.contains("password")
+/// "text box", so the role name alone misses it. The numeric role decides
+/// first; the role name (translated, toolkit-chosen) still counts. A text
+/// widget whose role could not be read is treated as one: its text stays
+/// hidden rather than risk showing a password.
+pub(crate) fn is_password_field(role: RoleRead, role_lower: &str) -> bool {
+    match role {
+        RoleRead::Known(number) => number == ROLE_PASSWORD_TEXT || role_lower.contains("password"),
+        RoleRead::Failed => true,
+        RoleRead::NotRead => role_lower.contains("password"),
+    }
 }
 
 /// The `value` of one walked node: its Value-interface value, else, for an
@@ -35,21 +50,28 @@ pub(crate) fn editable_text_value(
 /// content, for text widgets. Runs after the `LABELLED_BY` lookup so a
 /// labelled entry is named by its label and its typed text stays in `value`.
 /// A value control (GtkSpinButton implements AtkText with its formatted
-/// number) would otherwise be named after its own value, and a password
-/// field's content is never surfaced, not even when the toolkit itself set
-/// the accessible name to it.
+/// number) would otherwise be named after its own value.
+///
+/// A password field's content is never surfaced, and its own accessible name
+/// may mirror that content. The name is kept only when it came from a
+/// `LABELLED_BY` label (`labelled`), or when the whole content was read
+/// (`text_complete`) and the name shares nothing with it.
 pub(crate) fn text_content_name(
     name: String,
     is_password: bool,
+    labelled: bool,
+    text_complete: bool,
     has_value: bool,
     text_content: &str,
 ) -> String {
     if is_password {
+        let label = name.trim();
         let typed = text_content.trim();
-        return if !typed.is_empty() && name.trim() == typed {
-            String::new()
-        } else {
+        let distinct = typed.is_empty() || (!label.contains(typed) && !typed.contains(label));
+        return if labelled || (text_complete && distinct) {
             name
+        } else {
+            String::new()
         };
     }
     if name.trim().is_empty() && !text_content.trim().is_empty() && !has_value {
@@ -91,52 +113,86 @@ mod tests {
     #[test]
     fn a_labelled_entry_keeps_its_label_and_a_password_never_shows_its_text() {
         assert_eq!(
-            text_content_name("Verification code".into(), false, false, "482913"),
+            text_content_name(
+                "Verification code".into(),
+                false,
+                true,
+                true,
+                false,
+                "482913"
+            ),
             "Verification code"
         );
-        assert_eq!(text_content_name(String::new(), true, false, "hunter2"), "");
         assert_eq!(
-            text_content_name(String::new(), false, false, "draft"),
+            text_content_name(String::new(), true, false, true, false, "hunter2"),
+            ""
+        );
+        assert_eq!(
+            text_content_name(String::new(), false, false, true, false, "draft"),
             "draft"
         );
-        assert_eq!(text_content_name(String::new(), false, true, "0.0"), "");
+        assert_eq!(
+            text_content_name(String::new(), false, false, true, true, "0.0"),
+            ""
+        );
     }
 
-    /// What `get_window_state` derives for one walked entry: (name, value).
-    fn shown(role: Option<u32>, role_name: &str, text_content: &str) -> (String, Option<String>) {
+    /// What `get_window_state` derives for one walked, unlabelled entry whose
+    /// Text was read in full: (name, value).
+    fn shown(role: RoleRead, role_name: &str, text_content: &str) -> (String, Option<String>) {
         let is_password = is_password_field(role, &role_name.to_ascii_lowercase());
         let value = editable_text_value(!is_password, false, None, text_content);
-        (
-            text_content_name(String::new(), is_password, false, text_content),
-            value,
-        )
+        let name = text_content_name(String::new(), is_password, false, true, false, text_content);
+        (name, value)
     }
 
     #[test]
     fn a_gtk4_password_entry_named_text_box_shows_neither_name_nor_value() {
         // GTK 4.14 reports role 40 (PASSWORD_TEXT) with the role name "text box".
         assert_eq!(
-            shown(Some(ROLE_PASSWORD_TEXT), "text box", "pw-entry-secret"),
+            shown(
+                RoleRead::Known(ROLE_PASSWORD_TEXT),
+                "text box",
+                "pw-entry-secret"
+            ),
             (String::new(), None)
         );
-        // The role name alone, when the number cannot be read.
+        // The role name alone, when the node has no text interface to ask.
         assert_eq!(
-            shown(None, "password text", "hunter2"),
+            shown(RoleRead::NotRead, "password text", "hunter2"),
             (String::new(), None)
         );
         // An ordinary GTK4 text box still shows its text.
         assert_eq!(
-            shown(Some(61), "text box", "draft"),
+            shown(RoleRead::Known(61), "text box", "draft"),
             ("draft".into(), Some("draft".into()))
         );
-        // A toolkit that names the field after its content.
+    }
+
+    #[test]
+    fn a_text_widget_whose_role_cannot_be_read_hides_its_text() {
         assert_eq!(
-            text_content_name("pw-entry-secret".into(), true, false, "pw-entry-secret"),
+            shown(RoleRead::Failed, "text box", "pw-entry-secret"),
+            (String::new(), None)
+        );
+    }
+
+    #[test]
+    fn a_password_field_keeps_only_a_name_it_can_prove_is_not_its_content() {
+        let name = |name: &str, labelled, complete, typed| {
+            text_content_name(name.into(), true, labelled, complete, false, typed)
+        };
+        // A toolkit that names the field after its content.
+        assert_eq!(name("pw-entry-secret", false, true, "pw-entry-secret"), "");
+        // Text unread, failed, or cut off at the read cap: the name may be it.
+        assert_eq!(name("pw-entry-secret", false, false, ""), "");
+        assert_eq!(
+            name("pw-entry-secret-and-more", false, false, "pw-entry-secret"),
             ""
         );
-        assert_eq!(
-            text_content_name("Password".into(), true, false, "hunter2"),
-            "Password"
-        );
+        // A distinct name over fully read content, or a LABELLED_BY label.
+        assert_eq!(name("Password", false, true, "hunter2"), "Password");
+        assert_eq!(name("Password", false, true, ""), "Password");
+        assert_eq!(name("Password", true, false, ""), "Password");
     }
 }

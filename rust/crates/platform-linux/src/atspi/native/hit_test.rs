@@ -70,10 +70,7 @@ async fn describe_node(node: &HitNode<'_>) -> PointOwner {
         .await
         .and_then(Result::ok)
         .unwrap_or_default();
-    let name = call(node.acc.name())
-        .await
-        .and_then(Result::ok)
-        .unwrap_or_default();
+    let name = reportable_name(&node.acc, &role.to_ascii_lowercase()).await;
     PointOwner {
         object_ref: ObjectRef {
             bus: node.oref.name.clone(),
