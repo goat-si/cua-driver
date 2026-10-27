@@ -1050,14 +1050,7 @@ fn format_node_line(node: &AXNode) -> String {
             .actions
             .iter()
             .filter(|a| !UNLISTED_ACTIONS.contains(&a.as_str()))
-            .map(|a| {
-                a.strip_prefix("AX")
-                    .unwrap_or(a)
-                    .to_lowercase()
-                    .chars()
-                    .flat_map(char::escape_default)
-                    .collect()
-            })
+            .map(|a| crate::input::ax_actions::displayed_action(a))
             .collect();
         if !shown.is_empty() {
             attrs.push(format!("actions=[{}]", shown.join(",")));

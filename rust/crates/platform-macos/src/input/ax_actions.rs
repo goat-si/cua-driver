@@ -254,10 +254,23 @@ fn action_key(action: &str) -> String {
 /// increment/decrement actions callable without guessing their capitalization.
 pub fn advertised_action<'a>(requested: &str, advertised: &'a [String]) -> Option<&'a str> {
     let key = action_key(requested);
+    let shown = requested.to_lowercase();
     advertised
         .iter()
-        .find(|candidate| action_key(candidate) == key)
+        .find(|candidate| action_key(candidate) == key || displayed_action(candidate) == shown)
         .map(String::as_str)
+}
+
+/// An action name as a tree row shows it: no `AX` prefix, lower case, and
+/// escaped so a custom name cannot split the row. Agents copy this spelling.
+pub fn displayed_action(action: &str) -> String {
+    action
+        .strip_prefix("AX")
+        .unwrap_or(action)
+        .to_lowercase()
+        .chars()
+        .flat_map(char::escape_default)
+        .collect()
 }
 
 pub fn background_action_may_front(action: &str) -> bool {
@@ -562,6 +575,18 @@ mod tests {
             advertised[1]
         );
         assert!(resolve_element_action("AXDelete", &advertised, false).is_err());
+        // The escaped spelling a tree row shows also names the action.
+        let korean = vec!["Name:보관\nTarget:list".to_string()];
+        let shown = displayed_action(&korean[0]);
+        assert!(shown.contains("\\n"));
+        assert_eq!(
+            resolve_element_action(&shown, &korean, false).unwrap(),
+            korean[0]
+        );
+        assert_eq!(
+            resolve_element_action(&displayed_action(&advertised[1]), &advertised, false).unwrap(),
+            advertised[1]
+        );
         assert!(resolve_element_action("raise", &["AXRaise".into()], false).is_err());
         assert_eq!(
             resolve_element_action("AXRaise", &["AXRaise".into()], true).unwrap(),
