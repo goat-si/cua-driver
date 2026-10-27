@@ -170,6 +170,55 @@ fn screen_sharing_modifier_delivery_error(
     )
 }
 
+/// The keys a call names, as typed, with the resolved key and modifiers, or
+/// the refusal for missing or unknown ones. Pure: it reads only the arguments.
+pub(super) fn requested_hotkey(
+    args: &Value,
+) -> Result<(Vec<String>, String, Vec<String>), ToolResult> {
+    use cua_driver_core::tool_args::ArgsExt;
+    if args.get("keys").and_then(|v| v.as_array()).is_none() {
+        return Err(super::invalid_arguments("Missing required parameter: keys"));
+    }
+    let raw_keys = args.str_array("keys");
+
+    if raw_keys.is_empty() {
+        return Err(super::invalid_arguments(
+            "keys must be a non-empty array of strings.",
+        ));
+    }
+
+    // Split: modifiers are all entries that are modifier names; base key is everything else.
+    // Typically: last non-modifier is the key; all others are modifiers.
+    let modifiers: Vec<String> = raw_keys
+        .iter()
+        .filter(|k| is_modifier(k))
+        .cloned()
+        .collect();
+    let non_modifiers: Vec<String> = raw_keys
+        .iter()
+        .filter(|k| !is_modifier(k))
+        .cloned()
+        .collect();
+
+    if non_modifiers.is_empty() {
+        return Err(super::invalid_arguments(
+            "keys must include at least one non-modifier key (e.g. \"c\" in [\"cmd\", \"c\"]).",
+        ));
+    }
+
+    // Use the last non-modifier key; if there are multiple, treat earlier ones as extra keys.
+    // A symbol typed with Shift becomes its key plus shift, and an unknown key or modifier
+    // is refused here, before any menu, focus or key work.
+    let (key, modifiers) = match crate::input::keyboard::resolve_key_press(
+        non_modifiers.last().unwrap(),
+        &modifiers,
+    ) {
+        Ok(resolved) => resolved,
+        Err(error) => return Err(super::press_key::invalid_key(error)),
+    };
+    Ok((raw_keys, key, modifiers))
+}
+
 #[async_trait]
 impl Tool for HotkeyTool {
     fn def(&self) -> &ToolDef {
@@ -218,43 +267,11 @@ impl Tool for HotkeyTool {
             };
         }
 
-        if args.get("keys").and_then(|v| v.as_array()).is_none() {
-            return super::invalid_arguments("Missing required parameter: keys");
-        }
-        let raw_keys = args.str_array("keys");
-
-        if raw_keys.is_empty() {
-            return super::invalid_arguments("keys must be a non-empty array of strings.");
-        }
-
-        // Split: modifiers are all entries that are modifier names; base key is everything else.
-        // Typically: last non-modifier is the key; all others are modifiers.
-        let modifiers: Vec<String> = raw_keys
-            .iter()
-            .filter(|k| is_modifier(k))
-            .cloned()
-            .collect();
-        let non_modifiers: Vec<String> = raw_keys
-            .iter()
-            .filter(|k| !is_modifier(k))
-            .cloned()
-            .collect();
-
-        if non_modifiers.is_empty() {
-            return super::invalid_arguments(
-                "keys must include at least one non-modifier key (e.g. \"c\" in [\"cmd\", \"c\"]).",
-            );
-        }
-
-        // Use the last non-modifier key; if there are multiple, treat earlier ones as extra keys.
-        // A symbol typed with Shift becomes its key plus shift, and an unknown key or modifier
-        // is refused here, before any menu, focus or key work.
-        let (key, modifiers) = match crate::input::keyboard::resolve_key_press(
-            non_modifiers.last().unwrap(),
-            &modifiers,
-        ) {
-            Ok(resolved) => resolved,
-            Err(error) => return super::press_key::invalid_key(error),
+        // Validate the keys first: an unknown key is refused before any
+        // menu, focus, target or key work.
+        let (raw_keys, key, modifiers) = match requested_hotkey(&args) {
+            Ok(requested) => requested,
+            Err(refusal) => return refusal,
         };
         let pid = match super::target_pid(&self.state, &args) {
             Ok(v) => v,

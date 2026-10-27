@@ -279,6 +279,17 @@ fn with_confirmed_key_focus_or_fallback<T>(
     dispatch()
 }
 
+/// The key a call names, as typed and resolved with its modifiers, or the
+/// refusal for a missing or unknown one. Pure: it reads only the arguments.
+pub(super) fn requested_key(args: &Value) -> Result<(String, String, Vec<String>), ToolResult> {
+    use cua_driver_core::tool_args::ArgsExt;
+    let key_raw = args.require_str("key")?;
+    let (key, modifiers) =
+        crate::input::keyboard::resolve_key_press(&key_raw, &args.str_array("modifiers"))
+            .map_err(invalid_key)?;
+    Ok((key_raw, key, modifiers))
+}
+
 /// A key or modifier this driver cannot press, refused before anything is sent.
 pub(super) fn invalid_key(error: anyhow::Error) -> ToolResult {
     let message = error.to_string();
@@ -328,7 +339,9 @@ fn delivery_failed(error: anyhow::Error) -> ToolResult {
         }));
     }
     if error.is::<KeyFocusUnconfirmedAfterClick>() {
-        return ToolResult::error(error.to_string()).with_structured(serde_json::json!({
+        // Not an error: the click was sent and may have acted. The caller
+        // reads the window before sending anything again.
+        return ToolResult::text(format!("⚠️ {error}")).with_structured(serde_json::json!({
             "code": "target_focus_unconfirmed_after_click",
             "path": "cgevent",
             "effect": "unverifiable",
@@ -420,18 +433,12 @@ impl Tool for PressKeyTool {
                 Err(error) => ToolResult::error(format!("desktop press_key task failed: {error}")),
             };
         }
-        let key_raw = match args.require_str("key") {
-            Ok(v) => v,
-            Err(e) => return e,
-        };
         // Resolve the key first: an unknown name is refused before any
         // target work, so nothing is focused or sent for it.
-        let (key, modifiers) =
-            match crate::input::keyboard::resolve_key_press(&key_raw, &args.str_array("modifiers"))
-            {
-                Ok(resolved) => resolved,
-                Err(error) => return invalid_key(error),
-            };
+        let (key_raw, key, modifiers) = match requested_key(&args) {
+            Ok(requested) => requested,
+            Err(refusal) => return refusal,
+        };
         let pid = match super::target_pid(&self.state, &args) {
             Ok(v) => v,
             Err(e) => return e,
@@ -966,13 +973,24 @@ mod tests {
             )
             .await;
         let structured = result.structured_content.expect("published action result");
+        assert_ne!(result.is_error, Some(true), "{structured}");
         assert_eq!(structured["effect"], "unverifiable", "{structured}");
-        assert_ne!(structured["dispatched"], false, "{structured}");
+        assert_eq!(structured["route"], "synthetic_events", "{structured}");
+        assert!(structured.get("dispatched").is_none(), "{structured}");
+        let summary = structured["summary"].as_str().unwrap_or_default();
         assert!(
-            structured
-                .get("hint")
-                .and_then(serde_json::Value::as_str)
-                .is_none_or(|hint| !hint.contains("no key was sent")),
+            summary.contains("no key was dispatched") && summary.contains("click may have acted"),
+            "{structured}"
+        );
+        let hint = structured["hint"]
+            .as_str()
+            .expect("a read-before-repeat hint");
+        assert!(
+            hint.contains("Read what changed") && !hint.contains("The key was sent"),
+            "{structured}"
+        );
+        assert_eq!(
+            structured["next_call"]["tool"], "get_window_state",
             "{structured}"
         );
     }

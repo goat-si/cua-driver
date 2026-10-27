@@ -45,9 +45,11 @@ mod type_text_chars;
 mod zoom;
 
 use cua_driver_core::{
-    tool::{Tool, ToolRegistry},
+    protocol::ToolResult,
+    tool::{ProtectedResourceOwnership, Tool, ToolDef, ToolRegistry},
     window_target::{PidOnlyWindowTargetGuard, WindowTargetCandidate, WindowTargetCandidates},
 };
+use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -288,6 +290,78 @@ fn pid_keyboard_guarded<T: Tool + 'static>(
         PidOnlyWindowTargetGuard::new(Box::new(tool), candidates.clone())
             .with_fallback_resolver(Arc::new(pid_focused_window)),
     )
+}
+
+/// Runs a tool's pure argument check before `inner` (a window guard), so a
+/// malformed call is refused for its arguments before any window lookup.
+struct ArgumentsFirst {
+    inner: Box<dyn Tool>,
+    refuse: fn(&Value) -> Option<ToolResult>,
+}
+
+#[async_trait::async_trait]
+impl Tool for ArgumentsFirst {
+    fn def(&self) -> &ToolDef {
+        self.inner.def()
+    }
+
+    fn has_independent_input_lane(&self, args: &Value) -> bool {
+        self.inner.has_independent_input_lane(args)
+    }
+
+    async fn protected_resource_ownership(
+        &self,
+        adapter_id: &str,
+        args: &Value,
+    ) -> ProtectedResourceOwnership {
+        self.inner
+            .protected_resource_ownership(adapter_id, args)
+            .await
+    }
+
+    async fn protected_resource_scope(
+        &self,
+        adapter_id: &str,
+        args: &Value,
+    ) -> Result<Option<Value>, String> {
+        self.inner.protected_resource_scope(adapter_id, args).await
+    }
+
+    async fn validate_protected_resource_scope(
+        &self,
+        adapter_id: &str,
+        args: &Value,
+        approved_scope: &Value,
+    ) -> Result<(), String> {
+        self.inner
+            .validate_protected_resource_scope(adapter_id, args, approved_scope)
+            .await
+    }
+
+    async fn invoke(&self, args: Value) -> ToolResult {
+        // A desktop-scope call without a pid has its own key handling and
+        // no window lookup to precede.
+        let desktop_without_pid = args.get("scope").and_then(Value::as_str) == Some("desktop")
+            && args.get("pid").is_none_or(Value::is_null);
+        if !desktop_without_pid {
+            if let Some(refusal) = (self.refuse)(&args) {
+                return refusal;
+            }
+        }
+        self.inner.invoke(args).await
+    }
+}
+
+/// [`pid_keyboard_guarded`] behind the tool's own argument check.
+fn keyboard_tool<T: Tool + 'static>(
+    tool: T,
+    candidates: &WindowTargetCandidates,
+    refuse: fn(&Value) -> Option<ToolResult>,
+) -> Box<dyn Tool> {
+    Box::new(ArgumentsFirst {
+        inner: pid_keyboard_guarded(tool, candidates),
+        refuse,
+    })
 }
 
 pub use check_permissions::{
@@ -1237,13 +1311,15 @@ pub fn register_all(
         type_text::TypeTextTool::new(state.clone()),
         &pid_window_candidates,
     ));
-    registry.register(pid_keyboard_guarded(
+    registry.register(keyboard_tool(
         press_key::PressKeyTool::new(state.clone()),
         &pid_window_candidates,
+        |args| press_key::requested_key(args).err(),
     ));
-    registry.register(pid_keyboard_guarded(
+    registry.register(keyboard_tool(
         hotkey::HotkeyTool::new(state.clone()),
         &pid_window_candidates,
+        |args| hotkey::requested_hotkey(args).err(),
     ));
     registry.register(pid_window_guarded(
         set_value::SetValueTool::new(state.clone()),
@@ -1514,5 +1590,60 @@ mod windowserver_refusal_tests {
             .as_str()
             .unwrap()
             .contains("cua-driver permissions grant"));
+    }
+}
+
+#[cfg(test)]
+mod arguments_first_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// press_key and hotkey are registered behind a guard that looks up the
+    /// pid's windows. An unknown key must be refused for the key before that
+    /// lookup, not as a window error that hides it.
+    #[tokio::test]
+    async fn an_unknown_key_is_refused_before_the_registered_window_lookup() {
+        let lookups = Arc::new(AtomicUsize::new(0));
+        let counted = lookups.clone();
+        let candidates: WindowTargetCandidates = Arc::new(move |_| {
+            counted.fetch_add(1, Ordering::SeqCst);
+            Vec::new()
+        });
+        let state = Arc::new(ToolState::new(false, false, None));
+        let tools = [
+            (
+                keyboard_tool(
+                    press_key::PressKeyTool::new(state.clone()),
+                    &candidates,
+                    |args| press_key::requested_key(args).err(),
+                ),
+                serde_json::json!({"pid": 123, "key": "notakey"}),
+            ),
+            (
+                keyboard_tool(
+                    hotkey::HotkeyTool::new(state.clone()),
+                    &candidates,
+                    |args| hotkey::requested_hotkey(args).err(),
+                ),
+                serde_json::json!({"pid": 123, "keys": ["cmd", "notakey"]}),
+            ),
+        ];
+        for (tool, args) in tools {
+            let result = tool.invoke(args.clone()).await;
+            let structured = result.structured_content.expect("structured refusal");
+            assert_eq!(
+                structured["code"], "invalid_arguments",
+                "{args}: {structured}"
+            );
+            assert_eq!(lookups.load(Ordering::SeqCst), 0, "{args}");
+        }
+        // A valid key still goes through the window lookup.
+        let press = keyboard_tool(press_key::PressKeyTool::new(state), &candidates, |args| {
+            press_key::requested_key(args).err()
+        });
+        let _ = press
+            .invoke(serde_json::json!({"pid": 123, "key": "return"}))
+            .await;
+        assert_eq!(lookups.load(Ordering::SeqCst), 1);
     }
 }

@@ -945,7 +945,10 @@ fn effect_hint(c: &Ctx, effect: &str) -> Option<RecoveryHint> {
              duplicated."
         }
         ("press_key" | "hotkey", _) => {
-            "The key was sent but its effect is not confirmed. Read what changed before sending it again."
+            // Also the outcome when only a focusing click was sent: the
+            // summary says whether the key itself went out.
+            "Input was sent but its effect is not confirmed. Read what changed, and the summary for \
+             whether the key itself was sent, before sending it again."
         }
         ("scroll", _) => {
             "The scroll was sent but not confirmed. Check that the content moved before scrolling more."
