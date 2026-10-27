@@ -596,6 +596,13 @@ mod tests {
             resolve_element_action("press", &[], false).unwrap(),
             "AXPress"
         );
+        // `focus` is a pixel-only rung; on an element it is refused before
+        // anything is sent, as an argument error.
+        let focus = resolve_element_action("focus", &["AXPress".into()], false).unwrap_err();
+        assert_eq!(
+            element_action_refusal_code(&focus),
+            Some("invalid_arguments")
+        );
     }
 
     use super::*;
