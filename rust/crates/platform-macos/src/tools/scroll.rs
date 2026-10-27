@@ -700,6 +700,34 @@ impl Tool for ScrollTool {
         let prior_front = apps::frontmost_pid();
         let snapshot = WindowChangeDetector::snapshot(prior_front);
 
+        // No target to aim a wheel at: read the focused element's scroll area
+        // before and after the keys, so a scroll that moved it is confirmed.
+        let focused_area = match (window_id, delivery_mode.is_foreground()) {
+            (Some(wid), false) => {
+                let probe_direction = direction.clone();
+                latency::spawn_action_blocking(move || unsafe {
+                    let focused = crate::ax::exact_target::focused_element_in_window(pid, wid)?;
+                    let center = crate::ax::bindings::element_screen_center(focused);
+                    let area = center.and_then(|point| {
+                        crate::ax::scroll_area::ScrollArea::find(
+                            pid,
+                            Some(focused),
+                            point,
+                            Some(wid),
+                        )
+                    });
+                    core_foundation::base::CFRelease(focused as CFTypeRef);
+                    let area = area?;
+                    let before = area.position(&probe_direction)?;
+                    Some((area, before))
+                })
+                .await
+                .ok()
+                .flatten()
+            }
+            _ => None,
+        };
+
         let result = focus_guard::with_focus_suppressed(
             Some(pid),
             prior_front,
@@ -729,6 +757,27 @@ impl Tool for ScrollTool {
 
         let changes = super::finish_window_observation(snapshot).await;
 
+        if let (Ok(Ok(())), Some((area, before))) = (&result, focused_area) {
+            let read_direction = direction.clone();
+            let after = latency::spawn_action_blocking(move || {
+                std::thread::sleep(std::time::Duration::from_millis(120));
+                unsafe { area.position(&read_direction) }
+            })
+            .await
+            .ok()
+            .flatten();
+            if let Some(outcome) = keystroke_read_back(
+                &direction,
+                &by,
+                amount,
+                before,
+                after,
+                &changes.result_suffix(),
+            ) {
+                return outcome;
+            }
+        }
+
         match result {
             Ok(Ok(())) => ToolResult::text(format!(
                 "✅ Sent {direction} scroll by {by} × {amount} via keystroke \
@@ -740,6 +789,49 @@ impl Tool for ScrollTool {
             Err(e) => ToolResult::error(format!("Task error: {e}")),
         }
     }
+}
+
+/// Background scroll for Electron/Chromium windows, which drop background
+/// What the focused scroll area's bar says about a keystroke scroll: confirmed
+/// when it moved, suspected_noop when it already sat at the end the keys
+/// scroll toward. None when it did not move otherwise, since the keys may
+/// have scrolled something other than that area.
+fn keystroke_read_back(
+    direction: &str,
+    by: &str,
+    amount: usize,
+    before: f64,
+    after: Option<f64>,
+    suffix: &str,
+) -> Option<ToolResult> {
+    let after = after?;
+    if crate::ax::scroll_area::moved(before, after) {
+        return Some(
+            ToolResult::text(format!(
+                "✅ Scrolled {direction} by {by} × {amount} via keystroke; the focused scroll \
+                 area's bar moved from {before:.3} to {after:.3}.{suffix}"
+            ))
+            .with_structured(serde_json::json!({
+                "path": "key_events",
+                "verified": true,
+                "effect": "confirmed",
+                "scroll_position": { "before": before, "after": after },
+            })),
+        );
+    }
+    crate::ax::scroll_area::at_end(direction, before).then(|| {
+        ToolResult::text(format!(
+            "The focused scroll area was already at its end ({before:.3}); the {direction} keys \
+             changed nothing there.{suffix}"
+        ))
+        .with_structured(serde_json::json!({
+            "path": "key_events",
+            "verified": true,
+            "effect": "suspected_noop",
+            "at_edge": true,
+            "scroll_position": { "before": before, "after": after },
+        }))
+    })
 }
 
 /// Background scroll for Electron/Chromium windows, which drop background
@@ -1055,6 +1147,22 @@ mod tests {
         assert_eq!(clamp_amount(1100), AMOUNT_MAX as usize);
         assert_eq!(clamp_amount(0), AMOUNT_MIN as usize);
         assert_eq!(clamp_amount(3), 3);
+    }
+
+    #[test]
+    fn a_keystroke_scroll_is_judged_by_the_focused_scroll_bar() {
+        let moved = keystroke_read_back("down", "page", 1, 0.0, Some(0.4), "").unwrap();
+        let structured = moved.structured_content.unwrap();
+        assert_eq!(structured["effect"], "confirmed");
+        assert_eq!(structured["scroll_position"]["after"], 0.4);
+        let at_end = keystroke_read_back("down", "line", 3, 1.0, Some(1.0), "").unwrap();
+        assert_eq!(
+            at_end.structured_content.unwrap()["effect"],
+            "suspected_noop"
+        );
+        // Unmoved mid-range or unreadable afterwards proves nothing either way.
+        assert!(keystroke_read_back("down", "line", 3, 0.5, Some(0.5), "").is_none());
+        assert!(keystroke_read_back("up", "line", 3, 0.5, None, "").is_none());
     }
 
     #[tokio::test]
