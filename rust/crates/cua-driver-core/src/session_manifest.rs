@@ -15,6 +15,13 @@ use serde::Deserialize;
 #[cfg(feature = "yaml")]
 use sha2::{Digest, Sha256};
 
+#[cfg(windows)]
+#[path = "goat_windows_executable_identity.rs"]
+mod windows_executable_identity;
+#[cfg(all(test, windows, feature = "yaml"))]
+#[path = "goat_windows_executable_identity_tests.rs"]
+mod windows_executable_identity_tests;
+
 pub const SESSION_POLICY_FILE_ENV: &str = "CUA_DRIVER_SESSION_POLICY_FILE";
 pub const SESSION_POLICY_APPROVED_ENV: &str = "CUA_DRIVER_SESSION_POLICY_APPROVED";
 pub const CAPABILITY_MANIFEST_FILE_ENV: &str = "CUA_DRIVER_CAPABILITY_MANIFEST_FILE";
@@ -59,10 +66,36 @@ pub struct SessionManifest {
 struct ApplicationGrant {
     bundle_id: Option<String>,
     executable: Option<String>,
+    #[cfg(windows)]
+    file_identity: Option<windows_executable_identity::ExecutableIdentity>,
     #[allow(dead_code)]
     launch: bool,
     all_windows: bool,
     terminate: TerminationGrant,
+}
+
+impl ApplicationGrant {
+    fn executable_identity_matches(&self, executable: Option<&str>) -> bool {
+        #[cfg(windows)]
+        if self
+            .bundle_id
+            .as_deref()
+            .or(self.executable.as_deref())
+            .is_some_and(is_windows_path_identity)
+        {
+            return self.file_identity.as_ref().is_some_and(|approved| {
+                executable
+                    .and_then(|path| {
+                        normalize_windows_executable_path(path)?;
+                        windows_executable_identity::ExecutableIdentity::read(path).ok()
+                    })
+                    .as_ref()
+                    == Some(approved)
+            });
+        }
+        let _ = executable;
+        true
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -250,6 +283,11 @@ impl SessionManifest {
                         )
                         .is_some_and(|(allowed, actual)| allowed == actual);
                     identity_matches
+                        && application.executable_identity_matches(
+                            resource
+                                .pointer("/fingerprint/executable")
+                                .and_then(serde_json::Value::as_str),
+                        )
                         && match application.terminate {
                             TerminationGrant::Deny => false,
                             TerminationGrant::DriverLaunched => driver_owned,
@@ -360,6 +398,7 @@ impl SessionManifest {
                     .as_deref()
                     .zip(executable)
                     .is_some_and(|(allowed, actual)| allowed == actual))
+                && application.executable_identity_matches(attested_executable)
         })
     }
 
@@ -1145,6 +1184,15 @@ fn validate_applications(
             return Err("application resources repeat an identity".to_owned());
         }
         validated.push(ApplicationGrant {
+            #[cfg(windows)]
+            file_identity: bundle_id
+                .as_deref()
+                .or(executable.as_deref())
+                .filter(|path| is_windows_path_identity(path))
+                .and_then(|path| {
+                    normalize_windows_executable_path(path)?;
+                    windows_executable_identity::ExecutableIdentity::read(path).ok()
+                }),
             bundle_id,
             executable,
             launch: raw.launch,
@@ -2261,6 +2309,15 @@ allow:
     #[cfg(feature = "yaml")]
     #[test]
     fn windows_path_bundle_grant_does_not_cover_a_same_named_program() {
+        let _directory = tempfile::tempdir().unwrap();
+        #[cfg(windows)]
+        let granted = {
+            let path = _directory.path().join("chrome.exe");
+            std::fs::write(&path, b"approved application").unwrap();
+            path.to_string_lossy().into_owned()
+        };
+        #[cfg(not(windows))]
+        let granted = GRANTED_CHROME.to_owned();
         let loaded = manifest(&format!(
             r#"
 version: 2
@@ -2269,11 +2326,12 @@ expires_after: 8h
 idle_timeout: 30m
 resources:
   apps:
-    - bundle_id: '{GRANTED_CHROME}'
+    - bundle_id: {encoded_grant}
       windows: all
 allow:
   tools: [list_windows, click]
-"#
+"#,
+            encoded_grant = serde_json::to_string(&granted).unwrap(),
         ))
         .unwrap();
         // What Windows `list_apps` reports for any running `chrome.exe`: the
@@ -2283,7 +2341,7 @@ allow:
                 "kind": kind,
                 "pid": 42,
                 "window_id": 7,
-                "bundle_id": GRANTED_CHROME,
+                "bundle_id": granted,
                 "fingerprint": fingerprint,
             })
         };
@@ -2299,11 +2357,8 @@ allow:
                 loaded.authorize_protected_resource(adapter, &resource(kind, fingerprint))
             };
             // The genuine program, in any spelling the OS may report.
-            outcome(at(GRANTED_CHROME)).unwrap();
-            outcome(at(
-                r"\\?\C:\Program Files\Google\Chrome\Application\chrome.exe",
-            ))
-            .unwrap();
+            outcome(at(&granted)).unwrap();
+            outcome(at(&format!(r"\\?\{}", granted.to_uppercase()))).unwrap();
             // A different program that only shares the file name.
             assert!(
                 outcome(at(r"C:\Users\victim\chrome.exe")).is_err(),
