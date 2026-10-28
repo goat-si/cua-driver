@@ -554,6 +554,68 @@ impl Tool for PressKeyTool {
             }
         }
 
+        // ── Menu key equivalents in a background app ──
+        // Background key events reach a window's views but never its app's
+        // menu key equivalents: a background cmd+a to TextEdit was reported
+        // "Pressed" and selected nothing. After the exact-target gate, the key
+        // scope and the focus-conflict check above, and under the same
+        // per-PID lease, a Command combo that is a menu item's key equivalent
+        // runs that item through accessibility, or is refused with no keys
+        // sent, as hotkey does. Browsers, Electron, a frontmost app and the
+        // px form keep the key route.
+        if !fg && px.is_none() {
+            if let (Some(wid), Some(lease), Some(combo)) = (
+                window_id,
+                _mutation_lease.as_ref(),
+                super::menu_equivalent::Combo::parse(&modifiers, &key),
+            ) {
+                let menu_item = latency::spawn_action_blocking(move || {
+                    let native = !super::type_text::is_browser_pid(pid)
+                        && !crate::browser::electron_js::ElectronJs::is_electron(pid);
+                    let in_front = apps::frontmost_pid() == Some(pid);
+                    if native && !in_front {
+                        super::menu_equivalent::find(pid, &combo)
+                    } else {
+                        None
+                    }
+                })
+                .await
+                .ok()
+                .flatten();
+                if let Some(item) = menu_item {
+                    if let Some(ptr) = pre_focus_ptr {
+                        // The menu command acts on the focused element: focus
+                        // it and read that back, or run nothing.
+                        let focused = latency::spawn_action_blocking(move || {
+                            crate::input::ax_actions::focus_element(ptr).is_ok()
+                                && crate::input::ax_actions::element_has_keyboard_focus_in_window(
+                                    pid, window_id, ptr,
+                                )
+                        })
+                        .await
+                        .unwrap_or(false);
+                        if !focused {
+                            return super::pre_dispatch_refusal(
+                                "target_focus_unconfirmed",
+                                format!(
+                                    "press_key: the element did not take focus, so its menu command ({}) was not run and no keys were sent.",
+                                    item.path.join(" > ")
+                                ),
+                            );
+                        }
+                    }
+                    let menu_result = super::invoke_menu::run_in_background_with_lease(
+                        lease,
+                        wid,
+                        item.path,
+                        super::invoke_menu::MenuRequest::KeyEquivalent(display_key.clone()),
+                    )
+                    .await;
+                    return super::hotkey::menu_refusal_without_keys(menu_result);
+                }
+            }
+        }
+
         // px form: pixel-click to focus, then the key goes to the focused element.
         // Reuses click's translation + delivery_mode; after it, deliver via the
         // plain background path (the focus-click already handled fronting if fg).

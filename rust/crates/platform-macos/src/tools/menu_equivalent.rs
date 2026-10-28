@@ -100,18 +100,35 @@ pub(super) fn find(pid: i32, combo: &Combo) -> Option<MenuMatch> {
         let bar = bar?;
         let mut found: Option<MenuMatch> = None;
         let mut budget = MAX_ITEMS;
-        for (index, top) in semantic_items(bar).into_iter().enumerate() {
-            let title = copy_string_attr(top, "AXTitle").unwrap_or_default();
-            if index > 0 || title != "Apple" {
-                search(top, vec![title], combo, &mut found, &mut budget, 0);
-            }
-            CFRelease(top as CFTypeRef);
-            if found.as_ref().is_some_and(|m| m.enabled) {
-                break;
-            }
-        }
+        visit_releasing(
+            semantic_items(bar),
+            |index, top| {
+                let title = copy_string_attr(top, "AXTitle").unwrap_or_default();
+                if index > 0 || title != "Apple" {
+                    search(top, vec![title], combo, &mut found, &mut budget, 0);
+                }
+                found.as_ref().is_some_and(|m| m.enabled)
+            },
+            |top| CFRelease(top as CFTypeRef),
+        );
         CFRelease(bar as CFTypeRef);
         found
+    }
+}
+
+/// Visit retained items in order until `visit` returns true (stop), then
+/// release every item: the visited ones and the ones never reached.
+fn visit_releasing<T: Copy>(
+    items: Vec<T>,
+    mut visit: impl FnMut(usize, T) -> bool,
+    mut release: impl FnMut(T),
+) {
+    let mut stopped = false;
+    for (index, item) in items.into_iter().enumerate() {
+        if !stopped {
+            stopped = visit(index, item);
+        }
+        release(item);
     }
 }
 
@@ -202,5 +219,29 @@ mod tests {
         let minimize_all = combo(&["cmd", "option"], "m").unwrap();
         assert!(minimize_all.matches("M", MOD_OPTION));
         assert!(!minimize_all.matches("M", MOD_OPTION | MOD_CONTROL));
+    }
+
+    #[test]
+    fn an_early_match_still_releases_every_top_level_item() {
+        let mut visited = Vec::new();
+        let mut released = Vec::new();
+        visit_releasing(
+            vec![10, 11, 12, 13],
+            |index, item| {
+                visited.push(item);
+                index == 1
+            },
+            |item| released.push(item),
+        );
+        assert_eq!(visited, vec![10, 11], "nothing is searched after the match");
+        assert_eq!(
+            released,
+            vec![10, 11, 12, 13],
+            "every retained item is released"
+        );
+
+        let mut released = Vec::new();
+        visit_releasing(vec![1, 2], |_, _| false, |item| released.push(item));
+        assert_eq!(released, vec![1, 2]);
     }
 }

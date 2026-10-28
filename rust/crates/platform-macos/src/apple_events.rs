@@ -364,40 +364,78 @@ pub struct SavedDocument {
     pub file_written: bool,
 }
 
+/// How far a failed background save got.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SaveStage {
+    /// Refused before any event was sent, or the script found no document
+    /// to save: nothing was saved.
+    NotSent,
+    /// The script failed, and its error does not say which of its events
+    /// failed: the save may have been sent before it (a denied or timed-out
+    /// modified-flag readback comes after the save).
+    MaybeSent,
+    /// The app accepted the save and its answer did not confirm it.
+    Sent,
+}
+
+/// Why a background save did not confirm.
+#[derive(Debug, Clone)]
+pub struct SaveFailure {
+    pub refusal: ScriptRefusal,
+    pub stage: SaveStage,
+}
+
 pub fn save_document(
     bundle_id: &str,
     app_name: &str,
     path: &Path,
-) -> Result<SavedDocument, ScriptRefusal> {
-    ensure_permitted(bundle_id, app_name)?;
+) -> Result<SavedDocument, SaveFailure> {
+    ensure_permitted(bundle_id, app_name).map_err(|refusal| SaveFailure {
+        refusal,
+        stage: SaveStage::NotSent,
+    })?;
     let before = modified_time(path);
     let path_text = path.to_string_lossy();
     let result = run_script(
         SAVE_DOCUMENT_SCRIPT,
         &[&path_text, bundle_id],
         Duration::from_secs(30),
-    )?;
+    )
+    .map_err(|refusal| SaveFailure {
+        refusal,
+        stage: SaveStage::MaybeSent,
+    })?;
     match result.as_str() {
         "false" => {}
         "true" => {
-            return Err(ScriptRefusal {
-                code: "save_unconfirmed",
-                reason: format!(
-                    "{app_name} accepted the save, but still reports unsaved changes in {}",
-                    path.display()
-                ),
+            return Err(SaveFailure {
+                refusal: ScriptRefusal {
+                    code: "save_unconfirmed",
+                    reason: format!(
+                        "{app_name} accepted the save, but still reports unsaved changes in {}",
+                        path.display()
+                    ),
+                },
+                stage: SaveStage::Sent,
             })
         }
         "no-document" => {
-            return Err(ScriptRefusal {
-                code: "automation_failed",
-                reason: format!("{app_name} lists no open document for {}", path.display()),
-            })
+            return Err(SaveFailure {
+                refusal: ScriptRefusal {
+                    code: "automation_failed",
+                    reason: format!("{app_name} lists no open document for {}", path.display()),
+                },
+                // The script found no document to save, so it saved nothing.
+                stage: SaveStage::NotSent,
+            });
         }
         other => {
-            return Err(ScriptRefusal {
-                code: "save_unconfirmed",
-                reason: format!("{app_name} answered \"{other}\" to the save"),
+            return Err(SaveFailure {
+                refusal: ScriptRefusal {
+                    code: "save_unconfirmed",
+                    reason: format!("{app_name} answered \"{other}\" to the save"),
+                },
+                stage: SaveStage::Sent,
             })
         }
     }

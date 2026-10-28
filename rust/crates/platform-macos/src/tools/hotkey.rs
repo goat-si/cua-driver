@@ -630,7 +630,7 @@ impl Tool for HotkeyTool {
 /// background marked as a refusal that sent nothing. Keys are not tried
 /// instead: a background key event never reaches a native app's menus, so it
 /// would report delivery and change nothing (a background cmd+[ to Finder).
-fn menu_refusal_without_keys(mut result: ToolResult) -> ToolResult {
+pub(super) fn menu_refusal_without_keys(mut result: ToolResult) -> ToolResult {
     let unavailable = result.is_error == Some(true)
         && result
             .structured_content
