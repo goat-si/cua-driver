@@ -1067,15 +1067,14 @@ fn send_drag_synthesized_impl(
         // Release the held modifiers, retrying once like the click path so a
         // partially inserted release does not leave system key state held.
         let release_modifiers = || {
-            let size = std::mem::size_of::<INPUT>() as i32;
             mod_ups.is_empty()
-                || SendInput(&mod_ups, size) as usize == mod_ups.len()
-                || SendInput(&mod_ups, size) as usize == mod_ups.len()
+                || crate::input::delivery::send_input(&mod_ups) as usize == mod_ups.len()
+                || crate::input::delivery::send_input(&mod_ups) as usize == mod_ups.len()
         };
 
         // 0. Hold the modifiers before the press.
         if !mod_downs.is_empty() {
-            let sent = SendInput(&mod_downs, std::mem::size_of::<INPUT>() as i32);
+            let sent = crate::input::delivery::send_input(&mod_downs);
             if sent as usize != mod_downs.len() {
                 let _ = release_modifiers();
                 restore(true);
