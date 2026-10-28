@@ -678,32 +678,39 @@ unsafe fn walk_element(
             // An exhaustive walk keeps the area's own labels, read with their
             // failures, so a selector naming it is answered; the bar
             // position stays the row's value.
-            let (title, description, identifier) = if exhaustive_nodes() {
+            let ((title, description, own_value, identifier), exhaustive) = if exhaustive_nodes() {
                 match read_content_attrs(element, budget, batching_disabled) {
                     Some(attrs) => {
                         let (labels, complete) = scroll_area_labels(attrs);
                         if !complete {
                             note_skipped();
                         }
-                        labels
+                        (labels, true)
                     }
                     None => {
                         note_skipped();
-                        (None, None, None)
+                        ((None, None, None, None), true)
                     }
                 }
             } else {
                 (
-                    None,
-                    trimmed_label(copy_string_attr(element, "AXDescription")),
-                    copy_string_attr(element, "AXIdentifier"),
+                    (
+                        None,
+                        trimmed_label(copy_string_attr(element, "AXDescription")),
+                        None,
+                        copy_string_attr(element, "AXIdentifier"),
+                    ),
+                    false,
                 )
             };
             let node = AXNode {
                 element_index: Some(idx),
                 role: role.clone(),
                 title,
-                value: Some(label),
+                // A verify read keeps the area's own label order (its value,
+                // then its identifier); the bar position is in value_state,
+                // which is what the row's structured `value` reports.
+                value: if exhaustive { own_value } else { Some(label) },
                 description,
                 identifier,
                 help: None,
@@ -1193,19 +1200,26 @@ fn trimmed_label(text: Option<String>) -> Option<String> {
         .filter(|text| !text.is_empty())
 }
 
-/// A scrollable area's (title, description, identifier) for an exhaustive
-/// walk, and whether they show everything a selector could match: false when
-/// a read failed, or when its own AXValue is its only label, since the row's
-/// value is the bar position.
-type ScrollAreaLabels = (Option<String>, Option<String>, Option<String>);
+/// A scrollable area's own (title, description, value, identifier) for an
+/// exhaustive walk, and whether they show everything a selector could match
+/// (false when a label read failed).
+type ScrollAreaLabels = (
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+);
 
 fn scroll_area_labels(attrs: super::content_attrs::ContentAttrs) -> (ScrollAreaLabels, bool) {
-    let title = trimmed_label(attrs.title);
-    let description = trimmed_label(attrs.description);
-    let hidden_value =
-        title.is_none() && description.is_none() && trimmed_label(attrs.value).is_some();
-    let complete = !attrs.read_failed && !hidden_value;
-    ((title, description, attrs.identifier), complete)
+    (
+        (
+            trimmed_label(attrs.title),
+            trimmed_label(attrs.description),
+            trimmed_label(attrs.value),
+            attrs.identifier,
+        ),
+        !attrs.read_failed,
+    )
 }
 
 fn role_only_node(
@@ -1737,14 +1751,17 @@ mod lean_row_tests {
             help: None,
             read_failed,
         };
-        let ((title, _, identifier), complete) =
+        let ((title, _, _, identifier), complete) =
             super::scroll_area_labels(attrs(Some(" Editor "), None, false));
         assert_eq!(title.as_deref(), Some("Editor"));
         assert_eq!(identifier.as_deref(), Some("editor-scroll"));
         assert!(complete);
         assert!(!super::scroll_area_labels(attrs(Some("Editor"), None, true)).1);
-        assert!(!super::scroll_area_labels(attrs(None, Some("Notes"), false)).1);
-        assert!(super::scroll_area_labels(attrs(Some("Editor"), Some("Notes"), false)).1);
+        // Its own value is kept for the label, not hidden by the position.
+        let ((_, _, value, _), complete) =
+            super::scroll_area_labels(attrs(None, Some(" Notes "), false));
+        assert_eq!(value.as_deref(), Some("Notes"));
+        assert!(complete);
     }
 
     /// Review round 2: a container kept by an exhaustive walk keeps the

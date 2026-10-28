@@ -2069,6 +2069,18 @@ mod tests {
     /// DSH-08: a walk of the matched window that finished without skipping a
     /// node proves its observation elements complete, so verify_state can
     /// answer `unsatisfied` instead of `unknown` for an absent control.
+    /// Review round 5: in a verify read a scrollable area labelled only by its
+    /// identifier keeps that label; the bar position is its structured value.
+    #[test]
+    fn a_verify_read_scroll_area_keeps_its_identifier_label() {
+        let mut area = node(Some(0), "AXScrollArea", None, 1, None, None, vec![]);
+        area.identifier = Some("editor-scroll".into());
+        area.value_state = Some("0.000".into());
+        let entry = element_entry(&area, None);
+        assert_eq!(entry["label"], "editor-scroll");
+        assert_eq!(entry["value"], "0.000");
+    }
+
     #[test]
     fn a_finished_walk_proves_its_elements_complete() {
         let nodes = || {
