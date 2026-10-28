@@ -956,6 +956,8 @@ enum DistanceCheck {
     AsRequested,
     /// Further than 1.5x the request: `later` is the bar on the extra read.
     Overshoot { later: f64, requested: f64 },
+    /// The extra read found the bar back at or past where it started.
+    Reversed { later: f64 },
 }
 
 /// A background-wheel fallback route, in the order the verdict tries them.
@@ -1030,6 +1032,11 @@ fn wheel_verdict<A: crate::ax::scroll_area::WheelArea>(
             Some(after) if moved(before, after) => {
                 return WheelVerdict::Moved { before, after };
             }
+            // The bar moved the other way: something else is scrolling this
+            // area, so neither "at the end" nor a fallback is safe to claim.
+            Some(after) if crate::ax::scroll_area::moved(before, after) => {
+                return WheelVerdict::Unknown;
+            }
             Some(_) => {}
         }
         if poll.expired() {
@@ -1075,18 +1082,21 @@ fn wheel_verdict<A: crate::ax::scroll_area::WheelArea>(
             // poll, the fallback or the app itself may have moved it, so it is
             // reported without a cause.
             Some(after) if moved(before, after) => {
+                let distance =
+                    distance_check(area, direction, before, after, wheel_distance, &budget);
+                if let DistanceCheck::Reversed { later } = distance {
+                    return WheelVerdict::Unverified {
+                        attempted: format!(
+                            "{}; the bar moved ({before:.3} → {after:.3}) and then back ({later:.3})",
+                            attempted.join(", ")
+                        ),
+                    };
+                }
                 return WheelVerdict::MovedAfterFallback {
                     before,
                     after,
                     attempted: attempted.join(", "),
-                    distance: distance_check(
-                        area,
-                        direction,
-                        before,
-                        after,
-                        wheel_distance,
-                        &budget,
-                    ),
+                    distance,
                 };
             }
             // The bar moved the other way: not this scroll, and not a no-op.
@@ -1141,14 +1151,17 @@ fn distance_check<A: crate::ax::scroll_area::WheelArea>(
     wheel_distance: f64,
     budget: &crate::ax::scroll_area::Budget,
 ) -> DistanceCheck {
+    use crate::ax::scroll_area::{moved_toward, signed_progress};
+    budget.pause(FALLBACK_SETTLE);
+    let later = area.position(direction, budget).unwrap_or(after);
+    if !moved_toward(direction, before, later) {
+        return DistanceCheck::Reversed { later };
+    }
     let Some(requested) = area.bar_units(direction, wheel_distance, budget) else {
         return DistanceCheck::NotMeasured;
     };
-    budget.pause(FALLBACK_SETTLE);
-    let later = area.position(direction, budget).unwrap_or(after);
     let clamped = |value: f64| value <= 1e-4 || value >= 1.0 - 1e-4;
-    let toward = crate::ax::scroll_area::signed_progress(direction, before, later);
-    if !clamped(later) && toward > 1.5 * requested {
+    if !clamped(later) && signed_progress(direction, before, later) > 1.5 * requested {
         DistanceCheck::Overshoot { later, requested }
     } else {
         DistanceCheck::AsRequested
@@ -1196,7 +1209,7 @@ impl WheelVerdict {
                         " The content length could not be measured, so the distance was not checked."
                             .to_owned()
                     }
-                    DistanceCheck::AsRequested => String::new(),
+                    DistanceCheck::AsRequested | DistanceCheck::Reversed { .. } => String::new(),
                     DistanceCheck::Overshoot { later, .. } => format!(
                         " The content moved further than requested (bar {before:.3} → {later:.3})."
                     ),
@@ -1688,17 +1701,14 @@ mod tests {
         #[test]
         fn movement_the_other_way_is_not_this_scroll() {
             // Before any fallback: the app moves the bar down while the wheel
-            // scrolls up; the poll does not take that as the wheel landing.
+            // scrolls up. That is neither the wheel landing nor a reason to
+            // scroll again: the wheel result stays unverified, nothing more sent.
             let clock = FakeClock::new();
             let mut area = FakeArea::new(&clock, 0.5);
             area.at(Duration::from_millis(30), 0.6);
             area.set = sent(0.45);
-            let got = verdict(&area, &clock);
-            assert!(
-                matches!(&got, WheelVerdict::MovedAfterFallback { attempted, .. } if attempted == "scroll bar value"),
-                "{got:?}"
-            );
-            assert_eq!(area.mutations(), vec!["set"]);
+            assert_eq!(verdict(&area, &clock), WheelVerdict::Unknown);
+            assert!(area.mutations().is_empty());
 
             // After a fallback: the bar ends up further down than it started.
             let clock = FakeClock::new();
@@ -1718,7 +1728,7 @@ mod tests {
         }
 
         #[test]
-        fn overshoot_counts_only_movement_toward_the_request() {
+        fn a_reversal_after_the_fallback_is_unverified() {
             let clock = FakeClock::new();
             let mut area = FakeArea::new(&clock, 0.5);
             area.set = sent(0.45);
@@ -1727,15 +1737,21 @@ mod tests {
             area.at(Duration::from_millis(400), 0.7);
             let got = verdict(&area, &clock);
             assert!(
-                matches!(
-                    &got,
-                    WheelVerdict::MovedAfterFallback {
-                        distance: DistanceCheck::AsRequested,
-                        ..
-                    }
-                ),
-                "{got:?}"
+                matches!(&got, WheelVerdict::Unverified { attempted } if attempted.contains("then back (0.700)")),
+                "a reversal after the fallback is not confirmed progress: {got:?}"
             );
+        }
+
+        #[test]
+        fn movement_the_other_way_at_the_end_is_not_a_noop() {
+            let clock = FakeClock::new();
+            let mut area = FakeArea::new(&clock, 1.0);
+            // Scrolling down from the end while the app moves the bar up.
+            area.at(Duration::from_millis(40), 0.8);
+            area.set = sent(0.9);
+            let got = wheel_verdict(&area, "down", 1.0, 40.0, 1, None, &clock);
+            assert_eq!(got, WheelVerdict::Unknown);
+            assert!(area.mutations().is_empty());
         }
 
         #[test]
