@@ -759,23 +759,23 @@ pub(crate) async fn focus_by_pixel(
     } else {
         click.await
     };
-    if focus.is_error != Some(true) {
+    let landed = if focus.is_error != Some(true) {
         // AXFocused is non-destructive: unlike a second real click, it keeps a
         // Cmd+A selection intact before a follow-up type_text or Cmd+V.
         tokio::time::sleep(std::time::Duration::from_millis(120)).await;
-        // A background focus-click is `effect:"unverifiable"` by construction:
-        // it cannot prove the renderer moved its first responder. Returning on
-        // "it didn't error" therefore skipped the real-click fallback below
-        // whenever the click was a silent no-op — advancing on transport
-        // success alone, which is exactly what the ladder forbids. Confirm the
-        // focus actually moved before claiming this rung worked.
-        if !foreground || pixel_focus_landed(pid, window_id, x, y).await {
-            return Ok(());
+        Some(pixel_focus_landed(pid, window_id, x, y).await)
+    } else {
+        None
+    };
+    match pixel_focus_step(landed, foreground) {
+        PixelFocusStep::Focused => return Ok(()),
+        PixelFocusStep::RealClick => {}
+        PixelFocusStep::ClickFailed => {
+            return Err(cua_driver_core::protocol::ToolResult::error(format!(
+                "focus pixel-click at ({x:.0},{y:.0}) failed."
+            )));
         }
-    } else if !foreground {
-        return Err(cua_driver_core::protocol::ToolResult::error(format!(
-            "focus pixel-click at ({x:.0},{y:.0}) failed."
-        )));
+        PixelFocusStep::Unconfirmed => return Err(pixel_focus_unconfirmed(pid, window_id, x, y)),
     }
 
     // Some renderer surfaces do not expose a usable AX focus action. The
@@ -809,6 +809,59 @@ pub(crate) async fn focus_by_pixel(
     // Brief settle so the renderer registers focus before the keystrokes.
     tokio::time::sleep(std::time::Duration::from_millis(120)).await;
     Ok(())
+}
+
+/// What [`focus_by_pixel`] does after its non-destructive focus click.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PixelFocusStep {
+    /// The focused element now covers the point: send the keys.
+    Focused,
+    /// Foreground only: fall back to a real click on the point.
+    RealClick,
+    /// Background: the focus click itself failed. Nothing was sent.
+    ClickFailed,
+    /// Background: the focus click went out but the focused element does not
+    /// cover the point. The keys are not sent.
+    Unconfirmed,
+}
+
+/// `landed` is the focus read-back after a focus click that did not error,
+/// `None` when the click failed. A background focus click is
+/// `effect:"unverifiable"` by construction, so only the read-back can show
+/// that the keys will reach the point.
+fn pixel_focus_step(landed: Option<bool>, foreground: bool) -> PixelFocusStep {
+    match (landed, foreground) {
+        (Some(true), _) => PixelFocusStep::Focused,
+        (_, true) => PixelFocusStep::RealClick,
+        (Some(false), false) => PixelFocusStep::Unconfirmed,
+        (None, false) => PixelFocusStep::ClickFailed,
+    }
+}
+
+/// The refusal for [`PixelFocusStep::Unconfirmed`]: the focus click was sent,
+/// so focus may have moved, but no key or text was sent.
+fn pixel_focus_unconfirmed(
+    pid: i32,
+    window_id: Option<u32>,
+    x: f64,
+    y: f64,
+) -> cua_driver_core::protocol::ToolResult {
+    let message = format!(
+        "The focus click at ({x:.0},{y:.0}) was sent, but the focused element does not cover \
+         that point, so no key or text was sent. Read the window, then target the field by \
+         element_token, or retry with delivery_mode:\"foreground\"."
+    );
+    cua_driver_core::protocol::ToolResult::error(message.clone()).with_structured(
+        serde_json::json!({
+            "code": "pixel_focus_unconfirmed",
+            "effect": "unverifiable",
+            "keys_sent": false,
+            "retryable": false,
+            "pid": pid,
+            "window_id": window_id,
+            "message": message,
+        }),
+    )
 }
 
 /// Confirm that a focus pixel-click actually moved the application's focused
@@ -1489,7 +1542,36 @@ mod cursor_overlay_facility_tests {
 // binary has no CoreGraphics linkage.
 #[cfg(test)]
 mod pixel_focus_readback_tests {
-    use super::point_within_rect;
+    use super::{pixel_focus_step, pixel_focus_unconfirmed, point_within_rect, PixelFocusStep};
+
+    /// DSH-04: a background focus click whose read-back shows focus elsewhere
+    /// must not let the keys go out. There is no real-click fallback in the
+    /// background, so the call stops there.
+    #[test]
+    fn background_keys_wait_for_a_confirmed_focus() {
+        assert_eq!(pixel_focus_step(Some(true), false), PixelFocusStep::Focused);
+        assert_eq!(
+            pixel_focus_step(Some(false), false),
+            PixelFocusStep::Unconfirmed
+        );
+        assert_eq!(pixel_focus_step(None, false), PixelFocusStep::ClickFailed);
+        assert_eq!(pixel_focus_step(Some(true), true), PixelFocusStep::Focused);
+        assert_eq!(
+            pixel_focus_step(Some(false), true),
+            PixelFocusStep::RealClick
+        );
+        assert_eq!(pixel_focus_step(None, true), PixelFocusStep::RealClick);
+    }
+
+    #[test]
+    fn an_unconfirmed_focus_says_no_key_was_sent() {
+        let result = pixel_focus_unconfirmed(7, Some(9), 10.0, 20.0);
+        assert_eq!(result.is_error, Some(true));
+        let data = result.structured_content.expect("structured refusal");
+        assert_eq!(data["code"], "pixel_focus_unconfirmed");
+        assert_eq!(data["effect"], "unverifiable");
+        assert_eq!(data["keys_sent"], false);
+    }
 
     #[test]
     fn confirms_a_point_inside_the_focused_element() {
