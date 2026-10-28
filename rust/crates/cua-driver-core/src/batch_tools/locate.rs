@@ -524,6 +524,14 @@ impl<'a> Locator<'a> {
     }
 
     async fn call(&self, tool: &str, args: Value) -> Result<Value, String> {
+        // Once the batch scope refused a read in this step or script call,
+        // the locator sends nothing more (a discarded baseline read must not
+        // lead to a second attempt).
+        if let Some(code) = self.scope_refusal() {
+            return Err(format!(
+                "{tool}: not sent, because an earlier read was refused by the batch scope ({code})"
+            ));
+        }
         let (pid, window_id) = call_target(&args);
         let result = self.registry.invoke(tool, self.with_session(args)).await;
         self.record(journal_entry(tool, pid, window_id, &result));

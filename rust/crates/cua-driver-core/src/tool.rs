@@ -1807,13 +1807,11 @@ impl ToolRegistry {
         {
             return result;
         }
-        if let Err(result) = crate::action_target::enforce_delivery_target(resolved_name, &args) {
-            return result;
-        }
         // A call dispatched by a `run_steps` batch or a `run_script` program
         // that carries a `scope` must stay inside it. Checked before
-        // authorization, consent and the platform tool, so a refused call
-        // sends nothing.
+        // the delivery guard, authorization, consent and the platform tool,
+        // so a call outside the scope is always refused with the scope's own
+        // code (which ends the batch or script) and sends nothing.
         if let Some(scope) = crate::batch_scope::current() {
             if let Err(refusal) = scope
                 .check(resolved_name, &args, tool.def().read_only, self)
@@ -1821,6 +1819,9 @@ impl ToolRegistry {
             {
                 return refusal.into_result();
             }
+        }
+        if let Err(result) = crate::action_target::enforce_delivery_target(resolved_name, &args) {
+            return result;
         }
 
         // This registry is the canonical native dispatch boundary shared by
