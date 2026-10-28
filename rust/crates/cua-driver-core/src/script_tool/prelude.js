@@ -65,6 +65,13 @@
     }
     if (Array.isArray(value)) return { x: value[0], y: value[1] };
     if (typeof value === "object") {
+      // An element from app.query() carries its token alongside the role and
+      // label it was found by: act on that exact element.
+      if (typeof value.element_token === "string" && value.element_token) {
+        return value.timeout_ms === undefined
+          ? { element_token: value.element_token }
+          : { element_token: value.element_token, timeout_ms: value.timeout_ms };
+      }
       const out = {};
       for (const key of ["role", "name", "label", "nth", "element_token", "x", "y", "timeout_ms"]) {
         if (value[key] !== undefined) out[key] = value[key];

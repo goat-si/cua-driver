@@ -634,3 +634,20 @@ async fn checkpoint_verification_skips_the_report_wait_of_every_action_only() {
         .await;
     assert_eq!(structured(&rejected)["code"], "invalid_script");
 }
+
+#[tokio::test]
+async fn an_element_from_query_is_a_click_target() {
+    let harness = Harness::new();
+    let result = harness
+        .run(
+            r#"const app = await cua.getApp("Notes");
+const [save] = await app.query({role: "button", name: "Save"});
+await app.click(save);
+return save.element_token;"#,
+        )
+        .await;
+    assert_ne!(result.is_error, Some(true), "{}", text(&result));
+    let click = &harness.calls("click")[0];
+    assert_eq!(click["element_token"], "s00000009:2");
+    assert!(click.get("role").is_none() && click.get("label").is_none());
+}

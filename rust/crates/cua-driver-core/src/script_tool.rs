@@ -184,8 +184,8 @@ impl Tool for RunScriptTool {
                 pressKey(\"return\" | \"cmd+s\", t?), hotkey([\"cmd\",\"s\"]), scroll(t, \
                 direction, amount?), setValue(t, value), drag([x,y], [x,y]), zoom([x1,y1,x2,y2])\n\
                 where a target `t` is {role, name, nth?} (found fresh, waits up to 3 s), an \
-                element_token string, a row number from this app's last getState(), or [x, y] \
-                window pixels.\n\
+                element returned by app.query(), an element_token string, a row number from \
+                this app's last getState(), or [x, y] window pixels.\n\
                 - `cua.call(tool, args)` for any other allowed tool: click, double_click, \
                 right_click, set_value, type_text, press_key, hotkey, scroll, drag, \
                 launch_app, list_apps, list_windows, get_window_state, verify_state, zoom.\n\
