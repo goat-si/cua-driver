@@ -81,7 +81,7 @@ pub fn schema_properties() -> Value {
         },
         "since": {
             "type": "string",
-            "description": "A `snapshot_id` from an earlier get_window_state of the same window, or \"latest\" for this window's most recent read with the same query/max_elements/max_depth. Use it on every re-read after acting. Returns only what changed against that snapshot: `+` added rows, `~` changed rows, `-` removed rows (removed ids are the old snapshot's), or `no change`. Falls back to a full read when the snapshot is unknown, expired, belongs to another window, or was read with a different query/max_elements/max_depth; `since_status` says which. The response still carries a NEW snapshot_id and its element_tokens; rows not listed keep their previous [N] unless a `reindexed:` line says otherwise."
+            "description": "A `snapshot_id` from an earlier get_window_state of the same window, or \"latest\" for this window's most recent read with the same query/max_elements/max_depth. Use it on every re-read after acting. Returns only what changed against that snapshot: `+` added rows, `~` changed rows, `-` removed rows (removed ids are the old snapshot's), or `no change`. With tree_format \"elements\" or \"both\", `elements` still lists the whole new snapshot. Falls back to a full read when the snapshot is unknown, expired, belongs to another window, or was read with a different query/max_elements/max_depth; `since_status` says which. The response still carries a NEW snapshot_id and its element_tokens; rows not listed keep their previous [N] unless a `reindexed:` line says otherwise."
         },
         "verbose": {
             "type": "boolean",
@@ -341,13 +341,10 @@ pub fn apply(
             if let Some(focus) = focus {
                 structured["focused_element"] = json!(focus);
             }
-            let keep: std::collections::HashSet<u64> = report
-                .added
-                .iter()
-                .chain(report.changed.iter())
-                .filter_map(|row| row.index)
-                .collect();
-            retain_elements(structured, opts.tree_format, Some(&keep));
+            // `tree_diff` is the compact answer. When the caller asked for
+            // `elements`, they list the whole new snapshot: every token in it
+            // is valid, and `returned_element_count` stays equal to its length.
+            retain_elements(structured, opts.tree_format);
             if let Some(obj) = structured.as_object_mut() {
                 obj.remove("tree_markdown");
             }
@@ -380,7 +377,7 @@ pub fn apply(
             match opts.tree_format {
                 TreeFormat::Markdown => {
                     body = md.clone();
-                    retain_elements(structured, TreeFormat::Markdown, None);
+                    retain_elements(structured, TreeFormat::Markdown);
                 }
                 TreeFormat::Elements => {
                     body = "(tree is in structuredContent.elements; pass tree_format \"markdown\" for the compact text rendering)".to_owned();
@@ -542,26 +539,14 @@ fn trim_metadata(opts: &ViewOptions, structured: &mut Value) {
     }
 }
 
-/// Keep `elements` per the requested format. `keep` limits them to the given
-/// element indices (diff reads).
-fn retain_elements(
-    structured: &mut Value,
-    format: TreeFormat,
-    keep: Option<&std::collections::HashSet<u64>>,
-) {
-    let Some(obj) = structured.as_object_mut() else {
-        return;
-    };
+/// Keep `elements` per the requested format: dropped whole for markdown,
+/// otherwise left exactly as the backend built them, so
+/// `returned_element_count` keeps describing the array.
+fn retain_elements(structured: &mut Value, format: TreeFormat) {
     if format == TreeFormat::Markdown {
-        obj.remove("elements");
-        return;
-    }
-    if let (Some(keep), Some(Value::Array(elements))) = (keep, obj.get_mut("elements")) {
-        elements.retain(|e| {
-            e.get("element_index")
-                .and_then(Value::as_u64)
-                .is_some_and(|i| keep.contains(&i))
-        });
+        if let Some(obj) = structured.as_object_mut() {
+            obj.remove("elements");
+        }
     }
 }
 
@@ -1472,6 +1457,67 @@ mod tests {
             &mut s5,
         );
         assert_eq!(s5["since_status"], "other_window");
+    }
+
+    /// A payload shaped like a real backend read: one element per indexed
+    /// row and `returned_element_count` equal to `elements.len()`.
+    fn typed_payload(sid: &str, md: &str) -> (Vec<Content>, Value) {
+        let (content, mut structured) = payload(sid, md);
+        let elements: Vec<Value> = parse_rows(md)
+            .iter()
+            .filter_map(|row| row.index)
+            .map(|i| {
+                json!({
+                    "element_index": i,
+                    "element_token": format!("{sid}:{i}"),
+                    "role": "AXButton",
+                    "depth": 1,
+                })
+            })
+            .collect();
+        structured["total_element_count"] = json!(elements.len());
+        structured["returned_element_count"] = json!(elements.len());
+        structured["elements"] = json!(elements);
+        (content, structured)
+    }
+
+    #[test]
+    fn since_with_elements_returns_every_element_and_passes_the_typed_check() {
+        let window = 7010;
+        let (mut c1, mut s1) = typed_payload("s000000e1", OLD);
+        apply(&opts(json!({})), &ctx(window), &mut c1, &mut s1);
+
+        let edited = OLD.replace("\"a\"", "\"ab\"");
+        for (format, sid, base) in [
+            ("both", "s000000e2", "s000000e1"),
+            ("elements", "s000000e3", "s000000e2"),
+            // Unchanged tree: still every element.
+            ("both", "s000000e4", "s000000e3"),
+        ] {
+            let (mut c, mut s) = typed_payload(sid, &edited);
+            apply(
+                &opts(json!({"tree_format": format, "since": base})),
+                &ctx(window),
+                &mut c,
+                &mut s,
+            );
+            let expected = if sid == "s000000e2" {
+                "diff"
+            } else {
+                "no_change"
+            };
+            assert_eq!(s["since_status"], expected, "{format} since {base}");
+            assert!(s.get("tree_markdown").is_none());
+            assert!(s["tree_diff"].is_string());
+            let elements = s["elements"].as_array().unwrap();
+            assert_eq!(elements.len(), 4, "{format}: every element of {sid}");
+            assert!(elements
+                .iter()
+                .all(|e| e["element_token"].as_str().unwrap().starts_with(sid)));
+            assert_eq!(s["returned_element_count"], 4);
+            cua_driver_contract::validate_success_output("get_window_state", s.clone())
+                .unwrap_or_else(|e| panic!("{format} since {base}: {e}"));
+        }
     }
 
     #[test]
