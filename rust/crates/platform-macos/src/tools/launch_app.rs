@@ -657,19 +657,65 @@ fn unresolved_folders() -> Vec<String> {
     held.iter().map(|(title, _)| title.clone()).collect()
 }
 
-fn note_unresolved_folders(targets: &[FolderTarget], found: &[crate::windows::WindowInfo]) {
-    let mut held = UNRESOLVED_FOLDERS.lock().unwrap_or_else(|e| e.into_inner());
+/// Most timed-out folder names remembered at once; the oldest go first.
+const UNRESOLVED_FOLDER_CAP: usize = 64;
+
+/// The titles of `targets` that no window in `found` stands for, each found
+/// window standing for one target.
+fn missing_folder_titles(
+    targets: &[FolderTarget],
+    found: &[crate::windows::WindowInfo],
+) -> Vec<String> {
+    let mut left: Vec<&str> = found.iter().map(|w| w.title.as_str()).collect();
+    let mut missing = Vec::new();
     for title in targets.iter().filter_map(|t| t.title.as_deref()) {
-        if !found.iter().any(|w| w.title == title) {
-            held.push((title.to_owned(), std::time::Instant::now()));
+        match left.iter().position(|w| *w == title) {
+            Some(at) => {
+                left.remove(at);
+            }
+            None => missing.push(title.to_owned()),
         }
     }
+    missing
 }
 
-/// Whether the launch asks for Finder, by bundle id or by name.
+/// Add `titles` to `held`, once per name with the newest time, keeping at
+/// most [`UNRESOLVED_FOLDER_CAP`] names.
+fn remember_unresolved(
+    held: &mut Vec<(String, std::time::Instant)>,
+    titles: &[String],
+    now: std::time::Instant,
+) {
+    for title in titles {
+        held.retain(|(held_title, _)| held_title != title);
+        held.push((title.clone(), now));
+    }
+    let excess = held.len().saturating_sub(UNRESOLVED_FOLDER_CAP);
+    held.drain(..excess);
+}
+
+fn note_unresolved_folders(targets: &[FolderTarget], found: &[crate::windows::WindowInfo]) {
+    let missing = missing_folder_titles(targets, found);
+    let mut held = UNRESOLVED_FOLDERS.lock().unwrap_or_else(|e| e.into_inner());
+    remember_unresolved(&mut held, &missing, std::time::Instant::now());
+}
+
+/// Whether the launch asks for Finder: by bundle id, or by a name that
+/// resolves to Finder (its display name, app path or bundle id).
 fn is_finder_request(bundle_id: Option<&str>, name: Option<&str>) -> bool {
-    bundle_id == Some("com.apple.finder")
-        || bundle_id.is_none() && name.is_some_and(|name| name.eq_ignore_ascii_case("finder"))
+    const FINDER: &str = "com.apple.finder";
+    match (bundle_id, name) {
+        (Some(bundle_id), _) => bundle_id == FINDER,
+        (None, Some(name)) => {
+            name.eq_ignore_ascii_case("finder")
+                || name == FINDER
+                || crate::apps::locate_by_name(name)
+                    .and_then(|app| app.app_ref_and_bundle_id().1)
+                    .as_deref()
+                    == Some(FINDER)
+        }
+        (None, None) => false,
+    }
 }
 
 /// How long the Finder folder windows get to appear.
@@ -894,8 +940,9 @@ fn hex_value(byte: u8) -> Option<u8> {
 mod tests {
     use super::{
         finder_folder_targets, is_cua_driver_bundle_id, is_finder_request, local_file_target,
-        match_folder_windows, normalize_launch_url, preflight_file_urls, rank_launch_windows,
-        response_identity, structured_launch_failure, LaunchAppTool,
+        match_folder_windows, missing_folder_titles, normalize_launch_url, preflight_file_urls,
+        rank_launch_windows, remember_unresolved, response_identity, structured_launch_failure,
+        LaunchAppTool, UNRESOLVED_FOLDER_CAP,
     };
     use cua_driver_core::tool::Tool;
     use serde_json::json;
@@ -938,6 +985,12 @@ mod tests {
         // on Finder's launch turn.
         assert!(is_finder_request(Some("com.apple.finder"), None));
         assert!(is_finder_request(None, Some("Finder")));
+        // Finder by its app path or its bundle id given as the name.
+        assert!(is_finder_request(
+            None,
+            Some("/System/Library/CoreServices/Finder.app")
+        ));
+        assert!(is_finder_request(None, Some("com.apple.finder")));
         assert!(!is_finder_request(Some("com.apple.Safari"), None));
         assert!(!is_finder_request(None, Some("TextEdit")));
         // Not Finder, or not a folder: the app's windows are reported as before.
@@ -1024,6 +1077,41 @@ mod tests {
         );
         assert_eq!(ids(&found), vec![3, 4]);
         assert!(ready);
+    }
+
+    #[test]
+    fn a_timed_out_folder_is_remembered_once_per_missing_window() {
+        let dir = std::env::temp_dir().join("cua-launch-unresolved-test");
+        let (a, b) = (dir.join("A/reports"), dir.join("B/reports"));
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+        let url = |p: &std::path::Path| p.to_string_lossy().into_owned();
+        let both = finder_folder_targets(Some("com.apple.finder"), &[url(&a), url(&b)]);
+        // One "reports" window appeared for two "reports" folders: the
+        // other is still on its way.
+        assert_eq!(
+            missing_folder_titles(&both, &[window(3, "reports", 900.0, 500.0)]),
+            vec!["reports".to_owned()]
+        );
+        assert!(missing_folder_titles(
+            &both,
+            &[
+                window(3, "reports", 900.0, 500.0),
+                window(4, "reports", 900.0, 500.0)
+            ]
+        )
+        .is_empty());
+
+        // Remembered once per name, newest time kept, bounded.
+        let now = std::time::Instant::now();
+        let mut held = Vec::new();
+        remember_unresolved(&mut held, &["reports".to_owned()], now);
+        remember_unresolved(&mut held, &["reports".to_owned()], now);
+        assert_eq!(held.len(), 1);
+        let many: Vec<String> = (0..200).map(|i| format!("f{i}")).collect();
+        remember_unresolved(&mut held, &many, now);
+        assert_eq!(held.len(), UNRESOLVED_FOLDER_CAP);
+        assert!(held.iter().any(|(title, _)| title == "f199"));
     }
 
     #[test]
