@@ -1,6 +1,15 @@
 # GOAT's build of Cua Driver: every platform GOAT ships, unsigned (GOAT signs inside its helper app),
 # the license/source gate, the protocol-compatibility check against the release GOAT pins, and on a
 # release tag, provenance attestations and a GitHub release. No secrets: nothing here signs or notarizes.
+#
+# What runs where:
+# - pull_request: the platform builds, lints and the PR schema/unit jobs.
+# - push to main: the same code already passed its PR, so only version and deny run, plus the
+#   platform builds and clippy when the push changes what their caches are keyed on (see the version
+#   job). The slow regression lanes do not run.
+# - schedule (daily, main HEAD): everything, including the slow lanes, which also keeps main's caches
+#   warm for the PR jobs that restore them.
+# - release tag and workflow_dispatch with slow_tests (the default): everything; a tag also publishes.
 name: goat-ci
 
 on:
@@ -9,6 +18,21 @@ on:
   push:
     branches: [main]
     tags: ["cua-driver-rs-v*-goat.*"]
+    # Skip documentation-only pushes to main. Path filters are not evaluated for tag pushes, so a
+    # release tag always runs. Later patterns win: the Markdown re-included below is compiled into the
+    # binary (rust/Skills, a crate's doc attribute), packaged into the release archives (LICENSE.md,
+    # THIRD_PARTY_NOTICES.md) or read by the notices check.
+    paths:
+      - "**"
+      - "!**/*.md"
+      - "!docs/**"
+      - "LICENSE.md"
+      - "rust/THIRD_PARTY_NOTICES.md"
+      - "rust/Skills/**"
+      - "rust/crates/*/README.md"
+  schedule:
+    # 18:17 UTC daily, on the default branch.
+    - cron: "17 18 * * *"
   workflow_dispatch:
     inputs:
       slow_tests:
@@ -20,9 +44,11 @@ on:
 permissions:
   contents: read
 
+# Pull requests and pushes to main supersede their own earlier run. Tag pushes, dispatches and the
+# schedule each get a group of their own, so nothing cancels or queues behind them.
 concurrency:
-  group: goat-ci-${{ github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  group: goat-ci-${{ (github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main')) && github.ref || github.run_id }}
+  cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
@@ -36,6 +62,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.version.outputs.version }}
+      builds: ${{ steps.builds.outputs.run }}
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
       - name: Determine version
@@ -50,6 +77,35 @@ jobs:
             fi
           fi
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+      # A push to main carries code its pull request already built, linted and checked, so rebuilding
+      # it only matters when the push changes what the build caches are keyed on (the Cargo manifests
+      # and lock) or this workflow (toolchain, Debian package set): then the builds save the caches
+      # that pull requests restore. Every other event builds. The daily schedule builds main as well.
+      - name: Decide whether the platform builds run
+        id: builds
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT: ${{ github.event_name }}
+          BEFORE: ${{ github.event.before }}
+        run: |
+          if [[ "$EVENT" != push || "$GITHUB_REF" != refs/heads/main ]]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          run=true
+          if gh api "repos/$GITHUB_REPOSITORY/compare/$BEFORE...$GITHUB_SHA" > "$RUNNER_TEMP/compare.json"; then
+            # The compare API lists at most 300 files; a longer list may hide a manifest, so build.
+            if (( $(jq '.files | length' "$RUNNER_TEMP/compare.json") < 300 )); then
+              jq -r '.files[] | .filename, (.previous_filename // empty)' "$RUNNER_TEMP/compare.json" | tee "$RUNNER_TEMP/changed.txt"
+              if ! grep -Eq '^((rust|vendor)/(.*/)?Cargo\.(toml|lock)|\.github/workflows/goat-ci\.yml)$' "$RUNNER_TEMP/changed.txt"; then
+                run=false
+              fi
+            fi
+          else
+            echo "::warning::could not list the changes in this push; building"
+          fi
+          echo "Platform builds run: $run"
+          echo "run=$run" >> "$GITHUB_OUTPUT"
       - name: Protocol checker tests
         working-directory: goat/compat
         run: python3 -m unittest -v test_check_protocol
@@ -82,6 +138,7 @@ jobs:
   linux:
     name: linux-${{ matrix.arch }}
     needs: version
+    if: needs.version.outputs.builds == 'true'
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -147,9 +204,10 @@ jobs:
             [ "$CACHED" = "true" ] && echo "::warning::cached package set did not install offline; fetching from the snapshot"
             online_install
           fi
-      # Saved from main, tags and dispatches only: every PR can restore those, and every Linux job
-      # that does keeps the entry recent. A PR-scoped copy is visible to that PR alone, and under the
-      # repository's cache quota it is evicted before anything reads it again.
+      # Saved from main (pushes, the schedule and dispatches), tags and other dispatches only: every PR
+      # can restore main's entries, and every Linux job that does keeps the entry recent. A PR-scoped
+      # copy is visible to that PR alone, and under the repository's cache quota it is evicted before
+      # anything reads it again.
       - name: Save the pinned package set
         if: steps.apt-cache.outputs.cache-hit != 'true' && github.event_name != 'pull_request'
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
@@ -225,6 +283,7 @@ jobs:
   windows:
     name: windows-${{ matrix.arch }}
     needs: version
+    if: needs.version.outputs.builds == 'true'
     runs-on: windows-latest
     strategy:
       fail-fast: false
@@ -320,6 +379,7 @@ jobs:
   macos:
     name: darwin-universal
     needs: version
+    if: needs.version.outputs.builds == 'true'
     runs-on: macos-26
     env:
       MACOSX_DEPLOYMENT_TARGET: "13.0"
@@ -389,9 +449,6 @@ jobs:
           name: darwin-universal
           path: rust/release/*-binary.tar.gz
           if-no-files-found: error
-
-  # Lints the macOS platform crate and the workspace crates it builds on, on every PR
-  # (goat-si/cua-driver#9). Runs beside the build jobs, so it adds no time to a PR.
       # PR runs only restore. A PR-scoped copy serves that PR alone, and under the repository's
       # 10 GB cache quota it evicts main's caches and the Debian package set (goat-si/cua-driver#20).
       - name: Save the Rust build cache
@@ -403,8 +460,13 @@ jobs:
             ~/.cargo/git
             rust/target
           key: ${{ steps.rust-cache.outputs.cache-primary-key }}
+
+  # Lints the macOS platform crate and the workspace crates it builds on, on every PR
+  # (goat-si/cua-driver#9). Runs beside the build jobs, so it adds no time to a PR.
   clippy-macos:
     name: Clippy macOS
+    needs: version
+    if: needs.version.outputs.builds == 'true'
     runs-on: macos-26
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
@@ -435,10 +497,10 @@ jobs:
             rust/target
           key: ${{ steps.rust-cache.outputs.cache-primary-key }}
 
-  # The slow lanes below run on main, release tags and dispatches only, so a PR never ran the
-  # tools/list schema contract or the platform unit suites: goat.4's toggle_state enum, which held a
-  # null, failed only in its tag run. These PR jobs run those parts and restore (never save) the
-  # slow lanes' caches from main.
+  # The slow lanes below run on release tags, dispatches and the daily schedule only, so a PR never
+  # ran the tools/list schema contract or the platform unit suites: goat.4's toggle_state enum, which
+  # held a null, failed only in its tag run. These PR jobs run those parts and restore (never save)
+  # the slow lanes' caches, which the scheduled run on main saves.
   pr-unit-linux:
     if: github.event_name == 'pull_request'
     needs: version
@@ -552,10 +614,11 @@ jobs:
   # .github/workflows/ci-rust-{linux,macos,windows}.yml at cua-driver-rs-v0.37.0), ported verbatim
   # apart from paths, action pins and caching. Tests needing a logged-in, TCC-authorized desktop or
   # real apps are #[ignore] upstream and run in its desktop harnesses, not here. goat-si/cua-driver#12.
-  # Slow regression jobs run on main, release tags and manual dispatches, not on every PR.
-  # They are still required for release tags, so the release gate does not get weaker.
+  # Slow regression jobs run on release tags, manual dispatches (slow_tests) and the daily schedule,
+  # never on a PR or a push to main. They are still required for release tags, so the release gate
+  # does not get weaker; GOAT.md has the release procedure.
   test-linux:
-    if: github.event_name != 'pull_request' && (github.event_name != 'workflow_dispatch' || inputs.slow_tests)
+    if: github.event_name == 'schedule' || (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')) || (github.event_name == 'workflow_dispatch' && inputs.slow_tests)
     needs: version
     name: Rust Linux unit and compile
     runs-on: ubuntu-latest
@@ -723,7 +786,7 @@ jobs:
         run: cargo check -p cua-driver --features portal-input --locked
 
   test-macos:
-    if: github.event_name != 'pull_request' && (github.event_name != 'workflow_dispatch' || inputs.slow_tests)
+    if: github.event_name == 'schedule' || (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')) || (github.event_name == 'workflow_dispatch' && inputs.slow_tests)
     needs: version
     name: Rust macOS unit
     runs-on: macos-26
@@ -778,7 +841,7 @@ jobs:
         run: cargo test --locked -p cua-driver-e2e
 
   test-windows:
-    if: github.event_name != 'pull_request' && (github.event_name != 'workflow_dispatch' || inputs.slow_tests)
+    if: github.event_name == 'schedule' || (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')) || (github.event_name == 'workflow_dispatch' && inputs.slow_tests)
     needs: version
     name: Rust Windows unit and compile
     runs-on: windows-latest
