@@ -941,6 +941,13 @@ enum WheelVerdict {
     /// An accessibility scroll was sent (or may have been: the app answered
     /// with an error or not in time) and its effect could not be read back.
     Unverified { attempted: String },
+    /// The bar moved after a mutation the app answered with an error or not
+    /// in time: what moved it is not known.
+    MovedAfterAttempt {
+        before: f64,
+        after: f64,
+        attempted: String,
+    },
     /// The area could not be read again (before any fallback was sent).
     Unknown,
 }
@@ -1069,6 +1076,16 @@ fn wheel_verdict<A: crate::ax::scroll_area::WheelArea>(
         attempted.push(attempt_label(route, count, failed));
         budget.pause(FALLBACK_SETTLE);
         match area.position(direction, &budget) {
+            // The app answered the mutation with an error or not in time: the
+            // bar moved, but by the late wheel, the mutation or the app is
+            // not known.
+            Some(after) if failed && moved(before, after) => {
+                return WheelVerdict::MovedAfterAttempt {
+                    before,
+                    after,
+                    attempted: attempted.join(", "),
+                };
+            }
             Some(after) if moved(before, after) => {
                 return WheelVerdict::Accessibility {
                     route: route.route(),
@@ -1094,8 +1111,13 @@ fn wheel_verdict<A: crate::ax::scroll_area::WheelArea>(
     }
     match (attempted.is_empty(), ran_out) {
         (true, true) => WheelVerdict::Unknown,
-        (tried, _) => WheelVerdict::Dropped {
-            tried_accessibility: !tried,
+        // Something was sent and the budget ran out before the ladder ended:
+        // it may still apply, so this is not a verified no-op.
+        (false, true) => WheelVerdict::Unverified {
+            attempted: attempted.join(", "),
+        },
+        (no_attempt, false) => WheelVerdict::Dropped {
+            tried_accessibility: !no_attempt,
         },
     }
 }
@@ -1193,9 +1215,9 @@ impl WheelVerdict {
                     });
                 }
                 ToolResult::text(format!(
-                    "✅ The background wheel did not move this scroll area, so it was scrolled \
-                     {direction} through accessibility ({route}) instead: no event posted, \
-                     nothing fronted.{note}{suffix}"
+                    "✅ The background wheel did not move this scroll area within 250 ms, so it \
+                     was scrolled {direction} through accessibility ({route}); nothing was \
+                     fronted.{note}{suffix}"
                 ))
                 .with_structured(structured)
             }
@@ -1217,6 +1239,18 @@ impl WheelVerdict {
             .with_structured(serde_json::json!({
                 "path": "ax", "verified": false, "effect": "unverifiable",
                 "attempted": attempted
+            })),
+            WheelVerdict::MovedAfterAttempt { before, after, attempted } => ToolResult::text(format!(
+                "✅ {sent}; it did not visibly move the scroll area within 250 ms, so \
+                 accessibility was tried ({attempted}). The bar then moved \
+                 ({before:.3} → {after:.3}); whether the wheel, that attempt or the app moved \
+                 it is not known.{suffix}"
+            ))
+            .with_structured(serde_json::json!({
+                "path": "ax", "verified": true, "effect": "confirmed",
+                "evidence": readback(before, after),
+                "attempted": attempted,
+                "cause_known": false
             })),
             WheelVerdict::Unknown => return None,
         })
@@ -1541,7 +1575,8 @@ mod tests {
             );
             assert_eq!(area.mutations(), vec!["set"]);
 
-            // Applied within the settle: confirmed, still nothing else sent.
+            // Moved within the settle: reported without crediting the failed write;
+            // still nothing else sent.
             let clock = FakeClock::new();
             let mut area = FakeArea::new(&clock, 0.5);
             area.set = Effect {
@@ -1552,20 +1587,14 @@ mod tests {
             area.reveal = sent(0.3);
             let got = verdict(&area, &clock);
             assert!(
-                matches!(
-                    got,
-                    WheelVerdict::Accessibility {
-                        route: "scroll bar value",
-                        ..
-                    }
-                ),
-                "{got:?}"
+                matches!(&got, WheelVerdict::MovedAfterAttempt { attempted, .. } if attempted.contains("scroll bar value")),
+                "the move is reported without crediting the failed write: {got:?}"
             );
             assert_eq!(area.mutations(), vec!["set"]);
         }
 
         #[test]
-        fn a_failed_page_action_stops_the_ladder() {
+        fn a_failed_reveal_stops_the_ladder() {
             let clock = FakeClock::new();
             let mut area = FakeArea::new(&clock, 0.5);
             area.settable = false;
@@ -1581,6 +1610,44 @@ mod tests {
                 "{got:?}"
             );
             assert_eq!(area.mutations(), vec!["reveal"]);
+        }
+
+        #[test]
+        fn a_failed_page_action_stops_the_ladder() {
+            let clock = FakeClock::new();
+            let mut area = FakeArea::new(&clock, 0.5);
+            area.settable = false;
+            area.page = Effect {
+                answer: Mutation::Failed { count: 1 },
+                cost: Duration::from_millis(5),
+                bar: None,
+            };
+            let got = verdict(&area, &clock);
+            assert!(
+                matches!(&got, WheelVerdict::Unverified { attempted } if attempted.starts_with("page action")),
+                "{got:?}"
+            );
+            assert_eq!(area.mutations(), vec!["reveal", "set", "page"]);
+        }
+
+        #[test]
+        fn running_out_after_a_sent_fallback_is_unverified_not_a_noop() {
+            let clock = FakeClock::new();
+            let mut area = FakeArea::new(&clock, 0.5);
+            // The write is accepted and reads back unmoved, leaving under a
+            // route's worth of budget: it may still apply.
+            area.set = Effect {
+                answer: Mutation::Sent { count: 1 },
+                cost: Duration::from_millis(800),
+                bar: None,
+            };
+            area.reveal = sent(0.3);
+            let got = verdict(&area, &clock);
+            assert!(
+                matches!(&got, WheelVerdict::Unverified { attempted } if attempted == "scroll bar value"),
+                "{got:?}"
+            );
+            assert_eq!(area.mutations(), vec!["set"]);
         }
 
         #[test]

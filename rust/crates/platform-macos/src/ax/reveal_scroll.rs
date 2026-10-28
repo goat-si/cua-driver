@@ -426,7 +426,7 @@ unsafe fn reveal_core(
                 _ => false,
             });
             let mut leaf = true;
-            if !behind && depth < MAX_DEPTH && visited < MAX_NODES {
+            if !behind && depth < MAX_DEPTH && visited < MAX_NODES && !limits.expired() {
                 let children = copy_children(element);
                 leaf = children.is_empty();
                 for child in children.into_iter().rev() {
@@ -470,6 +470,9 @@ unsafe fn reveal_core(
         }
         sent = mutation_of(perform_action(elements[index], "AXScrollToVisible"));
         limits.pause(std::time::Duration::from_millis(150));
+        if limits.expired() {
+            return (sent, finish(elements, None));
+        }
         let after = element_screen_rect(elements[index]).unwrap_or(before);
         let moved = match direction {
             "down" => before[1] - after[1],
@@ -495,6 +498,9 @@ unsafe fn reveal_core(
         }
         sent = mutation_of(perform_action(elements[pick.index], "AXScrollToVisible"));
         limits.pause(std::time::Duration::from_millis(150));
+        if limits.expired() {
+            return (sent, finish(elements, None));
+        }
         let after = element_screen_rect(elements[pick.index]);
         let reference_after = reference.and_then(|at| element_screen_rect(elements[at]));
         let shown =

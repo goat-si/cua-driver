@@ -13,7 +13,8 @@ use super::bindings::{
     ax_get_window_id, copy_action_names, copy_ax_windows, copy_children, copy_element_attr,
     copy_number_attr, copy_string_attr, element_at_screen_position, element_screen_rect,
     is_attribute_settable, kAXErrorSuccess, perform_action, set_number_attr,
-    AXUIElementCreateApplication, AXUIElementRef, AXUIElementSetMessagingTimeout,
+    AXUIElementCopyElementAtPosition, AXUIElementCreateApplication, AXUIElementRef,
+    AXUIElementSetMessagingTimeout,
 };
 use std::time::{Duration, Instant};
 
@@ -157,25 +158,19 @@ impl ScrollArea {
         window_id: Option<u32>,
         budget: Option<&Budget>,
     ) -> Option<Self> {
-        let expired = || budget.is_some_and(|budget| budget.expired());
-        if let Some(element) = element {
-            CFRetain(element as CFTypeRef);
-            if let Some(area) = ascend(element, budget) {
-                return Some(area);
-            }
-        }
-        if expired() {
-            return None;
-        }
-        if let Some(hit) = element_at_screen_position(pid, point.0, point.1) {
-            if let Some(area) = ascend(hit, budget) {
-                return Some(area);
-            }
-        }
-        if expired() {
-            return None;
-        }
-        by_frame(pid, point, window_id, budget)
+        let steps: Vec<Box<dyn FnOnce() -> Option<Self> + '_>> = vec![
+            Box::new(move || {
+                let element = element?;
+                CFRetain(element as CFTypeRef);
+                ascend(element, budget)
+            }),
+            Box::new(move || {
+                let hit = hit_within(pid, point, budget)?;
+                ascend(hit, budget)
+            }),
+            Box::new(move || by_frame(pid, point, window_id, budget)),
+        ];
+        first_found(|| budget.is_some_and(|budget| budget.expired()), steps)
     }
 
     /// The scroll bar's value along `direction`'s axis, from 0 to 1.
@@ -228,6 +223,45 @@ unsafe fn ascend(element: AXUIElementRef, budget: Option<&Budget>) -> Option<Scr
     None
 }
 
+/// The element of pid at point, with the application element bounded by
+/// WHEEL_AX_TIMEOUT_S when a budget applies.
+unsafe fn hit_within(
+    pid: i32,
+    point: (f64, f64),
+    budget: Option<&Budget>,
+) -> Option<AXUIElementRef> {
+    if budget.is_none() {
+        return element_at_screen_position(pid, point.0, point.1);
+    }
+    let application = AXUIElementCreateApplication(pid);
+    if application.is_null() {
+        return None;
+    }
+    bound(application);
+    let mut element = std::ptr::null_mut();
+    let error =
+        AXUIElementCopyElementAtPosition(application, point.0 as f32, point.1 as f32, &mut element);
+    CFRelease(application as CFTypeRef);
+    (error == kAXErrorSuccess && !element.is_null()).then_some(element)
+}
+
+/// Runs the probe steps in order until one finds something; none starts
+/// once expired is true.
+pub fn first_found<'a, T>(
+    expired: impl Fn() -> bool,
+    steps: Vec<Box<dyn FnOnce() -> Option<T> + 'a>>,
+) -> Option<T> {
+    for step in steps {
+        if expired() {
+            return None;
+        }
+        if let Some(found) = step() {
+            return Some(found);
+        }
+    }
+    None
+}
+
 /// The smallest AXScrollArea in `pid`'s window whose frame holds `point`.
 unsafe fn by_frame(
     pid: i32,
@@ -247,8 +281,14 @@ unsafe fn by_frame(
     let mut best: Option<(AXUIElementRef, f64)> = None;
     let mut visited = 0;
     for window in windows {
-        if window_id.is_none() || ax_get_window_id(window) == window_id {
-            smallest_holding(window, point, 0, &mut visited, &mut best, budget);
+        let expired = budget.is_some_and(|budget| budget.expired());
+        if !expired {
+            if budget.is_some() {
+                bound(window);
+            }
+            if window_id.is_none() || ax_get_window_id(window) == window_id {
+                smallest_holding(window, point, 0, &mut visited, &mut best, budget);
+            }
         }
         CFRelease(window as CFTypeRef);
     }
@@ -438,6 +478,76 @@ pub fn span_of(
     span.map(|(low, high)| high - low)
 }
 
+/// A scroll bar write, step by step: read the bar, the viewport and the
+/// content, compute the target, check the bar takes a value, write. The
+/// budget is checked before every step, the write last, so nothing is
+/// written once it has run out.
+pub fn write_bar(
+    expired: &dyn Fn() -> bool,
+    position: impl FnOnce() -> Option<f64>,
+    viewport: impl FnOnce() -> Option<f64>,
+    content: impl FnOnce() -> Option<f64>,
+    target: impl FnOnce(f64, f64, f64) -> Option<f64>,
+    settable: impl FnOnce() -> bool,
+    write: impl FnOnce(f64) -> bool,
+) -> Mutation {
+    if expired() {
+        return Mutation::NotSent;
+    }
+    let Some(position) = position() else {
+        return Mutation::NotSent;
+    };
+    if expired() {
+        return Mutation::NotSent;
+    }
+    let Some(viewport) = viewport() else {
+        return Mutation::NotSent;
+    };
+    if expired() {
+        return Mutation::NotSent;
+    }
+    let Some(content) = content() else {
+        return Mutation::NotSent;
+    };
+    let Some(next) = target(position, viewport, content) else {
+        return Mutation::NotSent;
+    };
+    if expired() || !settable() || expired() {
+        return Mutation::NotSent;
+    }
+    if write(next) {
+        Mutation::Sent { count: 1 }
+    } else {
+        Mutation::Failed { count: 1 }
+    }
+}
+
+/// Up to pages page actions, each only with budget left; an action the app
+/// answers with an error ends the ladder as Failed (it may still apply).
+pub fn page_ladder(
+    expired: impl Fn() -> bool,
+    pages: usize,
+    mut perform: impl FnMut() -> bool,
+    mut pause: impl FnMut(),
+) -> Mutation {
+    let mut count = 0;
+    for _ in 0..pages.max(1) {
+        if expired() {
+            break;
+        }
+        count += 1;
+        if !perform() {
+            return Mutation::Failed { count };
+        }
+        pause();
+    }
+    if count == 0 {
+        Mutation::NotSent
+    } else {
+        Mutation::Sent { count }
+    }
+}
+
 /// Bounds `element`'s accessibility calls on the wheel's verdict path.
 unsafe fn bound(element: AXUIElementRef) {
     AXUIElementSetMessagingTimeout(element, WHEEL_AX_TIMEOUT_S);
@@ -521,34 +631,25 @@ impl WheelArea for ScrollArea {
 
     fn set_position(&self, direction: &str, distance: f64, budget: &Budget) -> Mutation {
         let horizontal = matches!(direction, "left" | "right");
+        if budget.expired() {
+            return Mutation::NotSent;
+        }
         unsafe {
-            let (Some(position), Some(viewport)) = (
-                self.position_within(direction, budget),
-                WheelArea::extent(self, direction, budget),
-            ) else {
-                return Mutation::NotSent;
-            };
-            let Some(content) = self.content_length_within(horizontal, budget) else {
-                return Mutation::NotSent;
-            };
-            let Some(next) = position_after(direction, position, distance, content, viewport)
-            else {
-                return Mutation::NotSent;
-            };
-            if budget.expired() {
-                return Mutation::NotSent;
-            }
             let Some(bar) = copy_element_attr(self.element, bar_attribute(direction)) else {
                 return Mutation::NotSent;
             };
             bound(bar);
-            let mutation = if budget.expired() || !is_attribute_settable(bar, "AXValue") {
-                Mutation::NotSent
-            } else if set_number_attr(bar, "AXValue", next) == kAXErrorSuccess {
-                Mutation::Sent { count: 1 }
-            } else {
-                Mutation::Failed { count: 1 }
-            };
+            let mutation = write_bar(
+                &|| budget.expired(),
+                || copy_number_attr(bar, "AXValue").filter(|value| value.is_finite()),
+                || WheelArea::extent(self, direction, budget),
+                || self.content_length_within(horizontal, budget),
+                |position, viewport, content| {
+                    position_after(direction, position, distance, content, viewport)
+                },
+                || is_attribute_settable(bar, "AXValue"),
+                |next| set_number_attr(bar, "AXValue", next) == kAXErrorSuccess,
+            );
             CFRelease(bar as CFTypeRef);
             mutation
         }
@@ -590,22 +691,12 @@ impl WheelArea for ScrollArea {
             {
                 return Mutation::NotSent;
             }
-            let mut count = 0;
-            for _ in 0..pages.max(1) {
-                if budget.expired() {
-                    break;
-                }
-                count += 1;
-                if perform_action(self.element, action) != kAXErrorSuccess {
-                    return Mutation::Failed { count };
-                }
-                budget.pause(Duration::from_millis(30));
-            }
-            if count == 0 {
-                Mutation::NotSent
-            } else {
-                Mutation::Sent { count }
-            }
+            page_ladder(
+                || budget.expired(),
+                pages,
+                || perform_action(self.element, action) == kAXErrorSuccess,
+                || budget.pause(Duration::from_millis(30)),
+            )
         }
     }
 
@@ -636,6 +727,126 @@ mod tests {
         fn sleep(&self, duration: Duration) {
             self.0.set(self.0.get() + duration);
         }
+    }
+
+    #[test]
+    fn a_bar_write_is_never_sent_after_the_deadline() {
+        let expired = std::cell::Cell::new(false);
+        let written = std::cell::Cell::new(false);
+        let target = |p: f64, v: f64, c: f64| position_after("down", p, 100.0, c, v);
+        // The settable check uses up the budget: no write.
+        let got = write_bar(
+            &|| expired.get(),
+            || Some(0.5),
+            || Some(500.0),
+            || Some(2500.0),
+            target,
+            || {
+                expired.set(true);
+                true
+            },
+            |_| {
+                written.set(true);
+                true
+            },
+        );
+        assert_eq!(got, Mutation::NotSent);
+        assert!(!written.get());
+        // The content read runs out: nothing after it.
+        expired.set(false);
+        let got = write_bar(
+            &|| expired.get(),
+            || Some(0.5),
+            || {
+                expired.set(true);
+                Some(500.0)
+            },
+            || panic!("no content read after the deadline"),
+            target,
+            || true,
+            |_| panic!("no write"),
+        );
+        assert_eq!(got, Mutation::NotSent);
+        // With budget: an accepted write is Sent, a refused one Failed.
+        expired.set(false);
+        assert_eq!(
+            write_bar(
+                &|| false,
+                || Some(0.5),
+                || Some(500.0),
+                || Some(2500.0),
+                target,
+                || true,
+                |next| {
+                    assert_eq!(next, 0.55);
+                    true
+                }
+            ),
+            Mutation::Sent { count: 1 }
+        );
+        assert_eq!(
+            write_bar(
+                &|| false,
+                || Some(0.5),
+                || Some(500.0),
+                || Some(2500.0),
+                target,
+                || true,
+                |_| false
+            ),
+            Mutation::Failed { count: 1 }
+        );
+    }
+
+    #[test]
+    fn page_actions_stop_at_the_deadline_and_at_a_failure() {
+        let left = std::cell::Cell::new(2);
+        let got = page_ladder(
+            || left.get() == 0,
+            5,
+            || {
+                left.set(left.get() - 1);
+                true
+            },
+            || {},
+        );
+        assert_eq!(got, Mutation::Sent { count: 2 });
+        let mut calls = 0;
+        let got = page_ladder(
+            || false,
+            5,
+            || {
+                calls += 1;
+                calls < 2
+            },
+            || {},
+        );
+        assert_eq!(got, Mutation::Failed { count: 2 });
+        assert_eq!(
+            page_ladder(|| true, 5, || panic!("none sent"), || {}),
+            Mutation::NotSent
+        );
+    }
+
+    #[test]
+    fn a_blocked_probe_step_stops_the_later_ones() {
+        let clock = StepClock(std::cell::Cell::new(Instant::now()));
+        let budget = Budget::new(&clock, Duration::from_millis(400));
+        let steps: Vec<Box<dyn FnOnce() -> Option<u32>>> = vec![
+            Box::new(|| {
+                // A hit test on a busy app: its 0.25 s timeout, twice.
+                clock.sleep(Duration::from_millis(500));
+                None
+            }),
+            Box::new(|| panic!("no step starts after the probe budget")),
+        ];
+        assert_eq!(first_found(|| budget.expired(), steps), None);
+        let steps: Vec<Box<dyn FnOnce() -> Option<u32>>> = vec![
+            Box::new(|| None),
+            Box::new(|| Some(7)),
+            Box::new(|| panic!("found already")),
+        ];
+        assert_eq!(first_found(|| false, steps), Some(7));
     }
 
     #[test]
