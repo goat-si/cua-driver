@@ -171,7 +171,7 @@ impl Tool for RunStepsTool {
                 none. Reads (get_window_state, zoom) do not run between steps: one there is \
                 skipped; a get_window_state last is the `observe`, a zoom last runs after it. \
                 Every step goes through the same session, permission and approval checks as a \
-                direct call; a batch grants nothing extra. With `scope` ({apps, delivery?}) the \
+                direct call; a batch grants nothing extra. With `app_scope` ({apps, delivery?}) the \
                 driver also refuses, per call, anything outside those apps' windows \
                 (code outside_scope) or needing the foreground (code foreground_not_allowed); \
                 a refused step sends nothing and has effect \"refused\". \
@@ -278,7 +278,7 @@ impl Tool for RunStepsTool {
                         "type": "object",
                         "description": "Optional end-of-batch observation: arguments for ONE get_window_state call. `pid` and `window_id` default to those of the last step that names both. Defaults to since=\"latest\" (only what changed since your last read of that window with the same query/max_elements/max_depth; a full read when there is none), include_screenshot=false and max_elements=250; pass include_screenshot=true to see the window, or since=null for a full read. Omit to read nothing. {} observes the last window."
                     },
-                    "scope": crate::batch_scope::input_schema()
+                    "app_scope": crate::batch_scope::input_schema()
                 },
                 "additionalProperties": false
             }),
@@ -455,8 +455,8 @@ impl Plan {
             .map(str::to_owned);
 
         let default_window = batch_window(object)?;
-        let scope =
-            crate::batch_scope::BatchScope::parse(object.get("scope")).map_err(PlanError::batch)?;
+        let scope = crate::batch_scope::BatchScope::parse(object.get("app_scope"))
+            .map_err(PlanError::batch)?;
         let default_delivery = match object.get("delivery_mode") {
             None | Some(Value::Null) => None,
             Some(Value::String(mode)) if matches!(mode.as_str(), "background" | "foreground") => {
@@ -709,11 +709,29 @@ impl Plan {
                 .await
             };
             // A lookup or check the scope refused fails the step with the
-            // scope's code, as a refused action does.
+            // scope's code, as a refused action does, even when the check
+            // itself would have passed (a `gone:true` check reads a refused
+            // window as absent): the batch stops at the first refused call.
             let mut outcome = outcome;
+            // run_steps reports targets per step; the per-call journal is for
+            // run_script, so drop it here to keep it bounded.
+            locator.take_journal();
             if let Some(code) = locator.take_scope_refusal() {
-                if !outcome.ok && outcome.report.get("effect").is_none() {
-                    outcome.report["code"] = json!(code);
+                if outcome.ok {
+                    outcome.ok = false;
+                    outcome.report["ok"] = json!(false);
+                    outcome.report["phase"] = json!("find");
+                    outcome.report["message"] =
+                        json!("a read this step needed was refused by the batch scope");
+                    outcome.line = format!(
+                        "{}. {} ERROR (find): a read this step needed was refused by the batch scope ({code})",
+                        index + 1,
+                        outcome.report["tool"].as_str().unwrap_or("step")
+                    );
+                }
+                // An action that already ran keeps the effect it returned.
+                outcome.report["code"] = json!(code);
+                if outcome.report.get("effect").is_none() {
                     outcome.report["effect"] = json!("refused");
                 }
             }
@@ -740,7 +758,7 @@ impl Plan {
             "steps": reports,
         });
         if let Some(scope) = &self.scope {
-            structured["scope"] = scope.to_json();
+            structured["app_scope"] = scope.to_json();
         }
         let header = match failed_step {
             None => format!("run_steps: {total}/{total} steps ok"),

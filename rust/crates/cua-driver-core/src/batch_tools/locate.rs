@@ -458,6 +458,9 @@ pub(crate) struct Locator<'a> {
     /// reports `outside_scope` / `foreground_not_allowed` rather than a
     /// plain lookup failure.
     scope_refusal: std::sync::Mutex<Option<&'static str>>,
+    /// Every driver call made through this locator since the last
+    /// [`Self::take_journal`], in order: {tool, pid, window_id, ok, effect, code}.
+    journal: std::sync::Mutex<Vec<Value>>,
 }
 
 impl<'a> Locator<'a> {
@@ -469,7 +472,27 @@ impl<'a> Locator<'a> {
             baseline_max_elements: None,
             baselined: Default::default(),
             scope_refusal: Default::default(),
+            journal: Default::default(),
         }
+    }
+
+    /// Add a driver call made outside the locator (a script's own action or
+    /// read) to the journal, so it stays in dispatch order.
+    pub fn record(&self, entry: Value) {
+        self.journal
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(entry);
+    }
+
+    /// The driver calls recorded since the last call.
+    pub fn take_journal(&self) -> Vec<Value> {
+        std::mem::take(
+            &mut *self
+                .journal
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        )
     }
 
     /// The scope refusal code a lookup hit since the last call, if any.
@@ -493,7 +516,12 @@ impl<'a> Locator<'a> {
     }
 
     async fn call(&self, tool: &str, args: Value) -> Result<Value, String> {
+        let (pid, window_id) = (
+            args.get("pid").and_then(Value::as_i64),
+            args.get("window_id").and_then(Value::as_u64),
+        );
         let result = self.registry.invoke(tool, self.with_session(args)).await;
+        self.record(journal_entry(tool, pid, window_id, &result));
         if result.is_error == Some(true) {
             let code = result
                 .structured_content
@@ -1878,4 +1906,29 @@ mod tests {
         assert_eq!(element.name.as_deref(), Some("Go"));
         assert_eq!(args.keys().collect::<Vec<_>>(), ["count", "pid"]);
     }
+}
+
+/// One driver call as the run_script journal records it.
+pub(crate) fn journal_entry(
+    tool: &str,
+    pid: Option<i64>,
+    window_id: Option<u64>,
+    result: &crate::protocol::ToolResult,
+) -> Value {
+    let field = |key: &str| {
+        result
+            .structured_content
+            .as_ref()
+            .and_then(|value| value.get(key))
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+    };
+    json!({
+        "tool": tool,
+        "pid": pid,
+        "window_id": window_id,
+        "ok": result.is_error != Some(true),
+        "effect": field("effect"),
+        "code": field("code"),
+    })
 }

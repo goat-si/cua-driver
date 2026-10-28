@@ -1,7 +1,7 @@
 //! Per-call app and delivery scope for `run_steps` and `run_script`.
 //!
 //! A host that limits a turn to some apps cannot see inside a batch or a
-//! script before it runs. With `scope`, the driver enforces that limit
+//! script before it runs. With `app_scope`, the driver enforces that limit
 //! itself: every call the batch or script dispatches, including the reads
 //! the locator makes to find a target, the menu-bar reroute and a
 //! `foreground_fallback` retry, is checked here before any authorization,
@@ -26,7 +26,7 @@ use serde_json::{json, Value};
 
 use crate::protocol::ToolResult;
 
-/// Refusal code: the call targets no window of an app in `scope.apps`.
+/// Refusal code: the call targets no window of an app in `app_scope.apps`.
 pub const OUTSIDE_SCOPE: &str = "outside_scope";
 /// Refusal code: the call needs foreground or desktop-wide delivery and the
 /// scope allows background delivery only.
@@ -37,6 +37,17 @@ pub const MAX_SCOPE_APPS: usize = 32;
 /// Reads that enumerate apps or windows and target none. They stay
 /// available in a scope so a batch can find its app's window by name.
 const ENUMERATION_TOOLS: &[&str] = &["list_apps", "list_windows"];
+/// Whether `launch_app` resolves `bundle_id` alone to that app's bundle.
+const LAUNCH_BY_BUNDLE_ID: bool = cfg!(target_os = "macos");
+/// `launch_app` arguments a scoped batch may pass: the bundle id and options
+/// that cannot select another program.
+const LAUNCH_KEYS: &[&str] = &[
+    "bundle_id",
+    "urls",
+    "creates_new_application_instance",
+    "additional_arguments",
+    "session",
+];
 /// Tools that always bring a window forward.
 const FOREGROUND_TOOLS: &[&str] = &["bring_to_front", "activate_app"];
 
@@ -94,39 +105,45 @@ pub trait ScopeFacts: Send + Sync {
     async fn window_of(&self, pid: i64, window_id: u64) -> bool;
 }
 
-/// A parsed `scope` argument plus the verdicts it cached during one call.
+/// A parsed `app_scope` argument plus the verdicts it cached during one call.
+/// (pid, start time, attested executable).
+type ProcessKey = (i64, u64, Option<String>);
+
 #[derive(Debug)]
 pub struct BatchScope {
     apps: Vec<AppIdentity>,
     raw_apps: Vec<String>,
     delivery: ScopeDelivery,
-    /// (pid, start time) -> whether that process is one of the scoped apps.
-    processes: Mutex<HashMap<(i64, Option<u64>), bool>>,
-    /// (pid, start time, window id) confirmed to be a window of that process.
-    windows: Mutex<HashSet<(i64, Option<u64>, u64)>>,
+    /// Whether a process instance is one of the scoped apps, keyed by what
+    /// the OS attests for it: pid, start time and executable. A process the
+    /// OS gives no start time for is never cached, and an `exec` into
+    /// another executable is a new key.
+    processes: Mutex<HashMap<ProcessKey, bool>>,
+    /// Windows confirmed to belong to a cached process instance.
+    windows: Mutex<HashSet<(ProcessKey, u64)>>,
 }
 
 impl BatchScope {
-    /// Parse a `scope` argument. `None` and `null` mean no scope.
+    /// Parse an `app_scope` argument. `None` and `null` mean no scope.
     pub fn parse(value: Option<&Value>) -> Result<Option<Arc<Self>>, String> {
         let object = match value {
             None | Some(Value::Null) => return Ok(None),
             Some(Value::Object(object)) => object,
-            Some(_) => return Err("`scope` must be an object {apps, delivery?}".into()),
+            Some(_) => return Err("`app_scope` must be an object {apps, delivery?}".into()),
         };
         if let Some(key) = object
             .keys()
             .find(|key| !matches!(key.as_str(), "apps" | "delivery"))
         {
-            return Err(format!("`scope` has unknown field `{key}`"));
+            return Err(format!("`app_scope` has unknown field `{key}`"));
         }
         let raw = object
             .get("apps")
             .and_then(Value::as_array)
-            .ok_or("`scope.apps` must be a non-empty array of app identities")?;
+            .ok_or("`app_scope.apps` must be a non-empty array of app identities")?;
         if raw.is_empty() || raw.len() > MAX_SCOPE_APPS {
             return Err(format!(
-                "`scope.apps` must hold 1 to {MAX_SCOPE_APPS} app identities, got {}",
+                "`app_scope.apps` must hold 1 to {MAX_SCOPE_APPS} app identities, got {}",
                 raw.len()
             ));
         }
@@ -135,7 +152,7 @@ impl BatchScope {
         for entry in raw {
             let text = entry
                 .as_str()
-                .ok_or("each `scope.apps` entry must be a string")?;
+                .ok_or("each `app_scope.apps` entry must be a string")?;
             let identity = parse_identity(text)?;
             if !apps.contains(&identity) {
                 apps.push(identity);
@@ -147,7 +164,7 @@ impl BatchScope {
             Some(Value::String(mode)) if mode == "background" => ScopeDelivery::Background,
             Some(Value::String(mode)) if mode == "foreground" => ScopeDelivery::Foreground,
             Some(_) => {
-                return Err("`scope.delivery` must be \"background\" or \"foreground\"".into())
+                return Err("`app_scope.delivery` must be \"background\" or \"foreground\"".into())
             }
         };
         Ok(Some(Arc::new(Self {
@@ -223,18 +240,24 @@ impl BatchScope {
                 format!("{tool} names no window, so it would act on or read the whole desktop; in a scoped batch pass the pid and window_id of a window of {}", self.apps_text()),
             ));
         };
+        // Read fresh on every call: a cached verdict is reused only for the
+        // same attested process instance and executable.
         let process = facts.process(pid).await;
-        let start_time = process.as_ref().and_then(|facts| facts.start_time);
-        let cached = self
-            .processes
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .get(&(pid, start_time))
-            .copied();
+        let executable = process.as_ref().and_then(|facts| facts.executable.clone());
+        let key: Option<ProcessKey> = process
+            .as_ref()
+            .and_then(|facts| facts.start_time)
+            .map(|start_time| (pid, start_time, executable.clone()));
+        let cached = key.as_ref().and_then(|key| {
+            self.processes
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .get(key)
+                .copied()
+        });
         let in_scope = match cached {
             Some(verdict) => verdict,
             None => {
-                let executable = process.as_ref().and_then(|facts| facts.executable.clone());
                 let needs_bundle = self
                     .apps
                     .iter()
@@ -245,10 +268,12 @@ impl BatchScope {
                     None
                 };
                 let verdict = self.matches(bundle.as_deref(), executable.as_deref());
-                self.processes
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .insert((pid, start_time), verdict);
+                if let Some(key) = &key {
+                    self.processes
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .insert(key.clone(), verdict);
+                }
                 verdict
             }
         };
@@ -262,12 +287,13 @@ impl BatchScope {
             ));
         }
         if let Some(window_id) = window_id {
-            let key = (pid, start_time, window_id);
-            let known = self
-                .windows
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .contains(&key);
+            let window_key = key.clone().map(|key| (key, window_id));
+            let known = window_key.as_ref().is_some_and(|window_key| {
+                self.windows
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .contains(window_key)
+            });
             if !known {
                 if !facts.window_of(pid, window_id).await {
                     return Err(refusal(
@@ -275,16 +301,43 @@ impl BatchScope {
                         format!("window {window_id} is not a window of pid {pid}"),
                     ));
                 }
-                self.windows
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .insert(key);
+                if let Some(window_key) = window_key {
+                    self.windows
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .insert(window_key);
+                }
             }
         }
         Ok(())
     }
 
     fn check_launch(&self, args: &Value) -> Result<(), Refusal> {
+        let refuse = |message: String| Refusal {
+            code: OUTSIDE_SCOPE,
+            message,
+            tool: "launch_app".to_owned(),
+            pid: None,
+            window_id: None,
+        };
+        // Only macOS launches by bundle id alone (LaunchServices resolves it
+        // to that bundle). Windows lets path/launch_path/aumid/name override
+        // it and Linux ignores it, so a scoped batch cannot prove what would
+        // start there: the host launches the app before the batch.
+        if !LAUNCH_BY_BUNDLE_ID {
+            return Err(refuse(
+                "a scoped batch cannot launch apps on this platform; launch the app before the batch".to_owned(),
+            ));
+        }
+        if let Some(key) = args.as_object().and_then(|object| {
+            object
+                .keys()
+                .find(|key| !LAUNCH_KEYS.contains(&key.as_str()))
+        }) {
+            return Err(refuse(format!(
+                "a scoped batch launches by bundle_id only; `{key}` is not allowed"
+            )));
+        }
         let bundle = args.get("bundle_id").and_then(Value::as_str);
         if bundle.is_some_and(|bundle| {
             self.apps
@@ -325,7 +378,7 @@ impl BatchScope {
 fn parse_identity(text: &str) -> Result<AppIdentity, String> {
     if text.trim() != text || text.is_empty() {
         return Err(format!(
-            "`scope.apps` entry {text:?} must be a bundle id or an executable path without surrounding spaces"
+            "`app_scope.apps` entry {text:?} must be a bundle id or an executable path without surrounding spaces"
         ));
     }
     if crate::session_manifest::is_windows_path_identity(text) {
@@ -333,7 +386,7 @@ fn parse_identity(text: &str) -> Result<AppIdentity, String> {
             .map(|_| AppIdentity::WindowsExecutable(text.to_owned()))
             .ok_or_else(|| {
                 format!(
-                    "`scope.apps` entry {text:?} is not a usable absolute Windows executable path"
+                    "`app_scope.apps` entry {text:?} is not a usable absolute Windows executable path"
                 )
             });
     }
@@ -347,13 +400,13 @@ fn parse_identity(text: &str) -> Result<AppIdentity, String> {
             Ok(AppIdentity::PosixExecutable(text.to_owned()))
         } else {
             Err(format!(
-                "`scope.apps` entry {text:?} must be a canonical absolute executable path"
+                "`app_scope.apps` entry {text:?} must be a canonical absolute executable path"
             ))
         };
     }
     if text.contains(['/', '\\']) || text.chars().any(char::is_whitespace) {
         return Err(format!(
-            "`scope.apps` entry {text:?} is neither a bundle id nor an absolute executable path"
+            "`app_scope.apps` entry {text:?} is neither a bundle id nor an absolute executable path"
         ));
     }
     Ok(AppIdentity::Bundle(text.to_owned()))
@@ -394,12 +447,12 @@ impl Refusal {
     }
 }
 
-/// JSON schema of the `scope` argument, shared by `run_steps` and
+/// JSON schema of the `app_scope` argument, shared by `run_steps` and
 /// `run_script`.
 pub fn input_schema() -> Value {
     json!({
         "type": "object",
-        "description": "Optional limit the driver enforces on every call the batch makes, including the reads it makes to find a target. A call whose pid is not one of `apps`, whose window_id is not a window of that pid, or that names no window is refused with effect \"refused\" and code \"outside_scope\"; with delivery \"background\" (the default), a call that needs the foreground or the whole desktop (bring_to_front, delivery_mode \"foreground\", keys or pointer without a pid) is refused with code \"foreground_not_allowed\". Nothing is sent for a refused call, and the batch stops there like at any other failure. list_apps and list_windows stay available; launch_app is allowed only for a scoped bundle_id.",
+        "description": "Optional limit the driver enforces on every call the batch makes, including the reads it makes to find a target. A call whose pid is not one of `apps`, whose window_id is not a window of that pid, or that names no window is refused with effect \"refused\" and code \"outside_scope\"; with delivery \"background\" (the default), a call that needs the foreground or the whole desktop (bring_to_front, delivery_mode \"foreground\", keys or pointer without a pid) is refused with code \"foreground_not_allowed\". Nothing is sent for a refused call, and the batch stops there like at any other failure. list_apps and list_windows stay available; launch_app is allowed only on macOS, by a scoped bundle_id alone.",
         "required": ["apps"],
         "properties": {
             "apps": {

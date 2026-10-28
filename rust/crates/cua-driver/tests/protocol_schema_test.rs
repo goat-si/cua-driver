@@ -298,7 +298,7 @@ fn assert_tools_list_schema_shape(mut d: RawDriver) {
     // clients choose one typed window or desktop target on each action.
     let capture_scope = &properties("start_session")["capture_scope"];
     // A host detects driver-enforced batch scopes from tools/list: both batch
-    // tools advertise the same optional `scope` object with these refusal
+    // tools advertise the same optional `app_scope` object with these refusal
     // semantics (see batch_scope.rs).
     for batch in ["run_steps", "run_script"] {
         let Some(tool) = tools.iter().find(|tool| tool["name"] == batch) else {
@@ -306,39 +306,39 @@ fn assert_tools_list_schema_shape(mut d: RawDriver) {
             continue;
         };
         let schema = &tool["inputSchema"];
-        let scope = &schema["properties"]["scope"];
-        assert_eq!(scope["type"], "object", "{batch}.scope: {scope:?}");
+        let scope = &schema["properties"]["app_scope"];
+        assert_eq!(scope["type"], "object", "{batch}.app_scope: {scope:?}");
         assert_eq!(
             scope["required"],
             serde_json::json!(["apps"]),
-            "{batch}.scope"
+            "{batch}.app_scope"
         );
-        assert_eq!(scope["additionalProperties"], false, "{batch}.scope");
+        assert_eq!(scope["additionalProperties"], false, "{batch}.app_scope");
         assert_eq!(
             scope["properties"]["apps"]["type"], "array",
-            "{batch}.scope.apps"
+            "{batch}.app_scope.apps"
         );
         assert_eq!(
             scope["properties"]["apps"]["items"]["type"], "string",
-            "{batch}.scope.apps"
+            "{batch}.app_scope.apps"
         );
         assert_eq!(
             scope["properties"]["delivery"]["enum"],
             serde_json::json!(["background", "foreground"]),
-            "{batch}.scope.delivery"
+            "{batch}.app_scope.delivery"
         );
         let description = scope["description"].as_str().unwrap_or_default();
         for code in ["outside_scope", "foreground_not_allowed"] {
             assert!(
                 description.contains(code),
-                "{batch}.scope should name {code}"
+                "{batch}.app_scope should name {code}"
             );
         }
         assert!(
             !schema["required"]
                 .as_array()
-                .is_some_and(|required| required.contains(&serde_json::json!("scope"))),
-            "{batch}.scope must stay optional"
+                .is_some_and(|required| required.contains(&serde_json::json!("app_scope"))),
+            "{batch}.app_scope must stay optional"
         );
     }
     for expected in ["auto", "window", "desktop"] {

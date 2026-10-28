@@ -73,6 +73,10 @@ fn scope(value: Value) -> Arc<BatchScope> {
     BatchScope::parse(Some(&value)).unwrap().unwrap()
 }
 
+fn scope_of(value: Value) -> Arc<BatchScope> {
+    scope(value)
+}
+
 async fn check(scope: &BatchScope, tool: &str, args: Value, facts: &Facts) -> Result<(), Refusal> {
     let read_only = matches!(
         tool,
@@ -341,28 +345,94 @@ async fn verdicts_are_cached_per_process_instance() {
 }
 
 #[tokio::test]
-async fn launch_is_allowed_only_for_a_scoped_bundle_id() {
+async fn a_cached_verdict_never_outlives_the_attested_executable() {
+    let mut facts = notes_and_mail();
+    let scope = scope(json!({"apps": ["com.example.notes"]}));
+    check(&scope, "click", json!({"pid": 42, "window_id": 7}), &facts)
+        .await
+        .unwrap();
+    // Same pid and start time, but the process exec'd another executable.
+    facts.processes.insert(
+        42,
+        ProcessFacts {
+            start_time: Some(1),
+            executable: Some("/usr/bin/osascript".into()),
+        },
+    );
+    facts.bundles.remove(&42);
+    assert_eq!(
+        check(&scope, "click", json!({"pid": 42, "window_id": 7}), &facts)
+            .await
+            .unwrap_err()
+            .code,
+        OUTSIDE_SCOPE
+    );
+
+    // Without a start time nothing is cached: every call looks again.
+    let mut facts = notes_and_mail();
+    facts.processes.insert(
+        42,
+        ProcessFacts {
+            start_time: None,
+            executable: None,
+        },
+    );
+    let scope = scope_of(json!({"apps": ["com.example.notes"]}));
+    for _ in 0..2 {
+        check(&scope, "click", json!({"pid": 42, "window_id": 7}), &facts)
+            .await
+            .unwrap();
+    }
+    assert_eq!(
+        *facts.lookups.lock().unwrap(),
+        vec!["bundle 42", "window 42/7", "bundle 42", "window 42/7"]
+    );
+    facts.bundles.insert(42, "com.example.mail".into());
+    assert_eq!(
+        check(&scope, "click", json!({"pid": 42, "window_id": 7}), &facts)
+            .await
+            .unwrap_err()
+            .code,
+        OUTSIDE_SCOPE
+    );
+}
+
+#[tokio::test]
+async fn launch_is_allowed_only_by_a_scoped_bundle_id_alone_on_macos() {
     let facts = notes_and_mail();
     let scope = scope(json!({"apps": ["com.example.notes", "/usr/bin/gedit"]}));
-    check(
+    let allowed = check(
         &scope,
         "launch_app",
-        json!({"bundle_id": "com.example.notes"}),
+        json!({"bundle_id": "com.example.notes", "urls": ["/tmp/a.txt"], "creates_new_application_instance": true}),
         &facts,
     )
-    .await
-    .unwrap();
+    .await;
+    if LAUNCH_BY_BUNDLE_ID {
+        allowed.unwrap();
+    } else {
+        // Windows and Linux launch_app can pick another program than the
+        // bundle id names, so a scoped batch cannot launch there.
+        assert_eq!(allowed.unwrap_err().code, OUTSIDE_SCOPE);
+    }
     for args in [
         json!({"bundle_id": "com.example.mail"}),
         json!({"name": "Notes"}),
         json!({"bundle_id": "/usr/bin/gedit"}),
+        // A scoped bundle id next to a selector that could start another program.
+        json!({"bundle_id": "com.example.notes", "name": "Mail"}),
+        json!({"bundle_id": "com.example.notes", "path": r"C:\Windows\notepad.exe"}),
+        json!({"bundle_id": "com.example.notes", "launch_path": "/Applications/Mail.app"}),
+        json!({"bundle_id": "com.example.notes", "aumid": "Mail_8wekyb3d8bbwe!App"}),
+        json!({"bundle_id": "com.example.notes", "webkit_inspector_port": 9222}),
     ] {
         assert_eq!(
-            check(&scope, "launch_app", args, &facts)
+            check(&scope, "launch_app", args.clone(), &facts)
                 .await
                 .unwrap_err()
                 .code,
-            OUTSIDE_SCOPE
+            OUTSIDE_SCOPE,
+            "{args}"
         );
     }
 }
@@ -394,8 +464,8 @@ fn a_refusal_is_an_error_result_with_effect_refused_and_a_stable_code() {
 type Calls = Arc<Mutex<Vec<(String, Value)>>>;
 
 /// Fake apps: Notes (pid 42, window 7, button "Save") and Mail (pid 99,
-/// window 9, button "Send"). Actions answer \`effect: unverifiable\`; an
-/// action asked to \`need_foreground\` refuses background delivery the way
+/// window 9, button "Send"). Actions answer `effect: unverifiable`; an
+/// action asked to `need_foreground` refuses background delivery the way
 /// Electron targets do.
 struct Fake {
     def: ToolDef,
@@ -524,7 +594,7 @@ impl Harness {
         (result, structured)
     }
 
-    /// Calls of \`tool\` that reached the fake, with their pid.
+    /// Calls of `tool` that reached the fake, with their pid.
     fn sent(&self, tool: &str) -> Vec<Value> {
         self.calls
             .lock()
@@ -557,7 +627,7 @@ async fn run_steps_refuses_a_step_outside_the_scope_and_stops_there() {
         .run(
             "run_steps",
             json!({
-                "scope": {"apps": [NOTES_ONLY]},
+                "app_scope": {"apps": [NOTES_ONLY]},
                 "steps": [
                     {"click": {"pid": 42, "window_id": 7, "element_token": "s00000001:1"}},
                     {"click": {"pid": 99, "window_id": 9, "element_token": "s00000002:1"}},
@@ -570,7 +640,7 @@ async fn run_steps_refuses_a_step_outside_the_scope_and_stops_there() {
     assert_eq!(out["failed_step"], 1);
     assert_eq!(out["executed"], 2);
     assert_eq!(
-        out["scope"],
+        out["app_scope"],
         json!({"apps": [NOTES_ONLY], "delivery": "background"})
     );
     assert_eq!(out["steps"][0]["effect"], "unverifiable");
@@ -589,7 +659,7 @@ async fn run_steps_refuses_a_lookup_in_a_window_outside_the_scope() {
         .run(
             "run_steps",
             json!({
-                "scope": {"apps": [NOTES_ONLY]},
+                "app_scope": {"apps": [NOTES_ONLY]},
                 "steps": [{"click": {"app": "Mail", "role": "button", "name": "Send"}}]
             }),
         )
@@ -614,7 +684,7 @@ async fn run_steps_background_scope_refuses_foreground_steps_and_the_foreground_
         .run(
             "run_steps",
             json!({
-                "scope": {"apps": [NOTES_ONLY]},
+                "app_scope": {"apps": [NOTES_ONLY]},
                 "steps": [{"click": {"pid": 42, "window_id": 7, "element_token": "s00000001:1", "delivery_mode": "foreground"}}]
             }),
         )
@@ -629,7 +699,7 @@ async fn run_steps_background_scope_refuses_foreground_steps_and_the_foreground_
         .run(
             "run_steps",
             json!({
-                "scope": {"apps": [NOTES_ONLY]},
+                "app_scope": {"apps": [NOTES_ONLY]},
                 "foreground_fallback": true,
                 "steps": [{"click": {"pid": 42, "window_id": 7, "element_token": "s00000001:1", "need_foreground": true}}]
             }),
@@ -646,7 +716,7 @@ async fn run_steps_background_scope_refuses_foreground_steps_and_the_foreground_
     let (_, out) = harness
         .run(
             "run_steps",
-            json!({"scope": {"apps": [NOTES_ONLY]}, "steps": [{"press_key": {"key": "return"}}]}),
+            json!({"app_scope": {"apps": [NOTES_ONLY]}, "steps": [{"press_key": {"key": "return"}}]}),
         )
         .await;
     assert_eq!(out["steps"][0]["code"], FOREGROUND_NOT_ALLOWED, "{out}");
@@ -663,13 +733,13 @@ async fn run_steps_without_scope_is_unchanged_and_a_bad_scope_runs_nothing() {
         )
         .await;
     assert_ne!(result.is_error, Some(true), "{}", text(&result));
-    assert!(out.get("scope").is_none());
+    assert!(out.get("app_scope").is_none());
     assert_eq!(harness.sent("click").len(), 1);
 
     let (result, out) = harness
         .run(
             "run_steps",
-            json!({"scope": {"apps": []}, "steps": [{"click": {"pid": 42, "window_id": 7}}]}),
+            json!({"app_scope": {"apps": []}, "steps": [{"click": {"pid": 42, "window_id": 7}}]}),
         )
         .await;
     assert_eq!(result.is_error, Some(true));
@@ -684,14 +754,14 @@ async fn run_script_refuses_calls_outside_the_scope_and_journals_every_effect() 
         .run(
             "run_script",
             json!({
-                "scope": {"apps": [NOTES_ONLY]},
+                "app_scope": {"apps": [NOTES_ONLY]},
                 "script": "const notes = await cua.getApp({pid: 42, windowId: 7});\nawait notes.click({role: 'button', name: 'Save'});\nconst mail = await cua.getApp('Mail');\nawait mail.click([10, 10]);\nreturn 1;"
             }),
         )
         .await;
     assert_eq!(result.is_error, Some(true), "{}", text(&result));
     assert_eq!(out["error"]["code"], OUTSIDE_SCOPE, "{out}");
-    assert_eq!(out["scope"]["apps"], json!([NOTES_ONLY]));
+    assert_eq!(out["app_scope"]["apps"], json!([NOTES_ONLY]));
     let calls = out["calls"].as_array().unwrap();
     let save = calls
         .iter()
@@ -726,7 +796,7 @@ async fn run_script_scope_refusals_carry_their_code_to_the_script_and_block_the_
         .run(
             "run_script",
             json!({
-                "scope": {"apps": [NOTES_ONLY]},
+                "app_scope": {"apps": [NOTES_ONLY]},
                 "script": "const codes = [];\nfor (const call of [() => cua.call('press_key', {key: 'return'}), () => cua.call('launch_app', {bundle_id: 'com.example.mail'}), async () => (await cua.getApp('Mail')).query({role: 'button'})]) {\n  try { await call(); codes.push('sent'); } catch (error) { codes.push(error.code); }\n}\nreturn codes;"
             }),
         )
@@ -772,12 +842,12 @@ async fn run_script_records_effects_without_a_scope_and_rejects_a_bad_one() {
         .unwrap();
     assert_eq!(click["effect"], "unverifiable");
     assert_eq!(click["tool"], "click");
-    assert!(out.get("scope").is_none());
+    assert!(out.get("app_scope").is_none());
 
     let (result, out) = harness
         .run(
             "run_script",
-            json!({"script": "return 1;", "scope": {"apps": ["com.example.notes"], "delivery": "sometimes"}}),
+            json!({"script": "return 1;", "app_scope": {"apps": ["com.example.notes"], "delivery": "sometimes"}}),
         )
         .await;
     assert_eq!(result.is_error, Some(true));
@@ -790,7 +860,7 @@ fn run_steps_and_run_script_advertise_scope_in_their_input_schemas() {
     for tool in ["run_steps", "run_script"] {
         let def = harness.registry.get_def(tool).unwrap();
         assert_eq!(
-            def.input_schema["properties"]["scope"],
+            def.input_schema["properties"]["app_scope"],
             input_schema(),
             "{tool}"
         );
@@ -798,8 +868,8 @@ fn run_steps_and_run_script_advertise_scope_in_their_input_schemas() {
             !def.input_schema["required"]
                 .as_array()
                 .unwrap()
-                .contains(&json!("scope")),
-            "{tool}: scope is optional"
+                .contains(&json!("app_scope")),
+            "{tool}: app_scope is optional"
         );
     }
     let schema = input_schema();
@@ -809,4 +879,93 @@ fn run_steps_and_run_script_advertise_scope_in_their_input_schemas() {
         schema["properties"]["delivery"]["enum"],
         json!(["background", "foreground"])
     );
+}
+
+#[tokio::test]
+async fn a_gone_check_on_a_refused_window_fails_the_step_instead_of_passing() {
+    let harness = Harness::new();
+    let (result, out) = harness
+        .run(
+            "run_steps",
+            json!({
+                "app_scope": {"apps": [NOTES_ONLY]},
+                "steps": [
+                    {"expect": [{"app": "Mail", "text": "Inbox", "gone": true, "timeout_ms": 0}]},
+                    {"press_key": {"pid": 42, "window_id": 7, "key": "a"}}
+                ]
+            }),
+        )
+        .await;
+    assert_eq!(result.is_error, Some(true), "{}", text(&result));
+    assert_eq!(out["failed_step"], 0, "{out}");
+    assert_eq!(out["steps"][0]["code"], OUTSIDE_SCOPE);
+    assert_eq!(out["steps"][0]["effect"], "refused");
+    assert!(harness.sent("press_key").is_empty(), "the batch stopped");
+
+    let (result, out) = harness
+        .run(
+            "run_script",
+            json!({
+                "app_scope": {"apps": [NOTES_ONLY]},
+                "script": "const mail = await cua.getApp('Mail');\nawait mail.waitFor({text: 'Inbox', gone: true, timeout_ms: 0});\nawait cua.call('press_key', {pid: 42, window_id: 7, key: 'a'});\nreturn 1;"
+            }),
+        )
+        .await;
+    assert_eq!(result.is_error, Some(true), "{}", text(&result));
+    assert_eq!(out["error"]["code"], OUTSIDE_SCOPE, "{out}");
+    assert!(harness.sent("press_key").is_empty());
+}
+
+#[tokio::test]
+async fn the_script_journal_lists_every_driver_call_of_each_op() {
+    let harness = Harness::new();
+    let (result, out) = harness
+        .run(
+            "run_script",
+            json!({"script": "const app = await cua.getApp('Notes');\nawait app.click({role: 'button', name: 'Save'});\nreturn 1;"}),
+        )
+        .await;
+    assert_ne!(result.is_error, Some(true), "{}", text(&result));
+    let calls = out["calls"].as_array().unwrap();
+    let get_app = calls.iter().find(|call| call["op"] == "get_app").unwrap();
+    assert_eq!(get_app["tool"], "list_windows", "{get_app}");
+    let click = calls.iter().find(|call| call["op"] == "click").unwrap();
+    let tools: Vec<&str> = click["driver_calls"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|call| call["tool"].as_str().unwrap())
+        .collect();
+    assert_eq!(tools.last(), Some(&"click"), "{click}");
+    assert!(tools.contains(&"get_window_state"), "{click}");
+    let last = click["driver_calls"]
+        .as_array()
+        .unwrap()
+        .last()
+        .unwrap()
+        .clone();
+    assert_eq!(last["effect"], "unverifiable");
+    assert_eq!(
+        (last["pid"].clone(), last["window_id"].clone()),
+        (json!(42), json!(7))
+    );
+}
+
+#[test]
+fn the_batch_scope_argument_keeps_to_the_shared_schema_canon() {
+    // `scope` is the shared window/desktop action argument, so the batch
+    // argument has its own name.
+    let harness = Harness::new();
+    for tool in ["run_steps", "run_script"] {
+        let def = harness.registry.get_def(tool).unwrap();
+        assert!(
+            def.input_schema["properties"].get("scope").is_none(),
+            "{tool}"
+        );
+        assert_eq!(
+            crate::tool_schema::shared_schema_violations(tool, &def.input_schema),
+            Vec::<String>::new(),
+            "{tool}"
+        );
+    }
 }

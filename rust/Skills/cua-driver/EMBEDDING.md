@@ -265,13 +265,13 @@ with `0`.
 ### App scope for run_steps and run_script
 
 A host that limits a turn to some apps cannot see inside a batch or a script
-before it runs. It passes `scope` on `run_steps` or `run_script` instead, and
+before it runs. It passes `app_scope` on `run_steps` or `run_script` instead, and
 the driver checks every call the batch or script dispatches against it,
 including the reads it makes to find a target by name, the menu-bar reroute and
 a `foreground_fallback` retry:
 
 ```json
-{"scope": {"apps": ["com.apple.calculator"], "delivery": "background"}}
+{"app_scope": {"apps": ["com.apple.calculator"], "delivery": "background"}}
 ```
 
 - `apps` (required, 1 to 32 strings) uses the capability manifest's identity
@@ -288,8 +288,13 @@ a `foreground_fallback` retry:
   With `"background"`, `bring_to_front`, `delivery_mode:"foreground"` and
   input that names no pid (global keys, screen points, the desktop pointer)
   are refused with code `foreground_not_allowed`. `list_apps` and
-  `list_windows` stay available; `launch_app` is allowed only with a scoped
-  `bundle_id`.
+  `list_windows` stay available. `launch_app` is allowed only on macOS, with
+  a scoped `bundle_id` and no other program selector (`name`, `path`, ...);
+  on Windows and Linux `launch_app` can start another program than a bundle
+  id names, so launch the app before the batch there.
+- A step or script call that needed a read the scope refused fails with that
+  code even if it would otherwise have passed (a `gone:true` check never
+  counts a refused window as gone).
 - A refused call sends nothing. Its result is an error whose
   `structuredContent` has `effect: "refused"`, `code`, `refusal: {code,
   message}`, `error: {code, hint}`, `tool`, `pid` and `window_id`. The batch
@@ -297,9 +302,9 @@ a `foreground_fallback` retry:
   `code` (it may catch it, and every later call is checked again).
 - The scope lives for the one `run_steps` or `run_script` call. It travels as
   a task-local of that call, never as a step argument, so no step or script
-  can change it. Results echo it as `scope`.
-- Support is visible in `tools/list`: both tools advertise `scope` in their
-  input schema. Without `scope` nothing changes.
+  can change it. Results echo it as `app_scope`.
+- Support is visible in `tools/list`: both tools advertise `app_scope` in their
+  input schema. Without `app_scope` nothing changes.
 
 ### Steps inside `run_steps` and `run_script` (macOS)
 

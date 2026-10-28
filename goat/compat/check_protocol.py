@@ -509,9 +509,13 @@ def added_optional_properties(old, new):
     """Top-level input properties new adds to old when that is the only change, else [].
 
     A new optional argument cannot break a caller that never sends it: every call GOAT makes
-    today is still valid. Anything else (a changed or removed property, a new required one, a
+    today is still valid. That holds only when the old schema refused unknown arguments
+    (additionalProperties false): against a permissive schema a caller may already send the new
+    name with another shape. Anything else (a changed or removed property, a new required one, a
     different additionalProperties) still counts as a changed input schema."""
     if not isinstance(old, dict) or not isinstance(new, dict):
+        return []
+    if old.get("additionalProperties") is not False:
         return []
     old_properties, new_properties = old.get("properties") or {}, new.get("properties") or {}
     added = sorted(set(new_properties) - set(old_properties))

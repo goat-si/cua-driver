@@ -61,6 +61,8 @@ const THREAD_STACK_BYTES: usize = 16 * 1024 * 1024;
 const RETURN_TEXT_LIMIT: usize = 8_000;
 const CALL_TEXT_LIMIT: usize = 12_000;
 const IMAGES_KEPT: usize = 2;
+/// Most driver calls one script op lists in the call log (the last ones).
+const MAX_DRIVER_CALLS_PER_OP: usize = 20;
 /// Extra time the engine thread gets to notice a deadline or cancel.
 const SHUTDOWN_GRACE: Duration = Duration::from_millis(1_500);
 
@@ -189,7 +191,7 @@ impl Tool for RunScriptTool {
                 launch_app, list_apps, list_windows, get_window_state, verify_state, zoom.\n\
                 A failed driver call throws a CuaError (catch it to recover). Every call goes \
                 through the same session, permission and approval checks as a direct call. \
-                With `scope` ({apps, delivery?}) the driver also refuses every call outside \
+                With `app_scope` ({apps, delivery?}) the driver also refuses every call outside \
                 those apps' windows (error.code outside_scope) or needing the foreground \
                 (foreground_not_allowed); nothing is sent for it.\n\n\
                 Limits: `timeout_ms` wall time (default 30000, max 120000), `max_calls` driver \
@@ -225,7 +227,7 @@ impl Tool for RunScriptTool {
                         "maximum": MAX_MAX_CALLS,
                         "description": "Most driver calls the script may make. Default 100."
                     },
-                    "scope": crate::batch_scope::input_schema()
+                    "app_scope": crate::batch_scope::input_schema()
                 },
                 "additionalProperties": false
             }),
@@ -274,7 +276,7 @@ impl Request {
             !key.starts_with('_')
                 && !matches!(
                     key.as_str(),
-                    "script" | "timeout_ms" | "max_calls" | "session" | "scope"
+                    "script" | "timeout_ms" | "max_calls" | "session" | "app_scope"
                 )
         }) {
             return Err(format!("unknown field `{key}`"));
@@ -312,7 +314,7 @@ impl Request {
                 .get("_public_session_label")
                 .and_then(Value::as_str)
                 .map(str::to_owned),
-            scope: crate::batch_scope::BatchScope::parse(object.get("scope"))?,
+            scope: crate::batch_scope::BatchScope::parse(object.get("app_scope"))?,
         })
     }
 }
@@ -338,6 +340,10 @@ struct CallRecord {
     /// What the driver call behind this op reported, as a direct call
     /// would: the tool it ran, its target, `effect` and `code`.
     facts: CallFacts,
+    /// Every driver call the op made, in order (lookups included).
+    driver_calls: Vec<Value>,
+    /// Earlier driver calls of the op left out of `driver_calls`.
+    driver_calls_omitted: usize,
 }
 
 /// The driver tool a script op ran last, its target, and what it returned.
@@ -386,18 +392,44 @@ async fn run(registry: &ToolRegistry, request: Request) -> ToolResult {
                 let call_started = Instant::now();
                 api.last = None;
                 api.locator.take_scope_refusal();
+                api.locator.take_journal();
                 let mut result = match tokio::time::timeout_at(deadline.into(), api.dispatch(&call.op, call.args)).await {
                     Ok(result) => result,
                     Err(_) => Err(HostError::new("the script's wall-time limit was reached", "timeout")),
                 };
                 let mut facts = api.last.take().unwrap_or_default();
-                // A lookup the scope refused fails the op with the scope's
-                // code, as a refused action does.
-                if let (Some(code), Err(error)) = (api.locator.take_scope_refusal(), &mut result) {
+                // Every driver call this op made, lookups included.
+                // A polling wait can make dozens of reads: keep the last ones.
+                let mut driver_calls = api.locator.take_journal();
+                let driver_calls_omitted = driver_calls.len().saturating_sub(MAX_DRIVER_CALLS_PER_OP);
+                driver_calls.drain(..driver_calls_omitted);
+                if facts.tool.is_none() {
+                    if let Some(last) = driver_calls.last() {
+                        let text = |key: &str| last.get(key).and_then(Value::as_str).map(str::to_owned);
+                        facts.tool = text("tool");
+                        facts.pid = last.get("pid").and_then(Value::as_i64);
+                        facts.window_id = last.get("window_id").and_then(Value::as_u64);
+                        facts.effect = text("effect");
+                        facts.code = text("code");
+                    }
+                }
+                // A read the scope refused fails the op with the scope's code,
+                // as a refused action does, even when the op would otherwise
+                // have succeeded (a `gone` wait reads a refused window as
+                // absent): the script never acts on a refused read.
+                if let Some(code) = api.locator.take_scope_refusal() {
+                    match &mut result {
+                        Ok(_) => {
+                            result = Err(HostError::new(
+                                "a read this call needed was refused by the batch scope",
+                                code,
+                            ))
+                        }
+                        Err(error) => error.code = Some(code.to_owned()),
+                    }
+                    facts.code = Some(code.to_owned());
                     if facts.effect.is_none() {
-                        error.code = Some(code.to_owned());
                         facts.effect = Some("refused".to_owned());
-                        facts.code = Some(code.to_owned());
                     }
                 }
                 if let Err(error) = &result {
@@ -417,6 +449,8 @@ async fn run(registry: &ToolRegistry, request: Request) -> ToolResult {
                             Err(error) => error.message.clone(),
                         },
                         facts,
+                        driver_calls,
+                        driver_calls_omitted,
                     });
                 }
                 let _ = call.reply.send(result);
@@ -553,6 +587,12 @@ impl<'a> Api<'a> {
         };
         facts.effect = structured_str("effect");
         facts.code = structured_str("code");
+        self.locator.record(locate::journal_entry(
+            tool,
+            facts.pid,
+            facts.window_id,
+            &result,
+        ));
         self.last = Some(facts);
         let mut text = String::new();
         for content in &result.content {
@@ -840,6 +880,8 @@ fn render(
                 "code": record.facts.code,
                 "pid": record.facts.pid,
                 "window_id": record.facts.window_id,
+                "driver_calls": record.driver_calls,
+                "driver_calls_omitted": (record.driver_calls_omitted > 0).then_some(record.driver_calls_omitted),
                 "ms": record.elapsed.as_millis() as u64,
                 "detail": record.detail,
             })
@@ -855,7 +897,7 @@ fn render(
         "calls": calls_json,
     });
     if let Some(scope) = scope {
-        structured["scope"] = scope.to_json();
+        structured["app_scope"] = scope.to_json();
     }
     let is_error = match &outcome.result {
         Ok(value) => {
