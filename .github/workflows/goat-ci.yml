@@ -21,7 +21,7 @@ on:
     # Skip documentation-only pushes to main. Path filters are not evaluated for tag pushes, so a
     # release tag always runs. Later patterns win: the Markdown re-included below is compiled into the
     # binary (rust/Skills, a crate's doc attribute), packaged into the release archives (LICENSE.md,
-    # THIRD_PARTY_NOTICES.md) or read by the notices check.
+    # THIRD_PARTY_NOTICES.md, the whole wayland-helper directory) or read by the notices check.
     paths:
       - "**"
       - "!**/*.md"
@@ -30,6 +30,7 @@ on:
       - "rust/THIRD_PARTY_NOTICES.md"
       - "rust/Skills/**"
       - "rust/crates/*/README.md"
+      - "wayland-helper/**"
   schedule:
     # 18:17 UTC daily, on the default branch.
     - cron: "17 18 * * *"
