@@ -149,6 +149,40 @@ fn is_toggle_press(ax_action: &str, role: &str, advertised: &[String]) -> bool {
 /// cannot complete means the app did not answer in time, so a short read-back
 /// proves nothing. Neither qualifies; an unresolved error after dispatch is
 /// reported as unverifiable by `unresolved_perform_error`.
+/// How long a changed window title must hold before it counts. A window
+/// that navigated does not flip its title back.
+const WINDOW_TITLE_STABILITY: std::time::Duration = std::time::Duration::from_millis(60);
+
+/// The window an element is in, with its title before the action.
+struct WindowTitleProbe {
+    window: AXUIElementRef,
+    before: String,
+}
+
+impl WindowTitleProbe {
+    /// # Safety
+    ///
+    /// `element` must be a valid, live `AXUIElementRef`.
+    unsafe fn of(element: AXUIElementRef) -> Option<Self> {
+        let window = copy_element_attr(element, "AXWindow")?;
+        let Some(before) = copy_string_attr(window, "AXTitle") else {
+            CFRelease(window as CFTypeRef);
+            return None;
+        };
+        Some(Self { window, before })
+    }
+
+    fn read(&self) -> Option<String> {
+        unsafe { copy_string_attr(self.window, "AXTitle") }
+    }
+}
+
+impl Drop for WindowTitleProbe {
+    fn drop(&mut self) {
+        unsafe { CFRelease(self.window as CFTypeRef) };
+    }
+}
+
 fn press_error_may_have_acted(err: crate::ax::bindings::AXError) -> bool {
     use crate::ax::bindings::{
         kAXErrorActionUnsupported, kAXErrorAttributeUnsupported, kAXErrorFailure,
@@ -1912,6 +1946,12 @@ fn perform_ax_click(
     let toggle_before = is_toggle_press(ax_action, &role, &advertised)
         .then(read_value)
         .flatten();
+    // A press or open that navigates (Finder's sidebar) can retitle the
+    // window while the app still returns an AX error; keep the window to
+    // read that back.
+    let window_before = matches!(ax_action, "AXOpen" | "AXPress")
+        .then(|| unsafe { WindowTitleProbe::of(element) })
+        .flatten();
     drop(preflight);
     if !foreground {
         latency::section(latency::Stage::KeyPrime, || {
@@ -1937,6 +1977,28 @@ fn perform_ax_click(
                         "✅ Performed {ax_action} on [{idx}] {role} \"{title}\"; AXValue is now \
                          {now} (was {before}) on two reads, although the app returned AX error \
                          {err}."
+                    ),
+                    false,
+                    false,
+                    true,
+                    false,
+                ));
+            }
+        }
+        if let Some(probe) = window_before.as_ref().filter(|_| press_error_may_have_acted(err)) {
+            if let Some(now) = settled_value(
+                |now| now != probe.before,
+                || probe.read(),
+                SELECTION_READBACK_TIMEOUT,
+                SELECTION_READBACK_POLL,
+                WINDOW_TITLE_STABILITY,
+            ) {
+                return Ok((
+                    format!(
+                        "✅ Performed {ax_action} on [{idx}] {role} \"{title}\"; the window \
+                         title is now \"{now}\" (was \"{}\") on two reads, although the app \
+                         returned AX error {err}.",
+                        probe.before
                     ),
                     false,
                     false,
