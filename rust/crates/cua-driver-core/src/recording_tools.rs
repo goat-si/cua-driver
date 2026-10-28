@@ -45,63 +45,30 @@ impl Tool for StartRecordingTool {
     fn def(&self) -> &ToolDef {
         START_REC_DEF.get_or_init(|| ToolDef {
             name: "start_recording".into(),
-            description: "Start trajectory recording for the calling session. Each action-tool \
-                invocation (click, right_click, scroll, type_text, press_key, hotkey, \
-                set_value) from that session writes a turn folder under `output_dir`. \
-                Without `session`, every call on the same connection is recorded, \
-                including named-session calls. Other connections and session lifecycle \
-                calls (`start_session` / `end_session`) are not recorded. CLI recordings started with \
-                `cua-driver recording start` are daemon-wide.\n\n\
-                Each turn folder holds:\n\n\
-                - `before_state.json` / `after_state.json` — application AX/UIA/AT-SPI \
-                  state immediately before and after the action.\n\
-                - `before.png` / `after.png` — target-window screenshots immediately \
-                  before and after the action.\n\
-                - `evidence.json` — capture status and a stable classification when an \
-                  expected artifact could not be captured.\n\
-                - `app_state.json` — post-action AX/UIA snapshot for the target pid.\n\
-                - `screenshot.png` — compatibility alias of `after.png`.\n\
-                - `action.json` — tool name, full input arguments, result summary, \
-                  result-error flag, pid, click point (when applicable), ISO-8601 \
-                  timestamp.\n\
-                - `click.png` — for dispatched click-family actions only, `before.png` \
-                  with a red marker at the click point. A call refused before target \
-                  resolution is explicitly not applicable instead.\n\n\
-                The per-turn accessibility walk is bounded like `get_window_state`: \
-                `state_timeout_ms` (default 1000) caps each before/after walk, a walk \
-                that runs out of budget records the PARTIAL tree, and `evidence.json` \
-                carries `truncated`, `truncation_reason`, `nodes_visited`, \
-                `nodes_pending` and `timeout_ms` for that phase. A provider that stops \
-                answering is abandoned after the budget plus a short grace and the \
-                phase is classified `state_capture_timeout`. Actions refused before \
-                dispatch (for example an unknown or expired `capture_id`) skip the \
-                state walk; their state is classified `not_applicable` / \
-                `action_refused_before_dispatch`. Pass `include_accessibility_tree: \
-                false` to record screenshots and actions without state.\n\n\
-                Turn folders are named `turn-00001/`, `turn-00002/`, etc.  Turn \
-                numbering restarts at 1 each time recording is (re-)started.\n\n\
-                **Video is off by default.** Pass `record_video: true` to also \
-                capture the main display to `<output_dir>/recording.mp4` (H.264 / \
-                30 fps) for the lifetime of the session. The recording is torn \
-                down automatically when the MCP client disconnects.\n\n\
-                **macOS uses native ScreenCaptureKit** (daemon-owned SCStream + \
-                SCRecordingOutput) under the daemon's Screen Recording grant, \
-                with no ffmpeg subprocess. Requires macOS 15.0+. On macOS 26 \
-                (Tahoe), the first direct capture can also show a one-time \
-                consent asking to let Cua Driver bypass the system private \
-                window picker and directly access your screen and audio; \
-                choose Allow, or run `cua-driver permissions grant` beforehand \
-                to answer it up front. The recorder captures screen video only \
-                and does not enable system-audio capture.\n\n\
-                **Windows + Linux use an ffmpeg subprocess** (`gdigrab` / \
-                `x11grab` + libx264). Requires ffmpeg on PATH (winget install \
-                Gyan.FFmpeg / apt install ffmpeg); when ffmpeg is missing or \
-                fails on startup the per-turn capture (screenshots + \
-                action.json) still runs and the session's `last_error` field \
-                carries the diagnostic.\n\n\
-                State persists for the life of the daemon; a restart \
-                resets to disabled with no on-disk state. Call `stop_recording` to \
-                disable + finalize the mp4."
+            description: "Start trajectory recording for the calling session (without `session`: every call on this \
+                connection, named sessions included). Each action call (click, right_click, scroll, type_text, \
+                press_key, hotkey, set_value) writes a turn folder `turn-00001/`, `turn-00002/`, ... under \
+                `output_dir`, numbered from 1 on each start: `before_state.json` / `after_state.json` \
+                (AX/UIA/AT-SPI state), `before.png` / `after.png` (window screenshots; `screenshot.png` aliases \
+                `after.png`), `app_state.json`, `action.json` (tool, arguments, result summary, error flag, pid, \
+                click point, ISO-8601 time), `click.png` (click-family only: `before.png` with the click point \
+                marked) and `evidence.json` (capture status, and why an expected artifact is missing). Session \
+                lifecycle calls and other connections are not recorded; `cua-driver recording start` is \
+                daemon-wide.\n\
+                \n\
+                Each state walk is bounded by `state_timeout_ms` (default 1000) and records the PARTIAL tree \
+                when cut (`truncated`, `truncation_reason`, `nodes_visited`, `nodes_pending`, `timeout_ms` in \
+                evidence.json); an unresponsive provider is classified `state_capture_timeout`, and actions \
+                refused before dispatch `not_applicable` / `action_refused_before_dispatch`. \
+                `include_accessibility_tree:false` records no state.\n\
+                \n\
+                Video is off by default. `record_video:true` also records the main display to \
+                `<output_dir>/recording.mp4` (H.264, 30 fps, no audio) until the client disconnects: on macOS \
+                15+ with ScreenCaptureKit under the daemon's Screen Recording grant (macOS 26 may ask once for \
+                direct screen access; `cua-driver permissions grant` answers it ahead), on Windows and Linux \
+                with ffmpeg on PATH (when it is missing or fails, per-turn capture continues and the session's \
+                `last_error` says why). State lasts for the daemon's lifetime; `stop_recording` ends it and \
+                finalizes the video."
                 .into(),
             input_schema: json!({
                 "type": "object",
@@ -233,16 +200,10 @@ impl Tool for StopRecordingTool {
     fn def(&self) -> &ToolDef {
         STOP_REC_DEF.get_or_init(|| ToolDef {
             name: "stop_recording".into(),
-            description: "Stop trajectory recording. Disables further per-turn capture \
-                and, when video was enabled, gracefully terminates the ffmpeg subprocess \
-                so the mp4's moov atom is finalized (the file is playable). Calling \
-                stop on an already-stopped session is a no-op. The response carries \
-                `last_video_path` pointing at the finalized mp4 (when video was on).\n\n\
-                A manual `stop_recording` is **unconditional** — it stops whatever \
-                recording is active regardless of which session started it. \
-                Ownership-scoped teardown (so one client disconnecting can't stop a \
-                recording a later client started) is handled by the registry's \
-                `session_end` lifecycle hook, not by this tool."
+            description: "Stop trajectory recording: per-turn capture stops and an enabled video is finalized (playable); \
+                `last_video_path` names it. Stopping an already-stopped recording is a no-op. This stops \
+                whatever recording is active, whichever session started it; a disconnecting client ends only the \
+                recording it started."
                 .into(),
             input_schema: json!({
                 "type": "object",
@@ -350,23 +311,12 @@ impl Tool for ReplayTrajectoryTool {
             // Description ported from Swift `ReplayTrajectoryTool.swift`
             // with its caveats about element-indexed actions and recording-
             // during-replay semantics.
-            description: "Replay a recorded trajectory by re-invoking every turn's tool call \
-                in lexical order. `dir` must point at a directory previously written by \
-                `start_recording`. Each `turn-NNNNN/` is parsed for `action.json`, and the \
-                recorded tool is called with its recorded `arguments` via the same dispatch \
-                path an MCP / CLI call uses.\n\n\
-                Caveats:\n\
-                - Element-token actions (`click({pid, element_token})` etc.) will fail \
-                  because element tokens are per-snapshot and don't survive across \
-                  sessions. Pixel clicks (`click({pid, x, y})`) and all keyboard tools \
-                  replay cleanly. Failures are reported but don't stop replay unless \
-                  `stop_on_error` is true.\n\
-                - `get_window_state` and other read-only tools are NOT currently recorded, \
-                  so replays do not re-populate the per-(pid, window_id) element cache.\n\
-                - If recording is ENABLED while replay runs, the replay itself is recorded \
-                  into the currently configured output directory.  That's deliberate: \
-                  recording a replay against a new build and diffing the two trajectories \
-                  is the regression-test workflow.".into(),
+            description: "Replay a recorded trajectory: `dir` is a `start_recording` directory, and each \
+                `turn-NNNNN/action.json` tool call is re-invoked in lexical order through the normal dispatch \
+                path. Element-token actions fail (tokens do not survive sessions); pixel clicks and keyboard \
+                tools replay. Failures are reported and stop the replay only with `stop_on_error`. Read-only \
+                tools such as `get_window_state` are not recorded, so no element cache is rebuilt. If recording \
+                is on, the replay is itself recorded, so two builds' trajectories can be diffed.".into(),
             input_schema: json!({
                 "type": "object",
                 "required": ["dir"],

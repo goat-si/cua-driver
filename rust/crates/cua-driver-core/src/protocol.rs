@@ -350,68 +350,29 @@ pub fn initialize_result() -> Value {
 }
 
 /// MCP `instructions` (`InitializeResult.instructions`) sent to every
-/// connecting client. The spec frames this as a "hint... MAY be added
-/// to the system prompt" — eager, every-turn cost. We keep it under
-/// the community-recommended ~200-word ceiling and host the long-form
-/// workflow in `Skills/cua-driver/SKILL.md`.
-///
-/// Templated per-host: the accessibility-tree provider name (AX on
-/// macOS, UIA on Windows, AT-SPI on Linux) is injected so a connecting
-/// agent only sees the path that applies, not all three. Same pattern
-/// Goose uses in its `ComputerController` extension and Open
-/// Interpreter uses for its system message.
+/// connecting client. Some hosts repeat them in front of every tool's
+/// description (Codex code mode does, once per tool), so each byte here costs
+/// about one byte per advertised tool. They are a pointer: the workflow and
+/// rules they used to carry are the `start` topic of `get_guide`, cut from
+/// `Skills/cua-driver/SKILL.md` (sections "Efficient loop" and "Rules"),
+/// which an agent fetches once.
 fn agent_instructions() -> String {
-    // macOS needs no platform pointer: its permission line below names MACOS.md.
-    let (tree_kind, platform_skill_pointer) = if cfg!(target_os = "macos") {
-        ("AX", "")
+    // macOS reaches MACOS.md through get_guide topics; other hosts name their
+    // platform file.
+    let platform_skill_pointer = if cfg!(target_os = "macos") {
+        ""
     } else if cfg!(target_os = "windows") {
-        (
-            "UIA",
-            ", WINDOWS.md (UIA tree, UWP/ApplicationFrameHost hosting, Session 0 isolation)",
-        )
+        ", `WINDOWS.md`"
     } else {
-        (
-            "AT-SPI",
-            ", LINUX.md (X11/Wayland status, AT-SPI bus, BETA-level support)",
-        )
+        ", `LINUX.md`"
     };
-
-    // macOS only: Cua Driver's own TCC prompts have one narrow, owner-gated
-    // exception to "system prompts belong to the user"; the steps and
-    // guardrails live in MACOS.md ("Install and approve permissions").
-    let permission_line = if cfg!(target_os = "macos") {
-        "\n\nmacOS: if `check_permissions` shows Accessibility or Screen Recording off, ask the user; approve Cua Driver's own prompts only if the owner explicitly authorized it (MACOS.md)."
-    } else {
-        ""
-    };
-
-    // Only point at run_script when this driver offers it.
-    #[cfg(feature = "script")]
-    let script_enabled = crate::script_tool::enabled();
-    #[cfg(not(feature = "script"))]
-    let script_enabled = false;
-    let script_line = if script_enabled {
-        " Loops, branches or retries: one `run_script` call."
-    } else {
-        ""
-    };
-
+    let other_topics: Vec<&str> = crate::guide::topic_names()
+        .into_iter()
+        .filter(|topic| !matches!(*topic, "start" | "overview"))
+        .collect();
     format!(
-        r#"cua-driver: background GUI automation. No shell: for non-GUI outcomes use an app API/SDK, CLI or filesystem and read the result back there.
-
-1. `list_windows({{app:"Name"}})` or `launch_app` for `pid` and `window_id`.
-2. Read narrowly: `get_window_state` with `query:"Save"`. Re-read with `since:"latest"`.
-3. Act by `element_token` ({tree_kind}): row `[N]` is `<snapshot_id>:N`. Pixels only for surfaces missing from the tree.
-4. Act through `run_steps({{steps:[{{tool,args}}],observe:{{}}}})`, even for one step: stops at the first failure, returns what changed.{script_line}
-5. Verify at checkpoints, not after every action: `verify_state(pid, window_id, expect)`. `unknown` and `effect:"unverifiable"` are not success.
-
-Use the narrowest semantic route first: `set_window_frame` plus `list_windows` for geometry, typed browser tools for pages. Background: `element_token`, keyboard, pixels; `delivery_mode:"foreground"` (may move the pointer) last.
-
-Chrome/Edge/Brave page: `get_browser_state({{pid, window_id}})`, its `detail.next_call` (`browser_prepare`) if refused, then `browser_click`/`browser_type`/`browser_pointer` (hover, drag); never desktop pointer tools.
-
-`start_session` is optional; repeat a short `session` label on every call that accepts it. On continuation/recent-work, call `history_status`; if ready, make one bounded initial `history_query` before broad discovery.{permission_line}
-
-Guides: `get_guide({{topic}})` (drag, browser, permissions, batching, menus), `skill://cua-driver/SKILL.md`{platform_skill_pointer}."#
+        r#"cua-driver: background GUI automation; no shell. Before the first action call `get_guide({{topic:"start"}})`: targeting by `pid`/`window_id`, narrow reads, `element_token`, `run_steps`, `verify_state` (`unknown` and `unverifiable` are not success), routing and rules. Other topics: {}. Full guide: `skill://cua-driver/SKILL.md`{platform_skill_pointer}."#,
+        other_topics.join(", ")
     )
 }
 
@@ -498,57 +459,35 @@ mod action_record_wire_tests {
 #[cfg(test)]
 mod agent_instruction_tests {
     use super::{agent_instructions, initialize_result};
+    use crate::guide::{guide_for, topic_names, Platform};
 
-    #[test]
-    fn instructions_route_structured_and_visual_verification_to_the_right_owner() {
-        let instructions = agent_instructions();
-        assert!(instructions.contains("verify_state"));
-        assert!(instructions.contains("`unknown` and `effect:\"unverifiable\"` are not success"));
-        assert!(instructions.contains("app API/SDK"));
-        assert!(instructions.contains("read the result back there"));
-        assert!(instructions.contains("narrowest semantic route first"));
-        // cua-driver#22: token, keyboard and pixels come before the
-        // foreground, which may move the user's pointer.
-        let ladder = &instructions[instructions
-            .find("Background: `element_token`")
-            .expect("background ladder")..];
-        let foreground = ladder
-            .find("`delivery_mode:\"foreground\"` (may move the pointer) last")
-            .expect("foreground rung last");
-        assert!(ladder.find("keyboard") < Some(foreground));
-        assert!(ladder.find("pixels") < Some(foreground));
-        assert!(instructions.contains("`set_window_frame` plus `list_windows`"));
-        assert!(instructions.contains("typed browser tools"));
-        assert!(instructions.contains("`get_browser_state({pid, window_id})`"));
-        assert!(instructions.contains("`detail.next_call` (`browser_prepare`)"));
-        assert!(
-            instructions.contains("`browser_pointer` (hover, drag); never desktop pointer tools")
-        );
-        assert!(instructions.contains("No shell"));
-        // The efficient workflow must be front-loaded: targeted read, act by
-        // token, verify at checkpoints.
-        assert!(instructions.contains("`query:\"Save\"`"));
-        assert!(instructions.contains("Act by `element_token`"));
-        assert!(instructions.contains("Verify at checkpoints, not after every action"));
-        assert!(
-            instructions.find("Read narrowly") < instructions.find("Act by `element_token`"),
-            "the targeted read must precede acting"
-        );
-        #[cfg(feature = "script")]
-        if crate::script_tool::enabled() {
-            assert!(instructions.contains("one `run_script` call"));
-        }
-        assert!(
-            instructions.split_whitespace().count() <= 200,
-            "initialize instructions should stay within the documented context budget"
-        );
+    /// Hosts that repeat the instructions per tool pay this budget once per
+    /// tool; keep it a pointer.
+    const INSTRUCTIONS_BYTE_BUDGET: usize = 450;
+
+    fn start_guides() -> Vec<(Platform, String)> {
+        Platform::ALL
+            .into_iter()
+            .map(|platform| (platform, guide_for("start", platform).unwrap().text))
+            .collect()
     }
 
     #[test]
-    fn instructions_point_at_get_guide_and_keep_the_skill_resource() {
-        let instructions = agent_instructions();
-        assert!(instructions.contains("`get_guide({topic})`"));
-        for topic in crate::guide::topic_names()
+    fn instructions_are_a_short_pointer_to_the_start_guide() {
+        let instructions = initialize_result()["instructions"]
+            .as_str()
+            .expect("initialize result should carry agent instructions")
+            .to_owned();
+        assert_eq!(instructions, agent_instructions());
+        assert!(
+            instructions.len() <= INSTRUCTIONS_BYTE_BUDGET,
+            "{} bytes: {instructions}",
+            instructions.len()
+        );
+        assert!(instructions.contains("background GUI automation; no shell"));
+        assert!(instructions.contains("`get_guide({topic:\"start\"})`"));
+        assert!(instructions.contains("`unknown` and `unverifiable` are not success"));
+        for topic in topic_names()
             .into_iter()
             .filter(|topic| *topic != "overview")
         {
@@ -558,64 +497,89 @@ mod agent_instruction_tests {
             );
         }
         assert!(instructions.contains("`skill://cua-driver/SKILL.md`"));
-        assert!(instructions.split_whitespace().count() <= 200);
     }
 
     #[test]
-    fn macos_instructions_gate_permission_approval_on_owner_authorization() {
-        let instructions = agent_instructions();
-        let has_line = instructions.contains("Cua Driver's own prompts");
-        assert_eq!(
-            has_line,
-            cfg!(target_os = "macos"),
-            "only the macOS instructions mention TCC prompts"
-        );
-        if has_line {
-            // Keeps the narrow exception narrow: ask first, own prompts only,
-            // explicit owner authorization; MACOS.md holds the detail.
-            assert!(instructions.contains("ask the user"));
-            assert!(instructions.contains(
-                "approve Cua Driver's own prompts only if the owner explicitly authorized it"
-            ));
-            assert!(instructions.contains("(MACOS.md)"));
-            assert!(instructions.contains("`check_permissions`"));
+    fn the_start_guide_routes_verification_and_input_to_the_right_owner() {
+        for (platform, guide) in start_guides() {
+            assert!(guide.contains("verify_state"), "{platform:?}");
+            assert!(guide.contains("`unknown` and `effect:\"unverifiable\"` are not success"));
+            assert!(guide.contains("app API/SDK"));
+            assert!(guide.contains("read the result back there"));
+            assert!(guide.contains("No shell"));
+            assert!(guide.contains("narrowest semantic route first"));
+            // cua-driver#22: token, keyboard and pixels come before the
+            // foreground, which may move the user's pointer.
+            let ladder = &guide[guide
+                .find("Background: `element_token`")
+                .expect("background ladder")..];
+            let foreground = ladder
+                .find("`delivery_mode:\"foreground\"` (may move the pointer) last")
+                .expect("foreground rung last");
+            assert!(ladder.find("keyboard") < Some(foreground));
+            assert!(ladder.find("pixels") < Some(foreground));
+            assert!(guide.contains("`set_window_frame` plus `list_windows`"));
+            assert!(guide.contains("typed browser tools"));
+            assert!(guide.contains("`get_browser_state({pid, window_id})`"));
+            assert!(guide.contains("`detail.next_call` (`browser_prepare`)"));
+            assert!(guide.contains("`browser_pointer` (hover, drag); never desktop pointer tools"));
+            // The efficient workflow comes first: targeted read, act by
+            // token, verify at checkpoints.
+            assert!(guide.contains("`list_windows({app:\"Name\"})`"));
+            assert!(guide.contains("query:\"Save\""));
+            assert!(guide.contains("Act by `element_token`"));
+            assert!(guide.contains("Verify at checkpoints, not after every action"));
+            assert!(
+                guide.find("Read narrowly") < guide.find("Act by `element_token`"),
+                "the targeted read must precede acting"
+            );
+            assert!(guide.contains("one `run_script` call"));
+            // run_script can be disabled or built out; the guide must not send
+            // an agent to a tool tools/list does not advertise.
+            assert!(guide.contains("one `run_script` call when `tools/list` advertises it"));
+            assert!(guide.contains("otherwise direct calls or `run_steps`"));
+            // The rules travel with the loop.
+            assert!(guide.contains("## Rules"));
         }
     }
 
     #[test]
-    fn initialize_instructions_describe_implicit_session_lifecycle() {
-        let result = initialize_result();
-        let instructions = result["instructions"]
-            .as_str()
-            .expect("initialize result should carry agent instructions");
-
-        assert!(instructions.contains("`start_session` is optional"));
-        assert!(
-            instructions.contains("repeat a short `session` label on every call that accepts it")
-        );
-        assert!(
-            !instructions.contains("`start_session(session)` once"),
-            "initialize instructions must not require explicit session setup"
-        );
+    fn the_start_guide_gates_permission_approval_on_owner_authorization() {
+        for (_, guide) in start_guides() {
+            // Keeps the narrow exception narrow: ask first, own prompts only,
+            // explicit owner authorization; MACOS.md holds the detail.
+            assert!(guide.contains("`check_permissions`"));
+            assert!(guide.contains("ask the user"));
+            assert!(guide.contains(
+                "approve Cua Driver's own prompts only if the owner explicitly authorized it"
+            ));
+            assert!(guide.contains("(MACOS.md)"));
+        }
     }
 
     #[test]
-    fn initialize_instructions_conditionally_consult_history_before_discovery() {
-        let instructions = initialize_result()["instructions"]
-            .as_str()
-            .expect("initialize result should carry agent instructions")
-            .to_owned();
+    fn the_start_guide_describes_implicit_session_lifecycle() {
+        for (_, guide) in start_guides() {
+            assert!(guide.contains("`start_session` is optional"));
+            assert!(guide.contains("repeat a short `session` label on every call that accepts it"));
+            assert!(
+                !guide.contains("`start_session(session)` once"),
+                "the start guide must not require explicit session setup"
+            );
+        }
+    }
 
-        assert!(instructions.contains("continuation/recent-work"));
-        let status = instructions.find("call `history_status`").unwrap();
-        let bounded_query = instructions
-            .find("one bounded initial `history_query`")
-            .unwrap();
-        let discovery = instructions.find("broad discovery").unwrap();
-        assert!(status < bounded_query);
-        assert!(bounded_query < discovery);
-        assert!(instructions.contains("if ready"));
-        assert!(instructions.split_whitespace().count() <= 200);
+    #[test]
+    fn the_start_guide_conditionally_consults_history_before_discovery() {
+        for (_, guide) in start_guides() {
+            assert!(guide.contains("continuation/recent-work"));
+            let status = guide.find("call `history_status`").unwrap();
+            let bounded_query = guide.find("one bounded initial `history_query`").unwrap();
+            let discovery = guide.find("broad discovery").unwrap();
+            assert!(status < bounded_query);
+            assert!(bounded_query < discovery);
+            assert!(guide.contains("if ready"));
+        }
     }
 }
 

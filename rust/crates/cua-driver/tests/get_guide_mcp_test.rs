@@ -5,7 +5,14 @@
 use cua_driver_testkit::RawDriver;
 use serde_json::{json, Value};
 
-const TOPICS: [&str; 5] = ["drag", "browser", "permissions", "batching", "menus"];
+const TOPICS: [&str; 6] = [
+    "start",
+    "drag",
+    "browser",
+    "permissions",
+    "batching",
+    "menus",
+];
 
 fn spawn() -> Option<RawDriver> {
     let mut driver = RawDriver::spawn()?;
@@ -20,12 +27,12 @@ fn spawn() -> Option<RawDriver> {
     let init = driver.recv();
     let instructions = init["result"]["instructions"].as_str().unwrap_or_default();
     assert!(
-        instructions.contains("`get_guide({topic})`"),
-        "the instructions must point at get_guide: {instructions}"
+        instructions.contains("`get_guide({topic:\"start\"})`"),
+        "the instructions must point at the start guide: {instructions}"
     );
     assert!(
-        instructions.split_whitespace().count() <= 200,
-        "the instructions keep their 200-word cap"
+        instructions.len() <= 450,
+        "hosts repeat the instructions per tool; they stay a 450-byte pointer"
     );
     for topic in TOPICS {
         assert!(instructions.contains(topic), "{topic}: {instructions}");

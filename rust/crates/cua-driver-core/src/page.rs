@@ -254,38 +254,26 @@ fn def() -> &'static ToolDef {
     static DEF: std::sync::OnceLock<ToolDef> = std::sync::OnceLock::new();
     DEF.get_or_init(|| ToolDef {
         name: "page".into(),
-        description: "Legacy browser compatibility tool. Prefer get_browser_state and the \
-            typed browser_* tools for exact targeting, endpoint ownership, and consent. \
-            Read-only get_text and query_dom remain available by default. Mutating actions \
-            require the daemon operator to set CUA_DRIVER_ENABLE_LEGACY_PAGE_MUTATIONS=1 before \
-            daemon startup (restart the daemon after changing it); this escape hatch does not \
-            provide the typed browser surface's exact binding or \
-            existing-profile grant guarantees. Supports \
-            Chrome, Brave, Edge, Safari (via AppleScript on macOS), Electron apps (via CDP), \
-            Chromium/Firefox on Windows (via UIA for read; CDP for execute_javascript when \
-            --remote-debugging-port is set), and WKWebView/Tauri/AT-SPI fallbacks.\n\n\
+        description: "Legacy browser compatibility tool. Prefer get_browser_state and the typed browser_* tools for \
+            exact targeting, endpoint ownership, and consent. Read-only get_text and query_dom are available \
+            by default; mutating actions require CUA_DRIVER_ENABLE_LEGACY_PAGE_MUTATIONS=1 set by the daemon \
+            operator before daemon startup, and lack the typed tools' exact binding and existing-profile \
+            grant guarantees. Supports Chrome, Brave, Edge, Safari (AppleScript on macOS), Electron apps \
+            (CDP), Chromium/Firefox on Windows (UIA for reads; CDP for execute_javascript with \
+            --remote-debugging-port), and WKWebView/Tauri/AT-SPI fallbacks.\n\
+            \n\
             Actions:\n\
-            - execute_javascript: Run JS and return the result.\n\
-            - get_text: Extract visible text from the page.\n\
-            - query_dom: Find elements matching a CSS selector.\n\
-            - click_element: Click a CSS-selected element AND animate the agent cursor \
-              to its on-screen center first (so the user sees what the agent is doing). \
-              Prefer over `execute_javascript('el.click()')` whenever you want visible \
-              cursor feedback.\n\
-            - insert_text: Insert `text` at whatever currently holds DOM focus in one \
-              native operation (CDP Input.insertText) — no synthesized key events, but \
-              more durable than a one-shot execute_javascript write since rich-text \
-              editors already have to treat it like an IME commit. Try this before \
-              type_keystrokes on a contenteditable that discarded an execute_javascript \
-              write. Click/focus the target field first.\n\
-            - type_keystrokes: Type `text` via real per-character keystroke events into \
-              whatever currently holds DOM focus. Slower than insert_text but the most \
-              durable rung — use it when insert_text also gets discarded, or the editor's \
-              own keydown/keyup handlers need to see real keys. Click/focus the target \
-              field first.\n\
-            - enable_javascript_apple_events: macOS-only — patch the browser's \
-              Preferences to allow JS from Apple Events (Chrome/Brave/Edge, requires user \
-              confirmation and a browser restart).".into(),
+            - execute_javascript: run JS and return the result.\n\
+            - get_text: visible page text.\n\
+            - query_dom: elements matching a CSS selector.\n\
+            - click_element: click a CSS-selected element, moving the agent cursor to its center first.\n\
+            - insert_text: insert `text` at the DOM focus in one native operation (CDP Input.insertText), no \
+            key events; try it before type_keystrokes when a contenteditable discarded an execute_javascript \
+            write. Focus the field first.\n\
+            - type_keystrokes: type `text` as real per-character key events at the DOM focus; slower, for \
+            editors whose key handlers must see keys. Focus the field first.\n\
+            - enable_javascript_apple_events: macOS only; allow JS from Apple Events in Chrome/Brave/Edge \
+            preferences (needs user confirmation and a browser restart).".into(),
         input_schema: serde_json::json!({
             "type": "object",
             // `pid` and `window_id` are required for every action except

@@ -104,6 +104,54 @@ class CompareTest(unittest.TestCase):
                 schema,
             )
 
+    def test_reworded_annotations_are_compatible(self):
+        click = {"type": "object", "additionalProperties": False, "description": "old", "properties": {
+            "x": {"type": "number", "description": "Window pixel x.", "title": "X"},
+            "mode": {"anyOf": [{"type": "string", "enum": ["a"], "description": "a"}, {"type": "null"}]},
+            "list": {"type": "array", "items": {"type": "object", "properties": {"id": {"type": "integer", "examples": [1]}}}},
+        }}
+        reworded = json.loads(json.dumps(click))
+        reworded["description"] = "new"
+        reworded["properties"]["x"]["description"] = "Pixel x in the latest screenshot."
+        del reworded["properties"]["x"]["title"]
+        reworded["properties"]["mode"]["anyOf"][0]["description"] = "the a mode"
+        reworded["properties"]["list"]["items"]["properties"]["id"]["$comment"] = "row id"
+        base = variant(tools={**MCP["tools"], "click": click})
+        self.assertEqual(compare(base, variant(tools={**MCP["tools"], "click": reworded}), {}), [])
+        self.assertEqual(check_protocol.reworded_tools(base["forms"]["embedded-proxy"]["tools"], {**MCP["tools"], "click": reworded}), ["click"])
+        # Rewording together with a new optional argument is still an addition.
+        added = {**reworded, "properties": {**reworded["properties"], "scope": {"type": "object", "description": "s"}}}
+        self.assertEqual(compare(base, variant(tools={**MCP["tools"], "click": added}), {}), [])
+
+    def test_annotation_stripping_keeps_validation_keywords_and_argument_names(self):
+        # Arguments named like annotation keywords are arguments, not annotations.
+        named = {"type": "object", "properties": {"title": {"type": "string"}, "description": {"type": "string"}}}
+        self.assertEqual(check_protocol.without_annotations(named), named)
+        base = variant(tools={**MCP["tools"], "click": named})
+        for changed in (
+            {"type": "object", "properties": {"title": {"type": "string"}}},
+            {"type": "object", "properties": {"title": {"type": "integer"}, "description": {"type": "string"}}},
+        ):
+            self.assertEqual(
+                compare(base, variant(tools={**MCP["tools"], "click": changed}), {}),
+                ["tools click: embedded-proxy: input schema changed"],
+                changed,
+            )
+        # A changed default, enum or nested type is still a change even when a description moves too.
+        click = {"type": "object", "properties": {"mode": {"type": "string", "enum": ["a", "b"], "default": "a", "description": "m"}}}
+        base = variant(tools={**MCP["tools"], "click": click})
+        for mode in (
+            {"type": "string", "enum": ["a", "b"], "default": "b", "description": "m"},
+            {"type": "string", "enum": ["a"], "default": "a", "description": "changed"},
+            {"type": "integer", "description": "m"},
+        ):
+            changed = {"type": "object", "properties": {"mode": mode}}
+            self.assertEqual(
+                compare(base, variant(tools={**MCP["tools"], "click": changed}), {}),
+                ["tools click: embedded-proxy: input schema changed"],
+                mode,
+            )
+
     def test_cli_mcp_and_daemon_breaks_are_incompatible(self):
         retyped = {**BASE["manifest"], "subcommands": [{"name": "serve", "args": [{"name": "socket", "type": "path"}]}]}
         self.assertEqual(compare(BASE, variant(manifest=retyped), {}), ["subcommands serve socket: argument ('socket', 'string') removed or retyped"])

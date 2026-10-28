@@ -31,21 +31,13 @@ fn with_cursor_motion_properties(mut schema: Value) -> Value {
 fn def() -> &'static ToolDef {
     DEF.get_or_init(|| ToolDef {
         name: "set_config".into(),
-        description: "Update cua-driver-rs configuration. Changes to \
-            max_image_dimension take effect immediately. The \
-            experimental_pip keys are persisted to ~/.cua-driver/config.json and \
-            take effect on the next daemon restart (the PiP backend is \
-            initialised once at startup).\n\nNote: capture_mode is a per-call \
-            param (on get_window_state / click), not a stored setting. Capture \
-            modality is selected by each action's target; the old \
-            capture_scope config key is retired.\n\nCursor motion defaults: \
-            cursor.motion.style, cursor.motion.timing and \
-            cursor.motion.effects.<trail|glow|magnet|ripple|squish> are saved to \
-            ~/.cua-driver/config.json and seed sessions started afterwards. \
-            start_session cursor_motion and set_agent_cursor_motion override them; \
-            reduced motion always wins.\n\nAgent cursor badge: cursor.badges is \
-            minimal (default), verbose or off, saved to ~/.cua-driver/config.json \
-            and applied to every cursor at once."
+        description: "Update driver configuration. `max_image_dimension` applies at once. The experimental_pip keys \
+            are saved to ~/.cua-driver/config.json and apply after a daemon restart. cursor.motion.style, \
+            cursor.motion.timing and cursor.motion.effects.<trail|glow|magnet|ripple|squish> are saved there \
+            and seed sessions started afterwards (start_session cursor_motion and set_agent_cursor_motion \
+            override them; reduced motion wins). cursor.badges (minimal by default, verbose or off) is saved \
+            and applies to every cursor. capture_mode is a per-call argument; the capture_scope key is \
+            retired."
             .into(),
         input_schema: with_cursor_motion_properties(serde_json::json!({
             "type": "object",

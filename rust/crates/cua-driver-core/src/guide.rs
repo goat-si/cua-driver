@@ -85,6 +85,11 @@ struct Topic {
 /// fails there instead of silently emptying a topic.
 const TOPICS: &[Topic] = &[
     Topic {
+        name: "start",
+        summary: "read before the first action: the loop, routing and rules",
+        parts: &[any("SKILL.md", "Efficient loop"), any("SKILL.md", "Rules")],
+    },
+    Topic {
         name: "overview",
         summary: "the whole SKILL.md: loop, rules, failure map",
         parts: &[any("SKILL.md", "cua-driver")],

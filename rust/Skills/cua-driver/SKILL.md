@@ -35,13 +35,26 @@ Operate one exact target, observe it narrowly, act by element, and verify the us
 
 ## Efficient loop
 
-The MCP server instructions carry the same rules, so they apply even when this file is not opened.
+`get_guide({topic:"start"})` returns this section and [Rules](#rules) with no skill installed; the MCP server instructions point there.
 
-1. Start with a targeted read: `get_window_state({pid, window_id, query:"Save"})` returns about 2K chars where a full snapshot is about 42K. Bound large trees with `max_elements` / `max_depth`. Widen only if the target is missing.
-2. Act by `element_token`: row `[N]` of a read is `<snapshot_id>:N` (for example `"s0000002a:11"`, not `"11"`). Use pixels only for surfaces missing from the tree.
-3. Act through `run_steps` with `observe:{}`, even for a single step. It runs the steps, stops at the first failure, and returns only what changed since your last read, so you do not need a separate read after acting; see [Workflow](WORKFLOW.md#batch-known-actions). When the flow needs logic between actions (a loop, a branch on what the app shows, a retry), write it as one `run_script` instead; see [Workflow](WORKFLOW.md#script-a-flow).
-4. To re-read a window, pass `since:"latest"`: you get the changed rows, not the whole tree. To just look, use `include_accessibility_tree:false` where advertised (it keeps the current tokens valid). Do not use `max_elements:1` or a junk `query` to get a picture.
-5. Verify at checkpoints (after a meaningful state change, before finishing), not after every action. One `verify_state` or one targeted `get_window_state` is usually enough.
+Cua Driver is background GUI automation. No shell: for an outcome that does not live in a GUI, use an app API/SDK, CLI or filesystem and read the result back there.
+
+1. Find the target: `list_windows({app:"Name"})` or `launch_app` gives `pid` and `window_id`; pass both on every call.
+2. Read narrowly: start with a targeted read: `get_window_state({pid, window_id, query:"Save"})` returns about 2K chars where a full snapshot is about 42K. Bound large trees with `max_elements` / `max_depth`. Widen only if the target is missing.
+3. Act by `element_token` (from the AX tree on macOS, UIA on Windows, AT-SPI on Linux): row `[N]` of a read is `<snapshot_id>:N` (for example `"s0000002a:11"`, not `"11"`). Use pixels only for surfaces missing from the tree.
+4. Act through `run_steps({steps:[{tool,args}],observe:{}})`, even for a single step. It runs the steps, stops at the first failure, and returns only what changed since your last read, so you do not need a separate read after acting; see [Workflow](WORKFLOW.md#batch-known-actions). Loops, branches or retries: one `run_script` call when `tools/list` advertises it (it can be disabled or built out); otherwise direct calls or `run_steps` with a read between decisions; see [Workflow](WORKFLOW.md#script-a-flow).
+5. To re-read a window, pass `since:"latest"`: you get the changed rows, not the whole tree. To just look, use `include_accessibility_tree:false` where advertised (it keeps the current tokens valid). Do not use `max_elements:1` or a junk `query` to get a picture.
+6. Verify at checkpoints, not after every action (after a meaningful state change, before finishing): one `verify_state(pid, window_id, expect)` or one targeted `get_window_state` is usually enough. `unknown` and `effect:"unverifiable"` are not success.
+
+Use the narrowest semantic route first: `set_window_frame` plus `list_windows` for geometry, typed browser tools for pages. Background: `element_token`, keyboard, pixels; `delivery_mode:"foreground"` (may move the pointer) last.
+
+Chrome/Edge/Brave page: `get_browser_state({pid, window_id})`, its `detail.next_call` (`browser_prepare`) if refused, then `browser_click`/`browser_type`/`browser_pointer` (hover, drag); never desktop pointer tools.
+
+`start_session` is optional; repeat a short `session` label on every call that accepts it. On continuation/recent-work, call `history_status`; if ready, make one bounded initial `history_query` before broad discovery ([details](#consult-recent-cua-activity-only-for-continuation)).
+
+macOS: if `check_permissions` shows Accessibility or Screen Recording off, ask the user; approve Cua Driver's own prompts only if the owner explicitly authorized it (MACOS.md).
+
+More: `get_guide({topic})` with drag, browser, permissions, batching or menus; `overview` is this whole file.
 
 ## Act
 
@@ -123,4 +136,4 @@ Load on demand; do not reabsorb these into this file:
 - [BROWSER.md](BROWSER.md): exact page binding and typed browser actions; only when the requested method permits them.
 - [RECORDING.md](RECORDING.md): capture lifecycle, artifact checks, replay limits.
 - [EMBEDDING.md](EMBEDDING.md): trusted application-host integration, not routine GUI operation.
-- `get_guide({topic})`: an MCP tool that returns the drag, browser, permissions, batching and menus sections of these files on demand, with no skill install or resource read. `overview` returns this file.
+- `get_guide({topic})`: an MCP tool that returns the start, drag, browser, permissions, batching and menus sections of these files on demand, with no skill install or resource read. `overview` returns this file.

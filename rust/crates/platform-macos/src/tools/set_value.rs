@@ -48,9 +48,16 @@ static DEF: std::sync::OnceLock<ToolDef> = std::sync::OnceLock::new();
 fn def() -> &'static ToolDef {
     DEF.get_or_init(|| ToolDef {
         name: "set_value".into(),
-        description: "Set an element's value by `element_token`. A popup button / select dropdown: selects the menu item whose title or value matches `value` (case-insensitive). Safari `<select>` is set through the DOM; AppKit and Chromium popups list items only while open, so the menu is opened, the item pressed and the menu closed again (in the background the user's front window keeps key focus). An unknown value lists the options. Any other element: writes AXValue (sliders, steppers, date pickers, native text fields).\n\
-            \n\
-            A Finder file name cell (list or icon view, not being edited) is renamed through Finder's scripting interface with Finder left in the background, and the new name is read back from disk; the value is the full new name with its extension. macOS asks the user once to allow Cua Driver to control Finder. Finder's Get Info `Name` field is refused with `file_name_needs_rename`. Safari's address field is refused with `address_field_not_settable` (it reads the write back but never opens it); its refusal names the route that opens an address. For free-form text in web inputs use `type_text_chars`: WebKit ignores AXValue writes.".into(),
+        description: "Set an element's value by `element_token`. Popup button / select: selects the item whose title \
+            or value matches `value` (case-insensitive); Safari `<select>` through the DOM, AppKit and \
+            Chromium popups by opening the menu, pressing the item and closing it (the user's front window \
+            keeps key focus). An unknown value lists the options. Other elements: writes AXValue (sliders, \
+            steppers, date pickers, native text fields). A Finder file name cell (list or icon view, not \
+            being edited) is renamed through Finder's scripting interface in the background and read back \
+            from disk; `value` is the full new name with its extension (macOS asks once to allow controlling \
+            Finder). Refusals: Finder's Get Info `Name` field, `file_name_needs_rename`; Safari's address \
+            field, `address_field_not_settable` (the refusal names the route that opens an address). WebKit \
+            ignores AXValue writes to web inputs: use `type_text_chars`.".into(),
         input_schema: serde_json::json!({
             "type": "object",
             "required": ["value"],

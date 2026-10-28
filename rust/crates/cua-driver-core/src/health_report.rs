@@ -374,48 +374,24 @@ fn def() -> &'static ToolDef {
         // The description is part of the public contract — downstream
         // consumers depend on it spelling out `schema_version="1"` and the per-
         // platform check matrix. A test pins this commitment.
-        description: r#"Single-call end-to-end driver diagnostics. Designed to let downstream consumers ship one stable call instead of stitching together check_permissions, doctor, version, bundle attribution, and platform capability status. On macOS, prompt-capable direct capture is deliberately skipped. For standalone CuaDriver, use `cua-driver permissions grant` to verify it explicitly. For an embedded or linked driver, use the host's permission flow for the app or executable macOS attributes this process's permission request to; the standalone command does not verify the host's capture readiness. cua-driver owns the health model; consumers stay thin.
-
-Input — all optional:
-  {
-    "include": ["<check_name>", ...],   // run only these
-    "skip":    ["<check_name>", ...]    // skip these
-  }
-If both are given, `include` wins.
-
-Canonical check names:
-  macOS  : binary_version, platform_supported, session_active,
-           bundle_identity, tcc_accessibility, tcc_screen_recording,
-           ax_capability, screen_capture_capability, windowserver_connection
-  Windows: binary_version, platform_supported, session_active,
-           ax_capability (via UIA), screen_capture_capability (via DXGI)
-  Linux  : binary_version, platform_supported, session_active,
-           ax_capability (via AT-SPI), screen_capture_capability (via X11)
-
-Output — stable contract, schema_version="1":
-  {
-    "schema_version": "1",
-    "platform": "darwin" | "win32" | "linux",
-    "driver_version": "<semver>",
-    "overall": "ok" | "degraded" | "failed",
-    "checks": [
-      {
-        "name": "<one of the canonical names above>",
-        "status": "pass" | "fail" | "skip",
-        "message": "<one-line summary, always present>",
-        "hint": "<remediation step, present when status=fail>",
-        "data": { /* check-specific structured fields */ }
-      },
-      ...
-    ]
-  }
-
-`overall` rules:
-  - `ok`       — every non-skipped check passes
-  - `degraded` — at least one non-core check fails (binary is still usable)
-  - `failed`   — any core check fails (binary_version, platform_supported, session_active)
-
-Stability: schema_version="1" is the contract. Future breaking changes will be `"2"`. Adding new check names under the same schema_version is non-breaking; consumers must tolerate unknown check names."#.into(),
+        description: "Driver diagnostics in one call. `include` / `skip` take canonical check names; `include` wins. \
+            Checks on macOS: binary_version, platform_supported, session_active, bundle_identity, \
+            tcc_accessibility, tcc_screen_recording, ax_capability, screen_capture_capability, \
+            windowserver_connection. Windows: binary_version, platform_supported, session_active, \
+            ax_capability (UIA), screen_capture_capability (DXGI). Linux: binary_version, \
+            platform_supported, session_active, ax_capability (AT-SPI), screen_capture_capability (X11).\n\
+            \n\
+            Output, schema_version=\"1\": {schema_version, platform (\"darwin\" | \"win32\" | \"linux\"), \
+            driver_version, overall (\"ok\" | \"degraded\" | \"failed\"), checks: [{name, status (\"pass\" | \
+            \"fail\" | \"skip\"), message, hint (when status is fail), data}]}. `ok`: every non-skipped \
+            check passes; `degraded`: a non-core check fails; `failed`: a core check (binary_version, \
+            platform_supported, session_active) fails. New check names can appear under schema_version \
+            \"1\", so tolerate unknown ones; a breaking change will be \"2\".\n\
+            \n\
+            On macOS the prompt-capable direct capture probe is skipped. For standalone CuaDriver, use \
+            `cua-driver permissions grant` to verify it explicitly. For an embedded or linked driver, use \
+            the host's permission flow for the app or executable macOS attributes this process's permission \
+            request to; the standalone command does not verify the host's capture readiness.".into(),
         input_schema: json!({
             "type": "object",
             "properties": {

@@ -6,7 +6,9 @@ daemon metadata. A fork change that removes or retypes a tool, subcommand or arg
 tool's input schema or a capability, drops or widens what a tool's output schema promises, changes
 the daemon contract, or stops a launch form from starting breaks GOAT without a GOAT change. Those
 fail unless goat/compat/allowed-changes.json records the change with a reason. Additions (new
-tools, new optional top-level arguments) pass and are listed. Standard library only.
+tools, new optional top-level arguments) pass and are listed. Wording is not protocol: tool
+descriptions and the schema annotations in ANNOTATION_KEYWORDS never decide whether a call is
+valid, so changing them passes and is listed. Standard library only.
 """
 
 import argparse
@@ -39,6 +41,16 @@ EXIT_SECONDS = 15
 MAX_PAGES = 50
 # Daemon contract fields GOAT reads and compares (goat-si/goat apps/desktop/src/cua/ComputerUseHelper.ts).
 CONTRACT_FIELDS = ("contract_version", "mcp_protocol_version", "capability_version", "tools_list_schema_version")
+# JSON Schema annotation keywords (JSON Schema 2020-12, "Meta-Data" vocabulary, and $comment): they
+# never change which arguments a schema accepts. "default" is left out on purpose: a changed default
+# changes what an omitted argument does.
+ANNOTATION_KEYWORDS = ("description", "title", "examples", "$comment")
+# Keywords whose value is a map of name -> subschema, and those whose value is a subschema or a list
+# of subschemas. Only these are walked, so an argument named "title" or "description" stays compared.
+SCHEMA_MAP_KEYWORDS = ("properties", "patternProperties", "$defs", "definitions", "dependentSchemas")
+SUBSCHEMA_KEYWORDS = ("items", "additionalProperties", "additionalItems", "unevaluatedProperties",
+                      "unevaluatedItems", "contains", "propertyNames", "not", "if", "then", "else",
+                      "anyOf", "oneOf", "allOf", "prefixItems")
 
 
 def fail(message):
@@ -474,7 +486,9 @@ def compare(baseline, candidate, allowed):
         for name, schema in old_mcp["tools"].items():
             if name not in new_mcp["tools"]:
                 check("tools", name, f"{form}: removed")
-            elif new_mcp["tools"][name] != schema and not added_optional_properties(schema, new_mcp["tools"][name]):
+                continue
+            old_input, new_input = without_annotations(schema), without_annotations(new_mcp["tools"][name])
+            if new_input != old_input and not added_optional_properties(old_input, new_input):
                 check("tools", name, f"{form}: input schema changed")
         new_outputs = new_mcp.get("outputSchemas", {})
         for name, schema in old_mcp.get("outputSchemas", {}).items():
@@ -503,6 +517,34 @@ def compare(baseline, candidate, allowed):
         if candidate["daemon"].get(field) != baseline["daemon"].get(field):
             check("daemon", field, f"{baseline['daemon'].get(field)} -> {candidate['daemon'].get(field)}")
     return problems
+
+
+def without_annotations(schema):
+    """schema without the annotation keywords of it and every subschema it contains: what decides
+    whether a call is valid. Values of other keywords (enum, const, default, required) are kept
+    verbatim, and so are argument names."""
+    if isinstance(schema, list):
+        return [without_annotations(item) for item in schema]
+    if not isinstance(schema, dict):
+        return schema
+    stripped = {}
+    for key, value in schema.items():
+        if key in ANNOTATION_KEYWORDS:
+            continue
+        if key in SCHEMA_MAP_KEYWORDS and isinstance(value, dict):
+            stripped[key] = {name: without_annotations(sub) for name, sub in value.items()}
+        elif key in SUBSCHEMA_KEYWORDS:
+            stripped[key] = without_annotations(value)
+        else:
+            stripped[key] = value
+    return stripped
+
+
+def reworded_tools(old_tools, new_tools):
+    """Tools present in both whose input schema changed only in its annotations."""
+    return sorted(name for name, schema in old_tools.items()
+                  if name in new_tools and new_tools[name] != schema
+                  and without_annotations(new_tools[name]) == without_annotations(schema))
 
 
 def added_optional_properties(old, new):
@@ -549,9 +591,12 @@ def main():
         added = sorted(set(mcp["tools"]) - set(baseline["forms"].get(form, {}).get("tools", {})))
         print(f"{form}: baseline {len(baseline['forms'][form]['tools'])} tools, candidate {len(mcp['tools'])}" + (f"; added: {', '.join(added)}" if added else ""))
         for name, schema in sorted(baseline["forms"].get(form, {}).get("tools", {}).items()):
-            arguments = added_optional_properties(schema, mcp["tools"].get(name))
+            arguments = added_optional_properties(without_annotations(schema), without_annotations(mcp["tools"].get(name)))
             if arguments:
                 print(f"{form}: {name} added optional argument(s): {', '.join(arguments)}")
+        reworded = reworded_tools(baseline["forms"].get(form, {}).get("tools", {}), mcp["tools"])
+        if reworded:
+            print(f"{form}: argument descriptions reworded (not protocol): {', '.join(reworded)}")
     print(f"daemon contract: baseline {baseline['daemon']['contract_version']}, candidate {candidate['daemon']['contract_version']}")
     problems = compare(baseline, candidate, allowed)
     for problem in problems:
