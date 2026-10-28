@@ -540,16 +540,20 @@ fn exact_window_is_ready(
 /// the app would take the user's front window, so refuse and name the route.
 fn background_unavailable(reason: String) -> ToolResult {
     let message = format!(
-        "{reason}. invoke_menu does not activate a background app: macOS keeps this menu item \
-         unavailable while the app is behind the user's window. If the user allows it, call \
-         bring_to_front for this window first, then invoke_menu, or send the app's keyboard \
-         shortcut with hotkey and delivery_mode:\"foreground\". A background hotkey does not \
-         help: the disabled item ignores its shortcut too. Otherwise use the control in the \
-         window."
+        "{reason}. Nothing was sent: macOS disables this menu item while the app is behind the \
+         user's window, and invoke_menu does not activate a background app. Use the window's \
+         own control instead when it has one, by its element_token from get_window_state (the \
+         window's close button for Close Window, the toolbar's view buttons for a view change). \
+         A background hotkey does not help: the disabled item ignores its shortcut too. If the \
+         user allows taking the screen, call bring_to_front for this window first, then \
+         invoke_menu, or send the app's keyboard shortcut with hotkey and \
+         delivery_mode:\"foreground\"."
     );
     ToolResult::error(message.clone()).with_structured(serde_json::json!({
         "status": "refused",
         "code": "background_unavailable",
+        "effect": "refused",
+        "dispatched": false,
         "refusal": { "code": "background_unavailable", "message": message }
     }))
 }
@@ -620,13 +624,36 @@ unsafe fn require_live_menu_window(
     require_menu_window(requested, read("AXFocusedWindow"), read("AXMainWindow"))
 }
 
+/// Make the requested window the app's key window from the background (the
+/// focus record only, as a background press does: the app is not activated
+/// or raised and the user's window keeps key), then require the exact
+/// focused and main window read-back before any menu is resolved.
+unsafe fn make_menu_window_key(
+    app: AXUIElementRef,
+    pid: i32,
+    window_id: u32,
+) -> Result<(), BackgroundPressError> {
+    if crate::input::skylight::activate_without_raise_with(pid, window_id, false) {
+        crate::input::skylight::note_primed_key(pid, window_id);
+        let mut waited = Duration::ZERO;
+        while waited < ENABLE_WAIT {
+            std::thread::sleep(ENABLE_POLL);
+            waited += ENABLE_POLL;
+            if require_live_menu_window(app, window_id).is_ok() {
+                return Ok(());
+            }
+        }
+    }
+    require_live_menu_window(app, window_id)
+}
+
 fn unbound_menu_window(
     pid: i32,
     requested: u32,
     focused: Option<u32>,
     main: Option<u32>,
 ) -> ToolResult {
-    super::background_refusal_result(
+    let mut result = super::background_refusal_result(
         pid,
         requested,
         &cua_driver_core::background_input::BackgroundRefusal {
@@ -637,8 +664,18 @@ fn unbound_menu_window(
             ),
             advice: Some("foreground"),
         },
-    )
+    );
+    if let Some(structured) = result.structured_content.as_mut() {
+        structured["hint"] = serde_json::Value::String(UNBOUND_MENU_HINT.to_owned());
+    }
+    result
 }
+
+const UNBOUND_MENU_HINT: &str = "The app runs its menu commands against its key window, and the \
+    requested window could not be made the app's key window from the background, so the command \
+    could have gone to another of its windows. Act on the window's own control instead, by its \
+    element_token from get_window_state (its close button, a toolbar button). If the user allows \
+    taking the screen, call bring_to_front for this window first, then invoke_menu.";
 
 /// Resolve the whole path from the app's live menu bar without opening any
 /// level, then perform the final item's action. Used for a background app:
@@ -656,7 +693,9 @@ unsafe fn invoke_path_in_background(
         ));
     }
     set_messaging_timeout(app);
-    if let Err(error) = require_live_menu_window(app, window_id) {
+    if let Err(error) = require_live_menu_window(app, window_id)
+        .or_else(|_| make_menu_window_key(app, pid, window_id))
+    {
         CFRelease(app as CFTypeRef);
         return Err(error);
     }
@@ -678,6 +717,7 @@ unsafe fn invoke_path_in_background(
         if copy_bool_attr(target, "AXEnabled") == Some(false)
             && crate::input::skylight::activate_without_raise_with(pid, window_id, false)
         {
+            crate::input::skylight::note_primed_key(pid, window_id);
             let mut waited = Duration::ZERO;
             while waited < ENABLE_WAIT && copy_bool_attr(target, "AXEnabled") == Some(false) {
                 std::thread::sleep(ENABLE_POLL);
@@ -1064,6 +1104,14 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("no menu action was dispatched"));
+        // The cause and the routes that work without the menu.
+        let hint = data["hint"].as_str().unwrap();
+        assert!(
+            hint.contains("could not be made the app's key window"),
+            "{hint}"
+        );
+        assert!(hint.contains("element_token"), "{hint}");
+        assert!(hint.contains("bring_to_front"), "{hint}");
     }
 
     #[test]
@@ -1072,7 +1120,13 @@ mod tests {
         assert_eq!(result.is_error, Some(true));
         let structured = result.structured_content.expect("structured refusal");
         assert_eq!(structured["code"], "background_unavailable");
+        // Nothing was sent: the effect says so, not only the code.
+        assert_eq!(structured["effect"], "refused");
+        assert_eq!(structured["dispatched"], false);
         let message = structured["refusal"]["message"].as_str().unwrap();
+        assert!(message.contains("macOS disables"), "{message}");
+        // The window's own control (its close button for Close Window).
+        assert!(message.contains("close button"), "{message}");
         assert!(message.contains("does not activate a background app"));
         assert!(message.contains("bring_to_front"));
         assert!(message.contains("delivery_mode:\"foreground\""));

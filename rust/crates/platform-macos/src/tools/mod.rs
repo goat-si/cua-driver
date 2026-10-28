@@ -1284,6 +1284,9 @@ pub fn register_all(
                 // cursor are a harmless no-op.
                 cursor_registry.remove(session_id);
                 crate::cursor::overlay::remove_cursor(session_id.to_owned());
+                // A window the session left key inside a background app is
+                // let go with it (end_session or a closed transport).
+                crate::input::skylight::release_primed_key();
             });
         registry.retain_session_end_hook(registration);
         let revive_registration =

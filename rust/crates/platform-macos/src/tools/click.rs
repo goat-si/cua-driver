@@ -1763,6 +1763,7 @@ fn prime_key_window_for_background_press(pid: i32, window_id: u32, action: &str)
     };
     let mut last = LAST_KEY_PRIME.lock().unwrap_or_else(|e| e.into_inner());
     if last.is_some_and(|last| last.still_holds(&now))
+        && crate::input::skylight::primed_key_still_held(pid, window_id)
         && crate::ax::bindings::focused_window_id_of_pid(pid) == Some(window_id)
     {
         return;
@@ -1774,6 +1775,7 @@ fn prime_key_window_for_background_press(pid: i32, window_id: u32, action: &str)
         return;
     }
     if crate::input::skylight::activate_without_raise_with(pid, window_id, false) {
+        crate::input::skylight::note_primed_key(pid, window_id);
         std::thread::sleep(KEY_PRIME_SETTLE);
         // Recorded after this priming's own focus record. An activation or
         // another focus change during the settle may already have undone it.

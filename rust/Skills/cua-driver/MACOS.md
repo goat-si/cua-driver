@@ -86,11 +86,16 @@ frontmost app, and command items may be disabled otherwise. Use `invoke_menu`
 for a known application-menu path. With the app in the background it resolves
 the whole path without opening a menu and never activates the app. Both the
 app's focused and main window must identify the requested window before menu
-lookup and again before dispatch; a sibling or unreadable context is refused
-with `window_not_key`. A requested window ID alone does not bind the app-wide
-menu. The tool does not silently change documents to satisfy this check. If macOS
-keeps the item unavailable to a background app it refuses with
-`background_unavailable` (then, if the user allows it, `bring_to_front` first).
+lookup and again before dispatch. When another window of the app is key, the
+requested window is first made key inside the app with a focus record (no
+activation, no raise, the user's window keeps key); a context that still does
+not read back as the requested window is refused with `window_not_key`. A
+requested window ID alone does not bind the app-wide menu, and the tool never
+runs the command against another document. If macOS keeps the item disabled
+for a background app it refuses with `background_unavailable`, effect
+`refused`: nothing was sent. Use the window's own control by element instead
+(its close button for Close Window), or, if the user allows it,
+`bring_to_front` first.
 One exception: a disabled Save (the ⌘S item) of a document window is saved
 through the app's scripting interface instead, still in the background, and the
 result says so; TextEdit disables Save whenever it is behind the user's window.
