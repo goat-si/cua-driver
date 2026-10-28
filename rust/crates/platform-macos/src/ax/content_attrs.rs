@@ -54,14 +54,8 @@ impl ContentAttrs {
 
     unsafe fn from_singles(element: AXUIElementRef) -> Self {
         Self::from_single_reads(
-            |name| {
-                let read = copy_string_attr(element, name);
-                checked_single_read(read, || single_read_error(element, name))
-            },
-            || {
-                let read = copy_stringish_attr(element, "AXValue");
-                checked_single_read(read, || single_read_error(element, "AXValue"))
-            },
+            |name| single_read(element, name, |value| string_from_cf(value)),
+            || single_read(element, "AXValue", |value| stringish_from_cf(value)),
         )
     }
 
@@ -110,42 +104,47 @@ impl ContentAttrs {
     }
 }
 
-/// `read` when it found something or the attribute has no value; otherwise
-/// the error of reading it again, when that is a real failure.
-fn checked_single_read<T>(
-    read: Option<T>,
-    error: impl FnOnce() -> AXError,
-) -> Result<Option<T>, AXError> {
-    if read.is_some() {
-        return Ok(read);
-    }
-    let error = error();
-    if [
-        kAXErrorSuccess,
-        kAXErrorNoValue,
-        kAXErrorAttributeUnsupported,
-    ]
-    .contains(&error)
-    {
-        Ok(None)
-    } else {
-        Err(error)
-    }
-}
-
-/// The error code of reading `name` from `element` once more.
+/// One read of `name`: its decoded value with the read's own error code, so
+/// a failure is never mistaken for an absent attribute and no second request
+/// is made.
 ///
 /// # Safety
 /// `element` must be a live `AXUIElementRef`.
-unsafe fn single_read_error(element: AXUIElementRef, name: &str) -> AXError {
+unsafe fn single_read<T>(
+    element: AXUIElementRef,
+    name: &str,
+    decode: impl FnOnce(core_foundation::base::CFTypeRef) -> Option<T>,
+) -> Result<Option<T>, AXError> {
     use core_foundation::{base::TCFType, string::CFString};
     let attr = CFString::new(name);
     let mut value: core_foundation::base::CFTypeRef = std::ptr::null();
     let error = AXUIElementCopyAttributeValue(element, attr.as_concrete_TypeRef(), &mut value);
+    let decoded = (!value.is_null() && error == kAXErrorSuccess).then(|| decode(value));
     if !value.is_null() {
         core_foundation::base::CFRelease(value);
     }
-    error
+    single_read_outcome(error, decoded.flatten())
+}
+
+/// What one read means: a value, an absent attribute, or a failure that may
+/// hide content. Only errors where the app did not answer or the element
+/// went away hide content: a timeout or lost connection (`CannotComplete`),
+/// a stale element, or accessibility turned off. The rest describe the
+/// attribute itself: AppKit answers `kAXErrorFailure` for attributes an
+/// element does not implement (TextEdit's AXDescription, 28 Oct 2026), as
+/// steadily as "unsupported".
+fn single_read_outcome<T>(error: AXError, decoded: Option<T>) -> Result<Option<T>, AXError> {
+    if [
+        kAXErrorCannotComplete,
+        kAXErrorInvalidUIElement,
+        kAXErrorAPIDisabled,
+    ]
+    .contains(&error)
+    {
+        Err(error)
+    } else {
+        Ok(decoded)
+    }
 }
 
 /// A timeout returns no content, so the walker emits only the role already read.
@@ -253,20 +252,29 @@ mod tests {
 
     #[test]
     fn only_real_errors_fail_a_single_read() {
+        // Errors that describe the attribute itself: absent.
         for absent in [
             kAXErrorSuccess,
             kAXErrorNoValue,
             kAXErrorAttributeUnsupported,
+            kAXErrorFailure,
+            kAXErrorIllegalArgument,
+            kAXErrorNotImplemented,
         ] {
-            assert_eq!(checked_single_read::<String>(None, || absent), Ok(None));
+            assert_eq!(single_read_outcome::<String>(absent, None), Ok(None));
         }
+        // The app did not answer or the element went away: content unknown.
+        for failed in [
+            kAXErrorCannotComplete,
+            kAXErrorInvalidUIElement,
+            kAXErrorAPIDisabled,
+        ] {
+            assert_eq!(single_read_outcome::<String>(failed, None), Err(failed));
+        }
+        // Review round 3: a read that succeeds keeps its value.
         assert_eq!(
-            checked_single_read::<String>(None, || kAXErrorCannotComplete),
-            Err(kAXErrorCannotComplete)
-        );
-        assert_eq!(
-            checked_single_read(Some(1), || panic!("a found value is not read again")),
-            Ok(Some(1))
+            single_read_outcome(kAXErrorSuccess, Some("Save")),
+            Ok(Some("Save"))
         );
     }
 
