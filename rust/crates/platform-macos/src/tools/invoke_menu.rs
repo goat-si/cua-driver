@@ -943,25 +943,14 @@ pub(super) async fn run_in_background_with_lease(
                     ActionTransport::MacosAppleEvent,
                     "The app's scripting interface reported the document saved",
                 ),
-                Ok(Err(failure)) if !failure.sent => background_unavailable(format!(
-                    "{preface}{message}, and saving through {app_name}'s scripting interface did \
-                     not run ({}: {}). Nothing was saved",
-                    failure.refusal.code, failure.refusal.reason
-                )),
-                Ok(Err(failure)) => sent_unverified(
+                Ok(Err(failure)) => {
+                    save_failure_result(&preface, &path, &message, &app_name, failure)
+                }
+                Err(error) => uncertain_dispatch(
                     &preface,
                     &path,
-                    &format!(
-                        "it is disabled in the background, and the save sent through \
-                         {app_name}'s scripting interface did not confirm ({}: {})",
-                        failure.refusal.code, failure.refusal.reason
-                    ),
-                    ActionTransport::MacosAppleEvent,
-                ),
-                Err(error) => sent_unverified(
-                    &preface,
-                    &path,
-                    &format!("the background save task failed ({error})"),
+                    &format!("the background save task ended without a result ({error})"),
+                    Dispatch::Possible,
                     ActionTransport::MacosAppleEvent,
                 ),
             }
@@ -975,45 +964,110 @@ pub(super) async fn run_in_background_with_lease(
             main,
         })) => unbound_menu_window(pid, requested, focused, main),
         Ok(Err(BackgroundPressError::Other(error))) => refusal(error),
-        Ok(Err(BackgroundPressError::SentWithError(error))) => {
-            sent_unverified(&preface, &path, &error, ActionTransport::MacosAxAction)
-        }
-        // The press task ended without a result; it may have stopped after
-        // the action was sent, so this is not a nothing-sent refusal either.
-        Err(error) => sent_unverified(
+        Ok(Err(BackgroundPressError::SentWithError(error))) => uncertain_dispatch(
             &preface,
             &path,
-            &format!("the background press task failed ({error})"),
+            &error,
+            Dispatch::Sent,
+            ActionTransport::MacosAxAction,
+        ),
+        // The press task ended without a result; it may have stopped before
+        // or after the action was sent, so this is not a nothing-sent
+        // refusal either.
+        Err(error) => uncertain_dispatch(
+            &preface,
+            &path,
+            &format!("the background press task ended without a result ({error})"),
+            Dispatch::Possible,
             ActionTransport::MacosAxAction,
         ),
     }
 }
 
-/// The menu item's action was (or may have been) sent and its outcome is not
-/// known. Retrying could run the command twice, so the result says to read
-/// fresh state first.
-fn sent_unverified(
+/// Whether a command whose outcome is unknown reached the app.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Dispatch {
+    /// It was sent and reported an error.
+    Sent,
+    /// It may or may not have been sent.
+    Possible,
+}
+
+/// A disabled background Save whose scripting-interface save did not
+/// confirm. Only a save that never ran is a nothing-sent refusal.
+fn save_failure_result(
+    preface: &str,
+    path: &[String],
+    message: &str,
+    app_name: &str,
+    failure: crate::apple_events::SaveFailure,
+) -> ToolResult {
+    use crate::apple_events::SaveStage;
+    let detail = format!("{}: {}", failure.refusal.code, failure.refusal.reason);
+    let dispatch = match failure.stage {
+        SaveStage::NotSent => {
+            return background_unavailable(format!(
+                "{preface}{message}, and saving through {app_name}'s scripting interface did not \
+                 run ({detail}). Nothing was saved"
+            ))
+        }
+        SaveStage::MaybeSent => Dispatch::Possible,
+        SaveStage::Sent => Dispatch::Sent,
+    };
+    uncertain_dispatch(
+        preface,
+        path,
+        &format!(
+            "it is disabled in the background, and saving through {app_name}'s scripting \
+             interface did not confirm ({detail})"
+        ),
+        dispatch,
+        ActionTransport::MacosAppleEvent,
+    )
+}
+
+/// The command was, or may have been, sent and its outcome is not known.
+/// Retrying could run it twice, so the result says to read fresh state
+/// first.
+fn uncertain_dispatch(
     preface: &str,
     path: &[String],
     error: &str,
+    dispatch: Dispatch,
     transport: ActionTransport,
 ) -> ToolResult {
+    let (lead, detail, dispatched) = match dispatch {
+        Dispatch::Sent => (
+            "Sent",
+            "The command was sent and reported an error, which does not show it did not run",
+            serde_json::json!(true),
+        ),
+        Dispatch::Possible => (
+            "May have sent",
+            "The command may have been sent before the failure; its outcome is unknown",
+            serde_json::Value::Null,
+        ),
+    };
     let mut result = background_success(
         format!(
-            "{preface}Sent {} with the app in the background (not activated), but {error}. The \
-             command may still have run: read fresh state before retrying it.",
+            "{preface}{lead} {} with the app in the background (not activated), but {error}. The \
+             command may have run: read fresh state before retrying it.",
             path.join(" > ")
         ),
         ActionEffect::Unverifiable,
         transport,
-        "The command was sent and reported an error, which does not show it did not run",
+        detail,
     );
-    result.structured_content = Some(serde_json::json!({
+    let mut structured = serde_json::json!({
         "status": "unverifiable",
         "effect": "unverifiable",
-        "dispatched": true,
         "error": error,
-    }));
+    });
+    // dispatched stays a boolean: it is left out when it is not known.
+    if !dispatched.is_null() {
+        structured["dispatched"] = dispatched;
+    }
+    result.structured_content = Some(structured);
     result
 }
 
@@ -1234,6 +1288,76 @@ mod tests {
     }
 
     #[test]
+    fn a_save_is_refused_only_when_it_never_ran() {
+        use crate::apple_events::{SaveFailure, SaveStage, ScriptRefusal};
+        let path = vec!["File".to_owned(), "Save".to_owned()];
+        let failure = |code, stage| SaveFailure {
+            refusal: ScriptRefusal {
+                code,
+                reason: "reason".into(),
+            },
+            stage,
+        };
+        // Automation denied before any event: nothing sent.
+        let refused = save_failure_result(
+            "",
+            &path,
+            "Save is disabled",
+            "TextEdit",
+            failure("automation_denied", SaveStage::NotSent),
+        );
+        let structured = refused.structured_content.expect("structured");
+        assert_eq!(structured["effect"], "refused");
+        assert_eq!(structured["dispatched"], false);
+        // A script-level denial can be the modified-flag readback after the
+        // save was accepted: the save may have run.
+        let maybe = save_failure_result(
+            "",
+            &path,
+            "Save is disabled",
+            "TextEdit",
+            failure("automation_denied", SaveStage::MaybeSent),
+        );
+        let text = text_of(&maybe);
+        let structured = maybe.structured_content.expect("structured");
+        assert_eq!(structured["effect"], "unverifiable");
+        assert!(structured.get("dispatched").is_none(), "{structured}");
+        assert!(text.contains("May have sent File > Save"), "{text}");
+        assert!(!text.contains("Nothing was saved"), "{text}");
+        // Accepted but still dirty: sent, outcome unknown.
+        let sent = save_failure_result(
+            "",
+            &path,
+            "Save is disabled",
+            "TextEdit",
+            failure("save_unconfirmed", SaveStage::Sent),
+        );
+        let structured = sent.structured_content.expect("structured");
+        assert_eq!(structured["effect"], "unverifiable");
+        assert_eq!(structured["dispatched"], true);
+    }
+
+    #[test]
+    fn a_task_that_ended_without_a_result_may_or_may_not_have_sent() {
+        let path = vec!["Edit".to_owned(), "Select All".to_owned()];
+        let result = uncertain_dispatch(
+            "",
+            &path,
+            "the background press task ended without a result (panic)",
+            Dispatch::Possible,
+            ActionTransport::MacosAxAction,
+        );
+        let text = text_of(&result);
+        assert!(
+            text.starts_with("May have sent Edit > Select All"),
+            "{text}"
+        );
+        let structured = result.structured_content.expect("structured");
+        assert_eq!(structured["effect"], "unverifiable");
+        assert!(structured.get("dispatched").is_none(), "{structured}");
+    }
+
+    #[test]
     fn an_ax_error_after_the_final_action_is_sent_is_not_a_refusal() {
         // A fake dispatch: the action reports an error but may have run.
         let mut sent = 0;
@@ -1255,10 +1379,11 @@ mod tests {
         ));
 
         let path = vec!["Edit".to_owned(), "Select All".to_owned()];
-        let result = sent_unverified(
+        let result = uncertain_dispatch(
             &MenuRequest::KeyEquivalent("cmd+a".into()).preface(&path),
             &path,
             &error,
+            Dispatch::Sent,
             ActionTransport::MacosAxAction,
         );
         assert_ne!(result.is_error, Some(true));
@@ -1277,7 +1402,7 @@ mod tests {
         let structured = passed.structured_content.expect("structured");
         assert_eq!(structured["effect"], "unverifiable");
         assert!(structured.get("keys_sent").is_none());
-        assert!(text.contains("may still have run"), "{text}");
+        assert!(text.contains("may have run"), "{text}");
         assert!(text.contains("Edit > Select All"), "{text}");
     }
 

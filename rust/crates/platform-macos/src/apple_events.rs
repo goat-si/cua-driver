@@ -364,14 +364,25 @@ pub struct SavedDocument {
     pub file_written: bool,
 }
 
+/// How far a failed background save got.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SaveStage {
+    /// Refused before any event was sent, or the script found no document
+    /// to save: nothing was saved.
+    NotSent,
+    /// The script failed, and its error does not say which of its events
+    /// failed: the save may have been sent before it (a denied or timed-out
+    /// modified-flag readback comes after the save).
+    MaybeSent,
+    /// The app accepted the save and its answer did not confirm it.
+    Sent,
+}
+
 /// Why a background save did not confirm.
 #[derive(Debug, Clone)]
 pub struct SaveFailure {
     pub refusal: ScriptRefusal,
-    /// The save event was (or may have been) sent to the app, so the
-    /// document may still be saved. False only when nothing was sent or the
-    /// script saved nothing.
-    pub sent: bool,
+    pub stage: SaveStage,
 }
 
 pub fn save_document(
@@ -381,7 +392,7 @@ pub fn save_document(
 ) -> Result<SavedDocument, SaveFailure> {
     ensure_permitted(bundle_id, app_name).map_err(|refusal| SaveFailure {
         refusal,
-        sent: false,
+        stage: SaveStage::NotSent,
     })?;
     let before = modified_time(path);
     let path_text = path.to_string_lossy();
@@ -391,8 +402,8 @@ pub fn save_document(
         Duration::from_secs(30),
     )
     .map_err(|refusal| SaveFailure {
-        sent: script_failure_may_have_sent(&refusal),
         refusal,
+        stage: SaveStage::MaybeSent,
     })?;
     match result.as_str() {
         "false" => {}
@@ -405,7 +416,7 @@ pub fn save_document(
                         path.display()
                     ),
                 },
-                sent: true,
+                stage: SaveStage::Sent,
             })
         }
         "no-document" => {
@@ -415,7 +426,7 @@ pub fn save_document(
                     reason: format!("{app_name} lists no open document for {}", path.display()),
                 },
                 // The script found no document to save, so it saved nothing.
-                sent: false,
+                stage: SaveStage::NotSent,
             });
         }
         other => {
@@ -424,7 +435,7 @@ pub fn save_document(
                     code: "save_unconfirmed",
                     reason: format!("{app_name} answered \"{other}\" to the save"),
                 },
-                sent: true,
+                stage: SaveStage::Sent,
             })
         }
     }
@@ -434,13 +445,6 @@ pub fn save_document(
 
 pub fn modified_time(path: &Path) -> Option<std::time::SystemTime> {
     std::fs::metadata(path).and_then(|m| m.modified()).ok()
-}
-
-/// macOS refusing the event (-1743) means it was not delivered; any other
-/// script failure (a timeout, an execution error) may have come after the
-/// app started acting on it.
-fn script_failure_may_have_sent(refusal: &ScriptRefusal) -> bool {
-    refusal.code != "automation_denied"
 }
 
 /// Wait up to `timeout` for `path`'s modification time to move past
@@ -509,17 +513,6 @@ mod tests {
 
     #[test]
     fn script_errors_name_a_denied_permission() {
-        assert!(!script_failure_may_have_sent(&script_error_refusal(
-            "0:120: execution error: Not authorized to send Apple events to TextEdit. (-1743)"
-        )));
-        // A timeout or an execution error can follow a save the app started.
-        assert!(script_failure_may_have_sent(&ScriptRefusal {
-            code: "automation_timeout",
-            reason: String::new(),
-        }));
-        assert!(script_failure_may_have_sent(&script_error_refusal(
-            "0:80: execution error: TextEdit got an error: AppleEvent timed out. (-1712)"
-        )));
         let denied = script_error_refusal(
             "0:120: execution error: Not authorized to send Apple events to Finder. (-1743)",
         );
