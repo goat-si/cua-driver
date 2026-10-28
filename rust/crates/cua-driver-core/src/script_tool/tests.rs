@@ -588,3 +588,49 @@ async fn script_actions_are_paced_as_batched_steps_and_reads_are_not() {
         of("get_window_state")
     );
 }
+
+#[tokio::test]
+async fn checkpoint_verification_skips_the_report_wait_of_every_action_only() {
+    let harness = Harness::new();
+    let result = harness
+        .run_with(json!({
+            "verify": "checkpoint",
+            "script": "const app = await cua.getApp('Notes');\nawait app.click({role: 'button', name: 'Save'});\nawait app.click({role: 'button', name: 'Save'}, {post_action_wait: 'default'});\nawait app.getState();\nreturn 1;"
+        }))
+        .await;
+    assert_ne!(result.is_error, Some(true), "{}", text(&result));
+    assert_eq!(structured(&result)["verify"], "checkpoint");
+    let clicks = harness.calls("click");
+    assert_eq!(clicks.len(), 2);
+    if crate::post_action_wait::SKIP_SUPPORTED {
+        assert_eq!(clicks[0]["post_action_wait"], "none");
+    } else {
+        // Platforms that never wait do not advertise the argument.
+        assert!(
+            clicks[0].get("post_action_wait").is_none(),
+            "{:?}",
+            clicks[0]
+        );
+    }
+    assert_ne!(
+        clicks[1]["post_action_wait"], "none",
+        "an explicit value wins"
+    );
+    assert!(harness
+        .calls("get_window_state")
+        .iter()
+        .all(|args| args.get("post_action_wait").is_none()));
+
+    // Default: every action keeps its wait.
+    let harness = Harness::new();
+    let result = harness
+        .run("const app = await cua.getApp('Notes');\nawait app.click({role: 'button', name: 'Save'});\nreturn 1;")
+        .await;
+    assert!(structured(&result).get("verify").is_none());
+    assert!(harness.calls("click")[0].get("post_action_wait").is_none());
+
+    let rejected = harness
+        .run_with(json!({"script": "return 1;", "verify": "sometimes"}))
+        .await;
+    assert_eq!(structured(&rejected)["code"], "invalid_script");
+}
