@@ -1058,6 +1058,20 @@ fn uncertain_dispatch(
         transport,
         detail,
     );
+    if dispatch == Dispatch::Possible {
+        // Nothing shows the app received the command: no delivery mode and
+        // no native-API evidence is claimed.
+        result.action_record = Some(
+            ActionExecutionRecord::builder(
+                ActionEffect::Unverifiable,
+                transport,
+                RequestedDelivery::Background,
+            )
+            .actual_delivery(ActualDelivery::Unknown)
+            .build()
+            .expect("invoke_menu record is valid"),
+        );
+    }
     let mut structured = serde_json::json!({
         "status": "unverifiable",
         "effect": "unverifiable",
@@ -1352,9 +1366,25 @@ mod tests {
             text.starts_with("May have sent Edit > Select All"),
             "{text}"
         );
+        let record = result.action_record.clone();
         let structured = result.structured_content.expect("structured");
         assert_eq!(structured["effect"], "unverifiable");
         assert!(structured.get("dispatched").is_none(), "{structured}");
+        // The public result claims neither a delivery mode nor evidence.
+        let public = serde_json::to_value(
+            record
+                .as_ref()
+                .expect("record")
+                .public_result()
+                .expect("valid record"),
+        )
+        .unwrap();
+        assert_eq!(public["effect"], "unverifiable", "{public}");
+        assert_eq!(public["delivery"]["mode"], "unknown", "{public}");
+        assert!(
+            public.get("evidence").is_none_or(|e| e.is_null()),
+            "{public}"
+        );
     }
 
     #[test]
