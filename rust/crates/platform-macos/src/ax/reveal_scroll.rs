@@ -177,21 +177,87 @@ pub unsafe fn reveal_scroll(
     direction: &str,
     distance: f64,
 ) -> Option<RevealOutcome> {
-    let hit = element_at_screen_position(pid, point.0, point.1)?;
-    let candidates = scroll_candidates(hit, direction);
-    CFRelease(hit as CFTypeRef);
+    reveal_scroll_with(pid, point, window, direction, distance, electron_limits()).outcome
+}
+
+/// What trying the candidates in turn produced.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CandidateRun<O> {
+    /// The first candidate's outcome that moved something.
+    pub outcome: Option<O>,
+    /// A reveal action was sent (or answered with an error) for some
+    /// candidate.
+    pub attempted: bool,
+    /// The proceed hook refused: no candidate after that was tried.
+    pub stopped: bool,
+}
+
+/// Tries candidates in order until one moves something, releasing every
+/// candidate; after a failed reveal (it may still apply) or once stopped
+/// reports true, the rest are released untried.
+pub fn first_outcome<C, O>(
+    candidates: Vec<C>,
+    mut attempt: impl FnMut(&C) -> (Mutation, Option<O>),
+    stopped: impl Fn() -> bool,
+    mut release: impl FnMut(C),
+) -> CandidateRun<O> {
+    let mut run = CandidateRun {
+        outcome: None,
+        attempted: false,
+        stopped: false,
+    };
     let mut candidates = candidates.into_iter();
-    while let Some((container, role)) = candidates.next() {
-        let outcome = reveal_in(container, &role, window, direction, distance);
-        CFRelease(container as CFTypeRef);
-        if let Some(outcome) = outcome {
-            for (rest, _) in candidates {
-                CFRelease(rest as CFTypeRef);
-            }
-            return Some(outcome);
+    for candidate in candidates.by_ref() {
+        let (mutation, outcome) = attempt(&candidate);
+        release(candidate);
+        run.attempted |= mutation != Mutation::NotSent;
+        if outcome.is_some() {
+            run.outcome = outcome;
+            break;
+        }
+        // The app answered with an error or not in time: it may still apply
+        // that reveal, so no other candidate scrolls on top of it.
+        if matches!(mutation, Mutation::Failed { .. }) {
+            break;
+        }
+        if stopped() {
+            run.stopped = true;
+            break;
         }
     }
-    None
+    candidates.for_each(&mut release);
+    run
+}
+
+/// reveal_scroll within limits (a proceed hook runs right before the reveal
+/// action, after the target was found).
+///
+/// # Safety
+///
+/// As reveal_scroll.
+pub unsafe fn reveal_scroll_with(
+    pid: i32,
+    point: (f64, f64),
+    window: Option<Rect>,
+    direction: &str,
+    distance: f64,
+    limits: RevealLimits,
+) -> CandidateRun<RevealOutcome> {
+    let Some(hit) = element_at_screen_position(pid, point.0, point.1) else {
+        return CandidateRun {
+            outcome: None,
+            attempted: false,
+            stopped: false,
+        };
+    };
+    let candidates = scroll_candidates(hit, direction);
+    CFRelease(hit as CFTypeRef);
+    first_outcome(
+        candidates,
+        |(container, role)| reveal_core(*container, role, window, direction, distance, limits),
+        || limits.proceed.is_some_and(|proceed| !proceed()),
+        |(container, _)| CFRelease(container as CFTypeRef),
+    )
 }
 
 /// The elements at or above `element` to try, innermost first and retained:
@@ -276,6 +342,9 @@ pub struct RevealLimits<'a> {
     pub budget: Option<Budget<'a>>,
     /// Accessibility messaging timeout set on every element read.
     pub element_timeout: Option<f32>,
+    /// Asked right before AXScrollToVisible, after the target was found;
+    /// false sends nothing.
+    pub proceed: Option<&'a dyn Fn() -> bool>,
 }
 
 impl RevealLimits<'_> {
@@ -284,11 +353,16 @@ impl RevealLimits<'_> {
         RevealLimits {
             budget: None,
             element_timeout: None,
+            proceed: None,
         }
     }
 
     fn expired(&self) -> bool {
         self.budget.is_some_and(|budget| budget.expired())
+    }
+
+    fn may_act(&self) -> bool {
+        !self.expired() && self.proceed.is_none_or(|proceed| proceed())
     }
 
     fn pause(&self, duration: std::time::Duration) {
@@ -348,25 +422,7 @@ pub fn walk_until<T>(
     }
 }
 
-pub(crate) unsafe fn reveal_in(
-    container: AXUIElementRef,
-    role: &str,
-    window: Option<Rect>,
-    direction: &str,
-    distance: f64,
-) -> Option<RevealOutcome> {
-    reveal_core(
-        container,
-        role,
-        window,
-        direction,
-        distance,
-        electron_limits(),
-    )
-    .1
-}
-
-/// reveal_in within limits, reporting whether AXScrollToVisible was sent
+/// A reveal within limits, reporting whether AXScrollToVisible was sent
 /// and how the app answered.
 pub(crate) unsafe fn reveal_attempt(
     container: AXUIElementRef,
@@ -468,7 +524,7 @@ unsafe fn reveal_core(
     let outcome = if let Some(index) = pick_reveal_target(viewport, direction, distance, &real) {
         // A real frame: measure the move on the element itself.
         let before = nodes[index].0;
-        if limits.expired() {
+        if !limits.may_act() {
             return (Mutation::NotSent, finish(elements, None));
         }
         sent = mutation_of(perform_action(elements[index], "AXScrollToVisible"));
@@ -496,7 +552,7 @@ unsafe fn reveal_core(
             .iter()
             .position(|(rect, leaf)| *leaf && real_size(*rect) && contains(viewport, *rect));
         let reference_before = reference.map(|at| nodes[at].0);
-        if limits.expired() {
+        if !limits.may_act() {
             return (Mutation::NotSent, finish(elements, None));
         }
         sent = mutation_of(perform_action(elements[pick.index], "AXScrollToVisible"));
@@ -618,6 +674,102 @@ mod tests {
             ),
             WalkEnd::NodeCap
         );
+    }
+
+    #[test]
+    fn a_proceed_hook_that_says_no_keeps_the_reveal_from_acting() {
+        let no = || false;
+        let yes = || true;
+        let mut limits = electron_limits();
+        assert!(limits.may_act());
+        limits.proceed = Some(&no);
+        assert!(!limits.may_act());
+        limits.proceed = Some(&yes);
+        assert!(limits.may_act());
+    }
+
+    #[test]
+    fn a_refused_candidate_stops_the_loop_and_releases_the_rest() {
+        // Window moved away and back: the hook refused once and stays
+        // refused, so no later candidate acts.
+        let refused = std::cell::Cell::new(false);
+        let released = std::cell::RefCell::new(Vec::new());
+        let acted = std::cell::RefCell::new(Vec::new());
+        let run = first_outcome(
+            vec![1, 2, 3],
+            |&candidate| {
+                if candidate == 1 {
+                    refused.set(true);
+                    return (Mutation::NotSent, None::<u32>);
+                }
+                acted.borrow_mut().push(candidate);
+                (Mutation::Sent { count: 1 }, Some(candidate))
+            },
+            || refused.get(),
+            |candidate| released.borrow_mut().push(candidate),
+        );
+        assert_eq!(
+            run,
+            CandidateRun {
+                outcome: None,
+                attempted: false,
+                stopped: true
+            }
+        );
+        assert!(acted.borrow().is_empty());
+        assert_eq!(*released.borrow(), vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn an_earlier_sent_reveal_is_reported_when_a_later_one_is_refused() {
+        let calls = std::cell::Cell::new(0);
+        let run = first_outcome(
+            vec![1, 2, 3],
+            |&candidate| {
+                calls.set(calls.get() + 1);
+                match candidate {
+                    1 => (Mutation::Sent { count: 1 }, None::<u32>),
+                    _ => (Mutation::NotSent, None),
+                }
+            },
+            || calls.get() >= 2,
+            |_| {},
+        );
+        assert_eq!(
+            run,
+            CandidateRun {
+                outcome: None,
+                attempted: true,
+                stopped: true
+            }
+        );
+        assert_eq!(calls.get(), 2);
+    }
+
+    #[test]
+    fn a_failed_reveal_is_not_followed_by_another() {
+        let sent = std::cell::RefCell::new(Vec::new());
+        let released = std::cell::RefCell::new(Vec::new());
+        let run = first_outcome(
+            vec![1, 2, 3],
+            |&candidate| {
+                sent.borrow_mut().push(candidate);
+                // The first reveal times out (and the app applies it late).
+                (Mutation::Failed { count: 1 }, None::<u32>)
+            },
+            || false,
+            |candidate| released.borrow_mut().push(candidate),
+        );
+        assert_eq!(
+            run,
+            CandidateRun {
+                outcome: None,
+                attempted: true,
+                stopped: false
+            }
+        );
+        assert_eq!(*sent.borrow(), vec![1], "no second reveal");
+        assert_eq!(*released.borrow(), vec![1, 2, 3]);
     }
 
     #[test]

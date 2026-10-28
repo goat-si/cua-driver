@@ -461,6 +461,8 @@ fn def() -> &'static ToolDef {
                     "type": "string",
                     "description": "Write a screenshot with a crosshair at (x, y) to this path. Needs window_id; not with from_zoom."
                 },
+                "coordinate_space": super::window_points::coordinate_space_schema(),
+                "window_basis": super::window_points::window_basis_schema(),
                 "delivery_mode": {
                     "type": "string",
                     "enum": ["background", "foreground"],
@@ -488,6 +490,20 @@ impl Tool for ClickTool {
     }
 
     async fn invoke(&self, args: Value) -> ToolResult {
+        let space = match super::window_points::point_space(&args) {
+            Ok(space) => space,
+            Err(refusal) => return refusal,
+        };
+        let point = args
+            .get("x")
+            .and_then(Value::as_f64)
+            .zip(args.get("y").and_then(Value::as_f64));
+        super::window_points::annotate(self.invoke_in(args, space).await, space, point)
+    }
+}
+
+impl ClickTool {
+    async fn invoke_in(&self, args: Value, space: super::window_points::PointSpace) -> ToolResult {
         use cua_driver_core::tool_args::ArgsExt;
 
         // ── Window-less screen-absolute branch (scope="desktop") ──────
@@ -1045,6 +1061,15 @@ impl Tool for ClickTool {
         } else if let (Some(mut cx), Some(mut cy)) = (x, y) {
             // ── Pixel path ─────────────────────────────────────────────────
 
+            let mut validated_frame: Option<super::px_frame::WindowPxFrame> = None;
+            if matches!(space, super::window_points::PointSpace::WindowPoints(_))
+                && (capture_id.is_some() || from_zoom || debug_image_out.is_some())
+            {
+                return super::invalid_arguments(
+                    "coordinate_space window_points cannot be combined with capture_id, from_zoom or \
+                     debug_image_out: those name screenshot pixels.",
+                );
+            }
             if capture_id.is_some() && (from_zoom || debug_image_out.is_some()) {
                 return super::invalid_arguments(
                     "click.capture_id is incompatible with from_zoom and debug_image_out; \
@@ -1123,6 +1148,23 @@ impl Tool for ClickTool {
                     }
                     Err(refusal) => return refusal,
                 }
+            } else if matches!(space, super::window_points::PointSpace::WindowPoints(_)) {
+                match super::window_points::to_window_pixels(
+                    &self.state,
+                    &args,
+                    pid,
+                    window_id,
+                    space,
+                    &[(cx, cy)],
+                )
+                .await
+                {
+                    Ok(resolved) => {
+                        (cx, cy) = resolved.pixels[0];
+                        validated_frame = resolved.frame;
+                    }
+                    Err(refusal) => return refusal,
+                }
             } else {
                 match super::window_click_point(
                     &self.state,
@@ -1153,7 +1195,7 @@ impl Tool for ClickTool {
             // Chromium recipe falls back to public PID posting. Its SkyLight
             // route uses the translated screen coordinates instead.
             let (screen_x, screen_y, win_local_x, win_local_y) = if let Some(wid) = window_id {
-                match super::px_frame::resolve_or_refuse(wid).await {
+                match super::window_points::frame_or_resolve(validated_frame.clone(), wid).await {
                     Ok(frame) => {
                         let (sx, sy, lx, ly) = frame.to_screen(cx, cy);
                         // A window-local point outside the live frame would
@@ -1267,6 +1309,19 @@ impl Tool for ClickTool {
                     && modifiers.is_empty()
             }) {
                 let focus_only = action == "focus";
+                if let Err(refusal) =
+                    super::window_points::recheck_now(space, window_id, validated_frame.as_ref())
+                {
+                    return refusal;
+                }
+                let dispatch_guard = match super::window_points::DispatchGuard::new(
+                    space,
+                    window_id,
+                    validated_frame.clone(),
+                ) {
+                    Ok(guard) => guard,
+                    Err(refusal) => return refusal,
+                };
                 let ax_result = latency::spawn_action_blocking(move || unsafe {
                     let Some(element) = element_at_screen_position(pid, screen_x, screen_y) else {
                         return Ok::<bool, anyhow::Error>(false);
@@ -1295,6 +1350,12 @@ impl Tool for ClickTool {
                         CFRelease(element as _);
                         return Ok(false);
                     }
+                    // Last, after the hit test and its checks: the window must
+                    // still be where the window points were translated.
+                    if let Err(moved) = super::window_points::check_guard(&dispatch_guard) {
+                        CFRelease(element as _);
+                        return Err(moved.into());
+                    }
                     let delivered = if focus_only {
                         crate::input::ax_actions::focus_element(element as usize).is_ok()
                     } else {
@@ -1306,6 +1367,11 @@ impl Tool for ClickTool {
                     Ok(delivered)
                 })
                 .await;
+                if let Ok(Err(error)) = &ax_result {
+                    if let Some(refusal) = super::window_points::moved_refusal(error, space) {
+                        return refusal;
+                    }
+                }
                 match ax_result {
                     Ok(Ok(true)) => {
                         crate::cursor::overlay::send_command(
@@ -1349,6 +1415,11 @@ impl Tool for ClickTool {
             let fg = delivery_mode.is_foreground() && window_id.is_some();
             // Background delivery cannot satisfy a toolkit that reads the
             // hardware pointer; refuse before any activation or dispatch.
+            if let Err(refusal) =
+                super::window_points::recheck_now(space, window_id, validated_frame.as_ref())
+            {
+                return refusal;
+            }
             let route = match super::pixel_route::resolve(pid, fg, window_id, "mouse_click").await {
                 Ok(route) => route,
                 Err(refusal) => return refusal,
@@ -1456,6 +1527,14 @@ impl Tool for ClickTool {
             // button != left. Left-button path stays on the existing Chromium-
             // routed `click_at_xy_with_window_local` for back-compat.
             let button_kind = button_str.clone();
+            let dispatch_guard = match super::window_points::DispatchGuard::new(
+                space,
+                window_id,
+                validated_frame.clone(),
+            ) {
+                Ok(guard) => guard,
+                Err(refusal) => return refusal,
+            };
             let result = focus_guard::with_focus_suppressed(
                 if activation_policy == PixelActivationPolicy::SuppressTarget {
                     Some(pid)
@@ -1467,6 +1546,7 @@ impl Tool for ClickTool {
                 || async move {
                     latency::spawn_action_blocking(move || {
                         let do_click = move || -> anyhow::Result<()> {
+                            super::window_points::check_guard(&dispatch_guard)?;
                             let m: Vec<&str> = mods_owned.iter().map(String::as_str).collect();
                             if route == PixelClickRoute::ForegroundHid {
                                 // Warp the hardware pointer to the mapped global
@@ -1548,6 +1628,11 @@ impl Tool for ClickTool {
             }
 
             let changes = super::finish_window_observation(snapshot).await;
+            if let Ok(Err(error)) = &result {
+                if let Some(refusal) = super::window_points::moved_refusal(error, space) {
+                    return refusal;
+                }
+            }
 
             let button_label = match (button_str.as_str(), count) {
                 ("right", _) => "right-click",

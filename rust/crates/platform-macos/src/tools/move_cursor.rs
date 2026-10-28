@@ -42,6 +42,8 @@ fn def() -> &'static ToolDef {
                 "y": { "type": "number", "description": "Destination Y, in the same space as x." },
                 "scope": { "type": "string", "enum": ["window", "desktop"], "default": "window", "description": "\"window\" (default) moves only the agent cursor overlay; \"desktop\" moves the real OS pointer." },
                 "cursor_id": { "type": "string", "description": "Cursor instance to move. Default: 'default'." },
+                "coordinate_space": super::window_points::coordinate_space_schema(),
+                "window_basis": super::window_points::window_basis_schema(),
                 "delivery_mode": cua_driver_core::tool_schema::delivery_mode_schema_with("Desktop scope only. Default \"background\": refuses, before moving anything, when the point is over a window of an app that is not in front, since that would move the user's pointer. \"foreground\": move the real pointer anyway; only when nobody is using this screen or the user agreed.")
             },
             "additionalProperties": false
@@ -60,6 +62,20 @@ impl Tool for MoveCursorTool {
     }
 
     async fn invoke(&self, args: Value) -> ToolResult {
+        let space = match super::window_points::point_space(&args) {
+            Ok(space) => space,
+            Err(refusal) => return refusal,
+        };
+        let point = args
+            .get("x")
+            .and_then(Value::as_f64)
+            .zip(args.get("y").and_then(Value::as_f64));
+        super::window_points::annotate(self.invoke_in(args, space).await, space, point)
+    }
+}
+
+impl MoveCursorTool {
+    async fn invoke_in(&self, args: Value, space: super::window_points::PointSpace) -> ToolResult {
         use cua_driver_core::tool_args::ArgsExt;
         if args.opt_str("scope").as_deref() == Some("desktop") {
             let input = match parse_typed_projection::<MoveCursorInput>("move_cursor", &args) {
@@ -99,7 +115,9 @@ impl Tool for MoveCursorTool {
             };
         }
         if let (Some(pid), Some(wid)) = (args.opt_i64("pid"), args.opt_u64("window_id")) {
-            return self.move_over_window(&args, pid as i32, wid as u32).await;
+            return self
+                .move_over_window(&args, pid as i32, wid as u32, space)
+                .await;
         }
         if !self.state.cursor_overlay_available {
             return super::cursor_overlay_unavailable();
@@ -136,7 +154,13 @@ impl MoveCursorTool {
     /// the real pointer, and pointer-move events posted to a background app
     /// do not reach its tracking areas (VM check, 11 Oct 2026: BenchLab saw no
     /// hover through the SkyLight, public or both routes).
-    async fn move_over_window(&self, args: &Value, pid: i32, wid: u32) -> ToolResult {
+    async fn move_over_window(
+        &self,
+        args: &Value,
+        pid: i32,
+        wid: u32,
+        space: super::window_points::PointSpace,
+    ) -> ToolResult {
         use cua_driver_core::tool_args::ArgsExt;
         if !self.state.cursor_overlay_available {
             return super::cursor_overlay_unavailable();
@@ -145,15 +169,24 @@ impl MoveCursorTool {
             (Ok(x), Ok(y)) => (x, y),
             (Err(e), _) | (_, Err(e)) => return e,
         };
-        let ratio = match super::screenshot_scale(&self.state, args, pid, Some(wid)) {
-            Ok(ratio) => ratio,
+        let ((px, py), validated_frame) = match super::window_points::to_window_pixels(
+            &self.state,
+            args,
+            pid,
+            Some(wid),
+            space,
+            &[(x, y)],
+        )
+        .await
+        {
+            Ok(resolved) => (resolved.pixels[0], resolved.frame),
             Err(refusal) => return refusal,
         };
-        let frame = match super::px_frame::resolve_or_refuse(wid).await {
+        let frame = match super::window_points::frame_or_resolve(validated_frame, wid).await {
             Ok(frame) => frame,
             Err(refusal) => return refusal,
         };
-        let (screen_x, screen_y, local_x, local_y) = frame.to_screen(x * ratio, y * ratio);
+        let (screen_x, screen_y, local_x, local_y) = frame.to_screen(px, py);
         if local_x < 0.0
             || local_y < 0.0
             || local_x > frame.bounds.width

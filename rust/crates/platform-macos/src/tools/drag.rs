@@ -116,6 +116,8 @@ fn def() -> &'static ToolDef {
                     "description": "When true, coordinates are in the last zoom image for this pid; driver maps back to window coordinates."
                 },
                 "scope": { "type": "string", "enum": ["window", "desktop"], "default": "window", "description": "Use desktop with no pid/window_id for native get_desktop_state screenshot coordinates." },
+                "coordinate_space": super::window_points::coordinate_space_schema(),
+                "window_basis": super::window_points::window_basis_schema(),
                 "delivery_mode": cua_driver_core::tool_schema::delivery_mode_schema_with(DELIVERY_MODE_DESCRIPTION)
             },
             "additionalProperties": false
@@ -134,6 +136,20 @@ impl Tool for DragTool {
     }
 
     async fn invoke(&self, args: Value) -> ToolResult {
+        let space = match super::window_points::point_space(&args) {
+            Ok(space) => space,
+            Err(refusal) => return refusal,
+        };
+        let point = args
+            .get("to_x")
+            .and_then(Value::as_f64)
+            .zip(args.get("to_y").and_then(Value::as_f64));
+        super::window_points::annotate(self.invoke_in(args, space).await, space, point)
+    }
+}
+
+impl DragTool {
+    async fn invoke_in(&self, args: Value, space: super::window_points::PointSpace) -> ToolResult {
         use cua_driver_core::tool_args::ArgsExt;
         let cursor_key = super::cursor_tools::resolve_cursor_key(&args);
         if args.opt_str("scope").as_deref() == Some("desktop")
@@ -266,6 +282,12 @@ impl Tool for DragTool {
             }
         };
 
+        if from_zoom && matches!(space, super::window_points::PointSpace::WindowPoints(_)) {
+            return super::invalid_arguments(
+                "coordinate_space window_points cannot be combined with from_zoom.",
+            );
+        }
+        let mut validated_frame: Option<super::px_frame::WindowPxFrame> = None;
         // from_zoom: translate from last zoom crop context.
         if from_zoom {
             match super::zoom_context(&self.state, &args, pid, window_id) {
@@ -280,14 +302,24 @@ impl Tool for DragTool {
                 Err(refusal) => return refusal,
             }
         } else {
-            let ratio = match super::screenshot_scale(&self.state, &args, pid, window_id) {
-                Ok(ratio) => ratio,
+            // Both ends against one frame read: a stale basis refuses the drag.
+            match super::window_points::to_window_pixels(
+                &self.state,
+                &args,
+                pid,
+                window_id,
+                space,
+                &[(from_x, from_y), (to_x, to_y)],
+            )
+            .await
+            {
+                Ok(resolved) => {
+                    (from_x, from_y) = resolved.pixels[0];
+                    (to_x, to_y) = resolved.pixels[1];
+                    validated_frame = resolved.frame;
+                }
                 Err(refusal) => return refusal,
-            };
-            from_x *= ratio;
-            from_y *= ratio;
-            to_x *= ratio;
-            to_y *= ratio;
+            }
         }
 
         // Translate window-local screenshot pixels → screen coordinates, and
@@ -295,7 +327,7 @@ impl Tool for DragTool {
         // of the drag resolve against ONE frame, so a window that closed
         // mid-call refuses rather than dragging across the desktop behind it.
         let (from_sx, from_sy, from_lx, from_ly, to_sx, to_sy, to_lx, to_ly) =
-            match super::px_frame::resolve_or_refuse(wid).await {
+            match super::window_points::frame_or_resolve(validated_frame.clone(), wid).await {
                 Ok(frame) => {
                     let (fsx, fsy, flx, fly) = frame.to_screen(from_x, from_y);
                     let (tsx, tsy, tlx, tly) = frame.to_screen(to_x, to_y);
@@ -320,6 +352,11 @@ impl Tool for DragTool {
             // the app's main process instead, where the held button is part
             // of the event; refuse when that route is unavailable.
             if crate::browser::ElectronJs::is_electron(pid) {
+                if let Err(refusal) =
+                    super::window_points::recheck_now(space, window_id, validated_frame.as_ref())
+                {
+                    return refusal;
+                }
                 return self
                     .electron_background_drag(
                         &cursor_key,
@@ -333,6 +370,7 @@ impl Tool for DragTool {
                         steps,
                         &modifiers,
                         button,
+                        (space, validated_frame.clone()),
                     )
                     .await;
             }
@@ -344,6 +382,12 @@ impl Tool for DragTool {
             cursor_overlay::OverlayCommand::PinAbove(wid as u64),
         );
         crate::cursor::overlay::animate_cursor_to(cursor_key.clone(), from_sx, from_sy).await;
+
+        if let Err(refusal) =
+            super::window_points::recheck_now(space, window_id, validated_frame.as_ref())
+        {
+            return refusal;
+        }
 
         // ── Focus-suppression wrap (Swift WindowChangeDetector + FocusGuard) ──
         // Drags can trigger drag-and-drop side-effects that spawn helper
@@ -416,6 +460,14 @@ impl Tool for DragTool {
             cursor_key.clone(),
             cursor_overlay::OverlayCommand::SetPressed(true),
         );
+        let dispatch_guard = match super::window_points::DispatchGuard::new(
+            space,
+            window_id,
+            validated_frame.clone(),
+        ) {
+            Ok(guard) => guard,
+            Err(refusal) => return refusal,
+        };
         let result = focus_guard::with_focus_suppressed(
             // Neither mode suppresses the target: foreground deliberately
             // activates it for the HID gesture, and background lets the
@@ -441,6 +493,9 @@ impl Tool for DragTool {
                             pid as libc::pid_t,
                             wid,
                             || {
+                                // After the activation and its focus wait,
+                                // right before the press.
+                                super::window_points::check_guard(&dispatch_guard)?;
                                 crate::input::mouse::drag_at_xy_observed(
                                     pid,
                                     from_sx,
@@ -475,6 +530,8 @@ impl Tool for DragTool {
                     // the session ends where the user's pointer is not
                     // moving, and report it.
                     let before = drag_image_windows(pid);
+                    // After the window read, right before the press.
+                    super::window_points::check_guard(&dispatch_guard)?;
                     let mut session_seen = false;
                     let outcome = crate::input::mouse::drag_at_xy_background(
                         pid,
@@ -525,6 +582,11 @@ impl Tool for DragTool {
         }
 
         let changes = super::finish_window_observation(snapshot).await;
+        if let Ok(Err(error)) = &result {
+            if let Some(refusal) = super::window_points::moved_refusal(error, space) {
+                return refusal;
+            }
+        }
 
         crate::cursor::overlay::send_command(
             cursor_key.clone(),
@@ -679,6 +741,10 @@ impl DragTool {
         steps: usize,
         modifiers: &[String],
         button: DragButton,
+        (space, validated_frame): (
+            super::window_points::PointSpace,
+            Option<super::px_frame::WindowPxFrame>,
+        ),
     ) -> ToolResult {
         use crate::input::electron_drag::{
             electron_drag_js, parse_electron_drag_reply, ElectronDragButton, ElectronDragReply,
@@ -708,6 +774,17 @@ impl DragTool {
             cursor_key.clone(),
             cursor_overlay::OverlayCommand::SetPressed(true),
         );
+        // The cursor animation above takes time: the window must still be
+        // where the window points were translated.
+        if let Err(refusal) =
+            super::window_points::recheck_now(space, Some(wid), validated_frame.as_ref())
+        {
+            crate::cursor::overlay::send_command(
+                cursor_key.to_owned(),
+                cursor_overlay::OverlayCommand::SetPressed(false),
+            );
+            return refusal;
+        }
         let reply = crate::browser::ElectronJs::execute_main(&electron_drag_js(&spec), pid).await;
         let outcome = match &reply {
             Ok(text) => parse_electron_drag_reply(text),

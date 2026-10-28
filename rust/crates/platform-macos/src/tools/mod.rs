@@ -42,6 +42,7 @@ mod pixel_route;
 pub(crate) mod px_frame;
 mod set_config;
 mod type_text_chars;
+pub(crate) mod window_points;
 mod zoom;
 
 use cua_driver_core::{

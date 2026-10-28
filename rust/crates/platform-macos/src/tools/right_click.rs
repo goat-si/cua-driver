@@ -60,6 +60,8 @@ fn def() -> &'static ToolDef {
                     "items": { "type": "string" },
                     "description": "Modifier keys held during the right-click: cmd/shift/option/ctrl. Pixel path only."
                 },
+                "coordinate_space": super::window_points::coordinate_space_schema(),
+                "window_basis": super::window_points::window_basis_schema(),
                 "delivery_mode": cua_driver_core::tool_schema::delivery_mode_schema()
             },
             "additionalProperties": false
@@ -78,6 +80,20 @@ impl Tool for RightClickTool {
     }
 
     async fn invoke(&self, args: Value) -> ToolResult {
+        let space = match super::window_points::point_space(&args) {
+            Ok(space) => space,
+            Err(refusal) => return refusal,
+        };
+        let point = args
+            .get("x")
+            .and_then(Value::as_f64)
+            .zip(args.get("y").and_then(Value::as_f64));
+        super::window_points::annotate(self.invoke_in(args, space).await, space, point)
+    }
+}
+
+impl RightClickTool {
+    async fn invoke_in(&self, args: Value, space: super::window_points::PointSpace) -> ToolResult {
         use cua_driver_core::tool_args::ArgsExt;
         let pid = match super::target_pid(&self.state, &args) {
             Ok(v) => v,
@@ -154,20 +170,27 @@ impl Tool for RightClickTool {
         }
 
         // ── Pixel path ───────────────────────────────────────────────────────
-        let (mut cx, mut cy) = (x.unwrap(), y.unwrap());
-        // Scale back from downscaled-image space to native pixels when needed.
-        let ratio = match super::screenshot_scale(&self.state, &args, pid, window_id) {
-            Ok(ratio) => ratio,
+        // Scale back from screenshot pixels (or window points) to native
+        // window pixels.
+        let ((cx, cy), validated_frame) = match super::window_points::to_window_pixels(
+            &self.state,
+            &args,
+            pid,
+            window_id,
+            space,
+            &[(x.unwrap(), y.unwrap())],
+        )
+        .await
+        {
+            Ok(resolved) => (resolved.pixels[0], resolved.frame),
             Err(refusal) => return refusal,
         };
-        cx *= ratio;
-        cy *= ratio;
 
         // Window-local → screen coordinate translation + win-local logical coords
         // for CGEventSetWindowLocation (shared with click.rs via px_frame, which
         // refuses a window with no live frame).
         let (screen_x, screen_y, win_local_x, win_local_y) = if let Some(wid) = window_id {
-            match super::px_frame::resolve_or_refuse(wid).await {
+            match super::window_points::frame_or_resolve(validated_frame.clone(), wid).await {
                 Ok(frame) => {
                     let translated = frame.to_screen(cx, cy);
                     if !delivery_mode.is_foreground()
@@ -234,9 +257,22 @@ impl Tool for RightClickTool {
         };
 
         let fg = delivery_mode.is_foreground() && window_id.is_some();
+        if let Err(refusal) =
+            super::window_points::recheck_now(space, window_id, validated_frame.as_ref())
+        {
+            return refusal;
+        }
         let route = match super::pixel_route::resolve(pid, fg, window_id, "mouse_right_click").await
         {
             Ok(route) => route,
+            Err(refusal) => return refusal,
+        };
+        let dispatch_guard = match super::window_points::DispatchGuard::new(
+            space,
+            window_id,
+            validated_frame.clone(),
+        ) {
+            Ok(guard) => guard,
             Err(refusal) => return refusal,
         };
         let result = latency::spawn_blocking(move || -> anyhow::Result<()> {
@@ -245,6 +281,7 @@ impl Tool for RightClickTool {
                 .flatten();
             let _action = latency::span(latency::Stage::ActionBlocking);
             let do_it = move || -> anyhow::Result<()> {
+                super::window_points::check_guard(&dispatch_guard)?;
                 let m: Vec<&str> = modifiers.iter().map(String::as_str).collect();
                 if route == super::pixel_route::PixelClickRoute::ForegroundHid {
                     // Warp the hardware pointer and post at the HID tap; see
@@ -282,6 +319,11 @@ impl Tool for RightClickTool {
             }
         })
         .await;
+        if let Ok(Err(error)) = &result {
+            if let Some(refusal) = super::window_points::moved_refusal(error, space) {
+                return refusal;
+            }
+        }
         match result {
             Ok(Ok(())) => ToolResult::text(format!(
                 "Right-clicked{mod_suffix} at ({screen_x:.1}, {screen_y:.1}) ({}).",

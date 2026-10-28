@@ -105,6 +105,8 @@ fn def() -> &'static ToolDef {
                 "x": { "type": "number", "description": "Window-local screenshot X (get_window_state PNG). With y, wheel-scrolls at that point; needs window_id." },
                 "y": { "type": "number", "description": "Window-local screenshot Y." },
                 "scope": { "type": "string", "enum": ["window", "desktop"], "default": "window", "description": "\"desktop\" with x,y and no pid/window_id uses get_desktop_state coordinates." },
+                "coordinate_space": super::window_points::coordinate_space_schema(),
+                "window_basis": super::window_points::window_basis_schema(),
                 "delivery_mode": cua_driver_core::tool_schema::delivery_mode_schema_with("Default \"background\": no fronting or focus steal. \"foreground\": briefly front the window, act, restore the prior app; last resort when background did not land.")
             },
             "additionalProperties": false
@@ -123,6 +125,20 @@ impl Tool for ScrollTool {
     }
 
     async fn invoke(&self, args: Value) -> ToolResult {
+        let space = match super::window_points::point_space(&args) {
+            Ok(space) => space,
+            Err(refusal) => return refusal,
+        };
+        let point = args
+            .get("x")
+            .and_then(Value::as_f64)
+            .zip(args.get("y").and_then(Value::as_f64));
+        super::window_points::annotate(self.invoke_in(args, space).await, space, point)
+    }
+}
+
+impl ScrollTool {
+    async fn invoke_in(&self, args: Value, space: super::window_points::PointSpace) -> ToolResult {
         use cua_driver_core::tool_args::ArgsExt;
         if args.opt_str("scope").as_deref() == Some("desktop")
             && args.get("pid").is_none()
@@ -326,6 +342,8 @@ impl Tool for ScrollTool {
         };
 
         // Resolve a screen-space wheel target, if a target was supplied.
+        // The window-points frame the target was translated with (pixel x, y).
+        let mut validated_frame: Option<super::px_frame::WindowPxFrame> = None;
         let wheel_target: Option<WheelTarget> = if let Some(element_ptr) = pre_focus_ptr {
             // Revealing an element is itself an AX mutation. Prove that the
             // cached element still belongs to the exact requested window before
@@ -418,12 +436,22 @@ impl Tool for ScrollTool {
             // click pixel path — undo any session downscale, then translate
             // through the shared window frame (which refuses a window with no
             // live frame rather than scrolling at screen-absolute coords).
-            let ratio = match super::screenshot_scale(&self.state, &args, pid, window_id) {
-                Ok(ratio) => ratio,
+            match super::window_points::to_window_pixels(
+                &self.state,
+                &args,
+                pid,
+                window_id,
+                space,
+                &[(cx, cy)],
+            )
+            .await
+            {
+                Ok(resolved) => {
+                    (cx, cy) = resolved.pixels[0];
+                    validated_frame = resolved.frame;
+                }
                 Err(refusal) => return refusal,
-            };
-            cx *= ratio;
-            cy *= ratio;
+            }
             let Some(wid) = window_id else {
                 // Unreachable: the None case refused above. Kept explicit so a
                 // future edit cannot reintroduce the screen-absolute fallback.
@@ -431,7 +459,7 @@ impl Tool for ScrollTool {
                     "window_id is required when scrolling by window-local x,y pixels.".to_string(),
                 );
             };
-            match super::px_frame::resolve_or_refuse(wid).await {
+            match super::window_points::frame_or_resolve(validated_frame.clone(), wid).await {
                 Ok(frame) => {
                     let (sx, sy, lx, ly) = frame.to_screen(cx, cy);
                     Some(WheelTarget {
@@ -450,6 +478,7 @@ impl Tool for ScrollTool {
 
         if electron_background {
             return electron_reveal_scroll(
+                (space, validated_frame.clone()),
                 pid,
                 window_id,
                 wheel_target
@@ -569,7 +598,18 @@ impl Tool for ScrollTool {
                 .flatten()
             };
             let amount_ticks = amount;
+            if let Err(refusal) =
+                super::window_points::recheck_now(space, wid, validated_frame.as_ref())
+            {
+                return refusal;
+            }
             let fg = delivery_mode.is_foreground() && wid.is_some();
+            let dispatch_guard =
+                match super::window_points::DispatchGuard::new(space, wid, validated_frame.clone())
+                {
+                    Ok(guard) => guard,
+                    Err(refusal) => return refusal,
+                };
             let result = focus_guard::with_focus_suppressed(
                 Some(pid),
                 prior_front,
@@ -577,6 +617,7 @@ impl Tool for ScrollTool {
                 || async move {
                     latency::spawn_action_blocking(move || -> anyhow::Result<()> {
                         let do_it = move || -> anyhow::Result<()> {
+                            super::window_points::check_guard(&dispatch_guard)?;
                             crate::input::mouse::scroll_wheel_at_xy(
                                 pid,
                                 screen_x,
@@ -607,6 +648,11 @@ impl Tool for ScrollTool {
             .await;
 
             let changes = super::finish_window_observation(snapshot).await;
+            if let Ok(Err(error)) = &result {
+                if let Some(refusal) = super::window_points::moved_refusal(error, space) {
+                    return refusal;
+                }
+            }
             let mode_label = if fg {
                 " (delivery_mode:foreground)"
             } else {
@@ -851,7 +897,12 @@ fn keystroke_read_back(
 /// wheel events: reveal the content just past the edge of the scroll
 /// container under `point` (the window's center when there is no target)
 /// through accessibility. Refuses as before when no container moves.
+#[allow(clippy::too_many_arguments)]
 async fn electron_reveal_scroll(
+    (space, validated_frame): (
+        super::window_points::PointSpace,
+        Option<super::px_frame::WindowPxFrame>,
+    ),
     pid: i32,
     window_id: Option<u32>,
     point: Option<(f64, f64)>,
@@ -900,14 +951,55 @@ async fn electron_reveal_scroll(
             return refusal;
         }
     }
+    if let Err(refusal) =
+        super::window_points::recheck_now(space, window_id, validated_frame.as_ref())
+    {
+        return refusal;
+    }
+    let dispatch_guard =
+        match super::window_points::DispatchGuard::new(space, window_id, validated_frame.clone()) {
+            Ok(guard) => guard,
+            Err(refusal) => return refusal,
+        };
     let window_rect = window.map(|b| [b.x, b.y, b.width, b.height]);
     let direction_owned = direction.to_owned();
     let outcome = latency::spawn_action_blocking(move || unsafe {
-        crate::ax::reveal_scroll::reveal_scroll(pid, point, window_rect, &direction_owned, distance)
+        // Checked after the hit test and the walk, right before the reveal.
+        let moved = std::cell::Cell::new(None);
+        // Latched: once refused, refused for every later candidate.
+        let proceed = || {
+            if moved.get().is_some() {
+                return false;
+            }
+            match super::window_points::check_guard(&dispatch_guard) {
+                Ok(()) => true,
+                Err(error) => {
+                    moved.set(Some(error));
+                    false
+                }
+            }
+        };
+        let limits = crate::ax::reveal_scroll::RevealLimits {
+            proceed: Some(&proceed),
+            ..crate::ax::reveal_scroll::electron_limits()
+        };
+        let run = crate::ax::reveal_scroll::reveal_scroll_with(
+            pid,
+            point,
+            window_rect,
+            &direction_owned,
+            distance,
+            limits,
+        );
+        (run, moved.get())
     })
     .await;
-    match outcome {
-        Ok(Some(outcome)) => ToolResult::text(format!(
+    let (run, moved) = match outcome {
+        Ok(pair) => pair,
+        Err(_) => return unavailable(),
+    };
+    match classify_electron_reveal(run, moved) {
+        ElectronReveal::Scrolled(outcome) => ToolResult::text(format!(
             "✅ Scrolled {direction} about {:.0} pt in the background through accessibility \
              (revealed the content just past the {}'s edge; this Electron/Chromium window drops \
              background wheel events).",
@@ -918,7 +1010,51 @@ async fn electron_reveal_scroll(
             "verified": false,
             "effect": "unverifiable",
         })),
-        _ => unavailable(),
+        ElectronReveal::MovedBeforeAny(moved) => {
+            let error = anyhow::Error::from(moved);
+            super::window_points::moved_refusal(&error, space).unwrap_or_else(unavailable)
+        }
+        ElectronReveal::Attempted { moved_after } => ToolResult::text(format!(
+            "An accessibility reveal was sent to scroll {direction}, but no movement could be \
+             read back{}; it may have scrolled. Read the window before scrolling again.",
+            if moved_after {
+                " before the window moved"
+            } else {
+                ""
+            }
+        ))
+        .with_structured(serde_json::json!({
+            "path": "ax", "verified": false, "effect": "unverifiable"
+        })),
+        ElectronReveal::NothingSent => unavailable(),
+    }
+}
+
+/// How an Electron background reveal ended, for its result.
+#[derive(Debug, PartialEq)]
+enum ElectronReveal {
+    /// A candidate's reveal moved its content.
+    Scrolled(crate::ax::reveal_scroll::RevealOutcome),
+    /// The window moved before any reveal was sent: nothing sent.
+    MovedBeforeAny(super::window_points::WindowMoved),
+    /// A reveal was sent (or answered with an error) and nothing moved that
+    /// could be read back; it may still have scrolled.
+    Attempted { moved_after: bool },
+    /// No candidate sent anything.
+    NothingSent,
+}
+
+fn classify_electron_reveal(
+    run: crate::ax::reveal_scroll::CandidateRun<crate::ax::reveal_scroll::RevealOutcome>,
+    moved: Option<super::window_points::WindowMoved>,
+) -> ElectronReveal {
+    match (run.outcome, run.attempted, moved) {
+        (Some(outcome), _, _) => ElectronReveal::Scrolled(outcome),
+        (None, true, moved) => ElectronReveal::Attempted {
+            moved_after: moved.is_some(),
+        },
+        (None, false, Some(moved)) => ElectronReveal::MovedBeforeAny(moved),
+        (None, false, None) => ElectronReveal::NothingSent,
     }
 }
 
@@ -1327,6 +1463,56 @@ unsafe fn collect_ax_buttons(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_electron_reveal_that_was_sent_is_never_reported_as_refused() {
+        use super::{classify_electron_reveal, ElectronReveal};
+        use crate::ax::reveal_scroll::{first_outcome, CandidateRun, RevealOutcome};
+        use crate::ax::scroll_area::Mutation;
+        use crate::tools::window_points::WindowMoved;
+        // Sent or answered with an error, nothing read back, window still.
+        for mutation in [Mutation::Sent { count: 1 }, Mutation::Failed { count: 1 }] {
+            let run = first_outcome(
+                vec![1],
+                |_| (mutation, None::<RevealOutcome>),
+                || false,
+                |_| {},
+            );
+            assert_eq!(
+                classify_electron_reveal(run, None),
+                ElectronReveal::Attempted { moved_after: false },
+                "{mutation:?}"
+            );
+        }
+        let moved = WindowMoved { window_id: 7 };
+        let attempted = CandidateRun {
+            outcome: None,
+            attempted: true,
+            stopped: true,
+        };
+        assert_eq!(
+            classify_electron_reveal(attempted, Some(moved)),
+            ElectronReveal::Attempted { moved_after: true }
+        );
+        let untried = CandidateRun {
+            outcome: None,
+            attempted: false,
+            stopped: true,
+        };
+        assert_eq!(
+            classify_electron_reveal(untried, Some(moved)),
+            ElectronReveal::MovedBeforeAny(moved)
+        );
+        let nothing = CandidateRun::<RevealOutcome> {
+            outcome: None,
+            attempted: false,
+            stopped: false,
+        };
+        assert_eq!(
+            classify_electron_reveal(nothing, None),
+            ElectronReveal::NothingSent
+        );
+    }
 
     mod wheel_verdict_tests {
         use super::super::{fallback_order, wheel_verdict, DistanceCheck, Fallback, WheelVerdict};
