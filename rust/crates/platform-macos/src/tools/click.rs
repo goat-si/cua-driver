@@ -1786,7 +1786,14 @@ fn perform_ax_click(
     // Capture advertised actions BEFORE dispatching so we can detect silent no-ops
     // (AX returns success even when the element doesn't advertise the action).
     let role = unsafe { copy_string_attr(element, "AXRole") }.unwrap_or_default();
-    let title = unsafe { copy_string_attr(element, "AXTitle") }.unwrap_or_default();
+    // The name shown in the result: an untitled control (KakaoTalk's tabs)
+    // is named by its description, help or identifier instead of "".
+    let title = ["AXTitle", "AXDescription", "AXHelp", "AXIdentifier"]
+        .iter()
+        .find_map(|attr| {
+            unsafe { copy_string_attr(element, attr) }.filter(|text| !text.trim().is_empty())
+        })
+        .unwrap_or_default();
 
     // A click on an AppKit collection item is frequently represented by a
     // label child or row that does not advertise AXPress. Prefer a bounded,
