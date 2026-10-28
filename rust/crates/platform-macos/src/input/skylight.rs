@@ -250,12 +250,14 @@ fn note_focus_change() {
 /// A window the driver made key inside a background app with a focus record
 /// only (no hand-back): a background press, a menu, a pixel click. Kept so
 /// the driver lets it go again instead of leaving the app holding key focus
-/// behind the person's window.
+/// behind the person's window. One entry per app.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct PrimedKey {
     pub(crate) pid: pid_t,
     pub(crate) window_id: u32,
     pub(crate) at: std::time::Instant,
+    /// Let go at the next chance (another app was primed, the session ended).
+    pub(crate) release_requested: bool,
 }
 
 /// How long a primed key window is held for the next action on it.
@@ -263,60 +265,107 @@ pub(crate) const PRIMED_KEY_HOLD: std::time::Duration = std::time::Duration::fro
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum PrimedKeyVerdict {
-    /// Still held for the next action.
+    /// Still held, for the next action or until an action on the app ends.
     Keep,
     /// Let it go: post the defocus record.
     Release,
-    /// The person brought the app forward; its key window is theirs now.
-    /// Forget it and post nothing.
+    /// Forget it and post nothing: the app is in front (its key window is
+    /// the person's now), or WindowServer cannot say which app is.
     Forget,
 }
 
-/// What to do with `key` now. `idle_ms` is the time since the person's last
-/// physical input (`None` when unknown, which never releases early).
+/// What to do with `key` now.
+///
+/// - `live_front`: whether WindowServer reports the key's app frontmost
+///   right now ([`front_process_matches`], not AppKit's possibly stale
+///   frontmost app); `None` when it cannot say.
+/// - `idle_ms`: time since the person's last physical input; `None` when
+///   unknown, which never releases early.
+/// - `action_in_flight`: an action holds the app's mutation lease and may
+///   rely on the key window, so a release waits for it.
 pub(crate) fn primed_key_verdict(
     key: &PrimedKey,
-    frontmost: Option<pid_t>,
+    live_front: Option<bool>,
     idle_ms: Option<u64>,
     now: std::time::Instant,
+    action_in_flight: bool,
 ) -> PrimedKeyVerdict {
-    if frontmost == Some(key.pid) {
-        return PrimedKeyVerdict::Forget;
-    }
     let age = now.saturating_duration_since(key.at);
     let input_since = idle_ms.is_some_and(|idle| u128::from(idle) < age.as_millis());
-    if input_since || age >= PRIMED_KEY_HOLD {
-        PrimedKeyVerdict::Release
-    } else {
-        PrimedKeyVerdict::Keep
+    let wanted = key.release_requested || input_since || age >= PRIMED_KEY_HOLD;
+    match live_front {
+        Some(true) => PrimedKeyVerdict::Forget,
+        _ if !wanted || action_in_flight => PrimedKeyVerdict::Keep,
+        None => PrimedKeyVerdict::Forget,
+        Some(false) => PrimedKeyVerdict::Release,
     }
 }
 
-static PRIMED_KEY: std::sync::Mutex<Option<PrimedKey>> = std::sync::Mutex::new(None);
-static PRIMED_KEY_WATCH: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
-fn primed_key_slot() -> std::sync::MutexGuard<'static, Option<PrimedKey>> {
-    PRIMED_KEY.lock().unwrap_or_else(|e| e.into_inner())
+/// Whether ending a session lets go of the primed key windows. They carry
+/// no session owner, so only the last live session's end does; otherwise
+/// the person's input or [`PRIMED_KEY_HOLD`] lets them go.
+pub(crate) fn release_on_session_end(live_sessions_left: usize) -> bool {
+    live_sessions_left == 0
 }
 
-/// Record that `window_id` of `pid` was made key by a focus record. A
-/// previous primed window of another app is let go; inside the same app the
-/// new focus record has already moved key off it.
-pub(crate) fn note_primed_key(pid: pid_t, window_id: u32) {
-    let previous = primed_key_slot().replace(PrimedKey {
-        pid,
-        window_id,
-        at: std::time::Instant::now(),
-    });
-    if let Some(previous) = previous.filter(|p| p.pid != pid) {
-        if crate::apps::frontmost_pid() != Some(previous.pid) {
-            post_key_release(previous);
+static PRIMED_KEYS: std::sync::Mutex<Vec<PrimedKey>> = std::sync::Mutex::new(Vec::new());
+static PRIMED_KEY_WATCH: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn primed_keys() -> std::sync::MutexGuard<'static, Vec<PrimedKey>> {
+    PRIMED_KEYS.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+#[cfg(test)]
+pub(crate) fn primed_keys_for_test() -> Vec<PrimedKey> {
+    primed_keys().clone()
+}
+
+/// Apply every verdict. Runs with the registry locked, so a priming and a
+/// release never interleave: a release posted here can never undo a priming
+/// recorded after it.
+fn sweep_primed_keys(keys: &mut Vec<PrimedKey>) {
+    let now = std::time::Instant::now();
+    let idle_ms = crate::tools::physical_input_idle_ms();
+    keys.retain(|key| {
+        match primed_key_verdict(
+            key,
+            front_process_matches(key.pid, key.window_id),
+            idle_ms,
+            now,
+            crate::background_mutation::is_held(key.pid),
+        ) {
+            PrimedKeyVerdict::Keep => true,
+            PrimedKeyVerdict::Forget => false,
+            PrimedKeyVerdict::Release => {
+                post_key_release(*key);
+                false
+            }
         }
+    });
+}
+
+/// Record that `window_id` of `pid` was made key by a focus record. It
+/// replaces the app's previous entry (the new record already moved key inside
+/// the app); every other app's primed window is let go.
+pub(crate) fn note_primed_key(pid: pid_t, window_id: u32) {
+    {
+        let mut keys = primed_keys();
+        keys.retain(|key| key.pid != pid);
+        for key in keys.iter_mut() {
+            key.release_requested = true;
+        }
+        sweep_primed_keys(&mut keys);
+        keys.push(PrimedKey {
+            pid,
+            window_id,
+            at: std::time::Instant::now(),
+            release_requested: false,
+        });
     }
     if !PRIMED_KEY_WATCH.swap(true, std::sync::atomic::Ordering::AcqRel) {
         let spawned = std::thread::Builder::new()
             .name("cua-primed-key".into())
-            .spawn(watch_primed_key);
+            .spawn(watch_primed_keys);
         if spawned.is_err() {
             PRIMED_KEY_WATCH.store(false, std::sync::atomic::Ordering::Release);
         }
@@ -326,53 +375,43 @@ pub(crate) fn note_primed_key(pid: pid_t, window_id: u32) {
 /// Whether `window_id` of `pid` is still the primed key window and the
 /// person has not touched the keyboard or pointer since it was primed.
 pub(crate) fn primed_key_still_held(pid: pid_t, window_id: u32) -> bool {
-    let Some(key) = *primed_key_slot() else {
-        return false;
-    };
-    (key.pid, key.window_id) == (pid, window_id)
-        && primed_key_verdict(
-            &key,
-            None,
-            crate::tools::physical_input_idle_ms(),
-            std::time::Instant::now(),
-        ) == PrimedKeyVerdict::Keep
+    let keys = primed_keys();
+    keys.iter().any(|key| {
+        (key.pid, key.window_id) == (pid, window_id)
+            && primed_key_verdict(
+                key,
+                Some(false),
+                crate::tools::physical_input_idle_ms(),
+                std::time::Instant::now(),
+                false,
+            ) == PrimedKeyVerdict::Keep
+    })
 }
 
-/// Let the primed key window go now (session end, transport close).
-pub(crate) fn release_primed_key() {
-    let Some(key) = primed_key_slot().take() else {
+/// A session ended (end_session or a closed transport) and
+/// `live_sessions_left` remain: let the primed key windows go when it was the
+/// last one. A window whose app still has an action in flight goes when that
+/// action ends.
+pub(crate) fn release_primed_keys_on_session_end(live_sessions_left: usize) {
+    if !release_on_session_end(live_sessions_left) {
         return;
-    };
-    if crate::apps::frontmost_pid() != Some(key.pid) {
-        post_key_release(key);
     }
+    let mut keys = primed_keys();
+    for key in keys.iter_mut() {
+        key.release_requested = true;
+    }
+    sweep_primed_keys(&mut keys);
 }
 
-/// Polls the primed key window and lets it go once the person types,
-/// clicks or moves the pointer, or once it is [`PRIMED_KEY_HOLD`] old.
-fn watch_primed_key() {
+/// Re-applies the verdicts every 100 ms until no primed window is left.
+fn watch_primed_keys() {
     loop {
         std::thread::sleep(std::time::Duration::from_millis(100));
-        let mut slot = primed_key_slot();
-        let Some(key) = *slot else {
+        let mut keys = primed_keys();
+        sweep_primed_keys(&mut keys);
+        if keys.is_empty() {
             PRIMED_KEY_WATCH.store(false, std::sync::atomic::Ordering::Release);
             return;
-        };
-        match primed_key_verdict(
-            &key,
-            crate::apps::frontmost_pid(),
-            crate::tools::physical_input_idle_ms(),
-            std::time::Instant::now(),
-        ) {
-            PrimedKeyVerdict::Keep => {}
-            PrimedKeyVerdict::Forget => {
-                *slot = None;
-            }
-            PrimedKeyVerdict::Release => {
-                *slot = None;
-                drop(slot);
-                post_key_release(key);
-            }
         }
     }
 }
@@ -2010,7 +2049,10 @@ mod key_prime_tests {
 
 #[cfg(test)]
 mod primed_key_tests {
-    use super::{primed_key_verdict, PrimedKey, PrimedKeyVerdict, PRIMED_KEY_HOLD};
+    use super::{
+        note_primed_key, primed_key_verdict, primed_keys_for_test, release_on_session_end,
+        PrimedKey, PrimedKeyVerdict, PRIMED_KEY_HOLD,
+    };
     use std::time::{Duration, Instant};
 
     fn primed(pid: i32, age: Duration) -> PrimedKey {
@@ -2018,15 +2060,19 @@ mod primed_key_tests {
             pid,
             window_id: 7,
             at: Instant::now() - age,
+            release_requested: false,
         }
     }
+
+    /// Not front by WindowServer's live answer, no action in flight.
+    const BEHIND: Option<bool> = Some(false);
 
     #[test]
     fn a_fresh_priming_is_kept_while_the_person_is_idle() {
         let key = primed(4, Duration::from_millis(300));
         // Last physical input 5 s ago, before the priming.
         assert_eq!(
-            primed_key_verdict(&key, Some(1), Some(5_000), Instant::now()),
+            primed_key_verdict(&key, BEHIND, Some(5_000), Instant::now(), false),
             PrimedKeyVerdict::Keep
         );
     }
@@ -2035,7 +2081,7 @@ mod primed_key_tests {
     fn the_persons_input_after_the_priming_releases_it() {
         let key = primed(4, Duration::from_millis(800));
         assert_eq!(
-            primed_key_verdict(&key, Some(1), Some(100), Instant::now()),
+            primed_key_verdict(&key, BEHIND, Some(100), Instant::now(), false),
             PrimedKeyVerdict::Release
         );
     }
@@ -2044,7 +2090,17 @@ mod primed_key_tests {
     fn an_old_priming_is_released() {
         let key = primed(4, PRIMED_KEY_HOLD + Duration::from_millis(1));
         assert_eq!(
-            primed_key_verdict(&key, Some(1), Some(60_000), Instant::now()),
+            primed_key_verdict(&key, BEHIND, Some(60_000), Instant::now(), false),
+            PrimedKeyVerdict::Release
+        );
+    }
+
+    #[test]
+    fn a_requested_release_is_released() {
+        let mut key = primed(4, Duration::from_millis(10));
+        key.release_requested = true;
+        assert_eq!(
+            primed_key_verdict(&key, BEHIND, Some(60_000), Instant::now(), false),
             PrimedKeyVerdict::Release
         );
     }
@@ -2054,8 +2110,28 @@ mod primed_key_tests {
         // Its key window is the person's now: forget it, post nothing.
         let key = primed(4, Duration::from_millis(800));
         assert_eq!(
-            primed_key_verdict(&key, Some(4), Some(100), Instant::now()),
+            primed_key_verdict(&key, Some(true), Some(100), Instant::now(), false),
             PrimedKeyVerdict::Forget
+        );
+    }
+
+    #[test]
+    fn an_unknown_front_app_never_gets_a_defocus_record() {
+        let key = primed(4, PRIMED_KEY_HOLD + Duration::from_millis(1));
+        assert_eq!(
+            primed_key_verdict(&key, None, Some(100), Instant::now(), false),
+            PrimedKeyVerdict::Forget
+        );
+    }
+
+    #[test]
+    fn an_action_in_flight_on_the_app_defers_the_release() {
+        // The action may rely on the key window (a WindowKeyScope that found
+        // it already key): the release waits until the action's lease ends.
+        let key = primed(4, PRIMED_KEY_HOLD + Duration::from_millis(1));
+        assert_eq!(
+            primed_key_verdict(&key, BEHIND, Some(100), Instant::now(), true),
+            PrimedKeyVerdict::Keep
         );
     }
 
@@ -2063,8 +2139,31 @@ mod primed_key_tests {
     fn an_unknown_idle_time_does_not_release_early() {
         let key = primed(4, Duration::from_millis(300));
         assert_eq!(
-            primed_key_verdict(&key, Some(1), None, Instant::now()),
+            primed_key_verdict(&key, BEHIND, None, Instant::now(), false),
             PrimedKeyVerdict::Keep
         );
+    }
+
+    #[test]
+    fn a_session_end_releases_only_when_no_other_session_is_live() {
+        assert!(release_on_session_end(0));
+        assert!(!release_on_session_end(1));
+    }
+
+    #[test]
+    fn a_new_priming_replaces_its_apps_entry_and_lets_other_apps_go() {
+        // No such processes: WindowServer cannot say who is front, so the
+        // other app's entry is dropped without a record being posted.
+        note_primed_key(-90_001, 1);
+        note_primed_key(-90_001, 2);
+        let ours = |keys: &[PrimedKey]| {
+            keys.iter()
+                .filter(|k| k.pid == -90_001 || k.pid == -90_002)
+                .map(|k| (k.pid, k.window_id))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(ours(&primed_keys_for_test()), vec![(-90_001, 2)]);
+        note_primed_key(-90_002, 3);
+        assert_eq!(ours(&primed_keys_for_test()), vec![(-90_002, 3)]);
     }
 }

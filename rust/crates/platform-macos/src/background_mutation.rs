@@ -40,6 +40,17 @@ pub(crate) async fn acquire(pid: i32) -> OwnedMutexGuard<()> {
     process_lock(pid).lock_owned().await
 }
 
+/// Whether some action holds this process's mutation lease right now.
+/// Never creates a lock and never waits.
+pub(crate) fn is_held(pid: i32) -> bool {
+    let lock = process_locks()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .get(&pid)
+        .and_then(Weak::upgrade);
+    lock.is_some_and(|lock| lock.try_lock().is_err())
+}
+
 /// Run one nested tool call with non-forgeable proof that its caller already
 /// owns this process's mutation lease.
 pub(crate) async fn with_held_lease<T>(pid: i32, future: impl Future<Output = T>) -> T {
@@ -56,6 +67,15 @@ pub(crate) fn held_by_current_task(pid: i32) -> bool {
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[tokio::test]
+    async fn a_held_lease_is_seen_without_waiting_or_creating_one() {
+        assert!(!is_held(-91_101));
+        let guard = acquire(-91_101).await;
+        assert!(is_held(-91_101));
+        drop(guard);
+        assert!(!is_held(-91_101));
+    }
 
     #[tokio::test]
     async fn same_pid_mutations_serialize_until_the_first_guard_drops() {

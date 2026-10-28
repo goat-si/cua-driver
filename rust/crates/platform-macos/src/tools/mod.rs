@@ -1286,7 +1286,9 @@ pub fn register_all(
                 crate::cursor::overlay::remove_cursor(session_id.to_owned());
                 // A window the session left key inside a background app is
                 // let go with it (end_session or a closed transport).
-                crate::input::skylight::release_primed_key();
+                crate::input::skylight::release_primed_keys_on_session_end(
+                    cua_driver_core::session::active_session_count(),
+                );
             });
         registry.retain_session_end_hook(registration);
         let revive_registration =

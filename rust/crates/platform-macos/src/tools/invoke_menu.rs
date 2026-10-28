@@ -764,7 +764,7 @@ unsafe fn invoke_path_in_background(
 }
 
 /// The file behind a document window (its `AXDocument` URL), if any.
-fn document_path_of_window(pid: i32, window_id: u32) -> Option<std::path::PathBuf> {
+pub(super) fn document_path_of_window(pid: i32, window_id: u32) -> Option<std::path::PathBuf> {
     unsafe {
         let app = AXUIElementCreateApplication(pid);
         if app.is_null() {
