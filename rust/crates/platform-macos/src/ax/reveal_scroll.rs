@@ -193,7 +193,8 @@ pub struct CandidateRun<O> {
 }
 
 /// Tries candidates in order until one moves something, releasing every
-/// candidate; once stopped reports true, the rest are released untried.
+/// candidate; after a failed reveal (it may still apply) or once stopped
+/// reports true, the rest are released untried.
 pub fn first_outcome<C, O>(
     candidates: Vec<C>,
     mut attempt: impl FnMut(&C) -> (Mutation, Option<O>),
@@ -212,6 +213,11 @@ pub fn first_outcome<C, O>(
         run.attempted |= mutation != Mutation::NotSent;
         if outcome.is_some() {
             run.outcome = outcome;
+            break;
+        }
+        // The app answered with an error or not in time: it may still apply
+        // that reveal, so no other candidate scrolls on top of it.
+        if matches!(mutation, Mutation::Failed { .. }) {
             break;
         }
         if stopped() {
@@ -738,6 +744,32 @@ mod tests {
             }
         );
         assert_eq!(calls.get(), 2);
+    }
+
+    #[test]
+    fn a_failed_reveal_is_not_followed_by_another() {
+        let sent = std::cell::RefCell::new(Vec::new());
+        let released = std::cell::RefCell::new(Vec::new());
+        let run = first_outcome(
+            vec![1, 2, 3],
+            |&candidate| {
+                sent.borrow_mut().push(candidate);
+                // The first reveal times out (and the app applies it late).
+                (Mutation::Failed { count: 1 }, None::<u32>)
+            },
+            || false,
+            |candidate| released.borrow_mut().push(candidate),
+        );
+        assert_eq!(
+            run,
+            CandidateRun {
+                outcome: None,
+                attempted: true,
+                stopped: false
+            }
+        );
+        assert_eq!(*sent.borrow(), vec![1], "no second reveal");
+        assert_eq!(*released.borrow(), vec![1, 2, 3]);
     }
 
     #[test]
