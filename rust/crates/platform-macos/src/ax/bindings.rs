@@ -671,6 +671,11 @@ pub unsafe fn copy_children(element: AXUIElementRef) -> Vec<AXUIElementRef> {
 
 /// [`copy_children`], or `None` when the read failed rather than finding no
 /// children: a walk that gets `None` has not seen what lies below.
+///
+/// # Safety
+///
+/// `element` must be a valid `AXUIElementRef`. Every returned element is
+/// retained; the caller releases each one.
 pub unsafe fn copy_children_checked(element: AXUIElementRef) -> Option<Vec<AXUIElementRef>> {
     let attr = CFStr::new("AXChildren");
     let mut value: CFTypeRef = std::ptr::null();
