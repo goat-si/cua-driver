@@ -648,9 +648,11 @@ mod tests {
                 },
             },
         }];
+        let tick = || unsafe { windows::Win32::System::SystemInformation::GetTickCount() };
         let before = last_input();
         let sent = unsafe { send_input(&nudge) };
         let after = last_input();
+        let read_done = tick();
         if sent != 1 || after.is_none() || after == before {
             eprintln!(
                 "skipped: this session has no input desktop (SendInput {sent}, last input {before:?} -> {after:?})"
@@ -660,15 +662,25 @@ mod tests {
         // The OS must stamp the driver's injection inside the span the
         // wrapper recorded; the tracker's decisions on top of that are
         // covered with a controlled clock in cua-driver-core.
-        let now = unsafe { windows::Win32::System::SystemInformation::GetTickCount() };
         let tracker = *OWN_INPUT
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (_, end) = tracker.own_span().expect("the injection recorded its span");
+        // Someone else's input can land between the injection and the read.
+        // Use the observation only when the read followed the injection
+        // promptly and the input did not change again.
+        if cua_driver_core::delivery::elapsed_idle_ms_from_ticks(read_done, end)
+            > cua_driver_core::delivery::OWN_INPUT_TICK_SLACK_MS
+            || last_input() != after
+        {
+            eprintln!("skipped: the last-input read was late or other input arrived");
+            return;
+        }
         let after = after.expect("checked above");
         assert!(
-            tracker.is_own_input(now, after),
+            tracker.is_own_input(read_done, after),
             "the driver's injection, stamped at tick {after}, must fall inside \
-             its recorded span ({tracker:?}, now {now})"
+             its recorded span ({tracker:?}, read at {read_done})"
         );
     }
 
