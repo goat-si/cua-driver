@@ -1017,7 +1017,8 @@ fn wheel_verdict<A: crate::ax::scroll_area::WheelArea>(
     window: Option<[f64; 4]>,
     clock: &dyn crate::ax::scroll_area::Clock,
 ) -> WheelVerdict {
-    use crate::ax::scroll_area::{at_end, moved, pages_for, Budget, Mutation};
+    use crate::ax::scroll_area::{at_end, moved_toward, pages_for, Budget, Mutation};
+    let moved = |before: f64, after: f64| moved_toward(direction, before, after);
     let budget = Budget::new(clock, VERDICT_BUDGET);
     // The wheel's last notch was posted 30 ms ago; wait for the app to apply
     // it, reading the bar as it goes.
@@ -1088,6 +1089,12 @@ fn wheel_verdict<A: crate::ax::scroll_area::WheelArea>(
                     ),
                 };
             }
+            // The bar moved the other way: not this scroll, and not a no-op.
+            Some(after) if crate::ax::scroll_area::moved(before, after) => {
+                return WheelVerdict::Unverified {
+                    attempted: attempted.join(", "),
+                };
+            }
             Some(_) if !failed => {}
             _ => {
                 return WheelVerdict::Unverified {
@@ -1140,7 +1147,8 @@ fn distance_check<A: crate::ax::scroll_area::WheelArea>(
     budget.pause(FALLBACK_SETTLE);
     let later = area.position(direction, budget).unwrap_or(after);
     let clamped = |value: f64| value <= 1e-4 || value >= 1.0 - 1e-4;
-    if !clamped(later) && (later - before).abs() > 1.5 * requested {
+    let toward = crate::ax::scroll_area::signed_progress(direction, before, later);
+    if !clamped(later) && toward > 1.5 * requested {
         DistanceCheck::Overshoot { later, requested }
     } else {
         DistanceCheck::AsRequested
@@ -1206,7 +1214,10 @@ impl WheelVerdict {
                     });
                 }
                 ToolResult::text(format!(
-                    "✅ {sent}; it did not visibly move the scroll area within 250 ms, so                      accessibility was tried ({attempted}). The bar then moved                      ({before:.3} → {after:.3}); whether the wheel, that attempt or the app moved                      it is not known. Nothing was fronted.{note}{suffix}"
+                    "✅ {sent}; it did not visibly move the scroll area within 250 ms, so \
+                     accessibility was tried ({attempted}). The bar then moved \
+                     ({before:.3} → {after:.3}); whether the wheel, that attempt or the app moved \
+                     it is not known. Nothing was fronted.{note}{suffix}"
                 ))
                 .with_structured(structured)
             }
@@ -1671,6 +1682,59 @@ mod tests {
             assert!(
                 text.contains("whether the wheel, that attempt or the app moved"),
                 "{text}"
+            );
+        }
+
+        #[test]
+        fn movement_the_other_way_is_not_this_scroll() {
+            // Before any fallback: the app moves the bar down while the wheel
+            // scrolls up; the poll does not take that as the wheel landing.
+            let clock = FakeClock::new();
+            let mut area = FakeArea::new(&clock, 0.5);
+            area.at(Duration::from_millis(30), 0.6);
+            area.set = sent(0.45);
+            let got = verdict(&area, &clock);
+            assert!(
+                matches!(&got, WheelVerdict::MovedAfterFallback { attempted, .. } if attempted == "scroll bar value"),
+                "{got:?}"
+            );
+            assert_eq!(area.mutations(), vec!["set"]);
+
+            // After a fallback: the bar ends up further down than it started.
+            let clock = FakeClock::new();
+            let mut area = FakeArea::new(&clock, 0.5);
+            area.set = sent(0.6);
+            area.reveal = sent(0.3);
+            let got = verdict(&area, &clock);
+            assert!(
+                matches!(&got, WheelVerdict::Unverified { attempted } if attempted == "scroll bar value"),
+                "{got:?}"
+            );
+            assert_eq!(
+                area.mutations(),
+                vec!["set"],
+                "no second scroll after unexplained movement"
+            );
+        }
+
+        #[test]
+        fn overshoot_counts_only_movement_toward_the_request() {
+            let clock = FakeClock::new();
+            let mut area = FakeArea::new(&clock, 0.5);
+            area.set = sent(0.45);
+            area.units = Some(0.05);
+            // The extra read finds the bar pushed back past the start.
+            area.at(Duration::from_millis(400), 0.7);
+            let got = verdict(&area, &clock);
+            assert!(
+                matches!(
+                    &got,
+                    WheelVerdict::MovedAfterFallback {
+                        distance: DistanceCheck::AsRequested,
+                        ..
+                    }
+                ),
+                "{got:?}"
             );
         }
 

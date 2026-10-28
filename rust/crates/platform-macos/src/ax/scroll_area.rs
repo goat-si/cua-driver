@@ -44,6 +44,22 @@ fn bar_attribute(direction: &str) -> &'static str {
     }
 }
 
+/// How far the bar went from before to after in direction's sense: positive
+/// toward the end direction scrolls to (down/right raise the value, up/left
+/// lower it), negative the other way.
+pub fn signed_progress(direction: &str, before: f64, after: f64) -> f64 {
+    match direction {
+        "up" | "left" => before - after,
+        _ => after - before,
+    }
+}
+
+/// Whether the bar moved toward where direction scrolls, beyond rounding.
+/// Movement the other way is not this scroll.
+pub fn moved_toward(direction: &str, before: f64, after: f64) -> bool {
+    signed_progress(direction, before, after) > EPSILON
+}
+
 /// Whether a scroll bar went from `before` to `after`.
 pub fn moved(before: f64, after: f64) -> bool {
     (after - before).abs() > EPSILON
@@ -918,6 +934,18 @@ mod tests {
             vec![0, 1],
             "every element left behind is released"
         );
+    }
+
+    #[test]
+    fn progress_is_signed_by_direction() {
+        assert!(moved_toward("down", 0.5, 0.6));
+        assert!(!moved_toward("down", 0.5, 0.4));
+        assert!(moved_toward("up", 0.5, 0.4));
+        assert!(!moved_toward("up", 0.5, 0.6));
+        assert!(moved_toward("left", 0.5, 0.4));
+        assert!(moved_toward("right", 0.5, 0.6));
+        assert!(!moved_toward("down", 0.5, 0.5));
+        assert_eq!(signed_progress("up", 0.5, 0.7), -0.19999999999999996);
     }
 
     #[test]

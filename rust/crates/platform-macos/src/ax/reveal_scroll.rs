@@ -505,6 +505,10 @@ unsafe fn reveal_core(
             return (sent, finish(elements, None));
         }
         let after = element_screen_rect(elements[pick.index]);
+        // The first frame read may have used up the budget.
+        if limits.expired() {
+            return (sent, finish(elements, None));
+        }
         let reference_after = reference.and_then(|at| element_screen_rect(elements[at]));
         let shown =
             after.is_some_and(|rect| real_size(rect) && intersect(rect, viewport).is_some());
