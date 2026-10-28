@@ -164,7 +164,7 @@ impl Tool for TypeTextTool {
                             "effect": "unverifiable"
                         }))
                 }
-                Ok(Err(error)) => ToolResult::error(format!("desktop type_text failed: {error}")),
+                Ok(Err(error)) => text_delivery_failure("desktop type_text failed", &error),
                 Err(error) => ToolResult::error(format!("desktop type_text task failed: {error}")),
             };
         }
@@ -573,9 +573,28 @@ impl Tool for TypeTextTool {
                     s
                 })
             }
-            Ok(Err(e)) => ToolResult::error(format!("type_text failed: {e}")),
+            Ok(Err(e)) => text_delivery_failure("type_text failed", &e),
             Err(e) => ToolResult::error(format!("Task error: {e}")),
         }
+    }
+}
+
+/// The error result for a failed text delivery. A paste that failed after its
+/// Cmd+V went out may already be in the field: it says so as
+/// `effect:"unverifiable"`, so the caller reads the field before typing again.
+pub(crate) fn text_delivery_failure(prefix: &str, error: &anyhow::Error) -> ToolResult {
+    let message = format!("{prefix}: {error:#}");
+    match error.downcast_ref::<crate::input::keyboard::PasteMayHaveLanded>() {
+        Some(paste) => ToolResult::error(format!(
+            "{message}. Read the field before typing the text again."
+        ))
+        .with_structured(serde_json::json!({
+            "code": "paste_may_have_landed",
+            "effect": "unverifiable",
+            "clipboard_restored": paste.clipboard_restored(),
+            "retryable": false,
+        })),
+        None => ToolResult::error(message),
     }
 }
 
@@ -1837,6 +1856,57 @@ fn no_focused_text_input_refusal(
 
 #[cfg(test)]
 mod tests {
+    /// DSH-03: a paste that may have landed is not reported as a plain
+    /// failure an agent would answer by typing the text again.
+    #[test]
+    fn a_paste_that_may_have_landed_is_reported_unverifiable() {
+        let mut pb_error = None;
+        let _ = crate::input::keyboard::run_pasteboard_transaction(
+            &mut FailingRestore::default(),
+            "text",
+            || Ok(()),
+            std::time::Duration::ZERO,
+        )
+        .map_err(|error| pb_error = Some(error));
+        let error = pb_error.expect("the restore failed");
+        let result = super::text_delivery_failure("type_text failed", &error);
+        assert_eq!(result.is_error, Some(true));
+        let data = result.structured_content.expect("structured failure");
+        assert_eq!(data["code"], "paste_may_have_landed");
+        assert_eq!(data["effect"], "unverifiable");
+        assert_eq!(data["clipboard_restored"], false);
+
+        let plain = super::text_delivery_failure("type_text failed", &anyhow::anyhow!("no source"));
+        assert_eq!(plain.is_error, Some(true));
+        assert!(plain.structured_content.is_none());
+    }
+
+    #[derive(Default)]
+    struct FailingRestore {
+        count: isize,
+    }
+
+    impl crate::input::keyboard::PasteboardBackend for FailingRestore {
+        fn change_count(&self) -> isize {
+            self.count
+        }
+        fn snapshot_items(
+            &self,
+        ) -> anyhow::Result<Vec<crate::input::keyboard::PasteboardItemSnapshot>> {
+            Ok(Vec::new())
+        }
+        fn write_items(
+            &mut self,
+            _: &[crate::input::keyboard::PasteboardItemSnapshot],
+        ) -> anyhow::Result<isize> {
+            self.count += 1;
+            Ok(self.count)
+        }
+        fn clear(&mut self) -> anyhow::Result<isize> {
+            anyhow::bail!("clear failed")
+        }
+    }
+
     #[test]
     fn unfocused_window_needs_a_confirmed_key_window() {
         assert!(super::unfocused_window_accepts_keys(
