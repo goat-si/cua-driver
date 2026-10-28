@@ -12,8 +12,10 @@ use core_foundation::base::{CFRelease, CFRetain, CFTypeRef};
 
 use super::bindings::{
     copy_children, copy_element_attr, copy_string_attr, element_at_screen_position,
-    element_screen_rect, perform_action, AXUIElementRef,
+    element_screen_rect, kAXErrorSuccess, perform_action, AXUIElementRef,
+    AXUIElementSetMessagingTimeout,
 };
+use super::scroll_area::{Budget, Mutation};
 
 /// Roles that scroll their content.
 const CONTAINER_ROLES: &[&str] = &["AXScrollArea", "AXWebArea"];
@@ -266,6 +268,86 @@ pub fn past_edge(frame: Rect, direction: &str, rect: Rect) -> bool {
     }
 }
 
+/// Time and messaging limits on a reveal. The Electron path runs unbounded,
+/// as it always has; the background wheel's fallback bounds both.
+#[derive(Clone, Copy)]
+pub struct RevealLimits<'a> {
+    /// Stop walking (and send nothing) once this runs out; clamp the settle.
+    pub budget: Option<Budget<'a>>,
+    /// Accessibility messaging timeout set on every element read.
+    pub element_timeout: Option<f32>,
+}
+
+impl RevealLimits<'_> {
+    /// No deadline and the system's messaging timeout.
+    pub const fn unbounded() -> RevealLimits<'static> {
+        RevealLimits {
+            budget: None,
+            element_timeout: None,
+        }
+    }
+
+    fn expired(&self) -> bool {
+        self.budget.is_some_and(|budget| budget.expired())
+    }
+
+    fn pause(&self, duration: std::time::Duration) {
+        match &self.budget {
+            Some(budget) => budget.pause(duration),
+            None => std::thread::sleep(duration),
+        }
+    }
+
+    unsafe fn bound(&self, element: AXUIElementRef) {
+        if let Some(timeout) = self.element_timeout {
+            AXUIElementSetMessagingTimeout(element, timeout);
+        }
+    }
+}
+
+/// The limits the Electron/Chromium background scroll uses: unchanged by the
+/// wheel fallback's budget.
+pub(crate) const fn electron_limits() -> RevealLimits<'static> {
+    RevealLimits::unbounded()
+}
+
+/// How a bounded walk ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WalkEnd {
+    Done,
+    NodeCap,
+    Expired,
+}
+
+/// Depth-first walk: pops (node, depth) from the end of the stack and hands
+/// each to visit with the visit count; visit pushes the node's children
+/// itself. Stops before a node once expired is true, or after max_nodes
+/// visits. Unvisited nodes stay in the stack for the caller to release.
+pub fn walk_until<T>(
+    stack: &mut Vec<(T, usize)>,
+    max_nodes: usize,
+    mut expired: impl FnMut() -> bool,
+    mut visit: impl FnMut(T, usize, usize, &mut Vec<(T, usize)>),
+) -> WalkEnd {
+    let mut visited = 0usize;
+    loop {
+        if stack.is_empty() {
+            return WalkEnd::Done;
+        }
+        if expired() {
+            return WalkEnd::Expired;
+        }
+        let Some((node, depth)) = stack.pop() else {
+            return WalkEnd::Done;
+        };
+        visited += 1;
+        visit(node, depth, visited, stack);
+        if visited >= max_nodes {
+            return WalkEnd::NodeCap;
+        }
+    }
+}
+
 pub(crate) unsafe fn reveal_in(
     container: AXUIElementRef,
     role: &str,
@@ -273,9 +355,50 @@ pub(crate) unsafe fn reveal_in(
     direction: &str,
     distance: f64,
 ) -> Option<RevealOutcome> {
-    let frame = element_screen_rect(container)?;
+    reveal_core(
+        container,
+        role,
+        window,
+        direction,
+        distance,
+        electron_limits(),
+    )
+    .1
+}
+
+/// reveal_in within limits, reporting whether AXScrollToVisible was sent
+/// and how the app answered.
+pub(crate) unsafe fn reveal_attempt(
+    container: AXUIElementRef,
+    role: &str,
+    window: Option<Rect>,
+    direction: &str,
+    distance: f64,
+    limits: RevealLimits,
+) -> Mutation {
+    reveal_core(container, role, window, direction, distance, limits).0
+}
+
+unsafe fn reveal_core(
+    container: AXUIElementRef,
+    role: &str,
+    window: Option<Rect>,
+    direction: &str,
+    distance: f64,
+    limits: RevealLimits,
+) -> (Mutation, Option<RevealOutcome>) {
+    if limits.expired() {
+        return (Mutation::NotSent, None);
+    }
+    limits.bound(container);
+    let Some(frame) = element_screen_rect(container) else {
+        return (Mutation::NotSent, None);
+    };
     let viewport = match window {
-        Some(window) => intersect(frame, window)?,
+        Some(window) => match intersect(frame, window) {
+            Some(viewport) => viewport,
+            None => return (Mutation::NotSent, None),
+        },
         None => frame,
     };
     // Visit descendants in document order, keeping each element with a
@@ -288,38 +411,42 @@ pub(crate) unsafe fn reveal_in(
         .rev()
         .map(|child| (child, 1))
         .collect();
-    let mut visited = 0usize;
-    while let Some((element, depth)) = stack.pop() {
-        visited += 1;
-        let rect = element_screen_rect(element);
-        let behind = rect.is_some_and(|[x, y, w, h]| match direction {
-            "down" => y + h < viewport[1],
-            "up" => y > viewport[1] + viewport[3],
-            "right" => x + w < viewport[0],
-            "left" => x > viewport[0] + viewport[2],
-            _ => false,
-        });
-        let mut leaf = true;
-        if !behind && depth < MAX_DEPTH && visited < MAX_NODES {
-            let children = copy_children(element);
-            leaf = children.is_empty();
-            for child in children.into_iter().rev() {
-                stack.push((child, depth + 1));
+    let end = walk_until(
+        &mut stack,
+        MAX_NODES,
+        || limits.expired(),
+        |element, depth, visited, stack| {
+            limits.bound(element);
+            let rect = element_screen_rect(element);
+            let behind = rect.is_some_and(|[x, y, w, h]| match direction {
+                "down" => y + h < viewport[1],
+                "up" => y > viewport[1] + viewport[3],
+                "right" => x + w < viewport[0],
+                "left" => x > viewport[0] + viewport[2],
+                _ => false,
+            });
+            let mut leaf = true;
+            if !behind && depth < MAX_DEPTH && visited < MAX_NODES {
+                let children = copy_children(element);
+                leaf = children.is_empty();
+                for child in children.into_iter().rev() {
+                    stack.push((child, depth + 1));
+                }
             }
-        }
-        match rect {
-            Some(rect) if !behind => {
-                elements.push(element);
-                nodes.push((rect, leaf));
+            match rect {
+                Some(rect) if !behind => {
+                    elements.push(element);
+                    nodes.push((rect, leaf));
+                }
+                _ => CFRelease(element as CFTypeRef),
             }
-            _ => CFRelease(element as CFTypeRef),
-        }
-        if visited >= MAX_NODES {
-            break;
-        }
-    }
+        },
+    );
     for (element, _) in stack {
         CFRelease(element as CFTypeRef);
+    }
+    if end == WalkEnd::Expired {
+        return (Mutation::NotSent, finish(elements, None));
     }
 
     // Real frames past the edge first; Chromium's clamped slivers otherwise.
@@ -334,11 +461,15 @@ pub(crate) unsafe fn reveal_in(
             }
         })
         .collect();
+    let mut sent = Mutation::NotSent;
     let outcome = if let Some(index) = pick_reveal_target(viewport, direction, distance, &real) {
         // A real frame: measure the move on the element itself.
         let before = nodes[index].0;
-        perform_action(elements[index], "AXScrollToVisible");
-        std::thread::sleep(std::time::Duration::from_millis(150));
+        if limits.expired() {
+            return (Mutation::NotSent, finish(elements, None));
+        }
+        sent = mutation_of(perform_action(elements[index], "AXScrollToVisible"));
+        limits.pause(std::time::Duration::from_millis(150));
         let after = element_screen_rect(elements[index]).unwrap_or(before);
         let moved = match direction {
             "down" => before[1] - after[1],
@@ -359,14 +490,17 @@ pub(crate) unsafe fn reveal_in(
             .iter()
             .position(|(rect, leaf)| *leaf && real_size(*rect) && contains(viewport, *rect));
         let reference_before = reference.map(|at| nodes[at].0);
-        perform_action(elements[pick.index], "AXScrollToVisible");
-        std::thread::sleep(std::time::Duration::from_millis(150));
+        if limits.expired() {
+            return (Mutation::NotSent, finish(elements, None));
+        }
+        sent = mutation_of(perform_action(elements[pick.index], "AXScrollToVisible"));
+        limits.pause(std::time::Duration::from_millis(150));
         let after = element_screen_rect(elements[pick.index]);
         let reference_after = reference.and_then(|at| element_screen_rect(elements[at]));
         let shown =
             after.is_some_and(|rect| real_size(rect) && intersect(rect, viewport).is_some());
         if content_moved(reference_before, reference_after) != Some(true) && !shown {
-            return finish(elements, None);
+            return (sent, finish(elements, None));
         }
         after.filter(|rect| real_size(*rect)).map(|after| {
             let past = (pick.rows as f64 - 1.0) * pick.pitch;
@@ -385,7 +519,17 @@ pub(crate) unsafe fn reveal_in(
     } else {
         None
     };
-    finish(elements, outcome)
+    (sent, finish(elements, outcome))
+}
+
+/// An AXScrollToVisible answer as a mutation: anything but success may
+/// still have been applied.
+fn mutation_of(error: i32) -> Mutation {
+    if error == kAXErrorSuccess {
+        Mutation::Sent { count: 1 }
+    } else {
+        Mutation::Failed { count: 1 }
+    }
 }
 
 /// Release the visited elements and return `outcome`.
@@ -425,6 +569,50 @@ pub fn content_moved(before: Option<Rect>, after: Option<Rect>) -> Option<bool> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_walk_stops_at_its_deadline_and_keeps_the_rest() {
+        let mut stack = vec![(0u32, 1usize)];
+        let mut visits = 0;
+        let mut checks = 0;
+        let end = walk_until(
+            &mut stack,
+            MAX_NODES,
+            || {
+                checks += 1;
+                checks > 5
+            },
+            |node, depth, _, stack| {
+                visits += 1;
+                // An endless tree: every node has two children.
+                stack.push((node * 2 + 1, depth + 1));
+                stack.push((node * 2 + 2, depth + 1));
+            },
+        );
+        assert_eq!(end, WalkEnd::Expired);
+        assert_eq!(visits, 5);
+        assert!(
+            !stack.is_empty(),
+            "the unvisited nodes stay for the caller to release"
+        );
+        let mut stack = vec![(0u32, 1usize)];
+        assert_eq!(
+            walk_until(
+                &mut stack,
+                3,
+                || false,
+                |node, depth, _, stack| stack.push((node + 1, depth + 1))
+            ),
+            WalkEnd::NodeCap
+        );
+    }
+
+    #[test]
+    fn the_electron_reveal_keeps_its_unbounded_walk() {
+        let limits = electron_limits();
+        assert!(limits.budget.is_none());
+        assert!(limits.element_timeout.is_none());
+    }
 
     const VIEWPORT: Rect = [0.0, 100.0, 800.0, 500.0];
 

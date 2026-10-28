@@ -13,8 +13,9 @@ use super::bindings::{
     ax_get_window_id, copy_action_names, copy_ax_windows, copy_children, copy_element_attr,
     copy_number_attr, copy_string_attr, element_at_screen_position, element_screen_rect,
     is_attribute_settable, kAXErrorSuccess, perform_action, set_number_attr,
-    AXUIElementCreateApplication, AXUIElementRef,
+    AXUIElementCreateApplication, AXUIElementRef, AXUIElementSetMessagingTimeout,
 };
+use std::time::{Duration, Instant};
 
 const MAX_ASCENT: usize = 40;
 const MAX_NODES: usize = 4_000;
@@ -146,18 +147,35 @@ impl ScrollArea {
         point: (f64, f64),
         window_id: Option<u32>,
     ) -> Option<Self> {
+        Self::find_inner(pid, element, point, window_id, None)
+    }
+
+    unsafe fn find_inner(
+        pid: i32,
+        element: Option<AXUIElementRef>,
+        point: (f64, f64),
+        window_id: Option<u32>,
+        budget: Option<&Budget>,
+    ) -> Option<Self> {
+        let expired = || budget.is_some_and(|budget| budget.expired());
         if let Some(element) = element {
             CFRetain(element as CFTypeRef);
-            if let Some(area) = ascend(element) {
+            if let Some(area) = ascend(element, budget) {
                 return Some(area);
             }
+        }
+        if expired() {
+            return None;
         }
         if let Some(hit) = element_at_screen_position(pid, point.0, point.1) {
-            if let Some(area) = ascend(hit) {
+            if let Some(area) = ascend(hit, budget) {
                 return Some(area);
             }
         }
-        by_frame(pid, point, window_id)
+        if expired() {
+            return None;
+        }
+        by_frame(pid, point, window_id, budget)
     }
 
     /// The scroll bar's value along `direction`'s axis, from 0 to 1.
@@ -185,98 +203,18 @@ impl ScrollArea {
             height
         })
     }
-
-    /// Reveals the content about `distance` points past the edge in
-    /// `direction` with AXScrollToVisible, clipped to `window`. True when the
-    /// reveal moved something.
-    ///
-    /// # Safety
-    ///
-    /// Call from a blocking context.
-    pub unsafe fn reveal(&self, window: Option<[f64; 4]>, direction: &str, distance: f64) -> bool {
-        super::reveal_scroll::reveal_in(self.element, "AXScrollArea", window, direction, distance)
-            .is_some()
-    }
-
-    /// Moves the scroll bar about `distance` points in `direction` by setting
-    /// its value, sized by the area's exposed contents. False when the bar is
-    /// not settable or the content length cannot be read.
-    ///
-    /// # Safety
-    ///
-    /// Call from a blocking context.
-    pub unsafe fn set_position(&self, direction: &str, distance: f64) -> bool {
-        let horizontal = matches!(direction, "left" | "right");
-        let (Some(position), Some(viewport), Some(content)) = (
-            self.position(direction),
-            self.extent(direction),
-            content_length(self.element, horizontal),
-        ) else {
-            return false;
-        };
-        let Some(next) = position_after(direction, position, distance, content, viewport) else {
-            return false;
-        };
-        let Some(bar) = copy_element_attr(self.element, bar_attribute(direction)) else {
-            return false;
-        };
-        let set = is_attribute_settable(bar, "AXValue")
-            && set_number_attr(bar, "AXValue", next) == kAXErrorSuccess;
-        CFRelease(bar as CFTypeRef);
-        set
-    }
-
-    /// Performs `direction`'s page action `pages` times. False when the
-    /// area offers no such action or the first one fails.
-    ///
-    /// # Safety
-    ///
-    /// Call from a blocking context.
-    pub unsafe fn page(&self, direction: &str, pages: usize) -> bool {
-        let Some(action) = page_action(direction) else {
-            return false;
-        };
-        if !copy_action_names(self.element)
-            .iter()
-            .any(|name| name == action)
-        {
-            return false;
-        }
-        let mut performed = false;
-        for _ in 0..pages.max(1) {
-            if perform_action(self.element, action) != kAXErrorSuccess {
-                break;
-            }
-            performed = true;
-            std::thread::sleep(std::time::Duration::from_millis(30));
-        }
-        performed
-    }
-}
-
-/// The span of the area's direct children other than its scroll bars, along
-/// one axis: the content's length, scrolled or not.
-unsafe fn content_length(area: AXUIElementRef, horizontal: bool) -> Option<f64> {
-    let mut span: Option<(f64, f64)> = None;
-    for child in copy_children(area) {
-        if copy_string_attr(child, "AXRole").as_deref() != Some("AXScrollBar") {
-            if let Some([x, y, width, height]) = element_screen_rect(child) {
-                let (start, length) = if horizontal { (x, width) } else { (y, height) };
-                span = Some(match span {
-                    Some((low, high)) => (low.min(start), high.max(start + length)),
-                    None => (start, start + length),
-                });
-            }
-        }
-        CFRelease(child as CFTypeRef);
-    }
-    span.map(|(low, high)| high - low)
 }
 
 /// The nearest AXScrollArea at or above `element`, consuming its retain.
-unsafe fn ascend(element: AXUIElementRef) -> Option<ScrollArea> {
+unsafe fn ascend(element: AXUIElementRef, budget: Option<&Budget>) -> Option<ScrollArea> {
     let mut current = element;
     for _ in 0..MAX_ASCENT {
+        if let Some(budget) = budget {
+            if budget.expired() {
+                break;
+            }
+            bound(current);
+        }
         match copy_string_attr(current, "AXRole").as_deref() {
             Some("AXScrollArea") => return Some(ScrollArea { element: current }),
             Some("AXWindow") | Some("AXApplication") | None => break,
@@ -291,10 +229,18 @@ unsafe fn ascend(element: AXUIElementRef) -> Option<ScrollArea> {
 }
 
 /// The smallest AXScrollArea in `pid`'s window whose frame holds `point`.
-unsafe fn by_frame(pid: i32, point: (f64, f64), window_id: Option<u32>) -> Option<ScrollArea> {
+unsafe fn by_frame(
+    pid: i32,
+    point: (f64, f64),
+    window_id: Option<u32>,
+    budget: Option<&Budget>,
+) -> Option<ScrollArea> {
     let application = AXUIElementCreateApplication(pid);
     if application.is_null() {
         return None;
+    }
+    if budget.is_some() {
+        bound(application);
     }
     let windows = copy_ax_windows(application);
     CFRelease(application as CFTypeRef);
@@ -302,7 +248,7 @@ unsafe fn by_frame(pid: i32, point: (f64, f64), window_id: Option<u32>) -> Optio
     let mut visited = 0;
     for window in windows {
         if window_id.is_none() || ax_get_window_id(window) == window_id {
-            smallest_holding(window, point, 0, &mut visited, &mut best);
+            smallest_holding(window, point, 0, &mut visited, &mut best, budget);
         }
         CFRelease(window as CFTypeRef);
     }
@@ -315,9 +261,16 @@ unsafe fn smallest_holding(
     depth: usize,
     visited: &mut usize,
     best: &mut Option<(AXUIElementRef, f64)>,
+    budget: Option<&Budget>,
 ) {
     if depth > MAX_DEPTH || *visited >= MAX_NODES {
         return;
+    }
+    if let Some(budget) = budget {
+        if budget.expired() {
+            return;
+        }
+        bound(element);
     }
     *visited += 1;
     if copy_string_attr(element, "AXRole").as_deref() == Some("AXScrollArea") {
@@ -334,14 +287,406 @@ unsafe fn smallest_holding(
         }
     }
     for child in copy_children(element) {
-        smallest_holding(child, point, depth + 1, visited, best);
+        smallest_holding(child, point, depth + 1, visited, best, budget);
         CFRelease(child as CFTypeRef);
+    }
+}
+
+// ── The background wheel's verdict path: bounded in time ─────────────────────
+
+/// Per-element accessibility messaging timeout on the background wheel's
+/// verdict path. The system default is 6 s, so one read of a busy app's
+/// element could hold a scroll for that long.
+pub const WHEEL_AX_TIMEOUT_S: f32 = 0.25;
+
+/// The time source of the wheel verdict, faked in tests.
+pub trait Clock {
+    fn now(&self) -> Instant;
+    fn sleep(&self, duration: Duration);
+}
+
+/// The real clock.
+pub struct SystemClock;
+
+impl Clock for SystemClock {
+    fn now(&self) -> Instant {
+        Instant::now()
+    }
+    fn sleep(&self, duration: Duration) {
+        std::thread::sleep(duration);
+    }
+}
+
+/// A deadline that every accessibility call and pause on the wheel's verdict
+/// path checks first.
+#[derive(Clone, Copy)]
+pub struct Budget<'a> {
+    clock: &'a dyn Clock,
+    deadline: Instant,
+}
+
+impl<'a> Budget<'a> {
+    /// A budget of `length` from now.
+    pub fn new(clock: &'a dyn Clock, length: Duration) -> Self {
+        Self {
+            clock,
+            deadline: clock.now() + length,
+        }
+    }
+
+    /// This budget, ending no later than `length` from now.
+    pub fn sooner(&self, length: Duration) -> Self {
+        Self {
+            clock: self.clock,
+            deadline: self.deadline.min(self.clock.now() + length),
+        }
+    }
+
+    /// Time left before the deadline.
+    pub fn left(&self) -> Duration {
+        self.deadline.saturating_duration_since(self.clock.now())
+    }
+
+    /// The deadline has passed.
+    pub fn expired(&self) -> bool {
+        self.left().is_zero()
+    }
+
+    /// Sleeps for `duration`, or for what is left when that is shorter.
+    pub fn pause(&self, duration: Duration) {
+        let duration = duration.min(self.left());
+        if !duration.is_zero() {
+            self.clock.sleep(duration);
+        }
+    }
+}
+
+/// What a scroll mutation through accessibility did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mutation {
+    /// Nothing was dispatched: the area does not offer it, a precondition
+    /// failed, or the budget ran out first.
+    NotSent,
+    /// Dispatched; the app reported success. `count` is how many actions
+    /// went out (page actions), 1 otherwise.
+    Sent { count: usize },
+    /// Dispatched; the app reported an error or did not answer in time. It
+    /// may still apply it later.
+    Failed { count: usize },
+}
+
+/// The operations the wheel verdict needs from a scroll area. Every one
+/// checks `budget` before each accessibility call and gives up (`None`,
+/// `false`, [`Mutation::NotSent`]) when it has run out.
+pub trait WheelArea {
+    /// The bar's value along `direction`'s axis, 0 to 1.
+    fn position(&self, direction: &str, budget: &Budget) -> Option<f64>;
+    /// The bar along `direction`'s axis takes an AXValue write.
+    fn bar_settable(&self, direction: &str, budget: &Budget) -> bool;
+    /// Moves the bar about `distance` points by writing its value.
+    fn set_position(&self, direction: &str, distance: f64, budget: &Budget) -> Mutation;
+    /// Reveals the content about `distance` points past the edge.
+    fn reveal(
+        &self,
+        window: Option<[f64; 4]>,
+        direction: &str,
+        distance: f64,
+        budget: &Budget,
+    ) -> Mutation;
+    /// Performs `direction`'s page action up to `pages` times.
+    fn page(&self, direction: &str, pages: usize, budget: &Budget) -> Mutation;
+    /// The visible extent along the axis, in points.
+    fn extent(&self, direction: &str, budget: &Budget) -> Option<f64>;
+    /// `distance` points as a change of the bar's 0..1 value: distance over
+    /// the scrollable length (content minus viewport). `None` when either
+    /// cannot be measured or nothing scrolls along that axis.
+    fn bar_units(&self, direction: &str, distance: f64, budget: &Budget) -> Option<f64>;
+}
+
+/// `distance` points as a change of a bar's 0..1 value, for content
+/// `content` points long in a viewport `viewport` points long.
+pub fn bar_units_for(distance: f64, content: f64, viewport: f64) -> Option<f64> {
+    let scrollable = content - viewport;
+    (scrollable.is_finite() && scrollable > 1.0 && distance.is_finite() && distance > 0.0)
+        .then(|| distance / scrollable)
+}
+
+/// The span along one axis of child frames read lazily from `frames`:
+/// the content's length. `None` when `expired` turns true before every
+/// frame was read, or no child had a frame.
+pub fn span_of(
+    mut frames: impl Iterator<Item = Option<[f64; 4]>>,
+    horizontal: bool,
+    mut expired: impl FnMut() -> bool,
+) -> Option<f64> {
+    let mut span: Option<(f64, f64)> = None;
+    loop {
+        if expired() {
+            return None;
+        }
+        let Some(frame) = frames.next() else {
+            break;
+        };
+        if let Some([x, y, width, height]) = frame {
+            let (start, length) = if horizontal { (x, width) } else { (y, height) };
+            span = Some(match span {
+                Some((low, high)) => (low.min(start), high.max(start + length)),
+                None => (start, start + length),
+            });
+        }
+    }
+    span.map(|(low, high)| high - low)
+}
+
+/// Bounds `element`'s accessibility calls on the wheel's verdict path.
+unsafe fn bound(element: AXUIElementRef) {
+    AXUIElementSetMessagingTimeout(element, WHEEL_AX_TIMEOUT_S);
+}
+
+impl ScrollArea {
+    /// [`ScrollArea::find`] for the background wheel: every element it
+    /// touches gets [`WHEEL_AX_TIMEOUT_S`] and the frame walk stops at
+    /// `budget`, so a busy app cannot hold the probe. The area returned is
+    /// bounded the same way.
+    ///
+    /// # Safety
+    ///
+    /// As [`ScrollArea::find`].
+    pub unsafe fn find_within(
+        pid: i32,
+        element: Option<AXUIElementRef>,
+        point: (f64, f64),
+        window_id: Option<u32>,
+        budget: &Budget,
+    ) -> Option<Self> {
+        let area = Self::find_inner(pid, element, point, window_id, Some(budget))?;
+        bound(area.element);
+        (!budget.expired()).then_some(area)
+    }
+
+    /// The bar's value, bounded by `budget`.
+    unsafe fn position_within(&self, direction: &str, budget: &Budget) -> Option<f64> {
+        if budget.expired() {
+            return None;
+        }
+        let bar = copy_element_attr(self.element, bar_attribute(direction))?;
+        bound(bar);
+        let value = (!budget.expired())
+            .then(|| copy_number_attr(bar, "AXValue"))
+            .flatten();
+        CFRelease(bar as CFTypeRef);
+        value.filter(|value| value.is_finite())
+    }
+
+    unsafe fn content_length_within(&self, horizontal: bool, budget: &Budget) -> Option<f64> {
+        if budget.expired() {
+            return None;
+        }
+        let children = copy_children(self.element);
+        let frames = children.iter().map(|&child| {
+            bound(child);
+            if copy_string_attr(child, "AXRole").as_deref() == Some("AXScrollBar") {
+                None
+            } else {
+                element_screen_rect(child)
+            }
+        });
+        let span = span_of(frames, horizontal, || budget.expired());
+        for child in children {
+            CFRelease(child as CFTypeRef);
+        }
+        span
+    }
+}
+
+impl WheelArea for ScrollArea {
+    fn position(&self, direction: &str, budget: &Budget) -> Option<f64> {
+        unsafe { self.position_within(direction, budget) }
+    }
+
+    fn bar_settable(&self, direction: &str, budget: &Budget) -> bool {
+        if budget.expired() {
+            return false;
+        }
+        unsafe {
+            let Some(bar) = copy_element_attr(self.element, bar_attribute(direction)) else {
+                return false;
+            };
+            bound(bar);
+            let settable = !budget.expired() && is_attribute_settable(bar, "AXValue");
+            CFRelease(bar as CFTypeRef);
+            settable
+        }
+    }
+
+    fn set_position(&self, direction: &str, distance: f64, budget: &Budget) -> Mutation {
+        let horizontal = matches!(direction, "left" | "right");
+        unsafe {
+            let (Some(position), Some(viewport)) = (
+                self.position_within(direction, budget),
+                WheelArea::extent(self, direction, budget),
+            ) else {
+                return Mutation::NotSent;
+            };
+            let Some(content) = self.content_length_within(horizontal, budget) else {
+                return Mutation::NotSent;
+            };
+            let Some(next) = position_after(direction, position, distance, content, viewport)
+            else {
+                return Mutation::NotSent;
+            };
+            if budget.expired() {
+                return Mutation::NotSent;
+            }
+            let Some(bar) = copy_element_attr(self.element, bar_attribute(direction)) else {
+                return Mutation::NotSent;
+            };
+            bound(bar);
+            let mutation = if budget.expired() || !is_attribute_settable(bar, "AXValue") {
+                Mutation::NotSent
+            } else if set_number_attr(bar, "AXValue", next) == kAXErrorSuccess {
+                Mutation::Sent { count: 1 }
+            } else {
+                Mutation::Failed { count: 1 }
+            };
+            CFRelease(bar as CFTypeRef);
+            mutation
+        }
+    }
+
+    fn reveal(
+        &self,
+        window: Option<[f64; 4]>,
+        direction: &str,
+        distance: f64,
+        budget: &Budget,
+    ) -> Mutation {
+        unsafe {
+            super::reveal_scroll::reveal_attempt(
+                self.element,
+                "AXScrollArea",
+                window,
+                direction,
+                distance,
+                super::reveal_scroll::RevealLimits {
+                    budget: Some(*budget),
+                    element_timeout: Some(WHEEL_AX_TIMEOUT_S),
+                },
+            )
+        }
+    }
+
+    fn page(&self, direction: &str, pages: usize, budget: &Budget) -> Mutation {
+        let Some(action) = page_action(direction) else {
+            return Mutation::NotSent;
+        };
+        if budget.expired() {
+            return Mutation::NotSent;
+        }
+        unsafe {
+            if !copy_action_names(self.element)
+                .iter()
+                .any(|name| name == action)
+            {
+                return Mutation::NotSent;
+            }
+            let mut count = 0;
+            for _ in 0..pages.max(1) {
+                if budget.expired() {
+                    break;
+                }
+                count += 1;
+                if perform_action(self.element, action) != kAXErrorSuccess {
+                    return Mutation::Failed { count };
+                }
+                budget.pause(Duration::from_millis(30));
+            }
+            if count == 0 {
+                Mutation::NotSent
+            } else {
+                Mutation::Sent { count }
+            }
+        }
+    }
+
+    fn extent(&self, direction: &str, budget: &Budget) -> Option<f64> {
+        if budget.expired() {
+            return None;
+        }
+        unsafe { self.extent(direction) }
+    }
+
+    fn bar_units(&self, direction: &str, distance: f64, budget: &Budget) -> Option<f64> {
+        let horizontal = matches!(direction, "left" | "right");
+        let viewport = WheelArea::extent(self, direction, budget)?;
+        let content = unsafe { self.content_length_within(horizontal, budget)? };
+        bar_units_for(distance, content, viewport)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct StepClock(std::cell::Cell<Instant>);
+    impl Clock for StepClock {
+        fn now(&self) -> Instant {
+            self.0.get()
+        }
+        fn sleep(&self, duration: Duration) {
+            self.0.set(self.0.get() + duration);
+        }
+    }
+
+    #[test]
+    fn a_budget_clamps_pauses_to_what_is_left() {
+        let clock = StepClock(std::cell::Cell::new(Instant::now()));
+        let start = clock.now();
+        let budget = Budget::new(&clock, Duration::from_millis(100));
+        budget.pause(Duration::from_millis(60));
+        budget.pause(Duration::from_millis(60));
+        assert_eq!(clock.now() - start, Duration::from_millis(100));
+        assert!(budget.expired());
+        let shorter =
+            Budget::new(&clock, Duration::from_millis(500)).sooner(Duration::from_millis(50));
+        assert_eq!(shorter.left(), Duration::from_millis(50));
+    }
+
+    #[test]
+    fn the_content_span_stops_when_the_deadline_passes_mid_walk() {
+        let frames = vec![
+            Some([0.0, 0.0, 10.0, 100.0]),
+            None,
+            Some([0.0, 100.0, 10.0, 300.0]),
+        ];
+        assert_eq!(
+            span_of(frames.clone().into_iter(), false, || false),
+            Some(400.0)
+        );
+        assert_eq!(
+            span_of(frames.clone().into_iter(), true, || false),
+            Some(10.0)
+        );
+        let mut reads = 0;
+        let lazy = frames.into_iter().inspect(|_| reads += 1);
+        let mut checks = 0;
+        assert_eq!(
+            span_of(lazy, false, || {
+                checks += 1;
+                checks > 2
+            }),
+            None
+        );
+        assert_eq!(reads, 2, "no frame is read after the deadline");
+    }
+
+    #[test]
+    fn points_become_bar_units_over_the_scrollable_length() {
+        assert_eq!(bar_units_for(360.0, 2400.0, 600.0), Some(0.2));
+        assert_eq!(bar_units_for(360.0, 500.0, 600.0), None);
+        assert_eq!(bar_units_for(0.0, 2400.0, 600.0), None);
+        assert_eq!(bar_units_for(360.0, f64::NAN, 600.0), None);
+    }
 
     #[test]
     fn each_direction_has_its_page_action() {

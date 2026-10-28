@@ -549,13 +549,19 @@ impl Tool for ScrollTool {
                 None
             } else {
                 latency::spawn_action_blocking(move || unsafe {
-                    let area = crate::ax::scroll_area::ScrollArea::find(
+                    use crate::ax::scroll_area::{Budget, ScrollArea, SystemClock, WheelArea};
+                    // Bounded: a busy app must not hold the scroll before the
+                    // wheel is even sent. Past the budget the wheel goes out
+                    // unverified, as it does without a scroll area.
+                    let budget = Budget::new(&SystemClock, PROBE_BUDGET);
+                    let area = ScrollArea::find_within(
                         pid,
                         probe_element.map(|ptr| ptr as AXUIElementRef),
                         (screen_x, screen_y),
                         wid,
+                        &budget,
                     )?;
-                    let position = area.position(&probe_direction)?;
+                    let position = WheelArea::position(&area, &probe_direction, &budget)?;
                     Some((area, position))
                 })
                 .await
@@ -612,7 +618,7 @@ impl Tool for ScrollTool {
                 let verdict_window = wid
                     .and_then(crate::windows::window_bounds_by_id)
                     .map(|b| [b.x, b.y, b.width, b.height]);
-                let verdict = latency::spawn_action_blocking(move || unsafe {
+                let verdict = latency::spawn_action_blocking(move || {
                     wheel_verdict(
                         &area,
                         &verdict_direction,
@@ -620,6 +626,7 @@ impl Tool for ScrollTool {
                         wheel_distance,
                         amount,
                         verdict_window,
+                        &crate::ax::scroll_area::SystemClock,
                     )
                 })
                 .await
@@ -916,6 +923,7 @@ async fn electron_reveal_scroll(
 }
 
 /// What a background wheel did to the scroll area read before it.
+#[derive(Debug, Clone, PartialEq)]
 enum WheelVerdict {
     /// The bar moved: the wheel landed.
     Moved { before: f64, after: f64 },
@@ -926,93 +934,204 @@ enum WheelVerdict {
         route: &'static str,
         before: f64,
         after: f64,
+        distance: DistanceCheck,
     },
     /// Neither the wheel nor accessibility moved the bar.
     Dropped { tried_accessibility: bool },
-    /// The area could not be read again.
+    /// An accessibility scroll was sent (or may have been: the app answered
+    /// with an error or not in time) and its effect could not be read back.
+    Unverified { attempted: String },
+    /// The area could not be read again (before any fallback was sent).
     Unknown,
 }
 
+/// How far an accessibility fallback moved the bar compared with the
+/// request, in the bar's 0..1 units.
+#[derive(Debug, Clone, PartialEq)]
+enum DistanceCheck {
+    /// Content or viewport could not be measured, so it was not compared.
+    NotMeasured,
+    /// Within 1.5x of the request (or clamped at an end).
+    AsRequested,
+    /// Further than 1.5x the request: `later` is the bar on the extra read.
+    Overshoot { later: f64, requested: f64 },
+}
+
+/// A background-wheel fallback route, in the order the verdict tries them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Fallback {
+    ScrollBar,
+    Reveal,
+    Page,
+}
+
+impl Fallback {
+    fn route(self) -> &'static str {
+        match self {
+            Fallback::ScrollBar => "scroll bar value",
+            Fallback::Reveal => "AXScrollToVisible",
+            Fallback::Page => "page action",
+        }
+    }
+}
+
+/// A settable bar is one exact write of the requested distance, so it goes
+/// first; the reveal walk can cost seconds on a long list (R3: KakaoTalk).
+/// Without a settable bar the reveal keeps its old place ahead of pages.
+fn fallback_order(bar_settable: bool) -> &'static [Fallback] {
+    if bar_settable {
+        &[Fallback::ScrollBar, Fallback::Reveal, Fallback::Page]
+    } else {
+        &[Fallback::Reveal, Fallback::ScrollBar, Fallback::Page]
+    }
+}
+
+/// Everything the verdict does after the wheel, bounded.
+const VERDICT_BUDGET: std::time::Duration = std::time::Duration::from_millis(1200);
+/// How long a late wheel is waited for before a fallback runs.
+const WHEEL_POLL_FOR: std::time::Duration = std::time::Duration::from_millis(250);
+const WHEEL_POLL_EVERY: std::time::Duration = std::time::Duration::from_millis(20);
+/// No route starts with less than this left.
+const MIN_ROUTE: std::time::Duration = std::time::Duration::from_millis(150);
+/// The reveal walk's own cap inside the verdict budget.
+const REVEAL_BUDGET: std::time::Duration = std::time::Duration::from_millis(600);
+const FALLBACK_SETTLE: std::time::Duration = std::time::Duration::from_millis(80);
+/// The probe before the wheel: finding the area and reading its bar.
+const PROBE_BUDGET: std::time::Duration = std::time::Duration::from_millis(400);
+
 /// Reads the bar after a background wheel and, when it did not move, scrolls
-/// the area through its page actions instead.
+/// the area through accessibility instead, within [`VERDICT_BUDGET`].
 ///
-/// # Safety
-///
-/// Performs AX calls; call from a blocking context.
-unsafe fn wheel_verdict(
-    area: &crate::ax::scroll_area::ScrollArea,
+/// A mutation that was sent and read back unmoved lets the next route run
+/// (an AppKit scroll view can advertise page actions and refuse them). A
+/// mutation the app answered with an error or not in time may still apply,
+/// so nothing else is sent: one more read decides between confirmed and
+/// unverified.
+fn wheel_verdict<A: crate::ax::scroll_area::WheelArea>(
+    area: &A,
     direction: &str,
     before: f64,
     wheel_distance: f64,
     amount: usize,
     window: Option<[f64; 4]>,
+    clock: &dyn crate::ax::scroll_area::Clock,
 ) -> WheelVerdict {
-    use crate::ax::scroll_area::{at_end, moved, pages_for};
-    let settle = || std::thread::sleep(std::time::Duration::from_millis(80));
-    // The wheel's last notch was posted 30 ms ago; let the app apply it.
-    settle();
-    let Some(after) = area.position(direction) else {
-        return WheelVerdict::Unknown;
-    };
-    if moved(before, after) {
-        return WheelVerdict::Moved { before, after };
+    use crate::ax::scroll_area::{at_end, moved, pages_for, Budget, Mutation};
+    let budget = Budget::new(clock, VERDICT_BUDGET);
+    // The wheel's last notch was posted 30 ms ago; wait for the app to apply
+    // it, reading the bar as it goes.
+    let poll = budget.sooner(WHEEL_POLL_FOR);
+    loop {
+        poll.pause(WHEEL_POLL_EVERY);
+        match area.position(direction, &budget) {
+            None => return WheelVerdict::Unknown,
+            Some(after) if moved(before, after) => {
+                return WheelVerdict::Moved { before, after };
+            }
+            Some(_) => {}
+        }
+        if poll.expired() {
+            break;
+        }
     }
     if at_end(direction, before) {
         return WheelVerdict::AtEnd;
     }
-    // Revealing content past the edge and setting the bar keep the requested
-    // distance; page actions are the coarse last resort (AppKit scroll views
-    // can advertise them and still refuse them).
-    let mut tried = false;
-    if area.reveal(window, direction, wheel_distance) {
-        tried = true;
-        settle();
-        if let Some(after) = area
-            .position(direction)
-            .filter(|after| moved(before, *after))
-        {
-            return WheelVerdict::Accessibility {
-                route: "AXScrollToVisible",
-                before,
-                after,
-            };
+    let mut attempted: Vec<String> = Vec::new();
+    let mut ran_out = false;
+    for &route in fallback_order(area.bar_settable(direction, &budget)) {
+        if budget.left() < MIN_ROUTE {
+            ran_out = true;
+            break;
+        }
+        let mutation = match route {
+            Fallback::ScrollBar => area.set_position(direction, wheel_distance, &budget),
+            Fallback::Reveal => area.reveal(
+                window,
+                direction,
+                wheel_distance,
+                &budget.sooner(REVEAL_BUDGET),
+            ),
+            Fallback::Page => {
+                let pages = pages_for(
+                    wheel_distance,
+                    area.extent(direction, &budget).unwrap_or(0.0),
+                    amount,
+                );
+                area.page(direction, pages, &budget)
+            }
+        };
+        let (count, failed) = match mutation {
+            Mutation::NotSent => continue,
+            Mutation::Sent { count } => (count, false),
+            Mutation::Failed { count } => (count, true),
+        };
+        attempted.push(attempt_label(route, count, failed));
+        budget.pause(FALLBACK_SETTLE);
+        match area.position(direction, &budget) {
+            Some(after) if moved(before, after) => {
+                return WheelVerdict::Accessibility {
+                    route: route.route(),
+                    before,
+                    after,
+                    distance: distance_check(
+                        area,
+                        direction,
+                        before,
+                        after,
+                        wheel_distance,
+                        &budget,
+                    ),
+                };
+            }
+            Some(_) if !failed => {}
+            _ => {
+                return WheelVerdict::Unverified {
+                    attempted: attempted.join(", "),
+                }
+            }
         }
     }
-    if area.set_position(direction, wheel_distance) {
-        tried = true;
-        settle();
-        if let Some(after) = area
-            .position(direction)
-            .filter(|after| moved(before, *after))
-        {
-            return WheelVerdict::Accessibility {
-                route: "scroll bar value",
-                before,
-                after,
-            };
-        }
+    match (attempted.is_empty(), ran_out) {
+        (true, true) => WheelVerdict::Unknown,
+        (tried, _) => WheelVerdict::Dropped {
+            tried_accessibility: !tried,
+        },
     }
-    let pages = pages_for(
-        wheel_distance,
-        area.extent(direction).unwrap_or(0.0),
-        amount,
-    );
-    if area.page(direction, pages) {
-        tried = true;
-        settle();
-        if let Some(after) = area
-            .position(direction)
-            .filter(|after| moved(before, *after))
-        {
-            return WheelVerdict::Accessibility {
-                route: "page action",
-                before,
-                after,
-            };
-        }
+}
+
+fn attempt_label(route: Fallback, count: usize, failed: bool) -> String {
+    let what = match (route, count) {
+        (Fallback::Page, count) if count != 1 => format!("{} ({count} pages)", route.route()),
+        _ => route.route().to_owned(),
+    };
+    if failed {
+        format!("{what}, which the app answered with an error or not in time")
+    } else {
+        what
     }
-    WheelVerdict::Dropped {
-        tried_accessibility: tried,
+}
+
+/// Compares the fallback's move with the request in bar units, with one more
+/// read for movement that kept coming after the first one.
+fn distance_check<A: crate::ax::scroll_area::WheelArea>(
+    area: &A,
+    direction: &str,
+    before: f64,
+    after: f64,
+    wheel_distance: f64,
+    budget: &crate::ax::scroll_area::Budget,
+) -> DistanceCheck {
+    let Some(requested) = area.bar_units(direction, wheel_distance, budget) else {
+        return DistanceCheck::NotMeasured;
+    };
+    budget.pause(FALLBACK_SETTLE);
+    let later = area.position(direction, budget).unwrap_or(after);
+    let clamped = |value: f64| value <= 1e-4 || value >= 1.0 - 1e-4;
+    if !clamped(later) && (later - before).abs() > 1.5 * requested {
+        DistanceCheck::Overshoot { later, requested }
+    } else {
+        DistanceCheck::AsRequested
     }
 }
 
@@ -1051,15 +1170,35 @@ impl WheelVerdict {
             .with_structured(serde_json::json!({
                 "path": "cgevent", "verified": true, "effect": "suspected_noop"
             })),
-            WheelVerdict::Accessibility { route, before, after } => ToolResult::text(format!(
-                "✅ The background wheel did not move this scroll area, so it was scrolled \
-                 {direction} through accessibility ({route}) instead: no event posted, \
-                 nothing fronted.{suffix}"
-            ))
-            .with_structured(serde_json::json!({
-                "path": "ax", "verified": true, "effect": "confirmed",
-                "evidence": readback(before, after)
-            })),
+            WheelVerdict::Accessibility { route, before, after, distance } => {
+                let note = match distance {
+                    DistanceCheck::NotMeasured => {
+                        " The content length could not be measured, so the distance was not checked."
+                            .to_owned()
+                    }
+                    DistanceCheck::AsRequested => String::new(),
+                    DistanceCheck::Overshoot { later, .. } => format!(
+                        " The content moved further than requested (bar {before:.3} → {later:.3}); \
+                         a late wheel or the app itself may have added to it."
+                    ),
+                };
+                let mut structured = serde_json::json!({
+                    "path": "ax", "verified": true, "effect": "confirmed",
+                    "evidence": readback(before, after),
+                    "distance_measured": !matches!(distance, DistanceCheck::NotMeasured),
+                });
+                if let DistanceCheck::Overshoot { later, requested } = distance {
+                    structured["overshoot"] = serde_json::json!({
+                        "before": before, "after": later, "requested": requested
+                    });
+                }
+                ToolResult::text(format!(
+                    "✅ The background wheel did not move this scroll area, so it was scrolled \
+                     {direction} through accessibility ({route}) instead: no event posted, \
+                     nothing fronted.{note}{suffix}"
+                ))
+                .with_structured(structured)
+            }
             WheelVerdict::Dropped { tried_accessibility } => ToolResult::text(format!(
                 "{sent}, but the scroll area did not move{}. This window ignores background \
                  scrolling; use delivery_mode:foreground if foreground input is allowed.{suffix}",
@@ -1069,6 +1208,15 @@ impl WheelVerdict {
                 "path": if *tried_accessibility { "ax" } else { "cgevent" },
                 "verified": true,
                 "effect": "suspected_noop"
+            })),
+            WheelVerdict::Unverified { attempted } => ToolResult::text(format!(
+                "{sent}; the scroll area did not visibly move, so it was then scrolled through \
+                 accessibility ({attempted}), but the result could not be read back in time. \
+                 Read the window before scrolling again.{suffix}"
+            ))
+            .with_structured(serde_json::json!({
+                "path": "ax", "verified": false, "effect": "unverifiable",
+                "attempted": attempted
             })),
             WheelVerdict::Unknown => return None,
         })
@@ -1144,6 +1292,373 @@ unsafe fn collect_ax_buttons(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    mod wheel_verdict_tests {
+        use super::super::{fallback_order, wheel_verdict, DistanceCheck, Fallback, WheelVerdict};
+        use crate::ax::scroll_area::{Budget, Clock, Mutation, WheelArea};
+        use std::cell::{Cell, RefCell};
+        use std::time::{Duration, Instant};
+
+        struct FakeClock(Cell<Instant>);
+        impl FakeClock {
+            fn new() -> Self {
+                Self(Cell::new(Instant::now()))
+            }
+            fn advance(&self, by: Duration) {
+                self.0.set(self.0.get() + by);
+            }
+        }
+        impl Clock for FakeClock {
+            fn now(&self) -> Instant {
+                self.0.get()
+            }
+            fn sleep(&self, duration: Duration) {
+                self.advance(duration);
+            }
+        }
+
+        /// What a fake mutation does: its answer, its cost, and the bar
+        /// value it leaves after a delay (a late apply when the delay is long).
+        #[derive(Clone, Copy)]
+        struct Effect {
+            answer: Mutation,
+            cost: Duration,
+            bar: Option<(Duration, f64)>,
+        }
+        const NOT_SENT: Effect = Effect {
+            answer: Mutation::NotSent,
+            cost: Duration::ZERO,
+            bar: None,
+        };
+        fn sent(bar: f64) -> Effect {
+            Effect {
+                answer: Mutation::Sent { count: 1 },
+                cost: Duration::from_millis(5),
+                bar: Some((Duration::ZERO, bar)),
+            }
+        }
+
+        struct FakeArea<'c> {
+            clock: &'c FakeClock,
+            start: Instant,
+            /// (offset from start, bar value), applied in order.
+            timeline: RefCell<Vec<(Duration, f64)>>,
+            log: RefCell<Vec<&'static str>>,
+            settable: bool,
+            read_cost: Duration,
+            read_blocked: bool,
+            set: Effect,
+            reveal: Effect,
+            page: Effect,
+            units: Option<f64>,
+        }
+
+        impl<'c> FakeArea<'c> {
+            fn new(clock: &'c FakeClock, bar: f64) -> Self {
+                Self {
+                    clock,
+                    start: clock.now(),
+                    timeline: RefCell::new(vec![(Duration::ZERO, bar)]),
+                    log: RefCell::new(Vec::new()),
+                    settable: true,
+                    read_cost: Duration::from_millis(2),
+                    read_blocked: false,
+                    set: NOT_SENT,
+                    reveal: NOT_SENT,
+                    page: NOT_SENT,
+                    units: Some(0.01),
+                }
+            }
+            fn at(&self, after: Duration, bar: f64) {
+                self.timeline.borrow_mut().push((after, bar));
+            }
+            fn bar(&self) -> f64 {
+                let now = self.clock.now() - self.start;
+                self.timeline
+                    .borrow()
+                    .iter()
+                    .filter(|(at, _)| *at <= now)
+                    .max_by_key(|(at, _)| *at)
+                    .map(|(_, bar)| *bar)
+                    .unwrap()
+            }
+            fn mutate(&self, name: &'static str, effect: Effect, budget: &Budget) -> Mutation {
+                if budget.expired() {
+                    return Mutation::NotSent;
+                }
+                self.log.borrow_mut().push(name);
+                self.clock.advance(effect.cost);
+                if let Some((delay, bar)) = effect.bar {
+                    let now = self.clock.now() - self.start;
+                    self.at(now + delay, bar);
+                }
+                effect.answer
+            }
+            fn mutations(&self) -> Vec<&'static str> {
+                self.log.borrow().clone()
+            }
+        }
+
+        impl WheelArea for FakeArea<'_> {
+            fn position(&self, _: &str, budget: &Budget) -> Option<f64> {
+                if budget.expired() || self.read_blocked {
+                    return None;
+                }
+                self.clock.advance(self.read_cost);
+                Some(self.bar())
+            }
+            fn bar_settable(&self, _: &str, _: &Budget) -> bool {
+                self.settable
+            }
+            fn set_position(&self, _: &str, _: f64, budget: &Budget) -> Mutation {
+                self.mutate("set", self.set, budget)
+            }
+            fn reveal(&self, _: Option<[f64; 4]>, _: &str, _: f64, budget: &Budget) -> Mutation {
+                self.mutate("reveal", self.reveal, budget)
+            }
+            fn page(&self, _: &str, _: usize, budget: &Budget) -> Mutation {
+                self.mutate("page", self.page, budget)
+            }
+            fn extent(&self, _: &str, _: &Budget) -> Option<f64> {
+                Some(500.0)
+            }
+            fn bar_units(&self, _: &str, _: f64, _: &Budget) -> Option<f64> {
+                self.units
+            }
+        }
+
+        fn verdict(area: &FakeArea, clock: &FakeClock) -> WheelVerdict {
+            wheel_verdict(area, "up", 0.5, 40.0, 1, None, clock)
+        }
+
+        #[test]
+        fn fallback_order_puts_a_settable_bar_first() {
+            assert_eq!(
+                fallback_order(true),
+                &[Fallback::ScrollBar, Fallback::Reveal, Fallback::Page]
+            );
+            assert_eq!(
+                fallback_order(false),
+                &[Fallback::Reveal, Fallback::ScrollBar, Fallback::Page]
+            );
+        }
+
+        #[test]
+        fn a_settable_bar_is_set_before_any_reveal() {
+            let clock = FakeClock::new();
+            let mut area = FakeArea::new(&clock, 0.5);
+            area.set = sent(0.49);
+            area.reveal = sent(0.3);
+            let got = verdict(&area, &clock);
+            assert!(
+                matches!(
+                    got,
+                    WheelVerdict::Accessibility {
+                        route: "scroll bar value",
+                        ..
+                    }
+                ),
+                "{got:?}"
+            );
+            assert_eq!(area.mutations(), vec!["set"]);
+        }
+
+        #[test]
+        fn an_unsettable_bar_tries_reveal_then_page() {
+            let clock = FakeClock::new();
+            let mut area = FakeArea::new(&clock, 0.5);
+            area.settable = false;
+            area.page = sent(0.49);
+            let got = verdict(&area, &clock);
+            assert!(
+                matches!(
+                    got,
+                    WheelVerdict::Accessibility {
+                        route: "page action",
+                        ..
+                    }
+                ),
+                "{got:?}"
+            );
+            assert_eq!(area.mutations(), vec!["reveal", "set", "page"]);
+        }
+
+        #[test]
+        fn a_late_wheel_within_the_poll_is_moved_not_a_fallback() {
+            let clock = FakeClock::new();
+            let mut area = FakeArea::new(&clock, 0.5);
+            area.at(Duration::from_millis(60), 0.49);
+            area.set = sent(0.4);
+            let got = verdict(&area, &clock);
+            assert_eq!(
+                got,
+                WheelVerdict::Moved {
+                    before: 0.5,
+                    after: 0.49
+                }
+            );
+            assert!(area.mutations().is_empty());
+        }
+
+        #[test]
+        fn a_blocked_bar_read_returns_unknown_without_fallback() {
+            let clock = FakeClock::new();
+            let mut area = FakeArea::new(&clock, 0.5);
+            area.read_blocked = true;
+            area.set = sent(0.49);
+            assert_eq!(verdict(&area, &clock), WheelVerdict::Unknown);
+            assert!(area.mutations().is_empty());
+        }
+
+        #[test]
+        fn the_budget_stops_routes_without_a_second_scroll() {
+            let clock = FakeClock::new();
+            let mut area = FakeArea::new(&clock, 0.5);
+            // One read of a busy app eats the budget down to under a route.
+            area.read_cost = Duration::from_millis(1100);
+            area.set = sent(0.49);
+            assert_eq!(verdict(&area, &clock), WheelVerdict::Unknown);
+            assert!(area.mutations().is_empty());
+        }
+
+        #[test]
+        fn a_timed_out_mutation_stops_further_fallbacks() {
+            let clock = FakeClock::new();
+            let mut area = FakeArea::new(&clock, 0.5);
+            // The write times out after 300 ms with budget left, and the app
+            // applies it 200 ms later: past the one read, so unverified.
+            area.set = Effect {
+                answer: Mutation::Failed { count: 1 },
+                cost: Duration::from_millis(300),
+                bar: Some((Duration::from_millis(200), 0.49)),
+            };
+            area.reveal = sent(0.3);
+            area.page = sent(0.3);
+            let got = verdict(&area, &clock);
+            assert!(
+                matches!(&got, WheelVerdict::Unverified { attempted } if attempted.contains("scroll bar value")),
+                "{got:?}"
+            );
+            assert_eq!(area.mutations(), vec!["set"]);
+
+            // Applied within the settle: confirmed, still nothing else sent.
+            let clock = FakeClock::new();
+            let mut area = FakeArea::new(&clock, 0.5);
+            area.set = Effect {
+                answer: Mutation::Failed { count: 1 },
+                cost: Duration::from_millis(300),
+                bar: Some((Duration::from_millis(20), 0.49)),
+            };
+            area.reveal = sent(0.3);
+            let got = verdict(&area, &clock);
+            assert!(
+                matches!(
+                    got,
+                    WheelVerdict::Accessibility {
+                        route: "scroll bar value",
+                        ..
+                    }
+                ),
+                "{got:?}"
+            );
+            assert_eq!(area.mutations(), vec!["set"]);
+        }
+
+        #[test]
+        fn a_failed_page_action_stops_the_ladder() {
+            let clock = FakeClock::new();
+            let mut area = FakeArea::new(&clock, 0.5);
+            area.settable = false;
+            area.reveal = Effect {
+                answer: Mutation::Failed { count: 1 },
+                cost: Duration::from_millis(5),
+                bar: None,
+            };
+            area.page = sent(0.49);
+            let got = verdict(&area, &clock);
+            assert!(
+                matches!(&got, WheelVerdict::Unverified { attempted } if attempted.contains("AXScrollToVisible")),
+                "{got:?}"
+            );
+            assert_eq!(area.mutations(), vec!["reveal"]);
+        }
+
+        #[test]
+        fn expiry_after_a_successful_bar_write_reports_the_write_unverified() {
+            let clock = FakeClock::new();
+            let mut area = FakeArea::new(&clock, 0.5);
+            area.set = Effect {
+                answer: Mutation::Sent { count: 1 },
+                cost: Duration::from_millis(1000),
+                bar: Some((Duration::from_millis(500), 0.49)),
+            };
+            let got = verdict(&area, &clock);
+            assert!(
+                matches!(&got, WheelVerdict::Unverified { attempted } if attempted == "scroll bar value"),
+                "{got:?}"
+            );
+            assert_eq!(area.mutations(), vec!["set"]);
+        }
+
+        #[test]
+        fn expiry_between_page_actions_reports_pages_sent() {
+            let clock = FakeClock::new();
+            let mut area = FakeArea::new(&clock, 0.5);
+            area.settable = false;
+            area.page = Effect {
+                answer: Mutation::Sent { count: 2 },
+                cost: Duration::from_millis(1000),
+                bar: Some((Duration::from_millis(500), 0.3)),
+            };
+            let got = verdict(&area, &clock);
+            assert!(
+                matches!(&got, WheelVerdict::Unverified { attempted } if attempted == "page action (2 pages)"),
+                "{got:?}"
+            );
+        }
+
+        #[test]
+        fn overshoot_is_reported_without_a_cause() {
+            let distance = |bar: f64, units: Option<f64>| {
+                let clock = FakeClock::new();
+                let mut area = FakeArea::new(&clock, 0.5);
+                area.set = sent(bar);
+                area.units = units;
+                match verdict(&area, &clock) {
+                    WheelVerdict::Accessibility { distance, .. } => distance,
+                    other => panic!("{other:?}"),
+                }
+            };
+            // Requested 0.05 of the bar: 0.1 is 2x, 0.06 is 1.2x.
+            assert_eq!(
+                distance(0.4, Some(0.05)),
+                DistanceCheck::Overshoot {
+                    later: 0.4,
+                    requested: 0.05
+                }
+            );
+            assert_eq!(distance(0.44, Some(0.05)), DistanceCheck::AsRequested);
+            // Clamped at the top: not an overshoot.
+            assert_eq!(distance(0.0, Some(0.05)), DistanceCheck::AsRequested);
+            assert_eq!(distance(0.4, None), DistanceCheck::NotMeasured);
+        }
+
+        #[test]
+        fn movement_before_the_fallback_is_a_move_not_an_overshoot() {
+            let clock = FakeClock::new();
+            let mut area = FakeArea::new(&clock, 0.5);
+            area.at(Duration::from_millis(10), 0.2);
+            area.set = sent(0.1);
+            assert_eq!(
+                verdict(&area, &clock),
+                WheelVerdict::Moved {
+                    before: 0.5,
+                    after: 0.2
+                }
+            );
+            assert!(area.mutations().is_empty());
+        }
+    }
 
     #[test]
     fn amount_is_clamped_to_the_advertised_range() {
