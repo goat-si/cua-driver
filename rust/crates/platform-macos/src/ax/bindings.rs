@@ -666,20 +666,29 @@ pub fn focused_element_window_id_of_pid(pid: i32) -> Option<u32> {
 ///
 /// `element` must be valid, and the caller must release every returned element.
 pub unsafe fn copy_children(element: AXUIElementRef) -> Vec<AXUIElementRef> {
+    copy_children_checked(element).unwrap_or_default()
+}
+
+/// [`copy_children`], or `None` when the read failed rather than finding no
+/// children: a walk that gets `None` has not seen what lies below.
+pub unsafe fn copy_children_checked(element: AXUIElementRef) -> Option<Vec<AXUIElementRef>> {
     let attr = CFStr::new("AXChildren");
     let mut value: CFTypeRef = std::ptr::null();
     let err = AXUIElementCopyAttributeValue(element, attr.as_concrete_TypeRef(), &mut value);
+    if !children_read_succeeded(err) {
+        return None;
+    }
     if err != kAXErrorSuccess || value.is_null() {
-        return vec![];
+        return Some(vec![]);
     }
     let cf_array_type_id = CFArray::<CFTypeRef>::type_id();
     if core_foundation::base::CFGetTypeID(value) != cf_array_type_id {
         CFRelease(value);
-        return vec![];
+        return None;
     }
     let arr = CFArray::<CFTypeRef>::wrap_under_create_rule(value as _);
     let ax_type_id = AXUIElementGetTypeID();
-    (0..arr.len())
+    let children = (0..arr.len())
         .filter_map(|i| {
             let item = *arr.get(i)?;
             if core_foundation::base::CFGetTypeID(item) == ax_type_id {
@@ -690,7 +699,17 @@ pub unsafe fn copy_children(element: AXUIElementRef) -> Vec<AXUIElementRef> {
                 None
             }
         })
-        .collect()
+        .collect();
+    Some(children)
+}
+
+/// Whether an `AXChildren` read answered: with children, or with "none" for
+/// an element that has no value or no such attribute.
+pub(crate) fn children_read_succeeded(err: AXError) -> bool {
+    matches!(
+        err,
+        kAXErrorSuccess | kAXErrorNoValue | kAXErrorAttributeUnsupported
+    )
 }
 
 /// Copy an AX element-valued attribute. The returned element is retained and

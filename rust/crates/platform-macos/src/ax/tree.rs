@@ -200,6 +200,12 @@ pub struct TreeWalkResult {
     pub nodes: Vec<AXNode>,
     /// True when the walk was cut short by its node or time budget.
     pub truncated: bool,
+    /// True when the walk passed over a node or subtree without visiting it
+    /// for a reason other than its budget: the depth cap with children below,
+    /// an `AXChildren` read that failed, a node whose attributes could not be
+    /// read, omitted tabs, off-screen rows or menus left unwalked, or web
+    /// content excluded from this walk.
+    pub nodes_skipped: bool,
     /// Why and where the walk stopped (see [`cua_driver_core::walk_budget`]).
     pub walk: WalkOutcome,
     /// Whether the requested `window_id` actually resolved to an AX surface,
@@ -221,6 +227,7 @@ impl TreeWalkResult {
             tree_markdown,
             nodes,
             truncated: false,
+            nodes_skipped: false,
             walk: cua_driver_core::walk_budget::WalkBudget::nodes_only(usize::MAX).outcome(),
             window_scope: None,
         }
@@ -340,6 +347,7 @@ fn walk_tree_with_web_content(
     mut budget: WalkBudget,
     include_web_content: bool,
 ) -> TreeWalkResult {
+    let ledger = SkipLedger::start();
     let mut nodes: Vec<AXNode> = Vec::new();
     let mut lines: Vec<(usize, String)> = Vec::new(); // (depth, line)
     let mut index_counter = 0usize;
@@ -354,6 +362,7 @@ fn walk_tree_with_web_content(
                 tree_markdown: String::new(),
                 nodes,
                 truncated: false,
+                nodes_skipped: true,
                 walk: budget.outcome(),
                 // No application AX element at all, so a requested window
                 // certainly did not resolve.
@@ -438,6 +447,9 @@ fn walk_tree_with_web_content(
             with_dense_rows_windowed(false, || {
                 for visible in [true, false] {
                     if !visible && !search_offscreen {
+                        if deferred.iter().any(|row| !row.visible) {
+                            note_skipped();
+                        }
                         continue;
                     }
                     for row in deferred.iter_mut().filter(|row| row.visible == visible) {
@@ -476,7 +488,12 @@ fn walk_tree_with_web_content(
     }
 
     let walk = budget.outcome();
-    fold_actionless_text_subtrees(&mut lines, &mut nodes);
+    let nodes_skipped = ledger.finish();
+    // Folding merges text rows into their parent; an exhaustive walk keeps
+    // every row it visited.
+    if !exhaustive_nodes() {
+        fold_actionless_text_subtrees(&mut lines, &mut nodes);
+    }
     nodes.retain(|n| n.role != "AXTabStripSummary");
     prune_echo_text_rows(&mut lines);
     let raw_markdown = render_lines(&lines);
@@ -495,6 +512,7 @@ fn walk_tree_with_web_content(
         tree_markdown,
         nodes,
         truncated: walk.truncated(),
+        nodes_skipped,
         walk,
         window_scope,
     }
@@ -588,6 +606,7 @@ unsafe fn walk_element(
     deferred: &mut Vec<DeferredRow>,
 ) {
     if depth > max_depth {
+        note_skipped();
         return;
     }
     // Node and time budget: a refused node is counted as discovered but not
@@ -604,6 +623,7 @@ unsafe fn walk_element(
 
     let in_web_content = in_web_content || is_web_content_role(&role);
     if in_web_content && !include_web_content {
+        note_skipped();
         return;
     }
 
@@ -664,6 +684,27 @@ unsafe fn walk_element(
 
     // Skip pure layout containers that have no interesting content.
     if role == "AXScrollArea" || role == "AXGroup" {
+        // An exhaustive walk keeps the container as a display-only row, so a
+        // selector naming it is answered rather than assumed absent.
+        if exhaustive_nodes() {
+            let node = match read_content_attrs(element, budget, batching_disabled) {
+                Some(attrs) => {
+                    display_node(&role, attrs, element, depth, parent_index, in_web_content)
+                }
+                None => {
+                    note_skipped();
+                    role_only_node(
+                        role.clone(),
+                        element as usize,
+                        depth,
+                        parent_index,
+                        in_web_content,
+                    )
+                }
+            };
+            lines.push((depth, format_node_line(&node)));
+            nodes.push(node);
+        }
         // Still recurse — children may be interesting. Layout containers
         // collapse, so children inherit the parent's depth AND the same
         // parent_index (no actionable node was emitted here).
@@ -700,6 +741,8 @@ unsafe fn walk_element(
         help,
     }) = read_content_attrs(element, budget, batching_disabled)
     else {
+        // Only the role is known: a selector on its label cannot be answered.
+        note_skipped();
         let node = role_only_node(role, element as usize, depth, parent_index, in_web_content);
         lines.push((depth, format_node_line(&node)));
         nodes.push(node);
@@ -747,6 +790,21 @@ unsafe fn walk_element(
     );
 
     if !is_actionable && !has_content && role != "AXWindow" && role != "AXSheet" {
+        if exhaustive_nodes() {
+            let node = AXNode {
+                identifier: identifier.clone(),
+                help: help.clone(),
+                ..role_only_node(
+                    role.clone(),
+                    element as usize,
+                    depth,
+                    parent_index,
+                    in_web_content,
+                )
+            };
+            lines.push((depth, format_node_line(&node)));
+            nodes.push(node);
+        }
         walk_children(
             element,
             &role,
@@ -886,6 +944,7 @@ unsafe fn walk_element(
     lines.push((depth, line));
     nodes.push(node);
     if collapse_here {
+        note_skipped();
         return;
     }
 
@@ -923,9 +982,18 @@ unsafe fn walk_children(
     deferred: &mut Vec<DeferredRow>,
 ) {
     if depth > max_depth {
+        // A tree that ends exactly at the cap is still complete.
+        let below = copy_children(element);
+        if !below.is_empty() {
+            note_skipped();
+        }
+        release_all(below);
         return;
     }
-    let children = copy_children(element);
+    let Some(children) = copy_children_checked(element) else {
+        note_skipped();
+        return;
+    };
     let tab_plan = if !in_web_content && children.len() >= TAB_STRIP_COMPACTION_THRESHOLD {
         plan_macos_tab_strip(element, role, &children)
     } else {
@@ -951,6 +1019,7 @@ unsafe fn walk_children(
                 ));
             }
             if !tp.keep[index] {
+                note_skipped();
                 CFRelease(child as CFTypeRef);
                 continue;
             }
@@ -1078,6 +1147,35 @@ fn role_only_node(
     }
 }
 
+/// A display-only row for a container an ordinary walk collapses: its
+/// labels, no index, no value.
+fn display_node(
+    role: &str,
+    attrs: ContentAttrs,
+    element: AXUIElementRef,
+    depth: usize,
+    parent_element_index: Option<usize>,
+    in_web_content: bool,
+) -> AXNode {
+    let label = |text: Option<String>| {
+        text.map(|text| text.trim().to_owned())
+            .filter(|text| !text.is_empty())
+    };
+    AXNode {
+        title: label(attrs.title),
+        description: label(attrs.description),
+        identifier: attrs.identifier,
+        help: attrs.help,
+        ..role_only_node(
+            role.to_owned(),
+            element as usize,
+            depth,
+            parent_element_index,
+            in_web_content,
+        )
+    }
+}
+
 fn is_web_content_role(role: &str) -> bool {
     let normalized = role
         .chars()
@@ -1187,6 +1285,55 @@ fn format_node_line(node: &AXNode) -> String {
 
 thread_local! {
     static MENUS_COLLAPSED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static WALK_SKIPPED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static EXHAUSTIVE_NODES: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Run `walk` keeping every visited node in `nodes` (or not) on this thread:
+/// layout containers and unlabelled rows stay as display-only rows and text
+/// rows are not folded into their parent. Only `verify_state`'s internal
+/// read asks for this, so that `elements` lists the whole walked window and
+/// a selector matching none of it names nothing there.
+pub fn with_exhaustive_nodes<T>(exhaustive: bool, walk: impl FnOnce() -> T) -> T {
+    let previous = EXHAUSTIVE_NODES.with(|flag| flag.replace(exhaustive));
+    let result = walk();
+    EXHAUSTIVE_NODES.with(|flag| flag.set(previous));
+    result
+}
+
+fn exhaustive_nodes() -> bool {
+    EXHAUSTIVE_NODES.with(std::cell::Cell::get)
+}
+
+/// Record that the walk on this thread passed over a node or subtree without
+/// visiting it (see [`TreeWalkResult::nodes_skipped`]).
+fn note_skipped() {
+    WALK_SKIPPED.with(|flag| flag.set(true));
+}
+
+/// The skip record of one walk. A nested walk on the same thread keeps its
+/// own record and hands the outer one back when it ends.
+struct SkipLedger {
+    previous: bool,
+}
+
+impl SkipLedger {
+    fn start() -> Self {
+        Self {
+            previous: WALK_SKIPPED.with(|flag| flag.replace(false)),
+        }
+    }
+
+    /// Whether this walk skipped anything.
+    fn finish(self) -> bool {
+        WALK_SKIPPED.with(std::cell::Cell::get)
+    }
+}
+
+impl Drop for SkipLedger {
+    fn drop(&mut self) {
+        WALK_SKIPPED.with(|flag| flag.set(self.previous));
+    }
 }
 
 /// Shown on the menu bar row of a read whose menus were not walked.
@@ -1434,6 +1581,34 @@ mod lean_row_tests {
                 "- [12] AXStaticText = \"Inbox\"",
             ]
         );
+    }
+
+    /// DSH-08: each walk keeps its own skip record; a walk nested on the same
+    /// thread neither clears nor leaks into the outer one.
+    #[test]
+    fn each_walk_keeps_its_own_skip_record() {
+        use super::{note_skipped, SkipLedger};
+        let outer = SkipLedger::start();
+        note_skipped();
+        let inner = SkipLedger::start();
+        assert!(!inner.finish(), "a nested walk starts clean");
+        assert!(outer.finish(), "the outer skip survives the nested walk");
+        let next = SkipLedger::start();
+        assert!(!next.finish());
+    }
+
+    #[test]
+    fn only_a_failed_children_read_hides_what_lies_below() {
+        use super::super::bindings::{
+            children_read_succeeded, kAXErrorAttributeUnsupported, kAXErrorCannotComplete,
+            kAXErrorFailure, kAXErrorInvalidUIElement, kAXErrorNoValue, kAXErrorSuccess,
+        };
+        assert!(children_read_succeeded(kAXErrorSuccess));
+        assert!(children_read_succeeded(kAXErrorNoValue));
+        assert!(children_read_succeeded(kAXErrorAttributeUnsupported));
+        assert!(!children_read_succeeded(kAXErrorCannotComplete));
+        assert!(!children_read_succeeded(kAXErrorFailure));
+        assert!(!children_read_succeeded(kAXErrorInvalidUIElement));
     }
 
     #[test]

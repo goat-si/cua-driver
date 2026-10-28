@@ -48,3 +48,13 @@ cannot prove the exact target window's full UIA tree.
 Internal `verify_state` reads also remain incomplete while the Windows
 structured projection omits display-only UIA nodes. A complete native walk
 does not make that projection exhaustive.
+
+On macOS, ordinary `get_window_state` reads report `elements_complete: false`:
+they collapse layout containers, drop unlabelled rows and fold text rows into
+their parent, so a missing row proves nothing. The internal `verify_state`
+read walks without that compaction and reports `elements_complete: true` when
+the walk of the exact requested window finished without a node or time
+budget stop and without passing over anything: no children below
+`max_depth`, no failed `AXChildren` read, no node whose attributes could not
+be read, no omitted tabs. Only then can `verify_state` answer `unsatisfied`
+for an element that is not there instead of `unknown`.

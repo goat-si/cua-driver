@@ -307,11 +307,11 @@ impl Tool for GetWindowStateTool {
         // a trusted direct in-process invocation can enable this mode.
         // `display_only` is the public form of the same mode: pixels for a
         // preview, with no snapshot or capture change.
-        let observation_only = display_only
-            || args
-                .get("_observation_only")
-                .and_then(|value| value.as_bool())
-                == Some(true);
+        let verify_read = args
+            .get("_observation_only")
+            .and_then(|value| value.as_bool())
+            == Some(true);
+        let observation_only = display_only || verify_read;
         // Optional caps — when omitted, fall back to the defaults baked into
         // the AX walker (#22865). minimum:1 keyed in the schema, but defend
         // against 0 here as well so a misbehaving client can't disable the
@@ -359,6 +359,7 @@ impl Tool for GetWindowStateTool {
                         tree_markdown,
                         nodes: Vec::new(),
                         truncated: true,
+                        nodes_skipped: false,
                         walk,
                         window_scope: Some(crate::ax::window_scope::WindowScope::Matched),
                     };
@@ -367,13 +368,15 @@ impl Tool for GetWindowStateTool {
                 }
                 let tree = crate::ax::tree::with_menus_collapsed(collapse_menus, || {
                     crate::ax::dense_rows::with_dense_rows_windowed(window_dense_rows, || {
-                        crate::ax::tree::walk_tree_budgeted(
-                            pid,
-                            Some(window_id),
-                            q.as_deref(),
-                            max_depth,
-                            budget,
-                        )
+                        crate::ax::tree::with_exhaustive_nodes(verify_read, || {
+                            crate::ax::tree::walk_tree_budgeted(
+                                pid,
+                                Some(window_id),
+                                q.as_deref(),
+                                max_depth,
+                                budget,
+                            )
+                        })
                     })
                 });
                 HUNG_TARGET_BREAKER.record_outcome(target_key, &tree.walk);
@@ -694,11 +697,7 @@ impl Tool for GetWindowStateTool {
             _ => elements_json,
         };
         let filtered_element_count = elements_json.len();
-        // The structured array intentionally contains only actionable nodes,
-        // and AX child reads can fail independently of the element/depth caps.
-        // Until the walker exposes a proof over the projected search domain,
-        // absence must remain unknown rather than being claimed complete.
-        let elements_complete = false;
+        let elements_complete = elements_complete(tree_result.as_ref(), scope_matched, verify_read);
 
         let mut structured = serde_json::json!({
             "window_id": window_id,
@@ -1150,6 +1149,22 @@ pub(crate) fn build_observation_elements_array(
     nodes: &[crate::ax::tree::AXNode],
 ) -> Vec<serde_json::Value> {
     nodes.iter().map(|node| element_entry(node, None)).collect()
+}
+
+/// Whether `elements` lists every node the walk of the requested window
+/// visited, so a selector that matches none of them names nothing in the
+/// window. Only `verify_state`'s exhaustive read can say so: an ordinary read
+/// collapses layout containers, drops unlabelled rows and folds text rows,
+/// and its public array lists only the addressable rows.
+fn elements_complete(
+    tree: Option<&crate::ax::tree::TreeWalkResult>,
+    scope_matched: bool,
+    exhaustive: bool,
+) -> bool {
+    let Some(tree) = tree else {
+        return false;
+    };
+    exhaustive && scope_matched && !tree.truncated && !tree.nodes_skipped
 }
 
 fn element_entry(node: &crate::ax::tree::AXNode, snapshot_id: Option<u32>) -> serde_json::Value {
@@ -2008,6 +2023,34 @@ mod tests {
         )];
         let entries = build_elements_array_with_token(&nodes, None);
         assert_eq!(entries[0]["actions"], json!(["AXPress", "AXShowMenu"]));
+    }
+
+    /// DSH-08: a walk of the matched window that finished without skipping a
+    /// node proves its observation elements complete, so verify_state can
+    /// answer `unsatisfied` instead of `unknown` for an absent control.
+    #[test]
+    fn a_finished_walk_proves_its_elements_complete() {
+        let nodes = || {
+            vec![
+                node(Some(0), "AXButton", Some("OK"), 1, None, None, vec![]),
+                node(None, "AXStaticText", Some("Saved"), 1, None, None, vec![]),
+            ]
+        };
+        let finished = crate::ax::tree::TreeWalkResult::for_test(String::new(), nodes());
+        assert!(super::elements_complete(Some(&finished), true, true));
+        // An ordinary read compacts its rows, so it proves nothing.
+        assert!(!super::elements_complete(Some(&finished), true, false));
+        // Another surface, or no tree at all, proves nothing.
+        assert!(!super::elements_complete(Some(&finished), false, true));
+        assert!(!super::elements_complete(None, true, true));
+
+        let mut skipped = crate::ax::tree::TreeWalkResult::for_test(String::new(), nodes());
+        skipped.nodes_skipped = true;
+        assert!(!super::elements_complete(Some(&skipped), true, true));
+
+        let mut truncated = crate::ax::tree::TreeWalkResult::for_test(String::new(), nodes());
+        truncated.truncated = true;
+        assert!(!super::elements_complete(Some(&truncated), true, true));
     }
 
     #[test]
