@@ -403,6 +403,11 @@ pub fn physical_input_idle_ms() -> Option<u64> {
     unsafe {
         use windows::Win32::System::SystemInformation::GetTickCount;
         use windows::Win32::UI::Input::KeyboardAndMouse::{GetLastInputInfo, LASTINPUTINFO};
+        // Hold the record while reading the OS, so an injection on another
+        // thread cannot land between the read and the update.
+        let mut tracker = OWN_INPUT
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut info = LASTINPUTINFO {
             cbSize: std::mem::size_of::<LASTINPUTINFO>() as u32,
             dwTime: 0,
@@ -410,12 +415,8 @@ pub fn physical_input_idle_ms() -> Option<u64> {
         if !GetLastInputInfo(&mut info).as_bool() {
             return None;
         }
-        let now_ticks = GetTickCount();
-        // `GetLastInputInfo` counts the driver's own `SendInput` too.
-        OWN_INPUT
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .idle_ms(now_ticks, info.dwTime)
+        // `GetLastInputInfo` counts the driver's own input too.
+        tracker.idle_ms(GetTickCount(), info.dwTime)
     }
     #[cfg(not(target_os = "windows"))]
     {
@@ -429,21 +430,20 @@ pub fn physical_input_idle_ms() -> Option<u64> {
 static OWN_INPUT: std::sync::Mutex<cua_driver_core::delivery::OwnInputTracker> =
     std::sync::Mutex::new(cua_driver_core::delivery::OwnInputTracker::new());
 
-/// `SendInput` for every driver injection. It records when the driver
-/// injected, so the foreground idle gate does not read the driver's own last
-/// action as the person's input and refuse the next one.
+/// Run one driver injection of any kind (`SendInput`, `keybd_event`,
+/// synthetic pointer input) through the process-wide record. `inject`
+/// returns its result and whether it inserted input. The record keeps the
+/// person's latest input from before the injection and the injection's tick
+/// span, so the foreground idle gate does not read the driver's own action as
+/// the person's input and refuse the next one.
 ///
 /// # Safety
 ///
-/// The same as `SendInput`.
+/// The same as the Win32 calls `inject` makes.
 #[cfg(target_os = "windows")]
-pub(crate) unsafe fn send_input(
-    events: &[windows::Win32::UI::Input::KeyboardAndMouse::INPUT],
-) -> u32 {
+pub(crate) unsafe fn record_own_input<T>(inject: impl FnOnce() -> (T, bool)) -> T {
     use windows::Win32::System::SystemInformation::GetTickCount;
-    use windows::Win32::UI::Input::KeyboardAndMouse::{
-        GetLastInputInfo, SendInput, INPUT, LASTINPUTINFO,
-    };
+    use windows::Win32::UI::Input::KeyboardAndMouse::{GetLastInputInfo, LASTINPUTINFO};
     let mut tracker = OWN_INPUT
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -458,11 +458,24 @@ pub(crate) unsafe fn send_input(
             };
             GetLastInputInfo(&mut info).as_bool().then_some(info.dwTime)
         },
-        || {
-            let sent = SendInput(events, std::mem::size_of::<INPUT>() as i32);
-            (sent, sent > 0)
-        },
+        inject,
     )
+}
+
+/// `SendInput` for every driver injection, through [`record_own_input`].
+///
+/// # Safety
+///
+/// The same as `SendInput`.
+#[cfg(target_os = "windows")]
+pub(crate) unsafe fn send_input(
+    events: &[windows::Win32::UI::Input::KeyboardAndMouse::INPUT],
+) -> u32 {
+    use windows::Win32::UI::Input::KeyboardAndMouse::{SendInput, INPUT};
+    record_own_input(|| {
+        let sent = SendInput(events, std::mem::size_of::<INPUT>() as i32);
+        (sent, sent > 0)
+    })
 }
 
 /// Pure preflight evaluation for a Windows foreground delivery request.
@@ -712,6 +725,36 @@ mod tests {
     #[cfg(target_os = "windows")]
     #[test]
     fn the_drivers_injection_is_stamped_inside_its_recorded_span() {
+        assert_stamped_inside_recorded_span("SendInput", || {
+            assert_eq!(
+                unsafe { send_input(&nudge()) },
+                1,
+                "SendInput must insert the event on an input desktop"
+            );
+        });
+    }
+
+    /// The reserved no-name key the foreground fallback presses goes through
+    /// the same record as `SendInput`.
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn the_no_name_key_is_stamped_inside_its_recorded_span() {
+        use windows::Win32::UI::Input::KeyboardAndMouse::{
+            keybd_event, KEYBD_EVENT_FLAGS, KEYEVENTF_KEYUP,
+        };
+        assert_stamped_inside_recorded_span("keybd_event(VK_NONAME)", || unsafe {
+            record_own_input(|| {
+                keybd_event(0xFC, 0, KEYBD_EVENT_FLAGS(0), 0);
+                keybd_event(0xFC, 0, KEYEVENTF_KEYUP, 0);
+                ((), true)
+            });
+        });
+    }
+
+    /// Run `inject` on a verified input desktop, after a fresh tick, and
+    /// require the OS to stamp it inside the span the record kept.
+    #[cfg(target_os = "windows")]
+    fn assert_stamped_inside_recorded_span(name: &str, inject: impl FnOnce()) {
         let _serial = IDLE_GATE_TESTS
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -721,13 +764,10 @@ mod tests {
         }
         let before = last_input_tick();
         wait_two_tick_changes();
-        assert_eq!(
-            unsafe { send_input(&nudge()) },
-            1,
-            "SendInput must insert the event on an input desktop"
-        );
-        let after = wait_for_new_input(before)
-            .expect("the OS must stamp the injection within 500 ms on an input desktop");
+        inject();
+        let after = wait_for_new_input(before).unwrap_or_else(|| {
+            panic!("the OS must stamp {name} within 500 ms on an input desktop")
+        });
         // Someone else's input can land right after the injection. Use the
         // observation only when the input did not change again.
         if last_input_tick() != Some(after) {
@@ -741,8 +781,7 @@ mod tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         assert!(
             tracker.is_own_input(after),
-            "the driver's injection, stamped at tick {after}, must fall inside \
-             its recorded span ({tracker:?})"
+            "{name}, stamped at tick {after}, must fall inside its recorded span ({tracker:?})"
         );
     }
 
