@@ -1708,6 +1708,23 @@ impl ToolRegistry {
             "type_text_chars" => "type_text",
             other => renamed_tool(other).unwrap_or(other),
         };
+        // A call dispatched by a `run_steps` batch or a `run_script` program
+        // that carries an app scope must stay inside it. Admission runs first,
+        // before any argument parsing that can fail (post_action_wait here,
+        // aliases and targets below), so a call outside the scope always gets
+        // the scope's own code (which ends the batch or script) and sends
+        // nothing. The view applies only the infallible normalizations.
+        if let Some(scope) = crate::batch_scope::current() {
+            if let (Some(scoped_tool), true) = (self.tools.get(tool), args.is_object()) {
+                let view = batch_scope_view(scoped_tool.def(), &args);
+                if let Err(refusal) = scope
+                    .check(tool, &view, scoped_tool.def().read_only, self)
+                    .await
+                {
+                    return refusal.into_result();
+                }
+            }
+        }
         let wait = if crate::post_action_wait::accepts(tool) {
             crate::post_action_wait::from_args(tool, &args)
         } else {
@@ -1793,23 +1810,12 @@ impl ToolRegistry {
         // consent, recording, or implementation layer interprets the call.
         coerce_string_scalars(&tool.def().input_schema, &mut args);
         normalize_delivery_mode_args(tool.def(), &mut args);
-        // A call dispatched by a `run_steps` batch or a `run_script` program
-        // that carries an app scope must stay inside it. The raw target is
-        // checked before any argument normalization can fail, so a call
-        // outside the scope always gets the scope's own code (which ends the
-        // batch or script) and sends nothing.
+        // The view the batch scope admitted this call on (see
+        // `invoke_authorized`), for the second check below.
         let batch_scope = crate::batch_scope::current();
         let scope_view = batch_scope
             .as_ref()
             .map(|_| crate::batch_scope::target_view(&args));
-        if let (Some(scope), Some(view)) = (&batch_scope, &scope_view) {
-            if let Err(refusal) = scope
-                .check(resolved_name, view, tool.def().read_only, self)
-                .await
-            {
-                return refusal.into_result();
-            }
-        }
         if let Err(detail) = normalize_argument_aliases(resolved_name, &mut args) {
             return ToolResult::error(format!("{resolved_name}: {detail}")).with_structured(
                 serde_json::json!({
@@ -6379,6 +6385,18 @@ impl crate::batch_scope::ScopeFacts for ToolRegistry {
                 })
             })
     }
+}
+
+/// The arguments a batch scope admits a call on: the call's own arguments
+/// after the infallible normalizations dispatch applies first (string
+/// scalars, the `dispatch` spelling of `delivery_mode`), with a typed
+/// target flattened. `invoke_authorized_unannotated` computes the same view
+/// after those normalizations to decide whether to check again.
+fn batch_scope_view(def: &ToolDef, args: &Value) -> Value {
+    let mut view = args.clone();
+    coerce_string_scalars(&def.input_schema, &mut view);
+    normalize_delivery_mode_args(def, &mut view);
+    crate::batch_scope::target_view(&view)
 }
 
 fn permission_denied_result(message: String) -> ToolResult {
