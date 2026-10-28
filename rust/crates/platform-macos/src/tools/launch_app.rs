@@ -558,7 +558,7 @@ fn opened_folder_windows(
     windows: &mut Vec<crate::windows::WindowInfo>,
     titles: &[String],
 ) -> Vec<crate::windows::WindowInfo> {
-    windows.retain(|window| titles.iter().any(|title| window.title == *title));
+    windows.retain(|window| titles.contains(&window.title));
     rank_launch_windows(windows);
     std::mem::take(windows)
 }
@@ -799,7 +799,7 @@ mod tests {
         let dir = std::env::temp_dir().join("cua-launch-folder-test");
         std::fs::create_dir_all(&dir).unwrap();
         let folder = dir.to_string_lossy().into_owned();
-        let titles = finder_folder_titles(Some("com.apple.finder"), &[folder.clone()]);
+        let titles = finder_folder_titles(Some("com.apple.finder"), std::slice::from_ref(&folder));
         assert_eq!(titles, vec!["cua-launch-folder-test".to_owned()]);
         // Not Finder, or not a folder: the app's windows are reported as before.
         assert!(finder_folder_titles(Some("com.apple.TextEdit"), &[folder]).is_empty());
