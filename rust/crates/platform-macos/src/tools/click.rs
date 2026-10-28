@@ -634,6 +634,7 @@ impl Tool for ClickTool {
                 let requested = effective_action.clone();
                 let foreground = delivery_mode.is_foreground();
                 let resolved = latency::spawn_action_blocking(move || {
+                    let _span = latency::span(latency::Stage::Preflight);
                     let element = action_guard.as_ptr() as AXUIElementRef;
                     let advertised = unsafe { copy_action_names(element) };
                     crate::input::ax_actions::resolve_element_action(
@@ -659,6 +660,7 @@ impl Tool for ClickTool {
             {
                 let select_guard = element_guard.clone();
                 let refusal = latency::spawn_action_blocking(move || {
+                    let _span = latency::span(latency::Stage::Preflight);
                     let element = select_guard.as_ptr() as AXUIElementRef;
                     super::set_value::is_chromium_web_select(pid, wid, element).then(|| {
                         super::set_value::chromium_select_open_refusal(pid, wid, Some(idx), element)
@@ -678,6 +680,7 @@ impl Tool for ClickTool {
             // The element's screen rect rides along on the glide so motion
             // styles can time by target size and highlight the target.
             let (center, target_rect) = latency::spawn_action_blocking(move || unsafe {
+                let _span = latency::span(latency::Stage::Preflight);
                 let el = center_guard.as_ptr() as AXUIElementRef;
                 (
                     crate::ax::bindings::element_screen_center(el),
@@ -778,6 +781,7 @@ impl Tool for ClickTool {
             let selection_center = if effective_action == "press" {
                 let selection_guard = element_guard.clone();
                 latency::spawn_action_blocking(move || {
+                    let _span = latency::span(latency::Stage::Preflight);
                     crate::input::ax_actions::nearest_container_selection_state(
                         selection_guard.as_ptr(),
                     )
@@ -1713,6 +1717,7 @@ fn perform_ax_click(
 
     // Read live capabilities before dispatch: custom actions and
     // AXIncrement/AXDecrement are valid only on elements that expose them.
+    let preflight = latency::span(latency::Stage::Preflight);
     let advertised = unsafe { copy_action_names(element) };
     let ax_action =
         crate::input::ax_actions::resolve_element_action(action_str, &advertised, foreground)?;
@@ -1845,10 +1850,15 @@ fn perform_ax_click(
     let toggle_before = is_toggle_press(ax_action, &role, &advertised)
         .then(read_value)
         .flatten();
+    drop(preflight);
     if !foreground {
-        prime_key_window_for_background_press(pid, window_id, ax_action);
+        latency::section(latency::Stage::KeyPrime, || {
+            prime_key_window_for_background_press(pid, window_id, ax_action)
+        });
     }
-    let err = unsafe { crate::ax::bindings::perform_action(element, ax_action) };
+    let err = latency::section(latency::Stage::AxPerform, || unsafe {
+        crate::ax::bindings::perform_action(element, ax_action)
+    });
     if err != crate::ax::bindings::kAXErrorSuccess {
         // Checked before the row-selection fallback, which writes AXSelected
         // on an ancestor: a toggle whose press landed needs no other write.
