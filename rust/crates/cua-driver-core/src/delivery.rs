@@ -626,6 +626,18 @@ mod tests {
     }
 
     #[test]
+    fn input_in_the_injections_last_tick_is_the_documented_ambiguity() {
+        // Ticks advance in steps of 10 to 16 ms. A person's input right after
+        // the injection can carry the same tick as the span's end, and is
+        // then set aside with the driver's own input: the documented limit.
+        let mut gate = OwnInputTracker::new();
+        held_up_injection(&mut gate, [10_000, 10_000, 10_016], Some(5_000));
+        assert_eq!(gate.idle_ms(10_200, 10_016), Some(5_200));
+        // One tick later it counts.
+        assert_eq!(gate.idle_ms(10_200, 10_031), Some(169));
+    }
+
+    #[test]
     fn a_prompt_injection_does_not_lock_the_driver_out() {
         use std::cell::Cell;
         let clock = Cell::new(1_000_u32);

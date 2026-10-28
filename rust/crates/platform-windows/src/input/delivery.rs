@@ -616,30 +616,26 @@ mod tests {
         .is_ok());
     }
 
-    /// The foreground idle gate reads `GetLastInputInfo`, which also counts
-    /// `SendInput`. The gate sets the driver's own input aside by its
-    /// recorded span, so the OS must stamp a real injection inside it.
+    /// The OS's last-input tick.
     #[cfg(target_os = "windows")]
-    #[test]
-    fn the_drivers_injection_is_stamped_inside_its_recorded_span() {
-        let _serial = IDLE_GATE_TESTS
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+    fn last_input_tick() -> Option<u32> {
+        use windows::Win32::UI::Input::KeyboardAndMouse::{GetLastInputInfo, LASTINPUTINFO};
+        let mut info = LASTINPUTINFO {
+            cbSize: std::mem::size_of::<LASTINPUTINFO>() as u32,
+            dwTime: 0,
+        };
+        unsafe { GetLastInputInfo(&mut info) }
+            .as_bool()
+            .then_some(info.dwTime)
+    }
+
+    /// A zero-distance relative move: input the OS counts, with no effect.
+    #[cfg(target_os = "windows")]
+    fn nudge() -> [windows::Win32::UI::Input::KeyboardAndMouse::INPUT; 1] {
         use windows::Win32::UI::Input::KeyboardAndMouse::{
-            GetLastInputInfo, INPUT, INPUT_0, INPUT_MOUSE, LASTINPUTINFO, MOUSEEVENTF_MOVE,
-            MOUSEINPUT,
+            INPUT, INPUT_0, INPUT_MOUSE, MOUSEEVENTF_MOVE, MOUSEINPUT,
         };
-        let last_input = || {
-            let mut info = LASTINPUTINFO {
-                cbSize: std::mem::size_of::<LASTINPUTINFO>() as u32,
-                dwTime: 0,
-            };
-            unsafe { GetLastInputInfo(&mut info) }
-                .as_bool()
-                .then_some(info.dwTime)
-        };
-        // A zero-distance relative move: input the OS counts, with no effect.
-        let nudge = [INPUT {
+        [INPUT {
             r#type: INPUT_MOUSE,
             Anonymous: INPUT_0 {
                 mi: MOUSEINPUT {
@@ -647,40 +643,106 @@ mod tests {
                     ..Default::default()
                 },
             },
-        }];
-        let tick = || unsafe { windows::Win32::System::SystemInformation::GetTickCount() };
-        let before = last_input();
-        let sent = unsafe { send_input(&nudge) };
-        let after = last_input();
-        let read_done = tick();
-        if sent != 1 || after.is_none() || after == before {
-            eprintln!(
-                "skipped: this session has no input desktop (SendInput {sent}, last input {before:?} -> {after:?})"
-            );
+        }]
+    }
+
+    /// Why this process cannot inject input, checked independently of any
+    /// injection: session 0, or no input desktop to open.
+    #[cfg(target_os = "windows")]
+    fn input_desktop_unavailable() -> Option<String> {
+        use windows::Win32::System::RemoteDesktop::ProcessIdToSessionId;
+        use windows::Win32::System::StationsAndDesktops::{
+            CloseDesktop, OpenInputDesktop, DESKTOP_CONTROL_FLAGS, DESKTOP_READOBJECTS,
+        };
+        use windows::Win32::System::Threading::GetCurrentProcessId;
+        let mut session = u32::MAX;
+        if unsafe { ProcessIdToSessionId(GetCurrentProcessId(), &mut session) }.is_ok()
+            && session == 0
+        {
+            return Some("session 0 has no interactive input desktop".into());
+        }
+        match unsafe { OpenInputDesktop(DESKTOP_CONTROL_FLAGS(0), false, DESKTOP_READOBJECTS) } {
+            Ok(desktop) => {
+                let _ = unsafe { CloseDesktop(desktop) };
+                None
+            }
+            Err(error) => Some(format!("OpenInputDesktop failed: {error}")),
+        }
+    }
+
+    /// Let the tick counter advance twice, so the next input is stamped with
+    /// a tick that differs from every earlier one.
+    #[cfg(target_os = "windows")]
+    fn wait_two_tick_changes() {
+        use windows::Win32::System::SystemInformation::GetTickCount;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        for _ in 0..2 {
+            let tick = unsafe { GetTickCount() };
+            while unsafe { GetTickCount() } == tick {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the tick counter stopped"
+                );
+                std::thread::yield_now();
+            }
+        }
+    }
+
+    /// The OS's last-input tick once it differs from `before`, waiting up
+    /// to 500 ms for the OS to stamp an injection.
+    #[cfg(target_os = "windows")]
+    fn wait_for_new_input(before: Option<u32>) -> Option<u32> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+        loop {
+            let now = last_input_tick();
+            if now.is_some() && now != before {
+                return now;
+            }
+            if std::time::Instant::now() >= deadline {
+                return None;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+
+    /// The foreground idle gate reads `GetLastInputInfo`, which also counts
+    /// `SendInput`. The gate sets the driver's own input aside by its
+    /// recorded span, so the OS must stamp a real injection inside it; a
+    /// stamp that lands after `SendInput` returned fails here.
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn the_drivers_injection_is_stamped_inside_its_recorded_span() {
+        let _serial = IDLE_GATE_TESTS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(reason) = input_desktop_unavailable() {
+            eprintln!("skipped: {reason}");
             return;
         }
-        // The OS must stamp the driver's injection inside the span the
-        // wrapper recorded; the tracker's decisions on top of that are
-        // covered with a controlled clock in cua-driver-core.
+        let before = last_input_tick();
+        wait_two_tick_changes();
+        assert_eq!(
+            unsafe { send_input(&nudge()) },
+            1,
+            "SendInput must insert the event on an input desktop"
+        );
+        let after = wait_for_new_input(before)
+            .expect("the OS must stamp the injection within 500 ms on an input desktop");
+        // Someone else's input can land right after the injection. Use the
+        // observation only when the input did not change again.
+        if last_input_tick() != Some(after) {
+            eprintln!("skipped: other input arrived during the check");
+            return;
+        }
+        // The tracker's decisions on top of this are covered with a
+        // controlled clock in cua-driver-core.
         let tracker = *OWN_INPUT
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let (_, end) = tracker.own_span().expect("the injection recorded its span");
-        // Someone else's input can land between the injection and the read.
-        // Use the observation only when the read followed the injection
-        // promptly and the input did not change again.
-        if cua_driver_core::delivery::elapsed_idle_ms_from_ticks(read_done, end)
-            > cua_driver_core::delivery::OWN_INPUT_SECTION_MAX_MS
-            || last_input() != after
-        {
-            eprintln!("skipped: the last-input read was late or other input arrived");
-            return;
-        }
-        let after = after.expect("checked above");
         assert!(
             tracker.is_own_input(after),
             "the driver's injection, stamped at tick {after}, must fall inside \
-             its recorded span ({tracker:?}, read at {read_done})"
+             its recorded span ({tracker:?})"
         );
     }
 
@@ -695,49 +757,27 @@ mod tests {
     #[cfg(target_os = "windows")]
     #[test]
     fn input_between_two_driver_injections_still_trips_the_foreground_idle_gate() {
-        use windows::Win32::UI::Input::KeyboardAndMouse::{
-            GetLastInputInfo, SendInput, INPUT, INPUT_0, INPUT_MOUSE, LASTINPUTINFO,
-            MOUSEEVENTF_MOVE, MOUSEINPUT,
-        };
+        use windows::Win32::UI::Input::KeyboardAndMouse::{SendInput, INPUT};
         let _serial = IDLE_GATE_TESTS
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let last_input = || {
-            let mut info = LASTINPUTINFO {
-                cbSize: std::mem::size_of::<LASTINPUTINFO>() as u32,
-                dwTime: 0,
-            };
-            unsafe { GetLastInputInfo(&mut info) }
-                .as_bool()
-                .then_some(info.dwTime)
-        };
-        // A zero-distance relative move: input the OS counts, with no effect.
-        let nudge = [INPUT {
-            r#type: INPUT_MOUSE,
-            Anonymous: INPUT_0 {
-                mi: MOUSEINPUT {
-                    dwFlags: MOUSEEVENTF_MOVE,
-                    ..Default::default()
-                },
-            },
-        }];
-        let before = last_input();
-        let first = unsafe { send_input(&nudge) };
-        let after = last_input();
-        if first != 1 || after.is_none() || after == before {
-            eprintln!(
-                "skipped: this session has no input desktop (SendInput {first}, last input {before:?} -> {after:?})"
-            );
+        if let Some(reason) = input_desktop_unavailable() {
+            eprintln!("skipped: {reason}");
             return;
         }
+        let before = last_input_tick();
+        wait_two_tick_changes();
+        assert_eq!(unsafe { send_input(&nudge()) }, 1);
+        wait_for_new_input(before)
+            .expect("the OS must stamp the injection within 500 ms on an input desktop");
         // The person's input: a `SendInput` the driver did not make. Let
         // the tick counter move past the driver's span first.
         std::thread::sleep(std::time::Duration::from_millis(200));
-        let person = unsafe { SendInput(&nudge, std::mem::size_of::<INPUT>() as i32) };
+        let person = unsafe { SendInput(&nudge(), std::mem::size_of::<INPUT>() as i32) };
         assert_eq!(person, 1, "the stand-in for physical input must be sent");
         std::thread::sleep(std::time::Duration::from_millis(200));
         // The driver's next batch overwrites the OS's last-input tick.
-        assert_eq!(unsafe { send_input(&nudge) }, 1);
+        assert_eq!(unsafe { send_input(&nudge()) }, 1);
         let idle = physical_input_idle_ms();
         assert!(
             gate_foreground_physical_idle_with_sample(0, EventKind::Keystroke, idle, 60_000)
