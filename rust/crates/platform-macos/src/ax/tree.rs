@@ -540,7 +540,7 @@ unsafe fn copy_top_level(
     pid: i32,
     window_id: Option<u32>,
 ) -> Vec<AXUIElementRef> {
-    let mut top_level = copy_children(app_elem);
+    let mut top_level = children_or_skipped(copy_children_checked(app_elem));
     // A requested window on another Space is absent from AXWindows; the
     // `_including` variant recovers it by exact CGWindowID.
     let from_windows = match window_id {
@@ -563,6 +563,16 @@ unsafe fn copy_top_level(
         }
     }
     top_level
+}
+
+/// The children a checked `AXChildren` read found; a failed read records
+/// the walk as skipping what it could not see (at the application root: the
+/// menu bar and any sheet), even when `AXWindows` still recovers the window.
+fn children_or_skipped<T>(read: Option<Vec<T>>) -> Vec<T> {
+    read.unwrap_or_else(|| {
+        note_skipped();
+        Vec::new()
+    })
 }
 
 /// Decide which of `top_level` a walk scoped to `wid` covers.
@@ -1782,6 +1792,19 @@ mod lean_row_tests {
         let node = super::display_node("AXGroup", attrs, std::ptr::null_mut(), 1, None, false);
         assert_eq!(node.value.as_deref(), Some("Saved"));
         assert_eq!(node.element_index, None);
+    }
+
+    /// Review round 6: a failed AXChildren read at the application root
+    /// leaves the walk incomplete even when AXWindows recovers the window.
+    #[test]
+    fn a_failed_root_children_read_is_recorded() {
+        use super::{children_or_skipped, SkipLedger};
+        let ledger = SkipLedger::start();
+        assert_eq!(children_or_skipped::<u8>(Some(vec![1, 2])), vec![1, 2]);
+        assert!(!ledger.finish());
+        let ledger = SkipLedger::start();
+        assert!(children_or_skipped::<u8>(None).is_empty());
+        assert!(ledger.finish());
     }
 
     #[test]
