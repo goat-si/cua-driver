@@ -177,7 +177,50 @@ pub unsafe fn reveal_scroll(
     direction: &str,
     distance: f64,
 ) -> Option<RevealOutcome> {
-    reveal_scroll_with(pid, point, window, direction, distance, electron_limits())
+    reveal_scroll_with(pid, point, window, direction, distance, electron_limits()).outcome
+}
+
+/// What trying the candidates in turn produced.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CandidateRun<O> {
+    /// The first candidate's outcome that moved something.
+    pub outcome: Option<O>,
+    /// A reveal action was sent (or answered with an error) for some
+    /// candidate.
+    pub attempted: bool,
+    /// The proceed hook refused: no candidate after that was tried.
+    pub stopped: bool,
+}
+
+/// Tries candidates in order until one moves something, releasing every
+/// candidate; once stopped reports true, the rest are released untried.
+pub fn first_outcome<C, O>(
+    candidates: Vec<C>,
+    mut attempt: impl FnMut(&C) -> (Mutation, Option<O>),
+    stopped: impl Fn() -> bool,
+    mut release: impl FnMut(C),
+) -> CandidateRun<O> {
+    let mut run = CandidateRun {
+        outcome: None,
+        attempted: false,
+        stopped: false,
+    };
+    let mut candidates = candidates.into_iter();
+    for candidate in candidates.by_ref() {
+        let (mutation, outcome) = attempt(&candidate);
+        release(candidate);
+        run.attempted |= mutation != Mutation::NotSent;
+        if outcome.is_some() {
+            run.outcome = outcome;
+            break;
+        }
+        if stopped() {
+            run.stopped = true;
+            break;
+        }
+    }
+    candidates.for_each(&mut release);
+    run
 }
 
 /// reveal_scroll within limits (a proceed hook runs right before the reveal
@@ -193,22 +236,22 @@ pub unsafe fn reveal_scroll_with(
     direction: &str,
     distance: f64,
     limits: RevealLimits,
-) -> Option<RevealOutcome> {
-    let hit = element_at_screen_position(pid, point.0, point.1)?;
+) -> CandidateRun<RevealOutcome> {
+    let Some(hit) = element_at_screen_position(pid, point.0, point.1) else {
+        return CandidateRun {
+            outcome: None,
+            attempted: false,
+            stopped: false,
+        };
+    };
     let candidates = scroll_candidates(hit, direction);
     CFRelease(hit as CFTypeRef);
-    let mut candidates = candidates.into_iter();
-    while let Some((container, role)) = candidates.next() {
-        let outcome = reveal_core(container, &role, window, direction, distance, limits).1;
-        CFRelease(container as CFTypeRef);
-        if let Some(outcome) = outcome {
-            for (rest, _) in candidates {
-                CFRelease(rest as CFTypeRef);
-            }
-            return Some(outcome);
-        }
-    }
-    None
+    first_outcome(
+        candidates,
+        |(container, role)| reveal_core(*container, role, window, direction, distance, limits),
+        || limits.proceed.is_some_and(|proceed| !proceed()),
+        |(container, _)| CFRelease(container as CFTypeRef),
+    )
 }
 
 /// The elements at or above `element` to try, innermost first and retained:
@@ -637,6 +680,64 @@ mod tests {
         assert!(!limits.may_act());
         limits.proceed = Some(&yes);
         assert!(limits.may_act());
+    }
+
+    #[test]
+    fn a_refused_candidate_stops_the_loop_and_releases_the_rest() {
+        // Window moved away and back: the hook refused once and stays
+        // refused, so no later candidate acts.
+        let refused = std::cell::Cell::new(false);
+        let released = std::cell::RefCell::new(Vec::new());
+        let acted = std::cell::RefCell::new(Vec::new());
+        let run = first_outcome(
+            vec![1, 2, 3],
+            |&candidate| {
+                if candidate == 1 {
+                    refused.set(true);
+                    return (Mutation::NotSent, None::<u32>);
+                }
+                acted.borrow_mut().push(candidate);
+                (Mutation::Sent { count: 1 }, Some(candidate))
+            },
+            || refused.get(),
+            |candidate| released.borrow_mut().push(candidate),
+        );
+        assert_eq!(
+            run,
+            CandidateRun {
+                outcome: None,
+                attempted: false,
+                stopped: true
+            }
+        );
+        assert!(acted.borrow().is_empty());
+        assert_eq!(*released.borrow(), vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn an_earlier_sent_reveal_is_reported_when_a_later_one_is_refused() {
+        let calls = std::cell::Cell::new(0);
+        let run = first_outcome(
+            vec![1, 2, 3],
+            |&candidate| {
+                calls.set(calls.get() + 1);
+                match candidate {
+                    1 => (Mutation::Sent { count: 1 }, None::<u32>),
+                    _ => (Mutation::NotSent, None),
+                }
+            },
+            || calls.get() >= 2,
+            |_| {},
+        );
+        assert_eq!(
+            run,
+            CandidateRun {
+                outcome: None,
+                attempted: true,
+                stopped: true
+            }
+        );
+        assert_eq!(calls.get(), 2);
     }
 
     #[test]

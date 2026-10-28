@@ -966,18 +966,24 @@ async fn electron_reveal_scroll(
     let outcome = latency::spawn_action_blocking(move || unsafe {
         // Checked after the hit test and the walk, right before the reveal.
         let moved = std::cell::Cell::new(None);
-        let proceed = || match super::window_points::check_guard(&dispatch_guard) {
-            Ok(()) => true,
-            Err(error) => {
-                moved.set(Some(error));
-                false
+        // Latched: once refused, refused for every later candidate.
+        let proceed = || {
+            if moved.get().is_some() {
+                return false;
+            }
+            match super::window_points::check_guard(&dispatch_guard) {
+                Ok(()) => true,
+                Err(error) => {
+                    moved.set(Some(error));
+                    false
+                }
             }
         };
         let limits = crate::ax::reveal_scroll::RevealLimits {
             proceed: Some(&proceed),
             ..crate::ax::reveal_scroll::electron_limits()
         };
-        let outcome = crate::ax::reveal_scroll::reveal_scroll_with(
+        let run = crate::ax::reveal_scroll::reveal_scroll_with(
             pid,
             point,
             window_rect,
@@ -985,18 +991,31 @@ async fn electron_reveal_scroll(
             distance,
             limits,
         );
-        (outcome, moved.get())
+        (run, moved.get())
     })
     .await;
     let outcome = match outcome {
-        Ok((_, Some(moved))) => {
+        Ok((run, _)) if run.outcome.is_some() => Ok(run.outcome),
+        // The window moved before any reveal was sent: nothing sent.
+        Ok((run, Some(moved))) if !run.attempted => {
             let error = anyhow::Error::from(moved);
             if let Some(refusal) = super::window_points::moved_refusal(&error, space) {
                 return refusal;
             }
             Ok(None)
         }
-        Ok((outcome, None)) => Ok(outcome),
+        // A reveal went out for an earlier container, then the window moved.
+        Ok((_, Some(_))) => {
+            return ToolResult::text(format!(
+                "An accessibility reveal was sent to scroll {direction}, then the window moved \
+                 before it could be confirmed or another one tried; it may have scrolled. Read \
+                 the window before scrolling again."
+            ))
+            .with_structured(serde_json::json!({
+                "path": "ax", "verified": false, "effect": "unverifiable"
+            }));
+        }
+        Ok((run, None)) => Ok(run.outcome),
         Err(error) => Err(error),
     };
     match outcome {
