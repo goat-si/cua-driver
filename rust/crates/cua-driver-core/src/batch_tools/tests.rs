@@ -787,3 +787,25 @@ async fn non_scalar_set_value_is_rejected_before_any_batch_action() {
         assert_eq!(harness.hits("set_value"), 0);
     }
 }
+
+#[tokio::test]
+async fn a_failed_batch_names_the_failed_steps_code_and_message_at_the_top() {
+    let harness = Harness::new();
+    let result = harness
+        .run(json!({"pid": 1, "window_id": 2, "steps": [
+            {"tool": "click", "args": {"x": 1, "y": 1}},
+            {"tool": "click", "args": {"x": 2, "y": 2, "fail_message": "click failed: event tap gone"}}
+        ]}))
+        .await;
+    assert_eq!(result.is_error, Some(true));
+    let structured = result.structured_content.unwrap();
+    assert_eq!(structured["failed_step"], 1);
+    assert_eq!(structured["code"], "step_failed");
+    assert!(
+        structured["message"]
+            .as_str()
+            .unwrap()
+            .contains("event tap gone"),
+        "{structured}"
+    );
+}

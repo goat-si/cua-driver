@@ -789,6 +789,20 @@ impl Plan {
         if let Some(scope) = &self.scope {
             structured["app_scope"] = scope.to_json();
         }
+        // A failed batch names its cause at the top: without a `code` here
+        // the MCP envelope stamps a bare `tool_invocation_failed`, and a
+        // client that shows only the top level loses the step's reason.
+        if let Some(index) = failed_step {
+            let step = &structured["steps"][index];
+            let code = step["code"].as_str().unwrap_or("step_failed").to_owned();
+            let message = step["message"].clone();
+            let effect = step["effect"].clone();
+            structured["code"] = json!(code);
+            structured["message"] = message;
+            if !effect.is_null() {
+                structured["effect"] = effect;
+            }
+        }
         let header = match failed_step {
             None => format!("run_steps: {total}/{total} steps ok"),
             Some(index) => format!(
