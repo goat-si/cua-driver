@@ -188,7 +188,7 @@ impl Drop for WindowKeyScope {
             match primed {
                 KeyPrime::AlreadyKey => {}
                 KeyPrime::KeyRecords => {
-                    post_window_key_records(pid, Some(target), previous);
+                    hand_key_back(pid, Some(target), previous);
                 }
                 KeyPrime::AxFocusedWindow => {
                     set_app_focused_window(pid, previous);
@@ -304,6 +304,10 @@ const KEY_RECORD_SETTLE: std::time::Duration = std::time::Duration::from_millis(
 /// is for the caller to confirm.
 pub fn post_window_key_records(pid: pid_t, current: Option<u32>, target: u32) -> bool {
     crate::window_change_detector::end_tail();
+    post_key_records(pid, current, target)
+}
+
+fn post_key_records(pid: pid_t, current: Option<u32>, target: u32) -> bool {
     note_focus_change();
     let Some(post) = post_event_record_to_fn() else {
         return false;
@@ -330,6 +334,14 @@ pub fn post_window_key_records(pid: pid_t, current: Option<u32>, target: u32) ->
         ok &= send(&make_key_window_record(target, event_kind));
     }
     ok
+}
+
+/// Hand key back inside `pid` after a [`WindowKeyScope`]: the same records
+/// as [`post_window_key_records`], without ending the previous action's
+/// detached window watch. The hand-back belongs to the action that just
+/// returned, and its post-action focus hold must outlast it.
+pub(crate) fn hand_key_back(pid: pid_t, current: Option<u32>, target: u32) -> bool {
+    post_key_records(pid, current, target)
 }
 
 /// Wait until the app's focus has settled on `target`, for at most `budget`.

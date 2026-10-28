@@ -94,7 +94,7 @@ impl Tool for LaunchAppTool {
             .await
             .unwrap_or(false)
         {
-            tracing::warn!("a key hand-back was still running when the app was fronted");
+            return super::key_restore_pending_refusal("launch_app", None, None);
         }
         crate::window_change_detector::note_intentional_activation();
         let bundle_id = args.opt_str("bundle_id");

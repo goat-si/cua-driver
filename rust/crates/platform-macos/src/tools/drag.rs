@@ -394,11 +394,17 @@ impl Tool for DragTool {
             false
         } else {
             match latency::spawn_action_blocking(move || {
-                crate::input::mouse::prepare_background_pixel_click(pid, wid)
+                // A key hand-back still running would move key focus under
+                // this action's focus record: send nothing instead.
+                crate::input::skylight::await_key_restores()
+                    .then(|| crate::input::mouse::prepare_background_pixel_click(pid, wid))
             })
             .await
             {
-                Ok(activated) => {
+                Ok(None) => {
+                    return super::key_restore_pending_refusal("drag", Some(pid), Some(wid));
+                }
+                Ok(Some(activated)) => {
                     if !activated && crate::input::skylight::windowserver_connection_invalid() {
                         return super::windowserver_connection_refusal(pid, Some(wid));
                     }

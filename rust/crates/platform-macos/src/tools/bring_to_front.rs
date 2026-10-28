@@ -339,7 +339,15 @@ impl Tool for BringToFrontTool {
             .await
             .unwrap_or(false)
         {
-            tracing::warn!("a key hand-back was still running when the app was fronted");
+            let pid = args
+                .get("pid")
+                .and_then(Value::as_i64)
+                .and_then(|p| i32::try_from(p).ok());
+            let window_id = args
+                .get("window_id")
+                .and_then(Value::as_u64)
+                .and_then(|w| u32::try_from(w).ok());
+            return super::key_restore_pending_refusal("bring_to_front", pid, window_id);
         }
         crate::window_change_detector::note_intentional_activation();
         let pid = match args.get("pid").and_then(Value::as_i64) {

@@ -183,6 +183,10 @@ pub fn release_detached_holds() {
     drop(holds);
 }
 
+/// Serializes tests that arm or end the process-wide detached holds.
+#[cfg(test)]
+pub(crate) static HOLD_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Detached holds still armed.
 #[cfg(test)]
 pub(crate) fn detached_hold_count() -> usize {
@@ -213,10 +217,26 @@ mod tests {
     /// post-action hold that would otherwise stay armed for its 50 ms.
     #[tokio::test]
     async fn the_next_action_ends_a_detached_hold() {
+        let _serial = HOLD_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let lease = focus_steal::begin_suppression(Some(-41), -42, "test.hold");
         hold_then_release(lease, Duration::from_secs(30));
         assert!(detached_hold_count() >= 1);
         crate::window_change_detector::end_tail();
         assert_eq!(detached_hold_count(), 0);
+    }
+
+    /// A background key hand-back runs on its own thread right after the
+    /// action returns. It is not a new action: the action's own post-action
+    /// hold must stay armed through it.
+    #[tokio::test]
+    async fn a_key_hand_back_keeps_the_actions_hold() {
+        let _serial = HOLD_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        crate::window_change_detector::end_tail();
+        let lease = focus_steal::begin_suppression(Some(-43), -44, "test.hand_back");
+        hold_then_release(lease, Duration::from_secs(30));
+        // No such process: the records are not posted, the path still runs.
+        crate::input::skylight::hand_key_back(-1, Some(1), 2);
+        assert_eq!(detached_hold_count(), 1);
+        crate::window_change_detector::end_tail();
     }
 }
