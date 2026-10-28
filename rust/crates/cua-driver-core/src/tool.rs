@@ -1793,6 +1793,23 @@ impl ToolRegistry {
         // consent, recording, or implementation layer interprets the call.
         coerce_string_scalars(&tool.def().input_schema, &mut args);
         normalize_delivery_mode_args(tool.def(), &mut args);
+        // A call dispatched by a `run_steps` batch or a `run_script` program
+        // that carries an app scope must stay inside it. The raw target is
+        // checked before any argument normalization can fail, so a call
+        // outside the scope always gets the scope's own code (which ends the
+        // batch or script) and sends nothing.
+        let batch_scope = crate::batch_scope::current();
+        let scope_view = batch_scope
+            .as_ref()
+            .map(|_| crate::batch_scope::target_view(&args));
+        if let (Some(scope), Some(view)) = (&batch_scope, &scope_view) {
+            if let Err(refusal) = scope
+                .check(resolved_name, view, tool.def().read_only, self)
+                .await
+            {
+                return refusal.into_result();
+            }
+        }
         if let Err(detail) = normalize_argument_aliases(resolved_name, &mut args) {
             return ToolResult::error(format!("{resolved_name}: {detail}")).with_structured(
                 serde_json::json!({
@@ -1807,17 +1824,17 @@ impl ToolRegistry {
         {
             return result;
         }
-        // A call dispatched by a `run_steps` batch or a `run_script` program
-        // that carries a `scope` must stay inside it. Checked before
-        // the delivery guard, authorization, consent and the platform tool,
-        // so a call outside the scope is always refused with the scope's own
-        // code (which ends the batch or script) and sends nothing.
-        if let Some(scope) = crate::batch_scope::current() {
-            if let Err(refusal) = scope
-                .check(resolved_name, &args, tool.def().read_only, self)
-                .await
-            {
-                return refusal.into_result();
+        // Checked again on the normalized arguments, before the delivery
+        // guard, authorization, consent and the platform tool, when
+        // normalization changed what the scope reads.
+        if let (Some(scope), Some(view)) = (&batch_scope, &scope_view) {
+            if crate::batch_scope::scope_inputs(view) != crate::batch_scope::scope_inputs(&args) {
+                if let Err(refusal) = scope
+                    .check(resolved_name, &args, tool.def().read_only, self)
+                    .await
+                {
+                    return refusal.into_result();
+                }
             }
         }
         if let Err(result) = crate::action_target::enforce_delivery_target(resolved_name, &args) {

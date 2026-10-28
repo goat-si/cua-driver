@@ -475,6 +475,44 @@ pub fn input_schema() -> Value {
     })
 }
 
+/// The parts of a call the scope check reads: target pid and window, the
+/// requested delivery, and a launch's bundle id. A call whose normalized
+/// arguments keep these needs no second check.
+pub fn scope_inputs(args: &Value) -> (Option<i64>, Option<u64>, Option<String>, Option<String>) {
+    let text = |key: &str| args.get(key).and_then(Value::as_str).map(str::to_owned);
+    (
+        args.get("pid").and_then(Value::as_i64),
+        args.get("window_id").and_then(Value::as_u64),
+        text("delivery_mode"),
+        text("bundle_id"),
+    )
+}
+
+/// The call's target as the scope sees it before argument normalization:
+/// a typed `target: {kind: "window", pid, window_id}` is flattened, and a
+/// desktop target names no window. The registry checks this view before any
+/// normalization can fail, so a call outside the scope always gets the
+/// scope's own code.
+pub fn target_view(args: &Value) -> Value {
+    let mut view = args.clone();
+    let Some(object) = view.as_object_mut() else {
+        return view;
+    };
+    let Some(Value::Object(target)) = object.get("target").cloned() else {
+        return view;
+    };
+    object.remove("pid");
+    object.remove("window_id");
+    if target.get("kind").and_then(Value::as_str) == Some("window") {
+        for key in ["pid", "window_id"] {
+            if let Some(value) = target.get(key) {
+                object.insert(key.to_owned(), value.clone());
+            }
+        }
+    }
+    view
+}
+
 tokio::task_local! {
     static CURRENT: Arc<BatchScope>;
 }
