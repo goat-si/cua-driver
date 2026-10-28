@@ -994,32 +994,12 @@ async fn electron_reveal_scroll(
         (run, moved.get())
     })
     .await;
-    let outcome = match outcome {
-        Ok((run, _)) if run.outcome.is_some() => Ok(run.outcome),
-        // The window moved before any reveal was sent: nothing sent.
-        Ok((run, Some(moved))) if !run.attempted => {
-            let error = anyhow::Error::from(moved);
-            if let Some(refusal) = super::window_points::moved_refusal(&error, space) {
-                return refusal;
-            }
-            Ok(None)
-        }
-        // A reveal went out for an earlier container, then the window moved.
-        Ok((_, Some(_))) => {
-            return ToolResult::text(format!(
-                "An accessibility reveal was sent to scroll {direction}, then the window moved \
-                 before it could be confirmed or another one tried; it may have scrolled. Read \
-                 the window before scrolling again."
-            ))
-            .with_structured(serde_json::json!({
-                "path": "ax", "verified": false, "effect": "unverifiable"
-            }));
-        }
-        Ok((run, None)) => Ok(run.outcome),
-        Err(error) => Err(error),
+    let (run, moved) = match outcome {
+        Ok(pair) => pair,
+        Err(_) => return unavailable(),
     };
-    match outcome {
-        Ok(Some(outcome)) => ToolResult::text(format!(
+    match classify_electron_reveal(run, moved) {
+        ElectronReveal::Scrolled(outcome) => ToolResult::text(format!(
             "✅ Scrolled {direction} about {:.0} pt in the background through accessibility \
              (revealed the content just past the {}'s edge; this Electron/Chromium window drops \
              background wheel events).",
@@ -1030,7 +1010,51 @@ async fn electron_reveal_scroll(
             "verified": false,
             "effect": "unverifiable",
         })),
-        _ => unavailable(),
+        ElectronReveal::MovedBeforeAny(moved) => {
+            let error = anyhow::Error::from(moved);
+            super::window_points::moved_refusal(&error, space).unwrap_or_else(unavailable)
+        }
+        ElectronReveal::Attempted { moved_after } => ToolResult::text(format!(
+            "An accessibility reveal was sent to scroll {direction}, but no movement could be \
+             read back{}; it may have scrolled. Read the window before scrolling again.",
+            if moved_after {
+                " before the window moved"
+            } else {
+                ""
+            }
+        ))
+        .with_structured(serde_json::json!({
+            "path": "ax", "verified": false, "effect": "unverifiable"
+        })),
+        ElectronReveal::NothingSent => unavailable(),
+    }
+}
+
+/// How an Electron background reveal ended, for its result.
+#[derive(Debug, PartialEq)]
+enum ElectronReveal {
+    /// A candidate's reveal moved its content.
+    Scrolled(crate::ax::reveal_scroll::RevealOutcome),
+    /// The window moved before any reveal was sent: nothing sent.
+    MovedBeforeAny(super::window_points::WindowMoved),
+    /// A reveal was sent (or answered with an error) and nothing moved that
+    /// could be read back; it may still have scrolled.
+    Attempted { moved_after: bool },
+    /// No candidate sent anything.
+    NothingSent,
+}
+
+fn classify_electron_reveal(
+    run: crate::ax::reveal_scroll::CandidateRun<crate::ax::reveal_scroll::RevealOutcome>,
+    moved: Option<super::window_points::WindowMoved>,
+) -> ElectronReveal {
+    match (run.outcome, run.attempted, moved) {
+        (Some(outcome), _, _) => ElectronReveal::Scrolled(outcome),
+        (None, true, moved) => ElectronReveal::Attempted {
+            moved_after: moved.is_some(),
+        },
+        (None, false, Some(moved)) => ElectronReveal::MovedBeforeAny(moved),
+        (None, false, None) => ElectronReveal::NothingSent,
     }
 }
 
@@ -1439,6 +1463,56 @@ unsafe fn collect_ax_buttons(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_electron_reveal_that_was_sent_is_never_reported_as_refused() {
+        use super::{classify_electron_reveal, ElectronReveal};
+        use crate::ax::reveal_scroll::{first_outcome, CandidateRun, RevealOutcome};
+        use crate::ax::scroll_area::Mutation;
+        use crate::tools::window_points::WindowMoved;
+        // Sent or answered with an error, nothing read back, window still.
+        for mutation in [Mutation::Sent { count: 1 }, Mutation::Failed { count: 1 }] {
+            let run = first_outcome(
+                vec![1],
+                |_| (mutation, None::<RevealOutcome>),
+                || false,
+                |_| {},
+            );
+            assert_eq!(
+                classify_electron_reveal(run, None),
+                ElectronReveal::Attempted { moved_after: false },
+                "{mutation:?}"
+            );
+        }
+        let moved = WindowMoved { window_id: 7 };
+        let attempted = CandidateRun {
+            outcome: None,
+            attempted: true,
+            stopped: true,
+        };
+        assert_eq!(
+            classify_electron_reveal(attempted, Some(moved)),
+            ElectronReveal::Attempted { moved_after: true }
+        );
+        let untried = CandidateRun {
+            outcome: None,
+            attempted: false,
+            stopped: true,
+        };
+        assert_eq!(
+            classify_electron_reveal(untried, Some(moved)),
+            ElectronReveal::MovedBeforeAny(moved)
+        );
+        let nothing = CandidateRun::<RevealOutcome> {
+            outcome: None,
+            attempted: false,
+            stopped: false,
+        };
+        assert_eq!(
+            classify_electron_reveal(nothing, None),
+            ElectronReveal::NothingSent
+        );
+    }
 
     mod wheel_verdict_tests {
         use super::super::{fallback_order, wheel_verdict, DistanceCheck, Fallback, WheelVerdict};
