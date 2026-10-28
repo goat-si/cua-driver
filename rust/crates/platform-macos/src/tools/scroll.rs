@@ -342,6 +342,8 @@ impl ScrollTool {
         };
 
         // Resolve a screen-space wheel target, if a target was supplied.
+        // The window-points frame the target was translated with (pixel x, y).
+        let mut validated_frame: Option<super::px_frame::WindowPxFrame> = None;
         let wheel_target: Option<WheelTarget> = if let Some(element_ptr) = pre_focus_ptr {
             // Revealing an element is itself an AX mutation. Prove that the
             // cached element still belongs to the exact requested window before
@@ -434,7 +436,6 @@ impl ScrollTool {
             // click pixel path — undo any session downscale, then translate
             // through the shared window frame (which refuses a window with no
             // live frame rather than scrolling at screen-absolute coords).
-            let validated_frame: Option<super::px_frame::WindowPxFrame>;
             match super::window_points::to_window_pixels(
                 &self.state,
                 &args,
@@ -477,6 +478,7 @@ impl ScrollTool {
 
         if electron_background {
             return electron_reveal_scroll(
+                (space, validated_frame.clone()),
                 pid,
                 window_id,
                 wheel_target
@@ -596,7 +598,9 @@ impl ScrollTool {
                 .flatten()
             };
             let amount_ticks = amount;
-            if let Err(refusal) = super::window_points::recheck_now(space, wid) {
+            if let Err(refusal) =
+                super::window_points::recheck_now(space, wid, validated_frame.as_ref())
+            {
                 return refusal;
             }
             let fg = delivery_mode.is_foreground() && wid.is_some();
@@ -881,7 +885,12 @@ fn keystroke_read_back(
 /// wheel events: reveal the content just past the edge of the scroll
 /// container under `point` (the window's center when there is no target)
 /// through accessibility. Refuses as before when no container moves.
+#[allow(clippy::too_many_arguments)]
 async fn electron_reveal_scroll(
+    (space, validated_frame): (
+        super::window_points::PointSpace,
+        Option<super::px_frame::WindowPxFrame>,
+    ),
     pid: i32,
     window_id: Option<u32>,
     point: Option<(f64, f64)>,
@@ -929,6 +938,11 @@ async fn electron_reveal_scroll(
         if let Err(refusal) = gate {
             return refusal;
         }
+    }
+    if let Err(refusal) =
+        super::window_points::recheck_now(space, window_id, validated_frame.as_ref())
+    {
+        return refusal;
     }
     let window_rect = window.map(|b| [b.x, b.y, b.width, b.height]);
     let direction_owned = direction.to_owned();

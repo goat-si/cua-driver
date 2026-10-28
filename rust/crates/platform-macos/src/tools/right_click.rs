@@ -257,7 +257,9 @@ impl RightClickTool {
         };
 
         let fg = delivery_mode.is_foreground() && window_id.is_some();
-        if let Err(refusal) = super::window_points::recheck_now(space, window_id) {
+        if let Err(refusal) =
+            super::window_points::recheck_now(space, window_id, validated_frame.as_ref())
+        {
             return refusal;
         }
         let route = match super::pixel_route::resolve(pid, fg, window_id, "mouse_right_click").await

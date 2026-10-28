@@ -352,6 +352,11 @@ impl DragTool {
             // the app's main process instead, where the held button is part
             // of the event; refuse when that route is unavailable.
             if crate::browser::ElectronJs::is_electron(pid) {
+                if let Err(refusal) =
+                    super::window_points::recheck_now(space, window_id, validated_frame.as_ref())
+                {
+                    return refusal;
+                }
                 return self
                     .electron_background_drag(
                         &cursor_key,
@@ -365,6 +370,7 @@ impl DragTool {
                         steps,
                         &modifiers,
                         button,
+                        (space, validated_frame.clone()),
                     )
                     .await;
             }
@@ -377,7 +383,9 @@ impl DragTool {
         );
         crate::cursor::overlay::animate_cursor_to(cursor_key.clone(), from_sx, from_sy).await;
 
-        if let Err(refusal) = super::window_points::recheck_now(space, window_id) {
+        if let Err(refusal) =
+            super::window_points::recheck_now(space, window_id, validated_frame.as_ref())
+        {
             return refusal;
         }
 
@@ -715,6 +723,10 @@ impl DragTool {
         steps: usize,
         modifiers: &[String],
         button: DragButton,
+        (space, validated_frame): (
+            super::window_points::PointSpace,
+            Option<super::px_frame::WindowPxFrame>,
+        ),
     ) -> ToolResult {
         use crate::input::electron_drag::{
             electron_drag_js, parse_electron_drag_reply, ElectronDragButton, ElectronDragReply,
@@ -744,6 +756,17 @@ impl DragTool {
             cursor_key.clone(),
             cursor_overlay::OverlayCommand::SetPressed(true),
         );
+        // The cursor animation above takes time: the window must still be
+        // where the window points were translated.
+        if let Err(refusal) =
+            super::window_points::recheck_now(space, Some(wid), validated_frame.as_ref())
+        {
+            crate::cursor::overlay::send_command(
+                cursor_key.to_owned(),
+                cursor_overlay::OverlayCommand::SetPressed(false),
+            );
+            return refusal;
+        }
         let reply = crate::browser::ElectronJs::execute_main(&electron_drag_js(&spec), pid).await;
         let outcome = match &reply {
             Ok(text) => parse_electron_drag_reply(text),

@@ -1309,6 +1309,11 @@ impl ClickTool {
                     && modifiers.is_empty()
             }) {
                 let focus_only = action == "focus";
+                if let Err(refusal) =
+                    super::window_points::recheck_now(space, window_id, validated_frame.as_ref())
+                {
+                    return refusal;
+                }
                 let ax_result = latency::spawn_action_blocking(move || unsafe {
                     let Some(element) = element_at_screen_position(pid, screen_x, screen_y) else {
                         return Ok::<bool, anyhow::Error>(false);
@@ -1391,7 +1396,9 @@ impl ClickTool {
             let fg = delivery_mode.is_foreground() && window_id.is_some();
             // Background delivery cannot satisfy a toolkit that reads the
             // hardware pointer; refuse before any activation or dispatch.
-            if let Err(refusal) = super::window_points::recheck_now(space, window_id) {
+            if let Err(refusal) =
+                super::window_points::recheck_now(space, window_id, validated_frame.as_ref())
+            {
                 return refusal;
             }
             let route = match super::pixel_route::resolve(pid, fg, window_id, "mouse_click").await {

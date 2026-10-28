@@ -76,6 +76,11 @@ impl Tool for DoubleClickTool {
     }
 
     async fn invoke(&self, args: Value) -> ToolResult {
+        // Checked before any route, element or pixel: window points need a
+        // window target and x, y (the pixel path re-checks in click).
+        if let Err(refusal) = super::window_points::point_space(&args) {
+            return refusal;
+        }
         use cua_driver_core::tool_args::ArgsExt;
         let pid = match super::target_pid(&self.state, &args) {
             Ok(v) => v,

@@ -77,6 +77,9 @@ pub fn point_space(args: &Value) -> Result<PointSpace, ToolResult> {
         Some("window_points") => {
             if args.get("scope").and_then(Value::as_str) == Some("desktop")
                 || args.get("window_id").is_none_or(Value::is_null)
+                || args
+                    .get("element_token")
+                    .is_some_and(|token| !token.is_null())
             {
                 return Err(super::invalid_arguments(
                     "coordinate_space window_points needs a window target (pid and window_id); it cannot be \
@@ -181,30 +184,46 @@ pub fn resolve_window_points(
     })
 }
 
-/// Checks the basis against the live frame again, for just before dispatch.
+/// Checks, just before an actuator, that the window is still exactly the
+/// frame the points were translated with. Comparing with that frame rather
+/// than the basis keeps a 1 pt drift on each side of the basis from adding
+/// up to 2 pt between translation and dispatch.
 pub fn recheck(
     space: PointSpace,
     window_id: u32,
+    used: Option<&super::px_frame::WindowPxFrame>,
     live: Option<WindowBounds>,
 ) -> Result<(), ToolResult> {
-    let PointSpace::WindowPoints(basis) = space else {
+    let (PointSpace::WindowPoints(basis), Some(used)) = (space, used) else {
         return Ok(());
     };
     let live = live.ok_or_else(|| {
         super::px_frame::refusal(&super::px_frame::PxFrameError::WindowNotFound { window_id })
     })?;
-    if basis_matches(&basis, &live) {
+    let same = |a: f64, b: f64| (a - b).abs() < SAME_FRAME_PT;
+    if same(used.bounds.x, live.x)
+        && same(used.bounds.y, live.y)
+        && same(used.bounds.width, live.width)
+        && same(used.bounds.height, live.height)
+    {
         Ok(())
     } else {
         Err(geometry_changed(window_id, &basis, &live))
     }
 }
 
+/// Two reads of an unmoved window's frame agree to far better than this.
+const SAME_FRAME_PT: f64 = 0.01;
+
 /// [recheck] against the window's frame now.
-pub(super) fn recheck_now(space: PointSpace, window_id: Option<u32>) -> Result<(), ToolResult> {
-    match (space, window_id) {
-        (PointSpace::WindowPoints(_), Some(wid)) => {
-            recheck(space, wid, crate::windows::window_bounds_by_id(wid))
+pub(super) fn recheck_now(
+    space: PointSpace,
+    window_id: Option<u32>,
+    used: Option<&super::px_frame::WindowPxFrame>,
+) -> Result<(), ToolResult> {
+    match window_id {
+        Some(wid) if matches!(space, PointSpace::WindowPoints(_)) => {
+            recheck(space, wid, used, crate::windows::window_bounds_by_id(wid))
         }
         _ => Ok(()),
     }
@@ -377,17 +396,25 @@ mod tests {
     fn a_move_between_resolving_and_dispatch_refuses() {
         let b = basis(0.0, 0.0, 800.0, 600.0);
         let space = PointSpace::WindowPoints(b);
-        assert!(
-            resolve_window_points(7, &b, &[(1.0, 1.0)], Some(bounds(0.0, 0.0, 800.0, 600.0)))
-                .is_ok()
-        );
-        let refusal = recheck(space, 7, Some(bounds(40.0, 0.0, 800.0, 600.0))).unwrap_err();
+        // Translated with a frame 1 pt left of the basis; at dispatch it is
+        // 1 pt right of it. Each is within the basis tolerance, but the two
+        // differ by 2 pt, so the dispatch is refused.
+        let resolved =
+            resolve_window_points(7, &b, &[(1.0, 1.0)], Some(bounds(-1.0, 0.0, 800.0, 600.0)))
+                .unwrap();
+        let used = resolved.frame.as_ref();
+        let refusal = recheck(space, 7, used, Some(bounds(1.0, 0.0, 800.0, 600.0))).unwrap_err();
         assert_eq!(
             refusal.structured_content.unwrap()["code"],
             "window_geometry_changed"
         );
-        assert!(recheck(space, 7, Some(bounds(0.5, 0.0, 800.0, 600.0))).is_ok());
-        assert!(recheck(PointSpace::Screenshot, 7, None).is_ok());
+        assert!(recheck(space, 7, used, Some(bounds(-1.0, 0.0, 800.0, 600.0))).is_ok());
+        assert!(recheck(space, 7, used, Some(bounds(-1.0, 0.0, 801.0, 600.0))).is_err());
+        assert!(
+            recheck(space, 7, used, None).is_err(),
+            "a closed window refuses"
+        );
+        assert!(recheck(PointSpace::Screenshot, 7, None, None).is_ok());
     }
 
     #[test]
@@ -407,6 +434,8 @@ mod tests {
             PointSpace::WindowPoints(basis(1.5, -3.0, 800.0, 600.0))
         );
         for bad in [
+            json!({"window_id": 9, "element_token": "s00000001:3", "coordinate_space": "window_points",
+                "window_basis": {"x": 0, "y": 0, "w": 800, "h": 600}}),
             json!({"window_id": 9, "coordinate_space": "window_points"}),
             json!({"scope": "desktop", "window_id": 9, "coordinate_space": "window_points",
                 "window_basis": {"x": 0, "y": 0, "w": 800, "h": 600}}),
@@ -450,7 +479,14 @@ mod tests {
                 .invoke(with(json!({"x": 10, "y": 10})))
                 .await,
             super::super::double_click::DoubleClickTool::new(state.clone())
-                .invoke(with(json!({"x": 10, "y": 10})))
+                .invoke(with(json!({"x": 10, "y": 10, "pid": 1, "window_id": 1})))
+                .await,
+            super::super::double_click::DoubleClickTool::new(state.clone())
+                .invoke(
+                    json!({"pid": 1, "window_id": 1, "element_token": "s00000001:1",
+                    "coordinate_space": "window_points",
+                    "window_basis": {"x": 0, "y": 0, "w": 800, "h": 600}}),
+                )
                 .await,
             super::super::right_click::RightClickTool::new(state.clone())
                 .invoke(with(json!({"x": 10, "y": 10})))
