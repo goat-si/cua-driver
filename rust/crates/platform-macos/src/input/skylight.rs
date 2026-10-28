@@ -322,17 +322,27 @@ pub(crate) fn primed_keys_for_test() -> Vec<PrimedKey> {
 
 /// Apply every verdict. Runs with the registry locked, so a priming and a
 /// release never interleave: a release posted here can never undo a priming
-/// recorded after it.
+/// recorded after it. A release also holds the app's mutation lease (taken
+/// without waiting) from the front check through the post, so no action on
+/// that app runs meanwhile; an app with an action in flight keeps its entry.
 fn sweep_primed_keys(keys: &mut Vec<PrimedKey>) {
     let now = std::time::Instant::now();
     let idle_ms = crate::tools::physical_input_idle_ms();
     keys.retain(|key| {
+        // Nothing to decide unless a release is wanted; the front check and
+        // the lease are only taken then.
+        if primed_key_verdict(key, Some(false), idle_ms, now, false) == PrimedKeyVerdict::Keep {
+            return true;
+        }
+        let Some(_lease) = crate::background_mutation::try_acquire(key.pid) else {
+            return true;
+        };
         match primed_key_verdict(
             key,
             front_process_matches(key.pid, key.window_id),
             idle_ms,
             now,
-            crate::background_mutation::is_held(key.pid),
+            false,
         ) {
             PrimedKeyVerdict::Keep => true,
             PrimedKeyVerdict::Forget => false,
@@ -2148,6 +2158,21 @@ mod primed_key_tests {
     fn a_session_end_releases_only_when_no_other_session_is_live() {
         assert!(release_on_session_end(0));
         assert!(!release_on_session_end(1));
+    }
+
+    /// The release takes the app's mutation lease itself, so an action that
+    /// holds it (or starts while the release runs) is never cut short.
+    #[tokio::test]
+    async fn a_release_waits_while_an_action_holds_the_apps_lease() {
+        let ours = |pid: i32| primed_keys_for_test().iter().any(|k| k.pid == pid);
+        note_primed_key(-90_010, 1);
+        let action = crate::background_mutation::acquire(-90_010).await;
+        // Another app's priming asks for -90_010's release.
+        note_primed_key(-90_011, 2);
+        assert!(ours(-90_010), "released during the action");
+        drop(action);
+        note_primed_key(-90_012, 3);
+        assert!(!ours(-90_010), "kept after the action ended");
     }
 
     #[test]

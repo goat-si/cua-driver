@@ -225,6 +225,22 @@ impl Tool for LaunchAppTool {
         // upgrade happens AFTER the blocking call returns (back on the
         // async runtime), then we sleep holding the targeted lease.
         let launch_result = tokio::task::spawn_blocking(move || {
+            // Finder's windows before a folder launch: only a window the
+            // launch adds can show the requested folder.
+            let finder_before: std::collections::HashSet<u32> = if urls.is_empty() {
+                Default::default()
+            } else {
+                crate::apps::list_running_apps()
+                    .into_iter()
+                    .find(|app| app.bundle_id.as_deref() == Some("com.apple.finder"))
+                    .map(|finder| {
+                        finder_windows(finder.pid)
+                            .into_iter()
+                            .map(|w| w.window_id)
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            };
             let pid = if let Some(ref bid) = bundle_id {
                 if urls.is_empty()
                     && additional_arguments.is_empty()
@@ -273,13 +289,14 @@ impl Tool for LaunchAppTool {
                 app_info.as_ref().and_then(|app| app.bundle_id.as_deref()),
                 &urls,
             );
-            let windows = if folders.is_empty() {
-                resolve_windows_for_pid(pid)
+            let (windows, folders_ready) = if folders.is_empty() {
+                (resolve_windows_for_pid(pid), None)
             } else {
-                await_folder_windows(pid, &folders)
+                let (found, ready) = await_folder_windows(pid, &folders, &finder_before);
+                (found, Some(ready))
             };
 
-            Ok::<_, anyhow::Error>((pid, app_info, windows))
+            Ok::<_, anyhow::Error>((pid, app_info, windows, folders_ready))
         })
         .await;
 
@@ -296,7 +313,7 @@ impl Tool for LaunchAppTool {
         // Surfaced in the structured response so callers can observe
         // whether focus-steal prevention actually held.
         let mut self_activation_suppressed: Option<bool> = None;
-        if let Ok(Ok((pid, _, _))) = &launch_result {
+        if let Ok(Ok((pid, _, _, _))) = &launch_result {
             if let Some(prior) = prior_frontmost {
                 if *pid != prior {
                     let targeted_lease = crate::focus_steal::FocusStealPreventer::begin_suppression(
@@ -453,7 +470,7 @@ impl Tool for LaunchAppTool {
         }
 
         match launch_result {
-            Ok(Ok((pid, app_info, windows))) => {
+            Ok(Ok((pid, app_info, windows, folders_ready))) => {
                 let (app_name, bid) = response_identity(
                     app_info.as_ref(),
                     response_bundle_id.as_deref(),
@@ -478,6 +495,15 @@ impl Tool for LaunchAppTool {
                     ));
                 }
 
+                if folders_ready == Some(false) {
+                    summary.push_str(
+                        "\n\nFinder took the request, but not every folder got a new window \
+                         within 3 s. A folder that was already open keeps its existing window, \
+                         which Finder does not identify by folder: call list_windows and check \
+                         the window before acting on it.",
+                    );
+                }
+
                 let windows_json: Vec<Value> = windows
                     .iter()
                     .map(super::list_windows::window_record_json)
@@ -488,7 +514,11 @@ impl Tool for LaunchAppTool {
                     "bundle_id": bid,
                     "name": app_name,
                     "windows": windows_json,
-                    "launch_state": launch_state(true, true, !windows.is_empty()),
+                    "launch_state": launch_state(
+                        true,
+                        true,
+                        folders_ready.unwrap_or(!windows.is_empty()),
+                    ),
                 });
                 // Only emit `self_activation_suppressed` when the
                 // belt-and-braces demotion check actually ran. `None`
@@ -536,11 +566,9 @@ fn resolve_windows_for_pid(pid: i32) -> Vec<crate::windows::WindowInfo> {
     vec![]
 }
 
-/// A folder a Finder launch asked for: the title Finder gives its window and
-/// its canonical path.
+/// A folder a Finder launch asked for, by the title Finder gives its window.
 struct FolderTarget {
     title: String,
-    path: std::path::PathBuf,
 }
 
 /// The folders in `urls`, when every one is a local folder opened with
@@ -552,42 +580,39 @@ fn finder_folder_targets(bundle_id: Option<&str>, urls: &[String]) -> Vec<Folder
     let mut targets = Vec::new();
     for url in urls {
         let path = std::path::Path::new(url);
-        let (Some(name), Ok(path)) = (
-            path.file_name().filter(|_| path.is_dir()),
-            path.canonicalize(),
-        ) else {
+        let Some(name) = path.file_name().filter(|_| path.is_dir()) else {
             return Vec::new();
         };
         targets.push(FolderTarget {
             title: name.to_string_lossy().into_owned(),
-            path,
         });
     }
     targets
 }
 
-/// The windows among `windows` (each with the canonical folder its
-/// `AXDocument` names, when Finder reports one) that show a requested
-/// folder, best first, and whether every requested folder has one. A window
-/// titled like a folder but showing another folder of that name does not
-/// count.
+/// The windows that show the requested folders, best first, and whether
+/// every folder has one. Finder reports no folder for its windows (its
+/// `AXDocument` is empty), so a window counts only when the launch opened it:
+/// absent from `before` and titled with the folder's name. Each window stands
+/// for one folder. A folder that was already open in a window is reported as
+/// not ready rather than guessed from a window of the same name.
 fn match_folder_windows(
     targets: &[FolderTarget],
-    windows: Vec<(crate::windows::WindowInfo, Option<std::path::PathBuf>)>,
+    windows: Vec<crate::windows::WindowInfo>,
+    before: &std::collections::HashSet<u32>,
 ) -> (Vec<crate::windows::WindowInfo>, bool) {
-    let shows = |window: &crate::windows::WindowInfo,
-                 folder: &Option<std::path::PathBuf>,
-                 target: &FolderTarget| {
-        window.title == target.title && folder.as_ref().is_none_or(|folder| *folder == target.path)
-    };
-    let ready = targets
-        .iter()
-        .all(|target| windows.iter().any(|(w, folder)| shows(w, folder, target)));
-    let mut found: Vec<_> = windows
+    let mut fresh: Vec<_> = windows
         .into_iter()
-        .filter(|(w, folder)| targets.iter().any(|target| shows(w, folder, target)))
-        .map(|(w, _)| w)
+        .filter(|w| !before.contains(&w.window_id))
         .collect();
+    let mut found = Vec::new();
+    let mut ready = true;
+    for target in targets {
+        match fresh.iter().position(|w| w.title == target.title) {
+            Some(at) => found.push(fresh.remove(at)),
+            None => ready = false,
+        }
+    }
     rank_launch_windows(&mut found);
     (found, ready)
 }
@@ -595,28 +620,27 @@ fn match_folder_windows(
 /// How long the Finder folder windows get to appear.
 const FOLDER_WINDOW_WAIT: std::time::Duration = std::time::Duration::from_secs(3);
 
-/// The folder `window_id` of Finder shows, from its `AXDocument`.
-fn finder_window_folder(pid: i32, window_id: u32) -> Option<std::path::PathBuf> {
-    super::invoke_menu::document_path_of_window(pid, window_id)
-        .and_then(|path| path.canonicalize().ok())
+/// Finder's on-screen document windows, by id.
+fn finder_windows(pid: i32) -> Vec<crate::windows::WindowInfo> {
+    crate::windows::pid_windows_with_space_snapshot(pid, false)
+        .windows
+        .into_iter()
+        .filter(|w| w.layer == 0 && w.bounds.width > 1.0 && w.bounds.height > 1.0)
+        .collect()
 }
 
-fn await_folder_windows(pid: i32, targets: &[FolderTarget]) -> Vec<crate::windows::WindowInfo> {
+/// Wait for each folder's new window; returns the windows found and whether
+/// every folder got one.
+fn await_folder_windows(
+    pid: i32,
+    targets: &[FolderTarget],
+    before: &std::collections::HashSet<u32>,
+) -> (Vec<crate::windows::WindowInfo>, bool) {
     let deadline = std::time::Instant::now() + FOLDER_WINDOW_WAIT;
     loop {
-        let candidates = crate::windows::pid_windows_with_space_snapshot(pid, false)
-            .windows
-            .into_iter()
-            .filter(|w| w.layer == 0 && w.bounds.width > 1.0 && w.bounds.height > 1.0)
-            .filter(|w| targets.iter().any(|target| w.title == target.title))
-            .map(|w| {
-                let folder = finder_window_folder(pid, w.window_id);
-                (w, folder)
-            })
-            .collect();
-        let (found, ready) = match_folder_windows(targets, candidates);
+        let (found, ready) = match_folder_windows(targets, finder_windows(pid), before);
         if ready || std::time::Instant::now() >= deadline {
-            return found;
+            return (found, ready);
         }
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
@@ -860,40 +884,49 @@ mod tests {
         let ids = |found: &[crate::windows::WindowInfo]| {
             found.iter().map(|w| w.window_id).collect::<Vec<_>>()
         };
-        // Finder is always running: the person's "Recents" window, or an
-        // already open folder of the same name elsewhere, is not the launch.
+        // Finder reports no folder for its windows, so only a window the
+        // launch opened (absent before it) proves the folder is shown. The
+        // person's "Recents", or an "A/reports" window that was already open,
+        // does not.
+        let before: std::collections::HashSet<u32> = [1, 2].into();
         let (found, ready) = match_folder_windows(
             &targets,
             vec![
-                (window(1, "Recents", 900.0, 500.0), None),
-                (window(2, "reports", 900.0, 500.0), Some(a.clone())),
+                window(1, "Recents", 900.0, 500.0),
+                window(2, "reports", 900.0, 500.0),
             ],
+            &before,
         );
         assert!(ids(&found).is_empty());
         assert!(!ready);
         let (found, ready) = match_folder_windows(
             &targets,
             vec![
-                (window(2, "reports", 900.0, 500.0), Some(a.clone())),
-                (window(3, "reports", 900.0, 500.0), Some(b.clone())),
+                window(2, "reports", 900.0, 500.0),
+                window(3, "reports", 900.0, 500.0),
             ],
+            &before,
         );
         assert_eq!(ids(&found), vec![3]);
         assert!(ready);
-        // A window whose folder Finder does not report still counts by title.
-        let (found, ready) =
-            match_folder_windows(&targets, vec![(window(4, "reports", 900.0, 500.0), None)]);
-        assert_eq!(ids(&found), vec![4]);
-        assert!(ready);
 
-        // Several folders: ready only when every one has its window.
+        // Several folders: one new window per folder, and ready only when
+        // every folder has one. One window never stands for two folders.
         let both = finder_folder_targets(Some("com.apple.finder"), &[url(&a), url(&b)]);
+        let (found, ready) =
+            match_folder_windows(&both, vec![window(3, "reports", 900.0, 500.0)], &before);
+        assert_eq!(ids(&found), vec![3]);
+        assert!(!ready);
         let (found, ready) = match_folder_windows(
             &both,
-            vec![(window(2, "reports", 900.0, 500.0), Some(a.clone()))],
+            vec![
+                window(3, "reports", 900.0, 500.0),
+                window(4, "reports", 900.0, 500.0),
+            ],
+            &before,
         );
-        assert_eq!(ids(&found), vec![2]);
-        assert!(!ready);
+        assert_eq!(ids(&found), vec![3, 4]);
+        assert!(ready);
     }
 
     #[test]
