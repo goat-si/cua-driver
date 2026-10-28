@@ -864,12 +864,10 @@ fn screenshot_window_bytes_sck_inner(window_id: u32) -> anyhow::Result<Vec<u8>> 
 /// Bound the dependency's synchronous callback wrappers without permitting an
 /// unbounded number of detached workers. Ownership of the gate permit and all
 /// ScreenCaptureKit/CF objects stays on the worker until it really returns.
-fn screenshot_window_bytes_sck(window_id: u32) -> anyhow::Result<Vec<u8>> {
-    run_native_capture_worker(
-        native_capture_gate(),
-        WINDOW_CAPTURE_NATIVE_TIMEOUT,
-        move || screenshot_window_bytes_sck_inner(window_id),
-    )
+fn screenshot_window_bytes_sck(window_id: u32, budget: Duration) -> anyhow::Result<Vec<u8>> {
+    run_native_capture_worker(native_capture_gate(), budget, move || {
+        screenshot_window_bytes_sck_inner(window_id)
+    })
     .map_err(|error| {
         anyhow::anyhow!(
             "ScreenCaptureKit capture failed for window {window_id}: {error:#}; \
@@ -886,26 +884,27 @@ fn screenshot_window_bytes_sck(window_id: u32) -> anyhow::Result<Vec<u8>> {
 pub fn screenshot_window_bytes(window_id: u32) -> anyhow::Result<Vec<u8>> {
     refuse_without_direct_capture_consent()?;
     let off_space = crate::windows::window_on_current_space_by_id(window_id) == Some(false);
-    capture_window_with_space_route(
+    // One budget for the whole read: a backend that stalls spends it, and the
+    // next one gets only what is left instead of a fresh timeout of its own.
+    let deadline = Instant::now() + WINDOW_CAPTURE_NATIVE_TIMEOUT;
+    let remaining = move || deadline.saturating_duration_since(Instant::now());
+    capture_window_with_space_route_within(
         window_id,
         off_space,
         |id| {
             capture_window_with_backends(
                 id,
-                screenshot_window_bytes_sck,
+                |id| screenshot_window_bytes_sck(id, remaining()),
                 screenshot_window_bytes_shell,
             )
         },
-        screenshot_window_bytes_skylight,
+        |id| screenshot_window_bytes_skylight(id, remaining()),
+        remaining,
     )
 }
 
-/// Route a window capture by Space.
-///
-/// Off the current Space, the public backends return nothing useful, so the
-/// SkyLight capture goes first and the public chain is the fallback. On the
-/// current Space the public chain goes first and SkyLight is the last resort.
-/// When everything fails the error keeps every backend's context.
+/// [`capture_window_with_space_route_within`] with an unlimited budget.
+#[cfg(test)]
 fn capture_window_with_space_route<P, S>(
     window_id: u32,
     off_space: bool,
@@ -916,12 +915,47 @@ where
     P: FnOnce(u32) -> anyhow::Result<Vec<u8>>,
     S: FnOnce(u32) -> anyhow::Result<Vec<u8>>,
 {
+    capture_window_with_space_route_within(window_id, off_space, public, skylight, || Duration::MAX)
+}
+
+/// Route a window capture by Space.
+///
+/// Off the current Space, the public backends return nothing useful, so the
+/// SkyLight capture goes first and the public chain is the fallback. On the
+/// current Space the public chain goes first and SkyLight is the last resort.
+/// When everything fails the error keeps every backend's context.
+fn capture_window_with_space_route_within<P, S, R>(
+    window_id: u32,
+    off_space: bool,
+    public: P,
+    skylight: S,
+    remaining: R,
+) -> anyhow::Result<Vec<u8>>
+where
+    P: FnOnce(u32) -> anyhow::Result<Vec<u8>>,
+    S: FnOnce(u32) -> anyhow::Result<Vec<u8>>,
+    R: Fn() -> Duration,
+{
+    // A second backend needs at least this much time to be worth starting.
+    const MIN_BACKEND_BUDGET: Duration = Duration::from_millis(100);
+    let spent = |next: &str| {
+        format!(
+            "{next} capture not tried: the {} ms capture budget was spent",
+            WINDOW_CAPTURE_NATIVE_TIMEOUT.as_millis()
+        )
+    };
     if off_space {
         let skylight_err = match skylight(window_id) {
             Ok(bytes) if !bytes.is_empty() => return Ok(bytes),
             Ok(_) => anyhow::anyhow!("SkyLight capture produced empty bytes"),
             Err(error) => error,
         };
+        if remaining() < MIN_BACKEND_BUDGET {
+            return Err(anyhow::anyhow!(
+                "window {window_id} is on another Space; SkyLight capture: {skylight_err:#}; {}",
+                spent("public")
+            ));
+        }
         return public(window_id).map_err(|public_err| {
             anyhow::anyhow!(
                 "window {window_id} is on another Space; SkyLight capture: {skylight_err:#}; \
@@ -931,6 +965,9 @@ where
     }
     match public(window_id) {
         Ok(bytes) => Ok(bytes),
+        Err(public_err) if remaining() < MIN_BACKEND_BUDGET => {
+            Err(anyhow::anyhow!("{public_err:#}; {}", spent("SkyLight")))
+        }
         Err(public_err) => match skylight(window_id) {
             Ok(bytes) if !bytes.is_empty() => Ok(bytes),
             Ok(_) => Err(anyhow::anyhow!(
@@ -944,19 +981,15 @@ where
 }
 
 /// Off-Space capture through `SLSHWCaptureWindowList` (see module docs).
-fn screenshot_window_bytes_skylight(window_id: u32) -> anyhow::Result<Vec<u8>> {
+fn screenshot_window_bytes_skylight(window_id: u32, budget: Duration) -> anyhow::Result<Vec<u8>> {
     // Bounded like the ScreenCaptureKit path: a WindowServer call that does
     // not return must not hold a screenshot past the observation deadline.
-    run_native_capture_worker(
-        skylight_capture_gate(),
-        WINDOW_CAPTURE_NATIVE_TIMEOUT,
-        move || {
-            let image = crate::input::skylight::hw_capture_window(window_id).ok_or_else(|| {
-                anyhow::anyhow!("SLSHWCaptureWindowList returned no image for window {window_id}")
-            })?;
-            core_cgimage_to_png(&image, &format!("window {window_id}"))
-        },
-    )
+    run_native_capture_worker(skylight_capture_gate(), budget, move || {
+        let image = crate::input::skylight::hw_capture_window(window_id).ok_or_else(|| {
+            anyhow::anyhow!("SLSHWCaptureWindowList returned no image for window {window_id}")
+        })?;
+        core_cgimage_to_png(&image, &format!("window {window_id}"))
+    })
 }
 
 fn skylight_capture_gate() -> &'static NativeCaptureGate {
@@ -1553,6 +1586,70 @@ mod tests {
             on.contains("public denied") && on.contains("sky denied"),
             "{on}"
         );
+    }
+
+    /// DSH-31: a backend that used the whole capture budget leaves none for
+    /// the next one. The read fails at once instead of waiting a second
+    /// timeout, and says why the next backend was not tried.
+    #[test]
+    fn a_spent_capture_budget_skips_the_next_backend() {
+        let left = Cell::new(Duration::from_secs(3));
+        let sky_calls = Cell::new(0u32);
+        let error = capture_window_with_space_route_within(
+            7,
+            false,
+            |_| {
+                left.set(Duration::ZERO);
+                anyhow::bail!("ScreenCaptureKit capture timed out after 3000 ms")
+            },
+            |_| {
+                sky_calls.set(sky_calls.get() + 1);
+                anyhow::bail!("SkyLight capture timed out after 3000 ms")
+            },
+            || left.get(),
+        )
+        .expect_err("no backend produced an image")
+        .to_string();
+        assert_eq!(sky_calls.get(), 0, "SkyLight ran with no budget left");
+        assert!(error.contains("SkyLight capture not tried"), "{error}");
+        assert!(error.contains("ScreenCaptureKit"), "{error}");
+
+        // Off the current Space SkyLight goes first; the public chain is
+        // skipped the same way when SkyLight used the budget.
+        let left = Cell::new(Duration::from_secs(3));
+        let public_calls = Cell::new(0u32);
+        let error = capture_window_with_space_route_within(
+            7,
+            true,
+            |_| {
+                public_calls.set(public_calls.get() + 1);
+                anyhow::bail!("public failed")
+            },
+            |_| {
+                left.set(Duration::ZERO);
+                anyhow::bail!("SkyLight capture timed out after 3000 ms")
+            },
+            || left.get(),
+        )
+        .expect_err("no backend produced an image")
+        .to_string();
+        assert_eq!(
+            public_calls.get(),
+            0,
+            "public capture ran with no budget left"
+        );
+        assert!(error.contains("public capture not tried"), "{error}");
+
+        // With budget left, the next backend still runs.
+        let got = capture_window_with_space_route_within(
+            7,
+            false,
+            |_| anyhow::bail!("ScreenCaptureKit window not found"),
+            |_| Ok(b"sky".to_vec()),
+            || Duration::from_millis(2900),
+        )
+        .expect("SkyLight runs within the remaining budget");
+        assert_eq!(got, b"sky");
     }
 
     #[test]

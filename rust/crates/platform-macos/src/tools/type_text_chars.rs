@@ -131,7 +131,7 @@ impl Tool for TypeTextCharsTool {
             Ok(Ok(())) => ToolResult::text(format!(
                 "Typed {text_len} character(s) with {delay_ms}ms delay."
             )),
-            Ok(Err(e)) => ToolResult::error(format!("Type text chars failed: {e}")),
+            Ok(Err(e)) => super::type_text::text_delivery_failure("Type text chars failed", &e),
             Err(e) => ToolResult::error(format!("Task error: {e}")),
         }
     }

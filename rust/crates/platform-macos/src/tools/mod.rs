@@ -759,14 +759,6 @@ pub(crate) async fn focus_by_pixel(
                 .await?;
         }
     }
-    // The requested field may already hold keyboard focus, for example after
-    // a pixel hotkey Cmd+A. Any focus action is then redundant, and the real
-    // click fallback would be destructive: Chromium's omnibox hit-tests to an
-    // enclosing AXGroup that rejects AXFocused, so the fallback click moved
-    // the caret and dropped the selection (#4125).
-    if focused_element_holds_point(pid, window_id, x, y, true).await {
-        return Ok(());
-    }
     if let Some(ref s) = session {
         click_args["session"] = serde_json::json!(s);
     }
@@ -776,6 +768,19 @@ pub(crate) async fn focus_by_pixel(
     if from_zoom {
         click_args["from_zoom"] = serde_json::json!(true);
     }
+    // The focus checks look at the same window point the click lands on:
+    // (x, y) are pixels of the session's (possibly downsized or zoomed)
+    // image, scaled back exactly as ClickTool does.
+    let (native_x, native_y) =
+        window_click_point(state, &click_args, pid, window_id, x, y, from_zoom)?;
+    // The requested field may already hold keyboard focus, for example after
+    // a pixel hotkey Cmd+A. Any focus action is then redundant, and the real
+    // click fallback would be destructive: Chromium's omnibox hit-tests to an
+    // enclosing AXGroup that rejects AXFocused, so the fallback click moved
+    // the caret and dropped the selection (#4125).
+    if focused_element_holds_point(pid, window_id, native_x, native_y).await {
+        return Ok(());
+    }
     let click_tool = click::ClickTool::new(state.clone());
     let click = click_tool.invoke(click_args);
     let focus = if let Some(lease) = mutation_lease {
@@ -783,23 +788,23 @@ pub(crate) async fn focus_by_pixel(
     } else {
         click.await
     };
-    if focus.is_error != Some(true) {
+    let landed = if focus.is_error != Some(true) {
         // AXFocused is non-destructive: unlike a second real click, it keeps a
         // Cmd+A selection intact before a follow-up type_text or Cmd+V.
         tokio::time::sleep(std::time::Duration::from_millis(120)).await;
-        // A background focus-click is `effect:"unverifiable"` by construction:
-        // it cannot prove the renderer moved its first responder. Returning on
-        // "it didn't error" therefore skipped the real-click fallback below
-        // whenever the click was a silent no-op — advancing on transport
-        // success alone, which is exactly what the ladder forbids. Confirm the
-        // focus actually moved before claiming this rung worked.
-        if !foreground || pixel_focus_landed(pid, window_id, x, y).await {
-            return Ok(());
+        Some(pixel_focus_landed(pid, window_id, native_x, native_y).await)
+    } else {
+        None
+    };
+    match pixel_focus_step(landed, foreground) {
+        PixelFocusStep::Focused => return Ok(()),
+        PixelFocusStep::RealClick => {}
+        PixelFocusStep::ClickFailed => {
+            return Err(cua_driver_core::protocol::ToolResult::error(format!(
+                "focus pixel-click at ({x:.0},{y:.0}) failed."
+            )));
         }
-    } else if !foreground {
-        return Err(cua_driver_core::protocol::ToolResult::error(format!(
-            "focus pixel-click at ({x:.0},{y:.0}) failed."
-        )));
+        PixelFocusStep::Unconfirmed => return Err(pixel_focus_unconfirmed(pid, window_id, x, y)),
     }
 
     // Some renderer surfaces do not expose a usable AX focus action. The
@@ -835,6 +840,59 @@ pub(crate) async fn focus_by_pixel(
     Ok(())
 }
 
+/// What [`focus_by_pixel`] does after its non-destructive focus click.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PixelFocusStep {
+    /// The focused element now covers the point: send the keys.
+    Focused,
+    /// Foreground only: fall back to a real click on the point.
+    RealClick,
+    /// Background: the focus click itself failed. Nothing was sent.
+    ClickFailed,
+    /// Background: the focus click went out but the focused element does not
+    /// cover the point. The keys are not sent.
+    Unconfirmed,
+}
+
+/// `landed` is the focus read-back after a focus click that did not error,
+/// `None` when the click failed. A background focus click is
+/// `effect:"unverifiable"` by construction, so only the read-back can show
+/// that the keys will reach the point.
+fn pixel_focus_step(landed: Option<bool>, foreground: bool) -> PixelFocusStep {
+    match (landed, foreground) {
+        (Some(true), _) => PixelFocusStep::Focused,
+        (_, true) => PixelFocusStep::RealClick,
+        (Some(false), false) => PixelFocusStep::Unconfirmed,
+        (None, false) => PixelFocusStep::ClickFailed,
+    }
+}
+
+/// The refusal for [`PixelFocusStep::Unconfirmed`]: the focus click was sent,
+/// so focus may have moved, but no key or text was sent.
+fn pixel_focus_unconfirmed(
+    pid: i32,
+    window_id: Option<u32>,
+    x: f64,
+    y: f64,
+) -> cua_driver_core::protocol::ToolResult {
+    let message = format!(
+        "The focus click at ({x:.0},{y:.0}) was sent, but the focused element does not cover \
+         that point, so no key or text was sent. Read the window, then target the field by \
+         element_token, or retry with delivery_mode:\"foreground\"."
+    );
+    cua_driver_core::protocol::ToolResult::error(message.clone()).with_structured(
+        serde_json::json!({
+            "code": "pixel_focus_unconfirmed",
+            "effect": "unverifiable",
+            "keys_sent": false,
+            "retryable": false,
+            "pid": pid,
+            "window_id": window_id,
+            "message": message,
+        }),
+    )
+}
+
 /// Confirm that a focus pixel-click actually moved the application's focused
 /// element onto the clicked point.
 ///
@@ -849,7 +907,9 @@ pub(crate) async fn focus_by_pixel(
 /// conservative direction: an unprovable focus escalates to the stronger rung
 /// rather than being reported as success.
 async fn pixel_focus_landed(pid: i32, window_id: Option<u32>, x: f64, y: f64) -> bool {
-    focused_element_holds_point(pid, window_id, x, y, false).await
+    // The focused element must belong to the requested window: a sibling
+    // window's focused field can overlap the same point.
+    focused_element_holds_point(pid, window_id, x, y).await
 }
 
 /// Whether the application's focused element covers the window-local pixel
@@ -857,13 +917,7 @@ async fn pixel_focus_landed(pid: i32, window_id: Option<u32>, x: f64, y: f64) ->
 /// also belong to that exact window, so focus held by a same-process sibling
 /// window that overlaps the point never counts as the requested target.
 /// Unprovable answers are `false`.
-async fn focused_element_holds_point(
-    pid: i32,
-    window_id: Option<u32>,
-    x: f64,
-    y: f64,
-    require_window: bool,
-) -> bool {
+async fn focused_element_holds_point(pid: i32, window_id: Option<u32>, x: f64, y: f64) -> bool {
     let Some(wid) = window_id else {
         return false;
     };
@@ -877,20 +931,26 @@ async fn focused_element_holds_point(
                 return false;
             };
             let rect = crate::ax::bindings::element_screen_rect(focused);
-            let focused_window = if require_window {
-                crate::ax::exact_target::element_window_id(focused)
-            } else {
-                Some(wid)
-            };
+            let focused_window = crate::ax::exact_target::element_window_id(focused);
             core_foundation::base::CFRelease(focused as core_foundation::base::CFTypeRef);
-            let Some(rect) = rect else {
-                return false;
-            };
-            focused_window == Some(wid) && point_within_rect(rect, screen_x, screen_y)
+            focus_holds_point(focused_window, wid, rect, screen_x, screen_y)
         }
     })
     .await
     .unwrap_or(false)
+}
+
+/// Whether the focused element, in window `focused_window` with screen rect
+/// `rect`, covers the point in window `wid`. A focused element of another
+/// window never does, even where the two windows overlap.
+fn focus_holds_point(
+    focused_window: Option<u32>,
+    wid: u32,
+    rect: Option<[f64; 4]>,
+    x: f64,
+    y: f64,
+) -> bool {
+    focused_window == Some(wid) && rect.is_some_and(|rect| point_within_rect(rect, x, y))
 }
 
 /// Whether `[x, y, width, height]` (screen coordinates, top-left origin)
@@ -1160,6 +1220,27 @@ pub(super) fn screenshot_scale(
     state
         .snapshots
         .screenshot_scale(pid, window_id.map(u64::from), args)
+}
+
+/// The window-local native-pixel point a pixel action at (x, y) lands on:
+/// (x, y) are pixels of the session's latest screenshot of the window, which
+/// may be downsized, or of a zoom crop with `from_zoom`. ClickTool and the
+/// pixel-focus checks share this so they look at one point.
+pub(super) fn window_click_point(
+    state: &ToolState,
+    args: &serde_json::Value,
+    pid: i32,
+    window_id: Option<u32>,
+    x: f64,
+    y: f64,
+    from_zoom: bool,
+) -> Result<(f64, f64), cua_driver_core::protocol::ToolResult> {
+    if from_zoom {
+        let zoom = zoom_context(state, args, pid, window_id)?;
+        return Ok(zoom.zoom_to_window(x, y));
+    }
+    let ratio = screenshot_scale(state, args, pid, window_id)?;
+    Ok((x * ratio, y * ratio))
 }
 
 pub(super) fn zoom_context(
@@ -1518,7 +1599,82 @@ mod cursor_overlay_facility_tests {
 // binary has no CoreGraphics linkage.
 #[cfg(test)]
 mod pixel_focus_readback_tests {
-    use super::point_within_rect;
+    use super::{
+        focus_holds_point, pixel_focus_step, pixel_focus_unconfirmed, point_within_rect,
+        PixelFocusStep,
+    };
+
+    /// Review finding: a sibling window's focused field overlapping the point
+    /// does not confirm focus in the requested window.
+    #[test]
+    fn only_the_requested_windows_focus_confirms() {
+        let field = Some([100.0, 100.0, 200.0, 30.0]);
+        assert!(focus_holds_point(Some(9), 9, field, 150.0, 110.0));
+        assert!(!focus_holds_point(Some(8), 9, field, 150.0, 110.0));
+        assert!(!focus_holds_point(None, 9, field, 150.0, 110.0));
+        assert!(!focus_holds_point(Some(9), 9, None, 150.0, 110.0));
+    }
+
+    /// Review round 2: the focus checks use the point the click lands on. A
+    /// screenshot delivered at half its native size maps (1000, 300) to
+    /// (2000, 600), for the click and the read-back alike.
+    #[test]
+    fn focus_checks_use_the_clicks_window_point() {
+        let state = super::ToolState::new(false, true, None);
+        state.snapshots.publish_for_session(
+            10,
+            20,
+            crate::ax::snapshot::AxSnapshot::from_nodes(&[]),
+            Some("s"),
+            Some(2.0),
+        );
+        let args = serde_json::json!({ "_session_id": "s" });
+        let point = super::window_click_point(&state, &args, 10, Some(20), 1000.0, 300.0, false)
+            .expect("the session has a screenshot of the window");
+        assert_eq!(point, (2000.0, 600.0));
+        assert!(
+            super::window_click_point(
+                &state,
+                &serde_json::json!({}),
+                10,
+                Some(20),
+                1.0,
+                1.0,
+                false
+            )
+            .is_err(),
+            "another session's screenshot is not this call's frame"
+        );
+    }
+
+    /// DSH-04: a background focus click whose read-back shows focus elsewhere
+    /// must not let the keys go out. There is no real-click fallback in the
+    /// background, so the call stops there.
+    #[test]
+    fn background_keys_wait_for_a_confirmed_focus() {
+        assert_eq!(pixel_focus_step(Some(true), false), PixelFocusStep::Focused);
+        assert_eq!(
+            pixel_focus_step(Some(false), false),
+            PixelFocusStep::Unconfirmed
+        );
+        assert_eq!(pixel_focus_step(None, false), PixelFocusStep::ClickFailed);
+        assert_eq!(pixel_focus_step(Some(true), true), PixelFocusStep::Focused);
+        assert_eq!(
+            pixel_focus_step(Some(false), true),
+            PixelFocusStep::RealClick
+        );
+        assert_eq!(pixel_focus_step(None, true), PixelFocusStep::RealClick);
+    }
+
+    #[test]
+    fn an_unconfirmed_focus_says_no_key_was_sent() {
+        let result = pixel_focus_unconfirmed(7, Some(9), 10.0, 20.0);
+        assert_eq!(result.is_error, Some(true));
+        let data = result.structured_content.expect("structured refusal");
+        assert_eq!(data["code"], "pixel_focus_unconfirmed");
+        assert_eq!(data["effect"], "unverifiable");
+        assert_eq!(data["keys_sent"], false);
+    }
 
     #[test]
     fn confirms_a_point_inside_the_focused_element() {

@@ -114,10 +114,13 @@ fn text_target_may_be_secret(pid: Option<i32>) -> bool {
 
 /// Deliver `text` either as pasteboard runs split around control keys, or as
 /// one typed run when the pasteboard route is not wanted or
-/// `pasteboard_allowed` refuses it. A failed paste falls back to typing that
-/// run. After a Return or Tab every later run is typed: the key can move focus
-/// to a password field (username, Tab, password) before that run would be
-/// pasted, and a check made then would race the app handling the key.
+/// `pasteboard_allowed` refuses it. A paste that failed before Cmd+V went out
+/// falls back to typing that run; one that failed after it ([`PasteMayHaveLanded`])
+/// is returned as the error, because the run may already be in the field and
+/// typing it would insert it twice. After a Return or Tab every later run is
+/// typed: the key can move focus to a password field (username, Tab, password)
+/// before that run would be pasted, and a check made then would race the app
+/// handling the key.
 fn deliver_text_runs(
     text: &str,
     pasteboard_allowed: impl FnOnce() -> bool,
@@ -132,7 +135,10 @@ fn deliver_text_runs(
     for segment in split_text_delivery_segments(text) {
         match segment {
             TextDeliverySegment::Text(run) if pasting => {
-                if paste(run).is_err() {
+                if let Err(error) = paste(run) {
+                    if error.downcast_ref::<PasteMayHaveLanded>().is_some() {
+                        return Err(error);
+                    }
                     type_run(run)?;
                 }
             }
@@ -189,12 +195,49 @@ pub trait PasteboardBackend {
     fn clear(&mut self) -> anyhow::Result<isize>;
 }
 
+/// A paste that failed after its Cmd+V was handed to the target, or while it
+/// was being handed over. The text may already be in the field, so it must not
+/// be typed again; and when the restore failed, the user's clipboard still
+/// holds the pasted text.
+#[derive(Debug)]
+pub struct PasteMayHaveLanded {
+    source: anyhow::Error,
+    clipboard_restored: bool,
+}
+
+impl PasteMayHaveLanded {
+    /// Whether the user's clipboard content was put back.
+    pub fn clipboard_restored(&self) -> bool {
+        self.clipboard_restored
+    }
+}
+
+impl std::fmt::Display for PasteMayHaveLanded {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "the text may already have been pasted, so it was not typed again ({:#})",
+            self.source
+        )?;
+        if !self.clipboard_restored {
+            write!(f, "; the clipboard still holds the pasted text")?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for PasteMayHaveLanded {}
+
 /// Execute a clipboard-preserving paste transaction against backend:
 /// 1. Snapshot all existing pasteboard items and verify changeCount stability.
 /// 2. Write transient/concealed/auto-generated markers + UTF-8 text.
 /// 3. Invoke trigger_paste (rolling back immediately if it fails).
 /// 4. Sleep settle_delay (50 ms in production) and restore backed-up items
 ///    only if changeCount still equals our write's changeCount.
+///
+/// Errors from steps 1–2 sent nothing. Errors from steps 3–4 are
+/// [`PasteMayHaveLanded`]: a trigger that failed partway may have sent the
+/// Cmd+V key-down, and a failed restore follows a paste that was sent.
 pub fn run_pasteboard_transaction<B: PasteboardBackend>(
     backend: &mut B,
     text: &str,
@@ -228,10 +271,13 @@ pub fn run_pasteboard_transaction<B: PasteboardBackend>(
     let written_count = backend.write_items(&[transient_item])?;
 
     if let Err(err) = trigger_paste() {
-        if backend.change_count() == written_count {
-            let _ = restore_pasteboard_snapshot(backend, &snapshot);
+        let clipboard_restored = backend.change_count() != written_count
+            || restore_pasteboard_snapshot(backend, &snapshot).is_ok();
+        return Err(PasteMayHaveLanded {
+            source: err,
+            clipboard_restored,
         }
-        return Err(err);
+        .into());
     }
 
     if !settle_delay.is_zero() {
@@ -239,7 +285,13 @@ pub fn run_pasteboard_transaction<B: PasteboardBackend>(
     }
 
     if backend.change_count() == written_count {
-        restore_pasteboard_snapshot(backend, &snapshot)?;
+        if let Err(err) = restore_pasteboard_snapshot(backend, &snapshot) {
+            return Err(PasteMayHaveLanded {
+                source: err,
+                clipboard_restored: false,
+            }
+            .into());
+        }
     }
     Ok(())
 }
@@ -1773,6 +1825,8 @@ mod tests {
         items: Vec<PasteboardItemSnapshot>,
         writes: Vec<Vec<PasteboardItemSnapshot>>,
         concurrent_copy_during_paste: Option<Vec<PasteboardItemSnapshot>>,
+        /// Fail every write after the transient one, i.e. the restore.
+        fail_restore: bool,
     }
 
     impl PasteboardBackend for MockPasteboard {
@@ -1783,6 +1837,9 @@ mod tests {
             Ok(self.items.clone())
         }
         fn write_items(&mut self, items: &[PasteboardItemSnapshot]) -> anyhow::Result<isize> {
+            if self.fail_restore && !self.writes.is_empty() {
+                anyhow::bail!("pasteboard restore write failed");
+            }
             self.count += 1;
             self.items = items.to_vec();
             self.writes.push(items.to_vec());
@@ -1814,6 +1871,7 @@ mod tests {
             items: original.clone(),
             writes: Vec::new(),
             concurrent_copy_during_paste: None,
+            fail_restore: false,
         };
         let mut pasted = false;
         run_pasteboard_transaction(
@@ -1867,6 +1925,7 @@ mod tests {
             items: original,
             writes: Vec::new(),
             concurrent_copy_during_paste: Some(user_new.clone()),
+            fail_restore: false,
         };
         let ptr = &mut pb as *mut MockPasteboard;
         run_pasteboard_transaction(
@@ -1897,6 +1956,7 @@ mod tests {
             items: original,
             writes: Vec::new(),
             concurrent_copy_during_paste: None,
+            fail_restore: false,
         };
         let err = run_pasteboard_transaction(
             &mut pb,
@@ -1906,8 +1966,81 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.to_string().contains("Cmd+V dispatch failed"));
+        // The key-down may have gone out before the trigger failed.
+        let landed = err
+            .downcast_ref::<PasteMayHaveLanded>()
+            .expect("a failed trigger may still have pasted");
+        assert!(landed.clipboard_restored());
         assert!(pb.items[0]
             .representations
             .contains(&("public.utf8-plain-text".to_owned(), b"keep me".to_vec())));
+    }
+
+    /// DSH-03: Cmd+V went out, then restoring the user's clipboard failed.
+    /// The text is already in the field, so typing the run again would
+    /// insert it twice. The failure is reported instead.
+    #[test]
+    fn a_paste_that_was_sent_is_never_typed_again() {
+        let mut pb = MockPasteboard {
+            count: 1,
+            items: vec![PasteboardItemSnapshot {
+                representations: vec![("public.utf8-plain-text".to_owned(), b"keep".to_vec())],
+            }],
+            writes: Vec::new(),
+            concurrent_copy_during_paste: None,
+            fail_restore: true,
+        };
+        let mut triggered = 0;
+        let mut typed = Vec::new();
+        let result = deliver_text_runs(
+            "안녕하세요 반갑습니다",
+            || true,
+            |run| {
+                run_pasteboard_transaction(
+                    &mut pb,
+                    run,
+                    || {
+                        triggered += 1;
+                        Ok(())
+                    },
+                    std::time::Duration::ZERO,
+                )
+            },
+            |run| {
+                typed.push(run.to_owned());
+                Ok(())
+            },
+            |_| Ok(()),
+        );
+        assert_eq!(triggered, 1);
+        assert!(typed.is_empty(), "pasted text was typed again: {typed:?}");
+        let err = result.expect_err("a paste whose restore failed must be reported");
+        assert!(
+            format!("{err:#}").contains("restore write failed"),
+            "{err:#}"
+        );
+        let landed = err
+            .downcast_ref::<PasteMayHaveLanded>()
+            .expect("a sent paste is reported as one that may have landed");
+        assert!(!landed.clipboard_restored());
+    }
+
+    /// A paste that failed before Cmd+V went out sent nothing, so the run is
+    /// still typed.
+    #[test]
+    fn a_paste_that_failed_before_sending_falls_back_to_typing() {
+        let mut typed = Vec::new();
+        deliver_text_runs(
+            "안녕하세요 반갑습니다",
+            || true,
+            |_| Err(anyhow::anyhow!("pasteboard changeCount mutated")),
+            |run| {
+                typed.push(run.to_owned());
+                Ok(())
+            },
+            |_| Ok(()),
+        )
+        .unwrap();
+        assert_eq!(typed, vec!["안녕하세요 반갑습니다".to_owned()]);
     }
 }

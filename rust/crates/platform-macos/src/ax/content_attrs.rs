@@ -19,6 +19,10 @@ pub(crate) struct ContentAttrs {
     pub description: Option<String>,
     pub identifier: Option<String>,
     pub help: Option<String>,
+    /// A single read failed with an error other than "no value" or
+    /// "unsupported": the attribute may hold content this node does not show.
+    /// (A batched read with such an error falls back to single reads.)
+    pub read_failed: bool,
 }
 
 fn value_with_placeholder(
@@ -44,27 +48,169 @@ impl ContentAttrs {
             description: slots.string(3),
             identifier: slots.string(4),
             help: slots.string(5).filter(|help| !help.trim().is_empty()),
+            read_failed: false,
         }
     }
 
     unsafe fn from_singles(element: AXUIElementRef) -> Self {
-        let title = copy_string_attr(element, "AXTitle");
-        let copied_value = copy_stringish_attr(element, "AXValue");
-        let mut placeholder = None;
-        let value = value_with_placeholder(copied_value.as_ref(), || {
-            placeholder = copy_string_attr(element, "AXPlaceholderValue");
-            placeholder.clone()
-        });
+        Self::from_single_reads(
+            |name| single_read(element, name, |value| string_from_cf(value)),
+            || single_read(element, "AXValue", |value| stringish_from_cf(value)),
+        )
+    }
+
+    /// Content from one read per attribute. `Err` is a read that failed with
+    /// an error other than "no value" or "unsupported".
+    fn from_single_reads(
+        mut string: impl FnMut(&str) -> Result<Option<String>, AXError>,
+        stringish_value: impl FnOnce() -> Result<Option<StringishAttrValue>, AXError>,
+    ) -> Self {
+        let title = string("AXTitle");
+        let copied_value = stringish_value();
+        let mut placeholder_read = None;
+        let value =
+            value_with_placeholder(copied_value.as_ref().ok().and_then(Option::as_ref), || {
+                let read = string("AXPlaceholderValue");
+                let placeholder = read.as_ref().ok().cloned().flatten();
+                placeholder_read = Some(read);
+                placeholder
+            });
+        let description = string("AXDescription");
+        let identifier = string("AXIdentifier");
+        let help = string("AXHelp");
+        // The label a selector matches is the first present of title,
+        // description, value (or placeholder) and identifier. A failed read
+        // hides content only when nothing before it in that order is present.
+        let value_failed =
+            copied_value.is_err() || placeholder_read.as_ref().is_some_and(|read| read.is_err());
+        let read_failed = label_hidden(&[
+            label_slot(&title),
+            label_slot(&description),
+            if value_failed {
+                LabelSlot::Failed
+            } else if value
+                .as_deref()
+                .is_some_and(|value| !value.trim().is_empty())
+            {
+                LabelSlot::Present
+            } else {
+                LabelSlot::Absent
+            },
+            label_slot(&identifier),
+        ]);
         Self {
-            title,
-            copied_value,
+            title: title.ok().flatten(),
+            copied_value: copied_value.ok().flatten(),
             value,
-            placeholder,
-            description: copy_string_attr(element, "AXDescription"),
-            identifier: copy_string_attr(element, "AXIdentifier"),
-            help: copy_string_attr(element, "AXHelp").filter(|help| !help.trim().is_empty()),
+            placeholder: placeholder_read.and_then(|read| read.ok().flatten()),
+            description: description.ok().flatten(),
+            identifier: identifier.ok().flatten(),
+            help: help.ok().flatten().filter(|help| !help.trim().is_empty()),
+            read_failed,
         }
     }
+}
+
+/// One attribute of the label precedence, as read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LabelSlot {
+    Present,
+    Absent,
+    Failed,
+}
+
+fn label_slot(read: &Result<Option<String>, AXError>) -> LabelSlot {
+    match read {
+        Err(_) => LabelSlot::Failed,
+        Ok(Some(text)) if !text.trim().is_empty() => LabelSlot::Present,
+        Ok(_) => LabelSlot::Absent,
+    }
+}
+
+/// Whether a failed read comes before the first present label attribute.
+fn label_hidden(slots: &[LabelSlot]) -> bool {
+    slots
+        .iter()
+        .find(|slot| **slot != LabelSlot::Absent)
+        .is_some_and(|slot| *slot == LabelSlot::Failed)
+}
+
+/// One read of `name`: its decoded value with the read's own error code, so
+/// a failure is never mistaken for an absent attribute and no second request
+/// is made.
+///
+/// # Safety
+/// `element` must be a live `AXUIElementRef`.
+unsafe fn single_read<T>(
+    element: AXUIElementRef,
+    name: &str,
+    decode: impl FnOnce(core_foundation::base::CFTypeRef) -> Option<T>,
+) -> Result<Option<T>, AXError> {
+    use core_foundation::{base::TCFType, string::CFString};
+    let attr = CFString::new(name);
+    let mut value: core_foundation::base::CFTypeRef = std::ptr::null();
+    let error = AXUIElementCopyAttributeValue(element, attr.as_concrete_TypeRef(), &mut value);
+    let decoded = (!value.is_null() && error == kAXErrorSuccess).then(|| decode(value));
+    if !value.is_null() {
+        core_foundation::base::CFRelease(value);
+    }
+    single_read_outcome(error, decoded.flatten(), || attribute_listed(element, name))
+}
+
+/// What one read means: a value, an absent attribute, or a failure that may
+/// hide content.
+///
+/// Success, no value and "unsupported" are definite. A timeout or lost
+/// connection, a stale element, or accessibility turned off hide content.
+/// Any other error (`kAXErrorFailure`, illegal argument, not implemented) is
+/// a generic failure that proves nothing by itself: the attribute counts as
+/// absent only when the element does not list it among its attribute names
+/// (`listed` returns `Some(false)`). AppKit answers `kAXErrorFailure` for an
+/// attribute an element does not implement (TextEdit's AXDescription, 28 Oct
+/// 2026); the name list tells that apart from a failed read of a real label.
+fn single_read_outcome<T>(
+    error: AXError,
+    decoded: Option<T>,
+    listed: impl FnOnce() -> Option<bool>,
+) -> Result<Option<T>, AXError> {
+    if [
+        kAXErrorSuccess,
+        kAXErrorNoValue,
+        kAXErrorAttributeUnsupported,
+    ]
+    .contains(&error)
+    {
+        return Ok(decoded);
+    }
+    if [
+        kAXErrorCannotComplete,
+        kAXErrorInvalidUIElement,
+        kAXErrorAPIDisabled,
+    ]
+    .contains(&error)
+    {
+        return Err(error);
+    }
+    match listed() {
+        Some(false) => Ok(None),
+        _ => Err(error),
+    }
+}
+
+/// Whether `element` lists `name` among its attribute names; `None` when the
+/// list cannot be read.
+///
+/// # Safety
+/// `element` must be a live `AXUIElementRef`.
+unsafe fn attribute_listed(element: AXUIElementRef, name: &str) -> Option<bool> {
+    use core_foundation::{array::CFArray, base::TCFType, string::CFString};
+    let mut names: core_foundation::array::CFArrayRef = std::ptr::null();
+    let error = AXUIElementCopyAttributeNames(element, &mut names);
+    if error != kAXErrorSuccess || names.is_null() {
+        return None;
+    }
+    let names = CFArray::<CFString>::wrap_under_create_rule(names);
+    Some(names.iter().any(|listed| listed.to_string() == name))
 }
 
 /// A timeout returns no content, so the walker emits only the role already read.
@@ -136,11 +282,86 @@ mod tests {
 
     #[test]
     fn empty_or_whitespace_values_use_the_placeholder_without_trimming_it() {
+        // (batched reads never fail a slot: a real slot error falls back to
+        // single reads, below)
         for value in ["", " \t\n "] {
             let attrs = content(&CFString::new(value).as_CFType(), "  placeholder  ");
             assert_eq!(attrs.value.as_deref(), Some("  placeholder  "));
             assert_eq!(attrs.copied_value.unwrap().state_value, value);
         }
+    }
+
+    /// Review round 2: a single read that fails with a real error (a timeout,
+    /// CannotComplete) is not an absent label. The node says so, so the walk
+    /// cannot claim its elements complete.
+    #[test]
+    fn a_failed_single_read_is_not_an_absent_label() {
+        let failed = ContentAttrs::from_single_reads(
+            |name| match name {
+                "AXTitle" => Err(kAXErrorCannotComplete),
+                "AXDescription" => Ok(Some("Save".into())),
+                _ => Ok(None),
+            },
+            || Ok(None),
+        );
+        assert!(failed.read_failed);
+        assert_eq!(failed.title, None);
+        assert_eq!(failed.description.as_deref(), Some("Save"));
+
+        let absent = ContentAttrs::from_single_reads(|_| Ok(None), || Ok(None));
+        assert!(!absent.read_failed);
+
+        let value_failed =
+            ContentAttrs::from_single_reads(|_| Ok(None), || Err(kAXErrorCannotComplete));
+        assert!(value_failed.read_failed);
+    }
+
+    #[test]
+    fn only_real_errors_fail_a_single_read() {
+        let never = || -> Option<bool> { panic!("a definite answer needs no name list") };
+        for absent in [
+            kAXErrorSuccess,
+            kAXErrorNoValue,
+            kAXErrorAttributeUnsupported,
+        ] {
+            assert_eq!(single_read_outcome::<String>(absent, None, never), Ok(None));
+        }
+        // The app did not answer or the element went away: content unknown.
+        for failed in [
+            kAXErrorCannotComplete,
+            kAXErrorInvalidUIElement,
+            kAXErrorAPIDisabled,
+        ] {
+            assert_eq!(
+                single_read_outcome::<String>(failed, None, never),
+                Err(failed)
+            );
+        }
+        // Review round 4: a generic failure proves absence only when the
+        // element does not list the attribute.
+        for generic in [
+            kAXErrorFailure,
+            kAXErrorIllegalArgument,
+            kAXErrorNotImplemented,
+        ] {
+            assert_eq!(
+                single_read_outcome::<String>(generic, None, || Some(false)),
+                Ok(None)
+            );
+            assert_eq!(
+                single_read_outcome::<String>(generic, None, || Some(true)),
+                Err(generic)
+            );
+            assert_eq!(
+                single_read_outcome::<String>(generic, None, || None),
+                Err(generic)
+            );
+        }
+        // Review round 3: a read that succeeds keeps its value.
+        assert_eq!(
+            single_read_outcome(kAXErrorSuccess, Some("Save"), never),
+            Ok(Some("Save"))
+        );
     }
 
     #[test]
@@ -252,5 +473,48 @@ mod tests {
             &mut next_walk_disabled
         ));
         assert!(!next_walk_disabled);
+    }
+    /// Review round 4: a failed read matters only where the label would come
+    /// from it. With a title present, a failed description hides nothing.
+    #[test]
+    fn a_failed_read_after_the_label_hides_nothing() {
+        let with_title = ContentAttrs::from_single_reads(
+            |name| match name {
+                "AXTitle" => Ok(Some("Ruler".into())),
+                "AXDescription" => Err(kAXErrorFailure),
+                _ => Ok(None),
+            },
+            || Ok(None),
+        );
+        assert!(!with_title.read_failed);
+        assert_eq!(with_title.title.as_deref(), Some("Ruler"));
+
+        let untitled = ContentAttrs::from_single_reads(
+            |name| match name {
+                "AXDescription" => Err(kAXErrorFailure),
+                "AXIdentifier" => Ok(Some("marker".into())),
+                _ => Ok(None),
+            },
+            || Ok(None),
+        );
+        assert!(untitled.read_failed, "the description would be the label");
+
+        let help_failed = ContentAttrs::from_single_reads(
+            |name| match name {
+                "AXHelp" => Err(kAXErrorCannotComplete),
+                _ => Ok(None),
+            },
+            || Ok(None),
+        );
+        assert!(!help_failed.read_failed, "help is not part of the label");
+
+        let placeholder_failed = ContentAttrs::from_single_reads(
+            |name| match name {
+                "AXPlaceholderValue" => Err(kAXErrorCannotComplete),
+                _ => Ok(None),
+            },
+            || Ok(None),
+        );
+        assert!(placeholder_failed.read_failed);
     }
 }

@@ -200,6 +200,12 @@ pub struct TreeWalkResult {
     pub nodes: Vec<AXNode>,
     /// True when the walk was cut short by its node or time budget.
     pub truncated: bool,
+    /// True when the walk passed over a node or subtree without visiting it
+    /// for a reason other than its budget: the depth cap with children below,
+    /// an `AXChildren` read that failed, a node whose attributes could not be
+    /// read, omitted tabs, off-screen rows or menus left unwalked, or web
+    /// content excluded from this walk.
+    pub nodes_skipped: bool,
     /// Why and where the walk stopped (see [`cua_driver_core::walk_budget`]).
     pub walk: WalkOutcome,
     /// Whether the requested `window_id` actually resolved to an AX surface,
@@ -221,6 +227,7 @@ impl TreeWalkResult {
             tree_markdown,
             nodes,
             truncated: false,
+            nodes_skipped: false,
             walk: cua_driver_core::walk_budget::WalkBudget::nodes_only(usize::MAX).outcome(),
             window_scope: None,
         }
@@ -340,6 +347,7 @@ fn walk_tree_with_web_content(
     mut budget: WalkBudget,
     include_web_content: bool,
 ) -> TreeWalkResult {
+    let ledger = SkipLedger::start();
     let mut nodes: Vec<AXNode> = Vec::new();
     let mut lines: Vec<(usize, String)> = Vec::new(); // (depth, line)
     let mut index_counter = 0usize;
@@ -354,6 +362,7 @@ fn walk_tree_with_web_content(
                 tree_markdown: String::new(),
                 nodes,
                 truncated: false,
+                nodes_skipped: true,
                 walk: budget.outcome(),
                 // No application AX element at all, so a requested window
                 // certainly did not resolve.
@@ -391,7 +400,18 @@ fn walk_tree_with_web_content(
                 let walk = top_level.clone();
                 break (top_level, walk);
             };
-            let decision = scope_top_level(&top_level, pid, wid);
+            let mut decision = scope_top_level(&top_level, pid, wid);
+            // A save sheet has a CGWindowID of its own but lives under its
+            // document's AXWindow, so no top-level child claims it. Its
+            // controls belong to that window: point there, walk nothing.
+            if matches!(decision.scope, WindowScope::AxUnresolved { .. }) {
+                if let Some(parent_window_id) = window_holding_sheet(&top_level, wid) {
+                    decision = ScopeDecision {
+                        scope: WindowScope::SheetOfWindow { parent_window_id },
+                        walk: Vec::new(),
+                    };
+                }
+            }
             if matches!(decision.scope, WindowScope::AxUnresolved { .. }) {
                 match launch_wait.step(attempt_started, Instant::now(), || is_still_launching(pid))
                 {
@@ -438,6 +458,9 @@ fn walk_tree_with_web_content(
             with_dense_rows_windowed(false, || {
                 for visible in [true, false] {
                     if !visible && !search_offscreen {
+                        if deferred.iter().any(|row| !row.visible) {
+                            note_skipped();
+                        }
                         continue;
                     }
                     for row in deferred.iter_mut().filter(|row| row.visible == visible) {
@@ -476,7 +499,12 @@ fn walk_tree_with_web_content(
     }
 
     let walk = budget.outcome();
-    fold_actionless_text_subtrees(&mut lines, &mut nodes);
+    let nodes_skipped = ledger.finish();
+    // Folding merges text rows into their parent; an exhaustive walk keeps
+    // every row it visited.
+    if !exhaustive_nodes() {
+        fold_actionless_text_subtrees(&mut lines, &mut nodes);
+    }
     nodes.retain(|n| n.role != "AXTabStripSummary");
     prune_echo_text_rows(&mut lines);
     let raw_markdown = render_lines(&lines);
@@ -495,6 +523,7 @@ fn walk_tree_with_web_content(
         tree_markdown,
         nodes,
         truncated: walk.truncated(),
+        nodes_skipped,
         walk,
         window_scope,
     }
@@ -511,7 +540,7 @@ unsafe fn copy_top_level(
     pid: i32,
     window_id: Option<u32>,
 ) -> Vec<AXUIElementRef> {
-    let mut top_level = copy_children(app_elem);
+    let mut top_level = children_or_skipped(copy_children_checked(app_elem));
     // A requested window on another Space is absent from AXWindows; the
     // `_including` variant recovers it by exact CGWindowID.
     let from_windows = match window_id {
@@ -534,6 +563,16 @@ unsafe fn copy_top_level(
         }
     }
     top_level
+}
+
+/// The children a checked `AXChildren` read found; a failed read records
+/// the walk as skipping what it could not see (at the application root: the
+/// menu bar and any sheet), even when `AXWindows` still recovers the window.
+fn children_or_skipped<T>(read: Option<Vec<T>>) -> Vec<T> {
+    read.unwrap_or_else(|| {
+        note_skipped();
+        Vec::new()
+    })
 }
 
 /// Decide which of `top_level` a walk scoped to `wid` covers.
@@ -565,6 +604,29 @@ unsafe fn scope_top_level(top_level: &[AXUIElementRef], pid: i32, wid: u32) -> S
     })
 }
 
+/// The CGWindowID of the app window holding an `AXSheet` whose own
+/// CGWindowID is `wid`.
+unsafe fn window_holding_sheet(top_level: &[AXUIElementRef], wid: u32) -> Option<u32> {
+    for &window in top_level {
+        if copy_string_attr(window, "AXRole").as_deref() != Some("AXWindow") {
+            continue;
+        }
+        let children = copy_children(window);
+        let holds = children.iter().any(|&child| {
+            set_messaging_timeout(child);
+            copy_string_attr(child, "AXRole").as_deref() == Some("AXSheet")
+                && ax_get_window_id(child) == Some(wid)
+        });
+        release_all(children);
+        if holds {
+            if let Some(parent) = ax_get_window_id(window).filter(|&parent| parent != wid) {
+                return Some(parent);
+            }
+        }
+    }
+    None
+}
+
 /// Release elements retained by [`copy_top_level`].
 unsafe fn release_all(elements: Vec<AXUIElementRef>) {
     for element in elements {
@@ -588,6 +650,7 @@ unsafe fn walk_element(
     deferred: &mut Vec<DeferredRow>,
 ) {
     if depth > max_depth {
+        note_skipped();
         return;
     }
     // Node and time budget: a refused node is counted as discovered but not
@@ -600,10 +663,15 @@ unsafe fn walk_element(
     // element, so every descendant must be bounded before any attribute read.
     set_messaging_timeout(element);
 
-    let role = copy_string_attr(element, "AXRole").unwrap_or_else(|| "AXUnknown".into());
+    let role = copy_string_attr(element, "AXRole").unwrap_or_else(|| {
+        // A selector on the role cannot be answered for this node.
+        note_skipped();
+        "AXUnknown".into()
+    });
 
     let in_web_content = in_web_content || is_web_content_role(&role);
     if in_web_content && !include_web_content {
+        note_skipped();
         return;
     }
 
@@ -617,16 +685,44 @@ unsafe fn walk_element(
             let idx = *counter;
             *counter += 1;
             CFRetain(element as CFTypeRef);
-            let description = copy_string_attr(element, "AXDescription")
-                .map(|d| d.trim().to_owned())
-                .filter(|d| !d.is_empty());
+            // An exhaustive walk keeps the area's own labels, read with their
+            // failures, so a selector naming it is answered; the bar
+            // position stays the row's value.
+            let ((title, description, own_value, identifier), exhaustive) = if exhaustive_nodes() {
+                match read_content_attrs(element, budget, batching_disabled) {
+                    Some(attrs) => {
+                        let (labels, complete) = scroll_area_labels(attrs);
+                        if !complete {
+                            note_skipped();
+                        }
+                        (labels, true)
+                    }
+                    None => {
+                        note_skipped();
+                        ((None, None, None, None), true)
+                    }
+                }
+            } else {
+                (
+                    (
+                        None,
+                        trimmed_label(copy_string_attr(element, "AXDescription")),
+                        None,
+                        copy_string_attr(element, "AXIdentifier"),
+                    ),
+                    false,
+                )
+            };
             let node = AXNode {
                 element_index: Some(idx),
                 role: role.clone(),
-                title: None,
-                value: Some(label),
+                title,
+                // A verify read keeps the area's own label order (its value,
+                // then its identifier); the bar position is in value_state,
+                // which is what the row's structured `value` reports.
+                value: if exhaustive { own_value } else { Some(label) },
                 description,
-                identifier: copy_string_attr(element, "AXIdentifier"),
+                identifier,
                 help: None,
                 actions: copy_action_names(element),
                 element_ptr: element as usize,
@@ -664,6 +760,30 @@ unsafe fn walk_element(
 
     // Skip pure layout containers that have no interesting content.
     if role == "AXScrollArea" || role == "AXGroup" {
+        // An exhaustive walk keeps the container as a display-only row, so a
+        // selector naming it is answered rather than assumed absent.
+        if exhaustive_nodes() {
+            let node = match read_content_attrs(element, budget, batching_disabled) {
+                Some(attrs) => {
+                    if attrs.read_failed {
+                        note_skipped();
+                    }
+                    display_node(&role, attrs, element, depth, parent_index, in_web_content)
+                }
+                None => {
+                    note_skipped();
+                    role_only_node(
+                        role.clone(),
+                        element as usize,
+                        depth,
+                        parent_index,
+                        in_web_content,
+                    )
+                }
+            };
+            lines.push((depth, format_node_line(&node)));
+            nodes.push(node);
+        }
         // Still recurse — children may be interesting. Layout containers
         // collapse, so children inherit the parent's depth AND the same
         // parent_index (no actionable node was emitted here).
@@ -698,13 +818,20 @@ unsafe fn walk_element(
         description,
         identifier,
         help,
+        read_failed,
     }) = read_content_attrs(element, budget, batching_disabled)
     else {
+        // Only the role is known: a selector on its label cannot be answered.
+        note_skipped();
         let node = role_only_node(role, element as usize, depth, parent_index, in_web_content);
         lines.push((depth, format_node_line(&node)));
         nodes.push(node);
         return;
     };
+    if read_failed {
+        // A label read failed: a selector on it cannot be answered.
+        note_skipped();
+    }
     let actions = copy_action_names(element);
     let (subrole, placeholder) = if should_probe_secure_text_role(&role, None) {
         let subrole = copy_string_attr(element, "AXSubrole");
@@ -747,6 +874,21 @@ unsafe fn walk_element(
     );
 
     if !is_actionable && !has_content && role != "AXWindow" && role != "AXSheet" {
+        if exhaustive_nodes() {
+            let node = AXNode {
+                identifier: identifier.clone(),
+                help: help.clone(),
+                ..role_only_node(
+                    role.clone(),
+                    element as usize,
+                    depth,
+                    parent_index,
+                    in_web_content,
+                )
+            };
+            lines.push((depth, format_node_line(&node)));
+            nodes.push(node);
+        }
         walk_children(
             element,
             &role,
@@ -886,6 +1028,7 @@ unsafe fn walk_element(
     lines.push((depth, line));
     nodes.push(node);
     if collapse_here {
+        note_skipped();
         return;
     }
 
@@ -923,9 +1066,21 @@ unsafe fn walk_children(
     deferred: &mut Vec<DeferredRow>,
 ) {
     if depth > max_depth {
+        // A tree that ends exactly at the cap is still complete.
+        match copy_children_checked(element) {
+            Some(below) if below.is_empty() => {}
+            Some(below) => {
+                note_skipped();
+                release_all(below);
+            }
+            None => note_skipped(),
+        }
         return;
     }
-    let children = copy_children(element);
+    let Some(children) = copy_children_checked(element) else {
+        note_skipped();
+        return;
+    };
     let tab_plan = if !in_web_content && children.len() >= TAB_STRIP_COMPACTION_THRESHOLD {
         plan_macos_tab_strip(element, role, &children)
     } else {
@@ -951,6 +1106,7 @@ unsafe fn walk_children(
                 ));
             }
             if !tp.keep[index] {
+                note_skipped();
                 CFRelease(child as CFTypeRef);
                 continue;
             }
@@ -1048,6 +1204,34 @@ unsafe fn plan_macos_tab_strip(
     )
 }
 
+/// Trimmed text, or `None` when empty.
+fn trimmed_label(text: Option<String>) -> Option<String> {
+    text.map(|text| text.trim().to_owned())
+        .filter(|text| !text.is_empty())
+}
+
+/// A scrollable area's own (title, description, value, identifier) for an
+/// exhaustive walk, and whether they show everything a selector could match
+/// (false when a label read failed).
+type ScrollAreaLabels = (
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+);
+
+fn scroll_area_labels(attrs: super::content_attrs::ContentAttrs) -> (ScrollAreaLabels, bool) {
+    (
+        (
+            trimmed_label(attrs.title),
+            trimmed_label(attrs.description),
+            trimmed_label(attrs.value),
+            attrs.identifier,
+        ),
+        !attrs.read_failed,
+    )
+}
+
 fn role_only_node(
     role: String,
     element_ptr: usize,
@@ -1075,6 +1259,49 @@ fn role_only_node(
         enabled: None,
         selected: None,
         in_web_content,
+    }
+}
+
+/// A display-only row for a container an ordinary walk collapses: its
+/// labels and value (redacted like any other row's), no index.
+fn display_node(
+    role: &str,
+    attrs: ContentAttrs,
+    element: AXUIElementRef,
+    depth: usize,
+    parent_element_index: Option<usize>,
+    in_web_content: bool,
+) -> AXNode {
+    let label = |text: Option<String>| {
+        text.map(|text| text.trim().to_owned())
+            .filter(|text| !text.is_empty())
+    };
+    let title = label(attrs.title);
+    let description = label(attrs.description);
+    let meta = FieldSecurityMeta {
+        role,
+        subrole: None,
+        title: title.as_deref(),
+        description: description.as_deref(),
+        placeholder: attrs.placeholder.as_deref(),
+        identifier: attrs.identifier.as_deref(),
+        help: attrs.help.as_deref(),
+        is_password_flag: false,
+    };
+    let (value, _) = redact_if_secure(&meta, label(attrs.value), None);
+    AXNode {
+        title,
+        description,
+        value,
+        identifier: attrs.identifier,
+        help: attrs.help,
+        ..role_only_node(
+            role.to_owned(),
+            element as usize,
+            depth,
+            parent_element_index,
+            in_web_content,
+        )
     }
 }
 
@@ -1187,6 +1414,59 @@ fn format_node_line(node: &AXNode) -> String {
 
 thread_local! {
     static MENUS_COLLAPSED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static WALK_SKIPPED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static EXHAUSTIVE_NODES: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Run `walk` keeping every visited node in `nodes` (or not) on this thread:
+/// layout containers and unlabelled rows stay as display-only rows and text
+/// rows are not folded into their parent. Only `verify_state`'s internal
+/// read asks for this, so that `elements` lists the whole walked window and
+/// a selector matching none of it names nothing there.
+pub fn with_exhaustive_nodes<T>(exhaustive: bool, walk: impl FnOnce() -> T) -> T {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            EXHAUSTIVE_NODES.with(|flag| flag.set(self.0));
+        }
+    }
+    let _restore = Restore(EXHAUSTIVE_NODES.with(|flag| flag.replace(exhaustive)));
+    walk()
+}
+
+fn exhaustive_nodes() -> bool {
+    EXHAUSTIVE_NODES.with(std::cell::Cell::get)
+}
+
+/// Record that the walk on this thread passed over a node or subtree without
+/// visiting it (see [`TreeWalkResult::nodes_skipped`]).
+fn note_skipped() {
+    WALK_SKIPPED.with(|flag| flag.set(true));
+}
+
+/// The skip record of one walk. A nested walk on the same thread keeps its
+/// own record and hands the outer one back when it ends.
+struct SkipLedger {
+    previous: bool,
+}
+
+impl SkipLedger {
+    fn start() -> Self {
+        Self {
+            previous: WALK_SKIPPED.with(|flag| flag.replace(false)),
+        }
+    }
+
+    /// Whether this walk skipped anything.
+    fn finish(self) -> bool {
+        WALK_SKIPPED.with(std::cell::Cell::get)
+    }
+}
+
+impl Drop for SkipLedger {
+    fn drop(&mut self) {
+        WALK_SKIPPED.with(|flag| flag.set(self.previous));
+    }
 }
 
 /// Shown on the menu bar row of a read whose menus were not walked.
@@ -1434,6 +1714,111 @@ mod lean_row_tests {
                 "- [12] AXStaticText = \"Inbox\"",
             ]
         );
+    }
+
+    /// DSH-08: each walk keeps its own skip record; a walk nested on the same
+    /// thread neither clears nor leaks into the outer one.
+    #[test]
+    fn each_walk_keeps_its_own_skip_record() {
+        use super::{note_skipped, SkipLedger};
+        let outer = SkipLedger::start();
+        note_skipped();
+        let inner = SkipLedger::start();
+        assert!(!inner.finish(), "a nested walk starts clean");
+        assert!(outer.finish(), "the outer skip survives the nested walk");
+        let next = SkipLedger::start();
+        assert!(!next.finish());
+    }
+
+    /// Review finding: a walk that panics must not leave exhaustive mode on
+    /// for later walks on the thread.
+    #[test]
+    fn exhaustive_mode_ends_with_its_walk_even_on_panic() {
+        use super::{exhaustive_nodes, with_exhaustive_nodes};
+        let unwound = std::panic::catch_unwind(|| {
+            with_exhaustive_nodes(true, || -> () { panic!("walk failed") })
+        });
+        assert!(unwound.is_err());
+        assert!(!exhaustive_nodes());
+        assert!(with_exhaustive_nodes(true, exhaustive_nodes));
+        assert!(!exhaustive_nodes());
+    }
+
+    /// Review round 2: a container kept by an exhaustive walk keeps the
+    /// Review round 3: a scrollable area keeps its own title in an
+    /// exhaustive walk; a failed read or a value hidden by the bar position
+    /// leaves the walk incomplete.
+    #[test]
+    fn a_scroll_area_keeps_its_labels_in_an_exhaustive_walk() {
+        use super::super::content_attrs::ContentAttrs;
+        let attrs = |title: Option<&str>, value: Option<&str>, read_failed| ContentAttrs {
+            title: title.map(str::to_owned),
+            copied_value: None,
+            value: value.map(str::to_owned),
+            placeholder: None,
+            description: None,
+            identifier: Some("editor-scroll".into()),
+            help: None,
+            read_failed,
+        };
+        let ((title, _, _, identifier), complete) =
+            super::scroll_area_labels(attrs(Some(" Editor "), None, false));
+        assert_eq!(title.as_deref(), Some("Editor"));
+        assert_eq!(identifier.as_deref(), Some("editor-scroll"));
+        assert!(complete);
+        assert!(!super::scroll_area_labels(attrs(Some("Editor"), None, true)).1);
+        // Its own value is kept for the label, not hidden by the position.
+        let ((_, _, value, _), complete) =
+            super::scroll_area_labels(attrs(None, Some(" Notes "), false));
+        assert_eq!(value.as_deref(), Some("Notes"));
+        assert!(complete);
+    }
+
+    /// Review round 2: a container kept by an exhaustive walk keeps the
+    /// value that labels it (AXGroup = "Saved").
+    #[test]
+    fn an_exhaustive_container_row_keeps_its_value() {
+        use super::super::content_attrs::ContentAttrs;
+        let attrs = ContentAttrs {
+            title: None,
+            copied_value: None,
+            value: Some(" Saved ".into()),
+            placeholder: None,
+            description: None,
+            identifier: None,
+            help: None,
+            read_failed: false,
+        };
+        let node = super::display_node("AXGroup", attrs, std::ptr::null_mut(), 1, None, false);
+        assert_eq!(node.value.as_deref(), Some("Saved"));
+        assert_eq!(node.element_index, None);
+    }
+
+    /// Review round 6: a failed AXChildren read at the application root
+    /// leaves the walk incomplete even when AXWindows recovers the window.
+    #[test]
+    fn a_failed_root_children_read_is_recorded() {
+        use super::{children_or_skipped, SkipLedger};
+        let ledger = SkipLedger::start();
+        assert_eq!(children_or_skipped::<u8>(Some(vec![1, 2])), vec![1, 2]);
+        assert!(!ledger.finish());
+        let ledger = SkipLedger::start();
+        assert!(children_or_skipped::<u8>(None).is_empty());
+        assert!(ledger.finish());
+    }
+
+    #[test]
+    fn only_a_failed_children_read_hides_what_lies_below() {
+        use super::super::bindings::{
+            children_read_succeeded, kAXErrorAttributeUnsupported, kAXErrorCannotComplete,
+            kAXErrorFailure, kAXErrorInvalidUIElement, kAXErrorNoValue, kAXErrorSuccess,
+        };
+        assert!(children_read_succeeded(kAXErrorSuccess));
+        assert!(children_read_succeeded(kAXErrorNoValue));
+        assert!(children_read_succeeded(kAXErrorAttributeUnsupported));
+        assert!(!children_read_succeeded(kAXErrorCannotComplete));
+        assert!(!children_read_succeeded(kAXErrorFailure));
+        assert!(!children_read_succeeded(kAXErrorInvalidUIElement));
     }
 
     #[test]

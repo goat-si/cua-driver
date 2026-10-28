@@ -1114,23 +1114,22 @@ impl Tool for ClickTool {
                     }
                     Err(refusal) => return refusal,
                 }
-            } else if from_zoom {
-                match super::zoom_context(&self.state, &args, pid, window_id) {
-                    Ok(ctx) => {
-                        let (wx, wy) = ctx.zoom_to_window(cx, cy);
+            } else {
+                match super::window_click_point(
+                    &self.state,
+                    &args,
+                    pid,
+                    window_id,
+                    cx,
+                    cy,
+                    from_zoom,
+                ) {
+                    Ok((wx, wy)) => {
                         cx = wx;
                         cy = wy;
                     }
                     Err(refusal) => return refusal,
                 }
-            } else {
-                let ratio = match super::screenshot_scale(&self.state, &args, pid, window_id) {
-                    Ok(ratio) => ratio,
-                    Err(refusal) => return refusal,
-                };
-                // Coordinates are in the downscaled image space; scale back to native pixels.
-                cx *= ratio;
-                cy *= ratio;
             }
 
             // ── Window-local → screen coordinate translation ──────────────────
