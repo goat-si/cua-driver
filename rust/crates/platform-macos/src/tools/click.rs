@@ -1652,9 +1652,9 @@ fn press_needs_key_window(action: &str, front_pid: Option<i32>, pid: i32, native
 /// in either direction) or a change of the target app's focused window can
 /// take key status away from it, and both are read again before each press.
 fn prime_key_window_for_background_press(pid: i32, window_id: u32, action: &str) {
-    let native = !super::type_text::is_browser_pid(pid)
-        && !crate::browser::electron_js::ElectronJs::is_electron(pid);
-    if !press_needs_key_window(action, apps::frontmost_pid(), pid, native) {
+    // `native` (a browser or Electron lookup) is read last: a reused
+    // priming was only ever recorded for a native app.
+    if !press_needs_key_window(action, apps::frontmost_pid(), pid, true) {
         return;
     }
     let primed = KeyPrime {
@@ -1670,6 +1670,11 @@ fn prime_key_window_for_background_press(pid: i32, window_id: u32, action: &str)
         return;
     }
     *last = None;
+    let native = !super::type_text::is_browser_pid(pid)
+        && !crate::browser::electron_js::ElectronJs::is_electron(pid);
+    if !native {
+        return;
+    }
     if crate::input::skylight::activate_without_raise_with(pid, window_id, false) {
         std::thread::sleep(KEY_PRIME_SETTLE);
         // An activation during the settle may already have undone it.

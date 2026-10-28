@@ -1,7 +1,7 @@
 //! Whether an action's result waits for its post-action window-change report.
 //!
 //! After an input action the macOS adapter watches the window list for a short
-//! time (300 ms for a direct call) so its result can name a menu, dialog, new
+//! time (120 ms for a direct call) so its result can name a menu, dialog, new
 //! window or foreground change the action caused. For an agent that reads the
 //! window state after every action anyway, that wait is most of a background
 //! click's latency.
@@ -82,7 +82,7 @@ pub fn schema() -> Value {
         "type": "string",
         "enum": ["default", "none"],
         "description": "Whether the result waits for the post-action window-change report \
-                        (default \"default\": up to 300 ms for a new window, menu, dialog or \
+                        (default \"default\": up to 120 ms for a new window, menu, dialog or \
                         foreground change). \"none\" returns as soon as the input is delivered \
                         and says window changes were not observed; the watch keeps running in \
                         the background and a change it sees is reported on the next action's \

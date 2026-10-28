@@ -231,8 +231,11 @@ const DEFAULT_POLL_INTERVAL: Duration = Duration::from_millis(25);
 /// then the result returns, and the rest of the observation deadline runs
 /// detached (see [`Tail`]): the focus-steal lease stays armed and a late
 /// window is reported on the next action's result. Before this, every
-/// action that opened nothing paid the whole deadline.
-const REPORT_WINDOW: Duration = Duration::from_millis(300);
+/// action that opened nothing paid the whole deadline. It was 300 ms until
+/// measurement showed it was most of a direct click (the AX press itself
+/// takes 3-5 ms on Calculator); a menu, popover or sheet that an AX press
+/// opens is listed well inside 120 ms.
+const REPORT_WINDOW: Duration = Duration::from_millis(120);
 
 /// A late change older than this is not reported on a later result.
 const LATE_REPORT_MAX_AGE: Duration = Duration::from_secs(10);
