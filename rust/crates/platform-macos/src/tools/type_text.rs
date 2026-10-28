@@ -80,7 +80,7 @@ fn def() -> &'static ToolDef {
                     "type": "integer",
                     "minimum": 0,
                     "maximum": 200,
-                    "description": "Ms between characters in the CGEvent fallback. Default 30."
+                    "description": "Ms between characters in the CGEvent fallback. Default 30 (0 for a terminal emulator)."
                 },
                 "scope": { "type": "string", "enum": ["window", "desktop"], "default": "window", "description": "\"desktop\" with no pid/window_id types into the frontmost app." },
                 "delivery_mode": {
@@ -190,7 +190,17 @@ impl Tool for TypeTextTool {
             Ok(window_id) => window_id,
             Err(error) => return error,
         };
-        let delay_ms = args.u64_or("delay_ms", 30);
+        // A terminal reads keys from its pty: all 13 characters of a test
+        // string arrived and read back with no extra delay (Terminal.app),
+        // and the 30 ms default cost 0.4 s of a 0.8 s insert. The 8 ms key
+        // gap still separates every key.
+        let delay_ms = args.opt_u64("delay_ms").unwrap_or_else(|| {
+            if crate::terminal::is_terminal_pid(pid) {
+                0
+            } else {
+                30
+            }
+        });
         let delivery_mode = super::DeliveryMode::parse(args.opt_str("delivery_mode").as_deref());
         if let Some(error) = screen_sharing_delivery_error(
             crate::input::keyboard::is_screen_sharing_pid(pid),
@@ -442,9 +452,9 @@ impl Tool for TypeTextTool {
                 // chrome (address bar, toolbar) stays trusted. Probe ONLY when a
                 // path with AXValue-only verification would otherwise confirm, so
                 // native types and already-unverified deliveries pay nothing.
-                let target_is_web_content = verified
-                    && path_has_untrusted_web_readback(path)
-                    && target_in_web_area(pid, element_ptr, window_id);
+                let web_area = (verified && path_has_untrusted_web_readback(path))
+                    .then(|| classify_target_web_area(pid, element_ptr, window_id));
+                let target_is_web_content = web_area.is_some_and(web_readback_is_untrusted);
                 let verification = surface_verification(path, verified, target_is_web_content);
                 let verified = verification.verified;
                 let untrusted_web_readback = verification.untrusted_web_readback;
@@ -459,20 +469,27 @@ impl Tool for TypeTextTool {
                 let (mark, note) = if verified {
                     ("✅ Inserted", String::new())
                 } else if untrusted_web_readback {
+                    let web = web_area == Some(WebAreaClassification::WebContent);
                     let next_step = if electron_web_content && used_pixel_focus {
                         "The pixel-focus rung already ran, so do not repeat it; verify the \
                          result via the screenshot."
-                    } else {
+                    } else if web {
                         "For a browser tab use the `page` tool (it drives the DOM); for an \
                          embedded web view, re-type with the px form (x,y)."
+                    } else {
+                        "Read the window to check the text before sending it again."
+                    };
+                    let surface = if web {
+                        "web-content surface (Chromium / WebKit / Electron): AXValue \
+                         read-back is not independent proof that the renderer/DOM observed \
+                         the input."
+                    } else {
+                        "the window's focused element could not be read, so the AXValue \
+                         read-back cannot be tied to the target window."
                     };
                     (
                         "📨 Sent (unverified)",
-                        format!(
-                            " — web-content surface (Chromium / WebKit / Electron): \
-                             AXValue read-back is not independent proof that the \
-                             renderer/DOM observed the input. {next_step}"
-                        ),
+                        format!(" — {surface} {next_step}"),
                     )
                 } else if path == PATH_KEY_EVENTS_FG {
                     (

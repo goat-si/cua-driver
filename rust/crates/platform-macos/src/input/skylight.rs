@@ -180,16 +180,51 @@ impl Drop for WindowKeyScope {
         ) else {
             return;
         };
-        match self.primed {
-            KeyPrime::AlreadyKey => {}
-            KeyPrime::KeyRecords => {
-                post_window_key_records(self.pid, Some(self.target), previous);
+        let (pid, target, primed) = (self.pid, self.target, self.primed);
+        // The records' settle pauses (240 ms) are not part of the action:
+        // hand key back on a thread. The next `enter_exact_window_key` waits
+        // for it, so two scopes never interleave their records.
+        let restore = move || {
+            match primed {
+                KeyPrime::AlreadyKey => {}
+                KeyPrime::KeyRecords => {
+                    post_window_key_records(pid, Some(target), previous);
+                }
+                KeyPrime::AxFocusedWindow => {
+                    set_app_focused_window(pid, previous);
+                }
             }
-            KeyPrime::AxFocusedWindow => {
-                set_app_focused_window(self.pid, previous);
-            }
+            key_restore_done();
+        };
+        *KEY_RESTORES.0.lock().unwrap_or_else(|e| e.into_inner()) += 1;
+        if let Err(error) = std::thread::Builder::new()
+            .name("cua-key-restore".into())
+            .spawn(restore)
+        {
+            tracing::warn!("key restore thread failed to start: {error}");
+            key_restore_done();
         }
     }
+}
+
+/// Hand-backs of [`WindowKeyScope`]s still running. Entering a new scope
+/// waits for none to be left, so it never reads or moves key focus
+/// mid-restore.
+static KEY_RESTORES: (std::sync::Mutex<usize>, std::sync::Condvar) =
+    (std::sync::Mutex::new(0), std::sync::Condvar::new());
+
+fn key_restore_done() {
+    let mut pending = KEY_RESTORES.0.lock().unwrap_or_else(|e| e.into_inner());
+    *pending = pending.saturating_sub(1);
+    KEY_RESTORES.1.notify_all();
+}
+
+/// Wait (at most 2 s) until no key hand-back is running.
+fn await_key_restores() {
+    let pending = KEY_RESTORES.0.lock().unwrap_or_else(|e| e.into_inner());
+    let _ = KEY_RESTORES
+        .1
+        .wait_timeout_while(pending, std::time::Duration::from_secs(2), |n| *n > 0);
 }
 
 fn set_app_focused_window(pid: pid_t, wid: u32) -> bool {
@@ -281,11 +316,13 @@ pub fn post_window_key_records(pid: pid_t, current: Option<u32>, target: u32) ->
 /// The make-key records are handled on the app's main thread, so the change
 /// trails the post; a never-active LibreOffice shows it last, when a focused
 /// element appears. The caller re-reads and decides.
+///
+/// Polled from the start: a read that still shows the old focus keeps the
+/// wait going, so no fixed settle is needed before the first read.
 fn await_key_focus(pid: pid_t, target: u32, budget: std::time::Duration) {
-    std::thread::sleep(KEY_RECORD_SETTLE);
-    let deadline = std::time::Instant::now() + budget;
+    let deadline = std::time::Instant::now() + KEY_RECORD_SETTLE + budget;
     while !key_focus_of_pid(pid).settled_on(target) && std::time::Instant::now() < deadline {
-        std::thread::sleep(std::time::Duration::from_millis(40));
+        std::thread::sleep(std::time::Duration::from_millis(10));
     }
 }
 
@@ -293,6 +330,8 @@ fn await_key_focus(pid: pid_t, target: u32, budget: std::time::Duration) {
 /// pointer), confirmed by re-reading the app's focus, and return a guard that
 /// hands key back. `Err` when it cannot be confirmed.
 pub fn enter_exact_window_key(pid: pid_t, target_wid: u32) -> Result<WindowKeyScope, String> {
+    // Wait for the previous scope's hand-back to finish.
+    await_key_restores();
     let before = key_focus_of_pid(pid);
     let previous = before.window;
     let order_before = app_window_order(pid);
