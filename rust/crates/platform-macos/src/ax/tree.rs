@@ -400,7 +400,18 @@ fn walk_tree_with_web_content(
                 let walk = top_level.clone();
                 break (top_level, walk);
             };
-            let decision = scope_top_level(&top_level, pid, wid);
+            let mut decision = scope_top_level(&top_level, pid, wid);
+            // A save sheet has a CGWindowID of its own but lives under its
+            // document's AXWindow, so no top-level child claims it. Its
+            // controls belong to that window: point there, walk nothing.
+            if matches!(decision.scope, WindowScope::AxUnresolved { .. }) {
+                if let Some(parent_window_id) = window_holding_sheet(&top_level, wid) {
+                    decision = ScopeDecision {
+                        scope: WindowScope::SheetOfWindow { parent_window_id },
+                        walk: Vec::new(),
+                    };
+                }
+            }
             if matches!(decision.scope, WindowScope::AxUnresolved { .. }) {
                 match launch_wait.step(attempt_started, Instant::now(), || is_still_launching(pid))
                 {
@@ -581,6 +592,29 @@ unsafe fn scope_top_level(top_level: &[AXUIElementRef], pid: i32, wid: u32) -> S
     decide_window_scope(&candidates, wid, || {
         crate::windows::resolve_window_owner(pid, wid)
     })
+}
+
+/// The CGWindowID of the app window holding an `AXSheet` whose own
+/// CGWindowID is `wid`.
+unsafe fn window_holding_sheet(top_level: &[AXUIElementRef], wid: u32) -> Option<u32> {
+    for &window in top_level {
+        if copy_string_attr(window, "AXRole").as_deref() != Some("AXWindow") {
+            continue;
+        }
+        let children = copy_children(window);
+        let holds = children.iter().any(|&child| {
+            set_messaging_timeout(child);
+            copy_string_attr(child, "AXRole").as_deref() == Some("AXSheet")
+                && ax_get_window_id(child) == Some(wid)
+        });
+        release_all(children);
+        if holds {
+            if let Some(parent) = ax_get_window_id(window).filter(|&parent| parent != wid) {
+                return Some(parent);
+            }
+        }
+    }
+    None
 }
 
 /// Release elements retained by [`copy_top_level`].

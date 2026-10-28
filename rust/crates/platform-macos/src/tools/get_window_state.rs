@@ -840,6 +840,20 @@ impl Tool for GetWindowStateTool {
                                app settles, or act with delivery_mode:\"foreground\"."
                 });
             }
+            Degradation::SheetOfWindow { parent_window_id } => {
+                structured["degraded"] = serde_json::json!(true);
+                structured["degraded_reason"] = serde_json::json!(format!(
+                    "window_is_sheet: window_id {window_id} is a sheet (such as a Save \
+                     sheet) attached to window {parent_window_id}. Its controls belong to \
+                     that window: read window {parent_window_id}, whose tree includes the \
+                     sheet, and act on the sheet's rows with window_id {parent_window_id}."
+                ));
+                structured["sheet_of_window_id"] = serde_json::json!(parent_window_id);
+                structured["next_call"] = serde_json::json!({
+                    "tool": "get_window_state",
+                    "arguments": {"pid": pid, "window_id": parent_window_id},
+                });
+            }
         }
         // Additive read-only `background_input` capability section (macOS
         // background input v1): the same fresh facts that gate every
@@ -1016,7 +1030,9 @@ fn window_scope_refusal(
     use crate::ax::WindowScope;
     match scope {
         // Resolved, or resolvable-as-degraded — the caller gets a response.
-        WindowScope::Matched | WindowScope::AxUnresolved { .. } => None,
+        WindowScope::Matched
+        | WindowScope::AxUnresolved { .. }
+        | WindowScope::SheetOfWindow { .. } => None,
         WindowScope::NotFound => Some(
             ToolResult::error(format!(
                 "window_id {window_id} is not a live window (closed, or the id is stale). \
@@ -1076,6 +1092,9 @@ enum Degradation {
     /// lock). macOS then reports no AXWindows for any app, so an empty or
     /// unresolved tree has this cause rather than the app's own state.
     ScreenLocked,
+    /// The requested window is a sheet attached to `parent_window_id`; its
+    /// controls are read and acted on through that window.
+    SheetOfWindow { parent_window_id: u32 },
 }
 
 /// Name the locked screen as the cause of an empty or unresolved tree.
@@ -1107,6 +1126,11 @@ fn degradation_for(
         }
         return Degradation::AxWindowUnresolved {
             ax_window_count: *ax_window_count,
+        };
+    }
+    if let Some(crate::ax::WindowScope::SheetOfWindow { parent_window_id }) = scope {
+        return Degradation::SheetOfWindow {
+            parent_window_id: *parent_window_id,
         };
     }
     if element_count == 0 {
@@ -1351,6 +1375,23 @@ mod window_scope_contract_tests {
                 false
             ),
             Degradation::AxWindowUnresolved { ax_window_count: 3 }
+        );
+    }
+
+    /// DSH-29: a Save sheet read by its own window id points at the document
+    /// window holding it instead of reading as an unresolved empty window.
+    #[test]
+    fn a_sheet_read_by_its_own_id_points_at_its_window() {
+        let scope = WindowScope::SheetOfWindow {
+            parent_window_id: 11,
+        };
+        assert!(window_scope_refusal(800, 22, &scope).is_none());
+        assert!(!scope.is_matched());
+        assert_eq!(
+            degradation_for(true, 0, Some(&scope), false),
+            Degradation::SheetOfWindow {
+                parent_window_id: 11
+            }
         );
     }
 

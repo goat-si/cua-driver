@@ -31,6 +31,13 @@ pub enum WindowScope {
     /// AX surface is not, so callers report a degraded (empty-tree) snapshot
     /// rather than an error.
     AxUnresolved { ax_window_count: usize },
+    /// The CGWindowID is a sheet's own window (a document's Save sheet): the
+    /// `AXSheet` sits under the AXWindow `parent_window_id`, and its controls
+    /// are read and acted on through that window, whose snapshot includes the
+    /// sheet (an element under a sheet belongs to the sheet's parent window,
+    /// see `exact_target::element_window_id`). Nothing is walked here; the
+    /// caller points at the parent window instead.
+    SheetOfWindow { parent_window_id: u32 },
 }
 
 impl WindowScope {
