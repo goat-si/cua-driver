@@ -617,11 +617,11 @@ mod tests {
     }
 
     /// The foreground idle gate reads `GetLastInputInfo`, which also counts
-    /// `SendInput`. A foreground action right after the driver's own
-    /// injection used to be refused as if the person were typing.
+    /// `SendInput`. The gate sets the driver's own input aside by its
+    /// recorded span, so the OS must stamp a real injection inside it.
     #[cfg(target_os = "windows")]
     #[test]
-    fn the_drivers_own_injection_does_not_trip_the_foreground_idle_gate() {
+    fn the_drivers_injection_is_stamped_inside_its_recorded_span() {
         let _serial = IDLE_GATE_TESTS
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -657,26 +657,19 @@ mod tests {
             );
             return;
         }
-        // The idle time may not be shorter than the time since the input
-        // before the driver's injection: the injection is not the person's.
-        // Measure that bound first: the idle time is read later, so it can
-        // only be longer when the tracking is right.
-        let since_before = before.map(|tick| {
-            let now = unsafe { windows::Win32::System::SystemInformation::GetTickCount() };
-            cua_driver_core::delivery::elapsed_idle_ms_from_ticks(now, tick)
-        });
-        let idle = physical_input_idle_ms();
-        if last_input() != after {
-            eprintln!("skipped: other input arrived during the check");
-            return;
-        }
-        if let (Some(idle), Some(since_before)) = (idle, since_before) {
-            assert!(
-                idle >= since_before,
-                "the driver's own injection must not count as physical input \
-                 (idle {idle} ms, last earlier input {since_before} ms ago)"
-            );
-        }
+        // The OS must stamp the driver's injection inside the span the
+        // wrapper recorded; the tracker's decisions on top of that are
+        // covered with a controlled clock in cua-driver-core.
+        let now = unsafe { windows::Win32::System::SystemInformation::GetTickCount() };
+        let tracker = *OWN_INPUT
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let after = after.expect("checked above");
+        assert!(
+            tracker.is_own_input(now, after),
+            "the driver's injection, stamped at tick {after}, must fall inside \
+             its recorded span ({tracker:?}, now {now})"
+        );
     }
 
     /// The idle-gate tests share the process-wide injection record and the
