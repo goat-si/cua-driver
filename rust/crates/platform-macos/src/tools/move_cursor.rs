@@ -25,16 +25,14 @@ static DEF: std::sync::OnceLock<ToolDef> = std::sync::OnceLock::new();
 fn def() -> &'static ToolDef {
     DEF.get_or_init(|| ToolDef {
         name: "move_cursor".into(),
-        description: "Move a cursor to (x, y). With target {kind: \"window\", pid, window_id}, \
-            x/y are window screenshot pixels (as for click) and only the agent cursor moves \
-            there; in a background app it also hovers through a route that leaves the real \
-            pointer alone where one exists (AXShowAlternateUI on the element under the point, \
-            or an Electron page) and says so. Without a target, moves only the agent cursor \
-            overlay, in screen points. Other macOS hover and tooltips follow the real pointer, \
-            so most background apps see no hover; for a web page in Chrome, Edge or Brave use \
-            browser_pointer hover instead. With scope=desktop, moves the user's real OS pointer \
-            in native get_desktop_state screenshot coordinates; over a window of an app that is \
-            not in front it refuses unless delivery_mode is \"foreground\".".into(),
+        description: "Move a cursor to (x, y). With target {kind: \"window\", pid, window_id}, x/y are window \
+            screenshot pixels and only the agent cursor moves; in a background app it also hovers where a \
+            route leaves the real pointer alone (AXShowAlternateUI on the element under the point, or an \
+            Electron page) and says so. Other macOS hover follows the real pointer: for a web page in \
+            Chrome, Edge or Brave use browser_pointer hover. Without a target, only the agent cursor overlay \
+            moves, in screen points. With scope=desktop, the user's real pointer moves, in get_desktop_state \
+            screenshot coordinates; over a window of an app that is not in front it refuses unless \
+            delivery_mode is \"foreground\".".into(),
         input_schema: serde_json::json!({
             "type": "object",
             "required": ["x", "y"],

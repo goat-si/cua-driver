@@ -14,32 +14,17 @@ fn def() -> &'static ToolDef {
     DEF.get_or_init(|| ToolDef {
         name: "launch_app".into(),
         description:
-            "Launch a macOS app in the background — the target does NOT come to the foreground.\n\n\
-             Provide either `bundle_id` (preferred — unambiguous, e.g. `com.apple.calculator`) \
-             or `name` (e.g. \"Calculator\", or the absolute `.app` path from `list_apps` \
-             `launch_path`). If both are given, bundle_id wins.\n\n\
-             Optional `urls` are handed to the app as open targets — for Finder, pass a folder \
-             path to open a backgrounded Finder window there.\n\n\
-             Browser DevTools setup belongs to `browser_prepare`, which can prove that a \
-             separate isolated profile is driver-owned before enabling CDP.\n\n\
-             Optional `webkit_inspector_port`: opens a WebKit inspector server on the specified \
-             port (sets WEBKIT_INSPECTOR_SERVER=127.0.0.1:N + TAURI_WEBVIEW_AUTOMATION=1). \
-             Use this for Tauri/WebKit-based apps.\n\n\
-             Optional `creates_new_application_instance`: when true, forces a new app instance \
-             even if one is already running (passes -n to open). Reach for this when another \
-             agent or session may drive the SAME app concurrently — it returns a fresh pid + \
-             window so each session acts on its own isolated window instead of clobbering one \
-             shared instance. Without it, single-instance apps (Calculator, many utilities) hand \
-             every caller the same window, so two sessions fight over it.\n\n\
-             Optional `additional_arguments`: extra argv strings appended after --args.\n\n\
-             Returns the launched app's pid, bundle_id, name, and a `windows` array \
-             (same shape as `list_windows`) so callers can skip an extra round-trip before \
-             `get_window_state(pid, window_id)`. `launch_state` distinguishes whether the \
-             request was sent, the process is running, and a window is ready. When the \
-             focus-steal belt-and-braces \
-             demotion check ran (target pid ≠ prior frontmost), the response also includes \
-             `self_activation_suppressed: bool` — true if focus stayed with the prior \
-             frontmost, false if the launched app held focus despite the re-demote attempt."
+            "Launch a macOS app in the background; it does not come to the foreground. Give `bundle_id` \
+                (preferred, e.g. `com.apple.calculator`) or `name` (\"Calculator\", or the absolute `.app` path \
+                from `list_apps` `launch_path`); bundle_id wins. `urls` are opened by the app (a folder path \
+                opens a backgrounded Finder window there). `webkit_inspector_port` opens a WebKit inspector \
+                server for Tauri/WebKit apps. `creates_new_application_instance:true` forces a new instance \
+                (open -n), so concurrent sessions each get their own window. `additional_arguments` go after \
+                --args. Browser DevTools setup belongs to `browser_prepare`.\n\
+                \n\
+                Returns pid, bundle_id, name, a `windows` array (as `list_windows`) and `launch_state` (request \
+                sent, process running, window ready). When the launched app was not already frontmost, \
+                `self_activation_suppressed` says whether focus stayed with the previous app."
             .into(),
         input_schema: serde_json::json!({
             "type": "object",

@@ -160,51 +160,44 @@ impl Tool for RunScriptTool {
     fn def(&self) -> &ToolDef {
         DEF.get_or_init(|| ToolDef {
             name: RUN_SCRIPT_TOOL.into(),
-            description: "Run a JavaScript program that drives apps through Cua Driver, in ONE \
-                call: loops, conditions, reads and checks between actions, and only the result \
-                comes back. Use it when the flow needs logic (a loop over rows, a branch on what \
-                the app shows, a retry); use run_steps for a fixed list of steps.\n\n\
-                The script is the body of an async function: use `await`, and `return` a JSON \
-                value. It runs in a sandbox with no filesystem, network, process, timers or \
+            description: "Run a JavaScript program against Cua Driver in one call: loops, branches, retries and reads \
+                between actions; only its result comes back. The script is the body of an async function: \
+                `await`, and `return` a JSON value. Sandbox: no filesystem, network, process, timers or \
                 environment; the only API is `cua`:\n\
-                - `await cua.getApp(\"TextEdit\" | \"com.apple.TextEdit\" | {pid, windowId})` → \
-                app (follows the app's frontmost window unless a windowId is given)\n\
-                - `await cua.launch(nameOrBundleId)` → app; `cua.listApps()`, \
-                `cua.listWindows({pid?})`, `cua.sleep(ms)`, `cua.computer.target`\n\
-                - app.getState(opts?) → get_window_state result (`tree_markdown` or \
-                `tree_diff`, `snapshot_id`; pass get_window_state options such as \
-                {since:\"latest\"})\n\
-                - app.query({role?, name?, text?}) → matching elements across the app's \
-                windows {element_token, role, label, value, enabled, selected, frame}, then \
-                matching static-text rows {role, label, value, text, display_only} (read text \
-                such as a status line from their `value`)\n\
-                - app.waitFor({role?, name?, text?, gone?, value?, timeout_ms?}) and \
-                app.verify(predicate | predicates) (verify_state)\n\
-                - app.click(t), doubleClick(t), rightClick(t), typeText(text, t?), \
-                pressKey(\"return\" | \"cmd+s\", t?), hotkey([\"cmd\",\"s\"]), scroll(t, \
-                direction, amount?), setValue(t, value), drag([x,y], [x,y]), zoom([x1,y1,x2,y2])\n\
-                where a target `t` is {role, name, nth?} (found fresh, waits up to 3 s), an \
-                element returned by app.query(), an element_token string, a row number from \
-                this app's last getState(), or [x, y] window pixels.\n\
-                - `cua.call(tool, args)` for any other allowed tool: click, double_click, \
-                right_click, set_value, type_text, press_key, hotkey, scroll, drag, \
-                launch_app, list_apps, list_windows, get_window_state, verify_state, zoom.\n\
-                A failed driver call throws a CuaError (catch it to recover). Every call goes \
-                through the same session, permission and approval checks as a direct call. \
-                With `app_scope` ({apps, delivery?}) the driver also refuses every call outside \
-                those apps' windows (error.code outside_scope) or needing the foreground \
-                (foreground_not_allowed); nothing is sent for it.\n\n\
-                `verify:\"checkpoint\"` makes actions return as soon as their input is \
-                delivered (no per-action window-change wait); check with app.waitFor / \
-                app.verify / getState where it matters.\n\n\
-                Limits: `timeout_ms` wall time (default 30000, max 120000), `max_calls` driver \
-                calls (default 100, max 500), 32 MiB heap. Returns the return value, console \
-                output, and a per-call log (each call's tool, target pid/window_id, and the \
-                effect and code the driver returned); an error names the script line, the call \
-                and the reason.\n\n\
+                - `await cua.getApp(\"TextEdit\" | \"com.apple.TextEdit\" | {pid, windowId})` → app (follows the \
+                app's frontmost window unless a windowId is given)\n\
+                - `await cua.launch(nameOrBundleId)` → app; `cua.listApps()`, `cua.listWindows({pid?})`, \
+                `cua.sleep(ms)`, `cua.computer.target`\n\
+                - app.getState(opts?) → get_window_state result (`tree_markdown` or `tree_diff`, `snapshot_id`; \
+                takes get_window_state options such as {since:\"latest\"})\n\
+                - app.query({role?, name?, text?}) → matching elements across the app's windows {element_token, \
+                role, label, value, enabled, selected, frame}, then matching static-text rows {role, label, \
+                value, text, display_only}\n\
+                - app.waitFor({role?, name?, text?, gone?, value?, timeout_ms?}) and app.verify(predicate | \
+                predicates) (verify_state)\n\
+                - app.click(t), doubleClick(t), rightClick(t), typeText(text, t?), pressKey(\"return\" | \
+                \"cmd+s\", t?), hotkey([\"cmd\",\"s\"]), scroll(t, direction, amount?), setValue(t, value), \
+                drag([x,y], [x,y]), zoom([x1,y1,x2,y2])\n\
+                where a target `t` is {role, name, nth?} (found fresh, waits up to 3 s), an element from \
+                app.query(), an element_token string, a row number from this app's last getState(), or [x, y] \
+                window pixels.\n\
+                - `cua.call(tool, args)` for any other allowed tool: click, double_click, right_click, \
+                set_value, type_text, press_key, hotkey, scroll, drag, launch_app, list_apps, list_windows, \
+                get_window_state, verify_state, zoom.\n\
+                A failed driver call throws a CuaError. Every call passes the same session, permission and \
+                approval checks as a direct call; with `app_scope`, a call outside those apps' windows fails \
+                with error.code outside_scope and one needing the foreground with foreground_not_allowed, and \
+                nothing is sent for it. `verify:\"checkpoint\"`: actions return once their input is delivered; \
+                check with app.waitFor / app.verify / getState.\n\
+                \n\
+                Limits: `timeout_ms` (default 30000, max 120000), `max_calls` (default 100, max 500), 32 MiB \
+                heap. Returns the value, console output and a per-call log (tool, pid/window_id, effect, code); \
+                an error names the script line, the call and the reason.\n\
+                \n\
                 Example:\n\
                 const app = await cua.getApp(\"Calculator\");\n\
-                for (const key of [\"7\", \"multiply\", \"6\", \"equals\"]) await app.click({role: \"button\", name: key});\n\
+                for (const key of [\"7\", \"multiply\", \"6\", \"equals\"]) await app.click({role: \"button\", \
+                name: key});\n\
                 const [display] = await app.query({role: \"statictext\"});\n\
                 return display.value;"
                 .into(),

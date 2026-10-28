@@ -12,33 +12,14 @@ static DEF: std::sync::OnceLock<ToolDef> = std::sync::OnceLock::new();
 fn def() -> &'static ToolDef {
     DEF.get_or_init(|| ToolDef {
         name: "list_apps".into(),
-        description: "List macOS apps — both currently running and installed-but-not-running — \
-            with per-app state flags:\n\n\
-            - running: is a process for this app live? (pid is 0 when false)\n\
-            - active: is it the system-frontmost app? (implies running)\n\
-            - launch_path: filesystem path to the `.app` bundle, when known. \
-            Pass this as `name` to `launch_app` to start the app cold.\n\
-            - kind: `\"desktop\"` for `.app` bundles on macOS.\n\
-            - last_used: RFC3339 timestamp from the bundle's filesystem mtime, \
-            when readable.\n\n\
-            Optional fields (bundle_id, launch_path, kind, last_used) are \
-            omitted when unknown, never null.\n\n\
-            Standalone running entries include only apps with \
-            NSApplicationActivationPolicyRegular — background helpers and \
-            system UI agents are filtered out. Installed apps resolve their \
-            running/pid state against all live processes by bundle identifier, \
-            so an installed app whose process runs as an accessory \
-            (LSUIElement / menu-bar apps, e.g. Cua Driver itself) still reports \
-            its live pid. Installed apps come from scanning /Applications, \
-            /Applications/Utilities, ~/Applications, /System/Applications, and \
-            /System/Applications/Utilities.\n\n\
-            Use this for \"is X installed?\" as well as \"is X running?\"; \
-            the list includes every installed app. To get an open app's pid \
-            and window_id, call list_windows({app: \"Name\"}) instead, which \
-            also gives per-window state (on-screen, on-current-Space, \
-            minimized, window titles). For just opening an \
-            app — running or not — call launch_app({bundle_id: ...}) directly; \
-            list_apps is not a prerequisite."
+        description: "List macOS apps, running and installed, with: `running` (pid is 0 when false), `active` \
+            (system-frontmost), `launch_path` (the `.app` path; pass it as `name` to `launch_app`), `kind` \
+            (`\"desktop\"`) and `last_used` (RFC3339, from the bundle's mtime). Unknown optional fields are \
+            omitted, never null. Running entries are regular-policy apps; installed apps (from \
+            /Applications, /Applications/Utilities, ~/Applications, /System/Applications and \
+            /System/Applications/Utilities) report a live pid even when the process runs as an accessory. \
+            For an open app's pid and window_id use `list_windows`; to open an app call `launch_app` \
+            directly."
             .into(),
         input_schema: serde_json::json!({
             "type": "object",

@@ -31,18 +31,13 @@ const VERIFY_STABLE: Duration = Duration::from_millis(100);
 fn def() -> &'static ToolDef {
     DEF.get_or_init(|| ToolDef {
         name: "bring_to_front".into(),
-        description: "Persistently activate an app and leave it in the foreground. Most input \
-             does not need this; use it only for a focus-proxy surface that must remain \
-             foreground across interactions. With window_id, success means the exact ordinary \
-             macOS window was independently verified as the frontmost process's focused window \
-             and the front window of that process on the display it sits on. \
-             `exact_window_effect.frontmost_ordinary` additionally reports whether it is first \
-             in the global WindowServer layer-0 order; another application (an always-raised \
-             utility window, another display's front window) can hold that spot without the \
-             requested window losing keyboard focus, so it is reported and not required. \
-             Request acceptance alone is reported as a partial \
-             result, never as activation. This DOES steal foreground and does NOT restore the \
-             previously frontmost application."
+        description: "Activate an app and leave it in the foreground. This steals focus and does NOT restore the \
+            previous app; most input does not need it (use it for a focus-proxy surface that must stay in \
+            front). With window_id, success means that ordinary window was verified as the frontmost \
+            process's focused window and that process's front window on its display; \
+            `exact_window_effect.frontmost_ordinary` also reports whether it is first in the global \
+            WindowServer layer-0 order (another app's always-raised window can hold that spot, so it is not \
+            required). A request that was only accepted is a partial result, never activation."
             .into(),
         input_schema: json!({
             "type": "object",

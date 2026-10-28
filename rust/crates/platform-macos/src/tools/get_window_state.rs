@@ -32,15 +32,35 @@ const AX_WALK_BACKSTOP_GRACE: std::time::Duration = std::time::Duration::from_se
 fn def() -> &'static ToolDef {
     DEF.get_or_init(|| ToolDef {
         name: "get_window_state".into(),
-        description: "Snapshot a window: the accessibility tree plus a screenshot. By default the tree is ONE compact Markdown rendering (`tree_format:\"markdown\"`): a row `[N]` is addressed with `element_token` `<snapshot_id>:N`, where `snapshot_id` is in the response header and in structuredContent. `tree_format:\"elements\"` returns the structured `elements` array instead (`element_index`, `element_token`, `role`, `label`, `value`, `actions`, `frame`, `parent_index`, `depth`); `\"both\"` returns both (about twice the size). Pass the token to click, type_text, press_key, etc.\n\
+        description: "Snapshot a window: the accessibility tree plus a screenshot. The tree is one compact Markdown \
+            rendering by default (`tree_format:\"markdown\"`): row `[N]` is `element_token` \
+            `<snapshot_id>:N`, with `snapshot_id` in the header and structuredContent; \
+            `tree_format:\"elements\"` returns the structured `elements` array instead, `\"both\"` both. A \
+            read walks at most 250 nodes by default and says `truncated:true` when cut; raise \
+            `max_elements`, or narrow with `query` and `max_depth`. Long lists and tables are read last, \
+            on-screen rows first; skipped off-screen rows show as one \"(offscreen rows: N ...)\" line \
+            unless `query` is set. `verbose:true` adds `_note` and the full `background_input` report; \
+            `full_output:true` restores the full response (both forms, all metadata, ≤2 000 nodes).\n\
             \n\
-            START NARROW: a read walks at most 250 nodes by default and says `Tree truncated at max_elements=…` (`truncated:true`) when it stops; raise `max_elements`, or use `query` (case-insensitive substring; matching rows plus ancestors) and `max_depth`. Long lists and tables are read after the rest of the window, on-screen rows first; skipped off-screen rows appear as one \"(offscreen rows: N ...)\" line unless query is set. Indices and tokens stay valid for the whole snapshot. `verbose:true` adds `_note` and the full `background_input` report; `full_output:true` restores the previous full response (both representations, all metadata, ≤2 000 nodes).\n\
+            `since:\"latest\"`, or an earlier snapshot_id of this window, returns only what changed: `+` \
+            added, `~` changed, `-` removed rows, a `reindexed:` line, or `no change since …`; use the NEW \
+            snapshot_id in tokens. A `since` that is unknown, expired, for another window or a different \
+            query/max_elements/max_depth falls back to a full read; `since_status` says why.\n\
             \n\
-            DIFF READS (use them for every re-read after acting): `since:\"latest\"`, or `since:<snapshot_id>` from an earlier read of the same window, returns only what changed: `+` added, `~` changed, `-` removed rows (removed ids are the old snapshot's), a `reindexed:` line if indices shifted, or `no change since …; focused element is …`. The response carries a NEW snapshot_id: use it in tokens. An unknown, expired, other-window or differently-scoped (query/max_elements/max_depth) `since` falls back to a full read; `since_status` says why.\n\
+            A new snapshot of the same (pid, window_id) stales the previous tokens \
+            (`invalidated_snapshot_ids`). `include_screenshot:false` returns the tree only and keeps the \
+            last screenshot's pixel frame while the window keeps its size; \
+            `include_accessibility_tree:false` returns only the screenshot and keeps the current rows and \
+            tokens valid (both false is an error); adding `display_only:true` also leaves the pixel frame \
+            alone. On Electron, Catalyst or virtualized rows with `h:1` frames the tree can be wrong: check \
+            the screenshot.\n\
             \n\
-            A new snapshot of the same (pid, window_id) replaces the previous one and stales its tokens (`invalidated_snapshot_ids`). `include_screenshot:false` returns the tree only and keeps the last screenshot's pixel frame while the window keeps its size; `include_accessibility_tree:false` returns only the screenshot and keeps the current snapshot's rows and tokens valid (use it, not `max_elements:1`, when you just need to look); adding `display_only:true` (live previews) also leaves the pixel frame alone. The tree can lie on some surfaces (Electron, Catalyst, virtualized rows with `h:1` frames): cross-check the screenshot, and use pixel x,y at action time only for elements missing from the tree.\n\
-            \n\
-            Refusals: `window_id_not_found`; `window_owner_pid_mismatch` names the real `owner_pid` (sandboxed Open/Save panels belong to a panel service). `degraded_reason` `ax_window_unresolved` or `ax_app_launching` (the latter with `truncation_reason: app_lookup_timeout`) means an empty tree: re-snapshot, or act with `delivery_mode:\"foreground\"`. `degraded_reason` `screen_locked` means the screen saver, display sleep or a lock hid every window from accessibility: wake and unlock the Mac, then re-snapshot; foreground input would reach the lock screen. `px_frame_mismatch` / `px_capture_unavailable` omit the unprovable screenshot; the AX payload stays valid.".into(),
+            Refusals: `window_id_not_found`; `window_owner_pid_mismatch` names the real `owner_pid` \
+            (sandboxed Open/Save panels belong to a panel service). `degraded_reason` \
+            `ax_window_unresolved`, or `ax_app_launching` with `truncation_reason: app_lookup_timeout`: an \
+            empty tree; re-snapshot, or act with `delivery_mode:\"foreground\"`. `screen_locked`: the screen \
+            saver, display sleep or lock hid every window; foreground input would reach the lock screen. \
+            `px_frame_mismatch` / `px_capture_unavailable`: the screenshot is omitted, the tree stays valid.".into(),
         input_schema: cua_driver_core::window_state_view::extend_input_schema(serde_json::json!({
             "type": "object",
             "required": ["pid", "window_id"],

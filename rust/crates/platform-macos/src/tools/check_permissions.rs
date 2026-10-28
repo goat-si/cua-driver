@@ -310,26 +310,18 @@ fn def() -> &'static ToolDef {
     DEF.get_or_init(|| ToolDef {
         // Matches Swift `CheckPermissionsTool.swift` description verbatim.
         name: "check_permissions".into(),
-        description: "Report TCC permission status for Accessibility and Screen Recording. \
-            By default also raises the system permission dialogs for any missing grants — \
-            Apple's request APIs are no-ops when the grant is already active, so this is \
-            safe to call repeatedly. Pass {\"prompt\": false} for a purely read-only \
-            status check.\n\n\
-            Returns: `accessibility` + `screen_recording` (booleans from the TCC \
-            preflight APIs), `screen_recording_capturable` (a live ScreenCaptureKit \
-            probe when `prompt` is true; null on read-only calls), \
-            `direct_capture_status` (`ready`, `unavailable`, `timed_out`, `probe_failed`, \
-            `blocked_by_screen_recording`, or `not_checked`), `direct_capture_error` (a structured \
-            timeout/probe failure when applicable), `direct_capture_verification` (validated \
-            source, UTC time, and bundle identity from an explicit grant probe), and `source` \
-            (which TCC identity the \
-            booleans reflect: the CuaDriver daemon vs the launching terminal/IDE). \
-            macOS attributes grants to the responsible process, so a standalone call \
-            from a terminal reports the terminal's grants, not the driver's. The \
-            prompt-capable ScreenCaptureKit probe never runs when `prompt` is false. \
-            Pass `probe_direct_capture:false` with `prompt:true` to register/request only \
-            the two required TCC grants before separately explaining Tahoe's direct-capture \
-            consent.".into(),
+        description: "Report TCC status for Accessibility and Screen Recording, and by default raise the system \
+            dialogs for missing grants (a no-op for active ones); `{\"prompt\": false}` is a read-only \
+            check. Returns `accessibility` and `screen_recording` (TCC preflight booleans), \
+            `screen_recording_capturable` (a live ScreenCaptureKit probe when `prompt` is true; null \
+            otherwise), `direct_capture_status` (`ready`, `unavailable`, `timed_out`, `probe_failed`, \
+            `blocked_by_screen_recording` or `not_checked`), `direct_capture_error`, \
+            `direct_capture_verification` (source, UTC time and bundle identity from an explicit grant \
+            probe) and `source`: the TCC identity the booleans reflect, because macOS attributes grants to \
+            the responsible process (a call from a terminal reports the terminal's). \
+            `probe_direct_capture:false` with `prompt:true` requests only the two TCC grants. When a grant \
+            is off, ask the user; approve Cua Driver's own prompts only if the owner explicitly authorized \
+            it (MACOS.md).".into(),
         input_schema: serde_json::json!({
             "type": "object",
             "properties": {

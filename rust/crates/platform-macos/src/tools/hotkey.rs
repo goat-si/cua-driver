@@ -33,38 +33,21 @@ fn def() -> &'static ToolDef {
     DEF.get_or_init(|| ToolDef {
         name: "hotkey".into(),
         description:
-            "Press a key combination — e.g. `[\"cmd\", \"c\"]` for Copy, \
-             `[\"cmd\", \"shift\", \"4\"]` for screenshot selection. Follows the same \
-             `delivery_mode` ladder as click/type_text — it does NOT raise the \
-             window by default:\n\
-             • `background` (default): post the combo to the target pid WITHOUT \
-               fronting or raising it — uses the macOS 14+ auth-message envelope so \
-               Chromium/Electron accept it as trusted live input. With an AX target, \
-               focus that exact element first. No top-level focus steal. \
-               `window_id` here only targets the combo; it does not raise. Background \
-               key events never reach a native app's menus, so when the combo is a \
-               menu item's key equivalent (cmd+s, cmd+w, ...) and the app is not in \
-               front, that menu item runs through accessibility instead (a disabled \
-               Save is saved through the app's scripting interface and verified on \
-               disk); a menu item macOS keeps disabled in the background is refused \
-               with `background_unavailable`, and no keys are sent.\n\
-             • `foreground`: briefly front the window (NSMenu path, < 1 ms via \
-               SLPSSetFrontProcessWithOptions) so native menu key-equivalents \
-               (Cmd+Z, Cmd+W) dispatch, then restore the prior frontmost — the \
-               explicit escalation for menu-bar shortcuts on non-Chromium apps that \
-               ignore a background combo. With an AX target or x,y, the focused field \
-               receives the chord through the foreground HID queue (needed by native \
-               Chromium fields such as the omnibox). Requires window_id.\n\n\
-             A combo is never driver-verifiable (no read-back) → effect:\"unverifiable\"; \
-             confirm via screenshot. NOTE: a keyboard combo does NOT focus a text \
-             field — to type into a backgrounded Electron input, establish real \
-             renderer focus with a PIXEL click first, then `type_text`. If an app only \
-             accepts paste, call `clipboard_write`, then `clipboard_read` and verify its \
-             types (and text when applicable) before selecting or replacing editor content; \
-             only then send Cmd+V.\n\n\
-             Recognized modifiers: cmd/command, shift, option/alt, ctrl/control, fn. \
-             Non-modifier keys use the same vocabulary as `press_key`. Order: \
-             modifiers first, one non-modifier last."
+            "Press a key combination, e.g. `[\"cmd\", \"c\"]`: modifiers (cmd/command, shift, option/alt, \
+                ctrl/control, fn) first, then one non-modifier key from the `press_key` vocabulary. It does not \
+                raise the window.\n\
+                • `background` (default): posts the combo to the target pid as trusted input (Chromium/Electron \
+                accept it); with an AX target, that element is focused first. When the combo is a menu item's \
+                key equivalent (cmd+s, cmd+w, ...) and the app is not in front, the menu item runs through \
+                accessibility instead (a disabled Save is saved through the app's scripting interface and \
+                verified on disk); a menu item macOS keeps disabled in the background is refused with \
+                `background_unavailable` and no keys are sent.\n\
+                • `foreground`: briefly fronts the window so native menu key equivalents dispatch, then restores \
+                the prior frontmost app; with an AX target or x,y the focused field receives the chord (native \
+                Chromium fields such as the omnibox need this). Requires window_id.\n\
+                The result is `effect:\"unverifiable\"` (no read-back). A combo does not focus a text field: for \
+                a backgrounded Electron input, pixel-click it first. Paste: `clipboard_write`, then \
+                `clipboard_read` to check its types (and text) before sending cmd+v."
             .into(),
         input_schema: serde_json::json!({
             "type": "object",

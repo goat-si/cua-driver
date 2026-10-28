@@ -57,36 +57,23 @@ fn def() -> &'static ToolDef {
     DEF.get_or_init(|| ToolDef {
         name: "drag".into(),
         description:
-            "Press-drag-release gesture from (from_x, from_y) to (to_x, to_y) in \
-             window-local screenshot pixels — the same space get_window_state returns. \
-             Top-left origin of the target's window.\n\n\
-             Use for: marquee/lasso selection, drag-and-drop, resizing via a handle, \
-             scrubbing a slider, repositioning a panel.\n\n\
-             `duration_ms` (default 500) is the wall-clock budget for the path between \
-             mouse-down and mouse-up; `steps` (default 20) is the number of intermediate \
-             mouseDragged events linearly interpolated along the path. Increase both for \
-             slower, more human drags; decrease for snap gestures.\n\n\
-             `modifier` keys (cmd/shift/option/ctrl) are held across the entire gesture.\n\n\
-             When `from_zoom` is true, coordinates are in the last zoom image for this \
-             pid; the driver maps them back to window coordinates before dispatching.\n\n\
-             A window-scoped drag (pid + window_id) runs in the background by default: \
-             the gesture is posted to that window, the real pointer does not move, and the \
-             user's frontmost window keeps focus. It works for controls that follow the \
-             drag events: sliders, canvases, and pointer-event widgets on web pages in \
-             Chrome. In an Electron window the driver sends the gesture from the app's \
-             main process, so pointer-capture widgets and HTML5 drag and drop also drop \
-             there. Elsewhere, a drag that starts a macOS drag-and-drop session (reordering a list \
-             by drag and drop, moving a file, HTML5 draggable content) cannot drop in the \
-             background, because macOS tracks those with the real pointer; the driver \
-             detects it, releases at once and returns background_unavailable with reason \
-             drag_and_drop_session. For a page in a browser \
-             tab already bound with get_browser_state, browser_pointer action:\"drag\" \
-             drives the same gesture through CDP with page refs. The result is not \
-             driver-verified: confirm with a screenshot or the accessibility tree. If \
-             nothing changed, use a route that is not a drag first: a Move control or menu \
-             item by element_token, or the keyboard (a shortcut, cut and paste). Retry with \
-             delivery_mode:\"foreground\" last, only if the user allows it: it briefly \
-             fronts the window and moves the user's physical pointer."
+            "Press-drag-release from (from_x, from_y) to (to_x, to_y) in window-local screenshot pixels \
+                (top-left origin, the get_window_state space); with `from_zoom:true`, in the last zoom image for \
+                this pid. `duration_ms` (default 500) and `steps` (default 20 interpolated moves) set the speed; \
+                `modifier` keys (cmd/shift/option/ctrl) are held throughout.\n\
+                \n\
+                A window-scoped drag (pid + window_id) runs in the background by default: it is posted to that window, the \
+                real pointer does not move and the user's front window keeps focus. It works for controls that \
+                follow drag events (sliders, canvases, pointer-event widgets on Chrome pages); in an Electron \
+                window it is sent from the app's main process, so pointer-capture widgets and HTML5 drag and \
+                drop work too. Elsewhere a drag that starts a macOS drag-and-drop session (list reordering, \
+                moving a file, HTML5 draggable content) cannot drop in the background: the driver releases at \
+                once and returns background_unavailable with reason drag_and_drop_session. For a browser tab \
+                bound with get_browser_state, use browser_pointer action:\"drag\". The result is not \
+                driver-verified. If nothing changed, use a route that is not a drag first: a Move control or \
+                menu item by element_token, or the keyboard (a shortcut, cut and paste). Retry with \
+                delivery_mode:\"foreground\" last, only if the user allows it: it briefly fronts the window and \
+                moves the user's physical pointer."
             .into(),
         input_schema: serde_json::json!({
             "type": "object",

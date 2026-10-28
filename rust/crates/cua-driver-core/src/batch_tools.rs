@@ -158,71 +158,45 @@ impl Tool for RunStepsTool {
     fn def(&self) -> &ToolDef {
         DEF.get_or_init(|| ToolDef {
             name: RUN_STEPS_TOOL.into(),
-            description: "The default way to act: run one or more action tools in ONE call, in \
-                order, stop at the first failure, and (with `observe`) get what changed in the \
-                same response. Use it whenever you know the next action(s) and would otherwise \
-                re-read the window after them: fill three fields, click, and see the result in \
-                one call instead of five. Even a single step plus `observe:{}` replaces an \
-                action call followed by a get_window_state call. \
-                Each step is `{tool, args}` where `tool` is one of click, double_click, \
-                right_click, set_value, type_text, press_key, hotkey, scroll, drag, move_cursor \
-                and `args` are exactly that tool's arguments. `pid` and `window_id` (or `app`/\
-                `window`) on run_steps itself are the default window of every step that names \
-                none. Reads (get_window_state, zoom) do not run between steps: one there is \
-                skipped; a get_window_state last is the `observe`, a zoom last runs after it. \
-                Every step goes through the same session, permission and approval checks as a \
-                direct call; a batch grants nothing extra. With `app_scope` ({apps, delivery?}) the \
-                driver also refuses, per call, anything outside those apps' windows \
-                (code outside_scope) or needing the foreground (code foreground_not_allowed); \
-                a refused step sends nothing and has effect \"refused\". \
-                All steps are validated before the first one runs, so a malformed step 4 \
-                changes nothing. Element tokens and element_index values come from a \
-                get_window_state read before the batch; a step that changes the UI can \
-                invalidate later element targets, so put element-targeted actions before the \
-                actions that reshuffle the window, or target later steps by role/name. A token \
-                that went stale is retried once on the element with the same role and label, if \
-                exactly one matches.\n\n\
-                Returns per-step status (`ok` or the error message) and, when `observe` is \
-                given, ONE bounded get_window_state read after the last executed step (after a \
-                failure caused by a dialog holding focus, that dialog is read, even without \
-                `observe`). A step refused because its app ignores background input says \
-                how to re-send it; `foreground_fallback:true` retries such steps in the \
-                foreground once (the window is activated). That \
-                read is a `since:\"latest\"` diff by default: only the rows that changed \
-                since your last read of the window, plus a new snapshot_id. Without \
-                `observe` nothing is read. The batch uses one session: steps may \
-                omit `session` or repeat the batch's. `delay_ms` pauses between steps (max \
-                2000). At most 64 steps; `delivery_mode` on run_steps is the default for its steps.\n\n\
-                TARGET BY NAME (no earlier read needed, so one batch can cross screens): \
-                a step can be written `{\"click\": {...args}}` as well as `{tool, args}`, and \
-                its args may name the target instead of carrying a token: `role` (button, \
-                textfield, link, checkbox, menuitem, ...; AX/UIA/AT-SPI names also work), \
-                `name` (the element's label; exact match wins over substring, case-insensitive), \
-                `nth` (0-based, when several match), and `app` (app name or bundle id) and/or \
-                `window` (title substring) instead of pid/window_id. The batch reads the window \
-                fresh (a role and name are looked up in the visible window first; closed \
-                menus and off-screen rows are read when that finds no unique match, or for \
-                `nth` or a menu role), waits up to 3 s (step `timeout_ms`, max 10000) for the element to \
-                appear, and acts on it; with only `app` it uses that app's frontmost window, so \
-                a dialog that opened on top is found. Later steps inherit the window, so name \
-                `app` once. The first lookup in a window also reads it once for `observe`, so \
-                the end diff shows what the batch changed even in a window you never read. Several matches fail with the candidates listed; add `nth` or a \
-                fuller name.\n\n\
-                WAITS AND CHECKS: a step may add `wait_for` (checked before its action) and \
-                `expect` (one check or up to 4, checked after it); a step may also be only a \
-                check. A check is {role?, name?, text?, gone?, value?, value_contains?, \
-                enabled?, selected?, app?, window?, timeout_ms?}: `text` matches any row of the \
-                tree, static text included; `gone:true` waits for it to disappear. Checks poll \
-                until they hold or time out (wait_for 5 s, expect 2 s, max 10 s), and a check \
-                that does not hold fails the step with what was found instead. The report says \
-                which step failed, in which phase (wait_for, find, action, expect) and why. \
-                Whole batch: at most 60 s.\n\n\
-                Example (fill a form, submit, confirm the dialog, check the result):\n\
-                {\"steps\":[\
-                {\"set_value\":{\"app\":\"Safari\",\"role\":\"textfield\",\"name\":\"Email\",\"value\":\"ada@example.com\"}},\
-                {\"click\":{\"role\":\"button\",\"name\":\"Submit\"},\"expect\":[{\"role\":\"button\",\"name\":\"Confirm\"}]},\
-                {\"click\":{\"role\":\"button\",\"name\":\"Confirm\"},\"expect\":[{\"name\":\"Confirm\",\"gone\":true},{\"text\":\"Thanks\"}]}\
-                ],\"observe\":{}}"
+            description: "Run action steps in one call, in order, stopping at the first failure; with `observe` the result \
+                also carries what changed. Each step is `{tool, args}` or `{<tool>: args}`: `tool` is one of \
+                click, double_click, right_click, set_value, type_text, press_key, hotkey, scroll, drag, \
+                move_cursor, and `args` are that tool's arguments. `pid`/`window_id` (or `app`/`window`) on \
+                run_steps are the default window of steps that name none. A get_window_state step is skipped \
+                unless it is last (then it is the `observe`); a zoom runs only last. Every step passes the same \
+                session, permission and approval checks as a direct call. With `app_scope`, a call outside those \
+                apps' windows is refused with code outside_scope and one needing the foreground with \
+                foreground_not_allowed; a refused step sends nothing (effect \"refused\"). All steps are \
+                validated before the first runs. Element tokens come from a read before the batch and a step \
+                that reshuffles the window can stale later ones: put token steps first, or target later steps by \
+                role/name. A stale token is retried once on the single element with the same role and label.\n\
+                \n\
+                Result: per-step status (`ok` or the error) and, with `observe`, one bounded get_window_state \
+                read after the last executed step, a `since:\"latest\"` diff by default (a dialog that took \
+                focus after a failure is read even without `observe`). A step refused because its app ignores \
+                background input says how to re-send it; `foreground_fallback:true` retries it once in the \
+                foreground. Steps may omit `session` or repeat the batch's. At most 64 steps and 60 s per \
+                batch.\n\
+                \n\
+                Target by name (no earlier read needed): args may carry `role` (button, textfield, link, \
+                checkbox, menuitem, ...; AX/UIA/AT-SPI names also work), `name` (the label; exact match beats \
+                substring, case-insensitive), `nth` (0-based) and `app` (name or bundle id) and/or `window` \
+                (title substring) instead of pid/window_id/element_token. The batch reads the window fresh (the \
+                visible window first; closed menus and off-screen rows when that finds no unique match, or for \
+                `nth` or a menu role), waits up to 3 s for the element (step `timeout_ms`, max 10000) and acts; \
+                with only `app` it uses that app's frontmost window. Later steps inherit the window. The first \
+                lookup in a window also seeds the `observe` diff. Several matches fail with the candidates \
+                listed.\n\
+                \n\
+                Checks: a step may add `wait_for` (before its action) and `expect` (one or up to 4, after it), \
+                or be only a check: {role?, name?, text?, gone?, value?, value_contains?, enabled?, selected?, \
+                app?, window?, timeout_ms?}. `text` matches any row, static text included; `gone:true` waits for \
+                it to disappear. Checks poll (wait_for 5 s, expect 2 s, max 10 s); one that does not hold fails \
+                the step with what was found. A failure names the step, its phase (wait_for, find, action, \
+                expect) and why.\n\
+                \n\
+                Example: \
+                {\"steps\":[{\"set_value\":{\"app\":\"Safari\",\"role\":\"textfield\",\"name\":\"Email\",\"value\":\"ada@example.com\"}},{\"click\":{\"role\":\"button\",\"name\":\"Submit\"},\"expect\":[{\"text\":\"Thanks\"}]}],\"observe\":{}}"
                 .into(),
             input_schema: json!({
                 "type": "object",

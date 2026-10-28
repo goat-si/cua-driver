@@ -410,12 +410,21 @@ async fn wait_until_frontmost(pid: i32, budget: std::time::Duration) -> bool {
 fn def() -> &'static ToolDef {
     DEF.get_or_init(|| ToolDef {
         name: "click".into(),
-        description: "Click a target pid. Prefer `element_token` (from get_window_state): it identifies one snapshot element, works on backgrounded, minimized or off-Space windows, and moves no cursor or focus. Use `x, y` only for canvas / video / WebGL / custom-drawn surfaces missing from the AX tree.\n\
+        description: "Click a target pid. Prefer `element_token` (from get_window_state): it addresses one snapshot \
+            element, works on backgrounded, minimized or off-Space windows, and moves no cursor or focus; \
+            tokens are scoped to (pid, window_id) and go stale when that window is snapshotted again. `x, y` \
+            are window-local pixels of the get_window_state screenshot, sent as CGEvent mouse events to a \
+            visible window, for surfaces missing from the tree; `modifier` takes cmd/shift/option/ctrl, and \
+            `from_zoom:true` takes zoom-image pixels.\n\
             \n\
-            - element_token: AX action path. Tokens are scoped to (pid, window_id) and stale once the window is snapshotted again.\n\
-            - x, y: window-local pixels of the get_window_state screenshot, sent as CGEvent mouse events. Needs a visible window. `modifier` takes cmd/shift/option/ctrl.\n\
-            \n\
-            `button` defaults to left; on the AX path \"right\" maps to AXShowMenu and \"middle\" falls back to a pixel click at the element center. `action`: press (default), show_menu, pick, confirm, cancel, open, show_alternate_ui, show_default_ui, or any action the target element lists (including increment, decrement, and custom actions). AXRaise requires foreground delivery because it fronts the window. An element listing showalternateui reveals its hover-only controls with show_alternate_ui, in the background and without the pointer. `from_zoom:true` translates zoom-image pixels after a `zoom` call. Pressing a popup button opens its menu and leaves it open until an item is chosen or it is dismissed; in the background the user's front window keeps key focus meanwhile. To choose an option in one call use `set_value`. In the background a web `<select>` (Chrome, Electron) is not opened, because its menu would raise the browser window: the click is refused with `select_menu_would_raise_window`; use `set_value`.".into(),
+            `button` defaults to left; on the AX path \"right\" maps to AXShowMenu and \"middle\" falls back \
+            to a pixel click at the element center. `action`: press (default), show_menu, pick, confirm, \
+            cancel, open, show_alternate_ui, show_default_ui, or any action the element lists (increment, \
+            decrement, custom actions). AXRaise requires foreground delivery. show_alternate_ui reveals an \
+            element's hover-only controls in the background. A pressed popup button stays open until an item \
+            is chosen or it is dismissed; to choose in one call use `set_value`. A web `<select>` (Chrome, \
+            Electron) is not opened in the background: refused with `select_menu_would_raise_window`; use \
+            `set_value`.".into(),
         input_schema: serde_json::json!({
             "type": "object",
             // `pid` is conditionally required — needed for window/element clicks
