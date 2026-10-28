@@ -47,7 +47,8 @@ fn def() -> &'static ToolDef {
                 Chromium fields such as the omnibox need this). Requires window_id.\n\
                 The result is `effect:\"unverifiable\"` (no read-back). A combo does not focus a text field: for \
                 a backgrounded Electron input, pixel-click it first. Paste: `clipboard_write`, then \
-                `clipboard_read` to check its types (and text) before sending cmd+v."
+                `clipboard_read` to check its types (and text) before selecting or replacing editor content; \
+                send cmd+v only after that check succeeds."
             .into(),
         input_schema: serde_json::json!({
             "type": "object",

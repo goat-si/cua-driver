@@ -534,6 +534,10 @@ mod agent_instruction_tests {
                 "the targeted read must precede acting"
             );
             assert!(guide.contains("one `run_script` call"));
+            // run_script can be disabled or built out; the guide must not send
+            // an agent to a tool tools/list does not advertise.
+            assert!(guide.contains("one `run_script` call when `tools/list` advertises it"));
+            assert!(guide.contains("otherwise direct calls or `run_steps`"));
             // The rules travel with the loop.
             assert!(guide.contains("## Rules"));
         }

@@ -81,8 +81,9 @@ pub fn schema() -> Value {
     json!({
         "type": "string",
         "enum": ["default", "none"],
-        "description": "\"default\": the result waits up to 120 ms (100 ms for a batched step) for \
-                        a new window, menu, dialog or foreground change. \"none\": it returns once \
+        "description": "\"default\": the result waits up to 120 ms for a new window, menu, dialog \
+                        or foreground change (100 ms for a run_steps step that another step \
+                        follows, unless CUA_DRIVER_BATCH_PACING=full). \"none\": it returns once \
                         the input is delivered and says window changes were not observed; a change \
                         seen later is reported on the next action's result. Paths that do not \
                         watch for window changes ignore it."
