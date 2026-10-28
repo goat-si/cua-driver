@@ -27,6 +27,9 @@ pub(crate) enum Stage {
     AxResolve,
     Snapshot,
     Protect,
+    /// No longer timed: the post-action focus hold runs detached. Kept so
+    /// the trace line keeps its columns.
+    #[allow(dead_code)]
     Settle,
     Action,
     ActionBlocking,

@@ -1646,13 +1646,63 @@ fn press_needs_key_window(action: &str, front_pid: Option<i32>, pid: i32, native
 /// Make the target window AppKit-key without raising it, activating the app
 /// or taking key status from the user's window (the focus record only, as the
 /// background pixel click does), then let AppKit settle.
+///
+/// A press right after another one on the same window reuses that priming
+/// (see [`KeyPrime`]): only an app activation (the person switching apps,
+/// in either direction) or a change of the target app's focused window can
+/// take key status away from it, and both are read again before each press.
 fn prime_key_window_for_background_press(pid: i32, window_id: u32, action: &str) {
     let native = !super::type_text::is_browser_pid(pid)
         && !crate::browser::electron_js::ElectronJs::is_electron(pid);
-    if press_needs_key_window(action, apps::frontmost_pid(), pid, native)
-        && crate::input::skylight::activate_without_raise_with(pid, window_id, false)
+    if !press_needs_key_window(action, apps::frontmost_pid(), pid, native) {
+        return;
+    }
+    let primed = KeyPrime {
+        pid,
+        window_id,
+        activations: crate::focus_steal::activation_count(),
+        at: std::time::Instant::now(),
+    };
+    let mut last = LAST_KEY_PRIME.lock().unwrap_or_else(|e| e.into_inner());
+    if last.is_some_and(|last| last.still_holds(&primed))
+        && crate::input::skylight::key_window_of_pid(pid) == Some(window_id)
     {
-        std::thread::sleep(std::time::Duration::from_millis(80));
+        return;
+    }
+    *last = None;
+    if crate::input::skylight::activate_without_raise_with(pid, window_id, false) {
+        std::thread::sleep(KEY_PRIME_SETTLE);
+        // An activation during the settle may already have undone it.
+        *last = (crate::focus_steal::activation_count() == primed.activations).then_some(primed);
+    }
+}
+
+/// How long AppKit gets to take the focus record before the press.
+const KEY_PRIME_SETTLE: std::time::Duration = std::time::Duration::from_millis(80);
+
+/// How long a key-window priming is reused for later presses on its window.
+const KEY_PRIME_REUSE: std::time::Duration = std::time::Duration::from_secs(10);
+
+static LAST_KEY_PRIME: std::sync::Mutex<Option<KeyPrime>> = std::sync::Mutex::new(None);
+
+/// The last window made key for a background press, and the app-activation
+/// count when it was.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct KeyPrime {
+    pid: i32,
+    window_id: u32,
+    activations: u64,
+    at: std::time::Instant,
+}
+
+impl KeyPrime {
+    /// Whether this priming still covers a press described by `now`: same
+    /// window, no app activated since, and recent.
+    fn still_holds(&self, now: &KeyPrime) -> bool {
+        self.pid == now.pid
+            && self.window_id == now.window_id
+            && self.activations == now.activations
+            && now.at.saturating_duration_since(self.at) < KEY_PRIME_REUSE
     }
 }
 
@@ -2317,6 +2367,28 @@ mod tests {
     /// Surface 5: schema must advertise the new `button` field with the three
     /// canonical values and default to "left". Hermes / Codex / Claude Code
     /// consumers branch on this enum being present.
+    #[test]
+    fn a_key_window_priming_is_reused_only_for_the_same_window_without_activations() {
+        let at = std::time::Instant::now();
+        let primed = KeyPrime {
+            pid: 2,
+            window_id: 7,
+            activations: 5,
+            at,
+        };
+        let later = |pid, window_id, activations, secs| KeyPrime {
+            pid,
+            window_id,
+            activations,
+            at: at + std::time::Duration::from_secs(secs),
+        };
+        assert!(primed.still_holds(&later(2, 7, 5, 1)));
+        assert!(!primed.still_holds(&later(2, 8, 5, 1)), "other window");
+        assert!(!primed.still_holds(&later(3, 7, 5, 1)), "other app");
+        assert!(!primed.still_holds(&later(2, 7, 6, 1)), "an app activated");
+        assert!(!primed.still_holds(&later(2, 7, 5, 10)), "too old");
+    }
+
     #[test]
     fn background_press_needs_the_key_window_only_in_a_native_background_app() {
         assert!(press_needs_key_window("AXPress", Some(1), 2, true));
