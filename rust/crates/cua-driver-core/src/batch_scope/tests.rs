@@ -1217,3 +1217,31 @@ async fn the_locator_makes_no_second_attempt_after_a_refused_read() {
     );
     assert_eq!(reads[0]["code"], OUTSIDE_SCOPE);
 }
+
+#[cfg(feature = "script")]
+#[tokio::test]
+async fn a_call_outside_the_scope_is_refused_even_with_invalid_arguments() {
+    // Argument normalization errors (a scroll's invalid dx/dy, a legacy
+    // desktop scope on a window where the backend refuses it) must not
+    // answer before the scope: a script could catch them and carry on.
+    for first in [
+        "cua.call('scroll', {pid: 99, window_id: 9, dx: 1, dy: 1})",
+        "cua.call('click', {pid: 99, window_id: 9, x: 1, y: 1, scope: 'desktop'})",
+        "cua.call('click', {target: {kind: 'window', pid: 99, window_id: 9}, x: 1, y: 1, scope: 'desktop'})",
+    ] {
+        let harness = Harness::new();
+        let script = format!(
+            "let caught = null;\ntry {{ await {first}; }} catch (error) {{ caught = error.code; }}\nawait cua.call('click', {{pid: 42, window_id: 7, element_token: 's00000001:1'}});\nreturn caught;"
+        );
+        let (result, out) = harness
+            .run(
+                "run_script",
+                json!({"app_scope": {"apps": [NOTES_ONLY]}, "script": script}),
+            )
+            .await;
+        assert_eq!(result.is_error, Some(true), "{first}: {}", text(&result));
+        assert_eq!(out["error"]["code"], OUTSIDE_SCOPE, "{first}: {out}");
+        assert!(harness.sent("click").is_empty(), "{first}: nothing after the refusal");
+        assert!(harness.sent("scroll").is_empty());
+    }
+}
