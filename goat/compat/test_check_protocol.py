@@ -65,6 +65,45 @@ class CompareTest(unittest.TestCase):
         changed = {**MCP["tools"], "click": {"type": "object", "properties": {"x": {"type": "string"}}}}
         self.assertEqual(compare(BASE, variant(tools=changed), {}), ["tools click: embedded-proxy: input schema changed"])
 
+    def test_a_new_optional_argument_is_an_addition(self):
+        click = {**MCP["tools"]["click"], "additionalProperties": False}
+        base = variant(tools={**MCP["tools"], "click": click})
+        scoped = {**click, "properties": {**click["properties"], "scope": {"type": "object"}}}
+        self.assertEqual(compare(base, variant(tools={**MCP["tools"], "click": scoped}), {}), [])
+        self.assertEqual(check_protocol.added_optional_properties(click, scoped), ["scope"])
+        # A closed schema with no properties at all; adding the first one is still additive.
+        closed_zoom = {"type": "object", "additionalProperties": False}
+        zoom = {**closed_zoom, "properties": {"scope": {"type": "object"}}}
+        base = variant(tools={**MCP["tools"], "zoom": closed_zoom})
+        self.assertEqual(compare(base, variant(tools={**MCP["tools"], "zoom": zoom}), {}), [])
+
+    def test_a_new_argument_on_a_permissive_schema_is_a_change(self):
+        # {"scope": "desktop"} is a valid call against the old permissive click; a new
+        # object-typed scope would refuse it.
+        click = MCP["tools"]["click"]
+        scoped = {**click, "properties": {**click["properties"], "scope": {"type": "object"}}}
+        self.assertEqual(check_protocol.added_optional_properties(click, scoped), [])
+        self.assertEqual(
+            compare(BASE, variant(tools={**MCP["tools"], "click": scoped}), {}),
+            ["tools click: embedded-proxy: input schema changed"],
+        )
+
+    def test_a_required_or_reshaping_new_argument_is_a_change(self):
+        click = {**MCP["tools"]["click"], "additionalProperties": False}
+        base = variant(tools={**MCP["tools"], "click": click})
+        breaking = [
+            {**click, "properties": {**click["properties"], "scope": {}}, "required": ["scope"]},
+            {**click, "properties": {**click["properties"], "scope": {}}, "additionalProperties": True},
+            {**click, "properties": {"x": {"type": "string"}, "scope": {}}},
+            {**click, "properties": {"scope": {}}},
+        ]
+        for schema in breaking:
+            self.assertEqual(
+                compare(base, variant(tools={**MCP["tools"], "click": schema}), {}),
+                ["tools click: embedded-proxy: input schema changed"],
+                schema,
+            )
+
     def test_cli_mcp_and_daemon_breaks_are_incompatible(self):
         retyped = {**BASE["manifest"], "subcommands": [{"name": "serve", "args": [{"name": "socket", "type": "path"}]}]}
         self.assertEqual(compare(BASE, variant(manifest=retyped), {}), ["subcommands serve socket: argument ('socket', 'string') removed or retyped"])

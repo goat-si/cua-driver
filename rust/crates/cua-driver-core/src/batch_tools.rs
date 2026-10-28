@@ -171,7 +171,10 @@ impl Tool for RunStepsTool {
                 none. Reads (get_window_state, zoom) do not run between steps: one there is \
                 skipped; a get_window_state last is the `observe`, a zoom last runs after it. \
                 Every step goes through the same session, permission and approval checks as a \
-                direct call; a batch grants nothing extra. \
+                direct call; a batch grants nothing extra. With `app_scope` ({apps, delivery?}) the \
+                driver also refuses, per call, anything outside those apps' windows \
+                (code outside_scope) or needing the foreground (code foreground_not_allowed); \
+                a refused step sends nothing and has effect \"refused\". \
                 All steps are validated before the first one runs, so a malformed step 4 \
                 changes nothing. Element tokens and element_index values come from a \
                 get_window_state read before the batch; a step that changes the UI can \
@@ -274,7 +277,8 @@ impl Tool for RunStepsTool {
                     "observe": {
                         "type": "object",
                         "description": "Optional end-of-batch observation: arguments for ONE get_window_state call. `pid` and `window_id` default to those of the last step that names both. Defaults to since=\"latest\" (only what changed since your last read of that window with the same query/max_elements/max_depth; a full read when there is none), include_screenshot=false and max_elements=250; pass include_screenshot=true to see the window, or since=null for a full read. Omit to read nothing. {} observes the last window."
-                    }
+                    },
+                    "app_scope": crate::batch_scope::input_schema()
                 },
                 "additionalProperties": false
             }),
@@ -298,7 +302,8 @@ impl Tool for RunStepsTool {
             Ok(plan) => plan,
             Err(error) => return error.into_result(),
         };
-        plan.run(&registry).await
+        let scope = plan.scope.clone();
+        crate::batch_scope::enter(scope, plan.run(&registry)).await
     }
 }
 
@@ -346,6 +351,8 @@ struct Plan {
     /// Retry a step refused for background delivery once in the foreground.
     foreground_fallback: bool,
     session: Option<String>,
+    /// App and delivery limit checked on every call the batch dispatches.
+    scope: Option<std::sync::Arc<crate::batch_scope::BatchScope>>,
 }
 
 struct PlanError {
@@ -448,6 +455,8 @@ impl Plan {
             .map(str::to_owned);
 
         let default_window = batch_window(object)?;
+        let scope = crate::batch_scope::BatchScope::parse(object.get("app_scope"))
+            .map_err(PlanError::batch)?;
         let default_delivery = match object.get("delivery_mode") {
             None | Some(Value::Null) => None,
             Some(Value::String(mode)) if matches!(mode.as_str(), "background" | "foreground") => {
@@ -613,6 +622,7 @@ impl Plan {
             default_window,
             foreground_fallback,
             session,
+            scope,
         })
     }
 
@@ -698,6 +708,33 @@ impl Plan {
                 )
                 .await
             };
+            // A lookup or check the scope refused fails the step with the
+            // scope's code, as a refused action does, even when the check
+            // itself would have passed (a `gone:true` check reads a refused
+            // window as absent): the batch stops at the first refused call.
+            let mut outcome = outcome;
+            // run_steps reports targets per step; the per-call journal is for
+            // run_script, so drop it here to keep it bounded.
+            locator.take_journal();
+            if let Some(code) = locator.take_scope_refusal() {
+                if outcome.ok {
+                    outcome.ok = false;
+                    outcome.report["ok"] = json!(false);
+                    outcome.report["phase"] = json!("find");
+                    outcome.report["message"] =
+                        json!("a read this step needed was refused by the batch scope");
+                    outcome.line = format!(
+                        "{}. {} ERROR (find): a read this step needed was refused by the batch scope ({code})",
+                        index + 1,
+                        outcome.report["tool"].as_str().unwrap_or("step")
+                    );
+                }
+                // An action that already ran keeps the effect it returned.
+                outcome.report["code"] = json!(code);
+                if outcome.report.get("effect").is_none() {
+                    outcome.report["effect"] = json!("refused");
+                }
+            }
             if !outcome.ok {
                 recovery = Recovery::after(&outcome.report, last_window.as_ref());
                 if let Some(Recovery { window, .. }) = &recovery {
@@ -720,6 +757,9 @@ impl Plan {
             "failed_step": failed_step,
             "steps": reports,
         });
+        if let Some(scope) = &self.scope {
+            structured["app_scope"] = scope.to_json();
+        }
         let header = match failed_step {
             None => format!("run_steps: {total}/{total} steps ok"),
             Some(index) => format!(
@@ -764,6 +804,29 @@ impl Plan {
             }
             (None, None) => None,
         };
+        // The batch ends at the first call its app scope refused: after a
+        // refused step nothing more is dispatched (no recovery, observation
+        // or tail read), and a refused final read fails the batch the same way.
+        let mut scope_refused: Option<&'static str> = failed_step.and_then(|index| {
+            let code = structured["steps"][index]["code"].as_str()?;
+            [
+                crate::batch_scope::OUTSIDE_SCOPE,
+                crate::batch_scope::FOREGROUND_NOT_ALLOWED,
+            ]
+            .into_iter()
+            .find(|known| *known == code)
+        });
+        let observe = if scope_refused.is_some() {
+            if observe.is_some() {
+                lines.push(
+                    "observation skipped: the batch stopped at a call its app scope refused"
+                        .to_owned(),
+                );
+            }
+            None
+        } else {
+            observe
+        };
         if let Some(mut args) = observe {
             let filled = fill_observed_window(&mut args, last_window.as_ref());
             let result = if filled {
@@ -795,6 +858,11 @@ impl Plan {
                 let message = bounded_message(&result);
                 lines.push(format!("observation: get_window_state ERROR: {message}"));
                 report["message"] = Value::String(message);
+                if let Some(code) = scope_refusal_code(&result) {
+                    report["code"] = json!(code);
+                    report["effect"] = json!("refused");
+                    scope_refused = Some(code);
+                }
             }
             structured["observation"] = report;
         }
@@ -802,35 +870,69 @@ impl Plan {
         let mut tail_content = Vec::new();
         let mut tail_reports = Vec::new();
         for (tool, mut args) in self.tail_reads {
+            if scope_refused.is_some() {
+                break;
+            }
             fill_observed_window(&mut args, last_window.as_ref());
             let result = registry.invoke(tool, args).await;
             let ok = result.is_error != Some(true);
             let message = bounded_message(&result);
+            let refused = scope_refusal_code(&result);
             if ok {
                 lines.push(format!("{tool}: ok (below)"));
                 tail_content.extend(result.content);
             } else {
                 lines.push(format!("{tool}: ERROR: {message}"));
             }
-            tail_reports.push(json!({ "tool": tool, "ok": ok, "message": message }));
+            let mut report = json!({ "tool": tool, "ok": ok, "message": message });
+            if let Some(code) = refused {
+                report["code"] = json!(code);
+                report["effect"] = json!("refused");
+                scope_refused = Some(code);
+            }
+            tail_reports.push(report);
         }
         if !tail_reports.is_empty() {
             structured["reads"] = Value::Array(tail_reports);
+        }
+        if let Some(code) = scope_refused {
+            structured["ok"] = json!(false);
+            structured["code"] = json!(code);
+            lines[0] = format!(
+                "{} (failed: a final read was refused by the batch scope)",
+                lines[0]
+            );
         }
 
         let mut content = vec![Content::text(lines.join("\n"))];
         content.append(&mut observation_content);
         content.append(&mut tail_content);
-        if failed_step.is_some() {
+        let failed = failed_step.is_some() || scope_refused.is_some();
+        if failed {
             fit_error_text(&mut content, ERROR_TEXT_BUDGET);
         }
         ToolResult {
             content,
-            is_error: failed_step.map(|_| true),
+            is_error: failed.then_some(true),
             structured_content: Some(structured),
             ..Default::default()
         }
     }
+}
+
+/// The batch scope's refusal code on a result, if it is one.
+fn scope_refusal_code(result: &ToolResult) -> Option<&'static str> {
+    let code = result
+        .structured_content
+        .as_ref()
+        .and_then(|value| value.get("code"))
+        .and_then(Value::as_str)?;
+    [
+        crate::batch_scope::OUTSIDE_SCOPE,
+        crate::batch_scope::FOREGROUND_NOT_ALLOWED,
+    ]
+    .into_iter()
+    .find(|known| *known == code)
 }
 
 async fn run_step(
@@ -974,9 +1076,28 @@ async fn run_step(
             });
         }
 
+        // A wait_for or lookup earlier in this step that the batch scope
+        // refused proves nothing (a refused read is not "gone"): never send
+        // the action on it.
+        if let Some(code) = locator.scope_refusal() {
+            return failure(
+                index,
+                label,
+                Phase::Find,
+                code,
+                "a read this step needed was refused by the batch scope; the action was not sent"
+                    .to_owned(),
+                report,
+            );
+        }
         let mut result = registry.invoke(tool, args.clone()).await;
         let mut refound_note = None;
-        if result.is_error == Some(true) && tool == "click" {
+        // The menu-bar reroute can focus or raise a window, so a batch whose
+        // app scope allows background delivery only keeps the click's own
+        // error instead.
+        let background_scope = crate::batch_scope::current()
+            .is_some_and(|scope| scope.delivery() == crate::batch_scope::ScopeDelivery::Background);
+        if result.is_error == Some(true) && tool == "click" && !background_scope {
             if let Some((menu_args, note)) = menu_bar_route(&args, &result) {
                 report["refound"] = json!(note);
                 result = registry.invoke("invoke_menu", menu_args).await;
@@ -1011,6 +1132,16 @@ async fn run_step(
         }
         let ok = result.is_error != Some(true);
         let mut message = bounded_message(&result);
+        // The step reports the effect its action returned, as a direct call
+        // would (confirmed, unverifiable, refused, ...).
+        if let Some(effect) = result
+            .structured_content
+            .as_ref()
+            .and_then(|value| value.get("effect"))
+            .and_then(Value::as_str)
+        {
+            report["effect"] = json!(effect);
+        }
         if let (false, Some(hint)) = (ok, &foreground_hint) {
             message.push_str(hint);
         }

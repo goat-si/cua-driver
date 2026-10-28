@@ -5,8 +5,8 @@ GOAT starts the driver in the launch forms below and reads its CLI manifest, MCP
 daemon metadata. A fork change that removes or retypes a tool, subcommand or argument, changes a
 tool's input schema or a capability, drops or widens what a tool's output schema promises, changes
 the daemon contract, or stops a launch form from starting breaks GOAT without a GOAT change. Those
-fail unless goat/compat/allowed-changes.json records the change with a reason. Additions pass and
-are listed. Standard library only.
+fail unless goat/compat/allowed-changes.json records the change with a reason. Additions (new
+tools, new optional top-level arguments) pass and are listed. Standard library only.
 """
 
 import argparse
@@ -474,7 +474,7 @@ def compare(baseline, candidate, allowed):
         for name, schema in old_mcp["tools"].items():
             if name not in new_mcp["tools"]:
                 check("tools", name, f"{form}: removed")
-            elif new_mcp["tools"][name] != schema:
+            elif new_mcp["tools"][name] != schema and not added_optional_properties(schema, new_mcp["tools"][name]):
                 check("tools", name, f"{form}: input schema changed")
         new_outputs = new_mcp.get("outputSchemas", {})
         for name, schema in old_mcp.get("outputSchemas", {}).items():
@@ -505,6 +505,31 @@ def compare(baseline, candidate, allowed):
     return problems
 
 
+def added_optional_properties(old, new):
+    """Top-level input properties new adds to old when that is the only change, else [].
+
+    A new optional argument cannot break a caller that never sends it: every call GOAT makes
+    today is still valid. That holds only when the old schema refused unknown arguments
+    (additionalProperties false): against a permissive schema a caller may already send the new
+    name with another shape. Anything else (a changed or removed property, a new required one, a
+    different additionalProperties) still counts as a changed input schema."""
+    if not isinstance(old, dict) or not isinstance(new, dict):
+        return []
+    if old.get("additionalProperties") is not False:
+        return []
+    old_properties, new_properties = old.get("properties") or {}, new.get("properties") or {}
+    added = sorted(set(new_properties) - set(old_properties))
+    if not added:
+        return []
+    if {key: value for key, value in new.items() if key != "properties"} != {
+        key: value for key, value in old.items() if key != "properties"
+    }:
+        return []
+    if any(new_properties.get(name) != value for name, value in old_properties.items()):
+        return []
+    return added
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--candidate", required=True, type=Path, help="fork-built cua-driver executable")
@@ -523,6 +548,10 @@ def main():
     for form, mcp in candidate["forms"].items():
         added = sorted(set(mcp["tools"]) - set(baseline["forms"].get(form, {}).get("tools", {})))
         print(f"{form}: baseline {len(baseline['forms'][form]['tools'])} tools, candidate {len(mcp['tools'])}" + (f"; added: {', '.join(added)}" if added else ""))
+        for name, schema in sorted(baseline["forms"].get(form, {}).get("tools", {}).items()):
+            arguments = added_optional_properties(schema, mcp["tools"].get(name))
+            if arguments:
+                print(f"{form}: {name} added optional argument(s): {', '.join(arguments)}")
     print(f"daemon contract: baseline {baseline['daemon']['contract_version']}, candidate {candidate['daemon']['contract_version']}")
     problems = compare(baseline, candidate, allowed)
     for problem in problems:

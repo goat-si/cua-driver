@@ -454,6 +454,13 @@ pub(crate) struct Locator<'a> {
     /// read of a window the caller never read.
     baseline_max_elements: Option<u64>,
     baselined: std::sync::Mutex<std::collections::HashSet<(i64, u64)>>,
+    /// The code of the last read a batch scope refused, so a failed lookup
+    /// reports `outside_scope` / `foreground_not_allowed` rather than a
+    /// plain lookup failure.
+    scope_refusal: std::sync::Mutex<Option<&'static str>>,
+    /// Every driver call made through this locator since the last
+    /// [`Self::take_journal`], in order: {tool, pid, window_id, ok, effect, code}.
+    journal: std::sync::Mutex<Vec<Value>>,
 }
 
 impl<'a> Locator<'a> {
@@ -464,7 +471,44 @@ impl<'a> Locator<'a> {
             deadline,
             baseline_max_elements: None,
             baselined: Default::default(),
+            scope_refusal: Default::default(),
+            journal: Default::default(),
         }
+    }
+
+    /// Add a driver call made outside the locator (a script's own action or
+    /// read) to the journal, so it stays in dispatch order.
+    pub fn record(&self, entry: Value) {
+        self.journal
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(entry);
+    }
+
+    /// The driver calls recorded since the last call.
+    pub fn take_journal(&self) -> Vec<Value> {
+        std::mem::take(
+            &mut *self
+                .journal
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        )
+    }
+
+    /// The scope refusal code a lookup hit since the last call, if any.
+    pub fn take_scope_refusal(&self) -> Option<&'static str> {
+        self.scope_refusal
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+    }
+
+    /// The scope refusal code a lookup hit since the last take, left in place.
+    pub fn scope_refusal(&self) -> Option<&'static str> {
+        *self
+            .scope_refusal
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     pub fn with_observe_baseline(mut self, max_elements: u64) -> Self {
@@ -480,8 +524,35 @@ impl<'a> Locator<'a> {
     }
 
     async fn call(&self, tool: &str, args: Value) -> Result<Value, String> {
+        // Once the batch scope refused a read in this step or script call,
+        // the locator sends nothing more (a discarded baseline read must not
+        // lead to a second attempt).
+        if let Some(code) = self.scope_refusal() {
+            return Err(format!(
+                "{tool}: not sent, because an earlier read was refused by the batch scope ({code})"
+            ));
+        }
+        let (pid, window_id) = call_target(&args);
         let result = self.registry.invoke(tool, self.with_session(args)).await;
+        self.record(journal_entry(tool, pid, window_id, &result));
         if result.is_error == Some(true) {
+            let code = result
+                .structured_content
+                .as_ref()
+                .and_then(|value| value.get("code"))
+                .and_then(Value::as_str);
+            let scope_code = [
+                crate::batch_scope::OUTSIDE_SCOPE,
+                crate::batch_scope::FOREGROUND_NOT_ALLOWED,
+            ]
+            .into_iter()
+            .find(|known| Some(*known) == code);
+            if let Some(scope_code) = scope_code {
+                *self
+                    .scope_refusal
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(scope_code);
+            }
             return Err(format!("{tool}: {}", first_text(&result)));
         }
         Ok(result.structured_content.unwrap_or(Value::Null))
@@ -824,6 +895,15 @@ impl<'a> Locator<'a> {
         for window in &windows {
             let read = match self.read(window).await {
                 Ok(read) => read,
+                // A read the batch scope refused proves nothing about the
+                // window, least of all that something is gone: fail now.
+                Err(miss) if self.scope_refusal().is_some() => {
+                    return Err(Miss::new(
+                        self.scope_refusal()
+                            .unwrap_or(crate::batch_scope::OUTSIDE_SCOPE),
+                        miss.message,
+                    ))
+                }
                 // A window that closed between the lookup and the read has
                 // no elements left.
                 Err(_) if check.gone => continue,
@@ -1848,4 +1928,46 @@ mod tests {
         assert_eq!(element.name.as_deref(), Some("Go"));
         assert_eq!(args.keys().collect::<Vec<_>>(), ["count", "pid"]);
     }
+}
+
+/// One driver call as the run_script journal records it.
+pub(crate) fn journal_entry(
+    tool: &str,
+    pid: Option<i64>,
+    window_id: Option<u64>,
+    result: &crate::protocol::ToolResult,
+) -> Value {
+    let field = |key: &str| {
+        result
+            .structured_content
+            .as_ref()
+            .and_then(|value| value.get(key))
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+    };
+    json!({
+        "tool": tool,
+        "pid": pid,
+        "window_id": window_id,
+        "ok": result.is_error != Some(true),
+        "effect": field("effect"),
+        "code": field("code"),
+    })
+}
+
+/// The window a call targets, from flat `pid`/`window_id` or a typed
+/// `target: {kind: "window", pid, window_id}`.
+pub(crate) fn call_target(args: &Value) -> (Option<i64>, Option<u64>) {
+    let target = args.get("target");
+    let pid = args.get("pid").and_then(Value::as_i64).or_else(|| {
+        target
+            .and_then(|target| target.get("pid"))
+            .and_then(Value::as_i64)
+    });
+    let window_id = args.get("window_id").and_then(Value::as_u64).or_else(|| {
+        target
+            .and_then(|target| target.get("window_id"))
+            .and_then(Value::as_u64)
+    });
+    (pid, window_id)
 }

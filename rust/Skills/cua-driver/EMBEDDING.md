@@ -262,6 +262,52 @@ Measured on macOS with Calculator in the background and Terminal frontmost, a
 background AX click took 1153 ms with the default, 325 ms with `200`, and 78 ms
 with `0`.
 
+### App scope for run_steps and run_script
+
+A host that limits a turn to some apps cannot see inside a batch or a script
+before it runs. It passes `app_scope` on `run_steps` or `run_script` instead, and
+the driver checks every call the batch or script dispatches against it,
+including the reads it makes to find a target by name, the menu-bar reroute and
+a `foreground_fallback` retry:
+
+```json
+{"app_scope": {"apps": ["com.apple.calculator"], "delivery": "background"}}
+```
+
+- `apps` (required, 1 to 32 strings) uses the capability manifest's identity
+  rules. A bundle or package id (macOS bundle id, Windows package family name
+  or AUMID) is compared exactly with what `list_apps` reports for the pid. An
+  absolute executable path is compared with the executable the OS reports for
+  the pid: POSIX paths case-exactly, Windows drive or UNC paths after Windows
+  normalization (case, separators, `\\?\` prefix). A path never matches a
+  claimed bundle id or `launch_path`, and a pid whose executable the OS cannot
+  report matches no path.
+- `delivery` is `"background"` (the default) or `"foreground"`.
+- A call whose `pid` is not one of `apps`, whose `window_id` is not a window
+  of that pid, or that names no window is refused with code `outside_scope`.
+  With `"background"`, `bring_to_front`, `delivery_mode:"foreground"` and
+  input that names no pid (global keys, screen points, the desktop pointer)
+  are refused with code `foreground_not_allowed`. `list_apps` and
+  `list_windows` stay available. `launch_app` is allowed only on macOS, with
+  a scoped `bundle_id` and no other program selector (`name`, `path`, ...);
+  on Windows and Linux `launch_app` can start another program than a bundle
+  id names, so launch the app before the batch there.
+- A step or script call that needed a read the scope refused fails with that
+  code even if it would otherwise have passed (a `gone:true` check never
+  counts a refused window as gone).
+- A refused call sends nothing. Its result is an error whose
+  `structuredContent` has `effect: "refused"`, `code`, `refusal: {code,
+  message}`, `error: {code, hint}`, `tool`, `pid` and `window_id`. The batch
+  stops there like at any other failure, and a refused final `observe` or
+  trailing read fails the batch too. A script sees a `CuaError` with that
+  `code` and ends there: even if it catches the error, no further call is
+  dispatched, and the result is an error naming the refused call.
+- The scope lives for the one `run_steps` or `run_script` call. It travels as
+  a task-local of that call, never as a step argument, so no step or script
+  can change it. Results echo it as `app_scope`.
+- Support is visible in `tools/list`: both tools advertise `app_scope` in their
+  input schema. Without `app_scope` nothing changes.
+
 ### Steps inside `run_steps` and `run_script` (macOS)
 
 Two waits make up most of a macOS action's latency: the agent cursor's glide to

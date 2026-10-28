@@ -75,6 +75,7 @@ pub mod agent_cursor;
 pub mod authorization;
 pub mod background_input;
 pub mod batch_nudge;
+pub mod batch_scope;
 pub mod batch_tools;
 pub mod browser;
 pub mod build_info;
