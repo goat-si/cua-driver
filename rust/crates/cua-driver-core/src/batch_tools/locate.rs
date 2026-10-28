@@ -114,7 +114,25 @@ pub(crate) struct ElementSpec {
     pub action: Option<&'static str>,
 }
 
+/// `max_elements` of a visible-window lookup read: the platform default walk
+/// budget, and a view key no `observe` uses.
+const VISIBLE_READ_MAX_ELEMENTS: u64 = 2000;
+
 impl ElementSpec {
+    /// Whether a unique match in the visible window can stand for the full
+    /// read: a role is named and is not a menu role (closed menus are only in
+    /// the full read), and no `nth` or `text` asks for a position or a row
+    /// among all of them.
+    fn visible_lookup_suffices(&self) -> bool {
+        self.nth.is_none()
+            && self.text.is_none()
+            && self.name.is_some()
+            && self
+                .role
+                .as_deref()
+                .is_some_and(|role| !role.to_ascii_lowercase().contains("menu"))
+    }
+
     pub fn is_empty(&self) -> bool {
         self.role.is_none() && self.name.is_none() && self.text.is_none()
     }
@@ -759,6 +777,15 @@ impl<'a> Locator<'a> {
     /// One fresh accessibility read. It refreshes the window's element
     /// tokens, so the tokens it returns are the ones to act with.
     pub async fn read(&self, window: &Window) -> Result<Read, Miss> {
+        self.read_view(window, false).await
+    }
+
+    /// A read of the window as a model sees it by default when `visible` is
+    /// set: menus collapsed and off-screen dense rows left out, about a
+    /// third of a full read (Calculator 90 against 210 ms, a GitHub page in
+    /// Aside 55 against 205 ms). Its `max_elements` is the platform default,
+    /// so it never matches the view of the batch's `observe` diff.
+    async fn read_view(&self, window: &Window, visible: bool) -> Result<Read, Miss> {
         if let Some(max_elements) = self.baseline_max_elements {
             let first = self
                 .baselined
@@ -780,16 +807,24 @@ impl<'a> Locator<'a> {
                     .await;
             }
         }
+        let args = if visible {
+            json!({
+                "pid": window.pid,
+                "window_id": window.window_id,
+                "tree_format": "both",
+                "max_elements": VISIBLE_READ_MAX_ELEMENTS,
+                "include_screenshot": false,
+            })
+        } else {
+            json!({
+                "pid": window.pid,
+                "window_id": window.window_id,
+                "full_output": true,
+                "include_screenshot": false,
+            })
+        };
         let state = self
-            .call(
-                "get_window_state",
-                json!({
-                    "pid": window.pid,
-                    "window_id": window.window_id,
-                    "full_output": true,
-                    "include_screenshot": false,
-                }),
-            )
+            .call("get_window_state", args)
             .await
             .map_err(|error| Miss::new("read_failed", error).in_window(window))?;
         let elements = state
@@ -845,6 +880,16 @@ impl<'a> Locator<'a> {
         let windows = self.search_windows(spec).await?;
         let mut best_miss: Option<(usize, Miss)> = None;
         for window in &windows {
+            // A control named by role is first looked up in the visible
+            // window; only when that has no unique match does the full read
+            // (every menu, every row) decide, as before.
+            if element.visible_lookup_suffices() {
+                if let Ok(read) = self.read_view(window, true).await {
+                    if let Ok(found) = pick(&read, element) {
+                        return Ok(found);
+                    }
+                }
+            }
             let read = self.read(window).await?;
             match pick(&read, element) {
                 Ok(found) => return Ok(found),
