@@ -670,7 +670,7 @@ mod tests {
         // Use the observation only when the read followed the injection
         // promptly and the input did not change again.
         if cua_driver_core::delivery::elapsed_idle_ms_from_ticks(read_done, end)
-            > cua_driver_core::delivery::OWN_INPUT_TICK_SLACK_MS
+            > cua_driver_core::delivery::OWN_INPUT_SECTION_MAX_MS
             || last_input() != after
         {
             eprintln!("skipped: the last-input read was late or other input arrived");
@@ -678,7 +678,7 @@ mod tests {
         }
         let after = after.expect("checked above");
         assert!(
-            tracker.is_own_input(read_done, after),
+            tracker.is_own_input(after),
             "the driver's injection, stamped at tick {after}, must fall inside \
              its recorded span ({tracker:?}, read at {read_done})"
         );
