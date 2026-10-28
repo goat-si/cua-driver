@@ -65,6 +65,30 @@ class CompareTest(unittest.TestCase):
         changed = {**MCP["tools"], "click": {"type": "object", "properties": {"x": {"type": "string"}}}}
         self.assertEqual(compare(BASE, variant(tools=changed), {}), ["tools click: embedded-proxy: input schema changed"])
 
+    def test_a_new_optional_argument_is_an_addition(self):
+        click = MCP["tools"]["click"]
+        scoped = {**click, "properties": {**click["properties"], "scope": {"type": "object"}}}
+        self.assertEqual(compare(BASE, variant(tools={**MCP["tools"], "click": scoped}), {}), [])
+        self.assertEqual(check_protocol.added_optional_properties(click, scoped), ["scope"])
+        # zoom declares no properties at all; adding the first one is still additive.
+        zoom = {"type": "object", "properties": {"scope": {"type": "object"}}}
+        self.assertEqual(compare(BASE, variant(tools={**MCP["tools"], "zoom": zoom}), {}), [])
+
+    def test_a_required_or_reshaping_new_argument_is_a_change(self):
+        click = MCP["tools"]["click"]
+        breaking = [
+            {**click, "properties": {**click["properties"], "scope": {}}, "required": ["scope"]},
+            {**click, "properties": {**click["properties"], "scope": {}}, "additionalProperties": False},
+            {**click, "properties": {"x": {"type": "string"}, "scope": {}}},
+            {**click, "properties": {"scope": {}}},
+        ]
+        for schema in breaking:
+            self.assertEqual(
+                compare(BASE, variant(tools={**MCP["tools"], "click": schema}), {}),
+                ["tools click: embedded-proxy: input schema changed"],
+                schema,
+            )
+
     def test_cli_mcp_and_daemon_breaks_are_incompatible(self):
         retyped = {**BASE["manifest"], "subcommands": [{"name": "serve", "args": [{"name": "socket", "type": "path"}]}]}
         self.assertEqual(compare(BASE, variant(manifest=retyped), {}), ["subcommands serve socket: argument ('socket', 'string') removed or retyped"])

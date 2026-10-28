@@ -171,7 +171,10 @@ impl Tool for RunStepsTool {
                 none. Reads (get_window_state, zoom) do not run between steps: one there is \
                 skipped; a get_window_state last is the `observe`, a zoom last runs after it. \
                 Every step goes through the same session, permission and approval checks as a \
-                direct call; a batch grants nothing extra. \
+                direct call; a batch grants nothing extra. With `scope` ({apps, delivery?}) the \
+                driver also refuses, per call, anything outside those apps' windows \
+                (code outside_scope) or needing the foreground (code foreground_not_allowed); \
+                a refused step sends nothing and has effect \"refused\". \
                 All steps are validated before the first one runs, so a malformed step 4 \
                 changes nothing. Element tokens and element_index values come from a \
                 get_window_state read before the batch; a step that changes the UI can \
@@ -274,7 +277,8 @@ impl Tool for RunStepsTool {
                     "observe": {
                         "type": "object",
                         "description": "Optional end-of-batch observation: arguments for ONE get_window_state call. `pid` and `window_id` default to those of the last step that names both. Defaults to since=\"latest\" (only what changed since your last read of that window with the same query/max_elements/max_depth; a full read when there is none), include_screenshot=false and max_elements=250; pass include_screenshot=true to see the window, or since=null for a full read. Omit to read nothing. {} observes the last window."
-                    }
+                    },
+                    "scope": crate::batch_scope::input_schema()
                 },
                 "additionalProperties": false
             }),
@@ -298,7 +302,8 @@ impl Tool for RunStepsTool {
             Ok(plan) => plan,
             Err(error) => return error.into_result(),
         };
-        plan.run(&registry).await
+        let scope = plan.scope.clone();
+        crate::batch_scope::enter(scope, plan.run(&registry)).await
     }
 }
 
@@ -346,6 +351,8 @@ struct Plan {
     /// Retry a step refused for background delivery once in the foreground.
     foreground_fallback: bool,
     session: Option<String>,
+    /// App and delivery limit checked on every call the batch dispatches.
+    scope: Option<std::sync::Arc<crate::batch_scope::BatchScope>>,
 }
 
 struct PlanError {
@@ -448,6 +455,8 @@ impl Plan {
             .map(str::to_owned);
 
         let default_window = batch_window(object)?;
+        let scope =
+            crate::batch_scope::BatchScope::parse(object.get("scope")).map_err(PlanError::batch)?;
         let default_delivery = match object.get("delivery_mode") {
             None | Some(Value::Null) => None,
             Some(Value::String(mode)) if matches!(mode.as_str(), "background" | "foreground") => {
@@ -613,6 +622,7 @@ impl Plan {
             default_window,
             foreground_fallback,
             session,
+            scope,
         })
     }
 
@@ -698,6 +708,15 @@ impl Plan {
                 )
                 .await
             };
+            // A lookup or check the scope refused fails the step with the
+            // scope's code, as a refused action does.
+            let mut outcome = outcome;
+            if let Some(code) = locator.take_scope_refusal() {
+                if !outcome.ok && outcome.report.get("effect").is_none() {
+                    outcome.report["code"] = json!(code);
+                    outcome.report["effect"] = json!("refused");
+                }
+            }
             if !outcome.ok {
                 recovery = Recovery::after(&outcome.report, last_window.as_ref());
                 if let Some(Recovery { window, .. }) = &recovery {
@@ -720,6 +739,9 @@ impl Plan {
             "failed_step": failed_step,
             "steps": reports,
         });
+        if let Some(scope) = &self.scope {
+            structured["scope"] = scope.to_json();
+        }
         let header = match failed_step {
             None => format!("run_steps: {total}/{total} steps ok"),
             Some(index) => format!(
@@ -1011,6 +1033,16 @@ async fn run_step(
         }
         let ok = result.is_error != Some(true);
         let mut message = bounded_message(&result);
+        // The step reports the effect its action returned, as a direct call
+        // would (confirmed, unverifiable, refused, ...).
+        if let Some(effect) = result
+            .structured_content
+            .as_ref()
+            .and_then(|value| value.get("effect"))
+            .and_then(Value::as_str)
+        {
+            report["effect"] = json!(effect);
+        }
         if let (false, Some(hint)) = (ok, &foreground_hint) {
             message.push_str(hint);
         }

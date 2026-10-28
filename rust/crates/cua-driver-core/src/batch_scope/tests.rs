@@ -1,0 +1,812 @@
+//! Batch scope: the per-call check against fake process facts, and
+//! end-to-end runs of run_steps and run_script whose fake tools record what
+//! actually reached them.
+
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+
+use async_trait::async_trait;
+use serde_json::{json, Value};
+
+use super::*;
+use crate::{
+    protocol::{Content, ToolResult},
+    tool::{Tool, ToolDef, ToolRegistry},
+};
+
+// ---------------------------------------------------------------- unit ----
+
+#[derive(Default)]
+struct Facts {
+    processes: HashMap<i64, ProcessFacts>,
+    bundles: HashMap<i64, String>,
+    windows: Vec<(i64, u64)>,
+    lookups: Mutex<Vec<String>>,
+}
+
+#[async_trait]
+impl ScopeFacts for Facts {
+    async fn process(&self, pid: i64) -> Option<ProcessFacts> {
+        self.processes.get(&pid).cloned()
+    }
+    async fn bundle_id(&self, pid: i64) -> Option<String> {
+        self.lookups.lock().unwrap().push(format!("bundle {pid}"));
+        self.bundles.get(&pid).cloned()
+    }
+    async fn window_of(&self, pid: i64, window_id: u64) -> bool {
+        self.lookups
+            .lock()
+            .unwrap()
+            .push(format!("window {pid}/{window_id}"));
+        self.windows.contains(&(pid, window_id))
+    }
+}
+
+fn notes_and_mail() -> Facts {
+    Facts {
+        processes: HashMap::from([
+            (
+                42,
+                ProcessFacts {
+                    start_time: Some(1),
+                    executable: Some("/Applications/Notes.app/Contents/MacOS/Notes".into()),
+                },
+            ),
+            (
+                99,
+                ProcessFacts {
+                    start_time: Some(1),
+                    executable: Some("/Applications/Mail.app/Contents/MacOS/Mail".into()),
+                },
+            ),
+        ]),
+        bundles: HashMap::from([
+            (42, "com.example.notes".into()),
+            (99, "com.example.mail".into()),
+        ]),
+        windows: vec![(42, 7), (99, 9)],
+        lookups: Mutex::default(),
+    }
+}
+
+fn scope(value: Value) -> Arc<BatchScope> {
+    BatchScope::parse(Some(&value)).unwrap().unwrap()
+}
+
+async fn check(scope: &BatchScope, tool: &str, args: Value, facts: &Facts) -> Result<(), Refusal> {
+    let read_only = matches!(
+        tool,
+        "get_window_state" | "zoom" | "verify_state" | "screenshot"
+    );
+    scope.check(tool, &args, read_only, facts).await
+}
+
+#[test]
+fn scope_parsing_accepts_identities_and_rejects_malformed_scopes() {
+    assert!(BatchScope::parse(None).unwrap().is_none());
+    assert!(BatchScope::parse(Some(&Value::Null)).unwrap().is_none());
+    let parsed = scope(
+        json!({"apps": ["com.example.notes", "com.example.notes", "/usr/bin/gedit", r"C:\Program Files\Notes\notes.exe"]}),
+    );
+    assert_eq!(parsed.delivery(), ScopeDelivery::Background);
+    assert_eq!(
+        parsed.to_json(),
+        json!({"apps": ["com.example.notes", "/usr/bin/gedit", r"C:\Program Files\Notes\notes.exe"], "delivery": "background"})
+    );
+    assert_eq!(
+        scope(json!({"apps": ["a.b"], "delivery": "foreground"})).delivery(),
+        ScopeDelivery::Foreground
+    );
+    for bad in [
+        json!("com.example.notes"),
+        json!({}),
+        json!({"apps": []}),
+        json!({"apps": "com.example.notes"}),
+        json!({"apps": [7]}),
+        json!({"apps": [""]}),
+        json!({"apps": [" com.example.notes"]}),
+        json!({"apps": ["usr/bin/gedit"]}),
+        json!({"apps": ["/usr/bin/../bin/gedit"]}),
+        json!({"apps": ["/usr/bin/"]}),
+        json!({"apps": ["/"]}),
+        json!({"apps": [r"C:\"]}),
+        json!({"apps": [r"\\.\pipe\x"]}),
+        json!({"apps": ["Notes App"]}),
+        json!({"apps": ["a.b"], "delivery": "auto"}),
+        json!({"apps": ["a.b"], "windows": [1]}),
+        json!({"apps": (0..=MAX_SCOPE_APPS).map(|n| format!("a.b{n}")).collect::<Vec<_>>()}),
+    ] {
+        assert!(
+            BatchScope::parse(Some(&bad)).is_err(),
+            "{bad} should be refused"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_call_on_a_scoped_app_window_passes_and_others_are_outside_scope() {
+    let facts = notes_and_mail();
+    let scope = scope(json!({"apps": ["com.example.notes"]}));
+    check(&scope, "click", json!({"pid": 42, "window_id": 7}), &facts)
+        .await
+        .unwrap();
+    // pid alone: the driver resolves that pid's own window.
+    check(&scope, "press_key", json!({"pid": 42, "key": "a"}), &facts)
+        .await
+        .unwrap();
+    let refused = check(&scope, "click", json!({"pid": 99, "window_id": 9}), &facts)
+        .await
+        .unwrap_err();
+    assert_eq!(refused.code, OUTSIDE_SCOPE);
+    assert_eq!((refused.pid, refused.window_id), (Some(99), Some(9)));
+    // A window of another process named with a scoped pid.
+    let refused = check(&scope, "click", json!({"pid": 42, "window_id": 9}), &facts)
+        .await
+        .unwrap_err();
+    assert_eq!(refused.code, OUTSIDE_SCOPE);
+    assert!(
+        refused.message.contains("not a window of pid 42"),
+        "{refused:?}"
+    );
+    // Reads are scoped as well.
+    assert_eq!(
+        check(
+            &scope,
+            "get_window_state",
+            json!({"pid": 99, "window_id": 9}),
+            &facts
+        )
+        .await
+        .unwrap_err()
+        .code,
+        OUTSIDE_SCOPE
+    );
+    // Enumeration stays available.
+    check(&scope, "list_windows", json!({}), &facts)
+        .await
+        .unwrap();
+    check(&scope, "list_apps", json!({}), &facts).await.unwrap();
+    // An unknown process is outside.
+    assert_eq!(
+        check(&scope, "click", json!({"pid": 5, "window_id": 1}), &facts)
+            .await
+            .unwrap_err()
+            .code,
+        OUTSIDE_SCOPE
+    );
+}
+
+#[tokio::test]
+async fn background_scope_refuses_foreground_and_desktop_wide_calls() {
+    let facts = notes_and_mail();
+    let background = scope(json!({"apps": ["com.example.notes"], "delivery": "background"}));
+    for (tool, args) in [
+        (
+            "click",
+            json!({"pid": 42, "window_id": 7, "delivery_mode": "foreground"}),
+        ),
+        ("bring_to_front", json!({"pid": 42, "window_id": 7})),
+        ("activate_app", json!({"pid": 42})),
+        ("press_key", json!({"key": "return"})),
+        ("hotkey", json!({"keys": ["cmd", "q"]})),
+        ("move_cursor", json!({"x": 10, "y": 10})),
+        ("click", json!({"x": 10, "y": 10, "scope": "desktop"})),
+    ] {
+        let refused = check(&background, tool, args.clone(), &facts)
+            .await
+            .unwrap_err();
+        assert_eq!(refused.code, FOREGROUND_NOT_ALLOWED, "{tool} {args}");
+    }
+    // A screen-wide read is not foreground, but it is outside the apps.
+    assert_eq!(
+        check(&background, "screenshot", json!({}), &facts)
+            .await
+            .unwrap_err()
+            .code,
+        OUTSIDE_SCOPE
+    );
+    // The foreground check does not wait for an identity lookup.
+    assert!(facts.lookups.lock().unwrap().is_empty());
+
+    let foreground = scope(json!({"apps": ["com.example.notes"], "delivery": "foreground"}));
+    check(
+        &foreground,
+        "click",
+        json!({"pid": 42, "window_id": 7, "delivery_mode": "foreground"}),
+        &facts,
+    )
+    .await
+    .unwrap();
+    check(
+        &foreground,
+        "bring_to_front",
+        json!({"pid": 42, "window_id": 7}),
+        &facts,
+    )
+    .await
+    .unwrap();
+    // Foreground still means the scoped apps' windows only.
+    for (tool, args) in [
+        ("press_key", json!({"key": "return"})),
+        ("bring_to_front", json!({"pid": 99, "window_id": 9})),
+    ] {
+        assert_eq!(
+            check(&foreground, tool, args, &facts)
+                .await
+                .unwrap_err()
+                .code,
+            OUTSIDE_SCOPE
+        );
+    }
+}
+
+#[tokio::test]
+async fn executable_identities_match_the_attested_executable_only() {
+    let mut facts = notes_and_mail();
+    // A claimed bundle id equal to the path never stands in for the
+    // attested executable.
+    facts
+        .bundles
+        .insert(99, "/Applications/Notes.app/Contents/MacOS/Notes".into());
+    let posix = scope(json!({"apps": ["/Applications/Notes.app/Contents/MacOS/Notes"]}));
+    check(&posix, "click", json!({"pid": 42, "window_id": 7}), &facts)
+        .await
+        .unwrap();
+    assert!(
+        check(&posix, "click", json!({"pid": 99, "window_id": 9}), &facts)
+            .await
+            .is_err()
+    );
+    // POSIX paths are case-exact.
+    let other_case = scope(json!({"apps": ["/applications/notes.app/Contents/MacOS/Notes"]}));
+    assert!(check(
+        &other_case,
+        "click",
+        json!({"pid": 42, "window_id": 7}),
+        &facts
+    )
+    .await
+    .is_err());
+
+    let mut windows = notes_and_mail();
+    windows.processes.insert(
+        42,
+        ProcessFacts {
+            start_time: Some(1),
+            executable: Some(r"\\?\C:\PROGRAM FILES\Notes\NOTES.EXE".into()),
+        },
+    );
+    windows
+        .bundles
+        .insert(99, r"C:\Program Files\Notes\notes.exe".into());
+    let windows_path = scope(json!({"apps": [r"c:/program files/notes/notes.exe"]}));
+    check(
+        &windows_path,
+        "click",
+        json!({"pid": 42, "window_id": 7}),
+        &windows,
+    )
+    .await
+    .unwrap();
+    assert!(check(
+        &windows_path,
+        "click",
+        json!({"pid": 99, "window_id": 9}),
+        &windows
+    )
+    .await
+    .is_err());
+    // No attested executable: a path identity fails closed.
+    windows.processes.remove(&42);
+    let fresh = scope(json!({"apps": [r"C:\Program Files\Notes\notes.exe"]}));
+    assert!(check(
+        &fresh,
+        "click",
+        json!({"pid": 42, "window_id": 7}),
+        &windows
+    )
+    .await
+    .is_err());
+}
+
+#[tokio::test]
+async fn verdicts_are_cached_per_process_instance() {
+    let mut facts = notes_and_mail();
+    let scope = scope(json!({"apps": ["com.example.notes"]}));
+    for _ in 0..3 {
+        check(&scope, "click", json!({"pid": 42, "window_id": 7}), &facts)
+            .await
+            .unwrap();
+    }
+    assert_eq!(
+        *facts.lookups.lock().unwrap(),
+        vec!["bundle 42".to_owned(), "window 42/7".to_owned()]
+    );
+    // The pid now belongs to another process instance (new start time).
+    facts.processes.insert(
+        42,
+        ProcessFacts {
+            start_time: Some(2),
+            executable: None,
+        },
+    );
+    facts.bundles.insert(42, "com.example.mail".into());
+    assert_eq!(
+        check(&scope, "click", json!({"pid": 42, "window_id": 7}), &facts)
+            .await
+            .unwrap_err()
+            .code,
+        OUTSIDE_SCOPE
+    );
+}
+
+#[tokio::test]
+async fn launch_is_allowed_only_for_a_scoped_bundle_id() {
+    let facts = notes_and_mail();
+    let scope = scope(json!({"apps": ["com.example.notes", "/usr/bin/gedit"]}));
+    check(
+        &scope,
+        "launch_app",
+        json!({"bundle_id": "com.example.notes"}),
+        &facts,
+    )
+    .await
+    .unwrap();
+    for args in [
+        json!({"bundle_id": "com.example.mail"}),
+        json!({"name": "Notes"}),
+        json!({"bundle_id": "/usr/bin/gedit"}),
+    ] {
+        assert_eq!(
+            check(&scope, "launch_app", args, &facts)
+                .await
+                .unwrap_err()
+                .code,
+            OUTSIDE_SCOPE
+        );
+    }
+}
+
+#[test]
+fn a_refusal_is_an_error_result_with_effect_refused_and_a_stable_code() {
+    let result = Refusal {
+        code: OUTSIDE_SCOPE,
+        message: "pid 99 is not one of the scoped apps (com.example.notes)".into(),
+        tool: "click".into(),
+        pid: Some(99),
+        window_id: Some(9),
+    }
+    .into_result();
+    assert_eq!(result.is_error, Some(true));
+    let structured = result.structured_content.unwrap();
+    assert_eq!(structured["effect"], "refused");
+    assert_eq!(structured["code"], OUTSIDE_SCOPE);
+    assert_eq!(structured["refusal"]["code"], OUTSIDE_SCOPE);
+    assert_eq!(structured["error"]["code"], OUTSIDE_SCOPE);
+    assert_eq!(
+        (structured["pid"].clone(), structured["window_id"].clone()),
+        (json!(99), json!(9))
+    );
+}
+
+// --------------------------------------------------------- end to end ----
+
+type Calls = Arc<Mutex<Vec<(String, Value)>>>;
+
+/// Fake apps: Notes (pid 42, window 7, button "Save") and Mail (pid 99,
+/// window 9, button "Send"). Actions answer \`effect: unverifiable\`; an
+/// action asked to \`need_foreground\` refuses background delivery the way
+/// Electron targets do.
+struct Fake {
+    def: ToolDef,
+    calls: Calls,
+}
+
+#[async_trait]
+impl Tool for Fake {
+    fn def(&self) -> &ToolDef {
+        &self.def
+    }
+
+    async fn invoke(&self, args: Value) -> ToolResult {
+        let name = self.def.name.clone();
+        self.calls
+            .lock()
+            .unwrap()
+            .push((name.clone(), args.clone()));
+        let windows = [(42, 7, "Notes", "Draft"), (99, 9, "Mail", "Inbox")];
+        match name.as_str() {
+            "list_windows" => {
+                let pid = args.get("pid").and_then(Value::as_i64);
+                let listed: Vec<Value> = windows
+                    .iter()
+                    .filter(|(owner, ..)| pid.is_none_or(|pid| pid == *owner))
+                    .map(|(pid, window_id, app, title)| {
+                        json!({
+                            "pid": pid, "window_id": window_id, "app_name": app, "title": title,
+                            "z_index": 1, "is_on_screen": true,
+                            "bounds": {"x": 0.0, "y": 0.0, "width": 800.0, "height": 600.0}
+                        })
+                    })
+                    .collect();
+                ToolResult::text("windows").with_structured(json!({ "windows": listed }))
+            }
+            "list_apps" => ToolResult::text("apps").with_structured(json!({"apps": [
+                {"pid": 42, "name": "Notes", "bundle_id": "com.example.notes", "running": true},
+                {"pid": 99, "name": "Mail", "bundle_id": "com.example.mail", "running": true}
+            ]})),
+            "get_window_state" => {
+                let pid = args["pid"].as_i64().unwrap_or(0);
+                let (window_id, label, snapshot) = if pid == 99 {
+                    (9, "Send", "s00000002")
+                } else {
+                    (7, "Save", "s00000001")
+                };
+                ToolResult::text(format!("- [0] AXWindow\n  - [1] AXButton \"{label}\"")).with_structured(json!({
+                    "pid": pid, "window_id": window_id, "snapshot_id": snapshot,
+                    "tree_markdown": format!("- [0] AXWindow\n  - [1] AXButton \"{label}\"\n"),
+                    "elements": [{"element_index": 1, "element_token": format!("{snapshot}:1"), "role": "AXButton", "label": label, "depth": 1}]
+                }))
+            }
+            "launch_app" => ToolResult::text("launched").with_structured(json!({"pid": 42})),
+            _ if args["need_foreground"] == true
+                && args.get("delivery_mode").and_then(Value::as_str) != Some("foreground") =>
+            {
+                ToolResult::error(format!("{name}: the target ignores background input"))
+                    .with_structured(json!({
+                        "code": "background_unavailable",
+                        "escalation": {"recommended": "foreground", "reason": "delivery_failed"}
+                    }))
+            }
+            _ => ToolResult::text(format!("{name} done")).with_structured(json!({
+                "effect": "unverifiable", "path": "ax"
+            })),
+        }
+    }
+}
+
+struct Harness {
+    registry: Arc<ToolRegistry>,
+    calls: Calls,
+}
+
+impl Harness {
+    fn new() -> Self {
+        let calls: Calls = Arc::default();
+        let mut registry = ToolRegistry::new();
+        for name in crate::batch_tools::BATCHABLE_TOOLS.iter().copied().chain([
+            "get_window_state",
+            "list_windows",
+            "list_apps",
+            "launch_app",
+            "verify_state",
+            "zoom",
+            "invoke_menu",
+            "bring_to_front",
+        ]) {
+            let read_only = matches!(
+                name,
+                "get_window_state" | "list_windows" | "list_apps" | "verify_state" | "zoom"
+            );
+            let schema = if read_only || name == "launch_app" {
+                json!({"type": "object"})
+            } else {
+                json!({"type": "object", "properties": {
+                    "pid": {"type": "integer"},
+                    "window_id": {"type": "integer"},
+                    "element_token": {"type": "string"},
+                    "delivery_mode": {"type": "string", "enum": ["background", "foreground"]}
+                }})
+            };
+            registry.register(Box::new(Fake {
+                def: ToolDef {
+                    name: name.into(),
+                    description: "fake".into(),
+                    input_schema: schema,
+                    read_only,
+                    destructive: false,
+                    idempotent: false,
+                    open_world: false,
+                },
+                calls: calls.clone(),
+            }));
+        }
+        registry.register_session_tools();
+        registry.register_script_tool();
+        let registry = Arc::new(registry);
+        registry.init_self_weak();
+        Self { registry, calls }
+    }
+
+    async fn run(&self, tool: &str, args: Value) -> (ToolResult, Value) {
+        let result = self.registry.invoke(tool, args).await;
+        let structured = result.structured_content.clone().unwrap_or(Value::Null);
+        (result, structured)
+    }
+
+    /// Calls of \`tool\` that reached the fake, with their pid.
+    fn sent(&self, tool: &str) -> Vec<Value> {
+        self.calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(name, _)| name == tool)
+            .map(|(_, args)| args.clone())
+            .collect()
+    }
+}
+
+fn text(result: &ToolResult) -> String {
+    result
+        .content
+        .iter()
+        .filter_map(|content| match content {
+            Content::Text { text, .. } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+const NOTES_ONLY: &str = "com.example.notes";
+
+#[tokio::test]
+async fn run_steps_refuses_a_step_outside_the_scope_and_stops_there() {
+    let harness = Harness::new();
+    let (result, out) = harness
+        .run(
+            "run_steps",
+            json!({
+                "scope": {"apps": [NOTES_ONLY]},
+                "steps": [
+                    {"click": {"pid": 42, "window_id": 7, "element_token": "s00000001:1"}},
+                    {"click": {"pid": 99, "window_id": 9, "element_token": "s00000002:1"}},
+                    {"press_key": {"pid": 42, "window_id": 7, "key": "a"}}
+                ]
+            }),
+        )
+        .await;
+    assert_eq!(result.is_error, Some(true), "{}", text(&result));
+    assert_eq!(out["failed_step"], 1);
+    assert_eq!(out["executed"], 2);
+    assert_eq!(
+        out["scope"],
+        json!({"apps": [NOTES_ONLY], "delivery": "background"})
+    );
+    assert_eq!(out["steps"][0]["effect"], "unverifiable");
+    assert_eq!(out["steps"][1]["effect"], "refused");
+    assert_eq!(out["steps"][1]["code"], OUTSIDE_SCOPE);
+    let clicks = harness.sent("click");
+    assert_eq!(clicks.len(), 1, "{clicks:?}");
+    assert_eq!(clicks[0]["pid"], 42);
+    assert!(harness.sent("press_key").is_empty(), "the batch stopped");
+}
+
+#[tokio::test]
+async fn run_steps_refuses_a_lookup_in_a_window_outside_the_scope() {
+    let harness = Harness::new();
+    let (result, out) = harness
+        .run(
+            "run_steps",
+            json!({
+                "scope": {"apps": [NOTES_ONLY]},
+                "steps": [{"click": {"app": "Mail", "role": "button", "name": "Send"}}]
+            }),
+        )
+        .await;
+    assert_eq!(result.is_error, Some(true));
+    assert_eq!(out["steps"][0]["code"], OUTSIDE_SCOPE, "{out}");
+    assert_eq!(out["steps"][0]["effect"], "refused");
+    assert!(harness.sent("click").is_empty());
+    assert!(
+        harness
+            .sent("get_window_state")
+            .iter()
+            .all(|args| args["pid"] != 99),
+        "Mail's window was never read"
+    );
+}
+
+#[tokio::test]
+async fn run_steps_background_scope_refuses_foreground_steps_and_the_foreground_fallback() {
+    let harness = Harness::new();
+    let (_, out) = harness
+        .run(
+            "run_steps",
+            json!({
+                "scope": {"apps": [NOTES_ONLY]},
+                "steps": [{"click": {"pid": 42, "window_id": 7, "element_token": "s00000001:1", "delivery_mode": "foreground"}}]
+            }),
+        )
+        .await;
+    assert_eq!(out["steps"][0]["code"], FOREGROUND_NOT_ALLOWED, "{out}");
+    assert_eq!(out["steps"][0]["effect"], "refused");
+    assert!(harness.sent("click").is_empty());
+
+    // The retry foreground_fallback would send is refused too: only the
+    // background attempt reached the app.
+    let (_, out) = harness
+        .run(
+            "run_steps",
+            json!({
+                "scope": {"apps": [NOTES_ONLY]},
+                "foreground_fallback": true,
+                "steps": [{"click": {"pid": 42, "window_id": 7, "element_token": "s00000001:1", "need_foreground": true}}]
+            }),
+        )
+        .await;
+    assert_eq!(out["steps"][0]["code"], FOREGROUND_NOT_ALLOWED, "{out}");
+    let clicks = harness.sent("click");
+    assert_eq!(clicks.len(), 1, "{clicks:?}");
+    assert!(clicks[0]
+        .get("delivery_mode")
+        .is_none_or(|mode| mode == "background"));
+
+    // A desktop-wide key press names no window.
+    let (_, out) = harness
+        .run(
+            "run_steps",
+            json!({"scope": {"apps": [NOTES_ONLY]}, "steps": [{"press_key": {"key": "return"}}]}),
+        )
+        .await;
+    assert_eq!(out["steps"][0]["code"], FOREGROUND_NOT_ALLOWED, "{out}");
+    assert!(harness.sent("press_key").is_empty());
+}
+
+#[tokio::test]
+async fn run_steps_without_scope_is_unchanged_and_a_bad_scope_runs_nothing() {
+    let harness = Harness::new();
+    let (result, out) = harness
+        .run(
+            "run_steps",
+            json!({"steps": [{"click": {"pid": 99, "window_id": 9, "element_token": "s00000002:1"}}]}),
+        )
+        .await;
+    assert_ne!(result.is_error, Some(true), "{}", text(&result));
+    assert!(out.get("scope").is_none());
+    assert_eq!(harness.sent("click").len(), 1);
+
+    let (result, out) = harness
+        .run(
+            "run_steps",
+            json!({"scope": {"apps": []}, "steps": [{"click": {"pid": 42, "window_id": 7}}]}),
+        )
+        .await;
+    assert_eq!(result.is_error, Some(true));
+    assert_eq!(out["code"], "invalid_batch");
+    assert_eq!(harness.sent("click").len(), 1, "nothing ran");
+}
+
+#[tokio::test]
+async fn run_script_refuses_calls_outside_the_scope_and_journals_every_effect() {
+    let harness = Harness::new();
+    let (result, out) = harness
+        .run(
+            "run_script",
+            json!({
+                "scope": {"apps": [NOTES_ONLY]},
+                "script": "const notes = await cua.getApp({pid: 42, windowId: 7});\nawait notes.click({role: 'button', name: 'Save'});\nconst mail = await cua.getApp('Mail');\nawait mail.click([10, 10]);\nreturn 1;"
+            }),
+        )
+        .await;
+    assert_eq!(result.is_error, Some(true), "{}", text(&result));
+    assert_eq!(out["error"]["code"], OUTSIDE_SCOPE, "{out}");
+    assert_eq!(out["scope"]["apps"], json!([NOTES_ONLY]));
+    let calls = out["calls"].as_array().unwrap();
+    let save = calls
+        .iter()
+        .find(|call| call["op"] == "click" && call["ok"] == true)
+        .unwrap();
+    assert_eq!(save["tool"], "click");
+    assert_eq!(save["effect"], "unverifiable");
+    assert_eq!(
+        (save["pid"].clone(), save["window_id"].clone()),
+        (json!(42), json!(7))
+    );
+    let refused = calls.last().unwrap();
+    assert_eq!(refused["op"], "click");
+    assert_eq!(refused["ok"], false);
+    assert_eq!(refused["effect"], "refused");
+    assert_eq!(refused["code"], OUTSIDE_SCOPE);
+    assert_eq!(refused["pid"], 99);
+    let clicks = harness.sent("click");
+    assert_eq!(clicks.len(), 1, "{clicks:?}");
+    assert_eq!(clicks[0]["pid"], 42);
+    assert!(
+        text(&result).contains("click ERROR, refused (outside_scope)"),
+        "{}",
+        text(&result)
+    );
+}
+
+#[tokio::test]
+async fn run_script_scope_refusals_carry_their_code_to_the_script_and_block_the_desktop() {
+    let harness = Harness::new();
+    let (result, out) = harness
+        .run(
+            "run_script",
+            json!({
+                "scope": {"apps": [NOTES_ONLY]},
+                "script": "const codes = [];\nfor (const call of [() => cua.call('press_key', {key: 'return'}), () => cua.call('launch_app', {bundle_id: 'com.example.mail'}), async () => (await cua.getApp('Mail')).query({role: 'button'})]) {\n  try { await call(); codes.push('sent'); } catch (error) { codes.push(error.code); }\n}\nreturn codes;"
+            }),
+        )
+        .await;
+    assert_ne!(result.is_error, Some(true), "{}", text(&result));
+    assert_eq!(
+        out["value"],
+        json!([FOREGROUND_NOT_ALLOWED, OUTSIDE_SCOPE, OUTSIDE_SCOPE]),
+        "{out}"
+    );
+    assert!(harness.sent("press_key").is_empty());
+    assert!(harness.sent("launch_app").is_empty());
+    assert!(harness
+        .sent("get_window_state")
+        .iter()
+        .all(|args| args["pid"] != 99));
+    let journal = out["calls"].as_array().unwrap();
+    assert!(
+        journal
+            .iter()
+            .filter(|call| call["ok"] == false)
+            .all(|call| call["effect"] == "refused"),
+        "{journal:?}"
+    );
+}
+
+#[tokio::test]
+async fn run_script_records_effects_without_a_scope_and_rejects_a_bad_one() {
+    let harness = Harness::new();
+    let (result, out) = harness
+        .run(
+            "run_script",
+            json!({"script": "const app = await cua.getApp({pid: 99, windowId: 9});\nawait app.click([5, 5]);\nreturn 1;"}),
+        )
+        .await;
+    assert_ne!(result.is_error, Some(true), "{}", text(&result));
+    let click = out["calls"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|call| call["op"] == "click")
+        .cloned()
+        .unwrap();
+    assert_eq!(click["effect"], "unverifiable");
+    assert_eq!(click["tool"], "click");
+    assert!(out.get("scope").is_none());
+
+    let (result, out) = harness
+        .run(
+            "run_script",
+            json!({"script": "return 1;", "scope": {"apps": ["com.example.notes"], "delivery": "sometimes"}}),
+        )
+        .await;
+    assert_eq!(result.is_error, Some(true));
+    assert_eq!(out["code"], "invalid_script");
+}
+
+#[test]
+fn run_steps_and_run_script_advertise_scope_in_their_input_schemas() {
+    let harness = Harness::new();
+    for tool in ["run_steps", "run_script"] {
+        let def = harness.registry.get_def(tool).unwrap();
+        assert_eq!(
+            def.input_schema["properties"]["scope"],
+            input_schema(),
+            "{tool}"
+        );
+        assert!(
+            !def.input_schema["required"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("scope")),
+            "{tool}: scope is optional"
+        );
+    }
+    let schema = input_schema();
+    assert_eq!(schema["required"], json!(["apps"]));
+    assert_eq!(schema["additionalProperties"], false);
+    assert_eq!(
+        schema["properties"]["delivery"]["enum"],
+        json!(["background", "foreground"])
+    );
+}

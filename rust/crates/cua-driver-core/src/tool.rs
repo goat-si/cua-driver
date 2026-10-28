@@ -1810,6 +1810,18 @@ impl ToolRegistry {
         if let Err(result) = crate::action_target::enforce_delivery_target(resolved_name, &args) {
             return result;
         }
+        // A call dispatched by a `run_steps` batch or a `run_script` program
+        // that carries a `scope` must stay inside it. Checked before
+        // authorization, consent and the platform tool, so a refused call
+        // sends nothing.
+        if let Some(scope) = crate::batch_scope::current() {
+            if let Err(refusal) = scope
+                .check(resolved_name, &args, tool.def().read_only, self)
+                .await
+            {
+                return refusal.into_result();
+            }
+        }
 
         // This registry is the canonical native dispatch boundary shared by
         // the same-process SDK and every transport adapter. Authorization must
@@ -6296,6 +6308,58 @@ resources:
         assert_eq!(args["_session_id"], "default");
         assert_eq!(args["cursor_id"], "default");
         assert!(args.get("_public_session_label").is_none());
+    }
+}
+
+/// What a batch scope needs to know about a process, read through the
+/// registry's own platform tools without dispatch (as manifest checks do),
+/// so the lookups are neither recorded nor checked against the scope.
+#[async_trait]
+impl crate::batch_scope::ScopeFacts for ToolRegistry {
+    async fn process(&self, pid: i64) -> Option<crate::batch_scope::ProcessFacts> {
+        let fingerprint = self.attest_process_fingerprint(pid).await?;
+        Some(crate::batch_scope::ProcessFacts {
+            start_time: fingerprint.start_time,
+            executable: fingerprint.executable,
+        })
+    }
+
+    async fn bundle_id(&self, pid: i64) -> Option<String> {
+        let result = self
+            .tools
+            .get("list_apps")?
+            .invoke(serde_json::json!({}))
+            .await;
+        result
+            .structured_content
+            .as_ref()?
+            .get("apps")?
+            .as_array()?
+            .iter()
+            .find(|app| app.get("pid").and_then(Value::as_i64) == Some(pid))?
+            .get("bundle_id")?
+            .as_str()
+            .map(str::to_owned)
+    }
+
+    async fn window_of(&self, pid: i64, window_id: u64) -> bool {
+        let Some(tool) = self.tools.get("list_windows") else {
+            return false;
+        };
+        let result = tool
+            .invoke(serde_json::json!({"pid": pid, "on_screen_only": false}))
+            .await;
+        result
+            .structured_content
+            .as_ref()
+            .and_then(|value| value.get("windows"))
+            .and_then(Value::as_array)
+            .is_some_and(|windows| {
+                windows.iter().any(|window| {
+                    window.get("pid").and_then(Value::as_i64) == Some(pid)
+                        && window.get("window_id").and_then(Value::as_u64) == Some(window_id)
+                })
+            })
     }
 }
 

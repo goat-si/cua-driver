@@ -1302,7 +1302,7 @@ fn validate_manifest_paths(section: &str, paths: Vec<String>) -> Result<HashSet<
 /// Purely textual, so it behaves the same on every host OS and can be
 /// unit-tested anywhere. Drive-letter (`C:\`, `C:/`), UNC (`\\server\share`)
 /// and verbatim (`\\?\C:\`) forms count as paths.
-fn is_windows_path_identity(value: &str) -> bool {
+pub(crate) fn is_windows_path_identity(value: &str) -> bool {
     let value = value.trim();
     let mut chars = value.chars();
     let drive_path = matches!(
@@ -1321,7 +1321,7 @@ fn is_windows_path_identity(value: &str) -> bool {
 /// contains a `.` or `..` component. The path read from a live process never
 /// has those, and resolving them lexically could point somewhere else once
 /// links are followed.
-fn normalize_windows_executable_path(path: &str) -> Option<String> {
+pub(crate) fn normalize_windows_executable_path(path: &str) -> Option<String> {
     let path = path.trim().replace('/', "\\");
     let (unc, rest) = if let Some(rest) = path.strip_prefix("\\\\?\\UNC\\") {
         (true, rest)
@@ -1374,7 +1374,7 @@ fn normalize_windows_executable_path(path: &str) -> Option<String> {
 ///   `list_apps` pairs a running process with an installed app by file name,
 ///   so any program named like the granted one would otherwise inherit the
 ///   grant. A missing or unusable path never matches.
-fn bundle_grant_matches(
+pub(crate) fn bundle_grant_matches(
     granted_bundle_id: &str,
     claimed_bundle_id: Option<&str>,
     attested_executable: Option<&str>,

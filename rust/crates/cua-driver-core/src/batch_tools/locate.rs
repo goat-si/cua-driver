@@ -454,6 +454,10 @@ pub(crate) struct Locator<'a> {
     /// read of a window the caller never read.
     baseline_max_elements: Option<u64>,
     baselined: std::sync::Mutex<std::collections::HashSet<(i64, u64)>>,
+    /// The code of the last read a batch scope refused, so a failed lookup
+    /// reports `outside_scope` / `foreground_not_allowed` rather than a
+    /// plain lookup failure.
+    scope_refusal: std::sync::Mutex<Option<&'static str>>,
 }
 
 impl<'a> Locator<'a> {
@@ -464,7 +468,16 @@ impl<'a> Locator<'a> {
             deadline,
             baseline_max_elements: None,
             baselined: Default::default(),
+            scope_refusal: Default::default(),
         }
+    }
+
+    /// The scope refusal code a lookup hit since the last call, if any.
+    pub fn take_scope_refusal(&self) -> Option<&'static str> {
+        self.scope_refusal
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
     }
 
     pub fn with_observe_baseline(mut self, max_elements: u64) -> Self {
@@ -482,6 +495,23 @@ impl<'a> Locator<'a> {
     async fn call(&self, tool: &str, args: Value) -> Result<Value, String> {
         let result = self.registry.invoke(tool, self.with_session(args)).await;
         if result.is_error == Some(true) {
+            let code = result
+                .structured_content
+                .as_ref()
+                .and_then(|value| value.get("code"))
+                .and_then(Value::as_str);
+            let scope_code = [
+                crate::batch_scope::OUTSIDE_SCOPE,
+                crate::batch_scope::FOREGROUND_NOT_ALLOWED,
+            ]
+            .into_iter()
+            .find(|known| Some(*known) == code);
+            if let Some(scope_code) = scope_code {
+                *self
+                    .scope_refusal
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(scope_code);
+            }
             return Err(format!("{tool}: {}", first_text(&result)));
         }
         Ok(result.structured_content.unwrap_or(Value::Null))

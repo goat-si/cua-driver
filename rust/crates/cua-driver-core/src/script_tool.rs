@@ -188,11 +188,15 @@ impl Tool for RunScriptTool {
                 right_click, set_value, type_text, press_key, hotkey, scroll, drag, \
                 launch_app, list_apps, list_windows, get_window_state, verify_state, zoom.\n\
                 A failed driver call throws a CuaError (catch it to recover). Every call goes \
-                through the same session, permission and approval checks as a direct call.\n\n\
+                through the same session, permission and approval checks as a direct call. \
+                With `scope` ({apps, delivery?}) the driver also refuses every call outside \
+                those apps' windows (error.code outside_scope) or needing the foreground \
+                (foreground_not_allowed); nothing is sent for it.\n\n\
                 Limits: `timeout_ms` wall time (default 30000, max 120000), `max_calls` driver \
                 calls (default 100, max 500), 32 MiB heap. Returns the return value, console \
-                output, and a per-call log; an error names the script line, the call and the \
-                reason.\n\n\
+                output, and a per-call log (each call's tool, target pid/window_id, and the \
+                effect and code the driver returned); an error names the script line, the call \
+                and the reason.\n\n\
                 Example:\n\
                 const app = await cua.getApp(\"Calculator\");\n\
                 for (const key of [\"7\", \"multiply\", \"6\", \"equals\"]) await app.click({role: \"button\", name: key});\n\
@@ -220,7 +224,8 @@ impl Tool for RunScriptTool {
                         "minimum": 1,
                         "maximum": MAX_MAX_CALLS,
                         "description": "Most driver calls the script may make. Default 100."
-                    }
+                    },
+                    "scope": crate::batch_scope::input_schema()
                 },
                 "additionalProperties": false
             }),
@@ -249,7 +254,8 @@ impl Tool for RunScriptTool {
                     )
             }
         };
-        run(&registry, request).await
+        let scope = request.scope.clone();
+        crate::batch_scope::enter(scope, run(&registry, request)).await
     }
 }
 
@@ -258,6 +264,7 @@ struct Request {
     timeout: Duration,
     max_calls: u32,
     session: Option<String>,
+    scope: Option<Arc<crate::batch_scope::BatchScope>>,
 }
 
 impl Request {
@@ -267,7 +274,7 @@ impl Request {
             !key.starts_with('_')
                 && !matches!(
                     key.as_str(),
-                    "script" | "timeout_ms" | "max_calls" | "session"
+                    "script" | "timeout_ms" | "max_calls" | "session" | "scope"
                 )
         }) {
             return Err(format!("unknown field `{key}`"));
@@ -305,6 +312,7 @@ impl Request {
                 .get("_public_session_label")
                 .and_then(Value::as_str)
                 .map(str::to_owned),
+            scope: crate::batch_scope::BatchScope::parse(object.get("scope"))?,
         })
     }
 }
@@ -327,6 +335,19 @@ struct CallRecord {
     ok: bool,
     elapsed: Duration,
     detail: String,
+    /// What the driver call behind this op reported, as a direct call
+    /// would: the tool it ran, its target, `effect` and `code`.
+    facts: CallFacts,
+}
+
+/// The driver tool a script op ran last, its target, and what it returned.
+#[derive(Clone, Debug, Default)]
+struct CallFacts {
+    tool: Option<String>,
+    pid: Option<i64>,
+    window_id: Option<u64>,
+    effect: Option<String>,
+    code: Option<String>,
 }
 
 async fn run(registry: &ToolRegistry, request: Request) -> ToolResult {
@@ -363,10 +384,27 @@ async fn run(registry: &ToolRegistry, request: Request) -> ToolResult {
         tokio::select! {
             Some(call) = call_rx.recv() => {
                 let call_started = Instant::now();
-                let result = match tokio::time::timeout_at(deadline.into(), api.dispatch(&call.op, call.args)).await {
+                api.last = None;
+                api.locator.take_scope_refusal();
+                let mut result = match tokio::time::timeout_at(deadline.into(), api.dispatch(&call.op, call.args)).await {
                     Ok(result) => result,
                     Err(_) => Err(HostError::new("the script's wall-time limit was reached", "timeout")),
                 };
+                let mut facts = api.last.take().unwrap_or_default();
+                // A lookup the scope refused fails the op with the scope's
+                // code, as a refused action does.
+                if let (Some(code), Err(error)) = (api.locator.take_scope_refusal(), &mut result) {
+                    if facts.effect.is_none() {
+                        error.code = Some(code.to_owned());
+                        facts.effect = Some("refused".to_owned());
+                        facts.code = Some(code.to_owned());
+                    }
+                }
+                if let Err(error) = &result {
+                    if facts.code.is_none() {
+                        facts.code = error.code.clone();
+                    }
+                }
                 if call.number > 0 {
                     log.push(CallRecord {
                         number: call.number,
@@ -378,6 +416,7 @@ async fn run(registry: &ToolRegistry, request: Request) -> ToolResult {
                             Ok(value) => summarize(value),
                             Err(error) => error.message.clone(),
                         },
+                        facts,
                     });
                 }
                 let _ = call.reply.send(result);
@@ -395,6 +434,7 @@ async fn run(registry: &ToolRegistry, request: Request) -> ToolResult {
         api.images,
         started.elapsed(),
         request.max_calls,
+        request.scope.as_deref(),
     )
 }
 
@@ -405,6 +445,8 @@ struct Api<'a> {
     session: Option<String>,
     deadline: Instant,
     images: Vec<Content>,
+    /// The last driver tool the current op ran, for the call log.
+    last: Option<CallFacts>,
 }
 
 impl<'a> Api<'a> {
@@ -415,6 +457,7 @@ impl<'a> Api<'a> {
             session,
             deadline,
             images: Vec::new(),
+            last: None,
         }
     }
 
@@ -483,6 +526,12 @@ impl<'a> Api<'a> {
         if let Some(session) = &self.session {
             args.insert("session".into(), json!(session));
         }
+        let mut facts = CallFacts {
+            tool: Some(tool.to_owned()),
+            pid: args.get("pid").and_then(Value::as_i64),
+            window_id: args.get("window_id").and_then(Value::as_u64),
+            ..CallFacts::default()
+        };
         // A script chains its actions, so each one returns without waiting out
         // the cursor glide or the full window-change report; the script's own
         // reads (`getState`, `waitFor`) see what an action opened.
@@ -494,6 +543,17 @@ impl<'a> Api<'a> {
         let result =
             crate::step_pacing::scope(pacing, self.registry.invoke(tool, Value::Object(args)))
                 .await;
+        let structured_str = |key: &str| {
+            result
+                .structured_content
+                .as_ref()
+                .and_then(|value| value.get(key))
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        };
+        facts.effect = structured_str("effect");
+        facts.code = structured_str("code");
+        self.last = Some(facts);
         let mut text = String::new();
         for content in &result.content {
             match content {
@@ -750,6 +810,7 @@ fn render(
     images: Vec<Content>,
     elapsed: Duration,
     max_calls: u32,
+    scope: Option<&crate::batch_scope::BatchScope>,
 ) -> ToolResult {
     let elapsed_ms = elapsed.as_millis() as u64;
     let outcome = outcome.unwrap_or_else(|| engine::Outcome {
@@ -772,8 +833,13 @@ fn render(
             json!({
                 "call": record.number,
                 "op": record.op,
+                "tool": record.facts.tool,
                 "line": (record.line > 0).then_some(record.line),
                 "ok": record.ok,
+                "effect": record.facts.effect,
+                "code": record.facts.code,
+                "pid": record.facts.pid,
+                "window_id": record.facts.window_id,
                 "ms": record.elapsed.as_millis() as u64,
                 "detail": record.detail,
             })
@@ -788,6 +854,9 @@ fn render(
         "console_truncated": outcome.console_truncated,
         "calls": calls_json,
     });
+    if let Some(scope) = scope {
+        structured["scope"] = scope.to_json();
+    }
     let is_error = match &outcome.result {
         Ok(value) => {
             structured["ok"] = json!(true);
@@ -861,7 +930,7 @@ fn render(
         lines.push("calls:".to_owned());
         for record in &log {
             lines.push(format!(
-                "  {}. {}{} {} ({} ms){}",
+                "  {}. {}{} {}{} ({} ms){}",
                 record.number,
                 if record.line > 0 {
                     format!("line {} ", record.line)
@@ -870,6 +939,12 @@ fn render(
                 },
                 record.op,
                 if record.ok { "ok" } else { "ERROR" },
+                match (&record.facts.effect, &record.facts.code) {
+                    (Some(effect), Some(code)) => format!(", {effect} ({code})"),
+                    (Some(effect), None) => format!(", {effect}"),
+                    (None, Some(code)) if !record.ok => format!(" ({code})"),
+                    _ => String::new(),
+                },
                 record.elapsed.as_millis(),
                 if record.detail.is_empty() {
                     String::new()
