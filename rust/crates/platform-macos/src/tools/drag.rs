@@ -116,6 +116,8 @@ fn def() -> &'static ToolDef {
                     "description": "When true, coordinates are in the last zoom image for this pid; driver maps back to window coordinates."
                 },
                 "scope": { "type": "string", "enum": ["window", "desktop"], "default": "window", "description": "Use desktop with no pid/window_id for native get_desktop_state screenshot coordinates." },
+                "coordinate_space": super::window_points::coordinate_space_schema(),
+                "window_basis": super::window_points::window_basis_schema(),
                 "delivery_mode": cua_driver_core::tool_schema::delivery_mode_schema_with(DELIVERY_MODE_DESCRIPTION)
             },
             "additionalProperties": false
@@ -134,6 +136,20 @@ impl Tool for DragTool {
     }
 
     async fn invoke(&self, args: Value) -> ToolResult {
+        let space = match super::window_points::point_space(&args) {
+            Ok(space) => space,
+            Err(refusal) => return refusal,
+        };
+        let point = args
+            .get("to_x")
+            .and_then(Value::as_f64)
+            .zip(args.get("to_y").and_then(Value::as_f64));
+        super::window_points::annotate(self.invoke_in(args, space).await, space, point)
+    }
+}
+
+impl DragTool {
+    async fn invoke_in(&self, args: Value, space: super::window_points::PointSpace) -> ToolResult {
         use cua_driver_core::tool_args::ArgsExt;
         let cursor_key = super::cursor_tools::resolve_cursor_key(&args);
         if args.opt_str("scope").as_deref() == Some("desktop")
@@ -266,6 +282,11 @@ impl Tool for DragTool {
             }
         };
 
+        if from_zoom && matches!(space, super::window_points::PointSpace::WindowPoints(_)) {
+            return super::invalid_arguments(
+                "coordinate_space window_points cannot be combined with from_zoom.",
+            );
+        }
         // from_zoom: translate from last zoom crop context.
         if from_zoom {
             match super::zoom_context(&self.state, &args, pid, window_id) {
@@ -280,14 +301,23 @@ impl Tool for DragTool {
                 Err(refusal) => return refusal,
             }
         } else {
-            let ratio = match super::screenshot_scale(&self.state, &args, pid, window_id) {
-                Ok(ratio) => ratio,
+            // Both ends against one frame read: a stale basis refuses the drag.
+            match super::window_points::to_window_pixels(
+                &self.state,
+                &args,
+                pid,
+                window_id,
+                space,
+                &[(from_x, from_y), (to_x, to_y)],
+            )
+            .await
+            {
+                Ok(pixels) => {
+                    (from_x, from_y) = pixels[0];
+                    (to_x, to_y) = pixels[1];
+                }
                 Err(refusal) => return refusal,
-            };
-            from_x *= ratio;
-            from_y *= ratio;
-            to_x *= ratio;
-            to_y *= ratio;
+            }
         }
 
         // Translate window-local screenshot pixels → screen coordinates, and

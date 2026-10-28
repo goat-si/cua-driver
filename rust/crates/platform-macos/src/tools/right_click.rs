@@ -60,6 +60,8 @@ fn def() -> &'static ToolDef {
                     "items": { "type": "string" },
                     "description": "Modifier keys held during the right-click: cmd/shift/option/ctrl. Pixel path only."
                 },
+                "coordinate_space": super::window_points::coordinate_space_schema(),
+                "window_basis": super::window_points::window_basis_schema(),
                 "delivery_mode": cua_driver_core::tool_schema::delivery_mode_schema()
             },
             "additionalProperties": false
@@ -78,6 +80,20 @@ impl Tool for RightClickTool {
     }
 
     async fn invoke(&self, args: Value) -> ToolResult {
+        let space = match super::window_points::point_space(&args) {
+            Ok(space) => space,
+            Err(refusal) => return refusal,
+        };
+        let point = args
+            .get("x")
+            .and_then(Value::as_f64)
+            .zip(args.get("y").and_then(Value::as_f64));
+        super::window_points::annotate(self.invoke_in(args, space).await, space, point)
+    }
+}
+
+impl RightClickTool {
+    async fn invoke_in(&self, args: Value, space: super::window_points::PointSpace) -> ToolResult {
         use cua_driver_core::tool_args::ArgsExt;
         let pid = match super::target_pid(&self.state, &args) {
             Ok(v) => v,
@@ -154,14 +170,21 @@ impl Tool for RightClickTool {
         }
 
         // ── Pixel path ───────────────────────────────────────────────────────
-        let (mut cx, mut cy) = (x.unwrap(), y.unwrap());
-        // Scale back from downscaled-image space to native pixels when needed.
-        let ratio = match super::screenshot_scale(&self.state, &args, pid, window_id) {
-            Ok(ratio) => ratio,
+        // Scale back from screenshot pixels (or window points) to native
+        // window pixels.
+        let (cx, cy) = match super::window_points::to_window_pixels(
+            &self.state,
+            &args,
+            pid,
+            window_id,
+            space,
+            &[(x.unwrap(), y.unwrap())],
+        )
+        .await
+        {
+            Ok(pixels) => pixels[0],
             Err(refusal) => return refusal,
         };
-        cx *= ratio;
-        cy *= ratio;
 
         // Window-local → screen coordinate translation + win-local logical coords
         // for CGEventSetWindowLocation (shared with click.rs via px_frame, which

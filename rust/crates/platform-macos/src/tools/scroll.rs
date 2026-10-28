@@ -105,6 +105,8 @@ fn def() -> &'static ToolDef {
                 "x": { "type": "number", "description": "Window-local screenshot X (get_window_state PNG). With y, wheel-scrolls at that point; needs window_id." },
                 "y": { "type": "number", "description": "Window-local screenshot Y." },
                 "scope": { "type": "string", "enum": ["window", "desktop"], "default": "window", "description": "\"desktop\" with x,y and no pid/window_id uses get_desktop_state coordinates." },
+                "coordinate_space": super::window_points::coordinate_space_schema(),
+                "window_basis": super::window_points::window_basis_schema(),
                 "delivery_mode": cua_driver_core::tool_schema::delivery_mode_schema_with("Default \"background\": no fronting or focus steal. \"foreground\": briefly front the window, act, restore the prior app; last resort when background did not land.")
             },
             "additionalProperties": false
@@ -123,6 +125,20 @@ impl Tool for ScrollTool {
     }
 
     async fn invoke(&self, args: Value) -> ToolResult {
+        let space = match super::window_points::point_space(&args) {
+            Ok(space) => space,
+            Err(refusal) => return refusal,
+        };
+        let point = args
+            .get("x")
+            .and_then(Value::as_f64)
+            .zip(args.get("y").and_then(Value::as_f64));
+        super::window_points::annotate(self.invoke_in(args, space).await, space, point)
+    }
+}
+
+impl ScrollTool {
+    async fn invoke_in(&self, args: Value, space: super::window_points::PointSpace) -> ToolResult {
         use cua_driver_core::tool_args::ArgsExt;
         if args.opt_str("scope").as_deref() == Some("desktop")
             && args.get("pid").is_none()
@@ -418,12 +434,19 @@ impl Tool for ScrollTool {
             // click pixel path — undo any session downscale, then translate
             // through the shared window frame (which refuses a window with no
             // live frame rather than scrolling at screen-absolute coords).
-            let ratio = match super::screenshot_scale(&self.state, &args, pid, window_id) {
-                Ok(ratio) => ratio,
+            match super::window_points::to_window_pixels(
+                &self.state,
+                &args,
+                pid,
+                window_id,
+                space,
+                &[(cx, cy)],
+            )
+            .await
+            {
+                Ok(pixels) => (cx, cy) = pixels[0],
                 Err(refusal) => return refusal,
-            };
-            cx *= ratio;
-            cy *= ratio;
+            }
             let Some(wid) = window_id else {
                 // Unreachable: the None case refused above. Kept explicit so a
                 // future edit cannot reintroduce the screen-absolute fallback.

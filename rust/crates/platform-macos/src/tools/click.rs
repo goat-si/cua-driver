@@ -461,6 +461,8 @@ fn def() -> &'static ToolDef {
                     "type": "string",
                     "description": "Write a screenshot with a crosshair at (x, y) to this path. Needs window_id; not with from_zoom."
                 },
+                "coordinate_space": super::window_points::coordinate_space_schema(),
+                "window_basis": super::window_points::window_basis_schema(),
                 "delivery_mode": {
                     "type": "string",
                     "enum": ["background", "foreground"],
@@ -488,6 +490,20 @@ impl Tool for ClickTool {
     }
 
     async fn invoke(&self, args: Value) -> ToolResult {
+        let space = match super::window_points::point_space(&args) {
+            Ok(space) => space,
+            Err(refusal) => return refusal,
+        };
+        let point = args
+            .get("x")
+            .and_then(Value::as_f64)
+            .zip(args.get("y").and_then(Value::as_f64));
+        super::window_points::annotate(self.invoke_in(args, space).await, space, point)
+    }
+}
+
+impl ClickTool {
+    async fn invoke_in(&self, args: Value, space: super::window_points::PointSpace) -> ToolResult {
         use cua_driver_core::tool_args::ArgsExt;
 
         // ── Window-less screen-absolute branch (scope="desktop") ──────
@@ -1045,6 +1061,14 @@ impl Tool for ClickTool {
         } else if let (Some(mut cx), Some(mut cy)) = (x, y) {
             // ── Pixel path ─────────────────────────────────────────────────
 
+            if matches!(space, super::window_points::PointSpace::WindowPoints(_))
+                && (capture_id.is_some() || from_zoom || debug_image_out.is_some())
+            {
+                return super::invalid_arguments(
+                    "coordinate_space window_points cannot be combined with capture_id, from_zoom or \
+                     debug_image_out: those name screenshot pixels.",
+                );
+            }
             if capture_id.is_some() && (from_zoom || debug_image_out.is_some()) {
                 return super::invalid_arguments(
                     "click.capture_id is incompatible with from_zoom and debug_image_out; \
@@ -1120,6 +1144,23 @@ impl Tool for ClickTool {
                     Ok((action_x, action_y)) => {
                         cx = action_x;
                         cy = action_y;
+                    }
+                    Err(refusal) => return refusal,
+                }
+            } else if matches!(space, super::window_points::PointSpace::WindowPoints(_)) {
+                match super::window_points::to_window_pixels(
+                    &self.state,
+                    &args,
+                    pid,
+                    window_id,
+                    space,
+                    &[(cx, cy)],
+                )
+                .await
+                {
+                    Ok(pixels) => {
+                        cx = pixels[0].0;
+                        cy = pixels[0].1;
                     }
                     Err(refusal) => return refusal,
                 }

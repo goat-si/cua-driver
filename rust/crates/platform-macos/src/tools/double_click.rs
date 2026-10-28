@@ -56,6 +56,8 @@ fn def() -> &'static ToolDef {
                 "y":             { "type": "number",  "description": "Screen Y coordinate (pixel path)." },
                 "window_id":     { "type": "integer", "description": "CGWindowID. Omit when element_token is supplied (the token carries it)." },
                 "element_token": cua_driver_core::tool_schema::element_token_schema(),
+                "coordinate_space": super::window_points::coordinate_space_schema(),
+                "window_basis": super::window_points::window_basis_schema(),
                 "delivery_mode": cua_driver_core::tool_schema::delivery_mode_schema()
             },
             "additionalProperties": false
