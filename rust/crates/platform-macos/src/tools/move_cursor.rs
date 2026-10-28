@@ -169,7 +169,7 @@ impl MoveCursorTool {
             (Ok(x), Ok(y)) => (x, y),
             (Err(e), _) | (_, Err(e)) => return e,
         };
-        let (px, py) = match super::window_points::to_window_pixels(
+        let ((px, py), validated_frame) = match super::window_points::to_window_pixels(
             &self.state,
             args,
             pid,
@@ -179,10 +179,10 @@ impl MoveCursorTool {
         )
         .await
         {
-            Ok(pixels) => pixels[0],
+            Ok(resolved) => (resolved.pixels[0], resolved.frame),
             Err(refusal) => return refusal,
         };
-        let frame = match super::px_frame::resolve_or_refuse(wid).await {
+        let frame = match super::window_points::frame_or_resolve(validated_frame, wid).await {
             Ok(frame) => frame,
             Err(refusal) => return refusal,
         };

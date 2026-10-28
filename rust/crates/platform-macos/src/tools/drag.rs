@@ -287,6 +287,7 @@ impl DragTool {
                 "coordinate_space window_points cannot be combined with from_zoom.",
             );
         }
+        let mut validated_frame: Option<super::px_frame::WindowPxFrame> = None;
         // from_zoom: translate from last zoom crop context.
         if from_zoom {
             match super::zoom_context(&self.state, &args, pid, window_id) {
@@ -312,9 +313,10 @@ impl DragTool {
             )
             .await
             {
-                Ok(pixels) => {
-                    (from_x, from_y) = pixels[0];
-                    (to_x, to_y) = pixels[1];
+                Ok(resolved) => {
+                    (from_x, from_y) = resolved.pixels[0];
+                    (to_x, to_y) = resolved.pixels[1];
+                    validated_frame = resolved.frame;
                 }
                 Err(refusal) => return refusal,
             }
@@ -325,7 +327,7 @@ impl DragTool {
         // of the drag resolve against ONE frame, so a window that closed
         // mid-call refuses rather than dragging across the desktop behind it.
         let (from_sx, from_sy, from_lx, from_ly, to_sx, to_sy, to_lx, to_ly) =
-            match super::px_frame::resolve_or_refuse(wid).await {
+            match super::window_points::frame_or_resolve(validated_frame.clone(), wid).await {
                 Ok(frame) => {
                     let (fsx, fsy, flx, fly) = frame.to_screen(from_x, from_y);
                     let (tsx, tsy, tlx, tly) = frame.to_screen(to_x, to_y);
@@ -374,6 +376,10 @@ impl DragTool {
             cursor_overlay::OverlayCommand::PinAbove(wid as u64),
         );
         crate::cursor::overlay::animate_cursor_to(cursor_key.clone(), from_sx, from_sy).await;
+
+        if let Err(refusal) = super::window_points::recheck_now(space, window_id) {
+            return refusal;
+        }
 
         // ── Focus-suppression wrap (Swift WindowChangeDetector + FocusGuard) ──
         // Drags can trigger drag-and-drop side-effects that spawn helper

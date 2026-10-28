@@ -75,6 +75,14 @@ pub fn point_space(args: &Value) -> Result<PointSpace, ToolResult> {
             Ok(PointSpace::Screenshot)
         }
         Some("window_points") => {
+            if args.get("scope").and_then(Value::as_str) == Some("desktop")
+                || args.get("window_id").is_none_or(Value::is_null)
+            {
+                return Err(super::invalid_arguments(
+                    "coordinate_space window_points needs a window target (pid and window_id); it cannot be \
+                     used with scope desktop.",
+                ));
+            }
             let basis = args.get("window_basis").and_then(Value::as_object);
             let number = |key: &str| {
                 basis
@@ -128,29 +136,83 @@ pub fn geometry_changed(window_id: u32, basis: &WindowBasis, live: &WindowBounds
     refusal
 }
 
-/// Window-local capture pixels for window points, given the live frame and
-/// its backing scale: what the pixel tools hand to WindowPxFrame::to_screen,
-/// which divides the scale back out, so the screen point is the frame origin
-/// plus (x, y) at any backing scale.
-pub fn points_to_window_pixels(
-    window_id: u32,
-    basis: &WindowBasis,
-    live: &WindowBounds,
-    scale: f64,
-    points: &[(f64, f64)],
-) -> Result<Vec<(f64, f64)>, ToolResult> {
-    if !basis_matches(basis, live) {
-        return Err(geometry_changed(window_id, basis, live));
-    }
-    Ok(points
-        .iter()
-        .map(|&(x, y)| (x * scale, y * scale))
-        .collect())
+/// Points resolved for dispatch: the window-local pixels the tool's frame
+/// translates, and for window points the one validated frame to translate
+/// them with (scale 1: the pixels are the points themselves).
+#[derive(Debug, Clone)]
+pub struct ResolvedPoints {
+    pub pixels: Vec<(f64, f64)>,
+    pub frame: Option<super::px_frame::WindowPxFrame>,
 }
 
-/// The window-local capture pixels for points in space: screenshot pixels
-/// scaled back through the session's screenshot, or window points checked
-/// against the live frame.
+/// Window points against the live frame: the basis must still match it and
+/// every point must lie inside it. Only window bounds are read, so neither
+/// a screenshot nor a pixel-scale proof is needed.
+pub fn resolve_window_points(
+    window_id: u32,
+    basis: &WindowBasis,
+    points: &[(f64, f64)],
+    live: Option<WindowBounds>,
+) -> Result<ResolvedPoints, ToolResult> {
+    let live = live.ok_or_else(|| {
+        super::px_frame::refusal(&super::px_frame::PxFrameError::WindowNotFound { window_id })
+    })?;
+    if !basis_matches(basis, &live) {
+        return Err(geometry_changed(window_id, basis, &live));
+    }
+    if let Some(&(x, y)) = points.iter().find(|&&(x, y)| {
+        !(x.is_finite() && y.is_finite()) || x < 0.0 || y < 0.0 || x > live.width || y > live.height
+    }) {
+        return Err(super::pre_dispatch_refusal(
+            "point_outside_window",
+            format!(
+                "({x:.1}, {y:.1}) is outside window {window_id}'s {:.0}×{:.0} pt frame. \
+                 Nothing was sent.",
+                live.width, live.height
+            ),
+        ));
+    }
+    Ok(ResolvedPoints {
+        pixels: points.to_vec(),
+        frame: Some(super::px_frame::WindowPxFrame {
+            bounds: live,
+            scale: 1.0,
+        }),
+    })
+}
+
+/// Checks the basis against the live frame again, for just before dispatch.
+pub fn recheck(
+    space: PointSpace,
+    window_id: u32,
+    live: Option<WindowBounds>,
+) -> Result<(), ToolResult> {
+    let PointSpace::WindowPoints(basis) = space else {
+        return Ok(());
+    };
+    let live = live.ok_or_else(|| {
+        super::px_frame::refusal(&super::px_frame::PxFrameError::WindowNotFound { window_id })
+    })?;
+    if basis_matches(&basis, &live) {
+        Ok(())
+    } else {
+        Err(geometry_changed(window_id, &basis, &live))
+    }
+}
+
+/// [recheck] against the window's frame now.
+pub(super) fn recheck_now(space: PointSpace, window_id: Option<u32>) -> Result<(), ToolResult> {
+    match (space, window_id) {
+        (PointSpace::WindowPoints(_), Some(wid)) => {
+            recheck(space, wid, crate::windows::window_bounds_by_id(wid))
+        }
+        _ => Ok(()),
+    }
+}
+
+/// The points in space as window-local pixels: screenshot pixels scaled
+/// back through the session's screenshot (the frame is resolved later as
+/// before), or window points against the live frame (that frame returned).
 pub(super) async fn to_window_pixels(
     state: &super::ToolState,
     args: &Value,
@@ -158,24 +220,43 @@ pub(super) async fn to_window_pixels(
     window_id: Option<u32>,
     space: PointSpace,
     points: &[(f64, f64)],
-) -> Result<Vec<(f64, f64)>, ToolResult> {
+) -> Result<ResolvedPoints, ToolResult> {
     match space {
         PointSpace::Screenshot => {
             let ratio = super::screenshot_scale(state, args, pid, window_id)?;
-            Ok(points
-                .iter()
-                .map(|&(x, y)| (x * ratio, y * ratio))
-                .collect())
+            Ok(ResolvedPoints {
+                pixels: points
+                    .iter()
+                    .map(|&(x, y)| (x * ratio, y * ratio))
+                    .collect(),
+                frame: None,
+            })
         }
         PointSpace::WindowPoints(basis) => {
             let Some(wid) = window_id else {
                 return Err(super::invalid_arguments(
-                    "coordinate_space \"window_points\" needs window_id.",
+                    "coordinate_space window_points needs window_id.",
                 ));
             };
-            let frame = super::px_frame::resolve_or_refuse(wid).await?;
-            points_to_window_pixels(wid, &basis, &frame.bounds, frame.scale, points)
+            resolve_window_points(
+                wid,
+                &basis,
+                points,
+                crate::windows::window_bounds_by_id(wid),
+            )
         }
+    }
+}
+
+/// The validated window-points frame, or the window's pixel frame resolved
+/// as before for screenshot pixels.
+pub(super) async fn frame_or_resolve(
+    validated: Option<super::px_frame::WindowPxFrame>,
+    window_id: u32,
+) -> Result<super::px_frame::WindowPxFrame, ToolResult> {
+    match validated {
+        Some(frame) => Ok(frame),
+        None => super::px_frame::resolve_or_refuse(window_id).await,
     }
 }
 
@@ -231,32 +312,19 @@ mod tests {
     }
 
     #[test]
-    fn window_points_land_on_the_frame_origin_plus_the_point_at_any_scale() {
-        for (origin, scale) in [
-            ((0.0, 0.0), 1.0),
-            ((1051.0, 75.0), 2.0),
-            ((-1200.0, 40.0), 2.0),
-            ((-1200.0, 40.0), 1.0),
-        ] {
+    fn window_points_land_on_the_frame_origin_plus_the_point() {
+        for origin in [(0.0, 0.0), (1051.0, 75.0), (-1200.0, 40.0)] {
             let live = bounds(origin.0, origin.1, 800.0, 600.0);
-            let pixels = points_to_window_pixels(
+            let resolved = resolve_window_points(
                 7,
                 &basis(origin.0, origin.1, 800.0, 600.0),
-                &live,
-                scale,
                 &[(100.0, 50.0)],
+                Some(live),
             )
             .unwrap();
-            let frame = super::super::px_frame::WindowPxFrame {
-                bounds: live,
-                scale,
-            };
-            let (sx, sy, lx, ly) = frame.to_screen(pixels[0].0, pixels[0].1);
-            assert_eq!(
-                (sx, sy),
-                (origin.0 + 100.0, origin.1 + 50.0),
-                "scale {scale}"
-            );
+            let frame = resolved.frame.expect("the validated frame");
+            let (sx, sy, lx, ly) = frame.to_screen(resolved.pixels[0].0, resolved.pixels[0].1);
+            assert_eq!((sx, sy), (origin.0 + 100.0, origin.1 + 50.0));
             assert_eq!((lx, ly), (100.0, 50.0));
         }
     }
@@ -273,36 +341,53 @@ mod tests {
             basis(100.0, 200.0, 800.0, 560.0),
         ] {
             let refusal =
-                points_to_window_pixels(7, &stale, &live, 2.0, &[(1.0, 1.0)]).unwrap_err();
+                resolve_window_points(7, &stale, &[(1.0, 1.0)], Some(live.clone())).unwrap_err();
             let structured = refusal.structured_content.expect("structured");
             assert_eq!(structured["code"], "window_geometry_changed");
             assert_eq!(structured["nothing_sent"], true);
             assert_eq!(structured["effect"], "refused");
         }
+        let gone = resolve_window_points(7, &basis(0.0, 0.0, 1.0, 1.0), &[(0.0, 0.0)], None);
+        assert_eq!(gone.unwrap_err().is_error, Some(true));
     }
 
     #[test]
-    fn both_drag_ends_use_one_basis_check() {
+    fn a_point_outside_the_window_refuses_including_either_drag_end() {
         let live = bounds(0.0, 0.0, 800.0, 600.0);
-        assert!(points_to_window_pixels(
-            7,
-            &basis(30.0, 0.0, 800.0, 600.0),
-            &live,
-            2.0,
-            &[(10.0, 10.0), (50.0, 50.0)]
-        )
-        .is_err());
-        assert_eq!(
-            points_to_window_pixels(
-                7,
-                &basis(0.0, 0.0, 800.0, 600.0),
-                &live,
-                2.0,
-                &[(10.0, 10.0), (50.0, 50.0)]
-            )
-            .unwrap(),
-            vec![(20.0, 20.0), (100.0, 100.0)]
+        let b = basis(0.0, 0.0, 800.0, 600.0);
+        for points in [
+            vec![(801.0, 10.0)],
+            vec![(10.0, -1.0)],
+            vec![(10.0, 10.0), (900.0, 10.0)],
+            vec![(f64::NAN, 10.0)],
+        ] {
+            let refusal = resolve_window_points(7, &b, &points, Some(live.clone())).unwrap_err();
+            assert_eq!(
+                refusal.structured_content.unwrap()["code"],
+                "point_outside_window",
+                "{points:?}"
+            );
+        }
+        let both =
+            resolve_window_points(7, &b, &[(10.0, 10.0), (800.0, 600.0)], Some(live)).unwrap();
+        assert_eq!(both.pixels, vec![(10.0, 10.0), (800.0, 600.0)]);
+    }
+
+    #[test]
+    fn a_move_between_resolving_and_dispatch_refuses() {
+        let b = basis(0.0, 0.0, 800.0, 600.0);
+        let space = PointSpace::WindowPoints(b);
+        assert!(
+            resolve_window_points(7, &b, &[(1.0, 1.0)], Some(bounds(0.0, 0.0, 800.0, 600.0)))
+                .is_ok()
         );
+        let refusal = recheck(space, 7, Some(bounds(40.0, 0.0, 800.0, 600.0))).unwrap_err();
+        assert_eq!(
+            refusal.structured_content.unwrap()["code"],
+            "window_geometry_changed"
+        );
+        assert!(recheck(space, 7, Some(bounds(0.5, 0.0, 800.0, 600.0))).is_ok());
+        assert!(recheck(PointSpace::Screenshot, 7, None).is_ok());
     }
 
     #[test]
@@ -314,6 +399,7 @@ mod tests {
         );
         assert_eq!(
             point_space(&json!({
+                "window_id": 9,
                 "coordinate_space": "window_points",
                 "window_basis": {"x": 1.5, "y": -3, "w": 800, "h": 600}
             }))
@@ -321,9 +407,13 @@ mod tests {
             PointSpace::WindowPoints(basis(1.5, -3.0, 800.0, 600.0))
         );
         for bad in [
-            json!({"coordinate_space": "window_points"}),
-            json!({"coordinate_space": "window_points", "window_basis": {"x": 0, "y": 0, "w": 0, "h": 600}}),
-            json!({"coordinate_space": "window_points", "window_basis": {"x": 0, "y": 0, "w": 800}}),
+            json!({"window_id": 9, "coordinate_space": "window_points"}),
+            json!({"scope": "desktop", "window_id": 9, "coordinate_space": "window_points",
+                "window_basis": {"x": 0, "y": 0, "w": 800, "h": 600}}),
+            json!({"coordinate_space": "window_points",
+                "window_basis": {"x": 0, "y": 0, "w": 800, "h": 600}}),
+            json!({"window_id": 9, "coordinate_space": "window_points", "window_basis": {"x": 0, "y": 0, "w": 0, "h": 600}}),
+            json!({"window_id": 9, "coordinate_space": "window_points", "window_basis": {"x": 0, "y": 0, "w": 800}}),
             json!({"coordinate_space": "pixels"}),
             json!({"window_basis": {"x": 0, "y": 0, "w": 800, "h": 600}}),
         ] {
@@ -333,6 +423,54 @@ mod tests {
                 "invalid_arguments",
                 "{bad}"
             );
+        }
+    }
+
+    /// Every pointer tool refuses window points at desktop scope before any
+    /// dispatch: there is no window frame to anchor them.
+    #[tokio::test]
+    async fn desktop_scope_window_points_refuse_before_dispatch() {
+        use cua_driver_core::tool::Tool;
+        use std::sync::Arc;
+        let state = Arc::new(super::super::ToolState::new(false, false, None));
+        let space = json!({
+            "scope": "desktop",
+            "coordinate_space": "window_points",
+            "window_basis": {"x": 0, "y": 0, "w": 800, "h": 600}
+        });
+        let with = |extra: Value| {
+            let mut args = space.clone();
+            for (key, value) in extra.as_object().unwrap() {
+                args[key] = value.clone();
+            }
+            args
+        };
+        let results = vec![
+            super::super::click::ClickTool::new(state.clone())
+                .invoke(with(json!({"x": 10, "y": 10})))
+                .await,
+            super::super::double_click::DoubleClickTool::new(state.clone())
+                .invoke(with(json!({"x": 10, "y": 10})))
+                .await,
+            super::super::right_click::RightClickTool::new(state.clone())
+                .invoke(with(json!({"x": 10, "y": 10})))
+                .await,
+            super::super::scroll::ScrollTool::new(state.clone())
+                .invoke(with(json!({"x": 10, "y": 10, "direction": "down"})))
+                .await,
+            super::super::drag::DragTool::new(state.clone())
+                .invoke(with(
+                    json!({"from_x": 1, "from_y": 1, "to_x": 9, "to_y": 9}),
+                ))
+                .await,
+            super::super::move_cursor::MoveCursorTool::new(state.clone())
+                .invoke(with(json!({"x": 10, "y": 10})))
+                .await,
+        ];
+        for (index, result) in results.into_iter().enumerate() {
+            let structured = result.structured_content.expect("structured refusal");
+            assert_eq!(structured["code"], "invalid_arguments", "tool {index}");
+            assert_eq!(structured["dispatched"], false, "tool {index}");
         }
     }
 

@@ -434,6 +434,7 @@ impl ScrollTool {
             // click pixel path — undo any session downscale, then translate
             // through the shared window frame (which refuses a window with no
             // live frame rather than scrolling at screen-absolute coords).
+            let validated_frame: Option<super::px_frame::WindowPxFrame>;
             match super::window_points::to_window_pixels(
                 &self.state,
                 &args,
@@ -444,7 +445,10 @@ impl ScrollTool {
             )
             .await
             {
-                Ok(pixels) => (cx, cy) = pixels[0],
+                Ok(resolved) => {
+                    (cx, cy) = resolved.pixels[0];
+                    validated_frame = resolved.frame;
+                }
                 Err(refusal) => return refusal,
             }
             let Some(wid) = window_id else {
@@ -454,7 +458,7 @@ impl ScrollTool {
                     "window_id is required when scrolling by window-local x,y pixels.".to_string(),
                 );
             };
-            match super::px_frame::resolve_or_refuse(wid).await {
+            match super::window_points::frame_or_resolve(validated_frame.clone(), wid).await {
                 Ok(frame) => {
                     let (sx, sy, lx, ly) = frame.to_screen(cx, cy);
                     Some(WheelTarget {
@@ -592,6 +596,9 @@ impl ScrollTool {
                 .flatten()
             };
             let amount_ticks = amount;
+            if let Err(refusal) = super::window_points::recheck_now(space, wid) {
+                return refusal;
+            }
             let fg = delivery_mode.is_foreground() && wid.is_some();
             let result = focus_guard::with_focus_suppressed(
                 Some(pid),

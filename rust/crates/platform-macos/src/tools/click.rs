@@ -1061,6 +1061,7 @@ impl ClickTool {
         } else if let (Some(mut cx), Some(mut cy)) = (x, y) {
             // ── Pixel path ─────────────────────────────────────────────────
 
+            let mut validated_frame: Option<super::px_frame::WindowPxFrame> = None;
             if matches!(space, super::window_points::PointSpace::WindowPoints(_))
                 && (capture_id.is_some() || from_zoom || debug_image_out.is_some())
             {
@@ -1158,9 +1159,9 @@ impl ClickTool {
                 )
                 .await
                 {
-                    Ok(pixels) => {
-                        cx = pixels[0].0;
-                        cy = pixels[0].1;
+                    Ok(resolved) => {
+                        (cx, cy) = resolved.pixels[0];
+                        validated_frame = resolved.frame;
                     }
                     Err(refusal) => return refusal,
                 }
@@ -1194,7 +1195,7 @@ impl ClickTool {
             // Chromium recipe falls back to public PID posting. Its SkyLight
             // route uses the translated screen coordinates instead.
             let (screen_x, screen_y, win_local_x, win_local_y) = if let Some(wid) = window_id {
-                match super::px_frame::resolve_or_refuse(wid).await {
+                match super::window_points::frame_or_resolve(validated_frame.clone(), wid).await {
                     Ok(frame) => {
                         let (sx, sy, lx, ly) = frame.to_screen(cx, cy);
                         // A window-local point outside the live frame would
@@ -1390,6 +1391,9 @@ impl ClickTool {
             let fg = delivery_mode.is_foreground() && window_id.is_some();
             // Background delivery cannot satisfy a toolkit that reads the
             // hardware pointer; refuse before any activation or dispatch.
+            if let Err(refusal) = super::window_points::recheck_now(space, window_id) {
+                return refusal;
+            }
             let route = match super::pixel_route::resolve(pid, fg, window_id, "mouse_click").await {
                 Ok(route) => route,
                 Err(refusal) => return refusal,

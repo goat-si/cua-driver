@@ -172,7 +172,7 @@ impl RightClickTool {
         // ── Pixel path ───────────────────────────────────────────────────────
         // Scale back from screenshot pixels (or window points) to native
         // window pixels.
-        let (cx, cy) = match super::window_points::to_window_pixels(
+        let ((cx, cy), validated_frame) = match super::window_points::to_window_pixels(
             &self.state,
             &args,
             pid,
@@ -182,7 +182,7 @@ impl RightClickTool {
         )
         .await
         {
-            Ok(pixels) => pixels[0],
+            Ok(resolved) => (resolved.pixels[0], resolved.frame),
             Err(refusal) => return refusal,
         };
 
@@ -190,7 +190,7 @@ impl RightClickTool {
         // for CGEventSetWindowLocation (shared with click.rs via px_frame, which
         // refuses a window with no live frame).
         let (screen_x, screen_y, win_local_x, win_local_y) = if let Some(wid) = window_id {
-            match super::px_frame::resolve_or_refuse(wid).await {
+            match super::window_points::frame_or_resolve(validated_frame.clone(), wid).await {
                 Ok(frame) => {
                     let translated = frame.to_screen(cx, cy);
                     if !delivery_mode.is_foreground()
@@ -257,6 +257,9 @@ impl RightClickTool {
         };
 
         let fg = delivery_mode.is_foreground() && window_id.is_some();
+        if let Err(refusal) = super::window_points::recheck_now(space, window_id) {
+            return refusal;
+        }
         let route = match super::pixel_route::resolve(pid, fg, window_id, "mouse_right_click").await
         {
             Ok(route) => route,
