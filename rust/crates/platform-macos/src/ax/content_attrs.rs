@@ -19,6 +19,10 @@ pub(crate) struct ContentAttrs {
     pub description: Option<String>,
     pub identifier: Option<String>,
     pub help: Option<String>,
+    /// A single read failed with an error other than "no value" or
+    /// "unsupported": the attribute may hold content this node does not show.
+    /// (A batched read with such an error falls back to single reads.)
+    pub read_failed: bool,
 }
 
 fn value_with_placeholder(
@@ -44,27 +48,104 @@ impl ContentAttrs {
             description: slots.string(3),
             identifier: slots.string(4),
             help: slots.string(5).filter(|help| !help.trim().is_empty()),
+            read_failed: false,
         }
     }
 
     unsafe fn from_singles(element: AXUIElementRef) -> Self {
-        let title = copy_string_attr(element, "AXTitle");
-        let copied_value = copy_stringish_attr(element, "AXValue");
+        Self::from_single_reads(
+            |name| {
+                let read = copy_string_attr(element, name);
+                checked_single_read(read, || single_read_error(element, name))
+            },
+            || {
+                let read = copy_stringish_attr(element, "AXValue");
+                checked_single_read(read, || single_read_error(element, "AXValue"))
+            },
+        )
+    }
+
+    /// Content from one read per attribute. `Err` is a read that failed with
+    /// an error other than "no value" or "unsupported".
+    fn from_single_reads(
+        mut string: impl FnMut(&str) -> Result<Option<String>, AXError>,
+        stringish_value: impl FnOnce() -> Result<Option<StringishAttrValue>, AXError>,
+    ) -> Self {
+        let mut read_failed = false;
+        let mut keep = |read: Result<Option<String>, AXError>| {
+            read.unwrap_or_else(|_| {
+                read_failed = true;
+                None
+            })
+        };
+        let title = keep(string("AXTitle"));
+        let copied_value = stringish_value().unwrap_or_else(|_| {
+            read_failed = true;
+            None
+        });
+        let mut keep = |read: Result<Option<String>, AXError>| {
+            read.unwrap_or_else(|_| {
+                read_failed = true;
+                None
+            })
+        };
         let mut placeholder = None;
         let value = value_with_placeholder(copied_value.as_ref(), || {
-            placeholder = copy_string_attr(element, "AXPlaceholderValue");
+            placeholder = keep(string("AXPlaceholderValue"));
             placeholder.clone()
         });
+        let description = keep(string("AXDescription"));
+        let identifier = keep(string("AXIdentifier"));
+        let help = keep(string("AXHelp")).filter(|help| !help.trim().is_empty());
         Self {
             title,
             copied_value,
             value,
             placeholder,
-            description: copy_string_attr(element, "AXDescription"),
-            identifier: copy_string_attr(element, "AXIdentifier"),
-            help: copy_string_attr(element, "AXHelp").filter(|help| !help.trim().is_empty()),
+            description,
+            identifier,
+            help,
+            read_failed,
         }
     }
+}
+
+/// `read` when it found something or the attribute has no value; otherwise
+/// the error of reading it again, when that is a real failure.
+fn checked_single_read<T>(
+    read: Option<T>,
+    error: impl FnOnce() -> AXError,
+) -> Result<Option<T>, AXError> {
+    if read.is_some() {
+        return Ok(read);
+    }
+    let error = error();
+    if [
+        kAXErrorSuccess,
+        kAXErrorNoValue,
+        kAXErrorAttributeUnsupported,
+    ]
+    .contains(&error)
+    {
+        Ok(None)
+    } else {
+        Err(error)
+    }
+}
+
+/// The error code of reading `name` from `element` once more.
+///
+/// # Safety
+/// `element` must be a live `AXUIElementRef`.
+unsafe fn single_read_error(element: AXUIElementRef, name: &str) -> AXError {
+    use core_foundation::{base::TCFType, string::CFString};
+    let attr = CFString::new(name);
+    let mut value: core_foundation::base::CFTypeRef = std::ptr::null();
+    let error = AXUIElementCopyAttributeValue(element, attr.as_concrete_TypeRef(), &mut value);
+    if !value.is_null() {
+        core_foundation::base::CFRelease(value);
+    }
+    error
 }
 
 /// A timeout returns no content, so the walker emits only the role already read.
@@ -136,11 +217,57 @@ mod tests {
 
     #[test]
     fn empty_or_whitespace_values_use_the_placeholder_without_trimming_it() {
+        // (batched reads never fail a slot: a real slot error falls back to
+        // single reads, below)
         for value in ["", " \t\n "] {
             let attrs = content(&CFString::new(value).as_CFType(), "  placeholder  ");
             assert_eq!(attrs.value.as_deref(), Some("  placeholder  "));
             assert_eq!(attrs.copied_value.unwrap().state_value, value);
         }
+    }
+
+    /// Review round 2: a single read that fails with a real error (a timeout,
+    /// CannotComplete) is not an absent label. The node says so, so the walk
+    /// cannot claim its elements complete.
+    #[test]
+    fn a_failed_single_read_is_not_an_absent_label() {
+        let failed = ContentAttrs::from_single_reads(
+            |name| match name {
+                "AXTitle" => Err(kAXErrorCannotComplete),
+                "AXDescription" => Ok(Some("Save".into())),
+                _ => Ok(None),
+            },
+            || Ok(None),
+        );
+        assert!(failed.read_failed);
+        assert_eq!(failed.title, None);
+        assert_eq!(failed.description.as_deref(), Some("Save"));
+
+        let absent = ContentAttrs::from_single_reads(|_| Ok(None), || Ok(None));
+        assert!(!absent.read_failed);
+
+        let value_failed =
+            ContentAttrs::from_single_reads(|_| Ok(None), || Err(kAXErrorCannotComplete));
+        assert!(value_failed.read_failed);
+    }
+
+    #[test]
+    fn only_real_errors_fail_a_single_read() {
+        for absent in [
+            kAXErrorSuccess,
+            kAXErrorNoValue,
+            kAXErrorAttributeUnsupported,
+        ] {
+            assert_eq!(checked_single_read::<String>(None, || absent), Ok(None));
+        }
+        assert_eq!(
+            checked_single_read::<String>(None, || kAXErrorCannotComplete),
+            Err(kAXErrorCannotComplete)
+        );
+        assert_eq!(
+            checked_single_read(Some(1), || panic!("a found value is not read again")),
+            Ok(Some(1))
+        );
     }
 
     #[test]

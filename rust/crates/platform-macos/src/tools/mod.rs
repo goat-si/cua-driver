@@ -735,14 +735,6 @@ pub(crate) async fn focus_by_pixel(
                 .await?;
         }
     }
-    // The requested field may already hold keyboard focus, for example after
-    // a pixel hotkey Cmd+A. Any focus action is then redundant, and the real
-    // click fallback would be destructive: Chromium's omnibox hit-tests to an
-    // enclosing AXGroup that rejects AXFocused, so the fallback click moved
-    // the caret and dropped the selection (#4125).
-    if focused_element_holds_point(pid, window_id, x, y).await {
-        return Ok(());
-    }
     if let Some(ref s) = session {
         click_args["session"] = serde_json::json!(s);
     }
@@ -751,6 +743,19 @@ pub(crate) async fn focus_by_pixel(
     }
     if from_zoom {
         click_args["from_zoom"] = serde_json::json!(true);
+    }
+    // The focus checks look at the same window point the click lands on:
+    // (x, y) are pixels of the session's (possibly downsized or zoomed)
+    // image, scaled back exactly as ClickTool does.
+    let (native_x, native_y) =
+        window_click_point(state, &click_args, pid, window_id, x, y, from_zoom)?;
+    // The requested field may already hold keyboard focus, for example after
+    // a pixel hotkey Cmd+A. Any focus action is then redundant, and the real
+    // click fallback would be destructive: Chromium's omnibox hit-tests to an
+    // enclosing AXGroup that rejects AXFocused, so the fallback click moved
+    // the caret and dropped the selection (#4125).
+    if focused_element_holds_point(pid, window_id, native_x, native_y).await {
+        return Ok(());
     }
     let click_tool = click::ClickTool::new(state.clone());
     let click = click_tool.invoke(click_args);
@@ -763,7 +768,7 @@ pub(crate) async fn focus_by_pixel(
         // AXFocused is non-destructive: unlike a second real click, it keeps a
         // Cmd+A selection intact before a follow-up type_text or Cmd+V.
         tokio::time::sleep(std::time::Duration::from_millis(120)).await;
-        Some(pixel_focus_landed(pid, window_id, x, y).await)
+        Some(pixel_focus_landed(pid, window_id, native_x, native_y).await)
     } else {
         None
     };
@@ -1193,6 +1198,27 @@ pub(super) fn screenshot_scale(
         .screenshot_scale(pid, window_id.map(u64::from), args)
 }
 
+/// The window-local native-pixel point a pixel action at (x, y) lands on:
+/// (x, y) are pixels of the session's latest screenshot of the window, which
+/// may be downsized, or of a zoom crop with `from_zoom`. ClickTool and the
+/// pixel-focus checks share this so they look at one point.
+pub(super) fn window_click_point(
+    state: &ToolState,
+    args: &serde_json::Value,
+    pid: i32,
+    window_id: Option<u32>,
+    x: f64,
+    y: f64,
+    from_zoom: bool,
+) -> Result<(f64, f64), cua_driver_core::protocol::ToolResult> {
+    if from_zoom {
+        let zoom = zoom_context(state, args, pid, window_id)?;
+        return Ok(zoom.zoom_to_window(x, y));
+    }
+    let ratio = screenshot_scale(state, args, pid, window_id)?;
+    Ok((x * ratio, y * ratio))
+}
+
 pub(super) fn zoom_context(
     state: &ToolState,
     args: &serde_json::Value,
@@ -1558,6 +1584,38 @@ mod pixel_focus_readback_tests {
         assert!(!focus_holds_point(Some(8), 9, field, 150.0, 110.0));
         assert!(!focus_holds_point(None, 9, field, 150.0, 110.0));
         assert!(!focus_holds_point(Some(9), 9, None, 150.0, 110.0));
+    }
+
+    /// Review round 2: the focus checks use the point the click lands on. A
+    /// screenshot delivered at half its native size maps (1000, 300) to
+    /// (2000, 600), for the click and the read-back alike.
+    #[test]
+    fn focus_checks_use_the_clicks_window_point() {
+        let state = super::ToolState::new(false, true, None);
+        state.snapshots.publish_for_session(
+            10,
+            20,
+            crate::ax::snapshot::AxSnapshot::from_nodes(&[]),
+            Some("s"),
+            Some(2.0),
+        );
+        let args = serde_json::json!({ "_session_id": "s" });
+        let point = super::window_click_point(&state, &args, 10, Some(20), 1000.0, 300.0, false)
+            .expect("the session has a screenshot of the window");
+        assert_eq!(point, (2000.0, 600.0));
+        assert!(
+            super::window_click_point(
+                &state,
+                &serde_json::json!({}),
+                10,
+                Some(20),
+                1.0,
+                1.0,
+                false
+            )
+            .is_err(),
+            "another session's screenshot is not this call's frame"
+        );
     }
 
     /// DSH-04: a background focus click whose read-back shows focus elsewhere

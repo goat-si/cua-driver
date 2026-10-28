@@ -727,6 +727,9 @@ unsafe fn walk_element(
         if exhaustive_nodes() {
             let node = match read_content_attrs(element, budget, batching_disabled) {
                 Some(attrs) => {
+                    if attrs.read_failed {
+                        note_skipped();
+                    }
                     display_node(&role, attrs, element, depth, parent_index, in_web_content)
                 }
                 None => {
@@ -777,6 +780,7 @@ unsafe fn walk_element(
         description,
         identifier,
         help,
+        read_failed,
     }) = read_content_attrs(element, budget, batching_disabled)
     else {
         // Only the role is known: a selector on its label cannot be answered.
@@ -786,6 +790,10 @@ unsafe fn walk_element(
         nodes.push(node);
         return;
     };
+    if read_failed {
+        // A label read failed: a selector on it cannot be answered.
+        note_skipped();
+    }
     let actions = copy_action_names(element);
     let (subrole, placeholder) = if should_probe_secure_text_role(&role, None) {
         let subrole = copy_string_attr(element, "AXSubrole");
@@ -1189,7 +1197,7 @@ fn role_only_node(
 }
 
 /// A display-only row for a container an ordinary walk collapses: its
-/// labels, no index, no value.
+/// labels and value (redacted like any other row's), no index.
 fn display_node(
     role: &str,
     attrs: ContentAttrs,
@@ -1202,9 +1210,23 @@ fn display_node(
         text.map(|text| text.trim().to_owned())
             .filter(|text| !text.is_empty())
     };
+    let title = label(attrs.title);
+    let description = label(attrs.description);
+    let meta = FieldSecurityMeta {
+        role,
+        subrole: None,
+        title: title.as_deref(),
+        description: description.as_deref(),
+        placeholder: attrs.placeholder.as_deref(),
+        identifier: attrs.identifier.as_deref(),
+        help: attrs.help.as_deref(),
+        is_password_flag: false,
+    };
+    let (value, _) = redact_if_secure(&meta, label(attrs.value), None);
     AXNode {
-        title: label(attrs.title),
-        description: label(attrs.description),
+        title,
+        description,
+        value,
         identifier: attrs.identifier,
         help: attrs.help,
         ..role_only_node(
@@ -1654,6 +1676,26 @@ mod lean_row_tests {
         assert!(!exhaustive_nodes());
         assert!(with_exhaustive_nodes(true, exhaustive_nodes));
         assert!(!exhaustive_nodes());
+    }
+
+    /// Review round 2: a container kept by an exhaustive walk keeps the
+    /// value that labels it (AXGroup = "Saved").
+    #[test]
+    fn an_exhaustive_container_row_keeps_its_value() {
+        use super::super::content_attrs::ContentAttrs;
+        let attrs = ContentAttrs {
+            title: None,
+            copied_value: None,
+            value: Some(" Saved ".into()),
+            placeholder: None,
+            description: None,
+            identifier: None,
+            help: None,
+            read_failed: false,
+        };
+        let node = super::display_node("AXGroup", attrs, std::ptr::null_mut(), 1, None, false);
+        assert_eq!(node.value.as_deref(), Some("Saved"));
+        assert_eq!(node.element_index, None);
     }
 
     #[test]
