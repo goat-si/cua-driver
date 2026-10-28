@@ -201,25 +201,13 @@ impl Tool for LaunchAppTool {
         // frontmost — handles the intra-`open()` synchronous activation
         // that fired before we could arm with the real pid.
         let prior_frontmost = crate::apps::frontmost_pid();
-        let finder_folder_handoff = response_bundle_id.as_deref().is_some_and(|bundle_id| {
-            additional_arguments.is_empty()
-                && env.is_empty()
-                && !creates_new_instance
-                && crate::apps::finder_folder_handoff(bundle_id, &urls)
+        let wildcard_lease = prior_frontmost.map(|prior| {
+            crate::focus_steal::FocusStealPreventer::begin_suppression(
+                None,
+                prior,
+                "LaunchAppTool.pre",
+            )
         });
-
-        // Finder's synchronous folder-open selector must be allowed to activate
-        // long enough to perform the request. Use the ordinary targeted
-        // post-launch guard to restore the prior foreground app immediately.
-        let wildcard_lease = prior_frontmost
-            .filter(|_| !finder_folder_handoff)
-            .map(|prior| {
-                crate::focus_steal::FocusStealPreventer::begin_suppression(
-                    None,
-                    prior,
-                    "LaunchAppTool.pre",
-                )
-            });
 
         // Predicate captured BEFORE moving inputs into spawn_blocking.
         // Same condition that selects the `openURLs:withApplicationAtURL:`
@@ -272,13 +260,23 @@ impl Tool for LaunchAppTool {
                 }
             };
 
-            // Retry loop: LaunchServices returns before WindowServer has
-            // registered the new windows. Poll up to 5x100ms.
-            let windows = resolve_windows_for_pid(pid);
-
             let app_info: Option<crate::apps::AppInfo> = {
                 let apps = crate::apps::list_running_apps();
                 apps.into_iter().find(|a| a.pid == pid)
+            };
+
+            // Finder is always running, so its existing windows say nothing
+            // about the folders asked for: wait for the folders' own windows.
+            // Otherwise poll up to 5x100ms: LaunchServices returns before
+            // WindowServer has registered the new windows.
+            let folder_titles = finder_folder_titles(
+                app_info.as_ref().and_then(|app| app.bundle_id.as_deref()),
+                &urls,
+            );
+            let windows = if folder_titles.is_empty() {
+                resolve_windows_for_pid(pid)
+            } else {
+                await_folder_windows(pid, &folder_titles)
             };
 
             Ok::<_, anyhow::Error>((pid, app_info, windows))
@@ -538,6 +536,49 @@ fn resolve_windows_for_pid(pid: i32) -> Vec<crate::windows::WindowInfo> {
     vec![]
 }
 
+/// The window titles Finder gives the folders in `urls`, when every one is a
+/// local folder opened with Finder; empty otherwise.
+fn finder_folder_titles(bundle_id: Option<&str>, urls: &[String]) -> Vec<String> {
+    if bundle_id != Some("com.apple.finder") || urls.is_empty() {
+        return Vec::new();
+    }
+    let mut titles = Vec::new();
+    for url in urls {
+        let path = std::path::Path::new(url);
+        match path.file_name().filter(|_| path.is_dir()) {
+            Some(name) => titles.push(name.to_string_lossy().into_owned()),
+            None => return Vec::new(),
+        }
+    }
+    titles
+}
+
+/// The windows among `windows` that show one of the folders, best first.
+fn opened_folder_windows(
+    windows: &mut Vec<crate::windows::WindowInfo>,
+    titles: &[String],
+) -> Vec<crate::windows::WindowInfo> {
+    windows.retain(|window| titles.iter().any(|title| window.title == *title));
+    rank_launch_windows(windows);
+    std::mem::take(windows)
+}
+
+/// How long a Finder folder window gets to appear.
+const FOLDER_WINDOW_WAIT: std::time::Duration = std::time::Duration::from_secs(3);
+
+fn await_folder_windows(pid: i32, titles: &[String]) -> Vec<crate::windows::WindowInfo> {
+    let deadline = std::time::Instant::now() + FOLDER_WINDOW_WAIT;
+    loop {
+        let mut found = crate::windows::pid_windows_with_space_snapshot(pid, false).windows;
+        found.retain(|w| w.layer == 0 && w.bounds.width > 1.0 && w.bounds.height > 1.0);
+        let opened = opened_folder_windows(&mut found, titles);
+        if !opened.is_empty() || std::time::Instant::now() >= deadline {
+            return opened;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+}
+
 fn rank_launch_windows(windows: &mut [crate::windows::WindowInfo]) {
     windows.sort_by_key(|window| std::cmp::Reverse(!window.title.trim().is_empty()));
 }
@@ -724,8 +765,9 @@ fn hex_value(byte: u8) -> Option<u8> {
 #[cfg(test)]
 mod tests {
     use super::{
-        is_cua_driver_bundle_id, local_file_target, normalize_launch_url, preflight_file_urls,
-        rank_launch_windows, response_identity, structured_launch_failure, LaunchAppTool,
+        finder_folder_titles, is_cua_driver_bundle_id, local_file_target, normalize_launch_url,
+        opened_folder_windows, preflight_file_urls, rank_launch_windows, response_identity,
+        structured_launch_failure, LaunchAppTool,
     };
     use cua_driver_core::tool::Tool;
     use serde_json::json;
@@ -750,6 +792,38 @@ mod tests {
             on_current_space: None,
             space_ids: None,
         }
+    }
+
+    #[test]
+    fn a_finder_folder_launch_is_judged_by_the_folders_own_window() {
+        let dir = std::env::temp_dir().join("cua-launch-folder-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let folder = dir.to_string_lossy().into_owned();
+        let titles = finder_folder_titles(Some("com.apple.finder"), &[folder.clone()]);
+        assert_eq!(titles, vec!["cua-launch-folder-test".to_owned()]);
+        // Not Finder, or not a folder: the app's windows are reported as before.
+        assert!(finder_folder_titles(Some("com.apple.TextEdit"), &[folder]).is_empty());
+        assert!(finder_folder_titles(
+            Some("com.apple.finder"),
+            &["https://example.com".to_owned()]
+        )
+        .is_empty());
+
+        // Finder is always running: the person's own "Recents" window is not
+        // the folder the launch opened, and alone does not make it ready.
+        let mut windows = vec![
+            window(1, "Recents", 900.0, 500.0),
+            window(2, "cua-launch-folder-test", 900.0, 500.0),
+        ];
+        assert_eq!(
+            opened_folder_windows(&mut windows.clone(), &titles)
+                .iter()
+                .map(|w| w.window_id)
+                .collect::<Vec<_>>(),
+            vec![2]
+        );
+        windows.remove(1);
+        assert!(opened_folder_windows(&mut windows, &titles).is_empty());
     }
 
     #[test]

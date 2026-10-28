@@ -13,12 +13,7 @@ use core_foundation::{
     string::CFString,
 };
 use serde::{Deserialize, Serialize};
-use std::{
-    ffi::c_void,
-    process::Command,
-    sync::mpsc::{self, SyncSender},
-    time::Duration,
-};
+use std::{ffi::c_void, process::Command};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppInfo {
@@ -426,14 +421,6 @@ pub fn launch_with_urls_by_bundle(
     env: &std::collections::HashMap<String, String>,
     creates_new_instance: bool,
 ) -> anyhow::Result<i32> {
-    if additional_args.is_empty()
-        && env.is_empty()
-        && !creates_new_instance
-        && finder_folder_handoff(bundle_id, urls)
-    {
-        return open_finder_folders(urls);
-    }
-
     // Pass the bundle id directly — see `launch_app` rationale above
     // (Cryptex-installed apps).
     //
@@ -475,15 +462,6 @@ pub fn launch_with_urls_by_name(
     let located = locate_by_name(name)
         .ok_or_else(|| anyhow::anyhow!("Could not locate app with name '{name}'"))?;
     let (app_ref, bid) = located.app_ref_and_bundle_id();
-    if additional_args.is_empty()
-        && env.is_empty()
-        && !creates_new_instance
-        && bid
-            .as_deref()
-            .is_some_and(|bundle_id| finder_folder_handoff(bundle_id, urls))
-    {
-        return open_finder_folders(urls);
-    }
     // See `launch_with_urls_by_bundle` — skip `oapp` AppleEvent on
     // the URL-handoff path.
     let cfg = nsworkspace::OpenConfig {
@@ -500,80 +478,6 @@ pub fn launch_with_urls_by_name(
     .with_context(|| format!("Failed to launch '{name}'"))?;
     let pid: i32 = unsafe { running.processIdentifier() };
     Ok(pid)
-}
-
-pub(crate) fn finder_folder_handoff(bundle_id: &str, urls: &[String]) -> bool {
-    bundle_id == "com.apple.finder"
-        && !urls.is_empty()
-        && urls.iter().all(|url| std::path::Path::new(url).is_dir())
-}
-
-fn open_finder_folders(urls: &[String]) -> anyhow::Result<i32> {
-    const MAIN_QUEUE_TIMEOUT: Duration = Duration::from_secs(5);
-
-    if objc2_foundation::MainThreadMarker::new().is_some() {
-        select_finder_folders(urls)?;
-    } else {
-        let (tx, rx) = mpsc::sync_channel(1);
-        let request = Box::new(FinderFolderRequest {
-            folders: urls.to_vec(),
-            tx,
-        });
-        unsafe {
-            let main_queue = &raw const _dispatch_main_q as *const c_void;
-            dispatch_async_f(
-                main_queue,
-                Box::into_raw(request) as *mut c_void,
-                open_finder_folders_on_main,
-            );
-        }
-        rx.recv_timeout(MAIN_QUEUE_TIMEOUT)
-            .context("Timed out waiting for Finder folder handoff on the AppKit main queue")?
-            .map_err(anyhow::Error::msg)?;
-    }
-
-    list_running_apps()
-        .into_iter()
-        .find(|app| app.bundle_id.as_deref() == Some("com.apple.finder") && app.pid > 0)
-        .map(|app| app.pid)
-        .ok_or_else(|| {
-            anyhow::anyhow!("Finder accepted the folder open request but is not running")
-        })
-}
-
-fn select_finder_folders(urls: &[String]) -> anyhow::Result<()> {
-    use objc2_app_kit::NSWorkspace;
-    use objc2_foundation::NSString;
-
-    let workspace = unsafe { NSWorkspace::sharedWorkspace() };
-    for folder in urls {
-        let folder = NSString::from_str(folder);
-        if !unsafe { workspace.selectFile_inFileViewerRootedAtPath(None, &folder) } {
-            anyhow::bail!("Finder refused to open folder: {folder}");
-        }
-    }
-    Ok(())
-}
-
-struct FinderFolderRequest {
-    folders: Vec<String>,
-    tx: SyncSender<Result<(), String>>,
-}
-
-#[link(name = "System", kind = "framework")]
-extern "C" {
-    static _dispatch_main_q: u8;
-    fn dispatch_async_f(
-        queue: *const c_void,
-        context: *mut c_void,
-        work: unsafe extern "C" fn(*mut c_void),
-    );
-}
-
-unsafe extern "C" fn open_finder_folders_on_main(context: *mut c_void) {
-    let request = unsafe { Box::from_raw(context.cast::<FinderFolderRequest>()) };
-    let result = select_finder_folders(&request.folders).map_err(|error| error.to_string());
-    let _ = request.tx.send(result);
 }
 
 // ── Bundle resolution ────────────────────────────────────────────────────────
@@ -1171,7 +1075,7 @@ mod plist_tests {
 #[cfg(test)]
 mod tests {
     use super::{
-        all_pids, bundle_root_of_executable, finder_folder_handoff, merge_app_lists, path_of_pid,
+        all_pids, bundle_root_of_executable, merge_app_lists, path_of_pid,
         running_apps_from_processes, AppInfo,
     };
     use std::collections::HashSet;
@@ -1326,21 +1230,6 @@ mod tests {
         assert_eq!(merged[0].pid, 0);
         assert!(merged[1].running);
         assert_eq!(merged[1].pid, 42);
-    }
-
-    #[test]
-    fn finder_folder_handoff_is_narrowly_selected() {
-        let folder = std::env::temp_dir().to_string_lossy().into_owned();
-
-        assert!(finder_folder_handoff(
-            "com.apple.finder",
-            std::slice::from_ref(&folder)
-        ));
-        assert!(!finder_folder_handoff("com.apple.TextEdit", &[folder]));
-        assert!(!finder_folder_handoff(
-            "com.apple.finder",
-            &["https://example.com".to_owned()]
-        ));
     }
 
     /// Write a minimal `.app` bundle under `root` and return its executable
