@@ -1148,3 +1148,72 @@ async fn nothing_is_read_after_a_step_the_scope_refused() {
     assert!(harness.sent("zoom").is_empty());
     assert!(harness.sent("press_key").is_empty());
 }
+
+#[cfg(feature = "script")]
+#[tokio::test]
+async fn a_desktop_click_is_refused_by_the_scope_before_the_delivery_guard() {
+    // The delivery guard would answer background_unavailable, which a script
+    // can catch and carry on from; the scope must answer first.
+    let harness = Harness::new();
+    let (result, out) = harness
+        .run(
+            "run_script",
+            json!({
+                "app_scope": {"apps": [NOTES_ONLY]},
+                "script": "let caught = null;\ntry { await cua.call('click', {target: {kind: 'desktop', display_id: 'primary'}, x: 10, y: 10, delivery_mode: 'background'}); } catch (error) { caught = error.code; }\nawait cua.call('click', {pid: 42, window_id: 7, element_token: 's00000001:1'});\nreturn caught;"
+            }),
+        )
+        .await;
+    assert_eq!(result.is_error, Some(true), "{}", text(&result));
+    assert_eq!(out["error"]["code"], FOREGROUND_NOT_ALLOWED, "{out}");
+    assert!(
+        harness.sent("click").is_empty(),
+        "nothing after the refusal"
+    );
+}
+
+#[tokio::test]
+async fn the_locator_makes_no_second_attempt_after_a_refused_read() {
+    use crate::batch_tools::locate::{ElementSpec, Locator, WindowSpec};
+    let harness = Harness::new();
+    let scope = scope(json!({"apps": [NOTES_ONLY]}));
+    let registry = harness.registry.clone();
+    let journal = enter(Some(scope), async {
+        // With an observe baseline, the first read of a window is a baseline
+        // read whose own failure is not reported.
+        let locator = Locator::new(
+            &registry,
+            None,
+            std::time::Instant::now() + std::time::Duration::from_secs(5),
+        )
+        .with_observe_baseline(250);
+        let found = locator
+            .find(
+                &WindowSpec {
+                    app: Some("Mail".into()),
+                    ..WindowSpec::default()
+                },
+                &ElementSpec {
+                    role: Some("button".into()),
+                    name: Some("Send".into()),
+                    ..ElementSpec::default()
+                },
+                std::time::Duration::ZERO,
+            )
+            .await;
+        assert!(found.is_err());
+        assert_eq!(locator.scope_refusal(), Some(OUTSIDE_SCOPE));
+        locator.take_journal()
+    })
+    .await;
+    let reads: Vec<&Value> = journal
+        .iter()
+        .filter(|entry| entry["tool"] == "get_window_state")
+        .collect();
+    assert_eq!(
+        reads.len(),
+        1,
+        "one refused read, no second attempt: {journal:?}"
+    );
+    assert_eq!(reads[0]["code"], OUTSIDE_SCOPE);
+}
