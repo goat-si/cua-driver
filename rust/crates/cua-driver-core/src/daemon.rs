@@ -329,6 +329,56 @@ pub fn send_request(socket_path: &str, request: &DaemonRequest) -> anyhow::Resul
     }
 }
 
+/// [`send_request`] over an overlapped named-pipe client, for async callers.
+/// The write and the reply each have [`REPLY_DEADLINE`]. Dropping the future
+/// closes the pipe at once, so a caller that stops waiting (the MCP proxy's
+/// per-call deadline) ends the request instead of leaving a blocked read.
+#[cfg(target_os = "windows")]
+pub async fn send_request_async(
+    socket_path: &str,
+    request: &DaemonRequest,
+) -> anyhow::Result<DaemonResponse> {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::net::windows::named_pipe::ClientOptions;
+    use tokio::time::{timeout, Instant};
+
+    let connect_deadline = Instant::now() + Duration::from_secs(3);
+    let pipe = loop {
+        match ClientOptions::new().open(socket_path) {
+            Ok(pipe) => break pipe,
+            Err(_) if Instant::now() < connect_deadline => {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            Err(error) => anyhow::bail!("connect to named pipe {socket_path}: {error}"),
+        }
+    };
+
+    let mut pipe = BufReader::new(pipe);
+    let line = serde_json::to_string(request)? + "\n";
+    timeout(REPLY_DEADLINE, async {
+        pipe.get_mut().write_all(line.as_bytes()).await?;
+        pipe.get_mut().flush().await
+    })
+    .await
+    .map_err(|_| {
+        anyhow::anyhow!("timed out after {REPLY_DEADLINE:?} writing the daemon request")
+    })??;
+
+    let mut response_line = String::new();
+    let read = timeout(REPLY_DEADLINE, pipe.read_line(&mut response_line))
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "timed out after {REPLY_DEADLINE:?} waiting for daemon response; \
+                 the daemon may still be running the request"
+            )
+        })??;
+    if read == 0 {
+        anyhow::bail!("daemon closed connection without response");
+    }
+    Ok(serde_json::from_str(response_line.trim_end())?)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{

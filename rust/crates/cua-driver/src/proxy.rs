@@ -1255,7 +1255,16 @@ async fn forward_tool_call(
         })
         .await
     };
-    #[cfg(not(unix))]
+    // The overlapped pipe client lives in this future, so the per-call
+    // deadline dropping it closes the pipe and frees the in-flight slot.
+    #[cfg(windows)]
+    let blocking = {
+        let _permit = permit;
+        Ok::<_, tokio::task::JoinError>(
+            cua_driver_core::daemon::send_request_async(&socket, &req).await,
+        )
+    };
+    #[cfg(not(any(unix, windows)))]
     let blocking = tokio::task::spawn_blocking(move || {
         let _permit = permit;
         send_request(&socket, &req)
@@ -2269,6 +2278,67 @@ mod tests {
         assert!(
             closed,
             "the daemon connection must close once the proxy drops the call"
+        );
+    }
+
+    /// Windows counterpart: the forwarded call used to run a synchronous pipe
+    /// read on a blocking thread, which kept the pipe and its in-flight slot
+    /// after the deadline dropped the call.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn a_dropped_forwarded_call_releases_its_daemon_pipe() {
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt};
+        let pipe_name = format!(
+            r"\\.\pipe\cua-driver-proxy-drop-test-{}",
+            std::process::id()
+        );
+        let server = tokio::net::windows::named_pipe::ServerOptions::new()
+            .first_pipe_instance(true)
+            .create(&pipe_name)
+            .unwrap();
+        // A daemon that reads the request, reports it, and never answers.
+        // It then waits for the proxy to close its end of the pipe.
+        let (received_tx, received_rx) = tokio::sync::oneshot::channel();
+        let mut daemon = tokio::spawn(async move {
+            server.connect().await.unwrap();
+            let mut reader = tokio::io::BufReader::new(server);
+            let mut request = String::new();
+            reader.read_line(&mut request).await.unwrap();
+            let _ = received_tx.send(request);
+            let mut rest = [0_u8; 16];
+            matches!(reader.read(&mut rest).await, Ok(0) | Err(_))
+        });
+        let mut call = Box::pin(forward_tool_call(
+            serde_json::json!(1),
+            "list_apps".into(),
+            serde_json::json!({}),
+            &pipe_name,
+            "s",
+            false,
+            None,
+        ));
+        // Drop the call only once the daemon holds the whole request, so the
+        // proxy is waiting on the reply.
+        let received = tokio::select! {
+            _ = &mut call => None,
+            received = tokio::time::timeout(std::time::Duration::from_secs(10), received_rx) => {
+                received.ok().and_then(Result::ok)
+            }
+        };
+        let Some(request) = received else {
+            // Dropping the server end also ends a blocking client read.
+            daemon.abort();
+            panic!("the daemon must receive the request and hold the call");
+        };
+        assert!(request.contains("list_apps"), "request: {request}");
+        drop(call);
+        let closed = tokio::time::timeout(std::time::Duration::from_secs(5), &mut daemon).await;
+        if closed.is_err() {
+            daemon.abort();
+        }
+        assert!(
+            matches!(closed, Ok(Ok(true))),
+            "the daemon pipe must close once the proxy drops the call"
         );
     }
 }
