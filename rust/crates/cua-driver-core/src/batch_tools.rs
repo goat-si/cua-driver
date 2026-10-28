@@ -804,9 +804,29 @@ impl Plan {
             }
             (None, None) => None,
         };
-        // A final read the batch scope refused fails the batch like a
-        // refused step, and no further read runs.
-        let mut scope_refused: Option<&'static str> = None;
+        // The batch ends at the first call its app scope refused: after a
+        // refused step nothing more is dispatched (no recovery, observation
+        // or tail read), and a refused final read fails the batch the same way.
+        let mut scope_refused: Option<&'static str> = failed_step.and_then(|index| {
+            let code = structured["steps"][index]["code"].as_str()?;
+            [
+                crate::batch_scope::OUTSIDE_SCOPE,
+                crate::batch_scope::FOREGROUND_NOT_ALLOWED,
+            ]
+            .into_iter()
+            .find(|known| *known == code)
+        });
+        let observe = if scope_refused.is_some() {
+            if observe.is_some() {
+                lines.push(
+                    "observation skipped: the batch stopped at a call its app scope refused"
+                        .to_owned(),
+                );
+            }
+            None
+        } else {
+            observe
+        };
         if let Some(mut args) = observe {
             let filled = fill_observed_window(&mut args, last_window.as_ref());
             let result = if filled {
@@ -1072,7 +1092,12 @@ async fn run_step(
         }
         let mut result = registry.invoke(tool, args.clone()).await;
         let mut refound_note = None;
-        if result.is_error == Some(true) && tool == "click" {
+        // The menu-bar reroute can focus or raise a window, so a batch whose
+        // app scope allows background delivery only keeps the click's own
+        // error instead.
+        let background_scope = crate::batch_scope::current()
+            .is_some_and(|scope| scope.delivery() == crate::batch_scope::ScopeDelivery::Background);
+        if result.is_error == Some(true) && tool == "click" && !background_scope {
             if let Some((menu_args, note)) = menu_bar_route(&args, &result) {
                 report["refound"] = json!(note);
                 result = registry.invoke("invoke_menu", menu_args).await;

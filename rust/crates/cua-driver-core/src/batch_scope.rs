@@ -49,7 +49,10 @@ const LAUNCH_KEYS: &[&str] = &[
     "session",
 ];
 /// Tools that always bring a window forward.
-const FOREGROUND_TOOLS: &[&str] = &["bring_to_front", "activate_app"];
+/// `invoke_menu` is here because driving a menu can focus or raise the
+/// target window (macOS focuses the exact window before opening its menu);
+/// `run_steps` reaches it only through its menu-bar reroute.
+const FOREGROUND_TOOLS: &[&str] = &["bring_to_front", "activate_app", "invoke_menu"];
 
 /// Delivery a scope allows.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
