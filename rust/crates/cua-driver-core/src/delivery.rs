@@ -239,6 +239,29 @@ impl OwnInputTracker {
         self.own = Some((start_ticks, end_ticks));
     }
 
+    /// Run one injection: sample the person's last input, then start the
+    /// injection span, inject, and record the span when `send` reports
+    /// that it inserted events. Sampling first matters: the span then starts
+    /// after every tick the sample could have seen, so a person's input kept
+    /// here always predates the span it is compared with.
+    pub fn inject<T>(
+        &mut self,
+        mut now_ticks: impl FnMut() -> u32,
+        last_input_ticks: impl FnOnce() -> Option<u32>,
+        send: impl FnOnce() -> (T, bool),
+    ) -> T {
+        let last_input = last_input_ticks();
+        let start = now_ticks();
+        if let Some(last_input) = last_input {
+            self.observe(start, last_input);
+        }
+        let (sent, inserted) = send();
+        if inserted {
+            self.record_injection(start, now_ticks());
+        }
+        sent
+    }
+
     /// Milliseconds since the person's latest input. When the OS's latest
     /// input is the driver's own, this falls back to the person's input seen
     /// before that injection, and returns `None` when there is none.
@@ -515,6 +538,41 @@ mod tests {
             evaluate_physical_input_idle(gate.idle_ms(1_400, 1_316), 1_000),
             PhysicalInputIdleGate::UserActive { idle_ms: 200, .. }
         ));
+    }
+
+    #[test]
+    fn an_injection_starts_its_span_after_sampling_the_persons_input() {
+        use std::cell::Cell;
+        let clock = Cell::new(1_000_u32);
+        let mut gate = OwnInputTracker::new();
+        gate.inject(
+            || clock.get(),
+            || {
+                // The driver is descheduled; the person types at 1_200 and
+                // the sample sees it at 1_210.
+                clock.set(1_210);
+                Some(1_200)
+            },
+            || {
+                clock.set(1_250);
+                ((), true)
+            },
+        );
+        // The OS now reports only the driver's own input at 1_250, but the
+        // person typed 100 ms ago.
+        assert_eq!(gate.idle_ms(1_300, 1_250), Some(100));
+        assert!(matches!(
+            evaluate_physical_input_idle(gate.idle_ms(1_300, 1_250), 1_000),
+            PhysicalInputIdleGate::UserActive { idle_ms: 100, .. }
+        ));
+    }
+
+    #[test]
+    fn an_injection_that_inserts_nothing_records_no_span() {
+        let mut gate = OwnInputTracker::new();
+        gate.inject(|| 1_000, || Some(500), || ((), false));
+        // Nothing was injected, so the OS's latest input is the person's.
+        assert_eq!(gate.idle_ms(1_100, 1_000), Some(100));
     }
 
     #[test]

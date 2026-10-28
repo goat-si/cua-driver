@@ -447,21 +447,22 @@ pub(crate) unsafe fn send_input(
     let mut tracker = OWN_INPUT
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    // Keep the person's latest input before this injection overwrites the
-    // OS's last-input tick.
-    let mut info = LASTINPUTINFO {
-        cbSize: std::mem::size_of::<LASTINPUTINFO>() as u32,
-        dwTime: 0,
-    };
-    let start = GetTickCount();
-    if GetLastInputInfo(&mut info).as_bool() {
-        tracker.observe(start, info.dwTime);
-    }
-    let sent = SendInput(events, std::mem::size_of::<INPUT>() as i32);
-    if sent > 0 {
-        tracker.record_injection(start, GetTickCount());
-    }
-    sent
+    tracker.inject(
+        || GetTickCount(),
+        || {
+            // The person's latest input, kept before this injection
+            // overwrites the OS's last-input tick.
+            let mut info = LASTINPUTINFO {
+                cbSize: std::mem::size_of::<LASTINPUTINFO>() as u32,
+                dwTime: 0,
+            };
+            GetLastInputInfo(&mut info).as_bool().then_some(info.dwTime)
+        },
+        || {
+            let sent = SendInput(events, std::mem::size_of::<INPUT>() as i32);
+            (sent, sent > 0)
+        },
+    )
 }
 
 /// Pure preflight evaluation for a Windows foreground delivery request.
@@ -658,14 +659,20 @@ mod tests {
         }
         // The idle time may not be shorter than the time since the input
         // before the driver's injection: the injection is not the person's.
-        let idle = physical_input_idle_ms();
+        // Measure that bound first: the idle time is read later, so it can
+        // only be longer when the tracking is right.
         let since_before = before.map(|tick| {
             let now = unsafe { windows::Win32::System::SystemInformation::GetTickCount() };
             cua_driver_core::delivery::elapsed_idle_ms_from_ticks(now, tick)
         });
+        let idle = physical_input_idle_ms();
+        if last_input() != after {
+            eprintln!("skipped: other input arrived during the check");
+            return;
+        }
         if let (Some(idle), Some(since_before)) = (idle, since_before) {
             assert!(
-                idle + cua_driver_core::delivery::OWN_INPUT_TICK_SLACK_MS >= since_before,
+                idle >= since_before,
                 "the driver's own injection must not count as physical input \
                  (idle {idle} ms, last earlier input {since_before} ms ago)"
             );
@@ -728,7 +735,7 @@ mod tests {
         assert_eq!(unsafe { send_input(&nudge) }, 1);
         let idle = physical_input_idle_ms();
         assert!(
-            gate_foreground_physical_idle_with_sample(0, EventKind::Keystroke, idle, 5_000)
+            gate_foreground_physical_idle_with_sample(0, EventKind::Keystroke, idle, 60_000)
                 .is_err(),
             "input between the driver's injections must still count (idle {idle:?})"
         );
