@@ -25,7 +25,7 @@ use std::{
 use crate::ax::bindings::{
     ax_get_window_id, copy_action_names, copy_ax_windows, copy_bool_attr, copy_children,
     copy_element_attr, copy_string_attr, kAXErrorSuccess, perform_action, set_bool_attr_true,
-    AXUIElementCreateApplication, AXUIElementRef, AXUIElementSetMessagingTimeout,
+    AXError, AXUIElementCreateApplication, AXUIElementRef, AXUIElementSetMessagingTimeout,
 };
 
 pub struct InvokeMenuTool;
@@ -567,6 +567,10 @@ enum BackgroundPressError {
         is_save: bool,
     },
     Other(String),
+    /// The final item's action was sent and AX reported an error. An AX
+    /// error or timeout does not prove the app did not run the command, so
+    /// this is never reported as nothing sent.
+    SentWithError(String),
     UnboundWindow {
         requested: u32,
         focused: Option<u32>,
@@ -592,6 +596,23 @@ unsafe fn item_is_save(item: AXUIElementRef) -> bool {
 /// how often it is re-read.
 const ENABLE_WAIT: Duration = Duration::from_millis(600);
 const ENABLE_POLL: Duration = Duration::from_millis(40);
+
+/// Classify the final item's AX action. Every error after the action was
+/// sent is SentWithError (the command may still run), never Other, which
+/// callers report as a nothing-sent refusal.
+fn dispatch_final_item(
+    perform: impl FnOnce() -> AXError,
+    is_save: bool,
+) -> Result<PressedItem, BackgroundPressError> {
+    let error = perform();
+    if error == kAXErrorSuccess {
+        Ok(PressedItem { is_save })
+    } else {
+        Err(BackgroundPressError::SentWithError(format!(
+            "the native action for the final menu item returned AX error {error}"
+        )))
+    }
+}
 
 /// AppKit resolves document menus against its key/main window, not the ID
 /// supplied by a caller. Unknown or sibling context must fail before lookup.
@@ -751,13 +772,7 @@ unsafe fn invoke_path_in_background(
         let bound = require_live_menu_window(app, window_id);
         CFRelease(app as CFTypeRef);
         bound?;
-        let error = perform_action(target, action);
-        if error != kAXErrorSuccess {
-            return Err(BackgroundPressError::Other(format!(
-                "invoke_menu: native action for the final menu item failed with AX error {error}"
-            )));
-        }
-        Ok(PressedItem { is_save })
+        dispatch_final_item(|| perform_action(target, action), is_save)
     })();
     CFRelease(target as CFTypeRef);
     result
@@ -928,12 +943,27 @@ pub(super) async fn run_in_background_with_lease(
                     ActionTransport::MacosAppleEvent,
                     "The app's scripting interface reported the document saved",
                 ),
-                Ok(Err(refusal)) => background_unavailable(format!(
-                    "{preface}{message}, and saving through {app_name}'s scripting interface did not \
-                     complete ({}: {}). Nothing was saved",
-                    refusal.code, refusal.reason
+                Ok(Err(failure)) if !failure.sent => background_unavailable(format!(
+                    "{preface}{message}, and saving through {app_name}'s scripting interface did \
+                     not run ({}: {}). Nothing was saved",
+                    failure.refusal.code, failure.refusal.reason
                 )),
-                Err(error) => refusal(format!("invoke_menu: blocking task failed: {error}")),
+                Ok(Err(failure)) => sent_unverified(
+                    &preface,
+                    &path,
+                    &format!(
+                        "it is disabled in the background, and the save sent through \
+                         {app_name}'s scripting interface did not confirm ({}: {})",
+                        failure.refusal.code, failure.refusal.reason
+                    ),
+                    ActionTransport::MacosAppleEvent,
+                ),
+                Err(error) => sent_unverified(
+                    &preface,
+                    &path,
+                    &format!("the background save task failed ({error})"),
+                    ActionTransport::MacosAppleEvent,
+                ),
             }
         }
         Ok(Err(BackgroundPressError::Disabled { message, .. })) => {
@@ -945,8 +975,46 @@ pub(super) async fn run_in_background_with_lease(
             main,
         })) => unbound_menu_window(pid, requested, focused, main),
         Ok(Err(BackgroundPressError::Other(error))) => refusal(error),
-        Err(error) => refusal(format!("invoke_menu: blocking task failed: {error}")),
+        Ok(Err(BackgroundPressError::SentWithError(error))) => {
+            sent_unverified(&preface, &path, &error, ActionTransport::MacosAxAction)
+        }
+        // The press task ended without a result; it may have stopped after
+        // the action was sent, so this is not a nothing-sent refusal either.
+        Err(error) => sent_unverified(
+            &preface,
+            &path,
+            &format!("the background press task failed ({error})"),
+            ActionTransport::MacosAxAction,
+        ),
     }
+}
+
+/// The menu item's action was (or may have been) sent and its outcome is not
+/// known. Retrying could run the command twice, so the result says to read
+/// fresh state first.
+fn sent_unverified(
+    preface: &str,
+    path: &[String],
+    error: &str,
+    transport: ActionTransport,
+) -> ToolResult {
+    let mut result = background_success(
+        format!(
+            "{preface}Sent {} with the app in the background (not activated), but {error}. The \
+             command may still have run: read fresh state before retrying it.",
+            path.join(" > ")
+        ),
+        ActionEffect::Unverifiable,
+        transport,
+        "The command was sent and reported an error, which does not show it did not run",
+    );
+    result.structured_content = Some(serde_json::json!({
+        "status": "unverifiable",
+        "effect": "unverifiable",
+        "dispatched": true,
+        "error": error,
+    }));
+    result
 }
 
 fn background_success(
@@ -1152,6 +1220,65 @@ mod tests {
             vec!["Window", "Left"]
         );
         assert!(normalized_path(vec!["Window".into(), "  ".into()]).is_err());
+    }
+
+    fn text_of(result: &ToolResult) -> String {
+        result
+            .content
+            .iter()
+            .filter_map(|c| match c {
+                cua_driver_core::protocol::Content::Text { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn an_ax_error_after_the_final_action_is_sent_is_not_a_refusal() {
+        // A fake dispatch: the action reports an error but may have run.
+        let mut sent = 0;
+        let outcome = dispatch_final_item(
+            || {
+                sent += 1;
+                -25204 // kAXErrorCannotComplete (a messaging timeout)
+            },
+            false,
+        );
+        assert_eq!(sent, 1);
+        let Err(BackgroundPressError::SentWithError(error)) = outcome else {
+            panic!("expected SentWithError, got {outcome:?}");
+        };
+        assert!(error.contains("-25204"), "{error}");
+        assert!(matches!(
+            dispatch_final_item(|| kAXErrorSuccess, true),
+            Ok(PressedItem { is_save: true })
+        ));
+
+        let path = vec!["Edit".to_owned(), "Select All".to_owned()];
+        let result = sent_unverified(
+            &MenuRequest::KeyEquivalent("cmd+a".into()).preface(&path),
+            &path,
+            &error,
+            ActionTransport::MacosAxAction,
+        );
+        assert_ne!(result.is_error, Some(true));
+        let structured = result.structured_content.clone().expect("structured");
+        assert_eq!(structured["effect"], "unverifiable");
+        assert_eq!(structured["dispatched"], true);
+        assert_ne!(structured["status"], "refused");
+        assert_eq!(
+            result.action_record.as_ref().expect("record").effect,
+            ActionEffect::Unverifiable
+        );
+        // press_key and hotkey pass it through unchanged: it is not a
+        // background_unavailable refusal.
+        let passed = super::super::hotkey::menu_refusal_without_keys(result);
+        let text = text_of(&passed);
+        let structured = passed.structured_content.expect("structured");
+        assert_eq!(structured["effect"], "unverifiable");
+        assert!(structured.get("keys_sent").is_none());
+        assert!(text.contains("may still have run"), "{text}");
+        assert!(text.contains("Edit > Select All"), "{text}");
     }
 
     #[test]

@@ -364,40 +364,67 @@ pub struct SavedDocument {
     pub file_written: bool,
 }
 
+/// Why a background save did not confirm.
+#[derive(Debug, Clone)]
+pub struct SaveFailure {
+    pub refusal: ScriptRefusal,
+    /// The save event was (or may have been) sent to the app, so the
+    /// document may still be saved. False only when nothing was sent or the
+    /// script saved nothing.
+    pub sent: bool,
+}
+
 pub fn save_document(
     bundle_id: &str,
     app_name: &str,
     path: &Path,
-) -> Result<SavedDocument, ScriptRefusal> {
-    ensure_permitted(bundle_id, app_name)?;
+) -> Result<SavedDocument, SaveFailure> {
+    ensure_permitted(bundle_id, app_name).map_err(|refusal| SaveFailure {
+        refusal,
+        sent: false,
+    })?;
     let before = modified_time(path);
     let path_text = path.to_string_lossy();
     let result = run_script(
         SAVE_DOCUMENT_SCRIPT,
         &[&path_text, bundle_id],
         Duration::from_secs(30),
-    )?;
+    )
+    .map_err(|refusal| SaveFailure {
+        sent: script_failure_may_have_sent(&refusal),
+        refusal,
+    })?;
     match result.as_str() {
         "false" => {}
         "true" => {
-            return Err(ScriptRefusal {
-                code: "save_unconfirmed",
-                reason: format!(
-                    "{app_name} accepted the save, but still reports unsaved changes in {}",
-                    path.display()
-                ),
+            return Err(SaveFailure {
+                refusal: ScriptRefusal {
+                    code: "save_unconfirmed",
+                    reason: format!(
+                        "{app_name} accepted the save, but still reports unsaved changes in {}",
+                        path.display()
+                    ),
+                },
+                sent: true,
             })
         }
         "no-document" => {
-            return Err(ScriptRefusal {
-                code: "automation_failed",
-                reason: format!("{app_name} lists no open document for {}", path.display()),
-            })
+            return Err(SaveFailure {
+                refusal: ScriptRefusal {
+                    code: "automation_failed",
+                    reason: format!("{app_name} lists no open document for {}", path.display()),
+                },
+                // The script found no document to save, so it saved nothing.
+                sent: false,
+            });
         }
         other => {
-            return Err(ScriptRefusal {
-                code: "save_unconfirmed",
-                reason: format!("{app_name} answered \"{other}\" to the save"),
+            return Err(SaveFailure {
+                refusal: ScriptRefusal {
+                    code: "save_unconfirmed",
+                    reason: format!("{app_name} answered \"{other}\" to the save"),
+                },
+                sent: true,
             })
         }
     }
@@ -407,6 +434,13 @@ pub fn save_document(
 
 pub fn modified_time(path: &Path) -> Option<std::time::SystemTime> {
     std::fs::metadata(path).and_then(|m| m.modified()).ok()
+}
+
+/// macOS refusing the event (-1743) means it was not delivered; any other
+/// script failure (a timeout, an execution error) may have come after the
+/// app started acting on it.
+fn script_failure_may_have_sent(refusal: &ScriptRefusal) -> bool {
+    refusal.code != "automation_denied"
 }
 
 /// Wait up to `timeout` for `path`'s modification time to move past
@@ -475,6 +509,17 @@ mod tests {
 
     #[test]
     fn script_errors_name_a_denied_permission() {
+        assert!(!script_failure_may_have_sent(&script_error_refusal(
+            "0:120: execution error: Not authorized to send Apple events to TextEdit. (-1743)"
+        )));
+        // A timeout or an execution error can follow a save the app started.
+        assert!(script_failure_may_have_sent(&ScriptRefusal {
+            code: "automation_timeout",
+            reason: String::new(),
+        }));
+        assert!(script_failure_may_have_sent(&script_error_refusal(
+            "0:80: execution error: TextEdit got an error: AppleEvent timed out. (-1712)"
+        )));
         let denied = script_error_refusal(
             "0:120: execution error: Not authorized to send Apple events to Finder. (-1743)",
         );
