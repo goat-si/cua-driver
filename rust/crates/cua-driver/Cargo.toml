@@ -123,4 +123,6 @@ windows = { version = "0.61", features = [
     # JOBOBJECT_EXTENDED_LIMIT_INFORMATION embeds IO_COUNTERS (Threading).
     "Win32_Security",
     "Win32_System_Threading",
+    # Find the daemon's script thread by its description in the shutdown test.
+    "Win32_System_Diagnostics_ToolHelp",
 ] }
