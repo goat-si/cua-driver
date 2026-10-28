@@ -183,10 +183,59 @@ unsafe fn send_net_zero_edit(
     }
     let _ = crate::input::ax_actions::focus_element(element as usize);
     net_zero_edit(
+        collapsed_caret_of(element),
         |key| crate::input::keyboard::press_key(pid, key, &[]),
         || copy_string_attr(element, "AXValue"),
         || std::thread::sleep(NET_ZERO_POLL_INTERVAL),
     )
+}
+
+/// The caret's UTF-16 offset when the selection is collapsed; `None` when it
+/// cannot be read or text is selected (a space would replace the selection).
+///
+/// # Safety
+/// `element` must be a live `AXUIElementRef`.
+unsafe fn collapsed_caret_of(element: AXUIElementRef) -> Option<usize> {
+    use core_foundation::{base::TCFType, string::CFString};
+    let attr = CFString::new("AXSelectedTextRange");
+    let mut value: core_foundation::base::CFTypeRef = std::ptr::null();
+    let err = crate::ax::bindings::AXUIElementCopyAttributeValue(
+        element,
+        attr.as_concrete_TypeRef(),
+        &mut value,
+    );
+    if err != crate::ax::bindings::kAXErrorSuccess || value.is_null() {
+        return None;
+    }
+    let mut range = CfRange {
+        location: 0,
+        length: 0,
+    };
+    let ok = crate::ax::bindings::AXValueGetValue(
+        value as _,
+        kAXValueCFRangeType,
+        &mut range as *mut CfRange as *mut _,
+    );
+    core_foundation::base::CFRelease(value);
+    (ok && range.length == 0)
+        .then(|| usize::try_from(range.location).ok())
+        .flatten()
+}
+
+/// `text` with a space inserted at UTF-16 offset `caret`; `None` when the
+/// offset is past the end or inside a character.
+fn with_space_at(text: &str, caret: usize) -> Option<String> {
+    let mut units = 0;
+    for (byte, ch) in text.char_indices() {
+        if units == caret {
+            return Some(format!("{} {}", &text[..byte], &text[byte..]));
+        }
+        if units > caret {
+            return None;
+        }
+        units += ch.len_utf16();
+    }
+    (units == caret).then(|| format!("{text} "))
 }
 
 /// Pause between reads while waiting for a key of the net-zero edit to show.
@@ -197,10 +246,12 @@ const NET_ZERO_POLLS: usize = 50;
 /// The net-zero edit against injected keys, value reads and pacing.
 ///
 /// 1. An unreadable text sends nothing: no key could be checked.
-/// 2. Send a space and wait for the text to grow by one character. If it does
-///    not, stop: a backspace now would delete the user's last character.
+/// 2. Send a space and wait for the text to change into exactly the earlier
+///    text with a space at the caret. Anything else (no change, or another
+///    edit) stops here: a backspace now could delete the user's text.
 /// 3. Send a backspace and wait for the text to read as before.
 fn net_zero_edit(
+    caret: Option<usize>,
     mut press: impl FnMut(&str) -> anyhow::Result<()>,
     mut read: impl FnMut() -> Option<String>,
     mut pause: impl FnMut(),
@@ -208,7 +259,10 @@ fn net_zero_edit(
     let Some(before) = read() else {
         return DocumentEdited::NotMarked;
     };
-    let before_len = before.chars().count();
+    // A selection or an unknown caret leaves nowhere to expect the space.
+    let Some(expected) = caret.and_then(|caret| with_space_at(&before, caret)) else {
+        return DocumentEdited::NotMarked;
+    };
     if press("space").is_err() {
         return DocumentEdited::NotMarked;
     }
@@ -225,14 +279,14 @@ fn net_zero_edit(
         }
         None
     };
-    let spaced = match await_change(&before) {
-        Some(now) if now.chars().count() == before_len + 1 => now,
+    match await_change(&before) {
+        Some(now) if now == expected => {}
         _ => return DocumentEdited::NotMarked,
-    };
+    }
     if press("delete").is_err() {
         return DocumentEdited::NotMarked;
     }
-    match await_change(&spaced) {
+    match await_change(&expected) {
         Some(now) if now == before => DocumentEdited::Marked,
         _ => DocumentEdited::NotMarked,
     }
@@ -272,7 +326,7 @@ unsafe fn caret_to_end_of(element: AXUIElementRef) {
 
 #[cfg(test)]
 mod tests {
-    use super::{net_zero_edit, DocumentEdited};
+    use super::{net_zero_edit, with_space_at, DocumentEdited};
     use std::cell::RefCell;
 
     /// A text field that applies the keys it is given, after `lag` reads.
@@ -325,7 +379,8 @@ mod tests {
     }
 
     fn run(field: &Field) -> DocumentEdited {
-        net_zero_edit(|key| field.press(key), || field.read(), || {})
+        let caret = field.value.borrow().encode_utf16().count();
+        net_zero_edit(Some(caret), |key| field.press(key), || field.read(), || {})
     }
 
     /// DSH-05: both keys lost leaves the text unchanged, which is no evidence
@@ -363,6 +418,7 @@ mod tests {
     fn an_unreadable_value_sends_nothing() {
         let sent = RefCell::new(Vec::<String>::new());
         let verdict = net_zero_edit(
+            Some(0),
             |key| {
                 sent.borrow_mut().push(key.to_owned());
                 Ok(())
@@ -372,6 +428,55 @@ mod tests {
         );
         assert_eq!(verdict, DocumentEdited::NotMarked);
         assert!(sent.borrow().is_empty());
+    }
+
+    /// Review finding: a lost space followed by another one-character edit
+    /// (`hello` → `helloX`) is not the space; deleting would remove the X.
+    #[test]
+    fn another_edit_is_not_taken_for_the_space() {
+        let sent = RefCell::new(Vec::<String>::new());
+        let reads = RefCell::new(0);
+        let verdict = net_zero_edit(
+            Some(5),
+            |key| {
+                sent.borrow_mut().push(key.to_owned());
+                Ok(())
+            },
+            || {
+                *reads.borrow_mut() += 1;
+                Some(
+                    if *reads.borrow() == 1 {
+                        "hello"
+                    } else {
+                        "helloX"
+                    }
+                    .to_owned(),
+                )
+            },
+            || {},
+        );
+        assert_eq!(verdict, DocumentEdited::NotMarked);
+        assert_eq!(*sent.borrow(), vec!["space".to_owned()]);
+    }
+
+    /// A selection, or a caret that cannot be read, sends nothing.
+    #[test]
+    fn no_collapsed_caret_sends_nothing() {
+        let field = Field::new("hello", 0, &[]);
+        assert_eq!(
+            net_zero_edit(None, |key| field.press(key), || field.read(), || {}),
+            DocumentEdited::NotMarked
+        );
+        assert!(field.sent.borrow().is_empty());
+    }
+
+    #[test]
+    fn the_space_is_expected_at_the_caret() {
+        assert_eq!(with_space_at("hello", 5).as_deref(), Some("hello "));
+        assert_eq!(with_space_at("hello", 0).as_deref(), Some(" hello"));
+        assert_eq!(with_space_at("한글", 1).as_deref(), Some("한 글"));
+        assert_eq!(with_space_at("a😀b", 2), None, "inside a surrogate pair");
+        assert_eq!(with_space_at("hello", 6), None);
     }
 
     #[test]

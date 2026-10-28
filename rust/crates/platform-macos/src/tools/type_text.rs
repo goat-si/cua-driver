@@ -249,6 +249,22 @@ impl Tool for TypeTextTool {
         // coordinate translation + delivery_mode, so it lands on the same pixel a
         // px-click would.
         let used_pixel_focus = px.is_some() && py.is_some();
+        // A background px insert makes the window key before the focus click
+        // and keeps it so through delivery, as press_key and hotkey do: the
+        // focus read-back then reads this window's focused element, and the
+        // keys reach the field it confirmed. The delivery's own key scope
+        // finds the window already key.
+        let _px_key_scope = if used_pixel_focus
+            && !delivery_mode.is_foreground()
+            && matches!(keyboard_policy, BackgroundKeyboardPolicy::Allowed)
+        {
+            match super::acquire_key_scope(pid, window_id, false).await {
+                Ok(scope) => scope,
+                Err(refusal) => return refusal,
+            }
+        } else {
+            None
+        };
         if let (Some(cx), Some(cy)) = (px, py) {
             // The px form has no exact element for a semantic-only write; when
             // the keyboard rung is refused, refuse before the focus click too.

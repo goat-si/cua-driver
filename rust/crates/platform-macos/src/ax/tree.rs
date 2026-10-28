@@ -653,7 +653,11 @@ unsafe fn walk_element(
     // element, so every descendant must be bounded before any attribute read.
     set_messaging_timeout(element);
 
-    let role = copy_string_attr(element, "AXRole").unwrap_or_else(|| "AXUnknown".into());
+    let role = copy_string_attr(element, "AXRole").unwrap_or_else(|| {
+        // A selector on the role cannot be answered for this node.
+        note_skipped();
+        "AXUnknown".into()
+    });
 
     let in_web_content = in_web_content || is_web_content_role(&role);
     if in_web_content && !include_web_content {
@@ -1017,11 +1021,14 @@ unsafe fn walk_children(
 ) {
     if depth > max_depth {
         // A tree that ends exactly at the cap is still complete.
-        let below = copy_children(element);
-        if !below.is_empty() {
-            note_skipped();
+        match copy_children_checked(element) {
+            Some(below) if below.is_empty() => {}
+            Some(below) => {
+                note_skipped();
+                release_all(below);
+            }
+            None => note_skipped(),
         }
-        release_all(below);
         return;
     }
     let Some(children) = copy_children_checked(element) else {
@@ -1329,10 +1336,14 @@ thread_local! {
 /// read asks for this, so that `elements` lists the whole walked window and
 /// a selector matching none of it names nothing there.
 pub fn with_exhaustive_nodes<T>(exhaustive: bool, walk: impl FnOnce() -> T) -> T {
-    let previous = EXHAUSTIVE_NODES.with(|flag| flag.replace(exhaustive));
-    let result = walk();
-    EXHAUSTIVE_NODES.with(|flag| flag.set(previous));
-    result
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            EXHAUSTIVE_NODES.with(|flag| flag.set(self.0));
+        }
+    }
+    let _restore = Restore(EXHAUSTIVE_NODES.with(|flag| flag.replace(exhaustive)));
+    walk()
 }
 
 fn exhaustive_nodes() -> bool {
@@ -1629,6 +1640,20 @@ mod lean_row_tests {
         assert!(outer.finish(), "the outer skip survives the nested walk");
         let next = SkipLedger::start();
         assert!(!next.finish());
+    }
+
+    /// Review finding: a walk that panics must not leave exhaustive mode on
+    /// for later walks on the thread.
+    #[test]
+    fn exhaustive_mode_ends_with_its_walk_even_on_panic() {
+        use super::{exhaustive_nodes, with_exhaustive_nodes};
+        let unwound = std::panic::catch_unwind(|| {
+            with_exhaustive_nodes(true, || -> () { panic!("walk failed") })
+        });
+        assert!(unwound.is_err());
+        assert!(!exhaustive_nodes());
+        assert!(with_exhaustive_nodes(true, exhaustive_nodes));
+        assert!(!exhaustive_nodes());
     }
 
     #[test]

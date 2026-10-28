@@ -740,7 +740,7 @@ pub(crate) async fn focus_by_pixel(
     // click fallback would be destructive: Chromium's omnibox hit-tests to an
     // enclosing AXGroup that rejects AXFocused, so the fallback click moved
     // the caret and dropped the selection (#4125).
-    if focused_element_holds_point(pid, window_id, x, y, true).await {
+    if focused_element_holds_point(pid, window_id, x, y).await {
         return Ok(());
     }
     if let Some(ref s) = session {
@@ -878,7 +878,9 @@ fn pixel_focus_unconfirmed(
 /// conservative direction: an unprovable focus escalates to the stronger rung
 /// rather than being reported as success.
 async fn pixel_focus_landed(pid: i32, window_id: Option<u32>, x: f64, y: f64) -> bool {
-    focused_element_holds_point(pid, window_id, x, y, false).await
+    // The focused element must belong to the requested window: a sibling
+    // window's focused field can overlap the same point.
+    focused_element_holds_point(pid, window_id, x, y).await
 }
 
 /// Whether the application's focused element covers the window-local pixel
@@ -886,13 +888,7 @@ async fn pixel_focus_landed(pid: i32, window_id: Option<u32>, x: f64, y: f64) ->
 /// also belong to that exact window, so focus held by a same-process sibling
 /// window that overlaps the point never counts as the requested target.
 /// Unprovable answers are `false`.
-async fn focused_element_holds_point(
-    pid: i32,
-    window_id: Option<u32>,
-    x: f64,
-    y: f64,
-    require_window: bool,
-) -> bool {
+async fn focused_element_holds_point(pid: i32, window_id: Option<u32>, x: f64, y: f64) -> bool {
     let Some(wid) = window_id else {
         return false;
     };
@@ -906,20 +902,26 @@ async fn focused_element_holds_point(
                 return false;
             };
             let rect = crate::ax::bindings::element_screen_rect(focused);
-            let focused_window = if require_window {
-                crate::ax::exact_target::element_window_id(focused)
-            } else {
-                Some(wid)
-            };
+            let focused_window = crate::ax::exact_target::element_window_id(focused);
             core_foundation::base::CFRelease(focused as core_foundation::base::CFTypeRef);
-            let Some(rect) = rect else {
-                return false;
-            };
-            focused_window == Some(wid) && point_within_rect(rect, screen_x, screen_y)
+            focus_holds_point(focused_window, wid, rect, screen_x, screen_y)
         }
     })
     .await
     .unwrap_or(false)
+}
+
+/// Whether the focused element, in window `focused_window` with screen rect
+/// `rect`, covers the point in window `wid`. A focused element of another
+/// window never does, even where the two windows overlap.
+fn focus_holds_point(
+    focused_window: Option<u32>,
+    wid: u32,
+    rect: Option<[f64; 4]>,
+    x: f64,
+    y: f64,
+) -> bool {
+    focused_window == Some(wid) && rect.is_some_and(|rect| point_within_rect(rect, x, y))
 }
 
 /// Whether `[x, y, width, height]` (screen coordinates, top-left origin)
@@ -1542,7 +1544,21 @@ mod cursor_overlay_facility_tests {
 // binary has no CoreGraphics linkage.
 #[cfg(test)]
 mod pixel_focus_readback_tests {
-    use super::{pixel_focus_step, pixel_focus_unconfirmed, point_within_rect, PixelFocusStep};
+    use super::{
+        focus_holds_point, pixel_focus_step, pixel_focus_unconfirmed, point_within_rect,
+        PixelFocusStep,
+    };
+
+    /// Review finding: a sibling window's focused field overlapping the point
+    /// does not confirm focus in the requested window.
+    #[test]
+    fn only_the_requested_windows_focus_confirms() {
+        let field = Some([100.0, 100.0, 200.0, 30.0]);
+        assert!(focus_holds_point(Some(9), 9, field, 150.0, 110.0));
+        assert!(!focus_holds_point(Some(8), 9, field, 150.0, 110.0));
+        assert!(!focus_holds_point(None, 9, field, 150.0, 110.0));
+        assert!(!focus_holds_point(Some(9), 9, None, 150.0, 110.0));
+    }
 
     /// DSH-04: a background focus click whose read-back shows focus elsewhere
     /// must not let the keys go out. There is no real-click fallback in the
