@@ -401,6 +401,9 @@ unsafe fn reveal_core(
         },
         None => frame,
     };
+    if limits.expired() {
+        return (Mutation::NotSent, None);
+    }
     // Visit descendants in document order, keeping each element with a
     // frame. Subtrees that lie wholly on the near side of the viewport
     // cannot hold the target.

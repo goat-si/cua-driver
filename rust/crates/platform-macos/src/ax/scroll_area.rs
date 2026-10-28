@@ -202,24 +202,51 @@ impl ScrollArea {
 
 /// The nearest AXScrollArea at or above `element`, consuming its retain.
 unsafe fn ascend(element: AXUIElementRef, budget: Option<&Budget>) -> Option<ScrollArea> {
-    let mut current = element;
-    for _ in 0..MAX_ASCENT {
-        if let Some(budget) = budget {
-            if budget.expired() {
-                break;
+    climb(
+        element,
+        MAX_ASCENT,
+        || budget.is_some_and(|budget| budget.expired()),
+        |current| {
+            if budget.is_some() {
+                bound(*current);
             }
-            bound(current);
+            copy_string_attr(*current, "AXRole")
+        },
+        |current| copy_element_attr(*current, "AXParent"),
+        |current| CFRelease(current as CFTypeRef),
+    )
+    .map(|element| ScrollArea { element })
+}
+
+/// Climbs from start (owned) to the nearest AXScrollArea, releasing every
+/// element it leaves; none past an AXWindow/AXApplication, a role it cannot
+/// read, max steps, or the deadline, which is checked before each read.
+pub fn climb<E>(
+    start: E,
+    max: usize,
+    expired: impl Fn() -> bool,
+    role: impl Fn(&E) -> Option<String>,
+    parent: impl Fn(&E) -> Option<E>,
+    release: impl Fn(E),
+) -> Option<E> {
+    let mut current = start;
+    for _ in 0..max {
+        if expired() {
+            break;
         }
-        match copy_string_attr(current, "AXRole").as_deref() {
-            Some("AXScrollArea") => return Some(ScrollArea { element: current }),
+        match role(&current).as_deref() {
+            Some("AXScrollArea") => return Some(current),
             Some("AXWindow") | Some("AXApplication") | None => break,
             Some(_) => {}
         }
-        let parent = copy_element_attr(current, "AXParent");
-        CFRelease(current as CFTypeRef);
-        current = parent?;
+        if expired() {
+            break;
+        }
+        let next = parent(&current);
+        release(current);
+        current = next?;
     }
-    CFRelease(current as CFTypeRef);
+    release(current);
     None
 }
 
@@ -313,7 +340,8 @@ unsafe fn smallest_holding(
         bound(element);
     }
     *visited += 1;
-    if copy_string_attr(element, "AXRole").as_deref() == Some("AXScrollArea") {
+    let expired = || budget.is_some_and(|budget| budget.expired());
+    if copy_string_attr(element, "AXRole").as_deref() == Some("AXScrollArea") && !expired() {
         if let Some([x, y, width, height]) = element_screen_rect(element) {
             let holds =
                 point.0 >= x && point.0 <= x + width && point.1 >= y && point.1 <= y + height;
@@ -325,6 +353,9 @@ unsafe fn smallest_holding(
                 }
             }
         }
+    }
+    if expired() {
+        return;
     }
     for child in copy_children(element) {
         smallest_holding(child, point, depth + 1, visited, best, budget);
@@ -593,9 +624,13 @@ impl ScrollArea {
             return None;
         }
         let children = copy_children(self.element);
+        // span_of checks the budget before each child; the frame read after a
+        // child's role read checks it again.
         let frames = children.iter().map(|&child| {
             bound(child);
-            if copy_string_attr(child, "AXRole").as_deref() == Some("AXScrollBar") {
+            if copy_string_attr(child, "AXRole").as_deref() == Some("AXScrollBar")
+                || budget.expired()
+            {
                 None
             } else {
                 element_screen_rect(child)
@@ -847,6 +882,42 @@ mod tests {
             Box::new(|| panic!("found already")),
         ];
         assert_eq!(first_found(|| false, steps), Some(7));
+    }
+
+    #[test]
+    fn climbing_stops_between_the_role_and_parent_reads_at_the_deadline() {
+        let expired = std::cell::Cell::new(false);
+        let released = std::cell::RefCell::new(Vec::new());
+        let got = climb(
+            1u32,
+            40,
+            || expired.get(),
+            |_| {
+                // A busy app's role read uses up the budget.
+                expired.set(true);
+                Some("AXGroup".to_owned())
+            },
+            |_| panic!("no parent read after the deadline"),
+            |element| released.borrow_mut().push(element),
+        );
+        assert_eq!(got, None);
+        assert_eq!(*released.borrow(), vec![1]);
+        let released = std::cell::RefCell::new(Vec::new());
+        let roles = ["AXGroup", "AXGroup", "AXScrollArea"];
+        let got = climb(
+            0usize,
+            40,
+            || false,
+            |element| Some(roles[*element].to_owned()),
+            |element| Some(element + 1),
+            |element| released.borrow_mut().push(element),
+        );
+        assert_eq!(got, Some(2));
+        assert_eq!(
+            *released.borrow(),
+            vec![0, 1],
+            "every element left behind is released"
+        );
     }
 
     #[test]
