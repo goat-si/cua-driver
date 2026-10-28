@@ -298,8 +298,10 @@ a `foreground_fallback` retry:
 - A refused call sends nothing. Its result is an error whose
   `structuredContent` has `effect: "refused"`, `code`, `refusal: {code,
   message}`, `error: {code, hint}`, `tool`, `pid` and `window_id`. The batch
-  stops there like at any other failure; a script sees a `CuaError` with that
-  `code` (it may catch it, and every later call is checked again).
+  stops there like at any other failure, and a refused final `observe` or
+  trailing read fails the batch too. A script sees a `CuaError` with that
+  `code` and ends there: even if it catches the error, no further call is
+  dispatched, and the result is an error naming the refused call.
 - The scope lives for the one `run_steps` or `run_script` call. It travels as
   a task-local of that call, never as a step argument, so no step or script
   can change it. Results echo it as `app_scope`.

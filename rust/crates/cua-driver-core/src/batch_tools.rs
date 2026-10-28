@@ -804,6 +804,9 @@ impl Plan {
             }
             (None, None) => None,
         };
+        // A final read the batch scope refused fails the batch like a
+        // refused step, and no further read runs.
+        let mut scope_refused: Option<&'static str> = None;
         if let Some(mut args) = observe {
             let filled = fill_observed_window(&mut args, last_window.as_ref());
             let result = if filled {
@@ -835,6 +838,11 @@ impl Plan {
                 let message = bounded_message(&result);
                 lines.push(format!("observation: get_window_state ERROR: {message}"));
                 report["message"] = Value::String(message);
+                if let Some(code) = scope_refusal_code(&result) {
+                    report["code"] = json!(code);
+                    report["effect"] = json!("refused");
+                    scope_refused = Some(code);
+                }
             }
             structured["observation"] = report;
         }
@@ -842,35 +850,69 @@ impl Plan {
         let mut tail_content = Vec::new();
         let mut tail_reports = Vec::new();
         for (tool, mut args) in self.tail_reads {
+            if scope_refused.is_some() {
+                break;
+            }
             fill_observed_window(&mut args, last_window.as_ref());
             let result = registry.invoke(tool, args).await;
             let ok = result.is_error != Some(true);
             let message = bounded_message(&result);
+            let refused = scope_refusal_code(&result);
             if ok {
                 lines.push(format!("{tool}: ok (below)"));
                 tail_content.extend(result.content);
             } else {
                 lines.push(format!("{tool}: ERROR: {message}"));
             }
-            tail_reports.push(json!({ "tool": tool, "ok": ok, "message": message }));
+            let mut report = json!({ "tool": tool, "ok": ok, "message": message });
+            if let Some(code) = refused {
+                report["code"] = json!(code);
+                report["effect"] = json!("refused");
+                scope_refused = Some(code);
+            }
+            tail_reports.push(report);
         }
         if !tail_reports.is_empty() {
             structured["reads"] = Value::Array(tail_reports);
+        }
+        if let Some(code) = scope_refused {
+            structured["ok"] = json!(false);
+            structured["code"] = json!(code);
+            lines[0] = format!(
+                "{} (failed: a final read was refused by the batch scope)",
+                lines[0]
+            );
         }
 
         let mut content = vec![Content::text(lines.join("\n"))];
         content.append(&mut observation_content);
         content.append(&mut tail_content);
-        if failed_step.is_some() {
+        let failed = failed_step.is_some() || scope_refused.is_some();
+        if failed {
             fit_error_text(&mut content, ERROR_TEXT_BUDGET);
         }
         ToolResult {
             content,
-            is_error: failed_step.map(|_| true),
+            is_error: failed.then_some(true),
             structured_content: Some(structured),
             ..Default::default()
         }
     }
+}
+
+/// The batch scope's refusal code on a result, if it is one.
+fn scope_refusal_code(result: &ToolResult) -> Option<&'static str> {
+    let code = result
+        .structured_content
+        .as_ref()
+        .and_then(|value| value.get("code"))
+        .and_then(Value::as_str)?;
+    [
+        crate::batch_scope::OUTSIDE_SCOPE,
+        crate::batch_scope::FOREGROUND_NOT_ALLOWED,
+    ]
+    .into_iter()
+    .find(|known| *known == code)
 }
 
 async fn run_step(
@@ -1014,6 +1056,20 @@ async fn run_step(
             });
         }
 
+        // A wait_for or lookup earlier in this step that the batch scope
+        // refused proves nothing (a refused read is not "gone"): never send
+        // the action on it.
+        if let Some(code) = locator.scope_refusal() {
+            return failure(
+                index,
+                label,
+                Phase::Find,
+                code,
+                "a read this step needed was refused by the batch scope; the action was not sent"
+                    .to_owned(),
+                report,
+            );
+        }
         let mut result = registry.invoke(tool, args.clone()).await;
         let mut refound_note = None;
         if result.is_error == Some(true) && tool == "click" {

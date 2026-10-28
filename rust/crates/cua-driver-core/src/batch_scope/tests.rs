@@ -582,6 +582,7 @@ impl Harness {
             }));
         }
         registry.register_session_tools();
+        #[cfg(feature = "script")]
         registry.register_script_tool();
         let registry = Arc::new(registry);
         registry.init_self_weak();
@@ -617,6 +618,13 @@ fn text(result: &ToolResult) -> String {
         .collect::<Vec<_>>()
         .join("\n")
 }
+
+/// The batch tools this build registers.
+const BATCH_TOOLS: &[&str] = &[
+    "run_steps",
+    #[cfg(feature = "script")]
+    "run_script",
+];
 
 const NOTES_ONLY: &str = "com.example.notes";
 
@@ -747,6 +755,7 @@ async fn run_steps_without_scope_is_unchanged_and_a_bad_scope_runs_nothing() {
     assert_eq!(harness.sent("click").len(), 1, "nothing ran");
 }
 
+#[cfg(feature = "script")]
 #[tokio::test]
 async fn run_script_refuses_calls_outside_the_scope_and_journals_every_effect() {
     let harness = Harness::new();
@@ -789,40 +798,60 @@ async fn run_script_refuses_calls_outside_the_scope_and_journals_every_effect() 
     );
 }
 
+#[cfg(feature = "script")]
 #[tokio::test]
-async fn run_script_scope_refusals_carry_their_code_to_the_script_and_block_the_desktop() {
-    let harness = Harness::new();
-    let (result, out) = harness
-        .run(
-            "run_script",
-            json!({
-                "app_scope": {"apps": [NOTES_ONLY]},
-                "script": "const codes = [];\nfor (const call of [() => cua.call('press_key', {key: 'return'}), () => cua.call('launch_app', {bundle_id: 'com.example.mail'}), async () => (await cua.getApp('Mail')).query({role: 'button'})]) {\n  try { await call(); codes.push('sent'); } catch (error) { codes.push(error.code); }\n}\nreturn codes;"
-            }),
-        )
-        .await;
-    assert_ne!(result.is_error, Some(true), "{}", text(&result));
-    assert_eq!(
-        out["value"],
-        json!([FOREGROUND_NOT_ALLOWED, OUTSIDE_SCOPE, OUTSIDE_SCOPE]),
-        "{out}"
-    );
-    assert!(harness.sent("press_key").is_empty());
-    assert!(harness.sent("launch_app").is_empty());
-    assert!(harness
-        .sent("get_window_state")
-        .iter()
-        .all(|args| args["pid"] != 99));
-    let journal = out["calls"].as_array().unwrap();
-    assert!(
-        journal
+async fn a_script_stops_at_its_first_scope_refusal_even_when_it_catches_it() {
+    for (first, code) in [
+        (
+            "cua.call('press_key', {key: 'return'})",
+            FOREGROUND_NOT_ALLOWED,
+        ),
+        (
+            "cua.call('launch_app', {bundle_id: 'com.example.mail'})",
+            OUTSIDE_SCOPE,
+        ),
+        (
+            "(await cua.getApp('Mail')).query({role: 'button'})",
+            OUTSIDE_SCOPE,
+        ),
+    ] {
+        let harness = Harness::new();
+        let script = format!(
+            "let caught = null;\ntry {{ await {first}; }} catch (error) {{ caught = error.code; }}\nawait cua.call('click', {{pid: 42, window_id: 7, element_token: 's00000001:1'}});\nreturn caught;"
+        );
+        let (result, out) = harness
+            .run(
+                "run_script",
+                json!({"app_scope": {"apps": [NOTES_ONLY]}, "script": script}),
+            )
+            .await;
+        assert_eq!(result.is_error, Some(true), "{first}: {}", text(&result));
+        assert_eq!(out["ok"], false);
+        assert_eq!(out["error"]["code"], code, "{first}: {out}");
+        assert_eq!(out["error"]["line"], 2, "{first}: {out}");
+        assert!(
+            harness.sent("click").is_empty(),
+            "{first}: no call after the refusal"
+        );
+        assert!(harness.sent("press_key").is_empty());
+        assert!(harness.sent("launch_app").is_empty());
+        assert!(harness
+            .sent("get_window_state")
             .iter()
-            .filter(|call| call["ok"] == false)
-            .all(|call| call["effect"] == "refused"),
-        "{journal:?}"
-    );
+            .all(|args| args["pid"] != 99));
+        let refused = out["calls"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|call| call["ok"] == false)
+            .cloned()
+            .unwrap();
+        assert_eq!(refused["effect"], "refused", "{first}: {refused}");
+        assert_eq!(refused["code"], code);
+    }
 }
 
+#[cfg(feature = "script")]
 #[tokio::test]
 async fn run_script_records_effects_without_a_scope_and_rejects_a_bad_one() {
     let harness = Harness::new();
@@ -857,7 +886,7 @@ async fn run_script_records_effects_without_a_scope_and_rejects_a_bad_one() {
 #[test]
 fn run_steps_and_run_script_advertise_scope_in_their_input_schemas() {
     let harness = Harness::new();
-    for tool in ["run_steps", "run_script"] {
+    for tool in BATCH_TOOLS {
         let def = harness.registry.get_def(tool).unwrap();
         assert_eq!(
             def.input_schema["properties"]["app_scope"],
@@ -902,20 +931,24 @@ async fn a_gone_check_on_a_refused_window_fails_the_step_instead_of_passing() {
     assert_eq!(out["steps"][0]["effect"], "refused");
     assert!(harness.sent("press_key").is_empty(), "the batch stopped");
 
-    let (result, out) = harness
-        .run(
-            "run_script",
-            json!({
-                "app_scope": {"apps": [NOTES_ONLY]},
-                "script": "const mail = await cua.getApp('Mail');\nawait mail.waitFor({text: 'Inbox', gone: true, timeout_ms: 0});\nawait cua.call('press_key', {pid: 42, window_id: 7, key: 'a'});\nreturn 1;"
-            }),
-        )
-        .await;
-    assert_eq!(result.is_error, Some(true), "{}", text(&result));
-    assert_eq!(out["error"]["code"], OUTSIDE_SCOPE, "{out}");
-    assert!(harness.sent("press_key").is_empty());
+    #[cfg(feature = "script")]
+    {
+        let (result, out) = harness
+            .run(
+                "run_script",
+                json!({
+                    "app_scope": {"apps": [NOTES_ONLY]},
+                    "script": "const mail = await cua.getApp('Mail');\nawait mail.waitFor({text: 'Inbox', gone: true, timeout_ms: 0});\nawait cua.call('press_key', {pid: 42, window_id: 7, key: 'a'});\nreturn 1;"
+                }),
+            )
+            .await;
+        assert_eq!(result.is_error, Some(true), "{}", text(&result));
+        assert_eq!(out["error"]["code"], OUTSIDE_SCOPE, "{out}");
+        assert!(harness.sent("press_key").is_empty());
+    }
 }
 
+#[cfg(feature = "script")]
 #[tokio::test]
 async fn the_script_journal_lists_every_driver_call_of_each_op() {
     let harness = Harness::new();
@@ -956,7 +989,7 @@ fn the_batch_scope_argument_keeps_to_the_shared_schema_canon() {
     // `scope` is the shared window/desktop action argument, so the batch
     // argument has its own name.
     let harness = Harness::new();
-    for tool in ["run_steps", "run_script"] {
+    for tool in BATCH_TOOLS {
         let def = harness.registry.get_def(tool).unwrap();
         assert!(
             def.input_schema["properties"].get("scope").is_none(),
@@ -968,4 +1001,78 @@ fn the_batch_scope_argument_keeps_to_the_shared_schema_canon() {
             "{tool}"
         );
     }
+}
+
+#[tokio::test]
+async fn a_refused_precondition_never_lets_the_same_step_act() {
+    let harness = Harness::new();
+    let (result, out) = harness
+        .run(
+            "run_steps",
+            json!({
+                "app_scope": {"apps": [NOTES_ONLY]},
+                "steps": [{
+                    "wait_for": {"pid": 99, "window_id": 9, "text": "Inbox", "gone": true, "timeout_ms": 0},
+                    "click": {"pid": 42, "window_id": 7, "element_token": "s00000001:1"}
+                }]
+            }),
+        )
+        .await;
+    assert_eq!(result.is_error, Some(true), "{}", text(&result));
+    assert_eq!(out["steps"][0]["code"], OUTSIDE_SCOPE, "{out}");
+    assert_eq!(out["steps"][0]["effect"], "refused");
+    assert!(harness.sent("click").is_empty(), "the action was not sent");
+}
+
+#[tokio::test]
+async fn a_refused_final_read_fails_the_batch() {
+    let harness = Harness::new();
+    let (result, out) = harness
+        .run(
+            "run_steps",
+            json!({
+                "app_scope": {"apps": [NOTES_ONLY]},
+                "steps": [{"click": {"pid": 42, "window_id": 7, "element_token": "s00000001:1"}}],
+                "observe": {"pid": 99, "window_id": 9}
+            }),
+        )
+        .await;
+    assert_eq!(result.is_error, Some(true), "{}", text(&result));
+    assert_eq!(out["ok"], false);
+    assert_eq!(out["code"], OUTSIDE_SCOPE);
+    assert_eq!(out["observation"]["code"], OUTSIDE_SCOPE, "{out}");
+    assert_eq!(out["observation"]["effect"], "refused");
+    assert_eq!(
+        out["steps"][0]["effect"], "unverifiable",
+        "the step itself ran"
+    );
+    assert!(harness
+        .sent("get_window_state")
+        .iter()
+        .all(|args| args["pid"] != 99));
+}
+
+#[cfg(feature = "script")]
+#[tokio::test]
+async fn the_journal_keeps_a_typed_window_target() {
+    let harness = Harness::new();
+    let (result, out) = harness
+        .run(
+            "run_script",
+            json!({"script": "await cua.call('click', {target: {kind: 'window', pid: 42, window_id: 7}, element_token: 's00000001:1'});\nreturn 1;"}),
+        )
+        .await;
+    assert_ne!(result.is_error, Some(true), "{}", text(&result));
+    let click = out["calls"][0].clone();
+    assert_eq!(
+        (click["pid"].clone(), click["window_id"].clone()),
+        (json!(42), json!(7)),
+        "{click}"
+    );
+    let inner = click["driver_calls"][0].clone();
+    assert_eq!(
+        (inner["pid"].clone(), inner["window_id"].clone()),
+        (json!(42), json!(7)),
+        "{inner}"
+    );
 }

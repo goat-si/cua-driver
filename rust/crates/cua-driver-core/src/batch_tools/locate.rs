@@ -503,6 +503,14 @@ impl<'a> Locator<'a> {
             .take()
     }
 
+    /// The scope refusal code a lookup hit since the last take, left in place.
+    pub fn scope_refusal(&self) -> Option<&'static str> {
+        *self
+            .scope_refusal
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     pub fn with_observe_baseline(mut self, max_elements: u64) -> Self {
         self.baseline_max_elements = Some(max_elements);
         self
@@ -516,10 +524,7 @@ impl<'a> Locator<'a> {
     }
 
     async fn call(&self, tool: &str, args: Value) -> Result<Value, String> {
-        let (pid, window_id) = (
-            args.get("pid").and_then(Value::as_i64),
-            args.get("window_id").and_then(Value::as_u64),
-        );
+        let (pid, window_id) = call_target(&args);
         let result = self.registry.invoke(tool, self.with_session(args)).await;
         self.record(journal_entry(tool, pid, window_id, &result));
         if result.is_error == Some(true) {
@@ -882,6 +887,15 @@ impl<'a> Locator<'a> {
         for window in &windows {
             let read = match self.read(window).await {
                 Ok(read) => read,
+                // A read the batch scope refused proves nothing about the
+                // window, least of all that something is gone: fail now.
+                Err(miss) if self.scope_refusal().is_some() => {
+                    return Err(Miss::new(
+                        self.scope_refusal()
+                            .unwrap_or(crate::batch_scope::OUTSIDE_SCOPE),
+                        miss.message,
+                    ))
+                }
                 // A window that closed between the lookup and the read has
                 // no elements left.
                 Err(_) if check.gone => continue,
@@ -1931,4 +1945,21 @@ pub(crate) fn journal_entry(
         "effect": field("effect"),
         "code": field("code"),
     })
+}
+
+/// The window a call targets, from flat `pid`/`window_id` or a typed
+/// `target: {kind: "window", pid, window_id}`.
+pub(crate) fn call_target(args: &Value) -> (Option<i64>, Option<u64>) {
+    let target = args.get("target");
+    let pid = args.get("pid").and_then(Value::as_i64).or_else(|| {
+        target
+            .and_then(|target| target.get("pid"))
+            .and_then(Value::as_i64)
+    });
+    let window_id = args.get("window_id").and_then(Value::as_u64).or_else(|| {
+        target
+            .and_then(|target| target.get("window_id"))
+            .and_then(Value::as_u64)
+    });
+    (pid, window_id)
 }

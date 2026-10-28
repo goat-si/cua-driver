@@ -346,6 +346,15 @@ struct CallRecord {
     driver_calls_omitted: usize,
 }
 
+/// The first call a scripts app scope refused; the script ends there.
+struct ScopeStop {
+    code: &'static str,
+    message: String,
+    call: u32,
+    line: u32,
+    op: String,
+}
+
 /// The driver tool a script op ran last, its target, and what it returned.
 #[derive(Clone, Debug, Default)]
 struct CallFacts {
@@ -385,6 +394,7 @@ async fn run(registry: &ToolRegistry, request: Request) -> ToolResult {
 
     let mut api = Api::new(registry, request.session.clone(), deadline);
     let mut log: Vec<CallRecord> = Vec::new();
+    let mut scope_stop: Option<ScopeStop> = None;
     let hard_stop = deadline + SHUTDOWN_GRACE;
     let outcome = loop {
         tokio::select! {
@@ -393,9 +403,18 @@ async fn run(registry: &ToolRegistry, request: Request) -> ToolResult {
                 api.last = None;
                 api.locator.take_scope_refusal();
                 api.locator.take_journal();
-                let mut result = match tokio::time::timeout_at(deadline.into(), api.dispatch(&call.op, call.args)).await {
-                    Ok(result) => result,
-                    Err(_) => Err(HostError::new("the script's wall-time limit was reached", "timeout")),
+                // After the first call the app scope refused, the script is
+                // over: nothing more is dispatched, even if it caught the error.
+                let mut result = if let Some(stop) = &scope_stop {
+                    Err(HostError::new(
+                        "the script already stopped at a call its app scope refused",
+                        stop.code,
+                    ))
+                } else {
+                    match tokio::time::timeout_at(deadline.into(), api.dispatch(&call.op, call.args)).await {
+                        Ok(result) => result,
+                        Err(_) => Err(HostError::new("the script's wall-time limit was reached", "timeout")),
+                    }
                 };
                 let mut facts = api.last.take().unwrap_or_default();
                 // Every driver call this op made, lookups included.
@@ -453,6 +472,28 @@ async fn run(registry: &ToolRegistry, request: Request) -> ToolResult {
                         driver_calls_omitted,
                     });
                 }
+                if scope_stop.is_none() {
+                    if let Err(error) = &result {
+                        let refused = [
+                            crate::batch_scope::OUTSIDE_SCOPE,
+                            crate::batch_scope::FOREGROUND_NOT_ALLOWED,
+                        ]
+                        .into_iter()
+                        .find(|code| error.code.as_deref() == Some(*code));
+                        if let Some(code) = refused {
+                            scope_stop = Some(ScopeStop {
+                                code,
+                                message: error.message.clone(),
+                                call: call.number,
+                                line: call.line,
+                                op: call.op.clone(),
+                            });
+                            // Stop the engine before it sees the reply, so a
+                            // catch block cannot make another call.
+                            cancel.store(true, Ordering::SeqCst);
+                        }
+                    }
+                }
                 let _ = call.reply.send(result);
             }
             outcome = &mut done_rx => break outcome.ok(),
@@ -461,6 +502,23 @@ async fn run(registry: &ToolRegistry, request: Request) -> ToolResult {
                 break tokio::time::timeout(SHUTDOWN_GRACE, &mut done_rx).await.ok().and_then(Result::ok);
             }
         }
+    };
+    let outcome = match (outcome, scope_stop) {
+        (Some(mut outcome), Some(stop)) => {
+            outcome.result = Err(engine::Failure {
+                kind: FailureKind::Exception,
+                message: format!(
+                    "stopped at the first call the app scope refused: {}",
+                    stop.message
+                ),
+                line: (stop.line > 0).then_some(stop.line),
+                op: Some(stop.op),
+                code: Some(stop.code.to_owned()),
+                call: (stop.call > 0).then_some(stop.call),
+            });
+            Some(outcome)
+        }
+        (outcome, _) => outcome,
     };
     render(
         outcome,
@@ -560,10 +618,11 @@ impl<'a> Api<'a> {
         if let Some(session) = &self.session {
             args.insert("session".into(), json!(session));
         }
+        let (pid, window_id) = locate::call_target(&Value::Object(args.clone()));
         let mut facts = CallFacts {
             tool: Some(tool.to_owned()),
-            pid: args.get("pid").and_then(Value::as_i64),
-            window_id: args.get("window_id").and_then(Value::as_u64),
+            pid,
+            window_id,
             ..CallFacts::default()
         };
         // A script chains its actions, so each one returns without waiting out
