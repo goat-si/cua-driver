@@ -1,4 +1,5 @@
 use async_trait::async_trait;
+use crate::goat::action_latency as latency;
 use cua_driver_core::{
     protocol::{Content, ToolResult},
     tool::{Tool, ToolDef},
@@ -217,7 +218,8 @@ impl Tool for GetWindowStateTool {
         // `com.apple.appkit.xpc.openAndSavePanelService`, so the owner-mismatch
         // shape is routine, and the caller must be told the real owner pid.
         {
-            let owner = match tokio::task::spawn_blocking(move || {
+            let owner = match latency::spawn_blocking(move || {
+                let _span = latency::span(latency::Stage::ReadOwner);
                 crate::windows::resolve_window_owner(pid, window_id)
             })
             .await
@@ -345,7 +347,8 @@ impl Tool for GetWindowStateTool {
             // when the budget runs out. The outer deadline is only a backstop
             // for an AX call that ignores the per-element messaging timeout
             // (dropping a spawn_blocking JoinHandle cannot cancel it).
-            let walk_future = tokio::task::spawn_blocking(move || {
+            let walk_future = latency::spawn_blocking(move || {
+                let _span = latency::span(latency::Stage::ReadWalk);
                 let target_key = (pid, u64::from(window_id));
                 let mut budget =
                     cua_driver_core::walk_budget::WalkBudget::new(timeout_ms, max_elements);
