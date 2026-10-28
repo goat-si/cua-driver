@@ -577,6 +577,11 @@ pub(crate) struct BackgroundMutationLease {
 }
 
 impl BackgroundMutationLease {
+    /// The app this lease serializes.
+    pub(crate) fn pid(&self) -> i32 {
+        self.pid
+    }
+
     /// Revalidate another actuator class while retaining the same per-PID
     /// lease. This supports explicit ladders without deadlocking by attempting
     /// to reacquire the coordinator recursively.

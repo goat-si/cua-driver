@@ -818,7 +818,19 @@ pub(super) async fn run_in_background(
     path: Vec<String>,
     request: MenuRequest,
 ) -> ToolResult {
-    let _mutation = super::acquire_background_mutation(pid).await;
+    let mutation = super::acquire_background_mutation(pid).await;
+    run_in_background_with_lease(&mutation, window_id, path, request).await
+}
+
+/// run_in_background for a caller that already holds the app's per-PID
+/// background mutation lease (it is not reentrant).
+pub(super) async fn run_in_background_with_lease(
+    lease: &super::BackgroundMutationLease,
+    window_id: u32,
+    path: Vec<String>,
+    request: MenuRequest,
+) -> ToolResult {
+    let pid = lease.pid();
     let document = latency::spawn_action_blocking(move || document_path_of_window(pid, window_id))
         .await
         .ok()
