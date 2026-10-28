@@ -1,5 +1,5 @@
-use async_trait::async_trait;
 use crate::goat::action_latency as latency;
+use async_trait::async_trait;
 use cua_driver_core::{
     protocol::{Content, ToolResult},
     tool::{Tool, ToolDef},

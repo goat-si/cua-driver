@@ -487,10 +487,7 @@ impl Tool for TypeTextTool {
                         "the window's focused element could not be read, so the AXValue \
                          read-back cannot be tied to the target window."
                     };
-                    (
-                        "📨 Sent (unverified)",
-                        format!(" — {surface} {next_step}"),
-                    )
+                    ("📨 Sent (unverified)", format!(" — {surface} {next_step}"))
                 } else if path == PATH_KEY_EVENTS_FG {
                     (
                         "📨 Sent (unverified)",

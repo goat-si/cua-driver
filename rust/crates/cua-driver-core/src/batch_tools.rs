@@ -489,7 +489,11 @@ impl Plan {
             None | Some(Value::Null) => false,
             Some(Value::String(mode)) if mode == "each" => false,
             Some(Value::String(mode)) if mode == "checkpoint" => true,
-            Some(_) => return Err(PlanError::batch("`verify` must be \"each\" or \"checkpoint\"")),
+            Some(_) => {
+                return Err(PlanError::batch(
+                    "`verify` must be \"each\" or \"checkpoint\"",
+                ))
+            }
         };
 
         // Reads the batch ends with are what `observe` is for: a trailing
@@ -565,7 +569,10 @@ impl Plan {
             // `verify:"checkpoint"`: every step but the last returns once its
             // input is delivered. The last keeps its report of what the batch
             // left open; a step that sets its own post_action_wait keeps it.
-            if let (true, Some(action)) = (checkpoint && index + 1 < raw_steps.len(), step.action.as_mut()) {
+            if let (true, Some(action)) = (
+                checkpoint && index + 1 < raw_steps.len(),
+                step.action.as_mut(),
+            ) {
                 if crate::post_action_wait::accepts(action.tool) {
                     if let Some(object) = action.args.as_object_mut() {
                         object

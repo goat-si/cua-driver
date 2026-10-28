@@ -1985,7 +1985,10 @@ fn perform_ax_click(
                 ));
             }
         }
-        if let Some(probe) = window_before.as_ref().filter(|_| press_error_may_have_acted(err)) {
+        if let Some(probe) = window_before
+            .as_ref()
+            .filter(|_| press_error_may_have_acted(err))
+        {
             if let Some(now) = settled_value(
                 |now| now != probe.before,
                 || probe.read(),

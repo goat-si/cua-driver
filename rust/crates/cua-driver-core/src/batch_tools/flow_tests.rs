@@ -607,7 +607,10 @@ async fn checkpoint_steps_skip_the_report_wait_except_the_last_and_report_ms() {
     if crate::post_action_wait::SKIP_SUPPORTED {
         assert_eq!(set_value["post_action_wait"], "none");
     }
-    assert!(click.get("post_action_wait").is_none(), "the last step keeps its report");
+    assert!(
+        click.get("post_action_wait").is_none(),
+        "the last step keeps its report"
+    );
     let steps = result.structured_content.unwrap()["steps"].clone();
     for step in steps.as_array().unwrap() {
         assert!(step["ms"].is_u64(), "{step}");
@@ -621,6 +624,10 @@ async fn verify_must_be_each_or_checkpoint() {
         .run(json!({"verify": "never", "steps": [{"click": {"app": "Demo", "role": "button", "name": "Next"}}]}))
         .await;
     assert_eq!(result.is_error, Some(true));
-    assert!(text(&result).contains("`verify` must be"), "{}", text(&result));
+    assert!(
+        text(&result).contains("`verify` must be"),
+        "{}",
+        text(&result)
+    );
     assert!(harness.calls("click").is_empty());
 }
