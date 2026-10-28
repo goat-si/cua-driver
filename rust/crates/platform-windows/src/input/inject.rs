@@ -145,8 +145,11 @@ pub(crate) unsafe fn force_foreground_assisted(target: HWND) -> (bool, bool) {
 
     const VK_NONAME: u8 = 0xFC;
     unsafe {
-        keybd_event(VK_NONAME, 0, KEYBD_EVENT_FLAGS(0), 0);
-        keybd_event(VK_NONAME, 0, KEYEVENTF_KEYUP, 0);
+        crate::input::delivery::record_own_input(|| {
+            keybd_event(VK_NONAME, 0, KEYBD_EVENT_FLAGS(0), 0);
+            keybd_event(VK_NONAME, 0, KEYEVENTF_KEYUP, 0);
+            ((), true)
+        });
     }
     for _ in 0..3 {
         if unsafe { force_foreground_attached(target) } {
@@ -155,6 +158,20 @@ pub(crate) unsafe fn force_foreground_assisted(target: HWND) -> (bool, bool) {
         sleep(Duration::from_millis(25));
     }
     (false, true)
+}
+
+/// `InjectSyntheticPointerInput` through the driver's own-input record, so
+/// the foreground idle gate does not read a synthetic pointer stroke as the
+/// person's input.
+unsafe fn inject_pointer(
+    device: HSYNTHETICPOINTERDEVICE,
+    info: &[POINTER_TYPE_INFO],
+) -> windows::core::Result<()> {
+    crate::input::delivery::record_own_input(|| {
+        let result = InjectSyntheticPointerInput(device, info);
+        let inserted = result.is_ok();
+        (result, inserted)
+    })
 }
 
 /// RAII guard that makes a specific target window **unable to become the
@@ -682,9 +699,9 @@ fn pen_taps(sx: i32, sy: i32, barrel: bool, count: usize) -> Result<()> {
         let mut result: Result<()> = Ok(());
         let n = count.max(1);
         for i in 0..n {
-            let r1 = InjectSyntheticPointerInput(dev, &[down]);
+            let r1 = inject_pointer(dev, &[down]);
             sleep(Duration::from_millis(25));
-            let r2 = InjectSyntheticPointerInput(dev, &[up]);
+            let r2 = inject_pointer(dev, &[up]);
             if let Err(e) = r1.and(r2) {
                 result = Err(anyhow::anyhow!("InjectSyntheticPointerInput(pen): {e}"));
                 break;
@@ -1054,7 +1071,7 @@ fn pen_drag(sx0: i32, sy0: i32, sx1: i32, sy1: i32, steps: usize, barrel: bool) 
             sx0,
             sy0,
         );
-        let mut res = InjectSyntheticPointerInput(dev, &[down]);
+        let mut res = inject_pointer(dev, &[down]);
         // Interpolated in-contact moves so frameworks that gate drag-tracking on
         // motion (rather than a single down→up) see a continuous stroke.
         let steps = steps.max(1);
@@ -1068,12 +1085,12 @@ fn pen_drag(sx0: i32, sy0: i32, sx1: i32, sy1: i32, steps: usize, barrel: bool) 
                 x,
                 y,
             );
-            res = res.and(InjectSyntheticPointerInput(dev, &[mv]));
+            res = res.and(inject_pointer(dev, &[mv]));
         }
         // Release at the end.
         sleep(Duration::from_millis(8));
         let up = mk(POINTER_FLAG_UP, sx1, sy1);
-        res = res.and(InjectSyntheticPointerInput(dev, &[up]));
+        res = res.and(inject_pointer(dev, &[up]));
         let _ = DestroySyntheticPointerDevice(dev);
         res.map_err(|e| anyhow::anyhow!("InjectSyntheticPointerInput(pen drag): {e}"))?;
     }
@@ -1159,7 +1176,7 @@ fn touch_drag(sx0: i32, sy0: i32, sx1: i32, sy1: i32, steps: usize) -> Result<()
             sx0,
             sy0,
         );
-        let mut res = InjectSyntheticPointerInput(dev, &[down]);
+        let mut res = inject_pointer(dev, &[down]);
         let steps = steps.clamp(1, 3);
         for i in 1..=steps {
             sleep(Duration::from_millis(2));
@@ -1171,11 +1188,11 @@ fn touch_drag(sx0: i32, sy0: i32, sx1: i32, sy1: i32, steps: usize) -> Result<()
                 x,
                 y,
             );
-            res = res.and(InjectSyntheticPointerInput(dev, &[mv]));
+            res = res.and(inject_pointer(dev, &[mv]));
         }
         sleep(Duration::from_millis(2));
         let up = mk(POINTER_FLAG_UP, sx1, sy1);
-        res = res.and(InjectSyntheticPointerInput(dev, &[up]));
+        res = res.and(inject_pointer(dev, &[up]));
         // Snap the cursor back to where the user left it. The OS processes the
         // promoted mouse messages slightly after injection, so a single restore
         // right after the `up` can be overrun by that late move — settle briefly,

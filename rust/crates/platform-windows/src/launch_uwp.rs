@@ -168,8 +168,11 @@ fn restore_foreground_best_effort(prior: HWND) {
     // doesn't trigger any application's key handler.
     const VK_NONAME: u8 = 0xFC;
     unsafe {
-        keybd_event(VK_NONAME, 0, KEYBD_EVENT_FLAGS(0), 0);
-        keybd_event(VK_NONAME, 0, KEYEVENTF_KEYUP, 0);
+        crate::input::delivery::record_own_input(|| {
+            keybd_event(VK_NONAME, 0, KEYBD_EVENT_FLAGS(0), 0);
+            keybd_event(VK_NONAME, 0, KEYEVENTF_KEYUP, 0);
+            ((), true)
+        });
     }
 
     for attempt in 0..3 {
