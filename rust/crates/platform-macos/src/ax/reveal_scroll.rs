@@ -177,12 +177,29 @@ pub unsafe fn reveal_scroll(
     direction: &str,
     distance: f64,
 ) -> Option<RevealOutcome> {
+    reveal_scroll_with(pid, point, window, direction, distance, electron_limits())
+}
+
+/// reveal_scroll within limits (a proceed hook runs right before the reveal
+/// action, after the target was found).
+///
+/// # Safety
+///
+/// As reveal_scroll.
+pub unsafe fn reveal_scroll_with(
+    pid: i32,
+    point: (f64, f64),
+    window: Option<Rect>,
+    direction: &str,
+    distance: f64,
+    limits: RevealLimits,
+) -> Option<RevealOutcome> {
     let hit = element_at_screen_position(pid, point.0, point.1)?;
     let candidates = scroll_candidates(hit, direction);
     CFRelease(hit as CFTypeRef);
     let mut candidates = candidates.into_iter();
     while let Some((container, role)) = candidates.next() {
-        let outcome = reveal_in(container, &role, window, direction, distance);
+        let outcome = reveal_core(container, &role, window, direction, distance, limits).1;
         CFRelease(container as CFTypeRef);
         if let Some(outcome) = outcome {
             for (rest, _) in candidates {
@@ -276,6 +293,9 @@ pub struct RevealLimits<'a> {
     pub budget: Option<Budget<'a>>,
     /// Accessibility messaging timeout set on every element read.
     pub element_timeout: Option<f32>,
+    /// Asked right before AXScrollToVisible, after the target was found;
+    /// false sends nothing.
+    pub proceed: Option<&'a dyn Fn() -> bool>,
 }
 
 impl RevealLimits<'_> {
@@ -284,11 +304,16 @@ impl RevealLimits<'_> {
         RevealLimits {
             budget: None,
             element_timeout: None,
+            proceed: None,
         }
     }
 
     fn expired(&self) -> bool {
         self.budget.is_some_and(|budget| budget.expired())
+    }
+
+    fn may_act(&self) -> bool {
+        !self.expired() && self.proceed.is_none_or(|proceed| proceed())
     }
 
     fn pause(&self, duration: std::time::Duration) {
@@ -348,25 +373,7 @@ pub fn walk_until<T>(
     }
 }
 
-pub(crate) unsafe fn reveal_in(
-    container: AXUIElementRef,
-    role: &str,
-    window: Option<Rect>,
-    direction: &str,
-    distance: f64,
-) -> Option<RevealOutcome> {
-    reveal_core(
-        container,
-        role,
-        window,
-        direction,
-        distance,
-        electron_limits(),
-    )
-    .1
-}
-
-/// reveal_in within limits, reporting whether AXScrollToVisible was sent
+/// A reveal within limits, reporting whether AXScrollToVisible was sent
 /// and how the app answered.
 pub(crate) unsafe fn reveal_attempt(
     container: AXUIElementRef,
@@ -468,7 +475,7 @@ unsafe fn reveal_core(
     let outcome = if let Some(index) = pick_reveal_target(viewport, direction, distance, &real) {
         // A real frame: measure the move on the element itself.
         let before = nodes[index].0;
-        if limits.expired() {
+        if !limits.may_act() {
             return (Mutation::NotSent, finish(elements, None));
         }
         sent = mutation_of(perform_action(elements[index], "AXScrollToVisible"));
@@ -496,7 +503,7 @@ unsafe fn reveal_core(
             .iter()
             .position(|(rect, leaf)| *leaf && real_size(*rect) && contains(viewport, *rect));
         let reference_before = reference.map(|at| nodes[at].0);
-        if limits.expired() {
+        if !limits.may_act() {
             return (Mutation::NotSent, finish(elements, None));
         }
         sent = mutation_of(perform_action(elements[pick.index], "AXScrollToVisible"));
@@ -618,6 +625,18 @@ mod tests {
             ),
             WalkEnd::NodeCap
         );
+    }
+
+    #[test]
+    fn a_proceed_hook_that_says_no_keeps_the_reveal_from_acting() {
+        let no = || false;
+        let yes = || true;
+        let mut limits = electron_limits();
+        assert!(limits.may_act());
+        limits.proceed = Some(&no);
+        assert!(!limits.may_act());
+        limits.proceed = Some(&yes);
+        assert!(limits.may_act());
     }
 
     #[test]

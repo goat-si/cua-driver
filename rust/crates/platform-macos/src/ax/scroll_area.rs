@@ -723,6 +723,7 @@ impl WheelArea for ScrollArea {
                 super::reveal_scroll::RevealLimits {
                     budget: Some(*budget),
                     element_timeout: Some(WHEEL_AX_TIMEOUT_S),
+                    proceed: None,
                 },
             )
         }

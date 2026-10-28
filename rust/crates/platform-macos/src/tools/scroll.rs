@@ -956,12 +956,49 @@ async fn electron_reveal_scroll(
     {
         return refusal;
     }
+    let dispatch_guard =
+        match super::window_points::DispatchGuard::new(space, window_id, validated_frame.clone()) {
+            Ok(guard) => guard,
+            Err(refusal) => return refusal,
+        };
     let window_rect = window.map(|b| [b.x, b.y, b.width, b.height]);
     let direction_owned = direction.to_owned();
     let outcome = latency::spawn_action_blocking(move || unsafe {
-        crate::ax::reveal_scroll::reveal_scroll(pid, point, window_rect, &direction_owned, distance)
+        // Checked after the hit test and the walk, right before the reveal.
+        let moved = std::cell::Cell::new(None);
+        let proceed = || match super::window_points::check_guard(&dispatch_guard) {
+            Ok(()) => true,
+            Err(error) => {
+                moved.set(Some(error));
+                false
+            }
+        };
+        let limits = crate::ax::reveal_scroll::RevealLimits {
+            proceed: Some(&proceed),
+            ..crate::ax::reveal_scroll::electron_limits()
+        };
+        let outcome = crate::ax::reveal_scroll::reveal_scroll_with(
+            pid,
+            point,
+            window_rect,
+            &direction_owned,
+            distance,
+            limits,
+        );
+        (outcome, moved.get())
     })
     .await;
+    let outcome = match outcome {
+        Ok((_, Some(moved))) => {
+            let error = anyhow::Error::from(moved);
+            if let Some(refusal) = super::window_points::moved_refusal(&error, space) {
+                return refusal;
+            }
+            Ok(None)
+        }
+        Ok((outcome, None)) => Ok(outcome),
+        Err(error) => Err(error),
+    };
     match outcome {
         Ok(Some(outcome)) => ToolResult::text(format!(
             "✅ Scrolled {direction} about {:.0} pt in the background through accessibility \

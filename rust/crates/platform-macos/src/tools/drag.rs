@@ -478,7 +478,6 @@ impl DragTool {
             "drag.CGEvent",
             || async move {
                 latency::spawn_action_blocking(move || -> anyhow::Result<bool> {
-                    super::window_points::check_guard(&dispatch_guard)?;
                     let m: Vec<&str> = mods_owned.iter().map(String::as_str).collect();
                     let observe = move |x: f64, y: f64| {
                         crate::cursor::overlay::send_command(
@@ -494,6 +493,9 @@ impl DragTool {
                             pid as libc::pid_t,
                             wid,
                             || {
+                                // After the activation and its focus wait,
+                                // right before the press.
+                                super::window_points::check_guard(&dispatch_guard)?;
                                 crate::input::mouse::drag_at_xy_observed(
                                     pid,
                                     from_sx,
@@ -528,6 +530,8 @@ impl DragTool {
                     // the session ends where the user's pointer is not
                     // moving, and report it.
                     let before = drag_image_windows(pid);
+                    // After the window read, right before the press.
+                    super::window_points::check_guard(&dispatch_guard)?;
                     let mut session_seen = false;
                     let outcome = crate::input::mouse::drag_at_xy_background(
                         pid,
