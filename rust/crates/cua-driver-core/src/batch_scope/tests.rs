@@ -1245,3 +1245,49 @@ async fn a_call_outside_the_scope_is_refused_even_with_invalid_arguments() {
         assert!(harness.sent("scroll").is_empty());
     }
 }
+
+#[cfg(feature = "script")]
+#[tokio::test]
+async fn a_call_outside_the_scope_is_refused_before_post_action_wait_is_parsed() {
+    // macOS parses post_action_wait before anything else in dispatch; an
+    // invalid value must not answer before the scope.
+    let harness = Harness::new();
+    let (result, out) = harness
+        .run(
+            "run_script",
+            json!({
+                "app_scope": {"apps": [NOTES_ONLY]},
+                "script": "let caught = null;\ntry { await cua.call('click', {pid: 99, window_id: 9, x: 1, y: 1, post_action_wait: 'off'}); } catch (error) { caught = error.code; }\nawait cua.call('click', {pid: 42, window_id: 7, element_token: 's00000001:1'});\nreturn caught;"
+            }),
+        )
+        .await;
+    assert_eq!(result.is_error, Some(true), "{}", text(&result));
+    assert_eq!(out["error"]["code"], OUTSIDE_SCOPE, "{out}");
+    assert!(
+        harness.sent("click").is_empty(),
+        "nothing after the refusal"
+    );
+}
+
+#[cfg(feature = "script")]
+#[tokio::test]
+async fn a_scoped_typed_window_target_is_accepted_on_its_exact_window() {
+    let harness = Harness::new();
+    let (result, out) = harness
+        .run(
+            "run_script",
+            json!({
+                "app_scope": {"apps": [NOTES_ONLY]},
+                "script": "await cua.call('click', {target: {kind: 'window', pid: 42, window_id: 7}, element_token: 's00000001:1'});\nreturn 1;"
+            }),
+        )
+        .await;
+    assert_ne!(result.is_error, Some(true), "{}", text(&result));
+    let clicks = harness.sent("click");
+    assert_eq!(clicks.len(), 1, "{out}");
+    assert_eq!(
+        (clicks[0]["pid"].clone(), clicks[0]["window_id"].clone()),
+        (json!(42), json!(7))
+    );
+    assert_eq!(out["calls"][0]["effect"], "unverifiable");
+}
