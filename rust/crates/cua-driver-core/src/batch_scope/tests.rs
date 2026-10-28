@@ -191,6 +191,10 @@ async fn background_scope_refuses_foreground_and_desktop_wide_calls() {
         ),
         ("bring_to_front", json!({"pid": 42, "window_id": 7})),
         ("activate_app", json!({"pid": 42})),
+        (
+            "invoke_menu",
+            json!({"pid": 42, "window_id": 7, "path": ["File", "Save"]}),
+        ),
         ("press_key", json!({"key": "return"})),
         ("hotkey", json!({"keys": ["cmd", "q"]})),
         ("move_cursor", json!({"x": 10, "y": 10})),
@@ -519,6 +523,9 @@ impl Tool for Fake {
                 }))
             }
             "launch_app" => ToolResult::text("launched").with_structured(json!({"pid": 42})),
+            _ if args["fail_message"].is_string() => {
+                ToolResult::error(args["fail_message"].as_str().unwrap_or_default().to_owned())
+            }
             _ if args["need_foreground"] == true
                 && args.get("delivery_mode").and_then(Value::as_str) != Some("foreground") =>
             {
@@ -1075,4 +1082,69 @@ async fn the_journal_keeps_a_typed_window_target() {
         (json!(42), json!(7)),
         "{inner}"
     );
+}
+
+#[tokio::test]
+async fn a_background_scope_never_reroutes_a_click_through_the_menu_bar() {
+    // A menu-bar item token refused as outside the window would normally run
+    // as invoke_menu, which can focus or raise the window.
+    crate::window_state_view::remember_for_test(
+        "s0000b0c1",
+        42,
+        7,
+        "- [0] AXWindow \"Draft\"\n- [27] AXMenuBar\n  - [700] AXMenuBarItem \"File\"\n    - [701] AXMenu\n      - [702] AXMenuItem \"Save\"\n",
+    );
+    let refused = "Background input refused (element_outside_target_window): the addressed element could not be proven to belong to window 7";
+    let step = json!({"click": {"pid": 42, "window_id": 7, "element_token": "s0000b0c1:702", "fail_message": refused}});
+
+    let harness = Harness::new();
+    let (result, out) = harness
+        .run(
+            "run_steps",
+            json!({"app_scope": {"apps": [NOTES_ONLY]}, "steps": [step.clone()]}),
+        )
+        .await;
+    assert_eq!(result.is_error, Some(true), "{}", text(&result));
+    assert!(harness.sent("invoke_menu").is_empty(), "{out}");
+    assert!(out["steps"][0].get("refound").is_none(), "{out}");
+
+    // With foreground allowed, the reroute still runs on the scoped window.
+    let harness = Harness::new();
+    let (_, out) = harness
+        .run(
+            "run_steps",
+            json!({"app_scope": {"apps": [NOTES_ONLY], "delivery": "foreground"}, "steps": [step]}),
+        )
+        .await;
+    let menus = harness.sent("invoke_menu");
+    assert_eq!(menus.len(), 1, "{out}");
+    assert_eq!(menus[0]["path"], json!(["File", "Save"]));
+}
+
+#[tokio::test]
+async fn nothing_is_read_after_a_step_the_scope_refused() {
+    let harness = Harness::new();
+    let (result, out) = harness
+        .run(
+            "run_steps",
+            json!({
+                "app_scope": {"apps": [NOTES_ONLY]},
+                "steps": [
+                    {"press_key": {"pid": 42, "window_id": 7, "key": "a", "delivery_mode": "foreground"}},
+                    {"zoom": {"pid": 42, "window_id": 7, "x1": 0, "y1": 0, "x2": 10, "y2": 10}}
+                ],
+                "observe": {"pid": 42, "window_id": 7}
+            }),
+        )
+        .await;
+    assert_eq!(result.is_error, Some(true), "{}", text(&result));
+    assert_eq!(out["steps"][0]["code"], FOREGROUND_NOT_ALLOWED, "{out}");
+    assert!(out.get("observation").is_none(), "{out}");
+    assert!(out.get("reads").is_none(), "{out}");
+    assert!(
+        harness.sent("get_window_state").is_empty(),
+        "no read after the refusal"
+    );
+    assert!(harness.sent("zoom").is_empty());
+    assert!(harness.sent("press_key").is_empty());
 }
