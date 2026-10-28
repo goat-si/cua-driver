@@ -511,6 +511,30 @@ pub(crate) fn windowserver_connection_refusal(
     )
 }
 
+/// A background key hand-back (`skylight::WindowKeyScope`) still running
+/// after its 2 s wait: fronting the app or priming a window now could move
+/// key focus under it, so `tool` sends nothing. Retrying is safe.
+pub(crate) fn key_restore_pending_refusal(
+    tool: &str,
+    pid: Option<i32>,
+    window_id: Option<u32>,
+) -> cua_driver_core::protocol::ToolResult {
+    let message = format!(
+        "{tool} sent nothing: the driver's previous key hand-back in a background app did not \
+         finish within 2 s. Retry the call; if this repeats, read the window first."
+    );
+    cua_driver_core::protocol::ToolResult::error(message.clone()).with_structured(
+        serde_json::json!({
+            "code": "key_restore_pending",
+            "effect": "refused",
+            "retryable": true,
+            "pid": pid,
+            "window_id": window_id,
+            "message": message,
+        }),
+    )
+}
+
 /// Exclusive per-process ownership of one background mutation. Callers must
 /// keep this value alive through actuator dispatch, focus restoration, and
 /// target-bound verification.
@@ -1260,6 +1284,11 @@ pub fn register_all(
                 // cursor are a harmless no-op.
                 cursor_registry.remove(session_id);
                 crate::cursor::overlay::remove_cursor(session_id.to_owned());
+                // A window the session left key inside a background app is
+                // let go with it (end_session or a closed transport).
+                crate::input::skylight::release_primed_keys_on_session_end(
+                    cua_driver_core::session::active_session_count(),
+                );
             });
         registry.retain_session_end_hook(registration);
         let revive_registration =
@@ -1645,5 +1674,24 @@ mod arguments_first_tests {
             .invoke(serde_json::json!({"pid": 123, "key": "return"}))
             .await;
         assert_eq!(lookups.load(Ordering::SeqCst), 1);
+    }
+}
+
+#[cfg(test)]
+mod key_restore_tests {
+    use super::key_restore_pending_refusal;
+
+    /// A key hand-back still running after 2 s: the action is refused with
+    /// nothing sent, instead of fronting or clicking under the hand-back.
+    #[test]
+    fn a_pending_key_hand_back_refuses_with_nothing_sent() {
+        let result = key_restore_pending_refusal("bring_to_front", Some(5), Some(9));
+        assert_eq!(result.is_error, Some(true));
+        let data = result.structured_content.expect("structured refusal");
+        assert_eq!(data["code"], "key_restore_pending");
+        assert_eq!(data["effect"], "refused");
+        assert_eq!(data["retryable"], true);
+        assert_eq!(data["pid"], 5);
+        assert_eq!(data["window_id"], 9);
     }
 }

@@ -525,6 +525,11 @@ pub fn prepare_background_pixel_click(pid: i32, wid: u32) -> bool {
     // again, so the user's typing was dropped until they clicked it.
     let activated =
         crate::input::skylight::activate_without_raise_with(pid as libc::pid_t, wid, false);
+    if activated {
+        // No hand-back follows the click: the window stays key in its app
+        // until the driver lets it go (see `skylight::note_primed_key`).
+        crate::input::skylight::note_primed_key(pid as libc::pid_t, wid);
+    }
     // Match Swift's settle interval so AppKit updates its active/key-window
     // routing before the mouseMoved + primer + target stream arrives.
     std::thread::sleep(std::time::Duration::from_millis(50));

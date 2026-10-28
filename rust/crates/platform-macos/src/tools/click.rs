@@ -1403,11 +1403,17 @@ impl Tool for ClickTool {
             {
                 let wid = window_id.expect("activation policy requires window_id");
                 match latency::spawn_action_blocking(move || {
-                    crate::input::mouse::prepare_background_pixel_click(pid, wid)
+                    // A key hand-back still running would move key focus under
+                    // this action's focus record: send nothing instead.
+                    crate::input::skylight::await_key_restores()
+                        .then(|| crate::input::mouse::prepare_background_pixel_click(pid, wid))
                 })
                 .await
                 {
-                    Ok(activated) => {
+                    Ok(None) => {
+                        return super::key_restore_pending_refusal("click", Some(pid), Some(wid));
+                    }
+                    Ok(Some(activated)) => {
                         if !activated && crate::input::skylight::windowserver_connection_invalid() {
                             return super::windowserver_connection_refusal(pid, Some(wid));
                         }
@@ -1757,6 +1763,7 @@ fn prime_key_window_for_background_press(pid: i32, window_id: u32, action: &str)
     };
     let mut last = LAST_KEY_PRIME.lock().unwrap_or_else(|e| e.into_inner());
     if last.is_some_and(|last| last.still_holds(&now))
+        && crate::input::skylight::primed_key_still_held(pid, window_id)
         && crate::ax::bindings::focused_window_id_of_pid(pid) == Some(window_id)
     {
         return;
@@ -1768,6 +1775,7 @@ fn prime_key_window_for_background_press(pid: i32, window_id: u32, action: &str)
         return;
     }
     if crate::input::skylight::activate_without_raise_with(pid, window_id, false) {
+        crate::input::skylight::note_primed_key(pid, window_id);
         std::thread::sleep(KEY_PRIME_SETTLE);
         // Recorded after this priming's own focus record. An activation or
         // another focus change during the settle may already have undone it.

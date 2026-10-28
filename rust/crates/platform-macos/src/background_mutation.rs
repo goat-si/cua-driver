@@ -40,6 +40,12 @@ pub(crate) async fn acquire(pid: i32) -> OwnedMutexGuard<()> {
     process_lock(pid).lock_owned().await
 }
 
+/// Take this process's mutation lease only if no action holds it, without
+/// waiting. An action that starts meanwhile waits until the guard drops.
+pub(crate) fn try_acquire(pid: i32) -> Option<OwnedMutexGuard<()>> {
+    process_lock(pid).try_lock_owned().ok()
+}
+
 /// Run one nested tool call with non-forgeable proof that its caller already
 /// owns this process's mutation lease.
 pub(crate) async fn with_held_lease<T>(pid: i32, future: impl Future<Output = T>) -> T {
@@ -56,6 +62,23 @@ pub(crate) fn held_by_current_task(pid: i32) -> bool {
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[tokio::test]
+    async fn a_lease_is_taken_without_waiting_only_when_free() {
+        let held = acquire(-91_101).await;
+        assert!(try_acquire(-91_101).is_none());
+        drop(held);
+        let taken = try_acquire(-91_101).expect("a free lease is taken");
+        // An action starting now waits for the guard.
+        let mut waiting = tokio::spawn(acquire(-91_101));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(30), &mut waiting)
+                .await
+                .is_err()
+        );
+        drop(taken);
+        drop(waiting.await.unwrap());
+    }
 
     #[tokio::test]
     async fn same_pid_mutations_serialize_until_the_first_guard_drops() {

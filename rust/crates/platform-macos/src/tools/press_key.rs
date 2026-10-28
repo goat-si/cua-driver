@@ -290,6 +290,27 @@ pub(super) fn requested_key(args: &Value) -> Result<(String, String, Vec<String>
     Ok((key_raw, key, modifiers))
 }
 
+/// The key as the result names it: the chord actually sent (`shift+8`), with
+/// the requested name after it when that differs (`shift+8 (*)`).
+pub(super) fn pressed_key_display(key_raw: &str, key: &str, modifiers: &[String]) -> String {
+    let chord = modifiers
+        .iter()
+        .map(String::as_str)
+        .chain(std::iter::once(key))
+        .collect::<Vec<_>>()
+        .join("+");
+    let raw = key_raw.trim();
+    let named = match raw.rsplit_once('+') {
+        Some((_, last)) if !last.is_empty() => last,
+        _ => raw,
+    };
+    if named.eq_ignore_ascii_case(key) {
+        chord
+    } else {
+        format!("{chord} ({raw})")
+    }
+}
+
 /// A key or modifier this driver cannot press, refused before anything is sent.
 pub(super) fn invalid_key(error: anyhow::Error) -> ToolResult {
     let message = error.to_string();
@@ -417,13 +438,14 @@ impl Tool for PressKeyTool {
                 Err(error) => return invalid_key(error),
             };
             let key_for_input = key.clone();
+            let display_key = pressed_key_display(&input.key, &key, &modifiers);
             let result = latency::spawn_action_blocking(move || {
                 let modifier_refs: Vec<&str> = modifiers.iter().map(String::as_str).collect();
                 crate::input::keyboard::press_key_global(&key_for_input, &modifier_refs)
             })
             .await;
             return match result {
-                Ok(Ok(())) => ToolResult::text(format!("Pressed '{key}' on the desktop."))
+                Ok(Ok(())) => ToolResult::text(format!("Pressed {display_key} on the desktop."))
                     .with_structured(serde_json::json!({
                         "scope": "desktop",
                         "path": "hid",
@@ -457,7 +479,7 @@ impl Tool for PressKeyTool {
         if let Err(error) = validate_post_target(pid) {
             return delivery_failed(error);
         }
-        let display_key = key_raw.clone();
+        let display_key = pressed_key_display(&key_raw, &key, &modifiers);
         // delivery_mode gates the raise: background (default) never fronts the
         // window (auth-envelope post, even with window_id); foreground is the
         // explicit NSMenu-activation rung. Matches click/type_text/hotkey.
@@ -736,6 +758,22 @@ impl Tool for PressKeyTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_summary_names_the_chord_that_was_sent() {
+        let shown = |key: &str, modifiers: &[&str]| {
+            let modifiers: Vec<String> = modifiers.iter().map(|m| (*m).to_owned()).collect();
+            let (key_raw, key, modifiers) =
+                requested_key(&serde_json::json!({ "key": key, "modifiers": modifiers }))
+                    .expect("a pressable key");
+            pressed_key_display(&key_raw, &key, &modifiers)
+        };
+        assert_eq!(shown("*", &[]), "shift+8 (*)");
+        // GOAT's proxy resolves `*` before the driver sees it.
+        assert_eq!(shown("8", &["shift"]), "shift+8");
+        assert_eq!(shown("return", &[]), "return");
+        assert_eq!(shown("a", &["cmd"]), "cmd+a");
+    }
 
     #[tokio::test]
     async fn an_unknown_key_is_refused_before_the_target_is_resolved() {

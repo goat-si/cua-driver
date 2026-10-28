@@ -50,7 +50,7 @@ fn def() -> &'static ToolDef {
         name: "set_value".into(),
         description: "Set an element's value by `element_token`. A popup button / select dropdown: selects the menu item whose title or value matches `value` (case-insensitive). Safari `<select>` is set through the DOM; AppKit and Chromium popups list items only while open, so the menu is opened, the item pressed and the menu closed again (in the background the user's front window keeps key focus). An unknown value lists the options. Any other element: writes AXValue (sliders, steppers, date pickers, native text fields).\n\
             \n\
-            A Finder file name cell (list or icon view, not being edited) is renamed through Finder's scripting interface with Finder left in the background, and the new name is read back from disk; the value is the full new name with its extension. macOS asks the user once to allow Cua Driver to control Finder. Finder's Get Info `Name` field is refused with `file_name_needs_rename`. For free-form text in web inputs use `type_text_chars`: WebKit ignores AXValue writes.".into(),
+            A Finder file name cell (list or icon view, not being edited) is renamed through Finder's scripting interface with Finder left in the background, and the new name is read back from disk; the value is the full new name with its extension. macOS asks the user once to allow Cua Driver to control Finder. Finder's Get Info `Name` field is refused with `file_name_needs_rename`. Safari's address field is refused with `address_field_not_settable` (it reads the write back but never opens it); its refusal names the route that opens an address. For free-form text in web inputs use `type_text_chars`: WebKit ignores AXValue writes.".into(),
         input_schema: serde_json::json!({
             "type": "object",
             "required": ["value"],
@@ -172,6 +172,21 @@ impl Tool for SetValueTool {
                 return finder_rename_result(pid, window_id, &path, &value, renamed);
             }
             None => {}
+        }
+
+        let address_guard = element_guard.clone();
+        let address_field = latency::spawn_action_blocking(move || unsafe {
+            let identifier =
+                copy_string_attr(address_guard.as_ptr() as AXUIElementRef, "AXIdentifier");
+            is_safari_address_field(
+                crate::apps::bundle_id_for_pid(pid).as_deref(),
+                identifier.as_deref(),
+            )
+        })
+        .await
+        .unwrap_or(false);
+        if address_field {
+            return address_field_refusal(pid, window_id);
         }
 
         let cursor_key = super::cursor_tools::resolve_cursor_key(&args);
@@ -414,6 +429,37 @@ const GET_INFO_RENAME_ROUTE: &str = "This is the Name & Extension field of Finde
     delivery_mode:\"foreground\" on this window. A changed extension makes Finder ask for \
     confirmation in a dialog first. Then check the new name in a fresh listing of the folder; \
     this window's title changes with it.";
+
+const ADDRESS_FIELD_NOT_SETTABLE: &str = "address_field_not_settable";
+
+const ADDRESS_FIELD_ROUTE: &str = "This is Safari's address and search field. Safari takes an \
+    AXValue write and reads it back, but the field keeps showing the page's address and nothing \
+    is opened, so nothing was written. To open an address with Safari left in the background: \
+    invoke_menu [\"File\", \"Open Location...\"] on this window (the field starts editing), \
+    then type_text the address into the field's element_token from a fresh get_window_state, \
+    then press_key return on this window. Check the window title or the field in a fresh \
+    get_window_state. To read or act on the page itself use the page tool.";
+
+/// Safari's address and search field: an `AXValue` write is read back while
+/// the field shows and keeps the page's address, and it never navigates.
+fn is_safari_address_field(bundle_id: Option<&str>, identifier: Option<&str>) -> bool {
+    bundle_id.is_some_and(|bundle| bundle.starts_with("com.apple.Safari"))
+        && identifier == Some("WEB_BROWSER_ADDRESS_AND_SEARCH_FIELD")
+}
+
+fn address_field_refusal(pid: i32, window_id: u32) -> ToolResult {
+    ToolResult::error(format!(
+        "set_value refused ({ADDRESS_FIELD_NOT_SETTABLE}): {ADDRESS_FIELD_ROUTE}"
+    ))
+    .with_structured(serde_json::json!({
+        "code": ADDRESS_FIELD_NOT_SETTABLE,
+        "effect": "refused",
+        "path": "ax",
+        "pid": pid,
+        "window_id": window_id,
+        "reason": ADDRESS_FIELD_ROUTE,
+    }))
+}
 
 fn file_name_needs_rename(pid: i32, window_id: u32, reason: &str) -> ToolResult {
     ToolResult::error(format!(
@@ -1295,10 +1341,45 @@ fn hex_digit(n: u8) -> char {
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_surface_trust, apply_verification_label, classify_write, file_name_needs_rename,
-        is_file_name_cell, is_get_info_name_field, not_applied_result, write_not_applied,
-        SetValueOutcome, GET_INFO_RENAME_ROUTE, LIST_RENAME_ROUTE,
+        address_field_refusal, apply_surface_trust, apply_verification_label, classify_write,
+        file_name_needs_rename, is_file_name_cell, is_get_info_name_field, is_safari_address_field,
+        not_applied_result, write_not_applied, SetValueOutcome, GET_INFO_RENAME_ROUTE,
+        LIST_RENAME_ROUTE,
     };
+
+    #[test]
+    fn only_safaris_address_field_is_an_address_field() {
+        let id = Some("WEB_BROWSER_ADDRESS_AND_SEARCH_FIELD");
+        assert!(is_safari_address_field(Some("com.apple.Safari"), id));
+        assert!(is_safari_address_field(
+            Some("com.apple.SafariTechnologyPreview"),
+            id
+        ));
+        assert!(!is_safari_address_field(
+            Some("com.apple.Safari"),
+            Some("SearchField")
+        ));
+        assert!(!is_safari_address_field(Some("com.apple.Safari"), None));
+        assert!(!is_safari_address_field(Some("com.apple.TextEdit"), id));
+        assert!(!is_safari_address_field(None, id));
+    }
+
+    #[test]
+    fn the_address_field_is_refused_with_the_route_that_navigates() {
+        // Safari reads the written AXValue back while the field still shows
+        // and keeps the page's URL; that read-back was reported as confirmed.
+        let result = address_field_refusal(7, 9);
+        assert_eq!(result.is_error, Some(true));
+        let data = result.structured_content.expect("structured refusal");
+        assert_eq!(data["code"], "address_field_not_settable");
+        assert_eq!(data["effect"], "refused");
+        assert_eq!(data["pid"], 7);
+        assert_eq!(data["window_id"], 9);
+        let text = data["reason"].as_str().unwrap();
+        assert!(text.contains("Open Location"), "{text}");
+        assert!(text.contains("type_text"), "{text}");
+        assert!(text.contains("press_key return"), "{text}");
+    }
 
     #[test]
     fn a_listed_file_name_is_a_file_name_cell() {
