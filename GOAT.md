@@ -82,8 +82,15 @@ Upstream moves several times a day; we sync deliberately, not continuously.
    the Node runtime builds with `--locked` against it, and CI checks it with
    `scripts/node-runtime/deny.toml`.
 4. Open a pull request; CI runs the protocol-compatibility test and builds every platform. Slow unit
-   and desktop-independent regression jobs run on `main`, release tags and `workflow_dispatch` instead
-   of blocking every PR. A manual dispatch can select `slow_tests: false` for the same fast build-only
-   lane, or `slow_tests: true` (the default) for the full regression lane on any branch.
-5. After merge and one live check per OS in GOAT, tag a release and bump GOAT's pin. Release tags still
-   require the slow regression jobs before publication.
+   and desktop-independent regression jobs run on release tags, `workflow_dispatch` and a daily
+   scheduled run of `main` instead of blocking every PR. A push to `main` runs only the version and
+   license checks, plus the platform builds when it changes the Cargo manifests, the lock or
+   `goat-ci.yml`; a newer push to `main` cancels an older one, and documentation-only pushes do not
+   run CI. A manual dispatch can select `slow_tests: false` for the fast build-only lane, or
+   `slow_tests: true` (the default) for the full regression lane on any branch.
+5. After merge and one live check per OS in GOAT, release from the version commit on `main`:
+   push a branch at exactly that commit (for example `release/goat.<N>-verify`) and run
+   `gh workflow run goat-ci --ref <branch> -f slow_tests=true`. Tag that commit only when this dispatch
+   run is fully green on that SHA, every slow lane included; the main push run of the commit is not the
+   release gate, because it skips the slow lanes. Then bump GOAT's pin. The tag run repeats the slow
+   regression jobs and publishes only if they pass.
