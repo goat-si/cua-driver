@@ -135,6 +135,17 @@ fn prefetch_capture<T: Send + 'static>(
     (should_capture && want_tree).then(|| tokio::task::spawn_blocking(capture))
 }
 
+/// The window geometry a published read records for later pixel actions:
+/// every published screenshot, whatever its encoding, since the pixels the
+/// agent points at are that screenshot's. Nothing without a published
+/// snapshot or a screenshot.
+fn published_read_frame<B>(
+    published: bool,
+    screenshot: Option<(B, (u32, u32))>,
+) -> Option<(B, (u32, u32))> {
+    screenshot.filter(|_| published)
+}
+
 fn verified_capture(
     window_id: u32,
     prefetched: Option<anyhow::Result<crate::capture::CapturedImage>>,
@@ -691,7 +702,7 @@ impl Tool for GetWindowStateTool {
         };
         // The capture registry holds PNG captures only; a JPEG read mints none.
         let capture_id = match (snapshot_id, screenshot.as_ref().filter(|_| !jpeg)) {
-            (Some(_), Some((png, _, width, height, native_width, native_height, bounds, _))) => {
+            (Some(_), Some((png, _, width, height, native_width, native_height, _, _))) => {
                 match self.state.capture_bindings.publish_window(
                     &args,
                     pid,
@@ -700,20 +711,25 @@ impl Tool for GetWindowStateTool {
                     (*width, *height),
                     (*native_width, *native_height),
                 ) {
-                    Ok(capture_id) => {
-                        super::px_frame::remember_published_frame(
-                            window_id,
-                            pid,
-                            bounds.clone(),
-                            (*native_width, *native_height),
-                        );
-                        Some(capture_id)
-                    }
+                    Ok(capture_id) => Some(capture_id),
                     Err(error) => return error,
                 }
             }
             _ => None,
         };
+        // Pixel actions read this window's frame from the last published
+        // screenshot, PNG or JPEG: a JPEG read delivered at a new backing
+        // scale must not leave an older capture's scale in place.
+        if let Some((bounds, native)) = published_read_frame(
+            snapshot_id.is_some(),
+            screenshot
+                .as_ref()
+                .map(|(_, _, _, _, native_width, native_height, bounds, _)| {
+                    (bounds, (*native_width, *native_height))
+                }),
+        ) {
+            super::px_frame::remember_published_frame(window_id, pid, bounds.clone(), native);
+        }
 
         // Build the structured `elements` array — one entry per actionable
         // node, matching the order (and indices) of the markdown rendering.
@@ -1589,6 +1605,19 @@ mod window_scope_contract_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_published_read_records_its_frame_and_an_unpublished_one_does_not() {
+        assert_eq!(
+            super::published_read_frame(true, Some(("bounds", (200, 100)))),
+            Some(("bounds", (200, 100)))
+        );
+        assert_eq!(
+            super::published_read_frame(false, Some(("bounds", (200, 100)))),
+            None
+        );
+        assert_eq!(super::published_read_frame::<&str>(true, None), None);
+    }
 
     #[test]
     fn verified_capture_reuses_or_recovers_prefetch() {

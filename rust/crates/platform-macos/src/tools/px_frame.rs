@@ -408,6 +408,27 @@ mod tests {
         }
     }
 
+    /// A later read of the same bounds at another backing scale (the window
+    /// moved to a 1x display and back to the same origin, or a JPEG read
+    /// after a PNG one) replaces the earlier scale: pixel actions follow the
+    /// screenshot the agent last saw.
+    #[test]
+    fn a_later_publication_with_the_same_bounds_replaces_the_scale() {
+        let mut frames = PublishedFrames::default();
+        frames.insert(11, published(2));
+        frames.insert(11, published(1));
+        let latest = frames.get(11, 42).expect("published");
+        let result = resolve_dimensions(
+            11,
+            &latest.bounds,
+            Some(&latest),
+            || panic!("a matching publication is sufficient"),
+            || panic!("no capture"),
+        )
+        .unwrap();
+        assert_eq!(result, (1.0, (500, 500)));
+    }
+
     #[test]
     fn changed_bounds_use_display_without_capture() {
         let prior = published(2);
