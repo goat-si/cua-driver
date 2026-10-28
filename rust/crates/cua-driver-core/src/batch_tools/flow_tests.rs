@@ -631,3 +631,33 @@ async fn verify_must_be_each_or_checkpoint() {
     );
     assert!(harness.calls("click").is_empty());
 }
+
+#[tokio::test]
+async fn a_substring_match_or_an_observe_with_the_lookup_budget_uses_the_full_read() {
+    let harness = Harness::new();
+    let result = harness
+        .run(json!({"steps": [
+            {"click": {"app": "Demo", "role": "button", "name": "Nex"}}
+        ]}))
+        .await;
+    assert_ne!(result.is_error, Some(true), "{}", text(&result));
+    let reads = harness.calls("get_window_state");
+    assert!(
+        reads.iter().any(|read| read["full_output"] == true),
+        "a substring-only visible match is not trusted: {reads:?}"
+    );
+
+    let harness = Harness::new();
+    let result = harness
+        .run(json!({"steps": [
+            {"click": {"app": "Demo", "role": "button", "name": "Next"}}
+        ], "observe": {"max_elements": 2000}}))
+        .await;
+    assert_ne!(result.is_error, Some(true), "{}", text(&result));
+    let reads = harness.calls("get_window_state");
+    let lookups: Vec<&Value> = reads[1..reads.len() - 1].iter().collect();
+    assert!(
+        lookups.iter().all(|read| read["full_output"] == true),
+        "the observation's own view is never read by a lookup: {reads:?}"
+    );
+}

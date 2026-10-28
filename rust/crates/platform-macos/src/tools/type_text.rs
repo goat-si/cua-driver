@@ -80,7 +80,7 @@ fn def() -> &'static ToolDef {
                     "type": "integer",
                     "minimum": 0,
                     "maximum": 200,
-                    "description": "Ms between characters in the CGEvent fallback. Default 30 (0 for a terminal emulator)."
+                    "description": "Ms between characters in the CGEvent fallback. Default 30."
                 },
                 "scope": { "type": "string", "enum": ["window", "desktop"], "default": "window", "description": "\"desktop\" with no pid/window_id types into the frontmost app." },
                 "delivery_mode": {

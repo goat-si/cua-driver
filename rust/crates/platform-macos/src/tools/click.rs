@@ -153,28 +153,82 @@ fn is_toggle_press(ax_action: &str, role: &str, advertised: &[String]) -> bool {
 /// that navigated does not flip its title back.
 const WINDOW_TITLE_STABILITY: std::time::Duration = std::time::Duration::from_millis(60);
 
-/// The window an element is in, with its title before the action.
+/// The window an element is in, its title before the action, and the
+/// element's own name. Only a title that changed TO that name is evidence:
+/// any other change could be the app's own doing.
 struct WindowTitleProbe {
     window: AXUIElementRef,
     before: String,
+    target: String,
 }
 
 impl WindowTitleProbe {
+    /// `None` when the element has no name to match.
+    ///
     /// # Safety
     ///
     /// `element` must be a valid, live `AXUIElementRef`.
     unsafe fn of(element: AXUIElementRef) -> Option<Self> {
+        let target = element_name(element)?;
         let window = copy_element_attr(element, "AXWindow")?;
         let Some(before) = copy_string_attr(window, "AXTitle") else {
             CFRelease(window as CFTypeRef);
             return None;
         };
-        Some(Self { window, before })
+        Some(Self {
+            window,
+            before,
+            target,
+        })
     }
 
     fn read(&self) -> Option<String> {
         unsafe { copy_string_attr(self.window, "AXTitle") }
     }
+
+    /// Whether `now` is a new title naming the pressed element.
+    fn names_target(&self, now: &str) -> bool {
+        title_names_target(&self.before, now, &self.target)
+    }
+}
+
+fn title_names_target(before: &str, now: &str, target: &str) -> bool {
+    let same = |a: &str, b: &str| a.trim().to_lowercase() == b.trim().to_lowercase();
+    !same(now, before) && same(now, target)
+}
+
+/// An element's visible name: its title or description, else the text of
+/// the first static text inside it (a Finder sidebar cell holds its label as
+/// a child), at most three levels down.
+///
+/// # Safety
+///
+/// `element` must be a valid, live `AXUIElementRef`.
+unsafe fn element_name(element: AXUIElementRef) -> Option<String> {
+    unsafe fn text_inside(element: AXUIElementRef, depth: usize) -> Option<String> {
+        if copy_string_attr(element, "AXRole").as_deref() == Some("AXStaticText") {
+            if let Some(value) =
+                copy_string_attr(element, "AXValue").filter(|v| !v.trim().is_empty())
+            {
+                return Some(value);
+            }
+        }
+        if depth == 0 {
+            return None;
+        }
+        let children = copy_children(element);
+        let found = children
+            .iter()
+            .find_map(|&child| text_inside(child, depth - 1));
+        for &child in &children {
+            CFRelease(child as CFTypeRef);
+        }
+        found
+    }
+    ["AXTitle", "AXDescription"]
+        .iter()
+        .find_map(|attr| copy_string_attr(element, attr).filter(|text| !text.trim().is_empty()))
+        .or_else(|| text_inside(element, 3))
 }
 
 impl Drop for WindowTitleProbe {
@@ -1683,23 +1737,27 @@ fn press_needs_key_window(action: &str, front_pid: Option<i32>, pid: i32, native
 ///
 /// A press right after another one on the same window reuses that priming
 /// (see [`KeyPrime`]): only an app activation (the person switching apps,
-/// in either direction) or a change of the target app's focused window can
-/// take key status away from it, and both are read again before each press.
+/// in either direction), a focus record or focused-window write the driver
+/// sent anywhere since, or a change of the target app's focused window can
+/// take key status away from it. All three are read again before each press;
+/// the focused window must be the app's own `AXFocusedWindow`, never a
+/// window-order guess.
 fn prime_key_window_for_background_press(pid: i32, window_id: u32, action: &str) {
     // `native` (a browser or Electron lookup) is read last: a reused
     // priming was only ever recorded for a native app.
     if !press_needs_key_window(action, apps::frontmost_pid(), pid, true) {
         return;
     }
-    let primed = KeyPrime {
+    let now = KeyPrime {
         pid,
         window_id,
         activations: crate::focus_steal::activation_count(),
+        focus_generation: crate::input::skylight::focus_generation(),
         at: std::time::Instant::now(),
     };
     let mut last = LAST_KEY_PRIME.lock().unwrap_or_else(|e| e.into_inner());
-    if last.is_some_and(|last| last.still_holds(&primed))
-        && crate::input::skylight::key_window_of_pid(pid) == Some(window_id)
+    if last.is_some_and(|last| last.still_holds(&now))
+        && crate::ax::bindings::focused_window_id_of_pid(pid) == Some(window_id)
     {
         return;
     }
@@ -1711,8 +1769,13 @@ fn prime_key_window_for_background_press(pid: i32, window_id: u32, action: &str)
     }
     if crate::input::skylight::activate_without_raise_with(pid, window_id, false) {
         std::thread::sleep(KEY_PRIME_SETTLE);
-        // An activation during the settle may already have undone it.
-        *last = (crate::focus_steal::activation_count() == primed.activations).then_some(primed);
+        // Recorded after this priming's own focus record. An activation or
+        // another focus change during the settle may already have undone it.
+        let primed = KeyPrime {
+            focus_generation: crate::input::skylight::focus_generation(),
+            ..now
+        };
+        *last = (crate::focus_steal::activation_count() == now.activations).then_some(primed);
     }
 }
 
@@ -1731,6 +1794,8 @@ struct KeyPrime {
     pid: i32,
     window_id: u32,
     activations: u64,
+    /// `skylight::focus_generation` after the priming's own record.
+    focus_generation: u64,
     at: std::time::Instant,
 }
 
@@ -1741,6 +1806,7 @@ impl KeyPrime {
         self.pid == now.pid
             && self.window_id == now.window_id
             && self.activations == now.activations
+            && self.focus_generation == now.focus_generation
             && now.at.saturating_duration_since(self.at) < KEY_PRIME_REUSE
     }
 }
@@ -1946,18 +2012,19 @@ fn perform_ax_click(
     let toggle_before = is_toggle_press(ax_action, &role, &advertised)
         .then(read_value)
         .flatten();
-    // A press or open that navigates (Finder's sidebar) can retitle the
-    // window while the app still returns an AX error; keep the window to
-    // read that back.
-    let window_before = matches!(ax_action, "AXOpen" | "AXPress")
-        .then(|| unsafe { WindowTitleProbe::of(element) })
-        .flatten();
     drop(preflight);
     if !foreground {
         latency::section(latency::Stage::KeyPrime, || {
             prime_key_window_for_background_press(pid, window_id, ax_action)
         });
     }
+    // A press or open that navigates (Finder's sidebar) can retitle the
+    // window after its element's name while the app still returns an AX
+    // error. Read the title right before dispatch, so nothing earlier
+    // (a navigation still finishing during the priming) counts.
+    let window_before = matches!(ax_action, "AXOpen" | "AXPress")
+        .then(|| unsafe { WindowTitleProbe::of(element) })
+        .flatten();
     let err = latency::section(latency::Stage::AxPerform, || unsafe {
         crate::ax::bindings::perform_action(element, ax_action)
     });
@@ -1990,7 +2057,7 @@ fn perform_ax_click(
             .filter(|_| press_error_may_have_acted(err))
         {
             if let Some(now) = settled_value(
-                |now| now != probe.before,
+                |now| probe.names_target(now),
                 || probe.read(),
                 SELECTION_READBACK_TIMEOUT,
                 SELECTION_READBACK_POLL,
@@ -2445,18 +2512,34 @@ mod tests {
     /// canonical values and default to "left". Hermes / Codex / Claude Code
     /// consumers branch on this enum being present.
     #[test]
+    fn only_a_window_title_that_becomes_the_target_name_confirms() {
+        assert!(title_names_target("Recents", "Downloads", "Downloads"));
+        assert!(title_names_target("Recents", " downloads ", "Downloads"));
+        assert!(
+            !title_names_target("Recents", "AirDrop", "Downloads"),
+            "another change"
+        );
+        assert!(
+            !title_names_target("Downloads", "Downloads", "Downloads"),
+            "no change"
+        );
+    }
+
+    #[test]
     fn a_key_window_priming_is_reused_only_for_the_same_window_without_activations() {
         let at = std::time::Instant::now();
         let primed = KeyPrime {
             pid: 2,
             window_id: 7,
             activations: 5,
+            focus_generation: 9,
             at,
         };
         let later = |pid, window_id, activations, secs| KeyPrime {
             pid,
             window_id,
             activations,
+            focus_generation: 9,
             at: at + std::time::Duration::from_secs(secs),
         };
         assert!(primed.still_holds(&later(2, 7, 5, 1)));
@@ -2464,6 +2547,14 @@ mod tests {
         assert!(!primed.still_holds(&later(3, 7, 5, 1)), "other app");
         assert!(!primed.still_holds(&later(2, 7, 6, 1)), "an app activated");
         assert!(!primed.still_holds(&later(2, 7, 5, 10)), "too old");
+        let refocused = KeyPrime {
+            focus_generation: 10,
+            ..later(2, 7, 5, 1)
+        };
+        assert!(
+            !primed.still_holds(&refocused),
+            "the driver moved some app's key focus since"
+        );
     }
 
     #[test]

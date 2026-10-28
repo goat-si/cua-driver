@@ -219,15 +219,34 @@ fn key_restore_done() {
     KEY_RESTORES.1.notify_all();
 }
 
-/// Wait (at most 2 s) until no key hand-back is running.
-fn await_key_restores() {
+/// Wait (at most 2 s) until no key hand-back is running. `false` when one
+/// is still running: the caller must not move focus or send input then.
+pub fn await_key_restores() -> bool {
     let pending = KEY_RESTORES.0.lock().unwrap_or_else(|e| e.into_inner());
-    let _ = KEY_RESTORES
+    let (pending, _) = KEY_RESTORES
         .1
-        .wait_timeout_while(pending, std::time::Duration::from_secs(2), |n| *n > 0);
+        .wait_timeout_while(pending, std::time::Duration::from_secs(2), |n| *n > 0)
+        .unwrap_or_else(|e| e.into_inner());
+    *pending == 0
+}
+
+/// Advanced by every focus record, focused-window write or foreground turn
+/// the driver makes. Two equal reads mean the driver moved no app's key
+/// focus in between (a person's or an app's own changes are not counted;
+/// see the activation count in `focus_steal`).
+static FOCUS_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The current [`FOCUS_GENERATION`].
+pub fn focus_generation() -> u64 {
+    FOCUS_GENERATION.load(std::sync::atomic::Ordering::Acquire)
+}
+
+fn note_focus_change() {
+    FOCUS_GENERATION.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
 }
 
 fn set_app_focused_window(pid: pid_t, wid: u32) -> bool {
+    note_focus_change();
     use crate::ax::bindings::{
         ax_get_window_id, copy_ax_windows, AXUIElementCreateApplication,
         AXUIElementSetAttributeValue,
@@ -285,6 +304,7 @@ const KEY_RECORD_SETTLE: std::time::Duration = std::time::Duration::from_millis(
 /// is for the caller to confirm.
 pub fn post_window_key_records(pid: pid_t, current: Option<u32>, target: u32) -> bool {
     crate::window_change_detector::end_tail();
+    note_focus_change();
     let Some(post) = post_event_record_to_fn() else {
         return false;
     };
@@ -330,8 +350,14 @@ fn await_key_focus(pid: pid_t, target: u32, budget: std::time::Duration) {
 /// pointer), confirmed by re-reading the app's focus, and return a guard that
 /// hands key back. `Err` when it cannot be confirmed.
 pub fn enter_exact_window_key(pid: pid_t, target_wid: u32) -> Result<WindowKeyScope, String> {
-    // Wait for the previous scope's hand-back to finish.
-    await_key_restores();
+    // Wait for the previous scope's hand-back to finish; refuse (nothing
+    // sent) when it does not.
+    if !await_key_restores() {
+        return Err(format!(
+            "window {target_wid}: the previous key hand-back in this app did not finish within \
+             2 s, so no keys were sent"
+        ));
+    }
     let before = key_focus_of_pid(pid);
     let previous = before.window;
     let order_before = app_window_order(pid);
@@ -1031,6 +1057,12 @@ pub fn activate_without_raise_with(
     defocus_front: bool,
 ) -> bool {
     crate::window_change_detector::end_tail();
+    // A key hand-back still running would move focus under this record.
+    if !await_key_restores() {
+        tracing::warn!("activate_without_raise: a key hand-back is still running; not sent");
+        return false;
+    }
+    note_focus_change();
     let post_fn = match post_event_record_to_fn() {
         Some(f) => f,
         None => return false,
@@ -1241,6 +1273,7 @@ fn make_key_window_record(window_id: u32, event_kind: u8) -> [u8; 0xF8] {
 /// make-key records for the requested WindowServer id, then let the caller
 /// raise the matching AX window. No other application window is addressed.
 pub fn make_exact_window_key(target_pid: libc::pid_t, target_wid: u32) -> bool {
+    note_focus_change();
     let Some(set_front) = set_front_process_fn() else {
         return false;
     };
@@ -1299,21 +1332,30 @@ pub fn foreground_turn_active() -> bool {
     FOREGROUND_LOCK.try_lock().is_err()
 }
 
-fn foreground_turn() -> ForegroundTurn {
+fn foreground_turn() -> anyhow::Result<ForegroundTurn> {
     // An intentional activation ends the previous action's detached window
     // watch, whose wildcard lease would otherwise revert it.
     crate::window_change_detector::end_tail();
+    // A background key hand-back still running would move key focus inside
+    // the app this turn fronts; nothing is sent until it is done.
+    if !await_key_restores() {
+        anyhow::bail!(
+            "a background key hand-back did not finish within 2 s, so the foreground action \
+             was not sent"
+        );
+    }
+    note_focus_change();
     crate::window_change_detector::note_intentional_activation();
     if HOLDS_FOREGROUND_LOCK.with(std::cell::Cell::get) {
-        return ForegroundTurn { _guard: None };
+        return Ok(ForegroundTurn { _guard: None });
     }
     let guard = FOREGROUND_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     HOLDS_FOREGROUND_LOCK.with(|held| held.set(true));
-    ForegroundTurn {
+    Ok(ForegroundTurn {
         _guard: Some(guard),
-    }
+    })
 }
 
 /// Tool-agnostic foreground-assist: briefly front `window_id`, wait for the
@@ -1346,7 +1388,7 @@ pub fn with_foreground_assist(
     target_wid: u32,
     body: impl FnOnce() -> anyhow::Result<()>,
 ) -> anyhow::Result<bool> {
-    let _turn = foreground_turn();
+    let _turn = foreground_turn()?;
     let set_front = match set_front_process_fn() {
         Some(f) => f,
         None => {
@@ -1478,7 +1520,7 @@ pub fn with_foreground_hid_activation(
     target_wid: u32,
     action: impl FnOnce() -> anyhow::Result<()>,
 ) -> anyhow::Result<()> {
-    let _turn = foreground_turn();
+    let _turn = foreground_turn()?;
     let set_front = set_front_process_fn()
         .ok_or_else(|| anyhow::anyhow!("foreground HID delivery is unavailable"))?;
 
@@ -1594,9 +1636,9 @@ mod tests {
                 let inside = inside.clone();
                 let max_inside = max_inside.clone();
                 std::thread::spawn(move || {
-                    let _turn = foreground_turn();
+                    let _turn = foreground_turn().unwrap();
                     // A nested helper on the holding thread must not deadlock.
-                    let _nested = foreground_turn();
+                    let _nested = foreground_turn().unwrap();
                     let now = inside.fetch_add(1, Ordering::SeqCst) + 1;
                     max_inside.fetch_max(now, Ordering::SeqCst);
                     std::thread::sleep(std::time::Duration::from_millis(5));

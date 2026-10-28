@@ -115,7 +115,9 @@ pub(crate) struct ElementSpec {
 }
 
 /// `max_elements` of a visible-window lookup read: the platform default walk
-/// budget, and a view key no `observe` uses.
+/// budget. An `observe` (or script read) of the same plain view would share
+/// its `since` history, so a batch whose observation baseline uses this
+/// budget skips the visible read and keeps the full one.
 const VISIBLE_READ_MAX_ELEMENTS: u64 = 2000;
 
 impl ElementSpec {
@@ -131,6 +133,18 @@ impl ElementSpec {
                 .role
                 .as_deref()
                 .is_some_and(|role| !role.to_ascii_lowercase().contains("menu"))
+    }
+
+    /// Whether `found`'s label is this spec's name, case aside.
+    fn names_exactly(&self, found: &Found) -> bool {
+        let label = found
+            .element
+            .get("label")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        self.name
+            .as_deref()
+            .is_some_and(|name| name.trim().to_lowercase() == label.trim().to_lowercase())
     }
 
     pub fn is_empty(&self) -> bool {
@@ -783,8 +797,8 @@ impl<'a> Locator<'a> {
     /// A read of the window as a model sees it by default when `visible` is
     /// set: menus collapsed and off-screen dense rows left out, about a
     /// third of a full read (Calculator 90 against 210 ms, a GitHub page in
-    /// Aside 55 against 205 ms). Its `max_elements` is the platform default,
-    /// so it never matches the view of the batch's `observe` diff.
+    /// Aside 55 against 205 ms). See [`VISIBLE_READ_MAX_ELEMENTS`] for how it
+    /// stays out of the batch's `observe` diff.
     async fn read_view(&self, window: &Window, visible: bool) -> Result<Read, Miss> {
         if let Some(max_elements) = self.baseline_max_elements {
             let first = self
@@ -883,9 +897,16 @@ impl<'a> Locator<'a> {
             // A control named by role is first looked up in the visible
             // window; only when that has no unique match does the full read
             // (every menu, every row) decide, as before.
-            if element.visible_lookup_suffices() {
+            if element.visible_lookup_suffices()
+                && self.baseline_max_elements != Some(VISIBLE_READ_MAX_ELEMENTS)
+            {
                 if let Ok(read) = self.read_view(window, true).await {
-                    if let Ok(found) = pick(&read, element) {
+                    // Only an exact name stands for the full read: a
+                    // substring match could hide an exact one off screen.
+                    if let Some(found) = pick(&read, element)
+                        .ok()
+                        .filter(|found| element.names_exactly(found))
+                    {
                         return Ok(found);
                     }
                 }

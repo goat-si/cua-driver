@@ -799,15 +799,24 @@ impl Plan {
         // A failed batch names its cause at the top: without a `code` here
         // the MCP envelope stamps a bare `tool_invocation_failed`, and a
         // client that shows only the top level loses the step's reason.
+        // Its effect is the failed step's only when no earlier step sent an
+        // action: after one did, input may have landed, so the batch is
+        // `partial` even when the failed step itself was refused.
         if let Some(index) = failed_step {
-            let step = &structured["steps"][index];
+            let steps = structured["steps"].as_array().cloned().unwrap_or_default();
+            let step = &steps[index];
             let code = step["code"].as_str().unwrap_or("step_failed").to_owned();
-            let message = step["message"].clone();
-            let effect = step["effect"].clone();
+            let earlier_action = steps[..index].iter().any(|earlier| {
+                earlier["tool"]
+                    .as_str()
+                    .is_some_and(|tool| BATCHABLE_TOOLS.contains(&tool))
+            });
             structured["code"] = json!(code);
-            structured["message"] = message;
-            if !effect.is_null() {
-                structured["effect"] = effect;
+            structured["message"] = step["message"].clone();
+            if earlier_action {
+                structured["effect"] = json!("partial");
+            } else if !step["effect"].is_null() {
+                structured["effect"] = step["effect"].clone();
             }
         }
         let header = match failed_step {

@@ -272,6 +272,8 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 pub fn end_tail() {
     let tail = lock(&TAIL).take();
     drop(tail);
+    // The previous action's post-action focus hold ends with its watch.
+    crate::focus_guard::release_detached_holds();
 }
 
 /// Advanced whenever the driver itself makes an app frontmost (bring_to_front,
@@ -978,8 +980,11 @@ mod tests {
         assert!(lock(&TAIL).is_none());
     }
 
-    /// A step of a batch returns after the shorter batch report window, and
-    /// the rest of the deadline still runs detached with the lease held.
+    /// A step of a batch returns after the batch report window, not the
+    /// 3 s deadline, and the rest of the deadline still runs detached with
+    /// the lease held. Which window a step gets (batch against direct) is
+    /// `step_pacing`'s, tested there without a clock; the direct window is
+    /// now only 20 ms longer, too close for a wall-clock comparison.
     ///
     /// The upper bound is a wall-clock comparison, so a loaded runner can
     /// overshoot it once; a few attempts keep the test from flaking.
@@ -1002,14 +1007,14 @@ mod tests {
             assert!(!changes.needs_restore());
             assert!(elapsed >= BATCH_REPORT_WINDOW, "returned after {elapsed:?}");
             assert!(lock(&TAIL).is_some(), "the remainder runs detached");
-            if elapsed < REPORT_WINDOW {
+            if elapsed < BATCH_REPORT_WINDOW * 3 {
                 break;
             }
         }
         end_tail();
         assert!(
-            elapsed < REPORT_WINDOW,
-            "a batched step waited as long as a direct call: {elapsed:?}"
+            elapsed < BATCH_REPORT_WINDOW * 3,
+            "a batched step waited for the observation deadline: {elapsed:?}"
         );
     }
 
