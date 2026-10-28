@@ -200,7 +200,9 @@ impl Tool for RunStepsTool {
                 `name` (the element's label; exact match wins over substring, case-insensitive), \
                 `nth` (0-based, when several match), and `app` (app name or bundle id) and/or \
                 `window` (title substring) instead of pid/window_id. The batch reads the window \
-                fresh, waits up to 3 s (step `timeout_ms`, max 10000) for the element to \
+                fresh (a role and name are looked up in the visible window first; closed \
+                menus and off-screen rows are read when that finds no unique match, or for \
+                `nth` or a menu role), waits up to 3 s (step `timeout_ms`, max 10000) for the element to \
                 appear, and acts on it; with only `app` it uses that app's frontmost window, so \
                 a dialog that opened on top is found. Later steps inherit the window, so name \
                 `app` once. The first lookup in a window also reads it once for `observe`, so \
@@ -269,6 +271,11 @@ impl Tool for RunStepsTool {
                         "type": "string",
                         "enum": ["background", "foreground"],
                         "description": "Default delivery_mode for steps whose tool takes one and that set none."
+                    },
+                    "verify": {
+                        "type": "string",
+                        "enum": ["each", "checkpoint"],
+                        "description": "\"each\" (default): every step waits for its window-change report, as a direct call does (100 ms on macOS for a step another step follows). \"checkpoint\": every step but the last returns as soon as its input is delivered (macOS; Linux and Windows do not wait anyway); check with the step's `expect`, the last step's report or `observe`. A window a step opens is still reported on the next step's result. A step that sets its own post_action_wait keeps it."
                     },
                     "foreground_fallback": {
                         "type": "boolean",
@@ -478,6 +485,17 @@ impl Plan {
             }
         };
 
+        let checkpoint = match object.get("verify") {
+            None | Some(Value::Null) => false,
+            Some(Value::String(mode)) if mode == "each" => false,
+            Some(Value::String(mode)) if mode == "checkpoint" => true,
+            Some(_) => {
+                return Err(PlanError::batch(
+                    "`verify` must be \"each\" or \"checkpoint\"",
+                ))
+            }
+        };
+
         // Reads the batch ends with are what `observe` is for: a trailing
         // get_window_state (or screenshot) becomes the observation, merged
         // with an explicit `observe`, and a trailing zoom runs after it.
@@ -548,6 +566,21 @@ impl Plan {
                 continue;
             }
             let mut step = parse_step(registry, index, raw, session.as_deref(), has_window)?;
+            // `verify:"checkpoint"`: every step but the last returns once its
+            // input is delivered. The last keeps its report of what the batch
+            // left open; a step that sets its own post_action_wait keeps it.
+            if let (true, Some(action)) = (
+                checkpoint && index + 1 < raw_steps.len(),
+                step.action.as_mut(),
+            ) {
+                if crate::post_action_wait::accepts(action.tool) {
+                    if let Some(object) = action.args.as_object_mut() {
+                        object
+                            .entry(crate::post_action_wait::POST_ACTION_WAIT_ARG)
+                            .or_insert_with(|| json!("none"));
+                    }
+                }
+            }
             if let (Some(mode), Some(action)) = (&default_delivery, step.action.as_mut()) {
                 if accepts(registry, action.tool, "delivery_mode") {
                     if let Some(object) = action.args.as_object_mut() {
@@ -672,6 +705,7 @@ impl Plan {
             if index > 0 && !self.delay.is_zero() {
                 tokio::time::sleep(self.delay).await;
             }
+            let step_started = Instant::now();
             let outcome = if started.elapsed() >= Duration::from_millis(MAX_BATCH_MS) {
                 failure(
                     index,
@@ -735,6 +769,8 @@ impl Plan {
                     outcome.report["effect"] = json!("refused");
                 }
             }
+            // Wall time of the step: lookup, checks and the action.
+            outcome.report["ms"] = json!(step_started.elapsed().as_millis() as u64);
             if !outcome.ok {
                 recovery = Recovery::after(&outcome.report, last_window.as_ref());
                 if let Some(Recovery { window, .. }) = &recovery {
@@ -759,6 +795,29 @@ impl Plan {
         });
         if let Some(scope) = &self.scope {
             structured["app_scope"] = scope.to_json();
+        }
+        // A failed batch names its cause at the top: without a `code` here
+        // the MCP envelope stamps a bare `tool_invocation_failed`, and a
+        // client that shows only the top level loses the step's reason.
+        // Its effect is the failed step's only when no earlier step sent an
+        // action: after one did, input may have landed, so the batch is
+        // `partial` even when the failed step itself was refused.
+        if let Some(index) = failed_step {
+            let steps = structured["steps"].as_array().cloned().unwrap_or_default();
+            let step = &steps[index];
+            let code = step["code"].as_str().unwrap_or("step_failed").to_owned();
+            let earlier_action = steps[..index].iter().any(|earlier| {
+                earlier["tool"]
+                    .as_str()
+                    .is_some_and(|tool| BATCHABLE_TOOLS.contains(&tool))
+            });
+            structured["code"] = json!(code);
+            structured["message"] = step["message"].clone();
+            if earlier_action {
+                structured["effect"] = json!("partial");
+            } else if !step["effect"].is_null() {
+                structured["effect"] = step["effect"].clone();
+            }
         }
         let header = match failed_step {
             None => format!("run_steps: {total}/{total} steps ok"),

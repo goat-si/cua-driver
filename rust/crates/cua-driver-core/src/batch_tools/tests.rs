@@ -37,6 +37,10 @@ impl Tool for Probe {
         if let Some(message) = args["fail_message"].as_str() {
             return ToolResult::error(message.to_owned());
         }
+        if args["refuse"] == true {
+            return ToolResult::error(format!("{} refused: nothing sent", self.def.name))
+                .with_structured(json!({"code": "background_unavailable", "effect": "refused"}));
+        }
         if args["fail"] == true {
             ToolResult::error(format!("{} refused: probe asked to fail", self.def.name))
         } else {
@@ -75,6 +79,7 @@ impl Harness {
                             "text": {"type": "string"},
                             "fail": {"type": "boolean"},
                             "fail_message": {"type": "string"},
+                            "refuse": {"type": "boolean"},
                             "element_token": {"type": "string"},
                             "value": {"type": "string"},
                             "key": {"type": "string"},
@@ -786,4 +791,56 @@ async fn non_scalar_set_value_is_rejected_before_any_batch_action() {
             .starts_with("set_value: invalid arguments at /value:"));
         assert_eq!(harness.hits("set_value"), 0);
     }
+}
+
+#[tokio::test]
+async fn a_failed_batch_names_the_failed_steps_code_and_message_at_the_top() {
+    let harness = Harness::new();
+    let result = harness
+        .run(json!({"pid": 1, "window_id": 2, "steps": [
+            {"tool": "click", "args": {"x": 1, "y": 1}},
+            {"tool": "click", "args": {"x": 2, "y": 2, "fail_message": "click failed: event tap gone"}}
+        ]}))
+        .await;
+    assert_eq!(result.is_error, Some(true));
+    let structured = result.structured_content.unwrap();
+    assert_eq!(structured["failed_step"], 1);
+    assert_eq!(structured["code"], "step_failed");
+    assert!(
+        structured["message"]
+            .as_str()
+            .unwrap()
+            .contains("event tap gone"),
+        "{structured}"
+    );
+}
+
+#[tokio::test]
+async fn a_refused_step_after_a_sent_action_makes_the_batch_partial() {
+    let harness = Harness::new();
+    let result = harness
+        .run(json!({"pid": 1, "window_id": 2, "steps": [
+            {"tool": "click", "args": {"x": 1, "y": 1}},
+            {"tool": "click", "args": {"x": 2, "y": 2, "refuse": true}}
+        ]}))
+        .await;
+    let structured = result.structured_content.unwrap();
+    assert_eq!(structured["steps"][1]["effect"], "refused");
+    assert_eq!(structured["code"], "background_unavailable");
+    assert_eq!(
+        structured["effect"], "partial",
+        "step 1 was sent: {structured}"
+    );
+
+    let harness = Harness::new();
+    let result = harness
+        .run(json!({"pid": 1, "window_id": 2, "steps": [
+            {"tool": "click", "args": {"x": 2, "y": 2, "refuse": true}}
+        ]}))
+        .await;
+    let structured = result.structured_content.unwrap();
+    assert_eq!(
+        structured["effect"], "refused",
+        "nothing was sent: {structured}"
+    );
 }

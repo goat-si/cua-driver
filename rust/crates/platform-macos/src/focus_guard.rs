@@ -41,9 +41,11 @@
 //!
 //! 1. A "is target already frontmost?" check so we don't arm a useless
 //!    self→self suppressor (matches Swift's `isTargetFrontmost` guard).
-//! 2. A 50ms post-action sleep that gives any in-flight focus-grab
+//! 2. A 50ms post-action hold that gives any in-flight focus-grab
 //!    reflex time to fire and be observed by the suppressor before the
-//!    lease is dropped. Matches Swift's `Task.sleep(nanoseconds: 50ms)`.
+//!    lease is dropped. Matches Swift's `Task.sleep(nanoseconds: 50ms)`,
+//!    except that the hold runs detached: the action's result does not
+//!    wait for it (it was a fixed 50 ms of every background click).
 //! 3. A static `origin` label for tracing — call sites pass a short
 //!    string like `"click.AXPress"` so leaked leases / late-firing
 //!    observers can be traced back to the caller.
@@ -67,9 +69,9 @@ use crate::focus_steal;
 /// - `origin` — short static label for tracing, e.g. `"click.AXPress"`.
 /// - `f` — the action to run with suppression armed.
 ///
-/// Returns whatever `f` returns. Drops the lease ~50ms after `f`
-/// resolves so any in-flight reflex activation is observed before
-/// suppression ends.
+/// Returns whatever `f` returns as soon as it resolves. The lease stays
+/// armed for another ~50ms on a detached task so any in-flight reflex
+/// activation is still observed before suppression ends.
 ///
 /// If `target_pid` is already the frontmost app (no point fighting
 /// ourselves) or `prior_frontmost` is `None` (no app to restore to),
@@ -125,16 +127,12 @@ where
 
     // Post-action settle — give the reactive observer time to fire on
     // any side-effect activation before we drop the lease. Matches
-    // Swift's 50ms sleep in `FocusGuard.withFocusSuppressed`.
-    if _lease.is_some() {
-        latency::timed(
-            latency::Stage::Settle,
-            tokio::time::sleep(Duration::from_millis(50)),
-        )
-        .await;
+    // Swift's 50ms sleep in `FocusGuard.withFocusSuppressed`. The hold
+    // only keeps the suppressor armed, so it runs detached and the
+    // result returns now.
+    if let Some(lease) = _lease {
+        hold_then_release(lease, POST_ACTION_SETTLE);
     }
-
-    // _lease drops here (RAII end_suppression).
     result
 }
 
@@ -147,6 +145,53 @@ where
 /// Most action tools should prefer `with_focus_suppressed` with an
 /// explicit `prior_frontmost` captured *before* the snapshot, so the
 /// wildcard lease + targeted lease both restore to the same pid.
+/// How long a targeted lease stays armed after the action returns.
+const POST_ACTION_SETTLE: Duration = Duration::from_millis(50);
+
+/// Leases kept armed after their action returned, by hold id.
+static DETACHED_HOLDS: std::sync::Mutex<Vec<(u64, focus_steal::SuppressionLease)>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// Keep `lease` armed for `hold` on a detached task. The caller is already
+/// on a Tokio runtime (it awaited the action there). The next action or
+/// intentional activation ends the hold early ([`release_detached_holds`],
+/// called from `window_change_detector::end_tail`), so a hold never reverts
+/// an activation the driver asked for.
+fn hold_then_release(lease: focus_steal::SuppressionLease, hold: Duration) {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    DETACHED_HOLDS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push((id, lease));
+    tokio::spawn(async move {
+        tokio::time::sleep(hold).await;
+        let released = {
+            let mut holds = DETACHED_HOLDS.lock().unwrap_or_else(|e| e.into_inner());
+            holds
+                .iter()
+                .position(|(held, _)| *held == id)
+                .map(|at| holds.swap_remove(at))
+        };
+        drop(released);
+    });
+}
+
+/// End every detached post-action hold now.
+pub fn release_detached_holds() {
+    let holds = std::mem::take(&mut *DETACHED_HOLDS.lock().unwrap_or_else(|e| e.into_inner()));
+    drop(holds);
+}
+
+/// Detached holds still armed.
+#[cfg(test)]
+pub(crate) fn detached_hold_count() -> usize {
+    DETACHED_HOLDS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .len()
+}
+
 pub async fn with_focus_suppressed_now<F, Fut, R>(
     target_pid: Option<i32>,
     origin: &'static str,
@@ -158,4 +203,20 @@ where
 {
     let prior = apps::frontmost_pid();
     with_focus_suppressed(target_pid, prior, origin, f).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The next action or intentional activation (`end_tail`) ends a
+    /// post-action hold that would otherwise stay armed for its 50 ms.
+    #[tokio::test]
+    async fn the_next_action_ends_a_detached_hold() {
+        let lease = focus_steal::begin_suppression(Some(-41), -42, "test.hold");
+        hold_then_release(lease, Duration::from_secs(30));
+        assert!(detached_hold_count() >= 1);
+        crate::window_change_detector::end_tail();
+        assert_eq!(detached_hold_count(), 0);
+    }
 }

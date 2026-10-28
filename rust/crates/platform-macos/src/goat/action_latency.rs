@@ -27,6 +27,9 @@ pub(crate) enum Stage {
     AxResolve,
     Snapshot,
     Protect,
+    /// No longer timed: the post-action focus hold runs detached. Kept so
+    /// the trace line keeps its columns.
+    #[allow(dead_code)]
     Settle,
     Action,
     ActionBlocking,
@@ -34,12 +37,33 @@ pub(crate) enum Stage {
     Detector,
     DetectorSleep,
     DetectorEnumeration,
+    /// Waiting for the agent cursor to arrive at the target.
+    Glide,
+    /// The AX reads before an element action is sent (actions, enabled,
+    /// role, title, centre, selection container). Inside ActionBlocking.
+    Preflight,
+    /// Making a background app's window key before a press. Inside
+    /// ActionBlocking.
+    KeyPrime,
+    /// The AXUIElementPerformAction call itself. Inside ActionBlocking.
+    AxPerform,
+    /// get_window_state: the WindowServer owner pre-flight.
+    ReadOwner,
+    /// get_window_state: the accessibility walk.
+    ReadWalk,
 }
 
 impl Stage {
-    const COUNT: usize = 10;
+    const COUNT: usize = 16;
     fn is_primary(self) -> bool {
-        !matches!(self, Self::DetectorSleep | Self::DetectorEnumeration)
+        !matches!(
+            self,
+            Self::DetectorSleep
+                | Self::DetectorEnumeration
+                | Self::Preflight
+                | Self::KeyPrime
+                | Self::AxPerform
+        )
     }
 }
 
@@ -87,7 +111,7 @@ impl Trace {
         let measured = interval_union(&mut metrics.primary_intervals, total);
         let d = &metrics.durations;
         format!(
-            "cua_goat_latency request_id={} tool={} outcome={} total_us={} ax_resolve_us={} snapshot_us={} protect_us={} focus_settle_us={} action_guarded_us={} action_blocking_us={} lease_drop_us={} detector_us={} detector_sleep_us={} detector_enumerations={} detector_enumeration_us={} detector_exit={} tail={} measured_us={} other_us={}",
+            "cua_goat_latency request_id={} tool={} outcome={} total_us={} ax_resolve_us={} snapshot_us={} protect_us={} focus_settle_us={} action_guarded_us={} action_blocking_us={} lease_drop_us={} detector_us={} detector_sleep_us={} detector_enumerations={} detector_enumeration_us={} detector_exit={} tail={} glide_us={} preflight_us={} key_prime_us={} ax_perform_us={} read_owner_us={} read_walk_us={} measured_us={} other_us={}",
             self.id, self.tool, outcome, total.as_micros(),
             d[Stage::AxResolve as usize].as_micros(),
             d[Stage::Snapshot as usize].as_micros(),
@@ -100,7 +124,14 @@ impl Trace {
             d[Stage::DetectorSleep as usize].as_micros(),
             metrics.enumerations,
             d[Stage::DetectorEnumeration as usize].as_micros(),
-            metrics.detector_exit, metrics.tail, measured.as_micros(),
+            metrics.detector_exit, metrics.tail,
+            d[Stage::Glide as usize].as_micros(),
+            d[Stage::Preflight as usize].as_micros(),
+            d[Stage::KeyPrime as usize].as_micros(),
+            d[Stage::AxPerform as usize].as_micros(),
+            d[Stage::ReadOwner as usize].as_micros(),
+            d[Stage::ReadWalk as usize].as_micros(),
+            measured.as_micros(),
             total.as_micros() - measured.as_micros(),
         )
     }
@@ -151,6 +182,12 @@ impl Drop for Span {
             }
         }
     }
+}
+
+/// Time a synchronous section as `stage` (no-op without a trace).
+pub(crate) fn section<T>(stage: Stage, run: impl FnOnce() -> T) -> T {
+    let _span = span(stage);
+    run()
 }
 
 pub(crate) fn resolve<T>(read: impl FnOnce() -> T) -> T {
@@ -335,6 +372,7 @@ impl<'a> Registry<'a> {
             "hotkey" => "hotkey",
             "set_value" => "set_value",
             "invoke_menu" => "invoke_menu",
+            "get_window_state" => "get_window_state",
             _ => {
                 self.0.register(tool);
                 return;

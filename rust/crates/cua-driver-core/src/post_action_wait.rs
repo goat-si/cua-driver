@@ -1,7 +1,7 @@
 //! Whether an action's result waits for its post-action window-change report.
 //!
 //! After an input action the macOS adapter watches the window list for a short
-//! time (300 ms for a direct call) so its result can name a menu, dialog, new
+//! time (120 ms for a direct call) so its result can name a menu, dialog, new
 //! window or foreground change the action caused. For an agent that reads the
 //! window state after every action anyway, that wait is most of a background
 //! click's latency.

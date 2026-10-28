@@ -334,6 +334,13 @@ impl Tool for BringToFrontTool {
 
     async fn invoke(&self, args: Value) -> ToolResult {
         crate::window_change_detector::end_tail();
+        // Let a background key hand-back finish before the app is fronted.
+        if !tokio::task::spawn_blocking(crate::input::skylight::await_key_restores)
+            .await
+            .unwrap_or(false)
+        {
+            tracing::warn!("a key hand-back was still running when the app was fronted");
+        }
         crate::window_change_detector::note_intentional_activation();
         let pid = match args.get("pid").and_then(Value::as_i64) {
             Some(p) => match libc::pid_t::try_from(p) {

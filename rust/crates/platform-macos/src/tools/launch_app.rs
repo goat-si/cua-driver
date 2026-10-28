@@ -89,6 +89,13 @@ impl Tool for LaunchAppTool {
     async fn invoke(&self, args: Value) -> ToolResult {
         use cua_driver_core::tool_args::ArgsExt;
         crate::window_change_detector::end_tail();
+        // Let a background key hand-back finish before the app is fronted.
+        if !tokio::task::spawn_blocking(crate::input::skylight::await_key_restores)
+            .await
+            .unwrap_or(false)
+        {
+            tracing::warn!("a key hand-back was still running when the app was fronted");
+        }
         crate::window_change_detector::note_intentional_activation();
         let bundle_id = args.opt_str("bundle_id");
         let name = args.opt_str("name");

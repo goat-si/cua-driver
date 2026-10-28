@@ -149,6 +149,94 @@ fn is_toggle_press(ax_action: &str, role: &str, advertised: &[String]) -> bool {
 /// cannot complete means the app did not answer in time, so a short read-back
 /// proves nothing. Neither qualifies; an unresolved error after dispatch is
 /// reported as unverifiable by `unresolved_perform_error`.
+/// How long a changed window title must hold before it counts. A window
+/// that navigated does not flip its title back.
+const WINDOW_TITLE_STABILITY: std::time::Duration = std::time::Duration::from_millis(60);
+
+/// The window an element is in, its title before the action, and the
+/// element's own name. Only a title that changed TO that name is evidence:
+/// any other change could be the app's own doing.
+struct WindowTitleProbe {
+    window: AXUIElementRef,
+    before: String,
+    target: String,
+}
+
+impl WindowTitleProbe {
+    /// `None` when the element has no name to match.
+    ///
+    /// # Safety
+    ///
+    /// `element` must be a valid, live `AXUIElementRef`.
+    unsafe fn of(element: AXUIElementRef) -> Option<Self> {
+        let target = element_name(element)?;
+        let window = copy_element_attr(element, "AXWindow")?;
+        let Some(before) = copy_string_attr(window, "AXTitle") else {
+            CFRelease(window as CFTypeRef);
+            return None;
+        };
+        Some(Self {
+            window,
+            before,
+            target,
+        })
+    }
+
+    fn read(&self) -> Option<String> {
+        unsafe { copy_string_attr(self.window, "AXTitle") }
+    }
+
+    /// Whether `now` is a new title naming the pressed element.
+    fn names_target(&self, now: &str) -> bool {
+        title_names_target(&self.before, now, &self.target)
+    }
+}
+
+fn title_names_target(before: &str, now: &str, target: &str) -> bool {
+    let same = |a: &str, b: &str| a.trim().to_lowercase() == b.trim().to_lowercase();
+    !same(now, before) && same(now, target)
+}
+
+/// An element's visible name: its title or description, else the text of
+/// the first static text inside it (a Finder sidebar cell holds its label as
+/// a child), at most three levels down.
+///
+/// # Safety
+///
+/// `element` must be a valid, live `AXUIElementRef`.
+unsafe fn element_name(element: AXUIElementRef) -> Option<String> {
+    unsafe fn text_inside(element: AXUIElementRef, depth: usize) -> Option<String> {
+        if copy_string_attr(element, "AXRole").as_deref() == Some("AXStaticText") {
+            if let Some(value) =
+                copy_string_attr(element, "AXValue").filter(|v| !v.trim().is_empty())
+            {
+                return Some(value);
+            }
+        }
+        if depth == 0 {
+            return None;
+        }
+        let children = copy_children(element);
+        let found = children
+            .iter()
+            .find_map(|&child| text_inside(child, depth - 1));
+        for &child in &children {
+            CFRelease(child as CFTypeRef);
+        }
+        found
+    }
+    ["AXTitle", "AXDescription"]
+        .iter()
+        .find_map(|attr| copy_string_attr(element, attr).filter(|text| !text.trim().is_empty()))
+        .or_else(|| text_inside(element, 3))
+}
+
+impl Drop for WindowTitleProbe {
+    fn drop(&mut self) {
+        unsafe { CFRelease(self.window as CFTypeRef) };
+    }
+}
+
 fn press_error_may_have_acted(err: crate::ax::bindings::AXError) -> bool {
     use crate::ax::bindings::{
         kAXErrorActionUnsupported, kAXErrorAttributeUnsupported, kAXErrorFailure,
@@ -634,6 +722,7 @@ impl Tool for ClickTool {
                 let requested = effective_action.clone();
                 let foreground = delivery_mode.is_foreground();
                 let resolved = latency::spawn_action_blocking(move || {
+                    let _span = latency::span(latency::Stage::Preflight);
                     let element = action_guard.as_ptr() as AXUIElementRef;
                     let advertised = unsafe { copy_action_names(element) };
                     crate::input::ax_actions::resolve_element_action(
@@ -659,6 +748,7 @@ impl Tool for ClickTool {
             {
                 let select_guard = element_guard.clone();
                 let refusal = latency::spawn_action_blocking(move || {
+                    let _span = latency::span(latency::Stage::Preflight);
                     let element = select_guard.as_ptr() as AXUIElementRef;
                     super::set_value::is_chromium_web_select(pid, wid, element).then(|| {
                         super::set_value::chromium_select_open_refusal(pid, wid, Some(idx), element)
@@ -678,6 +768,7 @@ impl Tool for ClickTool {
             // The element's screen rect rides along on the glide so motion
             // styles can time by target size and highlight the target.
             let (center, target_rect) = latency::spawn_action_blocking(move || unsafe {
+                let _span = latency::span(latency::Stage::Preflight);
                 let el = center_guard.as_ptr() as AXUIElementRef;
                 (
                     crate::ax::bindings::element_screen_center(el),
@@ -778,6 +869,7 @@ impl Tool for ClickTool {
             let selection_center = if effective_action == "press" {
                 let selection_guard = element_guard.clone();
                 latency::spawn_action_blocking(move || {
+                    let _span = latency::span(latency::Stage::Preflight);
                     crate::input::ax_actions::nearest_container_selection_state(
                         selection_guard.as_ptr(),
                     )
@@ -1642,13 +1734,80 @@ fn press_needs_key_window(action: &str, front_pid: Option<i32>, pid: i32, native
 /// Make the target window AppKit-key without raising it, activating the app
 /// or taking key status from the user's window (the focus record only, as the
 /// background pixel click does), then let AppKit settle.
+///
+/// A press right after another one on the same window reuses that priming
+/// (see [`KeyPrime`]): only an app activation (the person switching apps,
+/// in either direction), a focus record or focused-window write the driver
+/// sent anywhere since, or a change of the target app's focused window can
+/// take key status away from it. All three are read again before each press;
+/// the focused window must be the app's own `AXFocusedWindow`, never a
+/// window-order guess.
 fn prime_key_window_for_background_press(pid: i32, window_id: u32, action: &str) {
+    // `native` (a browser or Electron lookup) is read last: a reused
+    // priming was only ever recorded for a native app.
+    if !press_needs_key_window(action, apps::frontmost_pid(), pid, true) {
+        return;
+    }
+    let now = KeyPrime {
+        pid,
+        window_id,
+        activations: crate::focus_steal::activation_count(),
+        focus_generation: crate::input::skylight::focus_generation(),
+        at: std::time::Instant::now(),
+    };
+    let mut last = LAST_KEY_PRIME.lock().unwrap_or_else(|e| e.into_inner());
+    if last.is_some_and(|last| last.still_holds(&now))
+        && crate::ax::bindings::focused_window_id_of_pid(pid) == Some(window_id)
+    {
+        return;
+    }
+    *last = None;
     let native = !super::type_text::is_browser_pid(pid)
         && !crate::browser::electron_js::ElectronJs::is_electron(pid);
-    if press_needs_key_window(action, apps::frontmost_pid(), pid, native)
-        && crate::input::skylight::activate_without_raise_with(pid, window_id, false)
-    {
-        std::thread::sleep(std::time::Duration::from_millis(80));
+    if !native {
+        return;
+    }
+    if crate::input::skylight::activate_without_raise_with(pid, window_id, false) {
+        std::thread::sleep(KEY_PRIME_SETTLE);
+        // Recorded after this priming's own focus record. An activation or
+        // another focus change during the settle may already have undone it.
+        let primed = KeyPrime {
+            focus_generation: crate::input::skylight::focus_generation(),
+            ..now
+        };
+        *last = (crate::focus_steal::activation_count() == now.activations).then_some(primed);
+    }
+}
+
+/// How long AppKit gets to take the focus record before the press.
+const KEY_PRIME_SETTLE: std::time::Duration = std::time::Duration::from_millis(80);
+
+/// How long a key-window priming is reused for later presses on its window.
+const KEY_PRIME_REUSE: std::time::Duration = std::time::Duration::from_secs(10);
+
+static LAST_KEY_PRIME: std::sync::Mutex<Option<KeyPrime>> = std::sync::Mutex::new(None);
+
+/// The last window made key for a background press, and the app-activation
+/// count when it was.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct KeyPrime {
+    pid: i32,
+    window_id: u32,
+    activations: u64,
+    /// `skylight::focus_generation` after the priming's own record.
+    focus_generation: u64,
+    at: std::time::Instant,
+}
+
+impl KeyPrime {
+    /// Whether this priming still covers a press described by `now`: same
+    /// window, no app activated since, and recent.
+    fn still_holds(&self, now: &KeyPrime) -> bool {
+        self.pid == now.pid
+            && self.window_id == now.window_id
+            && self.activations == now.activations
+            && self.focus_generation == now.focus_generation
+            && now.at.saturating_duration_since(self.at) < KEY_PRIME_REUSE
     }
 }
 
@@ -1713,6 +1872,7 @@ fn perform_ax_click(
 
     // Read live capabilities before dispatch: custom actions and
     // AXIncrement/AXDecrement are valid only on elements that expose them.
+    let preflight = latency::span(latency::Stage::Preflight);
     let advertised = unsafe { copy_action_names(element) };
     let ax_action =
         crate::input::ax_actions::resolve_element_action(action_str, &advertised, foreground)?;
@@ -1726,7 +1886,14 @@ fn perform_ax_click(
     // Capture advertised actions BEFORE dispatching so we can detect silent no-ops
     // (AX returns success even when the element doesn't advertise the action).
     let role = unsafe { copy_string_attr(element, "AXRole") }.unwrap_or_default();
-    let title = unsafe { copy_string_attr(element, "AXTitle") }.unwrap_or_default();
+    // The name shown in the result: an untitled control (KakaoTalk's tabs)
+    // is named by its description, help or identifier instead of "".
+    let title = ["AXTitle", "AXDescription", "AXHelp", "AXIdentifier"]
+        .iter()
+        .find_map(|attr| {
+            unsafe { copy_string_attr(element, attr) }.filter(|text| !text.trim().is_empty())
+        })
+        .unwrap_or_default();
 
     // A click on an AppKit collection item is frequently represented by a
     // label child or row that does not advertise AXPress. Prefer a bounded,
@@ -1845,10 +2012,22 @@ fn perform_ax_click(
     let toggle_before = is_toggle_press(ax_action, &role, &advertised)
         .then(read_value)
         .flatten();
+    drop(preflight);
     if !foreground {
-        prime_key_window_for_background_press(pid, window_id, ax_action);
+        latency::section(latency::Stage::KeyPrime, || {
+            prime_key_window_for_background_press(pid, window_id, ax_action)
+        });
     }
-    let err = unsafe { crate::ax::bindings::perform_action(element, ax_action) };
+    // A press or open that navigates (Finder's sidebar) can retitle the
+    // window after its element's name while the app still returns an AX
+    // error. Read the title right before dispatch, so nothing earlier
+    // (a navigation still finishing during the priming) counts.
+    let window_before = matches!(ax_action, "AXOpen" | "AXPress")
+        .then(|| unsafe { WindowTitleProbe::of(element) })
+        .flatten();
+    let err = latency::section(latency::Stage::AxPerform, || unsafe {
+        crate::ax::bindings::perform_action(element, ax_action)
+    });
     if err != crate::ax::bindings::kAXErrorSuccess {
         // Checked before the row-selection fallback, which writes AXSelected
         // on an ancestor: a toggle whose press landed needs no other write.
@@ -1865,6 +2044,31 @@ fn perform_ax_click(
                         "✅ Performed {ax_action} on [{idx}] {role} \"{title}\"; AXValue is now \
                          {now} (was {before}) on two reads, although the app returned AX error \
                          {err}."
+                    ),
+                    false,
+                    false,
+                    true,
+                    false,
+                ));
+            }
+        }
+        if let Some(probe) = window_before
+            .as_ref()
+            .filter(|_| press_error_may_have_acted(err))
+        {
+            if let Some(now) = settled_value(
+                |now| probe.names_target(now),
+                || probe.read(),
+                SELECTION_READBACK_TIMEOUT,
+                SELECTION_READBACK_POLL,
+                WINDOW_TITLE_STABILITY,
+            ) {
+                return Ok((
+                    format!(
+                        "✅ Performed {ax_action} on [{idx}] {role} \"{title}\"; the window \
+                         title is now \"{now}\" (was \"{}\") on two reads, although the app \
+                         returned AX error {err}.",
+                        probe.before
                     ),
                     false,
                     false,
@@ -2307,6 +2511,52 @@ mod tests {
     /// Surface 5: schema must advertise the new `button` field with the three
     /// canonical values and default to "left". Hermes / Codex / Claude Code
     /// consumers branch on this enum being present.
+    #[test]
+    fn only_a_window_title_that_becomes_the_target_name_confirms() {
+        assert!(title_names_target("Recents", "Downloads", "Downloads"));
+        assert!(title_names_target("Recents", " downloads ", "Downloads"));
+        assert!(
+            !title_names_target("Recents", "AirDrop", "Downloads"),
+            "another change"
+        );
+        assert!(
+            !title_names_target("Downloads", "Downloads", "Downloads"),
+            "no change"
+        );
+    }
+
+    #[test]
+    fn a_key_window_priming_is_reused_only_for_the_same_window_without_activations() {
+        let at = std::time::Instant::now();
+        let primed = KeyPrime {
+            pid: 2,
+            window_id: 7,
+            activations: 5,
+            focus_generation: 9,
+            at,
+        };
+        let later = |pid, window_id, activations, secs| KeyPrime {
+            pid,
+            window_id,
+            activations,
+            focus_generation: 9,
+            at: at + std::time::Duration::from_secs(secs),
+        };
+        assert!(primed.still_holds(&later(2, 7, 5, 1)));
+        assert!(!primed.still_holds(&later(2, 8, 5, 1)), "other window");
+        assert!(!primed.still_holds(&later(3, 7, 5, 1)), "other app");
+        assert!(!primed.still_holds(&later(2, 7, 6, 1)), "an app activated");
+        assert!(!primed.still_holds(&later(2, 7, 5, 10)), "too old");
+        let refocused = KeyPrime {
+            focus_generation: 10,
+            ..later(2, 7, 5, 1)
+        };
+        assert!(
+            !primed.still_holds(&refocused),
+            "the driver moved some app's key focus since"
+        );
+    }
+
     #[test]
     fn background_press_needs_the_key_window_only_in_a_native_background_app() {
         assert!(press_needs_key_window("AXPress", Some(1), 2, true));

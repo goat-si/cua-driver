@@ -280,11 +280,13 @@ async fn one_batch_crosses_screens_by_name() {
     let reads = harness.calls("get_window_state");
     let observed = reads.last().unwrap();
     assert_eq!(observed["since"], "latest");
-    // Lookup reads are full_output, which `since` never remembers; the only
-    // other reads are one plain baseline per window the batch looked in.
+    // Lookup reads are visible-window reads (max_elements 2000) or
+    // full_output, which `since` never remembers with the observation's
+    // budget; the only other reads are one plain baseline per window the
+    // batch looked in.
     let baselines: Vec<u64> = reads[..reads.len() - 1]
         .iter()
-        .filter(|read| read["full_output"] != true)
+        .filter(|read| read["full_output"] != true && read["max_elements"] != 2000)
         .map(|read| read["window_id"].as_u64().unwrap())
         .collect();
     assert_eq!(baselines, [7, 8], "{reads:?}");
@@ -509,10 +511,12 @@ async fn the_end_observation_diffs_against_the_batch_start() {
     assert_ne!(result.is_error, Some(true), "{}", text(&result));
     let reads = harness.calls("get_window_state");
     // First a plain read with the observation's budget (remembered by
-    // `since`), then the full lookup read, then the end diff.
+    // `since`), then the visible-window lookup read (a view of its own),
+    // then the end diff.
     assert_eq!(reads[0]["max_elements"], 250);
     assert!(reads[0].get("full_output").is_none());
-    assert_eq!(reads[1]["full_output"], true);
+    assert_eq!(reads[1]["max_elements"], 2000);
+    assert!(reads[1].get("full_output").is_none());
     let last = reads.last().unwrap();
     assert_eq!(last["since"], "latest");
     assert_eq!(last["max_elements"], 250);
@@ -542,5 +546,118 @@ async fn a_trailing_get_window_state_in_shorthand_is_the_observation() {
     assert_eq!(
         harness.calls("get_window_state").last().unwrap()["window_id"],
         7
+    );
+}
+
+#[tokio::test]
+async fn a_named_control_found_in_the_visible_window_needs_no_full_read() {
+    let harness = Harness::new();
+    let result = harness
+        .run(json!({"steps": [
+            {"click": {"app": "Demo", "role": "button", "name": "Next"}}
+        ]}))
+        .await;
+    assert_ne!(result.is_error, Some(true), "{}", text(&result));
+    let reads = harness.calls("get_window_state");
+    assert_eq!(reads.len(), 1, "{reads:?}");
+    assert_eq!(reads[0]["max_elements"], 2000);
+    assert_eq!(reads[0]["tree_format"], "both");
+    assert!(reads[0].get("full_output").is_none());
+}
+
+#[tokio::test]
+async fn nth_ambiguity_and_a_missing_control_fall_back_to_the_full_read() {
+    let harness = Harness::new();
+    let result = harness
+        .run(json!({"steps": [
+            {"click": {"app": "Demo", "role": "button", "name": "OK", "nth": 1}}
+        ]}))
+        .await;
+    assert_ne!(result.is_error, Some(true), "{}", text(&result));
+    let reads = harness.calls("get_window_state");
+    assert_eq!(reads.len(), 1, "nth reads every row: {reads:?}");
+    assert_eq!(reads[0]["full_output"], true);
+
+    let harness = Harness::new();
+    let result = harness
+        .run(json!({"steps": [
+            {"click": {"app": "Demo", "role": "button", "name": "OK"}}
+        ]}))
+        .await;
+    assert_eq!(result.is_error, Some(true), "two OK buttons are ambiguous");
+    let reads = harness.calls("get_window_state");
+    assert!(
+        reads.iter().any(|read| read["full_output"] == true),
+        "the full read decides an ambiguous visible match: {reads:?}"
+    );
+}
+
+#[tokio::test]
+async fn checkpoint_steps_skip_the_report_wait_except_the_last_and_report_ms() {
+    let harness = Harness::new();
+    let result = harness
+        .run(json!({"verify": "checkpoint", "steps": [
+            {"set_value": {"app": "Demo", "role": "textfield", "name": "Email", "value": "a@b.c"}},
+            {"click": {"role": "button", "name": "Next"}}
+        ]}))
+        .await;
+    assert_ne!(result.is_error, Some(true), "{}", text(&result));
+    let set_value = &harness.calls("set_value")[0];
+    let click = &harness.calls("click")[0];
+    if crate::post_action_wait::SKIP_SUPPORTED {
+        assert_eq!(set_value["post_action_wait"], "none");
+    }
+    assert!(
+        click.get("post_action_wait").is_none(),
+        "the last step keeps its report"
+    );
+    let steps = result.structured_content.unwrap()["steps"].clone();
+    for step in steps.as_array().unwrap() {
+        assert!(step["ms"].is_u64(), "{step}");
+    }
+}
+
+#[tokio::test]
+async fn verify_must_be_each_or_checkpoint() {
+    let harness = Harness::new();
+    let result = harness
+        .run(json!({"verify": "never", "steps": [{"click": {"app": "Demo", "role": "button", "name": "Next"}}]}))
+        .await;
+    assert_eq!(result.is_error, Some(true));
+    assert!(
+        text(&result).contains("`verify` must be"),
+        "{}",
+        text(&result)
+    );
+    assert!(harness.calls("click").is_empty());
+}
+
+#[tokio::test]
+async fn a_substring_match_or_an_observe_with_the_lookup_budget_uses_the_full_read() {
+    let harness = Harness::new();
+    let result = harness
+        .run(json!({"steps": [
+            {"click": {"app": "Demo", "role": "button", "name": "Nex"}}
+        ]}))
+        .await;
+    assert_ne!(result.is_error, Some(true), "{}", text(&result));
+    let reads = harness.calls("get_window_state");
+    assert!(
+        reads.iter().any(|read| read["full_output"] == true),
+        "a substring-only visible match is not trusted: {reads:?}"
+    );
+
+    let harness = Harness::new();
+    let result = harness
+        .run(json!({"steps": [
+            {"click": {"app": "Demo", "role": "button", "name": "Next"}}
+        ], "observe": {"max_elements": 2000}}))
+        .await;
+    assert_ne!(result.is_error, Some(true), "{}", text(&result));
+    let reads = harness.calls("get_window_state");
+    let lookups: Vec<&Value> = reads[1..reads.len() - 1].iter().collect();
+    assert!(
+        lookups.iter().all(|read| read["full_output"] == true),
+        "the observation's own view is never read by a lookup: {reads:?}"
     );
 }

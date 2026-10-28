@@ -493,6 +493,16 @@ fn install_observer(dispatcher: &Arc<Dispatcher>) {
     std::mem::forget(queue);
 }
 
+/// App activations seen since the observer was installed.
+static ACTIVATIONS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// How many app activations the process has observed. Two equal reads mean
+/// no app was activated in between (the observer is installed first).
+pub fn activation_count() -> u64 {
+    let _ = FocusStealPreventer::shared();
+    ACTIVATIONS.load(std::sync::atomic::Ordering::Acquire)
+}
+
 /// Match a single activation notification against the dispatcher and,
 /// for each matching entry, re-activate the entry's `restore_to` pid.
 ///
@@ -501,6 +511,8 @@ fn install_observer(dispatcher: &Arc<Dispatcher>) {
 fn handle_activation(dispatcher: &Arc<Dispatcher>, note: &objc2_foundation::NSNotification) {
     use objc2::msg_send;
     use objc2::runtime::AnyObject;
+
+    ACTIVATIONS.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
 
     let activated_pid: i32 = unsafe {
         let info = match note.userInfo() {

@@ -460,6 +460,7 @@ pub(crate) async fn await_arrival(
     rx: tokio::sync::oneshot::Receiver<()>,
     render_loop_running: bool,
 ) -> bool {
+    let _span = crate::goat::action_latency::span(crate::goat::action_latency::Stage::Glide);
     let limit = cua_driver_core::step_pacing::glide_wait_limit(ARRIVAL_TIMEOUT);
     if limit < ARRIVAL_TIMEOUT {
         wait_for_arrival_briefly(rx, render_loop_running, limit).await

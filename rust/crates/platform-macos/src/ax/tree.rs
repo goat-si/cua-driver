@@ -174,6 +174,23 @@ impl CompactableNode for AXNode {
     }
 }
 
+/// Control roles that are pressable even when they list no AX actions.
+/// KakaoTalk's sidebar tabs are `AXButton`s with only `AXHelp` and
+/// `AXIdentifier` and an empty action list, yet `AXPress` on them switches
+/// the tab; without an index an agent could only reach them by pixel.
+fn is_actionless_control_role(role: &str) -> bool {
+    matches!(
+        role,
+        "AXButton"
+            | "AXRadioButton"
+            | "AXCheckBox"
+            | "AXPopUpButton"
+            | "AXMenuButton"
+            | "AXDisclosureTriangle"
+            | "AXLink"
+    )
+}
+
 fn is_addressable(actions_present: bool, value_settable: bool, enabled: Option<bool>) -> bool {
     (actions_present || value_settable) && enabled != Some(false)
 }
@@ -716,12 +733,18 @@ unsafe fn walk_element(
     // those controls disabled. Never assign such a row a live element index:
     // the same native state also causes dispatch to refuse it, and exposing an
     // index for it invites agents to retain an unusable menu target.
-    let enabled = if !actions.is_empty() || value_settable {
+    let actionless_control =
+        actions.is_empty() && !value_settable && is_actionless_control_role(&role);
+    let enabled = if !actions.is_empty() || value_settable || actionless_control {
         copy_bool_attr(element, "AXEnabled")
     } else {
         None
     };
-    let is_actionable = is_addressable(!actions.is_empty(), value_settable, enabled);
+    let is_actionable = is_addressable(
+        !actions.is_empty() || actionless_control,
+        value_settable,
+        enabled,
+    );
 
     if !is_actionable && !has_content && role != "AXWindow" && role != "AXSheet" {
         walk_children(
@@ -1325,6 +1348,16 @@ mod tests {
         assert!(is_addressable(true, false, None));
         assert!(!is_addressable(false, false, Some(true)));
         assert!(!is_addressable(true, false, Some(false)));
+    }
+
+    #[test]
+    fn actionless_control_roles_are_pressable_but_display_roles_are_not() {
+        for role in ["AXButton", "AXRadioButton", "AXCheckBox", "AXLink"] {
+            assert!(is_actionless_control_role(role), "{role}");
+        }
+        for role in ["AXStaticText", "AXImage", "AXGroup", "AXCell", "AXRow"] {
+            assert!(!is_actionless_control_role(role), "{role}");
+        }
 
         for role in [
             "AXTextField",

@@ -205,7 +205,7 @@ daemon child.
 After an input action, the driver watches the window list for a short time so
 it can report a menu, dialog, or new window that the action opened. On macOS,
 the watch lasts up to 1000 ms. The action's result waits for at most the first
-300 ms of it; when nothing has changed by then, the result returns and the rest
+120 ms of it; when nothing has changed by then, the result returns and the rest
 of the watch runs detached, still holding the focus-steal lease. A window that
 opens during that remainder is reported on the next action's result as
 `After the previous action returned, it opened new window(s): …`. The next
@@ -311,7 +311,7 @@ a `foreground_fallback` retry:
 ### Steps inside `run_steps` and `run_script` (macOS)
 
 Two waits make up most of a macOS action's latency: the agent cursor's glide to
-the target (600 ms or more with the default `steady` timing) and the first 300 ms
+the target (600 ms or more with the default `steady` timing) and the first 120 ms
 of the window watch above. A call that is one step of a `run_steps` batch or a
 `run_script` program is followed at once by another step, so the driver shortens
 both for it: the step waits at most 120 ms for the cursor to arrive and 100 ms
