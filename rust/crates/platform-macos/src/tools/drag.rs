@@ -460,6 +460,14 @@ impl DragTool {
             cursor_key.clone(),
             cursor_overlay::OverlayCommand::SetPressed(true),
         );
+        let dispatch_guard = match super::window_points::DispatchGuard::new(
+            space,
+            window_id,
+            validated_frame.clone(),
+        ) {
+            Ok(guard) => guard,
+            Err(refusal) => return refusal,
+        };
         let result = focus_guard::with_focus_suppressed(
             // Neither mode suppresses the target: foreground deliberately
             // activates it for the HID gesture, and background lets the
@@ -470,6 +478,7 @@ impl DragTool {
             "drag.CGEvent",
             || async move {
                 latency::spawn_action_blocking(move || -> anyhow::Result<bool> {
+                    super::window_points::check_guard(&dispatch_guard)?;
                     let m: Vec<&str> = mods_owned.iter().map(String::as_str).collect();
                     let observe = move |x: f64, y: f64| {
                         crate::cursor::overlay::send_command(
@@ -569,6 +578,11 @@ impl DragTool {
         }
 
         let changes = super::finish_window_observation(snapshot).await;
+        if let Ok(Err(error)) = &result {
+            if let Some(refusal) = super::window_points::moved_refusal(error, space) {
+                return refusal;
+            }
+        }
 
         crate::cursor::overlay::send_command(
             cursor_key.clone(),

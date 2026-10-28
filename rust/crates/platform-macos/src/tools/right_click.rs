@@ -267,12 +267,21 @@ impl RightClickTool {
             Ok(route) => route,
             Err(refusal) => return refusal,
         };
+        let dispatch_guard = match super::window_points::DispatchGuard::new(
+            space,
+            window_id,
+            validated_frame.clone(),
+        ) {
+            Ok(guard) => guard,
+            Err(refusal) => return refusal,
+        };
         let result = latency::spawn_blocking(move || -> anyhow::Result<()> {
             let _key_focus = (!fg)
                 .then(|| crate::key_focus_guard::protect(pid))
                 .flatten();
             let _action = latency::span(latency::Stage::ActionBlocking);
             let do_it = move || -> anyhow::Result<()> {
+                super::window_points::check_guard(&dispatch_guard)?;
                 let m: Vec<&str> = modifiers.iter().map(String::as_str).collect();
                 if route == super::pixel_route::PixelClickRoute::ForegroundHid {
                     // Warp the hardware pointer and post at the HID tap; see
@@ -310,6 +319,11 @@ impl RightClickTool {
             }
         })
         .await;
+        if let Ok(Err(error)) = &result {
+            if let Some(refusal) = super::window_points::moved_refusal(error, space) {
+                return refusal;
+            }
+        }
         match result {
             Ok(Ok(())) => ToolResult::text(format!(
                 "Right-clicked{mod_suffix} at ({screen_x:.1}, {screen_y:.1}) ({}).",

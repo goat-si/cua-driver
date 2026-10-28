@@ -604,6 +604,12 @@ impl ScrollTool {
                 return refusal;
             }
             let fg = delivery_mode.is_foreground() && wid.is_some();
+            let dispatch_guard =
+                match super::window_points::DispatchGuard::new(space, wid, validated_frame.clone())
+                {
+                    Ok(guard) => guard,
+                    Err(refusal) => return refusal,
+                };
             let result = focus_guard::with_focus_suppressed(
                 Some(pid),
                 prior_front,
@@ -611,6 +617,7 @@ impl ScrollTool {
                 || async move {
                     latency::spawn_action_blocking(move || -> anyhow::Result<()> {
                         let do_it = move || -> anyhow::Result<()> {
+                            super::window_points::check_guard(&dispatch_guard)?;
                             crate::input::mouse::scroll_wheel_at_xy(
                                 pid,
                                 screen_x,
@@ -641,6 +648,11 @@ impl ScrollTool {
             .await;
 
             let changes = super::finish_window_observation(snapshot).await;
+            if let Ok(Err(error)) = &result {
+                if let Some(refusal) = super::window_points::moved_refusal(error, space) {
+                    return refusal;
+                }
+            }
             let mode_label = if fg {
                 " (delivery_mode:foreground)"
             } else {

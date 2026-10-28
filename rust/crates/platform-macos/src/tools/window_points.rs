@@ -86,6 +86,15 @@ pub fn point_space(args: &Value) -> Result<PointSpace, ToolResult> {
                      used with scope desktop.",
                 ));
             }
+            let has = |key: &str| args.get(key).and_then(Value::as_f64).is_some();
+            if !((has("x") && has("y"))
+                || (has("from_x") && has("from_y") && has("to_x") && has("to_y")))
+            {
+                return Err(super::invalid_arguments(
+                    "coordinate_space window_points needs the point: x and y (from_x, from_y, \
+                     to_x and to_y for drag).",
+                ));
+            }
             let basis = args.get("window_basis").and_then(Value::as_object);
             let number = |key: &str| {
                 basis
@@ -194,8 +203,15 @@ pub fn recheck(
     used: Option<&super::px_frame::WindowPxFrame>,
     live: Option<WindowBounds>,
 ) -> Result<(), ToolResult> {
-    let (PointSpace::WindowPoints(basis), Some(used)) = (space, used) else {
+    let PointSpace::WindowPoints(basis) = space else {
         return Ok(());
+    };
+    let Some(used) = used else {
+        return Err(super::pre_dispatch_refusal(
+            "window_points_unresolved",
+            "The window points were not resolved against the window's frame for this route, \
+             so nothing was sent.",
+        ));
     };
     let live = live.ok_or_else(|| {
         super::px_frame::refusal(&super::px_frame::PxFrameError::WindowNotFound { window_id })
@@ -214,6 +230,105 @@ pub fn recheck(
 
 /// Two reads of an unmoved window's frame agree to far better than this.
 const SAME_FRAME_PT: f64 = 0.01;
+
+/// What a dispatch closure returns when its guard finds the window moved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WindowMoved {
+    pub window_id: u32,
+}
+
+impl std::fmt::Display for WindowMoved {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "window {} moved before the input was posted",
+            self.window_id
+        )
+    }
+}
+
+impl std::error::Error for WindowMoved {}
+
+/// The window-points recheck carried onto the actuator's own thread and run
+/// right before the native post, after all preparatory work.
+#[derive(Clone)]
+pub struct DispatchGuard {
+    window_id: u32,
+    frame: super::px_frame::WindowPxFrame,
+    read: fn(u32) -> Option<WindowBounds>,
+}
+
+impl DispatchGuard {
+    /// None for screenshot pixels. For window points the validated frame must
+    /// be present: an actuator without it fails closed.
+    pub fn new(
+        space: PointSpace,
+        window_id: Option<u32>,
+        frame: Option<super::px_frame::WindowPxFrame>,
+    ) -> Result<Option<Self>, ToolResult> {
+        Self::with_reader(space, window_id, frame, crate::windows::window_bounds_by_id)
+    }
+
+    fn with_reader(
+        space: PointSpace,
+        window_id: Option<u32>,
+        frame: Option<super::px_frame::WindowPxFrame>,
+        read: fn(u32) -> Option<WindowBounds>,
+    ) -> Result<Option<Self>, ToolResult> {
+        if space == PointSpace::Screenshot {
+            return Ok(None);
+        }
+        match (window_id, frame) {
+            (Some(window_id), Some(frame)) => Ok(Some(Self {
+                window_id,
+                frame,
+                read,
+            })),
+            _ => Err(super::pre_dispatch_refusal(
+                "window_points_unresolved",
+                "The window points were not resolved against the window's frame for this \
+                 route, so nothing was sent.",
+            )),
+        }
+    }
+
+    /// The window is still exactly the frame the points were translated with.
+    pub fn check(&self) -> Result<(), WindowMoved> {
+        let same = |a: f64, b: f64| (a - b).abs() < SAME_FRAME_PT;
+        match (self.read)(self.window_id) {
+            Some(live)
+                if same(self.frame.bounds.x, live.x)
+                    && same(self.frame.bounds.y, live.y)
+                    && same(self.frame.bounds.width, live.width)
+                    && same(self.frame.bounds.height, live.height) =>
+            {
+                Ok(())
+            }
+            _ => Err(WindowMoved {
+                window_id: self.window_id,
+            }),
+        }
+    }
+}
+
+/// Runs the guard when there is one.
+pub fn check_guard(guard: &Option<DispatchGuard>) -> Result<(), WindowMoved> {
+    guard.as_ref().map_or(Ok(()), DispatchGuard::check)
+}
+
+/// The guard's refusal when a dispatch closure stopped on it.
+pub fn moved_refusal(error: &anyhow::Error, space: PointSpace) -> Option<ToolResult> {
+    let moved = error.downcast_ref::<WindowMoved>()?;
+    let PointSpace::WindowPoints(basis) = space else {
+        return None;
+    };
+    Some(match crate::windows::window_bounds_by_id(moved.window_id) {
+        Some(live) => geometry_changed(moved.window_id, &basis, &live),
+        None => super::px_frame::refusal(&super::px_frame::PxFrameError::WindowNotFound {
+            window_id: moved.window_id,
+        }),
+    })
+}
 
 /// [recheck] against the window's frame now.
 pub(super) fn recheck_now(
@@ -414,7 +529,50 @@ mod tests {
             recheck(space, 7, used, None).is_err(),
             "a closed window refuses"
         );
+        assert!(
+            recheck(space, 7, None, Some(bounds(-1.0, 0.0, 800.0, 600.0))).is_err(),
+            "no frame fails closed"
+        );
         assert!(recheck(PointSpace::Screenshot, 7, None, None).is_ok());
+    }
+
+    fn moved_reader(_: u32) -> Option<WindowBounds> {
+        Some(bounds(30.0, 0.0, 800.0, 600.0))
+    }
+    fn still_reader(_: u32) -> Option<WindowBounds> {
+        Some(bounds(0.0, 0.0, 800.0, 600.0))
+    }
+
+    #[test]
+    fn the_dispatch_guard_stops_a_post_after_a_move_during_preparation() {
+        let b = basis(0.0, 0.0, 800.0, 600.0);
+        let space = PointSpace::WindowPoints(b);
+        let resolved =
+            resolve_window_points(7, &b, &[(1.0, 1.0)], Some(bounds(0.0, 0.0, 800.0, 600.0)))
+                .unwrap();
+        let moved =
+            DispatchGuard::with_reader(space, Some(7), resolved.frame.clone(), moved_reader)
+                .unwrap()
+                .expect("a guard for window points");
+        assert_eq!(moved.check(), Err(WindowMoved { window_id: 7 }));
+        let still = DispatchGuard::with_reader(space, Some(7), resolved.frame, still_reader)
+            .unwrap()
+            .unwrap();
+        assert_eq!(still.check(), Ok(()));
+        // An actuator without the validated frame fails closed.
+        let refusal = DispatchGuard::with_reader(space, Some(7), None, still_reader)
+            .err()
+            .expect("refused");
+        assert_eq!(
+            refusal.structured_content.unwrap()["code"],
+            "window_points_unresolved"
+        );
+        assert!(DispatchGuard::new(PointSpace::Screenshot, Some(7), None)
+            .unwrap()
+            .is_none());
+        // The error a closure returns is recognized as the guard's.
+        let error = anyhow::Error::from(WindowMoved { window_id: 7 });
+        assert!(error.downcast_ref::<WindowMoved>().is_some());
     }
 
     #[test]
@@ -426,7 +584,7 @@ mod tests {
         );
         assert_eq!(
             point_space(&json!({
-                "window_id": 9,
+                "window_id": 9, "x": 1, "y": 2,
                 "coordinate_space": "window_points",
                 "window_basis": {"x": 1.5, "y": -3, "w": 800, "h": 600}
             }))
@@ -434,6 +592,8 @@ mod tests {
             PointSpace::WindowPoints(basis(1.5, -3.0, 800.0, 600.0))
         );
         for bad in [
+            json!({"window_id": 9, "x": 1, "coordinate_space": "window_points",
+                "window_basis": {"x": 0, "y": 0, "w": 800, "h": 600}}),
             json!({"window_id": 9, "element_token": "s00000001:3", "coordinate_space": "window_points",
                 "window_basis": {"x": 0, "y": 0, "w": 800, "h": 600}}),
             json!({"window_id": 9, "coordinate_space": "window_points"}),

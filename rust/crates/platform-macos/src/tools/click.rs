@@ -1314,6 +1314,14 @@ impl ClickTool {
                 {
                     return refusal;
                 }
+                let dispatch_guard = match super::window_points::DispatchGuard::new(
+                    space,
+                    window_id,
+                    validated_frame.clone(),
+                ) {
+                    Ok(guard) => guard,
+                    Err(refusal) => return refusal,
+                };
                 let ax_result = latency::spawn_action_blocking(move || unsafe {
                     let Some(element) = element_at_screen_position(pid, screen_x, screen_y) else {
                         return Ok::<bool, anyhow::Error>(false);
@@ -1342,6 +1350,12 @@ impl ClickTool {
                         CFRelease(element as _);
                         return Ok(false);
                     }
+                    // Last, after the hit test and its checks: the window must
+                    // still be where the window points were translated.
+                    if let Err(moved) = super::window_points::check_guard(&dispatch_guard) {
+                        CFRelease(element as _);
+                        return Err(moved.into());
+                    }
                     let delivered = if focus_only {
                         crate::input::ax_actions::focus_element(element as usize).is_ok()
                     } else {
@@ -1353,6 +1367,11 @@ impl ClickTool {
                     Ok(delivered)
                 })
                 .await;
+                if let Ok(Err(error)) = &ax_result {
+                    if let Some(refusal) = super::window_points::moved_refusal(error, space) {
+                        return refusal;
+                    }
+                }
                 match ax_result {
                     Ok(Ok(true)) => {
                         crate::cursor::overlay::send_command(
@@ -1508,6 +1527,14 @@ impl ClickTool {
             // button != left. Left-button path stays on the existing Chromium-
             // routed `click_at_xy_with_window_local` for back-compat.
             let button_kind = button_str.clone();
+            let dispatch_guard = match super::window_points::DispatchGuard::new(
+                space,
+                window_id,
+                validated_frame.clone(),
+            ) {
+                Ok(guard) => guard,
+                Err(refusal) => return refusal,
+            };
             let result = focus_guard::with_focus_suppressed(
                 if activation_policy == PixelActivationPolicy::SuppressTarget {
                     Some(pid)
@@ -1519,6 +1546,7 @@ impl ClickTool {
                 || async move {
                     latency::spawn_action_blocking(move || {
                         let do_click = move || -> anyhow::Result<()> {
+                            super::window_points::check_guard(&dispatch_guard)?;
                             let m: Vec<&str> = mods_owned.iter().map(String::as_str).collect();
                             if route == PixelClickRoute::ForegroundHid {
                                 // Warp the hardware pointer to the mapped global
@@ -1600,6 +1628,11 @@ impl ClickTool {
             }
 
             let changes = super::finish_window_observation(snapshot).await;
+            if let Ok(Err(error)) = &result {
+                if let Some(refusal) = super::window_points::moved_refusal(error, space) {
+                    return refusal;
+                }
+            }
 
             let button_label = match (button_str.as_str(), count) {
                 ("right", _) => "right-click",
