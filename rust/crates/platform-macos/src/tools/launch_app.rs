@@ -229,12 +229,14 @@ impl Tool for LaunchAppTool {
             // launch adds can show the requested folder. Folder launches run
             // one at a time from snapshot to match, so two launches never
             // claim the same new window.
-            let _finder_turn = (!urls.is_empty()).then(|| {
+            let finder_folders =
+                !urls.is_empty() && is_finder_request(bundle_id.as_deref(), name.as_deref());
+            let _finder_turn = finder_folders.then(|| {
                 FINDER_FOLDER_LAUNCH
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
             });
-            let finder_before: std::collections::HashSet<u32> = if urls.is_empty() {
+            let finder_before: std::collections::HashSet<u32> = if !finder_folders {
                 Default::default()
             } else {
                 crate::apps::list_running_apps()
@@ -608,10 +610,15 @@ fn finder_folder_targets(bundle_id: Option<&str>, urls: &[String]) -> Vec<Folder
 /// absent from `before` and titled with the folder's name. Each window stands
 /// for one folder. A folder that was already open in a window is reported as
 /// not ready rather than guessed from a window of the same name.
+///
+/// `unresolved` names folders of earlier launches that timed out before
+/// their window appeared: such a window may still arrive, so a new window of
+/// that name proves nothing for this launch.
 fn match_folder_windows(
     targets: &[FolderTarget],
     windows: Vec<crate::windows::WindowInfo>,
     before: &std::collections::HashSet<u32>,
+    unresolved: &[String],
 ) -> (Vec<crate::windows::WindowInfo>, bool) {
     let mut fresh: Vec<_> = windows
         .into_iter()
@@ -620,10 +627,11 @@ fn match_folder_windows(
     let mut found = Vec::new();
     let mut ready = true;
     for target in targets {
-        match fresh
-            .iter()
-            .position(|w| target.title.as_deref() == Some(w.title.as_str()))
-        {
+        let title = target
+            .title
+            .as_deref()
+            .filter(|title| !unresolved.iter().any(|u| u == title));
+        match fresh.iter().position(|w| title == Some(w.title.as_str())) {
             Some(at) => found.push(fresh.remove(at)),
             None => ready = false,
         }
@@ -632,9 +640,37 @@ fn match_folder_windows(
     (found, ready)
 }
 
-/// Held by a launch with `urls` from Finder's window snapshot until its
-/// folder windows are matched.
+/// Held by a Finder launch with `urls` from Finder's window snapshot until
+/// its folder windows are matched.
 static FINDER_FOLDER_LAUNCH: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Folder names whose launch timed out before a window appeared, and when.
+static UNRESOLVED_FOLDERS: std::sync::Mutex<Vec<(String, std::time::Instant)>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// How long a timed-out folder name keeps later matches unconfirmed.
+const UNRESOLVED_FOLDER_TTL: std::time::Duration = std::time::Duration::from_secs(30);
+
+fn unresolved_folders() -> Vec<String> {
+    let mut held = UNRESOLVED_FOLDERS.lock().unwrap_or_else(|e| e.into_inner());
+    held.retain(|(_, at)| at.elapsed() < UNRESOLVED_FOLDER_TTL);
+    held.iter().map(|(title, _)| title.clone()).collect()
+}
+
+fn note_unresolved_folders(targets: &[FolderTarget], found: &[crate::windows::WindowInfo]) {
+    let mut held = UNRESOLVED_FOLDERS.lock().unwrap_or_else(|e| e.into_inner());
+    for title in targets.iter().filter_map(|t| t.title.as_deref()) {
+        if !found.iter().any(|w| w.title == title) {
+            held.push((title.to_owned(), std::time::Instant::now()));
+        }
+    }
+}
+
+/// Whether the launch asks for Finder, by bundle id or by name.
+fn is_finder_request(bundle_id: Option<&str>, name: Option<&str>) -> bool {
+    bundle_id == Some("com.apple.finder")
+        || bundle_id.is_none() && name.is_some_and(|name| name.eq_ignore_ascii_case("finder"))
+}
 
 /// How long the Finder folder windows get to appear.
 const FOLDER_WINDOW_WAIT: std::time::Duration = std::time::Duration::from_secs(3);
@@ -656,9 +692,15 @@ fn await_folder_windows(
     before: &std::collections::HashSet<u32>,
 ) -> (Vec<crate::windows::WindowInfo>, bool) {
     let deadline = std::time::Instant::now() + FOLDER_WINDOW_WAIT;
+    let unresolved = unresolved_folders();
     loop {
-        let (found, ready) = match_folder_windows(targets, finder_windows(pid), before);
-        if ready || std::time::Instant::now() >= deadline {
+        let (found, ready) =
+            match_folder_windows(targets, finder_windows(pid), before, &unresolved);
+        if ready {
+            return (found, ready);
+        }
+        if std::time::Instant::now() >= deadline {
+            note_unresolved_folders(targets, &found);
             return (found, ready);
         }
         std::thread::sleep(std::time::Duration::from_millis(100));
@@ -851,9 +893,9 @@ fn hex_value(byte: u8) -> Option<u8> {
 #[cfg(test)]
 mod tests {
     use super::{
-        finder_folder_targets, is_cua_driver_bundle_id, local_file_target, match_folder_windows,
-        normalize_launch_url, preflight_file_urls, rank_launch_windows, response_identity,
-        structured_launch_failure, LaunchAppTool,
+        finder_folder_targets, is_cua_driver_bundle_id, is_finder_request, local_file_target,
+        match_folder_windows, normalize_launch_url, preflight_file_urls, rank_launch_windows,
+        response_identity, structured_launch_failure, LaunchAppTool,
     };
     use cua_driver_core::tool::Tool;
     use serde_json::json;
@@ -892,6 +934,12 @@ mod tests {
         let targets = finder_folder_targets(Some("com.apple.finder"), &[url(&b)]);
         assert_eq!(targets.len(), 1);
         assert_eq!(targets[0].title.as_deref(), Some("reports"));
+        // Finder asked for by name is the same request; other apps never wait
+        // on Finder's launch turn.
+        assert!(is_finder_request(Some("com.apple.finder"), None));
+        assert!(is_finder_request(None, Some("Finder")));
+        assert!(!is_finder_request(Some("com.apple.Safari"), None));
+        assert!(!is_finder_request(None, Some("TextEdit")));
         // Not Finder, or not a folder: the app's windows are reported as before.
         assert!(finder_folder_targets(Some("com.apple.TextEdit"), &[url(&b)]).is_empty());
         assert!(finder_folder_targets(
@@ -915,6 +963,7 @@ mod tests {
                 window(2, "reports", 900.0, 500.0),
             ],
             &before,
+            &[],
         );
         assert!(ids(&found).is_empty());
         assert!(!ready);
@@ -925,9 +974,20 @@ mod tests {
                 window(3, "reports", 900.0, 500.0),
             ],
             &before,
+            &[],
         );
         assert_eq!(ids(&found), vec![3]);
         assert!(ready);
+        // An earlier launch of another "reports" timed out: its window may
+        // still appear, so a new "reports" window proves nothing now.
+        let (found, ready) = match_folder_windows(
+            &targets,
+            vec![window(3, "reports", 900.0, 500.0)],
+            &before,
+            &["reports".to_owned()],
+        );
+        assert!(ids(&found).is_empty());
+        assert!(!ready);
 
         // The root folder has no name to find its window by: a Finder
         // request all the same, never ready from some other window.
@@ -937,6 +997,7 @@ mod tests {
             &root,
             vec![window(5, "Macintosh HD", 900.0, 500.0)],
             &before,
+            &[],
         );
         assert!(ids(&found).is_empty());
         assert!(!ready);
@@ -944,8 +1005,12 @@ mod tests {
         // Several folders: one new window per folder, and ready only when
         // every folder has one. One window never stands for two folders.
         let both = finder_folder_targets(Some("com.apple.finder"), &[url(&a), url(&b)]);
-        let (found, ready) =
-            match_folder_windows(&both, vec![window(3, "reports", 900.0, 500.0)], &before);
+        let (found, ready) = match_folder_windows(
+            &both,
+            vec![window(3, "reports", 900.0, 500.0)],
+            &before,
+            &[],
+        );
         assert_eq!(ids(&found), vec![3]);
         assert!(!ready);
         let (found, ready) = match_folder_windows(
@@ -955,6 +1020,7 @@ mod tests {
                 window(4, "reports", 900.0, 500.0),
             ],
             &before,
+            &[],
         );
         assert_eq!(ids(&found), vec![3, 4]);
         assert!(ready);

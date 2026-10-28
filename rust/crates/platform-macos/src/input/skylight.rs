@@ -137,6 +137,8 @@ pub struct WindowKeyScope {
     /// The app's on-screen windows before priming, front to back.
     order_before: Vec<u32>,
     primed: KeyPrime,
+    /// Held until the hand-back has run; `None` when key never moved.
+    live: Option<LiveKeyScope>,
 }
 
 /// The window key goes back to. Normally the previous key window. LibreOffice
@@ -181,6 +183,7 @@ impl Drop for WindowKeyScope {
             return;
         };
         let (pid, target, primed) = (self.pid, self.target, self.primed);
+        let live = self.live.take();
         // The records' settle pauses (240 ms) are not part of the action:
         // hand key back on a thread. The next `enter_exact_window_key` waits
         // for it, so two scopes never interleave their records.
@@ -194,6 +197,7 @@ impl Drop for WindowKeyScope {
                     set_app_focused_window(pid, previous);
                 }
             }
+            drop(live);
             key_restore_done();
         };
         *KEY_RESTORES.0.lock().unwrap_or_else(|e| e.into_inner()) += 1;
@@ -204,6 +208,28 @@ impl Drop for WindowKeyScope {
             tracing::warn!("key restore thread failed to start: {error}");
             key_restore_done();
         }
+    }
+}
+
+/// [`WindowKeyScope`]s that moved key focus, counted from their creation
+/// until their hand-back has run. A scope can outlive the mutation lease of
+/// the action that made it (declaration order), so a primed-key release
+/// checks this count, not only the lease.
+static LIVE_KEY_SCOPES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// One count in [`LIVE_KEY_SCOPES`], released when dropped.
+struct LiveKeyScope;
+
+impl LiveKeyScope {
+    fn new() -> Self {
+        LIVE_KEY_SCOPES.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        LiveKeyScope
+    }
+}
+
+impl Drop for LiveKeyScope {
+    fn drop(&mut self) {
+        LIVE_KEY_SCOPES.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
     }
 }
 
@@ -219,9 +245,10 @@ fn key_restore_done() {
     KEY_RESTORES.1.notify_all();
 }
 
-/// Whether a key hand-back is running now. Never waits.
+/// Whether a key scope is live or its hand-back is running now. Never waits.
 fn key_restores_pending() -> bool {
-    *KEY_RESTORES.0.lock().unwrap_or_else(|e| e.into_inner()) > 0
+    LIVE_KEY_SCOPES.load(std::sync::atomic::Ordering::Acquire) > 0
+        || *KEY_RESTORES.0.lock().unwrap_or_else(|e| e.into_inner()) > 0
 }
 
 /// Wait (at most 2 s) until no key hand-back is running. `false` when one
@@ -606,6 +633,7 @@ pub fn enter_exact_window_key(pid: pid_t, target_wid: u32) -> Result<WindowKeySc
         target: target_wid,
         previous,
         order_before,
+        live: (primed != KeyPrime::AlreadyKey).then(LiveKeyScope::new),
         primed,
     })
 }
@@ -2167,13 +2195,22 @@ mod primed_key_tests {
         assert!(!release_on_session_end(1));
     }
 
+    /// Tests that publish, sweep or count into the process-wide registry
+    /// run one at a time.
+    static REGISTRY_TESTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn serial() -> std::sync::MutexGuard<'static, ()> {
+        REGISTRY_TESTS.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     /// The release takes the app's mutation lease itself, so an action that
     /// holds it (or starts while the release runs) is never cut short.
-    #[tokio::test]
-    async fn a_release_waits_while_an_action_holds_the_apps_lease() {
+    #[test]
+    fn a_release_waits_while_an_action_holds_the_apps_lease() {
+        let _serial = serial();
         let ours = |pid: i32| primed_keys_for_test().iter().any(|k| k.pid == pid);
+        let action = crate::background_mutation::try_acquire(-90_010).expect("free lease");
         note_primed_key(-90_010, 1);
-        let action = crate::background_mutation::acquire(-90_010).await;
         // Another app's priming asks for -90_010's release.
         note_primed_key(-90_011, 2);
         assert!(ours(-90_010), "released during the action");
@@ -2182,20 +2219,28 @@ mod primed_key_tests {
         assert!(!ours(-90_010), "kept after the action ended");
     }
 
+    /// A key scope can outlive its action's lease (fields drop in reverse
+    /// declaration order): from its creation until its hand-back has run, a
+    /// release waits as for an action.
     #[test]
-    fn a_running_key_hand_back_counts_as_an_action_in_flight() {
-        // The hand-back thread outlives the action's lease and may focus the
-        // primed window again after a release.
+    fn a_live_key_scope_counts_as_an_action_in_flight() {
+        let _serial = serial();
+        let ours = |pid: i32| primed_keys_for_test().iter().any(|k| k.pid == pid);
         assert!(!super::key_restores_pending());
-        *super::KEY_RESTORES.0.lock().unwrap() += 1;
-        let pending = super::key_restores_pending();
-        super::key_restore_done();
-        assert!(pending);
+        note_primed_key(-90_020, 1);
+        let scope = super::LiveKeyScope::new();
+        assert!(super::key_restores_pending());
+        note_primed_key(-90_021, 2);
+        assert!(ours(-90_020), "released while a key scope was live");
+        drop(scope);
         assert!(!super::key_restores_pending());
+        note_primed_key(-90_022, 3);
+        assert!(!ours(-90_020));
     }
 
     #[test]
     fn a_new_priming_replaces_its_apps_entry_and_lets_other_apps_go() {
+        let _serial = serial();
         // No such processes: WindowServer cannot say who is front, so the
         // other app's entry is dropped without a record being posted.
         note_primed_key(-90_001, 1);
