@@ -219,6 +219,11 @@ fn key_restore_done() {
     KEY_RESTORES.1.notify_all();
 }
 
+/// Whether a key hand-back is running now. Never waits.
+fn key_restores_pending() -> bool {
+    *KEY_RESTORES.0.lock().unwrap_or_else(|e| e.into_inner()) > 0
+}
+
 /// Wait (at most 2 s) until no key hand-back is running. `false` when one
 /// is still running: the caller must not move focus or send input then.
 pub fn await_key_restores() -> bool {
@@ -337,12 +342,14 @@ fn sweep_primed_keys(keys: &mut Vec<PrimedKey>) {
         let Some(_lease) = crate::background_mutation::try_acquire(key.pid) else {
             return true;
         };
+        // A key hand-back outlives its action's lease and may focus this
+        // window again after a release: wait for it as for an action.
         match primed_key_verdict(
             key,
             front_process_matches(key.pid, key.window_id),
             idle_ms,
             now,
-            false,
+            key_restores_pending(),
         ) {
             PrimedKeyVerdict::Keep => true,
             PrimedKeyVerdict::Forget => false,
@@ -2173,6 +2180,18 @@ mod primed_key_tests {
         drop(action);
         note_primed_key(-90_012, 3);
         assert!(!ours(-90_010), "kept after the action ended");
+    }
+
+    #[test]
+    fn a_running_key_hand_back_counts_as_an_action_in_flight() {
+        // The hand-back thread outlives the action's lease and may focus the
+        // primed window again after a release.
+        assert!(!super::key_restores_pending());
+        *super::KEY_RESTORES.0.lock().unwrap() += 1;
+        let pending = super::key_restores_pending();
+        super::key_restore_done();
+        assert!(pending);
+        assert!(!super::key_restores_pending());
     }
 
     #[test]

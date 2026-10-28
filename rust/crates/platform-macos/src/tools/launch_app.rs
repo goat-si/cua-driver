@@ -226,7 +226,14 @@ impl Tool for LaunchAppTool {
         // async runtime), then we sleep holding the targeted lease.
         let launch_result = tokio::task::spawn_blocking(move || {
             // Finder's windows before a folder launch: only a window the
-            // launch adds can show the requested folder.
+            // launch adds can show the requested folder. Folder launches run
+            // one at a time from snapshot to match, so two launches never
+            // claim the same new window.
+            let _finder_turn = (!urls.is_empty()).then(|| {
+                FINDER_FOLDER_LAUNCH
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+            });
             let finder_before: std::collections::HashSet<u32> = if urls.is_empty() {
                 Default::default()
             } else {
@@ -499,8 +506,9 @@ impl Tool for LaunchAppTool {
                     summary.push_str(
                         "\n\nFinder took the request, but not every folder got a new window \
                          within 3 s. A folder that was already open keeps its existing window, \
-                         which Finder does not identify by folder: call list_windows and check \
-                         the window before acting on it.",
+                         and the root folder's window carries its volume's name; Finder does not \
+                         identify a window by folder, so call list_windows and check the window \
+                         before acting on it.",
                     );
                 }
 
@@ -566,9 +574,11 @@ fn resolve_windows_for_pid(pid: i32) -> Vec<crate::windows::WindowInfo> {
     vec![]
 }
 
-/// A folder a Finder launch asked for, by the title Finder gives its window.
+/// A folder a Finder launch asked for, by the title Finder gives its window;
+/// `None` when that title cannot be known from the path (the root folder
+/// shows its volume's name), so no window can be confirmed as its own.
 struct FolderTarget {
-    title: String,
+    title: Option<String>,
 }
 
 /// The folders in `urls`, when every one is a local folder opened with
@@ -580,11 +590,13 @@ fn finder_folder_targets(bundle_id: Option<&str>, urls: &[String]) -> Vec<Folder
     let mut targets = Vec::new();
     for url in urls {
         let path = std::path::Path::new(url);
-        let Some(name) = path.file_name().filter(|_| path.is_dir()) else {
+        if !path.is_dir() {
             return Vec::new();
-        };
+        }
         targets.push(FolderTarget {
-            title: name.to_string_lossy().into_owned(),
+            title: path
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned()),
         });
     }
     targets
@@ -608,7 +620,10 @@ fn match_folder_windows(
     let mut found = Vec::new();
     let mut ready = true;
     for target in targets {
-        match fresh.iter().position(|w| w.title == target.title) {
+        match fresh
+            .iter()
+            .position(|w| target.title.as_deref() == Some(w.title.as_str()))
+        {
             Some(at) => found.push(fresh.remove(at)),
             None => ready = false,
         }
@@ -616,6 +631,10 @@ fn match_folder_windows(
     rank_launch_windows(&mut found);
     (found, ready)
 }
+
+/// Held by a launch with `urls` from Finder's window snapshot until its
+/// folder windows are matched.
+static FINDER_FOLDER_LAUNCH: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// How long the Finder folder windows get to appear.
 const FOLDER_WINDOW_WAIT: std::time::Duration = std::time::Duration::from_secs(3);
@@ -872,7 +891,7 @@ mod tests {
 
         let targets = finder_folder_targets(Some("com.apple.finder"), &[url(&b)]);
         assert_eq!(targets.len(), 1);
-        assert_eq!(targets[0].title, "reports");
+        assert_eq!(targets[0].title.as_deref(), Some("reports"));
         // Not Finder, or not a folder: the app's windows are reported as before.
         assert!(finder_folder_targets(Some("com.apple.TextEdit"), &[url(&b)]).is_empty());
         assert!(finder_folder_targets(
@@ -909,6 +928,18 @@ mod tests {
         );
         assert_eq!(ids(&found), vec![3]);
         assert!(ready);
+
+        // The root folder has no name to find its window by: a Finder
+        // request all the same, never ready from some other window.
+        let root = finder_folder_targets(Some("com.apple.finder"), &["/".to_owned()]);
+        assert_eq!(root.len(), 1);
+        let (found, ready) = match_folder_windows(
+            &root,
+            vec![window(5, "Macintosh HD", 900.0, 500.0)],
+            &before,
+        );
+        assert!(ids(&found).is_empty());
+        assert!(!ready);
 
         // Several folders: one new window per folder, and ready only when
         // every folder has one. One window never stands for two folders.
