@@ -194,6 +194,9 @@ impl Tool for RunScriptTool {
                 With `app_scope` ({apps, delivery?}) the driver also refuses every call outside \
                 those apps' windows (error.code outside_scope) or needing the foreground \
                 (foreground_not_allowed); nothing is sent for it.\n\n\
+                `verify:\"checkpoint\"` makes actions return as soon as their input is \
+                delivered (no per-action window-change wait); check with app.waitFor / \
+                app.verify / getState where it matters.\n\n\
                 Limits: `timeout_ms` wall time (default 30000, max 120000), `max_calls` driver \
                 calls (default 100, max 500), 32 MiB heap. Returns the return value, console \
                 output, and a per-call log (each call's tool, target pid/window_id, and the \
@@ -226,6 +229,11 @@ impl Tool for RunScriptTool {
                         "minimum": 1,
                         "maximum": MAX_MAX_CALLS,
                         "description": "Most driver calls the script may make. Default 100."
+                    },
+                    "verify": {
+                        "type": "string",
+                        "enum": ["each", "checkpoint"],
+                        "description": "\"each\" (default): every action waits for its window-change report, as a direct call does. \"checkpoint\": actions return as soon as their input is delivered (on macOS this skips about 100 ms of report wait per action; Linux and Windows do not wait anyway), and the script checks the result where it matters with app.waitFor, app.verify or getState. A window an action opens is still reported on the next action's result. An action that sets its own post_action_wait keeps it."
                     },
                     "app_scope": crate::batch_scope::input_schema()
                 },
@@ -267,6 +275,9 @@ struct Request {
     max_calls: u32,
     session: Option<String>,
     scope: Option<Arc<crate::batch_scope::BatchScope>>,
+    /// Actions skip their post-action report wait; the script verifies at
+    /// its own checkpoints.
+    checkpoint: bool,
 }
 
 impl Request {
@@ -276,7 +287,7 @@ impl Request {
             !key.starts_with('_')
                 && !matches!(
                     key.as_str(),
-                    "script" | "timeout_ms" | "max_calls" | "session" | "app_scope"
+                    "script" | "timeout_ms" | "max_calls" | "session" | "app_scope" | "verify"
                 )
         }) {
             return Err(format!("unknown field `{key}`"));
@@ -315,6 +326,12 @@ impl Request {
                 .and_then(Value::as_str)
                 .map(str::to_owned),
             scope: crate::batch_scope::BatchScope::parse(object.get("app_scope"))?,
+            checkpoint: match object.get("verify") {
+                None | Some(Value::Null) => false,
+                Some(Value::String(mode)) if mode == "each" => false,
+                Some(Value::String(mode)) if mode == "checkpoint" => true,
+                Some(_) => return Err("`verify` must be \"each\" or \"checkpoint\"".into()),
+            },
         })
     }
 }
@@ -393,6 +410,7 @@ async fn run(registry: &ToolRegistry, request: Request) -> ToolResult {
     }
 
     let mut api = Api::new(registry, request.session.clone(), deadline);
+    api.checkpoint = request.checkpoint;
     let mut log: Vec<CallRecord> = Vec::new();
     let mut scope_stop: Option<ScopeStop> = None;
     let hard_stop = deadline + SHUTDOWN_GRACE;
@@ -527,6 +545,7 @@ async fn run(registry: &ToolRegistry, request: Request) -> ToolResult {
         started.elapsed(),
         request.max_calls,
         request.scope.as_deref(),
+        request.checkpoint,
     )
 }
 
@@ -539,6 +558,8 @@ struct Api<'a> {
     images: Vec<Content>,
     /// The last driver tool the current op ran, for the call log.
     last: Option<CallFacts>,
+    /// `verify: "checkpoint"`: actions skip their post-action report wait.
+    checkpoint: bool,
 }
 
 impl<'a> Api<'a> {
@@ -550,6 +571,7 @@ impl<'a> Api<'a> {
             deadline,
             images: Vec::new(),
             last: None,
+            checkpoint: false,
         }
     }
 
@@ -617,6 +639,16 @@ impl<'a> Api<'a> {
     ) -> Result<Value, HostError> {
         if let Some(session) = &self.session {
             args.insert("session".into(), json!(session));
+        }
+        // Under `verify: "checkpoint"` an action returns once its input is
+        // delivered; the script's own waitFor/verify/getState are the checks.
+        // Only where the platform advertises the argument (macOS).
+        if self.checkpoint
+            && BATCHABLE_TOOLS.contains(&tool)
+            && crate::post_action_wait::accepts(tool)
+        {
+            args.entry(crate::post_action_wait::POST_ACTION_WAIT_ARG)
+                .or_insert_with(|| json!("none"));
         }
         let (pid, window_id) = locate::call_target(&Value::Object(args.clone()));
         let mut facts = CallFacts {
@@ -910,6 +942,7 @@ fn render(
     elapsed: Duration,
     max_calls: u32,
     scope: Option<&crate::batch_scope::BatchScope>,
+    checkpoint: bool,
 ) -> ToolResult {
     let elapsed_ms = elapsed.as_millis() as u64;
     let outcome = outcome.unwrap_or_else(|| engine::Outcome {
@@ -957,6 +990,9 @@ fn render(
     });
     if let Some(scope) = scope {
         structured["app_scope"] = scope.to_json();
+    }
+    if checkpoint {
+        structured["verify"] = json!("checkpoint");
     }
     let is_error = match &outcome.result {
         Ok(value) => {
