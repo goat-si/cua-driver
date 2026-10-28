@@ -10,7 +10,7 @@ monorepo so its relative `include_str!` paths still resolve:
 | `cua/crates/cua-teleport/src/ux/targets.json` | `libs/cua/crates/cua-teleport/src/ux/targets.json` |
 | `images/sandbox-images.json` | `libs/images/sandbox-images.json` |
 
-Source commit: trycua/cua `2d2f99228d4d2508dc6fcc84c176b296e146714a` (tag `cua-driver-rs-v0.37.0`). Files are
+Source commit: trycua/cua `f92b01906fc4f99be4c23cf7dc8282eef4a75b17` (main, 2026-10-28; the libs/cua-driver split is `0c3bebad`). Files are
 byte-identical to that commit except `cua-telemetry/Cargo.toml`, whose `*.workspace = true` fields are
 written out with the values from `libs/cua/Cargo.toml` at the same commit.
 

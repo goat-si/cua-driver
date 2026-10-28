@@ -1,9 +1,9 @@
-# GOAT fork: workspace inheritance from libs/cua/Cargo.toml (trycua/cua 2d2f99228d) written out,
+# GOAT fork: workspace inheritance from libs/cua/Cargo.toml (trycua/cua f92b01906f) written out,
 # because this crate no longer sits in that workspace. Sources are unchanged; see vendor/README.md.
 [package]
 name = "cua-telemetry"
 description = "Anonymous, content-free product telemetry shared by the cua SDK, the `cua` CLI, `cua daemon`, cua-spacesd, the Spaces app and cua-driver: one schema, one install id, one set of switches."
-version = "0.1.0"
+version = "0.9.0"
 edition = "2024"
 # Not the libs/cua workspace's 1.97: cua-driver links this crate, and the
 # driver's Nix package builds with nixpkgs stable's rustc (1.95 in 26.05).
@@ -11,7 +11,6 @@ rust-version = "1.95"
 authors = ["trycua"]
 license = "MIT"
 repository = "https://github.com/trycua/cua"
-publish = false
 
 [features]
 default = ["http"]
