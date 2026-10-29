@@ -246,6 +246,14 @@ const LATE_REPORT_MAX_AGE: Duration = Duration::from_secs(10);
 struct Tail {
     id: u64,
     _lease: Option<SuppressionLease>,
+    /// The tail's own before-state. A next action that supersedes the tail
+    /// before its next read checks the window list against it, so a window
+    /// that opened in between is still reported (see [`superseded_change`]).
+    window_ids: HashSet<u32>,
+    front_pid: Option<i32>,
+    /// The end of the previous action's observation: a tail still present
+    /// after it reports nothing more.
+    deadline: Instant,
 }
 
 static TAIL: Mutex<Option<Tail>> = Mutex::new(None);
@@ -290,6 +298,34 @@ pub fn note_intentional_activation() {
 /// The current intentional-activation epoch.
 pub fn intentional_epoch() -> u64 {
     INTENTIONAL_EPOCH.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// What a superseded tail had not read yet: windows open now that were not
+/// in its before-state, and a frontmost app other than its own. The next
+/// action reports it as the previous action's late change.
+fn superseded_change(
+    tail_windows: &HashSet<u32>,
+    tail_front: Option<i32>,
+    current: &[WindowInfo],
+    current_front: Option<i32>,
+) -> Option<Late> {
+    let (new_windows, _closed) = Snapshot::diff(tail_windows, current);
+    let foreground_changed = matches!(
+        (tail_front, current_front),
+        (Some(before), Some(now)) if before != now
+    );
+    (!new_windows.is_empty() || foreground_changed).then(|| Late {
+        at: Instant::now(),
+        new_windows,
+        foreground_changed,
+    })
+}
+
+/// The before-state of a tail ended at `now` by the next action, when it
+/// was still inside its deadline; an expired tail reports nothing more.
+fn unread_by_tail(tail: Option<Tail>, now: Instant) -> Option<(HashSet<u32>, Option<i32>)> {
+    tail.filter(|tail| now <= tail.deadline)
+        .map(|tail| (tail.window_ids, tail.front_pid))
 }
 
 /// Take a late change recorded by a detached tail, if it is recent.
@@ -376,10 +412,18 @@ impl WindowChangeDetector {
     ) -> Snapshot {
         let _latency = latency::span(latency::Stage::Snapshot);
         // A new action supersedes the previous action's detached observation.
+        // Taken in one step, so the tail cannot record a change after this.
+        let superseded = unread_by_tail(lock(&TAIL).take(), Instant::now());
         end_tail();
-        let window_ids: HashSet<u32> = host_windows().into_iter().map(|w| w.window_id).collect();
+        let current = host_windows();
+        let window_ids: HashSet<u32> = current.iter().map(|w| w.window_id).collect();
         let mut snapshot = Self::capture_from(window_ids, prior_front, suppress_focus, allowed_pid);
-        snapshot.earlier = take_late();
+        // A change the tail recorded, else one it had not read yet.
+        snapshot.earlier = take_late().or_else(|| {
+            superseded.and_then(|(tail_windows, tail_front)| {
+                superseded_change(&tail_windows, tail_front, &current, prior_front)
+            })
+        });
         snapshot
     }
 
@@ -533,6 +577,65 @@ impl Snapshot {
         })
     }
 
+    /// [`detect_async`](Self::detect_async) for an action whose result must
+    /// not wait for a window it did not open (a click): one sample right
+    /// away, a change in it reported; otherwise the result returns at once
+    /// and the whole deadline runs detached, so a window that shows later is
+    /// reported on the next action's result. `post_action_wait: "none"`
+    /// skips even the sample.
+    pub async fn detect_sampled_async(self) -> Changes {
+        let skip = matches!(
+            cua_driver_core::post_action_wait::current(),
+            cua_driver_core::post_action_wait::PostActionWait::None
+        );
+        latency::spawn_blocking(move || {
+            if skip {
+                self.detect_bounded_reporting(
+                    host_observation_bounds(),
+                    Duration::ZERO,
+                    observe_host,
+                )
+            } else {
+                self.detect_bounded_sampled(host_observation_bounds(), observe_host)
+            }
+        })
+        .await
+        .unwrap_or_else(|_| {
+            latency::detector_exit("join_error");
+            Changes::not_polled()
+        })
+    }
+
+    /// One immediate sample against the snapshot, with no sleep: its change,
+    /// or no change with the deadline handed to the detached watch.
+    fn detect_bounded_sampled(
+        mut self,
+        bounds: WindowObservationBounds,
+        mut observe: impl FnMut() -> (Vec<WindowInfo>, Option<i32>) + Send + 'static,
+    ) -> Changes {
+        let _latency = latency::span(latency::Stage::Detector);
+        let earlier = self.earlier.take();
+        if bounds.skips_observation() {
+            latency::detector_exit("skipped");
+            drop(self);
+            return Changes::not_polled().with_earlier(earlier);
+        }
+        let started = Instant::now();
+        let changes = match self.observe_once(&mut observe) {
+            Some(changes) => {
+                latency::detector_exit("change");
+                drop(self);
+                changes
+            }
+            None => {
+                latency::detector_exit("report_window");
+                self.continue_detached(started + bounds.timeout, bounds.poll, observe);
+                Changes::no_change()
+            }
+        };
+        changes.with_earlier(earlier)
+    }
+
     /// One observation against the snapshot: the change it shows, if any.
     fn observe_once(
         &self,
@@ -589,6 +692,9 @@ impl Snapshot {
         *lock(&TAIL) = Some(Tail {
             id,
             _lease: self._lease.take(),
+            window_ids: self.window_ids.clone(),
+            front_pid: self.front_pid,
+            deadline,
         });
         let still_mine = move || lock(&TAIL).as_ref().is_some_and(|tail| tail.id == id);
         let spawned = std::thread::Builder::new()
@@ -600,7 +706,15 @@ impl Snapshot {
                         return;
                     }
                     if let Some(changes) = self.observe_once(&mut observe) {
-                        if !still_mine() {
+                        // Recorded under the tail lock: a next action that
+                        // ended this tail (and reported the change itself)
+                        // never sees a stale record written after it.
+                        let tail = lock(&TAIL);
+                        // A read that returned after the deadline may show a
+                        // later change: it is not the action's.
+                        if !tail.as_ref().is_some_and(|tail| tail.id == id)
+                            || Instant::now() > deadline
+                        {
                             return;
                         }
                         *lock(&LATE) = Some(Late {
@@ -608,6 +722,7 @@ impl Snapshot {
                             new_windows: changes.new_windows,
                             foreground_changed: changes.foreground_changed,
                         });
+                        drop(tail);
                         // Keep the lease until the deadline: the change may be
                         // an activation it is still reverting.
                         break;
@@ -1101,6 +1216,99 @@ mod tests {
                 (vec![win(1, 7, "App", "Main")], Some(7))
             });
         assert!(!changes.needs_restore());
+        assert!(lock(&TAIL).is_none());
+    }
+
+    /// A next action that supersedes a tail before its next read still
+    /// reports what the tail had not read: a window that opened, and another
+    /// frontmost app.
+    #[test]
+    fn a_superseded_tail_still_reports_what_it_had_not_read() {
+        let tail_windows = HashSet::from([1]);
+        let opened = superseded_change(
+            &tail_windows,
+            Some(7),
+            &[win(1, 7, "App", "Main"), win(2, 7, "App", "Save")],
+            Some(7),
+        )
+        .expect("the new window is reported");
+        assert_eq!(opened.new_windows.len(), 1);
+        assert!(!opened.foreground_changed);
+        let fronted =
+            superseded_change(&tail_windows, Some(7), &[win(1, 7, "App", "Main")], Some(8))
+                .expect("the foreground change is reported");
+        assert!(fronted.foreground_changed && fronted.new_windows.is_empty());
+        assert!(
+            superseded_change(&tail_windows, Some(7), &[win(1, 7, "App", "Main")], Some(7))
+                .is_none()
+        );
+    }
+
+    /// A tail superseded after its deadline hands nothing to the next action.
+    #[test]
+    fn only_a_tail_inside_its_deadline_hands_its_before_state_on() {
+        let start = Instant::now();
+        let tail = || Tail {
+            id: 0,
+            _lease: None,
+            window_ids: HashSet::from([1]),
+            front_pid: Some(7),
+            deadline: start + Duration::from_millis(100),
+        };
+        assert_eq!(
+            unread_by_tail(Some(tail()), start + Duration::from_millis(100)),
+            Some((HashSet::from([1]), Some(7)))
+        );
+        assert_eq!(
+            unread_by_tail(Some(tail()), start + Duration::from_millis(101)),
+            None
+        );
+        assert_eq!(unread_by_tail(None, start), None);
+    }
+
+    /// A click's sampled observation reads once, without sleeping first, and
+    /// returns a quiet result at once with the deadline running detached.
+    #[test]
+    fn a_sampled_quiet_observation_reads_once_and_returns_with_a_detached_tail() {
+        let _serial = lock(&TAIL_TEST_LOCK);
+        end_tail();
+        let observations = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = observations.clone();
+        let snap = WindowChangeDetector::capture_from(HashSet::from([1]), Some(7), false, None);
+        // The detached watch sleeps a whole poll (1 s) before its first read,
+        // so every read counted at return is the result's own.
+        let changes = snap.detect_bounded_sampled(
+            observation_bounds_from(Some("2000"), Some("1000")),
+            move || {
+                counter.fetch_add(1, Ordering::SeqCst);
+                (vec![win(1, 7, "App", "Main")], Some(7))
+            },
+        );
+        assert_eq!(observations.load(Ordering::SeqCst), 1);
+        assert!(changes.polled && !changes.deferred);
+        assert!(changes.new_windows.is_empty() && !changes.foreground_changed);
+        assert_eq!(changes.result_suffix(), "");
+        assert!(lock(&TAIL).is_some(), "the deadline runs detached");
+        end_tail();
+    }
+
+    /// A window already listed at the sample is reported on this result,
+    /// with no tail left behind.
+    #[test]
+    fn a_sampled_observation_reports_a_window_seen_in_its_sample() {
+        let _serial = lock(&TAIL_TEST_LOCK);
+        end_tail();
+        let snap = WindowChangeDetector::capture_from(HashSet::from([1]), Some(7), false, None);
+        let changes = snap.detect_bounded_sampled(
+            observation_bounds_from(Some("2000"), Some("1000")),
+            || {
+                (
+                    vec![win(1, 7, "App", "Main"), win(2, 7, "App", "Save")],
+                    Some(7),
+                )
+            },
+        );
+        assert_eq!(changes.new_windows.len(), 1);
         assert!(lock(&TAIL).is_none());
     }
 
