@@ -280,13 +280,24 @@ pub fn run_pasteboard_transaction<B: PasteboardBackend>(
     if let Err(err) = trigger_paste() {
         let clipboard_restored = backend.change_count() != written_count
             || restore_pasteboard_snapshot(backend, &snapshot).is_ok();
+        // changeCount differing means another writer changed the clipboard:
+        // restoration was SKIPPED, not "restored". Distinguish that from a
+        // successful restore and from a failed one.
+        let concurrent_change = backend.change_count() != written_count;
         if let Some(abort) = err.downcast_ref::<PasteSequenceAbort>() {
             // A pre-dispatch abort keeps its typed reason AND the
             // restoration outcome instead of becoming PasteMayHaveLanded.
             return Err(PasteSequenceAbort {
                 posted: abort.posted,
                 reason: abort.reason.clone(),
-                clipboard_restored,
+                clipboard_restored: if concurrent_change {
+                    PasteRestoration::SkippedConcurrentChange
+                } else {
+                    match restore_pasteboard_snapshot(backend, &snapshot) {
+                        Ok(()) => PasteRestoration::Restored,
+                        Err(_) => PasteRestoration::Failed,
+                    }
+                },
             }
             .into());
         }
@@ -821,11 +832,32 @@ pub struct DesktopSequenceAbort {
 }
 
 /// A pre-dispatch paste abort with the clipboard restoration outcome.
+/// What happened to the user's pasteboard after a paste abort.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PasteRestoration {
+    Unknown,
+    Restored,
+    SkippedConcurrentChange,
+    Failed,
+}
+
+impl std::fmt::Display for PasteRestoration {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let text = match self {
+            PasteRestoration::Unknown => "unknown",
+            PasteRestoration::Restored => "restored",
+            PasteRestoration::SkippedConcurrentChange => "restoration skipped (concurrent change)",
+            PasteRestoration::Failed => "restoration failed",
+        };
+        f.write_str(text)
+    }
+}
+
 #[derive(Debug)]
 pub struct PasteSequenceAbort {
     pub posted: usize,
     pub reason: String,
-    pub clipboard_restored: bool,
+    pub clipboard_restored: PasteRestoration,
 }
 
 impl std::fmt::Display for PasteSequenceAbort {
@@ -898,7 +930,7 @@ pub fn type_text_global_with_guard(
                         posted: posted.load(std::sync::atomic::Ordering::SeqCst),
                         reason: "not_editable: the frontmost application or its focus changed                                  before the paste went out"
                             .into(),
-                        clipboard_restored: false,
+                        clipboard_restored: PasteRestoration::Unknown,
                     }));
                 }
                 press_key_global("v", &["cmd"])

@@ -482,6 +482,7 @@ unsafe fn owning_window_id_with_deadline(
             if std::time::Instant::now() >= deadline {
                 None
             } else {
+                let _ = AXUIElementSetMessagingTimeout(element.as_ptr() as AXUIElementRef, 0.5);
                 copy_string_attr(element.as_ptr() as AXUIElementRef, "AXRole")
             }
         },

@@ -161,7 +161,7 @@ impl Tool for TypeTextTool {
             let early_front_pid = crate::apps::frontmost_pid();
             let initial_focus = early_front_pid
                 .and_then(|pid| unsafe { crate::ax::bindings::focused_element_of_pid(pid) })
-                .map(|ptr| ptr as usize);
+                .map(|ptr| unsafe { crate::ax::snapshot::RetainedElement::retain(ptr as usize) });
             match early_front_pid {
                 Some(front_pid) => {
                     if let Some(refusal) =
@@ -197,8 +197,12 @@ impl Tool for TypeTextTool {
                             }
                             && crate::apps::frontmost_pid() == Some(checked_pid)
                             && initial_focus
-                                .map(|ptr| {
-                                    crate::input::ax_actions::is_element_focused(checked_pid, ptr)
+                                .as_ref()
+                                .map(|el| {
+                                    crate::input::ax_actions::is_element_focused(
+                                        checked_pid,
+                                        el.as_ptr(),
+                                    )
                                 })
                                 .unwrap_or(false)
                             && crate::apps::frontmost_pid() == Some(checked_pid)
@@ -211,7 +215,14 @@ impl Tool for TypeTextTool {
                 if let Some(abort) =
                     error.downcast_ref::<crate::input::keyboard::PasteSequenceAbort>()
                 {
-                    let restored = abort.clipboard_restored;
+                    let restored = match abort.clipboard_restored {
+                        crate::input::keyboard::PasteRestoration::Unknown => "unknown",
+                        crate::input::keyboard::PasteRestoration::Restored => "restored",
+                        crate::input::keyboard::PasteRestoration::SkippedConcurrentChange => {
+                            "restoration skipped (concurrent change)"
+                        }
+                        crate::input::keyboard::PasteRestoration::Failed => "restoration failed",
+                    };
                     let count = abort.posted;
                     return ToolResult::text(format!(
                         "Desktop typing stopped before the paste went out: {}. At least {}                          character(s) were sent earlier (clipboard_restored={}). Read fresh                          state before retrying.",
