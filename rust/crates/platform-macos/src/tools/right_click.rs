@@ -1,15 +1,29 @@
 use crate::goat::action_latency as latency;
 
 use async_trait::async_trait;
+use core_foundation::{
+    base::{CFEqual, CFGetTypeID, CFRelease, CFTypeRef, TCFType},
+    string::CFString,
+};
 use cua_driver_core::{
+    action_record::{
+        ActionEffect, ActionEvidence, ActionExecutionRecord, ActionTransport, ActualDelivery,
+        EvidenceKind, RequestedDelivery,
+    },
     protocol::ToolResult,
     tool::{Tool, ToolDef},
 };
 use serde_json::Value;
-use std::sync::Arc;
+use std::{
+    collections::HashSet,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use crate::ax::bindings::{
-    copy_action_names, copy_string_attr, kAXErrorSuccess, perform_action, AXUIElementRef,
+    ax_get_window_id, copy_action_names, copy_children_checked, copy_element_attr,
+    copy_string_attr, kAXErrorSuccess, perform_action, AXUIElementCopyAttributeValue,
+    AXUIElementCreateApplication, AXUIElementRef, AXUIElementSetMessagingTimeout,
 };
 
 use super::ToolState;
@@ -154,16 +168,38 @@ impl RightClickTool {
 
             // The context menu steals key focus from the user's app when the
             // target is in the background; the guard hands it back.
-            let result = latency::spawn_blocking(move || {
+            let result = latency::spawn_blocking(move || -> anyhow::Result<_> {
                 let _key_focus = crate::key_focus_guard::protect(pid);
                 let _action = latency::span(latency::Stage::ActionBlocking);
-                ax_show_menu(element_guard.as_ptr(), idx, pid, wid)
+                let element_ptr = element_guard.as_ptr();
+                let before = MenuSnapshot::read(pid, Some(element_ptr), Some(wid));
+                let action = move |dispatch| {
+                    let element = element_ptr as AXUIElementRef;
+                    unsafe {
+                        AXUIElementSetMessagingTimeout(element, 0.25);
+                    }
+                    let result = ax_show_menu(element_ptr, idx, pid, wid, dispatch);
+                    unsafe {
+                        AXUIElementSetMessagingTimeout(element, 0.0);
+                    }
+                    result
+                };
+                let (result, menu) = observe_right_click_action(before, action, || {
+                    MenuSnapshot::read(pid, Some(element_ptr), Some(wid))
+                });
+                let result =
+                    result.map_err(|_| anyhow::anyhow!("right-click action thread panicked"))?;
+                result.map(|delivery| (delivery, menu))
             })
             .await;
 
             return match result {
-                Ok(Ok(ElementRightClick::Ax(msg))) => ax_right_click_result(&msg),
-                Ok(Ok(ElementRightClick::Pixel(msg))) => ToolResult::text(msg),
+                Ok(Ok((ElementRightClick::Ax(msg), menu))) => {
+                    right_click_result(&msg, "ax", menu, false)
+                }
+                Ok(Ok((ElementRightClick::Pixel(msg), menu))) => {
+                    right_click_result(&msg, "cgevent", menu, false)
+                }
                 Ok(Err(e)) => ToolResult::error(format!("Right-click failed: {e}")),
                 Err(e) => ToolResult::error(format!("Task error: {e}")),
             };
@@ -275,48 +311,57 @@ impl RightClickTool {
             Ok(guard) => guard,
             Err(refusal) => return refusal,
         };
-        let result = latency::spawn_blocking(move || -> anyhow::Result<()> {
+        let result = latency::spawn_blocking(move || -> anyhow::Result<_> {
             let _key_focus = (!fg)
                 .then(|| crate::key_focus_guard::protect(pid))
                 .flatten();
             let _action = latency::span(latency::Stage::ActionBlocking);
-            let do_it = move || -> anyhow::Result<()> {
-                super::window_points::check_guard(&dispatch_guard)?;
-                let m: Vec<&str> = modifiers.iter().map(String::as_str).collect();
-                if route == super::pixel_route::PixelClickRoute::ForegroundHid {
-                    // Warp the hardware pointer and post at the HID tap; see
-                    // `pixel_route` for the cross-platform foreground contract.
-                    return crate::input::mouse::click_at_xy_desktop_with_modifiers(
-                        screen_x, screen_y, 1, "right", &m,
-                    );
-                }
-                if let Some(wid) = window_id {
-                    crate::input::mouse::right_click_at_xy_with_window_local(
-                        pid,
-                        screen_x,
-                        screen_y,
-                        win_local_x,
-                        win_local_y,
-                        wid,
-                        &m,
-                    )
-                } else {
-                    crate::input::mouse::right_click_at_xy(pid, screen_x, screen_y, &m)
-                }
-            };
+            let do_it =
+                move |dispatch: std::sync::mpsc::Sender<ActionEvent>| -> anyhow::Result<()> {
+                    super::window_points::check_guard(&dispatch_guard)?;
+                    let m: Vec<&str> = modifiers.iter().map(String::as_str).collect();
+                    let result = if route == super::pixel_route::PixelClickRoute::ForegroundHid {
+                        // Warp the hardware pointer and post at the HID tap; see
+                        // `pixel_route` for the cross-platform foreground contract.
+                        crate::input::mouse::click_at_xy_desktop_with_modifiers(
+                            screen_x, screen_y, 1, "right", &m,
+                        )
+                    } else if let Some(wid) = window_id {
+                        crate::input::mouse::right_click_at_xy_with_window_local(
+                            pid,
+                            screen_x,
+                            screen_y,
+                            win_local_x,
+                            win_local_y,
+                            wid,
+                            &m,
+                        )
+                    } else {
+                        crate::input::mouse::right_click_at_xy(pid, screen_x, screen_y, &m)
+                    };
+                    let _ = dispatch.send(ActionEvent::Sent(Instant::now()));
+                    result
+                };
             // Foreground rung: front the exact window → HID right-click →
             // restore the prior frontmost. No input is sent unless the exact
             // window is proven focused.
-            match (route, window_id) {
+            let before = MenuSnapshot::read(pid, None, window_id);
+            let action = move |dispatch| match (route, window_id) {
                 (super::pixel_route::PixelClickRoute::ForegroundHid, Some(wid)) => {
                     crate::input::skylight::with_foreground_hid_activation(
                         pid as libc::pid_t,
                         wid,
-                        do_it,
+                        || do_it(dispatch),
                     )
                 }
-                _ => do_it(),
-            }
+                _ => do_it(dispatch),
+            };
+            let (result, menu) = observe_right_click_action(before, action, || {
+                MenuSnapshot::read(pid, None, window_id)
+            });
+            let result =
+                result.map_err(|_| anyhow::anyhow!("right-click action thread panicked"))?;
+            result.map(|()| ((), menu))
         })
         .await;
         if let Ok(Err(error)) = &result {
@@ -325,13 +370,15 @@ impl RightClickTool {
             }
         }
         match result {
-            Ok(Ok(())) => ToolResult::text(format!(
-                "Right-clicked{mod_suffix} at ({screen_x:.1}, {screen_y:.1}) ({}).",
-                super::pixel_route::delivery_note(route)
-            ))
-            .with_structured(serde_json::json!({
-                "path": super::pixel_route::path_label(route), "verified": false, "effect": "unverifiable"
-            })),
+            Ok(Ok(((), menu))) => right_click_result(
+                &format!(
+                    "Right-clicked{mod_suffix} at ({screen_x:.1}, {screen_y:.1}) ({}).",
+                    super::pixel_route::delivery_note(route)
+                ),
+                super::pixel_route::path_label(route),
+                menu,
+                fg,
+            ),
             Ok(Err(e)) if route == super::pixel_route::PixelClickRoute::ForegroundHid => {
                 super::pixel_route::foreground_unavailable(
                     "Right-click",
@@ -340,7 +387,7 @@ impl RightClickTool {
                 )
             }
             Ok(Err(e)) => ToolResult::error(format!("Right-click failed: {e}")),
-            Err(e)     => ToolResult::error(format!("Task error: {e}")),
+            Err(e) => ToolResult::error(format!("Task error: {e}")),
         }
     }
 }
@@ -356,10 +403,455 @@ enum ElementRightClick {
     Pixel(String),
 }
 
-/// A right-click delivered as AXShowMenu. Nothing reads back the menu.
-fn ax_right_click_result(message: &str) -> ToolResult {
-    ToolResult::text(message)
-        .with_structured(serde_json::json!({ "path": "ax", "effect": "unverifiable" }))
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MenuEvidence {
+    None,
+    Accessibility,
+    Window,
+}
+
+#[derive(Debug)]
+struct RetainedAxElement(usize);
+
+impl Drop for RetainedAxElement {
+    fn drop(&mut self) {
+        unsafe { CFRelease(self.0 as CFTypeRef) }
+    }
+}
+
+#[derive(Debug)]
+struct MenuSnapshot {
+    window_ids: Option<HashSet<u32>>,
+    ax_menus: Option<Vec<RetainedAxElement>>,
+}
+
+impl MenuSnapshot {
+    fn read(pid: i32, target: Option<usize>, window_id: Option<u32>) -> Self {
+        Self {
+            window_ids: menu_window_ids(pid),
+            ax_menus: unsafe { ax_menus(pid, target, window_id) },
+        }
+    }
+}
+
+unsafe fn collect_direct_menus(root: AXUIElementRef, menus: &mut Vec<RetainedAxElement>) -> bool {
+    let Some(children) = copy_children_checked(root) else {
+        return false;
+    };
+    let mut menu_flags = Vec::with_capacity(children.len());
+    for &child in &children {
+        match is_ax_menu(child) {
+            Some(is_menu) => menu_flags.push(is_menu),
+            None => {
+                for child in &children {
+                    CFRelease(*child as CFTypeRef);
+                }
+                return false;
+            }
+        }
+    }
+    for (child, is_menu) in children.into_iter().zip(menu_flags) {
+        if is_menu {
+            let duplicate = menus
+                .iter()
+                .any(|existing| CFEqual(existing.0 as CFTypeRef, child as CFTypeRef) != 0);
+            if duplicate {
+                CFRelease(child as CFTypeRef);
+            } else {
+                menus.push(RetainedAxElement(child as usize));
+            }
+        } else {
+            CFRelease(child as CFTypeRef);
+        }
+    }
+    true
+}
+
+unsafe fn is_ax_menu(element: AXUIElementRef) -> Option<bool> {
+    let attr = CFString::new("AXRole");
+    let mut value: CFTypeRef = std::ptr::null();
+    let error = AXUIElementCopyAttributeValue(element, attr.as_concrete_TypeRef(), &mut value);
+    if error != kAXErrorSuccess || value.is_null() {
+        if !value.is_null() {
+            CFRelease(value);
+        }
+        return None;
+    }
+    if CFGetTypeID(value) != CFString::type_id() {
+        CFRelease(value);
+        return None;
+    }
+    let role = CFString::wrap_under_create_rule(value as _).to_string();
+    Some(role == "AXMenu")
+}
+
+unsafe fn window_child(app: AXUIElementRef, window_id: u32) -> Option<RetainedAxElement> {
+    let children = copy_children_checked(app)?;
+    let mut found = None;
+    for child in children {
+        if found.is_none() && ax_get_window_id(child) == Some(window_id) {
+            found = Some(RetainedAxElement(child as usize));
+        } else {
+            CFRelease(child as CFTypeRef);
+        }
+    }
+    found
+}
+
+unsafe fn ax_menus(
+    pid: i32,
+    target: Option<usize>,
+    window_id: Option<u32>,
+) -> Option<Vec<RetainedAxElement>> {
+    let app = AXUIElementCreateApplication(pid);
+    if app.is_null() {
+        return None;
+    }
+    let app = RetainedAxElement(app as usize);
+    let window = if let Some(target) = target.filter(|_| window_id.is_some()) {
+        let window = copy_element_attr(target as AXUIElementRef, "AXWindow")?;
+        Some(RetainedAxElement(window as usize))
+    } else if let Some(window_id) = window_id {
+        Some(window_child(app.0 as AXUIElementRef, window_id)?)
+    } else {
+        None
+    };
+    let mut menus = Vec::new();
+    if !collect_direct_menus(app.0 as AXUIElementRef, &mut menus) {
+        return None;
+    }
+    if let Some(target) = target {
+        if !collect_direct_menus(target as AXUIElementRef, &mut menus) {
+            return None;
+        }
+    }
+    if let Some(window) = window {
+        if !collect_direct_menus(window.0 as AXUIElementRef, &mut menus) {
+            return None;
+        }
+    }
+    Some(menus)
+}
+
+#[link(name = "CoreGraphics", kind = "framework")]
+extern "C" {
+    #[link_name = "CGWindowListCopyWindowInfo"]
+    fn cg_window_list_copy_window_info(
+        option: u32,
+        relative_to_window: u32,
+    ) -> core_foundation::array::CFArrayRef;
+}
+
+fn menu_window_ids(pid: i32) -> Option<HashSet<u32>> {
+    use core_foundation::{
+        array::CFArray,
+        base::{CFGetTypeID, CFTypeRef, TCFType},
+        dictionary::CFDictionary,
+        number::CFNumber,
+        string::CFString,
+    };
+    use std::ffi::c_void;
+
+    // Exclude desktop elements but retain off-screen and other-Space windows so
+    // re-exposing an existing menu cannot masquerade as a new window ID.
+    let raw = unsafe { cg_window_list_copy_window_info(16, 0) };
+    if raw.is_null() {
+        return None;
+    }
+    let windows: CFArray<CFTypeRef> = unsafe { CFArray::wrap_under_create_rule(raw as _) };
+    let mut ids = HashSet::new();
+    for item in windows.iter() {
+        let item = *item;
+        let dictionary_type = CFDictionary::<*const c_void, *const c_void>::type_id();
+        if unsafe { CFGetTypeID(item) } != dictionary_type {
+            return None;
+        }
+        let dictionary: CFDictionary<*const c_void, *const c_void> =
+            unsafe { CFDictionary::wrap_under_get_rule(item as _) };
+        let number = |key: &str| -> Option<i64> {
+            let key = CFString::new(key);
+            let value = *dictionary.find(key.as_concrete_TypeRef() as *const c_void)?;
+            unsafe {
+                (CFGetTypeID(value) == CFNumber::type_id())
+                    .then(|| CFNumber::wrap_under_get_rule(value as _).to_i64())
+                    .flatten()
+            }
+        };
+        let owner = number("kCGWindowOwnerPID")?;
+        if owner != i64::from(pid) {
+            continue;
+        }
+        let layer = number("kCGWindowLayer")?;
+        let id = number("kCGWindowNumber")?;
+        if layer == 101 {
+            ids.insert(u32::try_from(id).ok()?);
+        }
+    }
+    Some(ids)
+}
+
+unsafe fn menu_item_titles(menu: AXUIElementRef) -> Vec<String> {
+    let Some(children) = copy_children_checked(menu) else {
+        return Vec::new();
+    };
+    let mut titles = Vec::new();
+    for child in children {
+        if copy_string_attr(child, "AXRole").as_deref() == Some("AXMenuItem") {
+            if let Some(title) =
+                copy_string_attr(child, "AXTitle").filter(|title| !title.trim().is_empty())
+            {
+                titles.push(title);
+            }
+        }
+        CFRelease(child as CFTypeRef);
+    }
+    cap_menu_titles(titles)
+}
+
+fn cap_menu_titles(titles: impl IntoIterator<Item = String>) -> Vec<String> {
+    titles
+        .into_iter()
+        .filter(|title| !title.trim().is_empty())
+        .take(10)
+        .collect()
+}
+
+#[cfg(test)]
+fn has_new_by<T>(before: &[T], after: &[T], equal: impl Fn(&T, &T) -> bool) -> Option<usize> {
+    after
+        .iter()
+        .position(|candidate| !before.iter().any(|old| equal(old, candidate)))
+}
+
+#[cfg(test)]
+fn new_menu_observation(before: &MenuSnapshot, after: &MenuSnapshot) -> Option<MenuObservation> {
+    if let (Some(before_menus), Some(after_menus)) = (&before.ax_menus, &after.ax_menus) {
+        if let Some(index) = has_new_by(before_menus, after_menus, |old, menu| unsafe {
+            CFEqual(old.0 as CFTypeRef, menu.0 as CFTypeRef) != 0
+        }) {
+            let menu = &after_menus[index];
+            return Some(MenuObservation {
+                opened: true,
+                items: unsafe { menu_item_titles(menu.0 as AXUIElementRef) },
+                evidence: MenuEvidence::Accessibility,
+            });
+        }
+    }
+    if let (Some(before_ids), Some(after_ids)) = (&before.window_ids, &after.window_ids) {
+        if after_ids.difference(before_ids).next().is_some() {
+            return Some(MenuObservation {
+                opened: true,
+                items: Vec::new(),
+                evidence: MenuEvidence::Window,
+            });
+        }
+    }
+    None
+}
+
+fn new_menu_observation_between(
+    before: &MenuSnapshot,
+    sent: &MenuSnapshot,
+    after: &MenuSnapshot,
+) -> Option<MenuObservation> {
+    if let (Some(before_menus), Some(sent_menus), Some(after_menus)) =
+        (&before.ax_menus, &sent.ax_menus, &after.ax_menus)
+    {
+        for candidate in after_menus {
+            let absent = |menus: &Vec<RetainedAxElement>| {
+                !menus.iter().any(|old| unsafe {
+                    CFEqual(old.0 as CFTypeRef, candidate.0 as CFTypeRef) != 0
+                })
+            };
+            if absent(before_menus) && absent(sent_menus) {
+                return Some(MenuObservation {
+                    opened: true,
+                    items: unsafe { menu_item_titles(candidate.0 as AXUIElementRef) },
+                    evidence: MenuEvidence::Accessibility,
+                });
+            }
+        }
+    }
+    if let (Some(before_ids), Some(sent_ids), Some(after_ids)) =
+        (&before.window_ids, &sent.window_ids, &after.window_ids)
+    {
+        if after_ids
+            .difference(before_ids)
+            .any(|candidate| !sent_ids.contains(candidate))
+        {
+            return Some(MenuObservation {
+                opened: true,
+                items: Vec::new(),
+                evidence: MenuEvidence::Window,
+            });
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+fn poll_until<T>(
+    timeout: Duration,
+    interval: Duration,
+    mut now: impl FnMut() -> Instant,
+    sleep: impl FnMut(Duration),
+    read: impl FnMut() -> Option<T>,
+) -> Option<T> {
+    let deadline = now() + timeout;
+    poll_until_deadline(deadline, interval, now, sleep, read)
+}
+
+fn poll_until_deadline<T>(
+    deadline: Instant,
+    interval: Duration,
+    mut now: impl FnMut() -> Instant,
+    mut sleep: impl FnMut(Duration),
+    mut read: impl FnMut() -> Option<T>,
+) -> Option<T> {
+    loop {
+        let observed = read();
+        let current = now();
+        if current > deadline {
+            return None;
+        }
+        if let Some(observed) = observed {
+            return Some(observed);
+        }
+        let remaining = deadline.saturating_duration_since(current);
+        if remaining.is_zero() {
+            return None;
+        }
+        sleep(interval.min(remaining));
+    }
+}
+
+enum ActionEvent {
+    Sent(Instant),
+    Done,
+}
+
+fn observe_right_click_action<T: Send + 'static>(
+    before: MenuSnapshot,
+    action: impl FnOnce(std::sync::mpsc::Sender<ActionEvent>) -> T + Send + 'static,
+    mut read: impl FnMut() -> MenuSnapshot,
+) -> (std::thread::Result<T>, MenuObservation) {
+    let (event_tx, event_rx) = std::sync::mpsc::channel();
+    let action_tx = event_tx.clone();
+    let handle = std::thread::spawn(move || {
+        let result = action(action_tx);
+        let _ = event_tx.send(ActionEvent::Done);
+        result
+    });
+    let sent_at = match event_rx.recv() {
+        Ok(ActionEvent::Sent(sent_at)) => sent_at,
+        Ok(ActionEvent::Done) | Err(_) => {
+            let result = handle.join();
+            return (result, MenuObservation::none());
+        }
+    };
+    let sent_baseline = read();
+    let deadline = sent_at + Duration::from_millis(150);
+    let observation = poll_until_deadline(
+        deadline,
+        Duration::from_millis(15),
+        Instant::now,
+        std::thread::sleep,
+        || {
+            let after = read();
+            new_menu_observation_between(&before, &sent_baseline, &after)
+        },
+    )
+    .unwrap_or_else(MenuObservation::none);
+    let result = handle.join();
+    (result, observation)
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct MenuObservation {
+    opened: bool,
+    items: Vec<String>,
+    evidence: MenuEvidence,
+}
+
+impl MenuObservation {
+    fn none() -> Self {
+        Self {
+            opened: false,
+            items: Vec::new(),
+            evidence: MenuEvidence::None,
+        }
+    }
+}
+
+fn right_click_result(
+    message: &str,
+    path: &str,
+    menu: MenuObservation,
+    foreground: bool,
+) -> ToolResult {
+    let confirmed = menu.opened && menu.evidence != MenuEvidence::None;
+    let mut text = message.to_owned();
+    if confirmed {
+        text.push_str(" Context menu opened");
+        if !menu.items.is_empty() {
+            text.push_str(&format!(": {}", menu.items.join(", ")));
+        }
+        text.push('.');
+    }
+    let structured = serde_json::json!({
+        "path": path,
+        "verified": confirmed,
+        "effect": if confirmed { "confirmed" } else { "unverifiable" },
+        "menu_opened": confirmed,
+        "menu_items": confirmed.then(|| menu.items.clone()),
+    });
+    let (transport, requested, actual) = if path == "ax" {
+        (
+            ActionTransport::MacosAxAction,
+            RequestedDelivery::Background,
+            ActualDelivery::Background,
+        )
+    } else if foreground {
+        (
+            ActionTransport::MacosCgEventHid,
+            RequestedDelivery::Foreground,
+            ActualDelivery::Foreground,
+        )
+    } else {
+        (
+            ActionTransport::MacosCgEventPid,
+            RequestedDelivery::Background,
+            ActualDelivery::Background,
+        )
+    };
+    let evidence_kind = match menu.evidence {
+        MenuEvidence::Accessibility if confirmed => EvidenceKind::AccessibilityReadback,
+        MenuEvidence::Window if confirmed => EvidenceKind::WindowChange,
+        _ => EvidenceKind::NativeApiResult,
+    };
+    let record = ActionExecutionRecord::builder(
+        if confirmed {
+            ActionEffect::Confirmed
+        } else {
+            ActionEffect::Unverifiable
+        },
+        transport,
+        requested,
+    )
+    .actual_delivery(actual)
+    .evidence(ActionEvidence {
+        kind: evidence_kind,
+        detail: if confirmed {
+            "A new context menu was observed after the right-click".into()
+        } else {
+            "Right-click delivery completed without a new menu readback".into()
+        },
+    })
+    .build()
+    .expect("right-click record has valid evidence and delivery");
+    ToolResult::text(text)
+        .with_structured(structured)
+        .with_action_record(record)
 }
 
 /// AXShowMenu when the element advertises it, else a pixel right-click.
@@ -371,16 +863,19 @@ fn right_click_element(
     label: &str,
     advertises_show_menu: bool,
     show_menu: impl FnOnce() -> crate::ax::bindings::AXError,
+    ax_delivered: impl FnOnce(),
     pixel: impl FnOnce() -> anyhow::Result<String>,
 ) -> anyhow::Result<ElementRightClick> {
     if advertises_show_menu {
         let err = show_menu();
         if err == kAXErrorSuccess {
+            ax_delivered();
             return Ok(ElementRightClick::Ax(format!(
                 "Shown menu for {label} (AXShowMenu)."
             )));
         }
         if !super::click::perform_error_proves_nothing_was_sent(err) {
+            ax_delivered();
             return Ok(ElementRightClick::Ax(format!(
                 "⚠️ Sent AXShowMenu to {label}, but the app returned AX error {err}, which does \
                  not mean it failed: the menu may be open. Read the window before repeating it."
@@ -396,6 +891,7 @@ fn ax_show_menu(
     idx: usize,
     pid: i32,
     wid: u32,
+    dispatch: std::sync::mpsc::Sender<ActionEvent>,
 ) -> anyhow::Result<ElementRightClick> {
     let element = element_ptr as AXUIElementRef;
 
@@ -413,11 +909,19 @@ fn ax_show_menu(
     // a user performs, delivered to backgrounded windows via the window-local
     // primitive. This makes "right-click element N" land on any element, not
     // just ones with a native context-menu AX action.
+    let ax_dispatch = dispatch.clone();
     right_click_element(
         &format!("[{idx}] {role} \"{title}\""),
         advertised.iter().any(|a| a == "AXShowMenu"),
         || unsafe { perform_action(element, "AXShowMenu") },
-        || pixel_right_click(element, idx, &role, &title, pid, wid),
+        || {
+            let _ = ax_dispatch.send(ActionEvent::Sent(Instant::now()));
+        },
+        || {
+            let result = pixel_right_click(element, idx, &role, &title, pid, wid);
+            let _ = dispatch.send(ActionEvent::Sent(Instant::now()));
+            result
+        },
     )
 }
 
@@ -461,6 +965,7 @@ mod tests {
                 "[4] AXRow \"a\"",
                 true,
                 || err,
+                || {},
                 || panic!("pixel right-click on top of a menu that may be open"),
             )
             .expect("reported, not failed");
@@ -472,10 +977,12 @@ mod tests {
         // Proven unsent, or not advertised: one pixel right-click.
         for (advertised, err) in [(true, kAXErrorIllegalArgument), (false, kAXErrorSuccess)] {
             let pixels = std::cell::Cell::new(0);
+            let ax_delivered = std::cell::Cell::new(0);
             let outcome = right_click_element(
                 "[4]",
                 advertised,
                 || err,
+                || ax_delivered.set(ax_delivered.get() + 1),
                 || {
                     pixels.set(pixels.get() + 1);
                     Ok("pixel".into())
@@ -484,6 +991,11 @@ mod tests {
             .unwrap();
             assert_eq!(outcome, ElementRightClick::Pixel("pixel".into()));
             assert_eq!(pixels.get(), 1);
+            assert_eq!(
+                ax_delivered.get(),
+                0,
+                "a proven-unsent AX attempt has no sent signal"
+            );
         }
     }
 
@@ -496,7 +1008,12 @@ mod tests {
         }
 
         async fn invoke(&self, _args: Value) -> ToolResult {
-            ax_right_click_result("Shown menu for [4] AXRow \"a\" (AXShowMenu).")
+            right_click_result(
+                "Shown menu for [4] AXRow \"a\" (AXShowMenu).",
+                "ax",
+                MenuObservation::none(),
+                false,
+            )
         }
     }
 
@@ -513,5 +1030,279 @@ mod tests {
         let structured = result.structured_content.expect("published action result");
         assert_eq!(structured["route"], "accessibility", "{structured}");
         assert_eq!(structured["effect"], "unverifiable", "{structured}");
+    }
+
+    struct ConfirmedMenuProbe;
+
+    #[async_trait]
+    impl Tool for ConfirmedMenuProbe {
+        fn def(&self) -> &ToolDef {
+            def()
+        }
+
+        async fn invoke(&self, _args: Value) -> ToolResult {
+            right_click_result(
+                "menu delivered",
+                "ax",
+                MenuObservation {
+                    opened: true,
+                    items: vec!["Copy".into()],
+                    evidence: MenuEvidence::Accessibility,
+                },
+                false,
+            )
+        }
+    }
+
+    #[tokio::test]
+    async fn wave400c_registry_preserves_the_public_menu_readback() {
+        let mut registry = cua_driver_core::tool::ToolRegistry::new();
+        registry.register(Box::new(ConfirmedMenuProbe));
+        let result = registry
+            .invoke(
+                "right_click",
+                serde_json::json!({"pid": 1, "window_id": 2, "element_token": "s1:4"}),
+            )
+            .await;
+        let structured = result.structured_content.expect("public action result");
+        assert_eq!(structured["effect"], "confirmed", "{structured}");
+        assert_eq!(structured["verified"], true, "{structured}");
+        assert_eq!(structured["menu_opened"], true, "{structured}");
+        assert_eq!(structured["menu_items"], serde_json::json!(["Copy"]));
+        cua_driver_contract::validate_success_output("right_click", structured)
+            .expect("typed public output");
+    }
+
+    #[test]
+    fn wave400c_right_click_result_promotes_a_new_menu() {
+        let result = right_click_result(
+            "menu delivered",
+            "ax",
+            MenuObservation {
+                opened: true,
+                items: vec!["Copy".into(), "Paste".into()],
+                evidence: MenuEvidence::Accessibility,
+            },
+            false,
+        );
+        let structured = result.structured_content.unwrap();
+        assert_eq!(structured["effect"], "confirmed");
+        assert_eq!(structured["verified"], true);
+        assert_eq!(structured["menu_opened"], true);
+        assert_eq!(
+            structured["menu_items"],
+            serde_json::json!(["Copy", "Paste"])
+        );
+        assert_eq!(
+            result.action_record.unwrap().evidence[0].kind,
+            EvidenceKind::AccessibilityReadback
+        );
+    }
+
+    #[test]
+    fn wave400c_menu_novelty_rejects_reexposure_and_incomplete_baselines() {
+        assert_eq!(has_new_by(&[1, 2], &[1, 2], |a, b| a == b), None);
+        assert_eq!(has_new_by(&[1, 2], &[1, 2, 3], |a, b| a == b), Some(2));
+
+        let before = MenuSnapshot {
+            window_ids: Some(HashSet::from([7])),
+            ax_menus: None,
+        };
+        let reexposed = MenuSnapshot {
+            window_ids: Some(HashSet::from([7])),
+            ax_menus: None,
+        };
+        assert!(new_menu_observation(&before, &reexposed).is_none());
+        let new_window = MenuSnapshot {
+            window_ids: Some(HashSet::from([7, 8])),
+            ax_menus: None,
+        };
+        assert_eq!(
+            new_menu_observation(&before, &new_window).unwrap().evidence,
+            MenuEvidence::Window
+        );
+        let incomplete = MenuSnapshot {
+            window_ids: None,
+            ax_menus: None,
+        };
+        assert!(new_menu_observation(&incomplete, &new_window).is_none());
+
+        let crossed_after = MenuSnapshot {
+            window_ids: Some(HashSet::from([7, 8])),
+            ax_menus: None,
+        };
+        let other_baseline = MenuSnapshot {
+            window_ids: Some(HashSet::from([8])),
+            ax_menus: None,
+        };
+        assert!(new_menu_observation_between(&before, &other_baseline, &crossed_after).is_none());
+        let common_new = MenuSnapshot {
+            window_ids: Some(HashSet::from([7, 8, 9])),
+            ax_menus: None,
+        };
+        assert!(new_menu_observation_between(&before, &other_baseline, &common_new).is_some());
+    }
+
+    #[test]
+    fn wave400c_menu_titles_are_capped_and_empty_titles_are_dropped() {
+        let titles = (0..12)
+            .map(|index| format!("item {index}"))
+            .chain(["  ".into(), "ignored".into()]);
+        assert_eq!(cap_menu_titles(titles).len(), 10);
+    }
+
+    #[test]
+    fn wave400c_poll_uses_immediate_interval_and_deadline_reads() {
+        use std::{cell::RefCell, rc::Rc};
+        let start = Instant::now();
+        let clock = Rc::new(RefCell::new(start));
+        let sleeps = Rc::new(RefCell::new(Vec::new()));
+        let now_clock = clock.clone();
+        let sleep_clock = clock.clone();
+        let sleep_log = sleeps.clone();
+        let mut reads = 0;
+        let result: Option<()> = poll_until(
+            Duration::from_millis(150),
+            Duration::from_millis(15),
+            move || *now_clock.borrow(),
+            move |duration| {
+                *sleep_clock.borrow_mut() += duration;
+                sleep_log.borrow_mut().push(duration);
+            },
+            || {
+                reads += 1;
+                None
+            },
+        );
+        assert!(result.is_none());
+        assert_eq!(reads, 11);
+        assert_eq!(sleeps.borrow().as_slice(), &[Duration::from_millis(15); 10]);
+
+        let slow_clock = Rc::new(RefCell::new(start));
+        let now_clock = slow_clock.clone();
+        let read_clock = slow_clock.clone();
+        let observed = poll_until(
+            Duration::from_millis(150),
+            Duration::from_millis(15),
+            move || *now_clock.borrow(),
+            |_| {},
+            move || {
+                *read_clock.borrow_mut() += Duration::from_millis(151);
+                Some(())
+            },
+        );
+        assert!(
+            observed.is_none(),
+            "a read completing after the deadline cannot confirm"
+        );
+    }
+
+    #[test]
+    fn wave400c_observation_runs_while_the_action_is_blocked() {
+        let (baseline_tx, baseline_rx) = std::sync::mpsc::channel();
+        let before = MenuSnapshot {
+            window_ids: Some(HashSet::new()),
+            ax_menus: None,
+        };
+        let menu_ids = Arc::new(std::sync::Mutex::new(HashSet::from([1])));
+        let action_ids = menu_ids.clone();
+        let mut reads = 0;
+        let (result, observation) = observe_right_click_action(
+            before,
+            move |sent| {
+                let _ = sent.send(ActionEvent::Sent(Instant::now()));
+                baseline_rx.recv().unwrap();
+                action_ids.lock().unwrap().insert(2);
+                42
+            },
+            || {
+                reads += 1;
+                let snapshot = MenuSnapshot {
+                    window_ids: Some(menu_ids.lock().unwrap().clone()),
+                    ax_menus: None,
+                };
+                if reads == 1 {
+                    baseline_tx.send(()).unwrap();
+                }
+                snapshot
+            },
+        );
+        assert_eq!(result.unwrap(), 42);
+        assert!(observation.opened);
+        assert_eq!(observation.evidence, MenuEvidence::Window);
+    }
+
+    #[test]
+    fn wave400c_menu_seen_before_the_actual_dispatch_does_not_confirm() {
+        let before = MenuSnapshot {
+            window_ids: Some(HashSet::new()),
+            ax_menus: None,
+        };
+        let menu_ids = Arc::new(std::sync::Mutex::new(HashSet::from([1])));
+        let action_ids = menu_ids.clone();
+        let (result, observation) = observe_right_click_action(
+            before,
+            move |sent| {
+                action_ids.lock().unwrap().insert(2);
+                let _ = sent.send(ActionEvent::Sent(Instant::now()));
+            },
+            || MenuSnapshot {
+                window_ids: Some(menu_ids.lock().unwrap().clone()),
+                ax_menus: None,
+            },
+        );
+        result.unwrap();
+        assert!(!observation.opened);
+    }
+
+    #[test]
+    fn wave400c_proven_unsent_fallback_rearms_and_observes_the_pixel_dispatch() {
+        use crate::ax::bindings::kAXErrorIllegalArgument;
+        let (sent_tx, sent_rx) = std::sync::mpsc::channel();
+        let ax_tx = sent_tx.clone();
+        let outcome = right_click_element(
+            "[4]",
+            true,
+            || kAXErrorIllegalArgument,
+            move || {
+                let _ = ax_tx.send("ax");
+            },
+            move || {
+                let _ = sent_tx.send("pixel");
+                Ok("pixel".into())
+            },
+        )
+        .unwrap();
+        assert_eq!(outcome, ElementRightClick::Pixel("pixel".into()));
+        assert_eq!(sent_rx.recv().unwrap(), "pixel");
+        assert!(sent_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn wave400c_fast_completion_still_observes_the_sent_window() {
+        let before = MenuSnapshot {
+            window_ids: Some(HashSet::new()),
+            ax_menus: None,
+        };
+        let mut reads = 0;
+        let (result, observation) = observe_right_click_action(
+            before,
+            |sent| {
+                let _ = sent.send(ActionEvent::Sent(Instant::now()));
+            },
+            || {
+                reads += 1;
+                MenuSnapshot {
+                    window_ids: Some(if reads == 1 {
+                        HashSet::new()
+                    } else {
+                        HashSet::from([1])
+                    }),
+                    ax_menus: None,
+                }
+            },
+        );
+        result.unwrap();
+        assert!(observation.opened);
     }
 }

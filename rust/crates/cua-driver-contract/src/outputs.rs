@@ -707,6 +707,27 @@ pub struct ActionResult {
     /// or a call that keeps the user's window where it is).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub next_call: Option<ActionNextCall>,
+    /// Producer confirmation retained for the macOS drag/right-click readbacks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verified: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selection_changed: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected_text_range: Option<ActionSelectedTextRange>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected_text: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub menu_opened: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub menu_items: Option<Vec<String>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq, uniffi::Record)]
+#[serde(deny_unknown_fields)]
+pub struct ActionSelectedTextRange {
+    pub location: u64,
+    pub length: u64,
+    pub units: String,
 }
 
 /// A call an agent can make next: `{tool, arguments}`.
@@ -754,6 +775,8 @@ pub enum ActionResultValidationError {
     RefusedCannotHaveDelivery,
     RefusedCannotHaveEvidence,
     ErrorRequiresRefused,
+    VerifiedEffectMismatch,
+    ReadbackEffectMismatch,
 }
 
 impl std::fmt::Display for ActionResultValidationError {
@@ -764,6 +787,10 @@ impl std::fmt::Display for ActionResultValidationError {
             Self::RefusedCannotHaveDelivery => "refused effect cannot include delivery",
             Self::RefusedCannotHaveEvidence => "refused effect cannot include evidence",
             Self::ErrorRequiresRefused => "error is only reported with a refused effect",
+            Self::VerifiedEffectMismatch => "verified must agree with the confirmed effect",
+            Self::ReadbackEffectMismatch => {
+                "selection_changed/menu_opened true requires a confirmed effect"
+            }
         })
     }
 }
@@ -798,6 +825,21 @@ impl ActionResult {
             }
             effect if effect != ActionEffect::Refused && self.error.is_some() => {
                 Err(ActionResultValidationError::ErrorRequiresRefused)
+            }
+            effect
+                if self
+                    .verified
+                    .is_some_and(|verified| verified != (effect == ActionEffect::Confirmed)) =>
+            {
+                Err(ActionResultValidationError::VerifiedEffectMismatch)
+            }
+            ActionEffect::Confirmed
+                if self.selection_changed == Some(true) || self.menu_opened == Some(true) =>
+            {
+                Ok(())
+            }
+            _ if self.selection_changed == Some(true) || self.menu_opened == Some(true) => {
+                Err(ActionResultValidationError::ReadbackEffectMismatch)
             }
             _ => Ok(()),
         }
@@ -903,6 +945,12 @@ mod tests {
             error: None,
             hint: None,
             next_call: None,
+            verified: None,
+            selection_changed: None,
+            selected_text_range: None,
+            selected_text: None,
+            menu_opened: None,
+            menu_items: None,
         }
     }
 
@@ -964,9 +1012,15 @@ mod tests {
                 "escalation",
                 "evidence",
                 "hint",
+                "menu_items",
+                "menu_opened",
                 "next_call",
                 "route",
-                "summary"
+                "selected_text",
+                "selected_text_range",
+                "selection_changed",
+                "summary",
+                "verified"
             ]
         );
         assert_eq!(
@@ -1062,7 +1116,6 @@ mod tests {
             ("y", json!(20)),
             ("path", json!("cgevent")),
             ("transport", json!("windows_send_input")),
-            ("verified", json!(true)),
             ("extensions", json!({})),
         ] {
             let mut value = serde_json::to_value(&result).expect("serialize");
@@ -1125,6 +1178,37 @@ mod tests {
             }
         });
         assert!(serde_json::from_value::<ActionResult>(escalation_extension).is_err());
+    }
+
+    #[test]
+    fn wave400c_action_result_accepts_optional_selection_and_menu_readback() {
+        let value = json!({
+            "effect": "confirmed",
+            "route": "accessibility",
+            "evidence": [{"kind": "value_readback"}],
+            "verified": true,
+            "selection_changed": true,
+            "selected_text_range": {"location": 2, "length": 4, "units": "utf16"},
+            "selected_text": "text",
+            "menu_opened": true,
+            "menu_items": ["Copy", "Paste"]
+        });
+        let result = serde_json::from_value::<ActionResult>(value.clone())
+            .expect("Wave 400-C readback fields are part of the additive action contract");
+        assert_eq!(serde_json::to_value(result).unwrap(), value);
+
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct LegacyStrictActionResult {
+            #[allow(dead_code)]
+            effect: ActionEffect,
+            #[allow(dead_code)]
+            route: ActionRoute,
+        }
+        assert!(
+            serde_json::from_value::<LegacyStrictActionResult>(value).is_err(),
+            "documented compatibility limit: old strict clients must tolerate or learn the additive fields"
+        );
     }
 
     #[test]

@@ -2450,7 +2450,7 @@ impl ToolRegistry {
             }
         });
         if result.is_error != Some(true) && crate::action_record::is_action_tool(resolved_name) {
-            if let Err(error) = publish_action_result(&mut result) {
+            if let Err(error) = publish_action_result(&mut result, resolved_name) {
                 result = ToolResult::error(format!(
                     "internal action outcome mismatch for {resolved_name}: {error}; the tool may have executed. Verify state before retrying."
                 ))
@@ -3566,7 +3566,57 @@ fn session_selecting_tool(tool_name: &str) -> bool {
         )
 }
 
-fn publish_action_result(result: &mut ToolResult) -> Result<(), String> {
+fn optional_bool_field(value: &Value, key: &str) -> Result<Option<bool>, String> {
+    match value.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Bool(value)) => Ok(Some(*value)),
+        Some(_) => Err(format!("{key} must be a boolean")),
+    }
+}
+
+fn optional_string_field(value: &Value, key: &str) -> Result<Option<String>, String> {
+    match value.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(value)) => Ok(Some(value.clone())),
+        Some(_) => Err(format!("{key} must be a string")),
+    }
+}
+
+fn preserve_wave400c_readback_fields(
+    public: &mut cua_driver_contract::ActionResult,
+    producer: &Value,
+) -> Result<(), String> {
+    public.verified = optional_bool_field(producer, "verified")?;
+    public.selection_changed = optional_bool_field(producer, "selection_changed")?;
+    public.selected_text = optional_string_field(producer, "selected_text")?;
+    public.menu_opened = optional_bool_field(producer, "menu_opened")?;
+    public.menu_items = match producer.get("menu_items") {
+        None | Some(Value::Null) => None,
+        Some(Value::Array(items)) => Some(
+            items
+                .iter()
+                .map(|item| {
+                    item.as_str()
+                        .map(str::to_owned)
+                        .ok_or_else(|| "menu_items entries must be strings".to_owned())
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+        ),
+        Some(_) => return Err("menu_items must be an array".into()),
+    };
+    public.selected_text_range = match producer.get("selected_text_range") {
+        None | Some(Value::Null) => None,
+        Some(value @ Value::Object(_)) => Some(
+            serde_json::from_value(value.clone())
+                .map_err(|error| format!("invalid selected_text_range: {error}"))?,
+        ),
+        Some(_) => return Err("selected_text_range must be an object".into()),
+    };
+    Ok(())
+}
+
+fn publish_action_result(result: &mut ToolResult, tool_name: &str) -> Result<(), String> {
+    let producer_structured = result.structured_content.clone();
     let action = result
         .action_record
         .as_ref()
@@ -3583,6 +3633,11 @@ fn publish_action_result(result: &mut ToolResult) -> Result<(), String> {
         Content::Text { text, .. } if !text.trim().is_empty() => Some(text.clone()),
         _ => None,
     });
+    if cfg!(target_os = "macos") && matches!(tool_name, "drag" | "right_click") {
+        if let Some(producer) = producer_structured.as_ref() {
+            preserve_wave400c_readback_fields(&mut public, producer)?;
+        }
+    }
     public
         .validate_invariants()
         .map_err(|error| format!("invalid public projection: {error}"))?;
@@ -6097,7 +6152,8 @@ resources:
             &legacy,
         );
 
-        publish_action_result(&mut result).expect("browser refusal should project");
+        publish_action_result(&mut result, "browser_click")
+            .expect("browser refusal should project");
         let structured = result.structured_content.as_ref().unwrap();
         assert_eq!(structured["effect"], "refused");
         assert_eq!(structured["route"], "trusted_input");
@@ -6110,6 +6166,101 @@ resources:
                     if text.contains("browser_ref_stale")
             )
         }));
+    }
+
+    fn wave400c_projection_input() -> crate::protocol::ToolResult {
+        use crate::action_record::{
+            ActionEffect, ActionEvidence, ActionExecutionRecord, ActionTransport, ActualDelivery,
+            EvidenceKind, RequestedDelivery,
+        };
+        let legacy = serde_json::json!({
+            "verified": true,
+            "selection_changed": true,
+            "selected_text_range": {"location": 2, "length": 4, "units": "utf16"},
+            "selected_text": "text",
+            "menu_opened": true,
+            "menu_items": ["Copy", "Paste"]
+        });
+        crate::protocol::ToolResult::text("readback confirmed")
+            .with_structured(legacy)
+            .with_action_record(
+                ActionExecutionRecord::builder(
+                    ActionEffect::Confirmed,
+                    ActionTransport::MacosCgEventPid,
+                    RequestedDelivery::Background,
+                )
+                .actual_delivery(ActualDelivery::Background)
+                .evidence(ActionEvidence {
+                    kind: EvidenceKind::AccessibilityReadback,
+                    detail: "selection or menu read back".into(),
+                })
+                .build()
+                .unwrap(),
+            )
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn wave400c_fields_survive_only_for_drag_and_right_click() {
+        for tool_name in ["drag", "right_click"] {
+            let mut result = wave400c_projection_input();
+            publish_action_result(&mut result, tool_name).expect("publish readback");
+            let structured = result.structured_content.unwrap();
+            assert_eq!(structured["verified"], true);
+            assert_eq!(structured["selection_changed"], true);
+            assert_eq!(structured["selected_text_range"]["location"], 2);
+            assert_eq!(structured["selected_text"], "text");
+            assert_eq!(structured["menu_opened"], true);
+            assert_eq!(
+                structured["menu_items"],
+                serde_json::json!(["Copy", "Paste"])
+            );
+            cua_driver_contract::validate_success_output(tool_name, structured)
+                .expect("current typed output accepts the additive fields");
+        }
+
+        let mut other = wave400c_projection_input();
+        publish_action_result(&mut other, "click").expect("publish click");
+        let structured = other.structured_content.unwrap();
+        for key in [
+            "verified",
+            "selection_changed",
+            "selected_text_range",
+            "selected_text",
+            "menu_opened",
+            "menu_items",
+        ] {
+            assert!(structured.get(key).is_none(), "click leaked {key}");
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn wave400c_projection_rejects_malformed_readback_fields() {
+        let mut result = wave400c_projection_input();
+        result.structured_content.as_mut().unwrap()["selected_text_range"]["location"] =
+            serde_json::json!("2");
+        assert!(publish_action_result(&mut result, "drag").is_err());
+    }
+
+    #[test]
+    #[cfg(not(target_os = "macos"))]
+    fn wave400c_fields_are_not_preserved_outside_macos() {
+        for tool_name in ["drag", "right_click"] {
+            let mut result = wave400c_projection_input();
+            publish_action_result(&mut result, tool_name).expect("publish non-macOS action");
+            let structured = result.structured_content.unwrap();
+            for key in [
+                "verified",
+                "selection_changed",
+                "selected_text_range",
+                "selected_text",
+                "menu_opened",
+                "menu_items",
+            ] {
+                assert!(structured.get(key).is_none(), "{tool_name} leaked {key}");
+            }
+        }
     }
 
     #[tokio::test]

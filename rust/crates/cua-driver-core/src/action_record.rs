@@ -460,6 +460,12 @@ impl ActionExecutionRecord {
             // The dispatch seam adds these after the record is projected.
             hint: None,
             next_call: None,
+            verified: None,
+            selection_changed: None,
+            selected_text_range: None,
+            selected_text: None,
+            menu_opened: None,
+            menu_items: None,
         })
     }
 
