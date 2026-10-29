@@ -2143,7 +2143,7 @@ mod tests {
             count: std::cell::Cell::new(5),
             items: std::cell::RefCell::new(original),
             writes: Vec::new(),
-            concurrent_copy_during_paste: std::cell::RefCell::new(Some(user_new.clone())),
+            concurrent_copy_during_paste: std::cell::RefCell::new(None),
             fail_restore: false,
         };
         let shared = SharedMock::new(pb);
@@ -2175,7 +2175,7 @@ mod tests {
             count: std::cell::Cell::new(5),
             items: std::cell::RefCell::new(original),
             writes: Vec::new(),
-            concurrent_copy_during_paste: std::cell::RefCell::new(Some(user_new.clone())),
+            concurrent_copy_during_paste: std::cell::RefCell::new(None),
             fail_restore: false,
         };
         let shared = SharedMock::new(pb);
@@ -2212,7 +2212,7 @@ mod tests {
             count: std::cell::Cell::new(5),
             items: std::cell::RefCell::new(original),
             writes: Vec::new(),
-            concurrent_copy_during_paste: std::cell::RefCell::new(Some(user_new.clone())),
+            concurrent_copy_during_paste: std::cell::RefCell::new(None),
             fail_restore: false,
         };
         let shared = SharedMock::new(pb);
