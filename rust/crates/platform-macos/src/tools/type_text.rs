@@ -156,6 +156,24 @@ impl Tool for TypeTextTool {
             ) {
                 return synthesis_refusal_result("hid", &refusal, AxAttempt::NotAttempted);
             }
+            // Desktop scope dispatches globally: check the frontmost app's
+            // focused element and fail closed before any key is sent.
+            match crate::apps::frontmost_pid() {
+                Some(front_pid) => {
+                    if let Some(refusal) =
+                        super::not_editable::guard_untargeted(front_pid, None).await
+                    {
+                        return refusal;
+                    }
+                }
+                None => {
+                    return super::not_editable::not_editable_result(
+                        "the frontmost application could not be determined, so editability is                          unknown; nothing was sent."
+                            .into(),
+                        super::not_editable::FocusDispatch::None,
+                    )
+                }
+            }
             let result = latency::spawn_action_blocking(move || {
                 crate::input::keyboard::type_text_global(&text, delay_ms)
             })
@@ -246,6 +264,24 @@ impl Tool for TypeTextTool {
             _ => (None, BackgroundKeyboardPolicy::Allowed),
         };
 
+        // TOKEN rule: after the gate, attempt focus and refuse a text-role
+        // element that shows no editing evidence (handoff 3.7).
+        if let (Some((guard, _)), Some(wid)) = (&element_guard, window_id) {
+            if let Some(refusal) =
+                super::not_editable::token_not_editable_refusal(pid, guard.as_ptr(), wid).await
+            {
+                return refusal;
+            }
+        }
+        // CELL rule for untargeted typing: a non-editing cell of a
+        // row/outline/table (or an unreadable focused element) refuses the
+        // call before any key.
+        if element_guard.is_none() && px.is_none() {
+            if let Some(refusal) = super::not_editable::guard_untargeted(pid, window_id).await {
+                return refusal;
+            }
+        }
+
         // ── px form: focus by pixel-click, then type into the focused element ──
         // Pass x,y (no element_token) for an *element px action*: pixel-click the
         // field to give the Chromium/Electron renderer the real keyboard focus the
@@ -281,7 +317,7 @@ impl Tool for TypeTextTool {
                 .get("from_zoom")
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
-            if let Err(e) = super::focus_by_pixel(
+            let focus_receipt = match super::focus_by_pixel(
                 &self.state,
                 pid,
                 window_id,
@@ -292,10 +328,22 @@ impl Tool for TypeTextTool {
                 args.opt_str("_session_id"),
                 from_zoom,
                 _mutation_lease.as_ref(),
+                true,
             )
             .await
             {
-                return e;
+                Ok(receipt) => receipt,
+                Err(e) => return e,
+            };
+            // Verify the focus the click produced before typing: if it
+            // landed on a non-editing cell, no text is sent and the result
+            // reports the focus action truthfully.
+            if !super::not_editable::focused_cell_allows_typing(pid, window_id).await {
+                return super::not_editable::not_editable_result(
+                    "the element focused by the click is not being edited; no text was sent."
+                        .into(),
+                    focus_receipt,
+                );
             }
             // element_index stays None → the type path below writes to the now-
             // focused element via the CGEvent (key_events) rung.

@@ -30,17 +30,18 @@ pub(crate) enum FocusDispatch {
 /// or possibly delivered (unverifiable, delivery unknown).
 pub(crate) fn not_editable_result(message: String, focus: FocusDispatch) -> ToolResult {
     match focus {
-        FocusDispatch::None => ToolResult::error(message.clone()).with_structured(
-            serde_json::json!({
+        FocusDispatch::None => {
+            ToolResult::error(message.clone()).with_structured(serde_json::json!({
                 "code": "not_editable",
                 "effect": "refused",
                 "dispatched": false,
                 "keys_sent": false,
                 "message": message,
-            }),
-        ),
+            }))
+        }
         FocusDispatch::Sent => {
-            let text = format!("{message} The focus action was delivered; no text or keys were sent.");
+            let text =
+                format!("{message} The focus action was delivered; no text or keys were sent.");
             ToolResult::text(text.clone())
                 .with_structured(serde_json::json!({
                     "code": "not_editable",
@@ -86,7 +87,8 @@ pub(crate) fn not_editable_result(message: String, focus: FocusDispatch) -> Tool
     }
 }
 
-const CELL_MESSAGE: &str = "the target is a cell in a row, outline or table that is not being edited";
+const CELL_MESSAGE: &str =
+    "the target is a cell in a row, outline or table that is not being edited";
 const UNREADABLE_MESSAGE: &str = "the element at the point could not be classified as editable";
 
 fn verdict_message(verdict: CellVerdict, point: bool) -> &'static str {
@@ -110,9 +112,12 @@ fn cell_refusal(verdict: CellVerdict, point: bool) -> ToolResult {
 
 /// CELL rule for untargeted typing: classify the window's focused element.
 /// Returns a refusal for a non-editing cell or unreadable state.
-pub(crate) async fn guard_untargeted(pid: i32, window_id: u32) -> Option<ToolResult> {
+pub(crate) async fn guard_untargeted(pid: i32, window_id: Option<u32>) -> Option<ToolResult> {
     latency::spawn_action_blocking(move || unsafe {
-        let element = crate::ax::exact_target::focused_element_in_window(pid, window_id);
+        let element = match window_id {
+            Some(wid) => crate::ax::exact_target::focused_element_in_window(pid, wid),
+            None => crate::ax::bindings::focused_element_of_pid(pid),
+        };
         let verdict = match element {
             None => CellVerdict::Unreadable,
             Some(element) => {
@@ -160,10 +165,13 @@ pub(crate) async fn guard_point(pid: i32, x: f64, y: f64) -> Option<ToolResult> 
 
 /// After the focus step of a point-targeted route, verify the resulting
 /// focused element still allows typing before keys are sent.
-pub(crate) async fn focused_cell_allows_typing(pid: i32, window_id: u32) -> bool {
+pub(crate) async fn focused_cell_allows_typing(pid: i32, window_id: Option<u32>) -> bool {
     latency::spawn_action_blocking(move || unsafe {
-        let Some(element) = crate::ax::exact_target::focused_element_in_window(pid, window_id)
-        else {
+        let element = match window_id {
+            Some(wid) => crate::ax::exact_target::focused_element_in_window(pid, wid),
+            None => crate::ax::bindings::focused_element_of_pid(pid),
+        };
+        let Some(element) = element else {
             return false;
         };
         let verdict = facts_for_element(element)
@@ -278,4 +286,3 @@ mod tests {
         assert!(text_of(&result).contains("may have been sent"));
     }
 }
-

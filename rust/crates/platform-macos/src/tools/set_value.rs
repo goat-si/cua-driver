@@ -181,6 +181,15 @@ impl Tool for SetValueTool {
             None => {}
         }
 
+        // TOKEN rule (handoff 3.7): after the gate and the rename routes,
+        // attempt focus and refuse a text-role element with no editing
+        // evidence instead of writing into it.
+        if let Some(refusal) =
+            super::not_editable::token_not_editable_refusal(pid, element_ptr, window_id).await
+        {
+            return refusal;
+        }
+
         let address_guard = element_guard.clone();
         let address_field = latency::spawn_action_blocking(move || unsafe {
             let identifier =

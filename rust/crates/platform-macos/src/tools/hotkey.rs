@@ -494,6 +494,9 @@ impl Tool for HotkeyTool {
                     args.opt_str("_session_id"),
                     from_zoom,
                     _mutation_lease.as_ref(),
+                    // A hotkey combo (e.g. Cmd+C on a selected cell) is
+                    // not a printable insertion: no cell guard here.
+                    false,
                 )
                 .await
                 {

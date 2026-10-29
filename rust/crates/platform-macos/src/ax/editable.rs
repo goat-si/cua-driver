@@ -80,6 +80,9 @@ pub fn cell_verdict(facts: &ElementFacts) -> CellVerdict {
 
 /// Read the facts for one element. Ancestor and descendant walks are
 /// bounded; every AX read inherits the caller's messaging timeout.
+///
+/// # Safety
+/// The element reference must be valid and live, owned by the caller.
 pub unsafe fn facts_for_element(element: AXUIElementRef) -> Option<ElementFacts> {
     if element.is_null() {
         return None;
@@ -111,6 +114,8 @@ pub unsafe fn facts_for_element(element: AXUIElementRef) -> Option<ElementFacts>
     Some(facts)
 }
 
+/// # Safety
+/// The element reference must be valid and live, owned by the caller.
 unsafe fn has_focused_text_descendant(element: AXUIElementRef, depth: usize) -> bool {
     if depth >= 3 {
         return false;
@@ -128,8 +133,6 @@ unsafe fn has_focused_text_descendant(element: AXUIElementRef, depth: usize) -> 
     }
     false
 }
-
-
 
 #[cfg(test)]
 mod tests {
@@ -192,7 +195,10 @@ mod tests {
     #[test]
     fn an_inline_editor_in_session_is_editing() {
         // The cell itself is a focused text field.
-        assert_eq!(cell_verdict(&cell("AXTextField", true)), CellVerdict::Editing);
+        assert_eq!(
+            cell_verdict(&cell("AXTextField", true)),
+            CellVerdict::Editing
+        );
         // An unfocused text field in a cell is not in session.
         assert_eq!(
             cell_verdict(&cell("AXTextField", false)),
@@ -221,4 +227,3 @@ mod tests {
         assert_eq!(cell_verdict(&f), CellVerdict::NotEditing);
     }
 }
-

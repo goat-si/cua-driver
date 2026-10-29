@@ -747,7 +747,8 @@ pub(crate) async fn focus_by_pixel(
     session_id: Option<String>,
     from_zoom: bool,
     mutation_lease: Option<&BackgroundMutationLease>,
-) -> Result<(), cua_driver_core::protocol::ToolResult> {
+    guard_editable: bool,
+) -> Result<not_editable::FocusDispatch, cua_driver_core::protocol::ToolResult> {
     use cua_driver_core::tool::Tool;
     let mut click_args = serde_json::json!({
         "pid": pid, "x": x, "y": y,
@@ -780,13 +781,21 @@ pub(crate) async fn focus_by_pixel(
     // image, scaled back exactly as ClickTool does.
     let (native_x, native_y) =
         window_click_point(state, &click_args, pid, window_id, x, y, from_zoom)?;
+    // The not_editable cell guard runs before ANY focus action: a
+    // non-editing cell (or an unclassifiable hit) refuses the whole call, so
+    // no focus action or key can reach it (handoff 3.7 point route).
+    if guard_editable {
+        if let Some(refusal) = not_editable::guard_point(pid, native_x, native_y).await {
+            return Err(refusal);
+        }
+    }
     // The requested field may already hold keyboard focus, for example after
     // a pixel hotkey Cmd+A. Any focus action is then redundant, and the real
     // click fallback would be destructive: Chromium's omnibox hit-tests to an
     // enclosing AXGroup that rejects AXFocused, so the fallback click moved
     // the caret and dropped the selection (#4125).
     if focused_element_holds_point(pid, window_id, native_x, native_y).await {
-        return Ok(());
+        return Ok(not_editable::FocusDispatch::None);
     }
     let click_tool = click::ClickTool::new(state.clone());
     let click = click_tool.invoke(click_args);
@@ -834,7 +843,7 @@ pub(crate) async fn focus_by_pixel(
             return Err(pixel_focus_unconfirmed(pid, window_id, x, y));
         }
         FocusDecision::Proceed(step) => match step {
-            PixelFocusStep::Focused => return Ok(()),
+            PixelFocusStep::Focused => return Ok(not_editable::FocusDispatch::Sent),
             PixelFocusStep::RealClick => {}
             PixelFocusStep::ClickFailed => {
                 return Err(cua_driver_core::protocol::ToolResult::error(format!(
@@ -877,7 +886,7 @@ pub(crate) async fn focus_by_pixel(
     }
     // Brief settle so the renderer registers focus before the keystrokes.
     tokio::time::sleep(std::time::Duration::from_millis(120)).await;
-    Ok(())
+    Ok(not_editable::FocusDispatch::Sent)
 }
 
 /// What [`focus_by_pixel`] does after its non-destructive focus click.
