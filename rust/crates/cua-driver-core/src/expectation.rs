@@ -517,17 +517,35 @@ fn evaluate_element(
             None,
         );
     }
-    if (predicate.selector.role.is_none() && predicate.selector.label_contains.is_none())
-        || predicate
-            .selector
-            .role
-            .as_deref()
-            .is_some_and(|value| value.trim().is_empty())
+    let has_role = predicate
+        .selector
+        .role
+        .as_deref()
+        .is_some_and(|value| !value.trim().is_empty());
+    let has_label = predicate
+        .selector
+        .label_contains
+        .as_deref()
+        .is_some_and(|value| !value.trim().is_empty());
+    let has_value = predicate
+        .value_equals
+        .as_deref()
+        .is_some_and(|value| !value.trim().is_empty());
+    if predicate
+        .selector
+        .role
+        .as_deref()
+        .is_some_and(|value| value.trim().is_empty())
         || predicate
             .selector
             .label_contains
             .as_deref()
             .is_some_and(|value| value.trim().is_empty())
+        || (!has_role
+            && !has_label
+            && !has_value
+            && predicate.enabled.is_none()
+            && predicate.selected.is_none())
     {
         return (
             VerificationStatus::Unknown,
@@ -562,13 +580,18 @@ fn evaluate_element(
         .collect();
     // Observations may include display-only rows (static text, read-only
     // values) next to the addressable controls. A control's visible caption
-    // is usually such a row, so a selector that matches a control keeps
-    // resolving to that control alone; display-only rows are only the target
-    // when no addressable element matches.
+    // is usually such a row, so addressable candidates keep their priority.
+    // With field constraints, a display-only row can still satisfy the value
+    // after an addressable candidate with the same selector misses it.
+    let has_field_constraints = predicate.value_equals.is_some()
+        || predicate.enabled.is_some()
+        || predicate.selected.is_some();
     let (addressable, display_only): (Vec<&Value>, Vec<&Value>) = all_matches
         .into_iter()
         .partition(|element| element.get("display_only").and_then(Value::as_bool) != Some(true));
-    let matches = if addressable.is_empty() {
+    let matches = if has_field_constraints {
+        addressable.into_iter().chain(display_only).collect()
+    } else if addressable.is_empty() {
         display_only
     } else {
         addressable
@@ -618,11 +641,21 @@ fn evaluate_element(
             Some(json!({"matches": matches.len()})),
         );
     }
-    if trusted_matches.len() > 1
-        && (predicate.value_equals.is_some()
-            || predicate.enabled.is_some()
-            || predicate.selected.is_some())
-    {
+    if has_field_constraints {
+        let field_matches: Vec<&Value> = trusted_matches
+            .iter()
+            .copied()
+            .filter(|element| element_satisfies_fields(predicate, element))
+            .collect();
+        if let Some(element) = field_matches.first() {
+            return (
+                VerificationStatus::Satisfied,
+                None,
+                Some(project_element(element)),
+            );
+        }
+    }
+    if trusted_matches.len() > 1 && has_field_constraints {
         return (
             VerificationStatus::Unknown,
             Some(UnknownReason::MultiMatch),
@@ -685,11 +718,31 @@ fn selector_matches(selector: &cua_driver_contract::ElementSelector, element: &V
     }
     if let Some(label) = selector.label_contains.as_deref() {
         let needle = label.to_lowercase();
-        if !element
-            .get("label")
-            .and_then(Value::as_str)
-            .is_some_and(|actual| actual.to_lowercase().contains(&needle))
-        {
+        if !["label", "value", "identifier"].iter().any(|key| {
+            element
+                .get(*key)
+                .and_then(Value::as_str)
+                .is_some_and(|actual| actual.to_lowercase().contains(&needle))
+        }) {
+            return false;
+        }
+    }
+    true
+}
+
+fn element_satisfies_fields(predicate: &ElementPredicate, element: &Value) -> bool {
+    if let Some(expected) = predicate.value_equals.as_deref() {
+        if element.get("value").and_then(Value::as_str) != Some(expected) {
+            return false;
+        }
+    }
+    if let Some(expected) = predicate.enabled {
+        if element.get("enabled").and_then(Value::as_bool) != Some(expected) {
+            return false;
+        }
+    }
+    if let Some(expected) = predicate.selected {
+        if element.get("selected").and_then(Value::as_bool) != Some(expected) {
             return false;
         }
     }
@@ -913,6 +966,120 @@ mod tests {
         }
     }
 
+    fn field_predicate(
+        role: Option<&str>,
+        label: Option<&str>,
+        value: Option<&str>,
+        enabled: Option<bool>,
+        selected: Option<bool>,
+    ) -> StatePredicate {
+        StatePredicate {
+            window: None,
+            element: Some(ElementPredicate {
+                selector: ElementSelector {
+                    role: role.map(Into::into),
+                    label_contains: label.map(Into::into),
+                },
+                exists: Some(true),
+                value_equals: value.map(Into::into),
+                enabled,
+                selected,
+            }),
+        }
+    }
+
+    #[test]
+    fn field_only_predicates_are_admitted() {
+        let cases = [
+            (
+                field_predicate(None, None, Some("702"), None, None),
+                json!({"role":"AXStaticText","value":"702","display_only":true}),
+            ),
+            (
+                field_predicate(None, None, None, Some(true), None),
+                json!({"role":"AXButton","enabled":true}),
+            ),
+            (
+                field_predicate(None, None, None, None, Some(true)),
+                json!({"role":"AXRow","selected":true}),
+            ),
+        ];
+        for (predicate, element) in cases {
+            let outcomes = evaluate_predicates(&[predicate], &observed(vec![element]));
+            assert_eq!(outcomes[0].status, VerificationStatus::Satisfied);
+        }
+    }
+
+    #[test]
+    fn label_selector_matches_value_and_identifier_case_insensitively() {
+        for element in [
+            json!({"role":"AXTextArea","label":"jun — -zsh","value":"prefix GOAT-CU-OK suffix"}),
+            json!({"role":"AXButton","identifier":"Prefix GOAT-CU-OK Suffix"}),
+        ] {
+            let outcomes = evaluate_predicates(
+                &[field_predicate(None, Some("goat-cu-ok"), None, None, None)],
+                &observed(vec![element]),
+            );
+            assert_eq!(outcomes[0].status, VerificationStatus::Satisfied);
+        }
+    }
+
+    #[test]
+    fn field_filter_precedes_multi_match() {
+        let outcomes = evaluate_predicates(
+            &[field_predicate(
+                Some("AXStaticText"),
+                None,
+                Some("702"),
+                None,
+                None,
+            )],
+            &observed(vec![
+                json!({"role":"AXStaticText","value":"78 × 9","display_only":true}),
+                json!({"role":"AXStaticText","value":"702","display_only":true}),
+            ]),
+        );
+        assert_eq!(outcomes[0].status, VerificationStatus::Satisfied);
+        assert!(outcomes[0]
+            .observed_json
+            .as_deref()
+            .unwrap()
+            .contains("\"value\":\"702\""));
+    }
+
+    #[test]
+    fn field_filter_can_select_display_row_after_addressable_miss() {
+        let outcomes = evaluate_predicates(
+            &[field_predicate(
+                Some("AXStaticText"),
+                Some("Result"),
+                Some("702"),
+                None,
+                None,
+            )],
+            &observed(vec![
+                json!({
+                    "element_index":1,
+                    "role":"AXStaticText",
+                    "label":"Result",
+                    "value":"wrong"
+                }),
+                json!({
+                    "role":"AXStaticText",
+                    "label":"Result",
+                    "value":"702",
+                    "display_only":true
+                }),
+            ]),
+        );
+        assert_eq!(outcomes[0].status, VerificationStatus::Satisfied);
+        assert!(outcomes[0]
+            .observed_json
+            .as_deref()
+            .unwrap()
+            .contains("\"value\":\"702\""));
+    }
+
     #[test]
     fn label_less_display_text_value_is_readable() {
         // #4526: a static text with no title exposes its content via AXValue;
@@ -978,7 +1145,7 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_property_target_is_unknown_not_first_match_wins() {
+    fn duplicate_property_targets_can_be_disambiguated_by_their_fields() {
         let element = json!({
             "element_index": 3,
             "role": "checkbox",
@@ -994,8 +1161,7 @@ mod tests {
                 elements_complete: true,
             },
         );
-        assert_eq!(outcomes[0].status, VerificationStatus::Unknown);
-        assert_eq!(outcomes[0].unknown_reason, Some(UnknownReason::MultiMatch));
+        assert_eq!(outcomes[0].status, VerificationStatus::Satisfied);
     }
 
     #[test]

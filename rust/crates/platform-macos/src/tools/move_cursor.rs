@@ -26,7 +26,7 @@ fn def() -> &'static ToolDef {
     DEF.get_or_init(|| ToolDef {
         name: "move_cursor".into(),
         description: "Move a cursor to (x, y). With target {kind: \"window\", pid, window_id}, x/y are window \
-            screenshot pixels and only the agent cursor moves; in a background app it also hovers where a \
+            screenshot pixels and only the agent cursor moves; it also hovers where a \
             route leaves the real pointer alone (AXShowAlternateUI on the element under the point, or an \
             Electron page) and says so. Other macOS hover follows the real pointer: for a web page in \
             Chrome, Edge or Brave use browser_pointer hover. Without a target, only the agent cursor overlay \
@@ -208,20 +208,23 @@ impl MoveCursorTool {
         self.state
             .cursor_registry
             .update_position(&cursor_id, screen_x, screen_y);
-        if crate::apps::frontmost_pid() == Some(pid) {
-            return ToolResult::text(format!(
-                "Agent cursor '{cursor_id}' moved over window {wid} at ({x:.0}, {y:.0}); the real \
-                 pointer did not move."
-            ))
-            .with_structured(serde_json::json!({
-                "scope": "window",
-                "window_id": wid,
-                "screen_point": [screen_x, screen_y],
-                "hover_delivered": false,
-                "effect": "unverifiable"
-            }));
-        }
-        // Background app: try the hover routes that leave the real pointer alone.
+        route_window_hover_after_overlay(
+            crate::apps::frontmost_pid() == Some(pid),
+            || {
+                ToolResult::text(format!(
+                    "Agent cursor '{cursor_id}' moved over window {wid} at ({x:.0}, {y:.0}); the real \
+                     pointer did not move."
+                ))
+                .with_structured(serde_json::json!({
+                    "scope": "window",
+                    "window_id": wid,
+                    "screen_point": [screen_x, screen_y],
+                    "hover_delivered": false,
+                    "effect": "unverifiable"
+                }))
+            },
+            async {
+        // Try the hover routes that leave the real pointer alone.
         let chromium = tokio::task::spawn_blocking(move || {
             super::type_text::is_chromium_identity(
                 &crate::apps::bundle_id_for_pid(pid).unwrap_or_default(),
@@ -255,7 +258,7 @@ impl MoveCursorTool {
                 )
             } else {
                 format!(
-                    "Sent AXShowAlternateUI to {}{label}, the background hover route, but no new \
+                    "Sent AXShowAlternateUI to {}{label}, the pointer-free hover route, but no new \
                      control appeared in its accessibility tree, so it may have no hover-only \
                      controls. The real pointer did not move.",
                     reveal.role
@@ -302,21 +305,34 @@ impl MoveCursorTool {
         if chromium {
             return browser_hover_result(&cursor_id, pid, wid, x, y, screen_x, screen_y);
         }
-        ToolResult::text(format!(
-            "Agent cursor '{cursor_id}' moved over window {wid} at ({x:.0}, {y:.0}); the real \
-             pointer did not move.{BACKGROUND_HOVER_NOTE}"
-        ))
-        .with_structured(serde_json::json!({
-            "scope": "window",
-            "window_id": wid,
-            "screen_point": [screen_x, screen_y],
-            "hover_delivered": false,
-            "effect": "unverifiable"
-        }))
+                ToolResult::text(format!(
+                    "Agent cursor '{cursor_id}' moved over window {wid} at ({x:.0}, {y:.0}); the real \
+                     pointer did not move.{BACKGROUND_HOVER_NOTE}"
+                ))
+                .with_structured(serde_json::json!({
+                    "scope": "window",
+                    "window_id": wid,
+                    "screen_point": [screen_x, screen_y],
+                    "hover_delivered": false,
+                    "effect": "unverifiable"
+                }))
+            },
+        )
+        .await
     }
 }
 
-/// A window-target move over a background Chromium browser: the page saw no
+async fn route_window_hover_after_overlay(
+    _frontmost: bool,
+    _overlay_only: impl FnOnce() -> ToolResult,
+    hover: impl std::future::Future<Output = ToolResult>,
+) -> ToolResult {
+    // Window scope never moves the real pointer, so frontmost must not
+    // suppress the pointer-free AX/Electron routes.
+    hover.await
+}
+
+/// A window-target move over a Chromium browser when no pointer-free hover was delivered: the page saw no
 /// hover, and the browser tools are the route that delivers one without the
 /// user's pointer. Bench v2 PR-03 agents read the generic note's desktop
 /// option as the way forward and moved the user's pointer.
@@ -435,5 +451,28 @@ mod tests {
         let note = super::inactive_app_note("BenchLab");
         assert!(note.starts_with(" BenchLab is not the active app"));
         assert!(note.contains("bring_to_front"));
+    }
+
+    #[tokio::test]
+    async fn frontmost_window_still_runs_pointer_free_hover() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let overlay_only = AtomicBool::new(false);
+        let hover = AtomicBool::new(false);
+        let result = super::route_window_hover_after_overlay(
+            true,
+            || {
+                overlay_only.store(true, Ordering::SeqCst);
+                super::ToolResult::text("overlay only")
+            },
+            async {
+                hover.store(true, Ordering::SeqCst);
+                super::ToolResult::text("hover")
+            },
+        )
+        .await;
+        assert!(hover.load(Ordering::SeqCst));
+        assert!(!overlay_only.load(Ordering::SeqCst));
+        assert!(result.structured_content.is_none());
     }
 }
