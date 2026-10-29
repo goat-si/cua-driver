@@ -827,7 +827,7 @@ pub(crate) async fn focus_by_pixel(
     // The AX focus may have been applied and then clobbered: a negative
     // readback is indeterminate, so only a proven refusal falls through to
     // a real click.
-    if !focus_readback_allows_real_click(landed) {
+    if focus_readback_is_negative(landed) {
         return Err(pixel_focus_unconfirmed(pid, window_id, x, y));
     }
     match pixel_focus_step(landed, foreground) {
@@ -887,8 +887,11 @@ fn focus_error_allows_fallback(effect: Option<&str>, code: Option<&str>) -> bool
 
 /// A negative focus readback stops the ladder: only an unreadable readback
 /// (None) can reach the real-click fallback, and only in the foreground.
-fn focus_readback_allows_real_click(landed: Option<bool>) -> bool {
-    landed.is_none()
+fn focus_readback_is_negative(landed: Option<bool>) -> bool {
+    // Confirmed focus proceeds to the keys; only a NEGATIVE readback stops
+    // the ladder as indeterminate. An unreadable readback keeps the
+    // foreground fallback.
+    matches!(landed, Some(false))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1742,9 +1745,9 @@ mod pixel_focus_readback_tests {
 
     #[test]
     fn a_negative_readback_never_reaches_the_real_click() {
-        assert!(!super::focus_readback_allows_real_click(Some(false)));
-        assert!(super::focus_readback_allows_real_click(None));
-        assert!(!super::focus_readback_allows_real_click(Some(true)));
+        assert!(super::focus_readback_is_negative(Some(false)));
+        assert!(!super::focus_readback_is_negative(None));
+        assert!(!super::focus_readback_is_negative(Some(true)));
     }
 
     #[test]
