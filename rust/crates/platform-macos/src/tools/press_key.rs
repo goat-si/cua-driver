@@ -1324,8 +1324,16 @@ fn minimized_key_result(step: MinimizedKeyStep, pid: i32, display_key: &str) -> 
                 || error.is::<KeyFocusUnconfirmedAfterClick>()
                 || error.to_string().contains("no key was sent");
             let mut result = delivery_failed(error);
-            // Focus writes went out: never a nothing-sent refusal.
-            if step.focus_writes > 0 {
+            // Focus writes went out, or a key event may have: never a
+            // nothing-sent refusal.
+            if step.focus_writes > 0 || !before_any_key {
+                if !matches!(
+                    result.structured_content,
+                    Some(serde_json::Value::Object(_))
+                ) {
+                    result.structured_content =
+                        Some(serde_json::json!({ "effect": "unverifiable" }));
+                }
                 if let Some(serde_json::Value::Object(fields)) = result.structured_content.as_mut()
                 {
                     if fields.get("effect").and_then(|v| v.as_str()) == Some("refused") {
@@ -1342,17 +1350,18 @@ fn minimized_key_result(step: MinimizedKeyStep, pid: i32, display_key: &str) -> 
                         serde_json::json!(step.focus_writes),
                     );
                 }
+                let key_note = if before_any_key {
+                    "no key was sent."
+                } else {
+                    "a key event may have been sent. Read the window before repeating it."
+                };
+                let note = match step.focus_writes {
+                    0 => key_note.to_owned(),
+                    n => format!("{n} focus write(s) were sent to the element; {key_note}"),
+                };
                 result
                     .content
-                    .push(cua_driver_core::protocol::Content::text(format!(
-                        "{} focus write(s) were sent to the element; {}",
-                        step.focus_writes,
-                        if before_any_key {
-                            "no key was sent."
-                        } else {
-                            "a key event may also have been sent. Read the window before repeating it."
-                        }
-                    )));
+                    .push(cua_driver_core::protocol::Content::text(note));
             }
             if !notes.is_empty() {
                 result
@@ -2271,5 +2280,21 @@ mod minimized_key_receipt_tests {
         let structured = result.structured_content.as_ref().expect("structured");
         assert!(structured.get("keys_sent").is_none());
         assert_eq!(structured["focus_writes_sent"], 1);
+
+        // Window-only (no focus write) with a possibly sent key.
+        let window_only = MinimizedKeyStep {
+            outcome: Some(Err(anyhow::anyhow!("key-up event could not be created"))),
+            refusal: None,
+            notes: String::new(),
+            focus_writes: 0,
+        };
+        let result = minimized_key_result(window_only, 1, "return");
+        let structured = result.structured_content.as_ref().expect("structured");
+        assert_ne!(structured["effect"], "refused");
+        assert!(structured.get("keys_sent").is_none());
+        assert!(result.content.iter().any(|c| matches!(
+            c,
+            cua_driver_core::protocol::Content::Text { text, .. } if text.contains("may have been sent")
+        )));
     }
 }

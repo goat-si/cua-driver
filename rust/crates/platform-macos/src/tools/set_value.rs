@@ -663,13 +663,25 @@ fn attach_restore_cleanup(
 /// # Safety
 ///
 /// `element` must be a valid, live `AXUIElementRef`.
+/// `false` only when the window reads back without one; unreadable counts
+/// as a document (the save warning is the safe report).
 unsafe fn window_has_document(element: AXUIElementRef) -> bool {
     let Some(window) = crate::ax::bindings::copy_element_attr(element, "AXWindow") else {
-        return false;
+        return true;
     };
-    let document = copy_string_attr(window, "AXDocument").is_some();
+    let attr = core_foundation::string::CFString::new("AXDocument");
+    let mut value: core_foundation::base::CFTypeRef = std::ptr::null();
+    let err = crate::ax::bindings::AXUIElementCopyAttributeValue(
+        window,
+        core_foundation::base::TCFType::as_concrete_TypeRef(&attr),
+        &mut value,
+    );
+    if !value.is_null() {
+        CFRelease(value);
+    }
     CFRelease(window as _);
-    document
+    // kAXErrorNoValue / kAXErrorAttributeUnsupported: read back without one.
+    !matches!(err, -25212 | -25205)
 }
 
 /// The restored-window route's own focus step.
@@ -1083,7 +1095,10 @@ fn set_value_blocking_with(
             // front app. A document there is reported as not marked.
             let document = if changed == Some(true) && !restored_window {
                 unsafe { crate::document_edit::ensure_marked_after_ax_write(pid, element, true) }
-            } else if changed == Some(true) && unsafe { window_has_document(element) } {
+            } else if restored_window
+                && changed != Some(false)
+                && unsafe { window_has_document(element) }
+            {
                 crate::document_edit::DocumentEdited::NotMarked
             } else {
                 crate::document_edit::DocumentEdited::NotADocument
