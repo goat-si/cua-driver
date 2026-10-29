@@ -795,10 +795,17 @@ pub(crate) async fn focus_by_pixel(
         click.await
     };
     if focus.is_error == Some(true) {
-        // An AX focus task failure is indeterminate, not a fallback signal:
-        // stop instead of escalating to a real click (foreground) or
-        // pretending the focus failed cleanly (background).
-        return Err(focus);
+        // An INDETERMINATE focus task failure stops the ladder. A proven
+        // refusal (no element at the point, background_unavailable) keeps
+        // the existing foreground real-click fallback.
+        let indeterminate = focus
+            .structured_content
+            .as_ref()
+            .and_then(|v| v["effect"].as_str())
+            == Some("unverifiable");
+        if indeterminate {
+            return Err(focus);
+        }
     }
     let landed = if focus.is_error != Some(true) {
         // AXFocused is non-destructive: unlike a second real click, it keeps a

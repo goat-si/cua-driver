@@ -2412,6 +2412,15 @@ fn ancestor_action_kind(
     // above the candidate must be described as "sidebar". A press anywhere
     // else (content outlines, other apps, other controls) is not selection
     // evidence and falls through to the pixel route.
+    // If the hit itself is inside a non-sidebar outline, stop there: a
+    // higher sidebar ancestor must not be pressed in its place.
+    if chain
+        .iter()
+        .find(|(role, _, _)| role.as_deref() == Some("AXOutline"))
+        .is_some_and(|(_, _, sidebar)| !*sidebar)
+    {
+        return None;
+    }
     let sidebar_above = |index: usize| {
         chain[index + 1..]
             .iter()
@@ -2506,10 +2515,23 @@ unsafe fn ax_press_with_ancestors(
     }
     let action = CFString::new(action_name);
     let err = AXUIElementPerformAction(target, action.as_concrete_TypeRef());
+    let selected = if err == kAXErrorSuccess && action_name == "AXPress" {
+        // Selection evidence: the row/cell must actually read selected
+        // after the press. The target is still retained here.
+        crate::ax::bindings::copy_bool_attr(target, "AXSelected")
+    } else {
+        None
+    };
     for (_, _, el, _) in chain {
         CFRelease(el as _);
     }
     if err == kAXErrorSuccess {
+        if action_name == "AXPress" {
+            return Ok(match selected {
+                Some(true) => AxPressOutcome::Delivered,
+                _ => AxPressOutcome::Indeterminate,
+            });
+        }
         return Ok(AxPressOutcome::Delivered);
     }
     if !perform_error_proves_nothing_was_sent(err) {
