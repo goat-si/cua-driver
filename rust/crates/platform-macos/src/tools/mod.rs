@@ -1707,6 +1707,25 @@ mod pixel_focus_readback_tests {
     }
 
     #[test]
+    fn focus_fallback_requires_proof_of_non_dispatch() {
+        // The outer check in focus_by_pixel uses this predicate: only an
+        // explicit refusal or background_unavailable may reach the real
+        // click; every unclassified or unverifiable error stops first.
+        assert!(super::focus_error_allows_fallback(Some("refused"), None));
+        assert!(super::focus_error_allows_fallback(
+            None,
+            Some("background_unavailable")
+        ));
+        assert!(!super::focus_error_allows_fallback(
+            Some("unverifiable"),
+            None
+        ));
+        assert!(!super::focus_error_allows_fallback(None, None));
+        assert!(!super::focus_error_allows_fallback(Some("partial"), None));
+        assert!(!super::focus_error_allows_fallback(Some("confirmed"), None));
+    }
+
+    #[test]
     fn an_unconfirmed_focus_says_no_key_was_sent() {
         let result = pixel_focus_unconfirmed(7, Some(9), 10.0, 20.0);
         assert_eq!(result.is_error, Some(true));
