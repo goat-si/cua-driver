@@ -246,6 +246,11 @@ const LATE_REPORT_MAX_AGE: Duration = Duration::from_secs(10);
 struct Tail {
     id: u64,
     _lease: Option<SuppressionLease>,
+    /// The tail's own before-state. A next action that supersedes the tail
+    /// before its next read checks the window list against it, so a window
+    /// that opened in between is still reported (see [`superseded_change`]).
+    window_ids: HashSet<u32>,
+    front_pid: Option<i32>,
 }
 
 static TAIL: Mutex<Option<Tail>> = Mutex::new(None);
@@ -290,6 +295,27 @@ pub fn note_intentional_activation() {
 /// The current intentional-activation epoch.
 pub fn intentional_epoch() -> u64 {
     INTENTIONAL_EPOCH.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// What a superseded tail had not read yet: windows open now that were not
+/// in its before-state, and a frontmost app other than its own. The next
+/// action reports it as the previous action's late change.
+fn superseded_change(
+    tail_windows: &HashSet<u32>,
+    tail_front: Option<i32>,
+    current: &[WindowInfo],
+    current_front: Option<i32>,
+) -> Option<Late> {
+    let (new_windows, _closed) = Snapshot::diff(tail_windows, current);
+    let foreground_changed = matches!(
+        (tail_front, current_front),
+        (Some(before), Some(now)) if before != now
+    );
+    (!new_windows.is_empty() || foreground_changed).then(|| Late {
+        at: Instant::now(),
+        new_windows,
+        foreground_changed,
+    })
 }
 
 /// Take a late change recorded by a detached tail, if it is recent.
@@ -376,10 +402,19 @@ impl WindowChangeDetector {
     ) -> Snapshot {
         let _latency = latency::span(latency::Stage::Snapshot);
         // A new action supersedes the previous action's detached observation.
+        let superseded = lock(&TAIL)
+            .as_ref()
+            .map(|tail| (tail.window_ids.clone(), tail.front_pid));
         end_tail();
-        let window_ids: HashSet<u32> = host_windows().into_iter().map(|w| w.window_id).collect();
+        let current = host_windows();
+        let window_ids: HashSet<u32> = current.iter().map(|w| w.window_id).collect();
         let mut snapshot = Self::capture_from(window_ids, prior_front, suppress_focus, allowed_pid);
-        snapshot.earlier = take_late();
+        // A change the tail recorded, else one it had not read yet.
+        snapshot.earlier = take_late().or_else(|| {
+            superseded.and_then(|(tail_windows, tail_front)| {
+                superseded_change(&tail_windows, tail_front, &current, prior_front)
+            })
+        });
         snapshot
     }
 
@@ -648,6 +683,8 @@ impl Snapshot {
         *lock(&TAIL) = Some(Tail {
             id,
             _lease: self._lease.take(),
+            window_ids: self.window_ids.clone(),
+            front_pid: self.front_pid,
         });
         let still_mine = move || lock(&TAIL).as_ref().is_some_and(|tail| tail.id == id);
         let spawned = std::thread::Builder::new()
@@ -1161,6 +1198,31 @@ mod tests {
             });
         assert!(!changes.needs_restore());
         assert!(lock(&TAIL).is_none());
+    }
+
+    /// A next action that supersedes a tail before its next read still
+    /// reports what the tail had not read: a window that opened, and another
+    /// frontmost app.
+    #[test]
+    fn a_superseded_tail_still_reports_what_it_had_not_read() {
+        let tail_windows = HashSet::from([1]);
+        let opened = superseded_change(
+            &tail_windows,
+            Some(7),
+            &[win(1, 7, "App", "Main"), win(2, 7, "App", "Save")],
+            Some(7),
+        )
+        .expect("the new window is reported");
+        assert_eq!(opened.new_windows.len(), 1);
+        assert!(!opened.foreground_changed);
+        let fronted =
+            superseded_change(&tail_windows, Some(7), &[win(1, 7, "App", "Main")], Some(8))
+                .expect("the foreground change is reported");
+        assert!(fronted.foreground_changed && fronted.new_windows.is_empty());
+        assert!(
+            superseded_change(&tail_windows, Some(7), &[win(1, 7, "App", "Main")], Some(7))
+                .is_none()
+        );
     }
 
     /// A click's sampled observation reads once, without sleeping first, and

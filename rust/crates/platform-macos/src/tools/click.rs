@@ -132,11 +132,6 @@ fn selection_readback_confirms(
     }
 }
 
-const SELECTION_READBACK_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
-const SELECTION_READBACK_POLL: std::time::Duration = std::time::Duration::from_millis(25);
-const SELECTION_READBACK_SETTLE: std::time::Duration = std::time::Duration::from_millis(200);
-const SELECTION_READBACK_STABILITY: std::time::Duration = std::time::Duration::from_millis(250);
-
 /// AXPress on a radio button or checkbox that advertises it: a press whose
 /// effect the control's own AXValue shows.
 fn is_toggle_press(ax_action: &str, role: &str, advertised: &[String]) -> bool {
@@ -510,16 +505,19 @@ fn watch_for_change<C: crate::ax::scroll_area::Clock>(
         if clock.now() > deadline {
             return None;
         }
-        let seen = read();
-        if clock.now() > deadline {
-            return None;
-        }
-        if let Some(evidence) = seen {
-            if read() == Some(evidence) {
+        // Both reads must return by the deadline: a read that returned after
+        // it may show a later change.
+        if let Some(evidence) = read() {
+            if read() == Some(evidence) && clock.now() <= deadline {
                 return Some(evidence);
             }
         }
-        clock.sleep(CLICK_OBSERVATION_POLL);
+        // The last sleep ends at the deadline, for one last read there.
+        let left = deadline.saturating_duration_since(clock.now());
+        if left.is_zero() {
+            return None;
+        }
+        clock.sleep(left.min(CLICK_OBSERVATION_POLL));
     }
 }
 
@@ -1115,34 +1113,50 @@ impl ClickTool {
 
             let btn = button.clone();
             let desktop_modifiers: Vec<String> = args.str_array("modifier");
-            let result = latency::spawn_action_blocking(move || -> anyhow::Result<()> {
-                // Desktop scope is explicitly foreground and vision-driven: post
-                // at the global HID tap so WindowServer delivers to the window
-                // actually visible at this point. PID-posting here would silently
-                // turn the foreground contract back into background delivery.
-                let modifier_refs: Vec<&str> =
-                    desktop_modifiers.iter().map(String::as_str).collect();
-                crate::input::mouse::click_at_xy_desktop_with_modifiers(
-                    sx,
-                    sy,
-                    count,
-                    &btn,
-                    &modifier_refs,
-                )
-            })
-            .await;
+            let result =
+                latency::spawn_action_blocking(move || -> anyhow::Result<Option<Value>> {
+                    // The element under the point in the window there, read
+                    // before the post, as the public hit.
+                    let hit = super::desktop_pointer_guard::window_under_point(sx, sy).and_then(
+                        |window| unsafe {
+                            element_in_window_at(window.pid, window.window_id, sx, sy)
+                                .and_then(|(element, _)| pointer_hit(element.0))
+                        },
+                    );
+                    // Desktop scope is explicitly foreground and vision-driven: post
+                    // at the global HID tap so WindowServer delivers to the window
+                    // actually visible at this point. PID-posting here would silently
+                    // turn the foreground contract back into background delivery.
+                    let modifier_refs: Vec<&str> =
+                        desktop_modifiers.iter().map(String::as_str).collect();
+                    crate::input::mouse::click_at_xy_desktop_with_modifiers(
+                        sx,
+                        sy,
+                        count,
+                        &btn,
+                        &modifier_refs,
+                    )?;
+                    Ok(hit)
+                })
+                .await;
             let button_label = match button.as_str() {
                 "right" => "right-click",
                 "middle" => "middle-click",
                 _ => "click",
             };
             return match result {
-                Ok(Ok(())) => ToolResult::text(format!(
-                    "✅ Sent screen-absolute {button_label} at desktop-pixel \
-                     ({sx_shot:.0},{sy_shot:.0}) → screen-point ({sx:.0},{sy:.0}) \
-                     (desktop scope; not driver-verified)."
-                ))
-                .with_structured(serde_json::json!({ "path": "cgevent_hid", "verified": false, "effect": "unverifiable" })),
+                Ok(Ok(hit)) => {
+                    let mut structured = serde_json::json!({ "path": "cgevent_hid", "verified": false, "effect": "unverifiable" });
+                    if let Some(hit) = hit {
+                        structured["hit"] = hit;
+                    }
+                    ToolResult::text(format!(
+                        "✅ Sent screen-absolute {button_label} at desktop-pixel \
+                         ({sx_shot:.0},{sy_shot:.0}) → screen-point ({sx:.0},{sy:.0}) \
+                         (desktop scope; not driver-verified)."
+                    ))
+                    .with_structured(structured)
+                }
                 Ok(Err(e)) => ToolResult::error(format!("desktop-scope click failed: {e}")),
                 Err(e) => ToolResult::error(format!("task error: {e}")),
             };
@@ -1553,22 +1567,10 @@ impl ClickTool {
             });
 
             // Drop the wildcard lease + detect window/foreground side-effects.
-            let acted_at = std::time::Instant::now();
             let changes = snapshot.detect_sampled_async().await;
 
             match result {
-                Ok(Ok((
-                    (mut msg, needs_webkit_delay, suspected_noop, evidence, selection_via_pixel),
-                    fronted,
-                ))) => {
-                    // For text inputs, wait 800ms for WebKit DOM focus to settle
-                    // before returning — matches the Swift reference behaviour.
-                    // The window watch above already used part of it.
-                    if needs_webkit_delay {
-                        let settle = std::time::Duration::from_millis(800)
-                            .saturating_sub(acted_at.elapsed());
-                        tokio::time::sleep(settle).await;
-                    }
+                Ok(Ok(((mut msg, suspected_noop, evidence, selection_via_pixel), fronted))) => {
                     msg.push_str(&changes.result_suffix());
                     let result = ToolResult::text(msg).with_structured(ax_click_structured(
                         selection_via_pixel,
@@ -1938,7 +1940,7 @@ impl ClickTool {
                             Ok(AxPressOutcome::Unavailable) => PxAxPress::FallThrough,
                             Ok(AxPressOutcome::Indeterminate) => {
                                 CFRelease(element as _);
-                                return Ok(PxAxPress::Indeterminate);
+                                return Ok(PxAxPress::Indeterminate(hit));
                             }
                             Err(moved) => {
                                 CFRelease(element as _);
@@ -2003,7 +2005,7 @@ impl ClickTool {
                                 "code": "background_unavailable"
                             }));
                     }
-                    Ok(Ok(PxAxPress::Indeterminate)) => {
+                    Ok(Ok(PxAxPress::Indeterminate(hit))) => {
                         // (path and record below)
 
                         // An AX action may have been delivered: do NOT fall
@@ -2012,11 +2014,17 @@ impl ClickTool {
                             "The accessibility action for the background click may have run,                              but its selection could not be confirmed. Read fresh state before                              clicking again."
                                 .to_owned(),
                         )
-                        .with_structured(serde_json::json!({
-                            "path": "ax",
-                            "effect": "unverifiable",
-                            "code": "ax_action_unverified",
-                        }))
+                        .with_structured({
+                            let mut structured = serde_json::json!({
+                                "path": "ax",
+                                "effect": "unverifiable",
+                                "code": "ax_action_unverified",
+                            });
+                            if let Some(hit) = hit {
+                                structured["hit"] = hit;
+                            }
+                            structured
+                        })
                         .with_action_record(
                             cua_driver_core::action_record::ActionExecutionRecord::builder(
                                 cua_driver_core::action_record::ActionEffect::Unverifiable,
@@ -2468,9 +2476,9 @@ fn ax_click_structured(
     structured
 }
 
-/// `perform_ax_click`'s outcome: `(summary_text, needs_webkit_delay,
-/// suspected_noop, selection_verified, selection_via_pixel)`.
-type AxClickOutcome = (String, bool, bool, Option<ClickEvidence>, bool);
+/// `perform_ax_click`'s outcome: `(summary_text, suspected_noop,
+/// selection_verified, selection_via_pixel)`.
+type AxClickOutcome = (String, bool, Option<ClickEvidence>, bool);
 
 fn elapsed_ms(started: std::time::Instant) -> u64 {
     u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
@@ -2497,7 +2505,6 @@ fn selection_write_outcome(
                  confirmed AXSelected=true."
             ),
             false,
-            false,
             Some(ClickEvidence::Selected),
             false,
         );
@@ -2509,7 +2516,6 @@ fn selection_write_outcome(
              may have been selected already, or other input happened). Read the window before \
              repeating it."
         ),
-        false,
         false,
         None,
         false,
@@ -2557,7 +2563,6 @@ fn unconfirmed_selection_click(
              or acted: read the window before repeating it."
         ),
         false,
-        false,
         None,
         true,
     )
@@ -2585,14 +2590,13 @@ fn unresolved_perform_error(
              before repeating it."
         ),
         false,
-        false,
         None,
         false,
     ))
 }
 
-/// Returns `(summary_text, needs_webkit_delay, suspected_noop,
-/// selection_verified, selection_via_pixel)`.
+/// Returns `(summary_text, suspected_noop, selection_verified,
+/// selection_via_pixel)`.
 ///
 /// `suspected_noop` is true when the element did not advertise the action we
 /// dispatched — AXUIElementPerformAction returns success regardless, so this is
@@ -2694,6 +2698,12 @@ impl KeyPrime {
             && self.focus_generation == now.focus_generation
             && now.at.saturating_duration_since(self.at) < KEY_PRIME_REUSE
     }
+}
+
+/// Focus is the click's evidence only when the field was not focused before
+/// it and no physical input arrived meanwhile.
+fn text_focus_evidence(focused_before: bool, input_quiet: bool) -> Option<ClickEvidence> {
+    (!focused_before && input_quiet).then_some(ClickEvidence::Focused)
 }
 
 /// Whether an AX press on a text input must wait for the page to move DOM
@@ -2843,67 +2853,50 @@ fn perform_ax_click(
                     crate::input::mouse::WindowClickDelivery::from_foreground(foreground),
                 )?;
             }
-            // AppKit may publish a transient AXSelected transition while the
-            // event queue is still resolving the gesture. Let it settle before
-            // accepting a candidate, then require the same state to survive a
-            // second observation. A modified selection additionally preserves
-            // every peer that was selected before delivery.
-            std::thread::sleep(SELECTION_READBACK_SETTLE);
-            let deadline = std::time::Instant::now() + SELECTION_READBACK_TIMEOUT;
-            let mut last_observation = None;
-            loop {
-                if let Some((after, peers_preserved)) = selection.observe() {
-                    last_observation = Some((after, peers_preserved));
-                    let verified = selection_readback_confirms(
-                        before,
-                        after,
-                        !modifiers.is_empty(),
-                        peers_preserved,
-                    );
-                    if verified {
-                        std::thread::sleep(SELECTION_READBACK_STABILITY);
-                        if let Some((stable_after, stable_peers_preserved)) = selection.observe() {
-                            last_observation = Some((stable_after, stable_peers_preserved));
-                            if stable_after == after
-                                && selection_readback_confirms(
-                                    before,
-                                    stable_after,
-                                    !modifiers.is_empty(),
-                                    stable_peers_preserved,
-                                )
-                                // A person's click on the same row would read
-                                // the same: no physical input around the post.
-                                && input_quiet(
-                                    idle_before,
-                                    super::physical_input_idle_ms(),
-                                    elapsed_ms(input_from),
-                                )
-                            {
-                                return Ok((
-                                    format!(
-                                        "✅ Selected nearest {selected_role} for [{idx}] {role} \
-                                         \"{title}\"; AX selection write was unavailable, so a \
-                                         coordinate click was delivered and confirmed by stable \
-                                         AXSelected read-back."
-                                    ),
-                                    false,
-                                    false,
-                                    Some(if stable_after {
-                                        ClickEvidence::Selected
-                                    } else {
-                                        ClickEvidence::Deselected
-                                    }),
-                                    true,
-                                ));
-                            }
-                        }
-                    }
-                }
-                if std::time::Instant::now() >= deadline {
-                    break;
-                }
-                std::thread::sleep(SELECTION_READBACK_POLL);
+            // Poll the selection from delivery and return on the sample that
+            // shows the expected state, held on an immediate second read; a
+            // modified selection additionally preserves every peer that was
+            // selected before delivery.
+            let modified = !modifiers.is_empty();
+            let last_observation = std::cell::Cell::new(None);
+            let found = watch_for_change(
+                ObservationScope::Watch,
+                std::time::Instant::now(),
+                &crate::ax::scroll_area::SystemClock,
+                || {
+                    let (after, peers_preserved) = selection.observe()?;
+                    last_observation.set(Some((after, peers_preserved)));
+                    selection_readback_confirms(before, after, modified, peers_preserved).then_some(
+                        if after {
+                            ClickEvidence::Selected
+                        } else {
+                            ClickEvidence::Deselected
+                        },
+                    )
+                },
+            );
+            // A person's click on the same row would read the same: no
+            // physical input around the post.
+            if let Some(evidence) = found.filter(|_| {
+                input_quiet(
+                    idle_before,
+                    super::physical_input_idle_ms(),
+                    elapsed_ms(input_from),
+                )
+            }) {
+                return Ok((
+                    format!(
+                        "✅ Selected nearest {selected_role} for [{idx}] {role} \
+                         \"{title}\"; AX selection write was unavailable, so a \
+                         coordinate click was delivered and confirmed by AXSelected \
+                         read-back."
+                    ),
+                    false,
+                    Some(evidence),
+                    true,
+                ));
             }
+            let last_observation = last_observation.get();
             return Ok(unconfirmed_selection_click(
                 &selected_role,
                 (idx, &role, &title),
@@ -2943,6 +2936,11 @@ fn perform_ax_click(
     }
     if text_input_press {
         let in_web_area = text_in_web_area;
+        // Focus counts as the click's effect only when the field was not
+        // focused before and no physical input arrived meanwhile.
+        let focused_before = unsafe { copy_bool_attr(element, "AXFocused") } == Some(true);
+        let focus_idle_before = super::physical_input_idle_ms();
+        let focus_input_from = std::time::Instant::now();
         let scope = if text_key_scope {
             match crate::input::skylight::enter_exact_window_key_inline(
                 pid as libc::pid_t,
@@ -3014,7 +3012,6 @@ fn perform_ax_click(
                         "⚠️ Sent a window-local pointer focus to [{idx}] {role} \"{title}\", but focus could not be confirmed."
                     ),
                     false,
-                    false,
                     None,
                     true,
                 ));
@@ -3024,16 +3021,29 @@ fn perform_ax_click(
                 hand_back.map(|text| format!(" {text}")).unwrap_or_default()
             )
         }
-        let settle =
-            needs_web_focus_settle(ax_action, &role, || unsafe { ancestor_roles(element) });
+        let evidence = text_focus_evidence(
+            focused_before,
+            input_quiet(
+                focus_idle_before,
+                super::physical_input_idle_ms(),
+                elapsed_ms(focus_input_from),
+            ),
+        );
+        let summary = if evidence.is_some() {
+            format!("✅ Focused [{idx}] {role} \"{title}\" with AXFocused=true; focus read-back confirmed.")
+        } else {
+            format!(
+                "✅ [{idx}] {role} \"{title}\" holds focus (AXFocused=true), but it was focused \
+                 before the click or input arrived meanwhile, so nothing confirms the click."
+            )
+        };
         return Ok((
             format!(
-                "✅ Focused [{idx}] {role} \"{title}\" with AXFocused=true; focus read-back confirmed.{}",
+                "{summary}{}",
                 hand_back.map(|text| format!(" {text}")).unwrap_or_default()
             ),
-            settle,
             false,
-            Some(ClickEvidence::Focused),
+            evidence,
             in_web_area,
         ));
     }
@@ -3067,7 +3077,6 @@ fn perform_ax_click(
                          the app returned AX error {err}.",
                         evidence.detail()
                     ),
-                    false,
                     false,
                     Some(evidence),
                     false,
@@ -3159,10 +3168,20 @@ fn perform_ax_click(
         ));
     }
 
-    // DOM focus settle: 800 ms for text inputs in web content (returned to the
-    // async caller). A native text field has no DOM focus to wait for.
-    let needs_webkit_delay =
-        needs_web_focus_settle(ax_action, &role, || unsafe { ancestor_roles(element) });
+    // A text input in web content takes DOM focus after the press: poll its
+    // AXFocused and return as soon as it reads focused (no fixed settle). A
+    // native text field has no DOM focus to wait for.
+    if needs_web_focus_settle(ax_action, &role, || unsafe { ancestor_roles(element) }) {
+        watch_for_change(
+            ObservationScope::Watch,
+            std::time::Instant::now(),
+            &crate::ax::scroll_area::SystemClock,
+            || {
+                (unsafe { copy_bool_attr(element, "AXFocused") } == Some(true))
+                    .then_some(ClickEvidence::Focused)
+            },
+        );
+    }
 
     // Show focus-rect highlight around the element (matches Swift showFocusRect).
     // Also move the cursor to the element center so the glide animation plays.
@@ -3185,7 +3204,7 @@ fn perform_ax_click(
     let _ = pid;
     let _ = window_id; // used by caller context
 
-    Ok((summary, needs_webkit_delay, suspected_noop, evidence, false))
+    Ok((summary, suspected_noop, evidence, false))
 }
 
 fn background_hit_uses_ax(focus_only: bool, in_web_area: bool) -> bool {
@@ -3218,8 +3237,9 @@ enum PxAxPress {
     Delivered(Option<ClickEvidence>, Option<serde_json::Value>),
     /// Nothing was sent through AX: the routed pixel click goes next.
     FallThrough,
-    /// An AX action may have been delivered without evidence: stop.
-    Indeterminate,
+    /// An AX action may have been delivered without evidence: stop. Carries
+    /// the element the point resolved to, as the public hit.
+    Indeterminate(Option<serde_json::Value>),
 }
 
 /// The result of a background PX click delivered through AX: confirmed
@@ -3700,10 +3720,10 @@ mod tests {
     #[test]
     fn perform_error_after_dispatch_is_unverifiable_unless_nothing_was_sent() {
         for modified in [false, true] {
-            let (summary, needs_webkit_delay, suspected_noop, verified, via_pixel) =
+            let (summary, suspected_noop, verified, via_pixel) =
                 unconfirmed_selection_click("AXRow", (3, "AXCell", "a"), modified, "last=None");
             assert!(summary.contains("may have selected"), "{summary}");
-            assert!(!needs_webkit_delay && !suspected_noop && verified.is_none() && via_pixel);
+            assert!(!suspected_noop && verified.is_none() && via_pixel);
             let structured = ax_click_structured(via_pixel, false, verified, suspected_noop);
             assert_eq!(structured["effect"], "unverifiable");
             assert_eq!(structured["path"], "cgevent");
@@ -3721,7 +3741,7 @@ mod tests {
             kAXErrorNotImplemented,
             -25299, // a code this driver does not know
         ] {
-            let (summary, needs_webkit_delay, suspected_noop, verified, via_pixel) =
+            let (summary, suspected_noop, verified, via_pixel) =
                 unresolved_perform_error("AXOpen", may_have_acted, (3, "AXRow", "Desktop"))
                     .unwrap_or_else(|error| panic!("{may_have_acted} must not fail: {error}"));
             assert!(
@@ -3729,7 +3749,7 @@ mod tests {
                 "the AX error stays visible: {summary}"
             );
             assert!(!summary.starts_with('✅'), "not a success: {summary}");
-            assert!(!needs_webkit_delay && !suspected_noop && verified.is_none() && !via_pixel);
+            assert!(!suspected_noop && verified.is_none() && !via_pixel);
             let structured = ax_click_structured(via_pixel, false, verified, suspected_noop);
             assert_eq!(structured["effect"], "unverifiable", "{may_have_acted}");
             assert_eq!(structured["verified"], false);
@@ -3765,7 +3785,7 @@ mod tests {
         for code in codes {
             for fronted in [false, true] {
                 let case = format!("code={code} fronted={fronted}");
-                let (summary, _, suspected_noop, verified, via_pixel) =
+                let (summary, suspected_noop, verified, via_pixel) =
                     unresolved_perform_error("AXOpen", code, (3, "AXRow", "Desktop"))
                         .unwrap_or_else(|error| panic!("{case}: {error}"));
                 let legacy = ax_click_structured(via_pixel, fronted, verified, suspected_noop);
@@ -4124,21 +4144,66 @@ mod click_evidence_tests {
             (reads.get() == 1).then_some(ClickEvidence::TitleNamesTarget)
         });
         assert_eq!(found, None);
-        assert!(elapsed <= CLICK_OBSERVATION + CLICK_OBSERVATION_POLL);
+        assert!(elapsed <= CLICK_OBSERVATION);
+    }
+
+    /// Watch where every read takes `cost` on the fake clock.
+    fn run_costly_watch(
+        cost: Duration,
+        read: impl Fn(Duration) -> Option<ClickEvidence>,
+    ) -> (Option<ClickEvidence>, Duration) {
+        let start = Instant::now();
+        let clock = FakeClock {
+            now: Cell::new(start),
+            sleeps: RefCell::new(Vec::new()),
+        };
+        let found = watch_for_change(ObservationScope::Watch, start, &clock, || {
+            clock.now.set(clock.now.get() + cost);
+            read(clock.now.get() - start)
+        });
+        (found, clock.now.get() - start)
+    }
+
+    #[test]
+    fn a_confirming_read_that_returns_after_the_deadline_does_not_count() {
+        // 7 ms reads: the change is first read at 58 ms, and its second read
+        // returns at 65 ms, past the 60 ms deadline.
+        let (found, elapsed) = run_costly_watch(Duration::from_millis(7), |elapsed| {
+            (elapsed >= Duration::from_millis(50)).then_some(ClickEvidence::Selected)
+        });
+        assert_eq!(found, None);
+        assert!(
+            elapsed <= CLICK_OBSERVATION + Duration::from_millis(7),
+            "{elapsed:?}"
+        );
+        // Both reads inside the deadline confirm.
+        let (found, _) = run_costly_watch(Duration::from_millis(6), |elapsed| {
+            (elapsed >= Duration::from_millis(40)).then_some(ClickEvidence::Selected)
+        });
+        assert_eq!(found, Some(ClickEvidence::Selected));
+    }
+
+    #[test]
+    fn focus_confirms_a_text_click_only_as_a_change_with_no_input() {
+        assert_eq!(
+            text_focus_evidence(false, true),
+            Some(ClickEvidence::Focused)
+        );
+        assert_eq!(text_focus_evidence(true, true), None, "already focused");
+        assert_eq!(text_focus_evidence(false, false), None, "input meanwhile");
     }
 
     #[test]
     fn an_unchanged_watch_stops_inside_the_click_budget_and_late_changes_do_not_count() {
         // Point clicks have 100 ms in all; the read-back takes well under it.
-        assert!(CLICK_OBSERVATION + CLICK_OBSERVATION_POLL < Duration::from_millis(100));
+        assert!(CLICK_OBSERVATION < Duration::from_millis(100));
         let (found, _, elapsed, sleeps) = run_watch(ObservationScope::Watch, |_| None);
         assert_eq!(found, None);
-        assert!(elapsed > CLICK_OBSERVATION, "{elapsed:?}");
-        assert!(
-            elapsed <= CLICK_OBSERVATION + CLICK_OBSERVATION_POLL,
-            "{elapsed:?}"
+        assert_eq!(
+            elapsed, CLICK_OBSERVATION,
+            "the last read is at the deadline"
         );
-        assert!(sleeps.iter().all(|sleep| *sleep == CLICK_OBSERVATION_POLL));
+        assert!(sleeps.iter().all(|sleep| *sleep <= CLICK_OBSERVATION_POLL));
         let (found, _, _, _) = run_watch(ObservationScope::Watch, |elapsed| {
             (elapsed > CLICK_OBSERVATION).then_some(ClickEvidence::Selected)
         });
@@ -4183,14 +4248,14 @@ mod click_evidence_tests {
 
     #[test]
     fn a_selection_write_without_a_tied_transition_is_unverifiable() {
-        let (text, _, _, evidence, _) =
+        let (text, _, evidence, _) =
             selection_write_outcome(false, "AXRow", (3, "AXCell", "a"), Some(-25204));
         assert!(evidence.is_none());
         assert!(text.contains("could not be tied to this click"), "{text}");
         assert!(text.contains("-25204"));
         let structured = ax_click_structured(false, false, evidence, false);
         assert_eq!(structured["effect"], "unverifiable");
-        let (text, _, _, evidence, _) =
+        let (text, _, evidence, _) =
             selection_write_outcome(true, "AXRow", (3, "AXCell", "a"), None);
         assert_eq!(evidence, Some(ClickEvidence::Selected));
         assert!(text.starts_with('✅'));
