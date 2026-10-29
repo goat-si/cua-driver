@@ -274,12 +274,30 @@ fn off_space_staleness_note(
 }
 
 fn chromium_browser_window(pid: i32) -> bool {
-    let identity = format!(
-        "{} {}",
-        crate::apps::get_app_name_for_pid(pid).unwrap_or_default(),
-        crate::apps::bundle_id_for_pid(pid).unwrap_or_default()
+    chromium_identity(
+        &app_executable_name(pid).unwrap_or_default(),
+        &crate::apps::bundle_id_for_pid(pid).unwrap_or_default(),
     )
-    .to_ascii_lowercase();
+}
+
+/// The executable name of a running app, read from AppKit without spawning a
+/// process: the name `ps -o comm=` reports for an app launched from its bundle.
+/// A process AppKit does not list falls back to `ps`.
+fn app_executable_name(pid: i32) -> Option<String> {
+    use objc2_app_kit::NSRunningApplication;
+    let from_appkit = unsafe {
+        NSRunningApplication::runningApplicationWithProcessIdentifier(pid)
+            .and_then(|app| app.executableURL())
+            .and_then(|url| url.lastPathComponent())
+            .map(|name| name.to_string())
+    };
+    from_appkit
+        .filter(|name| !name.is_empty())
+        .or_else(|| crate::apps::get_app_name_for_pid(pid))
+}
+
+fn chromium_identity(executable: &str, bundle_id: &str) -> bool {
+    let identity = format!("{executable} {bundle_id}").to_ascii_lowercase();
     identity
         .split(|ch: char| !ch.is_ascii_alphanumeric())
         .any(|token| {
@@ -473,10 +491,7 @@ impl Tool for GetWindowStateTool {
         // capture-only / preview path. With BOTH the tree and the screenshot
         // opted out there is nothing to return, so refuse rather than emit an
         // empty payload.
-        let want_tree = args
-            .get("include_accessibility_tree")
-            .and_then(|v| v.as_bool())
-            != Some(false);
+        let want_tree = wants_tree(&args);
         if !want_tree && !should_capture {
             return ToolResult::error(
                 "Nothing to return: both include_accessibility_tree:false and \
@@ -547,6 +562,12 @@ impl Tool for GetWindowStateTool {
         // Start the screenshot grab before the tree walk so the two overlap:
         // ScreenCaptureKit and the accessibility walk use independent system
         // services, and the read otherwise pays for them one after the other.
+        // A capture-only read has no walk for its capture to overlap, so its
+        // background-input facts are gathered beside the capture the same
+        // way. A read that walks gathers them after the walk, as before: they
+        // ask the same app over accessibility.
+        let mut prefetched_facts: Option<cua_driver_core::background_input::BackgroundTargetFacts> =
+            None;
         let abandon_events_before_prefetch = crate::capture::native_capture_abandon_events();
         let prefetched_capture = prefetch_capture(should_capture, want_tree, move || {
             crate::capture::screenshot_window_image(window_id)
@@ -568,6 +589,7 @@ impl Tool for GetWindowStateTool {
                     let walk = budget.outcome();
                     let tree_markdown = walk.note().unwrap_or_default();
                     let tree = crate::ax::tree::TreeWalkResult {
+                        offscreen_rows: Vec::new(),
                         tree_markdown,
                         nodes: Vec::new(),
                         truncated: true,
@@ -665,7 +687,15 @@ impl Tool for GetWindowStateTool {
         let screenshot = if should_capture {
             let out_file = screenshot_out_file.clone();
             let panel_args = args.clone();
-            let res = tokio::task::spawn_blocking(move || -> Result<
+            let side_facts = !want_tree && !display_only;
+            let res = tokio::task::spawn_blocking(move || {
+                std::thread::scope(|scope| {
+                let side = side_facts.then(|| {
+                    scope.spawn(move || {
+                        crate::ax::exact_target::gather_background_facts(pid, window_id, None)
+                    })
+                });
+                let captured = (move || -> Result<
                 (
                     Vec<u8>,
                     Option<String>,
@@ -735,7 +765,17 @@ impl Tool for GetWindowStateTool {
                         scale,
                     ))
                 }
+            })();
+                (captured, side.and_then(|side| side.join().ok()))
+                })
             }).await;
+            let res = match res {
+                Ok((captured, side)) => {
+                    prefetched_facts = side;
+                    Ok(captured)
+                }
+                Err(e) => Err(e),
+            };
             match res {
                 Ok(Ok((png, file_path, w, h, orig_w, orig_h, bounds, scale))) => {
                     if !observation_only {
@@ -969,6 +1009,7 @@ impl Tool for GetWindowStateTool {
         }
         if let Some(r) = tree_result.as_ref() {
             r.walk.apply(&mut structured);
+            apply_offscreen_rows(&mut structured, &r.offscreen_rows);
         }
         // Surface 6: an opaque snapshot identifier consumers can log
         // alongside the per-element tokens for debug correlation. Same value
@@ -1115,8 +1156,11 @@ impl Tool for GetWindowStateTool {
         // previews poll several times a second.
         if !display_only {
             let capture_available = screenshot_dims.is_some();
+            let prefetched = prefetched_facts;
             let report = tokio::task::spawn_blocking(move || {
-                let facts = crate::ax::exact_target::gather_background_facts(pid, window_id, None);
+                let facts = prefetched.unwrap_or_else(|| {
+                    crate::ax::exact_target::gather_background_facts(pid, window_id, None)
+                });
                 cua_driver_core::background_input::background_input_capability_report(
                     cua_driver_core::background_input::ExactWindowTarget { pid, window_id },
                     &facts,
@@ -1173,14 +1217,14 @@ impl Tool for GetWindowStateTool {
         if on_current_space == Some(false) {
             structured["on_current_space"] = serde_json::json!(false);
         }
-        if let Some(note) = off_space_staleness_note(on_current_space, chromium_browser_window(pid))
-        {
+        let chromium = chromium_browser_window(pid);
+        if let Some(note) = off_space_staleness_note(on_current_space, chromium) {
             structured["off_space_staleness"] = serde_json::json!(note);
             content.push(Content::text(note));
         }
         cua_driver_core::window_inspection::mark_browser_chrome_capture_coverage(
             &mut structured,
-            chromium_browser_window(pid).then_some(
+            chromium.then_some(
                 cua_driver_core::window_inspection::BrowserChromeCaptureCoverage::MayBeIncomplete,
             ),
         );
@@ -1440,6 +1484,39 @@ pub(crate) fn build_observation_elements_array(
 /// window. Only `verify_state`'s exhaustive read can say so: an ordinary read
 /// collapses layout containers, drops unlabelled rows and folds text rows,
 /// and its public array lists only the addressable rows.
+/// Whether a read walks the accessibility tree. A screenshot request
+/// (`include_accessibility_tree:false`) captures the window only: no walk, no
+/// rows, and the window's current snapshot keeps its tokens.
+fn wants_tree(args: &Value) -> bool {
+    args.get("include_accessibility_tree")
+        .and_then(|v| v.as_bool())
+        != Some(false)
+}
+
+/// A read that left offscreen list rows unwalked says so: `partial_walk`, and
+/// each skipped run's range among its collection's children, beside the
+/// `(offscreen rows: N; ...)` line the tree text carries for it.
+fn apply_offscreen_rows(
+    structured: &mut serde_json::Value,
+    runs: &[crate::ax::dense_rows::OffscreenRows],
+) {
+    if runs.is_empty() {
+        return;
+    }
+    structured["partial_walk"] = serde_json::json!(true);
+    structured["omitted_offscreen_rows"] = runs
+        .iter()
+        .map(|run| {
+            serde_json::json!({
+                "parent_index": run.parent_index,
+                "first_position": run.first_position,
+                "last_position": run.last_position,
+                "count": run.count,
+            })
+        })
+        .collect();
+}
+
 fn elements_complete(
     tree: Option<&crate::ax::tree::TreeWalkResult>,
     scope_matched: bool,
@@ -1645,7 +1722,11 @@ fn selection_observation_for_nodes(
             {
                 entry["focused"] = serde_json::Value::Bool(true);
             }
-            let (selected_text, range) = crate::ax::tree::selected_text_if_allowed(element);
+            let (selected_text, range) = if may_carry_selected_text(&node.role) {
+                crate::ax::tree::selected_text_if_allowed(element)
+            } else {
+                (None, None)
+            };
             crate::ax::bindings::AXUIElementSetMessagingTimeout(element, 0.0);
             if let Some(selected_text) = selected_text {
                 entry["selected_text"] = serde_json::Value::String(selected_text);
@@ -1667,6 +1748,15 @@ fn selection_observation_for_nodes(
         CFRelease(app as CFTypeRef);
     }
     observations
+}
+
+/// Whether a row the walk read as `role` can report a text selection.
+/// `selected_text_if_allowed` reads seven attributes before it looks at the
+/// role and answers only for text fields, text areas and combo boxes, so a row
+/// the walk already read as another role is not asked again. A role the walk
+/// could not read (empty, or `AXUnknown`) is still asked.
+fn may_carry_selected_text(role: &str) -> bool {
+    crate::ax::tree::is_selection_text_role(role) || role == "AXUnknown" || role.trim().is_empty()
 }
 
 fn apply_selection_observation(
@@ -2357,6 +2447,105 @@ mod tests {
         assert_eq!(
             entry["value"], "i love u",
             "value must be surfaced separately"
+        );
+    }
+
+    #[test]
+    fn text_area_value_keeps_hangul_and_symbols_beside_the_row_fields() {
+        let typed = "안녕하세요, 세계! — ₩1,000 · ✓ <a&b> \"인용\" 😀";
+        let mut nodes = vec![node(
+            Some(0),
+            "AXTextArea",
+            Some("메모"),
+            1,
+            None,
+            Some([10.0, 20.0, 300.0, 120.0]),
+            vec!["AXConfirm".into()],
+        )];
+        nodes[0].value = Some(typed.into());
+        nodes[0].value_state = Some(typed.into());
+        nodes[0].identifier = Some("note-body".into());
+        nodes[0].enabled = Some(true);
+        nodes[0].selected = Some(false);
+        let mut elements = build_elements_array_with_token(&nodes, None);
+        apply_selection_observation(
+            &mut elements,
+            &[(0, serde_json::json!({"focused": true}))].into(),
+        );
+        let entry = &elements[0];
+        assert_eq!(entry["role"], "AXTextArea");
+        assert_eq!(entry["label"], "메모");
+        assert_eq!(entry["value"], typed, "the typed text survives unchanged");
+        assert_eq!(entry["identifier"], "note-body");
+        assert!(entry["frame"].is_object(), "frame: {entry}");
+        assert_eq!(entry["enabled"], true);
+        assert_eq!(entry["selected"], false);
+        assert_eq!(entry["focused"], true);
+    }
+
+    #[test]
+    fn chromium_browsers_are_named_by_executable_or_bundle_id() {
+        assert!(chromium_identity("Google Chrome", "com.google.Chrome"));
+        assert!(chromium_identity("Brave Browser", ""));
+        assert!(chromium_identity("Microsoft Edge", "com.microsoft.edgemac"));
+        assert!(chromium_identity("Arc", "company.thebrowser.Browser"));
+        assert!(!chromium_identity("Calculator", "com.apple.calculator"));
+        assert!(!chromium_identity("Safari", "com.apple.Safari"));
+        // A token inside a longer word does not count.
+        assert!(!chromium_identity("Searchlight", "com.example.archive"));
+    }
+
+    #[test]
+    fn a_screenshot_request_walks_no_tree() {
+        // The arguments a screenshot sends: capture only.
+        let screenshot = serde_json::json!({
+            "pid": 1, "window_id": 2, "include_accessibility_tree": false,
+            "include_screenshot": true, "max_elements": 4096
+        });
+        assert!(!wants_tree(&screenshot));
+        // Nothing overlaps a capture-only read, so no capture is prefetched
+        // for a walk either.
+        assert!(prefetch_capture(true, wants_tree(&screenshot), || ()).is_none());
+        // Without a walk there are no rows and no tree to report.
+        assert!(!elements_complete(None, true, true));
+        // An observe, and a read that does not say, walk the tree.
+        assert!(wants_tree(&serde_json::json!({
+            "include_accessibility_tree": true, "tree_format": "both"
+        })));
+        assert!(wants_tree(&serde_json::json!({})));
+    }
+
+    #[test]
+    fn a_partial_walk_names_each_skipped_offscreen_range() {
+        let mut structured = serde_json::json!({});
+        apply_offscreen_rows(&mut structured, &[]);
+        assert!(structured.get("partial_walk").is_none());
+        assert!(structured.get("omitted_offscreen_rows").is_none());
+
+        apply_offscreen_rows(
+            &mut structured,
+            &[
+                crate::ax::dense_rows::OffscreenRows {
+                    parent_index: Some(3),
+                    first_position: 0,
+                    last_position: 49,
+                    count: 50,
+                },
+                crate::ax::dense_rows::OffscreenRows {
+                    parent_index: Some(3),
+                    first_position: 60,
+                    last_position: 199,
+                    count: 140,
+                },
+            ],
+        );
+        assert_eq!(structured["partial_walk"], true);
+        assert_eq!(
+            structured["omitted_offscreen_rows"],
+            serde_json::json!([
+                {"parent_index": 3, "first_position": 0, "last_position": 49, "count": 50},
+                {"parent_index": 3, "first_position": 60, "last_position": 199, "count": 140},
+            ])
         );
     }
 

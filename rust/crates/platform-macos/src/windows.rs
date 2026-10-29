@@ -354,13 +354,7 @@ fn enumerate_windows(
     }
 
     if let Some(query) = &space_query {
-        for window in &mut results {
-            let space_ids = query.window_space_ids(window.window_id);
-            let display_space_id = space_ids
-                .as_ref()
-                .and_then(|_| query.current_space_for_window(window.window_id));
-            apply_window_space_metadata(window, space_ids, display_space_id);
-        }
+        fill_window_spaces(query, &mut results);
     }
 
     WindowEnumeration {
@@ -368,6 +362,57 @@ fn enumerate_windows(
         current_space_id,
         complete,
     }
+}
+
+/// The two per-window Space reads an enumeration makes, behind a trait so the
+/// single-window lookup can be checked against the full enumeration.
+trait WindowSpaceSource {
+    fn window_space_ids(&self, window_id: u32) -> Option<Vec<u64>>;
+    fn current_space_for_window(&self, window_id: u32) -> Option<u64>;
+}
+
+impl WindowSpaceSource for crate::input::skylight::SpaceQuery {
+    fn window_space_ids(&self, window_id: u32) -> Option<Vec<u64>> {
+        crate::input::skylight::SpaceQuery::window_space_ids(self, window_id)
+    }
+    fn current_space_for_window(&self, window_id: u32) -> Option<u64> {
+        crate::input::skylight::SpaceQuery::current_space_for_window(self, window_id)
+    }
+}
+
+fn fill_window_spaces(source: &impl WindowSpaceSource, windows: &mut [WindowInfo]) {
+    for window in windows {
+        let space_ids = source.window_space_ids(window.window_id);
+        let display_space_id = space_ids
+            .as_ref()
+            .and_then(|_| source.current_space_for_window(window.window_id));
+        apply_window_space_metadata(window, space_ids, display_space_id);
+    }
+}
+
+/// `window_id`'s row from `windows` with its Space metadata read for that
+/// window alone: the values [`all_windows`] reports for it, without two Space
+/// round trips for every other window on the system.
+fn layer0_window_with_spaces_in(
+    windows: Vec<WindowInfo>,
+    source: Option<&impl WindowSpaceSource>,
+    window_id: u32,
+) -> Option<WindowInfo> {
+    let mut window = windows.into_iter().find(|w| w.window_id == window_id)?;
+    if let Some(source) = source {
+        fill_window_spaces(source, std::slice::from_mut(&mut window));
+    }
+    Some(window)
+}
+
+fn layer0_window_with_spaces(window_id: u32) -> Option<WindowInfo> {
+    // Same order as the full enumeration: the Space query first, then the list.
+    let space_query = crate::input::skylight::SpaceQuery::new();
+    layer0_window_with_spaces_in(
+        all_windows_without_spaces(),
+        space_query.as_ref(),
+        window_id,
+    )
 }
 
 /// One CGWindowList entry, reduced to the identity fields closure needs.
@@ -605,10 +650,7 @@ pub fn window_info_by_id(window_id: u32) -> Option<WindowInfo> {
 /// Whether `window_id` is on the current Space of its display. `None` when
 /// WindowServer does not know the window or Space membership is unreadable.
 pub fn window_on_current_space_by_id(window_id: u32) -> Option<bool> {
-    all_windows()
-        .into_iter()
-        .find(|w| w.window_id == window_id)?
-        .on_current_space
+    layer0_window_with_spaces(window_id)?.on_current_space
 }
 
 /// WindowServer's Space and on-screen view of one layer-0 window.
@@ -623,13 +665,10 @@ pub(crate) struct WindowSpaceView {
 /// [`WindowSpaceView`] of `window_id`, or `None` when WindowServer does not
 /// list it as a layer-0 window.
 pub(crate) fn window_space_view_by_id(window_id: u32) -> Option<WindowSpaceView> {
-    all_windows()
-        .into_iter()
-        .find(|w| w.window_id == window_id)
-        .map(|w| WindowSpaceView {
-            on_current_space: w.on_current_space,
-            is_on_screen: w.is_on_screen,
-        })
+    layer0_window_with_spaces(window_id).map(|w| WindowSpaceView {
+        on_current_space: w.on_current_space,
+        is_on_screen: w.is_on_screen,
+    })
 }
 
 /// Look up a window's bounds by its CGWindowID.
@@ -924,6 +963,60 @@ mod tests {
             on_current_space: None,
             space_ids: None,
         }
+    }
+
+    /// Spaces per window, with every window whose Spaces were asked for.
+    struct FakeSpaces {
+        spaces: std::collections::HashMap<u32, Vec<u64>>,
+        display_space: std::collections::HashMap<u32, u64>,
+        asked: std::cell::RefCell<Vec<u32>>,
+    }
+
+    impl WindowSpaceSource for FakeSpaces {
+        fn window_space_ids(&self, window_id: u32) -> Option<Vec<u64>> {
+            self.asked.borrow_mut().push(window_id);
+            self.spaces.get(&window_id).cloned()
+        }
+        fn current_space_for_window(&self, window_id: u32) -> Option<u64> {
+            self.display_space.get(&window_id).copied()
+        }
+    }
+
+    #[test]
+    fn one_window_space_lookup_matches_the_full_enumeration_and_asks_only_for_it() {
+        let fake = FakeSpaces {
+            // 1 is on the current Space, 2 on another one, 3 has no Space
+            // answer, 4 is on a second display with its own current Space.
+            spaces: [(1, vec![7]), (2, vec![9]), (4, vec![11, 12])].into(),
+            display_space: [(1, 7), (2, 7), (3, 7), (4, 12)].into(),
+            asked: Default::default(),
+        };
+        let listed: Vec<WindowInfo> = (1..=4).map(|id| window(id, 50, "App")).collect();
+        let mut enumerated = listed.clone();
+        fill_window_spaces(&fake, &mut enumerated);
+        for target in 1..=4 {
+            fake.asked.borrow_mut().clear();
+            let one = layer0_window_with_spaces_in(listed.clone(), Some(&fake), target)
+                .expect("listed window");
+            assert_eq!(*fake.asked.borrow(), [target]);
+            let full = &enumerated[target as usize - 1];
+            assert_eq!(one.on_current_space, full.on_current_space);
+            assert_eq!(one.current_space_id, full.current_space_id);
+            assert_eq!(one.space_ids, full.space_ids);
+            assert_eq!(one.is_on_screen, full.is_on_screen);
+        }
+        assert_eq!(enumerated[0].on_current_space, Some(true));
+        assert_eq!(enumerated[1].on_current_space, Some(false));
+        assert_eq!(enumerated[2].on_current_space, None);
+        assert_eq!(enumerated[3].on_current_space, Some(true));
+
+        // An unlisted window is unknown, and nothing is asked for it.
+        fake.asked.borrow_mut().clear();
+        assert!(layer0_window_with_spaces_in(listed.clone(), Some(&fake), 99).is_none());
+        assert!(fake.asked.borrow().is_empty());
+        // Without a Space query the row keeps no Space metadata, as before.
+        let bare = layer0_window_with_spaces_in(listed, None::<&FakeSpaces>, 2).unwrap();
+        assert_eq!(bare.on_current_space, None);
     }
 
     #[test]

@@ -79,6 +79,14 @@ impl BatchSlots {
             Slot::Absent => None,
         }
     }
+
+    /// The slot's borrowed value, valid while these slots live.
+    pub(crate) fn raw(&self, index: usize) -> Option<CFTypeRef> {
+        match self.slots[index] {
+            Slot::Value(value) => Some(value),
+            Slot::Absent => None,
+        }
+    }
 }
 
 fn error_slot(error: Option<AXError>) -> Option<Slot> {

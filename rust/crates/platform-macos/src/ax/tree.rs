@@ -16,7 +16,6 @@ use super::bindings::*;
 use super::content_attrs::{read_content_attrs, ContentAttrs};
 use super::dense_rows::{
     self, rows_windowed, with_dense_rows_windowed, ChildPlan, Chunk, DeferredRow,
-    DENSE_COLLECTION_ROLES,
 };
 use super::launch::{is_still_launching, LaunchStep, LaunchWait};
 use super::snapshot::RetainedElement;
@@ -154,7 +153,7 @@ pub(crate) unsafe fn selected_text_if_allowed(
     let Some(role) = value(0).filter(|role| !role.trim().is_empty()) else {
         return (None, None);
     };
-    if !matches!(role, "AXTextField" | "AXTextArea" | "AXComboBox")
+    if !is_selection_text_role(role)
         || is_secure_text_field(&FieldSecurityMeta {
             role,
             subrole: value(1),
@@ -170,6 +169,11 @@ pub(crate) unsafe fn selected_text_if_allowed(
     }
     let selected = copy_string_attr(element, "AXSelectedText").filter(|text| !text.is_empty());
     (selected, read_selected_text_range(element))
+}
+
+/// The roles [`selected_text_if_allowed`] reads a selection from.
+pub(crate) fn is_selection_text_role(role: &str) -> bool {
+    matches!(role, "AXTextField" | "AXTextArea" | "AXComboBox")
 }
 
 /// A single node in the AX tree.
@@ -356,6 +360,9 @@ pub struct TreeWalkResult {
     /// [`WindowScope::Matched`] comes with an EMPTY walk, so `nodes` never
     /// describes a window other than the requested one.
     pub window_scope: Option<WindowScope>,
+    /// Offscreen rows a windowed read left unwalked, one entry per summary
+    /// line. Empty when every row was walked.
+    pub offscreen_rows: Vec<super::dense_rows::OffscreenRows>,
 }
 
 #[cfg(test)]
@@ -369,6 +376,7 @@ impl TreeWalkResult {
             nodes_skipped: false,
             walk: cua_driver_core::walk_budget::WalkBudget::nodes_only(usize::MAX).outcome(),
             window_scope: None,
+            offscreen_rows: Vec::new(),
         }
     }
 }
@@ -491,6 +499,7 @@ fn walk_tree_with_web_content(
     let mut lines: Vec<(usize, String)> = Vec::new(); // (depth, line)
     let mut index_counter = 0usize;
     let mut deferred = Vec::new();
+    let mut offscreen_rows = Vec::new();
     let mut batching_disabled = false;
     let mut window_scope: Option<WindowScope> = None;
 
@@ -498,6 +507,7 @@ fn walk_tree_with_web_content(
         let app_elem = AXUIElementCreateApplication(pid);
         if app_elem.is_null() {
             return TreeWalkResult {
+                offscreen_rows: Vec::new(),
                 tree_markdown: String::new(),
                 nodes,
                 truncated: false,
@@ -579,61 +589,62 @@ fn walk_tree_with_web_content(
             break (top_level, walk);
         };
 
-        // Walk each top-level child at depth 0.
+        // Walk each top-level child at depth 0. Its own frame, read only if
+        // a large container needs it, bounds what is on screen for children
+        // whose app does not list the visible ones.
         for child in walk_these {
-            walk_element(
-                child,
-                0,
-                None,
-                false,
-                &mut nodes,
-                &mut lines,
-                &mut index_counter,
-                &mut budget,
-                &mut batching_disabled,
-                max_depth,
-                include_web_content,
-                &mut deferred,
-            );
+            let surface = rows_windowed().then_some(child as usize);
+            dense_rows::with_visible_clip(surface, || {
+                walk_element(
+                    child,
+                    0,
+                    None,
+                    false,
+                    &mut nodes,
+                    &mut lines,
+                    &mut index_counter,
+                    &mut budget,
+                    &mut batching_disabled,
+                    max_depth,
+                    include_web_content,
+                    &mut deferred,
+                )
+            });
         }
 
         if !deferred.is_empty() {
             let search_offscreen = query.is_some_and(|q| !q.trim().is_empty());
-            with_dense_rows_windowed(false, || {
-                for visible in [true, false] {
-                    if !visible && !search_offscreen {
-                        if deferred.iter().any(|row| !row.visible) {
-                            note_skipped();
-                        }
-                        continue;
-                    }
-                    for row in deferred.iter_mut().filter(|row| row.visible == visible) {
-                        let mut chunk = Chunk {
-                            lines: Vec::new(),
-                            nodes: Vec::new(),
-                        };
-                        walk_element(
-                            row.element.as_ptr() as AXUIElementRef,
-                            row.depth,
-                            row.parent_index,
-                            row.in_web_content,
-                            &mut chunk.nodes,
-                            &mut chunk.lines,
-                            &mut index_counter,
-                            &mut budget,
-                            &mut batching_disabled,
-                            max_depth,
-                            include_web_content,
-                            &mut Vec::new(),
-                        );
-                        row.walked = Some(chunk);
-                    }
-                }
+            let skipped = with_dense_rows_windowed(false, || {
+                dense_rows::walk_deferred(&mut deferred, search_offscreen, |row| {
+                    let mut chunk = Chunk {
+                        lines: Vec::new(),
+                        nodes: Vec::new(),
+                    };
+                    walk_element(
+                        row.element.as_ptr() as AXUIElementRef,
+                        row.depth,
+                        row.parent_index,
+                        row.in_web_content,
+                        &mut chunk.nodes,
+                        &mut chunk.lines,
+                        &mut index_counter,
+                        &mut budget,
+                        &mut batching_disabled,
+                        max_depth,
+                        include_web_content,
+                        &mut Vec::new(),
+                    );
+                    chunk
+                })
             });
-            let (spliced_lines, spliced_nodes, map) = dense_rows::splice(lines, nodes, deferred);
+            if skipped {
+                note_skipped();
+            }
+            let (spliced_lines, spliced_nodes, runs) =
+                dense_rows::splice_and_renumber(lines, nodes, deferred);
             lines = spliced_lines;
             nodes = spliced_nodes;
-            dense_rows::renumber(&mut lines, &mut nodes, &map);
+            offscreen_rows = runs;
         }
 
         // Release all top-level elements (copy_children / copy_ax_windows both retain).
@@ -664,6 +675,7 @@ fn walk_tree_with_web_content(
     }
 
     TreeWalkResult {
+        offscreen_rows,
         tree_markdown,
         nodes,
         truncated: walk.truncated(),
@@ -1119,11 +1131,31 @@ unsafe fn walk_element(
     // index for it invites agents to retain an unusable menu target.
     let actionless_control =
         actions.is_empty() && !value_settable && is_actionless_control_role(&role);
-    let enabled = if !actions.is_empty() || value_settable || actionless_control {
-        copy_bool_attr(element, "AXEnabled")
+    // A row that may be indexed reads its control state and frame in one
+    // batched call; any other row reads only its frame, later.
+    // A batch that failed past the deadline stops the walk: like a content
+    // read that timed out, the row keeps only its role, without an index or
+    // its children.
+    let control = if !actions.is_empty() || value_settable || actionless_control {
+        match super::control_attrs::read_control_attrs(element, budget, batching_disabled) {
+            Some(control) => Some(control),
+            None => {
+                push_timed_out_row(
+                    role,
+                    element,
+                    depth,
+                    parent_index,
+                    in_web_content,
+                    nodes,
+                    lines,
+                );
+                return;
+            }
+        }
     } else {
         None
     };
+    let enabled = control.as_ref().and_then(|control| control.enabled);
     let is_actionable = is_addressable(
         &role,
         !actions.is_empty() || actionless_control,
@@ -1166,23 +1198,45 @@ unsafe fn walk_element(
     }
 
     let element_ptr = element as usize;
-    let frame = element_screen_rect(element);
+    let frame = match &control {
+        Some(control) => control.frame,
+        None => match super::control_attrs::read_frame(element, budget, batching_disabled) {
+            Some(frame) => frame,
+            None => {
+                push_timed_out_row(
+                    role,
+                    element,
+                    depth,
+                    parent_index,
+                    in_web_content,
+                    nodes,
+                    lines,
+                );
+                return;
+            }
+        },
+    };
     // Structured `elements` only contains actionable nodes. Keep all new AX
     // round-trips behind that same gate so display-only rows pay no cost.
-    let control_state = read_control_state_if_actionable(is_actionable, || ControlState {
-        value_state: copied_value
-            .map(|copied| copied.state_value)
-            .filter(|v| !v.trim().is_empty())
-            .or_else(|| value.clone())
-            .map(|v| v.trim().to_owned())
-            .filter(|v| !v.is_empty()),
-        value_description: copy_string_attr(element, "AXValueDescription")
-            .map(|v| v.trim().to_owned())
-            .filter(|v| !v.is_empty()),
-        min_value: copy_number_attr(element, "AXMinValue"),
-        max_value: copy_number_attr(element, "AXMaxValue"),
-        enabled,
-        selected: copy_bool_attr(element, "AXSelected"),
+    let control_state = read_control_state_if_actionable(is_actionable, || {
+        // An indexed row always has its batched control state.
+        let control = control.clone().unwrap_or_default();
+        ControlState {
+            value_state: copied_value
+                .map(|copied| copied.state_value)
+                .filter(|v| !v.trim().is_empty())
+                .or_else(|| value.clone())
+                .map(|v| v.trim().to_owned())
+                .filter(|v| !v.is_empty()),
+            value_description: control
+                .value_description
+                .map(|v| v.trim().to_owned())
+                .filter(|v| !v.is_empty()),
+            min_value: control.min_value,
+            max_value: control.max_value,
+            enabled,
+            selected: control.selected,
+        }
     });
     let security_meta = FieldSecurityMeta {
         role: &role,
@@ -1344,7 +1398,9 @@ unsafe fn walk_children(
     } else {
         None
     };
-    let plan = if rows_windowed() && !in_web_content && DENSE_COLLECTION_ROLES.contains(&role) {
+    let plan = if tab_plan.is_none()
+        && dense_rows::windows_children(rows_windowed(), in_web_content, role, children.len())
+    {
         Some(dense_rows::plan_collection_children(
             element, role, &children, budget,
         ))
@@ -1374,6 +1430,8 @@ unsafe fn walk_children(
             ChildPlan::Defer { visible } => deferred.push(DeferredRow {
                 anchor: nodes.len(),
                 seq: deferred.len(),
+                position: index,
+                collection: element as usize,
                 element: RetainedElement::retain(child as usize),
                 depth,
                 parent_index,
@@ -1463,6 +1521,23 @@ unsafe fn plan_macos_tab_strip(
 }
 
 /// Trimmed text, or `None` when empty.
+/// A row whose attribute read ran past the walk's deadline: its role only,
+/// with no index and no children, as for a content read that timed out.
+fn push_timed_out_row(
+    role: String,
+    element: AXUIElementRef,
+    depth: usize,
+    parent_index: Option<usize>,
+    in_web_content: bool,
+    nodes: &mut Vec<AXNode>,
+    lines: &mut Vec<(usize, String)>,
+) {
+    note_skipped();
+    let node = role_only_node(role, element as usize, depth, parent_index, in_web_content);
+    lines.push((depth, format_node_line(&node)));
+    nodes.push(node);
+}
+
 fn trimmed_label(text: Option<String>) -> Option<String> {
     text.map(|text| text.trim().to_owned())
         .filter(|text| !text.is_empty())
@@ -2016,6 +2091,25 @@ fn leading_indent_depth(line: &str) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_row_that_timed_out_keeps_only_its_role() {
+        let (mut nodes, mut lines) = (Vec::new(), Vec::new());
+        push_timed_out_row(
+            "AXMenuItem".into(),
+            std::ptr::null_mut(),
+            2,
+            Some(4),
+            false,
+            &mut nodes,
+            &mut lines,
+        );
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(nodes[0].element_index, None, "no index with unknown state");
+        assert_eq!(nodes[0].role, "AXMenuItem");
+        assert_eq!(nodes[0].parent_element_index, Some(4));
+        assert_eq!(lines.len(), 1);
+    }
     use std::cell::Cell;
 
     #[test]
