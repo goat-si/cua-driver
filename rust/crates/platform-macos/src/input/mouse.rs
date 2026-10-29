@@ -802,6 +802,25 @@ where
     let wid = wid.ok_or_else(|| {
         anyhow::anyhow!("a background drag needs the exact target window (window_id)")
     })?;
+    // The caller's validated local endpoints determine the origin, so the
+    // stamped window-local points come from the SAME frame the endpoints
+    // were translated with — never a second, later frame read.
+    if let Some((fx, fy)) = from_local {
+        return drag_at_xy_background_with_origin(
+            pid,
+            (from_x, from_y),
+            (to_x, to_y),
+            wid,
+            duration_ms,
+            steps,
+            modifiers,
+            button,
+            observe,
+            || true,
+            (from_x - fx, from_y - fy),
+        )
+        .map(|_| ());
+    }
     drag_at_xy_background(
         pid,
         (from_x, from_y),

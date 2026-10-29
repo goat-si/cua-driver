@@ -1359,7 +1359,7 @@ impl ClickTool {
                     let delivered = if focus_only {
                         crate::input::ax_actions::focus_element(element as usize).is_ok()
                     } else {
-                        match ax_press_with_ancestors(element, &dispatch_guard) {
+                        match ax_press_with_ancestors(element, &dispatch_guard, pid) {
                             Ok(AxPressOutcome::Delivered) => true,
                             Ok(AxPressOutcome::Unavailable) => false,
                             Ok(AxPressOutcome::Indeterminate) => {
@@ -1404,6 +1404,28 @@ impl ClickTool {
                         .with_structured(serde_json::json!({
                             "code": "background_unavailable"
                         }));
+                    }
+                    Ok(Err(error)) if !focus_only => {
+                        // The AX task may have failed after an action: do
+                        // not fall through to a second (pixel) click.
+                        return ToolResult::text(format!(
+                            "The accessibility action for the background click failed ({error});                              it may have run. Read fresh state before clicking again."
+                        ))
+                        .with_structured(serde_json::json!({
+                            "path": "ax",
+                            "effect": "unverifiable",
+                            "code": "ax_action_unverified",
+                        }))
+                        .with_action_record(
+                            cua_driver_core::action_record::ActionExecutionRecord::builder(
+                                cua_driver_core::action_record::ActionEffect::Unverifiable,
+                                cua_driver_core::action_record::ActionTransport::MacosAxAction,
+                                cua_driver_core::action_record::RequestedDelivery::Background,
+                            )
+                            .actual_delivery(cua_driver_core::action_record::ActualDelivery::Background)
+                            .build()
+                            .expect("ax unverifiable record is valid"),
+                        );
                     }
                     Ok(Err(error)) if focus_only => {
                         return ToolResult::error(format!("Background PX focus failed: {error}"))
@@ -2313,15 +2335,42 @@ enum AxPressOutcome {
     Indeterminate,
 }
 
+/// Which ancestor action a click should use, if any. Selection first:
+/// AXPress on the nearest ancestor that advertises it. AXOpen only on a
+/// Finder sidebar cell (AXCell below AXRow below AXOutline), where open IS
+/// the single-click navigation gesture — an outline elsewhere can be a file
+/// or document tree, where a click must select, not open.
+fn ancestor_action_kind(
+    chain: &[(Option<String>, Vec<String>)],
+    is_finder: bool,
+) -> Option<(usize, &'static str)> {
+    for (index, (role, actions)) in chain.iter().enumerate() {
+        if actions.iter().any(|a| a == "AXPress") {
+            return Some((index, "AXPress"));
+        }
+        if is_finder
+            && role.as_deref() == Some("AXCell")
+            && actions.iter().any(|a| a == "AXOpen")
+            && chain[index + 1..]
+                .iter()
+                .any(|(role, _)| role.as_deref() == Some("AXRow"))
+            && chain
+                .iter()
+                .any(|(role, _)| role.as_deref() == Some("AXOutline"))
+        {
+            return Some((index, "AXOpen"));
+        }
+    }
+    None
+}
+
 /// AXPress the element, or the nearest equivalent actionable ancestor. The
-/// window-points guard is rechecked immediately before EVERY action, an AX
-/// error that does not prove non-delivery stops the route as indeterminate,
-/// and AXOpen is used only for sidebar cells (AXOutline ancestry), where a
-/// single click and open are the same gesture — a file row's click must
-/// select, not open.
+/// window-points guard is rechecked immediately before EVERY action and an
+/// AX error that does not prove non-delivery stops as indeterminate.
 unsafe fn ax_press_with_ancestors(
     element: crate::ax::bindings::AXUIElementRef,
     dispatch_guard: &Option<super::window_points::DispatchGuard>,
+    pid: i32,
 ) -> Result<AxPressOutcome, super::window_points::WindowMoved> {
     use crate::ax::bindings::{copy_action_names, copy_element_attr, copy_string_attr};
     use core_foundation::base::CFRelease;
@@ -2339,59 +2388,92 @@ unsafe fn ax_press_with_ancestors(
             return Ok(AxPressOutcome::Indeterminate);
         }
     }
+    // Collect the ancestor chain first, so an AXOpen decision can see the
+    // outline above the cell rather than only the ancestors visited so far.
+    let mut chain: Vec<(
+        Option<String>,
+        Vec<String>,
+        crate::ax::bindings::AXUIElementRef,
+    )> = Vec::new();
     let mut current = element;
-    let mut in_outline = false;
     for _ in 0..4 {
         let Some(parent) = copy_element_attr(current, "AXParent") else {
             break;
-        };
-        let role = copy_string_attr(parent, "AXRole");
-        if role.as_deref() == Some("AXOutline") {
-            in_outline = true;
-        }
-        let actions = copy_action_names(parent);
-        let action = if actions.iter().any(|a| a == "AXPress") {
-            Some("AXPress")
-        } else if in_outline && actions.iter().any(|a| a == "AXOpen") {
-            Some("AXOpen")
-        } else {
-            None
-        };
-        let delivered = match action {
-            Some(name) => {
-                super::window_points::check_guard(dispatch_guard)?;
-                let cf = CFString::new(name);
-                let err = AXUIElementPerformAction(parent, cf.as_concrete_TypeRef());
-                if err == kAXErrorSuccess {
-                    Some(true)
-                } else if !perform_error_proves_nothing_was_sent(err) {
-                    Some(false)
-                } else {
-                    None
-                }
-            }
-            None => None,
         };
         if current != element {
             CFRelease(current as _);
         }
         current = parent;
-        match delivered {
-            Some(true) => {
-                CFRelease(current as _);
-                return Ok(AxPressOutcome::Delivered);
-            }
-            Some(false) => {
-                CFRelease(current as _);
-                return Ok(AxPressOutcome::Indeterminate);
-            }
-            None => {}
-        }
+        let role = copy_string_attr(current, "AXRole");
+        let actions = copy_action_names(current);
+        chain.push((role, actions, current));
     }
-    if current != element {
+    if current != element && !chain.iter().any(|(_, _, el)| *el == current) {
         CFRelease(current as _);
     }
+    let roles_actions: Vec<(Option<String>, Vec<String>)> = chain
+        .iter()
+        .map(|(role, actions, _)| (role.clone(), actions.clone()))
+        .collect();
+    let is_finder = crate::apps::bundle_id_for_pid(pid).as_deref() == Some("com.apple.finder");
+    let chosen = ancestor_action_kind(&roles_actions, is_finder);
+    let Some((index, action_name)) = chosen else {
+        for (_, _, el) in chain {
+            CFRelease(el as _);
+        }
+        return Ok(AxPressOutcome::Unavailable);
+    };
+    let target = chain[index].2;
+    super::window_points::check_guard(dispatch_guard)?;
+    let action = CFString::new(action_name);
+    let err = AXUIElementPerformAction(target, action.as_concrete_TypeRef());
+    for (_, _, el) in chain {
+        CFRelease(el as _);
+    }
+    if err == kAXErrorSuccess {
+        return Ok(AxPressOutcome::Delivered);
+    }
+    if !perform_error_proves_nothing_was_sent(err) {
+        return Ok(AxPressOutcome::Indeterminate);
+    }
     Ok(AxPressOutcome::Unavailable)
+}
+
+#[cfg(test)]
+mod ancestor_action_tests {
+    use super::ancestor_action_kind;
+
+    fn chain(items: &[(&str, &[&str])]) -> Vec<(Option<String>, Vec<String>)> {
+        items
+            .iter()
+            .map(|(role, actions)| {
+                (
+                    Some((*role).to_owned()),
+                    actions.iter().map(|a| (*a).to_owned()).collect(),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_finder_sidebar_cell_opens_but_a_file_row_only_selects() {
+        // Finder sidebar: AXCell(AXOpen) under AXRow under AXOutline.
+        let sidebar = chain(&[
+            ("AXRow", &[]),
+            ("AXCell", &["AXOpen"]),
+            ("AXRow", &[]),
+            ("AXOutline", &[]),
+        ]);
+        assert_eq!(ancestor_action_kind(&sidebar, true), Some((1, "AXOpen")));
+        // The same shape in another app's outline is NOT an open gesture.
+        assert_eq!(ancestor_action_kind(&sidebar, false), None);
+        // A file row with AXOpen is never opened by a single click.
+        let file_row = chain(&[("AXRow", &["AXOpen"]), ("AXTable", &[])]);
+        assert_eq!(ancestor_action_kind(&file_row, true), None);
+        // AXPress always wins as the selection-equivalent action.
+        let row = chain(&[("AXCell", &["AXOpen"]), ("AXRow", &["AXPress"])]);
+        assert_eq!(ancestor_action_kind(&row, true), Some((1, "AXPress")));
+    }
 }
 
 #[cfg(test)]
