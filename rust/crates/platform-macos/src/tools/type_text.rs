@@ -178,6 +178,11 @@ impl Tool for TypeTextTool {
             let checked_pid = early_front_pid.unwrap_or_default();
             let posted = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
             let posted_ref = posted.clone();
+            // The sequence's intended focused target is retained: the
+            // guard compares every later focused element against it, so a
+            // switch between two editable fields in the same app also stops.
+            let initial_focus = unsafe { crate::ax::bindings::focused_element_of_pid(checked_pid) }
+                .map(|ptr| ptr as usize);
             let result = latency::spawn_action_blocking(move || {
                 super::not_editable::desktop_dispatch_guard(checked_pid, true)?;
                 crate::input::keyboard::type_text_global_with_guard(
@@ -192,11 +197,21 @@ impl Tool for TypeTextTool {
                                 super::not_editable::sync_focused_cell_allows(checked_pid, None)
                             }
                             && crate::apps::frontmost_pid() == Some(checked_pid)
+                            && initial_focus
+                                .map(|ptr| {
+                                    crate::input::ax_actions::is_element_focused(checked_pid, ptr)
+                                })
+                                .unwrap_or(false)
                     },
                     posted_ref.as_ref(),
                 )
             })
             .await;
+            if let Some(ptr) = initial_focus {
+                unsafe {
+                    core_foundation::base::CFRelease(ptr as core_foundation::base::CFTypeRef)
+                };
+            }
             if result.is_err() || matches!(result, Ok(Err(_))) {
                 let count = posted.load(std::sync::atomic::Ordering::SeqCst);
                 if count > 0 {
@@ -204,7 +219,7 @@ impl Tool for TypeTextTool {
                     // that count, including event-construction and task
                     // failures.
                     return ToolResult::text(format!(
-                        "Desktop typing stopped after {count} character(s) were already sent.                          The remaining text was not sent; read fresh state before retrying."
+                        "Desktop typing stopped after at least {count} character(s) were sent.                          Any event or paste in flight is unverifiable; read fresh state before                          retrying."
                     ))
                     .with_structured(serde_json::json!({
                         "code": "not_editable",

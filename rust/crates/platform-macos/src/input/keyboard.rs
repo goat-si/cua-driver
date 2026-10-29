@@ -139,6 +139,11 @@ fn deliver_text_runs(
                     if error.downcast_ref::<PasteMayHaveLanded>().is_some() {
                         return Err(error);
                     }
+                    if error.downcast_ref::<DesktopSequenceAbort>().is_some() {
+                        // A guard abort is not a paste failure: never resume
+                        // typing after it, even if focus comes back.
+                        return Err(error);
+                    }
                     type_run(run)?;
                 }
             }
@@ -852,7 +857,19 @@ pub fn type_text_global_with_guard(
                 }));
             }
             let count = run.chars().count();
-            paste_text_preserving_clipboard(run, || press_key_global("v", &["cmd"]))?;
+            paste_text_preserving_clipboard(run, || {
+                // Revalidate at the trigger boundary: the transaction
+                // locked, snapshotted and wrote the pasteboard first, so
+                // focus may have changed during that work.
+                if !guard.borrow_mut()() {
+                    return Err(anyhow::Error::new(DesktopSequenceAbort {
+                        posted: posted.load(std::sync::atomic::Ordering::SeqCst),
+                        reason: "not_editable: the frontmost application or its focus changed                                  before the paste went out"
+                            .into(),
+                    }));
+                }
+                press_key_global("v", &["cmd"])
+            })?;
             posted.fetch_add(count, std::sync::atomic::Ordering::SeqCst);
             Ok(())
         },
