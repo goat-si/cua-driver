@@ -523,14 +523,20 @@ impl StepGate {
 struct GateDropGuard {
     gate: StepGate,
     slot: Arc<Mutex<Option<StepGate>>>,
+    worker: Option<tokio::task::JoinHandle<StepCompletion>>,
     armed: bool,
 }
 
 impl GateDropGuard {
-    fn new(gate: StepGate, slot: Arc<Mutex<Option<StepGate>>>) -> Self {
+    fn new(
+        gate: StepGate,
+        slot: Arc<Mutex<Option<StepGate>>>,
+        worker: tokio::task::JoinHandle<StepCompletion>,
+    ) -> Self {
         Self {
             gate,
             slot,
+            worker: Some(worker),
             armed: true,
         }
     }
@@ -545,6 +551,9 @@ impl Drop for GateDropGuard {
     fn drop(&mut self) {
         if self.armed {
             self.gate.timeout();
+            if let Some(worker) = self.worker.take() {
+                worker.abort();
+            }
             *self.slot.lock().unwrap_or_else(|error| error.into_inner()) = None;
         }
     }
@@ -1345,7 +1354,6 @@ async fn execute_step(
     *active_gate
         .lock()
         .unwrap_or_else(|error| error.into_inner()) = Some(gate.clone());
-    let guard = GateDropGuard::new(gate.clone(), active_gate);
     let worker_gate = gate.clone();
     let work = crate::step_pacing::scope(
         pacing,
@@ -1368,10 +1376,10 @@ async fn execute_step(
             work.await
         }
     };
-    let mut worker = tokio::spawn(work);
-    tokio::select! {
-        result = &mut worker => {
-            guard.disarm();
+    let worker = tokio::spawn(work);
+    let mut guard = GateDropGuard::new(gate.clone(), active_gate, worker);
+    let execution = tokio::select! {
+        result = guard.worker.as_mut().expect("worker") => {
             match result {
                 Ok(completion) => StepExecution::Completed(completion),
                 Err(error) => {
@@ -1391,12 +1399,15 @@ async fn execute_step(
             }
         }
         _ = deadline.wait() => {
-            let snapshot = gate.timeout();
-            guard.disarm();
-            // A timeout stops new admissions, but the result is assembled only
-            // after the already-admitted invocation has settled. No late input
-            // or worker outlives this batch result.
+            let worker = guard.worker.as_mut().expect("worker");
+            worker.abort();
+            gate.timeout();
+            // Cooperative workers settle at their next cancellation point. Waiting
+            // for that cancellation keeps admitted work and its guards from
+            // outliving the batch result; the refreshed snapshot also includes
+            // any refusal published while cancellation was settling.
             let _ = worker.await;
+            let snapshot = gate.timeout();
             StepExecution::Timeout {
                 outcome: failure(
                     index,
@@ -1409,7 +1420,9 @@ async fn execute_step(
                 snapshot,
             }
         }
-    }
+    };
+    guard.disarm();
+    execution
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2811,7 +2824,6 @@ mod timeout_tests {
         calls: Arc<Mutex<Vec<Value>>>,
         started: Arc<tokio::sync::Notify>,
         release: Arc<tokio::sync::Notify>,
-        finished: Arc<tokio::sync::Notify>,
         response: Arc<dyn Fn() -> ToolResult + Send + Sync>,
     }
 
@@ -2826,7 +2838,6 @@ mod timeout_tests {
             self.started.notify_one();
             self.release.notified().await;
             let result = (self.response)();
-            self.finished.notify_one();
             result
         }
     }
@@ -2873,8 +2884,8 @@ mod timeout_tests {
             "window_id": 7,
             "snapshot_id": "s00000001",
             "windows": [
-                {"pid":42,"window_id":7,"app_name":"Demo","title":"A","z_index":1,"is_on_screen":true},
-                {"pid":42,"window_id":22,"app_name":"Demo","title":"B","z_index":2,"is_on_screen":true}
+                {"pid":pid,"window_id":7,"app_name":"Demo","title":"A","z_index":1,"is_on_screen":true},
+                {"pid":pid,"window_id":22,"app_name":"Demo","title":"B","z_index":2,"is_on_screen":true}
             ]
         }))
     }
@@ -2897,13 +2908,12 @@ mod timeout_tests {
     async fn a_hung_step_returns_step_timeout() {
         let started = Arc::new(tokio::sync::Notify::new());
         let release = Arc::new(tokio::sync::Notify::new());
-        let finished = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let mut registry = ToolRegistry::new();
         registry.register(Box::new(HangingTool {
             def: tool_def("type_text"),
             started: started.clone(),
             release: release.clone(),
-            finished: finished.clone(),
+            finished: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             concurrency: Arc::new(tokio::sync::Semaphore::new(1)),
         }));
         let registry = Arc::new(registry);
@@ -2920,9 +2930,16 @@ mod timeout_tests {
         tokio::time::timeout(Duration::from_secs(1), started.notified())
             .await
             .expect("action start");
+        let busy = registry
+            .invoke("type_text", json!({"pid":425001,"window_id":7}))
+            .await;
+        assert!(
+            busy.is_error == Some(true) && format!("{busy:?}").contains("input_busy"),
+            "{busy:?}"
+        );
         deadline_tx.send(()).expect("trigger step deadline");
-        release.notify_one();
         let result = batch.await.expect("batch join");
+        release.notify_one();
         let structured = result.structured_content.expect("structured batch");
         assert_eq!(structured["code"], "step_timeout");
         assert_eq!(structured["failed_step"], 0);
@@ -2930,7 +2947,6 @@ mod timeout_tests {
         assert_eq!(structured["steps"][0]["tool"], "type_text");
         assert_eq!(structured["steps"][0]["effect"], "unverifiable");
 
-        assert!(finished.load(std::sync::atomic::Ordering::SeqCst));
         let completed = registry
             .invoke("type_text", json!({"pid":425001,"window_id":7}))
             .await;
@@ -2968,10 +2984,23 @@ mod timeout_tests {
     }
 
     #[test]
-    fn dropping_the_parent_guard_closes_the_step_gate() {
+    fn refreshed_timeout_snapshot_observes_late_scope_refusal() {
+        let gate = StepGate::new();
+        assert!(gate.begin_dispatch());
+        assert_eq!(gate.timeout().scope_refusal, None);
+        gate.complete_dispatch(Some(crate::batch_scope::OUTSIDE_SCOPE));
+        assert_eq!(
+            gate.timeout().scope_refusal,
+            Some(crate::batch_scope::OUTSIDE_SCOPE)
+        );
+    }
+
+    #[tokio::test]
+    async fn dropping_the_parent_guard_closes_the_step_gate() {
         let gate = StepGate::new();
         let slot = Arc::new(Mutex::new(Some(gate.clone())));
-        let guard = GateDropGuard::new(gate.clone(), slot.clone());
+        let worker = tokio::spawn(async { std::future::pending().await });
+        let guard = GateDropGuard::new(gate.clone(), slot.clone(), worker);
         drop(guard);
         assert!(!gate.begin_read());
         assert!(!gate.begin_dispatch());
@@ -3108,8 +3137,8 @@ mod timeout_tests {
             .await
             .expect("read start");
         deadline_tx.send(()).expect("trigger deadline");
-        release.notify_one();
         let result = batch.await.expect("batch join");
+        release.notify_one();
         let structured = result.structured_content.unwrap();
         assert_eq!(structured["code"], "step_timeout");
         assert!(clicks.lock().unwrap().is_empty());
@@ -3291,7 +3320,6 @@ mod timeout_tests {
         );
         let started = Arc::new(tokio::sync::Notify::new());
         let release = Arc::new(tokio::sync::Notify::new());
-        let finished = Arc::new(tokio::sync::Notify::new());
         let calls = Arc::new(Mutex::new(Vec::new()));
         let mut registry = ToolRegistry::new();
         registry.register(Box::new(RefusalTool {
@@ -3299,7 +3327,6 @@ mod timeout_tests {
             calls: calls.clone(),
             started: started.clone(),
             release: release.clone(),
-            finished: finished.clone(),
             response: Arc::new(|| {
                 ToolResult::error("element_token is stale")
                     .with_structured(json!({"code":"stale_element_token","effect":"refused"}))
@@ -3322,11 +3349,8 @@ mod timeout_tests {
         let batch = tokio::spawn(plan.run(registry, None));
         started.notified().await;
         deadline_tx.send(()).expect("deadline");
-        release.notify_one();
         let result = batch.await.expect("batch join");
-        tokio::time::timeout(Duration::from_secs(1), finished.notified())
-            .await
-            .expect("first refusal completion");
+        release.notify_one();
         assert_eq!(result.structured_content.unwrap()["code"], "step_timeout");
         assert_eq!(calls.lock().unwrap().len(), 1);
         assert!(menu_calls.lock().unwrap().is_empty());
@@ -3342,7 +3366,6 @@ mod timeout_tests {
         );
         let started = Arc::new(tokio::sync::Notify::new());
         let release = Arc::new(tokio::sync::Notify::new());
-        let finished = Arc::new(tokio::sync::Notify::new());
         let calls = Arc::new(Mutex::new(Vec::new()));
         let mut registry = ToolRegistry::new();
         register_probe(&mut registry, "list_windows", list_windows);
@@ -3360,7 +3383,6 @@ mod timeout_tests {
             calls: calls.clone(),
             started: started.clone(),
             release: release.clone(),
-            finished: finished.clone(),
             response: Arc::new(|| {
                 ToolResult::error("element_token is stale")
                     .with_structured(json!({"code":"stale_element_token","effect":"refused"}))
@@ -3382,11 +3404,8 @@ mod timeout_tests {
         let batch = tokio::spawn(plan.run(registry, None));
         started.notified().await;
         deadline_tx.send(()).expect("deadline");
-        release.notify_one();
         let result = batch.await.expect("batch join");
-        tokio::time::timeout(Duration::from_secs(1), finished.notified())
-            .await
-            .expect("first refusal completion");
+        release.notify_one();
         assert_eq!(result.structured_content.unwrap()["code"], "step_timeout");
         assert_eq!(calls.lock().unwrap().len(), 1);
     }
@@ -3395,7 +3414,6 @@ mod timeout_tests {
     async fn foreground_fallback_does_not_run_after_timeout() {
         let started = Arc::new(tokio::sync::Notify::new());
         let release = Arc::new(tokio::sync::Notify::new());
-        let finished = Arc::new(tokio::sync::Notify::new());
         let calls = Arc::new(Mutex::new(Vec::new()));
         let mut registry = ToolRegistry::new();
         registry.register(Box::new(RefusalTool {
@@ -3403,7 +3421,6 @@ mod timeout_tests {
             calls: calls.clone(),
             started: started.clone(),
             release: release.clone(),
-            finished: finished.clone(),
             response: Arc::new(|| {
                 ToolResult::error("background unavailable").with_structured(json!({
                     "effect":"refused",
@@ -3425,11 +3442,8 @@ mod timeout_tests {
         let batch = tokio::spawn(plan.run(registry, None));
         started.notified().await;
         deadline_tx.send(()).expect("deadline");
-        release.notify_one();
         let result = batch.await.expect("batch join");
-        tokio::time::timeout(Duration::from_secs(1), finished.notified())
-            .await
-            .expect("first refusal completion");
+        release.notify_one();
         assert_eq!(result.structured_content.unwrap()["code"], "step_timeout");
         assert_eq!(calls.lock().unwrap().len(), 1);
     }
