@@ -816,7 +816,13 @@ impl std::fmt::Display for DesktopSequenceAbort {
 impl std::error::Error for DesktopSequenceAbort {}
 
 pub fn type_text_global(text: &str, inter_char_delay_ms: u64) -> anyhow::Result<()> {
-    type_text_global_with_guard(text, inter_char_delay_ms, || true).map(|_| ())
+    type_text_global_with_guard(
+        text,
+        inter_char_delay_ms,
+        || true,
+        &std::sync::atomic::AtomicUsize::new(0),
+    )
+    .map(|_| ())
 }
 
 /// type_text_global with a per-character guard: the frontmost pid and its
@@ -827,31 +833,48 @@ pub fn type_text_global_with_guard(
     text: &str,
     inter_char_delay_ms: u64,
     guard: impl FnMut() -> bool,
+    posted: &std::sync::atomic::AtomicUsize,
 ) -> anyhow::Result<usize> {
     use core_graphics::event::CGEventTapLocation;
 
     let source = CGEventSource::new(CGEventSourceStateID::HIDSystemState)
         .map_err(|_| anyhow::anyhow!("CGEventSource::new failed"))?;
     let guard = std::cell::RefCell::new(guard);
-    let posted = std::cell::Cell::new(0usize);
     deliver_text_runs(
         text,
         || !text_target_may_be_secret(None),
-        |run| paste_text_preserving_clipboard(run, || press_key_global("v", &["cmd"])),
+        |run| {
+            if !guard.borrow_mut()() {
+                return Err(anyhow::Error::new(DesktopSequenceAbort {
+                    posted: posted.load(std::sync::atomic::Ordering::SeqCst),
+                    reason: "not_editable: the frontmost application or its focus changed                              during desktop typing"
+                        .into(),
+                }));
+            }
+            let count = run.chars().count();
+            paste_text_preserving_clipboard(run, || press_key_global("v", &["cmd"]))?;
+            posted.fetch_add(count, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        },
         |run| {
             for ch in run.chars() {
                 if !guard.borrow_mut()() {
                     return Err(anyhow::Error::new(DesktopSequenceAbort {
-                        posted: posted.get(),
+                        posted: posted.load(std::sync::atomic::Ordering::SeqCst),
                         reason: "not_editable: the frontmost application or its focus changed                                  during desktop typing"
                             .into(),
                     }));
                 }
-                let (down, up) = char_key_events(&source, ch)?;
+                let (down, up) = char_key_events(&source, ch).map_err(|error| {
+                anyhow::Error::new(DesktopSequenceAbort {
+                    posted: posted.load(std::sync::atomic::Ordering::SeqCst),
+                    reason: format!("desktop key event construction failed: {error}"),
+                })
+            })?;
                 down.post(CGEventTapLocation::HID);
                 key_gap_sleep();
                 up.post(CGEventTapLocation::HID);
-                posted.set(posted.get() + 1);
+                posted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 std::thread::sleep(
                     std::time::Duration::from_millis(inter_char_delay_ms).max(key_gap()),
                 );
@@ -861,21 +884,26 @@ pub fn type_text_global_with_guard(
         |ch| {
             if !guard.borrow_mut()() {
                 return Err(anyhow::Error::new(DesktopSequenceAbort {
-                    posted: posted.get(),
+                    posted: posted.load(std::sync::atomic::Ordering::SeqCst),
                     reason: "not_editable: the frontmost application or its focus changed                              during desktop typing"
                         .into(),
                 }));
             }
-            let (down, up) = char_key_events(&source, ch)?;
+            let (down, up) = char_key_events(&source, ch).map_err(|error| {
+                anyhow::Error::new(DesktopSequenceAbort {
+                    posted: posted.load(std::sync::atomic::Ordering::SeqCst),
+                    reason: format!("desktop key event construction failed: {error}"),
+                })
+            })?;
             down.post(CGEventTapLocation::HID);
             key_gap_sleep();
             up.post(CGEventTapLocation::HID);
-            posted.set(posted.get() + 1);
+            posted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             key_gap_sleep();
             Ok(())
         },
     )
-    .map(|_| posted.get())
+    .map(|_| posted.load(std::sync::atomic::Ordering::SeqCst))
 }
 
 /// Type ASCII text through the global HID queue as physical US-keyboard
