@@ -926,7 +926,17 @@ fn enter_scope(pid: pid_t, target_wid: u32, inline: bool) -> Result<WindowKeySco
     ) {
         Ok(primed) => primed,
         Err(error) => {
-            let disclosure = scope_disclosure(entry.get(), None);
+            // Records or a focused-window write may still have moved key
+            // inside the app: hand it back under the same front rule a
+            // scope's hand-back uses, and say what happened.
+            let noted = entry.get();
+            let hand_back = entry_hand_back_kind(noted).map(|primed| {
+                match restore_target(target_wid, previous, &order_before, &app_window_order(pid)) {
+                    Some(previous) => run_hand_back(pid, target_wid, primed, previous),
+                    None => HandBack::NoTarget,
+                }
+            });
+            let disclosure = scope_disclosure(noted, hand_back);
             return Err(if disclosure.is_empty() {
                 error
             } else {
@@ -946,6 +956,19 @@ fn enter_scope(pid: pid_t, target_wid: u32, inline: bool) -> Result<WindowKeySco
         done: false,
         ops: LIVE_SCOPE_OPS,
     })
+}
+
+/// How to hand key back after a failed entry: records when any record may
+/// have reached the app, the focused-window write when only that ran,
+/// nothing when entering touched nothing.
+fn entry_hand_back_kind(entry: KeyEntry) -> Option<KeyPrime> {
+    if entry.records_posted > 0 || entry.records_uncertain {
+        Some(KeyPrime::KeyRecords)
+    } else if entry.ax_write {
+        Some(KeyPrime::AxFocusedWindow)
+    } else {
+        None
+    }
 }
 
 // ── NSMenu shortcut activation SPIs ──────────────────────────────────────────
@@ -1382,6 +1405,9 @@ pub struct ValidationPost {
     pub records: u8,
     /// Cmd+F20 key-down/key-up posts that succeeded (of 2).
     pub keys: u8,
+    /// Cmd+F20 post calls made, successful or not (a failed call may still
+    /// have delivered the event).
+    pub key_attempts: u8,
     /// A post call returned failure.
     pub uncertain: bool,
     /// At least one post call was made.
@@ -1473,6 +1499,7 @@ fn menu_validation_guarded_with<E>(
         return out;
     }
     for event in [&down, &up] {
+        out.key_attempts += 1;
         if post_event(event) {
             out.keys += 1;
         } else {
@@ -3215,6 +3242,7 @@ mod wp2_scope_tests {
             ValidationPost {
                 records: 1,
                 keys: 0,
+                key_attempts: 0,
                 uncertain: false,
                 called: true
             }
@@ -3280,6 +3308,7 @@ mod wp2_scope_tests {
             ValidationPost {
                 records: 1,
                 keys: 0,
+                key_attempts: 0,
                 uncertain: true,
                 called: true
             }
@@ -3301,7 +3330,10 @@ mod wp2_scope_tests {
             },
         );
         assert_eq!(posted, vec![1, 2]);
-        assert_eq!((post.records, post.keys, post.uncertain), (2, 1, true));
+        assert_eq!(
+            (post.records, post.keys, post.key_attempts, post.uncertain),
+            (2, 1, 2, true)
+        );
         assert!(post.disclosure().contains("1 of 2 Cmd+F20"));
 
         let post = menu_validation_guarded_with(
@@ -3317,6 +3349,7 @@ mod wp2_scope_tests {
             ValidationPost {
                 records: 2,
                 keys: 2,
+                key_attempts: 2,
                 uncertain: false,
                 called: true
             }
@@ -3346,5 +3379,43 @@ mod wp2_scope_tests {
         );
         assert!(result.is_err());
         assert!(!wrote);
+    }
+}
+
+#[cfg(test)]
+mod entry_hand_back_tests {
+    use super::{entry_hand_back_kind, KeyEntry, KeyPrime};
+
+    #[test]
+    fn a_failed_entry_hands_back_whatever_may_have_moved_key() {
+        assert_eq!(
+            entry_hand_back_kind(KeyEntry::default()),
+            None,
+            "nothing touched"
+        );
+        let records = KeyEntry {
+            records_posted: 2,
+            ..KeyEntry::default()
+        };
+        assert_eq!(entry_hand_back_kind(records), Some(KeyPrime::KeyRecords));
+        let uncertain = KeyEntry {
+            records_uncertain: true,
+            ..KeyEntry::default()
+        };
+        assert_eq!(entry_hand_back_kind(uncertain), Some(KeyPrime::KeyRecords));
+        let ax_only = KeyEntry {
+            ax_write: true,
+            ..KeyEntry::default()
+        };
+        assert_eq!(
+            entry_hand_back_kind(ax_only),
+            Some(KeyPrime::AxFocusedWindow)
+        );
+        let both = KeyEntry {
+            records_posted: 4,
+            records_uncertain: false,
+            ax_write: true,
+        };
+        assert_eq!(entry_hand_back_kind(both), Some(KeyPrime::KeyRecords));
     }
 }

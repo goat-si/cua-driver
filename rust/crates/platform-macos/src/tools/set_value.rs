@@ -320,7 +320,15 @@ fn set_value_tool_result(
         Ok(Ok(outcome)) if outcome.not_applied && !ax_echo_surface => {
             let vcl = crate::input::pointer_toolkit::detect(pid)
                 == Some(crate::input::pointer_toolkit::PointerReadingToolkit::Vcl);
-            not_applied_result(element_index, vcl)
+            let mut result = not_applied_result(element_index, vcl);
+            if !suffix.trim().is_empty() {
+                result
+                    .content
+                    .push(cua_driver_core::protocol::Content::text(
+                        suffix.trim().to_owned(),
+                    ));
+            }
+            result
         }
         Ok(Ok(mut outcome)) => {
             apply_surface_trust(&mut outcome, ax_echo_surface);
@@ -346,8 +354,8 @@ fn set_value_tool_result(
             }
             ToolResult::text(msg).with_structured(structured)
         }
-        Ok(Err(e)) => ToolResult::error(format!("set_value failed: {e}")),
-        Err(e) => ToolResult::error(format!("Task error: {e}")),
+        Ok(Err(e)) => ToolResult::error(format!("set_value failed: {e}.{suffix}")),
+        Err(e) => ToolResult::error(format!("Task error: {e}.{suffix}")),
     }
 }
 
@@ -419,6 +427,57 @@ async fn minimized_set_value(
                 report,
             );
         }
+        // The window is visible now: prove it again as an exact, visible
+        // keyboard target with another app still in front, before anything
+        // (the TOKEN rule's focus attempt included) touches it.
+        let gate_guard = element_guard.clone();
+        let regated = latency::spawn_action_blocking(move || {
+            use cua_driver_core::background_input::{
+                decide_background_input, BackgroundAction, BackgroundInputDecision,
+                ExactWindowTarget,
+            };
+            let facts = crate::ax::exact_target::gather_background_facts(
+                pid,
+                window_id,
+                Some(gate_guard.as_ptr()),
+            );
+            let refusal = match decide_background_input(
+                ExactWindowTarget { pid, window_id },
+                &facts,
+                BackgroundAction::ExactWindowKeysFocused,
+            ) {
+                BackgroundInputDecision::Refuse(refusal) => Some((refusal.code, refusal.reason)),
+                BackgroundInputDecision::Execute { .. } if !restore.front_still_ok() => Some((
+                    cua_driver_core::background_input::refusal_codes::MINIMIZED_OR_HIDDEN,
+                    "its app came to the front, or which app is in front could not be read"
+                        .to_owned(),
+                )),
+                BackgroundInputDecision::Execute { .. } => None,
+            };
+            (restore, refusal)
+        })
+        .await;
+        let restore = match regated {
+            Ok((restore, None)) => restore,
+            Ok((restore, Some((code, reason)))) => {
+                let report = finish(restore).await;
+                return with_note(
+                    super::pre_dispatch_refusal(
+                        code,
+                        format!(
+                            "window {window_id} was restored, but {reason}; AXValue was not written."
+                        ),
+                    ),
+                    report,
+                );
+            }
+            Err(error) => {
+                return ToolResult::error(format!(
+                    "set_value: re-checking the restored window failed ({error}); it may be left \
+                     restored. Nothing was written."
+                ))
+            }
+        };
         let element_ptr = element_guard.as_ptr();
         if let Some(refusal) =
             super::not_editable::token_not_editable_refusal(pid, element_ptr, window_id).await
@@ -433,6 +492,15 @@ async fn minimized_set_value(
         );
         let write_guard = element_guard.clone();
         let written = latency::spawn_action_blocking(move || {
+            // Declared after the restore guard this closure owns, so a panic
+            // hands key back before the window is minimized again.
+            let scope = match crate::input::skylight::enter_exact_window_key_inline(
+                pid as libc::pid_t,
+                window_id,
+            ) {
+                Ok(scope) => scope,
+                Err(reason) => return (restore, Err(anyhow::anyhow!(reason)), String::new()),
+            };
             let result = set_value_blocking_with(
                 write_guard.as_ptr(),
                 element_index,
@@ -441,10 +509,13 @@ async fn minimized_set_value(
                 &value,
                 true,
             );
-            (restore, result)
+            let entry = scope.entry();
+            let hand_back = scope.finish();
+            let disclosure = crate::input::skylight::scope_disclosure(entry, Some(hand_back));
+            (restore, result, disclosure)
         })
         .await;
-        let (restore, result) = match written {
+        let (restore, result, disclosure) = match written {
             Ok(pair) => pair,
             Err(error) => {
                 return ToolResult::error(format!(
@@ -454,11 +525,17 @@ async fn minimized_set_value(
             }
         };
         let report = finish(restore).await;
-        let suffix = match report.describe() {
-            note if note.is_empty() => String::new(),
-            note => format!(" {note}"),
-        };
-        set_value_tool_result(Ok(result), ax_echo_surface, suffix, pid, element_index)
+        let suffix = [disclosure, report.describe()]
+            .into_iter()
+            .filter(|note| !note.is_empty())
+            .map(|note| format!(" {note}"))
+            .collect::<String>();
+        let mut result =
+            set_value_tool_result(Ok(result), ax_echo_surface, suffix, pid, element_index);
+        if let Some(serde_json::Value::Object(fields)) = result.structured_content.as_mut() {
+            fields.insert("restore_cleanup".into(), serde_json::json!(report.code()));
+        }
+        result
     });
     task.await.unwrap_or_else(|error| {
         ToolResult::error(format!(
@@ -741,14 +818,10 @@ fn set_value_blocking_with(
             document_edited: None,
         })
     } else {
+        // A restored window's caller already holds an inline key scope for
+        // the whole write and reports its hand-back.
         let _key_scope = if text_value_role_requires_exact_focus(&role) && restored_window {
-            Some(
-                crate::input::skylight::enter_exact_window_key_inline(
-                    pid as libc::pid_t,
-                    window_id,
-                )
-                .map_err(|reason| anyhow::anyhow!(reason))?,
-            )
+            None
         } else if text_value_role_requires_exact_focus(&role) {
             Some(
                 super::key_scope(pid, Some(window_id))

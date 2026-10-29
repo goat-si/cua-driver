@@ -1398,12 +1398,17 @@ fn menu_item_is_save(item: AXUIElementRef) -> bool {
 /// What the chord route did, decided on its blocking thread.
 enum ChordStep {
     /// The item was pressed (or may have been).
-    Pressed { text: String, may_have_run: bool },
+    Pressed {
+        text: String,
+        may_have_run: bool,
+        validation: crate::input::skylight::ValidationPost,
+    },
     /// Nothing from the menu was sent.
     Refused {
         code: &'static str,
         text: String,
-        validation_posted: bool,
+        /// What menu validation posted before the refusal, if anything.
+        validation: crate::input::skylight::ValidationPost,
     },
     /// A Save item: continue on invoke_menu's route under the same scope.
     Save {
@@ -1433,7 +1438,7 @@ fn chord_refusal(
     ChordStep::Refused {
         code,
         text,
-        validation_posted: validation.called,
+        validation,
     }
 }
 
@@ -1450,7 +1455,7 @@ fn chord_in_scope(pid: i32, wid: u32, combo: super::menu_equivalent::Combo) -> C
             return ChordStep::Refused {
                 code: "window_not_key",
                 text: format!("press_key: {reason}. No menu action was sent."),
-                validation_posted: false,
+                validation: crate::input::skylight::ValidationPost::default(),
             }
         }
     };
@@ -1550,9 +1555,10 @@ fn chord_in_scope(pid: i32, wid: u32, combo: super::menu_equivalent::Combo) -> C
                  effect is not read back: check the window.{notes}"
             ),
             may_have_run: false,
+            validation,
         }
     } else if super::click::perform_error_proves_nothing_was_sent(err) {
-        chord_refusal_after_hand_back(path, err, validation.called, notes)
+        chord_refusal_after_hand_back(path, err, validation, notes)
     } else {
         ChordStep::Pressed {
             text: format!(
@@ -1560,6 +1566,7 @@ fn chord_in_scope(pid: i32, wid: u32, combo: super::menu_equivalent::Combo) -> C
                  the menu action may have run. Read the window before repeating it.{notes}"
             ),
             may_have_run: true,
+            validation,
         }
     }
 }
@@ -1567,7 +1574,7 @@ fn chord_in_scope(pid: i32, wid: u32, combo: super::menu_equivalent::Combo) -> C
 fn chord_refusal_after_hand_back(
     path: String,
     err: crate::ax::bindings::AXError,
-    validation_posted: bool,
+    validation: crate::input::skylight::ValidationPost,
     notes: String,
 ) -> ChordStep {
     ChordStep::Refused {
@@ -1576,19 +1583,24 @@ fn chord_refusal_after_hand_back(
             "press_key: accessibility refused {path} (AX error {err}); no menu action was \
              sent.{notes}"
         ),
-        validation_posted,
+        validation,
     }
 }
 
 /// The tool result for a chord step other than Save.
 fn chord_result(step: ChordStep) -> ToolResult {
     match step {
-        ChordStep::Pressed { text, may_have_run } => ToolResult::text(text)
+        ChordStep::Pressed {
+            text,
+            may_have_run,
+            validation,
+        } => ToolResult::text(text)
             .with_structured(serde_json::json!({
                 "path": "menu_ax",
                 "verified": false,
                 "effect": "unverifiable",
-                "keys_sent": false,
+                // Only menu validation's Cmd+F20 can have been sent as keys.
+                "keys_sent": validation.key_attempts > 0,
                 "code": if may_have_run { Some("ax_action_unverified") } else { None },
             }))
             .with_action_record(
@@ -1604,15 +1616,15 @@ fn chord_result(step: ChordStep) -> ToolResult {
         ChordStep::Refused {
             code,
             text,
-            validation_posted,
+            validation,
         } => {
             let mut structured = serde_json::json!({
                 "code": code,
                 "effect": "refused",
                 "dispatched": false,
-                "keys_sent": false,
+                "keys_sent": validation.key_attempts > 0,
             });
-            if validation_posted {
+            if validation.called {
                 structured["dispatch"] = serde_json::json!("validation_posted");
             }
             if code == "background_unavailable" {
@@ -2106,19 +2118,26 @@ mod menu_chord_tests {
             code: "background_unavailable",
             text: "press_key: Format > Bold is disabled for this window. No menu action was sent."
                 .into(),
-            validation_posted: true,
+            validation: crate::input::skylight::ValidationPost {
+                records: 2,
+                keys: 2,
+                key_attempts: 2,
+                uncertain: false,
+                called: true,
+            },
         });
         assert_eq!(refused.is_error, Some(true));
         let structured = refused.structured_content.as_ref().expect("structured");
         assert_eq!(structured["effect"], "refused");
         assert_eq!(structured["dispatched"], false);
         assert_eq!(structured["dispatch"], "validation_posted");
+        assert_eq!(structured["keys_sent"], true, "the Cmd+F20 pair went out");
         assert_eq!(structured["escalation"]["recommended"], "foreground");
 
         let not_key = chord_result(ChordStep::Refused {
             code: "window_not_key",
             text: "press_key: x. No menu action was sent.".into(),
-            validation_posted: false,
+            validation: crate::input::skylight::ValidationPost::default(),
         });
         let structured = not_key.structured_content.as_ref().expect("structured");
         assert!(structured.get("dispatch").is_none());
@@ -2129,6 +2148,7 @@ mod menu_chord_tests {
     fn a_pressed_chord_is_unverifiable_and_an_ax_error_may_have_run() {
         let pressed = chord_result(ChordStep::Pressed {
             text: "Pressed Format > Font > Bold".into(),
+            validation: crate::input::skylight::ValidationPost::default(),
             may_have_run: false,
         });
         assert_ne!(pressed.is_error, Some(true));
@@ -2138,6 +2158,7 @@ mod menu_chord_tests {
         assert!(structured["code"].is_null());
         let maybe = chord_result(ChordStep::Pressed {
             text: "Sent AXPress".into(),
+            validation: crate::input::skylight::ValidationPost::default(),
             may_have_run: true,
         });
         let structured = maybe.structured_content.as_ref().expect("structured");

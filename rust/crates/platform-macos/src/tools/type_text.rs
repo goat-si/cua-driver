@@ -2757,6 +2757,16 @@ pub(super) enum RestoreReport {
 }
 
 impl RestoreReport {
+    /// A stable name for structured results.
+    pub(super) fn code(self) -> &'static str {
+        match self {
+            RestoreReport::NotTouched => "not_touched",
+            RestoreReport::Reminimized => "reminimized",
+            RestoreReport::ReminimizeNotConfirmed(_) => "reminimize_not_confirmed",
+            RestoreReport::LeftVisible => "left_visible",
+        }
+    }
+
     pub(super) fn describe(self) -> String {
         match self {
             RestoreReport::NotTouched => String::new(),
