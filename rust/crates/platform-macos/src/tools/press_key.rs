@@ -58,6 +58,58 @@ fn map_delivery_outcome(result: anyhow::Result<bool>) -> PressKeyDeliveryOutcome
     }
 }
 
+fn semantic_action_for_request(key: &str, modifiers: &[String]) -> Option<&'static str> {
+    if !modifiers.is_empty() {
+        return None;
+    }
+    match key {
+        "return" | "enter" => Some("AXConfirm"),
+        "escape" => Some("AXCancel"),
+        _ => None,
+    }
+}
+
+fn advertised_semantic_action(
+    key: &str,
+    modifiers: &[String],
+    advertised: &[String],
+) -> Option<&'static str> {
+    let action = semantic_action_for_request(key, modifiers)?;
+    advertised
+        .iter()
+        .any(|candidate| candidate == action)
+        .then_some(action)
+}
+
+fn semantic_press_result(display_key: &str, action: &str, pid: i32, confirmed: bool) -> ToolResult {
+    let effect = if confirmed {
+        ActionEffect::Confirmed
+    } else {
+        ActionEffect::Unverifiable
+    };
+    let mut record = ActionExecutionRecord::builder(
+        effect,
+        ActionTransport::MacosAxAction,
+        RequestedDelivery::Background,
+    )
+    .actual_delivery(ActualDelivery::Background);
+    if confirmed {
+        record = record.evidence(ActionEvidence {
+            kind: EvidenceKind::AccessibilityReadback,
+            detail: "the same native AX element changed value or selection after the semantic key action".into(),
+        });
+    }
+    ToolResult::text(format!(
+        "✅ Performed {action} for {display_key} on pid {pid}."
+    ))
+    .with_structured(serde_json::json!({
+        "path": "ax_semantic",
+        "verified": confirmed,
+        "effect": if confirmed { "confirmed" } else { "unverifiable" },
+    }))
+    .with_action_record(record.build().expect("semantic key record is valid"))
+}
+
 fn validate_post_target(pid: i32) -> anyhow::Result<()> {
     if pid <= 0 {
         anyhow::bail!("target pid {pid} is invalid");
@@ -296,6 +348,43 @@ fn late_cell_refusal(
                 "not_editable: the focused element at delivery is a non-editing cell or is                  unreadable; no keys were sent"
             );
         }
+    }
+    Ok(())
+}
+
+fn verify_raw_key_target(
+    pid: i32,
+    window_id: Option<u32>,
+    pre_focus_ptr: Option<usize>,
+    focused_key_route: bool,
+) -> anyhow::Result<()> {
+    let Some(wid) = window_id else {
+        return Ok(());
+    };
+    if focused_key_route {
+        if let Some(ptr) = pre_focus_ptr {
+            let exact_focus = super::type_text::element_in_requested_window(pid, wid, ptr)
+                && crate::input::ax_actions::is_element_focused(pid, ptr);
+            if !exact_focus {
+                anyhow::bail!(
+                    "the addressed element is not the application's focused element in window {wid}; no key was sent"
+                )
+            }
+            if !super::type_text::focused_window_matches_element(pid, wid, ptr) {
+                anyhow::bail!(
+                    "the addressed element remains focused, but the application's key window is not the requested window or its proven sheet parent; no key was sent"
+                )
+            }
+            return Ok(());
+        } else if crate::ax::bindings::focused_window_id_of_pid(pid) != Some(wid) {
+            anyhow::bail!(
+                "window {wid} is not the application's positively confirmed key window; no key was sent"
+            )
+        }
+    }
+    let conflict = crate::ax::exact_target::check_window_focus_conflict(pid, wid, pre_focus_ptr);
+    if let Some(err) = map_focus_conflict_to_refusal(pid, conflict) {
+        return Err(err.into());
     }
     Ok(())
 }
@@ -572,53 +661,83 @@ impl Tool for PressKeyTool {
             }
         }
 
-        // ── Exact-target background gate (macOS background input v1) ──
-        // A window-addressed background key is process-scoped transport: it
-        // must prove exact delivery to the requested window (fresh AXWindows
-        // membership, not minimized/hidden, no competing same-pid keyboard
-        // destination, proven element ancestry) BEFORE anything is sent —
-        // including the px focus click. delivery_mode:"foreground" stays the
-        // caller's explicit last resort and is not gated here.
-        let _mutation_lease = if !fg {
-            if let Some(wid) = window_id {
-                match super::gate_background_window_action(
-                    pid,
-                    wid,
-                    pre_focus_ptr,
-                    super::window_keyboard_action(
-                        cua_driver_core::background_input::BackgroundAction::GenericKey,
-                    ),
-                )
-                .await
-                {
-                    Ok(lease) => Some(lease),
-                    Err(refusal_result) => return refusal_result,
-                }
-            } else {
-                None
-            }
+        let _mutation_lease = if !fg && window_id.is_some() {
+            Some(super::acquire_background_mutation(pid).await)
         } else {
             None
         };
 
-        // The addressed window must be the app's confirmed key window before
-        // any key (or focus click) goes out; otherwise refuse (window_not_key).
-        let _key_scope = match super::acquire_key_scope(pid, window_id, fg).await {
-            Ok(scope) => scope,
-            Err(refusal) => return refusal,
-        };
-
-        if !fg {
-            if let Some(wid) = window_id {
-                let conflict = latency::spawn_action_blocking(move || {
-                    crate::ax::exact_target::check_window_focus_conflict(pid, wid, pre_focus_ptr)
+        // Return/Escape first use an advertised semantic action on the exact
+        // element. Pixel requests skip this branch: their requested point has
+        // not been focused yet, so the old focused element must not confirm.
+        if !fg && px.is_none() && semantic_action_for_request(&key, &modifiers).is_some() {
+            let semantic_guard = if let Some(guard) = pre_focus_guard.clone() {
+                Some(guard)
+            } else if let Some(wid) = window_id {
+                latency::spawn_action_blocking(move || unsafe {
+                    crate::ax::exact_target::focused_element_in_window(pid, wid).map(|ptr| {
+                        let owned = crate::ax::snapshot::RetainedElement::retain(ptr as usize);
+                        CFRelease(ptr as _);
+                        owned
+                    })
                 })
                 .await
-                .unwrap_or(crate::ax::exact_target::WindowFocusConflict::Clear);
-                if let Some(err) = map_focus_conflict_to_refusal(pid, conflict) {
-                    return delivery_failed(err.into());
+                .ok()
+                .flatten()
+            } else {
+                None
+            };
+            if let (Some(wid), Some(lease), Some(guard)) =
+                (window_id, _mutation_lease.as_ref(), semantic_guard)
+            {
+                let ptr = guard.as_ptr();
+                let advertised = latency::spawn_action_blocking(move || unsafe {
+                    crate::ax::bindings::copy_action_names(ptr as AXUIElementRef)
+                })
+                .await
+                .unwrap_or_default();
+                if let Some(action) = advertised_semantic_action(&key, &modifiers, &advertised) {
+                    if let Err(refusal) = lease
+                        .gate_again(
+                            wid,
+                            Some(ptr),
+                            cua_driver_core::background_input::BackgroundAction::AxSemantic,
+                        )
+                        .await
+                    {
+                        return refusal;
+                    }
+                    let result = latency::spawn_action_blocking(move || {
+                        dispatch_with_ax_oracle(pid, Some(wid), Some(ptr), || {
+                            crate::input::ax_actions::perform_ax_action(ptr, action)
+                        })
+                    })
+                    .await;
+                    return match result {
+                        Ok(Ok(confirmed)) => {
+                            semantic_press_result(&display_key, action, pid, confirmed)
+                        }
+                        Ok(Err(error)) => delivery_failed(error),
+                        Err(error) => {
+                            delivery_failed(anyhow::anyhow!("semantic key task failed: {error}"))
+                        }
+                    };
                 }
             }
+        }
+
+        let native_background_menu_app = !super::type_text::is_browser_pid(pid)
+            && !crate::browser::electron_js::ElectronJs::is_electron(pid);
+        if !fg
+            && px.is_none()
+            && pre_focus_ptr.is_some()
+            && native_background_menu_app
+            && super::menu_equivalent::Combo::parse(&modifiers, &key).is_some()
+        {
+            return super::pre_dispatch_refusal(
+                "background_unavailable",
+                "press_key: an explicit native element Command chord cannot be rebound safely after menu priming, and raw native menu keys can no-op. Use the window-only shortcut or a direct element action; no key or menu action was sent.".to_owned(),
+            );
         }
 
         // ── Menu key equivalents in a background app ──
@@ -630,7 +749,7 @@ impl Tool for PressKeyTool {
         // runs that item through accessibility, or is refused with no keys
         // sent, as hotkey does. Browsers, Electron, a frontmost app and the
         // px form keep the key route.
-        if !fg && px.is_none() {
+        if !fg && px.is_none() && pre_focus_ptr.is_none() {
             if let (Some(wid), Some(lease), Some(combo)) = (
                 window_id,
                 _mutation_lease.as_ref(),
@@ -650,27 +769,21 @@ impl Tool for PressKeyTool {
                 .ok()
                 .flatten();
                 if let Some(item) = menu_item {
-                    if let Some(ptr) = pre_focus_ptr {
-                        // The menu command acts on the focused element: focus
-                        // it and read that back, or run nothing.
-                        let focused = latency::spawn_action_blocking(move || {
-                            crate::input::ax_actions::focus_element(ptr).is_ok()
-                                && crate::input::ax_actions::element_has_keyboard_focus_in_window(
-                                    pid, window_id, ptr,
-                                )
-                        })
+                    if let Err(refusal) = lease
+                        .gate_again(
+                            wid,
+                            None,
+                            cua_driver_core::background_input::BackgroundAction::AxSemantic,
+                        )
                         .await
-                        .unwrap_or(false);
-                        if !focused {
-                            return super::pre_dispatch_refusal(
-                                "target_focus_unconfirmed",
-                                format!(
-                                    "press_key: the element did not take focus, so its menu command ({}) was not run and no keys were sent.",
-                                    item.path.join(" > ")
-                                ),
-                            );
-                        }
+                    {
+                        return refusal;
                     }
+                    let _menu_key_scope =
+                        match super::acquire_key_scope(pid, Some(wid), false).await {
+                            Ok(scope) => scope,
+                            Err(refusal) => return refusal,
+                        };
                     let menu_result = super::invoke_menu::run_in_background_with_lease(
                         lease,
                         wid,
@@ -682,6 +795,44 @@ impl Tool for PressKeyTool {
                 }
             }
         }
+
+        let focused_key_route = !fg && crate::input::skylight::is_focus_without_raise_available();
+        if !fg {
+            if let (Some(wid), Some(lease)) = (window_id, _mutation_lease.as_ref()) {
+                if pre_focus_ptr.is_some_and(|ptr| {
+                    !super::type_text::element_in_requested_window(pid, wid, ptr)
+                }) {
+                    return super::pre_dispatch_refusal(
+                        "element_outside_target_window",
+                        "press_key: the addressed element is not in the requested window or its exact sheet ancestry; no key was sent.",
+                    );
+                }
+                let action = if focused_key_route {
+                    cua_driver_core::background_input::BackgroundAction::ExactWindowKeysFocused
+                } else {
+                    super::window_keyboard_action(
+                        cua_driver_core::background_input::BackgroundAction::GenericKey,
+                    )
+                };
+                let gate_window_id = pre_focus_ptr
+                    .filter(|ptr| super::type_text::element_in_requested_window(pid, wid, *ptr))
+                    .map(|ptr| super::type_text::gate_window_id_for_element(ptr, wid))
+                    .unwrap_or(wid);
+                if let Err(refusal) = lease
+                    .gate_again(gate_window_id, pre_focus_ptr, action)
+                    .await
+                {
+                    return refusal;
+                }
+            }
+        }
+
+        // The addressed window must be the app's confirmed key window before
+        // any key (or focus click) goes out; otherwise refuse (window_not_key).
+        let _key_scope = match super::acquire_key_scope(pid, window_id, fg).await {
+            Ok(scope) => scope,
+            Err(refusal) => return refusal,
+        };
 
         let printable = printable_request(&key, &modifiers);
         // CELL rule for untargeted printable keys: a non-editing cell (or an
@@ -813,7 +964,7 @@ impl Tool for PressKeyTool {
                                                 target,
                                                 Some(wid),
                                             ) {
-                                                crate::input::ax_actions::click_element_center_for_focus(
+                                                super::type_text::click_element_center_for_focus_checked(
                                                     pid, wid, target, true,
                                                 )?;
                                                 Ok(true)
@@ -822,6 +973,7 @@ impl Tool for PressKeyTool {
                                             }
                                         },
                                         || {
+                                verify_raw_key_target(pid, Some(wid), pre_focus_ptr, false)?;
                                 late_cell_refusal(pid, Some(wid), printable, pre_focus_ptr.is_some())?;
                                 crate::input::keyboard::press_key_bare_global(&key, &m)
                             },
@@ -832,16 +984,6 @@ impl Tool for PressKeyTool {
                     }
                     // background (default): auth-envelope post, no raise.
                     dispatch_with_ax_oracle(pid, window_id, pre_focus_ptr, || {
-                        if let Some(wid) = window_id {
-                            let conflict = crate::ax::exact_target::check_window_focus_conflict(
-                                pid,
-                                wid,
-                                pre_focus_ptr,
-                            );
-                            if let Some(err) = map_focus_conflict_to_refusal(pid, conflict) {
-                                return Err(err.into());
-                            }
-                        }
                         with_confirmed_key_focus_or_fallback(
                             pre_focus_ptr,
                             crate::input::ax_actions::focus_element,
@@ -857,7 +999,7 @@ impl Tool for PressKeyTool {
                                         target,
                                         Some(wid),
                                     ) {
-                                        crate::input::ax_actions::click_element_center_for_focus(
+                                        super::type_text::click_element_center_for_focus_checked(
                                             pid, wid, target, false,
                                         )?;
                                         return Ok(true);
@@ -866,6 +1008,7 @@ impl Tool for PressKeyTool {
                                 Ok(false)
                             },
                             || {
+                            verify_raw_key_target(pid, window_id, pre_focus_ptr, focused_key_route)?;
                             late_cell_refusal(pid, window_id, printable, pre_focus_ptr.is_some())?;
                             crate::input::keyboard::press_key(pid, &key, &m)
                         },
@@ -917,6 +1060,31 @@ impl Tool for PressKeyTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn semantic_actions_require_unmodified_return_or_escape_and_live_advertising() {
+        let confirm = vec!["AXConfirm".to_owned()];
+        let cancel = vec!["AXCancel".to_owned()];
+        assert_eq!(
+            advertised_semantic_action("return", &[], &confirm),
+            Some("AXConfirm")
+        );
+        assert_eq!(
+            advertised_semantic_action("enter", &[], &confirm),
+            Some("AXConfirm")
+        );
+        assert_eq!(
+            advertised_semantic_action("escape", &[], &cancel),
+            Some("AXCancel")
+        );
+        assert_eq!(advertised_semantic_action("return", &[], &cancel), None);
+        assert_eq!(advertised_semantic_action("escape", &[], &confirm), None);
+        assert_eq!(
+            advertised_semantic_action("return", &["command".to_owned()], &confirm),
+            None
+        );
+        assert_eq!(advertised_semantic_action("a", &[], &confirm), None);
+    }
+
     #[test]
     fn printable_guard_eligibility_covers_names_and_chords() {
         let shift = |m: &[&str]| m.iter().map(|s| s.to_string()).collect::<Vec<_>>();

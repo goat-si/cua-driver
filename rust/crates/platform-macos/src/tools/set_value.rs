@@ -314,7 +314,7 @@ const FILE_NAME_NEEDS_RENAME: &str = "file_name_needs_rename";
 /// Whether `element` is a file's name as a list shows it (Finder's list and
 /// icon views): a text field that names a file and is not being edited.
 /// Finder's inline rename editor is focused, so it stays writable.
-unsafe fn file_name_cell(element: AXUIElementRef) -> bool {
+pub(super) unsafe fn file_name_cell(element: AXUIElementRef) -> bool {
     copy_string_attr(element, "AXRole").as_deref() == Some("AXTextField")
         && is_file_name_cell(
             copy_string_attr(element, "AXFilename").as_deref(),
@@ -565,6 +565,34 @@ fn set_value_blocking(
             document_edited: None,
         })
     } else {
+        let _key_scope = if text_value_role_requires_exact_focus(&role) {
+            Some(
+                super::key_scope(pid, Some(window_id))
+                    .map_err(|reason| anyhow::anyhow!(reason))?
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "set_value requires exact-window key priming before an editable text AXValue write, but that transport is unavailable"
+                        )
+                    })?,
+            )
+        } else {
+            None
+        };
+        if text_value_role_requires_exact_focus(&role) {
+            crate::input::ax_actions::focus_element(element_ptr)?;
+            let own_focus = unsafe { copy_bool_attr(element, "AXFocused") } == Some(true);
+            let exact_window =
+                super::type_text::element_in_requested_window(pid, window_id, element_ptr);
+            let app_focus = crate::input::ax_actions::is_element_focused(pid, element_ptr);
+            let key_window =
+                super::type_text::focused_window_matches_element(pid, window_id, element_ptr);
+            let focused = own_focus && exact_window && app_focus && key_window;
+            if !focused {
+                anyhow::bail!(
+                    "set_value target did not become the application's focused text element in the requested window (AXFocused={own_focus}, exact_window={exact_window}, app_focus={app_focus}, key_window={key_window}); AXValue was not written"
+                )
+            }
+        }
         // Default path: write AXValue directly. Numeric controls (AXSlider /
         // AXStepper) reject a CFString with -25201 and need a CFNumber; text
         // fields take a CFString. Try numeric first when the value parses as a
@@ -661,6 +689,13 @@ fn set_value_blocking(
             anyhow::bail!("AXUIElementSetAttributeValue(AXValue) failed with error {err}")
         }
     }
+}
+
+fn text_value_role_requires_exact_focus(role: &str) -> bool {
+    matches!(
+        role,
+        "AXTextField" | "AXTextArea" | "AXSearchField" | "AXSecureTextField" | "AXComboBox"
+    )
 }
 
 /// Re-reads (100 ms apart) before an unchanged value counts as not applied.
@@ -1359,8 +1394,8 @@ mod tests {
     use super::{
         address_field_refusal, apply_surface_trust, apply_verification_label, classify_write,
         file_name_needs_rename, is_file_name_cell, is_get_info_name_field, is_safari_address_field,
-        not_applied_result, write_not_applied, SetValueOutcome, GET_INFO_RENAME_ROUTE,
-        LIST_RENAME_ROUTE,
+        not_applied_result, text_value_role_requires_exact_focus, write_not_applied,
+        SetValueOutcome, GET_INFO_RENAME_ROUTE, LIST_RENAME_ROUTE,
     };
 
     #[test]
@@ -1644,6 +1679,22 @@ mod tests {
         assert_eq!(outcome.verified, Some(true));
         assert_eq!(outcome.changed, Some(true));
         assert_eq!(outcome.detail, "Set value.");
+    }
+
+    #[test]
+    fn editable_text_roles_require_exact_focus_before_value_writes() {
+        for role in [
+            "AXTextField",
+            "AXTextArea",
+            "AXSearchField",
+            "AXSecureTextField",
+            "AXComboBox",
+        ] {
+            assert!(text_value_role_requires_exact_focus(role), "{role}");
+        }
+        for role in ["AXSlider", "AXStepper", "AXPopUpButton", "AXButton"] {
+            assert!(!text_value_role_requires_exact_focus(role), "{role}");
+        }
     }
 
     #[test]

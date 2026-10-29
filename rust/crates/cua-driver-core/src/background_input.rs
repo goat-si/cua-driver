@@ -104,6 +104,12 @@ pub enum BackgroundAction {
     /// this only where that transport is available; otherwise they ask for
     /// `InsertText` / `GenericKey` and keep the fail-closed ambiguity guard.
     ExactWindowKeys,
+    /// [`ExactWindowKeys`] plus a caller-verified focus contract. This is used
+    /// only by text/key tools that re-prove the exact element (or the exact
+    /// window for window-only shortcuts) immediately before posting. Unlike
+    /// the legacy route, a known minimized/hidden target is eligible; unknown
+    /// visibility and unproven element ancestry remain refused.
+    ExactWindowKeysFocused,
 }
 
 impl BackgroundAction {
@@ -113,6 +119,7 @@ impl BackgroundAction {
             BackgroundAction::InsertText
                 | BackgroundAction::GenericKey
                 | BackgroundAction::ExactWindowKeys
+                | BackgroundAction::ExactWindowKeysFocused
         )
     }
 }
@@ -288,6 +295,13 @@ pub fn decide_background_input(
     // never unlock a route. Semantic AX stays available either way.
     let visibility_disproven =
         !(facts.target_minimized == Some(false) && facts.app_hidden == Some(false));
+    let visibility_unknown = facts.target_minimized.is_none() || facts.app_hidden.is_none();
+    let focused_key_visibility_proven = action == BackgroundAction::ExactWindowKeysFocused
+        && !visibility_unknown
+        && matches!(
+            facts.element,
+            ElementAncestry::NotAddressed | ElementAncestry::ProvenDescendant
+        );
     match action {
         BackgroundAction::AxSemantic => BackgroundInputDecision::Execute {
             verification: TargetBoundVerification {
@@ -316,8 +330,9 @@ pub fn decide_background_input(
         }
         BackgroundAction::InsertText
         | BackgroundAction::GenericKey
-        | BackgroundAction::ExactWindowKeys => {
-            if visibility_disproven {
+        | BackgroundAction::ExactWindowKeys
+        | BackgroundAction::ExactWindowKeysFocused => {
+            if visibility_disproven && !focused_key_visibility_proven {
                 return refuse(
                     refusal_codes::MINIMIZED_OR_HIDDEN,
                     format!(
@@ -332,7 +347,10 @@ pub fn decide_background_input(
             }
             debug_assert!(action.is_pid_keyboard());
             if facts.competing_keyboard_destinations > 0
-                && action != BackgroundAction::ExactWindowKeys
+                && !matches!(
+                    action,
+                    BackgroundAction::ExactWindowKeys | BackgroundAction::ExactWindowKeysFocused
+                )
             {
                 return refuse(
                     refusal_codes::SAME_PID_KEYBOARD_AMBIGUITY,
@@ -432,11 +450,12 @@ mod tests {
         }
     }
 
-    const ALL_ACTIONS: [BackgroundAction; 4] = [
+    const ALL_ACTIONS: [BackgroundAction; 5] = [
         BackgroundAction::AxSemantic,
         BackgroundAction::WindowPointer,
         BackgroundAction::InsertText,
         BackgroundAction::GenericKey,
+        BackgroundAction::ExactWindowKeysFocused,
     ];
 
     fn code_of(decision: BackgroundInputDecision) -> &'static str {
@@ -631,6 +650,61 @@ mod tests {
                 !decide_background_input(TARGET, &broken, BackgroundAction::ExactWindowKeys)
                     .is_execute()
             );
+        }
+    }
+
+    #[test]
+    fn focused_exact_keys_allow_known_minimized_windows_only_with_exact_targets() {
+        for facts in [
+            BackgroundTargetFacts {
+                target_minimized: Some(true),
+                ..matched_facts()
+            },
+            BackgroundTargetFacts {
+                app_hidden: Some(true),
+                ..matched_facts()
+            },
+        ] {
+            assert!(decide_background_input(
+                TARGET,
+                &facts,
+                BackgroundAction::ExactWindowKeysFocused
+            )
+            .is_execute());
+            let proven = BackgroundTargetFacts {
+                element: ElementAncestry::ProvenDescendant,
+                ..facts
+            };
+            assert!(decide_background_input(
+                TARGET,
+                &proven,
+                BackgroundAction::ExactWindowKeysFocused
+            )
+            .is_execute());
+        }
+        for facts in [
+            BackgroundTargetFacts {
+                target_minimized: None,
+                app_hidden: Some(true),
+                ..matched_facts()
+            },
+            BackgroundTargetFacts {
+                target_minimized: Some(true),
+                app_hidden: None,
+                ..matched_facts()
+            },
+            BackgroundTargetFacts {
+                target_minimized: Some(true),
+                element: ElementAncestry::Unproven,
+                ..matched_facts()
+            },
+        ] {
+            assert!(!decide_background_input(
+                TARGET,
+                &facts,
+                BackgroundAction::ExactWindowKeysFocused
+            )
+            .is_execute());
         }
     }
 
