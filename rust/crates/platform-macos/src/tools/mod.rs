@@ -795,15 +795,23 @@ pub(crate) async fn focus_by_pixel(
         click.await
     };
     let (error_effect, error_code) = if focus.is_error == Some(true) {
+        // An error with NO metadata is still an error: empty strings keep
+        // it from looking like a successful result, and it stops here.
         (
-            focus
-                .structured_content
-                .as_ref()
-                .and_then(|v| v["effect"].as_str()),
-            focus
-                .structured_content
-                .as_ref()
-                .and_then(|v| v["code"].as_str()),
+            Some(
+                focus
+                    .structured_content
+                    .as_ref()
+                    .and_then(|v| v["effect"].as_str())
+                    .unwrap_or(""),
+            ),
+            Some(
+                focus
+                    .structured_content
+                    .as_ref()
+                    .and_then(|v| v["code"].as_str())
+                    .unwrap_or(""),
+            ),
         )
     } else {
         (None, None)
@@ -1783,6 +1791,11 @@ mod pixel_focus_readback_tests {
         );
         assert_eq!(
             super::decide_focus_next(None, true, Some("unverifiable"), None),
+            super::FocusDecision::StopOriginalError
+        );
+        // An error with NO metadata stops too: it is not a success.
+        assert_eq!(
+            super::decide_focus_next(None, true, Some(""), Some("")),
             super::FocusDecision::StopOriginalError
         );
     }
