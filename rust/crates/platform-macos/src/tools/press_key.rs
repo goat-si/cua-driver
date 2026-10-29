@@ -1294,14 +1294,18 @@ fn minimized_key_result(step: MinimizedKeyStep, pid: i32, display_key: &str) -> 
         format!(" {}", step.notes)
     };
     if let Some((code, text)) = step.refusal {
-        return ToolResult::error(format!("press_key: {text}{notes}")).with_structured(
-            serde_json::json!({
-                "code": code,
-                "effect": "refused",
-                "dispatched": false,
-                "keys_sent": false,
-            }),
-        );
+        let mut structured = serde_json::json!({
+            "code": code,
+            "effect": "refused",
+            "dispatched": false,
+            "keys_sent": false,
+        });
+        // Error results are not projected into a summary: the restore and
+        // hand-back disclosure travels as a structured field too.
+        if !notes.trim().is_empty() {
+            structured["restore_note"] = serde_json::json!(notes.trim());
+        }
+        return ToolResult::error(format!("press_key: {text}{notes}")).with_structured(structured);
     }
     match step.outcome.map(map_delivery_outcome) {
         Some(
@@ -1378,6 +1382,12 @@ fn minimized_key_result(step: MinimizedKeyStep, pid: i32, display_key: &str) -> 
                 );
             }
             append_to_summary(&mut result, &notes);
+            if !notes.trim().is_empty() {
+                if let Some(serde_json::Value::Object(fields)) = result.structured_content.as_mut()
+                {
+                    fields.insert("restore_note".into(), serde_json::json!(notes.trim()));
+                }
+            }
             result
         }
         None => ToolResult::error(format!("press_key: no key was sent.{notes}")),

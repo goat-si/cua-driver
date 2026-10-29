@@ -609,13 +609,13 @@ async fn minimized_set_value(
             }
         };
         let report = finish(restore).await;
-        let suffix = [disclosure, report.describe()]
+        let suffix = [disclosure.clone(), report.describe()]
             .into_iter()
             .filter(|note| !note.is_empty())
             .map(|note| format!(" {note}"))
             .collect::<String>();
         let result = set_value_tool_result(Ok(result), ax_echo_surface, suffix, pid, element_index);
-        attach_restore_cleanup(result, report, "")
+        attach_restore_cleanup(result, report, &disclosure)
     });
     task.await.unwrap_or_else(|error| {
         ToolResult::error(format!(
@@ -652,16 +652,21 @@ fn attach_restore_cleanup(
             }
             None => result
                 .content
-                .push(cua_driver_core::protocol::Content::text(note)),
+                .push(cua_driver_core::protocol::Content::text(note.clone())),
         }
     }
-    match result.structured_content.as_mut() {
-        Some(serde_json::Value::Object(fields)) => {
-            fields.insert("restore_cleanup".into(), serde_json::json!(report.code()));
-        }
-        _ => {
-            result.structured_content =
-                Some(serde_json::json!({ "restore_cleanup": report.code() }));
+    if !matches!(
+        result.structured_content,
+        Some(serde_json::Value::Object(_))
+    ) {
+        result.structured_content = Some(serde_json::json!({}));
+    }
+    if let Some(serde_json::Value::Object(fields)) = result.structured_content.as_mut() {
+        fields.insert("restore_cleanup".into(), serde_json::json!(report.code()));
+        // Error results are not projected into a summary: carry the
+        // disclosure as a structured field too.
+        if !note.is_empty() {
+            fields.insert("restore_note".into(), serde_json::json!(note));
         }
     }
     result
@@ -2221,6 +2226,10 @@ mod restore_cleanup_tests {
         let structured = refusal.structured_content.as_ref().expect("structured");
         assert_eq!(structured["code"], "c");
         assert_eq!(structured["restore_cleanup"], "left_visible");
+        let note = structured["restore_note"]
+            .as_str()
+            .expect("structured note");
+        assert!(note.contains("left visible") && note.contains("went back"));
         let texts: Vec<String> = refusal
             .content
             .iter()
