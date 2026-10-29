@@ -1359,9 +1359,10 @@ impl ClickTool {
                     let delivered = if focus_only {
                         crate::input::ax_actions::focus_element(element as usize).is_ok()
                     } else {
-                        let press = core_foundation::string::CFString::new("AXPress");
-                        AXUIElementPerformAction(element, press.as_concrete_TypeRef())
-                            == kAXErrorSuccess
+                        // A static-text/image leaf usually has no AXPress:
+                        // fall back to the actionable ancestor (AXCell's
+                        // AXOpen, AXRow's AXPress) before giving up on AX.
+                        ax_press_with_ancestors(element)
                     };
                     CFRelease(element as _);
                     Ok(delivered)
@@ -2283,6 +2284,47 @@ fn perform_ax_click(
     let _ = window_id; // used by caller context
 
     Ok((summary, needs_webkit_delay, suspected_noop, false, false))
+}
+
+/// AXPress the element, or the nearest actionable ancestor (AXOpen on a
+/// cell, AXPress on a row) when the leaf itself cannot be pressed.
+unsafe fn ax_press_with_ancestors(element: crate::ax::bindings::AXUIElementRef) -> bool {
+    use crate::ax::bindings::{copy_action_names, copy_element_attr};
+    use core_foundation::base::CFRelease;
+    use core_foundation::string::CFString;
+    let perform = |el, name: &str| {
+        let action = CFString::new(name);
+        AXUIElementPerformAction(el, action.as_concrete_TypeRef()) == kAXErrorSuccess
+    };
+    if copy_action_names(element).iter().any(|a| a == "AXPress") && perform(element, "AXPress") {
+        return true;
+    }
+    let mut current = element;
+    for _ in 0..4 {
+        let Some(parent) = copy_element_attr(current, "AXParent") else {
+            break;
+        };
+        let actions = copy_action_names(parent);
+        let delivered = if actions.iter().any(|a| a == "AXOpen") {
+            perform(parent, "AXOpen")
+        } else if actions.iter().any(|a| a == "AXPress") {
+            perform(parent, "AXPress")
+        } else {
+            false
+        };
+        if current != element {
+            CFRelease(current as _);
+        }
+        current = parent;
+        if delivered {
+            CFRelease(current as _);
+            return true;
+        }
+    }
+    if current != element {
+        CFRelease(current as _);
+    }
+    false
 }
 
 #[cfg(test)]

@@ -587,14 +587,18 @@ fn chromium_click_route_plan(
     count: usize,
 ) -> Vec<ChromiumClickRouteStep> {
     let screen_target = (screen_x, screen_y);
-    let _ = (win_local_x, win_local_y);
+    // The stamped window location is WINDOW-LOCAL: AppKit reads it as
+    // (wx, frame.height - wy) with no screen-origin subtraction. Stamping
+    // the screen point here offset every background left click by the
+    // window origin (Finder's Applications click opened AirDrop).
+    let window_target = (win_local_x, win_local_y);
     let off_screen = (-1.0, -1.0);
     let mut steps = vec![
         ChromiumClickRouteStep {
             kind: ChromiumClickEventKind::Move,
             event_location: screen_target,
-            skylight_window_location: screen_target,
-            public_window_location: screen_target,
+            skylight_window_location: window_target,
+            public_window_location: window_target,
             click_state: 0,
             phase: 2,
             button_number: 0,
@@ -631,8 +635,8 @@ fn chromium_click_route_plan(
         steps.push(ChromiumClickRouteStep {
             kind: ChromiumClickEventKind::Down,
             event_location: screen_target,
-            skylight_window_location: screen_target,
-            public_window_location: screen_target,
+            skylight_window_location: window_target,
+            public_window_location: window_target,
             click_state,
             phase: 3,
             button_number: 0,
@@ -642,8 +646,8 @@ fn chromium_click_route_plan(
         steps.push(ChromiumClickRouteStep {
             kind: ChromiumClickEventKind::Up,
             event_location: screen_target,
-            skylight_window_location: screen_target,
-            public_window_location: screen_target,
+            skylight_window_location: window_target,
+            public_window_location: window_target,
             click_state,
             phase: 3,
             button_number: 0,
@@ -963,6 +967,9 @@ where
         .subsec_nanos() as i64;
     let route = post_route(MousePostMode::SkyLightPreferred, skylight_available());
     let window_id = wid as i64;
+    // The stamped window location is window-local: screen point minus the
+    // window's origin, per step (off-screen primers stay off-screen).
+    let window_origin = crate::windows::window_bounds_by_id(wid).map(|b| (b.x, b.y));
 
     let mut stopped_at: Option<(f64, f64)> = None;
     let mut last_point = from;
@@ -1002,7 +1009,11 @@ where
         set(91, window_id);
         set(92, window_id);
         set(58, gesture_id);
-        crate::input::skylight::set_window_location(ptr, step.point.0, step.point.1);
+        let local = match (window_origin, step.point) {
+            (Some((ox, oy)), (px, py)) if (px, py) != (-1.0, -1.0) => (px - ox, py - oy),
+            _ => step.point,
+        };
+        crate::input::skylight::set_window_location(ptr, local.0, local.1);
         set_explicit_flags(&event, flags);
         dispatch_mouse_event(route, pid, &event);
         if matches!(step.kind, Down | Dragged) {
@@ -1990,8 +2001,8 @@ mod tests {
                 ChromiumClickRouteStep {
                     kind: ChromiumClickEventKind::Move,
                     event_location: (564.0, 504.0),
-                    skylight_window_location: (564.0, 504.0),
-                    public_window_location: (564.0, 504.0),
+                    skylight_window_location: (394.0, 310.0),
+                    public_window_location: (394.0, 310.0),
                     click_state: 0,
                     phase: 2,
                     button_number: 0,
@@ -2023,8 +2034,8 @@ mod tests {
                 ChromiumClickRouteStep {
                     kind: ChromiumClickEventKind::Down,
                     event_location: (564.0, 504.0),
-                    skylight_window_location: (564.0, 504.0),
-                    public_window_location: (564.0, 504.0),
+                    skylight_window_location: (394.0, 310.0),
+                    public_window_location: (394.0, 310.0),
                     click_state: 1,
                     phase: 3,
                     button_number: 0,
@@ -2034,8 +2045,8 @@ mod tests {
                 ChromiumClickRouteStep {
                     kind: ChromiumClickEventKind::Up,
                     event_location: (564.0, 504.0),
-                    skylight_window_location: (564.0, 504.0),
-                    public_window_location: (564.0, 504.0),
+                    skylight_window_location: (394.0, 310.0),
+                    public_window_location: (394.0, 310.0),
                     click_state: 1,
                     phase: 3,
                     button_number: 0,
@@ -2058,12 +2069,11 @@ mod tests {
             .find(|step| step.kind == ChromiumClickEventKind::Down && step.phase == 3)
             .expect("target mouse-down step");
         assert_eq!(delivered.event_location, (564.0, 504.0));
-        assert_eq!(delivered.skylight_window_location, (564.0, 504.0));
-        assert_eq!(delivered.public_window_location, (564.0, 504.0));
-        let skylight_journal_point = (
-            delivered.skylight_window_location.0 + screen_to_canvas.0,
-            delivered.skylight_window_location.1 + screen_to_canvas.1,
-        );
+        // The stamped window location is the WINDOW-LOCAL hit, not the
+        // screen point: AppKit applies no screen-origin subtraction.
+        assert_eq!(delivered.skylight_window_location, capture_local);
+        assert_eq!(delivered.public_window_location, capture_local);
+        let skylight_journal_point = delivered.skylight_window_location;
         assert_eq!(skylight_journal_point, capture_local);
         assert!((292.0..=496.0).contains(&skylight_journal_point.0));
         assert!((132.0..=310.0).contains(&skylight_journal_point.1));
