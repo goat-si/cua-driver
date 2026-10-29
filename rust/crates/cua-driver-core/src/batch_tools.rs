@@ -989,7 +989,11 @@ impl Plan {
             // Wall time of the step: lookup, checks and the action.
             outcome.report["ms"] = json!(step_started.elapsed().as_millis() as u64);
             if !outcome.ok {
-                recovery = Recovery::after(&outcome.report, last_window.as_ref());
+                recovery = Recovery::after(
+                    &outcome.report,
+                    last_window.as_ref(),
+                    timeout_snapshot.is_some(),
+                );
                 if timed_out
                     && timeout_snapshot.as_ref().is_some_and(|snapshot| {
                         snapshot.read_pending || snapshot.scope_refusal.is_some()
@@ -1122,17 +1126,15 @@ impl Plan {
         if let Some(mut args) = observe {
             let filled = fill_observed_window(&mut args, last_window.as_ref());
             let result = if filled {
-                match tokio::time::timeout(
-                    Duration::from_secs(5),
-                    registry.invoke(OBSERVE_TOOL, args),
-                )
-                .await
-                {
-                    Ok(result) => result,
-                    Err(_) => ToolResult::error(
-                        "recovery observation exceeded its 5 s budget; the action outcome is still unknown",
+                if timed_out {
+                    invoke_observation_with_deadline(
+                        registry.as_ref(),
+                        args,
+                        StepDeadline::Budget(Duration::from_secs(5)),
                     )
-                    .with_structured(json!({"code":"recovery_timeout","effect":"unverifiable"})),
+                    .await
+                } else {
+                    registry.invoke(OBSERVE_TOOL, args).await
                 }
             } else {
                 ToolResult::error("no window to observe: no step resolved one")
@@ -1248,6 +1250,24 @@ fn scope_refusal_code(result: &ToolResult) -> Option<&'static str> {
     ]
     .into_iter()
     .find(|known| *known == code)
+}
+
+async fn invoke_observation_with_deadline(
+    registry: &ToolRegistry,
+    args: Value,
+    deadline: StepDeadline,
+) -> ToolResult {
+    let invocation = registry.invoke(OBSERVE_TOOL, args);
+    tokio::pin!(invocation);
+    tokio::select! {
+        result = invocation => result,
+        _ = deadline.wait() => {
+            ToolResult::error(
+                "recovery observation exceeded its 5 s budget; the action outcome is still unknown",
+            )
+            .with_structured(json!({"code":"recovery_timeout","effect":"unverifiable"}))
+        }
+    }
 }
 
 fn step_budget(step: &Step, remaining: Duration) -> (StepDeadline, &'static str) {
@@ -1710,7 +1730,7 @@ async fn run_step(
         .unwrap_or_else(|| context.clone());
     let mut checked = Vec::new();
     for (nth, check) in step.expect.iter().enumerate() {
-        if !check.window.is_empty() {
+        if !check.window.is_empty() || nth > 0 {
             gate.invalidate_window();
         }
         match locator.check(check, &fallback).await {
@@ -1932,7 +1952,7 @@ impl Recovery {
     /// A failure that names where to look next: another window of the app
     /// holds focus (read that dialog), or a pixel target in a window with no
     /// screenshot yet (capture it, so the next pixel step has a frame).
-    fn after(report: &Value, last: Option<&Window>) -> Option<Self> {
+    fn after(report: &Value, last: Option<&Window>, worker_timed_out: bool) -> Option<Self> {
         let message = report.get("message").and_then(Value::as_str)?;
         let last = last?;
         if let Some(holder) = focus_holder(message).filter(|id| *id != last.window_id) {
@@ -1951,10 +1971,12 @@ impl Recovery {
             });
         }
         let code = report.get("code").and_then(Value::as_str);
-        if matches!(
-            code,
-            Some("step_timeout" | "time_budget" | "step_join_failed")
-        ) {
+        if worker_timed_out
+            && matches!(
+                code,
+                Some("step_timeout" | "time_budget" | "step_join_failed")
+            )
+        {
             return Some(Self {
                 window: last.clone(),
                 screenshot: false,
@@ -2684,6 +2706,136 @@ mod timeout_tests {
         }
     }
 
+    struct ProbeTool {
+        def: ToolDef,
+        calls: Arc<Mutex<Vec<Value>>>,
+        response: Arc<dyn Fn() -> ToolResult + Send + Sync>,
+    }
+
+    #[async_trait]
+    impl Tool for ProbeTool {
+        fn def(&self) -> &ToolDef {
+            &self.def
+        }
+
+        async fn invoke(&self, args: Value) -> ToolResult {
+            self.calls.lock().unwrap().push(args);
+            (self.response)()
+        }
+    }
+
+    fn register_probe(
+        registry: &mut ToolRegistry,
+        name: &str,
+        response: impl Fn() -> ToolResult + Send + Sync + 'static,
+    ) -> Arc<Mutex<Vec<Value>>> {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        registry.register(Box::new(ProbeTool {
+            def: tool_def(name),
+            calls: calls.clone(),
+            response: Arc::new(response),
+        }));
+        calls
+    }
+
+    struct WindowReadTool {
+        def: ToolDef,
+        calls: Arc<Mutex<Vec<Value>>>,
+        started: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+        block: bool,
+    }
+
+    #[async_trait]
+    impl Tool for WindowReadTool {
+        fn def(&self) -> &ToolDef {
+            &self.def
+        }
+
+        async fn invoke(&self, args: Value) -> ToolResult {
+            self.calls.lock().unwrap().push(args.clone());
+            let window_id = args.get("window_id").and_then(Value::as_u64).unwrap_or(7);
+            self.started.notify_one();
+            if self.block && window_id != 22 {
+                self.release.notified().await;
+            }
+            let value = if window_id == 22 { "702" } else { "wrong" };
+            ToolResult::text("window").with_structured(json!({
+                "pid": 42,
+                "window_id": window_id,
+                "snapshot_id": "s00000001",
+                "elements": [{
+                    "element_index": 1,
+                    "element_token": "s00000001:1",
+                    "role": "AXStaticText",
+                    "depth": 1,
+                    "label": "Result",
+                    "value": value,
+                    "frame": {"x":0,"y":0,"w":10,"h":10}
+                }],
+                "tree_markdown": format!("- AXStaticText \"Result\" = \"{value}\"")
+            }))
+        }
+    }
+
+    struct PanicTool {
+        def: ToolDef,
+    }
+
+    struct EvidenceTool {
+        def: ToolDef,
+        calls: Arc<Mutex<Vec<(bool, crate::agent_cursor::InputOrigin)>>>,
+    }
+
+    #[async_trait]
+    impl Tool for EvidenceTool {
+        fn def(&self) -> &ToolDef {
+            &self.def
+        }
+
+        async fn invoke(&self, args: Value) -> ToolResult {
+            let native = args
+                .get(crate::snapshot_store::NATIVE_WINDOW_PIXELS_ARG)
+                .is_some();
+            let key = ["session", "_session_id", "cursor_id"]
+                .into_iter()
+                .find_map(|key| args.get(key).and_then(Value::as_str))
+                .unwrap_or("evidence");
+            let origin = crate::agent_cursor::input_origin(key);
+            self.calls.lock().unwrap().push((native, origin));
+            ToolResult::text("evidence")
+        }
+    }
+
+    #[async_trait]
+    impl Tool for PanicTool {
+        fn def(&self) -> &ToolDef {
+            &self.def
+        }
+
+        async fn invoke(&self, _args: Value) -> ToolResult {
+            panic!("intentional worker panic")
+        }
+    }
+
+    fn list_windows() -> ToolResult {
+        ToolResult::text("windows").with_structured(json!({
+            "pid": 42,
+            "window_id": 7,
+            "snapshot_id": "s00000001",
+            "windows": [
+                {"pid":42,"window_id":7,"app_name":"Demo","title":"A","z_index":1,"is_on_screen":true},
+                {"pid":42,"window_id":22,"app_name":"Demo","title":"B","z_index":2,"is_on_screen":true}
+            ]
+        }))
+    }
+
+    fn list_apps() -> ToolResult {
+        ToolResult::text("apps").with_structured(json!({
+            "apps": [{"pid":42,"name":"Demo","bundle_id":"com.example.demo","running":true,"active":false}]
+        }))
+    }
+
     #[tokio::test]
     async fn a_hung_step_returns_step_timeout() {
         let started = Arc::new(tokio::sync::Notify::new());
@@ -2780,5 +2932,251 @@ mod timeout_tests {
         assert!(!gate.begin_read());
         assert!(!gate.begin_dispatch());
         assert!(slot.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn starting_batch_budget_expiry_does_not_invent_recovery() {
+        let window = Window {
+            pid: 42,
+            window_id: 7,
+            app: None,
+            title: None,
+            on_screen: true,
+        };
+        let report = json!({"code":"time_budget","message":"batch budget exhausted"});
+        assert!(Recovery::after(&report, Some(&window), false).is_none());
+    }
+
+    #[tokio::test]
+    async fn normal_observation_is_not_limited_to_the_recovery_budget() {
+        let mut registry = ToolRegistry::new();
+        register_probe(&mut registry, "click", || ToolResult::text("clicked"));
+        register_probe(&mut registry, "get_window_state", list_windows);
+        let registry = Arc::new(registry);
+        let plan = Plan::parse(
+            &registry,
+            &json!({
+                "steps":[{"tool":"click","args":{"pid":42,"window_id":7}}],
+                "observe": {}
+            }),
+        )
+        .unwrap_or_else(|error| panic!("invalid plan: {}", error.message));
+        let result = plan.run(registry, None).await;
+        let structured = result.structured_content.unwrap();
+        assert_eq!(structured["observation"]["ok"], true, "{structured}");
+        assert!(structured.get("code").is_none());
+    }
+
+    #[tokio::test]
+    async fn later_expect_target_change_invalidates_confirmed_window() {
+        let started = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let mut registry = ToolRegistry::new();
+        register_probe(&mut registry, "list_windows", list_windows);
+        register_probe(&mut registry, "list_apps", list_apps);
+        registry.register(Box::new(WindowReadTool {
+            def: tool_def("get_window_state"),
+            calls: calls.clone(),
+            started: started.clone(),
+            release: release.clone(),
+            block: true,
+        }));
+        let registry = Arc::new(registry);
+        let mut plan = Plan::parse(
+            &registry,
+            &json!({
+                "steps":[{
+                    "expect":[
+                        {"pid":42,"window_id":22,"role":"AXStaticText","name":"Result","value":"702","timeout_ms":0},
+                        {"pid":42,"window_id":7,"role":"AXStaticText","name":"Result","value":"702","timeout_ms":10000}
+                    ]
+                }]
+            }),
+        )
+        .unwrap_or_else(|error| panic!("invalid plan: {}", error.message));
+        let (deadline_tx, deadline_rx) = tokio::sync::oneshot::channel();
+        plan.step_deadline = Some(StepDeadline::Trigger(deadline_rx));
+        let mut batch = Box::pin(plan.run(registry, None));
+        tokio::select! {
+            result = &mut batch => {
+                let structured = result.structured_content.unwrap();
+                panic!("batch ended before second expect read: {structured}");
+            }
+            _ = async {
+                while calls.lock().unwrap().len() < 2 {
+                    tokio::task::yield_now().await;
+                }
+            } => {}
+        }
+        deadline_tx.send(()).expect("trigger deadline");
+        release.notify_one();
+        let result = batch.await;
+        let structured = result.structured_content.unwrap();
+        assert_eq!(structured["code"], "step_timeout");
+        assert!(structured.get("observation").is_none());
+    }
+
+    #[tokio::test]
+    async fn releasing_a_find_after_timeout_does_not_start_action() {
+        let started = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let mut registry = ToolRegistry::new();
+        register_probe(&mut registry, "list_windows", list_windows);
+        register_probe(&mut registry, "list_apps", list_apps);
+        let clicks = register_probe(&mut registry, "click", || ToolResult::text("clicked"));
+        registry.register(Box::new(WindowReadTool {
+            def: tool_def("get_window_state"),
+            calls: Arc::new(Mutex::new(Vec::new())),
+            started: started.clone(),
+            release: release.clone(),
+            block: true,
+        }));
+        let registry = Arc::new(registry);
+        let mut plan = Plan::parse(
+            &registry,
+            &json!({
+                "steps":[{
+                    "tool":"click",
+                    "args":{"pid":42,"window_id":7,"role":"button","name":"Go","timeout_ms":10000}
+                }]
+            }),
+        )
+        .unwrap_or_else(|error| panic!("invalid plan: {}", error.message));
+        let (deadline_tx, deadline_rx) = tokio::sync::oneshot::channel();
+        plan.step_deadline = Some(StepDeadline::Trigger(deadline_rx));
+        let batch = tokio::spawn(plan.run(registry, None));
+        started.notified().await;
+        deadline_tx.send(()).expect("trigger deadline");
+        release.notify_one();
+        let result = batch.await.expect("batch join");
+        let structured = result.structured_content.unwrap();
+        assert_eq!(structured["code"], "step_timeout");
+        assert!(clicks.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn timeout_blocks_every_retry_entrypoint() {
+        let gate = StepGate::new();
+        assert!(gate.begin_dispatch());
+        gate.timeout();
+        let registry = ToolRegistry::new();
+        for tool in ["invoke_menu", "click", "type_text"] {
+            assert!(dispatch_action(&registry, &gate, tool, json!({}))
+                .await
+                .is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn worker_panic_is_a_join_failure_not_success() {
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(PanicTool {
+            def: tool_def("click"),
+        }));
+        let registry = Arc::new(registry);
+        let plan = Plan::parse(
+            &registry,
+            &json!({"steps":[{"tool":"click","args":{"pid":42,"window_id":7}}]}),
+        )
+        .unwrap_or_else(|error| panic!("invalid plan: {}", error.message));
+        let result = plan.run(registry, None).await;
+        let structured = result.structured_content.unwrap();
+        assert_eq!(structured["code"], "step_join_failed");
+        assert_eq!(structured["steps"][0]["effect"], "unverifiable");
+    }
+
+    #[tokio::test]
+    async fn recovery_deadline_is_bounded_and_preserves_step_timeout() {
+        let started = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(WindowReadTool {
+            def: tool_def("get_window_state"),
+            calls: Arc::new(Mutex::new(Vec::new())),
+            started: started.clone(),
+            release: release.clone(),
+            block: true,
+        }));
+        let registry = Arc::new(registry);
+        let (recovery_tx, recovery_rx) = tokio::sync::oneshot::channel();
+        let call = tokio::spawn(async move {
+            invoke_observation_with_deadline(
+                registry.as_ref(),
+                json!({"pid":425001,"window_id":7}),
+                StepDeadline::Trigger(recovery_rx),
+            )
+            .await
+        });
+        started.notified().await;
+        recovery_tx.send(()).expect("recovery deadline");
+        let result = call.await.expect("recovery join");
+        assert_eq!(
+            result.structured_content.unwrap()["code"],
+            "recovery_timeout"
+        );
+        release.notify_one();
+    }
+
+    #[tokio::test]
+    async fn recovery_refusal_does_not_replace_step_timeout() {
+        let action_started = Arc::new(tokio::sync::Notify::new());
+        let release_action = Arc::new(tokio::sync::Notify::new());
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(HangingTool {
+            def: tool_def("type_text"),
+            started: action_started.clone(),
+            release: release_action.clone(),
+            finished: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            concurrency: Arc::new(tokio::sync::Semaphore::new(1)),
+        }));
+        register_probe(&mut registry, "get_window_state", || {
+            ToolResult::error("outside scope")
+                .with_structured(json!({"code":"outside_scope","effect":"refused"}))
+        });
+        let registry = Arc::new(registry);
+        let mut plan = Plan::parse(
+            &registry,
+            &json!({"steps":[{"tool":"type_text","args":{"pid":425001,"window_id":7}}]}),
+        )
+        .unwrap_or_else(|error| panic!("invalid plan: {}", error.message));
+        let (step_tx, step_rx) = tokio::sync::oneshot::channel();
+        plan.step_deadline = Some(StepDeadline::Trigger(step_rx));
+        let batch = tokio::spawn(plan.run(registry, None));
+        action_started.notified().await;
+        step_tx.send(()).expect("step deadline");
+        release_action.notify_one();
+        let result = batch.await.expect("batch join");
+        let structured = result.structured_content.unwrap();
+        assert_eq!(structured["code"], "step_timeout");
+        assert_eq!(structured["observation"]["code"], "outside_scope");
+    }
+
+    #[tokio::test]
+    async fn spawned_step_preserves_origin_but_not_native_pixel_evidence() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(EvidenceTool {
+            def: tool_def("type_text"),
+            calls: calls.clone(),
+        }));
+        registry.register_session_tools();
+        let registry = Arc::new(registry);
+        registry.init_self_weak();
+        let result = registry
+            .invoke_from_trusted_adapter_with_native_window_pixels(
+                RUN_STEPS_TOOL,
+                json!({
+                    "session":"evidence",
+                    "_input_origin":"human",
+                    "steps":[{"tool":"type_text","args":{"pid":425002,"window_id":7,"text":"x"}}]
+                }),
+            )
+            .await;
+        assert_ne!(result.is_error, Some(true), "{result:?}");
+        let calls = calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert!(!calls[0].0, "nested calls must clear native pixel evidence");
+        assert_eq!(calls[0].1, crate::agent_cursor::InputOrigin::Human);
     }
 }

@@ -548,6 +548,10 @@ impl<'a> Locator<'a> {
         }
     }
 
+    fn read_admission_closed(&self) -> bool {
+        self.read_admission.as_ref().is_some_and(|admit| !admit())
+    }
+
     /// Add a driver call made outside the locator (a script's own action or
     /// read) to the journal, so it stays in dispatch order.
     pub fn record(&self, entry: Value) {
@@ -604,7 +608,7 @@ impl<'a> Locator<'a> {
                 "{tool}: not sent, because an earlier read was refused by the batch scope ({code})"
             ));
         }
-        if self.read_admission.as_ref().is_some_and(|admit| !admit()) {
+        if self.read_admission_closed() {
             return Err(format!("{tool}: read admission closed"));
         }
         let (pid, window_id) = call_target(&args);
@@ -917,6 +921,9 @@ impl<'a> Locator<'a> {
         let deadline = (started + timeout).min(self.deadline);
         loop {
             let attempt = self.find_once(window, element).await;
+            if self.read_admission_closed() {
+                return Err(Miss::new("step_timeout", "read admission closed"));
+            }
             match attempt {
                 Ok(found) => return Ok(found),
                 Err(miss) if !miss.worth_waiting() => return Err(miss),
@@ -928,6 +935,9 @@ impl<'a> Locator<'a> {
                             miss.message = format!("{} (waited {waited} ms)", miss.message);
                         }
                         return Err(miss);
+                    }
+                    if self.read_admission_closed() {
+                        return Err(Miss::new("step_timeout", "read admission closed"));
                     }
                     tokio::time::sleep(POLL_INTERVAL).await;
                 }
@@ -1071,6 +1081,9 @@ impl<'a> Locator<'a> {
         let deadline = (started + check.timeout).min(self.deadline);
         loop {
             let outcome = self.check_once(check, &window_spec, started).await;
+            if self.read_admission_closed() {
+                return Err(Miss::new("step_timeout", "read admission closed"));
+            }
             match outcome {
                 Ok(checked) => return Ok(checked),
                 Err(miss) if !miss.worth_waiting() => return Err(miss),
@@ -1083,6 +1096,9 @@ impl<'a> Locator<'a> {
                             started.elapsed().as_millis()
                         );
                         return Err(miss);
+                    }
+                    if self.read_admission_closed() {
+                        return Err(Miss::new("step_timeout", "read admission closed"));
                     }
                     tokio::time::sleep(POLL_INTERVAL).await;
                 }
