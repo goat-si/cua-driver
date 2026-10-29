@@ -1064,8 +1064,23 @@ fn set_value_blocking_with(
             };
             // An AX write bypasses NSTextView's edit model, so a document is
             // not marked edited and would never save the new text (DS-07).
-            let document = if changed == Some(true) {
+            // On a restored window the key edit goes out only while another
+            // app is in front and the field still holds the window's focus,
+            // both read right before it; otherwise the document is reported
+            // as not marked.
+            let key_edit_safe = !restored_window
+                || (crate::input::skylight::front_process_matches(pid as libc::pid_t, window_id)
+                    == Some(false)
+                    && crate::input::ax_actions::is_element_focused(pid, element_ptr)
+                    && super::type_text::focused_window_matches_element(
+                        pid,
+                        window_id,
+                        element_ptr,
+                    ));
+            let document = if changed == Some(true) && key_edit_safe {
                 unsafe { crate::document_edit::ensure_marked_after_ax_write(pid, element, true) }
+            } else if changed == Some(true) {
+                crate::document_edit::DocumentEdited::NotMarked
             } else {
                 crate::document_edit::DocumentEdited::NotADocument
             };
@@ -1084,7 +1099,12 @@ fn set_value_blocking_with(
         } else if let Some(target) = numeric_target {
             // Both direct writes failed for a numeric target — fall back to
             // stepping the control via AXIncrement / AXDecrement actions.
-            if step_to_value(element, target) {
+            let front_ok = || {
+                !restored_window
+                    || crate::input::skylight::front_process_matches(pid as libc::pid_t, window_id)
+                        == Some(false)
+            };
+            if step_to_value(element, target, front_ok) {
                 let after = unsafe { copy_string_attr(element, "AXValue") };
                 let (verified, changed) =
                     classify_write(before.as_deref(), after.as_deref(), value, true);
@@ -1201,7 +1221,9 @@ fn classify_write(
 ///
 /// Returns `true` once the control's value lands within half of the last
 /// observed step of `target`, `false` if it can't be read or can't be moved.
-fn step_to_value(element: AXUIElementRef, target: f64) -> bool {
+/// `proceed` is read before every step action (a restored window stops
+/// once its app may be the person's).
+fn step_to_value(element: AXUIElementRef, target: f64, proceed: impl Fn() -> bool) -> bool {
     // Can't target precisely without feedback — bail if AXValue is unreadable.
     let mut current = match unsafe { copy_number_attr(element, "AXValue") } {
         Some(v) => v,
@@ -1226,6 +1248,9 @@ fn step_to_value(element: AXUIElementRef, target: f64) -> bool {
         } else {
             "AXDecrement"
         };
+        if !proceed() {
+            return false;
+        }
         let _ = unsafe { perform_action(element, action) };
 
         let next = match unsafe { copy_number_attr(element, "AXValue") } {

@@ -1107,6 +1107,8 @@ struct MinimizedKeyStep {
     outcome: Option<anyhow::Result<bool>>,
     refusal: Option<(&'static str, String)>,
     notes: String,
+    /// Focus writes this route sent before the outcome.
+    focus_writes: u32,
 }
 
 fn minimized_notes(
@@ -1147,6 +1149,7 @@ fn minimized_key_worker(
         outcome: None,
         refusal: Some((code, text)),
         notes,
+        focus_writes: 0,
     };
     let Some(ops) = AxMinimizeOps::of(pid, wid) else {
         return refused(
@@ -1247,6 +1250,7 @@ fn minimized_key_worker(
         outcome: Some(outcome),
         refusal: None,
         notes: minimized_notes(restore.finish(), Some((entry, hand_back))),
+        focus_writes: focus_writes.get(),
     }
 }
 
@@ -1315,6 +1319,28 @@ fn minimized_key_result(step: MinimizedKeyStep, pid: i32, display_key: &str) -> 
         }
         Some(PressKeyDeliveryOutcome::Failed(error)) => {
             let mut result = delivery_failed(error);
+            // No key went out, but focus writes did: never a nothing-sent
+            // refusal.
+            if step.focus_writes > 0 {
+                if let Some(serde_json::Value::Object(fields)) = result.structured_content.as_mut()
+                {
+                    if fields.get("effect").and_then(|v| v.as_str()) == Some("refused") {
+                        fields.insert("effect".into(), serde_json::json!("unverifiable"));
+                        fields.remove("dispatched");
+                    }
+                    fields.insert("keys_sent".into(), serde_json::json!(false));
+                    fields.insert(
+                        "focus_writes_sent".into(),
+                        serde_json::json!(step.focus_writes),
+                    );
+                }
+                result
+                    .content
+                    .push(cua_driver_core::protocol::Content::text(format!(
+                        "{} focus write(s) were sent to the element; no key was sent.",
+                        step.focus_writes
+                    )));
+            }
             if !notes.is_empty() {
                 result
                     .content
@@ -2189,5 +2215,36 @@ mod menu_chord_tests {
         });
         let structured = maybe.structured_content.as_ref().expect("structured");
         assert_eq!(structured["code"], "ax_action_unverified");
+    }
+}
+
+#[cfg(test)]
+mod minimized_key_receipt_tests {
+    use super::*;
+
+    #[test]
+    fn a_failed_minimized_key_after_focus_writes_is_not_a_nothing_sent_refusal() {
+        let step = MinimizedKeyStep {
+            outcome: Some(Err(KeyFocusUnconfirmed.into())),
+            refusal: None,
+            notes: String::new(),
+            focus_writes: 2,
+        };
+        let result = minimized_key_result(step, 1, "return");
+        let structured = result.structured_content.as_ref().expect("structured");
+        assert_ne!(structured["effect"], "refused");
+        assert!(structured.get("dispatched").is_none());
+        assert_eq!(structured["keys_sent"], false);
+        assert_eq!(structured["focus_writes_sent"], 2);
+
+        let untouched = MinimizedKeyStep {
+            outcome: Some(Err(KeyFocusUnconfirmed.into())),
+            refusal: None,
+            notes: String::new(),
+            focus_writes: 0,
+        };
+        let result = minimized_key_result(untouched, 1, "return");
+        let structured = result.structured_content.as_ref().expect("structured");
+        assert!(structured.get("focus_writes_sent").is_none());
     }
 }
