@@ -566,6 +566,12 @@ enum BackgroundPressError {
         message: String,
         is_save: bool,
     },
+    /// Background menu validation was attempted, but the item still could
+    /// not be confirmed enabled. This never enters the legacy Save fallback.
+    ValidationFailed {
+        message: String,
+        dispatch: Dispatch,
+    },
     Other(String),
     /// The final item's action was sent and AX reported an error. An AX
     /// error or timeout does not prove the app did not run the command, so
@@ -596,6 +602,66 @@ unsafe fn item_is_save(item: AXUIElementRef) -> bool {
 /// how often it is re-read.
 const ENABLE_WAIT: Duration = Duration::from_millis(600);
 const ENABLE_POLL: Duration = Duration::from_millis(40);
+
+/// The item-404 AppKit validation trigger gets a separate short budget. The
+/// constants above also govern the slower initial window-key wait.
+const MENU_VALIDATION_WAIT: Duration = Duration::from_millis(40);
+const MENU_VALIDATION_POLL: Duration = Duration::from_millis(10);
+
+/// Validate an initially disabled item once, then require an actual enabled
+/// readback before dispatch. `None` is not enabled. The budget counts sleep
+/// durations only; a blocking AX read cannot turn it into a wall-clock SLA.
+fn validate_menu_enablement(
+    initial: Option<bool>,
+    prime: impl FnOnce() -> bool,
+    mut enabled: impl FnMut() -> Option<bool>,
+    mut sleep: impl FnMut(Duration),
+) -> Result<(), Dispatch> {
+    if initial != Some(false) {
+        return Ok(());
+    }
+    if !prime() {
+        // The public bool cannot identify a partial priming failure, so the
+        // result must leave validation delivery unknown rather than claim
+        // that no events were sent.
+        return Err(Dispatch::Possible);
+    }
+    let mut waited = Duration::ZERO;
+    let mut current = enabled();
+    while current != Some(true) && waited < MENU_VALIDATION_WAIT {
+        sleep(MENU_VALIDATION_POLL);
+        waited += MENU_VALIDATION_POLL;
+        current = enabled();
+    }
+    if current == Some(true) {
+        Ok(())
+    } else {
+        Err(Dispatch::Sent)
+    }
+}
+
+/// Map a fresh disabled read after validation without losing whether the new
+/// priming path ran. Keeping this decision in one helper lets tests drive the
+/// false → true → false race and prove an initially disabled Save cannot
+/// enter the legacy Apple Event fallback.
+fn disabled_menu_error(
+    initial: Option<bool>,
+    current: Option<bool>,
+    message: String,
+    is_save: bool,
+) -> Option<BackgroundPressError> {
+    if current != Some(false) {
+        return None;
+    }
+    if initial == Some(false) {
+        Some(BackgroundPressError::ValidationFailed {
+            message,
+            dispatch: Dispatch::Sent,
+        })
+    } else {
+        Some(BackgroundPressError::Disabled { message, is_save })
+    }
+}
 
 /// Classify the final item's AX action. Every error after the action was
 /// sent is SentWithError (the command may still run), never Other, which
@@ -732,27 +798,34 @@ unsafe fn invoke_path_in_background(
     set_messaging_timeout(target);
     let is_save = item_is_save(target);
     let result = (|| {
-        // Preserve enablement priming for an already-bound document. The
-        // context check above prevents this from switching to a sibling after
-        // resolving that sibling's menu; the check below revalidates dispatch.
-        if copy_bool_attr(target, "AXEnabled") == Some(false)
-            && crate::input::skylight::activate_without_raise_with(pid, window_id, false)
-        {
-            crate::input::skylight::note_primed_key(pid, window_id);
-            let mut waited = Duration::ZERO;
-            while waited < ENABLE_WAIT && copy_bool_attr(target, "AXEnabled") == Some(false) {
-                std::thread::sleep(ENABLE_POLL);
-                waited += ENABLE_POLL;
-            }
-        }
-        if copy_bool_attr(target, "AXEnabled") == Some(false) {
-            return Err(BackgroundPressError::Disabled {
+        // Preserve the initial state through validation so a later race back
+        // to disabled cannot enter the legacy Save fallback or produce a
+        // nothing-sent receipt after Cmd+F20 was posted.
+        let initial_enablement = copy_bool_attr(target, "AXEnabled");
+        if let Err(dispatch) = validate_menu_enablement(
+            initial_enablement,
+            || crate::input::skylight::prime_background_menu_validation(pid, window_id),
+            || copy_bool_attr(target, "AXEnabled"),
+            std::thread::sleep,
+        ) {
+            return Err(BackgroundPressError::ValidationFailed {
                 message: format!(
-                    "invoke_menu: path segment {} is disabled while the app is in the background",
+                    "invoke_menu: path segment {} could not be enabled after background menu validation",
                     path.len().saturating_sub(1)
                 ),
-                is_save,
+                dispatch,
             });
+        }
+        if let Some(error) = disabled_menu_error(
+            initial_enablement,
+            copy_bool_attr(target, "AXEnabled"),
+            format!(
+                "invoke_menu: path segment {} is disabled while the app is in the background",
+                path.len().saturating_sub(1)
+            ),
+            is_save,
+        ) {
+            return Err(error);
         }
         let actions = copy_action_names(target);
         let action = choose_action(&actions, true).ok_or_else(|| {
@@ -813,8 +886,8 @@ impl MenuRequest {
         match self {
             MenuRequest::Path => String::new(),
             MenuRequest::KeyEquivalent(combo) => format!(
-                "{combo} is the key equivalent of {}. Key events do not reach a background \
-                 app's menus, so no keys were sent. ",
+                "{combo} is the key equivalent of {}. The requested chord is not sent on the \
+                 native menu route. ",
                 path.join(" > ")
             ),
         }
@@ -955,6 +1028,9 @@ pub(super) async fn run_in_background_with_lease(
                 ),
             }
         }
+        Ok(Err(BackgroundPressError::ValidationFailed { message, dispatch })) => {
+            menu_validation_failure(&preface, &path, &message, dispatch)
+        }
         Ok(Err(BackgroundPressError::Disabled { message, .. })) => {
             background_unavailable(format!("{preface}{message}"))
         }
@@ -1009,7 +1085,7 @@ fn save_failure_result(
             return background_unavailable(format!(
                 "{preface}{message}, and saving through {app_name}'s scripting interface did not \
                  run ({detail}). Nothing was saved"
-            ))
+            ));
         }
         SaveStage::MaybeSent => Dispatch::Possible,
         SaveStage::Sent => Dispatch::Sent,
@@ -1024,6 +1100,57 @@ fn save_failure_result(
         dispatch,
         ActionTransport::MacosAppleEvent,
     )
+}
+
+/// A validation pair and a requested menu action are different dispatches.
+/// Keep this as an error so run_steps stops, and outside
+/// `background_unavailable` so its producer fields survive direct MCP and
+/// the hotkey/press_key wrapper cannot claim that no keys were sent.
+fn menu_validation_failure(
+    preface: &str,
+    path: &[String],
+    error: &str,
+    dispatch: Dispatch,
+) -> ToolResult {
+    let (lead, actual_delivery, validation_events_sent) = match dispatch {
+        Dispatch::Sent => (
+            "Posted Cmd+F20 menu-validation events (accepted for posting)",
+            ActualDelivery::Background,
+            Some(true),
+        ),
+        Dispatch::Possible => (
+            "Menu-validation events may have been posted",
+            ActualDelivery::Unknown,
+            None,
+        ),
+    };
+    let text = format!(
+        "{preface}{lead} for {}, but {error}. The requested menu action was not dispatched. \
+         Read fresh state before retrying.",
+        path.join(" > ")
+    );
+    let mut record = ActionExecutionRecord::builder(
+        ActionEffect::Unverifiable,
+        ActionTransport::MacosCgEventPid,
+        RequestedDelivery::Background,
+    )
+    .actual_delivery(actual_delivery);
+    if dispatch == Dispatch::Sent {
+        record = record.evidence(ActionEvidence {
+            kind: EvidenceKind::NativeApiResult,
+            detail: "Cmd+F20 keyDown/keyUp were accepted for SkyLight posting; AppKit consumption and AXEnabled enablement were not confirmed".into(),
+        });
+    }
+    ToolResult::error(text)
+        .with_action_record(record.build().expect("menu validation record is valid"))
+        .with_structured(serde_json::json!({
+            "status": "unverifiable",
+            "effect": "unverifiable",
+            "code": "menu_validation_unconfirmed",
+            "error": error,
+            "menu_action_dispatched": false,
+            "validation_events_sent": validation_events_sent,
+        }))
 }
 
 /// The command was, or may have been, sent and its outcome is not known.
@@ -1219,6 +1346,158 @@ impl Tool for InvokeMenuTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn menu_validation_bypasses_items_that_were_not_initially_disabled() {
+        for initial in [Some(true), None] {
+            let result = validate_menu_enablement(
+                initial,
+                || panic!("prime must not run"),
+                || panic!("enablement read must not run"),
+                |_| panic!("sleep must not run"),
+            );
+            assert_eq!(result, Ok(()));
+        }
+    }
+
+    #[test]
+    fn menu_validation_accepts_immediate_and_delayed_enablement() {
+        let immediate = validate_menu_enablement(
+            Some(false),
+            || true,
+            || Some(true),
+            |_| panic!("an enabled item must not sleep"),
+        );
+        assert_eq!(immediate, Ok(()));
+
+        let reads = std::cell::Cell::new(0usize);
+        let mut sleeps = Vec::new();
+        let delayed = validate_menu_enablement(
+            Some(false),
+            || true,
+            || {
+                reads.set(reads.get() + 1);
+                (reads.get() > 1).then_some(true)
+            },
+            |duration| sleeps.push(duration),
+        );
+        assert_eq!(delayed, Ok(()));
+        assert_eq!(sleeps, [MENU_VALIDATION_POLL]);
+    }
+
+    #[test]
+    fn menu_validation_bounds_disabled_and_unreadable_polls() {
+        for value in [Some(false), None] {
+            let mut sleeps = Vec::new();
+            let result = validate_menu_enablement(
+                Some(false),
+                || true,
+                || value,
+                |duration| sleeps.push(duration),
+            );
+            assert_eq!(result, Err(Dispatch::Sent));
+            assert_eq!(sleeps, [MENU_VALIDATION_POLL; 4]);
+            assert_eq!(
+                sleeps.iter().sum::<Duration>(),
+                MENU_VALIDATION_WAIT,
+                "four polling sleeps are the whole budget"
+            );
+        }
+    }
+
+    #[test]
+    fn menu_validation_prime_failure_does_not_poll() {
+        let result = validate_menu_enablement(
+            Some(false),
+            || false,
+            || panic!("enablement must not be read after prime failure"),
+            |_| panic!("sleep must not run after prime failure"),
+        );
+        assert_eq!(result, Err(Dispatch::Possible));
+    }
+
+    #[test]
+    fn initially_disabled_save_race_cannot_enter_the_legacy_fallback() {
+        // Drive the production sequence: initial false, validated true, then
+        // a fresh race read of false. Even with is_save=true, this must be a
+        // validation failure, not Disabled's Apple Event Save path.
+        let validated = validate_menu_enablement(
+            Some(false),
+            || true,
+            || Some(true),
+            |_| panic!("already-enabled item must not sleep"),
+        );
+        assert_eq!(validated, Ok(()));
+        let error = disabled_menu_error(Some(false), Some(false), "raced disabled".into(), true)
+            .expect("race must reject before AX action selection");
+        match error {
+            BackgroundPressError::ValidationFailed { dispatch, .. } => {
+                assert_eq!(dispatch, Dispatch::Sent);
+            }
+            BackgroundPressError::Disabled { .. } => {
+                panic!("initially disabled Save entered the Apple Event fallback variant")
+            }
+            _ => panic!("race produced an unrelated error"),
+        }
+
+        // Without the new priming path, the same disabled read keeps the
+        // legacy behavior and its Save fallback variant.
+        let legacy = disabled_menu_error(Some(true), Some(false), "disabled".into(), true)
+            .expect("unprimed race");
+        assert!(matches!(
+            legacy,
+            BackgroundPressError::Disabled { is_save: true, .. }
+        ));
+        assert!(disabled_menu_error(Some(false), Some(true), "enabled".into(), true).is_none());
+        assert!(disabled_menu_error(Some(true), None, "unreadable".into(), true).is_none());
+    }
+
+    #[test]
+    fn validation_failure_is_a_truthful_error_receipt() {
+        let path = vec!["Edit".into(), "Select All".into()];
+        let sent = menu_validation_failure("", &path, "still disabled", Dispatch::Sent);
+        assert_eq!(sent.is_error, Some(true));
+        let text = text_of(&sent);
+        assert!(text.contains("accepted for posting"), "{text}");
+        assert!(text.contains("The requested menu action was not dispatched"));
+        assert!(!text.contains("Nothing was sent"));
+        assert!(!text.contains("command may have run"));
+        let structured = sent.structured_content.clone().expect("structured");
+        assert_eq!(structured["status"], "unverifiable");
+        assert_eq!(structured["effect"], "unverifiable");
+        assert_eq!(structured["code"], "menu_validation_unconfirmed");
+        assert_eq!(structured["menu_action_dispatched"], false);
+        assert_eq!(structured["validation_events_sent"], true);
+        assert!(structured.get("dispatched").is_none());
+        assert!(structured.get("escalation").is_none());
+        let record = sent.action_record.expect("record");
+        assert_eq!(record.actual_delivery, Some(ActualDelivery::Background));
+        assert_eq!(record.transport, ActionTransport::MacosCgEventPid);
+
+        let possible = menu_validation_failure("", &path, "prime failed", Dispatch::Possible);
+        let structured = possible.structured_content.clone().expect("structured");
+        assert!(structured["validation_events_sent"].is_null());
+        assert_eq!(
+            possible
+                .action_record
+                .as_ref()
+                .expect("record")
+                .actual_delivery,
+            Some(ActualDelivery::Unknown)
+        );
+        let passed = super::super::hotkey::menu_refusal_without_keys(possible);
+        let structured = passed.structured_content.expect("structured");
+        assert_eq!(structured["code"], "menu_validation_unconfirmed");
+        assert!(structured.get("keys_sent").is_none());
+    }
+
+    #[test]
+    fn key_equivalent_preface_promises_only_the_requested_chord_unsent() {
+        let preface = MenuRequest::KeyEquivalent("cmd+a".into())
+            .preface(&["Edit".into(), "Select All".into()]);
+        assert!(preface.contains("The requested chord is not sent"));
+        assert!(!preface.contains("no keys were sent"));
+    }
 
     #[test]
     fn background_menu_requires_both_exact_document_contexts() {
@@ -1527,5 +1806,122 @@ mod tests {
         );
         assert_eq!(select_frontmost_pid(None, || Some(8), 7), Some(8));
         assert_eq!(select_frontmost_pid(None, || None, 7), None);
+    }
+
+    struct ValidationResultProbe {
+        def: ToolDef,
+        calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        fail_validation: bool,
+    }
+
+    #[async_trait]
+    impl Tool for ValidationResultProbe {
+        fn def(&self) -> &ToolDef {
+            &self.def
+        }
+
+        async fn invoke(&self, _args: Value) -> ToolResult {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            if self.fail_validation {
+                menu_validation_failure(
+                    "",
+                    &["Edit".into(), "Select All".into()],
+                    "still disabled",
+                    Dispatch::Sent,
+                )
+            } else {
+                ToolResult::text("dependent action ran")
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn validation_error_survives_direct_dispatch_and_stops_batch_steps() {
+        use cua_driver_core::{
+            authorization::PermissionMode,
+            session_authorization::{SessionAuthorizationRegistry, SessionModeCeiling},
+            tool::ToolRegistry,
+        };
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+
+        let calls = std::collections::HashMap::from([
+            ("invoke_menu", Arc::new(AtomicUsize::new(0))),
+            ("press_key", Arc::new(AtomicUsize::new(0))),
+            ("type_text", Arc::new(AtomicUsize::new(0))),
+        ]);
+        let mut registry = ToolRegistry::new();
+        for (name, fail_validation) in [
+            ("invoke_menu", true),
+            ("press_key", true),
+            ("type_text", false),
+        ] {
+            registry.register(Box::new(ValidationResultProbe {
+                def: ToolDef {
+                    name: name.into(),
+                    description: "validation result probe".into(),
+                    input_schema: serde_json::json!({
+                        "type": "object",
+                        "additionalProperties": true
+                    }),
+                    read_only: false,
+                    destructive: false,
+                    idempotent: false,
+                    open_world: false,
+                },
+                calls: calls[name].clone(),
+                fail_validation,
+            }));
+        }
+        registry.register_session_tools();
+        let registry = Arc::new(registry);
+        registry.init_self_weak();
+        let ceiling = SessionModeCeiling::for_trusted_sessions(
+            [PermissionMode::Unrestricted],
+            true,
+            Duration::from_secs(60),
+            Duration::from_secs(30),
+        )
+        .expect("ceiling");
+        let context = SessionAuthorizationRegistry::with_ceiling(ceiling)
+            .compatibility_context(PermissionMode::Unrestricted, None)
+            .expect("context");
+
+        let direct = registry
+            .invoke_with_context(
+                "invoke_menu",
+                serde_json::json!({
+                    "pid": 42,
+                    "window_id": 7,
+                    "path": ["Edit", "Select All"]
+                }),
+                context.clone(),
+            )
+            .await;
+        assert_eq!(direct.is_error, Some(true));
+        let structured = direct.structured_content.expect("direct structured");
+        assert_eq!(structured["code"], "menu_validation_unconfirmed");
+        assert_eq!(structured["menu_action_dispatched"], false);
+        assert_eq!(structured["validation_events_sent"], true);
+
+        let batch = registry
+            .invoke_with_context(
+                "run_steps",
+                serde_json::json!({"steps": [
+                    {"tool": "press_key", "args": {"pid": 42, "key": "a", "modifiers": ["cmd"]}},
+                    {"tool": "type_text", "args": {"pid": 42, "text": "must not run"}}
+                ]}),
+                context,
+            )
+            .await;
+        let structured = batch.structured_content.expect("batch structured");
+        assert_eq!(structured["ok"], false);
+        assert_eq!(structured["executed"], 1);
+        assert_eq!(structured["failed_step"], 0);
+        assert_eq!(calls["invoke_menu"].load(Ordering::SeqCst), 1);
+        assert_eq!(calls["press_key"].load(Ordering::SeqCst), 1);
+        assert_eq!(calls["type_text"].load(Ordering::SeqCst), 0);
     }
 }
