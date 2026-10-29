@@ -1615,39 +1615,94 @@ fn keys_posted_step(
 
 /// Post the chord to the held key window: only while it is still the app's
 /// focused and main window and another app is in front, then hand key back.
+/// Why the chord fallback did not post: the keyboard gate refused, or right
+/// before the post the window or the front app changed.
+#[derive(Debug, PartialEq, Eq)]
+enum KeysHeld {
+    GateRefused(String),
+    NoLongerTargeted,
+}
+
+/// The chord fallback over its side effects (tests drive it with fakes):
+/// post only when the gate passed and `still_targeted` holds right before,
+/// and hand key back exactly once on every path. Returns the post (or why
+/// none was made) and the hand-back's disclosure.
+fn run_keys_under_scope<S>(
+    scope: S,
+    gate: Result<(), String>,
+    still_targeted: impl FnOnce() -> bool,
+    post: impl FnOnce() -> crate::input::keyboard::ChordPost,
+    hand_back: impl FnOnce(S) -> String,
+) -> (Result<crate::input::keyboard::ChordPost, KeysHeld>, String) {
+    let outcome = match gate {
+        Err(reason) => Err(KeysHeld::GateRefused(reason)),
+        Ok(()) if !still_targeted() => Err(KeysHeld::NoLongerTargeted),
+        Ok(()) => Ok(post()),
+    };
+    (outcome, hand_back(scope))
+}
+
+#[allow(clippy::too_many_arguments)]
 fn keys_under_scope(
     pid: i32,
     wid: u32,
     scope: crate::input::skylight::WindowKeyScope,
+    gate: Result<(), String>,
     validation: crate::input::skylight::ValidationPost,
     path: String,
     key: &str,
     modifiers: &[String],
 ) -> ChordStep {
-    if !(menu_bound_to(pid, wid) && front_is_other_app(pid, wid)) {
-        return chord_refusal(
-            "window_not_key",
-            "before the keys, the window stopped being the app's focused and main window, or \
-             the app came to the front or which app is in front could not be read.",
-            scope,
-            validation,
-        );
-    }
     let mods: Vec<&str> = modifiers.iter().map(String::as_str).collect();
-    let post = crate::input::keyboard::press_chord_no_auth(pid, key, &mods);
-    let entry = scope.entry();
-    let hand_back = scope.finish();
-    let mut notes = vec![
-        validation.disclosure(),
-        crate::input::skylight::scope_disclosure(entry, Some(hand_back)),
-    ];
+    let (outcome, hand_back_note) = run_keys_under_scope(
+        scope,
+        gate,
+        || menu_bound_to(pid, wid) && front_is_other_app(pid, wid),
+        || crate::input::keyboard::press_chord_no_auth(pid, key, &mods),
+        |scope| {
+            let entry = scope.entry();
+            let hand_back = scope.finish();
+            crate::input::skylight::scope_disclosure(entry, Some(hand_back))
+        },
+    );
+    keys_step(outcome, &path, wid, validation, &hand_back_note)
+}
+
+/// The chord fallback's step from its outcome and notes.
+fn keys_step(
+    outcome: Result<crate::input::keyboard::ChordPost, KeysHeld>,
+    path: &str,
+    wid: u32,
+    validation: crate::input::skylight::ValidationPost,
+    hand_back_note: &str,
+) -> ChordStep {
+    let mut notes = vec![validation.disclosure(), hand_back_note.to_owned()];
     notes.retain(|note| !note.is_empty());
     let notes = if notes.is_empty() {
         String::new()
     } else {
         format!(" {}", notes.join(" "))
     };
-    keys_posted_step(post, &path, wid, validation, &notes)
+    match outcome {
+        Ok(post) => keys_posted_step(post, path, wid, validation, &notes),
+        Err(KeysHeld::GateRefused(reason)) => ChordStep::Refused {
+            code: "background_unavailable",
+            text: format!(
+                "press_key: {reason} The requested chord was not sent and no menu action was \
+                 sent.{notes}"
+            ),
+            validation,
+        },
+        Err(KeysHeld::NoLongerTargeted) => ChordStep::Refused {
+            code: "window_not_key",
+            text: format!(
+                "press_key: before the keys, the window stopped being the app's focused and \
+                 main window, or the app came to the front or which app is in front could not \
+                 be read. The requested chord was not sent and no menu action was sent.{notes}"
+            ),
+            validation,
+        },
+    }
 }
 
 fn chord_refusal(
@@ -2026,39 +2081,31 @@ async fn native_menu_chord(
             } => {
                 // Raw keys need the keyboard class's facts (a visible, not
                 // minimized window of a visible app), on the same lease.
-                if let Err(refusal) = lease
+                let gate = lease
                     .gate_again(
                         wid,
                         None,
                         cua_driver_core::background_input::BackgroundAction::ExactWindowKeys,
                     )
                     .await
-                {
-                    let reason = refusal_text(&refusal);
-                    let step = latency::spawn_action_blocking(move || {
-                        chord_refusal("background_unavailable", &reason, scope, validation)
-                    })
-                    .await;
-                    return match step {
-                        Ok(step) => chord_result(step),
-                        Err(error) => chord_task_failure(
-                            format!(
-                                "press_key: the key hand-back task failed ({error}); the \
-                                 requested chord and its menu action were not sent, and key \
-                                 focus inside the app may remain on the target window."
-                            ),
-                            validation,
-                            false,
-                        ),
-                    };
-                }
+                    .map_err(|refusal| refusal_text(&refusal));
+                let gate_refused = gate.is_err();
                 let (key, modifiers) = chord;
                 let step = latency::spawn_action_blocking(move || {
-                    keys_under_scope(pid, wid, scope, validation, path, &key, &modifiers)
+                    keys_under_scope(pid, wid, scope, gate, validation, path, &key, &modifiers)
                 })
                 .await;
                 match step {
                     Ok(step) => chord_result(step),
+                    Err(error) if gate_refused => chord_task_failure(
+                        format!(
+                            "press_key: the key hand-back task failed ({error}); the requested \
+                             chord and its menu action were not sent, and key focus inside the \
+                             app may remain on the target window."
+                        ),
+                        validation,
+                        false,
+                    ),
                     Err(error) => chord_task_failure(
                         format!(
                             "press_key: the key task failed ({error}); the requested chord may \
@@ -2118,6 +2165,72 @@ mod tests {
         assert_eq!(structured["path"], "keys_under_scope");
         let record = result.action_record.expect("record");
         assert!(matches!(record.effect, ActionEffect::Unverifiable));
+    }
+
+    /// The chord fallback posts only when the keyboard gate passed and the
+    /// window and front app still hold right before; key is handed back
+    /// exactly once on every path.
+    #[test]
+    fn the_chord_fallback_posts_only_through_the_gate_and_always_hands_back_once() {
+        use crate::input::keyboard::ChordPost;
+        let run = |gate: Result<(), String>, targeted: bool| {
+            let posts = std::cell::Cell::new(0);
+            let hand_backs = std::cell::Cell::new(0);
+            let (outcome, note) = run_keys_under_scope(
+                "scope",
+                gate,
+                || targeted,
+                || {
+                    posts.set(posts.get() + 1);
+                    ChordPost::Posted
+                },
+                |scope| {
+                    assert_eq!(scope, "scope");
+                    hand_backs.set(hand_backs.get() + 1);
+                    "Key focus went back to the app's previous window.".to_owned()
+                },
+            );
+            assert_eq!(hand_backs.get(), 1);
+            assert!(!note.is_empty());
+            (outcome, posts.get())
+        };
+        // Hidden, minimized or unknown visibility: the gate refuses.
+        let (outcome, posts) = run(Err("window 7 is minimized.".into()), true);
+        assert_eq!(posts, 0);
+        assert_eq!(
+            outcome,
+            Err(KeysHeld::GateRefused("window 7 is minimized.".into()))
+        );
+        // Binding lost, or the person's app is no longer in front (or unknown).
+        let (outcome, posts) = run(Ok(()), false);
+        assert_eq!(posts, 0);
+        assert_eq!(outcome, Err(KeysHeld::NoLongerTargeted));
+        let (outcome, posts) = run(Ok(()), true);
+        assert_eq!(posts, 1);
+        assert_eq!(outcome, Ok(ChordPost::Posted));
+
+        for (outcome, code) in [
+            (
+                Err(KeysHeld::GateRefused("hidden.".into())),
+                "background_unavailable",
+            ),
+            (Err(KeysHeld::NoLongerTargeted), "window_not_key"),
+        ] {
+            let result = chord_result(keys_step(
+                outcome,
+                "Edit > Clear to Start",
+                7,
+                crate::input::skylight::ValidationPost::default(),
+                "Key focus went back.",
+            ));
+            let structured = result.structured_content.expect("structured");
+            assert_eq!(structured["code"], code);
+            assert_eq!(structured["keys_sent"], false);
+            assert!(structured["message"]
+                .as_str()
+                .unwrap()
+                .contains("requested chord was not sent"));
+        }
     }
 
     #[test]
