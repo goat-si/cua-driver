@@ -161,7 +161,14 @@ impl Tool for TypeTextTool {
             let early_front_pid = crate::apps::frontmost_pid();
             let initial_focus = early_front_pid
                 .and_then(|pid| unsafe { crate::ax::bindings::focused_element_of_pid(pid) })
-                .map(|ptr| unsafe { crate::ax::snapshot::RetainedElement::retain(ptr as usize) });
+                .map(|ptr| unsafe {
+                    // focused_element_of_pid already returned +1: adopt it
+                    // into the wrapper and balance with one CFRelease, so
+                    // exactly one release happens on drop.
+                    let owned = crate::ax::snapshot::RetainedElement::retain(ptr as usize);
+                    core_foundation::base::CFRelease(ptr as core_foundation::base::CFTypeRef);
+                    owned
+                });
             match early_front_pid {
                 Some(front_pid) => {
                     if let Some(refusal) =

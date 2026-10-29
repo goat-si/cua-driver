@@ -549,6 +549,7 @@ pub unsafe fn element_window_id_with_deadline(
     if std::time::Instant::now() >= deadline {
         return None;
     }
+    let _ = AXUIElementSetMessagingTimeout(element, 0.5);
     if let Some(window) = copy_element_attr(element, "AXWindow") {
         let window_id = owning_window_id_with_deadline(window, deadline);
         CFRelease(window as CFTypeRef);
@@ -586,6 +587,7 @@ pub unsafe fn element_window_id_with_deadline(
         }
         {
             let parent = parent?;
+            let _ = AXUIElementSetMessagingTimeout(parent, 0.5);
             current = parent;
             owned = true;
         }

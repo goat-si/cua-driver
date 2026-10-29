@@ -287,6 +287,9 @@ pub fn run_pasteboard_transaction<B: PasteboardBackend>(
         if let Some(abort) = err.downcast_ref::<PasteSequenceAbort>() {
             // A pre-dispatch abort keeps its typed reason AND the
             // restoration outcome instead of becoming PasteMayHaveLanded.
+            // The tri-state comes from ONE ownership check and ONE restore
+            // attempt: a successful restore itself changes the count, and a
+            // failed restore is never retried.
             return Err(PasteSequenceAbort {
                 posted: abort.posted,
                 reason: abort.reason.clone(),
