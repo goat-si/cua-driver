@@ -857,11 +857,9 @@ fn held_window_enablement(
 /// validation receipt (never the scripted Save fallback, never "nothing sent").
 fn held_window_enablement_error(
     last: Option<bool>,
-    validation: crate::input::skylight::ValidationPost,
     segment: usize,
     is_save: bool,
 ) -> BackgroundPressError {
-    use crate::input::skylight::ValidationDelivery;
     let message = match last {
         Some(false) => format!(
             "invoke_menu: path segment {segment} reads disabled for this window after menu validation"
@@ -870,31 +868,15 @@ fn held_window_enablement_error(
             "invoke_menu: path segment {segment}'s enablement could not be read after menu validation"
         ),
     };
-    // A disabled Save still has the scripted Save (gated like any dispatch);
-    // the receipt lists what validation posted.
-    if is_save && last == Some(false) {
-        return BackgroundPressError::Disabled { message, is_save };
-    }
-    // Without a Cmd+F20 attempt no validation key went out (records alone,
-    // or nothing): a plain refusal whose receipt lists any records.
-    if validation.key_attempts == 0 {
-        return if last == Some(false) {
-            BackgroundPressError::Disabled { message, is_save }
-        } else {
-            BackgroundPressError::EnablementUnknown(message)
-        };
-    }
-    match validation.delivery() {
-        ValidationDelivery::NoneSent | ValidationDelivery::Sent => {
-            BackgroundPressError::ValidationFailed {
-                message,
-                dispatch: Dispatch::Sent,
-            }
-        }
-        ValidationDelivery::Possible => BackgroundPressError::ValidationFailed {
-            message,
-            dispatch: Dispatch::Possible,
-        },
+    // The requested menu action is known not to have been dispatched, so
+    // this is a refusal (background_unavailable). What validation and the
+    // key hold posted is added to the receipt by annotate_route, and the
+    // refusal then says "no menu action was sent" instead of "nothing". A
+    // disabled Save still has the scripted Save, gated like any dispatch.
+    if last == Some(false) {
+        BackgroundPressError::Disabled { message, is_save }
+    } else {
+        BackgroundPressError::EnablementUnknown(message)
     }
 }
 
@@ -1043,23 +1025,21 @@ unsafe fn press_bound_path(
             // The window is held as key: validate only under that hold, each
             // post only while another app is in front.
             let initial = copy_bool_attr(target, "AXEnabled");
-            let mut guarded = crate::input::skylight::ValidationPost::default();
             if let Err(last) = held_window_enablement(
                 initial,
                 || {
-                    guarded = crate::input::skylight::prime_menu_validation_guarded(
-                        pid as libc::pid_t,
-                        window_id,
-                        || front_is_other_app(pid, window_id) == Some(true),
-                    );
-                    *validation_post = Some(RouteValidation::Guarded(guarded));
+                    *validation_post = Some(RouteValidation::Guarded(
+                        crate::input::skylight::prime_menu_validation_guarded(
+                            pid as libc::pid_t,
+                            window_id,
+                            || front_is_other_app(pid, window_id) == Some(true),
+                        ),
+                    ));
                 },
                 || copy_bool_attr(target, "AXEnabled"),
                 std::thread::sleep,
             ) {
-                return Err(held_window_enablement_error(
-                    last, guarded, segment, is_save,
-                ));
+                return Err(held_window_enablement_error(last, segment, is_save));
             }
             let actions = copy_action_names(target);
             let action = choose_action(&actions, true).ok_or_else(|| {
@@ -1072,9 +1052,7 @@ unsafe fn press_bound_path(
             // disabled, or cannot be read now, is not pressed.
             let last = copy_bool_attr(target, "AXEnabled");
             if last != Some(true) {
-                return Err(held_window_enablement_error(
-                    last, guarded, segment, is_save,
-                ));
+                return Err(held_window_enablement_error(last, segment, is_save));
             }
             return dispatch_final_item(|| perform_action(target, action), is_save);
         }
@@ -2065,7 +2043,6 @@ mod tests {
     #[test]
     fn a_held_window_refusal_says_what_validation_posted() {
         use crate::input::skylight::ValidationPost;
-        let none = ValidationPost::default();
         let sent = ValidationPost {
             records: 2,
             keys: 2,
@@ -2073,51 +2050,40 @@ mod tests {
             uncertain: false,
             called: true,
         };
-        let partial = ValidationPost {
-            uncertain: true,
-            ..sent
-        };
-        assert!(matches!(
-            held_window_enablement_error(Some(false), none, 2, true),
-            BackgroundPressError::Disabled { is_save: true, .. }
-        ));
-        assert!(matches!(
-            held_window_enablement_error(None, none, 2, false),
-            BackgroundPressError::EnablementUnknown(_)
-        ));
-        assert!(matches!(
-            held_window_enablement_error(Some(false), sent, 2, false),
-            BackgroundPressError::ValidationFailed {
-                dispatch: Dispatch::Sent,
-                ..
-            }
-        ));
-        // A disabled Save keeps its scripted Save even after validation.
-        assert!(matches!(
-            held_window_enablement_error(Some(false), sent, 2, true),
-            BackgroundPressError::Disabled { is_save: true, .. }
-        ));
-        // Records but no Cmd+F20 attempt: not a validation-keys receipt.
-        let records_only = ValidationPost {
-            records: 2,
-            called: true,
-            ..ValidationPost::default()
-        };
-        assert!(matches!(
-            held_window_enablement_error(Some(false), records_only, 2, false),
-            BackgroundPressError::Disabled { is_save: false, .. }
-        ));
-        assert!(matches!(
-            held_window_enablement_error(None, records_only, 2, false),
-            BackgroundPressError::EnablementUnknown(_)
-        ));
-        assert!(matches!(
-            held_window_enablement_error(None, partial, 2, false),
-            BackgroundPressError::ValidationFailed {
-                dispatch: Dispatch::Possible,
-                ..
-            }
-        ));
+        for validated in [false, true] {
+            assert!(matches!(
+                held_window_enablement_error(Some(false), 2, validated),
+                BackgroundPressError::Disabled { is_save, .. } if is_save == validated
+            ));
+            assert!(matches!(
+                held_window_enablement_error(None, 2, validated),
+                BackgroundPressError::EnablementUnknown(_)
+            ));
+        }
+        // A refusal after posted validation: unavailable, with the validation
+        // input listed and no "nothing was sent".
+        let mut unavailable = background_unavailable(
+            "invoke_menu: path segment 2 reads disabled for this window after menu validation"
+                .into(),
+            true,
+        );
+        annotate_route(
+            &mut unavailable,
+            Some(RouteValidation::Guarded(sent)),
+            "",
+            None,
+        );
+        let structured = unavailable.structured_content.clone().expect("structured");
+        assert_eq!(structured["code"], "background_unavailable");
+        assert_eq!(structured["effect"], "refused");
+        assert_eq!(structured["dispatched"], false);
+        assert_eq!(structured["keys_sent"], true);
+        assert_eq!(structured["dispatch"], "validation_posted");
+        let text = text_of(&unavailable);
+        assert!(
+            text.contains("Cmd+F20") && !text.contains("Nothing was sent"),
+            "{text}"
+        );
 
         let mut refused = front_changed_refusal(1, 7);
         annotate_route(
