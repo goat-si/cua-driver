@@ -1478,15 +1478,16 @@ impl ClickTool {
                                 cua_driver_core::action_record::ActionTransport::MacosAxAction,
                                 cua_driver_core::action_record::RequestedDelivery::Background,
                             )
-                            .actual_delivery(cua_driver_core::action_record::ActualDelivery::Background)
+                            .actual_delivery(cua_driver_core::action_record::ActualDelivery::Unknown)
                             .build()
                             .expect("ax unverifiable record is valid"),
                         );
                     }
                     Err(error) if focus_only => {
                         // The focus task may have failed after an AX focus:
-                        // no pixel fallback.
-                        return ToolResult::text(format!(
+                        // no pixel fallback, and no success for the caller's
+                        // focus ladder.
+                        return ToolResult::error(format!(
                             "The accessibility focus task failed ({error}); it may have run.                              Read fresh state before focusing again."
                         ))
                         .with_structured(serde_json::json!({
@@ -2407,15 +2408,15 @@ fn ancestor_action_kind(
     // Selection first, across the WHOLE chain — but only on a selection
     // container (AXRow/AXCell): an enclosing actionable control's AXPress
     // would activate that control instead of selecting the hit item.
+    if !is_finder {
+        return None;
+    }
     for (index, (role, actions, _)) in chain.iter().enumerate() {
         if matches!(role.as_deref(), Some("AXRow" | "AXCell"))
             && actions.iter().any(|a| a == "AXPress")
         {
             return Some((index, "AXPress"));
         }
-    }
-    if !is_finder {
-        return None;
     }
     // AXOpen only for a Finder SIDEBAR cell: AXCell with AXOpen whose parent
     // is an AXRow and whose grandparent is an AXOutline described as
