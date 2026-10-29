@@ -2401,13 +2401,16 @@ enum AxPressOutcome {
 /// the single-click navigation gesture — an outline elsewhere can be a file
 /// or document tree, where a click must select, not open.
 fn ancestor_action_kind(
-    chain: &[(Option<String>, Vec<String>)],
+    chain: &[(Option<String>, Vec<String>, bool)],
     is_finder: bool,
 ) -> Option<(usize, &'static str)> {
-    // Selection first, across the WHOLE chain: any ancestor's AXPress beats
-    // an earlier cell's AXOpen.
-    for (index, (_, actions)) in chain.iter().enumerate() {
-        if actions.iter().any(|a| a == "AXPress") {
+    // Selection first, across the WHOLE chain — but only on a selection
+    // container (AXRow/AXCell): an enclosing actionable control's AXPress
+    // would activate that control instead of selecting the hit item.
+    for (index, (role, actions, _)) in chain.iter().enumerate() {
+        if matches!(role.as_deref(), Some("AXRow" | "AXCell"))
+            && actions.iter().any(|a| a == "AXPress")
+        {
             return Some((index, "AXPress"));
         }
     }
@@ -2415,17 +2418,18 @@ fn ancestor_action_kind(
         return None;
     }
     // AXOpen only for a Finder SIDEBAR cell: AXCell with AXOpen whose parent
-    // is an AXRow and whose grandparent is an AXOutline. File/content
-    // outlines do not have this exact cell-row-outline nesting.
-    for (index, (role, actions)) in chain.iter().enumerate() {
+    // is an AXRow and whose grandparent is an AXOutline described as
+    // "sidebar". The description must come from the candidate's OWN outline,
+    // not from any outline in the chain.
+    for (index, (role, actions, _)) in chain.iter().enumerate() {
         if role.as_deref() == Some("AXCell")
             && actions.iter().any(|a| a == "AXOpen")
             && chain
                 .get(index + 1)
-                .is_some_and(|(role, _)| role.as_deref() == Some("AXRow"))
+                .is_some_and(|(role, _, _)| role.as_deref() == Some("AXRow"))
             && chain
                 .get(index + 2)
-                .is_some_and(|(role, _)| role.as_deref() == Some("AXOutline"))
+                .is_some_and(|(role, _, sidebar)| role.as_deref() == Some("AXOutline") && *sidebar)
         {
             return Some((index, "AXOpen"));
         }
@@ -2463,6 +2467,7 @@ unsafe fn ax_press_with_ancestors(
         Option<String>,
         Vec<String>,
         crate::ax::bindings::AXUIElementRef,
+        bool,
     )> = Vec::new();
     let mut current = element;
     for _ in 0..4 {
@@ -2474,37 +2479,33 @@ unsafe fn ax_press_with_ancestors(
         current = parent;
         let role = copy_string_attr(current, "AXRole");
         let actions = copy_action_names(current);
-        chain.push((role, actions, current));
+        let sidebar = role.as_deref() == Some("AXOutline")
+            && copy_string_attr(current, "AXDescription")
+                .is_some_and(|d| d.eq_ignore_ascii_case("sidebar"));
+        chain.push((role, actions, current, sidebar));
     }
-    // The outline's own description identifies the sidebar; a same-shaped
-    // content outline is not a navigation surface.
-    let sidebar = chain.iter().any(|(role, _, el)| {
-        role.as_deref() == Some("AXOutline")
-            && copy_string_attr(*el, "AXDescription")
-                .is_some_and(|d| d.eq_ignore_ascii_case("sidebar"))
-    });
-    let roles_actions: Vec<(Option<String>, Vec<String>)> = chain
+    let roles_actions: Vec<(Option<String>, Vec<String>, bool)> = chain
         .iter()
-        .map(|(role, actions, _)| (role.clone(), actions.clone()))
+        .map(|(role, actions, _, sidebar)| (role.clone(), actions.clone(), *sidebar))
         .collect();
     let is_finder = crate::apps::bundle_id_for_pid(pid).as_deref() == Some("com.apple.finder");
-    let chosen = ancestor_action_kind(&roles_actions, is_finder && sidebar);
+    let chosen = ancestor_action_kind(&roles_actions, is_finder);
     let Some((index, action_name)) = chosen else {
-        for (_, _, el) in chain {
+        for (_, _, el, _) in chain {
             CFRelease(el as _);
         }
         return Ok(AxPressOutcome::Unavailable);
     };
     let target = chain[index].2;
     if let Err(moved) = super::window_points::check_guard(dispatch_guard) {
-        for (_, _, el) in chain {
+        for (_, _, el, _) in chain {
             CFRelease(el as _);
         }
         return Err(moved);
     }
     let action = CFString::new(action_name);
     let err = AXUIElementPerformAction(target, action.as_concrete_TypeRef());
-    for (_, _, el) in chain {
+    for (_, _, el, _) in chain {
         CFRelease(el as _);
     }
     if err == kAXErrorSuccess {
@@ -2520,13 +2521,14 @@ unsafe fn ax_press_with_ancestors(
 mod ancestor_action_tests {
     use super::ancestor_action_kind;
 
-    fn chain(items: &[(&str, &[&str])]) -> Vec<(Option<String>, Vec<String>)> {
+    fn chain(items: &[(&str, &[&str])]) -> Vec<(Option<String>, Vec<String>, bool)> {
         items
             .iter()
             .map(|(role, actions)| {
                 (
                     Some((*role).to_owned()),
                     actions.iter().map(|a| (*a).to_owned()).collect(),
+                    role == &"AXOutline",
                 )
             })
             .collect()
