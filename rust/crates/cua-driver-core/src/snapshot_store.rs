@@ -334,9 +334,11 @@ impl<S: SnapshotPayload> SnapshotStore<S> {
     /// Refresh the screenshot frame of the window's current snapshot in place,
     /// keeping its id, its elements and their tokens. Used by a
     /// screenshot-only read (no tree walk): it adds a new image but no new
-    /// element indices, so the tokens the caller holds stay valid. Returns the
-    /// kept snapshot id, or `None` when the window has no snapshot with
-    /// elements (the caller then publishes a new one).
+    /// element indices, so the tokens the caller holds stay valid. A snapshot
+    /// with no rows (an observe that found none, or an earlier screenshot)
+    /// keeps its id too: a screenshot never retires the window's snapshot id.
+    /// Returns the kept snapshot id, or `None` when the window has no
+    /// snapshot (the caller then publishes a new one).
     pub fn refresh_screenshot_for_session(
         &self,
         pid: i32,
@@ -353,7 +355,7 @@ impl<S: SnapshotPayload> SnapshotStore<S> {
             .get_mut(&pid)?
             .iter_mut()
             .find(|snapshot| snapshot.window_id == window_id)
-            .filter(|snapshot| snapshot.semantic && !snapshot.payload.is_empty())?;
+            .filter(|snapshot| snapshot.semantic)?;
         snapshot.screenshot_owner = session.map(str::to_owned);
         snapshot.screenshot_scale = Some(screenshot_scale);
         snapshot.screenshot_window_size = window_size;
@@ -1158,12 +1160,16 @@ mod tests {
             ResolvedElement::Element { element: 7, .. }
         ));
 
-        // A capture-only snapshot has no rows to keep: publish a new one.
-        cache.publish_sized_for_session(10, 21, Payload(vec![]), Some("a"), Some(1.0), None);
+        // A snapshot with no rows, from an observe that found none or an
+        // earlier screenshot, keeps its id as well.
+        let (empty, _) = cache
+            .publish_sized_for_session(10, 21, Payload(vec![]), Some("a"), None, None)
+            .unwrap();
         assert_eq!(
             cache.refresh_screenshot_for_session(10, 21, Some("a"), 1.0, None),
-            None
+            Some(empty)
         );
+        assert_eq!(scale(&cache, 21, "a"), Some(1.0));
     }
 
     #[test]

@@ -19,6 +19,7 @@
 mod batch_attrs;
 pub mod bindings;
 mod content_attrs;
+mod control_attrs;
 pub mod dense_rows;
 pub mod editable;
 pub mod enablement;

@@ -263,20 +263,27 @@ pub unsafe fn copy_url_attr(element: AXUIElementRef) -> Option<String> {
 ///
 /// `element` must be a valid, live `AXUIElementRef` for the duration of the call.
 pub unsafe fn copy_number_attr(element: AXUIElementRef, attr_name: &str) -> Option<f64> {
-    use core_foundation::number::CFNumber;
     let attr = CFStr::new(attr_name);
     let mut value: CFTypeRef = std::ptr::null();
     let err = AXUIElementCopyAttributeValue(element, attr.as_concrete_TypeRef(), &mut value);
     if err != kAXErrorSuccess || value.is_null() {
         return None;
     }
-    let cf_number_type_id = CFNumber::type_id();
-    if core_foundation::base::CFGetTypeID(value) != cf_number_type_id {
-        CFRelease(value);
+    let result = number_from_cf(value);
+    CFRelease(value);
+    result
+}
+
+/// [`copy_number_attr`]'s conversion of a borrowed value: a CFNumber as `f64`.
+///
+/// # Safety
+/// `value` must be a live CF object for the duration of the call.
+pub(crate) unsafe fn number_from_cf(value: CFTypeRef) -> Option<f64> {
+    use core_foundation::number::CFNumber;
+    if value.is_null() || core_foundation::base::CFGetTypeID(value) != CFNumber::type_id() {
         return None;
     }
-    let n = CFNumber::wrap_under_create_rule(value as _);
-    n.to_f64()
+    CFNumber::wrap_under_get_rule(value as _).to_f64()
 }
 
 /// Copy a boolean attribute from an AX element. Returns `None` on any error
@@ -288,24 +295,37 @@ pub unsafe fn copy_number_attr(element: AXUIElementRef, attr_name: &str) -> Opti
 /// `element` must be a valid Accessibility object reference for the duration
 /// of this call.
 pub unsafe fn copy_bool_attr(element: AXUIElementRef, attr_name: &str) -> Option<bool> {
-    use core_foundation::boolean::CFBoolean;
-    use core_foundation::number::CFNumber;
     let attr = CFStr::new(attr_name);
     let mut value: CFTypeRef = std::ptr::null();
     let err = AXUIElementCopyAttributeValue(element, attr.as_concrete_TypeRef(), &mut value);
     if err != kAXErrorSuccess || value.is_null() {
         return None;
     }
+    let result = bool_from_cf(value);
+    CFRelease(value);
+    result
+}
+
+/// [`copy_bool_attr`]'s conversion of a borrowed value: a CFBoolean, or a
+/// CFNumber read as nonzero.
+///
+/// # Safety
+/// `value` must be a live CF object for the duration of the call.
+pub(crate) unsafe fn bool_from_cf(value: CFTypeRef) -> Option<bool> {
+    use core_foundation::boolean::CFBoolean;
+    use core_foundation::number::CFNumber;
+    if value.is_null() {
+        return None;
+    }
     let type_id = core_foundation::base::CFGetTypeID(value);
     if type_id == CFBoolean::type_id() {
-        let b = CFBoolean::wrap_under_create_rule(value as _);
-        return Some(b.into());
+        return Some(CFBoolean::wrap_under_get_rule(value as _).into());
     }
     if type_id == CFNumber::type_id() {
-        let n = CFNumber::wrap_under_create_rule(value as _);
-        return n.to_f64().map(|f| f != 0.0);
+        return CFNumber::wrap_under_get_rule(value as _)
+            .to_f64()
+            .map(|f| f != 0.0);
     }
-    CFRelease(value);
     None
 }
 
@@ -348,16 +368,22 @@ pub unsafe fn copy_binary_attr(element: AXUIElementRef, attr_name: &str) -> Opti
 /// and the wider structured control-state response.
 #[derive(Debug, PartialEq, Eq)]
 pub struct StringishAttrValue {
-    /// Present only when the source value was a CFString.
+    /// Present only when the source value was text: a CFString, or the
+    /// string of a CFAttributedString.
     pub string_value: Option<String>,
-    /// CFString as-is, CFNumber as text, or CFBoolean as `"1"` / `"0"`.
+    /// CFString (or attributed string) as-is, CFNumber as text, CFBoolean as
+    /// `"1"` / `"0"`, or a CFURL as its absolute URL.
     pub state_value: String,
 }
 
-/// Convert a borrowed CF value without taking ownership of it.
+/// Convert a borrowed CF value without taking ownership of it. A value that
+/// reads as a string is kept; one that does not (a point, size or range) is
+/// `None`.
 pub(crate) unsafe fn stringish_from_cf(value: CFTypeRef) -> Option<StringishAttrValue> {
+    use core_foundation::attributed_string::{CFAttributedString, CFAttributedStringGetString};
     use core_foundation::boolean::CFBoolean;
     use core_foundation::number::CFNumber;
+    use core_foundation::url::CFURL;
     if value.is_null() {
         return None;
     }
@@ -367,6 +393,20 @@ pub(crate) unsafe fn stringish_from_cf(value: CFTypeRef) -> Option<StringishAttr
         return Some(StringishAttrValue {
             string_value: Some(string.clone()),
             state_value: string,
+        });
+    }
+    if type_id == CFAttributedString::type_id() {
+        let string = string_from_cf(CFAttributedStringGetString(value as _) as CFTypeRef)?;
+        return Some(StringishAttrValue {
+            string_value: Some(string.clone()),
+            state_value: string,
+        });
+    }
+    if type_id == CFURL::type_id() {
+        let url = CFURL::wrap_under_get_rule(value as _);
+        return Some(StringishAttrValue {
+            string_value: None,
+            state_value: url.absolute().get_string().to_string(),
         });
     }
     if type_id == CFNumber::type_id() {
@@ -513,21 +553,9 @@ pub unsafe fn element_screen_rect(element: AXUIElementRef) -> Option<[f64; 4]> {
     if err != kAXErrorSuccess || pos_ref.is_null() {
         return None;
     }
-    #[repr(C)]
-    struct CGPoint {
-        x: f64,
-        y: f64,
-    }
-    let mut pos = CGPoint { x: 0.0, y: 0.0 };
-    let ok = AXValueGetValue(
-        pos_ref as AXValueRef,
-        kAXValueCGPointType,
-        &mut pos as *mut _ as *mut std::ffi::c_void,
-    );
+    let pos = point_from_cf(pos_ref);
     CFRelease(pos_ref);
-    if !ok {
-        return None;
-    }
+    let pos = pos?;
 
     // AXSize → CGSize
     let sz_attr = CFStr::new("AXSize");
@@ -536,23 +564,63 @@ pub unsafe fn element_screen_rect(element: AXUIElementRef) -> Option<[f64; 4]> {
     if err2 != kAXErrorSuccess || sz_ref.is_null() {
         return None;
     }
+    let size = size_from_cf(sz_ref);
+    CFRelease(sz_ref);
+    rect_from_parts(Some(pos), size)
+}
+
+/// A borrowed AXPosition value as (x, y).
+///
+/// # Safety
+/// `value` must be a live CF object for the duration of the call.
+pub(crate) unsafe fn point_from_cf(value: CFTypeRef) -> Option<(f64, f64)> {
+    #[repr(C)]
+    struct CGPoint {
+        x: f64,
+        y: f64,
+    }
+    if value.is_null() || core_foundation::base::CFGetTypeID(value) != AXValueGetTypeID() {
+        return None;
+    }
+    let mut pos = CGPoint { x: 0.0, y: 0.0 };
+    AXValueGetValue(
+        value as AXValueRef,
+        kAXValueCGPointType,
+        &mut pos as *mut _ as *mut std::ffi::c_void,
+    )
+    .then_some((pos.x, pos.y))
+}
+
+/// A borrowed AXSize value as (width, height).
+///
+/// # Safety
+/// `value` must be a live CF object for the duration of the call.
+pub(crate) unsafe fn size_from_cf(value: CFTypeRef) -> Option<(f64, f64)> {
     #[repr(C)]
     struct CGSize {
         w: f64,
         h: f64,
     }
-    let mut sz = CGSize { w: 0.0, h: 0.0 };
-    let ok2 = AXValueGetValue(
-        sz_ref as AXValueRef,
-        kAXValueCGSizeType,
-        &mut sz as *mut _ as *mut std::ffi::c_void,
-    );
-    CFRelease(sz_ref);
-    if !ok2 || sz.w < 1.0 || sz.h < 1.0 {
+    if value.is_null() || core_foundation::base::CFGetTypeID(value) != AXValueGetTypeID() {
         return None;
     }
+    let mut sz = CGSize { w: 0.0, h: 0.0 };
+    AXValueGetValue(
+        value as AXValueRef,
+        kAXValueCGSizeType,
+        &mut sz as *mut _ as *mut std::ffi::c_void,
+    )
+    .then_some((sz.w, sz.h))
+}
 
-    Some([pos.x, pos.y, sz.w, sz.h])
+/// [`element_screen_rect`]'s frame from its position and size: none without
+/// both, or for a size under one point.
+pub(crate) fn rect_from_parts(
+    position: Option<(f64, f64)>,
+    size: Option<(f64, f64)>,
+) -> Option<[f64; 4]> {
+    let ((x, y), (w, h)) = (position?, size?);
+    (!(w < 1.0 || h < 1.0)).then_some([x, y, w, h])
 }
 
 /// Get the focused UI element of a running application by pid.
@@ -1244,7 +1312,13 @@ mod tests {
 
     #[test]
     fn borrowed_string_converters_preserve_empty_and_surrounding_whitespace() {
-        for text in ["", " \t\n ", "  Search  "] {
+        // Hangul, symbols and emoji pass through unchanged as well.
+        for text in [
+            "",
+            " \t\n ",
+            "  Search  ",
+            "안녕하세요 — ₩1,000 · ✓ <a&b> 😀",
+        ] {
             let value = CFStr::new(text);
             assert_eq!(
                 unsafe { string_from_cf(value.as_CFTypeRef()) }.as_deref(),
@@ -1254,6 +1328,25 @@ mod tests {
             assert_eq!(copied.string_value.as_deref(), Some(text));
             assert_eq!(copied.state_value, text);
         }
+    }
+
+    #[test]
+    fn attributed_strings_and_urls_are_kept_as_their_text() {
+        let text = "  메모: 오늘 ✓ 3/4 끝냄 😀 ";
+        let attributed =
+            core_foundation::attributed_string::CFAttributedString::new(&CFStr::new(text));
+        let copied = unsafe { stringish_from_cf(attributed.as_CFTypeRef()) }.unwrap();
+        assert_eq!(copied.string_value.as_deref(), Some(text));
+        assert_eq!(copied.state_value, text);
+
+        let url = core_foundation::url::CFURL::from_path("/tmp/한글 파일.txt", false).unwrap();
+        let copied = unsafe { stringish_from_cf(url.as_CFTypeRef()) }.unwrap();
+        assert_eq!(copied.string_value, None);
+        assert!(
+            copied.state_value.starts_with("file:///tmp/"),
+            "{}",
+            copied.state_value
+        );
     }
 
     #[test]

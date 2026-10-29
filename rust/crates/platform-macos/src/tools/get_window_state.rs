@@ -430,11 +430,6 @@ impl Tool for GetWindowStateTool {
             }
         }
 
-        // Which browser owns the window decides two notes at the end of the
-        // read. Naming the app spawns `ps`, so answer it beside the walk and
-        // the capture instead of after them.
-        let chromium_probe = tokio::task::spawn_blocking(move || chromium_browser_window(pid));
-
         let view = match cua_driver_core::window_state_view::ViewOptions::from_args(&args) {
             Ok(view) => view,
             Err(refusal) => return refusal,
@@ -549,6 +544,20 @@ impl Tool for GetWindowStateTool {
         // Start the screenshot grab before the tree walk so the two overlap:
         // ScreenCaptureKit and the accessibility walk use independent system
         // services, and the read otherwise pays for them one after the other.
+        // Which browser owns the window decides two notes at the end of the
+        // read. Naming the app spawns `ps`, so answer it beside the walk and
+        // the capture instead of after them. Started only once the arguments
+        // are accepted, so a refused request spawns nothing.
+        let chromium_probe = tokio::task::spawn_blocking(move || chromium_browser_window(pid));
+        // A capture-only read has no walk for its capture to overlap, so the
+        // background-input facts are gathered beside the capture instead of
+        // after it. A read that walks gathers them after the walk, as before:
+        // they ask the same app over accessibility.
+        let prefetched_facts = (!want_tree && !display_only).then(|| {
+            tokio::task::spawn_blocking(move || {
+                crate::ax::exact_target::gather_background_facts(pid, window_id, None)
+            })
+        });
         let abandon_events_before_prefetch = crate::capture::native_capture_abandon_events();
         let prefetched_capture = prefetch_capture(should_capture, want_tree, move || {
             crate::capture::screenshot_window_image(window_id)
@@ -1119,8 +1128,14 @@ impl Tool for GetWindowStateTool {
         // previews poll several times a second.
         if !display_only {
             let capture_available = screenshot_dims.is_some();
+            let prefetched = match prefetched_facts {
+                Some(handle) => handle.await.ok(),
+                None => None,
+            };
             let report = tokio::task::spawn_blocking(move || {
-                let facts = crate::ax::exact_target::gather_background_facts(pid, window_id, None);
+                let facts = prefetched.unwrap_or_else(|| {
+                    crate::ax::exact_target::gather_background_facts(pid, window_id, None)
+                });
                 cua_driver_core::background_input::background_input_capability_report(
                     cua_driver_core::background_input::ExactWindowTarget { pid, window_id },
                     &facts,
