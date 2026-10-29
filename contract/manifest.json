@@ -239,6 +239,21 @@
               "null"
             ]
           },
+          "menu_items": {
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "menu_opened": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
           "next_call": {
             "additionalProperties": false,
             "properties": {
@@ -269,9 +284,52 @@
             ],
             "type": "string"
           },
+          "selected_text": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "selected_text_range": {
+            "additionalProperties": false,
+            "properties": {
+              "length": {
+                "minimum": 0,
+                "type": "integer"
+              },
+              "location": {
+                "minimum": 0,
+                "type": "integer"
+              },
+              "units": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "location",
+              "length",
+              "units"
+            ],
+            "type": [
+              "object",
+              "null"
+            ]
+          },
+          "selection_changed": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
           "summary": {
             "type": [
               "string",
+              "null"
+            ]
+          },
+          "verified": {
+            "type": [
+              "boolean",
               "null"
             ]
           }
@@ -680,6 +738,21 @@
               "null"
             ]
           },
+          "menu_items": {
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "menu_opened": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
           "next_call": {
             "additionalProperties": false,
             "properties": {
@@ -710,9 +783,52 @@
             ],
             "type": "string"
           },
+          "selected_text": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "selected_text_range": {
+            "additionalProperties": false,
+            "properties": {
+              "length": {
+                "minimum": 0,
+                "type": "integer"
+              },
+              "location": {
+                "minimum": 0,
+                "type": "integer"
+              },
+              "units": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "location",
+              "length",
+              "units"
+            ],
+            "type": [
+              "object",
+              "null"
+            ]
+          },
+          "selection_changed": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
           "summary": {
             "type": [
               "string",
+              "null"
+            ]
+          },
+          "verified": {
+            "type": [
+              "boolean",
               "null"
             ]
           }
@@ -2246,6 +2362,21 @@
               "null"
             ]
           },
+          "menu_items": {
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "menu_opened": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
           "next_call": {
             "additionalProperties": false,
             "properties": {
@@ -2276,9 +2407,52 @@
             ],
             "type": "string"
           },
+          "selected_text": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "selected_text_range": {
+            "additionalProperties": false,
+            "properties": {
+              "length": {
+                "minimum": 0,
+                "type": "integer"
+              },
+              "location": {
+                "minimum": 0,
+                "type": "integer"
+              },
+              "units": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "location",
+              "length",
+              "units"
+            ],
+            "type": [
+              "object",
+              "null"
+            ]
+          },
+          "selection_changed": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
           "summary": {
             "type": [
               "string",
+              "null"
+            ]
+          },
+          "verified": {
+            "type": [
+              "boolean",
               "null"
             ]
           }
@@ -2477,6 +2651,21 @@
               "null"
             ]
           },
+          "menu_items": {
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "menu_opened": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
           "next_call": {
             "additionalProperties": false,
             "properties": {
@@ -2507,9 +2696,52 @@
             ],
             "type": "string"
           },
+          "selected_text": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "selected_text_range": {
+            "additionalProperties": false,
+            "properties": {
+              "length": {
+                "minimum": 0,
+                "type": "integer"
+              },
+              "location": {
+                "minimum": 0,
+                "type": "integer"
+              },
+              "units": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "location",
+              "length",
+              "units"
+            ],
+            "type": [
+              "object",
+              "null"
+            ]
+          },
+          "selection_changed": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
           "summary": {
             "type": [
               "string",
+              "null"
+            ]
+          },
+          "verified": {
+            "type": [
+              "boolean",
               "null"
             ]
           }
@@ -3107,6 +3339,21 @@
               "null"
             ]
           },
+          "menu_items": {
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "menu_opened": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
           "next_call": {
             "additionalProperties": false,
             "properties": {
@@ -3137,9 +3384,52 @@
             ],
             "type": "string"
           },
+          "selected_text": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "selected_text_range": {
+            "additionalProperties": false,
+            "properties": {
+              "length": {
+                "minimum": 0,
+                "type": "integer"
+              },
+              "location": {
+                "minimum": 0,
+                "type": "integer"
+              },
+              "units": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "location",
+              "length",
+              "units"
+            ],
+            "type": [
+              "object",
+              "null"
+            ]
+          },
+          "selection_changed": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
           "summary": {
             "type": [
               "string",
+              "null"
+            ]
+          },
+          "verified": {
+            "type": [
+              "boolean",
               "null"
             ]
           }
@@ -3850,6 +4140,21 @@
               "null"
             ]
           },
+          "menu_items": {
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "menu_opened": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
           "next_call": {
             "additionalProperties": false,
             "properties": {
@@ -3880,9 +4185,52 @@
             ],
             "type": "string"
           },
+          "selected_text": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "selected_text_range": {
+            "additionalProperties": false,
+            "properties": {
+              "length": {
+                "minimum": 0,
+                "type": "integer"
+              },
+              "location": {
+                "minimum": 0,
+                "type": "integer"
+              },
+              "units": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "location",
+              "length",
+              "units"
+            ],
+            "type": [
+              "object",
+              "null"
+            ]
+          },
+          "selection_changed": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
           "summary": {
             "type": [
               "string",
+              "null"
+            ]
+          },
+          "verified": {
+            "type": [
+              "boolean",
               "null"
             ]
           }
@@ -4125,6 +4473,21 @@
               "null"
             ]
           },
+          "menu_items": {
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "menu_opened": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
           "next_call": {
             "additionalProperties": false,
             "properties": {
@@ -4155,9 +4518,52 @@
             ],
             "type": "string"
           },
+          "selected_text": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "selected_text_range": {
+            "additionalProperties": false,
+            "properties": {
+              "length": {
+                "minimum": 0,
+                "type": "integer"
+              },
+              "location": {
+                "minimum": 0,
+                "type": "integer"
+              },
+              "units": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "location",
+              "length",
+              "units"
+            ],
+            "type": [
+              "object",
+              "null"
+            ]
+          },
+          "selection_changed": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
           "summary": {
             "type": [
               "string",
+              "null"
+            ]
+          },
+          "verified": {
+            "type": [
+              "boolean",
               "null"
             ]
           }
@@ -4773,6 +5179,21 @@
               "null"
             ]
           },
+          "menu_items": {
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "menu_opened": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
           "next_call": {
             "additionalProperties": false,
             "properties": {
@@ -4803,9 +5224,52 @@
             ],
             "type": "string"
           },
+          "selected_text": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "selected_text_range": {
+            "additionalProperties": false,
+            "properties": {
+              "length": {
+                "minimum": 0,
+                "type": "integer"
+              },
+              "location": {
+                "minimum": 0,
+                "type": "integer"
+              },
+              "units": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "location",
+              "length",
+              "units"
+            ],
+            "type": [
+              "object",
+              "null"
+            ]
+          },
+          "selection_changed": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
           "summary": {
             "type": [
               "string",
+              "null"
+            ]
+          },
+          "verified": {
+            "type": [
+              "boolean",
               "null"
             ]
           }
@@ -5419,6 +5883,21 @@
               "null"
             ]
           },
+          "menu_items": {
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "menu_opened": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
           "next_call": {
             "additionalProperties": false,
             "properties": {
@@ -5449,9 +5928,52 @@
             ],
             "type": "string"
           },
+          "selected_text": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "selected_text_range": {
+            "additionalProperties": false,
+            "properties": {
+              "length": {
+                "minimum": 0,
+                "type": "integer"
+              },
+              "location": {
+                "minimum": 0,
+                "type": "integer"
+              },
+              "units": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "location",
+              "length",
+              "units"
+            ],
+            "type": [
+              "object",
+              "null"
+            ]
+          },
+          "selection_changed": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
           "summary": {
             "type": [
               "string",
+              "null"
+            ]
+          },
+          "verified": {
+            "type": [
+              "boolean",
               "null"
             ]
           }

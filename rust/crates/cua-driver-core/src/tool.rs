@@ -1014,6 +1014,30 @@ pub enum ProtectedResourceOwnership {
     DriverOwned,
 }
 
+struct ApprovedObservation {
+    admission: &'static str,
+    resource: Option<Value>,
+    validate_external_panel: bool,
+}
+
+impl ApprovedObservation {
+    fn promptless() -> Self {
+        Self {
+            admission: "promptless",
+            resource: None,
+            validate_external_panel: false,
+        }
+    }
+
+    fn scoped(resource: Value, validate_external_panel: bool) -> Self {
+        Self {
+            admission: "scoped",
+            resource: Some(resource),
+            validate_external_panel,
+        }
+    }
+}
+
 /// A callable tool handler. Object-safe — uses `Box<dyn Tool>`.
 #[async_trait]
 pub trait Tool: Send + Sync {
@@ -2105,7 +2129,7 @@ impl ToolRegistry {
                         != ProtectedResourceOwnership::DriverOwned)
                 || context.capability_manifest().is_some())
         {
-            if let Err(error) = self
+            let observation = match self
                 .authorize_private_observation(
                     tool.as_ref(),
                     resolved_name,
@@ -2120,7 +2144,34 @@ impl ToolRegistry {
                 )
                 .await
             {
-                return protected_consent_refusal(error);
+                Ok(observation) => observation,
+                Err(error) => return protected_consent_refusal(error),
+            };
+            if resolved_name == "get_window_state" {
+                args["_observation_admission"] = Value::String(observation.admission.into());
+                if observation.validate_external_panel {
+                    let approved_scope = observation
+                        .resource
+                        .expect("external-panel admission carries its approved resource");
+                    if let Err(refusal) = self
+                        .validate_attested_resource(
+                            tool.as_ref(),
+                            if history_observation {
+                                "computer_history"
+                            } else {
+                                "private_observation"
+                            },
+                            &public_args,
+                            context,
+                            runtime_session.as_deref(),
+                            &approved_scope,
+                        )
+                        .await
+                    {
+                        return refusal;
+                    }
+                    args["_protected_observation_scope"] = approved_scope;
+                }
             }
         }
         if has_adapter("clipboard") {
@@ -2609,11 +2660,11 @@ impl ToolRegistry {
         context: &crate::session_authorization::EffectiveAuthorizationContext,
         lifecycle_session: Option<&str>,
         adapter_id: &str,
-    ) -> Result<(), crate::consent::ConsentError> {
+    ) -> Result<ApprovedObservation, crate::consent::ConsentError> {
         if context.mode() == crate::authorization::PermissionMode::Unrestricted
             && context.capability_manifest().is_none()
         {
-            return Ok(());
+            return Ok(ApprovedObservation::promptless());
         }
         let browser_target = args.get("target_id").and_then(Value::as_str);
         let browser_tab = args.get("tab_id").and_then(Value::as_str);
@@ -2637,7 +2688,7 @@ impl ToolRegistry {
             // Whole-display scope discovery is X11-specific on Linux. It is
             // not a grant boundary in standard mode and must not turn routine
             // promptless operation into a pure-Wayland failure.
-            return Ok(());
+            return Ok(ApprovedObservation::promptless());
         }
         let history_resource = history_observation_resource(tool_name);
         let browser_scope = if history_resource.is_none() {
@@ -2752,19 +2803,27 @@ impl ToolRegistry {
                 self.enrich_application_resource(&mut resource, pid).await;
             }
         }
+        let validate_external_panel = tool_name == "get_window_state"
+            && resource
+                .get("external_panel_service")
+                .and_then(Value::as_bool)
+                == Some(true);
         self.protected_resource_grants
             .authorize(
                 context,
                 adapter_id,
                 crate::authorization::RiskClass::R2,
                 lifecycle_session,
-                resource,
+                resource.clone(),
                 &format!("{summary} using {tool_name}"),
                 Duration::from_secs(30 * 60),
                 Duration::from_secs(8 * 60 * 60),
             )
             .await?;
-        Ok(())
+        Ok(ApprovedObservation::scoped(
+            resource,
+            validate_external_panel,
+        ))
     }
 
     async fn authorize_desktop_input(

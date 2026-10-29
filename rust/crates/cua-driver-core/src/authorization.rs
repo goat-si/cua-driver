@@ -242,6 +242,7 @@ const PRIVATE_OBSERVATION_OPERATIONS: &[&str] = &[
     "escalate_session",
     "zoom",
     "start_recording",
+    "menu_bar_extras[operation=list]",
 ];
 const PRIVATE_OBSERVATION_SCOPE_KEYS: &[&str] = &[
     "daemon_generation",
@@ -285,6 +286,8 @@ const DESKTOP_INPUT_OPERATIONS: &[&str] = &[
     "set_value",
     "bring_to_front",
     "set_window_frame",
+    "select_text",
+    "menu_bar_extras",
 ];
 const DESKTOP_INPUT_SCOPE_KEYS: &[&str] = &[
     "daemon_generation",
@@ -763,7 +766,19 @@ pub fn enforcement_adapters_for_call(
         add("computer_history");
     }
 
-    if DESKTOP_INPUT_OPERATIONS.contains(&tool) {
+    if tool == "menu_bar_extras"
+        && matches!(args.get("operation").and_then(Value::as_str), Some("list"))
+    {
+        add("private_observation");
+    }
+
+    if DESKTOP_INPUT_OPERATIONS.contains(&tool)
+        && !(tool == "menu_bar_extras"
+            && matches!(
+                args.get("operation").and_then(Value::as_str),
+                Some("system" | "list")
+            ))
+    {
         add("desktop_input");
     }
 
@@ -904,7 +919,9 @@ pub fn advertised_risk_for(tool: &str) -> RiskAssessment {
         | "end_session"
         | "set_agent_cursor_enabled"
         | "set_agent_cursor_motion"
-        | "set_agent_cursor_theme" => RiskClass::R1,
+        | "set_agent_cursor_theme"
+        | "select_text"
+        | "menu_bar_extras" => RiskClass::R1,
 
         "clipboard_write" => RiskClass::R1,
 
@@ -963,6 +980,24 @@ pub fn advertised_risk_for(tool: &str) -> RiskAssessment {
 /// retained by the returned value.
 pub fn classify_tool_call(tool: &str, args: &Value) -> RiskAssessment {
     match tool {
+        "menu_bar_extras" => {
+            let operation = args.get("operation").and_then(Value::as_str);
+            let (class, operation_sensitive) = match operation {
+                Some("system") => (RiskClass::R0, false),
+                Some("list") => (RiskClass::R2, true),
+                Some("open" | "click" | "close") => (RiskClass::R1, false),
+                _ => (RiskClass::Unclassified, false),
+            };
+            RiskAssessment {
+                class,
+                enforcement: if class == RiskClass::Unclassified {
+                    RiskEnforcement::MetadataOnly
+                } else {
+                    RiskEnforcement::Active
+                },
+                operation_sensitive,
+            }
+        }
         "browser_prepare" => {
             let existing =
                 args.pointer("/strategy/kind").and_then(Value::as_str) == Some("existing_profile");
@@ -2080,6 +2115,38 @@ mod tests {
         assert_eq!(
             status["daemon_authorization_ceiling"]["allowed_modes"],
             serde_json::json!(["standard"])
+        );
+    }
+}
+
+#[cfg(test)]
+mod wave400f2_tests {
+    use super::*;
+
+    #[test]
+    fn new_tool_operations_have_reviewed_risk_and_adapters() {
+        let select = classify_tool_call("select_text", &serde_json::json!({}));
+        assert_eq!(select.class, RiskClass::R1);
+        assert_eq!(select.enforcement, RiskEnforcement::Active);
+        for (operation, class, adapter) in [
+            ("system", RiskClass::R0, None),
+            ("list", RiskClass::R2, Some("private_observation")),
+            ("open", RiskClass::R1, Some("desktop_input")),
+            ("click", RiskClass::R1, Some("desktop_input")),
+            ("close", RiskClass::R1, Some("desktop_input")),
+        ] {
+            let args = serde_json::json!({"operation": operation});
+            assert_eq!(classify_tool_call("menu_bar_extras", &args).class, class);
+            let adapters = enforcement_adapters_for_call("menu_bar_extras", &args);
+            assert_eq!(adapters.first().map(|adapter| adapter.id), adapter);
+        }
+        assert_eq!(
+            classify_tool_call(
+                "menu_bar_extras",
+                &serde_json::json!({"operation": "unknown"})
+            )
+            .class,
+            RiskClass::Unclassified
         );
     }
 }

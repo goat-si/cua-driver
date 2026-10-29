@@ -15,11 +15,13 @@ mod kill_app;
 mod launch_app;
 mod list_apps;
 mod list_windows;
+mod menu_bar_extras;
 mod menu_equivalent;
 pub(crate) mod not_editable;
 mod press_key;
 mod right_click;
 mod scroll;
+mod select_text;
 mod set_value;
 mod set_window_frame;
 mod type_text;
@@ -1552,6 +1554,8 @@ pub fn register_all(
                 session_config.clear(session_id);
                 snapshots.retire_session_screenshots(session_id);
                 capture_bindings.retire_session(session_id);
+                menu_bar_extras::end_session(session_id);
+                crate::ax::exact_target::end_context_menu_session(session_id);
                 // Per-session agent cursor: the session_id is the cursor key when
                 // the caller gave no explicit cursor_id, so dropping it here both
                 // prunes the metadata registry and stops the overlay painting that
@@ -1569,6 +1573,8 @@ pub fn register_all(
         registry.retain_session_end_hook(registration);
         let revive_registration =
             cua_driver_core::session::register_scoped_session_revive_hook(move |session_id| {
+                menu_bar_extras::revive_session(session_id);
+                crate::ax::exact_target::revive_context_menu_session(session_id);
                 crate::cursor::overlay::revive_cursor(session_id.to_owned());
             });
         registry.retain_session_revive_hook(revive_registration);
@@ -1596,6 +1602,7 @@ pub fn register_all(
     ));
     registry.register(Box::new(set_window_frame::SetWindowFrameTool));
     registry.register(Box::new(invoke_menu::InvokeMenuTool));
+    registry.register(Box::new(menu_bar_extras::MenuBarExtrasTool));
     registry.register(pid_window_guarded(
         click::ClickTool::new(state.clone()),
         &pid_window_candidates,
@@ -1628,6 +1635,10 @@ pub fn register_all(
     ));
     registry.register(pid_window_guarded(
         set_value::SetValueTool::new(state.clone()),
+        &pid_window_candidates,
+    ));
+    registry.register(pid_window_guarded(
+        select_text::SelectTextTool::new(state.clone()),
         &pid_window_candidates,
     ));
     registry.register(pid_window_guarded(
@@ -2044,5 +2055,36 @@ mod key_restore_tests {
         assert_eq!(data["retryable"], true);
         assert_eq!(data["pid"], 5);
         assert_eq!(data["window_id"], 9);
+    }
+}
+
+#[cfg(test)]
+mod wave400f2_registry_tests {
+    use super::*;
+
+    #[test]
+    fn new_tools_are_discoverable_with_exact_schemas() {
+        let state = Arc::new(ToolState::new(false, true, None));
+        let mut registry = cua_driver_core::tool::ToolRegistry::new();
+        registry.register(Box::new(select_text::SelectTextTool::new(state)));
+        registry.register(Box::new(menu_bar_extras::MenuBarExtrasTool));
+        let list = registry.tools_list();
+        let tools = list["tools"].as_array().expect("tools array");
+        let select = tools
+            .iter()
+            .find(|tool| tool["name"] == "select_text")
+            .expect("select_text");
+        for field in ["pid", "window_id", "element_token", "text"] {
+            assert!(select["inputSchema"]["required"]
+                .as_array()
+                .expect("required")
+                .contains(&serde_json::json!(field)));
+        }
+        let extras = tools
+            .iter()
+            .find(|tool| tool["name"] == "menu_bar_extras")
+            .expect("menu_bar_extras");
+        assert!(extras["inputSchema"]["properties"]["pid"].is_object());
+        assert!(extras["inputSchema"]["properties"]["window_id"].is_null());
     }
 }

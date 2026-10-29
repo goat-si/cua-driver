@@ -13,6 +13,75 @@ pub struct GetWindowStateTool {
     state: Arc<ToolState>,
 }
 
+const OPEN_SAVE_PANEL_SERVICE: &str = "com.apple.appkit.xpc.openAndSavePanelService";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PanelAttestation {
+    owner_pid: i32,
+    start_time: (u64, u64),
+}
+
+fn process_start_time(pid: i32) -> Option<(u64, u64)> {
+    unsafe {
+        let mut info: libc::proc_bsdinfo = std::mem::zeroed();
+        let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+        let filled = libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            &mut info as *mut _ as *mut libc::c_void,
+            size,
+        );
+        if filled != size {
+            return None;
+        }
+        Some((info.pbi_start_tvsec as u64, info.pbi_start_tvusec as u64))
+    }
+}
+
+fn panel_attestation(pid: i32, window_id: u32) -> Option<PanelAttestation> {
+    let owner = crate::windows::resolve_window_owner(pid, window_id);
+    let crate::ax::WindowScope::OwnerPidMismatch { owner_pid, .. } =
+        crate::ax::window_scope::scope_from_owner(&owner)?
+    else {
+        return None;
+    };
+    if crate::apps::bundle_id_for_pid(owner_pid).as_deref() != Some(OPEN_SAVE_PANEL_SERVICE) {
+        return None;
+    }
+    Some(PanelAttestation {
+        owner_pid,
+        start_time: process_start_time(owner_pid)?,
+    })
+}
+
+fn start_time_value(attestation: PanelAttestation) -> Option<u64> {
+    attestation
+        .start_time
+        .0
+        .checked_mul(1_000_000)
+        .and_then(|seconds| seconds.checked_add(attestation.start_time.1))
+}
+
+fn panel_admission_allowed(args: &Value, attestation: PanelAttestation) -> bool {
+    match args.get("_observation_admission").and_then(Value::as_str) {
+        Some("promptless") => true,
+        Some("scoped") => {
+            let Some(scope) = args.get("_protected_observation_scope") else {
+                return false;
+            };
+            scope.get("external_panel_service").and_then(Value::as_bool) == Some(true)
+                && scope.get("pid").and_then(Value::as_i64)
+                    == Some(i64::from(attestation.owner_pid))
+                && scope
+                    .pointer("/process_fingerprint/start_time")
+                    .and_then(Value::as_u64)
+                    == start_time_value(attestation)
+        }
+        _ => false,
+    }
+}
+
 impl GetWindowStateTool {
     pub fn new(state: Arc<ToolState>) -> Self {
         Self { state }
@@ -236,16 +305,77 @@ impl Tool for GetWindowStateTool {
         def()
     }
 
+    async fn protected_resource_scope(
+        &self,
+        _adapter_id: &str,
+        args: &Value,
+    ) -> Result<Option<Value>, String> {
+        let Some(pid) = args.get("pid").and_then(Value::as_i64) else {
+            return Ok(None);
+        };
+        let Some(window_id) = args.get("window_id").and_then(Value::as_u64) else {
+            return Ok(None);
+        };
+        let pid = i32::try_from(pid).map_err(|_| "pid is out of range".to_owned())?;
+        let window_id =
+            u32::try_from(window_id).map_err(|_| "window_id is out of range".to_owned())?;
+        let Some(attestation) = panel_attestation(pid, window_id) else {
+            return Ok(None);
+        };
+        Ok(Some(serde_json::json!({
+            "kind": "window",
+            "pid": attestation.owner_pid,
+            "window_id": window_id,
+            "external_panel_service": true,
+            "process_fingerprint": {
+                "pid": attestation.owner_pid,
+                "start_time": start_time_value(attestation)
+            }
+        })))
+    }
+
+    async fn validate_protected_resource_scope(
+        &self,
+        _adapter_id: &str,
+        args: &Value,
+        approved_scope: &Value,
+    ) -> Result<(), String> {
+        let pid = args
+            .get("pid")
+            .and_then(Value::as_i64)
+            .and_then(|pid| i32::try_from(pid).ok())
+            .ok_or_else(|| "pid is unavailable".to_owned())?;
+        let window_id = args
+            .get("window_id")
+            .and_then(Value::as_u64)
+            .and_then(|window_id| u32::try_from(window_id).ok())
+            .ok_or_else(|| "window_id is unavailable".to_owned())?;
+        let attestation = panel_attestation(pid, window_id)
+            .ok_or_else(|| "the external panel owner is no longer the exact service".to_owned())?;
+        let approved_pid = approved_scope.get("pid").and_then(Value::as_i64);
+        let approved_start = approved_scope
+            .pointer("/process_fingerprint/start_time")
+            .and_then(Value::as_u64);
+        if approved_pid == Some(i64::from(attestation.owner_pid))
+            && approved_start == start_time_value(attestation)
+        {
+            Ok(())
+        } else {
+            Err("the protected external-panel identity changed before dispatch".into())
+        }
+    }
+
     async fn invoke(&self, args: Value) -> ToolResult {
         let display_only = match cua_driver_core::window_state_view::display_only(&args) {
             Ok(display_only) => display_only,
             Err(refusal) => return refusal,
         };
         use cua_driver_core::tool_args::ArgsExt;
-        let pid = match args.require_i32("pid") {
+        let mut pid = match args.require_i32("pid") {
             Ok(v) => v,
             Err(e) => return e,
         };
+        let requested_pid = pid;
         let window_id = match args.require_u32("window_id") {
             Ok(v) => v,
             Err(e) => return e,
@@ -259,6 +389,7 @@ impl Tool for GetWindowStateTool {
         // hosts every sandboxed app's Open/Save panel in
         // `com.apple.appkit.xpc.openAndSavePanelService`, so the owner-mismatch
         // shape is routine, and the caller must be told the real owner pid.
+        let mut external_panel = None;
         {
             let owner = match latency::spawn_blocking(move || {
                 let _span = latency::span(latency::Stage::ReadOwner);
@@ -274,8 +405,27 @@ impl Tool for GetWindowStateTool {
                 }
             };
             if let Some(scope) = crate::ax::window_scope::scope_from_owner(&owner) {
-                if let Some(refusal) = window_scope_refusal(pid, window_id, &scope) {
-                    return refusal;
+                if matches!(scope, crate::ax::WindowScope::OwnerPidMismatch { .. }) {
+                    if let Some(attestation) = panel_attestation(requested_pid, window_id) {
+                        if !panel_admission_allowed(&args, attestation) {
+                            return ToolResult::error(
+                                "external Open/Save panel observation lacks matching admission or a live owner fingerprint",
+                            )
+                            .with_structured(serde_json::json!({
+                                "code": "external_panel_admission_mismatch",
+                                "pid": requested_pid,
+                                "window_id": window_id,
+                                "owner_pid": attestation.owner_pid
+                            }));
+                        }
+                        pid = attestation.owner_pid;
+                        external_panel = Some(attestation);
+                    }
+                }
+                if external_panel.is_none() {
+                    if let Some(refusal) = window_scope_refusal(requested_pid, window_id, &scope) {
+                        return refusal;
+                    }
                 }
             }
         }
@@ -401,7 +551,7 @@ impl Tool for GetWindowStateTool {
         let prefetched_capture = prefetch_capture(should_capture, want_tree, move || {
             crate::capture::screenshot_window_image(window_id)
         });
-        let (tree_result, prepared_snapshot) = if want_tree {
+        let (tree_result, prepared_snapshot, selection_observation) = if want_tree {
             let q = query.clone();
             // `timeout_ms` bounds the walk itself: it returns the partial tree
             // when the budget runs out. The outer deadline is only a backstop
@@ -409,6 +559,8 @@ impl Tool for GetWindowStateTool {
             // (dropping a spawn_blocking JoinHandle cannot cancel it).
             let walk_future = latency::spawn_blocking(move || {
                 let _span = latency::span(latency::Stage::ReadWalk);
+                let shared_deadline =
+                    std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
                 let target_key = (pid, u64::from(window_id));
                 let mut budget =
                     cua_driver_core::walk_budget::WalkBudget::new(timeout_ms, max_elements);
@@ -424,7 +576,7 @@ impl Tool for GetWindowStateTool {
                         window_scope: Some(crate::ax::window_scope::WindowScope::Matched),
                     };
                     let payload = crate::ax::snapshot::AxSnapshot::from_nodes(&tree.nodes);
-                    return (tree, payload);
+                    return (tree, payload, std::collections::HashMap::new());
                 }
                 let tree = crate::ax::tree::with_menus_collapsed(collapse_menus, || {
                     crate::ax::dense_rows::with_dense_rows_windowed(window_dense_rows, || {
@@ -441,14 +593,15 @@ impl Tool for GetWindowStateTool {
                 });
                 HUNG_TARGET_BREAKER.record_outcome(target_key, &tree.walk);
                 let payload = crate::ax::snapshot::AxSnapshot::from_nodes(&tree.nodes);
-                (tree, payload)
+                let selection = selection_observation_for_nodes(pid, &tree.nodes, shared_deadline);
+                (tree, payload, selection)
             });
             // A launching app is waited on for up to `timeout_ms` before the
             // walk's own `timeout_ms` starts (see `ax::launch`).
             let backstop =
                 std::time::Duration::from_millis(timeout_ms) * 2 + AX_WALK_BACKSTOP_GRACE;
             match tokio::time::timeout(backstop, walk_future).await {
-                Ok(Ok((tree, payload))) => (Some(tree), Some(payload)),
+                Ok(Ok((tree, payload, selection))) => (Some(tree), Some(payload), selection),
                 Ok(Err(e)) => return ToolResult::error(format!("AX tree walk failed: {e}")),
                 Err(_elapsed) => {
                     // The walk never returned: an AX call ignored its
@@ -464,7 +617,7 @@ impl Tool for GetWindowStateTool {
                 }
             }
         } else {
-            (None, None)
+            (None, None, std::collections::HashMap::new())
         };
 
         // The window can close, or its CGWindow can be re-parented onto another
@@ -511,6 +664,7 @@ impl Tool for GetWindowStateTool {
             && crate::capture::native_capture_abandon_events() > abandon_events_before_prefetch;
         let screenshot = if should_capture {
             let out_file = screenshot_out_file.clone();
+            let panel_args = args.clone();
             let res = tokio::task::spawn_blocking(move || -> Result<
                 (
                     Vec<u8>,
@@ -542,6 +696,16 @@ impl Tool for GetWindowStateTool {
                         reason: e.to_string(),
                     }
                 })?;
+                if let Some(initial) = external_panel {
+                    if panel_attestation(requested_pid, window_id) != Some(initial)
+                        || !panel_admission_allowed(&panel_args, initial)
+                    {
+                        return Err(super::px_frame::PxFrameError::CaptureUnavailable {
+                            window_id,
+                            reason: "external panel owner or process fingerprint changed before file publication".into(),
+                        });
+                    }
+                }
                 if let Some(ref path) = out_file {
                     std::fs::write(path, &png).map_err(|e| {
                         super::px_frame::PxFrameError::CaptureUnavailable {
@@ -666,6 +830,21 @@ impl Tool for GetWindowStateTool {
                     .flatten()
                     .map(|bounds| (bounds.width, bounds.height))
             });
+        if let Some(initial) = external_panel {
+            if panel_attestation(requested_pid, window_id) != Some(initial)
+                || !panel_admission_allowed(&args, initial)
+            {
+                return ToolResult::error(
+                    "external Open/Save panel owner or process fingerprint changed before publication",
+                )
+                .with_structured(serde_json::json!({
+                    "code": "external_panel_owner_changed",
+                    "pid": requested_pid,
+                    "window_id": window_id,
+                    "owner_pid": initial.owner_pid
+                }));
+            }
+        }
         // A screenshot-only read adds an image but no new element rows, so it
         // refreshes the current snapshot's frame and keeps its tokens valid.
         let refreshed = match (&prepared_snapshot, screenshot_resize_scale) {
@@ -752,7 +931,7 @@ impl Tool for GetWindowStateTool {
         );
         // Screenshot pixels of the delivered capture: window origin in screen
         // points, delivered pixels per point (backing scale x downsizing).
-        let elements_json = match (screenshot_frame.as_ref(), screenshot_dims) {
+        let mut elements_json = match (screenshot_frame.as_ref(), screenshot_dims) {
             (Some((bounds, _)), Some((width, _))) if bounds.width > 0.0 => {
                 cua_driver_core::element_frame::with_screenshot_frames(
                     elements_json,
@@ -762,6 +941,7 @@ impl Tool for GetWindowStateTool {
             }
             _ => elements_json,
         };
+        apply_selection_observation(&mut elements_json, &selection_observation);
         let filtered_element_count = elements_json.len();
         let elements_complete = elements_complete(tree_result.as_ref(), scope_matched, verify_read);
 
@@ -779,6 +959,11 @@ impl Tool for GetWindowStateTool {
                 Issue #22865: use `max_elements` / `max_depth` to bound the \
                 AX walk on apps with very large trees."
         });
+        if let Some(attestation) = external_panel {
+            structured["requested_pid"] = serde_json::json!(requested_pid);
+            structured["ax_pid"] = serde_json::json!(attestation.owner_pid);
+            structured["external_panel_service"] = serde_json::json!(OPEN_SAVE_PANEL_SERVICE);
+        }
         if query.is_some() {
             structured["filtered_element_count"] = serde_json::json!(filtered_element_count);
         }
@@ -1430,6 +1615,78 @@ fn element_entry(
     entry
 }
 
+fn selection_observation_for_nodes(
+    pid: i32,
+    nodes: &[crate::ax::tree::AXNode],
+    deadline: std::time::Instant,
+) -> std::collections::HashMap<usize, serde_json::Value> {
+    use crate::ax::bindings::{copy_element_attr, AXUIElementCreateApplication};
+    use core_foundation::base::{CFEqual, CFRelease, CFTypeRef};
+    let mut observations = std::collections::HashMap::new();
+    unsafe {
+        let app = AXUIElementCreateApplication(pid);
+        if app.is_null() {
+            return observations;
+        }
+        crate::ax::bindings::AXUIElementSetMessagingTimeout(app, 0.25);
+        let focused = copy_element_attr(app, "AXFocusedUIElement");
+        for node in nodes {
+            if std::time::Instant::now() >= deadline {
+                break;
+            }
+            let (Some(index), false) = (node.element_index, node.element_ptr == 0) else {
+                continue;
+            };
+            let element = node.element_ptr as crate::ax::bindings::AXUIElementRef;
+            crate::ax::bindings::AXUIElementSetMessagingTimeout(element, 0.25);
+            let mut entry = serde_json::json!({});
+            if focused
+                .is_some_and(|focused| CFEqual(element as CFTypeRef, focused as CFTypeRef) != 0)
+            {
+                entry["focused"] = serde_json::Value::Bool(true);
+            }
+            let (selected_text, range) = crate::ax::tree::selected_text_if_allowed(element);
+            crate::ax::bindings::AXUIElementSetMessagingTimeout(element, 0.0);
+            if let Some(selected_text) = selected_text {
+                entry["selected_text"] = serde_json::Value::String(selected_text);
+            }
+            if let Some(range) = range {
+                entry["selected_text_range"] = serde_json::json!({
+                    "location": range.location,
+                    "length": range.length,
+                    "units": "utf16"
+                });
+            }
+            if !entry.as_object().is_some_and(|object| object.is_empty()) {
+                observations.insert(index, entry);
+            }
+        }
+        if let Some(focused) = focused {
+            CFRelease(focused as CFTypeRef);
+        }
+        CFRelease(app as CFTypeRef);
+    }
+    observations
+}
+
+fn apply_selection_observation(
+    elements: &mut [serde_json::Value],
+    observations: &std::collections::HashMap<usize, serde_json::Value>,
+) {
+    for entry in elements {
+        let Some(index) = entry.get("element_index").and_then(Value::as_u64) else {
+            continue;
+        };
+        if let Some(observation) = observations.get(&(index as usize)) {
+            if let (Some(entry), Some(observation)) =
+                (entry.as_object_mut(), observation.as_object())
+            {
+                entry.extend(observation.clone());
+            }
+        }
+    }
+}
+
 /// Keep the structured response aligned with a query-filtered markdown tree.
 ///
 /// The AX walker deliberately keeps the complete node/cache snapshot so the
@@ -1525,7 +1782,7 @@ mod window_scope_contract_tests {
             parent_window_id: 11,
         };
         assert!(window_scope_refusal(800, 22, &scope).is_none());
-        assert!(!scope.is_matched());
+        assert!(scope.is_matched());
         assert_eq!(
             degradation_for(true, 0, Some(&scope), false),
             Degradation::SheetOfWindow {

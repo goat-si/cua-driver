@@ -7,15 +7,17 @@
 //! top-level keyboard destinations, and addressed-element ancestry. All reads are
 //! bounded and fail closed — an unreadable fact never unlocks a route.
 
-use core_foundation::base::{CFRelease, CFTypeRef};
+use core_foundation::base::{CFEqual, CFRelease, CFRetain, CFTypeRef};
 use cua_driver_core::background_input::{
     BackgroundTargetFacts, ElementAncestry, WindowServerOwnership,
 };
+use std::collections::HashMap;
+use std::sync::{LazyLock, Mutex};
 
 use super::bindings::{
-    ax_get_window_id, copy_ax_windows_including, copy_bool_attr, copy_element_attr,
-    copy_string_attr, focused_element_of_pid, AXUIElementCreateApplication, AXUIElementRef,
-    AXUIElementSetMessagingTimeout,
+    ax_get_window_id, copy_ax_windows_including, copy_bool_attr, copy_children_checked,
+    copy_element_attr, copy_string_attr, focused_element_of_pid, AXUIElementCreateApplication,
+    AXUIElementRef, AXUIElementSetMessagingTimeout,
 };
 use super::snapshot::RetainedElement;
 use crate::windows::{all_windows_without_spaces, resolve_window_owner, WindowOwner};
@@ -25,6 +27,117 @@ const MAX_ANCESTRY_DEPTH: usize = 40;
 
 /// Bounded sheet chain followed when mapping a sheet to its parent window.
 const MAX_SHEET_NESTING: usize = 8;
+
+#[derive(Debug)]
+pub(crate) struct ContextMenuElement(pub(crate) usize);
+impl Drop for ContextMenuElement {
+    fn drop(&mut self) {
+        unsafe { CFRelease(self.0 as CFTypeRef) }
+    }
+}
+impl Clone for ContextMenuElement {
+    fn clone(&self) -> Self {
+        unsafe { CFRetain(self.0 as CFTypeRef) };
+        Self(self.0)
+    }
+}
+
+struct ContextMenuRecord {
+    session: String,
+    generation: u64,
+    pid: i32,
+    window_id: u32,
+    target: Option<ContextMenuElement>,
+    menu: ContextMenuElement,
+}
+
+#[derive(Default)]
+struct ContextMenuRegistry {
+    next_id: u64,
+    records: HashMap<u64, ContextMenuRecord>,
+    generations: HashMap<String, u64>,
+}
+
+static CONTEXT_MENUS: LazyLock<Mutex<ContextMenuRegistry>> =
+    LazyLock::new(|| Mutex::new(ContextMenuRegistry::default()));
+
+fn generation(registry: &ContextMenuRegistry, session: &str) -> u64 {
+    registry.generations.get(session).copied().unwrap_or(0)
+}
+
+pub(crate) fn context_menu_generation(session: &str) -> u64 {
+    let registry = CONTEXT_MENUS.lock().unwrap();
+    generation(&registry, session)
+}
+
+pub(crate) fn register_context_menu(
+    session: &str,
+    expected_generation: u64,
+    pid: i32,
+    window_id: u32,
+    target: Option<ContextMenuElement>,
+    menu: usize,
+) -> Option<u64> {
+    let mut registry = CONTEXT_MENUS.lock().unwrap();
+    if generation(&registry, session) != expected_generation {
+        return None;
+    }
+    registry.next_id += 1;
+    let id = registry.next_id;
+    registry.records.insert(
+        id,
+        ContextMenuRecord {
+            session: session.to_owned(),
+            generation: expected_generation,
+            pid,
+            window_id,
+            target,
+            menu: ContextMenuElement(menu),
+        },
+    );
+    Some(id)
+}
+
+pub(crate) fn context_menu_for_close(
+    session: &str,
+    pid: i32,
+    window_id: u32,
+    opener_id: u64,
+) -> Option<(ContextMenuElement, Option<ContextMenuElement>)> {
+    let registry = CONTEXT_MENUS.lock().unwrap();
+    let record = registry.records.get(&opener_id)?;
+    (record.session == session
+        && record.generation == generation(&registry, session)
+        && record.pid == pid
+        && record.window_id == window_id)
+        .then(|| (record.menu.clone(), record.target.clone()))
+}
+
+pub(crate) fn finish_context_menu_close(opener_id: u64) {
+    CONTEXT_MENUS.lock().unwrap().records.remove(&opener_id);
+}
+
+pub(crate) fn end_context_menu_session(session: &str) {
+    let mut registry = CONTEXT_MENUS.lock().unwrap();
+    *registry.generations.entry(session.to_owned()).or_default() += 1;
+    registry
+        .records
+        .retain(|_, record| record.session != session);
+}
+
+pub(crate) fn revive_context_menu_session(session: &str) {
+    let mut registry = CONTEXT_MENUS.lock().unwrap();
+    *registry.generations.entry(session.to_owned()).or_default() += 1;
+}
+
+unsafe fn menu_has_opener_record(pid: i32, window_id: u32, menu: AXUIElementRef) -> bool {
+    let registry = CONTEXT_MENUS.lock().unwrap();
+    registry.records.values().any(|record| {
+        record.pid == pid
+            && record.window_id == window_id
+            && CFEqual(record.menu.0 as CFTypeRef, menu as CFTypeRef) != 0
+    })
+}
 
 /// Resolve the CGWindowID of the top-level AX window that owns `element`.
 ///
@@ -135,6 +248,50 @@ unsafe fn element_in_app_menu_bar(app: AXUIElementRef, element: AXUIElementRef) 
     found
 }
 
+unsafe fn element_in_recorded_top_level_menu(
+    _app: AXUIElementRef,
+    element: AXUIElementRef,
+    pid: i32,
+    window_id: u32,
+) -> bool {
+    let mut current = element;
+    let mut owned = false;
+    let mut found = false;
+    for _ in 0..MAX_ANCESTRY_DEPTH {
+        if copy_string_attr(current, "AXRole").as_deref() == Some("AXMenu") {
+            if let Some(parent) = copy_element_attr(current, "AXParent") {
+                found = menu_has_opener_record(pid, window_id, current);
+                CFRelease(parent as CFTypeRef);
+            }
+            break;
+        }
+        if matches!(
+            copy_string_attr(current, "AXRole").as_deref(),
+            Some("AXWindow") | Some("AXSheet") | Some("AXApplication") | None
+        ) {
+            break;
+        }
+        let parent = copy_element_attr(current, "AXParent");
+        if owned {
+            CFRelease(current as CFTypeRef);
+        }
+        match parent {
+            Some(parent) => {
+                current = parent;
+                owned = true;
+            }
+            None => {
+                owned = false;
+                break;
+            }
+        }
+    }
+    if owned {
+        CFRelease(current as CFTypeRef);
+    }
+    found
+}
+
 /// Map a window-role AX element to the CGWindowID of the top-level window it
 /// belongs to: an `AXWindow` maps to itself, an `AXSheet` to the window it is
 /// attached to (see [`element_window_id`]).
@@ -200,12 +357,77 @@ fn resolve_owning_window<E>(
 /// Caller must `CFRelease` the returned element.
 pub unsafe fn focused_element_in_window(pid: i32, window_id: u32) -> Option<AXUIElementRef> {
     let element = focused_element_of_pid(pid)?;
-    if element_window_id(element) == Some(window_id) {
+    let app = AXUIElementCreateApplication(pid);
+    if app.is_null() {
+        CFRelease(element as CFTypeRef);
+        return None;
+    }
+    let requested = sheet_parent_window_id(app, pid, window_id).unwrap_or(window_id);
+    CFRelease(app as CFTypeRef);
+    if requested != window_id && !element_in_requested_sheet(element, window_id) {
+        CFRelease(element as CFTypeRef);
+        return None;
+    }
+    if element_window_id(element) == Some(requested) {
         Some(element)
     } else {
         CFRelease(element as CFTypeRef);
         None
     }
+}
+
+unsafe fn sheet_parent_window_id(
+    app: AXUIElementRef,
+    pid: i32,
+    sheet_window_id: u32,
+) -> Option<u32> {
+    let windows = copy_ax_windows_including(app, pid, sheet_window_id);
+    let mut found = None;
+    for window in windows {
+        if found.is_none() {
+            if let Some(children) = copy_children_checked(window) {
+                for child in children {
+                    if copy_string_attr(child, "AXRole").as_deref() == Some("AXSheet")
+                        && ax_get_window_id(child) == Some(sheet_window_id)
+                    {
+                        found = ax_get_window_id(window);
+                    }
+                    CFRelease(child as CFTypeRef);
+                }
+            }
+        }
+        CFRelease(window as CFTypeRef);
+    }
+    found
+}
+
+unsafe fn element_in_requested_sheet(element: AXUIElementRef, sheet_window_id: u32) -> bool {
+    let mut current = element;
+    let mut owned = false;
+    for _ in 0..MAX_ANCESTRY_DEPTH {
+        if copy_string_attr(current, "AXRole").as_deref() == Some("AXSheet") {
+            let found = ax_get_window_id(current) == Some(sheet_window_id);
+            if owned {
+                CFRelease(current as CFTypeRef);
+            }
+            return found;
+        }
+        let parent = copy_element_attr(current, "AXParent");
+        if owned {
+            CFRelease(current as CFTypeRef);
+        }
+        match parent {
+            Some(parent) => {
+                current = parent;
+                owned = true;
+            }
+            None => return false,
+        }
+    }
+    if owned {
+        CFRelease(current as CFTypeRef);
+    }
+    false
 }
 
 /// Classification of whether a window-scoped keyboard action conflicts with
@@ -408,13 +630,14 @@ pub fn gather_background_facts(
     // SAFETY: the application element is created and released here; window
     // elements are released inside ax_window_records; the caller guarantees
     // element_ptr stays retained.
-    let (records, app_hidden, element, focused_window_id) = unsafe {
+    let (records, app_hidden, element, focused_window_id, sheet_parent) = unsafe {
         let app = AXUIElementCreateApplication(pid);
         if app.is_null() {
             (
                 Vec::new(),
                 None,
                 element_ptr.map(|_| ElementAncestry::Unproven),
+                None,
                 None,
             )
         } else {
@@ -429,15 +652,28 @@ pub fn gather_background_facts(
                 // A menu-bar item has no window ancestor: the menu bar hangs
                 // off the application. It still belongs to this app.
                 let in_menu_bar = window.is_none() && element_in_app_menu_bar(app, element);
-                element_ancestry(window, in_menu_bar, window_id)
+                let in_recorded_menu = window.is_none()
+                    && element_in_recorded_top_level_menu(app, element, pid, window_id);
+                let requested = match sheet_parent_window_id(app, pid, window_id) {
+                    Some(parent) if element_in_requested_sheet(element, window_id) => parent,
+                    _ => window_id,
+                };
+                element_ancestry(window, in_menu_bar || in_recorded_menu, requested)
             });
             let focused_window_id = copy_element_attr(app, "AXFocusedWindow").and_then(|window| {
                 let window_id = ax_get_window_id(window);
                 CFRelease(window as CFTypeRef);
                 window_id
             });
+            let sheet_parent = sheet_parent_window_id(app, pid, window_id);
             CFRelease(app as CFTypeRef);
-            (records, app_hidden, element, focused_window_id)
+            (
+                records,
+                app_hidden,
+                element,
+                focused_window_id,
+                sheet_parent,
+            )
         }
     };
 
@@ -460,7 +696,7 @@ pub fn gather_background_facts(
 
     BackgroundTargetFacts {
         window_server,
-        ax_window_present: target.is_some(),
+        ax_window_present: target.is_some() || sheet_parent.is_some(),
         target_minimized: target.and_then(|record| record.minimized),
         app_hidden,
         competing_keyboard_destinations,

@@ -23,11 +23,14 @@ use super::snapshot::RetainedElement;
 use super::window_scope::{
     decide_window_scope, is_window_like_role, ScopeDecision, TopLevelCandidate, WindowScope,
 };
-use core_foundation::base::{CFEqual, CFRelease, CFRetain, CFTypeRef};
+use core_foundation::{
+    base::{CFEqual, CFGetTypeID, CFRelease, CFRetain, CFTypeRef, TCFType},
+    string::CFString,
+};
 use cua_driver_core::snapshot_compaction::{
-    compact_tab_strip, fold_actionless_text_subtrees, format_omitted_tabs_line, redact_if_secure,
-    should_probe_secure_text_role, CompactableNode, FieldSecurityMeta, TabChildMeta,
-    TabStripCompaction, TAB_STRIP_COMPACTION_THRESHOLD,
+    compact_tab_strip, fold_actionless_text_subtrees, format_omitted_tabs_line,
+    is_secure_text_field, redact_if_secure, should_probe_secure_text_role, CompactableNode,
+    FieldSecurityMeta, TabChildMeta, TabStripCompaction, TAB_STRIP_COMPACTION_THRESHOLD,
 };
 use cua_driver_core::walk_budget::{WalkBudget, WalkOutcome};
 use std::time::Instant;
@@ -59,6 +62,114 @@ const AX_MESSAGING_TIMEOUT_SECONDS: f32 = 2.0;
 
 pub(crate) unsafe fn set_messaging_timeout(element: AXUIElementRef) {
     let _ = AXUIElementSetMessagingTimeout(element, AX_MESSAGING_TIMEOUT_SECONDS);
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SelectedTextRange {
+    pub location: isize,
+    pub length: isize,
+}
+
+#[repr(C)]
+struct CfRange {
+    location: isize,
+    length: isize,
+}
+
+pub(crate) unsafe fn read_selected_text_range(
+    element: AXUIElementRef,
+) -> Option<SelectedTextRange> {
+    let attr = CFString::new("AXSelectedTextRange");
+    let mut value: CFTypeRef = std::ptr::null();
+    let error = AXUIElementCopyAttributeValue(element, attr.as_concrete_TypeRef(), &mut value);
+    if error != kAXErrorSuccess || value.is_null() {
+        if !value.is_null() {
+            CFRelease(value);
+        }
+        return None;
+    }
+    if CFGetTypeID(value) != AXValueGetTypeID() {
+        CFRelease(value);
+        return None;
+    }
+    let mut range = CfRange {
+        location: 0,
+        length: 0,
+    };
+    let decoded = AXValueGetValue(
+        value as _,
+        kAXValueCFRangeType,
+        &mut range as *mut CfRange as *mut _,
+    );
+    CFRelease(value);
+    if !decoded || range.location < 0 || range.length < 0 {
+        return None;
+    }
+    Some(SelectedTextRange {
+        location: range.location,
+        length: range.length,
+    })
+}
+
+fn optional_text_attribute(element: AXUIElementRef, name: &str) -> Option<Option<String>> {
+    let attr = CFString::new(name);
+    let mut value: CFTypeRef = std::ptr::null();
+    let error =
+        unsafe { AXUIElementCopyAttributeValue(element, attr.as_concrete_TypeRef(), &mut value) };
+    if error == kAXErrorNoValue || error == kAXErrorAttributeUnsupported {
+        if !value.is_null() {
+            unsafe { CFRelease(value) };
+        }
+        return Some(None);
+    }
+    if error != kAXErrorSuccess
+        || value.is_null()
+        || unsafe { CFGetTypeID(value) } != CFString::type_id()
+    {
+        if !value.is_null() {
+            unsafe { CFRelease(value) };
+        }
+        return None;
+    }
+    let text = unsafe { CFString::wrap_under_create_rule(value as _) }.to_string();
+    Some(Some(text))
+}
+
+pub(crate) unsafe fn selected_text_if_allowed(
+    element: AXUIElementRef,
+) -> (Option<String>, Option<SelectedTextRange>) {
+    let attributes = [
+        optional_text_attribute(element, "AXRole"),
+        optional_text_attribute(element, "AXSubrole"),
+        optional_text_attribute(element, "AXTitle"),
+        optional_text_attribute(element, "AXDescription"),
+        optional_text_attribute(element, "AXPlaceholderValue"),
+        optional_text_attribute(element, "AXIdentifier"),
+        optional_text_attribute(element, "AXHelp"),
+    ];
+    if attributes.iter().any(Option::is_none) {
+        return (None, None);
+    }
+    let value = |index: usize| attributes[index].as_ref().unwrap().as_deref();
+    let Some(role) = value(0).filter(|role| !role.trim().is_empty()) else {
+        return (None, None);
+    };
+    if !matches!(role, "AXTextField" | "AXTextArea" | "AXComboBox")
+        || is_secure_text_field(&FieldSecurityMeta {
+            role,
+            subrole: value(1),
+            title: value(2),
+            description: value(3),
+            placeholder: value(4),
+            identifier: value(5),
+            help: value(6),
+            is_password_flag: false,
+        })
+    {
+        return (None, None);
+    }
+    let selected = copy_string_attr(element, "AXSelectedText").filter(|text| !text.is_empty());
+    (selected, read_selected_text_range(element))
 }
 
 /// A single node in the AX tree.
@@ -420,7 +531,7 @@ fn walk_tree_with_web_content(
             let recovery_deadline = budget
                 .time_limit()
                 .and_then(|limit| attempt_started.checked_add(limit));
-            let top_level = copy_top_level(app_elem, pid, window_id, recovery_deadline);
+            let mut top_level = copy_top_level(app_elem, pid, window_id, recovery_deadline);
 
             // Scope: keep non-window children (menu bar) + the target window —
             // but ONLY once the target window has actually been identified. When
@@ -433,13 +544,15 @@ fn walk_tree_with_web_content(
             };
             let mut decision = scope_top_level(&top_level, pid, wid);
             // A save sheet has a CGWindowID of its own but lives under its
-            // document's AXWindow, so no top-level child claims it. Its
-            // controls belong to that window: point there, walk nothing.
+            // document's AXWindow. Walk that parent so the live sheet root and
+            // its controls are published instead of returning an empty panel.
             if matches!(decision.scope, WindowScope::AxUnresolved { .. }) {
-                if let Some(parent_window_id) = window_holding_sheet(&top_level, wid) {
+                if let Some((parent_window_id, sheet)) = window_holding_sheet(&top_level, wid) {
+                    release_all(std::mem::take(&mut top_level));
+                    top_level.push(sheet);
                     decision = ScopeDecision {
                         scope: WindowScope::SheetOfWindow { parent_window_id },
-                        walk: Vec::new(),
+                        walk: vec![0],
                     };
                 }
             }
@@ -734,22 +847,32 @@ unsafe fn scope_top_level(top_level: &[AXUIElementRef], pid: i32, wid: u32) -> S
 
 /// The CGWindowID of the app window holding an `AXSheet` whose own
 /// CGWindowID is `wid`.
-unsafe fn window_holding_sheet(top_level: &[AXUIElementRef], wid: u32) -> Option<u32> {
+unsafe fn window_holding_sheet(
+    top_level: &[AXUIElementRef],
+    wid: u32,
+) -> Option<(u32, AXUIElementRef)> {
     for &window in top_level {
         if copy_string_attr(window, "AXRole").as_deref() != Some("AXWindow") {
             continue;
         }
         let children = copy_children(window);
-        let holds = children.iter().any(|&child| {
+        let mut sheet = None;
+        for child in children {
             set_messaging_timeout(child);
-            copy_string_attr(child, "AXRole").as_deref() == Some("AXSheet")
+            if sheet.is_none()
+                && copy_string_attr(child, "AXRole").as_deref() == Some("AXSheet")
                 && ax_get_window_id(child) == Some(wid)
-        });
-        release_all(children);
-        if holds {
-            if let Some(parent) = ax_get_window_id(window).filter(|&parent| parent != wid) {
-                return Some(parent);
+            {
+                sheet = Some(child);
+            } else {
+                CFRelease(child as CFTypeRef);
             }
+        }
+        if let Some(sheet) = sheet {
+            if let Some(parent) = ax_get_window_id(window).filter(|&parent| parent != wid) {
+                return Some((parent, sheet));
+            }
+            CFRelease(sheet as CFTypeRef);
         }
     }
     None
