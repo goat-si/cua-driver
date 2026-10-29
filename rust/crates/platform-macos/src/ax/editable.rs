@@ -195,7 +195,6 @@ pub unsafe fn facts_for_element(element: AXUIElementRef) -> Option<ElementFacts>
             && !(is_text_role(role) && facts.focused == Some(true))
         {
             let mut budget = MAX_SCAN_NODES;
-            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(800);
             let (found, finished) = scan_focused_text_descendant(element, 0, &mut budget, deadline);
             facts.focused_text_descendant = found;
             facts.descendant_scan_complete = finished;

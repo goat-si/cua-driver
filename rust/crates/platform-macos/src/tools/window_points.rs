@@ -231,7 +231,8 @@ pub fn recheck(
     let live = live.ok_or_else(|| {
         super::px_frame::refusal(&super::px_frame::PxFrameError::WindowNotFound { window_id })
     })?;
-    let same = |a: f64, b: f64| (a - b).abs() < SAME_FRAME_PT;
+    let tolerance = if basis.exact { 0.0 } else { SAME_FRAME_PT };
+    let same = |a: f64, b: f64| (a - b).abs() <= tolerance;
     if same(used.bounds.x, live.x)
         && same(used.bounds.y, live.y)
         && same(used.bounds.width, live.width)
@@ -271,6 +272,8 @@ pub struct DispatchGuard {
     window_id: u32,
     frame: super::px_frame::WindowPxFrame,
     read: fn(u32) -> Option<WindowBounds>,
+    /// Exact basis: no tolerance at the actuator.
+    exact: bool,
 }
 
 impl DispatchGuard {
@@ -298,6 +301,10 @@ impl DispatchGuard {
                 window_id,
                 frame,
                 read,
+                exact: match space {
+                    PointSpace::WindowPoints(basis) => basis.exact,
+                    PointSpace::Screenshot => false,
+                },
             })),
             _ => Err(super::pre_dispatch_refusal(
                 "window_points_unresolved",
@@ -309,7 +316,8 @@ impl DispatchGuard {
 
     /// The window is still exactly the frame the points were translated with.
     pub fn check(&self) -> Result<(), WindowMoved> {
-        let same = |a: f64, b: f64| (a - b).abs() < SAME_FRAME_PT;
+        let tolerance = if self.exact { 0.0 } else { SAME_FRAME_PT };
+        let same = |a: f64, b: f64| (a - b).abs() <= tolerance;
         match (self.read)(self.window_id) {
             Some(live)
                 if same(self.frame.bounds.x, live.x)
@@ -446,6 +454,44 @@ pub fn annotate(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_exact_basis_refuses_any_drift_at_resolution_and_dispatch() {
+        let mut exact = basis(100.0, 100.0, 800.0, 600.0);
+        exact.exact = true;
+        let live = WindowBounds {
+            x: 100.005,
+            y: 100.0,
+            width: 800.0,
+            height: 600.0,
+        };
+        assert!(!basis_matches(&exact, &live));
+        let used = super::super::px_frame::WindowPxFrame {
+            bounds: WindowBounds {
+                x: 100.0,
+                y: 100.0,
+                width: 800.0,
+                height: 600.0,
+            },
+            scale: 1.0,
+        };
+        assert!(recheck(
+            PointSpace::WindowPoints(exact),
+            7,
+            Some(&used),
+            Some(live.clone())
+        )
+        .is_err());
+        // A sub-0.01 move is allowed only for a tolerant basis.
+        let tolerant = basis(100.0, 100.0, 800.0, 600.0);
+        assert!(recheck(
+            PointSpace::WindowPoints(tolerant),
+            7,
+            Some(&used),
+            Some(live)
+        )
+        .is_ok());
+    }
 
     fn bounds(x: f64, y: f64, width: f64, height: f64) -> WindowBounds {
         WindowBounds {

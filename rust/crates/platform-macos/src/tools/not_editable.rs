@@ -45,7 +45,10 @@ pub(crate) fn account_focus_receipt(
     mut result: ToolResult,
     receipt: Option<FocusDispatch>,
 ) -> ToolResult {
-    let Some(focus) = receipt else {
+    let focus = receipt.unwrap_or(FocusDispatch::None);
+    // No focus action (no receipt, or an already-focused point): a late
+    // not_editable error still becomes the structured refusal.
+    if matches!(focus, FocusDispatch::None) {
         if result.is_error == Some(true) {
             let message = text_of_result(&result);
             if message.contains("not_editable") {
@@ -53,7 +56,7 @@ pub(crate) fn account_focus_receipt(
             }
         }
         return result;
-    };
+    }
     if !matches!(focus, FocusDispatch::SentAx | FocusDispatch::SentClick) {
         return result;
     }
@@ -75,7 +78,10 @@ pub(crate) fn account_focus_receipt(
     // partial. An error after text or keys may have been sent keeps its
     // uncertainty — a paste that may have landed is NOT a partial focus.
     let pre_key_refusal = effect == "refused"
-        || code == "pixel_focus_unconfirmed"
+        || matches!(
+            code,
+            "pixel_focus_unconfirmed" | "focus_dispatch_unverified"
+        )
         || (effect.is_empty() && text_of_result(&result).contains("not_editable"));
     if !pre_key_refusal {
         return result;
@@ -110,6 +116,16 @@ pub(crate) fn account_focus_receipt(
         .build()
         .expect("focus receipt record is valid"),
     );
+    // The public summary is the result text: it must not keep saying
+    // "nothing was sent" when the focus action was delivered.
+    let original = text_of_result(&result);
+    let summary =
+        format!("The focus action was delivered; the key or text was refused. {original}");
+    for content in result.content.iter_mut() {
+        if let cua_driver_core::protocol::Content::Text { text, .. } = content {
+            *text = summary.clone();
+        }
+    }
     result
 }
 
