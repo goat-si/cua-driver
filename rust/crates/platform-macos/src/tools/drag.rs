@@ -329,6 +329,9 @@ impl DragTool {
         let (from_sx, from_sy, from_lx, from_ly, to_sx, to_sy, to_lx, to_ly) =
             match super::window_points::frame_or_resolve(validated_frame.clone(), wid).await {
                 Ok(frame) => {
+                    // Keep the actual translation frame for EVERY route:
+                    // the drag's window-local stamps use its origin too.
+                    validated_frame = Some(frame.clone());
                     let (fsx, fsy, flx, fly) = frame.to_screen(from_x, from_y);
                     let (tsx, tsy, tlx, tly) = frame.to_screen(to_x, to_y);
                     (fsx, fsy, flx, fly, tsx, tsy, tlx, tly)
@@ -533,21 +536,43 @@ impl DragTool {
                     // After the window read, right before the press.
                     super::window_points::check_guard(&dispatch_guard)?;
                     let mut session_seen = false;
-                    let outcome = crate::input::mouse::drag_at_xy_background(
-                        pid,
-                        (from_sx, from_sy),
-                        (to_sx, to_sy),
-                        wid,
-                        duration_ms,
-                        steps,
-                        &m,
-                        button,
-                        observe,
-                        || {
-                            session_seen = !drag_image_windows(pid).is_subset(&before);
-                            !session_seen
-                        },
-                    )?;
+                    let origin = validated_frame
+                        .as_ref()
+                        .map(|frame| (frame.bounds.x, frame.bounds.y));
+                    let outcome = match origin {
+                        Some(origin) => crate::input::mouse::drag_at_xy_background_with_origin(
+                            pid,
+                            (from_sx, from_sy),
+                            (to_sx, to_sy),
+                            wid,
+                            duration_ms,
+                            steps,
+                            &m,
+                            button,
+                            observe,
+                            || {
+                                session_seen = !drag_image_windows(pid).is_subset(&before);
+                                !session_seen
+                            },
+                            origin,
+                        ),
+                        None => crate::input::mouse::drag_at_xy_background(
+                            pid,
+                            (from_sx, from_sy),
+                            (to_sx, to_sy),
+                            wid,
+                            duration_ms,
+                            steps,
+                            &m,
+                            button,
+                            observe,
+                            || {
+                                session_seen = !drag_image_windows(pid).is_subset(&before);
+                                !session_seen
+                            },
+                        ),
+                    }?;
+
                     let session = session_seen
                         || !drag_image_windows(pid).is_subset(&before)
                         || matches!(

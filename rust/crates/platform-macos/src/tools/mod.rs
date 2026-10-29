@@ -794,6 +794,28 @@ pub(crate) async fn focus_by_pixel(
     } else {
         click.await
     };
+    let (error_effect, error_code) = if focus.is_error == Some(true) {
+        // An error with NO metadata is still an error: empty strings keep
+        // it from looking like a successful result, and it stops here.
+        (
+            Some(
+                focus
+                    .structured_content
+                    .as_ref()
+                    .and_then(|v| v["effect"].as_str())
+                    .unwrap_or(""),
+            ),
+            Some(
+                focus
+                    .structured_content
+                    .as_ref()
+                    .and_then(|v| v["code"].as_str())
+                    .unwrap_or(""),
+            ),
+        )
+    } else {
+        (None, None)
+    };
     let landed = if focus.is_error != Some(true) {
         // AXFocused is non-destructive: unlike a second real click, it keeps a
         // Cmd+A selection intact before a follow-up type_text or Cmd+V.
@@ -802,15 +824,26 @@ pub(crate) async fn focus_by_pixel(
     } else {
         None
     };
-    match pixel_focus_step(landed, foreground) {
-        PixelFocusStep::Focused => return Ok(()),
-        PixelFocusStep::RealClick => {}
-        PixelFocusStep::ClickFailed => {
-            return Err(cua_driver_core::protocol::ToolResult::error(format!(
-                "focus pixel-click at ({x:.0},{y:.0}) failed."
-            )));
+    // The SAME decision the unit test drives: an indeterminate error stops
+    // with the original result, a negative readback stops as unconfirmed,
+    // and only a proven refusal reaches the real-click fallback.
+    match decide_focus_next(landed, foreground, error_effect, error_code) {
+        FocusDecision::StopOriginalError => return Err(focus),
+        FocusDecision::StopUnconfirmed => {
+            return Err(pixel_focus_unconfirmed(pid, window_id, x, y));
         }
-        PixelFocusStep::Unconfirmed => return Err(pixel_focus_unconfirmed(pid, window_id, x, y)),
+        FocusDecision::Proceed(step) => match step {
+            PixelFocusStep::Focused => return Ok(()),
+            PixelFocusStep::RealClick => {}
+            PixelFocusStep::ClickFailed => {
+                return Err(cua_driver_core::protocol::ToolResult::error(format!(
+                    "focus pixel-click at ({x:.0},{y:.0}) failed."
+                )));
+            }
+            PixelFocusStep::Unconfirmed => {
+                return Err(pixel_focus_unconfirmed(pid, window_id, x, y))
+            }
+        },
     }
 
     // Some renderer surfaces do not expose a usable AX focus action. The
@@ -847,6 +880,52 @@ pub(crate) async fn focus_by_pixel(
 }
 
 /// What [`focus_by_pixel`] does after its non-destructive focus click.
+/// Whether an AX-focus error permits the real-click fallback: only an
+/// explicit proof of non-dispatch (a refused effect or background_unavailable).
+fn focus_error_allows_fallback(effect: Option<&str>, code: Option<&str>) -> bool {
+    // An explicit uncertain effect wins over any non-dispatch code.
+    if effect == Some("unverifiable") {
+        return false;
+    }
+    effect == Some("refused") || code == Some("background_unavailable")
+}
+
+/// A negative focus readback stops the ladder: only an unreadable readback
+/// (None) can reach the real-click fallback, and only in the foreground.
+fn focus_readback_is_negative(landed: Option<bool>) -> bool {
+    // Confirmed focus proceeds to the keys; only a NEGATIVE readback stops
+    // the ladder as indeterminate. An unreadable readback keeps the
+    // foreground fallback.
+    matches!(landed, Some(false))
+}
+
+/// The outer focus-ladder decision, as data: whether the caller proceeds
+/// (and with what step) or stops with the original indeterminate error or a
+/// focus-unconfirmed result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FocusDecision {
+    Proceed(PixelFocusStep),
+    StopOriginalError,
+    StopUnconfirmed,
+}
+
+fn decide_focus_next(
+    landed: Option<bool>,
+    foreground: bool,
+    error_effect: Option<&str>,
+    error_code: Option<&str>,
+) -> FocusDecision {
+    if (error_effect.is_some() || error_code.is_some())
+        && !focus_error_allows_fallback(error_effect, error_code)
+    {
+        return FocusDecision::StopOriginalError;
+    }
+    if focus_readback_is_negative(landed) {
+        return FocusDecision::StopUnconfirmed;
+    }
+    FocusDecision::Proceed(pixel_focus_step(landed, foreground))
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PixelFocusStep {
     /// The focused element now covers the point: send the keys.
@@ -1670,6 +1749,62 @@ mod pixel_focus_readback_tests {
             PixelFocusStep::RealClick
         );
         assert_eq!(pixel_focus_step(None, true), PixelFocusStep::RealClick);
+    }
+
+    #[test]
+    fn focus_fallback_requires_proof_of_non_dispatch() {
+        // The outer check in focus_by_pixel uses this predicate: only an
+        // explicit refusal or background_unavailable may reach the real
+        // click; every unclassified or unverifiable error stops first.
+        assert!(super::focus_error_allows_fallback(Some("refused"), None));
+        assert!(super::focus_error_allows_fallback(
+            None,
+            Some("background_unavailable")
+        ));
+        assert!(!super::focus_error_allows_fallback(
+            Some("unverifiable"),
+            None
+        ));
+        assert!(!super::focus_error_allows_fallback(None, None));
+        assert!(!super::focus_error_allows_fallback(Some("partial"), None));
+        assert!(!super::focus_error_allows_fallback(Some("confirmed"), None));
+        // An explicit unverifiable effect wins over a non-dispatch code.
+        assert!(!super::focus_error_allows_fallback(
+            Some("unverifiable"),
+            Some("background_unavailable")
+        ));
+    }
+
+    #[test]
+    fn the_ladder_decision_covers_confirmed_negative_refusal_and_indeterminate() {
+        assert_eq!(
+            super::decide_focus_next(Some(true), false, None, None),
+            super::FocusDecision::Proceed(PixelFocusStep::Focused)
+        );
+        assert_eq!(
+            super::decide_focus_next(Some(false), true, None, None),
+            super::FocusDecision::StopUnconfirmed
+        );
+        assert_eq!(
+            super::decide_focus_next(None, true, Some("refused"), None),
+            super::FocusDecision::Proceed(PixelFocusStep::RealClick)
+        );
+        assert_eq!(
+            super::decide_focus_next(None, true, Some("unverifiable"), None),
+            super::FocusDecision::StopOriginalError
+        );
+        // An error with NO metadata stops too: it is not a success.
+        assert_eq!(
+            super::decide_focus_next(None, true, Some(""), Some("")),
+            super::FocusDecision::StopOriginalError
+        );
+    }
+
+    #[test]
+    fn a_negative_readback_never_reaches_the_real_click() {
+        assert!(super::focus_readback_is_negative(Some(false)));
+        assert!(!super::focus_readback_is_negative(None));
+        assert!(!super::focus_readback_is_negative(Some(true)));
     }
 
     #[test]
