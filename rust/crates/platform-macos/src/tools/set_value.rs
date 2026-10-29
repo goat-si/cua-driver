@@ -492,9 +492,23 @@ async fn minimized_set_value(
             }
         };
         let element_ptr = element_guard.as_ptr();
-        if let Some(refusal) =
-            super::not_editable::token_not_editable_refusal(pid, element_ptr, window_id).await
-        {
+        // The TOKEN rule may write AXFocused: re-read the front app right
+        // before it (not_editable.rs, which runs it, is outside this change).
+        let token_refusal =
+            if crate::input::skylight::front_process_matches(pid as libc::pid_t, window_id)
+                == Some(false)
+            {
+                super::not_editable::token_not_editable_refusal(pid, element_ptr, window_id).await
+            } else {
+                Some(super::pre_dispatch_refusal(
+                    cua_driver_core::background_input::refusal_codes::MINIMIZED_OR_HIDDEN,
+                    format!(
+                    "window {window_id} was restored, but its app came to the front or which app \
+                     is in front could not be read; AXValue was not written."
+                ),
+                ))
+            };
+        if let Some(refusal) = token_refusal {
             let entry = scope.entry();
             let hand_back = latency::spawn_action_blocking(move || scope.finish())
                 .await

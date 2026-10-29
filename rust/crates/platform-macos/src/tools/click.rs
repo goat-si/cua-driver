@@ -378,23 +378,6 @@ fn input_quiet(idle_before: Option<u64>, idle_after: Option<u64>, elapsed_ms: u6
     idle_before.is_some() && idle_after.is_some_and(|after| after >= elapsed_ms)
 }
 
-/// The input check for a click that posted its own pointer events, which
-/// reset the same HID clock: no physical input from the baseline reads up to
-/// the post (`idle_at_post` read right before it, `baseline_ms` after the
-/// baseline started), and none after the post finished (`idle_now` at least
-/// `since_post_ms`). Input during the post itself (a few milliseconds) cannot
-/// be told apart from the click's own events.
-fn input_quiet_around_own_post(
-    idle_before: Option<u64>,
-    idle_at_post: Option<u64>,
-    baseline_ms: u64,
-    idle_now: Option<u64>,
-    since_post_ms: u64,
-) -> bool {
-    input_quiet(idle_before, idle_at_post, baseline_ms)
-        && idle_now.is_some_and(|now| now >= since_post_ms)
-}
-
 /// One retained AX element, released on drop.
 struct Retained(AXUIElementRef);
 
@@ -598,9 +581,9 @@ pub(super) struct ClickProbe {
     input_from: std::time::Instant,
     /// Dispatch time: the observation deadline counts from here.
     started: std::time::Instant,
-    /// For a click that posts its own events: the input clock right before
-    /// the post, and when the post finished.
-    own_post: Option<(std::time::Instant, Option<u64>, Option<std::time::Instant>)>,
+    /// For a click that posts its own events: when that post finished
+    /// (`None` while it runs); the observation deadline counts from it.
+    own_post: Option<Option<std::time::Instant>>,
 }
 
 // SAFETY: the probe holds retained AX element references and plain data.
@@ -615,11 +598,13 @@ unsafe impl Send for ClickProbe {}
 ///
 /// `window` must be a valid, live `AXUIElementRef`.
 unsafe fn sheets_of(window: AXUIElementRef) -> Option<Vec<Retained>> {
-    let mut sheets = Vec::new();
-    for child in crate::ax::bindings::copy_children_checked(window)?
+    // Every child is owned (and released) before any role is read.
+    let children: Vec<Retained> = crate::ax::bindings::copy_children_checked(window)?
         .into_iter()
         .map(Retained)
-    {
+        .collect();
+    let mut sheets = Vec::new();
+    for child in children {
         // A child whose role cannot be read could be a sheet: the list is
         // unknown then, never one without it.
         if copy_string_attr(child.0, "AXRole")? == "AXSheet" {
@@ -694,16 +679,12 @@ impl ClickProbe {
 
     /// Right before the click posts its own pointer events.
     pub(super) fn own_post_starts(&mut self) {
-        self.own_post = Some((
-            std::time::Instant::now(),
-            super::physical_input_idle_ms(),
-            None,
-        ));
+        self.own_post = Some(None);
     }
 
     /// Right after the click's own pointer events were posted.
     pub(super) fn own_post_finished(&mut self) {
-        if let Some((_, _, finished)) = self.own_post.as_mut() {
+        if let Some(finished) = self.own_post.as_mut() {
             *finished = Some(std::time::Instant::now());
         }
     }
@@ -811,33 +792,33 @@ impl ClickProbe {
     /// when it holds on a second read and no physical input happened since
     /// dispatch.
     pub(super) fn observe(self) -> Option<ClickEvidence> {
-        let finished = self.own_post.and_then(|(_, _, finished)| finished);
-        let posted = self.own_post.is_some();
+        // A click that posts its own events observes from the end of that
+        // post; a post whose end was not recorded never confirms.
+        if self.own_post.is_some_and(|finished| finished.is_none()) {
+            return None;
+        }
         let (evidence, window) = self.observe_change()?;
-        // A post whose end was not recorded never confirms.
-        (!posted || finished.is_some())
-            .then_some(())
-            .filter(|()| window.quiet_after(finished))
-            .map(|()| evidence)
+        window.quiet().then_some(evidence)
     }
 
     /// The change read within the deadline, with the input window still to
-    /// be checked: a caller whose own input continues after the click (a
-    /// focus restore that posts records) checks it once that has ended.
+    /// be checked.
     pub(super) fn observe_change(self) -> Option<(ClickEvidence, InputWindow)> {
         // From delivery: the end of the click's own post when it made one
         // (a double click's two clicks take a while), else dispatch.
-        let delivered = self
-            .own_post
-            .and_then(|(_, _, finished)| finished)
-            .unwrap_or(self.started);
+        let delivered = self.own_post.flatten().unwrap_or(self.started);
         let deadline = delivered + CLICK_OBSERVATION;
         let found = loop {
             // A change first seen after the deadline is not this click's.
             if std::time::Instant::now() > deadline {
                 break None;
             }
-            if let Some(evidence) = self.read_once() {
+            let seen = self.read_once();
+            // A read that returned after the deadline may show a later change.
+            if std::time::Instant::now() > deadline {
+                break None;
+            }
+            if let Some(evidence) = seen {
                 let stability = match evidence {
                     ClickEvidence::ToggleChanged => SELECTION_READBACK_STABILITY,
                     _ => WINDOW_TITLE_STABILITY,
@@ -862,7 +843,6 @@ impl ClickProbe {
             InputWindow {
                 idle_before: self.idle_before,
                 input_from: self.input_from,
-                own_post: self.own_post.map(|(start, idle, _)| (start, idle)),
             },
         ))
     }
@@ -872,34 +852,23 @@ impl ClickProbe {
 pub(super) struct InputWindow {
     idle_before: Option<u64>,
     input_from: std::time::Instant,
-    /// The click's own post: when it started and the input clock then.
-    own_post: Option<(std::time::Instant, Option<u64>)>,
 }
 
 impl InputWindow {
-    /// No physical input from the baseline on, except during the driver's
-    /// own input that ended at `own_input_end`.
-    pub(super) fn quiet_after(&self, own_input_end: Option<std::time::Instant>) -> bool {
+    /// No physical input from the baseline reads on, the click's own post
+    /// included: input during the post cannot be told apart from the
+    /// click's effect. (The per-event-type clock this reads is not advanced
+    /// by the driver's own pid-routed events; a route that advances it
+    /// fails closed.)
+    pub(super) fn quiet(&self) -> bool {
         let idle_now = super::physical_input_idle_ms();
         tracing::debug!(
             idle_before = ?self.idle_before,
             ?idle_now,
-            own_post_idle = ?self.own_post.map(|(_, idle)| idle),
-            since_own_input_end_ms = ?own_input_end.map(elapsed_ms),
+            since_baseline_ms = elapsed_ms(self.input_from),
             "click evidence input window"
         );
-        match (self.own_post, own_input_end) {
-            (Some((start, idle_at_post)), Some(end)) => input_quiet_around_own_post(
-                self.idle_before,
-                idle_at_post,
-                u64::try_from(start.duration_since(self.input_from).as_millis())
-                    .unwrap_or(u64::MAX),
-                idle_now,
-                elapsed_ms(end),
-            ),
-            (Some(_), None) => false,
-            (None, _) => input_quiet(self.idle_before, idle_now, elapsed_ms(self.input_from)),
-        }
+        input_quiet(self.idle_before, idle_now, elapsed_ms(self.input_from))
     }
 }
 
@@ -2896,10 +2865,6 @@ fn perform_ax_click(
                 anyhow::bail!("selection target stopped exposing AXSelected before delivery");
             };
             let modifier_refs: Vec<&str> = modifiers.iter().map(String::as_str).collect();
-            // The click posts its own pointer events, which reset the input
-            // clock: check before the post and after it separately.
-            let post_start = std::time::Instant::now();
-            let idle_at_post = super::physical_input_idle_ms();
             if foreground && !modifier_refs.is_empty() {
                 crate::input::mouse::click_at_xy_desktop_with_modifiers_preserving_cursor(
                     target.screen_x,
@@ -2921,9 +2886,6 @@ fn perform_ax_click(
                     crate::input::mouse::WindowClickDelivery::from_foreground(foreground),
                 )?;
             }
-            let post_end = std::time::Instant::now();
-            let baseline_ms = u64::try_from(post_start.duration_since(input_from).as_millis())
-                .unwrap_or(u64::MAX);
             // AppKit may publish a transient AXSelected transition while the
             // event queue is still resolving the gesture. Let it settle before
             // accepting a candidate, then require the same state to survive a
@@ -2954,12 +2916,10 @@ fn perform_ax_click(
                                 )
                                 // A person's click on the same row would read
                                 // the same: no physical input around the post.
-                                && input_quiet_around_own_post(
+                                && input_quiet(
                                     idle_before,
-                                    idle_at_post,
-                                    baseline_ms,
                                     super::physical_input_idle_ms(),
-                                    elapsed_ms(post_end),
+                                    elapsed_ms(input_from),
                                 )
                             {
                                 return Ok((
@@ -4277,60 +4237,5 @@ mod finder_title_tests {
             !title_names_target("Recents", "Downloads — Local", "Desktop"),
             "another location"
         );
-    }
-}
-
-#[cfg(test)]
-mod own_post_input_tests {
-    use super::input_quiet_around_own_post;
-
-    #[test]
-    fn a_click_that_resets_the_input_clock_is_judged_around_its_post() {
-        // Quiet before; the clock now shows only the click's own events.
-        assert!(input_quiet_around_own_post(
-            Some(9_000),
-            Some(9_080),
-            80,
-            Some(320),
-            300
-        ));
-        // A person moved the pointer after the post.
-        assert!(!input_quiet_around_own_post(
-            Some(9_000),
-            Some(9_080),
-            80,
-            Some(120),
-            300
-        ));
-        // Input during the baseline reads, before the post.
-        assert!(!input_quiet_around_own_post(
-            Some(9_000),
-            Some(40),
-            80,
-            Some(320),
-            300
-        ));
-        // Unknown clock reads never confirm.
-        assert!(!input_quiet_around_own_post(
-            None,
-            Some(9_080),
-            80,
-            Some(320),
-            300
-        ));
-        assert!(!input_quiet_around_own_post(
-            Some(9_000),
-            None,
-            80,
-            Some(320),
-            300
-        ));
-        assert!(!input_quiet_around_own_post(
-            Some(9_000),
-            Some(9_080),
-            80,
-            None,
-            300
-        ));
     }
 }
