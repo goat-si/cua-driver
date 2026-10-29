@@ -10,8 +10,16 @@
 use crate::goat::action_latency as latency;
 
 use async_trait::async_trait;
+use core_foundation::{
+    base::{CFEqual, CFGetTypeID, CFRelease, CFTypeRef, TCFType},
+    string::CFString,
+};
 use cua_driver_contract::{ClickButton, DragInput};
 use cua_driver_core::{
+    action_record::{
+        ActionEffect, ActionEvidence, ActionExecutionRecord, ActionTransport, ActualDelivery,
+        EvidenceKind, RequestedDelivery,
+    },
     protocol::ToolResult,
     tool::{Tool, ToolDef},
     tool_args::parse_typed_projection,
@@ -21,6 +29,11 @@ use std::sync::Arc;
 
 use super::ToolState;
 use crate::apps;
+use crate::ax::bindings::{
+    copy_string_attr, kAXErrorAttributeUnsupported, kAXErrorNoValue, kAXErrorSuccess,
+    kAXValueCFRangeType, AXUIElementCopyAttributeValue, AXUIElementRef, AXValueGetTypeID,
+    AXValueGetValue,
+};
 use crate::focus_guard;
 use crate::input::mouse::DragButton;
 use crate::window_change_detector::WindowChangeDetector;
@@ -480,7 +493,7 @@ impl DragTool {
             prior_front,
             "drag.CGEvent",
             || async move {
-                latency::spawn_action_blocking(move || -> anyhow::Result<bool> {
+                latency::spawn_action_blocking(move || -> anyhow::Result<DragDispatchOutcome> {
                     let m: Vec<&str> = mods_owned.iter().map(String::as_str).collect();
                     let observe = move |x: f64, y: f64| {
                         crate::cursor::overlay::send_command(
@@ -492,12 +505,15 @@ impl DragTool {
                         // Keep the exact target window active for the
                         // complete HID gesture, then restore the prior
                         // front process.
+                        let mut selection = None;
                         return crate::input::skylight::with_foreground_hid_activation(
                             pid as libc::pid_t,
                             wid,
                             || {
                                 // After the activation and its focus wait,
                                 // right before the press.
+                                super::window_points::check_guard(&dispatch_guard)?;
+                                let before = focused_selection(pid, wid);
                                 super::window_points::check_guard(&dispatch_guard)?;
                                 crate::input::mouse::drag_at_xy_observed(
                                     pid,
@@ -515,6 +531,8 @@ impl DragTool {
                                     true,
                                     observe,
                                 )?;
+                                let after = focused_selection(pid, wid);
+                                selection = selection_confirmation(before.as_ref(), after.as_ref());
                                 // Hold the front until AppKit finishes the
                                 // drop: restoring the previous app while the
                                 // session is still open cancels it.
@@ -522,7 +540,10 @@ impl DragTool {
                                 Ok(())
                             },
                         )
-                        .map(|()| false);
+                        .map(|()| DragDispatchOutcome {
+                            native_drag_session: false,
+                            selection,
+                        });
                     }
                     // A drag that starts a system drag-and-drop session
                     // (list reordering, file drags, HTML5 draggable) is
@@ -534,6 +555,8 @@ impl DragTool {
                     // moving, and report it.
                     let before = drag_image_windows(pid);
                     // After the window read, right before the press.
+                    super::window_points::check_guard(&dispatch_guard)?;
+                    let before_selection = focused_selection(pid, wid);
                     super::window_points::check_guard(&dispatch_guard)?;
                     let mut session_seen = false;
                     let origin = validated_frame
@@ -579,7 +602,13 @@ impl DragTool {
                             outcome,
                             crate::input::mouse::BackgroundDragOutcome::StoppedEarly { .. }
                         );
-                    Ok(session)
+                    let after_selection = focused_selection(pid, wid);
+                    let selection =
+                        selection_confirmation(before_selection.as_ref(), after_selection.as_ref());
+                    Ok(DragDispatchOutcome {
+                        native_drag_session: session,
+                        selection,
+                    })
                 })
                 .await
             },
@@ -589,7 +618,13 @@ impl DragTool {
             cursor_key.clone(),
             cursor_overlay::OverlayCommand::SetPressed(false),
         );
-        if matches!(&result, Ok(Ok(false))) {
+        if matches!(
+            &result,
+            Ok(Ok(DragDispatchOutcome {
+                native_drag_session: false,
+                ..
+            }))
+        ) {
             self.state
                 .cursor_registry
                 .update_position(&cursor_key, to_sx, to_sy);
@@ -640,37 +675,50 @@ impl DragTool {
             )
         };
         match result {
-            Ok(Ok(true))
-                if cua_driver_core::delivery::brief_foreground_allowed()
-                    && !cua_driver_core::delivery::background_requested_explicitly(&args) =>
+            Ok(Ok(DragDispatchOutcome {
+                native_drag_session: true,
+                ..
+            })) if cua_driver_core::delivery::brief_foreground_allowed()
+                && !cua_driver_core::delivery::background_requested_explicitly(&args) =>
             {
                 self.brief_foreground_drag(&args, pid, wid, prior_front)
                     .await
             }
-            Ok(Ok(true)) => drag_and_drop_session_result(pid, wid, changes.result_suffix()),
-            Ok(Ok(false)) => ToolResult::text(format!(
-                "✅ Posted drag{btn_suffix}{mod_suffix} to pid {pid} window {wid} \
-                 from window-pixel ({}, {}) → ({}, {}), \
-                 screen ({}, {}) → ({}, {}) \
-                 in {duration_ms}ms / {steps} steps ({route_note}; not driver-verified — \
-                 confirm via screenshot).{}",
-                from_x as i64,
-                from_y as i64,
-                to_x as i64,
-                to_y as i64,
-                from_sx as i64,
-                from_sy as i64,
-                to_sx as i64,
-                to_sy as i64,
-                changes.result_suffix(),
-            ))
-            .with_structured(serde_json::json!({
-                "path": path,
-                "delivery_mode": if fg { "foreground" } else { "background" },
-                "verified": false,
-                "effect": "unverifiable",
-                "focus_without_raise": focus_without_raise
-            })),
+            Ok(Ok(DragDispatchOutcome {
+                native_drag_session: true,
+                ..
+            })) => drag_and_drop_session_result(pid, wid, changes.result_suffix()),
+            Ok(Ok(DragDispatchOutcome {
+                native_drag_session: false,
+                selection,
+            })) => {
+                let verification_note = if selection.is_some() {
+                    "text selection confirmed by accessibility readback"
+                } else {
+                    "not driver-verified — confirm via screenshot"
+                };
+                drag_success_result(
+                    format!(
+                        "✅ Posted drag{btn_suffix}{mod_suffix} to pid {pid} window {wid} \
+                         from window-pixel ({}, {}) → ({}, {}), \
+                         screen ({}, {}) → ({}, {}) \
+                         in {duration_ms}ms / {steps} steps ({route_note}; {verification_note}).{}",
+                        from_x as i64,
+                        from_y as i64,
+                        to_x as i64,
+                        to_y as i64,
+                        from_sx as i64,
+                        from_sy as i64,
+                        to_sx as i64,
+                        to_sy as i64,
+                        changes.result_suffix(),
+                    ),
+                    path,
+                    focus_without_raise,
+                    fg,
+                    selection,
+                )
+            }
             Ok(Err(e)) => ToolResult::error(format!("drag failed: {e}")),
             Err(e) => ToolResult::error(format!("Task error: {e}")),
         }
@@ -887,6 +935,373 @@ fn pointer_location() -> Option<(f64, f64)> {
     let source = CGEventSource::new(CGEventSourceStateID::HIDSystemState).ok()?;
     let location = CGEvent::new(source).ok()?.location();
     Some((location.x, location.y))
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SelectedTextRange {
+    location: u64,
+    length: u64,
+}
+
+#[derive(Debug)]
+struct RetainedAxElement(usize);
+
+impl Drop for RetainedAxElement {
+    fn drop(&mut self) {
+        unsafe { CFRelease(self.0 as CFTypeRef) }
+    }
+}
+
+#[derive(Clone, Debug)]
+enum OptionalStringAttr {
+    Value(Option<String>),
+    Unreadable,
+}
+
+#[derive(Clone, Debug)]
+struct SelectionReadback {
+    range: Option<SelectedTextRange>,
+    selected_text: Option<String>,
+    expose_selected_text: bool,
+}
+
+#[derive(Debug)]
+struct FocusedSelection {
+    element: RetainedAxElement,
+    readback: SelectionReadback,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SelectionConfirmation {
+    range: SelectedTextRange,
+    selected_text: Option<String>,
+}
+
+#[derive(Debug)]
+struct DragDispatchOutcome {
+    native_drag_session: bool,
+    selection: Option<SelectionConfirmation>,
+}
+
+#[repr(C)]
+struct CfRange {
+    location: isize,
+    length: isize,
+}
+
+unsafe fn optional_string_attr(element: AXUIElementRef, name: &str) -> OptionalStringAttr {
+    let attr = CFString::new(name);
+    let mut value: CFTypeRef = std::ptr::null();
+    let error = AXUIElementCopyAttributeValue(element, attr.as_concrete_TypeRef(), &mut value);
+    if error == kAXErrorNoValue || error == kAXErrorAttributeUnsupported {
+        if !value.is_null() {
+            CFRelease(value);
+        }
+        return OptionalStringAttr::Value(None);
+    }
+    if error != kAXErrorSuccess || value.is_null() {
+        if !value.is_null() {
+            CFRelease(value);
+        }
+        return OptionalStringAttr::Unreadable;
+    }
+    if CFGetTypeID(value) != CFString::type_id() {
+        CFRelease(value);
+        return OptionalStringAttr::Unreadable;
+    }
+    OptionalStringAttr::Value(Some(
+        CFString::wrap_under_create_rule(value as _).to_string(),
+    ))
+}
+
+fn selected_text_exposure_allowed(attributes: &[OptionalStringAttr; 7]) -> bool {
+    if attributes
+        .iter()
+        .any(|attr| matches!(attr, OptionalStringAttr::Unreadable))
+    {
+        return false;
+    }
+    let value = |index: usize| match &attributes[index] {
+        OptionalStringAttr::Value(value) => value.as_deref(),
+        OptionalStringAttr::Unreadable => None,
+    };
+    let Some(role) = value(0).filter(|role| !role.trim().is_empty()) else {
+        return false;
+    };
+    !cua_driver_core::snapshot_compaction::is_secure_text_field(
+        &cua_driver_core::snapshot_compaction::FieldSecurityMeta {
+            role,
+            subrole: value(1),
+            title: value(2),
+            description: value(3),
+            placeholder: value(4),
+            identifier: value(5),
+            help: value(6),
+            is_password_flag: false,
+        },
+    )
+}
+
+unsafe fn selected_text_range(element: AXUIElementRef) -> Option<SelectedTextRange> {
+    let attr = CFString::new("AXSelectedTextRange");
+    let mut value: CFTypeRef = std::ptr::null();
+    let error = AXUIElementCopyAttributeValue(element, attr.as_concrete_TypeRef(), &mut value);
+    if error != kAXErrorSuccess || value.is_null() {
+        if !value.is_null() {
+            CFRelease(value);
+        }
+        return None;
+    }
+    if CFGetTypeID(value) != AXValueGetTypeID() {
+        CFRelease(value);
+        return None;
+    }
+    let mut range = CfRange {
+        location: 0,
+        length: 0,
+    };
+    let decoded = AXValueGetValue(
+        value as _,
+        kAXValueCFRangeType,
+        &mut range as *mut CfRange as *mut _,
+    );
+    CFRelease(value);
+    if !decoded || range.location < 0 || range.length < 0 {
+        return None;
+    }
+    Some(SelectedTextRange {
+        location: range.location as u64,
+        length: range.length as u64,
+    })
+}
+
+fn focused_selection(pid: i32, window_id: u32) -> Option<FocusedSelection> {
+    unsafe {
+        let element = crate::ax::exact_target::focused_element_in_window(pid, window_id)?;
+        let element = RetainedAxElement(element as usize);
+        let attributes = [
+            optional_string_attr(element.0 as AXUIElementRef, "AXRole"),
+            optional_string_attr(element.0 as AXUIElementRef, "AXSubrole"),
+            optional_string_attr(element.0 as AXUIElementRef, "AXTitle"),
+            optional_string_attr(element.0 as AXUIElementRef, "AXDescription"),
+            optional_string_attr(element.0 as AXUIElementRef, "AXPlaceholderValue"),
+            optional_string_attr(element.0 as AXUIElementRef, "AXIdentifier"),
+            optional_string_attr(element.0 as AXUIElementRef, "AXHelp"),
+        ];
+        let expose_selected_text = selected_text_exposure_allowed(&attributes);
+        let readback = SelectionReadback {
+            range: selected_text_range(element.0 as AXUIElementRef),
+            selected_text: expose_selected_text
+                .then(|| copy_string_attr(element.0 as AXUIElementRef, "AXSelectedText"))
+                .flatten(),
+            expose_selected_text,
+        };
+        Some(FocusedSelection { element, readback })
+    }
+}
+
+fn selection_confirmation(
+    before: Option<&FocusedSelection>,
+    after: Option<&FocusedSelection>,
+) -> Option<SelectionConfirmation> {
+    let (before, after) = (before?, after?);
+    unsafe {
+        if CFEqual(before.element.0 as CFTypeRef, after.element.0 as CFTypeRef) == 0 {
+            return None;
+        }
+    }
+    selection_change(&before.readback, &after.readback)
+}
+
+fn selection_change(
+    before: &SelectionReadback,
+    after: &SelectionReadback,
+) -> Option<SelectionConfirmation> {
+    let before_range = before.range?;
+    let after_range = after.range?;
+    if after_range.length == 0 {
+        return None;
+    }
+    let range_changed = before_range != after_range;
+    let text_changed = match (before.selected_text.as_ref(), after.selected_text.as_ref()) {
+        (Some(before), Some(after)) => before != after,
+        _ => false,
+    };
+    if !range_changed && !text_changed {
+        return None;
+    }
+    Some(SelectionConfirmation {
+        range: after_range,
+        selected_text: after
+            .expose_selected_text
+            .then(|| after.selected_text.clone())
+            .flatten(),
+    })
+}
+
+fn drag_action_record(foreground: bool) -> ActionExecutionRecord {
+    let (transport, requested, actual) = if foreground {
+        (
+            ActionTransport::MacosCgEventHid,
+            RequestedDelivery::Foreground,
+            ActualDelivery::Foreground,
+        )
+    } else {
+        (
+            ActionTransport::MacosCgEventPid,
+            RequestedDelivery::Background,
+            ActualDelivery::Background,
+        )
+    };
+    ActionExecutionRecord::builder(ActionEffect::Confirmed, transport, requested)
+        .actual_delivery(actual)
+        .evidence(ActionEvidence {
+            kind: EvidenceKind::AccessibilityReadback,
+            detail: "The focused element changed to a nonempty UTF-16 selection".into(),
+        })
+        .build()
+        .expect("confirmed drag selection has accessibility evidence")
+}
+
+fn drag_success_result(
+    text: String,
+    path: &str,
+    focus_without_raise: bool,
+    foreground: bool,
+    selection: Option<SelectionConfirmation>,
+) -> ToolResult {
+    let mut structured = serde_json::json!({
+        "path": path,
+        "delivery_mode": if foreground { "foreground" } else { "background" },
+        "verified": selection.is_some(),
+        "effect": if selection.is_some() { "confirmed" } else { "unverifiable" },
+        "focus_without_raise": focus_without_raise,
+    });
+    let Some(selection) = selection else {
+        return ToolResult::text(text).with_structured(structured);
+    };
+    structured["selection_changed"] = serde_json::json!(true);
+    structured["selected_text_range"] = serde_json::json!({
+        "location": selection.range.location,
+        "length": selection.range.length,
+        "units": "utf16",
+    });
+    if let Some(selected_text) = selection.selected_text {
+        structured["selected_text"] = serde_json::json!(selected_text);
+    }
+    ToolResult::text(text)
+        .with_structured(structured)
+        .with_action_record(drag_action_record(foreground))
+}
+
+#[cfg(test)]
+mod wave400c_tests {
+    use super::*;
+
+    #[test]
+    fn wave400c_drag_result_promotes_a_confirmed_selection() {
+        let result = drag_success_result(
+            "drag delivered".into(),
+            "cgevent",
+            true,
+            false,
+            Some(SelectionConfirmation {
+                range: SelectedTextRange {
+                    location: 2,
+                    length: 4,
+                },
+                selected_text: Some("text".into()),
+            }),
+        );
+        let structured = result.structured_content.unwrap();
+        assert_eq!(structured["effect"], "confirmed");
+        assert_eq!(structured["verified"], true);
+        assert_eq!(structured["selection_changed"], true);
+        assert_eq!(
+            structured["selected_text_range"],
+            serde_json::json!({"location": 2, "length": 4, "units": "utf16"})
+        );
+        assert_eq!(structured["selected_text"], "text");
+        let record = result.action_record.unwrap();
+        assert_eq!(record.effect, ActionEffect::Confirmed);
+        assert_eq!(record.evidence[0].kind, EvidenceKind::AccessibilityReadback);
+    }
+
+    fn readback(before: (u64, u64), text: &str, expose_selected_text: bool) -> SelectionReadback {
+        SelectionReadback {
+            range: Some(SelectedTextRange {
+                location: before.0,
+                length: before.1,
+            }),
+            selected_text: Some(text.into()),
+            expose_selected_text,
+        }
+    }
+
+    #[test]
+    fn wave400c_selection_requires_a_nonempty_real_change() {
+        let collapsed = readback((0, 0), "", true);
+        let selected = readback((2, 4), "text", true);
+        assert!(selection_change(&collapsed, &selected).is_some());
+
+        let changed_text = readback((2, 4), "new!", true);
+        assert!(selection_change(&selected, &changed_text).is_some());
+        assert!(selection_change(&selected, &selected).is_none());
+        assert!(selection_change(&selected, &collapsed).is_none());
+
+        let missing_before = SelectionReadback {
+            range: None,
+            ..collapsed.clone()
+        };
+        assert!(selection_change(&missing_before, &selected).is_none());
+    }
+
+    #[test]
+    fn wave400c_secure_or_unreadable_metadata_never_exposes_selected_text() {
+        let ordinary: [OptionalStringAttr; 7] = std::array::from_fn(|index| {
+            OptionalStringAttr::Value((index == 0).then(|| "AXTextField".into()))
+        });
+        assert!(selected_text_exposure_allowed(&ordinary));
+
+        for index in 0..ordinary.len() {
+            let mut unreadable = ordinary.clone();
+            unreadable[index] = OptionalStringAttr::Unreadable;
+            assert!(
+                !selected_text_exposure_allowed(&unreadable),
+                "index {index}"
+            );
+        }
+        for (role, title) in [
+            ("AXSecureTextField", ""),
+            ("AXTextField", "Password"),
+            ("AXTextField", "One-time code"),
+        ] {
+            let mut secure = ordinary.clone();
+            secure[0] = OptionalStringAttr::Value(Some(role.into()));
+            secure[2] = OptionalStringAttr::Value(Some(title.into()));
+            assert!(!selected_text_exposure_allowed(&secure));
+        }
+
+        let before = readback((0, 0), "", false);
+        let after = readback((0, 4), "secret", false);
+        let confirmation = selection_change(&before, &after).unwrap();
+        assert_eq!(confirmation.selected_text, None);
+        let result = drag_success_result(
+            "selection changed".into(),
+            "cgevent",
+            true,
+            false,
+            Some(confirmation),
+        );
+        assert!(result
+            .structured_content
+            .unwrap()
+            .get("selected_text")
+            .is_none());
+        assert!(!result.action_record.unwrap().evidence[0]
+            .detail
+            .contains("secret"));
+    }
 }
 
 /// Structured record of a brief foreground step, for the agent and the log.
