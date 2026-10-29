@@ -41,9 +41,7 @@ pub enum WindowScope {
     /// The CGWindowID is a sheet's own window (a document's Save sheet): the
     /// `AXSheet` sits under the AXWindow `parent_window_id`, and its controls
     /// are read and acted on through that window, whose snapshot includes the
-    /// sheet (an element under a sheet belongs to the sheet's parent window,
-    /// see `exact_target::element_window_id`). Nothing is walked here; the
-    /// caller points at the parent window instead.
+    /// sheet. The parent walk recovers the live sheet root and its controls.
     SheetOfWindow { parent_window_id: u32 },
 }
 
@@ -51,7 +49,10 @@ impl WindowScope {
     /// True only when the requested window's own AX surface was found.
     /// Element caches and element-token snapshots may be written only then.
     pub fn is_matched(&self) -> bool {
-        matches!(self, WindowScope::Matched)
+        matches!(
+            self,
+            WindowScope::Matched | WindowScope::SheetOfWindow { .. }
+        )
     }
 }
 

@@ -175,6 +175,7 @@ fn is_scoped_action(tool_name: &str) -> bool {
             | "press_key"
             | "hotkey"
             | "set_value"
+            | "select_text"
     )
 }
 
@@ -579,5 +580,28 @@ mod tests {
         assert!(created);
         assert_eq!(fresh_state.policy, CaptureScopePolicy::Window);
         assert!(!fresh_state.desktop_unlocked);
+    }
+}
+
+#[cfg(test)]
+mod wave400f2_tests {
+    use super::*;
+
+    #[test]
+    fn select_text_is_window_scoped_and_extras_is_pid_scoped() {
+        assert_eq!(
+            tool_scope(
+                "select_text",
+                &serde_json::json!({"pid": 1, "window_id": 2})
+            ),
+            ToolScope::Window
+        );
+        assert_eq!(
+            tool_scope(
+                "menu_bar_extras",
+                &serde_json::json!({"operation": "list", "pid": 1})
+            ),
+            ToolScope::Unscoped
+        );
     }
 }
