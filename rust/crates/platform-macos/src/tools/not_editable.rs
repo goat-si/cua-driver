@@ -10,9 +10,15 @@ use cua_driver_core::action_record::{
 };
 use cua_driver_core::protocol::ToolResult;
 
-use crate::ax::bindings::{element_at_screen_position, AXUIElementRef};
-use crate::ax::editable::{cell_verdict, facts_for_element, token_refused, CellVerdict};
+use crate::ax::bindings::{
+    ax_get_window_id, copy_element_attr, copy_string_attr, element_at_screen_position,
+    AXUIElementRef, AXUIElementSetMessagingTimeout,
+};
+use crate::ax::editable::{
+    cell_verdict, facts_for_element, is_text_role, token_refused, CellVerdict,
+};
 use crate::goat::action_latency as latency;
+use core_foundation::base::{CFRelease, CFTypeRef};
 
 /// What happened before a not_editable refusal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -28,7 +34,11 @@ pub(crate) enum FocusDispatch {
 /// The not_editable result. A refusal after a focus attempt never claims
 /// nothing was sent: the focus action is reported as delivered (partial)
 /// or possibly delivered (unverifiable, delivery unknown).
-pub(crate) fn not_editable_result(message: String, focus: FocusDispatch) -> ToolResult {
+pub(crate) fn not_editable_result_with(
+    message: String,
+    focus: FocusDispatch,
+    foreground: bool,
+) -> ToolResult {
     match focus {
         FocusDispatch::None => {
             ToolResult::error(message.clone()).with_structured(serde_json::json!({
@@ -42,6 +52,11 @@ pub(crate) fn not_editable_result(message: String, focus: FocusDispatch) -> Tool
         FocusDispatch::Sent => {
             let text =
                 format!("{message} The focus action was delivered; no text or keys were sent.");
+            let (transport, delivery) = if foreground {
+                (ActionTransport::MacosCgEventHid, ActualDelivery::Foreground)
+            } else {
+                (ActionTransport::MacosAxAction, ActualDelivery::Background)
+            };
             ToolResult::text(text.clone())
                 .with_structured(serde_json::json!({
                     "code": "not_editable",
@@ -53,10 +68,10 @@ pub(crate) fn not_editable_result(message: String, focus: FocusDispatch) -> Tool
                 .with_action_record(
                     ActionExecutionRecord::builder(
                         ActionEffect::Partial,
-                        ActionTransport::MacosAxAction,
+                        transport,
                         RequestedDelivery::Background,
                     )
-                    .actual_delivery(ActualDelivery::Background)
+                    .actual_delivery(delivery)
                     .delivered_count(1)
                     .build()
                     .expect("not_editable partial record is valid"),
@@ -87,9 +102,14 @@ pub(crate) fn not_editable_result(message: String, focus: FocusDispatch) -> Tool
     }
 }
 
+pub(crate) fn not_editable_result(message: String, focus: FocusDispatch) -> ToolResult {
+    not_editable_result_with(message, focus, false)
+}
+
 const CELL_MESSAGE: &str =
     "the target is a cell in a row, outline or table that is not being edited";
 const UNREADABLE_MESSAGE: &str = "the element at the point could not be classified as editable";
+const CELL_MESSAGE_TOKEN: &str = "the target element is not being edited";
 
 fn verdict_message(verdict: CellVerdict, point: bool) -> &'static str {
     match (verdict, point) {
@@ -110,96 +130,156 @@ fn cell_refusal(verdict: CellVerdict, point: bool) -> ToolResult {
     not_editable_result(message, FocusDispatch::None)
 }
 
-/// CELL rule for untargeted typing: classify the window's focused element.
-/// Returns a refusal for a non-editing cell or unreadable state.
+fn verdict_allows(verdict: CellVerdict) -> bool {
+    matches!(verdict, CellVerdict::NotCell | CellVerdict::Editing)
+}
+
+/// Classify the focused element (untargeted route). Blocking, unsafe AX
+/// context; Unreadable on any failure.
+pub(crate) unsafe fn classify_untargeted(pid: i32, window_id: Option<u32>) -> CellVerdict {
+    let element = match window_id {
+        Some(wid) => crate::ax::exact_target::focused_element_in_window(pid, wid),
+        None => crate::ax::bindings::focused_element_of_pid(pid),
+    };
+    let Some(element) = element else {
+        return CellVerdict::Unreadable;
+    };
+    let verdict = facts_for_element(element)
+        .map(|facts| cell_verdict(&facts))
+        .unwrap_or(CellVerdict::Unreadable);
+    CFRelease(element as CFTypeRef);
+    verdict
+}
+
+/// Late recheck inside a delivery context: the focused element may have
+/// changed since the early guard. False on any unreadable state.
+pub(crate) unsafe fn sync_focused_cell_allows(pid: i32, window_id: Option<u32>) -> bool {
+    verdict_allows(classify_untargeted(pid, window_id))
+}
+
+/// CELL rule for untargeted typing. A blocking-task failure is a fail-closed
+/// refusal, never a pass.
 pub(crate) async fn guard_untargeted(pid: i32, window_id: Option<u32>) -> Option<ToolResult> {
-    latency::spawn_action_blocking(move || unsafe {
-        let element = match window_id {
-            Some(wid) => crate::ax::exact_target::focused_element_in_window(pid, wid),
-            None => crate::ax::bindings::focused_element_of_pid(pid),
-        };
-        let verdict = match element {
-            None => CellVerdict::Unreadable,
-            Some(element) => {
-                let verdict = facts_for_element(element)
-                    .map(|facts| cell_verdict(&facts))
-                    .unwrap_or(CellVerdict::Unreadable);
-                core_foundation::base::CFRelease(element as core_foundation::base::CFTypeRef);
-                verdict
-            }
-        };
+    match latency::spawn_action_blocking(move || unsafe {
+        let verdict = classify_untargeted(pid, window_id);
         match verdict {
             CellVerdict::NotEditing | CellVerdict::Unreadable => Some(cell_refusal(verdict, false)),
             _ => None,
         }
     })
     .await
-    .ok()
-    .flatten()
+    {
+        Ok(result) => result,
+        Err(_) => Some(cell_refusal(CellVerdict::Unreadable, false)),
+    }
 }
 
-/// CELL rule for point-targeted typing, before any focus action. A missing
-/// hit or unreadable ancestry fails closed with a pre-dispatch refusal.
-pub(crate) async fn guard_point(pid: i32, x: f64, y: f64) -> Option<ToolResult> {
-    latency::spawn_action_blocking(move || unsafe {
-        let element = element_at_screen_position(pid, x, y);
-        let verdict = match element {
-            None => CellVerdict::Unreadable,
-            Some(element) => {
-                let verdict = facts_for_element(element)
-                    .map(|facts| cell_verdict(&facts))
-                    .unwrap_or(CellVerdict::Unreadable);
-                core_foundation::base::CFRelease(element as core_foundation::base::CFTypeRef);
-                verdict
-            }
-        };
+/// CELL rule for point-targeted typing, before any focus action. The
+/// window-local native pixel point is translated to screen coordinates with
+/// the same frame the click uses; the hit must belong to the delivery
+/// window. A missing hit, a foreign-window hit, unreadable ancestry or a
+/// task failure all fail closed pre-dispatch.
+pub(crate) async fn guard_point(
+    pid: i32,
+    window_id: Option<u32>,
+    native_x: f64,
+    native_y: f64,
+) -> Option<ToolResult> {
+    let Some(wid) = window_id else {
+        return Some(cell_refusal(CellVerdict::Unreadable, true));
+    };
+    let frame = match super::px_frame::resolve_or_refuse(wid).await {
+        Ok(frame) => frame,
+        Err(_) => return Some(cell_refusal(CellVerdict::Unreadable, true)),
+    };
+    let (screen_x, screen_y, _, _) = frame.to_screen(native_x, native_y);
+    match latency::spawn_action_blocking(move || unsafe {
+        let verdict = classify_point_screen(pid, screen_x, screen_y, wid);
         match verdict {
             CellVerdict::NotEditing | CellVerdict::Unreadable => Some(cell_refusal(verdict, true)),
             _ => None,
         }
     })
     .await
-    .ok()
-    .flatten()
+    {
+        Ok(result) => result,
+        Err(_) => Some(cell_refusal(CellVerdict::Unreadable, true)),
+    }
+}
+
+/// Hit-test at a screen point and classify, requiring the hit to belong to
+/// the delivery window.
+unsafe fn classify_point_screen(pid: i32, x: f64, y: f64, window_id: u32) -> CellVerdict {
+    let Some(element) = element_at_screen_position(pid, x, y) else {
+        return CellVerdict::Unreadable;
+    };
+    // Prove the hit belongs to the delivery window: an overlapping
+    // same-process sibling must not be classified in its place.
+    let mut current = element;
+    let mut owner: Option<u32> = None;
+    for _ in 0..12 {
+        let Some(parent) = copy_element_attr(current, "AXParent") else {
+            break;
+        };
+        let _ = AXUIElementSetMessagingTimeout(parent, 0.5);
+        let role = copy_string_attr(parent, "AXRole");
+        if role.as_deref() == Some("AXWindow") {
+            owner = ax_get_window_id(parent);
+        }
+        if current != element {
+            CFRelease(current as CFTypeRef);
+        }
+        current = parent;
+        if owner.is_some() || role.as_deref() == Some("AXApplication") {
+            break;
+        }
+    }
+    if current != element {
+        CFRelease(current as CFTypeRef);
+    }
+    if owner != Some(window_id) {
+        return CellVerdict::Unreadable;
+    }
+    let verdict = facts_for_element(element)
+        .map(|facts| cell_verdict(&facts))
+        .unwrap_or(CellVerdict::Unreadable);
+    CFRelease(element as CFTypeRef);
+    verdict
 }
 
 /// After the focus step of a point-targeted route, verify the resulting
 /// focused element still allows typing before keys are sent.
 pub(crate) async fn focused_cell_allows_typing(pid: i32, window_id: Option<u32>) -> bool {
-    latency::spawn_action_blocking(move || unsafe {
-        let element = match window_id {
-            Some(wid) => crate::ax::exact_target::focused_element_in_window(pid, wid),
-            None => crate::ax::bindings::focused_element_of_pid(pid),
-        };
-        let Some(element) = element else {
-            return false;
-        };
-        let verdict = facts_for_element(element)
-            .map(|facts| cell_verdict(&facts))
-            .unwrap_or(CellVerdict::Unreadable);
-        core_foundation::base::CFRelease(element as core_foundation::base::CFTypeRef);
-        !matches!(verdict, CellVerdict::NotEditing | CellVerdict::Unreadable)
-    })
-    .await
-    .unwrap_or(false)
+    latency::spawn_action_blocking(move || unsafe { sync_focused_cell_allows(pid, window_id) })
+        .await
+        .unwrap_or_default()
 }
 
-/// TOKEN rule for element_token type_text/set_value: attempt AX focus when
-/// the element is not focused (the handoff's order), then evaluate. The
-/// refusal accounts for that focus attempt.
+/// TOKEN rule for element_token type_text/set_value. The role is read
+/// first: non-text targets are never focused (their behavior is unchanged).
+/// A text-role target is focused when needed (the handoff's order), then
+/// evaluated. focus_element masks AX errors, so the focus read-back decides
+/// whether the focus action was delivered or is indeterminate.
 pub(crate) async fn token_not_editable_refusal(
     pid: i32,
     element: usize,
     window_id: u32,
 ) -> Option<ToolResult> {
-    latency::spawn_action_blocking(move || unsafe {
+    match latency::spawn_action_blocking(move || unsafe {
         let element = element as AXUIElementRef;
+        let Some(initial) = facts_for_element(element) else {
+            return Some(not_editable_result(
+                "the target element could not be read; no text or keys were sent.".into(),
+                FocusDispatch::None,
+            ));
+        };
+        if !initial.role.as_deref().is_some_and(is_text_role) {
+            return None;
+        }
         let mut focus = FocusDispatch::None;
-        if facts_for_element(element).map(|f| f.focused) != Some(Some(true)) {
-            match crate::input::ax_actions::focus_element(element as usize) {
-                Ok(()) => focus = FocusDispatch::Sent,
-                Err(_) => focus = FocusDispatch::Indeterminate,
-            }
+        if initial.focused != Some(true) {
+            let _ = crate::input::ax_actions::focus_element(element as usize);
+            focus = FocusDispatch::Indeterminate;
         }
         let Some(facts) = facts_for_element(element) else {
             return Some(not_editable_result(
@@ -207,21 +287,30 @@ pub(crate) async fn token_not_editable_refusal(
                 focus,
             ));
         };
-        let _ = (pid, window_id);
+        if matches!(focus, FocusDispatch::Indeterminate) && facts.focused == Some(true) {
+            // The read-back proves the focus action landed.
+            focus = FocusDispatch::Sent;
+        }
         if token_refused(&facts) {
             return Some(not_editable_result(
-                format!("{}; no text or keys were sent.", CELL_MESSAGE_TOKEN),
+                format!("{CELL_MESSAGE_TOKEN}; no text or keys were sent."),
                 focus,
             ));
         }
+        let _ = (pid, window_id);
         None
     })
     .await
-    .ok()
-    .flatten()
+    {
+        Ok(result) => result,
+        // The task may have failed after the focus attempt: never treat a
+        // classification failure as permission to write.
+        Err(_) => Some(not_editable_result(
+            "the target's editability could not be classified; no text or keys were sent.".into(),
+            FocusDispatch::Indeterminate,
+        )),
+    }
 }
-
-const CELL_MESSAGE_TOKEN: &str = "the target element is not being edited";
 
 #[cfg(test)]
 mod tests {
@@ -264,8 +353,23 @@ mod tests {
             .expect("valid record");
         let public = serde_json::to_value(public).unwrap();
         assert_eq!(public["effect"], "partial");
+        assert_eq!(public["delivery"]["mode"], "background");
         assert_eq!(public["delivery"]["delivered_count"], 1);
         assert!(text_of(&result).contains("focus action was delivered"));
+    }
+
+    #[test]
+    fn a_foreground_click_receipt_reports_foreground_delivery() {
+        let result = not_editable_result_with("cell".into(), FocusDispatch::Sent, true);
+        let public = result
+            .action_record
+            .as_ref()
+            .unwrap()
+            .public_result()
+            .expect("valid record");
+        let public = serde_json::to_value(public).unwrap();
+        assert_eq!(public["delivery"]["mode"], "foreground");
+        assert_eq!(public["effect"], "partial");
     }
 
     #[test]

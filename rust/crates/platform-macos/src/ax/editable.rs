@@ -8,10 +8,13 @@
 //!   cell in a row/outline/table is not an editor. Typing is allowed only
 //!   with an inline editing session: the cell itself is a focused text
 //!   field, or a focused text-field descendant exists.
+//!
+//! Unreadable or truncated ancestry, and an unfinished descendant scan,
+//! fail closed: they never classify as NotCell or Editing.
 
 use crate::ax::bindings::{
     copy_bool_attr, copy_children, copy_element_attr, copy_string_attr, is_attribute_settable,
-    AXUIElementRef,
+    AXUIElementRef, AXUIElementSetMessagingTimeout,
 };
 use core_foundation::base::{CFRelease, CFTypeRef};
 
@@ -25,7 +28,7 @@ pub fn is_text_role(role: &str) -> bool {
 
 /// Facts read from an element and its ancestry. None means unreadable;
 /// every rule fails closed on unreadable state.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct ElementFacts {
     pub role: Option<String>,
     pub focused: Option<bool>,
@@ -35,6 +38,28 @@ pub struct ElementFacts {
     pub ancestor_roles: Vec<String>,
     /// A focused AXTextField/AXTextArea exists inside this element.
     pub focused_text_descendant: bool,
+    /// The ancestor walk reached a window/application root with every role
+    /// read. False on a failed parent read, an unreadable parent role, or
+    /// truncation: the element may hide an unclassified cell ancestor.
+    pub ancestry_complete: bool,
+    /// The bounded descendant scan finished. False when the work budget ran
+    /// out: a focused editor may exist that was not seen.
+    pub descendant_scan_complete: bool,
+}
+
+impl Default for ElementFacts {
+    fn default() -> Self {
+        Self {
+            role: None,
+            focused: None,
+            value_settable: None,
+            editable: None,
+            ancestor_roles: Vec::new(),
+            focused_text_descendant: false,
+            ancestry_complete: true,
+            descendant_scan_complete: true,
+        }
+    }
 }
 
 /// TOKEN rule: refuse only when all three editing indicators are negative.
@@ -54,7 +79,7 @@ pub enum CellVerdict {
     Editing,
     /// A cell with no editing session: typing must be refused.
     NotEditing,
-    /// Role or state could not be read: fail closed.
+    /// Role, ancestry or state could not be fully read: fail closed.
     Unreadable,
 }
 
@@ -69,17 +94,33 @@ pub fn cell_verdict(facts: &ElementFacts) -> CellVerdict {
     let Some(role) = facts.role.as_deref() else {
         return CellVerdict::Unreadable;
     };
+    if !facts.ancestry_complete {
+        return CellVerdict::Unreadable;
+    }
     if !in_table(role, &facts.ancestor_roles) {
         return CellVerdict::NotCell;
     }
-    if is_text_role(role) && facts.focused == Some(true) || facts.focused_text_descendant {
+    if is_text_role(role) && facts.focused == Some(true) {
         return CellVerdict::Editing;
+    }
+    if facts.focused_text_descendant {
+        return CellVerdict::Editing;
+    }
+    if !facts.descendant_scan_complete {
+        return CellVerdict::Unreadable;
     }
     CellVerdict::NotEditing
 }
 
-/// Read the facts for one element. Ancestor and descendant walks are
-/// bounded; every AX read inherits the caller's messaging timeout.
+/// Total nodes the descendant scan may visit before failing closed.
+const MAX_SCAN_NODES: usize = 48;
+const MAX_SCAN_DEPTH: usize = 3;
+const MAX_ANCESTORS: usize = 12;
+const AX_TIMEOUT_SECONDS: f32 = 0.5;
+
+/// Read the facts for one element. Walks and the descendant scan are
+/// bounded; every AX element read gets a 0.5 s messaging timeout so a busy
+/// app cannot stall the guard indefinitely.
 ///
 /// # Safety
 /// The element reference must be valid and live, owned by the caller.
@@ -87,6 +128,7 @@ pub unsafe fn facts_for_element(element: AXUIElementRef) -> Option<ElementFacts>
     if element.is_null() {
         return None;
     }
+    let _ = AXUIElementSetMessagingTimeout(element, AX_TIMEOUT_SECONDS);
     let mut facts = ElementFacts {
         role: copy_string_attr(element, "AXRole"),
         focused: copy_bool_attr(element, "AXFocused"),
@@ -95,43 +137,90 @@ pub unsafe fn facts_for_element(element: AXUIElementRef) -> Option<ElementFacts>
         ..Default::default()
     };
     let mut current = element;
-    for _ in 0..12 {
+    let mut complete = false;
+    for _ in 0..MAX_ANCESTORS {
         let Some(parent) = copy_element_attr(current, "AXParent") else {
             break;
         };
         if current != element {
             CFRelease(current as CFTypeRef);
         }
-        if let Some(role) = copy_string_attr(parent, "AXRole") {
-            facts.ancestor_roles.push(role);
+        let _ = AXUIElementSetMessagingTimeout(parent, AX_TIMEOUT_SECONDS);
+        match copy_string_attr(parent, "AXRole") {
+            Some(role) => {
+                complete = matches!(role.as_str(), "AXWindow" | "AXApplication");
+                facts.ancestor_roles.push(role);
+            }
+            None => {
+                // An unreadable parent role is not the end of the walk: the
+                // element may be an unclassified descendant of a cell.
+                facts.ancestry_complete = false;
+                CFRelease(parent as CFTypeRef);
+                return Some(facts);
+            }
         }
         current = parent;
+        if complete {
+            break;
+        }
     }
     if current != element {
         CFRelease(current as CFTypeRef);
     }
-    facts.focused_text_descendant = has_focused_text_descendant(element, 0);
+    facts.ancestry_complete = complete;
+    // The descendant scan only runs for table candidates: ordinary targets
+    // pay no walk at all.
+    if let Some(role) = facts.role.as_deref() {
+        if in_table(role, &facts.ancestor_roles)
+            && !(is_text_role(role) && facts.focused == Some(true))
+        {
+            let mut budget = MAX_SCAN_NODES;
+            let (found, finished) = scan_focused_text_descendant(element, 0, &mut budget);
+            facts.focused_text_descendant = found;
+            facts.descendant_scan_complete = finished;
+        }
+    }
     Some(facts)
 }
 
+/// Depth/breadth bounded scan. Returns (found, finished): finished is false
+/// when the budget ran out. Every child is released, including the
+/// unvisited siblings after a match.
+///
 /// # Safety
 /// The element reference must be valid and live, owned by the caller.
-unsafe fn has_focused_text_descendant(element: AXUIElementRef, depth: usize) -> bool {
-    if depth >= 3 {
-        return false;
+unsafe fn scan_focused_text_descendant(
+    element: AXUIElementRef,
+    depth: usize,
+    budget: &mut usize,
+) -> (bool, bool) {
+    if depth >= MAX_SCAN_DEPTH {
+        return (false, true);
     }
+    let mut found = false;
+    let mut finished = true;
     for child in copy_children(element) {
-        let found = copy_string_attr(child, "AXRole")
-            .as_deref()
-            .is_some_and(is_text_role)
-            && copy_bool_attr(child, "AXFocused") == Some(true);
-        let found = found || has_focused_text_descendant(child, depth + 1);
-        CFRelease(child as CFTypeRef);
-        if found {
-            return true;
+        let _ = AXUIElementSetMessagingTimeout(child, AX_TIMEOUT_SECONDS);
+        if !found {
+            if *budget == 0 {
+                finished = false;
+            } else {
+                *budget -= 1;
+                found = copy_string_attr(child, "AXRole")
+                    .as_deref()
+                    .is_some_and(is_text_role)
+                    && copy_bool_attr(child, "AXFocused") == Some(true);
+                if !found {
+                    let (nested, nested_finished) =
+                        scan_focused_text_descendant(child, depth + 1, budget);
+                    found = nested;
+                    finished = nested_finished;
+                }
+            }
         }
+        CFRelease(child as CFTypeRef);
     }
-    false
+    (found, finished)
 }
 
 #[cfg(test)]
@@ -156,55 +245,43 @@ mod tests {
 
     #[test]
     fn token_rule_follows_the_handoff() {
-        // Focused text field with an unsettable value is allowed.
         let mut f = facts("AXTextField");
         f.focused = Some(true);
         f.value_settable = Some(false);
         assert!(!token_refused(&f));
-        // Settable value alone is allowed.
         let mut f = facts("AXTextField");
         f.value_settable = Some(true);
         assert!(!token_refused(&f));
-        // AXEditable alone is allowed.
         let mut f = facts("AXTextArea");
         f.editable = Some(true);
         assert!(!token_refused(&f));
-        // All three negative: refused.
         assert!(token_refused(&facts("AXTextField")));
-        // Unreadable attributes fail closed for a text role.
         let mut f = facts("AXTextField");
         f.focused = Some(false);
         assert!(token_refused(&f));
-        // Non-text roles are not covered by this guard.
         assert!(!token_refused(&facts("AXButton")));
         assert!(!token_refused(&ElementFacts::default()));
     }
 
     #[test]
     fn a_focused_or_editable_cell_is_not_an_editor() {
-        // Focus alone on a cell is not an editing session.
         assert_eq!(cell_verdict(&cell("AXCell", true)), CellVerdict::NotEditing);
-        // AXEditable on the cell is not an editing session either.
         let mut f = cell("AXCell", false);
         f.editable = Some(true);
         assert_eq!(cell_verdict(&f), CellVerdict::NotEditing);
-        // Selected row, same.
         assert_eq!(cell_verdict(&cell("AXRow", true)), CellVerdict::NotEditing);
     }
 
     #[test]
     fn an_inline_editor_in_session_is_editing() {
-        // The cell itself is a focused text field.
         assert_eq!(
             cell_verdict(&cell("AXTextField", true)),
             CellVerdict::Editing
         );
-        // An unfocused text field in a cell is not in session.
         assert_eq!(
             cell_verdict(&cell("AXTextField", false)),
             CellVerdict::NotEditing
         );
-        // A focused text-field descendant of a static-text cell counts.
         let mut f = cell("AXStaticText", false);
         f.focused_text_descendant = true;
         assert_eq!(cell_verdict(&f), CellVerdict::Editing);
@@ -212,18 +289,33 @@ mod tests {
 
     #[test]
     fn non_cells_and_unreadable_states() {
-        // An ordinary text field outside a table is not guarded.
         let mut f = facts("AXTextField");
         f.focused = Some(false);
         assert_eq!(cell_verdict(&f), CellVerdict::NotCell);
-        // Unreadable role fails closed.
         assert_eq!(
-            cell_verdict(&ElementFacts::default()),
+            cell_verdict(&ElementFacts {
+                ancestry_complete: false,
+                ..Default::default()
+            }),
             CellVerdict::Unreadable
         );
-        // A group inside a table is still guarded.
         let mut f = facts("AXGroup");
         f.ancestor_roles = vec!["AXCell".into(), "AXRow".into(), "AXTable".into()];
+        assert_eq!(cell_verdict(&f), CellVerdict::NotEditing);
+    }
+
+    #[test]
+    fn incomplete_ancestry_and_scans_fail_closed() {
+        // A group whose ancestry was truncated may hide a cell ancestor.
+        let mut f = facts("AXGroup");
+        f.ancestry_complete = false;
+        assert_eq!(cell_verdict(&f), CellVerdict::Unreadable);
+        // An unfinished descendant scan cannot prove NotEditing.
+        let mut f = cell("AXCell", false);
+        f.descendant_scan_complete = false;
+        assert_eq!(cell_verdict(&f), CellVerdict::Unreadable);
+        // A finished scan with no editor is NotEditing.
+        let f = cell("AXCell", false);
         assert_eq!(cell_verdict(&f), CellVerdict::NotEditing);
     }
 }

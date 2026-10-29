@@ -279,6 +279,31 @@ fn with_confirmed_key_focus_or_fallback<T>(
     dispatch()
 }
 
+/// Late CELL recheck inside the delivery context: activation may have
+/// replaced the first responder since the early guard, so the actual focused
+/// element is re-read immediately before the key is posted.
+fn late_cell_refusal(
+    pid: i32,
+    window_id: Option<u32>,
+    printable: bool,
+    element_targeted: bool,
+) -> anyhow::Result<()> {
+    if printable && !element_targeted {
+        // Only an actual non-editing cell is refused here; unreadable state
+        // keeps the existing downstream behavior (the early guard already
+        // failed closed on it).
+        if matches!(
+            unsafe { super::not_editable::classify_untargeted(pid, window_id) },
+            crate::ax::editable::CellVerdict::NotEditing
+        ) {
+            anyhow::bail!(
+                "not_editable: the focused element at delivery is a non-editing cell; no keys                  were sent"
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Whether the resolved key+modifiers is a printable insertion (a single
 /// non-control character with no modifiers, or Shift only). Guard
 /// eligibility is decided here, independent of the keycode/unicode
@@ -691,10 +716,11 @@ impl Tool for PressKeyTool {
                 if printable
                     && !super::not_editable::focused_cell_allows_typing(pid, window_id).await
                 {
-                    return super::not_editable::not_editable_result(
+                    return super::not_editable::not_editable_result_with(
                         "the element focused by the click is not being edited; no keys were sent."
                             .into(),
                         focus_receipt,
+                        fg,
                     );
                 }
                 true
@@ -788,7 +814,10 @@ impl Tool for PressKeyTool {
                                                 Ok(false)
                                             }
                                         },
-                                        || crate::input::keyboard::press_key_bare_global(&key, &m),
+                                        || {
+                                late_cell_refusal(pid, Some(wid), printable, pre_focus_ptr.is_some())?;
+                                crate::input::keyboard::press_key_bare_global(&key, &m)
+                            },
                                     )
                                 },
                             )
@@ -829,7 +858,10 @@ impl Tool for PressKeyTool {
                                 }
                                 Ok(false)
                             },
-                            || crate::input::keyboard::press_key(pid, &key, &m),
+                            || {
+                            late_cell_refusal(pid, window_id, printable, pre_focus_ptr.is_some())?;
+                            crate::input::keyboard::press_key(pid, &key, &m)
+                        },
                         )
                     })
                 })

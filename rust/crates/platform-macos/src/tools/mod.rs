@@ -785,7 +785,7 @@ pub(crate) async fn focus_by_pixel(
     // non-editing cell (or an unclassifiable hit) refuses the whole call, so
     // no focus action or key can reach it (handoff 3.7 point route).
     if guard_editable {
-        if let Some(refusal) = not_editable::guard_point(pid, native_x, native_y).await {
+        if let Some(refusal) = not_editable::guard_point(pid, window_id, native_x, native_y).await {
             return Err(refusal);
         }
     }
@@ -880,6 +880,16 @@ pub(crate) async fn focus_by_pixel(
         .invoke(click_args)
         .await;
     if focus.is_error == Some(true) {
+        // Same accounting as the AX rung: an error does not prove nothing
+        // was sent, so a non-refusal error is an indeterminate mutation.
+        let refused = focus
+            .structured_content
+            .as_ref()
+            .and_then(|v| v["effect"].as_str())
+            == Some("refused");
+        if !refused {
+            return Err(focus_dispatch_unverified(pid, window_id, x, y));
+        }
         return Err(cua_driver_core::protocol::ToolResult::error(format!(
             "focus pixel-click at ({x:.0},{y:.0}) failed."
         )));

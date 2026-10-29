@@ -264,20 +264,21 @@ impl Tool for TypeTextTool {
             _ => (None, BackgroundKeyboardPolicy::Allowed),
         };
 
+        // CELL rule for untargeted typing: a non-editing cell of a
+        // row/outline/table (or an unreadable focused element) refuses the
+        // call before any key.
+        if element_guard.is_none() && px.is_none() {
+            if let Some(refusal) = super::not_editable::guard_untargeted(pid, window_id).await {
+                return refusal;
+            }
+        }
+
         // TOKEN rule: after the gate, attempt focus and refuse a text-role
         // element that shows no editing evidence (handoff 3.7).
         if let (Some((guard, _)), Some(wid)) = (&element_guard, window_id) {
             if let Some(refusal) =
                 super::not_editable::token_not_editable_refusal(pid, guard.as_ptr(), wid).await
             {
-                return refusal;
-            }
-        }
-        // CELL rule for untargeted typing: a non-editing cell of a
-        // row/outline/table (or an unreadable focused element) refuses the
-        // call before any key.
-        if element_guard.is_none() && px.is_none() {
-            if let Some(refusal) = super::not_editable::guard_untargeted(pid, window_id).await {
                 return refusal;
             }
         }
@@ -339,10 +340,11 @@ impl Tool for TypeTextTool {
             // landed on a non-editing cell, no text is sent and the result
             // reports the focus action truthfully.
             if !super::not_editable::focused_cell_allows_typing(pid, window_id).await {
-                return super::not_editable::not_editable_result(
+                return super::not_editable::not_editable_result_with(
                     "the element focused by the click is not being edited; no text was sent."
                         .into(),
                     focus_receipt,
+                    delivery_mode.is_foreground(),
                 );
             }
             // element_index stays None → the type path below writes to the now-
@@ -1508,6 +1510,22 @@ fn type_text_in_key_window(
                 ax_attempt: AxAttempt::NotAttempted,
             });
         }
+    }
+    // Late CELL recheck inside the delivery context: key-window/foreground
+    // activation may have replaced the first responder since the early
+    // guard, so the actual focused element is re-read before any rung types.
+    if element_ptr_and_idx.is_none()
+        && matches!(
+            unsafe { super::not_editable::classify_untargeted(pid, window_id) },
+            crate::ax::editable::CellVerdict::NotEditing
+        )
+    {
+        return Ok(TypeTextDelivery::Refused(BackgroundRefusal {
+            code: "not_editable",
+            reason: "the focused element at delivery is a non-editing cell; no text was sent."
+                .into(),
+            advice: None,
+        }));
     }
     let before = read_axvalue_bound(pid, element_ptr_and_idx, window_id);
 
