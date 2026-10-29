@@ -274,12 +274,30 @@ fn off_space_staleness_note(
 }
 
 fn chromium_browser_window(pid: i32) -> bool {
-    let identity = format!(
-        "{} {}",
-        crate::apps::get_app_name_for_pid(pid).unwrap_or_default(),
-        crate::apps::bundle_id_for_pid(pid).unwrap_or_default()
+    chromium_identity(
+        &app_executable_name(pid).unwrap_or_default(),
+        &crate::apps::bundle_id_for_pid(pid).unwrap_or_default(),
     )
-    .to_ascii_lowercase();
+}
+
+/// The executable name of a running app, read from AppKit without spawning a
+/// process: the name `ps -o comm=` reports for an app launched from its bundle.
+/// A process AppKit does not list falls back to `ps`.
+fn app_executable_name(pid: i32) -> Option<String> {
+    use objc2_app_kit::NSRunningApplication;
+    let from_appkit = unsafe {
+        NSRunningApplication::runningApplicationWithProcessIdentifier(pid)
+            .and_then(|app| app.executableURL())
+            .and_then(|url| url.lastPathComponent())
+            .map(|name| name.to_string())
+    };
+    from_appkit
+        .filter(|name| !name.is_empty())
+        .or_else(|| crate::apps::get_app_name_for_pid(pid))
+}
+
+fn chromium_identity(executable: &str, bundle_id: &str) -> bool {
+    let identity = format!("{executable} {bundle_id}").to_ascii_lowercase();
     identity
         .split(|ch: char| !ch.is_ascii_alphanumeric())
         .any(|token| {
@@ -544,11 +562,6 @@ impl Tool for GetWindowStateTool {
         // Start the screenshot grab before the tree walk so the two overlap:
         // ScreenCaptureKit and the accessibility walk use independent system
         // services, and the read otherwise pays for them one after the other.
-        // Which browser owns the window decides two notes at the end of the
-        // read. Naming the app spawns `ps`, so it is answered on a scoped
-        // thread beside the walk, or beside a capture-only read's capture,
-        // and joined there: no request leaves it running.
-        let mut chromium_answer: Option<bool> = None;
         // A capture-only read has no walk for its capture to overlap, so its
         // background-input facts are gathered beside the capture the same
         // way. A read that walks gathers them after the walk, as before: they
@@ -585,39 +598,32 @@ impl Tool for GetWindowStateTool {
                         window_scope: Some(crate::ax::window_scope::WindowScope::Matched),
                     };
                     let payload = crate::ax::snapshot::AxSnapshot::from_nodes(&tree.nodes);
-                    return (tree, payload, std::collections::HashMap::new(), None);
+                    return (tree, payload, std::collections::HashMap::new());
                 }
-                let (tree, chromium) = std::thread::scope(|scope| {
-                    let chromium = scope.spawn(move || chromium_browser_window(pid));
-                    let tree = crate::ax::tree::with_menus_collapsed(collapse_menus, || {
-                        crate::ax::dense_rows::with_dense_rows_windowed(window_dense_rows, || {
-                            crate::ax::tree::with_exhaustive_nodes(verify_read, || {
-                                crate::ax::tree::walk_tree_budgeted(
-                                    pid,
-                                    Some(window_id),
-                                    q.as_deref(),
-                                    max_depth,
-                                    budget,
-                                )
-                            })
+                let tree = crate::ax::tree::with_menus_collapsed(collapse_menus, || {
+                    crate::ax::dense_rows::with_dense_rows_windowed(window_dense_rows, || {
+                        crate::ax::tree::with_exhaustive_nodes(verify_read, || {
+                            crate::ax::tree::walk_tree_budgeted(
+                                pid,
+                                Some(window_id),
+                                q.as_deref(),
+                                max_depth,
+                                budget,
+                            )
                         })
-                    });
-                    (tree, chromium.join().ok())
+                    })
                 });
                 HUNG_TARGET_BREAKER.record_outcome(target_key, &tree.walk);
                 let payload = crate::ax::snapshot::AxSnapshot::from_nodes(&tree.nodes);
                 let selection = selection_observation_for_nodes(pid, &tree.nodes, shared_deadline);
-                (tree, payload, selection, chromium)
+                (tree, payload, selection)
             });
             // A launching app is waited on for up to `timeout_ms` before the
             // walk's own `timeout_ms` starts (see `ax::launch`).
             let backstop =
                 std::time::Duration::from_millis(timeout_ms) * 2 + AX_WALK_BACKSTOP_GRACE;
             match tokio::time::timeout(backstop, walk_future).await {
-                Ok(Ok((tree, payload, selection, chromium))) => {
-                    chromium_answer = chromium;
-                    (Some(tree), Some(payload), selection)
-                }
+                Ok(Ok((tree, payload, selection))) => (Some(tree), Some(payload), selection),
                 Ok(Err(e)) => return ToolResult::error(format!("AX tree walk failed: {e}")),
                 Err(_elapsed) => {
                     // The walk never returned: an AX call ignored its
@@ -682,15 +688,11 @@ impl Tool for GetWindowStateTool {
             let out_file = screenshot_out_file.clone();
             let panel_args = args.clone();
             let side_facts = !want_tree && !display_only;
-            let side_chromium = !want_tree;
             let res = tokio::task::spawn_blocking(move || {
                 std::thread::scope(|scope| {
-                let side = side_chromium.then(|| {
+                let side = side_facts.then(|| {
                     scope.spawn(move || {
-                        let facts = side_facts.then(|| {
-                            crate::ax::exact_target::gather_background_facts(pid, window_id, None)
-                        });
-                        (facts, chromium_browser_window(pid))
+                        crate::ax::exact_target::gather_background_facts(pid, window_id, None)
                     })
                 });
                 let captured = (move || -> Result<
@@ -769,10 +771,7 @@ impl Tool for GetWindowStateTool {
             }).await;
             let res = match res {
                 Ok((captured, side)) => {
-                    if let Some((facts, chromium)) = side {
-                        prefetched_facts = facts;
-                        chromium_answer = Some(chromium);
-                    }
+                    prefetched_facts = side;
                     Ok(captured)
                 }
                 Err(e) => Err(e),
@@ -1218,7 +1217,7 @@ impl Tool for GetWindowStateTool {
         if on_current_space == Some(false) {
             structured["on_current_space"] = serde_json::json!(false);
         }
-        let chromium = chromium_answer.unwrap_or_else(|| chromium_browser_window(pid));
+        let chromium = chromium_browser_window(pid);
         if let Some(note) = off_space_staleness_note(on_current_space, chromium) {
             structured["off_space_staleness"] = serde_json::json!(note);
             content.push(Content::text(note));
@@ -2482,6 +2481,18 @@ mod tests {
         assert_eq!(entry["enabled"], true);
         assert_eq!(entry["selected"], false);
         assert_eq!(entry["focused"], true);
+    }
+
+    #[test]
+    fn chromium_browsers_are_named_by_executable_or_bundle_id() {
+        assert!(chromium_identity("Google Chrome", "com.google.Chrome"));
+        assert!(chromium_identity("Brave Browser", ""));
+        assert!(chromium_identity("Microsoft Edge", "com.microsoft.edgemac"));
+        assert!(chromium_identity("Arc", "company.thebrowser.Browser"));
+        assert!(!chromium_identity("Calculator", "com.apple.calculator"));
+        assert!(!chromium_identity("Safari", "com.apple.Safari"));
+        // A token inside a longer word does not count.
+        assert!(!chromium_identity("Searchlight", "com.example.archive"));
     }
 
     #[test]

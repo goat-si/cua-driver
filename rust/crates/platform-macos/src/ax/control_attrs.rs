@@ -81,7 +81,8 @@ fn replay_after_batch_failure(
     true
 }
 
-/// The control state and frame of an element that may be indexed.
+/// The control state and frame of an element that may be indexed, or `None`
+/// when a failed batch ran past the walk's deadline (the walk is stopped).
 ///
 /// # Safety
 /// `element` must be a live AX element.
@@ -89,21 +90,22 @@ pub(crate) unsafe fn read_control_attrs(
     element: AXUIElementRef,
     budget: &mut WalkBudget,
     batching_disabled: &mut bool,
-) -> ControlAttrs {
+) -> Option<ControlAttrs> {
     if !*batching_disabled {
         match copy_attrs_batch(element, &CONTROL_ATTRIBUTES) {
-            BatchRead::Slots(slots) => return ControlAttrs::from_slots(&slots),
+            BatchRead::Slots(slots) => return Some(ControlAttrs::from_slots(&slots)),
             BatchRead::Fallback(kind) => {
                 if !replay_after_batch_failure(kind, budget, batching_disabled) {
-                    return ControlAttrs::default();
+                    return None;
                 }
             }
         }
     }
-    ControlAttrs::from_singles(element)
+    Some(ControlAttrs::from_singles(element))
 }
 
-/// The frame of an element, as [`element_screen_rect`] reads it.
+/// The frame of an element, as [`element_screen_rect`] reads it, or `None` when
+/// a failed batch ran past the walk's deadline (the walk is stopped).
 ///
 /// # Safety
 /// `element` must be a live AX element.
@@ -111,14 +113,14 @@ pub(crate) unsafe fn read_frame(
     element: AXUIElementRef,
     budget: &mut WalkBudget,
     batching_disabled: &mut bool,
-) -> Option<[f64; 4]> {
+) -> Option<Option<[f64; 4]>> {
     if !*batching_disabled {
         match copy_attrs_batch(element, &FRAME_ATTRIBUTES) {
             BatchRead::Slots(slots) => {
-                return rect_from_parts(
+                return Some(rect_from_parts(
                     slots.raw(0).and_then(|v| point_from_cf(v)),
                     slots.raw(1).and_then(|v| size_from_cf(v)),
-                )
+                ))
             }
             BatchRead::Fallback(kind) => {
                 if !replay_after_batch_failure(kind, budget, batching_disabled) {
@@ -127,7 +129,7 @@ pub(crate) unsafe fn read_frame(
             }
         }
     }
-    element_screen_rect(element)
+    Some(element_screen_rect(element))
 }
 
 #[cfg(test)]

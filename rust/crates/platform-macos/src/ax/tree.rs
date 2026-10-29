@@ -1133,12 +1133,25 @@ unsafe fn walk_element(
         actions.is_empty() && !value_settable && is_actionless_control_role(&role);
     // A row that may be indexed reads its control state and frame in one
     // batched call; any other row reads only its frame, later.
+    // A batch that failed past the deadline stops the walk: like a content
+    // read that timed out, the row keeps only its role, without an index or
+    // its children.
     let control = if !actions.is_empty() || value_settable || actionless_control {
-        Some(super::control_attrs::read_control_attrs(
-            element,
-            budget,
-            batching_disabled,
-        ))
+        match super::control_attrs::read_control_attrs(element, budget, batching_disabled) {
+            Some(control) => Some(control),
+            None => {
+                push_timed_out_row(
+                    role,
+                    element,
+                    depth,
+                    parent_index,
+                    in_web_content,
+                    nodes,
+                    lines,
+                );
+                return;
+            }
+        }
     } else {
         None
     };
@@ -1187,7 +1200,21 @@ unsafe fn walk_element(
     let element_ptr = element as usize;
     let frame = match &control {
         Some(control) => control.frame,
-        None => super::control_attrs::read_frame(element, budget, batching_disabled),
+        None => match super::control_attrs::read_frame(element, budget, batching_disabled) {
+            Some(frame) => frame,
+            None => {
+                push_timed_out_row(
+                    role,
+                    element,
+                    depth,
+                    parent_index,
+                    in_web_content,
+                    nodes,
+                    lines,
+                );
+                return;
+            }
+        },
     };
     // Structured `elements` only contains actionable nodes. Keep all new AX
     // round-trips behind that same gate so display-only rows pay no cost.
@@ -1494,6 +1521,23 @@ unsafe fn plan_macos_tab_strip(
 }
 
 /// Trimmed text, or `None` when empty.
+/// A row whose attribute read ran past the walk's deadline: its role only,
+/// with no index and no children, as for a content read that timed out.
+fn push_timed_out_row(
+    role: String,
+    element: AXUIElementRef,
+    depth: usize,
+    parent_index: Option<usize>,
+    in_web_content: bool,
+    nodes: &mut Vec<AXNode>,
+    lines: &mut Vec<(usize, String)>,
+) {
+    note_skipped();
+    let node = role_only_node(role, element as usize, depth, parent_index, in_web_content);
+    lines.push((depth, format_node_line(&node)));
+    nodes.push(node);
+}
+
 fn trimmed_label(text: Option<String>) -> Option<String> {
     text.map(|text| text.trim().to_owned())
         .filter(|text| !text.is_empty())
@@ -2014,6 +2058,25 @@ fn leading_indent_depth(line: &str) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_row_that_timed_out_keeps_only_its_role() {
+        let (mut nodes, mut lines) = (Vec::new(), Vec::new());
+        push_timed_out_row(
+            "AXMenuItem".into(),
+            std::ptr::null_mut(),
+            2,
+            Some(4),
+            false,
+            &mut nodes,
+            &mut lines,
+        );
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(nodes[0].element_index, None, "no index with unknown state");
+        assert_eq!(nodes[0].role, "AXMenuItem");
+        assert_eq!(nodes[0].parent_element_index, Some(4));
+        assert_eq!(lines.len(), 1);
+    }
     use std::cell::Cell;
 
     #[test]

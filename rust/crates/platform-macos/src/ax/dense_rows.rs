@@ -183,12 +183,15 @@ pub(crate) unsafe fn plan_collection_children(
     budget: &WalkBudget,
 ) -> Vec<ChildPlan> {
     let dense = DENSE_COLLECTION_ROLES.contains(&role);
-    let rows = if dense {
+    // Every read below asks the app, so each one first checks the deadline;
+    // a child left unclassified is deferred as visible and refused by the
+    // walker, which counts it as pending.
+    let rows = if dense && !budget.expired() {
         ElementSet::copy(element, "AXRows")
     } else {
         None
     };
-    let visible = if dense {
+    let visible = if dense && !budget.expired() {
         ElementSet::copy(element, "AXVisibleRows")
             .or_else(|| ElementSet::copy(element, "AXVisibleChildren"))
     } else {
@@ -200,11 +203,15 @@ pub(crate) unsafe fn plan_collection_children(
     let is_visible = |i: usize| match &visible {
         Some(set) => set.contains(children[i]),
         None => {
+            if budget.expired() {
+                return true;
+            }
             set_messaging_timeout(children[i]);
-            rect_visible(
-                element_screen_rect(children[i]),
-                *clip.get_or_init(|| visible_clip()),
-            )
+            let rect = element_screen_rect(children[i]);
+            if budget.expired() {
+                return true;
+            }
+            rect_visible(rect, *clip.get_or_init(|| visible_clip()))
         }
     };
     plan_children(
