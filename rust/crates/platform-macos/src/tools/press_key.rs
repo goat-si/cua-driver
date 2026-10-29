@@ -602,7 +602,7 @@ impl Tool for PressKeyTool {
                         "effect": "unverifiable"
                     })),
                 Ok(Err(error)) => super::not_editable::account_focus_receipt(
-                    ToolResult::error(format!("desktop press_key failed: {error}")),
+                    task_failure(format!("desktop press_key failed: {error}")),
                     None,
                 ),
                 Err(error) => super::not_editable::account_focus_receipt(
@@ -1278,10 +1278,6 @@ async fn minimized_key_route(
                 "press_key: the minimized-window task failed ({error}); a key may have been sent \
                  and the window may be left restored. Read the window before repeating it."
             ))
-            .with_structured(serde_json::json!({
-                "effect": "unverifiable",
-                "code": "ax_action_unverified",
-            }))
         }
     };
     minimized_key_result(step, pid, &display_key)
@@ -1402,7 +1398,7 @@ fn minimized_key_result(step: MinimizedKeyStep, pid: i32, display_key: &str) -> 
             }
             result
         }
-        None => ToolResult::error(format!("press_key: no key was sent.{notes}")),
+        None => task_failure(format!("press_key: no key was sent.{notes}")),
     }
 }
 
@@ -1423,6 +1419,16 @@ fn append_to_summary(result: &mut ToolResult, extra: &str) {
     result
         .content
         .push(cua_driver_core::protocol::Content::text(extra.to_owned()));
+}
+
+/// A task failure after which input may have gone out: unverifiable, with
+/// its whole text structured (error results get no summary).
+fn task_failure(message: String) -> ToolResult {
+    ToolResult::error(message.clone()).with_structured(serde_json::json!({
+        "effect": "unverifiable",
+        "code": "ax_action_unverified",
+        "message": message,
+    }))
 }
 
 // ── Window-only native menu chord (key scope + own menu dispatch) ───────────
@@ -1778,10 +1784,6 @@ async fn native_menu_chord(
                     "press_key: the menu task failed ({error}); it may have run. Read the window \
                      before repeating it."
                 ))
-                .with_structured(serde_json::json!({
-                    "effect": "unverifiable",
-                    "code": "ax_action_unverified",
-                }))
             }
         };
         match step {
@@ -1798,7 +1800,7 @@ async fn native_menu_chord(
                     .await;
                     return match step {
                         Ok(step) => chord_result(step),
-                        Err(error) => ToolResult::error(format!("press_key: {error}")),
+                        Err(error) => task_failure(format!("press_key: {error}")),
                     };
                 }
                 let result = super::invoke_menu::run_in_background_with_lease(
@@ -1820,10 +1822,6 @@ async fn native_menu_chord(
             "press_key: the menu task failed ({error}); it may have run. Read the window before \
              repeating it."
         ))
-        .with_structured(serde_json::json!({
-            "effect": "unverifiable",
-            "code": "ax_action_unverified",
-        }))
     })
 }
 

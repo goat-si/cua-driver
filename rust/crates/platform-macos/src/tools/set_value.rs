@@ -394,7 +394,7 @@ async fn minimized_set_value(
         let (restore, begun) = match begun {
             Ok(pair) => pair,
             Err(error) => {
-                return ToolResult::error(format!(
+                return restore_task_failure(format!(
                     "set_value: restoring the minimized window failed ({error}); it may be left \
                      restored. Nothing was written."
                 ))
@@ -484,7 +484,7 @@ async fn minimized_set_value(
                 );
             }
             Err(error) => {
-                return ToolResult::error(format!(
+                return restore_task_failure(format!(
                     "set_value: re-checking the restored window failed ({error}); it may be left \
                      restored. Nothing was written."
                 ))
@@ -602,7 +602,7 @@ async fn minimized_set_value(
         let (restore, result, disclosure) = match written {
             Ok(pair) => pair,
             Err(error) => {
-                return ToolResult::error(format!(
+                return restore_task_failure(format!(
                     "set_value: the write task failed ({error}); it may have written, and the \
                      window may be left restored. Read the field before repeating it."
                 ))
@@ -618,11 +618,21 @@ async fn minimized_set_value(
         attach_restore_cleanup(result, report, &disclosure)
     });
     task.await.unwrap_or_else(|error| {
-        ToolResult::error(format!(
+        restore_task_failure(format!(
             "set_value: the minimized-window task failed ({error}); it may have written, and the \
              window may be left restored. Read the field before repeating it."
         ))
     })
+}
+
+/// A restored-window task that failed: the window may be left restored and
+/// the write may have happened; the whole text is structured too.
+fn restore_task_failure(message: String) -> ToolResult {
+    ToolResult::error(message.clone()).with_structured(serde_json::json!({
+        "effect": "unverifiable",
+        "restore_cleanup": "unknown",
+        "message": message,
+    }))
 }
 
 /// Every result of a temporary restore says what became of the window: in
