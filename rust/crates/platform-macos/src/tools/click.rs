@@ -2854,13 +2854,17 @@ fn perform_ax_click(
             }
         }
 
+        // The input clock starts before the selection baseline (the selected
+        // peers included) is read.
+        let selection_idle_before = super::physical_input_idle_ms();
+        let selection_input_from = std::time::Instant::now();
         if let (Some(target), Some(selection)) = (
             selection_pixel,
             crate::input::ax_actions::capture_nearest_container_selection(element_ptr),
         ) {
             let selected_role = selection.role().to_owned();
-            let idle_before = super::physical_input_idle_ms();
-            let input_from = std::time::Instant::now();
+            let idle_before = selection_idle_before;
+            let input_from = selection_input_from;
             let Some((before, _)) = selection.observe() else {
                 anyhow::bail!("selection target stopped exposing AXSelected before delivery");
             };

@@ -492,22 +492,45 @@ async fn minimized_set_value(
             }
         };
         let element_ptr = element_guard.as_ptr();
-        // The TOKEN rule may write AXFocused: re-read the front app right
-        // before it (not_editable.rs, which runs it, is outside this change).
-        let token_refusal =
+        // Focus the field here, with the front app read in the same step
+        // right before the write, so the TOKEN rule below finds it focused
+        // and writes no focus of its own.
+        let focus_guard = element_guard.clone();
+        let focused = latency::spawn_action_blocking(move || {
             if crate::input::skylight::front_process_matches(pid as libc::pid_t, window_id)
-                == Some(false)
+                != Some(false)
             {
+                return Err(());
+            }
+            let _ = crate::input::ax_actions::focus_element(focus_guard.as_ptr());
+            Ok(unsafe {
+                crate::ax::bindings::copy_bool_attr(
+                    focus_guard.as_ptr() as AXUIElementRef,
+                    "AXFocused",
+                )
+            } == Some(true))
+        })
+        .await
+        .unwrap_or(Ok(false));
+        let token_refusal = match focused {
+            Ok(true) => {
                 super::not_editable::token_not_editable_refusal(pid, element_ptr, window_id).await
-            } else {
-                Some(super::pre_dispatch_refusal(
-                    cua_driver_core::background_input::refusal_codes::MINIMIZED_OR_HIDDEN,
-                    format!(
+            }
+            Ok(false) => Some(super::pre_dispatch_refusal(
+                "not_editable",
+                format!(
+                    "the field in restored window {window_id} did not read back as focused after \
+                     the focus attempt; AXValue was not written."
+                ),
+            )),
+            Err(()) => Some(super::pre_dispatch_refusal(
+                cua_driver_core::background_input::refusal_codes::MINIMIZED_OR_HIDDEN,
+                format!(
                     "window {window_id} was restored, but its app came to the front or which app \
                      is in front could not be read; AXValue was not written."
                 ),
-                ))
-            };
+            )),
+        };
         if let Some(refusal) = token_refusal {
             let entry = scope.entry();
             let hand_back = latency::spawn_action_blocking(move || scope.finish())
