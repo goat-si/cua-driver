@@ -356,6 +356,16 @@ impl ClickEvidence {
     }
 }
 
+/// A click task that failed after the action may have run: never a plain
+/// error the caller retries blindly.
+fn click_task_failure(message: String) -> ToolResult {
+    ToolResult::error(message.clone()).with_structured(serde_json::json!({
+        "effect": "unverifiable",
+        "code": "ax_action_unverified",
+        "message": message,
+    }))
+}
+
 /// The typed record for a click that was delivered and shows no readable
 /// change.
 fn unverifiable_click_record(
@@ -1677,7 +1687,10 @@ impl ClickTool {
                         ToolResult::error(format!("AX action failed: {e}"))
                     }
                 }
-                Err(e) => ToolResult::error(format!("Task error: {e}")),
+                Err(e) => click_task_failure(format!(
+                    "The accessibility click task failed ({e}); the action may have run. Read \
+                     fresh state before clicking again."
+                )),
             }
         } else if let (Some(mut cx), Some(mut cy)) = (x, y) {
             // ── Pixel path ─────────────────────────────────────────────────
@@ -2455,7 +2468,10 @@ impl ClickTool {
                     )
                 }
                 Ok(Err(e)) => ToolResult::error(format!("{button_label} failed: {e}")),
-                Err(e) => ToolResult::error(format!("Task error: {e}")),
+                Err(e) => click_task_failure(format!(
+                    "The {button_label} task failed ({e}); the click may have been posted. Read \
+                     fresh state before clicking again."
+                )),
             }
         } else {
             super::invalid_arguments("Provide either element_token or (x + y). pid is required for x,y clicks; an element_token carries its own pid.")
@@ -3011,6 +3027,16 @@ fn perform_ax_click(
                 foreground,
             )?;
         } else {
+            // The person may have activated the app since the scope was
+            // entered: read the front app right before the focus write.
+            if text_key_scope
+                && crate::input::skylight::front_process_matches(pid as libc::pid_t, window_id)
+                    != Some(false)
+            {
+                anyhow::bail!(
+                    "text input [{idx}]: its app came to the front, or which app is in front could not be read; AXFocused was not written and AXPress was not sent"
+                );
+            }
             crate::input::ax_actions::focus_element(element_ptr)?;
         }
         let focused = unsafe { copy_bool_attr(element, "AXFocused") } == Some(true)

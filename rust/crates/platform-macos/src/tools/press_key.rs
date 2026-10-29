@@ -602,7 +602,7 @@ impl Tool for PressKeyTool {
                         "effect": "unverifiable"
                     })),
                 Ok(Err(error)) => super::not_editable::account_focus_receipt(
-                    task_failure(format!("desktop press_key failed: {error}")),
+                    ToolResult::error(format!("desktop press_key failed: {error}")),
                     None,
                 ),
                 Err(error) => super::not_editable::account_focus_receipt(
@@ -1274,7 +1274,7 @@ async fn minimized_key_route(
     let step = match step {
         Ok(Ok(step)) => step,
         Ok(Err(error)) | Err(error) => {
-            return ToolResult::error(format!(
+            return task_failure(format!(
                 "press_key: the minimized-window task failed ({error}); a key may have been sent \
                  and the window may be left restored. Read the window before repeating it."
             ))
@@ -1398,7 +1398,7 @@ fn minimized_key_result(step: MinimizedKeyStep, pid: i32, display_key: &str) -> 
             }
             result
         }
-        None => task_failure(format!("press_key: no key was sent.{notes}")),
+        None => ToolResult::error(format!("press_key: no key was sent.{notes}")),
     }
 }
 
@@ -1421,6 +1421,8 @@ fn append_to_summary(result: &mut ToolResult, extra: &str) {
         .push(cua_driver_core::protocol::Content::text(extra.to_owned()));
 }
 
+// ── Window-only native menu chord (key scope + own menu dispatch) ───────────
+
 /// A task failure after which input may have gone out: unverifiable, with
 /// its whole text structured (error results get no summary).
 fn task_failure(message: String) -> ToolResult {
@@ -1430,8 +1432,6 @@ fn task_failure(message: String) -> ToolResult {
         "message": message,
     }))
 }
-
-// ── Window-only native menu chord (key scope + own menu dispatch) ───────────
 
 /// Run `work`, which owns the per-process mutation lease, in its own task.
 /// Dropping the caller's future does not abort it (a `JoinHandle` drop
@@ -1752,6 +1752,9 @@ fn chord_result(step: ChordStep) -> ToolResult {
                 "effect": "refused",
                 "dispatched": false,
                 "keys_sent": validation.key_attempts > 0,
+                // Error results get no summary: the validation and key
+                // focus disclosure travels in the structured message.
+                "message": text.clone(),
             });
             if validation.called {
                 structured["dispatch"] = serde_json::json!("validation_posted");
@@ -1780,7 +1783,7 @@ async fn native_menu_chord(
         let step = match latency::spawn_action_blocking(move || chord_in_scope(pid, wid, combo)).await {
             Ok(step) => step,
             Err(error) => {
-                return ToolResult::error(format!(
+                return task_failure(format!(
                     "press_key: the menu task failed ({error}); it may have run. Read the window \
                      before repeating it."
                 ))
@@ -1800,9 +1803,14 @@ async fn native_menu_chord(
                     .await;
                     return match step {
                         Ok(step) => chord_result(step),
-                        Err(error) => task_failure(format!("press_key: {error}")),
+                        Err(error) => task_failure(format!(
+                            "press_key: the key hand-back task failed ({error}); no menu action \
+                             was sent, and key focus inside the app may remain on the target \
+                             window."
+                        )),
                     };
                 }
+                let entry = scope.entry();
                 let result = super::invoke_menu::run_in_background_with_lease(
                     &lease,
                     wid,
@@ -1810,15 +1818,25 @@ async fn native_menu_chord(
                     super::invoke_menu::MenuRequest::KeyEquivalent(display_key),
                 )
                 .await;
-                let _ = latency::spawn_action_blocking(move || scope.finish()).await;
-                super::hotkey::menu_refusal_without_keys(result)
+                let hand_back = latency::spawn_action_blocking(move || scope.finish())
+                    .await
+                    .unwrap_or(crate::input::skylight::HandBack::NotConfirmed);
+                let mut result = super::hotkey::menu_refusal_without_keys(result);
+                let disclosure = crate::input::skylight::scope_disclosure(entry, Some(hand_back));
+                append_to_summary(&mut result, &disclosure);
+                if let Some(serde_json::Value::Object(fields)) = result.structured_content.as_mut() {
+                    if !disclosure.is_empty() {
+                        fields.insert("hand_back_note".into(), serde_json::json!(disclosure));
+                    }
+                }
+                result
             }
             step => chord_result(step),
         }
     })
     .await;
     outcome.unwrap_or_else(|error| {
-        ToolResult::error(format!(
+        task_failure(format!(
             "press_key: the menu task failed ({error}); it may have run. Read the window before \
              repeating it."
         ))
