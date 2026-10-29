@@ -582,6 +582,13 @@ enum BackgroundPressError {
         focused: Option<u32>,
         main: Option<u32>,
     },
+    /// The window could not be held as the app's key window (Direct).
+    KeyNotHeld(String),
+    /// Right before the dispatch the app came to the front, or which app is
+    /// in front could not be read.
+    FrontChanged,
+    /// The item's enablement could not be read; it was not dispatched.
+    EnablementUnknown(String),
 }
 
 /// What the background route knows about the pressed item.
@@ -598,13 +605,8 @@ unsafe fn item_is_save(item: AXUIElementRef) -> bool {
             == 0.0
 }
 
-/// How long a disabled item gets to enable after its window becomes key, and
-/// how often it is re-read.
-const ENABLE_WAIT: Duration = Duration::from_millis(600);
-const ENABLE_POLL: Duration = Duration::from_millis(40);
-
-/// The item-404 AppKit validation trigger gets a separate short budget. The
-/// constants above also govern the slower initial window-key wait.
+/// The item-404 AppKit validation trigger: how long a validated item gets to
+/// read enabled, and how often it is re-read.
 const MENU_VALIDATION_WAIT: Duration = Duration::from_millis(40);
 const MENU_VALIDATION_POLL: Duration = Duration::from_millis(10);
 
@@ -711,27 +713,169 @@ unsafe fn require_live_menu_window(
     require_menu_window(requested, read("AXFocusedWindow"), read("AXMainWindow"))
 }
 
-/// Make the requested window the app's key window from the background (the
-/// focus record only, as a background press does: the app is not activated
-/// or raised and the user's window keeps key), then require the exact
-/// focused and main window read-back before any menu is resolved.
-unsafe fn make_menu_window_key(
-    app: AXUIElementRef,
+/// Who holds the requested window as its app's key window while a
+/// background menu route runs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum KeyOwner {
+    /// invoke_menu itself: the route holds the window as key (no
+    /// activation, no raise) from before the menu is read until after its
+    /// command, then hands key back.
+    Direct,
+    /// hotkey / press_key already hold their own key state; the route never
+    /// moves key focus and refuses when the window is not the menu context.
+    Caller,
+}
+
+/// The live reads and the key hold of the background menu route. Tests
+/// drive the decisions below with fakes; nothing here can activate the app,
+/// raise a window or change which app is in front.
+trait MenuKeyOps {
+    type Scope;
+    /// The app's focused and main windows are the requested window.
+    fn bound(&mut self) -> Result<(), BackgroundPressError>;
+    /// Hold the requested window as the app's key window inside the app
+    /// only, while another app stays in front.
+    fn hold_key(&mut self) -> Result<Self::Scope, crate::input::skylight::ScopeEntryError>;
+    /// WindowServer reports another app in front: `Some(true)`.
+    fn front_is_other_app(&mut self) -> Option<bool>;
+}
+
+/// Why the route could not hold the requested window as the menu context.
+enum HoldFailure<S> {
+    /// The key hold could not be entered (what entering did is kept).
+    Entry(crate::input::skylight::ScopeEntryError),
+    /// The window is not the menu context; a held scope comes back so its
+    /// hand-back runs and is reported.
+    Unbound(BackgroundPressError, Option<S>),
+}
+
+/// Hold the requested window for `owner`: Direct enters exactly one key
+/// scope (a window that already is key enters without posting anything);
+/// Caller never moves key focus.
+fn hold_menu_window<O: MenuKeyOps>(
+    owner: KeyOwner,
+    ops: &mut O,
+) -> Result<Option<O::Scope>, HoldFailure<O::Scope>> {
+    let scope = match owner {
+        KeyOwner::Direct => Some(ops.hold_key().map_err(HoldFailure::Entry)?),
+        KeyOwner::Caller => None,
+    };
+    match ops.bound() {
+        Ok(()) => Ok(scope),
+        Err(error) => Err(HoldFailure::Unbound(error, scope)),
+    }
+}
+
+/// The checks immediately before the route's one dispatch (an AX press or
+/// the scripted Save): the window is still the menu context and another app
+/// is still in front. Unknown front is a refusal.
+fn gate_before_dispatch<O: MenuKeyOps>(ops: &mut O) -> Result<(), BackgroundPressError> {
+    ops.bound()?;
+    if ops.front_is_other_app() == Some(true) {
+        Ok(())
+    } else {
+        Err(BackgroundPressError::FrontChanged)
+    }
+}
+
+struct LiveMenuKey {
     pid: i32,
     window_id: u32,
-) -> Result<(), BackgroundPressError> {
-    if crate::input::skylight::activate_without_raise_with(pid, window_id, false) {
-        crate::input::skylight::note_primed_key(pid, window_id);
-        let mut waited = Duration::ZERO;
-        while waited < ENABLE_WAIT {
-            std::thread::sleep(ENABLE_POLL);
-            waited += ENABLE_POLL;
-            if require_live_menu_window(app, window_id).is_ok() {
-                return Ok(());
+}
+
+impl MenuKeyOps for LiveMenuKey {
+    type Scope = crate::input::skylight::WindowKeyScope;
+
+    fn bound(&mut self) -> Result<(), BackgroundPressError> {
+        unsafe {
+            let app = AXUIElementCreateApplication(self.pid);
+            if app.is_null() {
+                return Err(BackgroundPressError::Other(
+                    "invoke_menu: target application is unavailable".into(),
+                ));
             }
+            set_messaging_timeout(app);
+            let bound = require_live_menu_window(app, self.window_id);
+            CFRelease(app as CFTypeRef);
+            bound
         }
     }
-    require_live_menu_window(app, window_id)
+
+    fn hold_key(&mut self) -> Result<Self::Scope, crate::input::skylight::ScopeEntryError> {
+        crate::input::skylight::enter_exact_window_key_inline_detailed(
+            self.pid as libc::pid_t,
+            self.window_id,
+        )
+    }
+
+    fn front_is_other_app(&mut self) -> Option<bool> {
+        front_is_other_app(self.pid, self.window_id)
+    }
+}
+
+fn front_is_other_app(pid: i32, window_id: u32) -> Option<bool> {
+    crate::input::skylight::front_process_matches(pid as libc::pid_t, window_id).map(|same| !same)
+}
+
+/// A Direct route's enablement: an item that does not read enabled gets one
+/// guarded validation (its window is held as key), then must read enabled.
+/// `Err` carries the last read: `Some(false)` disabled, `None` unreadable.
+fn held_window_enablement(
+    initial: Option<bool>,
+    validate: impl FnOnce(),
+    mut enabled: impl FnMut() -> Option<bool>,
+    mut sleep: impl FnMut(Duration),
+) -> Result<(), Option<bool>> {
+    if initial == Some(true) {
+        return Ok(());
+    }
+    validate();
+    let mut waited = Duration::ZERO;
+    let mut current = enabled();
+    while current != Some(true) && waited < MENU_VALIDATION_WAIT {
+        sleep(MENU_VALIDATION_POLL);
+        waited += MENU_VALIDATION_POLL;
+        current = enabled();
+    }
+    if current == Some(true) {
+        Ok(())
+    } else {
+        Err(current)
+    }
+}
+
+/// The error for a Direct item that did not read enabled after validation:
+/// a refusal that sent nothing when validation posted nothing, otherwise a
+/// validation receipt (never the scripted Save fallback, never "nothing sent").
+fn held_window_enablement_error(
+    last: Option<bool>,
+    validation: crate::input::skylight::ValidationPost,
+    segment: usize,
+    is_save: bool,
+) -> BackgroundPressError {
+    use crate::input::skylight::ValidationDelivery;
+    let message = match last {
+        Some(false) => format!(
+            "invoke_menu: path segment {segment} reads disabled for this window after menu validation"
+        ),
+        _ => format!(
+            "invoke_menu: path segment {segment}'s enablement could not be read after menu validation"
+        ),
+    };
+    match validation.delivery() {
+        ValidationDelivery::NoneSent if last == Some(false) => {
+            BackgroundPressError::Disabled { message, is_save }
+        }
+        ValidationDelivery::NoneSent => BackgroundPressError::EnablementUnknown(message),
+        ValidationDelivery::Sent => BackgroundPressError::ValidationFailed {
+            message,
+            dispatch: Dispatch::Sent,
+        },
+        ValidationDelivery::Possible => BackgroundPressError::ValidationFailed {
+            message,
+            dispatch: Dispatch::Possible,
+        },
+    }
 }
 
 fn unbound_menu_window(
@@ -764,14 +908,56 @@ const UNBOUND_MENU_HINT: &str = "The app runs its menu commands against its key 
     element_token from get_window_state (its close button, a toolbar button). If the user allows \
     taking the screen, call bring_to_front for this window first, then invoke_menu.";
 
+/// What one background press did: its result, what menu validation posted,
+/// the key hold still to hand back, and a failed hold's side effects.
+struct PressRoute {
+    result: Result<PressedItem, BackgroundPressError>,
+    validation: Option<crate::input::skylight::ValidationPost>,
+    scope: Option<crate::input::skylight::WindowKeyScope>,
+    entry_error: Option<crate::input::skylight::ScopeEntryError>,
+}
+
 /// Resolve the whole path from the app's live menu bar without opening any
 /// level, then perform the final item's action. Used for a background app:
 /// opening a menu-bar menu would take key focus and draw over the user's
-/// front app.
+/// front app. A Direct route holds the window as key first.
 unsafe fn invoke_path_in_background(
     pid: i32,
     window_id: u32,
     path: &[String],
+    owner: KeyOwner,
+) -> PressRoute {
+    let mut ops = LiveMenuKey { pid, window_id };
+    let mut route = PressRoute {
+        result: Err(BackgroundPressError::Other(String::new())),
+        validation: None,
+        scope: None,
+        entry_error: None,
+    };
+    match hold_menu_window(owner, &mut ops) {
+        Ok(scope) => route.scope = scope,
+        Err(HoldFailure::Entry(error)) => {
+            route.result = Err(BackgroundPressError::KeyNotHeld(error.reason.clone()));
+            route.entry_error = Some(error);
+            return route;
+        }
+        Err(HoldFailure::Unbound(error, scope)) => {
+            route.scope = scope;
+            route.result = Err(error);
+            return route;
+        }
+    }
+    route.result = press_bound_path(pid, window_id, path, owner, &mut ops, &mut route.validation);
+    route
+}
+
+unsafe fn press_bound_path(
+    pid: i32,
+    window_id: u32,
+    path: &[String],
+    owner: KeyOwner,
+    ops: &mut LiveMenuKey,
+    validation_post: &mut Option<crate::input::skylight::ValidationPost>,
 ) -> Result<PressedItem, BackgroundPressError> {
     let app = AXUIElementCreateApplication(pid);
     if app.is_null() {
@@ -780,12 +966,6 @@ unsafe fn invoke_path_in_background(
         ));
     }
     set_messaging_timeout(app);
-    if let Err(error) = require_live_menu_window(app, window_id)
-        .or_else(|_| make_menu_window_key(app, pid, window_id))
-    {
-        CFRelease(app as CFTypeRef);
-        return Err(error);
-    }
     let menu_bar = copy_element_attr(app, "AXMenuBar");
     CFRelease(app as CFTypeRef);
     let menu_bar = menu_bar.ok_or_else(|| {
@@ -798,6 +978,39 @@ unsafe fn invoke_path_in_background(
     set_messaging_timeout(target);
     let is_save = item_is_save(target);
     let result = (|| {
+        let segment = path.len().saturating_sub(1);
+        if owner == KeyOwner::Direct {
+            // The window is held as key: validate only under that hold, each
+            // post only while another app is in front.
+            let initial = copy_bool_attr(target, "AXEnabled");
+            if let Err(last) = held_window_enablement(
+                initial,
+                || {
+                    *validation_post = Some(crate::input::skylight::prime_menu_validation_guarded(
+                        pid as libc::pid_t,
+                        window_id,
+                        || front_is_other_app(pid, window_id) == Some(true),
+                    ));
+                },
+                || copy_bool_attr(target, "AXEnabled"),
+                std::thread::sleep,
+            ) {
+                return Err(held_window_enablement_error(
+                    last,
+                    validation_post.unwrap_or_default(),
+                    segment,
+                    is_save,
+                ));
+            }
+            let actions = copy_action_names(target);
+            let action = choose_action(&actions, true).ok_or_else(|| {
+                BackgroundPressError::Other(
+                    "invoke_menu: the final menu item has no usable native menu action".to_owned(),
+                )
+            })?;
+            gate_before_dispatch(ops)?;
+            return dispatch_final_item(|| perform_action(target, action), is_save);
+        }
         // Preserve the initial state through validation so a later race back
         // to disabled cannot enter the legacy Save fallback or produce a
         // nothing-sent receipt after Cmd+F20 was posted.
@@ -834,17 +1047,9 @@ unsafe fn invoke_path_in_background(
             )
         })?;
         // Revalidate after path resolution, immediately before the only
-        // dispatch. Never fix a mismatch by silently switching documents.
-        let app = AXUIElementCreateApplication(pid);
-        if app.is_null() {
-            return Err(BackgroundPressError::Other(
-                "invoke_menu: target application is unavailable before dispatch".into(),
-            ));
-        }
-        set_messaging_timeout(app);
-        let bound = require_live_menu_window(app, window_id);
-        CFRelease(app as CFTypeRef);
-        bound?;
+        // dispatch, and require another app still in front. Never fix a
+        // mismatch by silently switching documents.
+        gate_before_dispatch(ops)?;
         dispatch_final_item(|| perform_action(target, action), is_save)
     })();
     CFRelease(target as CFTypeRef);
@@ -905,9 +1110,31 @@ pub(super) async fn run_in_background(
     window_id: u32,
     path: Vec<String>,
     request: MenuRequest,
+    owner: KeyOwner,
 ) -> ToolResult {
-    let mutation = super::acquire_background_mutation(pid).await;
-    run_in_background_with_lease(&mutation, window_id, path, request).await
+    if owner == KeyOwner::Caller {
+        let mutation = super::acquire_background_mutation(pid).await;
+        return run_in_background_with_lease(&mutation, window_id, path, request, owner).await;
+    }
+    // One task owns the lease and the key hold from before the menu is read
+    // until key is handed back, so a caller that stops waiting cannot cut
+    // the route short or release the lease before the hand-back.
+    let shown = path.clone();
+    let preface = request.preface(&path);
+    tokio::spawn(async move {
+        let mutation = super::acquire_background_mutation(pid).await;
+        run_in_background_with_lease(&mutation, window_id, path, request, KeyOwner::Direct).await
+    })
+    .await
+    .unwrap_or_else(|error| {
+        uncertain_dispatch(
+            &preface,
+            &shown,
+            &format!("the background menu task ended without a result ({error})"),
+            Dispatch::Possible,
+            ActionTransport::MacosAxAction,
+        )
+    })
 }
 
 /// run_in_background for a caller that already holds the app's per-PID
@@ -917,6 +1144,7 @@ pub(super) async fn run_in_background_with_lease(
     window_id: u32,
     path: Vec<String>,
     request: MenuRequest,
+    owner: KeyOwner,
 ) -> ToolResult {
     let pid = lease.pid();
     let document = latency::spawn_action_blocking(move || document_path_of_window(pid, window_id))
@@ -930,11 +1158,20 @@ pub(super) async fn run_in_background_with_lease(
     let outcome = latency::spawn_blocking(move || {
         let _key_focus = crate::key_focus_guard::protect(pid);
         let _action = latency::span(latency::Stage::ActionBlocking);
-        unsafe { invoke_path_in_background(pid, window_id, &press_path) }
+        unsafe { invoke_path_in_background(pid, window_id, &press_path, owner) }
     })
     .await;
+    let (outcome, validation, scope, entry_error) = match outcome {
+        Ok(route) => (
+            Ok(route.result),
+            route.validation,
+            route.scope,
+            route.entry_error,
+        ),
+        Err(error) => (Err(error), None, None, None),
+    };
     let preface = request.preface(&path);
-    match outcome {
+    let mut result = match outcome {
         Ok(Ok(PressedItem { is_save: true })) if document.is_some() => {
             let file = document.clone().expect("checked");
             let written = latency::spawn_action_blocking(move || {
@@ -981,6 +1218,21 @@ pub(super) async fn run_in_background_with_lease(
             ActionTransport::MacosAxAction,
             "Every menu hop resolved uniquely without opening it and AX accepted the final action",
         ),
+        Ok(Err(BackgroundPressError::Disabled {
+            is_save: true,
+            message,
+        })) if document.is_some()
+            && latency::spawn_action_blocking(move || front_is_other_app(pid, window_id))
+                .await
+                .ok()
+                .flatten()
+                != Some(true) =>
+        {
+            // The scripted Save is a dispatch too: not while the app may be
+            // the person's front app.
+            let _ = message;
+            front_changed_refusal(pid, window_id)
+        }
         Ok(Err(BackgroundPressError::Disabled {
             is_save: true,
             message,
@@ -1057,6 +1309,130 @@ pub(super) async fn run_in_background_with_lease(
             Dispatch::Possible,
             ActionTransport::MacosAxAction,
         ),
+        Ok(Err(BackgroundPressError::KeyNotHeld(reason))) => {
+            let mut refused = super::background_refusal_result(
+                pid,
+                window_id,
+                &cua_driver_core::background_input::BackgroundRefusal {
+                    code: super::WINDOW_NOT_KEY,
+                    reason: format!(
+                        "invoke_menu: window {window_id} could not be held as the app's key \
+                         window ({reason}); no menu action was dispatched"
+                    ),
+                    advice: Some("foreground"),
+                },
+            );
+            if let Some(structured) = refused.structured_content.as_mut() {
+                structured["hint"] = serde_json::Value::String(UNBOUND_MENU_HINT.to_owned());
+            }
+            refused
+        }
+        Ok(Err(BackgroundPressError::FrontChanged)) => front_changed_refusal(pid, window_id),
+        Ok(Err(BackgroundPressError::EnablementUnknown(message))) => {
+            let message = format!("{preface}{message}. The menu action was not dispatched.");
+            ToolResult::error(message.clone()).with_structured(serde_json::json!({
+                "status": "refused",
+                "code": "background_unavailable",
+                "effect": "refused",
+                "dispatched": false,
+                "refusal": { "code": "background_unavailable", "message": message }
+            }))
+        }
+    };
+    // Hand key back (Direct) before the caller releases the lease, then say
+    // what validation and the key hold posted on every exit.
+    let hand_back_note = match scope {
+        Some(scope) => {
+            let entry = scope.entry();
+            let hand_back = latency::spawn_action_blocking(move || scope.finish())
+                .await
+                .unwrap_or(crate::input::skylight::HandBack::NotConfirmed);
+            crate::input::skylight::scope_disclosure(entry, Some(hand_back))
+        }
+        None => String::new(),
+    };
+    annotate_route(
+        &mut result,
+        validation,
+        &hand_back_note,
+        entry_error.as_ref(),
+    );
+    result
+}
+
+fn front_changed_refusal(pid: i32, window_id: u32) -> ToolResult {
+    super::background_refusal_result(
+        pid,
+        window_id,
+        &cua_driver_core::background_input::BackgroundRefusal {
+            code: super::WINDOW_NOT_KEY,
+            reason: "invoke_menu: right before the press the app came to the front, or which app \
+                     is in front could not be read; no menu action was dispatched"
+                .to_owned(),
+            advice: Some("foreground"),
+        },
+    )
+}
+
+/// Add what the route posted besides its menu action: menu validation's
+/// records and Cmd+F20 pair, the key hold's records and its hand-back, a
+/// failed hold's side effects. Never turns a posted input into "nothing sent".
+fn annotate_route(
+    result: &mut ToolResult,
+    validation: Option<crate::input::skylight::ValidationPost>,
+    hand_back_note: &str,
+    entry_error: Option<&crate::input::skylight::ScopeEntryError>,
+) {
+    let posted = validation.filter(|post| post.called);
+    let notes: Vec<String> = [
+        posted.map(|post| post.disclosure()).unwrap_or_default(),
+        hand_back_note.to_owned(),
+    ]
+    .into_iter()
+    .filter(|note| !note.is_empty())
+    .collect();
+    super::press_key::append_to_summary(result, &notes.join(" "));
+    if posted.is_none() && hand_back_note.is_empty() && entry_error.is_none() {
+        return;
+    }
+    let structured = result
+        .structured_content
+        .get_or_insert_with(|| serde_json::json!({}));
+    let Value::Object(fields) = structured else {
+        return;
+    };
+    if let Some(post) = posted {
+        fields
+            .entry("dispatch")
+            .or_insert(serde_json::json!("validation_posted"));
+        fields.insert("keys_sent".into(), serde_json::json!(post.key_attempts > 0));
+        fields.insert(
+            "validation_note".into(),
+            serde_json::json!(post.disclosure()),
+        );
+    }
+    if !hand_back_note.is_empty() {
+        fields.insert("hand_back_note".into(), serde_json::json!(hand_back_note));
+    }
+    if let Some(error) = entry_error {
+        fields.insert(
+            "focus_records_posted".into(),
+            serde_json::json!(error.entry.records_posted),
+        );
+        fields.insert(
+            "focus_record_uncertain".into(),
+            serde_json::json!(error.entry.records_uncertain),
+        );
+        fields.insert(
+            "ax_focus_written".into(),
+            serde_json::json!(error.entry.ax_write),
+        );
+        if let Some(hand_back) = error.hand_back {
+            fields.insert(
+                "hand_back_note".into(),
+                serde_json::json!(hand_back.describe()),
+            );
+        }
     }
 }
 
@@ -1288,7 +1664,8 @@ impl Tool for InvokeMenuTool {
         .await
         .unwrap_or(false);
         if !target_in_front {
-            return run_in_background(pid, window_id, path, MenuRequest::Path).await;
+            return run_in_background(pid, window_id, path, MenuRequest::Path, KeyOwner::Direct)
+                .await;
         }
 
         let outcome = latency::spawn_action_blocking(move || {
@@ -1346,6 +1723,245 @@ impl Tool for InvokeMenuTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A fake app: which window is its menu context, whether the key hold
+    /// works, and which app is in front. It has no way to activate the app or
+    /// change the front app, so no route decision can do either.
+    struct FakeApp {
+        bound: bool,
+        hold_binds: bool,
+        hold_fails: bool,
+        front_other: Option<bool>,
+        holds: usize,
+    }
+
+    impl FakeApp {
+        /// A document window that is not its app's key window, with the
+        /// person's app in front.
+        fn non_key_window() -> Self {
+            FakeApp {
+                bound: false,
+                hold_binds: true,
+                hold_fails: false,
+                front_other: Some(true),
+                holds: 0,
+            }
+        }
+    }
+
+    impl MenuKeyOps for FakeApp {
+        type Scope = &'static str;
+        fn bound(&mut self) -> Result<(), BackgroundPressError> {
+            if self.bound {
+                Ok(())
+            } else {
+                Err(BackgroundPressError::UnboundWindow {
+                    requested: 7,
+                    focused: Some(8),
+                    main: Some(8),
+                })
+            }
+        }
+        fn hold_key(&mut self) -> Result<Self::Scope, crate::input::skylight::ScopeEntryError> {
+            self.holds += 1;
+            if self.hold_fails {
+                return Err(crate::input::skylight::ScopeEntryError {
+                    reason: "window 7 could not be confirmed".into(),
+                    entry: crate::input::skylight::KeyEntry {
+                        records_posted: 2,
+                        ..Default::default()
+                    },
+                    hand_back: Some(crate::input::skylight::HandBack::Restored),
+                });
+            }
+            if self.hold_binds {
+                self.bound = true;
+            }
+            Ok("scope")
+        }
+        fn front_is_other_app(&mut self) -> Option<bool> {
+            self.front_other
+        }
+    }
+
+    #[test]
+    fn a_non_key_window_is_held_as_key_and_its_menu_dispatches_with_the_front_app_unchanged() {
+        let mut app = FakeApp::non_key_window();
+        let held = hold_menu_window(KeyOwner::Direct, &mut app);
+        assert!(matches!(held, Ok(Some("scope"))));
+        assert_eq!(app.holds, 1);
+        assert!(gate_before_dispatch(&mut app).is_ok());
+        assert_eq!(
+            app.front_other,
+            Some(true),
+            "the person's app stays in front"
+        );
+    }
+
+    #[test]
+    fn a_window_that_already_is_key_still_gets_one_explicit_hold() {
+        let mut app = FakeApp {
+            bound: true,
+            ..FakeApp::non_key_window()
+        };
+        assert!(matches!(
+            hold_menu_window(KeyOwner::Direct, &mut app),
+            Ok(Some("scope"))
+        ));
+        assert_eq!(app.holds, 1);
+    }
+
+    #[test]
+    fn a_caller_owned_route_never_moves_key_focus() {
+        let mut app = FakeApp::non_key_window();
+        assert!(matches!(
+            hold_menu_window(KeyOwner::Caller, &mut app),
+            Err(HoldFailure::Unbound(
+                BackgroundPressError::UnboundWindow { .. },
+                None
+            ))
+        ));
+        assert_eq!(app.holds, 0);
+        let mut bound = FakeApp {
+            bound: true,
+            ..FakeApp::non_key_window()
+        };
+        assert!(matches!(
+            hold_menu_window(KeyOwner::Caller, &mut bound),
+            Ok(None)
+        ));
+        assert_eq!(bound.holds, 0);
+    }
+
+    #[test]
+    fn a_failed_hold_keeps_what_entering_posted_and_dispatches_nothing() {
+        let mut app = FakeApp {
+            hold_fails: true,
+            ..FakeApp::non_key_window()
+        };
+        let Err(HoldFailure::Entry(error)) = hold_menu_window(KeyOwner::Direct, &mut app) else {
+            panic!("a failed hold is an entry failure");
+        };
+        assert_eq!(error.entry.records_posted, 2);
+        let mut result = ToolResult::error("refused");
+        annotate_route(&mut result, None, "", Some(&error));
+        let structured = result.structured_content.expect("structured");
+        assert_eq!(structured["focus_records_posted"], 2);
+        assert_eq!(
+            structured["hand_back_note"],
+            crate::input::skylight::HandBack::Restored.describe()
+        );
+    }
+
+    #[test]
+    fn a_hold_that_does_not_bind_comes_back_for_its_hand_back() {
+        let mut app = FakeApp {
+            hold_binds: false,
+            ..FakeApp::non_key_window()
+        };
+        assert!(matches!(
+            hold_menu_window(KeyOwner::Direct, &mut app),
+            Err(HoldFailure::Unbound(_, Some("scope")))
+        ));
+    }
+
+    #[test]
+    fn the_dispatch_waits_for_the_window_and_another_app_in_front() {
+        for front in [Some(false), None] {
+            let mut app = FakeApp {
+                bound: true,
+                front_other: front,
+                ..FakeApp::non_key_window()
+            };
+            assert!(matches!(
+                gate_before_dispatch(&mut app),
+                Err(BackgroundPressError::FrontChanged)
+            ));
+        }
+        let mut lost = FakeApp::non_key_window();
+        assert!(matches!(
+            gate_before_dispatch(&mut lost),
+            Err(BackgroundPressError::UnboundWindow { .. })
+        ));
+    }
+
+    #[test]
+    fn a_held_window_item_is_validated_unless_it_reads_enabled() {
+        let validated = std::cell::Cell::new(0);
+        assert_eq!(
+            held_window_enablement(Some(true), || validated.set(1), || unreachable!(), |_| {}),
+            Ok(())
+        );
+        assert_eq!(validated.get(), 0);
+        // Disabled while the window was not key, enabled once it is held.
+        let reads = std::cell::RefCell::new(vec![Some(true), Some(false)]);
+        assert_eq!(
+            held_window_enablement(
+                Some(false),
+                || validated.set(1),
+                || reads.borrow_mut().pop().unwrap(),
+                |_| {}
+            ),
+            Ok(())
+        );
+        assert_eq!(validated.get(), 1);
+        for last in [Some(false), None] {
+            assert_eq!(
+                held_window_enablement(None, || {}, || last, |_| {}),
+                Err(last)
+            );
+        }
+    }
+
+    #[test]
+    fn a_held_window_refusal_says_what_validation_posted() {
+        use crate::input::skylight::ValidationPost;
+        let none = ValidationPost::default();
+        let sent = ValidationPost {
+            records: 2,
+            keys: 2,
+            key_attempts: 2,
+            uncertain: false,
+            called: true,
+        };
+        let partial = ValidationPost {
+            uncertain: true,
+            ..sent
+        };
+        assert!(matches!(
+            held_window_enablement_error(Some(false), none, 2, true),
+            BackgroundPressError::Disabled { is_save: true, .. }
+        ));
+        assert!(matches!(
+            held_window_enablement_error(None, none, 2, false),
+            BackgroundPressError::EnablementUnknown(_)
+        ));
+        assert!(matches!(
+            held_window_enablement_error(Some(false), sent, 2, true),
+            BackgroundPressError::ValidationFailed {
+                dispatch: Dispatch::Sent,
+                ..
+            }
+        ));
+        assert!(matches!(
+            held_window_enablement_error(None, partial, 2, false),
+            BackgroundPressError::ValidationFailed {
+                dispatch: Dispatch::Possible,
+                ..
+            }
+        ));
+
+        let mut refused = front_changed_refusal(1, 7);
+        annotate_route(&mut refused, Some(sent), "Key focus went back.", None);
+        let structured = refused.structured_content.clone().expect("structured");
+        assert_eq!(structured["code"], "window_not_key");
+        assert_eq!(structured["keys_sent"], true);
+        assert_eq!(structured["dispatch"], "validation_posted");
+        assert_eq!(structured["hand_back_note"], "Key focus went back.");
+        let text = text_of(&refused);
+        assert!(text.contains("no menu action was dispatched"), "{text}");
+        assert!(text.contains("Cmd+F20"), "{text}");
+    }
 
     #[test]
     fn menu_validation_bypasses_items_that_were_not_initially_disabled() {

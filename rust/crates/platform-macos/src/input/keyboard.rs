@@ -1280,6 +1280,68 @@ fn post_key_no_auth(
 }
 
 fn modifier_flags(modifiers: &[&str]) -> CGEventFlags {
+    modifier_flags_inner(modifiers)
+}
+
+/// What [`press_chord_no_auth`] did.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ChordPost {
+    /// The events could not be built; nothing was posted.
+    NotPosted(String),
+    /// The key-down and the key-up were both posted.
+    Posted,
+}
+
+/// Press and release `key` with `modifiers` for `pid` on the no-auth
+/// (IOHIDPostEvent) path, the one a native app's menu key equivalents fire
+/// on. Both events are built before either is posted, so a failure leaves
+/// nothing posted; once built, the down and the up always both go out, so no
+/// key is left down.
+pub fn press_chord_no_auth(pid: i32, key: &str, modifiers: &[&str]) -> ChordPost {
+    post_chord_with(
+        chord_events(key, modifiers),
+        |event: &CGEvent| {
+            super::tag_synthetic_event(event);
+            let event_ptr = event.as_ptr() as *mut std::ffi::c_void;
+            if !crate::input::skylight::post_to_pid(pid as libc::pid_t, event_ptr, false) {
+                event.post_to_pid(pid as libc::pid_t);
+            }
+        },
+        key_gap_sleep,
+    )
+}
+
+fn chord_events(key: &str, modifiers: &[&str]) -> anyhow::Result<(CGEvent, CGEvent)> {
+    let key_code = key_name_to_code(key)?;
+    let flags = modifier_flags(modifiers);
+    let make = |down: bool| -> anyhow::Result<CGEvent> {
+        let source = CGEventSource::new(CGEventSourceStateID::HIDSystemState)
+            .map_err(|_| anyhow::anyhow!("CGEventSource::new failed"))?;
+        let event = CGEvent::new_keyboard_event(source, key_code, down)
+            .map_err(|_| anyhow::anyhow!("CGEvent::new_keyboard_event failed"))?;
+        event.set_flags(flags);
+        Ok(event)
+    };
+    Ok((make(true)?, make(false)?))
+}
+
+fn post_chord_with<E>(
+    built: anyhow::Result<(E, E)>,
+    mut post: impl FnMut(&E),
+    gap: impl FnOnce(),
+) -> ChordPost {
+    match built {
+        Err(error) => ChordPost::NotPosted(error.to_string()),
+        Ok((down, up)) => {
+            post(&down);
+            gap();
+            post(&up);
+            ChordPost::Posted
+        }
+    }
+}
+
+fn modifier_flags_inner(modifiers: &[&str]) -> CGEventFlags {
     let mut flags = CGEventFlags::CGEventFlagNull;
     for m in modifiers {
         match m.to_lowercase().as_str() {
@@ -1589,6 +1651,26 @@ fn unknown_key_message(key: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_chord_that_cannot_be_built_posts_nothing() {
+        let mut posted = Vec::new();
+        let outcome = post_chord_with::<u8>(
+            Err(anyhow::anyhow!("unknown key")),
+            |event| posted.push(*event),
+            || panic!("no gap without a post"),
+        );
+        assert_eq!(outcome, ChordPost::NotPosted("unknown key".into()));
+        assert!(posted.is_empty());
+    }
+
+    #[test]
+    fn a_built_chord_posts_its_down_then_its_up() {
+        let mut posted = Vec::new();
+        let outcome = post_chord_with(Ok((1u8, 2u8)), |event| posted.push(*event), || {});
+        assert_eq!(outcome, ChordPost::Posted);
+        assert_eq!(posted, vec![1, 2]);
+    }
     use core_graphics::event::CGEventType;
 
     #[test]

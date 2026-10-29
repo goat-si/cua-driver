@@ -1619,6 +1619,19 @@ fn format_node_line_unbounded(node: &AXNode) -> String {
 
 const MAX_NODE_TEXT_CHARS: usize = 1_000;
 const MAX_NODE_LINE_BYTES: usize = 64 * 1_024;
+/// A capped value keeps this many leading characters; the rest of the cap
+/// goes to its end. A field's newest text is at its end (a terminal's last
+/// output, text typed at the end of a document), so a head-only cut hid
+/// exactly what an agent reads back after typing.
+const VALUE_HEAD_CHARS: usize = 250;
+
+fn escape_node_char(sanitized: &mut String, character: char) {
+    match character {
+        '\n' => sanitized.push_str("\\n"),
+        '\r' => sanitized.push_str("\\r"),
+        _ => sanitized.push(character),
+    }
+}
 
 fn sanitize_node_text(text: &str, char_limit: Option<usize>) -> String {
     let mut sanitized = String::new();
@@ -1628,14 +1641,34 @@ fn sanitize_node_text(text: &str, char_limit: Option<usize>) -> String {
             truncated = true;
             break;
         }
-        match character {
-            '\n' => sanitized.push_str("\\n"),
-            '\r' => sanitized.push_str("\\r"),
-            _ => sanitized.push(character),
-        }
+        escape_node_char(&mut sanitized, character);
     }
     if truncated {
         sanitized.push('…');
+    }
+    sanitized
+}
+
+/// A value for its tree line: within the cap as is, otherwise its first
+/// [`VALUE_HEAD_CHARS`] and last characters around one `…`, so both the
+/// start and the newest text stay readable.
+fn sanitize_node_value(text: &str, char_limit: Option<usize>) -> String {
+    let Some(limit) = char_limit else {
+        return sanitize_node_text(text, None);
+    };
+    let total = text.chars().count();
+    if total <= limit {
+        return sanitize_node_text(text, None);
+    }
+    let head = VALUE_HEAD_CHARS.min(limit);
+    let tail = limit - head;
+    let mut sanitized = String::new();
+    for character in text.chars().take(head) {
+        escape_node_char(&mut sanitized, character);
+    }
+    sanitized.push('…');
+    for character in text.chars().skip(total - tail) {
+        escape_node_char(&mut sanitized, character);
     }
     sanitized
 }
@@ -1658,7 +1691,7 @@ fn format_node_line_inner(node: &AXNode, bounded: bool) -> String {
     }
     // AXValue → = "value"
     if let Some(v) = &node.value {
-        parts.push_str(&format!(" = \"{}\"", sanitize_node_text(v, char_limit)));
+        parts.push_str(&format!(" = \"{}\"", sanitize_node_value(v, char_limit)));
     }
     // AXDescription → (description) — critical for Calculator digit buttons
     // where AXTitle="" but AXDescription="2". A description that only repeats
@@ -2020,9 +2053,92 @@ mod tests {
         assert_eq!(line.matches('\n').count(), 0);
         assert_eq!(line.matches('\r').count(), 0);
         assert!(
-            !line.contains("tail"),
-            "long values are cut before their tail"
+            line.contains("tail\"") && line.matches('…').count() == 1,
+            "a long value keeps its newest text: {line}"
         );
+    }
+
+    fn value_node(
+        role: &str,
+        element_index: Option<usize>,
+        title: Option<&str>,
+        value: Option<&str>,
+    ) -> AXNode {
+        let mut node = role_only_node(role.into(), 0, 0, None, false);
+        node.element_index = element_index;
+        node.title = title.map(str::to_owned);
+        node.value = value.map(str::to_owned);
+        node
+    }
+
+    /// Observe after typing: a long field (a terminal buffer, a document
+    /// typed at its end) shows its start and its newest text, Unicode and
+    /// symbols included, within the same cap.
+    #[test]
+    fn a_long_value_keeps_its_start_and_its_newest_text() {
+        let start = "start ";
+        let newest = "tail-probe 한글✓\nprompt%";
+        let value = format!("{start}{}{newest}", "filler line\n".repeat(400));
+        let node = value_node("AXTextArea", Some(2), None, Some(&value));
+        let line = format_node_line(&node);
+        assert!(line.contains("= \"start filler line\\n"), "{line}");
+        assert!(line.ends_with("tail-probe 한글✓\\nprompt%\""), "{line}");
+        assert_eq!(line.matches('…').count(), 1, "{line}");
+        assert!(!line.contains('\n'), "{line}");
+        let quoted = line.split(" = \"").nth(1).unwrap().trim_end_matches('"');
+        let unescaped = quoted.replace("\\n", "\n");
+        assert_eq!(unescaped.chars().count(), MAX_NODE_TEXT_CHARS + 1);
+        // The search form keeps the whole value.
+        let full = format_node_line_unbounded(&node);
+        assert!(full.contains(&value.replace('\n', "\\n")), "{full}");
+        assert!(!full.contains('…'));
+    }
+
+    #[test]
+    fn values_at_the_cap_are_whole_and_one_over_is_elided_once() {
+        let at_cap = "가".repeat(MAX_NODE_TEXT_CHARS);
+        let line = format_node_line(&value_node("AXTextArea", Some(0), None, Some(&at_cap)));
+        assert!(line.contains(&at_cap) && !line.contains('…'), "{line}");
+
+        let over = format!("{}✓", "가".repeat(MAX_NODE_TEXT_CHARS));
+        let line = format_node_line(&value_node("AXTextArea", Some(0), None, Some(&over)));
+        assert_eq!(line.matches('…').count(), 1);
+        assert!(line.ends_with("✓\""), "{line}");
+        let quoted = line.split(" = \"").nth(1).unwrap().trim_end_matches('"');
+        assert_eq!(quoted.chars().count(), MAX_NODE_TEXT_CHARS + 1);
+    }
+
+    #[test]
+    fn titles_keep_the_head_cap() {
+        let title = format!("{}tail", "a".repeat(MAX_NODE_TEXT_CHARS));
+        let line = format_node_line(&value_node("AXButton", Some(0), Some(&title), None));
+        assert!(!line.contains("tail") && line.contains("…\""), "{line}");
+    }
+
+    /// Redaction runs before a line is formatted, so neither end of a long
+    /// secure value reaches the capped line.
+    #[test]
+    fn a_long_secure_value_leaks_neither_its_start_nor_its_end() {
+        let secret = format!("HEADSECRET{}TAILSECRET", "x".repeat(5_000));
+        let meta = FieldSecurityMeta {
+            role: "AXSecureTextField",
+            subrole: None,
+            title: None,
+            description: None,
+            placeholder: None,
+            identifier: None,
+            help: None,
+            is_password_flag: false,
+        };
+        let (value, state) = redact_if_secure(&meta, Some(secret.clone()), Some(secret));
+        let mut field = value_node("AXSecureTextField", Some(0), None, value.as_deref());
+        field.value_state = state;
+        let line = format_node_line(&field);
+        assert!(
+            !line.contains("HEADSECRET") && !line.contains("TAILSECRET"),
+            "{line}"
+        );
+        assert!(!format_node_line_unbounded(&field).contains("SECRET"));
     }
 
     #[test]

@@ -788,7 +788,14 @@ impl Tool for PressKeyTool {
                     let lease = _mutation_lease
                         .take()
                         .expect("background window actions hold the per-pid lease");
-                    return native_menu_chord(lease, wid, combo, display_key.clone()).await;
+                    return native_menu_chord(
+                        lease,
+                        wid,
+                        combo,
+                        display_key.clone(),
+                        (key.clone(), modifiers.clone()),
+                    )
+                    .await;
                 }
             }
         }
@@ -1404,7 +1411,7 @@ fn minimized_key_result(step: MinimizedKeyStep, pid: i32, display_key: &str) -> 
 
 /// Append to the result's first text block: the published summary is that
 /// block, so a later block would not reach structured-only clients.
-fn append_to_summary(result: &mut ToolResult, extra: &str) {
+pub(super) fn append_to_summary(result: &mut ToolResult, extra: &str) {
     let extra = extra.trim();
     if extra.is_empty() {
         return;
@@ -1544,6 +1551,101 @@ enum ChordStep {
         scope: crate::input::skylight::WindowKeyScope,
         path: Vec<String>,
     },
+    /// The item still reads disabled with the window held as key and after
+    /// validation: the chord goes to that window as keys, once the keyboard
+    /// gate passes (coordinator decision keys_under_scope).
+    NeedsKeys {
+        scope: crate::input::skylight::WindowKeyScope,
+        validation: crate::input::skylight::ValidationPost,
+        path: String,
+    },
+    /// The chord was posted as keys to the held key window.
+    KeysPosted {
+        text: String,
+        validation: crate::input::skylight::ValidationPost,
+    },
+}
+
+/// What a chord whose item does not read enabled after validation does:
+/// only a confirmed disabled read sends the chord as keys; an unreadable
+/// one is refused with no key or menu action.
+#[derive(Debug, PartialEq, Eq)]
+enum NotEnabledRoute {
+    Keys,
+    Unreadable,
+}
+
+fn not_enabled_route(last: Option<bool>) -> NotEnabledRoute {
+    if last == Some(false) {
+        NotEnabledRoute::Keys
+    } else {
+        NotEnabledRoute::Unreadable
+    }
+}
+
+/// The step after the chord's key post, with the hand-back notes.
+fn keys_posted_step(
+    post: crate::input::keyboard::ChordPost,
+    path: &str,
+    wid: u32,
+    validation: crate::input::skylight::ValidationPost,
+    notes: &str,
+) -> ChordStep {
+    match post {
+        crate::input::keyboard::ChordPost::Posted => ChordStep::KeysPosted {
+            text: format!(
+                "{path} reads disabled for window {wid} from the background, so with the window \
+                 held as the app's key window (the app was not activated) the chord was sent to \
+                 it as keys. Its effect is not read back: check the window.{notes}"
+            ),
+            validation,
+        },
+        crate::input::keyboard::ChordPost::NotPosted(reason) => ChordStep::Refused {
+            code: "background_unavailable",
+            text: format!(
+                "press_key: {path} reads disabled for this window and the chord could not be \
+                 built ({reason}); no key or menu action was sent.{notes}"
+            ),
+            validation,
+        },
+    }
+}
+
+/// Post the chord to the held key window: only while it is still the app's
+/// focused and main window and another app is in front, then hand key back.
+fn keys_under_scope(
+    pid: i32,
+    wid: u32,
+    scope: crate::input::skylight::WindowKeyScope,
+    validation: crate::input::skylight::ValidationPost,
+    path: String,
+    key: &str,
+    modifiers: &[String],
+) -> ChordStep {
+    if !(menu_bound_to(pid, wid) && front_is_other_app(pid, wid)) {
+        return chord_refusal(
+            "window_not_key",
+            "before the keys, the window stopped being the app's focused and main window, or \
+             the app came to the front or which app is in front could not be read.",
+            scope,
+            validation,
+        );
+    }
+    let mods: Vec<&str> = modifiers.iter().map(String::as_str).collect();
+    let post = crate::input::keyboard::press_chord_no_auth(pid, key, &mods);
+    let entry = scope.entry();
+    let hand_back = scope.finish();
+    let mut notes = vec![
+        validation.disclosure(),
+        crate::input::skylight::scope_disclosure(entry, Some(hand_back)),
+    ];
+    notes.retain(|note| !note.is_empty());
+    let notes = if notes.is_empty() {
+        String::new()
+    } else {
+        format!(" {}", notes.join(" "))
+    };
+    keys_posted_step(post, &path, wid, validation, &notes)
 }
 
 fn chord_refusal(
@@ -1569,6 +1671,18 @@ fn chord_refusal(
         text,
         validation,
     }
+}
+
+/// The text of a gate refusal, for the chord's own refusal receipt.
+fn refusal_text(result: &ToolResult) -> String {
+    result
+        .content
+        .iter()
+        .find_map(|content| match content {
+            cua_driver_core::protocol::Content::Text { text, .. } => Some(text.clone()),
+            _ => None,
+        })
+        .unwrap_or_else(|| "the keyboard gate refused the window.".to_owned())
 }
 
 /// The chord's menu route on one blocking thread: hold the target window as
@@ -1632,12 +1746,23 @@ fn chord_in_scope(pid: i32, wid: u32, combo: super::menu_equivalent::Combo) -> C
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
         if !enabled() {
-            return chord_refusal(
-                "background_unavailable",
-                &format!("{} is disabled for this window.", found.path.join(" > ")),
-                scope,
-                validation,
-            );
+            let last = unsafe { copy_bool_attr(element, "AXEnabled") };
+            return match not_enabled_route(last) {
+                NotEnabledRoute::Keys => ChordStep::NeedsKeys {
+                    scope,
+                    validation,
+                    path: found.path.join(" > "),
+                },
+                NotEnabledRoute::Unreadable => chord_refusal(
+                    "background_unavailable",
+                    &format!(
+                        "{}'s enablement could not be read for this window.",
+                        found.path.join(" > ")
+                    ),
+                    scope,
+                    validation,
+                ),
+            };
         }
     }
     let actions = unsafe { crate::ax::bindings::copy_action_names(element) };
@@ -1766,6 +1891,25 @@ fn chord_result(step: ChordStep) -> ToolResult {
             ToolResult::error(text).with_structured(structured)
         }
         ChordStep::Save { .. } => unreachable!("Save continues on invoke_menu's route"),
+        ChordStep::NeedsKeys { .. } => unreachable!("keys go through the keyboard gate first"),
+        ChordStep::KeysPosted { text, validation } => ToolResult::text(text)
+            .with_structured(serde_json::json!({
+                "path": "keys_under_scope",
+                "verified": false,
+                "effect": "unverifiable",
+                "keys_sent": true,
+                "validation_keys_sent": validation.key_attempts > 0,
+            }))
+            .with_action_record(
+                ActionExecutionRecord::builder(
+                    ActionEffect::Unverifiable,
+                    ActionTransport::MacosCgEventPid,
+                    RequestedDelivery::Background,
+                )
+                .actual_delivery(ActualDelivery::Background)
+                .build()
+                .expect("an unverifiable key record is valid"),
+            ),
     }
 }
 
@@ -1776,6 +1920,7 @@ async fn native_menu_chord(
     wid: u32,
     combo: super::menu_equivalent::Combo,
     display_key: String,
+    chord: (String, Vec<String>),
 ) -> ToolResult {
     let pid = lease.pid();
     let outcome = run_detached(async move {
@@ -1816,6 +1961,7 @@ async fn native_menu_chord(
                     wid,
                     path,
                     super::invoke_menu::MenuRequest::KeyEquivalent(display_key),
+                    super::invoke_menu::KeyOwner::Caller,
                 )
                 .await;
                 let hand_back = latency::spawn_action_blocking(move || scope.finish())
@@ -1830,6 +1976,48 @@ async fn native_menu_chord(
                     }
                 }
                 result
+            }
+            ChordStep::NeedsKeys {
+                scope,
+                validation,
+                path,
+            } => {
+                // Raw keys need the keyboard class's facts (a visible, not
+                // minimized window of a visible app), on the same lease.
+                if let Err(refusal) = lease
+                    .gate_again(
+                        wid,
+                        None,
+                        cua_driver_core::background_input::BackgroundAction::ExactWindowKeys,
+                    )
+                    .await
+                {
+                    let reason = refusal_text(&refusal);
+                    let step = latency::spawn_action_blocking(move || {
+                        chord_refusal("background_unavailable", &reason, scope, validation)
+                    })
+                    .await;
+                    return match step {
+                        Ok(step) => chord_result(step),
+                        Err(error) => task_failure(format!(
+                            "press_key: the key hand-back task failed ({error}); no key or menu \
+                             action was sent, and key focus inside the app may remain on the \
+                             target window."
+                        )),
+                    };
+                }
+                let (key, modifiers) = chord;
+                let step = latency::spawn_action_blocking(move || {
+                    keys_under_scope(pid, wid, scope, validation, path, &key, &modifiers)
+                })
+                .await;
+                match step {
+                    Ok(step) => chord_result(step),
+                    Err(error) => task_failure(format!(
+                        "press_key: the key task failed ({error}); the chord may have been sent. \
+                         Read the window before repeating it."
+                    )),
+                }
             }
             step => chord_result(step),
         }
@@ -1846,6 +2034,60 @@ async fn native_menu_chord(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Coordinator decision keys_under_scope: only a confirmed disabled read
+    /// sends the chord as keys; an unreadable one sends nothing.
+    #[test]
+    fn only_a_confirmed_disabled_item_sends_the_chord_as_keys() {
+        assert_eq!(not_enabled_route(Some(false)), NotEnabledRoute::Keys);
+        assert_eq!(not_enabled_route(None), NotEnabledRoute::Unreadable);
+    }
+
+    #[test]
+    fn a_chord_sent_as_keys_is_unverifiable_and_says_keys_were_sent() {
+        let validation = crate::input::skylight::ValidationPost {
+            records: 2,
+            keys: 2,
+            key_attempts: 2,
+            uncertain: false,
+            called: true,
+        };
+        let step = keys_posted_step(
+            crate::input::keyboard::ChordPost::Posted,
+            "Edit > Clear to Start",
+            7,
+            validation,
+            " Key focus went back to the app's previous window.",
+        );
+        let result = chord_result(step);
+        assert_ne!(result.is_error, Some(true));
+        let structured = result.structured_content.clone().expect("structured");
+        assert_eq!(structured["effect"], "unverifiable");
+        assert_eq!(structured["keys_sent"], true);
+        assert_eq!(structured["path"], "keys_under_scope");
+        let record = result.action_record.expect("record");
+        assert!(matches!(record.effect, ActionEffect::Unverifiable));
+    }
+
+    #[test]
+    fn a_chord_that_could_not_be_built_is_refused_with_only_validation_keys() {
+        let step = keys_posted_step(
+            crate::input::keyboard::ChordPost::NotPosted("unknown key".into()),
+            "File > Close",
+            7,
+            crate::input::skylight::ValidationPost::default(),
+            "",
+        );
+        let result = chord_result(step);
+        assert_eq!(result.is_error, Some(true));
+        let structured = result.structured_content.expect("structured");
+        assert_eq!(structured["effect"], "refused");
+        assert_eq!(structured["keys_sent"], false);
+        assert!(structured["message"]
+            .as_str()
+            .unwrap()
+            .contains("no key or menu action was sent"));
+    }
     #[test]
     fn semantic_actions_require_unmodified_return_or_escape_and_live_advertising() {
         let confirm = vec!["AXConfirm".to_owned()];

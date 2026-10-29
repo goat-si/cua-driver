@@ -351,6 +351,7 @@ impl Tool for HotkeyTool {
                         wid,
                         item.path,
                         super::invoke_menu::MenuRequest::KeyEquivalent(key_display.clone()),
+                        super::invoke_menu::KeyOwner::Caller,
                     )
                     .await;
                     // Background key events never reach a native app's menus, so a menu
@@ -646,7 +647,9 @@ pub(super) fn menu_refusal_without_keys(mut result: ToolResult) -> ToolResult {
     if let Some(serde_json::Value::Object(fields)) = result.structured_content.as_mut() {
         fields.insert("effect".into(), serde_json::json!("refused"));
         fields.insert("dispatched".into(), serde_json::json!(false));
-        fields.insert("keys_sent".into(), serde_json::json!(false));
+        fields
+            .entry("keys_sent")
+            .or_insert(serde_json::json!(false));
         fields.entry("escalation").or_insert(
             serde_json::json!({ "recommended": "foreground", "requires": ["window_id"] }),
         );
@@ -665,6 +668,22 @@ fn delivered_structured(foreground: bool) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A refusal after menu validation posted Cmd+F20 keeps saying so.
+    #[test]
+    fn a_menu_refusal_keeps_the_validation_keys_it_sent() {
+        let posted = menu_refusal_without_keys(ToolResult::error("disabled").with_structured(
+            serde_json::json!({
+                "code": "background_unavailable",
+                "keys_sent": true,
+                "dispatch": "validation_posted",
+            }),
+        ));
+        let structured = posted.structured_content.expect("structured");
+        assert_eq!(structured["keys_sent"], true);
+        assert_eq!(structured["dispatch"], "validation_posted");
+        assert_eq!(structured["dispatched"], false);
+    }
 
     #[test]
     fn an_unavailable_background_menu_is_refused_without_keys() {

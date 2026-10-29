@@ -708,6 +708,31 @@ mod tests {
         }
     }
 
+    /// Raw keys sent under a held key window (press_key keys_under_scope)
+    /// still need a visible, not minimized window of a visible app.
+    #[test]
+    fn exact_window_keys_refuse_hidden_minimized_and_unknown_visibility() {
+        for facts in [
+            BackgroundTargetFacts {
+                app_hidden: Some(true),
+                ..matched_facts()
+            },
+            BackgroundTargetFacts {
+                target_minimized: Some(true),
+                ..matched_facts()
+            },
+            BackgroundTargetFacts {
+                target_minimized: None,
+                ..matched_facts()
+            },
+        ] {
+            assert!(
+                !decide_background_input(TARGET, &facts, BackgroundAction::ExactWindowKeys)
+                    .is_execute()
+            );
+        }
+    }
+
     /// The singleton rule: with no competing keyboard destination, exact
     /// background text/keys are permitted and verification is target-bound.
     #[test]

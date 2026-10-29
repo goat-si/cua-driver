@@ -852,7 +852,7 @@ fn await_key_focus(pid: pid_t, target: u32, budget: std::time::Duration) {
 /// pointer), confirmed by re-reading the app's focus, and return a guard that
 /// hands key back. `Err` when it cannot be confirmed.
 pub fn enter_exact_window_key(pid: pid_t, target_wid: u32) -> Result<WindowKeyScope, String> {
-    enter_scope(pid, target_wid, false)
+    enter_scope(pid, target_wid, false).map_err(|error| error.reason)
 }
 
 /// [`enter_exact_window_key`] for an action that must not touch the app
@@ -864,17 +864,48 @@ pub fn enter_exact_window_key_inline(
     pid: pid_t,
     target_wid: u32,
 ) -> Result<WindowKeyScope, String> {
+    enter_scope(pid, target_wid, true).map_err(|error| error.reason)
+}
+
+/// Why entering a key scope failed, with what entering did before it
+/// stopped (records posted, a focused-window write) and how key was handed
+/// back after it. `reason` is the same text the plain entry functions return.
+#[derive(Debug)]
+pub struct ScopeEntryError {
+    pub reason: String,
+    pub entry: KeyEntry,
+    pub hand_back: Option<HandBack>,
+}
+
+/// [`enter_exact_window_key_inline`] with the failed entry's side effects
+/// kept structured for the caller's receipt.
+pub fn enter_exact_window_key_inline_detailed(
+    pid: pid_t,
+    target_wid: u32,
+) -> Result<WindowKeyScope, ScopeEntryError> {
     enter_scope(pid, target_wid, true)
 }
 
-fn enter_scope(pid: pid_t, target_wid: u32, inline: bool) -> Result<WindowKeyScope, String> {
+fn untouched(reason: String) -> ScopeEntryError {
+    ScopeEntryError {
+        reason,
+        entry: KeyEntry::default(),
+        hand_back: None,
+    }
+}
+
+fn enter_scope(
+    pid: pid_t,
+    target_wid: u32,
+    inline: bool,
+) -> Result<WindowKeyScope, ScopeEntryError> {
     // Wait for the previous scope's hand-back to finish; refuse (nothing
     // sent) when it does not.
     if !await_key_restores() {
-        return Err(format!(
+        return Err(untouched(format!(
             "window {target_wid}: the previous key hand-back in this app did not finish within \
              2 s, so no keys were sent"
-        ));
+        )));
     }
     // Every record and the accessibility fallback re-read the front app:
     // entering stops once it differs from what it was at the start (the
@@ -882,10 +913,10 @@ fn enter_scope(pid: pid_t, target_wid: u32, inline: bool) -> Result<WindowKeySco
     // front from the start.
     let entry_front = front_process_matches(pid, target_wid);
     if inline && entry_front != Some(false) {
-        return Err(format!(
+        return Err(untouched(format!(
             "window {target_wid}: its app is frontmost, or which app is frontmost could not be \
              read, so key focus inside it was not moved and no keys were sent"
-        ));
+        )));
     }
     let front_unchanged = || front_process_matches(pid, target_wid) == entry_front;
     let entry = std::cell::Cell::new(KeyEntry::default());
@@ -937,10 +968,14 @@ fn enter_scope(pid: pid_t, target_wid: u32, inline: bool) -> Result<WindowKeySco
                 }
             });
             let disclosure = scope_disclosure(noted, hand_back);
-            return Err(if disclosure.is_empty() {
-                error
-            } else {
-                format!("{error}. Before refusing: {disclosure}")
+            return Err(ScopeEntryError {
+                reason: if disclosure.is_empty() {
+                    error
+                } else {
+                    format!("{error}. Before refusing: {disclosure}")
+                },
+                entry: noted,
+                hand_back,
             });
         }
     };
