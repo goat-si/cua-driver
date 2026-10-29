@@ -958,6 +958,39 @@ enum ObservedAction<T> {
     TimedOut,
 }
 
+/// Time source for the right-click observation window. Production uses the
+/// system clock; tests substitute a clock that only advances when the
+/// observer sleeps, so deadline ordering is fixed by the test, not the runner.
+trait ObservationClock {
+    fn now(&self) -> Instant;
+    fn sleep(&self, duration: Duration);
+    fn recv_timeout<M>(
+        &self,
+        receiver: &std::sync::mpsc::Receiver<M>,
+        timeout: Duration,
+    ) -> Result<M, std::sync::mpsc::RecvTimeoutError>;
+}
+
+struct SystemClock;
+
+impl ObservationClock for SystemClock {
+    fn now(&self) -> Instant {
+        Instant::now()
+    }
+
+    fn sleep(&self, duration: Duration) {
+        std::thread::sleep(duration);
+    }
+
+    fn recv_timeout<M>(
+        &self,
+        receiver: &std::sync::mpsc::Receiver<M>,
+        timeout: Duration,
+    ) -> Result<M, std::sync::mpsc::RecvTimeoutError> {
+        receiver.recv_timeout(timeout)
+    }
+}
+
 #[cfg(test)]
 impl<T> ObservedAction<T> {
     fn unwrap(self) -> T {
@@ -971,6 +1004,15 @@ impl<T> ObservedAction<T> {
 fn observe_right_click_action<T: Send + 'static>(
     before: MenuSnapshot,
     action: impl FnOnce(std::sync::mpsc::Sender<ActionEvent>) -> T + Send + 'static,
+    read: impl FnMut() -> MenuSnapshot,
+) -> (ObservedAction<T>, MenuObservation) {
+    observe_right_click_action_with(&SystemClock, before, action, read)
+}
+
+fn observe_right_click_action_with<T: Send + 'static>(
+    clock: &impl ObservationClock,
+    before: MenuSnapshot,
+    action: impl FnOnce(std::sync::mpsc::Sender<ActionEvent>) -> T + Send + 'static,
     mut read: impl FnMut() -> MenuSnapshot,
 ) -> (ObservedAction<T>, MenuObservation) {
     let (event_tx, event_rx) = std::sync::mpsc::channel();
@@ -981,7 +1023,7 @@ fn observe_right_click_action<T: Send + 'static>(
         let _ = result_tx.send(result);
         let _ = event_tx.send(ActionEvent::Done);
     });
-    let (sent_at, pre_dispatch) = match event_rx.recv_timeout(Duration::from_millis(250)) {
+    let (sent_at, pre_dispatch) = match clock.recv_timeout(&event_rx, Duration::from_millis(250)) {
         Ok(ActionEvent::Dispatching(sent_at)) => (sent_at, true),
         Ok(ActionEvent::Sent(sent_at)) => (sent_at, false),
         _ => return (ObservedAction::TimedOut, MenuObservation::none()),
@@ -992,8 +1034,8 @@ fn observe_right_click_action<T: Send + 'static>(
     let observation = poll_until_deadline(
         deadline,
         Duration::from_millis(15),
-        Instant::now,
-        std::thread::sleep,
+        || clock.now(),
+        |duration| clock.sleep(duration),
         || {
             let after = read();
             let current =
@@ -1022,8 +1064,8 @@ fn observe_right_click_action<T: Send + 'static>(
         },
     )
     .unwrap_or_else(MenuObservation::none);
-    let result = result_rx
-        .recv_timeout(Duration::from_millis(250))
+    let result = clock
+        .recv_timeout(&result_rx, Duration::from_millis(250))
         .map(ObservedAction::Completed)
         .unwrap_or(ObservedAction::TimedOut);
     (result, observation)
@@ -1558,40 +1600,146 @@ mod tests {
             "a read completing after the deadline cannot confirm"
         );
     }
+    /// Observation clock whose time moves only when the observer sleeps or a
+    /// test advances it. Messages are awaited without a wall-clock timeout, so
+    /// thread scheduling cannot move a deadline.
+    #[derive(Clone)]
+    struct FakeClock {
+        now: Arc<std::sync::Mutex<Instant>>,
+        sleeps: Arc<std::sync::Mutex<Vec<Duration>>>,
+        waits: Arc<std::sync::atomic::AtomicUsize>,
+        dropped_at_result_wait: Arc<std::sync::Mutex<Option<std::sync::mpsc::Sender<()>>>>,
+    }
 
-    #[test]
-    fn wave400c_observation_runs_while_the_action_is_blocked() {
+    impl FakeClock {
+        fn new() -> Self {
+            Self {
+                now: Arc::new(std::sync::Mutex::new(Instant::now())),
+                sleeps: Arc::new(std::sync::Mutex::new(Vec::new())),
+                waits: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                dropped_at_result_wait: Arc::new(std::sync::Mutex::new(None)),
+            }
+        }
+
+        fn advance(&self, duration: Duration) {
+            *self.now.lock().unwrap() += duration;
+        }
+
+        fn sleeps(&self) -> Vec<Duration> {
+            self.sleeps.lock().unwrap().clone()
+        }
+    }
+
+    impl ObservationClock for FakeClock {
+        fn now(&self) -> Instant {
+            *self.now.lock().unwrap()
+        }
+
+        fn sleep(&self, duration: Duration) {
+            self.advance(duration);
+            self.sleeps.lock().unwrap().push(duration);
+        }
+
+        fn recv_timeout<M>(
+            &self,
+            receiver: &std::sync::mpsc::Receiver<M>,
+            _timeout: Duration,
+        ) -> Result<M, std::sync::mpsc::RecvTimeoutError> {
+            // The observer waits first for the dispatch event and then, after
+            // polling, for the action result. Dropping the parked sender at
+            // the result wait unblocks an action the observer never released,
+            // so a fixture regression fails instead of deadlocking.
+            if self.waits.fetch_add(1, std::sync::atomic::Ordering::SeqCst) >= 1 {
+                drop(self.dropped_at_result_wait.lock().unwrap().take());
+            }
+            receiver
+                .recv()
+                .map_err(|_| std::sync::mpsc::RecvTimeoutError::Disconnected)
+        }
+    }
+
+    /// The action reports Sent, waits for the sent baseline read, adds menu
+    /// window 2, and then stays blocked until the observer's second sighting
+    /// releases it. The action returns whether that release came from the
+    /// observer. With `stall_on_second_sighting`, the second sighting read is
+    /// held up for 151ms, so it completes after the 150ms deadline although
+    /// the first sighting completed inside the window.
+    fn observe_while_action_is_blocked(
+        stall_on_second_sighting: bool,
+    ) -> (ObservedAction<bool>, MenuObservation, Vec<Duration>) {
+        let clock = FakeClock::new();
         let (baseline_tx, baseline_rx) = std::sync::mpsc::channel();
+        let (inserted_tx, inserted_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        *clock.dropped_at_result_wait.lock().unwrap() = Some(release_tx);
         let before = MenuSnapshot {
             window_ids: Some(HashSet::new()),
             ax_menus: None,
         };
         let menu_ids = Arc::new(std::sync::Mutex::new(HashSet::from([1])));
         let action_ids = menu_ids.clone();
+        let action_clock = clock.clone();
+        let read_clock = clock.clone();
         let mut reads = 0;
-        let (result, observation) = observe_right_click_action(
+        let (result, observation) = observe_right_click_action_with(
+            &clock,
             before,
             move |sent| {
-                let _ = sent.send(ActionEvent::Sent(Instant::now()));
+                let _ = sent.send(ActionEvent::Sent(action_clock.now()));
                 baseline_rx.recv().unwrap();
                 action_ids.lock().unwrap().insert(2);
-                42
+                inserted_tx.send(()).unwrap();
+                release_rx.recv().is_ok()
             },
-            || {
+            move || {
                 reads += 1;
+                if reads == 3 && stall_on_second_sighting {
+                    read_clock.advance(Duration::from_millis(151));
+                }
                 let snapshot = MenuSnapshot {
                     window_ids: Some(menu_ids.lock().unwrap().clone()),
                     ax_menus: None,
                 };
-                if reads == 1 {
-                    baseline_tx.send(()).unwrap();
+                match reads {
+                    1 => {
+                        baseline_tx.send(()).unwrap();
+                        inserted_rx.recv().unwrap();
+                    }
+                    3 => {
+                        let release = read_clock.dropped_at_result_wait.lock().unwrap().take();
+                        release.unwrap().send(()).unwrap();
+                    }
+                    _ => {}
                 }
                 snapshot
             },
         );
-        assert_eq!(result.unwrap(), 42);
+        (result, observation, clock.sleeps())
+    }
+
+    #[test]
+    fn wave400c_observation_runs_while_the_action_is_blocked() {
+        let (result, observation, sleeps) = observe_while_action_is_blocked(false);
+        assert!(
+            result.unwrap(),
+            "the action must stay blocked until the second sighting"
+        );
         assert!(observation.opened);
+        assert!(observation.continuous);
         assert_eq!(observation.evidence, MenuEvidence::Window);
+        assert_eq!(observation.window_id, Some(2));
+        assert_eq!(sleeps, vec![Duration::from_millis(15)]);
+    }
+
+    #[test]
+    fn wave400c_deadline_passing_before_the_second_sighting_does_not_confirm() {
+        // The ordering a loaded runner produced in tag run 40895615773: the
+        // first sighting lands inside the 150ms window, but the deadline
+        // passes before the second consistent sighting completes.
+        let (result, observation, sleeps) = observe_while_action_is_blocked(true);
+        assert!(result.unwrap());
+        assert!(!observation.opened);
+        assert_eq!(sleeps, vec![Duration::from_millis(15)]);
     }
 
     #[test]
@@ -1602,11 +1750,14 @@ mod tests {
         };
         let menu_ids = Arc::new(std::sync::Mutex::new(HashSet::from([1])));
         let action_ids = menu_ids.clone();
-        let (result, observation) = observe_right_click_action(
+        let clock = FakeClock::new();
+        let action_clock = clock.clone();
+        let (result, observation) = observe_right_click_action_with(
+            &clock,
             before,
             move |sent| {
                 action_ids.lock().unwrap().insert(2);
-                let _ = sent.send(ActionEvent::Sent(Instant::now()));
+                let _ = sent.send(ActionEvent::Sent(action_clock.now()));
             },
             || MenuSnapshot {
                 window_ids: Some(menu_ids.lock().unwrap().clone()),
@@ -1615,6 +1766,7 @@ mod tests {
         );
         result.unwrap();
         assert!(!observation.opened);
+        assert_eq!(clock.sleeps(), vec![Duration::from_millis(15); 10]);
     }
 
     #[test]
@@ -1669,11 +1821,14 @@ mod tests {
             window_ids: Some(HashSet::new()),
             ax_menus: None,
         };
+        let clock = FakeClock::new();
+        let action_clock = clock.clone();
         let mut reads = 0;
-        let (result, observation) = observe_right_click_action(
+        let (result, observation) = observe_right_click_action_with(
+            &clock,
             before,
-            |sent| {
-                let _ = sent.send(ActionEvent::Sent(Instant::now()));
+            move |sent| {
+                let _ = sent.send(ActionEvent::Sent(action_clock.now()));
             },
             || {
                 reads += 1;
@@ -1689,5 +1844,6 @@ mod tests {
         );
         result.unwrap();
         assert!(observation.opened);
+        assert_eq!(clock.sleeps(), vec![Duration::from_millis(15)]);
     }
 }
