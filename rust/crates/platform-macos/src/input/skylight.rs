@@ -135,6 +135,11 @@ pub fn prime_exact_window_key(
 
 /// Holds an exact window as the app's key window; hands key back on drop
 /// (with the same in-app records, so the app is never activated or raised).
+///
+/// A scope made with [`enter_exact_window_key_inline`] hands key back on the
+/// thread that drops (or [`finish`](WindowKeyScope::finish)es) it, so the
+/// caller's next local (a re-minimize, the mutation lease) is released only
+/// after the hand-back finished, also while unwinding from a panic.
 pub struct WindowKeyScope {
     pid: pid_t,
     target: u32,
@@ -142,8 +147,198 @@ pub struct WindowKeyScope {
     /// The app's on-screen windows before priming, front to back.
     order_before: Vec<u32>,
     primed: KeyPrime,
+    /// What entering did inside the app, whatever confirmed key at the end.
+    entry: KeyEntry,
+    /// Hand key back on the dropping thread instead of a restore thread.
+    inline: bool,
+    /// The hand-back already ran through `finish`.
+    done: bool,
+    /// The live reads and posts the hand-back uses (fakes in tests).
+    ops: ScopeOps,
     /// Held until the hand-back has run; `None` when key never moved.
     live: Option<LiveKeyScope>,
+}
+
+/// The side effects of a scope's hand-back.
+#[derive(Clone, Copy)]
+struct ScopeOps {
+    window_order: fn(pid_t) -> Vec<u32>,
+    hand_back: fn(pid_t, u32, KeyPrime, u32) -> HandBack,
+}
+
+const LIVE_SCOPE_OPS: ScopeOps = ScopeOps {
+    window_order: app_window_order,
+    hand_back: run_hand_back,
+};
+
+/// What entering a [`WindowKeyScope`] actually did inside the app, apart
+/// from how key was finally confirmed ([`KeyPrime`]). Records can have been
+/// posted before the accessibility fallback was the step that worked, and a
+/// receipt must name everything that may have reached the app.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct KeyEntry {
+    /// Key-window record posts that succeeded.
+    pub records_posted: u8,
+    /// A record post call returned failure: it cannot prove the record did
+    /// not reach the app.
+    pub records_uncertain: bool,
+    /// The app's AXFocusedWindow was written.
+    pub ax_write: bool,
+}
+
+/// How key focus was handed back when a [`WindowKeyScope`] ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HandBack {
+    /// Key never moved, so there was nothing to hand back.
+    NotMoved,
+    /// The previous window reads back as the app's key window.
+    Restored,
+    /// Nothing was posted: the app became frontmost (the person is using it)
+    /// or WindowServer could not say which app is.
+    LeftForPerson,
+    /// Stopped part-way for the same reason.
+    Partial,
+    /// No window of the app is left to hand key back to.
+    NoTarget,
+    /// Posted, but the previous window does not read back as key.
+    NotConfirmed,
+}
+
+impl HandBack {
+    /// One sentence for a tool result.
+    pub fn describe(self) -> &'static str {
+        match self {
+            HandBack::NotMoved => "Key focus inside the app was not moved.",
+            HandBack::Restored => "Key focus went back to the app's previous window.",
+            HandBack::LeftForPerson => {
+                "Key focus was left on the target window because the app is now frontmost or \
+                 which app is frontmost could not be read; nothing was posted to hand it back."
+            }
+            HandBack::Partial => {
+                "The key hand-back stopped part-way because the app became frontmost or which \
+                 app is frontmost could not be read; key may remain on the target window."
+            }
+            HandBack::NoTarget => "No other window of the app was left to hand key focus back to.",
+            HandBack::NotConfirmed => {
+                "Key focus was handed back, but the app's previous window does not read back \
+                 as its key window."
+            }
+        }
+    }
+}
+
+/// A hand-back may post into the app only while WindowServer reports another
+/// app frontmost. `Some(true)` is the person working in the app now;
+/// `None` cannot rule that out.
+pub(crate) fn hand_back_allowed(front_is_target_app: Option<bool>) -> bool {
+    front_is_target_app == Some(false)
+}
+
+/// What a scope did to the app's key focus, for a receipt that otherwise
+/// says no action was sent.
+/// `hand_back` is `None` when the scope never existed (entering failed).
+pub fn scope_disclosure(entry: KeyEntry, hand_back: Option<HandBack>) -> String {
+    let mut lines = Vec::new();
+    if entry.records_posted > 0 {
+        lines.push(format!(
+            "{} key-window record(s) were posted to the app for the target window.",
+            entry.records_posted
+        ));
+    }
+    if entry.records_uncertain {
+        lines
+            .push("A key-window record post failed and may still have reached the app.".to_owned());
+    }
+    if entry.ax_write {
+        lines.push(
+            "The app's focused window was set to the target window through accessibility."
+                .to_owned(),
+        );
+    }
+    if let Some(hand_back) = hand_back.filter(|h| !lines.is_empty() || *h != HandBack::NotMoved) {
+        lines.push(hand_back.describe().to_owned());
+    }
+    lines.join(" ")
+}
+
+/// Map a hand-back's record posts to its outcome. `posts` is `None` when the
+/// records could not be addressed (no SPI, no PSN): nothing was posted.
+fn hand_back_outcome(posts: Option<RecordPosts>, confirmed: impl FnOnce() -> bool) -> HandBack {
+    match posts {
+        None => HandBack::NotConfirmed,
+        Some(posts) if posts.stopped && posts.posted == 0 && posts.failed == 0 => {
+            HandBack::LeftForPerson
+        }
+        Some(posts) if posts.stopped => HandBack::Partial,
+        Some(_) if confirmed() => HandBack::Restored,
+        Some(_) => HandBack::NotConfirmed,
+    }
+}
+
+/// Hand key inside `pid` back from `target` to `previous`, re-reading the
+/// front app before every record (and before an AXFocusedWindow write).
+fn run_hand_back(pid: pid_t, target: u32, primed: KeyPrime, previous: u32) -> HandBack {
+    let allowed = || hand_back_allowed(front_process_matches(pid, target));
+    let confirmed = || {
+        await_key_focus(pid, previous, std::time::Duration::from_millis(200));
+        key_focus_of_pid(pid).routes_to(previous)
+    };
+    match primed {
+        KeyPrime::AlreadyKey => HandBack::NotMoved,
+        KeyPrime::KeyRecords => hand_back_outcome(
+            post_key_records(pid, Some(target), previous, allowed),
+            confirmed,
+        ),
+        KeyPrime::AxFocusedWindow => {
+            if !allowed() {
+                HandBack::LeftForPerson
+            } else if set_app_focused_window(pid, previous) && confirmed() {
+                HandBack::Restored
+            } else {
+                HandBack::NotConfirmed
+            }
+        }
+    }
+}
+
+impl WindowKeyScope {
+    /// How key was confirmed on entry.
+    pub fn primed(&self) -> KeyPrime {
+        self.primed
+    }
+
+    /// What entering posted or wrote inside the app.
+    pub fn entry(&self) -> KeyEntry {
+        self.entry
+    }
+
+    /// Hand key back now, on this thread, and report how it went.
+    pub fn finish(mut self) -> HandBack {
+        let outcome = self.hand_back_now();
+        self.done = true;
+        outcome
+    }
+
+    fn hand_back_now(&mut self) -> HandBack {
+        if self.primed == KeyPrime::AlreadyKey {
+            return HandBack::NotMoved;
+        }
+        let Some(previous) = restore_target(
+            self.target,
+            self.previous,
+            &self.order_before,
+            &(self.ops.window_order)(self.pid),
+        ) else {
+            drop(self.live.take());
+            return HandBack::NoTarget;
+        };
+        let live = self.live.take();
+        *KEY_RESTORES.0.lock().unwrap_or_else(|e| e.into_inner()) += 1;
+        let outcome = (self.ops.hand_back)(self.pid, self.target, self.primed, previous);
+        drop(live);
+        key_restore_done();
+        outcome
+    }
 }
 
 /// The window key goes back to. Normally the previous key window. LibreOffice
@@ -176,31 +371,32 @@ fn app_window_order(pid: pid_t) -> Vec<u32> {
 
 impl Drop for WindowKeyScope {
     fn drop(&mut self) {
-        if self.primed == KeyPrime::AlreadyKey {
+        if self.done || self.primed == KeyPrime::AlreadyKey {
+            return;
+        }
+        if self.inline {
+            let _ = self.hand_back_now();
             return;
         }
         let Some(previous) = restore_target(
             self.target,
             self.previous,
             &self.order_before,
-            &app_window_order(self.pid),
+            &(self.ops.window_order)(self.pid),
         ) else {
             return;
         };
-        let (pid, target, primed) = (self.pid, self.target, self.primed);
+        let (pid, target, primed, hand_back) =
+            (self.pid, self.target, self.primed, self.ops.hand_back);
         let live = self.live.take();
         // The records' settle pauses (240 ms) are not part of the action:
         // hand key back on a thread. The next `enter_exact_window_key` waits
-        // for it, so two scopes never interleave their records.
+        // for it, so two scopes never interleave their records. Every record
+        // still re-reads the front app first (`run_hand_back`).
         let restore = move || {
-            match primed {
-                KeyPrime::AlreadyKey => {}
-                KeyPrime::KeyRecords => {
-                    hand_key_back(pid, Some(target), previous);
-                }
-                KeyPrime::AxFocusedWindow => {
-                    set_app_focused_window(pid, previous);
-                }
+            let outcome = hand_back(pid, target, primed, previous);
+            if outcome != HandBack::Restored {
+                tracing::debug!(pid, target, ?outcome, "key hand-back did not complete");
             }
             drop(live);
             key_restore_done();
@@ -546,44 +742,96 @@ const KEY_RECORD_SETTLE: std::time::Duration = std::time::Duration::from_millis(
 /// is for the caller to confirm.
 pub fn post_window_key_records(pid: pid_t, current: Option<u32>, target: u32) -> bool {
     crate::window_change_detector::end_tail();
-    post_key_records(pid, current, target)
+    post_key_records(pid, current, target, || true).is_some_and(RecordPosts::complete)
 }
 
-fn post_key_records(pid: pid_t, current: Option<u32>, target: u32) -> bool {
-    note_focus_change();
-    let Some(post) = post_event_record_to_fn() else {
-        return false;
-    };
-    let mut psn = [0u8; 8];
-    if !get_process_psn_for_window(target, pid, &mut psn) {
-        return false;
+/// The posts of one key-record sequence.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct RecordPosts {
+    /// Post calls that succeeded.
+    pub(crate) posted: u8,
+    /// Post calls that returned failure (delivery unknown).
+    pub(crate) failed: u8,
+    /// `proceed` turned false before a record; the rest was not posted.
+    pub(crate) stopped: bool,
+}
+
+impl RecordPosts {
+    pub(crate) fn complete(self) -> bool {
+        self.failed == 0 && !self.stopped
     }
-    let send = |record: &[u8; 0xF8]| {
-        note_post_status(unsafe { post(psn.as_ptr() as *const c_void, record.as_ptr()) })
-    };
-    let mut ok = true;
+}
+
+/// Post the key-window records (see [`post_window_key_records`]) through
+/// `send`, asking `proceed` before every one of them. Pure over its
+/// closures, so the stop points are tested without a desktop.
+fn post_record_sequence(
+    current: Option<u32>,
+    target: u32,
+    mut proceed: impl FnMut() -> bool,
+    mut send: impl FnMut(&[u8; 0xF8]) -> bool,
+    mut settle: impl FnMut(),
+) -> RecordPosts {
+    let mut records: Vec<([u8; 0xF8], bool)> = Vec::with_capacity(4);
     if let Some(current) = current {
         let mut defocus = focus_record(current);
         defocus[0x8A] = 0x02;
-        ok &= send(&defocus);
-        std::thread::sleep(KEY_RECORD_SETTLE);
+        records.push((defocus, true));
     }
     let mut focus = focus_record(target);
     focus[0x8A] = 0x01;
-    ok &= send(&focus);
-    std::thread::sleep(KEY_RECORD_SETTLE);
+    records.push((focus, true));
     for event_kind in [0x01, 0x02] {
-        ok &= send(&make_key_window_record(target, event_kind));
+        records.push((make_key_window_record(target, event_kind), false));
     }
-    ok
+    let mut posts = RecordPosts::default();
+    for (record, settle_after) in records {
+        if !proceed() {
+            posts.stopped = true;
+            break;
+        }
+        if send(&record) {
+            posts.posted += 1;
+        } else {
+            posts.failed += 1;
+        }
+        if settle_after {
+            settle();
+        }
+    }
+    posts
+}
+
+/// `None` when the records cannot be addressed (no SPI, no PSN for
+/// `target`): nothing was posted.
+fn post_key_records(
+    pid: pid_t,
+    current: Option<u32>,
+    target: u32,
+    proceed: impl FnMut() -> bool,
+) -> Option<RecordPosts> {
+    note_focus_change();
+    let post = post_event_record_to_fn()?;
+    let mut psn = [0u8; 8];
+    if !get_process_psn_for_window(target, pid, &mut psn) {
+        return None;
+    }
+    Some(post_record_sequence(
+        current,
+        target,
+        proceed,
+        |record| note_post_status(unsafe { post(psn.as_ptr() as *const c_void, record.as_ptr()) }),
+        || std::thread::sleep(KEY_RECORD_SETTLE),
+    ))
 }
 
 /// Hand key back inside `pid` after a [`WindowKeyScope`]: the same records
 /// as [`post_window_key_records`], without ending the previous action's
 /// detached window watch. The hand-back belongs to the action that just
 /// returned, and its post-action focus hold must outlast it.
+#[cfg(test)]
 pub(crate) fn hand_key_back(pid: pid_t, current: Option<u32>, target: u32) -> bool {
-    post_key_records(pid, current, target)
+    post_key_records(pid, current, target, || true).is_some_and(RecordPosts::complete)
 }
 
 /// Wait until the app's focus has settled on `target`, for at most `budget`.
@@ -604,6 +852,22 @@ fn await_key_focus(pid: pid_t, target: u32, budget: std::time::Duration) {
 /// pointer), confirmed by re-reading the app's focus, and return a guard that
 /// hands key back. `Err` when it cannot be confirmed.
 pub fn enter_exact_window_key(pid: pid_t, target_wid: u32) -> Result<WindowKeyScope, String> {
+    enter_scope(pid, target_wid, false)
+}
+
+/// [`enter_exact_window_key`] for an action that must not touch the app
+/// while the person may be using it: it starts only while WindowServer
+/// reports another app frontmost, stops before any record or write once
+/// that changes, and returns a scope that hands key back on the thread
+/// that drops or [`finish`](WindowKeyScope::finish)es it.
+pub fn enter_exact_window_key_inline(
+    pid: pid_t,
+    target_wid: u32,
+) -> Result<WindowKeyScope, String> {
+    enter_scope(pid, target_wid, true)
+}
+
+fn enter_scope(pid: pid_t, target_wid: u32, inline: bool) -> Result<WindowKeyScope, String> {
     // Wait for the previous scope's hand-back to finish; refuse (nothing
     // sent) when it does not.
     if !await_key_restores() {
@@ -612,27 +876,74 @@ pub fn enter_exact_window_key(pid: pid_t, target_wid: u32) -> Result<WindowKeySc
              2 s, so no keys were sent"
         ));
     }
+    // Every record and the accessibility fallback re-read the front app:
+    // entering stops once it differs from what it was at the start (the
+    // person switched apps). An inline scope also requires another app in
+    // front from the start.
+    let entry_front = front_process_matches(pid, target_wid);
+    if inline && entry_front != Some(false) {
+        return Err(format!(
+            "window {target_wid}: its app is frontmost, or which app is frontmost could not be \
+             read, so key focus inside it was not moved and no keys were sent"
+        ));
+    }
+    let front_unchanged = || front_process_matches(pid, target_wid) == entry_front;
+    let entry = std::cell::Cell::new(KeyEntry::default());
     let before = key_focus_of_pid(pid);
     let previous = before.window;
     let order_before = app_window_order(pid);
-    let primed = prime_exact_window_key(
+    let primed = match prime_exact_window_key(
         target_wid,
         || key_focus_of_pid(pid),
         || {
-            let ok = post_window_key_records(pid, previous, target_wid);
+            crate::window_change_detector::end_tail();
+            let posts = post_key_records(pid, previous, target_wid, front_unchanged);
+            let mut noted = entry.get();
+            if let Some(posts) = posts {
+                noted.records_posted = noted.records_posted.saturating_add(posts.posted);
+                noted.records_uncertain |= posts.failed > 0;
+            }
+            entry.set(noted);
+            let ok = posts.is_some_and(RecordPosts::complete);
             if ok {
                 await_key_focus(pid, target_wid, std::time::Duration::from_millis(400));
             }
             ok
         },
         || {
+            if !front_unchanged() {
+                return false;
+            }
+            let mut noted = entry.get();
+            noted.ax_write = true;
+            entry.set(noted);
             let ok = set_app_focused_window(pid, target_wid);
             if ok {
                 await_key_focus(pid, target_wid, std::time::Duration::from_millis(200));
             }
             ok
         },
-    )?;
+    ) {
+        Ok(primed) => primed,
+        Err(error) => {
+            // Records or a focused-window write may still have moved key
+            // inside the app: hand it back under the same front rule a
+            // scope's hand-back uses, and say what happened.
+            let noted = entry.get();
+            let hand_back = entry_hand_back_kind(noted).map(|primed| {
+                match restore_target(target_wid, previous, &order_before, &app_window_order(pid)) {
+                    Some(previous) => run_hand_back(pid, target_wid, primed, previous),
+                    None => HandBack::NoTarget,
+                }
+            });
+            let disclosure = scope_disclosure(noted, hand_back);
+            return Err(if disclosure.is_empty() {
+                error
+            } else {
+                format!("{error}. Before refusing: {disclosure}")
+            });
+        }
+    };
     Ok(WindowKeyScope {
         pid,
         target: target_wid,
@@ -640,7 +951,24 @@ pub fn enter_exact_window_key(pid: pid_t, target_wid: u32) -> Result<WindowKeySc
         order_before,
         live: (primed != KeyPrime::AlreadyKey).then(LiveKeyScope::new),
         primed,
+        entry: entry.get(),
+        inline,
+        done: false,
+        ops: LIVE_SCOPE_OPS,
     })
+}
+
+/// How to hand key back after a failed entry: records when any record may
+/// have reached the app, the focused-window write when only that ran,
+/// nothing when entering touched nothing.
+fn entry_hand_back_kind(entry: KeyEntry) -> Option<KeyPrime> {
+    if entry.records_posted > 0 || entry.records_uncertain {
+        Some(KeyPrime::KeyRecords)
+    } else if entry.ax_write {
+        Some(KeyPrime::AxFocusedWindow)
+    } else {
+        None
+    }
 }
 
 // ── NSMenu shortcut activation SPIs ──────────────────────────────────────────
@@ -1066,6 +1394,160 @@ pub fn prime_background_menu_validation(pid: pid_t, wid: u32) -> bool {
         },
         menu_validation_events,
         |event, attach_auth| post_to_pid(pid, event.as_ptr() as *mut c_void, attach_auth),
+    )
+}
+
+/// What a guarded menu validation posted. A failed post call cannot prove
+/// the input did not reach the app, so it is kept apart from success.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ValidationPost {
+    /// Key-window record posts that succeeded (of 2).
+    pub records: u8,
+    /// Cmd+F20 key-down/key-up posts that succeeded (of 2).
+    pub keys: u8,
+    /// Cmd+F20 post calls made, successful or not (a failed call may still
+    /// have delivered the event).
+    pub key_attempts: u8,
+    /// A post call returned failure.
+    pub uncertain: bool,
+    /// At least one post call was made.
+    pub called: bool,
+}
+
+/// Whether validation input may have reached the app.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ValidationDelivery {
+    /// No post call was made.
+    NoneSent,
+    /// Every post call made succeeded.
+    Sent,
+    /// A post call failed; it may still have been delivered.
+    Possible,
+}
+
+impl ValidationPost {
+    pub fn delivery(self) -> ValidationDelivery {
+        if !self.called {
+            ValidationDelivery::NoneSent
+        } else if self.uncertain {
+            ValidationDelivery::Possible
+        } else {
+            ValidationDelivery::Sent
+        }
+    }
+
+    /// The receipt text for what was posted; empty when nothing was.
+    pub fn disclosure(self) -> String {
+        if !self.called {
+            return String::new();
+        }
+        let mut text = format!(
+            "Menu validation posted {} of 2 key-window records for the target window",
+            self.records
+        );
+        if self.keys > 0 {
+            text.push_str(&format!(
+                " and {} of 2 Cmd+F20 validation key events to it",
+                self.keys
+            ));
+        }
+        text.push('.');
+        if self.uncertain {
+            text.push_str(
+                " A validation post failed; that input may still have reached the target window.",
+            );
+        }
+        text
+    }
+}
+
+/// The guarded validation sequence over its side effects (tests drive it
+/// with fakes). `front_ok` is asked before each key-window record and before
+/// the Cmd+F20 pair; `confirm_key` must show the target as the app's key
+/// window before the pair. Once the key-down was posted the key-up always
+/// follows, so no key is left down.
+fn menu_validation_guarded_with<E>(
+    mut front_ok: impl FnMut() -> bool,
+    resolve_psn: impl FnOnce() -> bool,
+    mut post_record: impl FnMut(u8) -> bool,
+    confirm_key: impl FnOnce() -> bool,
+    make_events: impl FnOnce() -> Option<(E, E)>,
+    mut post_event: impl FnMut(&E) -> bool,
+) -> ValidationPost {
+    let mut out = ValidationPost::default();
+    if !resolve_psn() {
+        return out;
+    }
+    for event_kind in [0x01, 0x02] {
+        if !front_ok() {
+            return out;
+        }
+        out.called = true;
+        if post_record(event_kind) {
+            out.records += 1;
+        } else {
+            out.uncertain = true;
+        }
+    }
+    if out.records < 2 || !confirm_key() {
+        return out;
+    }
+    let Some((down, up)) = make_events() else {
+        return out;
+    };
+    if !front_ok() {
+        return out;
+    }
+    for event in [&down, &up] {
+        out.key_attempts += 1;
+        if post_event(event) {
+            out.keys += 1;
+        } else {
+            out.uncertain = true;
+        }
+    }
+    out
+}
+
+/// Wake AppKit's menu validation for `wid` while a [`WindowKeyScope`]
+/// already holds it as the app's key window: the key-window records and one
+/// Cmd+F20 pair, each only while `front_ok` still holds (another app is
+/// frontmost). No activation is used. The caller reads AXEnabled afterwards.
+pub fn prime_menu_validation_guarded(
+    pid: pid_t,
+    wid: u32,
+    front_ok: impl FnMut() -> bool,
+) -> ValidationPost {
+    let target_psn = std::cell::Cell::new([0u8; 8]);
+    menu_validation_guarded_with(
+        front_ok,
+        || {
+            if post_event_record_to_fn().is_none() {
+                return false;
+            }
+            let mut psn = [0u8; 8];
+            let resolved = get_process_psn_for_window(wid, pid, &mut psn);
+            if resolved {
+                target_psn.set(psn);
+            }
+            resolved
+        },
+        |event_kind| {
+            let Some(post) = post_event_record_to_fn() else {
+                return false;
+            };
+            note_focus_change();
+            let record = make_key_window_record(wid, event_kind);
+            note_post_status(unsafe {
+                post(target_psn.get().as_ptr() as *const c_void, record.as_ptr())
+            })
+        },
+        || {
+            await_key_focus(pid, wid, std::time::Duration::from_millis(200));
+            key_focus_of_pid(pid).routes_to(wid)
+        },
+        menu_validation_events,
+        |event| post_to_pid(pid, event.as_ptr() as *mut c_void, false),
     )
 }
 
@@ -2539,5 +3021,401 @@ mod primed_key_tests {
         assert_eq!(ours(&primed_keys_for_test()), vec![(-90_001, 2)]);
         note_primed_key(-90_002, 3);
         assert_eq!(ours(&primed_keys_for_test()), vec![(-90_002, 3)]);
+    }
+}
+
+#[cfg(test)]
+mod wp2_scope_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Mutex;
+
+    #[test]
+    fn a_hand_back_posts_only_while_another_app_is_in_front() {
+        assert!(hand_back_allowed(Some(false)));
+        assert!(!hand_back_allowed(Some(true)));
+        assert!(!hand_back_allowed(None));
+    }
+
+    #[test]
+    fn record_sequence_stops_before_the_record_where_the_front_changed() {
+        for stop_before in 0..4 {
+            let mut asked = 0;
+            let mut sent = 0;
+            let posts = post_record_sequence(
+                Some(7),
+                8,
+                || {
+                    asked += 1;
+                    asked <= stop_before
+                },
+                |_| {
+                    sent += 1;
+                    true
+                },
+                || {},
+            );
+            assert_eq!(sent, stop_before);
+            assert_eq!(posts.posted as usize, stop_before);
+            assert!(posts.stopped);
+            assert!(!posts.complete());
+        }
+        let posts = post_record_sequence(Some(7), 8, || true, |_| true, || {});
+        assert_eq!(
+            posts,
+            RecordPosts {
+                posted: 4,
+                failed: 0,
+                stopped: false
+            }
+        );
+        // No previous key window: no defocus record.
+        let posts = post_record_sequence(None, 8, || true, |_| true, || {});
+        assert_eq!(posts.posted, 3);
+    }
+
+    #[test]
+    fn a_failed_post_is_kept_as_unknown_delivery() {
+        let mut n = 0;
+        let posts = post_record_sequence(
+            Some(7),
+            8,
+            || true,
+            |_| {
+                n += 1;
+                n != 2
+            },
+            || {},
+        );
+        assert_eq!(
+            posts,
+            RecordPosts {
+                posted: 3,
+                failed: 1,
+                stopped: false
+            }
+        );
+        assert!(!posts.complete());
+    }
+
+    #[test]
+    fn hand_back_outcomes() {
+        let stopped_first = RecordPosts {
+            posted: 0,
+            failed: 0,
+            stopped: true,
+        };
+        let stopped_late = RecordPosts {
+            posted: 2,
+            failed: 0,
+            stopped: true,
+        };
+        let full = RecordPosts {
+            posted: 4,
+            failed: 0,
+            stopped: false,
+        };
+        assert_eq!(
+            hand_back_outcome(Some(stopped_first), || unreachable!()),
+            HandBack::LeftForPerson
+        );
+        assert_eq!(
+            hand_back_outcome(Some(stopped_late), || unreachable!()),
+            HandBack::Partial
+        );
+        assert_eq!(hand_back_outcome(Some(full), || true), HandBack::Restored);
+        assert_eq!(
+            hand_back_outcome(Some(full), || false),
+            HandBack::NotConfirmed
+        );
+        assert_eq!(
+            hand_back_outcome(None, || unreachable!()),
+            HandBack::NotConfirmed
+        );
+    }
+
+    #[test]
+    fn disclosure_names_what_entering_did() {
+        let none = KeyEntry::default();
+        assert_eq!(scope_disclosure(none, Some(HandBack::NotMoved)), "");
+        assert_eq!(scope_disclosure(none, None), "");
+        let records = KeyEntry {
+            records_posted: 4,
+            ..KeyEntry::default()
+        };
+        let text = scope_disclosure(records, Some(HandBack::Restored));
+        assert!(text.contains("4 key-window record(s) were posted"));
+        assert!(text.contains("went back"));
+        assert!(!text.contains("accessibility"));
+        let ax_only = KeyEntry {
+            ax_write: true,
+            ..KeyEntry::default()
+        };
+        let text = scope_disclosure(ax_only, Some(HandBack::LeftForPerson));
+        assert!(!text.contains("record"));
+        assert!(text.contains("through accessibility"));
+        assert!(text.contains("left on the target window"));
+        let both = KeyEntry {
+            records_posted: 2,
+            records_uncertain: true,
+            ax_write: true,
+        };
+        let text = scope_disclosure(both, None);
+        assert!(text.contains("2 key-window record(s)"));
+        assert!(text.contains("may still have reached"));
+        assert!(text.contains("through accessibility"));
+        assert!(!text.contains("Key focus"));
+    }
+
+    static LEASE: Mutex<()> = Mutex::new(());
+    static HANDED_BACK_UNDER_LEASE: AtomicBool = AtomicBool::new(false);
+
+    fn order_with_previous(_: pid_t) -> Vec<u32> {
+        vec![1]
+    }
+
+    fn hand_back_checking_lease(_: pid_t, _: u32, _: KeyPrime, previous: u32) -> HandBack {
+        assert_eq!(previous, 1);
+        HANDED_BACK_UNDER_LEASE.store(LEASE.try_lock().is_err(), Ordering::SeqCst);
+        HandBack::Restored
+    }
+
+    fn scope(inline: bool) -> WindowKeyScope {
+        WindowKeyScope {
+            pid: -77_001,
+            target: 2,
+            previous: Some(1),
+            order_before: vec![2, 1],
+            primed: KeyPrime::KeyRecords,
+            entry: KeyEntry::default(),
+            inline,
+            done: false,
+            ops: ScopeOps {
+                window_order: order_with_previous,
+                hand_back: hand_back_checking_lease,
+            },
+            live: Some(LiveKeyScope::new()),
+        }
+    }
+
+    #[test]
+    fn an_inline_scope_hands_back_before_the_lease_drops_even_on_panic() {
+        HANDED_BACK_UNDER_LEASE.store(false, Ordering::SeqCst);
+        let unwound = std::panic::catch_unwind(|| {
+            let _lease = LEASE.lock().unwrap_or_else(|e| e.into_inner());
+            let _scope = scope(true);
+            panic!("action failed mid-way");
+        });
+        assert!(unwound.is_err());
+        assert!(HANDED_BACK_UNDER_LEASE.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn finish_reports_the_hand_back_and_drop_does_not_repeat_it() {
+        HANDED_BACK_UNDER_LEASE.store(false, Ordering::SeqCst);
+        let lease = LEASE.lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(scope(true).finish(), HandBack::Restored);
+        assert!(HANDED_BACK_UNDER_LEASE.load(Ordering::SeqCst));
+        drop(lease);
+        let mut already_key = scope(true);
+        already_key.primed = KeyPrime::AlreadyKey;
+        assert_eq!(already_key.finish(), HandBack::NotMoved);
+    }
+
+    #[test]
+    fn validation_stops_where_the_front_changed_and_reports_what_was_posted() {
+        // Front changes before the second record.
+        let mut asks = 0;
+        let post = menu_validation_guarded_with(
+            || {
+                asks += 1;
+                asks < 2
+            },
+            || true,
+            |_| true,
+            || unreachable!(),
+            || Some((1u8, 2u8)),
+            |_| unreachable!(),
+        );
+        assert_eq!(
+            post,
+            ValidationPost {
+                records: 1,
+                keys: 0,
+                key_attempts: 0,
+                uncertain: false,
+                called: true
+            }
+        );
+        assert_eq!(post.delivery(), ValidationDelivery::Sent);
+        assert!(post.disclosure().contains("1 of 2 key-window records"));
+        assert!(!post.disclosure().contains("Cmd+F20"));
+
+        // Front changes before the Cmd+F20 pair.
+        let mut asks = 0;
+        let post = menu_validation_guarded_with(
+            || {
+                asks += 1;
+                asks < 3
+            },
+            || true,
+            |_| true,
+            || true,
+            || Some((1u8, 2u8)),
+            |_| unreachable!(),
+        );
+        assert_eq!(post.records, 2);
+        assert_eq!(post.keys, 0);
+
+        // Key not confirmed: no Cmd+F20.
+        let post = menu_validation_guarded_with(
+            || true,
+            || true,
+            |_| true,
+            || false,
+            || Some((1u8, 2u8)),
+            |_| unreachable!(),
+        );
+        assert_eq!((post.records, post.keys), (2, 0));
+
+        // Nothing resolvable: nothing called.
+        let post = menu_validation_guarded_with(
+            || true,
+            || false,
+            |_| unreachable!(),
+            || unreachable!(),
+            || Some((1u8, 2u8)),
+            |_| unreachable!(),
+        );
+        assert_eq!(post.delivery(), ValidationDelivery::NoneSent);
+        assert_eq!(post.disclosure(), "");
+
+        // A failed record post stops before the pair and is uncertain.
+        let mut n = 0;
+        let post = menu_validation_guarded_with(
+            || true,
+            || true,
+            |_| {
+                n += 1;
+                n == 1
+            },
+            || unreachable!(),
+            || Some((1u8, 2u8)),
+            |_| unreachable!(),
+        );
+        assert_eq!(
+            post,
+            ValidationPost {
+                records: 1,
+                keys: 0,
+                key_attempts: 0,
+                uncertain: true,
+                called: true
+            }
+        );
+        assert_eq!(post.delivery(), ValidationDelivery::Possible);
+        assert!(post.disclosure().contains("may still have reached"));
+
+        // A failed key-down is followed by the key-up.
+        let mut posted = Vec::new();
+        let post = menu_validation_guarded_with(
+            || true,
+            || true,
+            |_| true,
+            || true,
+            || Some((1u8, 2u8)),
+            |e| {
+                posted.push(*e);
+                *e == 2
+            },
+        );
+        assert_eq!(posted, vec![1, 2]);
+        assert_eq!(
+            (post.records, post.keys, post.key_attempts, post.uncertain),
+            (2, 1, 2, true)
+        );
+        assert!(post.disclosure().contains("1 of 2 Cmd+F20"));
+
+        let post = menu_validation_guarded_with(
+            || true,
+            || true,
+            |_| true,
+            || true,
+            || Some((1u8, 2u8)),
+            |_| true,
+        );
+        assert_eq!(
+            post,
+            ValidationPost {
+                records: 2,
+                keys: 2,
+                key_attempts: 2,
+                uncertain: false,
+                called: true
+            }
+        );
+    }
+
+    #[test]
+    fn the_accessibility_fallback_is_skipped_when_entering_must_stop() {
+        // Records fail to confirm, then the fallback closure refuses (as
+        // enter_scope's does once the front changed): no write, Err.
+        let mut wrote = false;
+        let result = prime_exact_window_key(
+            2,
+            || KeyFocus {
+                window: Some(1),
+                element_window: Some(1),
+            },
+            || false,
+            || {
+                let front_unchanged = false;
+                if !front_unchanged {
+                    return false;
+                }
+                wrote = true;
+                true
+            },
+        );
+        assert!(result.is_err());
+        assert!(!wrote);
+    }
+}
+
+#[cfg(test)]
+mod entry_hand_back_tests {
+    use super::{entry_hand_back_kind, KeyEntry, KeyPrime};
+
+    #[test]
+    fn a_failed_entry_hands_back_whatever_may_have_moved_key() {
+        assert_eq!(
+            entry_hand_back_kind(KeyEntry::default()),
+            None,
+            "nothing touched"
+        );
+        let records = KeyEntry {
+            records_posted: 2,
+            ..KeyEntry::default()
+        };
+        assert_eq!(entry_hand_back_kind(records), Some(KeyPrime::KeyRecords));
+        let uncertain = KeyEntry {
+            records_uncertain: true,
+            ..KeyEntry::default()
+        };
+        assert_eq!(entry_hand_back_kind(uncertain), Some(KeyPrime::KeyRecords));
+        let ax_only = KeyEntry {
+            ax_write: true,
+            ..KeyEntry::default()
+        };
+        assert_eq!(
+            entry_hand_back_kind(ax_only),
+            Some(KeyPrime::AxFocusedWindow)
+        );
+        let both = KeyEntry {
+            records_posted: 4,
+            records_uncertain: false,
+            ax_write: true,
+        };
+        assert_eq!(entry_hand_back_kind(both), Some(KeyPrime::KeyRecords));
     }
 }

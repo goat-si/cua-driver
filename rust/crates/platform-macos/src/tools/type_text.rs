@@ -2689,6 +2689,272 @@ fn no_focused_text_input_refusal(
     }
 }
 
+// ── Temporary restore of a minimized window (400-F1 wp2) ────────────────────
+
+/// Whether a minimized window may be restored for one action.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum RestoreDecision {
+    /// The window is visible: nothing to restore.
+    NotNeeded,
+    /// Proven minimized in a visible app: restore it for the action.
+    Restore,
+    /// The app is hidden, or a state is unknown: keep the existing refusal.
+    Refuse,
+}
+
+pub(super) fn restore_decision(
+    minimized: Option<bool>,
+    app_hidden: Option<bool>,
+) -> RestoreDecision {
+    if app_hidden != Some(false) {
+        return RestoreDecision::Refuse;
+    }
+    match minimized {
+        Some(true) => RestoreDecision::Restore,
+        Some(false) => RestoreDecision::NotNeeded,
+        None => RestoreDecision::Refuse,
+    }
+}
+
+/// A restore (and the input after it) may happen only while WindowServer
+/// reports another app frontmost: the person is not using the target app.
+pub(super) fn restore_front_ok(front_is_target_app: Option<bool>) -> bool {
+    front_is_target_app == Some(false)
+}
+
+/// The live reads and writes of a temporary restore (fakes in tests).
+pub(super) trait MinimizeOps {
+    /// Write AXMinimized; `Err` carries the AX error code.
+    fn set_minimized(&self, minimized: bool) -> Result<(), i32>;
+    fn read_minimized(&self) -> Option<bool>;
+    /// Whether the target's app is WindowServer-frontmost now.
+    fn front_is_target_app(&self) -> Option<bool>;
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RestoreState {
+    /// Nothing was written.
+    Untouched,
+    /// AXMinimized=false may have been applied (written, not yet read back).
+    MaybeUnminimized,
+    Restored,
+    /// Cleanup ran.
+    Finished,
+}
+
+/// What became of the window after the action.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum RestoreReport {
+    /// Nothing was written to the window.
+    NotTouched,
+    /// AXMinimized reads true again.
+    Reminimized,
+    /// AXMinimized=true was written but reads back as given.
+    ReminimizeNotConfirmed(Option<bool>),
+    /// Left visible: the target app is frontmost now, or which app is could
+    /// not be read (the person may be using it).
+    LeftVisible,
+}
+
+impl RestoreReport {
+    /// A stable name for structured results.
+    pub(super) fn code(self) -> &'static str {
+        match self {
+            RestoreReport::NotTouched => "not_touched",
+            RestoreReport::Reminimized => "reminimized",
+            RestoreReport::ReminimizeNotConfirmed(_) => "reminimize_not_confirmed",
+            RestoreReport::LeftVisible => "left_visible",
+        }
+    }
+
+    pub(super) fn describe(self) -> String {
+        match self {
+            RestoreReport::NotTouched => String::new(),
+            RestoreReport::Reminimized => {
+                "The window was restored from the Dock for the action and minimized again.".into()
+            }
+            RestoreReport::ReminimizeNotConfirmed(read) => format!(
+                "The window was restored from the Dock for the action; minimizing it again was \
+                 requested but AXMinimized reads {read:?}."
+            ),
+            RestoreReport::LeftVisible => "The window was restored from the Dock for the action \
+                 and left visible, because its app is now frontmost or which app is frontmost \
+                 could not be read."
+                .into(),
+        }
+    }
+}
+
+/// Owns a temporary restore from creation, before the first write: every
+/// failure after that write (an AX error after the attribute was applied, a
+/// readback timeout, an unreadable state) still re-minimizes or reports.
+pub(super) struct MinimizedRestore<O: MinimizeOps> {
+    ops: O,
+    state: RestoreState,
+}
+
+const RESTORE_POLLS: usize = 60;
+const RESTORE_POLL: std::time::Duration = std::time::Duration::from_millis(25);
+
+impl<O: MinimizeOps> MinimizedRestore<O> {
+    pub(super) fn new(ops: O) -> Self {
+        Self {
+            ops,
+            state: RestoreState::Untouched,
+        }
+    }
+
+    /// Restore the window and prove it: readback false and another app still
+    /// in front. `Err` when not; no input may follow then.
+    pub(super) fn begin(&mut self, mut pause: impl FnMut()) -> Result<(), String> {
+        if !restore_front_ok(self.ops.front_is_target_app()) {
+            return Err(
+                "its app is frontmost, or which app is frontmost could not be read, so \
+                        the minimized window was not restored"
+                    .into(),
+            );
+        }
+        self.state = RestoreState::MaybeUnminimized;
+        if let Err(code) = self.ops.set_minimized(false) {
+            return Err(format!(
+                "restoring the minimized window returned AX error {code}"
+            ));
+        }
+        for _ in 0..RESTORE_POLLS {
+            if self.ops.read_minimized() == Some(false) {
+                self.state = RestoreState::Restored;
+                break;
+            }
+            pause();
+        }
+        if self.state != RestoreState::Restored {
+            return Err("the window did not read back as restored".into());
+        }
+        if !restore_front_ok(self.ops.front_is_target_app()) {
+            return Err("its app came to the front while the window was restored".into());
+        }
+        Ok(())
+    }
+
+    /// The target's app is still not frontmost: input may go out now.
+    pub(super) fn front_still_ok(&self) -> bool {
+        restore_front_ok(self.ops.front_is_target_app())
+    }
+
+    pub(super) fn finish(mut self) -> RestoreReport {
+        self.cleanup(|| std::thread::sleep(RESTORE_POLL))
+    }
+
+    fn cleanup(&mut self, mut pause: impl FnMut()) -> RestoreReport {
+        match self.state {
+            RestoreState::Untouched | RestoreState::Finished => return RestoreReport::NotTouched,
+            RestoreState::MaybeUnminimized | RestoreState::Restored => {}
+        }
+        self.state = RestoreState::Finished;
+        if !restore_front_ok(self.ops.front_is_target_app()) {
+            return RestoreReport::LeftVisible;
+        }
+        let _ = self.ops.set_minimized(true);
+        let mut read = None;
+        for _ in 0..RESTORE_POLLS {
+            read = self.ops.read_minimized();
+            if read == Some(true) {
+                return RestoreReport::Reminimized;
+            }
+            pause();
+        }
+        RestoreReport::ReminimizeNotConfirmed(read)
+    }
+}
+
+impl<O: MinimizeOps> Drop for MinimizedRestore<O> {
+    fn drop(&mut self) {
+        let report = self.cleanup(|| std::thread::sleep(RESTORE_POLL));
+        if !matches!(
+            report,
+            RestoreReport::NotTouched | RestoreReport::Reminimized
+        ) {
+            tracing::warn!(
+                ?report,
+                "a temporarily restored window was not minimized again"
+            );
+        }
+    }
+}
+
+/// The real AXMinimized reads and writes for one exact window.
+pub(super) struct AxMinimizeOps {
+    pid: i32,
+    window_id: u32,
+    window: crate::ax::snapshot::RetainedElement,
+}
+
+impl AxMinimizeOps {
+    pub(super) fn of(pid: i32, window_id: u32) -> Option<Self> {
+        use crate::ax::bindings::{
+            ax_get_window_id, copy_ax_windows_including, AXUIElementCreateApplication,
+        };
+        unsafe {
+            let app = AXUIElementCreateApplication(pid);
+            if app.is_null() {
+                return None;
+            }
+            let mut found = None;
+            for window in copy_ax_windows_including(app, pid, window_id) {
+                if found.is_none() && ax_get_window_id(window) == Some(window_id) {
+                    found = Some(crate::ax::snapshot::RetainedElement::retain(
+                        window as usize,
+                    ));
+                }
+                CFRelease(window as _);
+            }
+            CFRelease(app as _);
+            found.map(|window| Self {
+                pid,
+                window_id,
+                window,
+            })
+        }
+    }
+}
+
+impl MinimizeOps for AxMinimizeOps {
+    fn set_minimized(&self, minimized: bool) -> Result<(), i32> {
+        use core_foundation::{base::TCFType, boolean::CFBoolean, string::CFString};
+        let attr = CFString::new("AXMinimized");
+        let value = if minimized {
+            CFBoolean::true_value()
+        } else {
+            CFBoolean::false_value()
+        };
+        let err = unsafe {
+            crate::ax::bindings::AXUIElementSetAttributeValue(
+                self.window.as_ptr() as crate::ax::bindings::AXUIElementRef,
+                attr.as_concrete_TypeRef(),
+                value.as_CFTypeRef(),
+            )
+        };
+        if err == 0 {
+            Ok(())
+        } else {
+            Err(err)
+        }
+    }
+
+    fn read_minimized(&self) -> Option<bool> {
+        unsafe {
+            crate::ax::bindings::copy_bool_attr(
+                self.window.as_ptr() as crate::ax::bindings::AXUIElementRef,
+                "AXMinimized",
+            )
+        }
+    }
+
+    fn front_is_target_app(&self) -> Option<bool> {
+        crate::input::skylight::front_process_matches(self.pid as libc::pid_t, self.window_id)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     /// DSH-03: a paste that may have landed is not reported as a plain
@@ -3247,5 +3513,154 @@ mod tests {
         }
         assert!(screen_sharing_delivery_error(true, true, Some(7)).is_none());
         assert!(screen_sharing_delivery_error(false, false, None).is_none());
+    }
+}
+
+#[cfg(test)]
+mod minimized_restore_tests {
+    use super::*;
+    use std::cell::{Cell, RefCell};
+
+    #[test]
+    fn restore_needs_a_visible_app_and_a_proven_minimized_window() {
+        assert_eq!(
+            restore_decision(Some(true), Some(false)),
+            RestoreDecision::Restore
+        );
+        assert_eq!(
+            restore_decision(Some(false), Some(false)),
+            RestoreDecision::NotNeeded
+        );
+        assert_eq!(restore_decision(None, Some(false)), RestoreDecision::Refuse);
+        assert_eq!(
+            restore_decision(Some(true), Some(true)),
+            RestoreDecision::Refuse,
+            "hidden app"
+        );
+        assert_eq!(
+            restore_decision(Some(true), None),
+            RestoreDecision::Refuse,
+            "unknown"
+        );
+        assert!(restore_front_ok(Some(false)));
+        assert!(!restore_front_ok(Some(true)));
+        assert!(!restore_front_ok(None));
+    }
+
+    /// Scripted AX: each read pops the next value (the last one repeats).
+    struct Fake {
+        writes: RefCell<Vec<bool>>,
+        write_error_on: Option<bool>,
+        reads: RefCell<Vec<Option<bool>>>,
+        fronts: RefCell<Vec<Option<bool>>>,
+        front_reads: Cell<usize>,
+    }
+
+    impl Fake {
+        fn new(reads: Vec<Option<bool>>, fronts: Vec<Option<bool>>) -> Self {
+            Self {
+                writes: RefCell::new(Vec::new()),
+                write_error_on: None,
+                reads: RefCell::new(reads),
+                fronts: RefCell::new(fronts),
+                front_reads: Cell::new(0),
+            }
+        }
+    }
+
+    fn pop<T: Copy>(values: &RefCell<Vec<T>>) -> T {
+        let mut values = values.borrow_mut();
+        if values.len() > 1 {
+            values.remove(0)
+        } else {
+            values[0]
+        }
+    }
+
+    impl MinimizeOps for &Fake {
+        fn set_minimized(&self, minimized: bool) -> Result<(), i32> {
+            self.writes.borrow_mut().push(minimized);
+            if self.write_error_on == Some(minimized) {
+                Err(-25200)
+            } else {
+                Ok(())
+            }
+        }
+        fn read_minimized(&self) -> Option<bool> {
+            pop(&self.reads)
+        }
+        fn front_is_target_app(&self) -> Option<bool> {
+            self.front_reads.set(self.front_reads.get() + 1);
+            pop(&self.fronts)
+        }
+    }
+
+    #[test]
+    fn a_front_target_app_is_never_touched() {
+        let fake = Fake::new(vec![Some(true)], vec![Some(true)]);
+        let mut restore = MinimizedRestore::new(&fake);
+        assert!(restore.begin(|| {}).is_err());
+        assert_eq!(restore.finish(), RestoreReport::NotTouched);
+        assert!(fake.writes.borrow().is_empty());
+    }
+
+    #[test]
+    fn a_restore_is_minimized_again_after_the_action() {
+        let fake = Fake::new(vec![Some(false), Some(true)], vec![Some(false)]);
+        let mut restore = MinimizedRestore::new(&fake);
+        restore.begin(|| {}).expect("restored");
+        assert!(restore.front_still_ok());
+        // read: false (begin) then true (finish)
+        assert_eq!(restore.finish(), RestoreReport::Reminimized);
+        assert_eq!(*fake.writes.borrow(), vec![false, true]);
+    }
+
+    #[test]
+    fn a_write_error_after_the_attribute_applied_is_still_cleaned_up() {
+        let mut fake = Fake::new(vec![Some(false), Some(true)], vec![Some(false)]);
+        fake.write_error_on = Some(false);
+        let mut restore = MinimizedRestore::new(&fake);
+        assert!(restore.begin(|| {}).is_err());
+        assert_eq!(restore.finish(), RestoreReport::Reminimized);
+        assert_eq!(*fake.writes.borrow(), vec![false, true]);
+    }
+
+    #[test]
+    fn a_readback_timeout_or_unreadable_state_is_cleaned_up_and_reported() {
+        let fake = Fake::new(vec![None], vec![Some(false)]);
+        let mut restore = MinimizedRestore::new(&fake);
+        assert!(restore.begin(|| {}).is_err(), "never read back as restored");
+        assert_eq!(
+            restore.finish(),
+            RestoreReport::ReminimizeNotConfirmed(None)
+        );
+        assert_eq!(*fake.writes.borrow(), vec![false, true]);
+    }
+
+    #[test]
+    fn a_switch_to_the_app_leaves_the_window_visible_and_says_so() {
+        // Front read 1 (begin start): other app; 2 (after restore): target.
+        let fake = Fake::new(vec![Some(false)], vec![Some(false), Some(true)]);
+        let mut restore = MinimizedRestore::new(&fake);
+        assert!(restore.begin(|| {}).is_err());
+        assert_eq!(restore.finish(), RestoreReport::LeftVisible);
+        assert_eq!(
+            *fake.writes.borrow(),
+            vec![false],
+            "no re-minimize under the person"
+        );
+        assert!(RestoreReport::LeftVisible
+            .describe()
+            .contains("left visible"));
+    }
+
+    #[test]
+    fn dropping_a_restore_without_finish_cleans_up() {
+        let fake = Fake::new(vec![Some(false), Some(true)], vec![Some(false)]);
+        {
+            let mut restore = MinimizedRestore::new(&fake);
+            restore.begin(|| {}).expect("restored");
+        }
+        assert_eq!(*fake.writes.borrow(), vec![false, true]);
     }
 }
