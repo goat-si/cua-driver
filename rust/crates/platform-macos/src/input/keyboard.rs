@@ -282,8 +282,10 @@ pub fn run_pasteboard_transaction<B: PasteboardBackend>(
     };
     let written_count = backend.write_items(&[transient_item])?;
 
-    let concurrent_change = backend.change_count() != written_count;
     if let Err(err) = trigger_paste() {
+        // Read AFTER the trigger returns: a concurrent copy during the
+        // trigger must never be overwritten by restoring the old snapshot.
+        let concurrent_change = backend.change_count() != written_count;
         // ONE ownership check, then at most ONE restore attempt: a
         // successful restore changes the count, and a failed one is not
         // retried.
@@ -327,7 +329,7 @@ pub fn run_pasteboard_transaction<B: PasteboardBackend>(
             return Err(PasteMayHaveLanded {
                 source: err,
                 clipboard_restored: false,
-                clipboard_changed_externally: concurrent_change,
+                clipboard_changed_externally: false,
             }
             .into());
         }
