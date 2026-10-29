@@ -809,9 +809,11 @@ pub(crate) async fn focus_by_pixel(
         // Only an EXPLICIT proof of non-dispatch allows the real-click
         // fallback: a refusal result, or background_unavailable. Any other
         // error (unverifiable, unclassified, post-dispatch) stops here.
-        let proven_refusal = effect == Some("refused") || code == Some("background_unavailable");
+        let proven_refusal = focus_error_allows_fallback(effect, code);
         if !proven_refusal {
-            return Err(pixel_focus_unconfirmed(pid, window_id, x, y));
+            // Preserve the original indeterminate result: the task may have
+            // failed before dispatch, so no "click was sent" wording.
+            return Err(focus);
         }
     }
     let landed = if focus.is_error != Some(true) {
@@ -873,6 +875,12 @@ pub(crate) async fn focus_by_pixel(
 }
 
 /// What [`focus_by_pixel`] does after its non-destructive focus click.
+/// Whether an AX-focus error permits the real-click fallback: only an
+/// explicit proof of non-dispatch (a refused effect or background_unavailable).
+fn focus_error_allows_fallback(effect: Option<&str>, code: Option<&str>) -> bool {
+    effect == Some("refused") || code == Some("background_unavailable")
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PixelFocusStep {
     /// The focused element now covers the point: send the keys.

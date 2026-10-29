@@ -2386,6 +2386,15 @@ fn perform_ax_click(
     Ok((summary, needs_webkit_delay, suspected_noop, false, false))
 }
 
+/// Selection evidence from a before/after pair: only a real
+/// unselected-to-selected transition proves the press selected the row.
+fn selection_outcome(before: Option<bool>, after: Option<bool>) -> AxPressOutcome {
+    match (before, after) {
+        (Some(false), Some(true)) => AxPressOutcome::Delivered,
+        _ => AxPressOutcome::Indeterminate,
+    }
+}
+
 /// Outcome of the AX press route for a point click.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AxPressOutcome {
@@ -2536,10 +2545,7 @@ unsafe fn ax_press_with_ancestors(
     }
     if err == kAXErrorSuccess {
         if action_name == "AXPress" {
-            return Ok(match (before_selected, selected) {
-                (Some(false), Some(true)) => AxPressOutcome::Delivered,
-                _ => AxPressOutcome::Indeterminate,
-            });
+            return Ok(selection_outcome(before_selected, selected));
         }
         return Ok(AxPressOutcome::Delivered);
     }
@@ -2605,6 +2611,30 @@ mod ancestor_action_tests {
             ("AXRow", &["AXPress"], false),
         ]);
         assert_eq!(ancestor_action_kind(&no_outline, true), None);
+    }
+
+    #[test]
+    fn selection_transition_matrix() {
+        use super::{selection_outcome, AxPressOutcome};
+        assert_eq!(
+            selection_outcome(Some(false), Some(true)),
+            AxPressOutcome::Delivered
+        );
+        for (before, after) in [
+            (Some(true), Some(true)),
+            (Some(true), Some(false)),
+            (Some(false), Some(false)),
+            (None, Some(true)),
+            (Some(false), None),
+            (Some(true), None),
+            (None, None),
+        ] {
+            assert_eq!(
+                selection_outcome(before, after),
+                AxPressOutcome::Indeterminate,
+                "{before:?} -> {after:?}"
+            );
+        }
     }
 }
 
