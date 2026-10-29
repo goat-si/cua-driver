@@ -347,6 +347,8 @@ struct Plan {
     scope: Option<std::sync::Arc<crate::batch_scope::BatchScope>>,
     #[cfg(test)]
     step_deadline: Option<StepDeadline>,
+    #[cfg(test)]
+    step_worker_finished: Option<Arc<tokio::sync::Notify>>,
 }
 
 struct PlanError {
@@ -551,9 +553,8 @@ impl Drop for GateDropGuard {
     fn drop(&mut self) {
         if self.armed {
             self.gate.timeout();
-            if let Some(worker) = self.worker.take() {
-                worker.abort();
-            }
+            // Dropping the JoinHandle detaches the admitted worker. Its
+            // platform guards must stay alive until the real work finishes.
             *self.slot.lock().unwrap_or_else(|error| error.into_inner()) = None;
         }
     }
@@ -811,6 +812,8 @@ impl Plan {
             scope,
             #[cfg(test)]
             step_deadline: None,
+            #[cfg(test)]
+            step_worker_finished: None,
         })
     }
 
@@ -949,6 +952,8 @@ impl Plan {
                         context.clone(),
                         last_window.clone(),
                         self.foreground_fallback,
+                        #[cfg(test)]
+                        self.step_worker_finished.clone(),
                         deadline,
                         timeout_code,
                     )
@@ -1346,6 +1351,7 @@ async fn execute_step(
     context: WindowSpec,
     last_window: Option<Window>,
     foreground_fallback: bool,
+    #[cfg(test)] worker_finished: Option<Arc<tokio::sync::Notify>>,
     deadline: StepDeadline,
     timeout_code: &'static str,
 ) -> StepExecution {
@@ -1370,11 +1376,16 @@ async fn execute_step(
     );
     let work = crate::batch_scope::enter(scope, work);
     let work = async move {
-        if let Some(context) = dispatch_context {
+        let completion = if let Some(context) = dispatch_context {
             context.scope(work).await
         } else {
             work.await
+        };
+        #[cfg(test)]
+        if let Some(worker_finished) = worker_finished {
+            worker_finished.notify_one();
         }
+        completion
     };
     let worker = tokio::spawn(work);
     let mut guard = GateDropGuard::new(gate.clone(), active_gate, worker);
@@ -1399,14 +1410,6 @@ async fn execute_step(
             }
         }
         _ = deadline.wait() => {
-            let worker = guard.worker.as_mut().expect("worker");
-            worker.abort();
-            gate.timeout();
-            // Cooperative workers settle at their next cancellation point. Waiting
-            // for that cancellation keeps admitted work and its guards from
-            // outliving the batch result; the refreshed snapshot also includes
-            // any refusal published while cancellation was settling.
-            let _ = worker.await;
             let snapshot = gate.timeout();
             StepExecution::Timeout {
                 outcome: failure(
@@ -2723,6 +2726,47 @@ mod timeout_tests {
         }
     }
 
+    struct BlockingHangingTool {
+        def: ToolDef,
+        started: Arc<tokio::sync::Notify>,
+        release: Arc<(Mutex<bool>, std::sync::Condvar)>,
+        finished: Arc<std::sync::atomic::AtomicBool>,
+        concurrency: Arc<tokio::sync::Semaphore>,
+    }
+
+    #[async_trait]
+    impl Tool for BlockingHangingTool {
+        fn def(&self) -> &ToolDef {
+            &self.def
+        }
+
+        async fn invoke(&self, _args: Value) -> ToolResult {
+            if self.finished.load(std::sync::atomic::Ordering::SeqCst) {
+                return ToolResult::text("finished");
+            }
+            let Ok(_permit) = self.concurrency.try_acquire() else {
+                return ToolResult::error("input_busy")
+                    .with_structured(json!({"code":"input_busy","effect":"refused"}));
+            };
+            self.started.notify_one();
+            let release = self.release.clone();
+            tokio::task::spawn_blocking(move || {
+                let (lock, condvar) = release.as_ref();
+                let mut released = lock.lock().unwrap_or_else(|error| error.into_inner());
+                while !*released {
+                    released = condvar
+                        .wait(released)
+                        .unwrap_or_else(|error| error.into_inner());
+                }
+            })
+            .await
+            .expect("blocking fixture");
+            self.finished
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            ToolResult::text("finished")
+        }
+    }
+
     fn tool_def(name: &str) -> ToolDef {
         ToolDef {
             name: name.into(),
@@ -2907,9 +2951,10 @@ mod timeout_tests {
     #[tokio::test]
     async fn a_hung_step_returns_step_timeout() {
         let started = Arc::new(tokio::sync::Notify::new());
-        let release = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+        let worker_finished = Arc::new(tokio::sync::Notify::new());
         let mut registry = ToolRegistry::new();
-        registry.register(Box::new(HangingTool {
+        registry.register(Box::new(BlockingHangingTool {
             def: tool_def("type_text"),
             started: started.clone(),
             release: release.clone(),
@@ -2926,6 +2971,7 @@ mod timeout_tests {
         .unwrap_or_else(|error| panic!("invalid plan: {}", error.message));
         let (deadline_tx, deadline_rx) = tokio::sync::oneshot::channel();
         plan.step_deadline = Some(StepDeadline::Trigger(deadline_rx));
+        plan.step_worker_finished = Some(worker_finished.clone());
         let batch = tokio::spawn(plan.run(registry.clone(), None));
         tokio::time::timeout(Duration::from_secs(1), started.notified())
             .await
@@ -2939,14 +2985,28 @@ mod timeout_tests {
         );
         deadline_tx.send(()).expect("trigger step deadline");
         let result = batch.await.expect("batch join");
-        release.notify_one();
         let structured = result.structured_content.expect("structured batch");
         assert_eq!(structured["code"], "step_timeout");
         assert_eq!(structured["failed_step"], 0);
         assert_eq!(structured["steps"][0]["index"], 0);
         assert_eq!(structured["steps"][0]["tool"], "type_text");
         assert_eq!(structured["steps"][0]["effect"], "unverifiable");
+        assert_eq!(structured["steps"][0]["scope_outcome"], "unknown");
 
+        let still_busy = registry
+            .invoke("type_text", json!({"pid":425001,"window_id":7}))
+            .await;
+        assert!(
+            still_busy.is_error == Some(true) && format!("{still_busy:?}").contains("input_busy"),
+            "{still_busy:?}"
+        );
+
+        let (lock, condvar) = release.as_ref();
+        *lock.lock().unwrap_or_else(|error| error.into_inner()) = true;
+        condvar.notify_one();
+        tokio::time::timeout(Duration::from_secs(1), worker_finished.notified())
+            .await
+            .expect("detached worker completion");
         let completed = registry
             .invoke("type_text", json!({"pid":425001,"window_id":7}))
             .await;
@@ -3320,6 +3380,7 @@ mod timeout_tests {
         );
         let started = Arc::new(tokio::sync::Notify::new());
         let release = Arc::new(tokio::sync::Notify::new());
+        let worker_finished = Arc::new(tokio::sync::Notify::new());
         let calls = Arc::new(Mutex::new(Vec::new()));
         let mut registry = ToolRegistry::new();
         registry.register(Box::new(RefusalTool {
@@ -3346,11 +3407,15 @@ mod timeout_tests {
         .unwrap_or_else(|error| panic!("invalid plan: {}", error.message));
         let (deadline_tx, deadline_rx) = tokio::sync::oneshot::channel();
         plan.step_deadline = Some(StepDeadline::Trigger(deadline_rx));
+        plan.step_worker_finished = Some(worker_finished.clone());
         let batch = tokio::spawn(plan.run(registry, None));
         started.notified().await;
         deadline_tx.send(()).expect("deadline");
         let result = batch.await.expect("batch join");
         release.notify_one();
+        tokio::time::timeout(Duration::from_secs(1), worker_finished.notified())
+            .await
+            .expect("menu refusal completion");
         assert_eq!(result.structured_content.unwrap()["code"], "step_timeout");
         assert_eq!(calls.lock().unwrap().len(), 1);
         assert!(menu_calls.lock().unwrap().is_empty());
@@ -3366,6 +3431,7 @@ mod timeout_tests {
         );
         let started = Arc::new(tokio::sync::Notify::new());
         let release = Arc::new(tokio::sync::Notify::new());
+        let worker_finished = Arc::new(tokio::sync::Notify::new());
         let calls = Arc::new(Mutex::new(Vec::new()));
         let mut registry = ToolRegistry::new();
         register_probe(&mut registry, "list_windows", list_windows);
@@ -3401,11 +3467,15 @@ mod timeout_tests {
         .unwrap_or_else(|error| panic!("invalid plan: {}", error.message));
         let (deadline_tx, deadline_rx) = tokio::sync::oneshot::channel();
         plan.step_deadline = Some(StepDeadline::Trigger(deadline_rx));
+        plan.step_worker_finished = Some(worker_finished.clone());
         let batch = tokio::spawn(plan.run(registry, None));
         started.notified().await;
         deadline_tx.send(()).expect("deadline");
         let result = batch.await.expect("batch join");
         release.notify_one();
+        tokio::time::timeout(Duration::from_secs(1), worker_finished.notified())
+            .await
+            .expect("stale refusal completion");
         assert_eq!(result.structured_content.unwrap()["code"], "step_timeout");
         assert_eq!(calls.lock().unwrap().len(), 1);
     }
@@ -3414,6 +3484,7 @@ mod timeout_tests {
     async fn foreground_fallback_does_not_run_after_timeout() {
         let started = Arc::new(tokio::sync::Notify::new());
         let release = Arc::new(tokio::sync::Notify::new());
+        let worker_finished = Arc::new(tokio::sync::Notify::new());
         let calls = Arc::new(Mutex::new(Vec::new()));
         let mut registry = ToolRegistry::new();
         registry.register(Box::new(RefusalTool {
@@ -3439,11 +3510,15 @@ mod timeout_tests {
         .unwrap_or_else(|error| panic!("invalid plan: {}", error.message));
         let (deadline_tx, deadline_rx) = tokio::sync::oneshot::channel();
         plan.step_deadline = Some(StepDeadline::Trigger(deadline_rx));
+        plan.step_worker_finished = Some(worker_finished.clone());
         let batch = tokio::spawn(plan.run(registry, None));
         started.notified().await;
         deadline_tx.send(()).expect("deadline");
         let result = batch.await.expect("batch join");
         release.notify_one();
+        tokio::time::timeout(Duration::from_secs(1), worker_finished.notified())
+            .await
+            .expect("foreground refusal completion");
         assert_eq!(result.structured_content.unwrap()["code"], "step_timeout");
         assert_eq!(calls.lock().unwrap().len(), 1);
     }
