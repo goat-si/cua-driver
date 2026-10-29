@@ -802,7 +802,7 @@ impl Plan {
     }
 
     async fn run(
-        mut self,
+        self,
         registry: Arc<ToolRegistry>,
         dispatch_context: Option<crate::tool::CapturedDispatchContext>,
     ) -> ToolResult {
@@ -854,7 +854,7 @@ impl Plan {
         }
         let locator = Arc::new(locator);
         #[cfg(test)]
-        let mut deadline_override = self.step_deadline.take();
+        let mut deadline_override = self.step_deadline;
         let mut reports = Vec::with_capacity(total);
         let mut lines = Vec::with_capacity(total + 2);
         let mut failed_step = None;
