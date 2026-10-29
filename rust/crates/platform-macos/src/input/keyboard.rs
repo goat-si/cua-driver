@@ -1995,35 +1995,51 @@ mod tests {
     }
 
     struct MockPasteboard {
-        count: isize,
-        items: Vec<PasteboardItemSnapshot>,
+        count: std::cell::Cell<isize>,
+        items: std::cell::RefCell<Vec<PasteboardItemSnapshot>>,
         writes: Vec<Vec<PasteboardItemSnapshot>>,
-        concurrent_copy_during_paste: Option<Vec<PasteboardItemSnapshot>>,
+        concurrent_copy_during_paste: std::cell::RefCell<Option<Vec<PasteboardItemSnapshot>>>,
         /// Fail every write after the transient one, i.e. the restore.
         fail_restore: bool,
     }
 
+    impl MockPasteboard {
+        fn items_now(&self) -> Vec<PasteboardItemSnapshot> {
+            self.items.borrow().clone()
+        }
+    }
+
     impl PasteboardBackend for MockPasteboard {
         fn change_count(&self) -> isize {
-            self.count
+            // A concurrent writer lands when the transaction re-reads the
+            // count after the trigger, with no aliased &mut anywhere.
+            // Only after the transient write: a concurrent writer during
+            // the trigger, not before it.
+            if !self.writes.is_empty() {
+                if let Some(new_items) = self.concurrent_copy_during_paste.borrow_mut().take() {
+                    self.count.set(self.count.get() + 1);
+                    *self.items.borrow_mut() = new_items;
+                }
+            }
+            self.count.get()
         }
         fn snapshot_items(&self) -> anyhow::Result<Vec<PasteboardItemSnapshot>> {
-            Ok(self.items.clone())
+            Ok(self.items.borrow().clone())
         }
         fn write_items(&mut self, items: &[PasteboardItemSnapshot]) -> anyhow::Result<isize> {
             if self.fail_restore && !self.writes.is_empty() {
                 anyhow::bail!("pasteboard restore write failed");
             }
-            self.count += 1;
-            self.items = items.to_vec();
+            self.count.set(self.count.get() + 1);
+            *self.items.borrow_mut() = items.to_vec();
             self.writes.push(items.to_vec());
-            Ok(self.count)
+            Ok(self.count.get())
         }
         fn clear(&mut self) -> anyhow::Result<isize> {
-            self.count += 1;
-            self.items.clear();
+            self.count.set(self.count.get() + 1);
+            self.items.borrow_mut().clear();
             self.writes.push(Vec::new());
-            Ok(self.count)
+            Ok(self.count.get())
         }
     }
 
@@ -2041,10 +2057,10 @@ mod tests {
             },
         ];
         let mut pb = MockPasteboard {
-            count: 10,
-            items: original.clone(),
+            count: std::cell::Cell::new(10),
+            items: std::cell::RefCell::new(original.clone()),
             writes: Vec::new(),
-            concurrent_copy_during_paste: None,
+            concurrent_copy_during_paste: std::cell::RefCell::new(None),
             fail_restore: false,
         };
         let mut pasted = false;
@@ -2074,14 +2090,14 @@ mod tests {
             .iter()
             .any(|(k, v)| k == PASTEBOARD_UTF8_TEXT_TYPE && v == "한글 입력 테스트".as_bytes()));
         // Restored items preserve every original representation plus transient/auto-generated markers.
-        assert_eq!(pb.items.len(), 2);
-        assert!(pb.items[0]
+        assert_eq!(pb.items_now().len(), 2);
+        assert!(pb.items_now()[0]
             .representations
             .contains(&("public.utf8-plain-text".to_owned(), b"user copied".to_vec())));
-        assert!(pb.items[0]
+        assert!(pb.items_now()[0]
             .representations
             .contains(&("public.html".to_owned(), b"<b>user</b>".to_vec())));
-        assert!(pb.items[1]
+        assert!(pb.items_now()[1]
             .representations
             .contains(&("public.png".to_owned(), vec![1, 2, 3, 4])));
     }
@@ -2095,29 +2111,15 @@ mod tests {
             representations: vec![("public.utf8-plain-text".to_owned(), b"user new".to_vec())],
         }];
         let mut pb = MockPasteboard {
-            count: 5,
-            items: original,
+            count: std::cell::Cell::new(5),
+            items: std::cell::RefCell::new(original),
             writes: Vec::new(),
-            concurrent_copy_during_paste: Some(user_new.clone()),
+            concurrent_copy_during_paste: std::cell::RefCell::new(Some(user_new.clone())),
             fail_restore: false,
         };
-        let ptr = &mut pb as *mut MockPasteboard;
-        run_pasteboard_transaction(
-            &mut pb,
-            "agent text",
-            || {
-                unsafe {
-                    if let Some(new_items) = (*ptr).concurrent_copy_during_paste.take() {
-                        (*ptr).count += 1;
-                        (*ptr).items = new_items;
-                    }
-                }
-                Ok(())
-            },
-            std::time::Duration::ZERO,
-        )
-        .unwrap();
-        assert_eq!(pb.items, user_new);
+        run_pasteboard_transaction(&mut pb, "agent text", || Ok(()), std::time::Duration::ZERO)
+            .unwrap();
+        assert_eq!(pb.items_now(), user_new);
     }
 
     #[test]
@@ -2129,29 +2131,24 @@ mod tests {
             representations: vec![("public.utf8-plain-text".to_owned(), b"user new".to_vec())],
         }];
         let mut pb = MockPasteboard {
-            count: 5,
-            items: original,
+            count: std::cell::Cell::new(5),
+            items: std::cell::RefCell::new(original),
             writes: Vec::new(),
-            concurrent_copy_during_paste: Some(user_new.clone()),
+            concurrent_copy_during_paste: std::cell::RefCell::new(Some(user_new.clone())),
             fail_restore: false,
         };
-        let ptr = &mut pb as *mut MockPasteboard;
         let err = run_pasteboard_transaction(
             &mut pb,
             "agent text",
-            || {
-                unsafe {
-                    if let Some(new_items) = (*ptr).concurrent_copy_during_paste.take() {
-                        (*ptr).count += 1;
-                        (*ptr).items = new_items;
-                    }
-                }
-                anyhow::bail!("trigger failed")
-            },
+            || anyhow::bail!("trigger failed"),
             std::time::Duration::ZERO,
         )
         .unwrap_err();
-        assert_eq!(pb.items, user_new, "the other writer's content survives");
+        assert_eq!(
+            pb.items_now(),
+            user_new,
+            "the other writer's content survives"
+        );
         let landed = err.downcast_ref::<PasteMayHaveLanded>().expect("landed");
         assert!(landed.clipboard_changed_externally);
         assert!(!landed.clipboard_restored());
@@ -2166,23 +2163,16 @@ mod tests {
             representations: vec![("public.utf8-plain-text".to_owned(), b"user new".to_vec())],
         }];
         let mut pb = MockPasteboard {
-            count: 5,
-            items: original,
+            count: std::cell::Cell::new(5),
+            items: std::cell::RefCell::new(original),
             writes: Vec::new(),
-            concurrent_copy_during_paste: Some(user_new.clone()),
+            concurrent_copy_during_paste: std::cell::RefCell::new(Some(user_new.clone())),
             fail_restore: false,
         };
-        let ptr = &mut pb as *mut MockPasteboard;
         let err = run_pasteboard_transaction(
             &mut pb,
             "agent text",
             || {
-                unsafe {
-                    if let Some(new_items) = (*ptr).concurrent_copy_during_paste.take() {
-                        (*ptr).count += 1;
-                        (*ptr).items = new_items;
-                    }
-                }
                 Err(anyhow::Error::new(PasteSequenceAbort {
                     posted: 0,
                     reason: "not_editable: focus changed".into(),
@@ -2192,7 +2182,11 @@ mod tests {
             std::time::Duration::ZERO,
         )
         .unwrap_err();
-        assert_eq!(pb.items, user_new, "the other writer's content survives");
+        assert_eq!(
+            pb.items_now(),
+            user_new,
+            "the other writer's content survives"
+        );
         let abort = err.downcast_ref::<PasteSequenceAbort>().expect("abort");
         assert_eq!(
             abort.clipboard_restored,
@@ -2206,10 +2200,10 @@ mod tests {
             representations: vec![("public.utf8-plain-text".to_owned(), b"keep me".to_vec())],
         }];
         let mut pb = MockPasteboard {
-            count: 1,
-            items: original,
+            count: std::cell::Cell::new(1),
+            items: std::cell::RefCell::new(original),
             writes: Vec::new(),
-            concurrent_copy_during_paste: None,
+            concurrent_copy_during_paste: std::cell::RefCell::new(None),
             fail_restore: false,
         };
         let err = run_pasteboard_transaction(
@@ -2225,7 +2219,7 @@ mod tests {
             .downcast_ref::<PasteMayHaveLanded>()
             .expect("a failed trigger may still have pasted");
         assert!(landed.clipboard_restored());
-        assert!(pb.items[0]
+        assert!(pb.items_now()[0]
             .representations
             .contains(&("public.utf8-plain-text".to_owned(), b"keep me".to_vec())));
     }
@@ -2236,12 +2230,12 @@ mod tests {
     #[test]
     fn a_paste_that_was_sent_is_never_typed_again() {
         let mut pb = MockPasteboard {
-            count: 1,
-            items: vec![PasteboardItemSnapshot {
+            count: std::cell::Cell::new(1),
+            items: std::cell::RefCell::new(vec![PasteboardItemSnapshot {
                 representations: vec![("public.utf8-plain-text".to_owned(), b"keep".to_vec())],
-            }],
+            }]),
             writes: Vec::new(),
-            concurrent_copy_during_paste: None,
+            concurrent_copy_during_paste: std::cell::RefCell::new(None),
             fail_restore: true,
         };
         let mut triggered = 0;
