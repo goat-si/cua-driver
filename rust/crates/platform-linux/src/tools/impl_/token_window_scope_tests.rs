@@ -49,6 +49,8 @@ fn text_field(path: &str) -> AtspiNode {
         checked: None,
         enabled: Some(true),
         selected: None,
+        toggle_state: None,
+        expanded: None,
         description: None,
         actions: Vec::new(),
         element_key: 0,

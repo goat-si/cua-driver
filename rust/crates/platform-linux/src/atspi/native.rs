@@ -442,6 +442,8 @@ struct Visited<'a> {
     checked: Option<bool>,
     enabled: Option<bool>,
     selected: Option<bool>,
+    toggle_state: Option<cua_driver_contract::ToggleState>,
+    expanded_state: Option<bool>,
     selectable: bool,
     /// False when the toolkit's state set is known and marks the widget
     /// neither `Showing` nor `Visible`: it exists in the tree but is hidden
@@ -587,6 +589,39 @@ impl RawObjectRef {
             name: oref.name_as_str()?.to_owned(),
             path: oref.path_as_str().to_owned(),
         })
+    }
+}
+
+/// A toggle's AT-SPI state (goat-si/goat#1261): INDETERMINATE is mixed, CHECKED is on,
+/// and so is PRESSED on a toggle button, which is how GTK 4 reports one. `None` for a role
+/// that does not toggle.
+fn toggle_state(role_lower: &str, state: &StateSet) -> Option<cua_driver_contract::ToggleState> {
+    use cua_driver_contract::ToggleState;
+    let toggle_button = role_lower.contains("toggle");
+    if !(toggle_button
+        || role_lower.contains("check")
+        || role_lower.contains("radio")
+        || role_lower == "switch")
+    {
+        return None;
+    }
+    Some(if state.contains(State::Indeterminate) {
+        ToggleState::Mixed
+    } else if state.contains(State::Checked) || (toggle_button && state.contains(State::Pressed)) {
+        ToggleState::On
+    } else {
+        ToggleState::Off
+    })
+}
+
+/// Expanded or collapsed from EXPANDED and EXPANDABLE; `None` for an element that cannot expand.
+fn expanded_state(state: &StateSet) -> Option<bool> {
+    if state.contains(State::Expanded) {
+        Some(true)
+    } else if state.contains(State::Expandable) {
+        Some(false)
+    } else {
+        None
     }
 }
 
@@ -1606,6 +1641,14 @@ async fn collect_visited_bounded_opts<'a>(
             .and_then(|state| state.as_ref().ok())
             .is_some_and(|state| state.contains(State::Expanded));
         let under_menubar = menubar_children.remove(&(oref.name.clone(), oref.path.clone()));
+        let toggle_state = state_r
+            .as_ref()
+            .and_then(|state| state.as_ref().ok())
+            .and_then(|state| toggle_state(&role_lower, state));
+        let expanded_state = state_r
+            .as_ref()
+            .and_then(|state| state.as_ref().ok())
+            .and_then(expanded_state);
         let selected = if role_lower.contains("check") {
             checked
         } else if role_lower.contains("radio")
@@ -1850,6 +1893,8 @@ async fn collect_visited_bounded_opts<'a>(
             checked,
             enabled,
             selected,
+            toggle_state,
+            expanded_state,
             selectable,
             showing,
             offscreen,
@@ -2322,6 +2367,8 @@ fn render(visited: &[Visited<'_>], only_frame: Option<usize>) -> (String, Vec<At
                 checked: v.checked,
                 enabled: v.enabled,
                 selected: v.selected,
+                toggle_state: v.toggle_state,
+                expanded: v.expanded_state,
                 description: (!description_parts.is_empty()).then(|| description_parts.join("; ")),
                 actions: v.actions.clone(),
                 element_key: idx as u64,
@@ -8692,5 +8739,75 @@ mod token_scope_tests {
         )
         .is_ok());
         assert!(window_element_membership(Some(0), None, proven(None, vec![REQUESTED_B])).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod toggle_and_expanded_state_tests {
+    use super::{expanded_state, toggle_state};
+    use atspi::{State, StateSet};
+    use cua_driver_contract::ToggleState;
+
+    #[test]
+    fn indeterminate_is_mixed_even_when_checked() {
+        let state = StateSet::new(State::Indeterminate | State::Checked);
+        assert_eq!(toggle_state("check box", &state), Some(ToggleState::Mixed));
+    }
+
+    #[test]
+    fn checked_is_on_and_its_absence_off_for_every_toggling_role() {
+        for role in [
+            "check box",
+            "check menu item",
+            "radio button",
+            "toggle button",
+            "switch",
+        ] {
+            assert_eq!(
+                toggle_state(role, &StateSet::new(State::Checked)),
+                Some(ToggleState::On)
+            );
+            assert_eq!(
+                toggle_state(role, &StateSet::empty()),
+                Some(ToggleState::Off)
+            );
+        }
+    }
+
+    #[test]
+    fn pressed_is_on_only_for_a_toggle_button() {
+        let pressed = StateSet::new(State::Pressed);
+        assert_eq!(
+            toggle_state("toggle button", &pressed),
+            Some(ToggleState::On)
+        );
+        assert_eq!(toggle_state("check box", &pressed), Some(ToggleState::Off));
+        assert_eq!(toggle_state("push button", &pressed), None);
+    }
+
+    #[test]
+    fn a_role_that_does_not_toggle_has_no_toggle_state() {
+        assert_eq!(
+            toggle_state("push button", &StateSet::new(State::Checked)),
+            None
+        );
+        assert_eq!(
+            toggle_state("text", &StateSet::new(State::Indeterminate)),
+            None
+        );
+    }
+
+    #[test]
+    fn expanded_needs_expandable_or_expanded() {
+        assert_eq!(
+            expanded_state(&StateSet::new(State::Expandable | State::Expanded)),
+            Some(true)
+        );
+        assert_eq!(expanded_state(&StateSet::new(State::Expanded)), Some(true));
+        assert_eq!(
+            expanded_state(&StateSet::new(State::Expandable)),
+            Some(false)
+        );
+        assert_eq!(expanded_state(&StateSet::empty()), None);
     }
 }

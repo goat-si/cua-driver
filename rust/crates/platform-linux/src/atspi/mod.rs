@@ -39,6 +39,11 @@ pub struct AtspiNode {
     pub enabled: Option<bool>,
     /// Toggle/selection state for selectable controls.
     pub selected: Option<bool>,
+    /// On, off or mixed for a check box, radio button, toggle button or switch
+    /// whose state set was read; `None` for anything else.
+    pub toggle_state: Option<cua_driver_contract::ToggleState>,
+    /// Expanded or collapsed for an element that can expand; `None` otherwise.
+    pub expanded: Option<bool>,
     pub description: Option<String>,
     pub actions: Vec<String>,
     /// For AT-SPI: element_key = element_index as u64.
@@ -791,6 +796,8 @@ fn walk_via_x11_properties(xid: u64, query: Option<&str>) -> AtspiTreeResult {
         checked: None,
         enabled: None,
         selected: None,
+        toggle_state: None,
+        expanded: None,
         description: if wm_class.is_empty() {
             None
         } else {
@@ -935,6 +942,8 @@ mod budget_tests {
                 checked: None,
                 enabled: Some(true),
                 selected: None,
+                toggle_state: None,
+                expanded: None,
                 description: None,
                 actions,
                 element_key: idx as u64,
@@ -1057,6 +1066,8 @@ mod token_dispatch_tests {
             checked: None,
             enabled: Some(true),
             selected: None,
+            toggle_state: None,
+            expanded: None,
             description: None,
             actions: vec!["click".into()],
             element_key: 0,
