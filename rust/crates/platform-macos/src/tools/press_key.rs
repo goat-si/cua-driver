@@ -1675,6 +1675,41 @@ fn chord_refusal(
     }
 }
 
+/// A chord task that ended without a result, with what validation had
+/// already posted kept apart from the requested chord.
+fn chord_task_failure(
+    message: String,
+    validation: crate::input::skylight::ValidationPost,
+    chord_may_have_been_sent: bool,
+) -> ToolResult {
+    let disclosure = validation.disclosure();
+    let message = if disclosure.is_empty() {
+        message
+    } else {
+        format!("{message} {disclosure}")
+    };
+    let mut result = task_failure(message);
+    if let Some(serde_json::Value::Object(fields)) = result.structured_content.as_mut() {
+        fields.insert(
+            "validation_keys_sent".into(),
+            serde_json::json!(validation.key_attempts > 0),
+        );
+        if validation.called {
+            fields.insert("dispatch".into(), serde_json::json!("validation_posted"));
+        }
+        if chord_may_have_been_sent {
+            fields.insert("chord_delivery".into(), serde_json::json!("possible"));
+        } else {
+            fields.insert("chord_sent".into(), serde_json::json!(false));
+            fields.insert(
+                "keys_sent".into(),
+                serde_json::json!(validation.key_attempts > 0),
+            );
+        }
+    }
+    result
+}
+
 /// The text of a gate refusal, for the chord's own refusal receipt.
 fn refusal_text(result: &ToolResult) -> String {
     result
@@ -2006,11 +2041,15 @@ async fn native_menu_chord(
                     .await;
                     return match step {
                         Ok(step) => chord_result(step),
-                        Err(error) => task_failure(format!(
-                            "press_key: the key hand-back task failed ({error}); no key or menu \
-                             action was sent, and key focus inside the app may remain on the \
-                             target window."
-                        )),
+                        Err(error) => chord_task_failure(
+                            format!(
+                                "press_key: the key hand-back task failed ({error}); the \
+                                 requested chord and its menu action were not sent, and key \
+                                 focus inside the app may remain on the target window."
+                            ),
+                            validation,
+                            false,
+                        ),
                     };
                 }
                 let (key, modifiers) = chord;
@@ -2020,10 +2059,14 @@ async fn native_menu_chord(
                 .await;
                 match step {
                     Ok(step) => chord_result(step),
-                    Err(error) => task_failure(format!(
-                        "press_key: the key task failed ({error}); the chord may have been sent. \
-                         Read the window before repeating it."
-                    )),
+                    Err(error) => chord_task_failure(
+                        format!(
+                            "press_key: the key task failed ({error}); the requested chord may \
+                             have been sent. Read the window before repeating it."
+                        ),
+                        validation,
+                        true,
+                    ),
                 }
             }
             step => chord_result(step),
@@ -2075,6 +2118,30 @@ mod tests {
         assert_eq!(structured["path"], "keys_under_scope");
         let record = result.action_record.expect("record");
         assert!(matches!(record.effect, ActionEffect::Unverifiable));
+    }
+
+    #[test]
+    fn a_failed_chord_task_keeps_the_validation_keys_apart_from_the_chord() {
+        let validation = crate::input::skylight::ValidationPost {
+            records: 2,
+            keys: 2,
+            key_attempts: 2,
+            uncertain: false,
+            called: true,
+        };
+        let not_sent = chord_task_failure("hand-back failed.".into(), validation, false);
+        let structured = not_sent.structured_content.clone().expect("structured");
+        assert_eq!(structured["chord_sent"], false);
+        assert_eq!(structured["keys_sent"], true);
+        assert_eq!(structured["validation_keys_sent"], true);
+        assert_eq!(structured["dispatch"], "validation_posted");
+        assert!(structured["message"].as_str().unwrap().contains("Cmd+F20"));
+
+        let maybe = chord_task_failure("key task failed.".into(), validation, true);
+        let structured = maybe.structured_content.expect("structured");
+        assert_eq!(structured["chord_delivery"], "possible");
+        assert_eq!(structured["effect"], "unverifiable");
+        assert!(structured.get("chord_sent").is_none());
     }
 
     #[test]
