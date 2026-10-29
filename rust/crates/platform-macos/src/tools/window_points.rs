@@ -26,6 +26,11 @@ pub struct WindowBasis {
     pub y: f64,
     pub w: f64,
     pub h: f64,
+    /// Require the live frame to equal the basis exactly (no tolerance).
+    /// Set by the typing cell guard, which classifies the element at the
+    /// point against this exact frame; a sub-point drift could cross a
+    /// cell boundary.
+    pub exact: bool,
 }
 
 /// How a pointer tool's x, y are measured.
@@ -104,7 +109,16 @@ pub fn point_space(args: &Value) -> Result<PointSpace, ToolResult> {
             };
             match (number("x"), number("y"), number("w"), number("h")) {
                 (Some(x), Some(y), Some(w), Some(h)) if w > 0.0 && h > 0.0 => {
-                    Ok(PointSpace::WindowPoints(WindowBasis { x, y, w, h }))
+                    Ok(PointSpace::WindowPoints(WindowBasis {
+                        x,
+                        y,
+                        w,
+                        h,
+                        exact: basis
+                            .and_then(|basis| basis.get("exact"))
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false),
+                    }))
                 }
                 _ => Err(super::invalid_arguments(
                     "coordinate_space \"window_points\" needs window_basis {x, y, w, h}: the \
@@ -121,10 +135,11 @@ pub fn point_space(args: &Value) -> Result<PointSpace, ToolResult> {
 
 /// Whether the live frame is still the one the point was read against.
 pub fn basis_matches(basis: &WindowBasis, live: &WindowBounds) -> bool {
-    (basis.x - live.x).abs() <= BASIS_TOLERANCE_PT
-        && (basis.y - live.y).abs() <= BASIS_TOLERANCE_PT
-        && (basis.w - live.width).abs() <= BASIS_TOLERANCE_PT
-        && (basis.h - live.height).abs() <= BASIS_TOLERANCE_PT
+    let tolerance = if basis.exact { 0.0 } else { BASIS_TOLERANCE_PT };
+    (basis.x - live.x).abs() <= tolerance
+        && (basis.y - live.y).abs() <= tolerance
+        && (basis.w - live.width).abs() <= tolerance
+        && (basis.h - live.height).abs() <= tolerance
 }
 
 /// The refusal when the window moved or resized since the point was read.
@@ -442,7 +457,13 @@ mod tests {
     }
 
     fn basis(x: f64, y: f64, w: f64, h: f64) -> WindowBasis {
-        WindowBasis { x, y, w, h }
+        WindowBasis {
+            x,
+            y,
+            w,
+            h,
+            exact: false,
+        }
     }
 
     #[test]

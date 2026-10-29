@@ -734,7 +734,16 @@ pub(crate) async fn finish_window_observation(
 /// type_text or Cmd+V. Otherwise prefer non-destructive AX focus; the
 /// foreground rung falls back to a real pixel click when needed.
 /// Reuses ClickTool's exact coordinate translation and delivery mode.
-/// `Ok(())` on success; `Err(ToolResult)` short-circuits the caller.
+/// Whether an AX-focus error permits the real-click fallback: only an
+/// explicit proof of non-dispatch (a refused effect or background_unavailable).
+fn focus_error_allows_fallback(effect: Option<&str>, code: Option<&str>) -> bool {
+    // An explicit uncertain effect wins over any non-dispatch code.
+    if effect == Some("unverifiable") {
+        return false;
+    }
+    effect == Some("refused") || code == Some("background_unavailable")
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn focus_by_pixel(
     state: &Arc<ToolState>,
@@ -785,13 +794,9 @@ pub(crate) async fn focus_by_pixel(
     // non-editing cell (or an unclassifiable hit) refuses the whole call, so
     // no focus action or key can reach it (handoff 3.7 point route). The
     // classified frame becomes the click's window_points basis, so the
-    // actuator itself refuses if the geometry changes before posting — the
-    // classification and the dispatch are bound to the same frame.
+    // actuator itself refuses if the geometry changes before posting.
     let mut guarded_click_args: Option<serde_json::Value> = None;
     if guard_editable {
-        if from_zoom {
-            return Err(not_editable::unresolved_point_refusal());
-        }
         let Some(wid) = window_id else {
             return Err(not_editable::unresolved_point_refusal());
         };
@@ -812,7 +817,9 @@ pub(crate) async fn focus_by_pixel(
             "y": frame.bounds.y,
             "w": frame.bounds.width,
             "h": frame.bounds.height,
+            "exact": true,
         });
+        click_args.as_object_mut().map(|o| o.remove("from_zoom"));
         guarded_click_args = Some(click_args.clone());
     }
     // The requested field may already hold keyboard focus, for example after
@@ -877,10 +884,7 @@ pub(crate) async fn focus_by_pixel(
                 )));
             }
             PixelFocusStep::Unconfirmed => {
-                return Err(not_editable::account_focus_receipt(
-                    pixel_focus_unconfirmed(pid, window_id, x, y),
-                    Some(not_editable::FocusDispatch::SentAx),
-                ))
+                return Err(pixel_focus_unconfirmed(pid, window_id, x, y))
             }
         },
     }
@@ -888,15 +892,11 @@ pub(crate) async fn focus_by_pixel(
     // Some renderer surfaces do not expose a usable AX focus action. The
     // explicit foreground rung retains its real-click fallback for them.
     gate_foreground_physical_idle(pid, window_id)?;
-    let mut click_args = guarded_click_args.unwrap_or_else(|| {
-        serde_json::json!({
-            "pid": pid, "x": x, "y": y,
-            "delivery_mode": "foreground",
-            "action": "press",
-        })
+    let mut click_args = serde_json::json!({
+        "pid": pid, "x": x, "y": y,
+        "delivery_mode": "foreground",
+        "action": "press",
     });
-    click_args["delivery_mode"] = serde_json::json!("foreground");
-    click_args["action"] = serde_json::json!("press");
     if let Some(wid) = window_id {
         click_args["window_id"] = serde_json::json!(wid);
     }
@@ -921,30 +921,21 @@ pub(crate) async fn focus_by_pixel(
     tokio::time::sleep(std::time::Duration::from_millis(120)).await;
     Ok(not_editable::FocusDispatch::SentClick)
 }
+
+/// What [`focus_by_pixel`] does after its non-destructive focus click.
 /// Whether an AX-focus error permits the real-click fallback: only an
 /// explicit proof of non-dispatch (a refused effect or background_unavailable).
-fn focus_error_allows_fallback(effect: Option<&str>, code: Option<&str>) -> bool {
-    // An explicit uncertain effect wins over any non-dispatch code.
-    if effect == Some("unverifiable") {
-        return false;
-    }
-    effect == Some("refused") || code == Some("background_unavailable")
+enum FocusDecision {
+    Proceed(PixelFocusStep),
+    StopOriginalError,
+    StopUnconfirmed,
 }
 
-/// A negative focus readback stops the ladder: only an unreadable readback
-/// (None) can reach the real-click fallback, and only in the foreground.
 fn focus_readback_is_negative(landed: Option<bool>) -> bool {
     // Confirmed focus proceeds to the keys; only a NEGATIVE readback stops
     // the ladder as indeterminate. An unreadable readback keeps the
     // foreground fallback.
     matches!(landed, Some(false))
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum FocusDecision {
-    Proceed(PixelFocusStep),
-    StopOriginalError,
-    StopUnconfirmed,
 }
 
 fn decide_focus_next(
@@ -967,52 +958,6 @@ fn decide_focus_next(
 /// The point was classified against one frame; if the window moved or its
 /// scale changed before the actuator finished, the focus action may have
 /// landed on a different element. Refuse the keys and account for the focus
-/// action that was already sent.
-async fn revalidate_guard_geometry(
-    window_id: Option<u32>,
-    guard_editable: bool,
-    frame: Option<&px_frame::WindowPxFrame>,
-    clicked: bool,
-) -> Result<(), cua_driver_core::protocol::ToolResult> {
-    if !guard_editable {
-        return Ok(());
-    }
-    let (Some(wid), Some(before)) = (window_id, frame) else {
-        return Ok(());
-    };
-    let after = match px_frame::resolve_or_refuse(wid).await {
-        Ok(frame) => frame,
-        Err(_) => {
-            return Err(not_editable::not_editable_result(
-                "the window's geometry could not be revalidated after the focus action; no keys                  were sent."
-                    .into(),
-                if clicked {
-                    not_editable::FocusDispatch::SentClick
-                } else {
-                    not_editable::FocusDispatch::SentAx
-                },
-            ))
-        }
-    };
-    let same = before.scale == after.scale
-        && before.bounds.x == after.bounds.x
-        && before.bounds.y == after.bounds.y
-        && before.bounds.width == after.bounds.width
-        && before.bounds.height == after.bounds.height;
-    if !same {
-        return Err(not_editable::not_editable_result(
-            "the window moved or changed scale during the focus action, so the classified point              no longer matches; no keys were sent."
-                .into(),
-            if clicked {
-                not_editable::FocusDispatch::SentClick
-            } else {
-                not_editable::FocusDispatch::SentAx
-            },
-        ));
-    }
-    Ok(())
-}
-
 /// The focus action may have been sent but its outcome is unknown: no keys
 /// are sent, and no further focus fallback runs after the indeterminate
 /// mutation.

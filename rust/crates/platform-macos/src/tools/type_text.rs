@@ -486,7 +486,12 @@ impl Tool for TypeTextTool {
                 path,
                 refusal,
                 ax_attempt,
-            })) => return synthesis_refusal_result(path, &refusal, ax_attempt),
+            })) => {
+                return super::not_editable::account_focus_receipt(
+                    synthesis_refusal_result(path, &refusal, ax_attempt),
+                    px_receipt,
+                )
+            }
             Ok(Ok(TypeTextDelivery::Typed(outcome))) => Ok(Ok(outcome)),
             Ok(Err(error)) => Ok(Err(error)),
             Err(error) => Err(error),

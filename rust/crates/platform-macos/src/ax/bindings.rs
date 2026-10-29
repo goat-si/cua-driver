@@ -121,7 +121,16 @@ extern "C" {
 ///
 /// The caller must release any returned element exactly once with `CFRelease`.
 pub unsafe fn element_at_screen_position(pid: i32, x: f64, y: f64) -> Option<AXUIElementRef> {
-    element_at_screen_position_bounded(pid, x, y, 1.0)
+    // The unbounded default keeps Electron reveal's existing AX timeout
+    // behavior; U4's guard uses the bounded variant explicitly.
+    let application = AXUIElementCreateApplication(pid);
+    if application.is_null() {
+        return None;
+    }
+    let mut element = std::ptr::null_mut();
+    let error = AXUIElementCopyElementAtPosition(application, x as f32, y as f32, &mut element);
+    CFRelease(application as CFTypeRef);
+    (error == kAXErrorSuccess && !element.is_null()).then_some(element)
 }
 
 /// element_at_screen_position with an explicit messaging timeout on the

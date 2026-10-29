@@ -48,7 +48,7 @@ pub(crate) fn account_focus_receipt(
     let Some(focus) = receipt else {
         if result.is_error == Some(true) {
             let message = text_of_result(&result);
-            if message.starts_with("not_editable") {
+            if message.contains("not_editable") {
                 return not_editable_result(message, FocusDispatch::None);
             }
         }
@@ -65,9 +65,24 @@ pub(crate) fn account_focus_receipt(
         .as_ref()
         .and_then(|v| v["effect"].as_str())
         .unwrap_or("");
-    if !matches!(effect, "refused" | "unverifiable" | "") {
+    let code = result
+        .structured_content
+        .as_ref()
+        .and_then(|v| v["code"].as_str())
+        .unwrap_or("");
+    // Only a proven pre-key refusal (or the focus-unconfirmed outcome,
+    // where the focus is known to be sent and no keys went out) becomes
+    // partial. An error after text or keys may have been sent keeps its
+    // uncertainty — a paste that may have landed is NOT a partial focus.
+    let pre_key_refusal = effect == "refused"
+        || code == "pixel_focus_unconfirmed"
+        || (effect.is_empty() && text_of_result(&result).contains("not_editable"));
+    if !pre_key_refusal {
         return result;
     }
+    // The registry publishes action records only for non-error results:
+    // a partial outcome is not a hard error.
+    result.is_error = None;
     let (transport, delivery) = if matches!(focus, FocusDispatch::SentClick) {
         (ActionTransport::MacosCgEventHid, ActualDelivery::Foreground)
     } else {
@@ -281,9 +296,17 @@ unsafe fn classify_point_screen(pid: i32, x: f64, y: f64, window_id: u32) -> Cel
     let _ = AXUIElementSetMessagingTimeout(element, 0.5);
     // Prove the hit belongs to the delivery window: an overlapping
     // same-process sibling must not be classified in its place.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(800);
     let mut current = element;
     let mut owner: Option<u32> = None;
     for _ in 0..12 {
+        if std::time::Instant::now() >= deadline {
+            if current != element {
+                CFRelease(current as CFTypeRef);
+            }
+            CFRelease(element as CFTypeRef);
+            return CellVerdict::Unreadable;
+        }
         let Some(parent) = copy_element_attr(current, "AXParent") else {
             break;
         };
@@ -414,6 +437,11 @@ mod tests {
             "effect": "refused",
         }));
         let result = account_focus_receipt(refusal, Some(FocusDispatch::SentAx));
+        assert_ne!(
+            result.is_error,
+            Some(true),
+            "the registry publishes partial records"
+        );
         let data = result.structured_content.clone().unwrap();
         assert_eq!(data["effect"], "partial");
         assert_eq!(data["focus_action"], "sent");
@@ -431,8 +459,12 @@ mod tests {
 
     #[test]
     fn an_unverifiable_focus_outcome_is_projected_as_partial_when_sent() {
-        let unconfirmed = ToolResult::error("focus click sent, not confirmed")
-            .with_structured(serde_json::json!({"effect": "unverifiable"}));
+        let unconfirmed = ToolResult::error("focus click sent, not confirmed").with_structured(
+            serde_json::json!({
+                "code": "pixel_focus_unconfirmed",
+                "effect": "unverifiable",
+            }),
+        );
         let result = account_focus_receipt(unconfirmed, Some(FocusDispatch::SentClick));
         assert_eq!(
             result.structured_content.clone().unwrap()["effect"],

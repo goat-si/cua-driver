@@ -132,11 +132,23 @@ pub unsafe fn facts_for_element(element: AXUIElementRef) -> Option<ElementFacts>
     let _ = AXUIElementSetMessagingTimeout(element, AX_TIMEOUT_SECONDS);
     let mut facts = ElementFacts {
         role: copy_string_attr(element, "AXRole"),
-        focused: copy_bool_attr(element, "AXFocused"),
-        value_settable: Some(is_attribute_settable(element, "AXValue")),
-        editable: copy_bool_attr(element, "AXEditable"),
         ..Default::default()
     };
+    if std::time::Instant::now() >= deadline {
+        facts.ancestry_complete = false;
+        return Some(facts);
+    }
+    facts.focused = copy_bool_attr(element, "AXFocused");
+    if std::time::Instant::now() >= deadline {
+        facts.ancestry_complete = false;
+        return Some(facts);
+    }
+    facts.value_settable = Some(is_attribute_settable(element, "AXValue"));
+    if std::time::Instant::now() >= deadline {
+        facts.ancestry_complete = false;
+        return Some(facts);
+    }
+    facts.editable = copy_bool_attr(element, "AXEditable");
     let mut current = element;
     let mut complete = false;
     for _ in 0..MAX_ANCESTORS {
@@ -228,7 +240,7 @@ unsafe fn scan_focused_text_descendant(
                     let (nested, nested_finished) =
                         scan_focused_text_descendant(child, depth + 1, budget, deadline);
                     found = nested;
-                    finished = nested_finished;
+                    finished = finished && nested_finished;
                 }
             }
         }
