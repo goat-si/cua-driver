@@ -496,6 +496,10 @@ impl StepGate {
         self.lock().window = None;
     }
 
+    fn is_timed_out(&self) -> bool {
+        self.lock().state == GateState::TimedOut
+    }
+
     fn confirm_window(&self, window: Window) {
         let mut data = self.lock();
         if data.state != GateState::TimedOut {
@@ -831,12 +835,23 @@ impl Plan {
                 }
             }) as locate::ReadOutcome
         };
+        let read_closed = {
+            let active_gate = active_gate.clone();
+            Arc::new(move || {
+                active_gate
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .as_ref()
+                    .is_none_or(|gate| gate.is_timed_out())
+            }) as locate::ReadClosed
+        };
         let mut locator = Locator::new_owned(
             registry.clone(),
             self.session.clone(),
             started + Duration::from_millis(MAX_BATCH_MS),
             Some(read_admission),
             Some(read_outcome),
+            Some(read_closed),
         );
         // A default diff observation gets a baseline from the batch's first
         // read of each window it looks in.
@@ -2697,7 +2712,11 @@ mod timeout_tests {
             description: "timeout fixture".into(),
             input_schema: json!({
                 "type":"object",
-                "properties":{"pid":{"type":"integer"},"window_id":{"type":"integer"}}
+                "properties":{
+                    "pid":{"type":"integer"},
+                    "window_id":{"type":"integer"},
+                    "delivery_mode":{"type":"string"}
+                }
             }),
             read_only: false,
             destructive: false,
@@ -2782,6 +2801,28 @@ mod timeout_tests {
         def: ToolDef,
     }
 
+    struct RefusalTool {
+        def: ToolDef,
+        calls: Arc<Mutex<Vec<Value>>>,
+        started: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+        response: Arc<dyn Fn() -> ToolResult + Send + Sync>,
+    }
+
+    #[async_trait]
+    impl Tool for RefusalTool {
+        fn def(&self) -> &ToolDef {
+            &self.def
+        }
+
+        async fn invoke(&self, args: Value) -> ToolResult {
+            self.calls.lock().unwrap().push(args);
+            self.started.notify_one();
+            self.release.notified().await;
+            (self.response)()
+        }
+    }
+
     struct EvidenceTool {
         def: ToolDef,
         calls: Arc<Mutex<Vec<(bool, crate::agent_cursor::InputOrigin)>>>,
@@ -2860,7 +2901,9 @@ mod timeout_tests {
         let (deadline_tx, deadline_rx) = tokio::sync::oneshot::channel();
         plan.step_deadline = Some(StepDeadline::Trigger(deadline_rx));
         let batch = tokio::spawn(plan.run(registry.clone(), None));
-        started.notified().await;
+        tokio::time::timeout(Duration::from_secs(1), started.notified())
+            .await
+            .expect("action start");
         deadline_tx.send(()).expect("trigger step deadline");
         let result = batch.await.expect("batch join");
         let structured = result.structured_content.expect("structured batch");
@@ -2949,9 +2992,17 @@ mod timeout_tests {
 
     #[tokio::test]
     async fn normal_observation_is_not_limited_to_the_recovery_budget() {
+        let started = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
         let mut registry = ToolRegistry::new();
         register_probe(&mut registry, "click", || ToolResult::text("clicked"));
-        register_probe(&mut registry, "get_window_state", list_windows);
+        registry.register(Box::new(WindowReadTool {
+            def: tool_def("get_window_state"),
+            calls: Arc::new(Mutex::new(Vec::new())),
+            started: started.clone(),
+            release: release.clone(),
+            block: true,
+        }));
         let registry = Arc::new(registry);
         let plan = Plan::parse(
             &registry,
@@ -2961,7 +3012,10 @@ mod timeout_tests {
             }),
         )
         .unwrap_or_else(|error| panic!("invalid plan: {}", error.message));
-        let result = plan.run(registry, None).await;
+        let batch = tokio::spawn(plan.run(registry, None));
+        started.notified().await;
+        release.notify_one();
+        let result = batch.await.expect("batch join");
         let structured = result.structured_content.unwrap();
         assert_eq!(structured["observation"]["ok"], true, "{structured}");
         assert!(structured.get("code").is_none());
@@ -3046,7 +3100,9 @@ mod timeout_tests {
         let (deadline_tx, deadline_rx) = tokio::sync::oneshot::channel();
         plan.step_deadline = Some(StepDeadline::Trigger(deadline_rx));
         let batch = tokio::spawn(plan.run(registry, None));
-        started.notified().await;
+        tokio::time::timeout(Duration::from_secs(1), started.notified())
+            .await
+            .expect("read start");
         deadline_tx.send(()).expect("trigger deadline");
         release.notify_one();
         let result = batch.await.expect("batch join");
@@ -3108,7 +3164,9 @@ mod timeout_tests {
             )
             .await
         });
-        started.notified().await;
+        tokio::time::timeout(Duration::from_secs(1), started.notified())
+            .await
+            .expect("read start");
         recovery_tx.send(()).expect("recovery deadline");
         let result = call.await.expect("recovery join");
         assert_eq!(
@@ -3137,19 +3195,220 @@ mod timeout_tests {
         let registry = Arc::new(registry);
         let mut plan = Plan::parse(
             &registry,
-            &json!({"steps":[{"tool":"type_text","args":{"pid":425001,"window_id":7}}]}),
+            &json!({"steps":[{"tool":"type_text","args":{"pid":425002,"window_id":7}}]}),
         )
         .unwrap_or_else(|error| panic!("invalid plan: {}", error.message));
         let (step_tx, step_rx) = tokio::sync::oneshot::channel();
         plan.step_deadline = Some(StepDeadline::Trigger(step_rx));
         let batch = tokio::spawn(plan.run(registry, None));
-        action_started.notified().await;
+        tokio::time::timeout(Duration::from_secs(1), action_started.notified())
+            .await
+            .expect("action start");
         step_tx.send(()).expect("step deadline");
         release_action.notify_one();
         let result = batch.await.expect("batch join");
         let structured = result.structured_content.unwrap();
         assert_eq!(structured["code"], "step_timeout");
         assert_eq!(structured["observation"]["code"], "outside_scope");
+    }
+
+    #[tokio::test]
+    async fn successful_find_then_action_timeout_recovers_window() {
+        let action_started = Arc::new(tokio::sync::Notify::new());
+        let release_action = Arc::new(tokio::sync::Notify::new());
+        let mut registry = ToolRegistry::new();
+        register_probe(&mut registry, "list_windows", list_windows);
+        register_probe(&mut registry, "list_apps", list_apps);
+        registry.register(Box::new(WindowReadTool {
+            def: tool_def("get_window_state"),
+            calls: Arc::new(Mutex::new(Vec::new())),
+            started: Arc::new(tokio::sync::Notify::new()),
+            release: Arc::new(tokio::sync::Notify::new()),
+            block: false,
+        }));
+        registry.register(Box::new(HangingTool {
+            def: tool_def("type_text"),
+            started: action_started.clone(),
+            release: release_action.clone(),
+            finished: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            concurrency: Arc::new(tokio::sync::Semaphore::new(1)),
+        }));
+        let registry = Arc::new(registry);
+        let mut plan = Plan::parse(
+            &registry,
+            &json!({
+                "steps":[{
+                    "tool":"type_text",
+                    "args":{"pid":42,"window_id":22,"role":"AXStaticText","name":"Result","timeout_ms":1000}
+                }]
+            }),
+        )
+        .unwrap_or_else(|error| panic!("invalid plan: {}", error.message));
+        let (deadline_tx, deadline_rx) = tokio::sync::oneshot::channel();
+        plan.step_deadline = Some(StepDeadline::Trigger(deadline_rx));
+        let batch = tokio::spawn(plan.run(registry, None));
+        tokio::time::timeout(Duration::from_secs(1), action_started.notified())
+            .await
+            .expect("action start");
+        deadline_tx.send(()).expect("deadline");
+        let result = batch.await.expect("batch join");
+        let structured = result.structured_content.unwrap();
+        assert_eq!(structured["code"], "step_timeout");
+        assert_eq!(structured["observation"]["ok"], true);
+        release_action.notify_one();
+    }
+
+    #[test]
+    fn closed_check_does_not_create_a_pending_read() {
+        let gate = StepGate::new();
+        assert!(!gate.is_timed_out());
+        assert!(gate.begin_read());
+        assert!(!gate.is_timed_out());
+        assert!(gate.timeout().read_pending);
+        assert!(gate.is_timed_out());
+    }
+
+    #[tokio::test]
+    async fn menu_reroute_does_not_run_after_timeout() {
+        crate::window_state_view::remember_for_test(
+            "s-menu-timeout",
+            42,
+            7,
+            r#"- [27] AXMenuBar
+  - [700] AXMenuBarItem "Sheet"
+    - [701] AXMenu
+      - [760] AXMenuItem "Navigate"
+        - [761] AXMenu
+          - [771] AXMenuItem "To Next Sheet"
+"#,
+        );
+        let started = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(RefusalTool {
+            def: tool_def("click"),
+            calls: calls.clone(),
+            started: started.clone(),
+            release: release.clone(),
+            response: Arc::new(|| {
+                ToolResult::error("element_token is stale")
+                    .with_structured(json!({"code":"stale_element_token","effect":"refused"}))
+            }),
+        }));
+        let menu_calls = register_probe(&mut registry, "invoke_menu", || ToolResult::text("menu"));
+        let registry = Arc::new(registry);
+        let mut plan = Plan::parse(
+            &registry,
+            &json!({
+                "steps":[{
+                    "tool":"click",
+                    "args":{"pid":42,"window_id":7,"element_token":"s-menu-timeout:771"}
+                }]
+            }),
+        )
+        .unwrap_or_else(|error| panic!("invalid plan: {}", error.message));
+        let (deadline_tx, deadline_rx) = tokio::sync::oneshot::channel();
+        plan.step_deadline = Some(StepDeadline::Trigger(deadline_rx));
+        let batch = tokio::spawn(plan.run(registry, None));
+        started.notified().await;
+        deadline_tx.send(()).expect("deadline");
+        release.notify_one();
+        let result = batch.await.expect("batch join");
+        assert_eq!(result.structured_content.unwrap()["code"], "step_timeout");
+        assert_eq!(calls.lock().unwrap().len(), 1);
+        assert!(menu_calls.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn stale_refind_does_not_run_after_timeout() {
+        crate::window_state_view::remember_for_test(
+            "s-stale-timeout",
+            42,
+            7,
+            "- [1] AXStaticText \"Result\"\n",
+        );
+        let started = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let mut registry = ToolRegistry::new();
+        register_probe(&mut registry, "list_windows", list_windows);
+        register_probe(&mut registry, "list_apps", list_apps);
+        registry.register(Box::new(WindowReadTool {
+            def: tool_def("get_window_state"),
+            calls: Arc::new(Mutex::new(Vec::new())),
+            started: Arc::new(tokio::sync::Notify::new()),
+            release: Arc::new(tokio::sync::Notify::new()),
+            block: false,
+        }));
+        registry.register(Box::new(RefusalTool {
+            def: tool_def("click"),
+            calls: calls.clone(),
+            started: started.clone(),
+            release: release.clone(),
+            response: Arc::new(|| {
+                ToolResult::error("element_token is stale")
+                    .with_structured(json!({"code":"stale_element_token","effect":"refused"}))
+            }),
+        }));
+        let registry = Arc::new(registry);
+        let mut plan = Plan::parse(
+            &registry,
+            &json!({
+                "steps":[{
+                    "tool":"click",
+                    "args":{"pid":42,"window_id":7,"element_token":"s-stale-timeout:1"}
+                }]
+            }),
+        )
+        .unwrap_or_else(|error| panic!("invalid plan: {}", error.message));
+        let (deadline_tx, deadline_rx) = tokio::sync::oneshot::channel();
+        plan.step_deadline = Some(StepDeadline::Trigger(deadline_rx));
+        let batch = tokio::spawn(plan.run(registry, None));
+        started.notified().await;
+        deadline_tx.send(()).expect("deadline");
+        release.notify_one();
+        let result = batch.await.expect("batch join");
+        assert_eq!(result.structured_content.unwrap()["code"], "step_timeout");
+        assert_eq!(calls.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn foreground_fallback_does_not_run_after_timeout() {
+        let started = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(RefusalTool {
+            def: tool_def("click"),
+            calls: calls.clone(),
+            started: started.clone(),
+            release: release.clone(),
+            response: Arc::new(|| {
+                ToolResult::error("background unavailable").with_structured(json!({
+                    "effect":"refused",
+                    "escalation":{"recommended":"foreground"}
+                }))
+            }),
+        }));
+        let registry = Arc::new(registry);
+        let mut plan = Plan::parse(
+            &registry,
+            &json!({
+                "steps":[{"tool":"click","args":{"pid":42,"window_id":7}}],
+                "foreground_fallback":true
+            }),
+        )
+        .unwrap_or_else(|error| panic!("invalid plan: {}", error.message));
+        let (deadline_tx, deadline_rx) = tokio::sync::oneshot::channel();
+        plan.step_deadline = Some(StepDeadline::Trigger(deadline_rx));
+        let batch = tokio::spawn(plan.run(registry, None));
+        started.notified().await;
+        deadline_tx.send(()).expect("deadline");
+        release.notify_one();
+        let result = batch.await.expect("batch join");
+        assert_eq!(result.structured_content.unwrap()["code"], "step_timeout");
+        assert_eq!(calls.lock().unwrap().len(), 1);
     }
 
     #[tokio::test]
@@ -3169,7 +3428,7 @@ mod timeout_tests {
                 json!({
                     "session":"evidence",
                     "_input_origin":"human",
-                    "steps":[{"tool":"type_text","args":{"pid":425002,"window_id":7,"text":"x"}}]
+                    "steps":[{"tool":"type_text","args":{"pid":425003,"window_id":7,"text":"x"}}]
                 }),
             )
             .await;

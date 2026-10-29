@@ -496,6 +496,7 @@ pub(crate) struct Locator<'a> {
     journal: std::sync::Mutex<Vec<Value>>,
     read_admission: Option<ReadAdmission>,
     read_outcome: Option<ReadOutcome>,
+    read_closed: Option<ReadClosed>,
 }
 
 enum LocatorRegistry<'a> {
@@ -505,6 +506,7 @@ enum LocatorRegistry<'a> {
 
 pub(crate) type ReadAdmission = Arc<dyn Fn() -> bool + Send + Sync>;
 pub(crate) type ReadOutcome = Arc<dyn Fn(Option<&'static str>) + Send + Sync>;
+pub(crate) type ReadClosed = Arc<dyn Fn() -> bool + Send + Sync>;
 
 impl<'a> Locator<'a> {
     pub fn new(registry: &'a ToolRegistry, session: Option<String>, deadline: Instant) -> Self {
@@ -518,6 +520,7 @@ impl<'a> Locator<'a> {
             journal: Default::default(),
             read_admission: None,
             read_outcome: None,
+            read_closed: None,
         }
     }
 
@@ -527,6 +530,7 @@ impl<'a> Locator<'a> {
         deadline: Instant,
         read_admission: Option<ReadAdmission>,
         read_outcome: Option<ReadOutcome>,
+        read_closed: Option<ReadClosed>,
     ) -> Locator<'static> {
         Locator {
             registry: LocatorRegistry::Owned(registry),
@@ -538,6 +542,7 @@ impl<'a> Locator<'a> {
             journal: Default::default(),
             read_admission,
             read_outcome,
+            read_closed,
         }
     }
 
@@ -549,7 +554,10 @@ impl<'a> Locator<'a> {
     }
 
     fn read_admission_closed(&self) -> bool {
-        self.read_admission.as_ref().is_some_and(|admit| !admit())
+        self.read_closed
+            .as_ref()
+            .or(self.read_admission.as_ref())
+            .is_some_and(|closed| closed())
     }
 
     /// Add a driver call made outside the locator (a script's own action or
