@@ -197,6 +197,8 @@ mod tests {
             checked: None,
             enabled: None,
             selected: None,
+            toggle_state: None,
+            expanded: None,
             description: None,
             actions: Vec::new(),
             element_key: 999,

@@ -294,12 +294,13 @@ pub struct WindowElement {
     pub enabled: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub selected: Option<bool>,
-    /// TogglePattern state, for elements that have one (Windows).
+    /// TogglePattern state (Windows), or the AT-SPI CHECKED/INDETERMINATE state of a
+    /// check box, radio button, toggle button or switch (Linux).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(schema_with = "toggle_state_schema")]
     pub toggle_state: Option<ToggleState>,
-    /// ExpandCollapsePattern state; partly expanded counts as expanded. Absent
-    /// for elements that cannot expand (Windows).
+    /// ExpandCollapsePattern state (Windows; partly expanded counts as expanded), or
+    /// AT-SPI EXPANDED/EXPANDABLE (Linux). Absent for elements that cannot expand.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expanded: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

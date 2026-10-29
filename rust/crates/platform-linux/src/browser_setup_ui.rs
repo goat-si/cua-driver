@@ -694,6 +694,8 @@ mod tests {
             checked: None,
             enabled: None,
             selected: None,
+            toggle_state: None,
+            expanded: None,
             description: None,
             actions: actions.iter().map(|value| (*value).to_owned()).collect(),
             element_key: 0,

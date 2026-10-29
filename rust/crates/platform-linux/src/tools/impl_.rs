@@ -738,6 +738,12 @@ fn build_element_entry(
     if let Some(selected) = n.selected {
         entry["selected"] = json!(selected);
     }
+    if let Some(toggle_state) = n.toggle_state {
+        entry["toggle_state"] = json!(toggle_state);
+    }
+    if let Some(expanded) = n.expanded {
+        entry["expanded"] = json!(expanded);
+    }
     let actions: Vec<String> = n
         .actions
         .iter()
