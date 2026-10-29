@@ -21,6 +21,7 @@ pub mod bindings;
 mod content_attrs;
 pub mod dense_rows;
 pub mod enablement;
+pub mod editable;
 pub mod exact_target;
 pub mod launch;
 pub mod reveal_scroll;

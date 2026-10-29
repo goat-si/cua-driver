@@ -16,6 +16,7 @@ mod launch_app;
 mod list_apps;
 mod list_windows;
 mod menu_equivalent;
+pub(crate) mod not_editable;
 mod press_key;
 mod right_click;
 mod scroll;
