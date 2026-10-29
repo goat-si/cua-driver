@@ -1433,22 +1433,63 @@ fn await_front_settled(pid: i32, window_id: u32) -> bool {
 const FRONT_SETTLE_STABLE: std::time::Duration = std::time::Duration::from_millis(250);
 const FRONT_SETTLE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(1500);
 
-/// Type via CGEvent keystrokes at the current insertion point, then verify by
-/// read-back. `type_text` is deliberately non-idempotent: it must never clear
-/// an existing value merely because AX cannot read that value back.
-fn cgevent_type_verified(
+/// The receiver a keystroke rung types into: the process, its requested
+/// window, and the retained element (with its snapshot index) when known.
+#[derive(Clone, Copy)]
+struct KeyReceiver {
     pid: i32,
-    text: &str,
-    delay_ms: u64,
-    before: Option<&str>,
-    element_ptr_and_idx: Option<(usize, Option<usize>)>,
-    settle_ms: u64,
     window_id: Option<u32>,
+    element: Option<(usize, Option<usize>)>,
+}
+
+/// What the keystroke rung sends and how it paces the first key.
+#[derive(Clone, Copy)]
+struct KeyTextRequest<'a> {
+    text: &'a str,
+    delay_ms: u64,
+    /// First-keystroke settle; the foreground rung passes a positive value.
+    settle_ms: u64,
     replace: bool,
+    /// A Chromium native field submission: type the body, then one Return.
     single_terminal_return: bool,
-    focused_key_route: bool,
+}
+
+/// Proofs required immediately before the first key is posted.
+#[derive(Clone, Copy)]
+struct KeyFocusChecks {
+    /// Require CFEqual app focus plus the matching key window on the receiver.
+    exact_focus: bool,
+    /// A window-only or pixel receiver: re-run the editing-cell check after
+    /// the first-key settle, because activation can end an editing session.
     recheck_editability_after_settle: bool,
+}
+
+/// Type via CGEvent keystrokes at the current insertion point, then verify by
+/// read-back against `before`. `type_text` is deliberately non-idempotent:
+/// it must never clear an existing value merely because AX cannot read that
+/// value back.
+fn cgevent_type_verified(
+    receiver: KeyReceiver,
+    request: KeyTextRequest<'_>,
+    before: Option<&str>,
+    checks: KeyFocusChecks,
 ) -> anyhow::Result<(bool, Option<usize>, bool)> {
+    let KeyReceiver {
+        pid,
+        window_id,
+        element: element_ptr_and_idx,
+    } = receiver;
+    let KeyTextRequest {
+        text,
+        delay_ms,
+        settle_ms,
+        replace,
+        single_terminal_return,
+    } = request;
+    let KeyFocusChecks {
+        exact_focus: focused_key_route,
+        recheck_editability_after_settle,
+    } = checks;
     if replace {
         let (ptr, _) = element_ptr_and_idx.ok_or_else(|| {
             anyhow::anyhow!("replace:true requires an exact window-bound text element")
@@ -2168,17 +2209,23 @@ fn type_text_in_key_window(
         let foreground_settle_ms = foreground_settle_ms(pid, apps::frontmost_pid());
         let do_type = |element: Option<(usize, Option<usize>)>| {
             cgevent_type_verified(
-                pid,
-                text,
-                delay_ms,
+                KeyReceiver {
+                    pid,
+                    window_id,
+                    element,
+                },
+                KeyTextRequest {
+                    text,
+                    delay_ms,
+                    settle_ms: foreground_settle_ms,
+                    replace,
+                    single_terminal_return: chromium_native_submission,
+                },
                 before.as_deref(),
-                element,
-                foreground_settle_ms,
-                window_id,
-                replace,
-                chromium_native_submission,
-                focused_key_route,
-                !late_fg_targeted,
+                KeyFocusChecks {
+                    exact_focus: focused_key_route,
+                    recheck_editability_after_settle: !late_fg_targeted,
+                },
             )
         };
         let ((verified, delivered_chars, ax_replacement), fronted) = match window_id {
@@ -2331,17 +2378,23 @@ fn type_text_in_key_window(
              using CGEvent key-event synthesis"
         );
         let (verified, delivered_chars, _) = cgevent_type_verified(
-            pid,
-            text,
-            delay_ms,
+            KeyReceiver {
+                pid,
+                window_id,
+                element: element_ptr_and_idx,
+            },
+            KeyTextRequest {
+                text,
+                delay_ms,
+                settle_ms: 0,
+                replace,
+                single_terminal_return: chromium_native_submission,
+            },
             before.as_deref(),
-            element_ptr_and_idx,
-            /*settle_ms=*/ 0,
-            window_id,
-            replace,
-            chromium_native_submission,
-            focused_key_route,
-            false,
+            KeyFocusChecks {
+                exact_focus: focused_key_route,
+                recheck_editability_after_settle: false,
+            },
         )?;
         return Ok(TypeTextDelivery::Typed(TypeTextOutcome {
             detail: format!(" via CGEvent (terminal emulator, {delay_ms}ms delay)"),
@@ -2492,17 +2545,23 @@ fn type_text_in_key_window(
     // Never clear here: a partial AX write is rare, and clearing would violate
     // insert-at-cursor semantics.
     let (verified, delivered_chars, ax_replacement) = cgevent_type_verified(
-        pid,
-        text,
-        delay_ms,
+        KeyReceiver {
+            pid,
+            window_id,
+            element: element_ptr_and_idx,
+        },
+        KeyTextRequest {
+            text,
+            delay_ms,
+            settle_ms: 0,
+            replace,
+            single_terminal_return: chromium_native_submission,
+        },
         before.as_deref(),
-        element_ptr_and_idx,
-        /*settle_ms=*/ 0,
-        window_id,
-        replace,
-        chromium_native_submission,
-        focused_key_route,
-        false,
+        KeyFocusChecks {
+            exact_focus: focused_key_route,
+            recheck_editability_after_settle: false,
+        },
     )?;
     Ok(TypeTextDelivery::Typed(TypeTextOutcome {
         detail: if ax_replacement {
