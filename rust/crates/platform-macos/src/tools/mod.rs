@@ -794,28 +794,20 @@ pub(crate) async fn focus_by_pixel(
     } else {
         click.await
     };
-    if focus.is_error == Some(true) {
-        // An INDETERMINATE focus task failure stops the ladder. A proven
-        // refusal (no element at the point, background_unavailable) keeps
-        // the existing foreground real-click fallback.
-        let effect = focus
-            .structured_content
-            .as_ref()
-            .and_then(|v| v["effect"].as_str());
-        let code = focus
-            .structured_content
-            .as_ref()
-            .and_then(|v| v["code"].as_str());
-        // Only an EXPLICIT proof of non-dispatch allows the real-click
-        // fallback: a refusal result, or background_unavailable. Any other
-        // error (unverifiable, unclassified, post-dispatch) stops here.
-        let proven_refusal = focus_error_allows_fallback(effect, code);
-        if !proven_refusal {
-            // Preserve the original indeterminate result: the task may have
-            // failed before dispatch, so no "click was sent" wording.
-            return Err(focus);
-        }
-    }
+    let (error_effect, error_code) = if focus.is_error == Some(true) {
+        (
+            focus
+                .structured_content
+                .as_ref()
+                .and_then(|v| v["effect"].as_str()),
+            focus
+                .structured_content
+                .as_ref()
+                .and_then(|v| v["code"].as_str()),
+        )
+    } else {
+        (None, None)
+    };
     let landed = if focus.is_error != Some(true) {
         // AXFocused is non-destructive: unlike a second real click, it keeps a
         // Cmd+A selection intact before a follow-up type_text or Cmd+V.
@@ -824,25 +816,26 @@ pub(crate) async fn focus_by_pixel(
     } else {
         None
     };
-    // The AX focus may have been applied and then clobbered: a negative
-    // readback is indeterminate, so only a proven refusal falls through to
-    // a real click.
-    match decide_focus_next(landed, foreground, None, None) {
+    // The SAME decision the unit test drives: an indeterminate error stops
+    // with the original result, a negative readback stops as unconfirmed,
+    // and only a proven refusal reaches the real-click fallback.
+    match decide_focus_next(landed, foreground, error_effect, error_code) {
+        FocusDecision::StopOriginalError => return Err(focus),
         FocusDecision::StopUnconfirmed => {
             return Err(pixel_focus_unconfirmed(pid, window_id, x, y));
         }
-        FocusDecision::StopOriginalError => unreachable!("no error in this path"),
-        FocusDecision::Proceed(_) => {}
-    }
-    match pixel_focus_step(landed, foreground) {
-        PixelFocusStep::Focused => return Ok(()),
-        PixelFocusStep::RealClick => {}
-        PixelFocusStep::ClickFailed => {
-            return Err(cua_driver_core::protocol::ToolResult::error(format!(
-                "focus pixel-click at ({x:.0},{y:.0}) failed."
-            )));
-        }
-        PixelFocusStep::Unconfirmed => return Err(pixel_focus_unconfirmed(pid, window_id, x, y)),
+        FocusDecision::Proceed(step) => match step {
+            PixelFocusStep::Focused => return Ok(()),
+            PixelFocusStep::RealClick => {}
+            PixelFocusStep::ClickFailed => {
+                return Err(cua_driver_core::protocol::ToolResult::error(format!(
+                    "focus pixel-click at ({x:.0},{y:.0}) failed."
+                )));
+            }
+            PixelFocusStep::Unconfirmed => {
+                return Err(pixel_focus_unconfirmed(pid, window_id, x, y))
+            }
+        },
     }
 
     // Some renderer surfaces do not expose a usable AX focus action. The
