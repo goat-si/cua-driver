@@ -329,6 +329,9 @@ impl DragTool {
         let (from_sx, from_sy, from_lx, from_ly, to_sx, to_sy, to_lx, to_ly) =
             match super::window_points::frame_or_resolve(validated_frame.clone(), wid).await {
                 Ok(frame) => {
+                    // Keep the actual translation frame for EVERY route:
+                    // the drag's window-local stamps use its origin too.
+                    validated_frame = Some(frame.clone());
                     let (fsx, fsy, flx, fly) = frame.to_screen(from_x, from_y);
                     let (tsx, tsy, tlx, tly) = frame.to_screen(to_x, to_y);
                     (fsx, fsy, flx, fly, tsx, tsy, tlx, tly)

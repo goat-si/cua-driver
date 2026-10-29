@@ -1366,7 +1366,10 @@ impl ClickTool {
                                 CFRelease(element as _);
                                 return Ok(None);
                             }
-                            Err(moved) => return Err(moved.into()),
+                            Err(moved) => {
+                                CFRelease(element as _);
+                                return Err(moved.into());
+                            }
                         }
                     };
                     CFRelease(element as _);
@@ -1476,6 +1479,28 @@ impl ClickTool {
                                 cua_driver_core::action_record::RequestedDelivery::Background,
                             )
                             .actual_delivery(cua_driver_core::action_record::ActualDelivery::Background)
+                            .build()
+                            .expect("ax unverifiable record is valid"),
+                        );
+                    }
+                    Err(error) if focus_only => {
+                        // The focus task may have failed after an AX focus:
+                        // no pixel fallback.
+                        return ToolResult::text(format!(
+                            "The accessibility focus task failed ({error}); it may have run.                              Read fresh state before focusing again."
+                        ))
+                        .with_structured(serde_json::json!({
+                            "path": "ax",
+                            "effect": "unverifiable",
+                            "code": "ax_action_unverified",
+                        }))
+                        .with_action_record(
+                            cua_driver_core::action_record::ActionExecutionRecord::builder(
+                                cua_driver_core::action_record::ActionEffect::Unverifiable,
+                                cua_driver_core::action_record::ActionTransport::MacosAxAction,
+                                cua_driver_core::action_record::RequestedDelivery::Background,
+                            )
+                            .actual_delivery(cua_driver_core::action_record::ActualDelivery::Unknown)
                             .build()
                             .expect("ax unverifiable record is valid"),
                         );
@@ -2451,12 +2476,19 @@ unsafe fn ax_press_with_ancestors(
         let actions = copy_action_names(current);
         chain.push((role, actions, current));
     }
+    // The outline's own description identifies the sidebar; a same-shaped
+    // content outline is not a navigation surface.
+    let sidebar = chain.iter().any(|(role, _, el)| {
+        role.as_deref() == Some("AXOutline")
+            && copy_string_attr(*el, "AXDescription")
+                .is_some_and(|d| d.eq_ignore_ascii_case("sidebar"))
+    });
     let roles_actions: Vec<(Option<String>, Vec<String>)> = chain
         .iter()
         .map(|(role, actions, _)| (role.clone(), actions.clone()))
         .collect();
     let is_finder = crate::apps::bundle_id_for_pid(pid).as_deref() == Some("com.apple.finder");
-    let chosen = ancestor_action_kind(&roles_actions, is_finder);
+    let chosen = ancestor_action_kind(&roles_actions, is_finder && sidebar);
     let Some((index, action_name)) = chosen else {
         for (_, _, el) in chain {
             CFRelease(el as _);
