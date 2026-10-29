@@ -16,6 +16,11 @@
 //! If anything fails to resolve the functions return `false` and callers
 //! fall back to the public `CGEvent::post_to_pid`.
 
+use core_graphics::{
+    event::{CGEvent, CGEventFlags},
+    event_source::{CGEventSource, CGEventSourceStateID},
+};
+use foreign_types::ForeignType;
 use libc::pid_t;
 use std::ffi::{c_void, CStr};
 use std::os::raw::{c_char, c_int, c_uint};
@@ -968,6 +973,102 @@ pub(super) fn post_to_pid(pid: pid_t, event_ptr: *mut c_void, attach_auth_messag
     true
 }
 
+const MENU_VALIDATION_KEY_CODE: u16 = 90;
+
+/// Construct the unbound Cmd+F20 pair used only to make AppKit validate its
+/// menus. Both wrappers are owned by the caller and remain alive through the
+/// synchronous posts.
+fn menu_validation_events() -> Option<(CGEvent, CGEvent)> {
+    let source = CGEventSource::new(CGEventSourceStateID::HIDSystemState).ok()?;
+    let down = CGEvent::new_keyboard_event(source.clone(), MENU_VALIDATION_KEY_CODE, true).ok()?;
+    let up = CGEvent::new_keyboard_event(source, MENU_VALIDATION_KEY_CODE, false).ok()?;
+    for event in [&down, &up] {
+        // HIDSystemState may inherit a person's physical modifiers. The
+        // validation chord is exactly Command, never that leaked state.
+        event.set_flags(CGEventFlags::CGEventFlagCommand);
+        super::tag_synthetic_event(event);
+    }
+    Some((down, up))
+}
+
+/// Execute the menu-validation sequence with each side effect isolated for
+/// deterministic tests. The public entry point below supplies the real
+/// SkyLight steps; tests can prove every cutoff and post order without a
+/// desktop or wall-clock sleeps.
+fn prime_background_menu_validation_with(
+    activate: impl FnOnce() -> bool,
+    note_primed: impl FnOnce(),
+    resolve_psn: impl FnOnce() -> bool,
+    mut post_record: impl FnMut(u8) -> bool,
+    make_events: impl FnOnce() -> Option<(CGEvent, CGEvent)>,
+    mut post_event: impl FnMut(&CGEvent, bool) -> bool,
+) -> bool {
+    if !activate() {
+        return false;
+    }
+    // Activation may already have changed key focus. Register it before any
+    // later fallible step so the focus guard can restore it after a failure.
+    note_primed();
+    if !resolve_psn() {
+        return false;
+    }
+    // Attempt the pair even when the first record fails, but never continue
+    // to key events with only a partial key-window sequence.
+    let key_down_record = post_record(0x01);
+    let key_up_record = post_record(0x02);
+    if !(key_down_record && key_up_record) {
+        return false;
+    }
+    // Preconstruct both events so an allocation failure cannot emit a
+    // down-only chord.
+    let Some((down, up)) = make_events() else {
+        return false;
+    };
+    // Do not short-circuit keyUp after a failed keyDown post. Authentication
+    // is always false: this deliberately takes the IOHID/NSMenu route.
+    let down_posted = post_event(&down, false);
+    let up_posted = post_event(&up, false);
+    down_posted && up_posted
+}
+
+/// Wake AppKit's background menu validation for `wid` without activating or
+/// raising its app. After focus and exact key-window records, one harmless
+/// Cmd+F20 keyDown/keyUp pair is posted through the unauthenticated
+/// SLEventPostToPid route. The current item-404 specification defines F20 as
+/// unbound; no replacement chord or public-transport fallback is used.
+///
+/// Returns `true` only when activation, both key records, event construction,
+/// and both SkyLight posts succeeded or were attempted. This is not proof
+/// that AppKit consumed the pair; callers must read the menu item's
+/// AXEnabled value to decide whether it may be pressed.
+pub fn prime_background_menu_validation(pid: pid_t, wid: u32) -> bool {
+    let target_psn = std::cell::Cell::new([0u8; 8]);
+    prime_background_menu_validation_with(
+        || activate_without_raise_with(pid, wid, false),
+        || note_primed_key(pid, wid),
+        || {
+            if post_event_record_to_fn().is_none() {
+                return false;
+            }
+            let mut psn = [0u8; 8];
+            let resolved = get_process_psn_for_window(wid, pid, &mut psn);
+            if resolved {
+                target_psn.set(psn);
+            }
+            resolved
+        },
+        |event_kind| {
+            let record = make_key_window_record(wid, event_kind);
+            let post = post_event_record_to_fn().expect("record post resolved above");
+            note_post_status(unsafe {
+                post(target_psn.get().as_ptr() as *const c_void, record.as_ptr())
+            })
+        },
+        menu_validation_events,
+        |event, attach_auth| post_to_pid(pid, event.as_ptr() as *mut c_void, attach_auth),
+    )
+}
+
 /// Stamp the event's screen-space `(x, y)` point via
 /// `CGEventSetWindowLocation`. Both the SkyLight and public PID routes receive
 /// this screen-space value; WindowServer derives the receiving window's local
@@ -1834,10 +1935,203 @@ fn preserves_exact_existing_focus(
 #[cfg(test)]
 mod tests {
     use super::{
-        focus_failure_hint_from, foreground_turn, make_key_window_record, note_post_status,
-        preserves_exact_existing_focus, reset_windowserver_connection_invalid_for_test,
-        windowserver_connection_invalid, WINDOWSERVER_INVALID_CONNECTION,
+        focus_failure_hint_from, foreground_turn, make_key_window_record, menu_validation_events,
+        note_post_status, preserves_exact_existing_focus, prime_background_menu_validation_with,
+        reset_windowserver_connection_invalid_for_test, windowserver_connection_invalid,
+        MENU_VALIDATION_KEY_CODE, WINDOWSERVER_INVALID_CONNECTION,
     };
+
+    #[test]
+    fn menu_validation_pair_is_exact_cmd_f20_down_and_up() {
+        use core_graphics::event::{CGEventType, EventField};
+
+        let (down, up) = menu_validation_events().expect("validation events");
+        for (event, expected_type) in [(down, CGEventType::KeyDown), (up, CGEventType::KeyUp)] {
+            assert_eq!(event.get_type() as u32, expected_type as u32);
+            assert_eq!(
+                event.get_integer_value_field(EventField::KEYBOARD_EVENT_KEYCODE),
+                i64::from(MENU_VALIDATION_KEY_CODE)
+            );
+            assert_eq!(
+                event.get_flags(),
+                core_graphics::event::CGEventFlags::CGEventFlagCommand
+            );
+            assert_eq!(
+                event.get_integer_value_field(EventField::EVENT_SOURCE_USER_DATA),
+                crate::input::GOAT_CUA_EVENT_USER_DATA
+            );
+        }
+    }
+
+    #[test]
+    fn menu_validation_sequence_registers_then_posts_in_order_without_auth() {
+        use core_graphics::event::CGEventType;
+        use std::{cell::RefCell, rc::Rc};
+
+        let log = Rc::new(RefCell::new(Vec::new()));
+        let result = prime_background_menu_validation_with(
+            {
+                let log = log.clone();
+                move || {
+                    log.borrow_mut().push("activate".into());
+                    true
+                }
+            },
+            {
+                let log = log.clone();
+                move || log.borrow_mut().push("note".into())
+            },
+            {
+                let log = log.clone();
+                move || {
+                    log.borrow_mut().push("resolve".into());
+                    true
+                }
+            },
+            {
+                let log = log.clone();
+                move |kind| {
+                    log.borrow_mut().push(format!("record:{kind}"));
+                    true
+                }
+            },
+            {
+                let log = log.clone();
+                move || {
+                    log.borrow_mut().push("make".into());
+                    menu_validation_events()
+                }
+            },
+            {
+                let log = log.clone();
+                move |event, auth| {
+                    let down = event.get_type() as u32 == CGEventType::KeyDown as u32;
+                    log.borrow_mut().push(format!("post:{down}:{auth}"));
+                    true
+                }
+            },
+        );
+        assert!(result);
+        assert_eq!(
+            log.borrow().as_slice(),
+            [
+                "activate",
+                "note",
+                "resolve",
+                "record:1",
+                "record:2",
+                "make",
+                "post:true:false",
+                "post:false:false",
+            ]
+        );
+    }
+
+    #[test]
+    fn menu_validation_activation_failure_sends_nothing() {
+        assert!(!prime_background_menu_validation_with(
+            || false,
+            || panic!("registration must not run"),
+            || panic!("PSN resolution must not run"),
+            |_| panic!("record must not run"),
+            || panic!("event construction must not run"),
+            |_, _| panic!("event post must not run"),
+        ));
+    }
+
+    #[test]
+    fn menu_validation_psn_failure_stops_after_registration() {
+        use std::{cell::RefCell, rc::Rc};
+
+        let log = Rc::new(RefCell::new(Vec::<String>::new()));
+        let result = prime_background_menu_validation_with(
+            {
+                let log = log.clone();
+                move || {
+                    log.borrow_mut().push("activate".into());
+                    true
+                }
+            },
+            {
+                let log = log.clone();
+                move || log.borrow_mut().push("note".into())
+            },
+            {
+                let log = log.clone();
+                move || {
+                    log.borrow_mut().push("resolve".into());
+                    false
+                }
+            },
+            |_| panic!("record must not run"),
+            || panic!("event construction must not run"),
+            |_, _| panic!("event post must not run"),
+        );
+        assert!(!result);
+        assert_eq!(log.borrow().as_slice(), ["activate", "note", "resolve"]);
+    }
+
+    #[test]
+    fn menu_validation_attempts_both_records_then_suppresses_f20() {
+        use std::{cell::RefCell, rc::Rc};
+
+        for failed_kind in [0x01, 0x02] {
+            let records = Rc::new(RefCell::new(Vec::new()));
+            let result = prime_background_menu_validation_with(
+                || true,
+                || (),
+                || true,
+                {
+                    let records = records.clone();
+                    move |kind| {
+                        records.borrow_mut().push(kind);
+                        kind != failed_kind
+                    }
+                },
+                || panic!("F20 construction must not follow a record failure"),
+                |_, _| panic!("F20 post must not follow a record failure"),
+            );
+            assert!(!result);
+            assert_eq!(records.borrow().as_slice(), [1, 2]);
+        }
+    }
+
+    #[test]
+    fn menu_validation_construction_failure_posts_nothing() {
+        assert!(!prime_background_menu_validation_with(
+            || true,
+            || (),
+            || true,
+            |_| true,
+            || None,
+            |_, _| panic!("no event may be posted after construction fails"),
+        ));
+    }
+
+    #[test]
+    fn menu_validation_posts_key_up_after_key_down_post_fails() {
+        use core_graphics::event::CGEventType;
+        use std::{cell::RefCell, rc::Rc};
+
+        let posts = Rc::new(RefCell::new(Vec::new()));
+        let result = prime_background_menu_validation_with(
+            || true,
+            || (),
+            || true,
+            |_| true,
+            menu_validation_events,
+            {
+                let posts = posts.clone();
+                move |event, auth| {
+                    let down = event.get_type() as u32 == CGEventType::KeyDown as u32;
+                    posts.borrow_mut().push((down, auth));
+                    !down
+                }
+            },
+        );
+        assert!(!result);
+        assert_eq!(posts.borrow().as_slice(), [(true, false), (false, false)]);
+    }
 
     #[test]
     fn a_1002_post_status_is_remembered_and_other_failures_are_not() {
