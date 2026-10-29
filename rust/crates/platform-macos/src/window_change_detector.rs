@@ -251,6 +251,9 @@ struct Tail {
     /// that opened in between is still reported (see [`superseded_change`]).
     window_ids: HashSet<u32>,
     front_pid: Option<i32>,
+    /// The end of the previous action's observation: a tail still present
+    /// after it reports nothing more.
+    deadline: Instant,
 }
 
 static TAIL: Mutex<Option<Tail>> = Mutex::new(None);
@@ -316,6 +319,13 @@ fn superseded_change(
         new_windows,
         foreground_changed,
     })
+}
+
+/// The before-state of a tail ended at `now` by the next action, when it
+/// was still inside its deadline; an expired tail reports nothing more.
+fn unread_by_tail(tail: Option<Tail>, now: Instant) -> Option<(HashSet<u32>, Option<i32>)> {
+    tail.filter(|tail| now <= tail.deadline)
+        .map(|tail| (tail.window_ids, tail.front_pid))
 }
 
 /// Take a late change recorded by a detached tail, if it is recent.
@@ -403,9 +413,7 @@ impl WindowChangeDetector {
         let _latency = latency::span(latency::Stage::Snapshot);
         // A new action supersedes the previous action's detached observation.
         // Taken in one step, so the tail cannot record a change after this.
-        let superseded = lock(&TAIL)
-            .take()
-            .map(|tail| (tail.window_ids, tail.front_pid));
+        let superseded = unread_by_tail(lock(&TAIL).take(), Instant::now());
         end_tail();
         let current = host_windows();
         let window_ids: HashSet<u32> = current.iter().map(|w| w.window_id).collect();
@@ -686,6 +694,7 @@ impl Snapshot {
             _lease: self._lease.take(),
             window_ids: self.window_ids.clone(),
             front_pid: self.front_pid,
+            deadline,
         });
         let still_mine = move || lock(&TAIL).as_ref().is_some_and(|tail| tail.id == id);
         let spawned = std::thread::Builder::new()
@@ -701,7 +710,11 @@ impl Snapshot {
                         // ended this tail (and reported the change itself)
                         // never sees a stale record written after it.
                         let tail = lock(&TAIL);
-                        if !tail.as_ref().is_some_and(|tail| tail.id == id) {
+                        // A read that returned after the deadline may show a
+                        // later change: it is not the action's.
+                        if !tail.as_ref().is_some_and(|tail| tail.id == id)
+                            || Instant::now() > deadline
+                        {
                             return;
                         }
                         *lock(&LATE) = Some(Late {
@@ -1229,6 +1242,28 @@ mod tests {
             superseded_change(&tail_windows, Some(7), &[win(1, 7, "App", "Main")], Some(7))
                 .is_none()
         );
+    }
+
+    /// A tail superseded after its deadline hands nothing to the next action.
+    #[test]
+    fn only_a_tail_inside_its_deadline_hands_its_before_state_on() {
+        let start = Instant::now();
+        let tail = || Tail {
+            id: 0,
+            _lease: None,
+            window_ids: HashSet::from([1]),
+            front_pid: Some(7),
+            deadline: start + Duration::from_millis(100),
+        };
+        assert_eq!(
+            unread_by_tail(Some(tail()), start + Duration::from_millis(100)),
+            Some((HashSet::from([1]), Some(7)))
+        );
+        assert_eq!(
+            unread_by_tail(Some(tail()), start + Duration::from_millis(101)),
+            None
+        );
+        assert_eq!(unread_by_tail(None, start), None);
     }
 
     /// A click's sampled observation reads once, without sleeping first, and

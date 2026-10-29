@@ -172,6 +172,11 @@ impl WindowTitleProbe {
             CFRelease(window as CFTypeRef);
             return None;
         };
+        // A title that already names the item cannot change to name it.
+        if !title_can_come_to_name(&before, &target) {
+            CFRelease(window as CFTypeRef);
+            return None;
+        }
         Some(Self {
             window,
             before,
@@ -187,6 +192,12 @@ impl WindowTitleProbe {
     fn names_target(&self, now: &str) -> bool {
         title_names_target(&self.before, now, &self.target)
     }
+}
+
+/// Whether a window titled `before` can still come to name `target`
+/// ([`title_names_target`] needs a change to it).
+fn title_can_come_to_name(before: &str, target: &str) -> bool {
+    window_title_name(before) != window_title_name(target)
 }
 
 fn title_names_target(before: &str, now: &str, target: &str) -> bool {
@@ -4404,6 +4415,16 @@ mod click_evidence_tests {
 #[cfg(test)]
 mod finder_title_tests {
     use super::{title_names_target, window_title_name};
+
+    #[test]
+    fn a_title_already_naming_the_item_is_not_probed() {
+        assert!(!super::title_can_come_to_name("Downloads", "downloads"));
+        assert!(!super::title_can_come_to_name(
+            "\u{2068}Desktop\u{2069} — Local",
+            "Desktop"
+        ));
+        assert!(super::title_can_come_to_name("Recents", "Downloads"));
+    }
 
     #[test]
     fn finder_location_titles_name_their_sidebar_item() {
