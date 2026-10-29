@@ -210,6 +210,9 @@ pub trait PasteboardBackend {
 pub struct PasteMayHaveLanded {
     source: anyhow::Error,
     clipboard_restored: bool,
+    /// Another writer changed the clipboard during the transaction, so its
+    /// current contents belong to that writer (not to this paste).
+    clipboard_changed_externally: bool,
 }
 
 impl PasteMayHaveLanded {
@@ -226,7 +229,9 @@ impl std::fmt::Display for PasteMayHaveLanded {
             "the text may already have been pasted, so it was not typed again ({:#})",
             self.source
         )?;
-        if !self.clipboard_restored {
+        if self.clipboard_changed_externally {
+            write!(f, "; another writer changed the clipboard during the paste")?;
+        } else if !self.clipboard_restored {
             write!(f, "; the clipboard still holds the pasted text")?;
         }
         Ok(())
@@ -277,11 +282,11 @@ pub fn run_pasteboard_transaction<B: PasteboardBackend>(
     };
     let written_count = backend.write_items(&[transient_item])?;
 
+    let concurrent_change = backend.change_count() != written_count;
     if let Err(err) = trigger_paste() {
         // ONE ownership check, then at most ONE restore attempt: a
         // successful restore changes the count, and a failed one is not
         // retried.
-        let concurrent_change = backend.change_count() != written_count;
         let restored_once =
             !concurrent_change && restore_pasteboard_snapshot(backend, &snapshot).is_ok();
         let outcome = if concurrent_change {
@@ -308,6 +313,7 @@ pub fn run_pasteboard_transaction<B: PasteboardBackend>(
         return Err(PasteMayHaveLanded {
             source: err,
             clipboard_restored,
+            clipboard_changed_externally: concurrent_change,
         }
         .into());
     }
@@ -321,6 +327,7 @@ pub fn run_pasteboard_transaction<B: PasteboardBackend>(
             return Err(PasteMayHaveLanded {
                 source: err,
                 clipboard_restored: false,
+                clipboard_changed_externally: concurrent_change,
             }
             .into());
         }
