@@ -28,14 +28,14 @@ fn def() -> &'static ToolDef {
             "type": "object",
             "required": ["operation"],
             "properties": {
-                "session": { "type": "string" },
-                "operation": { "type": "string", "enum": ["system", "list", "open", "click", "close"] },
+                "session": { "type": "string", "description": "Optional multi-call session label. Open handles are valid only within this session episode and are invalidated by end or revival." },
+                "operation": { "type": "string", "enum": ["system", "list", "open", "click", "close"], "description": "system discovers SystemUIServer pid; list enumerates one host; open opens a status item; click presses an enabled menu item; close cancels only the opener-owned menu." },
                 "pid": { "type": "integer", "description": "Exact host process. Required except operation=system." },
                 "owner_pid": { "type": "integer", "description": "Optional independently evidenced status-item owner filter." },
                 "item": { "type": "string", "description": "Exact status-item title or AXIdentifier." },
                 "menu_item": { "type": "string", "description": "Exact enabled menu-item title for click." },
                 "open_handle": { "type": "string", "description": "Opaque handle returned by open, required for click/close." },
-                "timeout_ms": { "type": "integer", "minimum": 100, "maximum": 10000 }
+                "timeout_ms": { "type": "integer", "minimum": 100, "maximum": 10000, "description": "Observation and readback timeout in milliseconds; default 2500, allowed range 100-10000." }
             },
             "additionalProperties": false
         }),
