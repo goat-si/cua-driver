@@ -827,7 +827,7 @@ pub(crate) async fn focus_by_pixel(
     // The AX focus may have been applied and then clobbered: a negative
     // readback is indeterminate, so only a proven refusal falls through to
     // a real click.
-    if matches!(landed, Some(false)) {
+    if !focus_readback_allows_real_click(landed) {
         return Err(pixel_focus_unconfirmed(pid, window_id, x, y));
     }
     match pixel_focus_step(landed, foreground) {
@@ -878,7 +878,17 @@ pub(crate) async fn focus_by_pixel(
 /// Whether an AX-focus error permits the real-click fallback: only an
 /// explicit proof of non-dispatch (a refused effect or background_unavailable).
 fn focus_error_allows_fallback(effect: Option<&str>, code: Option<&str>) -> bool {
+    // An explicit uncertain effect wins over any non-dispatch code.
+    if effect == Some("unverifiable") {
+        return false;
+    }
     effect == Some("refused") || code == Some("background_unavailable")
+}
+
+/// A negative focus readback stops the ladder: only an unreadable readback
+/// (None) can reach the real-click fallback, and only in the foreground.
+fn focus_readback_allows_real_click(landed: Option<bool>) -> bool {
+    landed.is_none()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1723,6 +1733,18 @@ mod pixel_focus_readback_tests {
         assert!(!super::focus_error_allows_fallback(None, None));
         assert!(!super::focus_error_allows_fallback(Some("partial"), None));
         assert!(!super::focus_error_allows_fallback(Some("confirmed"), None));
+        // An explicit unverifiable effect wins over a non-dispatch code.
+        assert!(!super::focus_error_allows_fallback(
+            Some("unverifiable"),
+            Some("background_unavailable")
+        ));
+    }
+
+    #[test]
+    fn a_negative_readback_never_reaches_the_real_click() {
+        assert!(!super::focus_readback_allows_real_click(Some(false)));
+        assert!(super::focus_readback_allows_real_click(None));
+        assert!(!super::focus_readback_allows_real_click(Some(true)));
     }
 
     #[test]
