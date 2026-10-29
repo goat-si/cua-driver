@@ -175,7 +175,8 @@ pub unsafe fn facts_for_element(element: AXUIElementRef) -> Option<ElementFacts>
             && !(is_text_role(role) && facts.focused == Some(true))
         {
             let mut budget = MAX_SCAN_NODES;
-            let (found, finished) = scan_focused_text_descendant(element, 0, &mut budget);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(800);
+            let (found, finished) = scan_focused_text_descendant(element, 0, &mut budget, deadline);
             facts.focused_text_descendant = found;
             facts.descendant_scan_complete = finished;
         }
@@ -193,6 +194,7 @@ unsafe fn scan_focused_text_descendant(
     element: AXUIElementRef,
     depth: usize,
     budget: &mut usize,
+    deadline: std::time::Instant,
 ) -> (bool, bool) {
     if depth >= MAX_SCAN_DEPTH {
         return (false, true);
@@ -200,19 +202,19 @@ unsafe fn scan_focused_text_descendant(
     let mut found = false;
     let mut finished = true;
     for child in copy_children(element) {
-        let _ = AXUIElementSetMessagingTimeout(child, AX_TIMEOUT_SECONDS);
         if !found {
-            if *budget == 0 {
+            if *budget == 0 || std::time::Instant::now() >= deadline {
                 finished = false;
             } else {
                 *budget -= 1;
+                let _ = AXUIElementSetMessagingTimeout(child, AX_TIMEOUT_SECONDS);
                 found = copy_string_attr(child, "AXRole")
                     .as_deref()
                     .is_some_and(is_text_role)
                     && copy_bool_attr(child, "AXFocused") == Some(true);
                 if !found {
                     let (nested, nested_finished) =
-                        scan_focused_text_descendant(child, depth + 1, budget);
+                        scan_focused_text_descendant(child, depth + 1, budget, deadline);
                     found = nested;
                     finished = nested_finished;
                 }

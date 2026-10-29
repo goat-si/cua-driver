@@ -783,9 +783,19 @@ pub(crate) async fn focus_by_pixel(
         window_click_point(state, &click_args, pid, window_id, x, y, from_zoom)?;
     // The not_editable cell guard runs before ANY focus action: a
     // non-editing cell (or an unclassifiable hit) refuses the whole call, so
-    // no focus action or key can reach it (handoff 3.7 point route).
+    // no focus action or key can reach it (handoff 3.7 point route). The
+    // frame is kept so the actuator can revalidate the same geometry.
     if guard_editable {
-        if let Some(refusal) = not_editable::guard_point(pid, window_id, native_x, native_y).await {
+        let Some(wid) = window_id else {
+            return Err(not_editable::unresolved_point_refusal());
+        };
+        let frame = match px_frame::resolve_or_refuse(wid).await {
+            Ok(frame) => frame,
+            Err(_) => return Err(not_editable::unresolved_point_refusal()),
+        };
+        if let Some(refusal) =
+            not_editable::guard_point_with_frame(pid, wid, &frame, native_x, native_y).await
+        {
             return Err(refusal);
         }
     }
@@ -843,7 +853,7 @@ pub(crate) async fn focus_by_pixel(
             return Err(pixel_focus_unconfirmed(pid, window_id, x, y));
         }
         FocusDecision::Proceed(step) => match step {
-            PixelFocusStep::Focused => return Ok(not_editable::FocusDispatch::Sent),
+            PixelFocusStep::Focused => return Ok(not_editable::FocusDispatch::SentAx),
             PixelFocusStep::RealClick => {}
             PixelFocusStep::ClickFailed => {
                 return Err(cua_driver_core::protocol::ToolResult::error(format!(
@@ -880,26 +890,14 @@ pub(crate) async fn focus_by_pixel(
         .invoke(click_args)
         .await;
     if focus.is_error == Some(true) {
-        // Same accounting as the AX rung: an error does not prove nothing
-        // was sent, so a non-refusal error is an indeterminate mutation.
-        let refused = focus
-            .structured_content
-            .as_ref()
-            .and_then(|v| v["effect"].as_str())
-            == Some("refused");
-        if !refused {
-            return Err(focus_dispatch_unverified(pid, window_id, x, y));
-        }
         return Err(cua_driver_core::protocol::ToolResult::error(format!(
             "focus pixel-click at ({x:.0},{y:.0}) failed."
         )));
     }
     // Brief settle so the renderer registers focus before the keystrokes.
     tokio::time::sleep(std::time::Duration::from_millis(120)).await;
-    Ok(not_editable::FocusDispatch::Sent)
+    Ok(not_editable::FocusDispatch::SentClick)
 }
-
-/// What [`focus_by_pixel`] does after its non-destructive focus click.
 /// Whether an AX-focus error permits the real-click fallback: only an
 /// explicit proof of non-dispatch (a refused effect or background_unavailable).
 fn focus_error_allows_fallback(effect: Option<&str>, code: Option<&str>) -> bool {
@@ -919,10 +917,6 @@ fn focus_readback_is_negative(landed: Option<bool>) -> bool {
     matches!(landed, Some(false))
 }
 
-/// The outer focus-ladder decision, as data: whether the caller proceeds
-/// (and with what step) or stops with the original indeterminate error or a
-/// focus-unconfirmed result.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FocusDecision {
     Proceed(PixelFocusStep),
     StopOriginalError,

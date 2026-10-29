@@ -121,10 +121,26 @@ extern "C" {
 ///
 /// The caller must release any returned element exactly once with `CFRelease`.
 pub unsafe fn element_at_screen_position(pid: i32, x: f64, y: f64) -> Option<AXUIElementRef> {
+    element_at_screen_position_bounded(pid, x, y, 1.0)
+}
+
+/// element_at_screen_position with an explicit messaging timeout on the
+/// application element, so a busy app cannot stall the hit test.
+///
+/// # Safety
+///
+/// The caller must release any returned element exactly once with CFRelease.
+pub unsafe fn element_at_screen_position_bounded(
+    pid: i32,
+    x: f64,
+    y: f64,
+    timeout_seconds: f32,
+) -> Option<AXUIElementRef> {
     let application = AXUIElementCreateApplication(pid);
     if application.is_null() {
         return None;
     }
+    let _ = AXUIElementSetMessagingTimeout(application, timeout_seconds);
     let mut element = std::ptr::null_mut();
     let error = AXUIElementCopyElementAtPosition(application, x as f32, y as f32, &mut element);
     CFRelease(application as CFTypeRef);

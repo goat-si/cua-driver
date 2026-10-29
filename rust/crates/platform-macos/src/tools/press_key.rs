@@ -289,15 +289,11 @@ fn late_cell_refusal(
     element_targeted: bool,
 ) -> anyhow::Result<()> {
     if printable && !element_targeted {
-        // Only an actual non-editing cell is refused here; unreadable state
-        // keeps the existing downstream behavior (the early guard already
-        // failed closed on it).
-        if matches!(
-            unsafe { super::not_editable::classify_untargeted(pid, window_id) },
-            crate::ax::editable::CellVerdict::NotEditing
-        ) {
+        // Fail closed at the final check: the earlier classification cannot
+        // establish the focus that activation or a focus change produced.
+        if !unsafe { super::not_editable::sync_focused_cell_allows(pid, window_id) } {
             anyhow::bail!(
-                "not_editable: the focused element at delivery is a non-editing cell; no keys                  were sent"
+                "not_editable: the focused element at delivery is a non-editing cell or is                  unreadable; no keys were sent"
             );
         }
     }
@@ -716,11 +712,10 @@ impl Tool for PressKeyTool {
                 if printable
                     && !super::not_editable::focused_cell_allows_typing(pid, window_id).await
                 {
-                    return super::not_editable::not_editable_result_with(
+                    return super::not_editable::not_editable_result(
                         "the element focused by the click is not being edited; no keys were sent."
                             .into(),
                         focus_receipt,
-                        fg,
                     );
                 }
                 true
@@ -825,7 +820,10 @@ impl Tool for PressKeyTool {
                     }
                     // background (default): auth-envelope post, no raise.
                     dispatch_with_ax_oracle(pid, window_id, pre_focus_ptr, || {
-                        if let Some(wid) = window_id {
+                        if let Some(wid) = window_id.filter(|_| !px_focus) {
+                            // After a confirmed px focus + post-focus verify
+                            // the exact focus delivery is already proven;
+                            // the conflict gate is redundant.
                             let conflict = crate::ax::exact_target::check_window_focus_conflict(
                                 pid,
                                 wid,

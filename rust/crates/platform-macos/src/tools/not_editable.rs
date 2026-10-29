@@ -11,7 +11,7 @@ use cua_driver_core::action_record::{
 use cua_driver_core::protocol::ToolResult;
 
 use crate::ax::bindings::{
-    ax_get_window_id, copy_element_attr, copy_string_attr, element_at_screen_position,
+    ax_get_window_id, copy_element_attr, copy_string_attr, element_at_screen_position_bounded,
     AXUIElementRef, AXUIElementSetMessagingTimeout,
 };
 use crate::ax::editable::{
@@ -25,8 +25,10 @@ use core_foundation::base::{CFRelease, CFTypeRef};
 pub(crate) enum FocusDispatch {
     /// No focus action was attempted: proven pre-dispatch.
     None,
-    /// A focus action (AXFocused or a click) was sent.
-    Sent,
+    /// An AX focus action was sent (background accessibility rung).
+    SentAx,
+    /// A real foreground click was sent.
+    SentClick,
     /// A focus action may have been sent; its outcome is unknown.
     Indeterminate,
 }
@@ -34,11 +36,7 @@ pub(crate) enum FocusDispatch {
 /// The not_editable result. A refusal after a focus attempt never claims
 /// nothing was sent: the focus action is reported as delivered (partial)
 /// or possibly delivered (unverifiable, delivery unknown).
-pub(crate) fn not_editable_result_with(
-    message: String,
-    focus: FocusDispatch,
-    foreground: bool,
-) -> ToolResult {
+pub(crate) fn not_editable_result(message: String, focus: FocusDispatch) -> ToolResult {
     match focus {
         FocusDispatch::None => {
             ToolResult::error(message.clone()).with_structured(serde_json::json!({
@@ -49,10 +47,10 @@ pub(crate) fn not_editable_result_with(
                 "message": message,
             }))
         }
-        FocusDispatch::Sent => {
+        FocusDispatch::SentAx | FocusDispatch::SentClick => {
             let text =
                 format!("{message} The focus action was delivered; no text or keys were sent.");
-            let (transport, delivery) = if foreground {
+            let (transport, delivery) = if matches!(focus, FocusDispatch::SentClick) {
                 (ActionTransport::MacosCgEventHid, ActualDelivery::Foreground)
             } else {
                 (ActionTransport::MacosAxAction, ActualDelivery::Background)
@@ -100,10 +98,6 @@ pub(crate) fn not_editable_result_with(
                 )
         }
     }
-}
-
-pub(crate) fn not_editable_result(message: String, focus: FocusDispatch) -> ToolResult {
-    not_editable_result_with(message, focus, false)
 }
 
 const CELL_MESSAGE: &str =
@@ -175,26 +169,18 @@ pub(crate) async fn guard_untargeted(pid: i32, window_id: Option<u32>) -> Option
 }
 
 /// CELL rule for point-targeted typing, before any focus action. The
-/// window-local native pixel point is translated to screen coordinates with
-/// the same frame the click uses; the hit must belong to the delivery
-/// window. A missing hit, a foreign-window hit, unreadable ancestry or a
-/// task failure all fail closed pre-dispatch.
-pub(crate) async fn guard_point(
+/// caller supplies the same frame the click will use; the hit must belong
+/// to the delivery window. Everything unclassifiable fails closed.
+pub(crate) async fn guard_point_with_frame(
     pid: i32,
-    window_id: Option<u32>,
+    window_id: u32,
+    frame: &super::px_frame::WindowPxFrame,
     native_x: f64,
     native_y: f64,
 ) -> Option<ToolResult> {
-    let Some(wid) = window_id else {
-        return Some(cell_refusal(CellVerdict::Unreadable, true));
-    };
-    let frame = match super::px_frame::resolve_or_refuse(wid).await {
-        Ok(frame) => frame,
-        Err(_) => return Some(cell_refusal(CellVerdict::Unreadable, true)),
-    };
     let (screen_x, screen_y, _, _) = frame.to_screen(native_x, native_y);
     match latency::spawn_action_blocking(move || unsafe {
-        let verdict = classify_point_screen(pid, screen_x, screen_y, wid);
+        let verdict = classify_point_screen(pid, screen_x, screen_y, window_id);
         match verdict {
             CellVerdict::NotEditing | CellVerdict::Unreadable => Some(cell_refusal(verdict, true)),
             _ => None,
@@ -207,12 +193,19 @@ pub(crate) async fn guard_point(
     }
 }
 
+/// A point guard that cannot resolve its window's frame: pre-dispatch
+/// refusal, nothing sent.
+pub(crate) fn unresolved_point_refusal() -> ToolResult {
+    cell_refusal(CellVerdict::Unreadable, true)
+}
+
 /// Hit-test at a screen point and classify, requiring the hit to belong to
 /// the delivery window.
 unsafe fn classify_point_screen(pid: i32, x: f64, y: f64, window_id: u32) -> CellVerdict {
-    let Some(element) = element_at_screen_position(pid, x, y) else {
+    let Some(element) = element_at_screen_position_bounded(pid, x, y, 0.5) else {
         return CellVerdict::Unreadable;
     };
+    let _ = AXUIElementSetMessagingTimeout(element, 0.5);
     // Prove the hit belongs to the delivery window: an overlapping
     // same-process sibling must not be classified in its place.
     let mut current = element;
@@ -238,6 +231,7 @@ unsafe fn classify_point_screen(pid: i32, x: f64, y: f64, window_id: u32) -> Cel
         CFRelease(current as CFTypeRef);
     }
     if owner != Some(window_id) {
+        CFRelease(element as CFTypeRef);
         return CellVerdict::Unreadable;
     }
     let verdict = facts_for_element(element)
@@ -273,6 +267,12 @@ pub(crate) async fn token_not_editable_refusal(
                 FocusDispatch::None,
             ));
         };
+        if initial.role.is_none() {
+            return Some(not_editable_result(
+                "the target element's role could not be read; no text or keys were sent.".into(),
+                FocusDispatch::None,
+            ));
+        }
         if !initial.role.as_deref().is_some_and(is_text_role) {
             return None;
         }
@@ -289,7 +289,7 @@ pub(crate) async fn token_not_editable_refusal(
         };
         if matches!(focus, FocusDispatch::Indeterminate) && facts.focused == Some(true) {
             // The read-back proves the focus action landed.
-            focus = FocusDispatch::Sent;
+            focus = FocusDispatch::SentAx;
         }
         if token_refused(&facts) {
             return Some(not_editable_result(
@@ -341,7 +341,7 @@ mod tests {
 
     #[test]
     fn a_refusal_after_a_sent_focus_action_is_partial() {
-        let result = not_editable_result("cell".into(), FocusDispatch::Sent);
+        let result = not_editable_result("cell".into(), FocusDispatch::SentAx);
         let data = result.structured_content.clone().unwrap();
         assert_eq!(data["effect"], "partial");
         assert_eq!(data["keys_sent"], false);
@@ -360,7 +360,7 @@ mod tests {
 
     #[test]
     fn a_foreground_click_receipt_reports_foreground_delivery() {
-        let result = not_editable_result_with("cell".into(), FocusDispatch::Sent, true);
+        let result = not_editable_result("cell".into(), FocusDispatch::SentClick);
         let public = result
             .action_record
             .as_ref()
