@@ -132,11 +132,22 @@ pub(crate) fn account_focus_receipt(
         .build()
         .expect("focus receipt record is valid"),
     );
-    // The public summary is the result text: it must not keep saying
-    // "nothing was sent" when the focus action was delivered.
+    // The public summary keeps the actionable reason, without any
+    // "nothing was sent" claim that a delivered focus contradicts.
+    let original = text_of_result(&result);
+    let reason = original
+        .split(". ")
+        .filter(|part| !part.to_lowercase().contains("nothing was sent"))
+        .collect::<Vec<_>>()
+        .join("; ");
     let summary = format!(
-        "The focus action was delivered; the key or text was refused ({}). Read fresh state          before retrying.",
-        if code.is_empty() { "not_editable".to_owned() } else { code }
+        "The focus action was delivered; the key or text was refused ({}): {} Read fresh state          before retrying.",
+        if code.is_empty() || original.contains("not_editable") {
+            "not_editable".to_owned()
+        } else {
+            code
+        },
+        reason
     );
     for content in result.content.iter_mut() {
         if let cua_driver_core::protocol::Content::Text { text, .. } = content {
@@ -349,6 +360,13 @@ unsafe fn classify_point_screen(pid: i32, x: f64, y: f64, window_id: u32) -> Cel
         let Some(parent) = copy_element_attr(current, "AXParent") else {
             break;
         };
+        if std::time::Instant::now() >= deadline {
+            if current != element {
+                CFRelease(current as CFTypeRef);
+            }
+            CFRelease(element as CFTypeRef);
+            return CellVerdict::Unreadable;
+        }
         let _ = AXUIElementSetMessagingTimeout(parent, 0.5);
         let role = copy_string_attr(parent, "AXRole");
         if role.as_deref() == Some("AXWindow") {

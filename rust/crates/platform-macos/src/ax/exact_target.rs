@@ -488,12 +488,72 @@ pub unsafe fn focused_element_in_window_with_deadline(
         CFRelease(element as CFTypeRef);
         return None;
     }
-    if element_window_id(element) == Some(window_id) {
+    if element_window_id_with_deadline(element, deadline) == Some(window_id) {
         Some(element)
     } else {
         CFRelease(element as CFTypeRef);
         None
     }
+}
+
+/// element_window_id under the caller's deadline: every read in the
+/// ownership walk is checked so a stalled app cannot outrun the guard.
+///
+/// # Safety
+///
+/// Caller must release the returned element exactly once with CFRelease.
+pub unsafe fn element_window_id_with_deadline(
+    element: AXUIElementRef,
+    deadline: std::time::Instant,
+) -> Option<u32> {
+    if std::time::Instant::now() >= deadline {
+        return None;
+    }
+    if let Some(window) = copy_element_attr(element, "AXWindow") {
+        let window_id = owning_window_id(window);
+        CFRelease(window as CFTypeRef);
+        if window_id.is_some() {
+            return window_id;
+        }
+    }
+    let mut current: AXUIElementRef = element;
+    let mut owned = false;
+    let mut resolved = None;
+    for _ in 0..MAX_ANCESTRY_DEPTH {
+        if std::time::Instant::now() >= deadline {
+            if owned {
+                CFRelease(current as CFTypeRef);
+            }
+            return None;
+        }
+        match copy_string_attr(current, "AXRole").as_deref() {
+            Some("AXWindow") | Some("AXSheet") => {
+                resolved = owning_window_id(current);
+                break;
+            }
+            Some("AXApplication") | None => break,
+            _ => {}
+        }
+        if std::time::Instant::now() >= deadline {
+            if owned {
+                CFRelease(current as CFTypeRef);
+            }
+            return None;
+        }
+        let parent = copy_element_attr(current, "AXParent");
+        if owned {
+            CFRelease(current as CFTypeRef);
+        }
+        {
+            let parent = parent?;
+            current = parent;
+            owned = true;
+        }
+    }
+    if owned {
+        CFRelease(current as CFTypeRef);
+    }
+    resolved
 }
 
 #[cfg(test)]
