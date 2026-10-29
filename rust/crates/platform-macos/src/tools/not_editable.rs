@@ -364,6 +364,8 @@ unsafe fn classify_point_screen(pid: i32, x: f64, y: f64, window_id: u32) -> Cel
             if current != element {
                 CFRelease(current as CFTypeRef);
             }
+            // The newly copied parent is released too on this exit.
+            CFRelease(parent as CFTypeRef);
             CFRelease(element as CFTypeRef);
             return CellVerdict::Unreadable;
         }

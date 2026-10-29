@@ -468,6 +468,37 @@ pub fn gather_background_facts(
     }
 }
 
+/// owning_window_id under the caller's deadline: the role, parent and
+/// window-id reads stop when the shared budget expires.
+unsafe fn owning_window_id_with_deadline(
+    window: AXUIElementRef,
+    deadline: std::time::Instant,
+) -> Option<u32> {
+    resolve_owning_window(
+        RetainedElement::retain(window as usize),
+        MAX_SHEET_NESTING,
+        |element| {
+            if std::time::Instant::now() >= deadline {
+                None
+            } else {
+                copy_string_attr(element.as_ptr() as AXUIElementRef, "AXRole")
+            }
+        },
+        |element| {
+            if std::time::Instant::now() >= deadline {
+                None
+            } else {
+                copy_element_attr(element.as_ptr() as AXUIElementRef, "AXParent").map(|parent| {
+                    let retained = RetainedElement::retain(parent as usize);
+                    CFRelease(parent as CFTypeRef);
+                    retained
+                })
+            }
+        },
+        |element| ax_get_window_id(element.as_ptr() as AXUIElementRef),
+    )
+}
+
 /// focused_element_in_window under the caller's deadline: each acquisition
 /// and ownership read is checked so a stalled app cannot outrun the guard's
 /// budget.
@@ -510,7 +541,7 @@ pub unsafe fn element_window_id_with_deadline(
         return None;
     }
     if let Some(window) = copy_element_attr(element, "AXWindow") {
-        let window_id = owning_window_id(window);
+        let window_id = owning_window_id_with_deadline(window, deadline);
         CFRelease(window as CFTypeRef);
         if window_id.is_some() {
             return window_id;
@@ -528,7 +559,7 @@ pub unsafe fn element_window_id_with_deadline(
         }
         match copy_string_attr(current, "AXRole").as_deref() {
             Some("AXWindow") | Some("AXSheet") => {
-                resolved = owning_window_id(current);
+                resolved = owning_window_id_with_deadline(current, deadline);
                 break;
             }
             Some("AXApplication") | None => break,
