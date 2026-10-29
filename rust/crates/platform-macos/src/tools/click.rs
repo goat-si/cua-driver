@@ -1442,7 +1442,7 @@ impl ClickTool {
                         // An AX action may have been delivered: do NOT fall
                         // through to a second (pixel) click.
                         return ToolResult::text(
-                            "The accessibility action for the background click may have been                              delivered, but it returned an error or timed out. Read fresh state                              before clicking again."
+                            "The accessibility action for the background click may have run,                              but its selection could not be confirmed. Read fresh state before                              clicking again."
                                 .to_owned(),
                         )
                         .with_structured(serde_json::json!({
@@ -2412,8 +2412,6 @@ fn ancestor_action_kind(
     // above the candidate must be described as "sidebar". A press anywhere
     // else (content outlines, other apps, other controls) is not selection
     // evidence and falls through to the pixel route.
-    // If the hit itself is inside a non-sidebar outline, stop there: a
-    // higher sidebar ancestor must not be pressed in its place.
     if chain
         .iter()
         .find(|(role, _, _)| role.as_deref() == Some("AXOutline"))
@@ -2498,6 +2496,14 @@ unsafe fn ax_press_with_ancestors(
         .iter()
         .map(|(role, actions, _, sidebar)| (role.clone(), actions.clone(), *sidebar))
         .collect();
+    // The hit's OWN outline role counts in the boundary decision (it is
+    // not part of the ancestor chain).
+    if copy_string_attr(element, "AXRole").as_deref() == Some("AXOutline")
+        && !copy_string_attr(element, "AXDescription")
+            .is_some_and(|d| d.eq_ignore_ascii_case("sidebar"))
+    {
+        return Ok(AxPressOutcome::Unavailable);
+    }
     let is_finder = crate::apps::bundle_id_for_pid(pid).as_deref() == Some("com.apple.finder");
     let chosen = ancestor_action_kind(&roles_actions, is_finder);
     let Some((index, action_name)) = chosen else {
@@ -2507,6 +2513,9 @@ unsafe fn ax_press_with_ancestors(
         return Ok(AxPressOutcome::Unavailable);
     };
     let target = chain[index].2;
+    // Selection is compared before and after the press: an already-selected
+    // row that merely activates cannot pass as a selection.
+    let before_selected = crate::ax::bindings::copy_bool_attr(target, "AXSelected");
     if let Err(moved) = super::window_points::check_guard(dispatch_guard) {
         for (_, _, el, _) in chain {
             CFRelease(el as _);
@@ -2527,9 +2536,9 @@ unsafe fn ax_press_with_ancestors(
     }
     if err == kAXErrorSuccess {
         if action_name == "AXPress" {
-            return Ok(match selected {
-                Some(true) => AxPressOutcome::Delivered,
-                _ => AxPressOutcome::Indeterminate,
+            return Ok(match (before_selected, selected) {
+                (Some(true), _) | (_, Some(false)) | (_, None) => AxPressOutcome::Indeterminate,
+                (_, Some(true)) => AxPressOutcome::Delivered,
             });
         }
         return Ok(AxPressOutcome::Delivered);

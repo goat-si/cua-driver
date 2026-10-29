@@ -815,6 +815,12 @@ pub(crate) async fn focus_by_pixel(
     } else {
         None
     };
+    // The AX focus may have been applied and then clobbered: a negative
+    // readback is indeterminate, so only a proven refusal falls through to
+    // a real click.
+    if matches!(landed, Some(false)) {
+        return Err(pixel_focus_unconfirmed(pid, window_id, x, y));
+    }
     match pixel_focus_step(landed, foreground) {
         PixelFocusStep::Focused => return Ok(()),
         PixelFocusStep::RealClick => {}
