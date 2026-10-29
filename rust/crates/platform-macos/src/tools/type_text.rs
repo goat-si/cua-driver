@@ -159,6 +159,9 @@ impl Tool for TypeTextTool {
             // Desktop scope dispatches globally: check the frontmost app's
             // focused element and fail closed before any key is sent.
             let early_front_pid = crate::apps::frontmost_pid();
+            let initial_focus = early_front_pid
+                .and_then(|pid| unsafe { crate::ax::bindings::focused_element_of_pid(pid) })
+                .map(|ptr| ptr as usize);
             match early_front_pid {
                 Some(front_pid) => {
                     if let Some(refusal) =
@@ -178,11 +181,7 @@ impl Tool for TypeTextTool {
             let checked_pid = early_front_pid.unwrap_or_default();
             let posted = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
             let posted_ref = posted.clone();
-            // The sequence's intended focused target is retained: the
-            // guard compares every later focused element against it, so a
-            // switch between two editable fields in the same app also stops.
-            let initial_focus = unsafe { crate::ax::bindings::focused_element_of_pid(checked_pid) }
-                .map(|ptr| ptr as usize);
+
             let result = latency::spawn_action_blocking(move || {
                 super::not_editable::desktop_dispatch_guard(checked_pid, true)?;
                 crate::input::keyboard::type_text_global_with_guard(
@@ -202,6 +201,7 @@ impl Tool for TypeTextTool {
                                     crate::input::ax_actions::is_element_focused(checked_pid, ptr)
                                 })
                                 .unwrap_or(false)
+                            && crate::apps::frontmost_pid() == Some(checked_pid)
                     },
                     posted_ref.as_ref(),
                 )
@@ -211,6 +211,23 @@ impl Tool for TypeTextTool {
                 unsafe {
                     core_foundation::base::CFRelease(ptr as core_foundation::base::CFTypeRef)
                 };
+            }
+            if let Ok(Err(error)) = &result {
+                if let Some(abort) =
+                    error.downcast_ref::<crate::input::keyboard::PasteSequenceAbort>()
+                {
+                    let restored = abort.clipboard_restored;
+                    let count = abort.posted;
+                    return ToolResult::text(format!(
+                        "Desktop typing stopped before the paste went out: {}. At least {}                          character(s) were sent earlier. Read fresh state before retrying.",
+                        abort.reason, count
+                    ))
+                    .with_structured(serde_json::json!({
+                        "code": "not_editable",
+                        "effect": "unverifiable",
+                        "clipboard_restored": restored,
+                    }));
+                }
             }
             if result.is_err() || matches!(result, Ok(Err(_))) {
                 let count = posted.load(std::sync::atomic::Ordering::SeqCst);
@@ -251,10 +268,13 @@ impl Tool for TypeTextTool {
                     text_delivery_failure("desktop type_text failed", &error),
                     None,
                 ),
-                Err(error) => super::not_editable::account_focus_receipt(
-                    ToolResult::error(format!("desktop type_text task failed: {error}")),
-                    None,
-                ),
+                Err(error) => ToolResult::text(format!(
+                    "The desktop typing task failed ({error}); it may have posted input before                      failing. Read fresh state before retrying."
+                ))
+                .with_structured(serde_json::json!({
+                    "code": "desktop_sequence_unverified",
+                    "effect": "unverifiable",
+                })),
             };
         }
         let pid = match super::target_pid(&self.state, &args) {

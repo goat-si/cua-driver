@@ -15,6 +15,7 @@ use cua_driver_core::background_input::{
 use super::bindings::{
     ax_get_window_id, copy_ax_windows_including, copy_bool_attr, copy_element_attr,
     copy_string_attr, focused_element_of_pid, AXUIElementCreateApplication, AXUIElementRef,
+    AXUIElementSetMessagingTimeout,
 };
 use super::snapshot::RetainedElement;
 use crate::windows::{all_windows_without_spaces, resolve_window_owner, WindowOwner};
@@ -495,7 +496,14 @@ unsafe fn owning_window_id_with_deadline(
                 })
             }
         },
-        |element| ax_get_window_id(element.as_ptr() as AXUIElementRef),
+        |element| {
+            if std::time::Instant::now() >= deadline {
+                None
+            } else {
+                let _ = AXUIElementSetMessagingTimeout(element.as_ptr() as AXUIElementRef, 0.5);
+                ax_get_window_id(element.as_ptr() as AXUIElementRef)
+            }
+        },
     )
 }
 

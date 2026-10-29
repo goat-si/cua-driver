@@ -278,6 +278,16 @@ pub fn run_pasteboard_transaction<B: PasteboardBackend>(
     if let Err(err) = trigger_paste() {
         let clipboard_restored = backend.change_count() != written_count
             || restore_pasteboard_snapshot(backend, &snapshot).is_ok();
+        if let Some(abort) = err.downcast_ref::<PasteSequenceAbort>() {
+            // A pre-dispatch abort keeps its typed reason AND the
+            // restoration outcome instead of becoming PasteMayHaveLanded.
+            return Err(PasteSequenceAbort {
+                posted: abort.posted,
+                reason: abort.reason.clone(),
+                clipboard_restored,
+            }
+            .into());
+        }
         return Err(PasteMayHaveLanded {
             source: err,
             clipboard_restored,
@@ -808,6 +818,26 @@ pub struct DesktopSequenceAbort {
     pub reason: String,
 }
 
+/// A pre-dispatch paste abort with the clipboard restoration outcome.
+#[derive(Debug)]
+pub struct PasteSequenceAbort {
+    pub posted: usize,
+    pub reason: String,
+    pub clipboard_restored: bool,
+}
+
+impl std::fmt::Display for PasteSequenceAbort {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} (clipboard_restored={})",
+            self.reason, self.clipboard_restored
+        )
+    }
+}
+
+impl std::error::Error for PasteSequenceAbort {}
+
 impl std::fmt::Display for DesktopSequenceAbort {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
@@ -862,10 +892,11 @@ pub fn type_text_global_with_guard(
                 // locked, snapshotted and wrote the pasteboard first, so
                 // focus may have changed during that work.
                 if !guard.borrow_mut()() {
-                    return Err(anyhow::Error::new(DesktopSequenceAbort {
+                    return Err(anyhow::Error::new(PasteSequenceAbort {
                         posted: posted.load(std::sync::atomic::Ordering::SeqCst),
                         reason: "not_editable: the frontmost application or its focus changed                                  before the paste went out"
                             .into(),
+                        clipboard_restored: false,
                     }));
                 }
                 press_key_global("v", &["cmd"])
