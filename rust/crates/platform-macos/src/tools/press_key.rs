@@ -476,10 +476,11 @@ impl Tool for PressKeyTool {
             };
             let key_for_input = key.clone();
             let display_key = pressed_key_display(&input.key, &key, &modifiers);
+            let early_front_pid = crate::apps::frontmost_pid();
             if printable_request(&key, &modifiers) {
                 // Desktop scope dispatches globally: check the frontmost
                 // app's focused element and fail closed before any key.
-                match crate::apps::frontmost_pid() {
+                match early_front_pid {
                     Some(front_pid) => {
                         if let Some(refusal) =
                             super::not_editable::guard_untargeted(front_pid, None).await
@@ -496,7 +497,7 @@ impl Tool for PressKeyTool {
                     }
                 }
             }
-            let checked_pid = crate::apps::frontmost_pid().unwrap_or_default();
+            let checked_pid = early_front_pid.unwrap_or_default();
             let printable_desktop = printable_request(&key, &modifiers);
             let result = latency::spawn_action_blocking(move || {
                 super::not_editable::desktop_dispatch_guard(checked_pid, printable_desktop)?;
@@ -511,8 +512,14 @@ impl Tool for PressKeyTool {
                         "path": "hid",
                         "effect": "unverifiable"
                     })),
-                Ok(Err(error)) => ToolResult::error(format!("desktop press_key failed: {error}")),
-                Err(error) => ToolResult::error(format!("desktop press_key task failed: {error}")),
+                Ok(Err(error)) => super::not_editable::account_focus_receipt(
+                    ToolResult::error(format!("desktop press_key failed: {error}")),
+                    None,
+                ),
+                Err(error) => super::not_editable::account_focus_receipt(
+                    ToolResult::error(format!("desktop press_key task failed: {error}")),
+                    None,
+                ),
             };
         }
         // Resolve the key first: an unknown name is refused before any

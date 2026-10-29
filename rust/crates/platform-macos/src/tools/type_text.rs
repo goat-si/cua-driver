@@ -158,7 +158,8 @@ impl Tool for TypeTextTool {
             }
             // Desktop scope dispatches globally: check the frontmost app's
             // focused element and fail closed before any key is sent.
-            match crate::apps::frontmost_pid() {
+            let early_front_pid = crate::apps::frontmost_pid();
+            match early_front_pid {
                 Some(front_pid) => {
                     if let Some(refusal) =
                         super::not_editable::guard_untargeted(front_pid, None).await
@@ -174,7 +175,7 @@ impl Tool for TypeTextTool {
                     )
                 }
             }
-            let checked_pid = crate::apps::frontmost_pid().unwrap_or_default();
+            let checked_pid = early_front_pid.unwrap_or_default();
             let result = latency::spawn_action_blocking(move || {
                 super::not_editable::desktop_dispatch_guard(checked_pid, true)?;
                 crate::input::keyboard::type_text_global(&text, delay_ms)
@@ -189,8 +190,14 @@ impl Tool for TypeTextTool {
                             "effect": "unverifiable"
                         }))
                 }
-                Ok(Err(error)) => text_delivery_failure("desktop type_text failed", &error),
-                Err(error) => ToolResult::error(format!("desktop type_text task failed: {error}")),
+                Ok(Err(error)) => super::not_editable::account_focus_receipt(
+                    text_delivery_failure("desktop type_text failed", &error),
+                    None,
+                ),
+                Err(error) => super::not_editable::account_focus_receipt(
+                    ToolResult::error(format!("desktop type_text task failed: {error}")),
+                    None,
+                ),
             };
         }
         let pid = match super::target_pid(&self.state, &args) {

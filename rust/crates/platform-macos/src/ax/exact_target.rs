@@ -468,6 +468,34 @@ pub fn gather_background_facts(
     }
 }
 
+/// focused_element_in_window under the caller's deadline: each acquisition
+/// and ownership read is checked so a stalled app cannot outrun the guard's
+/// budget.
+///
+/// # Safety
+///
+/// Caller must release the returned element exactly once with CFRelease.
+pub unsafe fn focused_element_in_window_with_deadline(
+    pid: i32,
+    window_id: u32,
+    deadline: std::time::Instant,
+) -> Option<AXUIElementRef> {
+    if std::time::Instant::now() >= deadline {
+        return None;
+    }
+    let element = focused_element_of_pid(pid)?;
+    if std::time::Instant::now() >= deadline {
+        CFRelease(element as CFTypeRef);
+        return None;
+    }
+    if element_window_id(element) == Some(window_id) {
+        Some(element)
+    } else {
+        CFRelease(element as CFTypeRef);
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{

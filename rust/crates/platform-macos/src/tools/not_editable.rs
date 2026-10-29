@@ -67,21 +67,37 @@ pub(crate) fn account_focus_receipt(
         .structured_content
         .as_ref()
         .and_then(|v| v["effect"].as_str())
-        .unwrap_or("");
+        .unwrap_or("")
+        .to_owned();
     let code = result
         .structured_content
         .as_ref()
         .and_then(|v| v["code"].as_str())
-        .unwrap_or("");
+        .unwrap_or("")
+        .to_owned();
     // Only a proven pre-key refusal (or the focus-unconfirmed outcome,
     // where the focus is known to be sent and no keys went out) becomes
     // partial. An error after text or keys may have been sent keeps its
     // uncertainty — a paste that may have landed is NOT a partial focus.
+    // An uncertain REAL click after a delivered AX focus is not a partial
+    // AX result: name both facts and keep the uncertainty.
+    if code == "focus_dispatch_unverified" {
+        if let Some(serde_json::Value::Object(fields)) = result.structured_content.as_mut() {
+            fields.insert("ax_focus_delivered".into(), serde_json::json!(true));
+        }
+        let original = text_of_result(&result);
+        let summary = format!(
+            "The accessibility focus action was delivered, and a real click may also have been sent. {original}"
+        );
+        for content in result.content.iter_mut() {
+            if let cua_driver_core::protocol::Content::Text { text, .. } = content {
+                *text = summary.clone();
+            }
+        }
+        return result;
+    }
     let pre_key_refusal = effect == "refused"
-        || matches!(
-            code,
-            "pixel_focus_unconfirmed" | "focus_dispatch_unverified"
-        )
+        || code == "pixel_focus_unconfirmed"
         || (effect.is_empty() && text_of_result(&result).contains("not_editable"));
     if !pre_key_refusal {
         return result;
@@ -118,9 +134,10 @@ pub(crate) fn account_focus_receipt(
     );
     // The public summary is the result text: it must not keep saying
     // "nothing was sent" when the focus action was delivered.
-    let summary =
-        "The focus action was delivered; the key or text was refused. Read fresh state before          retrying."
-            .to_owned();
+    let summary = format!(
+        "The focus action was delivered; the key or text was refused ({}). Read fresh state          before retrying.",
+        if code.is_empty() { "not_editable".to_owned() } else { code }
+    );
     for content in result.content.iter_mut() {
         if let cua_driver_core::protocol::Content::Text { text, .. } = content {
             *text = summary.clone();
@@ -237,7 +254,9 @@ fn verdict_allows(verdict: CellVerdict) -> bool {
 pub(crate) unsafe fn classify_untargeted(pid: i32, window_id: Option<u32>) -> CellVerdict {
     let deadline = std::time::Instant::now() + std::time::Duration::from_millis(800);
     let element = match window_id {
-        Some(wid) => crate::ax::exact_target::focused_element_in_window(pid, wid),
+        Some(wid) => {
+            crate::ax::exact_target::focused_element_in_window_with_deadline(pid, wid, deadline)
+        }
         None => crate::ax::bindings::focused_element_of_pid(pid),
     };
     let Some(element) = element else {
@@ -307,13 +326,16 @@ pub(crate) fn unresolved_point_refusal() -> ToolResult {
 /// Hit-test at a screen point and classify, requiring the hit to belong to
 /// the delivery window.
 unsafe fn classify_point_screen(pid: i32, x: f64, y: f64, window_id: u32) -> CellVerdict {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(800);
+    if std::time::Instant::now() >= deadline {
+        return CellVerdict::Unreadable;
+    }
     let Some(element) = element_at_screen_position_bounded(pid, x, y, 0.5) else {
         return CellVerdict::Unreadable;
     };
     let _ = AXUIElementSetMessagingTimeout(element, 0.5);
     // Prove the hit belongs to the delivery window: an overlapping
     // same-process sibling must not be classified in its place.
-    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(800);
     let mut current = element;
     let mut owner: Option<u32> = None;
     for _ in 0..12 {
@@ -446,6 +468,13 @@ pub(crate) fn desktop_dispatch_guard(expected_pid: i32, printable: bool) -> anyh
     if printable && !unsafe { sync_focused_cell_allows(expected_pid, None) } {
         anyhow::bail!(
             "not_editable: the frontmost focused element is a non-editing cell or is              unreadable; no keys were sent"
+        );
+    }
+    // The classification itself can be slow: the frontmost app is checked
+    // once more immediately before the global post.
+    if crate::apps::frontmost_pid() != Some(expected_pid) {
+        anyhow::bail!(
+            "not_editable: the frontmost application changed during classification; no keys              were sent"
         );
     }
     Ok(())

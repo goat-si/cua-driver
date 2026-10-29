@@ -144,6 +144,12 @@ pub unsafe fn facts_for_element_with_deadline(
         return None;
     }
     let _ = AXUIElementSetMessagingTimeout(element, AX_TIMEOUT_SECONDS);
+    if std::time::Instant::now() >= deadline {
+        return Some(ElementFacts {
+            ancestry_complete: false,
+            ..Default::default()
+        });
+    }
     let mut facts = ElementFacts {
         role: copy_string_attr(element, "AXRole"),
         ..Default::default()
