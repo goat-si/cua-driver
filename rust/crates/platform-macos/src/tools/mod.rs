@@ -827,8 +827,12 @@ pub(crate) async fn focus_by_pixel(
     // The AX focus may have been applied and then clobbered: a negative
     // readback is indeterminate, so only a proven refusal falls through to
     // a real click.
-    if focus_readback_is_negative(landed) {
-        return Err(pixel_focus_unconfirmed(pid, window_id, x, y));
+    match decide_focus_next(landed, foreground, None, None) {
+        FocusDecision::StopUnconfirmed => {
+            return Err(pixel_focus_unconfirmed(pid, window_id, x, y));
+        }
+        FocusDecision::StopOriginalError => unreachable!("no error in this path"),
+        FocusDecision::Proceed(_) => {}
     }
     match pixel_focus_step(landed, foreground) {
         PixelFocusStep::Focused => return Ok(()),
@@ -892,6 +896,33 @@ fn focus_readback_is_negative(landed: Option<bool>) -> bool {
     // the ladder as indeterminate. An unreadable readback keeps the
     // foreground fallback.
     matches!(landed, Some(false))
+}
+
+/// The outer focus-ladder decision, as data: whether the caller proceeds
+/// (and with what step) or stops with the original indeterminate error or a
+/// focus-unconfirmed result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FocusDecision {
+    Proceed(PixelFocusStep),
+    StopOriginalError,
+    StopUnconfirmed,
+}
+
+fn decide_focus_next(
+    landed: Option<bool>,
+    foreground: bool,
+    error_effect: Option<&str>,
+    error_code: Option<&str>,
+) -> FocusDecision {
+    if (error_effect.is_some() || error_code.is_some())
+        && !focus_error_allows_fallback(error_effect, error_code)
+    {
+        return FocusDecision::StopOriginalError;
+    }
+    if focus_readback_is_negative(landed) {
+        return FocusDecision::StopUnconfirmed;
+    }
+    FocusDecision::Proceed(pixel_focus_step(landed, foreground))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1741,6 +1772,26 @@ mod pixel_focus_readback_tests {
             Some("unverifiable"),
             Some("background_unavailable")
         ));
+    }
+
+    #[test]
+    fn the_ladder_decision_covers_confirmed_negative_refusal_and_indeterminate() {
+        assert_eq!(
+            super::decide_focus_next(Some(true), false, None, None),
+            super::FocusDecision::Proceed(PixelFocusStep::Focused)
+        );
+        assert_eq!(
+            super::decide_focus_next(Some(false), true, None, None),
+            super::FocusDecision::StopUnconfirmed
+        );
+        assert_eq!(
+            super::decide_focus_next(None, true, Some("refused"), None),
+            super::FocusDecision::Proceed(PixelFocusStep::RealClick)
+        );
+        assert_eq!(
+            super::decide_focus_next(None, true, Some("unverifiable"), None),
+            super::FocusDecision::StopOriginalError
+        );
     }
 
     #[test]
