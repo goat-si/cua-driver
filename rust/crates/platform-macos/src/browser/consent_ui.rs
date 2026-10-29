@@ -632,6 +632,7 @@ mod tests {
                     budget.stop_for_timeout();
                 }
                 trees.push(TreeWalkResult {
+                    offscreen_rows: Vec::new(),
                     nodes: vec![button],
                     tree_markdown: String::new(),
                     truncated: false,

@@ -143,6 +143,8 @@ pub(crate) struct Chunk {
 pub(crate) struct DeferredRow {
     pub anchor: usize,
     pub seq: usize,
+    /// The row's position among its collection's `AXChildren`.
+    pub position: usize,
     pub element: RetainedElement,
     pub depth: usize,
     pub parent_index: Option<usize>,
@@ -158,11 +160,33 @@ pub(crate) fn is_summary_line(line: &str) -> bool {
 
 type Spliced = (Vec<(usize, String)>, Vec<AXNode>, Vec<Option<usize>>);
 
+/// One run of consecutive offscreen rows a windowed read left unwalked: the
+/// range named by its summary line, by position among the collection's
+/// `AXChildren`. `parent_index` is the collection's nearest indexed ancestor,
+/// in the indices the walk returns.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OffscreenRows {
+    pub parent_index: Option<usize>,
+    pub first_position: usize,
+    pub last_position: usize,
+    pub count: usize,
+}
+
+#[cfg(test)]
 pub(crate) fn splice(
     lines: Vec<(usize, String)>,
     nodes: Vec<AXNode>,
-    mut deferred: Vec<DeferredRow>,
+    deferred: Vec<DeferredRow>,
 ) -> Spliced {
+    splice_with_offscreen_rows(lines, nodes, deferred).0
+}
+
+/// [`splice`], with the offscreen runs its summary lines stand for.
+pub(crate) fn splice_with_offscreen_rows(
+    lines: Vec<(usize, String)>,
+    nodes: Vec<AXNode>,
+    mut deferred: Vec<DeferredRow>,
+) -> (Spliced, Vec<OffscreenRows>) {
     debug_assert_eq!(lines.len(), nodes.len());
     deferred.sort_by_key(|row| (row.anchor, row.seq));
     let mut rows = deferred.into_iter().peekable();
@@ -171,6 +195,7 @@ pub(crate) fn splice(
         nodes: Vec::new(),
     };
     let mut map = Vec::new();
+    let mut offscreen = Vec::new();
     let mut original = lines.into_iter().zip(nodes);
     for anchor in 0..=original.len() {
         while rows.peek().is_some_and(|row| row.anchor == anchor) {
@@ -182,6 +207,7 @@ pub(crate) fn splice(
                 output.nodes.extend(chunk.nodes);
             } else if !row.visible {
                 let mut count = 1;
+                let mut last_position = row.position;
                 while rows.peek().is_some_and(|next| {
                     next.anchor == anchor
                         && next.depth == row.depth
@@ -189,9 +215,15 @@ pub(crate) fn splice(
                         && !next.visible
                         && next.walked.is_none()
                 }) {
-                    rows.next();
+                    last_position = rows.next().unwrap().position;
                     count += 1;
                 }
+                offscreen.push(OffscreenRows {
+                    parent_index: row.parent_index,
+                    first_position: row.position,
+                    last_position,
+                    count,
+                });
                 output.lines.push((
                     row.depth,
                     format!(
@@ -207,10 +239,16 @@ pub(crate) fn splice(
             output.nodes.push(node);
         }
     }
-    (output.lines, output.nodes, map)
+    ((output.lines, output.nodes, map), offscreen)
 }
 
-pub(crate) fn renumber(lines: &mut [(usize, String)], nodes: &mut [AXNode], map: &[Option<usize>]) {
+/// Renumber spliced rows in document order. Returns the old-to-new element
+/// index map.
+pub(crate) fn renumber(
+    lines: &mut [(usize, String)],
+    nodes: &mut [AXNode],
+    map: &[Option<usize>],
+) -> HashMap<usize, usize> {
     let indices: HashMap<usize, usize> = nodes
         .iter()
         .filter_map(|node| node.element_index)
@@ -228,6 +266,7 @@ pub(crate) fn renumber(lines: &mut [(usize, String)], nodes: &mut [AXNode], map:
             }
         }
     }
+    indices
 }
 
 #[cfg(test)]
@@ -291,6 +330,7 @@ mod tests {
         DeferredRow {
             anchor,
             seq,
+            position: seq,
             element: unsafe { RetainedElement::retain(0) },
             depth: 2,
             parent_index: Some(1),
@@ -306,6 +346,74 @@ mod tests {
             node(Some(1), "AXTable", "Messages", 1, Some(0)),
             node(Some(2), "AXTextArea", "Compose", 1, Some(0)),
         ])
+    }
+
+    #[test]
+    fn a_large_list_returns_only_its_visible_rows_and_names_the_skipped_ranges() {
+        const ROWS: usize = 200;
+        let shown = |i: usize| (50..60).contains(&i);
+        let plan = plan_children(ROWS, |_| true, Some(&shown), || false);
+        // As the windowed walker does: a visible row is read, an offscreen
+        // one is left unwalked.
+        let mut next_index = 3;
+        let deferred: Vec<DeferredRow> = plan
+            .iter()
+            .enumerate()
+            .map(|(position, plan)| {
+                let ChildPlan::Defer { visible } = *plan else {
+                    panic!("every child is a row");
+                };
+                let walked = visible.then(|| {
+                    let title = format!("Row {position}");
+                    next_index += 1;
+                    chunk(vec![node(
+                        Some(next_index - 1),
+                        "AXRow",
+                        &title,
+                        2,
+                        Some(1),
+                    )])
+                });
+                row(2, position, visible, walked)
+            })
+            .collect();
+        let base = window();
+        let ((mut lines, mut nodes, map), runs) =
+            splice_with_offscreen_rows(base.lines, base.nodes, deferred);
+        let indices = renumber(&mut lines, &mut nodes, &map);
+
+        let rows: Vec<_> = nodes
+            .iter()
+            .filter(|n| n.role == "AXRow")
+            .map(|n| n.title.as_deref().unwrap())
+            .collect();
+        let expected: Vec<String> = (50..60).map(|i| format!("Row {i}")).collect();
+        assert_eq!(rows, expected, "only the visible rows are returned");
+        assert_eq!(nodes.len(), 3 + 10);
+        assert_eq!(nodes.last().unwrap().element_index, Some(12));
+        assert_eq!(
+            lines.iter().filter(|(_, l)| is_summary_line(l)).count(),
+            2,
+            "one summary line per skipped run"
+        );
+        let parent = Some(indices[&1]);
+        assert_eq!(
+            runs,
+            [
+                OffscreenRows {
+                    parent_index: parent,
+                    first_position: 0,
+                    last_position: 49,
+                    count: 50,
+                },
+                OffscreenRows {
+                    parent_index: parent,
+                    first_position: 60,
+                    last_position: 199,
+                    count: 140,
+                },
+            ]
+        );
     }
 
     fn message() -> Chunk {

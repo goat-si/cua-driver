@@ -154,7 +154,7 @@ pub(crate) unsafe fn selected_text_if_allowed(
     let Some(role) = value(0).filter(|role| !role.trim().is_empty()) else {
         return (None, None);
     };
-    if !matches!(role, "AXTextField" | "AXTextArea" | "AXComboBox")
+    if !is_selection_text_role(role)
         || is_secure_text_field(&FieldSecurityMeta {
             role,
             subrole: value(1),
@@ -170,6 +170,11 @@ pub(crate) unsafe fn selected_text_if_allowed(
     }
     let selected = copy_string_attr(element, "AXSelectedText").filter(|text| !text.is_empty());
     (selected, read_selected_text_range(element))
+}
+
+/// The roles [`selected_text_if_allowed`] reads a selection from.
+pub(crate) fn is_selection_text_role(role: &str) -> bool {
+    matches!(role, "AXTextField" | "AXTextArea" | "AXComboBox")
 }
 
 /// A single node in the AX tree.
@@ -356,6 +361,9 @@ pub struct TreeWalkResult {
     /// [`WindowScope::Matched`] comes with an EMPTY walk, so `nodes` never
     /// describes a window other than the requested one.
     pub window_scope: Option<WindowScope>,
+    /// Offscreen rows a windowed read left unwalked, one entry per summary
+    /// line. Empty when every row was walked.
+    pub offscreen_rows: Vec<super::dense_rows::OffscreenRows>,
 }
 
 #[cfg(test)]
@@ -369,6 +377,7 @@ impl TreeWalkResult {
             nodes_skipped: false,
             walk: cua_driver_core::walk_budget::WalkBudget::nodes_only(usize::MAX).outcome(),
             window_scope: None,
+            offscreen_rows: Vec::new(),
         }
     }
 }
@@ -491,6 +500,7 @@ fn walk_tree_with_web_content(
     let mut lines: Vec<(usize, String)> = Vec::new(); // (depth, line)
     let mut index_counter = 0usize;
     let mut deferred = Vec::new();
+    let mut offscreen_rows = Vec::new();
     let mut batching_disabled = false;
     let mut window_scope: Option<WindowScope> = None;
 
@@ -498,6 +508,7 @@ fn walk_tree_with_web_content(
         let app_elem = AXUIElementCreateApplication(pid);
         if app_elem.is_null() {
             return TreeWalkResult {
+                offscreen_rows: Vec::new(),
                 tree_markdown: String::new(),
                 nodes,
                 truncated: false,
@@ -630,10 +641,18 @@ fn walk_tree_with_web_content(
                     }
                 }
             });
-            let (spliced_lines, spliced_nodes, map) = dense_rows::splice(lines, nodes, deferred);
+            let ((spliced_lines, spliced_nodes, map), runs) =
+                dense_rows::splice_with_offscreen_rows(lines, nodes, deferred);
             lines = spliced_lines;
             nodes = spliced_nodes;
-            dense_rows::renumber(&mut lines, &mut nodes, &map);
+            let indices = dense_rows::renumber(&mut lines, &mut nodes, &map);
+            offscreen_rows = runs
+                .into_iter()
+                .map(|run| dense_rows::OffscreenRows {
+                    parent_index: run.parent_index.map(|old| indices[&old]),
+                    ..run
+                })
+                .collect();
         }
 
         // Release all top-level elements (copy_children / copy_ax_windows both retain).
@@ -664,6 +683,7 @@ fn walk_tree_with_web_content(
     }
 
     TreeWalkResult {
+        offscreen_rows,
         tree_markdown,
         nodes,
         truncated: walk.truncated(),
@@ -1374,6 +1394,7 @@ unsafe fn walk_children(
             ChildPlan::Defer { visible } => deferred.push(DeferredRow {
                 anchor: nodes.len(),
                 seq: deferred.len(),
+                position: index,
                 element: RetainedElement::retain(child as usize),
                 depth,
                 parent_index,
