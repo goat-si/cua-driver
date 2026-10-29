@@ -139,7 +139,9 @@ fn deliver_text_runs(
                     if error.downcast_ref::<PasteMayHaveLanded>().is_some() {
                         return Err(error);
                     }
-                    if error.downcast_ref::<DesktopSequenceAbort>().is_some() {
+                    if error.downcast_ref::<DesktopSequenceAbort>().is_some()
+                        || error.downcast_ref::<PasteSequenceAbort>().is_some()
+                    {
                         // A guard abort is not a paste failure: never resume
                         // typing after it, even if focus comes back.
                         return Err(error);

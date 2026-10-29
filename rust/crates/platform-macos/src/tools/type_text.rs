@@ -207,11 +207,6 @@ impl Tool for TypeTextTool {
                 )
             })
             .await;
-            if let Some(ptr) = initial_focus {
-                unsafe {
-                    core_foundation::base::CFRelease(ptr as core_foundation::base::CFTypeRef)
-                };
-            }
             if let Ok(Err(error)) = &result {
                 if let Some(abort) =
                     error.downcast_ref::<crate::input::keyboard::PasteSequenceAbort>()
@@ -219,8 +214,8 @@ impl Tool for TypeTextTool {
                     let restored = abort.clipboard_restored;
                     let count = abort.posted;
                     return ToolResult::text(format!(
-                        "Desktop typing stopped before the paste went out: {}. At least {}                          character(s) were sent earlier. Read fresh state before retrying.",
-                        abort.reason, count
+                        "Desktop typing stopped before the paste went out: {}. At least {}                          character(s) were sent earlier (clipboard_restored={}). Read fresh                          state before retrying.",
+                        abort.reason, count, restored
                     ))
                     .with_structured(serde_json::json!({
                         "code": "not_editable",
