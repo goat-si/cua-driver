@@ -117,6 +117,16 @@ fn nearest_selectable_container_center(element_ptr: usize) -> Option<(f64, f64)>
     None
 }
 
+/// A plain click on a row already selected can show no change: nothing is
+/// watched. A modified click can toggle the row either way.
+fn selection_fallback_scope(before: bool, has_modifiers: bool) -> ObservationScope {
+    if has_modifiers || !before {
+        ObservationScope::Watch
+    } else {
+        ObservationScope::Nothing
+    }
+}
+
 fn selection_readback_confirms(
     before: bool,
     after: bool,
@@ -507,7 +517,11 @@ fn watch_for_change<C: crate::ax::scroll_area::Clock>(
         }
         // Both reads must return by the deadline: a read that returned after
         // it may show a later change.
-        if let Some(evidence) = read() {
+        let seen = read();
+        if clock.now() > deadline {
+            return None;
+        }
+        if let Some(evidence) = seen {
             if read() == Some(evidence) && clock.now() <= deadline {
                 return Some(evidence);
             }
@@ -2700,10 +2714,11 @@ impl KeyPrime {
     }
 }
 
-/// Focus is the click's evidence only when the field was not focused before
-/// it and no physical input arrived meanwhile.
-fn text_focus_evidence(focused_before: bool, input_quiet: bool) -> Option<ClickEvidence> {
-    (!focused_before && input_quiet).then_some(ClickEvidence::Focused)
+/// Focus is the click's evidence only when the field read unfocused before
+/// it (an unreadable baseline proves nothing) and no physical input arrived
+/// meanwhile.
+fn text_focus_evidence(focused_before: Option<bool>, input_quiet: bool) -> Option<ClickEvidence> {
+    (focused_before == Some(false) && input_quiet).then_some(ClickEvidence::Focused)
 }
 
 /// Whether an AX press on a text input must wait for the page to move DOM
@@ -2860,7 +2875,7 @@ fn perform_ax_click(
             let modified = !modifiers.is_empty();
             let last_observation = std::cell::Cell::new(None);
             let found = watch_for_change(
-                ObservationScope::Watch,
+                selection_fallback_scope(before, modified),
                 std::time::Instant::now(),
                 &crate::ax::scroll_area::SystemClock,
                 || {
@@ -2938,9 +2953,11 @@ fn perform_ax_click(
         let in_web_area = text_in_web_area;
         // Focus counts as the click's effect only when the field was not
         // focused before and no physical input arrived meanwhile.
-        let focused_before = unsafe { copy_bool_attr(element, "AXFocused") } == Some(true);
+        // The input clock starts before the baseline read, so a person
+        // focusing the field during the read also disqualifies it.
         let focus_idle_before = super::physical_input_idle_ms();
         let focus_input_from = std::time::Instant::now();
+        let focused_before = unsafe { copy_bool_attr(element, "AXFocused") };
         let scope = if text_key_scope {
             match crate::input::skylight::enter_exact_window_key_inline(
                 pid as libc::pid_t,
@@ -2977,16 +2994,22 @@ fn perform_ax_click(
                 }
                 crate::input::ax_actions::focus_element(element_ptr)?;
             }
-            Ok(
-                unsafe { copy_bool_attr(element, "AXFocused") } == Some(true)
+            // Focus can land shortly after delivery (a web field's DOM
+            // focus): poll it from delivery and stop on the sample that
+            // shows it.
+            let holds = || {
+                (unsafe { copy_bool_attr(element, "AXFocused") } == Some(true))
                     && super::type_text::element_in_requested_window(pid, window_id, element_ptr)
                     && crate::input::ax_actions::is_element_focused(pid, element_ptr)
-                    && super::type_text::focused_window_matches_element(
-                        pid,
-                        window_id,
-                        element_ptr,
-                    ),
+                    && super::type_text::focused_window_matches_element(pid, window_id, element_ptr)
+            };
+            Ok(watch_for_change(
+                ObservationScope::Watch,
+                std::time::Instant::now(),
+                &crate::ax::scroll_area::SystemClock,
+                || holds().then_some(ClickEvidence::Focused),
             )
+            .is_some())
         };
         let focused = focus_step();
         let hand_back = scope.map(|scope| {
@@ -4186,11 +4209,50 @@ mod click_evidence_tests {
     #[test]
     fn focus_confirms_a_text_click_only_as_a_change_with_no_input() {
         assert_eq!(
-            text_focus_evidence(false, true),
+            text_focus_evidence(Some(false), true),
             Some(ClickEvidence::Focused)
         );
-        assert_eq!(text_focus_evidence(true, true), None, "already focused");
-        assert_eq!(text_focus_evidence(false, false), None, "input meanwhile");
+        assert_eq!(
+            text_focus_evidence(Some(true), true),
+            None,
+            "already focused"
+        );
+        assert_eq!(text_focus_evidence(None, true), None, "unreadable baseline");
+        assert_eq!(
+            text_focus_evidence(Some(false), false),
+            None,
+            "input meanwhile"
+        );
+    }
+
+    #[test]
+    fn a_plain_click_on_a_selected_row_is_not_watched() {
+        assert_eq!(
+            selection_fallback_scope(true, false),
+            ObservationScope::Nothing
+        );
+        assert_eq!(
+            selection_fallback_scope(false, false),
+            ObservationScope::Watch
+        );
+        assert_eq!(
+            selection_fallback_scope(true, true),
+            ObservationScope::Watch
+        );
+    }
+
+    #[test]
+    fn a_first_read_that_returns_after_the_deadline_ends_the_watch() {
+        // 27 ms reads: the second read starts at 37 ms and returns at 64 ms,
+        // past the deadline, showing a change. No confirming read follows.
+        let reads = Cell::new(0);
+        let (found, elapsed) = run_costly_watch(Duration::from_millis(27), |elapsed| {
+            reads.set(reads.get() + 1);
+            (elapsed >= Duration::from_millis(40)).then_some(ClickEvidence::Selected)
+        });
+        assert_eq!(found, None);
+        assert_eq!(reads.get(), 2);
+        assert_eq!(elapsed, Duration::from_millis(64));
     }
 
     #[test]

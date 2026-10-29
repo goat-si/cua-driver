@@ -402,9 +402,10 @@ impl WindowChangeDetector {
     ) -> Snapshot {
         let _latency = latency::span(latency::Stage::Snapshot);
         // A new action supersedes the previous action's detached observation.
+        // Taken in one step, so the tail cannot record a change after this.
         let superseded = lock(&TAIL)
-            .as_ref()
-            .map(|tail| (tail.window_ids.clone(), tail.front_pid));
+            .take()
+            .map(|tail| (tail.window_ids, tail.front_pid));
         end_tail();
         let current = host_windows();
         let window_ids: HashSet<u32> = current.iter().map(|w| w.window_id).collect();
@@ -696,7 +697,11 @@ impl Snapshot {
                         return;
                     }
                     if let Some(changes) = self.observe_once(&mut observe) {
-                        if !still_mine() {
+                        // Recorded under the tail lock: a next action that
+                        // ended this tail (and reported the change itself)
+                        // never sees a stale record written after it.
+                        let tail = lock(&TAIL);
+                        if !tail.as_ref().is_some_and(|tail| tail.id == id) {
                             return;
                         }
                         *lock(&LATE) = Some(Late {
@@ -704,6 +709,7 @@ impl Snapshot {
                             new_windows: changes.new_windows,
                             foreground_changed: changes.foreground_changed,
                         });
+                        drop(tail);
                         // Keep the lease until the deadline: the change may be
                         // an activation it is still reverting.
                         break;
