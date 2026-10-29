@@ -499,41 +499,66 @@ async fn minimized_set_value(
         let focus_guard = element_guard.clone();
         let focused = latency::spawn_action_blocking(move || {
             let ptr = focus_guard.as_ptr();
-            if crate::input::skylight::front_process_matches(pid as libc::pid_t, window_id)
-                != Some(false)
-            {
-                return RestoredFocus::FrontChanged;
+            let already =
+                unsafe { crate::ax::bindings::copy_bool_attr(ptr as AXUIElementRef, "AXFocused") }
+                    == Some(true);
+            if !already {
+                if crate::input::skylight::front_process_matches(pid as libc::pid_t, window_id)
+                    != Some(false)
+                {
+                    return RestoredFocus::FrontChanged;
+                }
+                let _ = crate::input::ax_actions::focus_element(ptr);
             }
-            let _ = crate::input::ax_actions::focus_element(ptr);
             let holds_focus =
                 unsafe { crate::ax::bindings::copy_bool_attr(ptr as AXUIElementRef, "AXFocused") }
                     == Some(true)
                     && crate::input::ax_actions::is_element_focused(pid, ptr);
             if !holds_focus {
-                return RestoredFocus::NotFocused;
+                return RestoredFocus::NotFocused {
+                    focus_written: !already,
+                };
             }
             if unsafe { super::not_editable::sync_focused_cell_allows(pid, Some(window_id)) } {
                 RestoredFocus::Editable
             } else {
-                RestoredFocus::NotEditable
+                RestoredFocus::NotEditable {
+                    focus_written: !already,
+                }
             }
         })
         .await
-        .unwrap_or(RestoredFocus::NotFocused);
+        .unwrap_or(RestoredFocus::NotFocused {
+            focus_written: true,
+        });
         let token_refusal = match focused {
             RestoredFocus::Editable => None,
             // A focus write was sent: the receipts say so.
-            RestoredFocus::NotFocused => Some(super::not_editable::not_editable_result(
-                format!(
+            RestoredFocus::NotFocused { focus_written } => {
+                Some(super::not_editable::not_editable_result(
+                    format!(
                     "the field in restored window {window_id} did not read back as focused after \
                      the focus attempt; AXValue was not written."
                 ),
-                super::not_editable::FocusDispatch::Indeterminate,
-            )),
-            RestoredFocus::NotEditable => Some(super::not_editable::not_editable_result(
-                "the target element is not being edited; AXValue was not written.".to_owned(),
-                super::not_editable::FocusDispatch::SentAx,
-            )),
+                    if focus_written {
+                        super::not_editable::FocusDispatch::Indeterminate
+                    } else {
+                        super::not_editable::FocusDispatch::None
+                    },
+                ))
+            }
+            // focus_element hides AX errors: a write this route made is
+            // possibly delivered, never proven.
+            RestoredFocus::NotEditable { focus_written } => {
+                Some(super::not_editable::not_editable_result(
+                    "the target element is not being edited; AXValue was not written.".to_owned(),
+                    if focus_written {
+                        super::not_editable::FocusDispatch::Indeterminate
+                    } else {
+                        super::not_editable::FocusDispatch::None
+                    },
+                ))
+            }
             RestoredFocus::FrontChanged => Some(super::pre_dispatch_refusal(
                 cua_driver_core::background_input::refusal_codes::MINIMIZED_OR_HIDDEN,
                 format!(
@@ -636,8 +661,8 @@ fn attach_restore_cleanup(
 /// The restored-window route's own focus step.
 enum RestoredFocus {
     Editable,
-    NotFocused,
-    NotEditable,
+    NotFocused { focus_written: bool },
+    NotEditable { focus_written: bool },
     FrontChanged,
 }
 
@@ -962,11 +987,6 @@ fn set_value_blocking_with(
                     "set_value target did not become the application's focused text element in the requested window (AXFocused={own_focus}, exact_window={exact_window}, app_focus={app_focus}, key_window={key_window}); AXValue was not written"
                 )
             }
-            if restored_window && !front_ok() {
-                anyhow::bail!(
-                    "the app came to the front, or which app is in front could not be read; AXValue was not written"
-                )
-            }
         }
         // Default path: write AXValue directly. Numeric controls (AXSlider /
         // AXStepper) reject a CFString with -25201 and need a CFNumber; text
@@ -980,6 +1000,15 @@ fn set_value_blocking_with(
         // Read the value before writing so an unchanged field can be reported as
         // idempotent rather than silently indistinguishable from a fresh write.
         let before = unsafe { copy_string_attr(element, "AXValue") };
+        // A restored window: the last read before the write.
+        if restored_window
+            && crate::input::skylight::front_process_matches(pid as libc::pid_t, window_id)
+                != Some(false)
+        {
+            anyhow::bail!(
+                "the app came to the front, or which app is in front could not be read; AXValue was not written"
+            )
+        }
         let err = match numeric_target {
             Some(n) => {
                 let e = unsafe { set_number_attr(element, "AXValue", n) };

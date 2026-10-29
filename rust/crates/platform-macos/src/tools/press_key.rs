@@ -1206,7 +1206,15 @@ fn minimized_key_worker(
     let outcome = dispatch_with_ax_oracle(pid, Some(wid), ptr, || {
         with_confirmed_key_focus_or_fallback(
             ptr,
-            crate::input::ax_actions::focus_element,
+            // Every focus write, retries included, reads the front app first.
+            |target| {
+                if !restore.front_still_ok() {
+                    anyhow::bail!(
+                        "the app came to the front, or which app is in front could not be read; no focus or key was sent"
+                    );
+                }
+                crate::input::ax_actions::focus_element(target)
+            },
             |target| {
                 crate::input::ax_actions::element_has_keyboard_focus_in_window(
                     pid,
@@ -1216,12 +1224,13 @@ fn minimized_key_worker(
             },
             |_| Ok(false),
             || {
+                verify_raw_key_target(pid, Some(wid), ptr, true)?;
+                // The last read before the post.
                 if !restore.front_still_ok() {
                     anyhow::bail!(
                         "the app came to the front, or which app is in front could not be read; no key was sent"
                     );
                 }
-                verify_raw_key_target(pid, Some(wid), ptr, true)?;
                 crate::input::keyboard::press_key(pid, &key, &m)
             },
         )
