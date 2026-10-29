@@ -318,12 +318,7 @@ fn merge_kernel_running_states(
     processes: &[(i32, String)],
     front: Option<i32>,
 ) {
-    let kernel_pids: std::collections::HashSet<i32> =
-        processes.iter().map(|(pid, _)| *pid).collect();
-    for entries in running_states.values_mut() {
-        entries.retain(|(pid, _, _)| !kernel_pids.contains(pid));
-    }
-    running_states.retain(|_, entries| !entries.is_empty());
+    let mut resolved = Vec::new();
     for (pid, executable) in processes {
         let Some(app_path) = bundle_root_of_executable(executable) else {
             continue;
@@ -331,9 +326,18 @@ fn merge_kernel_running_states(
         let Some(bundle_id) = bundle_id_for_app_path(app_path).filter(|id| !id.is_empty()) else {
             continue;
         };
+        resolved.push((*pid, app_path, bundle_id));
+    }
+    let kernel_pids: std::collections::HashSet<i32> =
+        resolved.iter().map(|(pid, _, _)| *pid).collect();
+    for entries in running_states.values_mut() {
+        entries.retain(|(pid, _, _)| !kernel_pids.contains(pid));
+    }
+    running_states.retain(|_, entries| !entries.is_empty());
+    for (pid, app_path, bundle_id) in resolved.into_iter() {
         let entries = running_states.entry(bundle_id).or_default();
-        entries.retain(|(other_pid, _, _)| other_pid != pid);
-        entries.push((*pid, front == Some(*pid), Some(app_path.to_owned())));
+        entries.retain(|(other_pid, _, _)| *other_pid != pid);
+        entries.push((pid, front == Some(pid), Some(app_path.to_owned())));
         entries.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.2.cmp(&b.2)));
         entries.dedup();
     }
@@ -1549,6 +1553,32 @@ mod tests {
         assert_eq!(
             running_states.get(new_bundle),
             Some(&vec![(42, false, Some(new_path))])
+        );
+    }
+
+    #[test]
+    fn unidentified_kernel_processes_preserve_appkit_state() {
+        let bundle_id = "com.trycua.test.CuaLiveAgent";
+        let mut running_states = states(&[(bundle_id, 42, false, None)]);
+        merge_kernel_running_states(&mut running_states, &[(42, "/usr/bin/ssh".into())], None);
+        assert_eq!(
+            running_states.get(bundle_id),
+            Some(&vec![(42, false, None)])
+        );
+
+        let temp = tempfile::tempdir().expect("temp dir");
+        let macos = temp.path().join("NoId.app/Contents/MacOS");
+        std::fs::create_dir_all(&macos).unwrap();
+        std::fs::write(
+            temp.path().join("NoId.app/Contents/Info.plist"),
+            "<plist><dict></dict></plist>",
+        )
+        .unwrap();
+        let executable = macos.join("NoId").to_string_lossy().into_owned();
+        merge_kernel_running_states(&mut running_states, &[(42, executable)], None);
+        assert_eq!(
+            running_states.get(bundle_id),
+            Some(&vec![(42, false, None)])
         );
     }
 
