@@ -516,12 +516,13 @@ async fn minimized_set_value(
             Ok(true) => {
                 super::not_editable::token_not_editable_refusal(pid, element_ptr, window_id).await
             }
-            Ok(false) => Some(super::pre_dispatch_refusal(
-                "not_editable",
+            // A focus write was sent: the receipt says so.
+            Ok(false) => Some(super::not_editable::not_editable_result(
                 format!(
                     "the field in restored window {window_id} did not read back as focused after \
                      the focus attempt; AXValue was not written."
                 ),
+                super::not_editable::FocusDispatch::Indeterminate,
             )),
             Err(()) => Some(super::pre_dispatch_refusal(
                 cua_driver_core::background_input::refusal_codes::MINIMIZED_OR_HIDDEN,
@@ -913,7 +914,21 @@ fn set_value_blocking_with(
             None
         };
         if text_value_role_requires_exact_focus(&role) {
-            crate::input::ax_actions::focus_element(element_ptr)?;
+            // A restored window: no focus write once its app may be the
+            // person's (front read right before), and none when the field
+            // already holds focus.
+            let front_ok = || {
+                crate::input::skylight::front_process_matches(pid as libc::pid_t, window_id)
+                    == Some(false)
+            };
+            if restored_window && !front_ok() {
+                anyhow::bail!(
+                    "the app came to the front, or which app is in front could not be read; AXValue was not written"
+                )
+            }
+            if !restored_window || unsafe { copy_bool_attr(element, "AXFocused") } != Some(true) {
+                crate::input::ax_actions::focus_element(element_ptr)?;
+            }
             let own_focus = unsafe { copy_bool_attr(element, "AXFocused") } == Some(true);
             let exact_window =
                 super::type_text::element_in_requested_window(pid, window_id, element_ptr);
@@ -926,10 +941,7 @@ fn set_value_blocking_with(
                     "set_value target did not become the application's focused text element in the requested window (AXFocused={own_focus}, exact_window={exact_window}, app_focus={app_focus}, key_window={key_window}); AXValue was not written"
                 )
             }
-            if restored_window
-                && crate::input::skylight::front_process_matches(pid as libc::pid_t, window_id)
-                    != Some(false)
-            {
+            if restored_window && !front_ok() {
                 anyhow::bail!(
                     "the app came to the front, or which app is in front could not be read; AXValue was not written"
                 )
