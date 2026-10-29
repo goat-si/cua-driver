@@ -2121,6 +2121,86 @@ mod tests {
     }
 
     #[test]
+    fn a_concurrent_copy_then_a_trigger_error_skips_restoration() {
+        let original = vec![PasteboardItemSnapshot {
+            representations: vec![("public.utf8-plain-text".to_owned(), b"old".to_vec())],
+        }];
+        let user_new = vec![PasteboardItemSnapshot {
+            representations: vec![("public.utf8-plain-text".to_owned(), b"user new".to_vec())],
+        }];
+        let mut pb = MockPasteboard {
+            count: 5,
+            items: original,
+            writes: Vec::new(),
+            concurrent_copy_during_paste: Some(user_new.clone()),
+            fail_restore: false,
+        };
+        let ptr = &mut pb as *mut MockPasteboard;
+        let err = run_pasteboard_transaction(
+            &mut pb,
+            "agent text",
+            || {
+                unsafe {
+                    if let Some(new_items) = (*ptr).concurrent_copy_during_paste.take() {
+                        (*ptr).count += 1;
+                        (*ptr).items = new_items;
+                    }
+                }
+                anyhow::bail!("trigger failed")
+            },
+            std::time::Duration::ZERO,
+        )
+        .unwrap_err();
+        assert_eq!(pb.items, user_new, "the other writer's content survives");
+        let landed = err.downcast_ref::<PasteMayHaveLanded>().expect("landed");
+        assert!(landed.clipboard_changed_externally);
+        assert!(!landed.clipboard_restored());
+    }
+
+    #[test]
+    fn a_concurrent_copy_then_a_guard_abort_skips_restoration() {
+        let original = vec![PasteboardItemSnapshot {
+            representations: vec![("public.utf8-plain-text".to_owned(), b"old".to_vec())],
+        }];
+        let user_new = vec![PasteboardItemSnapshot {
+            representations: vec![("public.utf8-plain-text".to_owned(), b"user new".to_vec())],
+        }];
+        let mut pb = MockPasteboard {
+            count: 5,
+            items: original,
+            writes: Vec::new(),
+            concurrent_copy_during_paste: Some(user_new.clone()),
+            fail_restore: false,
+        };
+        let ptr = &mut pb as *mut MockPasteboard;
+        let err = run_pasteboard_transaction(
+            &mut pb,
+            "agent text",
+            || {
+                unsafe {
+                    if let Some(new_items) = (*ptr).concurrent_copy_during_paste.take() {
+                        (*ptr).count += 1;
+                        (*ptr).items = new_items;
+                    }
+                }
+                Err(anyhow::Error::new(PasteSequenceAbort {
+                    posted: 0,
+                    reason: "not_editable: focus changed".into(),
+                    clipboard_restored: PasteRestoration::Unknown,
+                }))
+            },
+            std::time::Duration::ZERO,
+        )
+        .unwrap_err();
+        assert_eq!(pb.items, user_new, "the other writer's content survives");
+        let abort = err.downcast_ref::<PasteSequenceAbort>().expect("abort");
+        assert_eq!(
+            abort.clipboard_restored,
+            PasteRestoration::SkippedConcurrentChange
+        );
+    }
+
+    #[test]
     fn pasteboard_transaction_rolls_back_immediately_when_trigger_fails() {
         let original = vec![PasteboardItemSnapshot {
             representations: vec![("public.utf8-plain-text".to_owned(), b"keep me".to_vec())],
