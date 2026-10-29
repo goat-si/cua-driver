@@ -1393,6 +1393,10 @@ async fn execute_step(
         _ = deadline.wait() => {
             let snapshot = gate.timeout();
             guard.disarm();
+            // A timeout stops new admissions, but the result is assembled only
+            // after the already-admitted invocation has settled. No late input
+            // or worker outlives this batch result.
+            let _ = worker.await;
             StepExecution::Timeout {
                 outcome: failure(
                     index,
@@ -2759,6 +2763,7 @@ mod timeout_tests {
 
     struct WindowReadTool {
         def: ToolDef,
+        pid: i64,
         calls: Arc<Mutex<Vec<Value>>>,
         started: Arc<tokio::sync::Notify>,
         release: Arc<tokio::sync::Notify>,
@@ -2780,7 +2785,7 @@ mod timeout_tests {
             }
             let value = if window_id == 22 { "702" } else { "wrong" };
             ToolResult::text("window").with_structured(json!({
-                "pid": 42,
+                "pid": self.pid,
                 "window_id": window_id,
                 "snapshot_id": "s00000001",
                 "elements": [{
@@ -2806,6 +2811,7 @@ mod timeout_tests {
         calls: Arc<Mutex<Vec<Value>>>,
         started: Arc<tokio::sync::Notify>,
         release: Arc<tokio::sync::Notify>,
+        finished: Arc<tokio::sync::Notify>,
         response: Arc<dyn Fn() -> ToolResult + Send + Sync>,
     }
 
@@ -2819,7 +2825,9 @@ mod timeout_tests {
             self.calls.lock().unwrap().push(args);
             self.started.notify_one();
             self.release.notified().await;
-            (self.response)()
+            let result = (self.response)();
+            self.finished.notify_one();
+            result
         }
     }
 
@@ -2859,9 +2867,9 @@ mod timeout_tests {
         }
     }
 
-    fn list_windows() -> ToolResult {
+    fn list_windows_for(pid: i64) -> ToolResult {
         ToolResult::text("windows").with_structured(json!({
-            "pid": 42,
+            "pid": pid,
             "window_id": 7,
             "snapshot_id": "s00000001",
             "windows": [
@@ -2871,10 +2879,18 @@ mod timeout_tests {
         }))
     }
 
-    fn list_apps() -> ToolResult {
+    fn list_apps_for(pid: i64) -> ToolResult {
         ToolResult::text("apps").with_structured(json!({
-            "apps": [{"pid":42,"name":"Demo","bundle_id":"com.example.demo","running":true,"active":false}]
+            "apps": [{"pid":pid,"name":"Demo","bundle_id":"com.example.demo","running":true,"active":false}]
         }))
+    }
+
+    fn list_windows() -> ToolResult {
+        list_windows_for(42)
+    }
+
+    fn list_apps() -> ToolResult {
+        list_apps_for(42)
     }
 
     #[tokio::test]
@@ -2905,6 +2921,7 @@ mod timeout_tests {
             .await
             .expect("action start");
         deadline_tx.send(()).expect("trigger step deadline");
+        release.notify_one();
         let result = batch.await.expect("batch join");
         let structured = result.structured_content.expect("structured batch");
         assert_eq!(structured["code"], "step_timeout");
@@ -2913,23 +2930,7 @@ mod timeout_tests {
         assert_eq!(structured["steps"][0]["tool"], "type_text");
         assert_eq!(structured["steps"][0]["effect"], "unverifiable");
 
-        let busy = registry
-            .invoke("type_text", json!({"pid":425001,"window_id":7}))
-            .await;
-        assert_eq!(busy.is_error, Some(true));
-        assert!(
-            bounded_message(&busy).contains("already active"),
-            "the detached worker must keep its guard after the timeout response: {}",
-            bounded_message(&busy)
-        );
-        release.notify_one();
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while !finished.load(std::sync::atomic::Ordering::SeqCst) {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("detached worker did not finish after release");
+        assert!(finished.load(std::sync::atomic::Ordering::SeqCst));
         let completed = registry
             .invoke("type_text", json!({"pid":425001,"window_id":7}))
             .await;
@@ -2998,6 +2999,7 @@ mod timeout_tests {
         register_probe(&mut registry, "click", || ToolResult::text("clicked"));
         registry.register(Box::new(WindowReadTool {
             def: tool_def("get_window_state"),
+            pid: 42,
             calls: Arc::new(Mutex::new(Vec::new())),
             started: started.clone(),
             release: release.clone(),
@@ -3027,10 +3029,11 @@ mod timeout_tests {
         let release = Arc::new(tokio::sync::Notify::new());
         let calls = Arc::new(Mutex::new(Vec::new()));
         let mut registry = ToolRegistry::new();
-        register_probe(&mut registry, "list_windows", list_windows);
-        register_probe(&mut registry, "list_apps", list_apps);
+        register_probe(&mut registry, "list_windows", || list_windows_for(425004));
+        register_probe(&mut registry, "list_apps", || list_apps_for(425004));
         registry.register(Box::new(WindowReadTool {
             def: tool_def("get_window_state"),
+            pid: 42,
             calls: calls.clone(),
             started: started.clone(),
             release: release.clone(),
@@ -3081,6 +3084,7 @@ mod timeout_tests {
         let clicks = register_probe(&mut registry, "click", || ToolResult::text("clicked"));
         registry.register(Box::new(WindowReadTool {
             def: tool_def("get_window_state"),
+            pid: 42,
             calls: Arc::new(Mutex::new(Vec::new())),
             started: started.clone(),
             release: release.clone(),
@@ -3109,6 +3113,7 @@ mod timeout_tests {
         let structured = result.structured_content.unwrap();
         assert_eq!(structured["code"], "step_timeout");
         assert!(clicks.lock().unwrap().is_empty());
+        assert!(structured.get("observation").is_none());
     }
 
     #[tokio::test]
@@ -3149,6 +3154,7 @@ mod timeout_tests {
         let mut registry = ToolRegistry::new();
         registry.register(Box::new(WindowReadTool {
             def: tool_def("get_window_state"),
+            pid: 42,
             calls: Arc::new(Mutex::new(Vec::new())),
             started: started.clone(),
             release: release.clone(),
@@ -3221,6 +3227,7 @@ mod timeout_tests {
         register_probe(&mut registry, "list_apps", list_apps);
         registry.register(Box::new(WindowReadTool {
             def: tool_def("get_window_state"),
+            pid: 425004,
             calls: Arc::new(Mutex::new(Vec::new())),
             started: Arc::new(tokio::sync::Notify::new()),
             release: Arc::new(tokio::sync::Notify::new()),
@@ -3239,7 +3246,7 @@ mod timeout_tests {
             &json!({
                 "steps":[{
                     "tool":"type_text",
-                    "args":{"pid":42,"window_id":22,"role":"AXStaticText","name":"Result","timeout_ms":1000}
+                    "args":{"pid":425004,"window_id":22,"role":"AXStaticText","name":"Result","timeout_ms":1000}
                 }]
             }),
         )
@@ -3251,11 +3258,11 @@ mod timeout_tests {
             .await
             .expect("action start");
         deadline_tx.send(()).expect("deadline");
+        release_action.notify_one();
         let result = batch.await.expect("batch join");
         let structured = result.structured_content.unwrap();
         assert_eq!(structured["code"], "step_timeout");
         assert_eq!(structured["observation"]["ok"], true);
-        release_action.notify_one();
     }
 
     #[test]
@@ -3284,6 +3291,7 @@ mod timeout_tests {
         );
         let started = Arc::new(tokio::sync::Notify::new());
         let release = Arc::new(tokio::sync::Notify::new());
+        let finished = Arc::new(tokio::sync::Notify::new());
         let calls = Arc::new(Mutex::new(Vec::new()));
         let mut registry = ToolRegistry::new();
         registry.register(Box::new(RefusalTool {
@@ -3291,6 +3299,7 @@ mod timeout_tests {
             calls: calls.clone(),
             started: started.clone(),
             release: release.clone(),
+            finished: finished.clone(),
             response: Arc::new(|| {
                 ToolResult::error("element_token is stale")
                     .with_structured(json!({"code":"stale_element_token","effect":"refused"}))
@@ -3315,6 +3324,9 @@ mod timeout_tests {
         deadline_tx.send(()).expect("deadline");
         release.notify_one();
         let result = batch.await.expect("batch join");
+        tokio::time::timeout(Duration::from_secs(1), finished.notified())
+            .await
+            .expect("first refusal completion");
         assert_eq!(result.structured_content.unwrap()["code"], "step_timeout");
         assert_eq!(calls.lock().unwrap().len(), 1);
         assert!(menu_calls.lock().unwrap().is_empty());
@@ -3330,12 +3342,14 @@ mod timeout_tests {
         );
         let started = Arc::new(tokio::sync::Notify::new());
         let release = Arc::new(tokio::sync::Notify::new());
+        let finished = Arc::new(tokio::sync::Notify::new());
         let calls = Arc::new(Mutex::new(Vec::new()));
         let mut registry = ToolRegistry::new();
         register_probe(&mut registry, "list_windows", list_windows);
         register_probe(&mut registry, "list_apps", list_apps);
         registry.register(Box::new(WindowReadTool {
             def: tool_def("get_window_state"),
+            pid: 42,
             calls: Arc::new(Mutex::new(Vec::new())),
             started: Arc::new(tokio::sync::Notify::new()),
             release: Arc::new(tokio::sync::Notify::new()),
@@ -3346,6 +3360,7 @@ mod timeout_tests {
             calls: calls.clone(),
             started: started.clone(),
             release: release.clone(),
+            finished: finished.clone(),
             response: Arc::new(|| {
                 ToolResult::error("element_token is stale")
                     .with_structured(json!({"code":"stale_element_token","effect":"refused"}))
@@ -3369,6 +3384,9 @@ mod timeout_tests {
         deadline_tx.send(()).expect("deadline");
         release.notify_one();
         let result = batch.await.expect("batch join");
+        tokio::time::timeout(Duration::from_secs(1), finished.notified())
+            .await
+            .expect("first refusal completion");
         assert_eq!(result.structured_content.unwrap()["code"], "step_timeout");
         assert_eq!(calls.lock().unwrap().len(), 1);
     }
@@ -3377,6 +3395,7 @@ mod timeout_tests {
     async fn foreground_fallback_does_not_run_after_timeout() {
         let started = Arc::new(tokio::sync::Notify::new());
         let release = Arc::new(tokio::sync::Notify::new());
+        let finished = Arc::new(tokio::sync::Notify::new());
         let calls = Arc::new(Mutex::new(Vec::new()));
         let mut registry = ToolRegistry::new();
         registry.register(Box::new(RefusalTool {
@@ -3384,6 +3403,7 @@ mod timeout_tests {
             calls: calls.clone(),
             started: started.clone(),
             release: release.clone(),
+            finished: finished.clone(),
             response: Arc::new(|| {
                 ToolResult::error("background unavailable").with_structured(json!({
                     "effect":"refused",
@@ -3407,6 +3427,9 @@ mod timeout_tests {
         deadline_tx.send(()).expect("deadline");
         release.notify_one();
         let result = batch.await.expect("batch join");
+        tokio::time::timeout(Duration::from_secs(1), finished.notified())
+            .await
+            .expect("first refusal completion");
         assert_eq!(result.structured_content.unwrap()["code"], "step_timeout");
         assert_eq!(calls.lock().unwrap().len(), 1);
     }

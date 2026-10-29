@@ -619,6 +619,9 @@ impl<'a> Locator<'a> {
         if self.read_admission_closed() {
             return Err(format!("{tool}: read admission closed"));
         }
+        if self.read_admission.as_ref().is_some_and(|admit| !admit()) {
+            return Err(format!("{tool}: read admission closed"));
+        }
         let (pid, window_id) = call_target(&args);
         let result = self.registry().invoke(tool, self.with_session(args)).await;
         let scope_code = result
