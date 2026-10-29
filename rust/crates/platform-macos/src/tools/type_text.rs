@@ -178,18 +178,39 @@ impl Tool for TypeTextTool {
             let checked_pid = early_front_pid.unwrap_or_default();
             let result = latency::spawn_action_blocking(move || {
                 super::not_editable::desktop_dispatch_guard(checked_pid, true)?;
-                crate::input::keyboard::type_text_global(&text, delay_ms)
+                crate::input::keyboard::type_text_global_with_guard(&text, delay_ms, || {
+                    crate::apps::frontmost_pid() == Some(checked_pid)
+                        && unsafe {
+                            super::not_editable::sync_focused_cell_allows(checked_pid, None)
+                        }
+                })
             })
             .await;
-            return match result {
-                Ok(Ok(())) => {
-                    ToolResult::text("Typed text into the frontmost desktop application.")
-                        .with_structured(serde_json::json!({
-                            "scope": "desktop",
-                            "path": "hid",
-                            "effect": "unverifiable"
-                        }))
+            if let Ok(Err(error)) = &result {
+                if let Some(abort) =
+                    error.downcast_ref::<crate::input::keyboard::DesktopSequenceAbort>()
+                {
+                    // The already-posted characters are a partial delivery,
+                    // not a refusal: name the count and the stop reason.
+                    return ToolResult::text(format!(
+                        "Desktop typing stopped after {} character(s) were already sent: {}.                          The remaining text was not sent; read fresh state before retrying.",
+                        abort.posted, abort.reason
+                    ))
+                    .with_structured(serde_json::json!({
+                        "code": "not_editable",
+                        "effect": "partial",
+                        "dispatched": true,
+                        "delivered_count": abort.posted,
+                    }));
                 }
+            }
+            return match result {
+                Ok(Ok(_)) => ToolResult::text("Typed text into the frontmost desktop application.")
+                    .with_structured(serde_json::json!({
+                        "scope": "desktop",
+                        "path": "hid",
+                        "effect": "unverifiable"
+                    })),
                 Ok(Err(error)) => super::not_editable::account_focus_receipt(
                     text_delivery_failure("desktop type_text failed", &error),
                     None,

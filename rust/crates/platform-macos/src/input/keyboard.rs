@@ -795,21 +795,63 @@ fn release_pid_modifiers(
 /// Type Unicode text into the frontmost application through the global HID
 /// queue. This is the desktop-scope counterpart to PID-routed `type_text` and
 /// mirrors computer-server's frontmost pynput typing behavior.
+/// A guarded desktop sequence stopped mid-way: how many characters were
+/// already posted before the guard refused.
+#[derive(Debug)]
+pub struct DesktopSequenceAbort {
+    pub posted: usize,
+    pub reason: String,
+}
+
+impl std::fmt::Display for DesktopSequenceAbort {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} ({} character(s) already sent)",
+            self.reason, self.posted
+        )
+    }
+}
+
+impl std::error::Error for DesktopSequenceAbort {}
+
 pub fn type_text_global(text: &str, inter_char_delay_ms: u64) -> anyhow::Result<()> {
+    type_text_global_with_guard(text, inter_char_delay_ms, || true).map(|_| ())
+}
+
+/// type_text_global with a per-character guard: the frontmost pid and its
+/// focused element are revalidated between events, so a mid-sequence focus
+/// change stops the remaining characters instead of typing into an
+/// unchecked app. The abort carries the already-posted count.
+pub fn type_text_global_with_guard(
+    text: &str,
+    inter_char_delay_ms: u64,
+    guard: impl FnMut() -> bool,
+) -> anyhow::Result<usize> {
     use core_graphics::event::CGEventTapLocation;
 
     let source = CGEventSource::new(CGEventSourceStateID::HIDSystemState)
         .map_err(|_| anyhow::anyhow!("CGEventSource::new failed"))?;
+    let guard = std::cell::RefCell::new(guard);
+    let posted = std::cell::Cell::new(0usize);
     deliver_text_runs(
         text,
         || !text_target_may_be_secret(None),
         |run| paste_text_preserving_clipboard(run, || press_key_global("v", &["cmd"])),
         |run| {
             for ch in run.chars() {
+                if !guard.borrow_mut()() {
+                    return Err(anyhow::Error::new(DesktopSequenceAbort {
+                        posted: posted.get(),
+                        reason: "not_editable: the frontmost application or its focus changed                                  during desktop typing"
+                            .into(),
+                    }));
+                }
                 let (down, up) = char_key_events(&source, ch)?;
                 down.post(CGEventTapLocation::HID);
                 key_gap_sleep();
                 up.post(CGEventTapLocation::HID);
+                posted.set(posted.get() + 1);
                 std::thread::sleep(
                     std::time::Duration::from_millis(inter_char_delay_ms).max(key_gap()),
                 );
@@ -817,14 +859,23 @@ pub fn type_text_global(text: &str, inter_char_delay_ms: u64) -> anyhow::Result<
             Ok(())
         },
         |ch| {
+            if !guard.borrow_mut()() {
+                return Err(anyhow::Error::new(DesktopSequenceAbort {
+                    posted: posted.get(),
+                    reason: "not_editable: the frontmost application or its focus changed                              during desktop typing"
+                        .into(),
+                }));
+            }
             let (down, up) = char_key_events(&source, ch)?;
             down.post(CGEventTapLocation::HID);
             key_gap_sleep();
             up.post(CGEventTapLocation::HID);
+            posted.set(posted.get() + 1);
             key_gap_sleep();
             Ok(())
         },
     )
+    .map(|_| posted.get())
 }
 
 /// Type ASCII text through the global HID queue as physical US-keyboard
