@@ -196,6 +196,33 @@ impl Tool for SetValueTool {
             return address_field_refusal(pid, window_id);
         }
 
+        // A text field in a minimized window: restore the window for the
+        // write (its key priming and focus need a visible window), then
+        // minimize it again, all under this lease.
+        let restore_guard = element_guard.clone();
+        let restore_needed = latency::spawn_action_blocking(move || {
+            let ptr = restore_guard.as_ptr();
+            let role =
+                unsafe { copy_string_attr(ptr as AXUIElementRef, "AXRole") }.unwrap_or_default();
+            let facts = crate::ax::exact_target::gather_background_facts(pid, window_id, Some(ptr));
+            text_value_role_requires_exact_focus(&role)
+                && super::type_text::restore_decision(facts.target_minimized, facts.app_hidden)
+                    == super::type_text::RestoreDecision::Restore
+        })
+        .await
+        .unwrap_or(false);
+        if restore_needed {
+            return minimized_set_value(
+                _mutation_lease,
+                element_guard,
+                element_index,
+                pid,
+                window_id,
+                value,
+            )
+            .await;
+        }
+
         // TOKEN rule (handoff 3.7): after the gate and the rename routes,
         // attempt focus and refuse a text-role element with no editing
         // evidence instead of writing into it.
@@ -271,40 +298,174 @@ impl Tool for SetValueTool {
 
         let changes = snapshot.detect_async().await;
 
-        match result {
-            Ok(Ok(outcome)) if outcome.not_applied && !ax_echo_surface => {
-                let vcl = crate::input::pointer_toolkit::detect(pid)
-                    == Some(crate::input::pointer_toolkit::PointerReadingToolkit::Vcl);
-                not_applied_result(element_index, vcl)
-            }
-            Ok(Ok(mut outcome)) => {
-                apply_surface_trust(&mut outcome, ax_echo_surface);
-                apply_verification_label(&mut outcome);
-                let mut msg = outcome.detail;
-                msg.push_str(&changes.result_suffix());
-                let verified = outcome.verified.unwrap_or(false);
-                let mut structured = serde_json::json!({
-                    "path": "ax",
-                    "verified": verified,
-                    "effect": if verified { "confirmed" } else { "unverifiable" },
-                });
-                if let Some(edited) = outcome.document_edited {
-                    structured["document_key_edit_sent"] = serde_json::json!(edited);
-                }
-                if ax_echo_surface {
-                    structured["escalation"] = serde_json::json!({
-                        "recommended": "px",
-                        "reason": "AXValue read-back is not trusted for web content. Verify \
-                                   through the renderer; use browser page tools for a tab or \
-                                   manipulate the control through its pixel action."
-                    });
-                }
-                ToolResult::text(msg).with_structured(structured)
-            }
-            Ok(Err(e)) => ToolResult::error(format!("set_value failed: {e}")),
-            Err(e) => ToolResult::error(format!("Task error: {e}")),
-        }
+        set_value_tool_result(
+            result.map_err(|error| error.to_string()),
+            ax_echo_surface,
+            changes.result_suffix(),
+            pid,
+            element_index,
+        )
     }
+}
+
+/// The tool result for a finished set_value write.
+fn set_value_tool_result(
+    result: Result<anyhow::Result<SetValueOutcome>, String>,
+    ax_echo_surface: bool,
+    suffix: String,
+    pid: i32,
+    element_index: usize,
+) -> ToolResult {
+    match result {
+        Ok(Ok(outcome)) if outcome.not_applied && !ax_echo_surface => {
+            let vcl = crate::input::pointer_toolkit::detect(pid)
+                == Some(crate::input::pointer_toolkit::PointerReadingToolkit::Vcl);
+            not_applied_result(element_index, vcl)
+        }
+        Ok(Ok(mut outcome)) => {
+            apply_surface_trust(&mut outcome, ax_echo_surface);
+            apply_verification_label(&mut outcome);
+            let mut msg = outcome.detail;
+            msg.push_str(&suffix);
+            let verified = outcome.verified.unwrap_or(false);
+            let mut structured = serde_json::json!({
+                "path": "ax",
+                "verified": verified,
+                "effect": if verified { "confirmed" } else { "unverifiable" },
+            });
+            if let Some(edited) = outcome.document_edited {
+                structured["document_key_edit_sent"] = serde_json::json!(edited);
+            }
+            if ax_echo_surface {
+                structured["escalation"] = serde_json::json!({
+                    "recommended": "px",
+                    "reason": "AXValue read-back is not trusted for web content. Verify \
+                               through the renderer; use browser page tools for a tab or \
+                               manipulate the control through its pixel action."
+                });
+            }
+            ToolResult::text(msg).with_structured(structured)
+        }
+        Ok(Err(e)) => ToolResult::error(format!("set_value failed: {e}")),
+        Err(e) => ToolResult::error(format!("Task error: {e}")),
+    }
+}
+
+// ── A text field in a minimized window (400-F1 wp2) ─────────────────────────
+
+/// Restore the minimized window, apply the TOKEN rule and the write on the
+/// visible window, then minimize it again. Everything runs in one task that
+/// owns the lease: a cancelled caller cannot release it, or skip the
+/// re-minimize, while the write is still in flight.
+async fn minimized_set_value(
+    lease: super::BackgroundMutationLease,
+    element_guard: crate::ax::snapshot::RetainedElement,
+    element_index: usize,
+    pid: i32,
+    window_id: u32,
+    value: String,
+) -> ToolResult {
+    use super::type_text::{AxMinimizeOps, MinimizedRestore, RestoreReport};
+    let task = tokio::spawn(async move {
+        let _lease = lease;
+        let Some(ops) = latency::spawn_action_blocking(move || AxMinimizeOps::of(pid, window_id))
+            .await
+            .ok()
+            .flatten()
+        else {
+            return super::pre_dispatch_refusal(
+                cua_driver_core::background_input::refusal_codes::MINIMIZED_OR_HIDDEN,
+                format!("window {window_id} is minimized and could not be resolved to restore it; AXValue was not written."),
+            );
+        };
+        let begun = latency::spawn_action_blocking(move || {
+            let mut restore = MinimizedRestore::new(ops);
+            let begun = restore.begin(|| std::thread::sleep(std::time::Duration::from_millis(25)));
+            (restore, begun)
+        })
+        .await;
+        let (restore, begun) = match begun {
+            Ok(pair) => pair,
+            Err(error) => {
+                return ToolResult::error(format!(
+                    "set_value: restoring the minimized window failed ({error}); it may be left \
+                     restored. Nothing was written."
+                ))
+            }
+        };
+        let finish = |restore: MinimizedRestore<AxMinimizeOps>| async move {
+            latency::spawn_action_blocking(move || restore.finish())
+                .await
+                .unwrap_or(RestoreReport::ReminimizeNotConfirmed(None))
+        };
+        let with_note = |mut result: ToolResult, report: RestoreReport| {
+            let note = report.describe();
+            if !note.is_empty() {
+                result
+                    .content
+                    .push(cua_driver_core::protocol::Content::text(note));
+            }
+            result
+        };
+        if let Err(reason) = begun {
+            let report = finish(restore).await;
+            return with_note(
+                super::pre_dispatch_refusal(
+                    cua_driver_core::background_input::refusal_codes::MINIMIZED_OR_HIDDEN,
+                    format!(
+                        "window {window_id} is minimized and {reason}; AXValue was not written."
+                    ),
+                ),
+                report,
+            );
+        }
+        let element_ptr = element_guard.as_ptr();
+        if let Some(refusal) =
+            super::not_editable::token_not_editable_refusal(pid, element_ptr, window_id).await
+        {
+            let report = finish(restore).await;
+            return with_note(refusal, report);
+        }
+        let ax_echo_surface = super::type_text::target_in_web_area(
+            pid,
+            Some((element_ptr, Some(element_index))),
+            Some(window_id),
+        );
+        let write_guard = element_guard.clone();
+        let written = latency::spawn_action_blocking(move || {
+            let result = set_value_blocking_with(
+                write_guard.as_ptr(),
+                element_index,
+                pid,
+                window_id,
+                &value,
+                true,
+            );
+            (restore, result)
+        })
+        .await;
+        let (restore, result) = match written {
+            Ok(pair) => pair,
+            Err(error) => {
+                return ToolResult::error(format!(
+                    "set_value: the write task failed ({error}); it may have written, and the \
+                     window may be left restored. Read the field before repeating it."
+                ))
+            }
+        };
+        let report = finish(restore).await;
+        let suffix = match report.describe() {
+            note if note.is_empty() => String::new(),
+            note => format!(" {note}"),
+        };
+        set_value_tool_result(Ok(result), ax_echo_surface, suffix, pid, element_index)
+    });
+    task.await.unwrap_or_else(|error| {
+        ToolResult::error(format!(
+            "set_value: the minimized-window task failed ({error}); it may have written, and the \
+             window may be left restored. Read the field before repeating it."
+        ))
+    })
 }
 
 // ── File name cells ──────────────────────────────────────────────────────────
@@ -542,6 +703,21 @@ fn set_value_blocking(
     window_id: u32,
     value: &str,
 ) -> anyhow::Result<SetValueOutcome> {
+    set_value_blocking_with(element_ptr, element_index, pid, window_id, value, false)
+}
+
+/// `restored_window`: the window was restored from the Dock for this write.
+/// Its key scope then hands key back on this thread before returning (the
+/// caller re-minimizes next), and the write happens only while another app
+/// is still in front.
+fn set_value_blocking_with(
+    element_ptr: usize,
+    element_index: usize,
+    pid: i32,
+    window_id: u32,
+    value: &str,
+    restored_window: bool,
+) -> anyhow::Result<SetValueOutcome> {
     let element = element_ptr as AXUIElementRef;
 
     let role = unsafe { copy_string_attr(element, "AXRole") }.unwrap_or_default();
@@ -565,7 +741,15 @@ fn set_value_blocking(
             document_edited: None,
         })
     } else {
-        let _key_scope = if text_value_role_requires_exact_focus(&role) {
+        let _key_scope = if text_value_role_requires_exact_focus(&role) && restored_window {
+            Some(
+                crate::input::skylight::enter_exact_window_key_inline(
+                    pid as libc::pid_t,
+                    window_id,
+                )
+                .map_err(|reason| anyhow::anyhow!(reason))?,
+            )
+        } else if text_value_role_requires_exact_focus(&role) {
             Some(
                 super::key_scope(pid, Some(window_id))
                     .map_err(|reason| anyhow::anyhow!(reason))?
@@ -590,6 +774,14 @@ fn set_value_blocking(
             if !focused {
                 anyhow::bail!(
                     "set_value target did not become the application's focused text element in the requested window (AXFocused={own_focus}, exact_window={exact_window}, app_focus={app_focus}, key_window={key_window}); AXValue was not written"
+                )
+            }
+            if restored_window
+                && crate::input::skylight::front_process_matches(pid as libc::pid_t, window_id)
+                    != Some(false)
+            {
+                anyhow::bail!(
+                    "the app came to the front, or which app is in front could not be read; AXValue was not written"
                 )
             }
         }

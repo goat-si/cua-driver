@@ -661,7 +661,7 @@ impl Tool for PressKeyTool {
             }
         }
 
-        let _mutation_lease = if !fg && window_id.is_some() {
+        let mut _mutation_lease = if !fg && window_id.is_some() {
             Some(super::acquire_background_mutation(pid).await)
         } else {
             None
@@ -755,12 +755,13 @@ impl Tool for PressKeyTool {
                 _mutation_lease.as_ref(),
                 super::menu_equivalent::Combo::parse(&modifiers, &key),
             ) {
+                let lookup = combo.clone();
                 let menu_item = latency::spawn_action_blocking(move || {
                     let native = !super::type_text::is_browser_pid(pid)
                         && !crate::browser::electron_js::ElectronJs::is_electron(pid);
                     let in_front = apps::frontmost_pid() == Some(pid);
                     if native && !in_front {
-                        super::menu_equivalent::find(pid, &combo)
+                        super::menu_equivalent::find(pid, &lookup)
                     } else {
                         None
                     }
@@ -779,24 +780,65 @@ impl Tool for PressKeyTool {
                     {
                         return refusal;
                     }
-                    let _menu_key_scope =
-                        match super::acquire_key_scope(pid, Some(wid), false).await {
-                            Ok(scope) => scope,
-                            Err(refusal) => return refusal,
-                        };
-                    let menu_result = super::invoke_menu::run_in_background_with_lease(
-                        lease,
-                        wid,
-                        item.path,
-                        super::invoke_menu::MenuRequest::KeyEquivalent(display_key.clone()),
-                    )
-                    .await;
-                    return super::hotkey::menu_refusal_without_keys(menu_result);
+                    // The item found above only decides that this chord is a
+                    // menu command; it is looked up again once the window is
+                    // the app's key window, since enablement and even the item
+                    // can differ per window.
+                    let _ = item;
+                    let lease = _mutation_lease
+                        .take()
+                        .expect("background window actions hold the per-pid lease");
+                    return native_menu_chord(lease, wid, combo, display_key.clone()).await;
                 }
             }
         }
 
         let focused_key_route = !fg && crate::input::skylight::is_focus_without_raise_available();
+
+        // ── A minimized window: restore it for this key, then minimize it again ──
+        // Only for a non-printable key (Return, Escape, arrows, Tab) or one
+        // addressed to an exact element: an untargeted printable key needs
+        // the editing-cell checks of the visible route.
+        if !fg
+            && px.is_none()
+            && (pre_focus_guard.is_some() || !printable_request(&key, &modifiers))
+        {
+            if let (Some(wid), Some(lease)) = (window_id, _mutation_lease.as_ref()) {
+                let facts_guard = pre_focus_guard.clone();
+                let decision = latency::spawn_action_blocking(move || {
+                    let ptr = facts_guard.as_ref().map(|guard| guard.as_ptr());
+                    let facts = crate::ax::exact_target::gather_background_facts(pid, wid, ptr);
+                    super::type_text::restore_decision(facts.target_minimized, facts.app_hidden)
+                })
+                .await
+                .unwrap_or(super::type_text::RestoreDecision::Refuse);
+                if decision == super::type_text::RestoreDecision::Restore {
+                    if let Err(refusal) = lease
+                        .gate_again(
+                            wid,
+                            pre_focus_ptr,
+                            cua_driver_core::background_input::BackgroundAction::AxSemantic,
+                        )
+                        .await
+                    {
+                        return refusal;
+                    }
+                    let lease = _mutation_lease
+                        .take()
+                        .expect("background window actions hold the per-pid lease");
+                    return minimized_key_route(
+                        lease,
+                        wid,
+                        pre_focus_guard.clone(),
+                        key.clone(),
+                        modifiers.clone(),
+                        display_key.clone(),
+                    )
+                    .await;
+                }
+            }
+        }
+
         if !fg {
             if let (Some(wid), Some(lease)) = (window_id, _mutation_lease.as_ref()) {
                 if pre_focus_ptr.is_some_and(|ptr| {
@@ -1055,6 +1097,599 @@ impl Tool for PressKeyTool {
         // Any refusal after a delivered focus action carries its receipt.
         super::not_editable::account_focus_receipt(result, px_receipt)
     }
+}
+
+// ── Raw key into a minimized window: temporary restore (400-F1 wp2) ─────────
+
+/// What the minimized-window worker did.
+struct MinimizedKeyStep {
+    /// `None` when refused before any key; otherwise the delivery result.
+    outcome: Option<anyhow::Result<bool>>,
+    refusal: Option<(&'static str, String)>,
+    notes: String,
+}
+
+fn minimized_notes(
+    restore: super::type_text::RestoreReport,
+    scope: Option<(
+        crate::input::skylight::KeyEntry,
+        crate::input::skylight::HandBack,
+    )>,
+) -> String {
+    let mut notes = Vec::new();
+    if let Some((entry, hand_back)) = scope {
+        notes.push(crate::input::skylight::scope_disclosure(
+            entry,
+            Some(hand_back),
+        ));
+    }
+    notes.push(restore.describe());
+    notes.retain(|note| !note.is_empty());
+    notes.join(" ")
+}
+
+/// Restore the minimized window, re-check it as a visible target, hold it as
+/// the app's key window, post the key to the exact element (or the window's
+/// focused element), hand key back and minimize the window again: all on
+/// this thread, so each step finishes before the next local drops.
+fn minimized_key_worker(
+    pid: i32,
+    wid: u32,
+    guard: Option<crate::ax::snapshot::RetainedElement>,
+    key: String,
+    modifiers: Vec<String>,
+) -> MinimizedKeyStep {
+    use super::type_text::{AxMinimizeOps, MinimizedRestore};
+    use cua_driver_core::background_input::{
+        decide_background_input, BackgroundAction, BackgroundInputDecision, ExactWindowTarget,
+    };
+    let refused = |code, text: String, notes: String| MinimizedKeyStep {
+        outcome: None,
+        refusal: Some((code, text)),
+        notes,
+    };
+    let Some(ops) = AxMinimizeOps::of(pid, wid) else {
+        return refused(
+            cua_driver_core::background_input::refusal_codes::MINIMIZED_OR_HIDDEN,
+            format!("window {wid} could not be resolved to restore it; no key was sent."),
+            String::new(),
+        );
+    };
+    let mut restore = MinimizedRestore::new(ops);
+    if let Err(reason) = restore.begin(|| std::thread::sleep(std::time::Duration::from_millis(25)))
+    {
+        return refused(
+            cua_driver_core::background_input::refusal_codes::MINIMIZED_OR_HIDDEN,
+            format!("window {wid} is minimized and {reason}; no key was sent."),
+            minimized_notes(restore.finish(), None),
+        );
+    }
+    let ptr = guard.as_ref().map(|guard| guard.as_ptr());
+    let facts = crate::ax::exact_target::gather_background_facts(pid, wid, ptr);
+    if let BackgroundInputDecision::Refuse(refusal) = decide_background_input(
+        ExactWindowTarget {
+            pid,
+            window_id: wid,
+        },
+        &facts,
+        BackgroundAction::ExactWindowKeysFocused,
+    ) {
+        return refused(
+            refusal.code,
+            format!("{}; no key was sent.", refusal.reason),
+            minimized_notes(restore.finish(), None),
+        );
+    }
+    let scope = match crate::input::skylight::enter_exact_window_key_inline(pid as libc::pid_t, wid)
+    {
+        Ok(scope) => scope,
+        Err(reason) => {
+            return refused(
+                super::WINDOW_NOT_KEY,
+                format!("{reason}."),
+                minimized_notes(restore.finish(), None),
+            )
+        }
+    };
+    let m: Vec<&str> = modifiers.iter().map(String::as_str).collect();
+    let outcome = dispatch_with_ax_oracle(pid, Some(wid), ptr, || {
+        with_confirmed_key_focus_or_fallback(
+            ptr,
+            crate::input::ax_actions::focus_element,
+            |target| {
+                crate::input::ax_actions::element_has_keyboard_focus_in_window(
+                    pid,
+                    Some(wid),
+                    target,
+                )
+            },
+            |_| Ok(false),
+            || {
+                if !restore.front_still_ok() {
+                    anyhow::bail!(
+                        "the app came to the front, or which app is in front could not be read; no key was sent"
+                    );
+                }
+                verify_raw_key_target(pid, Some(wid), ptr, true)?;
+                crate::input::keyboard::press_key(pid, &key, &m)
+            },
+        )
+    });
+    let entry = scope.entry();
+    let hand_back = scope.finish();
+    MinimizedKeyStep {
+        outcome: Some(outcome),
+        refusal: None,
+        notes: minimized_notes(restore.finish(), Some((entry, hand_back))),
+    }
+}
+
+async fn minimized_key_route(
+    lease: super::BackgroundMutationLease,
+    wid: u32,
+    guard: Option<crate::ax::snapshot::RetainedElement>,
+    key: String,
+    modifiers: Vec<String>,
+    display_key: String,
+) -> ToolResult {
+    let pid = lease.pid();
+    let step = run_detached(async move {
+        let _lease = lease;
+        latency::spawn_action_blocking(move || {
+            minimized_key_worker(pid, wid, guard, key, modifiers)
+        })
+        .await
+    })
+    .await;
+    let step = match step {
+        Ok(Ok(step)) => step,
+        Ok(Err(error)) | Err(error) => {
+            return ToolResult::error(format!(
+                "press_key: the minimized-window task failed ({error}); a key may have been sent \
+                 and the window may be left restored. Read the window before repeating it."
+            ))
+            .with_structured(serde_json::json!({
+                "effect": "unverifiable",
+                "code": "ax_action_unverified",
+            }))
+        }
+    };
+    minimized_key_result(step, pid, &display_key)
+}
+
+fn minimized_key_result(step: MinimizedKeyStep, pid: i32, display_key: &str) -> ToolResult {
+    let notes = if step.notes.is_empty() {
+        String::new()
+    } else {
+        format!(" {}", step.notes)
+    };
+    if let Some((code, text)) = step.refusal {
+        return ToolResult::error(format!("press_key: {text}{notes}")).with_structured(
+            serde_json::json!({
+                "code": code,
+                "effect": "refused",
+                "dispatched": false,
+                "keys_sent": false,
+            }),
+        );
+    }
+    match step.outcome.map(map_delivery_outcome) {
+        Some(
+            outcome @ (PressKeyDeliveryOutcome::Confirmed | PressKeyDeliveryOutcome::Unverifiable),
+        ) => {
+            let confirmed = matches!(outcome, PressKeyDeliveryOutcome::Confirmed);
+            ToolResult::text(format!("✅ Pressed {display_key} on pid {pid}.{notes}"))
+                .with_structured(serde_json::json!({
+                    "path": "key_events",
+                    "verified": confirmed,
+                    "effect": if confirmed { "confirmed" } else { "unverifiable" },
+                    "restored_minimized_window": true,
+                }))
+                .with_action_record(action_record(confirmed, false))
+        }
+        Some(PressKeyDeliveryOutcome::Failed(error)) => {
+            let mut result = delivery_failed(error);
+            if !notes.is_empty() {
+                result
+                    .content
+                    .push(cua_driver_core::protocol::Content::text(
+                        notes.trim_start().to_owned(),
+                    ));
+            }
+            result
+        }
+        None => ToolResult::error(format!("press_key: no key was sent.{notes}")),
+    }
+}
+
+// ── Window-only native menu chord (key scope + own menu dispatch) ───────────
+
+/// Run `work`, which owns the per-process mutation lease, in its own task.
+/// Dropping the caller's future does not abort it (a `JoinHandle` drop
+/// detaches), so the lease is released only after `work` finished: its
+/// blocking menu press and its key hand-back never outlive the lease.
+async fn run_detached<T, F>(work: F) -> Result<T, tokio::task::JoinError>
+where
+    T: Send + 'static,
+    F: std::future::Future<Output = T> + Send + 'static,
+{
+    tokio::spawn(work).await
+}
+
+/// Another app is frontmost (the person is not using the target app).
+fn front_is_other_app(pid: i32, wid: u32) -> bool {
+    crate::input::skylight::front_process_matches(pid as libc::pid_t, wid) == Some(false)
+}
+
+/// The app's focused and main windows are both `wid`: its menu commands
+/// apply to that window.
+fn menu_bound_to(pid: i32, wid: u32) -> bool {
+    use crate::ax::bindings::{ax_get_window_id, copy_element_attr, AXUIElementCreateApplication};
+    if crate::ax::bindings::focused_window_id_of_pid(pid) != Some(wid) {
+        return false;
+    }
+    unsafe {
+        let app = AXUIElementCreateApplication(pid);
+        if app.is_null() {
+            return false;
+        }
+        let main = copy_element_attr(app, "AXMainWindow");
+        CFRelease(app as _);
+        let Some(main) = main else {
+            return false;
+        };
+        let bound = ax_get_window_id(main) == Some(wid);
+        CFRelease(main as _);
+        bound
+    }
+}
+
+/// The menu item at `path` (titles from the menu bar down), retained.
+fn resolve_menu_item(pid: i32, path: &[String]) -> Option<crate::ax::snapshot::RetainedElement> {
+    use crate::ax::bindings::{copy_children, copy_element_attr, AXUIElementCreateApplication};
+    unsafe fn items_of(parent: AXUIElementRef) -> Vec<AXUIElementRef> {
+        let mut out = Vec::new();
+        for child in copy_children(parent) {
+            if copy_string_attr(child, "AXRole").as_deref() == Some("AXMenu") {
+                out.extend(copy_children(child));
+                CFRelease(child as _);
+            } else {
+                out.push(child);
+            }
+        }
+        out
+    }
+    unsafe {
+        let app = AXUIElementCreateApplication(pid);
+        if app.is_null() {
+            return None;
+        }
+        let bar = copy_element_attr(app, "AXMenuBar");
+        CFRelease(app as _);
+        let mut current = bar?;
+        for title in path {
+            let mut next = None;
+            for item in items_of(current) {
+                if next.is_none() && copy_string_attr(item, "AXTitle").as_deref() == Some(title) {
+                    next = Some(item);
+                } else {
+                    CFRelease(item as _);
+                }
+            }
+            CFRelease(current as _);
+            current = next?;
+        }
+        let owned = crate::ax::snapshot::RetainedElement::retain(current as usize);
+        CFRelease(current as _);
+        Some(owned)
+    }
+}
+
+/// A Save item (Command-S): it keeps invoke_menu's route, which verifies
+/// the write on disk and has a scripting fallback.
+fn menu_item_is_save(item: AXUIElementRef) -> bool {
+    unsafe {
+        copy_string_attr(item, "AXMenuItemCmdChar").is_some_and(|ch| ch.eq_ignore_ascii_case("s"))
+            && crate::ax::bindings::copy_number_attr(item, "AXMenuItemCmdModifiers").unwrap_or(0.0)
+                == 0.0
+    }
+}
+
+/// What the chord route did, decided on its blocking thread.
+enum ChordStep {
+    /// The item was pressed (or may have been).
+    Pressed { text: String, may_have_run: bool },
+    /// Nothing from the menu was sent.
+    Refused {
+        code: &'static str,
+        text: String,
+        validation_posted: bool,
+    },
+    /// A Save item: continue on invoke_menu's route under the same scope.
+    Save {
+        scope: crate::input::skylight::WindowKeyScope,
+        path: Vec<String>,
+    },
+}
+
+fn chord_refusal(
+    code: &'static str,
+    reason: &str,
+    scope: crate::input::skylight::WindowKeyScope,
+    validation: crate::input::skylight::ValidationPost,
+) -> ChordStep {
+    let entry = scope.entry();
+    let hand_back = scope.finish();
+    let mut text = format!("press_key: {reason} No menu action was sent.");
+    for extra in [
+        validation.disclosure(),
+        crate::input::skylight::scope_disclosure(entry, Some(hand_back)),
+    ] {
+        if !extra.is_empty() {
+            text.push(' ');
+            text.push_str(&extra);
+        }
+    }
+    ChordStep::Refused {
+        code,
+        text,
+        validation_posted: validation.called,
+    }
+}
+
+/// The chord's menu route on one blocking thread: hold the target window as
+/// the app's key window, find and validate the item for that window, and
+/// press it only while the window is still the app's focused and main
+/// window and another app is still in front.
+fn chord_in_scope(pid: i32, wid: u32, combo: super::menu_equivalent::Combo) -> ChordStep {
+    use crate::input::skylight::ValidationPost;
+    let scope = match crate::input::skylight::enter_exact_window_key_inline(pid as libc::pid_t, wid)
+    {
+        Ok(scope) => scope,
+        Err(reason) => {
+            return ChordStep::Refused {
+                code: "window_not_key",
+                text: format!("press_key: {reason}. No menu action was sent."),
+                validation_posted: false,
+            }
+        }
+    };
+    if !menu_bound_to(pid, wid) {
+        return chord_refusal(
+            "window_not_key",
+            "the window is not the app's focused and main window, so its menu command could \
+             apply to another window.",
+            scope,
+            ValidationPost::default(),
+        );
+    }
+    let Some(found) = super::menu_equivalent::find(pid, &combo) else {
+        return chord_refusal(
+            "background_unavailable",
+            "the app has no menu item for this key equivalent now.",
+            scope,
+            ValidationPost::default(),
+        );
+    };
+    let Some(item) = resolve_menu_item(pid, &found.path) else {
+        return chord_refusal(
+            "background_unavailable",
+            "the menu item could not be resolved.",
+            scope,
+            ValidationPost::default(),
+        );
+    };
+    let element = item.as_ptr() as AXUIElementRef;
+    if menu_item_is_save(element) {
+        return ChordStep::Save {
+            scope,
+            path: found.path,
+        };
+    }
+    let enabled = || unsafe { copy_bool_attr(element, "AXEnabled") } == Some(true);
+    let mut validation = ValidationPost::default();
+    if !enabled() {
+        validation =
+            crate::input::skylight::prime_menu_validation_guarded(pid as libc::pid_t, wid, || {
+                front_is_other_app(pid, wid)
+            });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(200);
+        while !enabled() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        if !enabled() {
+            return chord_refusal(
+                "background_unavailable",
+                &format!("{} is disabled for this window.", found.path.join(" > ")),
+                scope,
+                validation,
+            );
+        }
+    }
+    let actions = unsafe { crate::ax::bindings::copy_action_names(element) };
+    let Some(action) = ["AXPress", "AXPick"]
+        .into_iter()
+        .find(|name| actions.iter().any(|action| action == name))
+    else {
+        return chord_refusal(
+            "background_unavailable",
+            "the menu item has no press action.",
+            scope,
+            validation,
+        );
+    };
+    // The last checks, immediately before the one dispatch.
+    if !(menu_bound_to(pid, wid) && front_is_other_app(pid, wid)) {
+        return chord_refusal(
+            "window_not_key",
+            "before the press, the window stopped being the app's focused and main window, or \
+             the app came to the front or which app is in front could not be read.",
+            scope,
+            validation,
+        );
+    }
+    let err = unsafe { crate::ax::bindings::perform_action(element, action) };
+    let entry = scope.entry();
+    let hand_back = scope.finish();
+    let path = found.path.join(" > ");
+    let mut notes = vec![
+        validation.disclosure(),
+        crate::input::skylight::scope_disclosure(entry, Some(hand_back)),
+    ];
+    notes.retain(|note| !note.is_empty());
+    let notes = if notes.is_empty() {
+        String::new()
+    } else {
+        format!(" {}", notes.join(" "))
+    };
+    if err == crate::ax::bindings::kAXErrorSuccess {
+        ChordStep::Pressed {
+            text: format!(
+                "Pressed {path} through accessibility for window {wid}, with the app in the \
+                 background (not activated); the requested chord was not sent as keys. Its \
+                 effect is not read back: check the window.{notes}"
+            ),
+            may_have_run: false,
+        }
+    } else if super::click::perform_error_proves_nothing_was_sent(err) {
+        chord_refusal_after_hand_back(path, err, validation.called, notes)
+    } else {
+        ChordStep::Pressed {
+            text: format!(
+                "Sent {action} to {path} for window {wid}; the app returned AX error {err}, so \
+                 the menu action may have run. Read the window before repeating it.{notes}"
+            ),
+            may_have_run: true,
+        }
+    }
+}
+
+fn chord_refusal_after_hand_back(
+    path: String,
+    err: crate::ax::bindings::AXError,
+    validation_posted: bool,
+    notes: String,
+) -> ChordStep {
+    ChordStep::Refused {
+        code: "background_unavailable",
+        text: format!(
+            "press_key: accessibility refused {path} (AX error {err}); no menu action was \
+             sent.{notes}"
+        ),
+        validation_posted,
+    }
+}
+
+/// The tool result for a chord step other than Save.
+fn chord_result(step: ChordStep) -> ToolResult {
+    match step {
+        ChordStep::Pressed { text, may_have_run } => ToolResult::text(text)
+            .with_structured(serde_json::json!({
+                "path": "menu_ax",
+                "verified": false,
+                "effect": "unverifiable",
+                "keys_sent": false,
+                "code": if may_have_run { Some("ax_action_unverified") } else { None },
+            }))
+            .with_action_record(
+                ActionExecutionRecord::builder(
+                    ActionEffect::Unverifiable,
+                    ActionTransport::MacosAxAction,
+                    RequestedDelivery::Background,
+                )
+                .actual_delivery(ActualDelivery::Background)
+                .build()
+                .expect("an unverifiable menu record is valid"),
+            ),
+        ChordStep::Refused {
+            code,
+            text,
+            validation_posted,
+        } => {
+            let mut structured = serde_json::json!({
+                "code": code,
+                "effect": "refused",
+                "dispatched": false,
+                "keys_sent": false,
+            });
+            if validation_posted {
+                structured["dispatch"] = serde_json::json!("validation_posted");
+            }
+            if code == "background_unavailable" {
+                structured["escalation"] =
+                    serde_json::json!({ "recommended": "foreground", "requires": ["window_id"] });
+            }
+            ToolResult::error(text).with_structured(structured)
+        }
+        ChordStep::Save { .. } => unreachable!("Save continues on invoke_menu's route"),
+    }
+}
+
+/// The window-only native chord: everything from the key scope to the
+/// hand-back runs in a task that owns the lease.
+async fn native_menu_chord(
+    lease: super::BackgroundMutationLease,
+    wid: u32,
+    combo: super::menu_equivalent::Combo,
+    display_key: String,
+) -> ToolResult {
+    let pid = lease.pid();
+    let outcome = run_detached(async move {
+        let lease = lease;
+        let step = match latency::spawn_action_blocking(move || chord_in_scope(pid, wid, combo)).await {
+            Ok(step) => step,
+            Err(error) => {
+                return ToolResult::error(format!(
+                    "press_key: the menu task failed ({error}); it may have run. Read the window \
+                     before repeating it."
+                ))
+                .with_structured(serde_json::json!({
+                    "effect": "unverifiable",
+                    "code": "ax_action_unverified",
+                }))
+            }
+        };
+        match step {
+            ChordStep::Save { scope, path } => {
+                if !front_is_other_app(pid, wid) {
+                    let step = latency::spawn_action_blocking(move || {
+                        chord_refusal(
+                            "window_not_key",
+                            "the app came to the front, or which app is in front could not be read.",
+                            scope,
+                            crate::input::skylight::ValidationPost::default(),
+                        )
+                    })
+                    .await;
+                    return match step {
+                        Ok(step) => chord_result(step),
+                        Err(error) => ToolResult::error(format!("press_key: {error}")),
+                    };
+                }
+                let result = super::invoke_menu::run_in_background_with_lease(
+                    &lease,
+                    wid,
+                    path,
+                    super::invoke_menu::MenuRequest::KeyEquivalent(display_key),
+                )
+                .await;
+                let _ = latency::spawn_action_blocking(move || scope.finish()).await;
+                super::hotkey::menu_refusal_without_keys(result)
+            }
+            step => chord_result(step),
+        }
+    })
+    .await;
+    outcome.unwrap_or_else(|error| {
+        ToolResult::error(format!(
+            "press_key: the menu task failed ({error}); it may have run. Read the window before \
+             repeating it."
+        ))
+        .with_structured(serde_json::json!({
+            "effect": "unverifiable",
+            "code": "ax_action_unverified",
+        }))
+    })
 }
 
 #[cfg(test)]
@@ -1432,5 +2067,80 @@ mod tests {
             1_000,
         )
         .is_ok());
+    }
+}
+
+#[cfg(test)]
+mod menu_chord_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn a_detached_menu_task_keeps_the_lease_after_the_caller_is_dropped() {
+        let pid = -91_777;
+        let lease = crate::background_mutation::acquire(pid).await;
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel::<()>();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
+        let caller = tokio::spawn(run_detached(async move {
+            let _lease = lease;
+            let _ = started_tx.send(());
+            let _ = release_rx.await;
+            let _ = done_tx.send(());
+        }));
+        started_rx.await.expect("the menu task started");
+        caller.abort();
+        assert!(caller.await.is_err(), "the caller was cancelled");
+        assert!(
+            crate::background_mutation::try_acquire(pid).is_none(),
+            "the lease stays with the detached task"
+        );
+        release_tx.send(()).expect("the menu task is still running");
+        done_rx.await.expect("the menu task finished");
+        // Released once the task ends.
+        drop(crate::background_mutation::acquire(pid).await);
+    }
+
+    #[test]
+    fn a_refused_chord_says_no_menu_action_and_flags_posted_validation() {
+        let refused = chord_result(ChordStep::Refused {
+            code: "background_unavailable",
+            text: "press_key: Format > Bold is disabled for this window. No menu action was sent."
+                .into(),
+            validation_posted: true,
+        });
+        assert_eq!(refused.is_error, Some(true));
+        let structured = refused.structured_content.as_ref().expect("structured");
+        assert_eq!(structured["effect"], "refused");
+        assert_eq!(structured["dispatched"], false);
+        assert_eq!(structured["dispatch"], "validation_posted");
+        assert_eq!(structured["escalation"]["recommended"], "foreground");
+
+        let not_key = chord_result(ChordStep::Refused {
+            code: "window_not_key",
+            text: "press_key: x. No menu action was sent.".into(),
+            validation_posted: false,
+        });
+        let structured = not_key.structured_content.as_ref().expect("structured");
+        assert!(structured.get("dispatch").is_none());
+        assert!(structured.get("escalation").is_none());
+    }
+
+    #[test]
+    fn a_pressed_chord_is_unverifiable_and_an_ax_error_may_have_run() {
+        let pressed = chord_result(ChordStep::Pressed {
+            text: "Pressed Format > Font > Bold".into(),
+            may_have_run: false,
+        });
+        assert_ne!(pressed.is_error, Some(true));
+        let structured = pressed.structured_content.as_ref().expect("structured");
+        assert_eq!(structured["effect"], "unverifiable");
+        assert_eq!(structured["keys_sent"], false);
+        assert!(structured["code"].is_null());
+        let maybe = chord_result(ChordStep::Pressed {
+            text: "Sent AXPress".into(),
+            may_have_run: true,
+        });
+        let structured = maybe.structured_content.as_ref().expect("structured");
+        assert_eq!(structured["code"], "ax_action_unverified");
     }
 }
