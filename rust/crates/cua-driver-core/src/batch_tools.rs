@@ -959,7 +959,6 @@ impl Plan {
             // scope's code, as a refused action does, even when the check
             // itself would have passed (a `gone:true` check reads a refused
             // window as absent): the batch stops at the first refused call.
-            let mut outcome = outcome;
             // run_steps reports targets per step; the per-call journal is for
             // run_script, so drop it here to keep it bounded. A detached
             // worker keeps its journal and refusal state after a timeout.
@@ -1290,6 +1289,7 @@ enum StepExecution {
     },
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn execute_step(
     registry: Arc<ToolRegistry>,
     locator: Arc<Locator<'static>>,
@@ -1373,6 +1373,7 @@ async fn execute_step(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_step_owned(
     registry: Arc<ToolRegistry>,
     locator: Arc<Locator<'static>>,
@@ -1401,6 +1402,7 @@ async fn run_step_owned(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_step(
     registry: &ToolRegistry,
     locator: &Locator<'_>,
