@@ -1180,6 +1180,17 @@ fn minimized_key_worker(
             minimized_notes(restore.finish(), None),
         );
     }
+    // The gate accepts any readable visibility for focused keys; the
+    // restored window must read visible in a visible app.
+    if !(facts.target_minimized == Some(false) && facts.app_hidden == Some(false)) {
+        return refused(
+            cua_driver_core::background_input::refusal_codes::MINIMIZED_OR_HIDDEN,
+            format!(
+                "window {wid} was restored but does not read as visible in a visible app; no key was sent."
+            ),
+            minimized_notes(restore.finish(), None),
+        );
+    }
     let scope = match crate::input::skylight::enter_exact_window_key_inline(pid as libc::pid_t, wid)
     {
         Ok(scope) => scope,

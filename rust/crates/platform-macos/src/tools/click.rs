@@ -615,13 +615,18 @@ unsafe impl Send for ClickProbe {}
 ///
 /// `window` must be a valid, live `AXUIElementRef`.
 unsafe fn sheets_of(window: AXUIElementRef) -> Option<Vec<Retained>> {
-    Some(
-        crate::ax::bindings::copy_children_checked(window)?
-            .into_iter()
-            .map(Retained)
-            .filter(|child| copy_string_attr(child.0, "AXRole").as_deref() == Some("AXSheet"))
-            .collect(),
-    )
+    let mut sheets = Vec::new();
+    for child in crate::ax::bindings::copy_children_checked(window)?
+        .into_iter()
+        .map(Retained)
+    {
+        // A child whose role cannot be read could be a sheet: the list is
+        // unknown then, never one without it.
+        if copy_string_attr(child.0, "AXRole")? == "AXSheet" {
+            sheets.push(child);
+        }
+    }
+    Some(sheets)
 }
 
 /// The exact AX window `window_id` of `pid`, retained.
@@ -2396,9 +2401,7 @@ impl ClickTool {
             let (result, observing) = match result {
                 Ok(Ok(Some(probe))) => (
                     Ok(Ok(())),
-                    Some(latency::spawn_action_blocking(move || {
-                        probe.observe_change()
-                    })),
+                    Some(latency::spawn_action_blocking(move || probe.observe())),
                 ),
                 Ok(Ok(None)) => (Ok(Ok(())), None),
                 Ok(Err(error)) => (Ok(Err(error)), None),
@@ -2415,7 +2418,6 @@ impl ClickTool {
                 )
                 .await;
             }
-            let own_input_end = std::time::Instant::now();
 
             let changes = super::finish_window_observation(snapshot).await;
             if let Ok(Err(error)) = &result {
@@ -2432,16 +2434,8 @@ impl ClickTool {
             };
             match result {
                 Ok(Ok(())) => {
-                    // The focus restore after the click posts records that
-                    // reset the input clock too: the driver's own input ends
-                    // there.
                     let evidence = match observing {
-                        Some(observing) => observing
-                            .await
-                            .ok()
-                            .flatten()
-                            .filter(|(_, window)| window.quiet_after(Some(own_input_end)))
-                            .map(|(evidence, _)| evidence),
+                        Some(observing) => observing.await.ok().flatten(),
                         None => None,
                     };
                     let target = if route == PixelClickRoute::ForegroundHid {

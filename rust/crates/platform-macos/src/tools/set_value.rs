@@ -406,15 +406,8 @@ async fn minimized_set_value(
                 .await
                 .unwrap_or(RestoreReport::ReminimizeNotConfirmed(None))
         };
-        let with_note = |mut result: ToolResult, report: RestoreReport| {
-            let note = report.describe();
-            if !note.is_empty() {
-                result
-                    .content
-                    .push(cua_driver_core::protocol::Content::text(note));
-            }
-            result
-        };
+        let with_note =
+            |result: ToolResult, report: RestoreReport| attach_restore_cleanup(result, report, "");
         if let Err(reason) = begun {
             let report = finish(restore).await;
             return with_note(
@@ -428,8 +421,9 @@ async fn minimized_set_value(
             );
         }
         // The window is visible now: prove it again as an exact, visible
-        // keyboard target with another app still in front, before anything
-        // (the TOKEN rule's focus attempt included) touches it.
+        // keyboard target with another app still in front, and hold it as
+        // the app's key window before anything (the TOKEN rule's focus
+        // attempt included) touches it.
         let gate_guard = element_guard.clone();
         let regated = latency::spawn_action_blocking(move || {
             use cua_driver_core::background_input::{
@@ -447,6 +441,17 @@ async fn minimized_set_value(
                 BackgroundAction::ExactWindowKeysFocused,
             ) {
                 BackgroundInputDecision::Refuse(refusal) => Some((refusal.code, refusal.reason)),
+                // The gate accepts any readable visibility for focused keys;
+                // a restored window must read visible in a visible app.
+                BackgroundInputDecision::Execute { .. }
+                    if !(facts.target_minimized == Some(false)
+                        && facts.app_hidden == Some(false)) =>
+                {
+                    Some((
+                        cua_driver_core::background_input::refusal_codes::MINIMIZED_OR_HIDDEN,
+                        "it does not read as visible in a visible app".to_owned(),
+                    ))
+                }
                 BackgroundInputDecision::Execute { .. } if !restore.front_still_ok() => Some((
                     cua_driver_core::background_input::refusal_codes::MINIMIZED_OR_HIDDEN,
                     "its app came to the front, or which app is in front could not be read"
@@ -454,12 +459,20 @@ async fn minimized_set_value(
                 )),
                 BackgroundInputDecision::Execute { .. } => None,
             };
-            (restore, refusal)
+            if let Some(refusal) = refusal {
+                return (restore, Err(refusal));
+            }
+            let scope = crate::input::skylight::enter_exact_window_key_inline(
+                pid as libc::pid_t,
+                window_id,
+            )
+            .map_err(|reason| (super::WINDOW_NOT_KEY, reason));
+            (restore, scope)
         })
         .await;
-        let restore = match regated {
-            Ok((restore, None)) => restore,
-            Ok((restore, Some((code, reason)))) => {
+        let (restore, scope) = match regated {
+            Ok((restore, Ok(scope))) => (restore, scope),
+            Ok((restore, Err((code, reason)))) => {
                 let report = finish(restore).await;
                 return with_note(
                     super::pre_dispatch_refusal(
@@ -482,8 +495,13 @@ async fn minimized_set_value(
         if let Some(refusal) =
             super::not_editable::token_not_editable_refusal(pid, element_ptr, window_id).await
         {
+            let entry = scope.entry();
+            let hand_back = latency::spawn_action_blocking(move || scope.finish())
+                .await
+                .unwrap_or(crate::input::skylight::HandBack::NotConfirmed);
             let report = finish(restore).await;
-            return with_note(refusal, report);
+            let disclosure = crate::input::skylight::scope_disclosure(entry, Some(hand_back));
+            return attach_restore_cleanup(refusal, report, &disclosure);
         }
         let ax_echo_surface = super::type_text::target_in_web_area(
             pid,
@@ -492,15 +510,9 @@ async fn minimized_set_value(
         );
         let write_guard = element_guard.clone();
         let written = latency::spawn_action_blocking(move || {
-            // Declared after the restore guard this closure owns, so a panic
-            // hands key back before the window is minimized again.
-            let scope = match crate::input::skylight::enter_exact_window_key_inline(
-                pid as libc::pid_t,
-                window_id,
-            ) {
-                Ok(scope) => scope,
-                Err(reason) => return (restore, Err(anyhow::anyhow!(reason)), String::new()),
-            };
+            // The scope moved in after the restore guard, so a panic hands
+            // key back before the window is minimized again.
+            let scope = scope;
             let result = set_value_blocking_with(
                 write_guard.as_ptr(),
                 element_index,
@@ -530,12 +542,8 @@ async fn minimized_set_value(
             .filter(|note| !note.is_empty())
             .map(|note| format!(" {note}"))
             .collect::<String>();
-        let mut result =
-            set_value_tool_result(Ok(result), ax_echo_surface, suffix, pid, element_index);
-        if let Some(serde_json::Value::Object(fields)) = result.structured_content.as_mut() {
-            fields.insert("restore_cleanup".into(), serde_json::json!(report.code()));
-        }
-        result
+        let result = set_value_tool_result(Ok(result), ax_echo_surface, suffix, pid, element_index);
+        attach_restore_cleanup(result, report, "")
     });
     task.await.unwrap_or_else(|error| {
         ToolResult::error(format!(
@@ -543,6 +551,38 @@ async fn minimized_set_value(
              window may be left restored. Read the field before repeating it."
         ))
     })
+}
+
+/// Every result of a temporary restore says what became of the window: in
+/// text (once) and as structured `restore_cleanup`.
+fn attach_restore_cleanup(
+    mut result: ToolResult,
+    report: super::type_text::RestoreReport,
+    disclosure: &str,
+) -> ToolResult {
+    let note = [disclosure.to_owned(), report.describe()]
+        .into_iter()
+        .filter(|note| !note.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    let already = result.content.iter().any(|content| {
+        matches!(content, cua_driver_core::protocol::Content::Text { text, .. } if text.contains(&report.describe()))
+    });
+    if !note.is_empty() && !already {
+        result
+            .content
+            .push(cua_driver_core::protocol::Content::text(note));
+    }
+    match result.structured_content.as_mut() {
+        Some(serde_json::Value::Object(fields)) => {
+            fields.insert("restore_cleanup".into(), serde_json::json!(report.code()));
+        }
+        _ => {
+            result.structured_content =
+                Some(serde_json::json!({ "restore_cleanup": report.code() }));
+        }
+    }
+    result
 }
 
 // ── File name cells ──────────────────────────────────────────────────────────
@@ -1976,5 +2016,51 @@ mod tests {
             outcome.detail,
             "📨 Sent (unverified) AXValue on [4] AXTextField."
         );
+    }
+}
+
+#[cfg(test)]
+mod restore_cleanup_tests {
+    use super::super::type_text::RestoreReport;
+    use super::attach_restore_cleanup;
+    use cua_driver_core::protocol::ToolResult;
+
+    #[test]
+    fn every_restore_result_carries_its_cleanup() {
+        let error = attach_restore_cleanup(
+            ToolResult::error("set_value failed: x"),
+            RestoreReport::ReminimizeNotConfirmed(Some(false)),
+            "",
+        );
+        assert_eq!(
+            error.structured_content.as_ref().expect("structured")["restore_cleanup"],
+            "reminimize_not_confirmed"
+        );
+        let refusal = attach_restore_cleanup(
+            ToolResult::error("refused").with_structured(serde_json::json!({"code": "c"})),
+            RestoreReport::LeftVisible,
+            "Key focus went back to the app's previous window.",
+        );
+        let structured = refusal.structured_content.as_ref().expect("structured");
+        assert_eq!(structured["code"], "c");
+        assert_eq!(structured["restore_cleanup"], "left_visible");
+        let texts: Vec<String> = refusal
+            .content
+            .iter()
+            .filter_map(|c| match c {
+                cua_driver_core::protocol::Content::Text { text, .. } => Some(text.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(texts
+            .iter()
+            .any(|t| t.contains("left visible") && t.contains("went back")));
+        // Already described in the text: not repeated.
+        let once = attach_restore_cleanup(
+            ToolResult::text(format!("ok. {}", RestoreReport::Reminimized.describe())),
+            RestoreReport::Reminimized,
+            "",
+        );
+        assert_eq!(once.content.len(), 1);
     }
 }
