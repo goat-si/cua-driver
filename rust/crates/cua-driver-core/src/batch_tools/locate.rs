@@ -1259,7 +1259,7 @@ fn evaluate(check: &Check, read: &Read) -> Result<Option<String>, Miss> {
     let present = if by_text_only {
         !rows.is_empty()
     } else {
-        !structured.is_empty() || (check.element.text.is_none() && !rows.is_empty())
+        !structured.is_empty() || !rows.is_empty()
     };
     let window = &read.window;
     if check.gone {
@@ -2009,6 +2009,27 @@ mod tests {
         assert!(evaluate(&check(json!({"role":"AXStaticText","gone":true})), &read).is_err());
         assert!(evaluate(&check(json!({"role":"AXCheckBox","selected":true})), &read).is_ok());
         assert!(evaluate(&check(json!({"role":"AXCheckBox","selected":false})), &read).is_err());
+    }
+
+    #[test]
+    fn role_and_text_display_rows_participate_in_presence_and_fallback() {
+        let read = read(vec![], "- AXStaticText \"Result\" = \"702\"");
+        let check = |raw: Value| Check::parse(&raw, 0).unwrap();
+        assert!(evaluate(
+            &check(json!({"role":"AXStaticText","text":"Result","value":"702"})),
+            &read
+        )
+        .is_ok());
+        assert!(evaluate(
+            &check(json!({"role":"AXStaticText","text":"Result","value":"703"})),
+            &read
+        )
+        .is_err());
+        assert!(evaluate(
+            &check(json!({"role":"AXStaticText","text":"Result","gone":true})),
+            &read
+        )
+        .is_err());
     }
 
     #[test]

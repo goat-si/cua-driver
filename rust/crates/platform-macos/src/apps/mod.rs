@@ -318,6 +318,12 @@ fn merge_kernel_running_states(
     processes: &[(i32, String)],
     front: Option<i32>,
 ) {
+    let kernel_pids: std::collections::HashSet<i32> =
+        processes.iter().map(|(pid, _)| *pid).collect();
+    for entries in running_states.values_mut() {
+        entries.retain(|(pid, _, _)| !kernel_pids.contains(pid));
+    }
+    running_states.retain(|_, entries| !entries.is_empty());
     for (pid, executable) in processes {
         let Some(app_path) = bundle_root_of_executable(executable) else {
             continue;
@@ -748,9 +754,13 @@ pub(crate) fn merge_app_lists(
                 .find(|(_, _, live_path)| live_path.as_deref() == Some(installed_path))
         });
         let selected = exact.or_else(|| {
-            (app.launch_path.is_none() && installed_bundle_counts.get(bundle_id) == Some(&1))
-                .then(|| candidates.last())
-                .flatten()
+            let live_paths_unknown = candidates
+                .iter()
+                .all(|(_, _, live_path)| live_path.is_none());
+            ((app.launch_path.is_none() || live_paths_unknown)
+                && installed_bundle_counts.get(bundle_id) == Some(&1))
+            .then(|| candidates.last())
+            .flatten()
         });
         if let Some(&(pid, active, _)) = selected {
             app.running = true;
@@ -1504,6 +1514,42 @@ mod tests {
         other_install.launch_path = Some("/Users/test/CuaLiveAgent.app".to_owned());
         let merged = merge_app_lists(vec![running_copy], vec![other_install], &states(&[]));
         assert_eq!(merged.len(), 2, "a different installed copy must survive");
+    }
+
+    #[test]
+    fn unknown_live_paths_keep_the_bundle_id_fallback() {
+        let bundle_id = "com.trycua.test.CuaLiveAgent";
+        let mut installed = app("CuaLiveAgent", 0, Some(bundle_id), false);
+        installed.launch_path = Some("/Applications/CuaLiveAgent.app".to_owned());
+        let merged = merge_app_lists(
+            vec![],
+            vec![installed],
+            &states(&[(bundle_id, 42, false, None)]),
+        );
+        assert!(merged[0].running);
+        assert_eq!(merged[0].pid, 42);
+    }
+
+    #[test]
+    fn kernel_pid_reuse_removes_stale_state_from_every_bundle() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let old_executable =
+            synthetic_bundle(temp.path(), "CuaOldAgent", "<key>LSUIElement</key><true/>");
+        let new_executable =
+            synthetic_bundle(temp.path(), "CuaNewAgent", "<key>LSUIElement</key><true/>");
+        let old_path = bundle_root_of_executable(&old_executable).unwrap();
+        let new_path = bundle_root_of_executable(&new_executable)
+            .unwrap()
+            .to_owned();
+        let old_bundle = "com.trycua.test.CuaOldAgent";
+        let new_bundle = "com.trycua.test.CuaNewAgent";
+        let mut running_states = states(&[(old_bundle, 42, false, Some(old_path))]);
+        merge_kernel_running_states(&mut running_states, &[(42, new_executable)], None);
+        assert!(!running_states.contains_key(old_bundle));
+        assert_eq!(
+            running_states.get(new_bundle),
+            Some(&vec![(42, false, Some(new_path))])
+        );
     }
 
     /// The process-table readers see this very process at its own path. This
