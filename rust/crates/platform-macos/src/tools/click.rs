@@ -1324,7 +1324,7 @@ impl ClickTool {
                 };
                 let ax_result = latency::spawn_action_blocking(move || unsafe {
                     let Some(element) = element_at_screen_position(pid, screen_x, screen_y) else {
-                        return Ok::<bool, anyhow::Error>(false);
+                        return Ok::<Option<bool>, anyhow::Error>(Some(false));
                     };
                     // The pid-scoped hit-test can resolve an element from a
                     // same-process sibling overlapping the requested point.
@@ -1333,7 +1333,7 @@ impl ClickTool {
                     // (already gated for this exact window).
                     if crate::ax::exact_target::element_window_id(element) != Some(hit_test_wid) {
                         CFRelease(element as _);
-                        return Ok(false);
+                        return Ok(Some(false));
                     }
                     // An element that does not advertise AXPress can still
                     // accept it as a no-op. On a toolkit that drops routed
@@ -1348,7 +1348,7 @@ impl ClickTool {
                             == Some(crate::input::pointer_toolkit::PointerReadingToolkit::Vcl)
                     {
                         CFRelease(element as _);
-                        return Ok(false);
+                        return Ok(Some(false));
                     }
                     // Last, after the hit test and its checks: the window must
                     // still be where the window points were translated.
@@ -1359,13 +1359,18 @@ impl ClickTool {
                     let delivered = if focus_only {
                         crate::input::ax_actions::focus_element(element as usize).is_ok()
                     } else {
-                        // A static-text/image leaf usually has no AXPress:
-                        // fall back to the actionable ancestor (AXCell's
-                        // AXOpen, AXRow's AXPress) before giving up on AX.
-                        ax_press_with_ancestors(element)
+                        match ax_press_with_ancestors(element, &dispatch_guard) {
+                            Ok(AxPressOutcome::Delivered) => true,
+                            Ok(AxPressOutcome::Unavailable) => false,
+                            Ok(AxPressOutcome::Indeterminate) => {
+                                CFRelease(element as _);
+                                return Ok(None);
+                            }
+                            Err(moved) => return Err(moved.into()),
+                        }
                     };
                     CFRelease(element as _);
-                    Ok(delivered)
+                    Ok(Some(delivered))
                 })
                 .await;
                 if let Ok(Err(error)) = &ax_result {
@@ -1374,7 +1379,7 @@ impl ClickTool {
                     }
                 }
                 match ax_result {
-                    Ok(Ok(true)) => {
+                    Ok(Ok(Some(true))) => {
                         crate::cursor::overlay::send_command(
                             cursor_key.clone(),
                             cursor_overlay::OverlayCommand::ClickPulse {
@@ -1392,7 +1397,7 @@ impl ClickTool {
                             "effect": "unverifiable"
                         }));
                     }
-                    Ok(Ok(false)) if focus_only => {
+                    Ok(Ok(Some(false))) if focus_only => {
                         return ToolResult::error(
                             "Background PX focus is unavailable at the requested point.".to_owned(),
                         )
@@ -1405,6 +1410,18 @@ impl ClickTool {
                             .with_structured(serde_json::json!({
                                 "code": "background_unavailable"
                             }));
+                    }
+                    Ok(Ok(None)) => {
+                        // An AX action may have been delivered: do NOT fall
+                        // through to a second (pixel) click.
+                        return ToolResult::text(
+                            "The accessibility action for the background click may have been                              delivered, but it returned an error or timed out. Read fresh state                              before clicking again."
+                                .to_owned(),
+                        )
+                        .with_structured(serde_json::json!({
+                            "effect": "unverifiable",
+                            "code": "ax_action_unverified",
+                        }));
                     }
                     _ => {}
                 }
@@ -2286,45 +2303,95 @@ fn perform_ax_click(
     Ok((summary, needs_webkit_delay, suspected_noop, false, false))
 }
 
-/// AXPress the element, or the nearest actionable ancestor (AXOpen on a
-/// cell, AXPress on a row) when the leaf itself cannot be pressed.
-unsafe fn ax_press_with_ancestors(element: crate::ax::bindings::AXUIElementRef) -> bool {
-    use crate::ax::bindings::{copy_action_names, copy_element_attr};
+/// Outcome of the AX press route for a point click.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AxPressOutcome {
+    Delivered,
+    /// No actionable element: fall through to the routed pixel path.
+    Unavailable,
+    /// An AX action may have been delivered: stop, do not fall through.
+    Indeterminate,
+}
+
+/// AXPress the element, or the nearest equivalent actionable ancestor. The
+/// window-points guard is rechecked immediately before EVERY action, an AX
+/// error that does not prove non-delivery stops the route as indeterminate,
+/// and AXOpen is used only for sidebar cells (AXOutline ancestry), where a
+/// single click and open are the same gesture — a file row's click must
+/// select, not open.
+unsafe fn ax_press_with_ancestors(
+    element: crate::ax::bindings::AXUIElementRef,
+    dispatch_guard: &Option<super::window_points::DispatchGuard>,
+) -> Result<AxPressOutcome, super::window_points::WindowMoved> {
+    use crate::ax::bindings::{copy_action_names, copy_element_attr, copy_string_attr};
     use core_foundation::base::CFRelease;
     use core_foundation::string::CFString;
-    let perform = |el, name: &str| {
-        let action = CFString::new(name);
-        AXUIElementPerformAction(el, action.as_concrete_TypeRef()) == kAXErrorSuccess
-    };
-    if copy_action_names(element).iter().any(|a| a == "AXPress") && perform(element, "AXPress") {
-        return true;
+
+    let leaf_actions = copy_action_names(element);
+    if leaf_actions.iter().any(|a| a == "AXPress") {
+        super::window_points::check_guard(dispatch_guard)?;
+        let action = CFString::new("AXPress");
+        let err = AXUIElementPerformAction(element, action.as_concrete_TypeRef());
+        if err == kAXErrorSuccess {
+            return Ok(AxPressOutcome::Delivered);
+        }
+        if !perform_error_proves_nothing_was_sent(err) {
+            return Ok(AxPressOutcome::Indeterminate);
+        }
     }
     let mut current = element;
+    let mut in_outline = false;
     for _ in 0..4 {
         let Some(parent) = copy_element_attr(current, "AXParent") else {
             break;
         };
+        let role = copy_string_attr(parent, "AXRole");
+        if role.as_deref() == Some("AXOutline") {
+            in_outline = true;
+        }
         let actions = copy_action_names(parent);
-        let delivered = if actions.iter().any(|a| a == "AXOpen") {
-            perform(parent, "AXOpen")
-        } else if actions.iter().any(|a| a == "AXPress") {
-            perform(parent, "AXPress")
+        let action = if actions.iter().any(|a| a == "AXPress") {
+            Some("AXPress")
+        } else if in_outline && actions.iter().any(|a| a == "AXOpen") {
+            Some("AXOpen")
         } else {
-            false
+            None
+        };
+        let delivered = match action {
+            Some(name) => {
+                super::window_points::check_guard(dispatch_guard)?;
+                let cf = CFString::new(name);
+                let err = AXUIElementPerformAction(parent, cf.as_concrete_TypeRef());
+                if err == kAXErrorSuccess {
+                    Some(true)
+                } else if !perform_error_proves_nothing_was_sent(err) {
+                    Some(false)
+                } else {
+                    None
+                }
+            }
+            None => None,
         };
         if current != element {
             CFRelease(current as _);
         }
         current = parent;
-        if delivered {
-            CFRelease(current as _);
-            return true;
+        match delivered {
+            Some(true) => {
+                CFRelease(current as _);
+                return Ok(AxPressOutcome::Delivered);
+            }
+            Some(false) => {
+                CFRelease(current as _);
+                return Ok(AxPressOutcome::Indeterminate);
+            }
+            None => {}
         }
     }
     if current != element {
         CFRelease(current as _);
     }
-    false
+    Ok(AxPressOutcome::Unavailable)
 }
 
 #[cfg(test)]

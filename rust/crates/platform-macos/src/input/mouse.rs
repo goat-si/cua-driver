@@ -925,8 +925,46 @@ pub fn drag_at_xy_background<F, G>(
     steps: usize,
     modifiers: &[&str],
     button: DragButton,
+    observe: F,
+    keep_going: G,
+) -> anyhow::Result<BackgroundDragOutcome>
+where
+    F: FnMut(f64, f64),
+    G: FnMut() -> bool,
+{
+    // The stamped window location is window-local: screen point minus the
+    // window's origin, per step. The frame is validated once for the whole
+    // gesture; failing to validate refuses the gesture before any post.
+    let frame = crate::tools::px_frame::resolve_window_px_frame(wid)
+        .map_err(|e| anyhow::anyhow!("background drag frame validation failed: {e:?}"))?;
+    drag_at_xy_background_with_origin(
+        pid,
+        from,
+        to,
+        wid,
+        duration_ms,
+        steps,
+        modifiers,
+        button,
+        observe,
+        keep_going,
+        (frame.bounds.x, frame.bounds.y),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn drag_at_xy_background_with_origin<F, G>(
+    pid: i32,
+    from: (f64, f64),
+    to: (f64, f64),
+    wid: u32,
+    duration_ms: u64,
+    steps: usize,
+    modifiers: &[&str],
+    button: DragButton,
     mut observe: F,
     mut keep_going: G,
+    origin: (f64, f64),
 ) -> anyhow::Result<BackgroundDragOutcome>
 where
     F: FnMut(f64, f64),
@@ -967,10 +1005,7 @@ where
         .subsec_nanos() as i64;
     let route = post_route(MousePostMode::SkyLightPreferred, skylight_available());
     let window_id = wid as i64;
-    // The stamped window location is window-local: screen point minus the
-    // window's origin, per step (off-screen primers stay off-screen).
-    let window_origin = crate::windows::window_bounds_by_id(wid).map(|b| (b.x, b.y));
-
+    let window_origin = origin;
     let mut stopped_at: Option<(f64, f64)> = None;
     let mut last_point = from;
     for mut step in background_drag_plan(from, to, steps, duration_ms) {
@@ -1009,9 +1044,14 @@ where
         set(91, window_id);
         set(92, window_id);
         set(58, gesture_id);
-        let local = match (window_origin, step.point) {
-            (Some((ox, oy)), (px, py)) if (px, py) != (-1.0, -1.0) => (px - ox, py - oy),
-            _ => step.point,
+        let local = match step.kind {
+            // Primers are identified by kind, not by the (-1,-1) sentinel:
+            // a negative-origin display makes that a valid screen point.
+            PrimerDown | PrimerUp => step.point,
+            _ => (
+                step.point.0 - window_origin.0,
+                step.point.1 - window_origin.1,
+            ),
         };
         crate::input::skylight::set_window_location(ptr, local.0, local.1);
         set_explicit_flags(&event, flags);
@@ -2333,7 +2373,7 @@ mod tests {
     fn background_drag_posts_each_event_once_to_the_pid_with_window_routing() {
         let capture = Capture::start(true);
         let mut observed = Vec::new();
-        drag_at_xy_background(
+        drag_at_xy_background_with_origin(
             42,
             (100.0, 100.0),
             (200.0, 100.0),
@@ -2344,6 +2384,7 @@ mod tests {
             DragButton::Left,
             |x, y| observed.push((x, y)),
             || true,
+            (0.0, 0.0),
         )
         .unwrap();
         let posted = capture.posted();
@@ -2386,7 +2427,7 @@ mod tests {
     #[test]
     fn background_right_drag_uses_right_button_events_and_public_fallback() {
         let capture = Capture::start(false);
-        drag_at_xy_background(
+        drag_at_xy_background_with_origin(
             42,
             (0.0, 0.0),
             (10.0, 10.0),
@@ -2397,6 +2438,7 @@ mod tests {
             DragButton::Right,
             |_, _| {},
             || true,
+            (0.0, 0.0),
         )
         .unwrap();
         let posted = capture.posted();
@@ -2421,7 +2463,7 @@ mod tests {
     fn background_drag_stopped_early_releases_where_it_stands() {
         let capture = Capture::start(true);
         let mut checks = 0;
-        let outcome = drag_at_xy_background(
+        let outcome = drag_at_xy_background_with_origin(
             42,
             (0.0, 0.0),
             (100.0, 0.0),
@@ -2435,6 +2477,7 @@ mod tests {
                 checks += 1;
                 checks < 2
             },
+            (0.0, 0.0),
         )
         .unwrap();
         assert_eq!(
