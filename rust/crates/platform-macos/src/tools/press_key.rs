@@ -1336,10 +1336,10 @@ fn minimized_key_result(step: MinimizedKeyStep, pid: i32, display_key: &str) -> 
                 }
                 if let Some(serde_json::Value::Object(fields)) = result.structured_content.as_mut()
                 {
-                    if fields.get("effect").and_then(|v| v.as_str()) == Some("refused") {
-                        fields.insert("effect".into(), serde_json::json!("unverifiable"));
-                        fields.remove("dispatched");
-                    }
+                    // Something may have been delivered: never refused, and
+                    // never an effect-less error.
+                    fields.insert("effect".into(), serde_json::json!("unverifiable"));
+                    fields.remove("dispatched");
                     if before_any_key {
                         fields.insert("keys_sent".into(), serde_json::json!(false));
                     } else {
@@ -1362,6 +1362,22 @@ fn minimized_key_result(step: MinimizedKeyStep, pid: i32, display_key: &str) -> 
                 result
                     .content
                     .push(cua_driver_core::protocol::Content::text(note));
+                // An unconfirmed delivery, not an error: its record is published.
+                result.is_error = None;
+                result = result.with_action_record(
+                    ActionExecutionRecord::builder(
+                        ActionEffect::Unverifiable,
+                        if before_any_key {
+                            ActionTransport::MacosAxAction
+                        } else {
+                            ActionTransport::MacosCgEventPid
+                        },
+                        RequestedDelivery::Background,
+                    )
+                    .actual_delivery(ActualDelivery::Background)
+                    .build()
+                    .expect("an unverifiable minimized key record is valid"),
+                );
             }
             if !notes.is_empty() {
                 result
@@ -2254,7 +2270,7 @@ mod minimized_key_receipt_tests {
         };
         let result = minimized_key_result(step, 1, "return");
         let structured = result.structured_content.as_ref().expect("structured");
-        assert_ne!(structured["effect"], "refused");
+        assert_eq!(structured["effect"], "unverifiable");
         assert!(structured.get("dispatched").is_none());
         assert_eq!(structured["keys_sent"], false);
         assert_eq!(structured["focus_writes_sent"], 2);
@@ -2290,7 +2306,12 @@ mod minimized_key_receipt_tests {
         };
         let result = minimized_key_result(window_only, 1, "return");
         let structured = result.structured_content.as_ref().expect("structured");
-        assert_ne!(structured["effect"], "refused");
+        assert_eq!(structured["effect"], "unverifiable");
+        assert_ne!(result.is_error, Some(true));
+        assert_eq!(
+            result.action_record.as_ref().map(|r| r.effect),
+            Some(ActionEffect::Unverifiable)
+        );
         assert!(structured.get("keys_sent").is_none());
         assert!(result.content.iter().any(|c| matches!(
             c,
