@@ -1573,13 +1573,15 @@ enum ChordStep {
 enum NotEnabledRoute {
     Keys,
     Unreadable,
+    /// A fresh read shows it enabled after all: press it as an enabled item.
+    NowEnabled,
 }
 
 fn not_enabled_route(last: Option<bool>) -> NotEnabledRoute {
-    if last == Some(false) {
-        NotEnabledRoute::Keys
-    } else {
-        NotEnabledRoute::Unreadable
+    match last {
+        Some(false) => NotEnabledRoute::Keys,
+        Some(true) => NotEnabledRoute::NowEnabled,
+        None => NotEnabledRoute::Unreadable,
     }
 }
 
@@ -1604,7 +1606,7 @@ fn keys_posted_step(
             code: "background_unavailable",
             text: format!(
                 "press_key: {path} reads disabled for this window and the chord could not be \
-                 built ({reason}); no key or menu action was sent.{notes}"
+                 built ({reason}), so it was not sent as keys and no menu action was sent.{notes}"
             ),
             validation,
         },
@@ -1747,22 +1749,27 @@ fn chord_in_scope(pid: i32, wid: u32, combo: super::menu_equivalent::Combo) -> C
         }
         if !enabled() {
             let last = unsafe { copy_bool_attr(element, "AXEnabled") };
-            return match not_enabled_route(last) {
-                NotEnabledRoute::Keys => ChordStep::NeedsKeys {
-                    scope,
-                    validation,
-                    path: found.path.join(" > "),
-                },
-                NotEnabledRoute::Unreadable => chord_refusal(
-                    "background_unavailable",
-                    &format!(
-                        "{}'s enablement could not be read for this window.",
-                        found.path.join(" > ")
-                    ),
-                    scope,
-                    validation,
-                ),
-            };
+            match not_enabled_route(last) {
+                NotEnabledRoute::Keys => {
+                    return ChordStep::NeedsKeys {
+                        scope,
+                        validation,
+                        path: found.path.join(" > "),
+                    }
+                }
+                NotEnabledRoute::Unreadable => {
+                    return chord_refusal(
+                        "background_unavailable",
+                        &format!(
+                            "{}'s enablement could not be read for this window.",
+                            found.path.join(" > ")
+                        ),
+                        scope,
+                        validation,
+                    )
+                }
+                NotEnabledRoute::NowEnabled => {}
+            }
         }
     }
     let actions = unsafe { crate::ax::bindings::copy_action_names(element) };
@@ -2041,6 +2048,7 @@ mod tests {
     fn only_a_confirmed_disabled_item_sends_the_chord_as_keys() {
         assert_eq!(not_enabled_route(Some(false)), NotEnabledRoute::Keys);
         assert_eq!(not_enabled_route(None), NotEnabledRoute::Unreadable);
+        assert_eq!(not_enabled_route(Some(true)), NotEnabledRoute::NowEnabled);
     }
 
     #[test]
@@ -2086,7 +2094,7 @@ mod tests {
         assert!(structured["message"]
             .as_str()
             .unwrap()
-            .contains("no key or menu action was sent"));
+            .contains("not sent as keys and no menu action was sent"));
     }
     #[test]
     fn semantic_actions_require_unmodified_return_or_escape_and_live_advertising() {
