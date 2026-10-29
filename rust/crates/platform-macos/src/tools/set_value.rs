@@ -669,6 +669,27 @@ fn attach_restore_cleanup(
             fields.insert("restore_note".into(), serde_json::json!(note));
         }
     }
+    carry_message(result)
+}
+
+/// Error results are not projected into a summary: put their whole text
+/// (the cause, partial-write warnings, scope disclosure) in a structured
+/// `message` when none is there yet.
+fn carry_message(mut result: ToolResult) -> ToolResult {
+    let text: Vec<&str> = result
+        .content
+        .iter()
+        .filter_map(|content| match content {
+            cua_driver_core::protocol::Content::Text { text, .. } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    let text = text.join(" ");
+    if let Some(serde_json::Value::Object(fields)) = result.structured_content.as_mut() {
+        if !text.is_empty() && !fields.contains_key("message") {
+            fields.insert("message".into(), serde_json::json!(text));
+        }
+    }
     result
 }
 
@@ -2217,6 +2238,12 @@ mod restore_cleanup_tests {
         assert_eq!(
             error.structured_content.as_ref().expect("structured")["restore_cleanup"],
             "reminimize_not_confirmed"
+        );
+        // The error's own text reaches structured-only clients too.
+        assert!(
+            error.structured_content.as_ref().expect("structured")["message"]
+                .as_str()
+                .is_some_and(|m| m.contains("set_value failed: x"))
         );
         let refusal = attach_restore_cleanup(
             ToolResult::error("refused").with_structured(serde_json::json!({"code": "c"})),

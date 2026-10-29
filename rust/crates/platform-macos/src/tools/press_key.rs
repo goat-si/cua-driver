@@ -1305,7 +1305,10 @@ fn minimized_key_result(step: MinimizedKeyStep, pid: i32, display_key: &str) -> 
         if !notes.trim().is_empty() {
             structured["restore_note"] = serde_json::json!(notes.trim());
         }
-        return ToolResult::error(format!("press_key: {text}{notes}")).with_structured(structured);
+        // The whole text (scope entry and hand-back included) as structured.
+        let message = format!("press_key: {text}{notes}");
+        structured["message"] = serde_json::json!(message.clone());
+        return ToolResult::error(message).with_structured(structured);
     }
     match step.outcome.map(map_delivery_outcome) {
         Some(
@@ -1382,11 +1385,20 @@ fn minimized_key_result(step: MinimizedKeyStep, pid: i32, display_key: &str) -> 
                 );
             }
             append_to_summary(&mut result, &notes);
-            if !notes.trim().is_empty() {
-                if let Some(serde_json::Value::Object(fields)) = result.structured_content.as_mut()
-                {
+            let message = result
+                .content
+                .iter()
+                .filter_map(|content| match content {
+                    cua_driver_core::protocol::Content::Text { text, .. } => Some(text.clone()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join(" ");
+            if let Some(serde_json::Value::Object(fields)) = result.structured_content.as_mut() {
+                if !notes.trim().is_empty() {
                     fields.insert("restore_note".into(), serde_json::json!(notes.trim()));
                 }
+                fields.insert("message".into(), serde_json::json!(message));
             }
             result
         }
