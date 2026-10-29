@@ -3019,34 +3019,57 @@ fn perform_ax_click(
         } else {
             None
         };
-        if in_web_area {
-            super::type_text::click_element_center_for_focus_checked(
-                pid,
-                window_id,
-                element_ptr,
-                foreground,
-            )?;
-        } else {
-            // The person may have activated the app since the scope was
-            // entered: read the front app right before the focus write.
-            if text_key_scope
-                && crate::input::skylight::front_process_matches(pid as libc::pid_t, window_id)
-                    != Some(false)
-            {
-                anyhow::bail!(
-                    "text input [{idx}]: its app came to the front, or which app is in front could not be read; AXFocused was not written and AXPress was not sent"
-                );
+        // The focus step and its checks; the scope's hand-back is finished
+        // and disclosed on every way out of it.
+        let focus_step = || -> anyhow::Result<bool> {
+            if in_web_area {
+                super::type_text::click_element_center_for_focus_checked(
+                    pid,
+                    window_id,
+                    element_ptr,
+                    foreground,
+                )?;
+            } else {
+                // The person may have activated the app since the scope was
+                // entered: read the front app right before the focus write.
+                if text_key_scope
+                    && crate::input::skylight::front_process_matches(pid as libc::pid_t, window_id)
+                        != Some(false)
+                {
+                    anyhow::bail!(
+                        "text input [{idx}]: its app came to the front, or which app is in front could not be read; AXFocused was not written and AXPress was not sent"
+                    );
+                }
+                crate::input::ax_actions::focus_element(element_ptr)?;
             }
-            crate::input::ax_actions::focus_element(element_ptr)?;
-        }
-        let focused = unsafe { copy_bool_attr(element, "AXFocused") } == Some(true)
-            && super::type_text::element_in_requested_window(pid, window_id, element_ptr)
-            && crate::input::ax_actions::is_element_focused(pid, element_ptr)
-            && super::type_text::focused_window_matches_element(pid, window_id, element_ptr);
+            Ok(
+                unsafe { copy_bool_attr(element, "AXFocused") } == Some(true)
+                    && super::type_text::element_in_requested_window(pid, window_id, element_ptr)
+                    && crate::input::ax_actions::is_element_focused(pid, element_ptr)
+                    && super::type_text::focused_window_matches_element(
+                        pid,
+                        window_id,
+                        element_ptr,
+                    ),
+            )
+        };
+        let focused = focus_step();
         let hand_back = scope.map(|scope| {
             let entry = scope.entry();
             crate::input::skylight::scope_disclosure(entry, Some(scope.finish()))
         });
+        let focused = match focused {
+            Ok(focused) => focused,
+            // The original error stays downcastable (refusal codes); the
+            // disclosure is added as context.
+            Err(error) => match hand_back.filter(|text| !text.is_empty()) {
+                Some(text) => {
+                    let message = format!("{error} {text}");
+                    return Err(error.context(message));
+                }
+                None => return Err(error),
+            },
+        };
         if !focused {
             if in_web_area {
                 return Ok((
