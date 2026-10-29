@@ -20,7 +20,9 @@ use super::dense_rows::{
 };
 use super::launch::{is_still_launching, LaunchStep, LaunchWait};
 use super::snapshot::RetainedElement;
-use super::window_scope::{decide_window_scope, ScopeDecision, TopLevelCandidate, WindowScope};
+use super::window_scope::{
+    decide_window_scope, is_window_like_role, ScopeDecision, TopLevelCandidate, WindowScope,
+};
 use core_foundation::base::{CFEqual, CFRelease, CFRetain, CFTypeRef};
 use cua_driver_core::snapshot_compaction::{
     compact_tab_strip, fold_actionless_text_subtrees, format_omitted_tabs_line, redact_if_secure,
@@ -191,8 +193,34 @@ fn is_actionless_control_role(role: &str) -> bool {
     )
 }
 
-fn is_addressable(actions_present: bool, value_settable: bool, enabled: Option<bool>) -> bool {
-    (actions_present || value_settable) && enabled != Some(false)
+fn is_addressable(
+    role: &str,
+    actions_present: bool,
+    value_settable: bool,
+    enabled: Option<bool>,
+) -> bool {
+    (actions_present || value_settable) && (role != "AXMenuItem" || enabled != Some(false))
+}
+
+fn window_chrome_button_description<F>(
+    role: &str,
+    visible_title: &str,
+    visible_description: &str,
+    read_subrole: F,
+) -> Option<&'static str>
+where
+    F: FnOnce() -> Option<String>,
+{
+    if role != "AXButton" || !visible_title.is_empty() || !visible_description.is_empty() {
+        return None;
+    }
+    match read_subrole()?.as_str() {
+        "AXCloseButton" => Some("close button"),
+        "AXMinimizeButton" => Some("minimize button"),
+        "AXZoomButton" => Some("zoom button"),
+        "AXFullScreenButton" => Some("full screen button"),
+        _ => None,
+    }
 }
 
 pub struct TreeWalkResult {
@@ -389,7 +417,10 @@ fn walk_tree_with_web_content(
             let attempt_started = Instant::now();
             super::enablement::ensure_chromium_ax_enabled(pid, app_elem);
 
-            let top_level = copy_top_level(app_elem, pid, window_id);
+            let recovery_deadline = budget
+                .time_limit()
+                .and_then(|limit| attempt_started.checked_add(limit));
+            let top_level = copy_top_level(app_elem, pid, window_id, recovery_deadline);
 
             // Scope: keep non-window children (menu bar) + the target window —
             // but ONLY once the target window has actually been identified. When
@@ -506,12 +537,12 @@ fn walk_tree_with_web_content(
         fold_actionless_text_subtrees(&mut lines, &mut nodes);
     }
     nodes.retain(|n| n.role != "AXTabStripSummary");
-    prune_echo_text_rows(&mut lines);
-    let raw_markdown = render_lines(&lines);
+    let mut line_nodes = align_line_nodes(&lines, &nodes);
+    prune_echo_text_rows(&mut lines, &mut line_nodes, &nodes);
     let mut tree_markdown = if let Some(q) = query {
-        filter_tree(&raw_markdown, q)
+        filter_tree_with_original_text(&lines, &line_nodes, &nodes, q)
     } else {
-        raw_markdown
+        render_lines(&lines)
     };
 
     if let Some(note) = walk.note() {
@@ -539,6 +570,7 @@ unsafe fn copy_top_level(
     app_elem: AXUIElementRef,
     pid: i32,
     window_id: Option<u32>,
+    recovery_deadline: Option<Instant>,
 ) -> Vec<AXUIElementRef> {
     let mut top_level = children_or_skipped(copy_children_checked(app_elem));
     // A requested window on another Space is absent from AXWindows; the
@@ -562,7 +594,103 @@ unsafe fn copy_top_level(
             CFRelease(w as CFTypeRef);
         }
     }
+
+    if let Some(wid) = window_id {
+        let already_present = top_level.iter().any(|&element| {
+            set_messaging_timeout(element);
+            ax_get_window_id(element) == Some(wid)
+        });
+        if !already_present && !recovery_deadline_reached(recovery_deadline, Instant::now()) {
+            if let Some(bounds) = crate::windows::window_bounds_by_id(wid) {
+                let hit = window_center_hit_if_live(recovery_deadline, Instant::now(), || {
+                    element_at_screen_position(
+                        pid,
+                        bounds.x + bounds.width * 0.5,
+                        bounds.y + bounds.height * 0.5,
+                    )
+                });
+                if let Some(root) = hit.flatten().and_then(|element| {
+                    recover_window_root_at_center(element, wid, recovery_deadline)
+                }) {
+                    if top_level
+                        .iter()
+                        .any(|&element| CFEqual(element as CFTypeRef, root as CFTypeRef) != 0)
+                    {
+                        CFRelease(root as CFTypeRef);
+                    } else {
+                        top_level.push(root);
+                    }
+                }
+            }
+        }
+    }
     top_level
+}
+
+const MAX_WINDOW_RECOVERY_ANCESTORS: usize = 32;
+
+fn recovery_deadline_reached(deadline: Option<Instant>, now: Instant) -> bool {
+    deadline.is_some_and(|deadline| now >= deadline)
+}
+
+fn window_center_hit_if_live<T>(
+    deadline: Option<Instant>,
+    now: Instant,
+    hit: impl FnOnce() -> T,
+) -> Option<T> {
+    (!recovery_deadline_reached(deadline, now)).then(hit)
+}
+
+fn topmost_window_match(window_ids: &[Option<u32>], requested: u32) -> Option<usize> {
+    window_ids
+        .iter()
+        .rposition(|window_id| *window_id == Some(requested))
+}
+
+/// Recover the highest matching ancestor of a center-hit element. The hit and
+/// every parent are retained; keep only one extra retain on the returned root.
+unsafe fn recover_window_root_at_center(
+    hit: AXUIElementRef,
+    requested: u32,
+    deadline: Option<Instant>,
+) -> Option<AXUIElementRef> {
+    let mut ancestors = vec![hit];
+    for _ in 1..MAX_WINDOW_RECOVERY_ANCESTORS {
+        if recovery_deadline_reached(deadline, Instant::now()) {
+            release_all(ancestors);
+            return None;
+        }
+        let current = *ancestors.last().expect("the hit is always present");
+        set_messaging_timeout(current);
+        let Some(parent) = copy_element_attr(current, "AXParent") else {
+            break;
+        };
+        ancestors.push(parent);
+        if recovery_deadline_reached(deadline, Instant::now()) {
+            release_all(ancestors);
+            return None;
+        }
+    }
+
+    let mut window_ids = Vec::with_capacity(ancestors.len());
+    for &element in &ancestors {
+        if recovery_deadline_reached(deadline, Instant::now()) {
+            release_all(ancestors);
+            return None;
+        }
+        set_messaging_timeout(element);
+        window_ids.push(ax_get_window_id(element));
+        if recovery_deadline_reached(deadline, Instant::now()) {
+            release_all(ancestors);
+            return None;
+        }
+    }
+    let root = topmost_window_match(&window_ids, requested).map(|index| {
+        CFRetain(ancestors[index] as CFTypeRef);
+        ancestors[index]
+    });
+    release_all(ancestors);
+    root
 }
 
 /// The children a checked `AXChildren` read found; a failed read records
@@ -586,7 +714,7 @@ unsafe fn scope_top_level(top_level: &[AXUIElementRef], pid: i32, wid: u32) -> S
             let identifier = copy_string_attr(child, "AXIdentifier");
             // Match AX window element → CGWindowID via private SPI.
             // Only windows carry one, so skip the round-trip elsewhere.
-            let ax_window_id = if role == "AXWindow" {
+            let ax_window_id = if is_window_like_role(&role) {
                 ax_get_window_id(child)
             } else {
                 None
@@ -844,6 +972,12 @@ unsafe fn walk_element(
     let visible_title = title.as_deref().unwrap_or("").trim().to_owned();
     let visible_description = description.as_deref().unwrap_or("").trim().to_owned();
     let visible_value = value.as_deref().unwrap_or("").trim().to_owned();
+    let visible_description =
+        window_chrome_button_description(&role, &visible_title, &visible_description, || {
+            copy_string_attr(element, "AXSubrole")
+        })
+        .map(str::to_owned)
+        .unwrap_or(visible_description);
 
     let has_content =
         !visible_title.is_empty() || !visible_description.is_empty() || !visible_value.is_empty();
@@ -868,6 +1002,7 @@ unsafe fn walk_element(
         None
     };
     let is_actionable = is_addressable(
+        &role,
         !actions.is_empty() || actionless_control,
         value_settable,
         enabled,
@@ -1333,10 +1468,10 @@ mod web_content_role_tests {
     fn custom_action_names_cannot_split_or_escape_a_tree_row() {
         let mut node = role_only_node("AXButton".into(), 0, 0, None, false);
         node.element_index = Some(4);
-        node.actions = vec!["Name:Reveal \"details\"\nTarget:inspector".into()];
+        node.actions = vec!["Name:Reveal \"details\"\nTarget:inspector\nSelector:perform:".into()];
         assert_eq!(
             format_node_line(&node),
-            "- [4] AXButton [actions=[name:reveal \\\"details\\\"\\ntarget:inspector]]"
+            "- [4] AXButton [actions=[reveal \\\"details\\\"]]"
         );
     }
 
@@ -1352,22 +1487,55 @@ mod web_content_role_tests {
 }
 
 fn format_node_line(node: &AXNode) -> String {
+    format_node_line_inner(node, true)
+}
+
+fn format_node_line_unbounded(node: &AXNode) -> String {
+    format_node_line_inner(node, false)
+}
+
+const MAX_NODE_TEXT_CHARS: usize = 1_000;
+const MAX_NODE_LINE_BYTES: usize = 64 * 1_024;
+
+fn sanitize_node_text(text: &str, char_limit: Option<usize>) -> String {
+    let mut sanitized = String::new();
+    let mut truncated = false;
+    for (chars_seen, character) in text.chars().enumerate() {
+        if char_limit == Some(chars_seen) {
+            truncated = true;
+            break;
+        }
+        match character {
+            '\n' => sanitized.push_str("\\n"),
+            '\r' => sanitized.push_str("\\r"),
+            _ => sanitized.push(character),
+        }
+    }
+    if truncated {
+        sanitized.push('…');
+    }
+    sanitized
+}
+
+fn format_node_line_inner(node: &AXNode, bounded: bool) -> String {
+    let char_limit = bounded.then_some(MAX_NODE_TEXT_CHARS);
     let mut parts = String::new();
 
     // Common prefix (with or without index).
+    let role = sanitize_node_text(&node.role, char_limit);
     if let Some(idx) = node.element_index {
-        parts.push_str(&format!("- [{}] {}", idx, node.role));
+        parts.push_str(&format!("- [{}] {}", idx, role));
     } else {
-        parts.push_str(&format!("- {}", node.role));
+        parts.push_str(&format!("- {}", role));
     }
 
     // AXTitle → "title"
     if let Some(t) = &node.title {
-        parts.push_str(&format!(" \"{}\"", t));
+        parts.push_str(&format!(" \"{}\"", sanitize_node_text(t, char_limit)));
     }
     // AXValue → = "value"
     if let Some(v) = &node.value {
-        parts.push_str(&format!(" = \"{}\"", v));
+        parts.push_str(&format!(" = \"{}\"", sanitize_node_text(v, char_limit)));
     }
     // AXDescription → (description) — critical for Calculator digit buttons
     // where AXTitle="" but AXDescription="2". A description that only repeats
@@ -1377,21 +1545,24 @@ fn format_node_line(node: &AXNode) -> String {
         .as_ref()
         .filter(|d| node.title.as_ref() != Some(*d))
     {
-        parts.push_str(&format!(" ({})", d));
+        parts.push_str(&format!(" ({})", sanitize_node_text(d, char_limit)));
     }
 
     // Bracketed metadata block (identifier, help, actions).
     if node.element_index.is_some() {
         let mut attrs: Vec<String> = Vec::new();
+        if node.enabled == Some(false) {
+            attrs.push("disabled".into());
+        }
         if let Some(id) = node
             .identifier
             .as_deref()
             .filter(|id| !id.trim().is_empty())
         {
-            attrs.push(format!("id={}", id));
+            attrs.push(format!("id={}", sanitize_node_text(id, char_limit)));
         }
         if let Some(h) = &node.help {
-            attrs.push(format!("help=\"{}\"", h));
+            attrs.push(format!("help=\"{}\"", sanitize_node_text(h, char_limit)));
         }
         let shown: Vec<String> = node
             .actions
@@ -1409,6 +1580,14 @@ fn format_node_line(node: &AXNode) -> String {
         }
     }
 
+    if bounded && parts.len() > MAX_NODE_LINE_BYTES {
+        let mut end = MAX_NODE_LINE_BYTES;
+        while !parts.is_char_boundary(end) {
+            end -= 1;
+        }
+        parts.truncate(end);
+        parts.push('…');
+    }
     parts
 }
 
@@ -1488,28 +1667,79 @@ pub fn with_menus_collapsed<T>(collapse: bool, walk: impl FnOnce() -> T) -> T {
 /// structured `elements` still carry the full list.
 const UNLISTED_ACTIONS: &[&str] = &["AXShowMenu", "AXScrollToVisible"];
 
-/// Drop static-text leaf rows that only repeat text already shown on their
+/// Associate rendered lines with nodes while every line is still present.
+/// Only synthetic summary lines lack a node. Every other line follows the same
+/// DFS order, so renumbering or byte capping cannot break the association.
+fn align_line_nodes(lines: &[(usize, String)], nodes: &[AXNode]) -> Vec<Option<usize>> {
+    let mut next_node = 0;
+    lines
+        .iter()
+        .map(|(_, line)| {
+            if dense_rows::is_summary_line(line) || next_node >= nodes.len() {
+                return None;
+            }
+            let index = next_node;
+            next_node += 1;
+            Some(index)
+        })
+        .collect()
+}
+
+/// Drop static-text leaf rows that exactly repeat text already shown on their
 /// parent row (a web button "Save case" with a child text "Save case"). The
-/// rows keep their element indices; only the rendering omits them, and a
-/// `query` for the text still matches the parent.
-fn prune_echo_text_rows(lines: &mut Vec<(usize, String)>) {
+/// rows keep their element indices; only the rendering omits them. Compare
+/// original node text so truncation can never turn distinct text into an echo.
+fn prune_echo_text_rows(
+    lines: &mut Vec<(usize, String)>,
+    line_nodes: &mut Vec<Option<usize>>,
+    nodes: &[AXNode],
+) {
     let mut keep = vec![true; lines.len()];
     for i in 0..lines.len() {
         let (depth, line) = &lines[i];
-        let Some(text) = echo_text_of(line) else {
+        if echo_text_of(line).is_none() {
             continue;
-        };
+        }
         let is_leaf = lines.get(i + 1).is_none_or(|(next, _)| next <= depth);
         if !is_leaf || *depth == 0 {
             continue;
         }
-        let parent = lines[..i].iter().rev().find(|(d, _)| *d + 1 == *depth);
-        if parent.is_some_and(|(_, parent_line)| quoted_text_contains(parent_line, text)) {
+        let parent = lines[..i].iter().rposition(|(d, _)| *d + 1 == *depth);
+        let (Some(child_index), Some(parent)) = (line_nodes[i], parent) else {
+            continue;
+        };
+        let Some(parent_index) = line_nodes[parent] else {
+            continue;
+        };
+        let Some(text) = nodes[child_index].value.as_deref() else {
+            continue;
+        };
+        let parent = &nodes[parent_index];
+        let displayed_help = parent
+            .element_index
+            .is_some()
+            .then_some(parent.help.as_deref())
+            .flatten();
+        let repeats = [
+            parent.title.as_deref(),
+            parent.value.as_deref(),
+            displayed_help,
+        ]
+        .into_iter()
+        .flatten()
+        .any(|candidate| candidate == text);
+        if repeats {
             keep[i] = false;
         }
     }
     let mut index = 0;
     lines.retain(|_| {
+        let kept = keep[index];
+        index += 1;
+        kept
+    });
+    let mut index = 0;
+    line_nodes.retain(|_| {
         let kept = keep[index];
         index += 1;
         kept
@@ -1528,14 +1758,6 @@ fn echo_text_of(line: &str) -> Option<&str> {
     (!text.is_empty() && !text.contains('"')).then_some(text)
 }
 
-/// Whether one of the double-quoted strings on `line` contains `text`.
-fn quoted_text_contains(line: &str, text: &str) -> bool {
-    line.split('"')
-        .skip(1)
-        .step_by(2)
-        .any(|quoted| quoted.contains(text))
-}
-
 fn render_lines(lines: &[(usize, String)]) -> String {
     let mut out = String::new();
     for (depth, line) in lines {
@@ -1548,16 +1770,41 @@ fn render_lines(lines: &[(usize, String)]) -> String {
     out
 }
 
+fn filter_tree_with_original_text(
+    lines: &[(usize, String)],
+    line_nodes: &[Option<usize>],
+    nodes: &[AXNode],
+    query: &str,
+) -> String {
+    let output = render_lines(lines);
+    let mut search = String::new();
+    for (index, (_, output_line)) in lines.iter().enumerate() {
+        if let Some(node_index) = line_nodes[index] {
+            search.push_str(&format_node_line_unbounded(&nodes[node_index]));
+        } else {
+            search.push_str(output_line);
+        }
+        search.push('\n');
+    }
+    filter_tree_pair(&output, &search, query)
+}
+
 /// Filter the tree markdown to lines matching `query` plus their ancestor chain.
+#[cfg(test)]
 fn filter_tree(markdown: &str, query: &str) -> String {
+    filter_tree_pair(markdown, markdown, query)
+}
+
+fn filter_tree_pair(markdown: &str, search_markdown: &str, query: &str) -> String {
     let needle = query.to_lowercase();
     let lines: Vec<&str> = markdown.lines().collect();
+    let search_lines: Vec<&str> = search_markdown.lines().collect();
 
     let mut current_ancestor: Vec<&str> = Vec::new();
     let mut last_emitted_at: Vec<Option<&str>> = Vec::new();
     let mut output: Vec<&str> = Vec::new();
 
-    for line in &lines {
+    for (index, line) in lines.iter().enumerate() {
         if dense_rows::is_summary_line(line) {
             continue;
         }
@@ -1572,7 +1819,8 @@ fn filter_tree(markdown: &str, query: &str) -> String {
         }
         current_ancestor[depth] = line;
 
-        if line.to_lowercase().contains(&needle) {
+        let search_line = search_lines.get(index).copied().unwrap_or(line);
+        if search_line.to_lowercase().contains(&needle) {
             for ancestor_depth in 0..depth {
                 let ancestor = current_ancestor[ancestor_depth];
                 if ancestor.is_empty() {
@@ -1624,10 +1872,34 @@ mod tests {
 
     #[test]
     fn writable_value_controls_are_addressable_without_actions() {
-        assert!(is_addressable(false, true, Some(true)));
-        assert!(is_addressable(true, false, None));
-        assert!(!is_addressable(false, false, Some(true)));
-        assert!(!is_addressable(true, false, Some(false)));
+        assert!(is_addressable("AXTextField", false, true, Some(true)));
+        assert!(is_addressable("AXButton", true, false, None));
+        assert!(!is_addressable("AXStaticText", false, false, Some(true)));
+        assert!(!is_addressable("AXMenuItem", true, false, Some(false)));
+    }
+
+    #[test]
+    fn wave_400b_disabled_window_controls_remain_addressable() {
+        assert!(is_addressable("AXButton", true, false, Some(false)));
+        assert!(is_addressable("AXTextField", false, true, Some(false)));
+    }
+
+    #[test]
+    fn wave_400b_node_lines_show_disabled_and_cannot_be_forced_to_split() {
+        let mut node = role_only_node("AXButton".into(), 0, 0, None, false);
+        node.element_index = Some(4);
+        node.enabled = Some(false);
+        node.title = Some("first\nsecond\rthird".into());
+        node.value = Some(format!("{}tail", "가".repeat(1_001)));
+        let line = format_node_line(&node);
+        assert!(line.contains("[disabled]"));
+        assert!(line.contains("first\\nsecond\\rthird"));
+        assert_eq!(line.matches('\n').count(), 0);
+        assert_eq!(line.matches('\r').count(), 0);
+        assert!(
+            !line.contains("tail"),
+            "long values are cut before their tail"
+        );
     }
 
     #[test]
@@ -1678,19 +1950,130 @@ mod tests {
         });
         assert_eq!(reads.get(), 1, "actionable nodes must read state once");
         assert_eq!(actionable.enabled, Some(true));
+
+        let disabled = read_control_state_if_actionable(true, || ControlState {
+            enabled: Some(false),
+            ..ControlState::default()
+        });
+        assert_eq!(disabled.enabled, Some(false));
+    }
+
+    #[test]
+    fn wave_400b_window_chrome_names_are_mapped_and_read_lazily() {
+        for (subrole, expected) in [
+            ("AXCloseButton", "close button"),
+            ("AXMinimizeButton", "minimize button"),
+            ("AXZoomButton", "zoom button"),
+            ("AXFullScreenButton", "full screen button"),
+        ] {
+            assert_eq!(
+                window_chrome_button_description("AXButton", "", "", || {
+                    Some(subrole.to_owned())
+                }),
+                Some(expected)
+            );
+        }
+        assert_eq!(
+            window_chrome_button_description("AXButton", "", "", || {
+                Some("AXToolbarButton".into())
+            }),
+            None
+        );
+
+        let reads = Cell::new(0);
+        for (role, title, description) in [
+            ("AXButton", "Named", ""),
+            ("AXButton", "", "Described"),
+            ("AXWindow", "", ""),
+        ] {
+            assert_eq!(
+                window_chrome_button_description(role, title, description, || {
+                    reads.set(reads.get() + 1);
+                    Some("AXCloseButton".into())
+                }),
+                None
+            );
+        }
+        assert_eq!(reads.get(), 0, "named or non-button nodes skip AXSubrole");
+    }
+
+    #[test]
+    fn wave_400b_window_recovery_selects_the_topmost_match_and_checks_deadlines() {
+        let ids = [None, Some(22), Some(11), Some(22), None];
+        assert_eq!(topmost_window_match(&ids, 22), Some(3));
+        assert_eq!(topmost_window_match(&ids, 33), None);
+        let at_cap = vec![Some(22); MAX_WINDOW_RECOVERY_ANCESTORS];
+        assert_eq!(
+            topmost_window_match(&at_cap, 22),
+            Some(MAX_WINDOW_RECOVERY_ANCESTORS - 1)
+        );
+
+        let now = Instant::now();
+        assert!(!recovery_deadline_reached(None, now));
+        assert!(recovery_deadline_reached(Some(now), now));
+        assert!(!recovery_deadline_reached(
+            Some(now + std::time::Duration::from_millis(1)),
+            now
+        ));
+
+        let calls = Cell::new(0);
+        let expired = window_center_hit_if_live(Some(now), now, || {
+            calls.set(calls.get() + 1);
+            1
+        });
+        assert_eq!(expired, None);
+        assert_eq!(calls.get(), 0, "an expired recovery never starts a hit");
+        let live = window_center_hit_if_live(None, now, || {
+            calls.set(calls.get() + 1);
+            1
+        });
+        assert_eq!(live, Some(1));
+        assert_eq!(calls.get(), 1);
     }
 }
 
 #[cfg(test)]
 mod lean_row_tests {
-    use super::{echo_text_of, prune_echo_text_rows};
+    use super::{
+        align_line_nodes, echo_text_of, filter_tree_with_original_text, format_node_line,
+        prune_echo_text_rows, role_only_node, AXNode, COLLAPSED_MENU_NOTE, MAX_NODE_LINE_BYTES,
+    };
 
     fn rows(lines: &[(usize, &str)]) -> Vec<(usize, String)> {
         lines.iter().map(|(d, l)| (*d, l.to_string())).collect()
     }
 
+    fn node(
+        role: &str,
+        element_index: Option<usize>,
+        title: Option<&str>,
+        value: Option<&str>,
+        actions: &[&str],
+    ) -> AXNode {
+        let mut node = role_only_node(role.into(), 0, 0, None, false);
+        node.element_index = element_index;
+        node.title = title.map(str::to_owned);
+        node.value = value.map(str::to_owned);
+        node.actions = actions.iter().map(|action| (*action).to_owned()).collect();
+        node
+    }
+
+    fn prune(lines: &mut Vec<(usize, String)>, nodes: &[AXNode]) -> Vec<Option<usize>> {
+        let mut line_nodes = align_line_nodes(lines, nodes);
+        prune_echo_text_rows(lines, &mut line_nodes, nodes);
+        line_nodes
+    }
+
+    fn rendered(nodes: &[AXNode]) -> Vec<(usize, String)> {
+        nodes
+            .iter()
+            .enumerate()
+            .map(|(index, node)| (usize::from(index != 0), format_node_line(node)))
+            .collect()
+    }
+
     #[test]
-    fn echo_text_rows_under_a_labelled_parent_are_dropped() {
+    fn wave_400b_echo_text_rows_with_only_partial_parent_matches_are_kept() {
         let mut lines = rows(&[
             (0, "- [0] AXWindow \"Mail\" [actions=[raise]]"),
             (
@@ -1703,17 +2086,183 @@ mod lean_row_tests {
             (2, "- [12] AXStaticText = \"Inbox\""),
             (1, "- [13] AXStaticText = \"Mail\""),
         ]);
-        prune_echo_text_rows(&mut lines);
+        let nodes = vec![
+            node("AXWindow", Some(0), Some("Mail"), None, &["AXRaise"]),
+            node(
+                "AXButton",
+                Some(8),
+                Some("Atrium plant service CM-199"),
+                None,
+                &["AXPress"],
+            ),
+            node(
+                "AXStaticText",
+                Some(9),
+                None,
+                Some("Atrium plant service"),
+                &[],
+            ),
+            node("AXStaticText", Some(10), None, Some("CM-199"), &[]),
+            node("AXHeading", Some(11), Some("Messages"), None, &[]),
+            node("AXStaticText", Some(12), None, Some("Inbox"), &[]),
+            node("AXStaticText", Some(13), None, Some("Mail"), &[]),
+        ];
+        prune(&mut lines, &nodes);
         let kept: Vec<&str> = lines.iter().map(|(_, l)| l.as_str()).collect();
         assert_eq!(
             kept,
             [
                 "- [0] AXWindow \"Mail\" [actions=[raise]]",
                 "- [8] AXButton \"Atrium plant service CM-199\" [actions=[press]]",
+                "- [9] AXStaticText = \"Atrium plant service\"",
+                "- [10] AXStaticText = \"CM-199\"",
                 "- [11] AXHeading \"Messages\"",
                 "- [12] AXStaticText = \"Inbox\"",
             ]
         );
+    }
+
+    #[test]
+    fn wave_400b_echo_uses_original_exact_text_and_only_visible_parent_fields() {
+        let prefix = "가".repeat(1_000);
+        let parent_text = format!("{prefix}parent");
+        let child_text = format!("{prefix}child");
+        let nodes = vec![
+            node("AXButton", Some(0), Some(&parent_text), None, &[]),
+            node("AXStaticText", None, None, Some(&child_text), &[]),
+        ];
+        let mut lines = rendered(&nodes);
+        prune(&mut lines, &nodes);
+        assert_eq!(lines.len(), 2, "different text after the cap is not echo");
+
+        let nodes = vec![
+            node("AXButton", Some(0), Some(&parent_text), None, &[]),
+            node("AXStaticText", None, None, Some(&parent_text), &[]),
+        ];
+        let mut lines = rendered(&nodes);
+        prune(&mut lines, &nodes);
+        assert_eq!(lines.len(), 1, "exact original text remains an echo");
+
+        let mut display_parent = node("AXHeading", None, Some("Heading"), None, &[]);
+        display_parent.help = Some("needle".into());
+        let nodes = vec![
+            display_parent,
+            node("AXStaticText", None, None, Some("needle"), &[]),
+        ];
+        let mut lines = rendered(&nodes);
+        prune(&mut lines, &nodes);
+        assert_eq!(lines.len(), 2, "hidden display-only help is not visible");
+
+        let mut indexed_parent = node("AXHeading", Some(0), Some("Heading"), None, &[]);
+        indexed_parent.help = Some("needle".into());
+        let nodes = vec![
+            indexed_parent,
+            node("AXStaticText", None, None, Some("needle"), &[]),
+        ];
+        let mut lines = rendered(&nodes);
+        prune(&mut lines, &nodes);
+        assert_eq!(lines.len(), 1, "indexed help is rendered and can be echo");
+    }
+
+    #[test]
+    fn wave_400b_query_uses_the_aligned_original_after_duplicate_pruning() {
+        let prefix = "x".repeat(1_000);
+        let first = format!("{prefix}first");
+        let second = format!("{prefix}second");
+        let nodes = vec![
+            node("AXButton", Some(0), Some(&first), None, &[]),
+            node("AXStaticText", None, None, Some(&first), &[]),
+            node("AXStaticText", None, None, Some(&second), &[]),
+        ];
+        let mut lines = rendered(&nodes);
+        let line_nodes = prune(&mut lines, &nodes);
+        assert_eq!(lines.len(), 2);
+        assert_eq!(line_nodes, vec![Some(0), Some(2)]);
+        let filtered = filter_tree_with_original_text(&lines, &line_nodes, &nodes, "second");
+        assert!(filtered.contains("AXStaticText"), "{filtered}");
+    }
+
+    #[test]
+    fn wave_400b_query_past_the_cap_finds_indexed_and_display_only_nodes() {
+        let long_text = format!("{}needle", "x".repeat(1_001));
+        let long_title = format!("{}action", "y".repeat(1_001));
+        let nodes = vec![
+            node("AXWindow", Some(0), Some("Root"), None, &[]),
+            node("AXStaticText", None, None, Some(&long_text), &[]),
+            node("AXButton", Some(2), Some(&long_title), None, &[]),
+        ];
+        let lines = rendered(&nodes);
+        let line_nodes = align_line_nodes(&lines, &nodes);
+        let text = filter_tree_with_original_text(&lines, &line_nodes, &nodes, "needle");
+        assert!(text.contains("AXWindow"), "{text}");
+        assert!(text.contains("AXStaticText"), "{text}");
+        let action = filter_tree_with_original_text(&lines, &line_nodes, &nodes, "action");
+        assert!(action.contains("[2] AXButton"), "{action}");
+    }
+
+    #[test]
+    fn wave_400b_alignment_handles_menu_notes_and_summary_lines() {
+        let nodes = vec![
+            node("AXMenuBar", Some(0), Some("Menu"), None, &[]),
+            node("AXStaticText", None, None, Some("Child"), &[]),
+        ];
+        let mut lines = rendered(&nodes);
+        lines[0].1 = format!("{} {COLLAPSED_MENU_NOTE}", lines[0].1);
+        lines.insert(
+            1,
+            (
+                1,
+                "- (offscreen rows: 2; scroll the list, or pass query to search them)".into(),
+            ),
+        );
+        let line_nodes = align_line_nodes(&lines, &nodes);
+        assert_eq!(line_nodes, vec![Some(0), None, Some(1)]);
+        let filtered = filter_tree_with_original_text(&lines, &line_nodes, &nodes, "child");
+        assert!(filtered.contains("AXMenuBar"), "{filtered}");
+        assert!(filtered.contains("AXStaticText"), "{filtered}");
+    }
+
+    #[test]
+    fn wave_400b_alignment_survives_renumbering_a_byte_capped_row() {
+        let custom = format!("Name:{}\nTarget:0x0\nSelector:(null)", "x".repeat(200_000));
+        let mut first = node("AXButton", Some(100), Some("Root"), None, &[]);
+        first.actions = vec![custom];
+        let mut nodes = vec![
+            first,
+            node("AXStaticText", None, None, Some("needle"), &[]),
+            node("AXStaticText", None, None, Some("Root"), &[]),
+        ];
+        let mut lines = rendered(&nodes);
+        lines[0].1 = lines[0].1.replacen("- [100]", "- [2]", 1);
+        nodes[0].element_index = Some(2);
+        assert_ne!(
+            lines[0].1,
+            format_node_line(&nodes[0]),
+            "the fixture must reproduce renumbering across the byte cap"
+        );
+
+        let line_nodes = prune(&mut lines, &nodes);
+        assert_eq!(lines.len(), 2, "the exact echo is still pruned");
+        assert_eq!(line_nodes, vec![Some(0), Some(1)]);
+        let filtered = filter_tree_with_original_text(&lines, &line_nodes, &nodes, "needle");
+        assert!(filtered.contains("AXStaticText"), "{filtered}");
+    }
+
+    #[test]
+    fn wave_400b_node_line_byte_cap_covers_long_and_numerous_actions() {
+        let custom = format!("Name:{}\nTarget:0x0\nSelector:(null)", "가".repeat(200_000));
+        let mut long_action = node("AXButton", Some(0), None, None, &[]);
+        long_action.actions = vec![custom];
+        let line = format_node_line(&long_action);
+        assert!(line.len() <= MAX_NODE_LINE_BYTES + '…'.len_utf8());
+        assert!(line.ends_with('…'));
+        assert!(!line.contains('\n') && !line.contains('\r'));
+
+        let mut many_actions = node("AXButton", Some(0), None, None, &[]);
+        many_actions.actions = (0..20_000).map(|_| "AXPress".to_owned()).collect();
+        let line = format_node_line(&many_actions);
+        assert!(line.len() <= MAX_NODE_LINE_BYTES + '…'.len_utf8());
+        assert!(line.ends_with('…'));
     }
 
     /// DSH-08: each walk keeps its own skip record; a walk nested on the same
@@ -1841,7 +2390,13 @@ mod lean_row_tests {
             (1, "- [3] AXStaticText = \"Docs\""),
             (2, "- [4] AXStaticText = \"child\""),
         ]);
-        prune_echo_text_rows(&mut lines);
+        let nodes = vec![
+            node("AXLink", Some(1), Some("Docs"), None, &[]),
+            node("AXStaticText", Some(2), None, Some("Docs"), &["AXPress"]),
+            node("AXStaticText", Some(3), None, Some("Docs"), &[]),
+            node("AXStaticText", Some(4), None, Some("child"), &[]),
+        ];
+        prune(&mut lines, &nodes);
         assert_eq!(lines.len(), 4);
         assert_eq!(echo_text_of("- AXStaticText = \"x\""), Some("x"));
         assert_eq!(echo_text_of("- [2] AXStaticText = \"\""), None);

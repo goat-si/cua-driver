@@ -1221,9 +1221,14 @@ pub(crate) fn build_elements_array_with_token(
 ) -> Vec<serde_json::Value> {
     nodes
         .iter()
-        .filter_map(|node| {
+        .enumerate()
+        .filter_map(|(index, node)| {
             node.element_index?;
-            Some(element_entry(node, snapshot_id))
+            Some(element_entry(
+                node,
+                snapshot_id,
+                inherited_row_label(nodes, index),
+            ))
         })
         .collect()
 }
@@ -1238,7 +1243,11 @@ pub(crate) fn build_elements_array_with_token(
 pub(crate) fn build_observation_elements_array(
     nodes: &[crate::ax::tree::AXNode],
 ) -> Vec<serde_json::Value> {
-    nodes.iter().map(|node| element_entry(node, None)).collect()
+    nodes
+        .iter()
+        .enumerate()
+        .map(|(index, node)| element_entry(node, None, inherited_row_label(nodes, index)))
+        .collect()
 }
 
 /// Whether `elements` lists every node the walk of the requested window
@@ -1257,7 +1266,53 @@ fn elements_complete(
     exhaustive && scope_matched && !tree.truncated && !tree.nodes_skipped
 }
 
-fn element_entry(node: &crate::ax::tree::AXNode, snapshot_id: Option<u32>) -> serde_json::Value {
+fn inherited_row_label(nodes: &[crate::ax::tree::AXNode], row_index: usize) -> Option<&str> {
+    let row = &nodes[row_index];
+    if !matches!(row.role.as_str(), "AXRow" | "AXCell" | "AXOutlineRow") {
+        return None;
+    }
+    let has_label = [
+        row.title.as_deref(),
+        row.description.as_deref(),
+        row.value.as_deref(),
+        row.identifier.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .any(|text| !text.trim().is_empty());
+    if has_label {
+        return None;
+    }
+
+    for candidate in &nodes[row_index + 1..] {
+        if candidate.depth <= row.depth {
+            break;
+        }
+        if !matches!(candidate.role.as_str(), "AXStaticText" | "AXTextField") {
+            continue;
+        }
+        for text in [
+            candidate.title.as_deref(),
+            candidate.value.as_deref(),
+            candidate.description.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            let text = text.trim();
+            if !text.is_empty() {
+                return Some(text);
+            }
+        }
+    }
+    None
+}
+
+fn element_entry(
+    node: &crate::ax::tree::AXNode,
+    snapshot_id: Option<u32>,
+    inherited_label: Option<&str>,
+) -> serde_json::Value {
     // `label` is a best-effort human-readable string: title first,
     // then description, then value, then identifier. Mirrors what
     // a human reading the markdown row would call this element.
@@ -1266,7 +1321,9 @@ fn element_entry(node: &crate::ax::tree::AXNode, snapshot_id: Option<u32>) -> se
         .clone()
         .or_else(|| node.description.clone())
         .or_else(|| node.value.clone())
-        .or_else(|| node.identifier.clone());
+        .or_else(|| node.identifier.clone())
+        .filter(|label| !label.trim().is_empty())
+        .or_else(|| inherited_label.map(str::to_owned));
     let frame = node
         .frame
         .map(|[x, y, w, h]| serde_json::json!({ "x": x, "y": y, "w": w, "h": h }));
@@ -1290,6 +1347,14 @@ fn element_entry(node: &crate::ax::tree::AXNode, snapshot_id: Option<u32>) -> se
     }
     if let Some(label) = label {
         entry["label"] = serde_json::Value::String(label);
+    }
+    if let Some(identifier) = node
+        .identifier
+        .as_deref()
+        .map(str::trim)
+        .filter(|identifier| !identifier.is_empty())
+    {
+        entry["identifier"] = serde_json::Value::String(identifier.to_owned());
     }
     // Surface the element's AXValue separately from `label`. `label`
     // collapses title→description→value→identifier into one display
@@ -1343,7 +1408,15 @@ fn element_entry(node: &crate::ax::tree::AXNode, snapshot_id: Option<u32>) -> se
         entry["selected"] = serde_json::Value::Bool(selected);
     }
     if !node.actions.is_empty() {
-        entry["actions"] = serde_json::json!(node.actions);
+        let actions: Vec<&str> = node
+            .actions
+            .iter()
+            .map(|action| {
+                crate::input::ax_actions::custom_action_display_name(action)
+                    .unwrap_or(action.as_str())
+            })
+            .collect();
+        entry["actions"] = serde_json::json!(actions);
     }
     if node.in_web_content {
         entry["in_web_content"] = serde_json::Value::Bool(true);
@@ -2182,6 +2255,84 @@ mod tests {
     }
 
     #[test]
+    fn wave_400b_identifier_is_structured_independently_of_label() {
+        let mut button = node(Some(0), "AXButton", Some("OK"), 0, None, None, vec![]);
+        button.identifier = Some("  OKButton  ".into());
+        let entry = &build_elements_array_with_token(&[button], None)[0];
+        assert_eq!(entry["label"], "OK");
+        assert_eq!(entry["identifier"], "OKButton");
+
+        let mut blank = node(Some(1), "AXButton", None, 0, None, None, vec![]);
+        blank.identifier = Some(" \n ".into());
+        let entry = &build_elements_array_with_token(&[blank], None)[0];
+        assert!(entry.get("identifier").is_none());
+        assert!(entry.get("label").is_none());
+    }
+
+    #[test]
+    fn wave_400b_structured_actions_use_custom_display_names() {
+        let button = node(
+            Some(0),
+            "AXButton",
+            Some("Next"),
+            0,
+            None,
+            None,
+            vec![
+                "Name:Move Next\nTarget:0x0\nSelector:(null)".into(),
+                "AXPress".into(),
+            ],
+        );
+        let entry = &build_elements_array_with_token(&[button], None)[0];
+        assert_eq!(entry["actions"], json!(["Move Next", "AXPress"]));
+    }
+
+    #[test]
+    fn wave_400b_rows_inherit_the_first_descendant_text_without_crossing_rows() {
+        let row = node(Some(0), "AXRow", None, 1, None, None, vec![]);
+        let mut text = node(None, "AXStaticText", None, 2, Some(0), None, vec![]);
+        text.value = Some("Sender".into());
+        let next = node(Some(1), "AXRow", Some("Next row"), 1, None, None, vec![]);
+        let nodes = vec![row, text, next];
+
+        let public = build_elements_array_with_token(&nodes, None);
+        assert_eq!(public[0]["label"], "Sender");
+        assert_eq!(public[1]["label"], "Next row");
+
+        let observed = build_observation_elements_array(&nodes);
+        assert_eq!(observed[0]["label"], "Sender");
+        assert_eq!(observed[1]["label"], "Sender");
+        assert_eq!(observed[2]["label"], "Next row");
+    }
+
+    #[test]
+    fn wave_400b_actionless_rows_stay_out_of_the_public_action_array() {
+        let row = node(None, "AXCell", None, 1, None, None, vec![]);
+        let mut text = node(None, "AXTextField", None, 2, None, None, vec![]);
+        text.description = Some("Cell value".into());
+        let nodes = vec![row, text];
+        assert!(build_elements_array_with_token(&nodes, None).is_empty());
+        let observed = build_observation_elements_array(&nodes);
+        assert_eq!(observed[0]["label"], "Cell value");
+    }
+
+    #[test]
+    fn wave_400b_outline_rows_inherit_a_text_field_title() {
+        let row = node(Some(0), "AXOutlineRow", None, 1, None, None, vec![]);
+        let text = node(
+            None,
+            "AXTextField",
+            Some("Outline value"),
+            2,
+            Some(0),
+            None,
+            vec![],
+        );
+        let entry = &build_elements_array_with_token(&[row, text], None)[0];
+        assert_eq!(entry["label"], "Outline value");
+    }
+
+    #[test]
     fn build_elements_array_with_token_emits_actions_when_present() {
         let nodes = vec![node(
             Some(0),
@@ -2206,7 +2357,7 @@ mod tests {
         let mut area = node(Some(0), "AXScrollArea", None, 1, None, None, vec![]);
         area.identifier = Some("editor-scroll".into());
         area.value_state = Some("0.000".into());
-        let entry = element_entry(&area, None);
+        let entry = element_entry(&area, None, None);
         assert_eq!(entry["label"], "editor-scroll");
         assert_eq!(entry["value"], "0.000");
     }
