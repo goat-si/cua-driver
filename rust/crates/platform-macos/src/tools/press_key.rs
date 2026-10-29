@@ -1359,9 +1359,7 @@ fn minimized_key_result(step: MinimizedKeyStep, pid: i32, display_key: &str) -> 
                     0 => key_note.to_owned(),
                     n => format!("{n} focus write(s) were sent to the element; {key_note}"),
                 };
-                result
-                    .content
-                    .push(cua_driver_core::protocol::Content::text(note));
+                append_to_summary(&mut result, &note);
                 // An unconfirmed delivery, not an error: its record is published.
                 result.is_error = None;
                 result = result.with_action_record(
@@ -1379,17 +1377,30 @@ fn minimized_key_result(step: MinimizedKeyStep, pid: i32, display_key: &str) -> 
                     .expect("an unverifiable minimized key record is valid"),
                 );
             }
-            if !notes.is_empty() {
-                result
-                    .content
-                    .push(cua_driver_core::protocol::Content::text(
-                        notes.trim_start().to_owned(),
-                    ));
-            }
+            append_to_summary(&mut result, &notes);
             result
         }
         None => ToolResult::error(format!("press_key: no key was sent.{notes}")),
     }
+}
+
+/// Append to the result's first text block: the published summary is that
+/// block, so a later block would not reach structured-only clients.
+fn append_to_summary(result: &mut ToolResult, extra: &str) {
+    let extra = extra.trim();
+    if extra.is_empty() {
+        return;
+    }
+    for content in result.content.iter_mut() {
+        if let cua_driver_core::protocol::Content::Text { text, .. } = content {
+            text.push(' ');
+            text.push_str(extra);
+            return;
+        }
+    }
+    result
+        .content
+        .push(cua_driver_core::protocol::Content::text(extra.to_owned()));
 }
 
 // ── Window-only native menu chord (key scope + own menu dispatch) ───────────
@@ -2313,9 +2324,10 @@ mod minimized_key_receipt_tests {
             Some(ActionEffect::Unverifiable)
         );
         assert!(structured.get("keys_sent").is_none());
-        assert!(result.content.iter().any(|c| matches!(
-            c,
-            cua_driver_core::protocol::Content::Text { text, .. } if text.contains("may have been sent")
-        )));
+        // In the first text block: the published summary.
+        assert!(matches!(
+            result.content.first(),
+            Some(cua_driver_core::protocol::Content::Text { text, .. }) if text.contains("may have been sent")
+        ));
     }
 }

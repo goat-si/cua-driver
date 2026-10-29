@@ -321,12 +321,11 @@ fn set_value_tool_result(
             let vcl = crate::input::pointer_toolkit::detect(pid)
                 == Some(crate::input::pointer_toolkit::PointerReadingToolkit::Vcl);
             let mut result = not_applied_result(element_index, vcl);
-            if !suffix.trim().is_empty() {
-                result
-                    .content
-                    .push(cua_driver_core::protocol::Content::text(
-                        suffix.trim().to_owned(),
-                    ));
+            // The first text block is the published summary.
+            if let Some(cua_driver_core::protocol::Content::Text { text, .. }) =
+                result.content.first_mut()
+            {
+                text.push_str(&suffix);
             }
             result
         }
@@ -642,9 +641,19 @@ fn attach_restore_cleanup(
         matches!(content, cua_driver_core::protocol::Content::Text { text, .. } if text.contains(&report.describe()))
     });
     if !note.is_empty() && !already {
-        result
-            .content
-            .push(cua_driver_core::protocol::Content::text(note));
+        // The first text block is the published summary.
+        match result.content.iter_mut().find_map(|content| match content {
+            cua_driver_core::protocol::Content::Text { text, .. } => Some(text),
+            _ => None,
+        }) {
+            Some(text) => {
+                text.push(' ');
+                text.push_str(&note);
+            }
+            None => result
+                .content
+                .push(cua_driver_core::protocol::Content::text(note)),
+        }
     }
     match result.structured_content.as_mut() {
         Some(serde_json::Value::Object(fields)) => {
