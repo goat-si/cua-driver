@@ -46,6 +46,26 @@ fn def() -> &'static ToolDef {
     })
 }
 
+fn type_chars_outcome(
+    result: Result<anyhow::Result<()>, tokio::task::JoinError>,
+    text_len: usize,
+    delay_ms: u64,
+) -> ToolResult {
+    match result {
+        Ok(Ok(())) => ToolResult::text(format!(
+            "Typed {text_len} character(s) with {delay_ms}ms delay."
+        ))
+        .with_structured(serde_json::json!({
+            "path": "key_events",
+            "characters": text_len,
+            "verified": false,
+            "effect": "unverifiable"
+        })),
+        Ok(Err(e)) => super::type_text::text_delivery_failure("Type text chars failed", &e),
+        Err(e) => ToolResult::error(format!("Task error: {e}")),
+    }
+}
+
 #[async_trait]
 impl Tool for TypeTextCharsTool {
     fn def(&self) -> &ToolDef {
@@ -127,12 +147,31 @@ impl Tool for TypeTextCharsTool {
         })
         .await;
 
-        match result {
-            Ok(Ok(())) => ToolResult::text(format!(
-                "Typed {text_len} character(s) with {delay_ms}ms delay."
-            )),
-            Ok(Err(e)) => super::type_text::text_delivery_failure("Type text chars failed", &e),
-            Err(e) => ToolResult::error(format!("Task error: {e}")),
-        }
+        type_chars_outcome(result, text_len, delay_ms)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn successful_key_events_include_the_producer_effect_contract() {
+        let result = type_chars_outcome(Ok(Ok(())), 3, 17);
+        let structured = result.structured_content.expect("structured result");
+        assert_eq!(structured["path"], "key_events");
+        assert_eq!(structured["characters"], 3);
+        assert_eq!(structured["verified"], false);
+        assert_eq!(structured["effect"], "unverifiable");
+    }
+
+    #[test]
+    fn delivery_errors_do_not_get_a_success_payload() {
+        let result = type_chars_outcome(Ok(Err(anyhow::anyhow!("boom"))), 3, 17);
+        assert_eq!(result.is_error, Some(true));
+        assert!(result
+            .structured_content
+            .as_ref()
+            .is_none_or(|structured| structured.get("characters").is_none()));
     }
 }

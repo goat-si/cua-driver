@@ -34,10 +34,28 @@ pub(super) struct Combo {
     character: String,
 }
 
+fn canonical_menu_cmd_char(key: &str) -> Option<String> {
+    let mut chars = key.chars();
+    if let (Some(ch), None) = (chars.next(), chars.next()) {
+        if !ch.is_whitespace() && !ch.is_control() {
+            return Some(ch.to_uppercase().collect());
+        }
+    }
+    match key.trim().to_ascii_lowercase().as_str() {
+        "backspace" | "delete" => Some("\u{0008}".to_owned()),
+        "forward_delete" | "forwarddelete" => Some("\u{007f}".to_owned()),
+        "return" | "enter" => Some("\r".to_owned()),
+        "escape" | "esc" => Some("\u{001b}".to_owned()),
+        "up" | "arrowup" => Some("\u{001e}".to_owned()),
+        "down" | "arrowdown" => Some("\u{001f}".to_owned()),
+        "left" | "arrowleft" => Some("\u{001c}".to_owned()),
+        "right" | "arrowright" => Some("\u{001d}".to_owned()),
+        _ => None,
+    }
+}
+
 impl Combo {
-    /// A combo with Command and one printable base key; `None` for anything
-    /// else (no Command, a named key such as `return`), which keeps today's
-    /// key-event route.
+    /// A combo with Command and one printable or named menu-equivalent key.
     pub(super) fn parse(modifiers: &[String], key: &str) -> Option<Self> {
         let mut cmd = false;
         let mut combo = Combo {
@@ -55,14 +73,10 @@ impl Combo {
                 _ => return None,
             }
         }
-        let mut chars = key.chars();
-        let (Some(ch), None) = (chars.next(), chars.next()) else {
-            return None;
-        };
-        if !cmd || ch.is_whitespace() || ch.is_control() {
+        if !cmd {
             return None;
         }
-        combo.character = ch.to_uppercase().collect();
+        combo.character = canonical_menu_cmd_char(key)?;
         Some(combo)
     }
 
@@ -195,14 +209,43 @@ mod tests {
     }
 
     #[test]
-    fn only_command_combos_with_one_printable_key_are_menu_candidates() {
+    fn command_combos_accept_printable_and_named_menu_keys() {
         assert!(combo(&["cmd"], "s").is_some());
         assert!(combo(&["command", "shift"], "S").is_some());
         assert!(combo(&["cmd"], ",").is_some());
         assert_eq!(combo(&["ctrl"], "a"), None);
-        assert_eq!(combo(&["cmd"], "return"), None);
-        assert_eq!(combo(&["cmd"], "up"), None);
+        assert!(combo(&["cmd"], "return").is_some());
+        assert!(combo(&["cmd"], "up").is_some());
         assert_eq!(combo(&["cmd", "hyper"], "s"), None);
+    }
+
+    #[test]
+    fn named_keys_map_to_their_menu_command_characters() {
+        for (key, character) in [
+            ("backspace", "\u{0008}"),
+            ("delete", "\u{0008}"),
+            ("forward_delete", "\u{007f}"),
+            ("forwarddelete", "\u{007f}"),
+            ("return", "\r"),
+            ("enter", "\r"),
+            ("escape", "\u{001b}"),
+            ("esc", "\u{001b}"),
+            ("up", "\u{001e}"),
+            ("arrowup", "\u{001e}"),
+            ("down", "\u{001f}"),
+            ("arrowdown", "\u{001f}"),
+            ("left", "\u{001c}"),
+            ("arrowleft", "\u{001c}"),
+            ("right", "\u{001d}"),
+            ("arrowright", "\u{001d}"),
+        ] {
+            let parsed = combo(&["cmd"], key).unwrap_or_else(|| panic!("{key}"));
+            assert_eq!(parsed.character, character, "{key}");
+            assert!(parsed.matches(character, 0), "{key}");
+            assert!(!parsed.matches(character, MOD_SHIFT), "{key}");
+            assert_eq!(combo(&["ctrl"], key), None, "{key}");
+        }
+        assert_eq!(combo(&["cmd"], "hyper"), None);
     }
 
     #[test]

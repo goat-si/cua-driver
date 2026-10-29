@@ -1259,7 +1259,7 @@ fn evaluate(check: &Check, read: &Read) -> Result<Option<String>, Miss> {
     let present = if by_text_only {
         !rows.is_empty()
     } else {
-        !structured.is_empty() || (check.element.text.is_none() && !rows.is_empty())
+        !structured.is_empty() || !rows.is_empty()
     };
     let window = &read.window;
     if check.gone {
@@ -1311,6 +1311,14 @@ fn evaluate(check: &Check, read: &Read) -> Result<Option<String>, Miss> {
     };
     if let Some(element) = pool.iter().find(|element| fields_hold(check, element)) {
         return Ok(Some(describe_element(element)));
+    }
+    if check.element.nth.is_none() {
+        if let Some(row) = display_rows(read, &element_spec)
+            .iter()
+            .find(|row| fields_hold(check, row))
+        {
+            return Ok(Some(describe_element(row)));
+        }
     }
     let shown = pool
         .iter()
@@ -1470,7 +1478,7 @@ fn row_matches(row: &str, spec: &ElementSpec) -> bool {
             return false;
         }
     }
-    spec.text.is_some() || spec.name.is_some()
+    spec.role.is_some() || spec.text.is_some() || spec.name.is_some()
 }
 
 fn near_misses(read: &Read, spec: &ElementSpec) -> String {
@@ -1961,6 +1969,67 @@ mod tests {
             evaluate(&check, &read).unwrap_err().code,
             "unexpected_state"
         );
+    }
+
+    #[test]
+    fn field_checks_fall_back_to_display_rows() {
+        let mut structured = element(5, "AXStaticText", "Result");
+        structured["value"] = json!("wrong");
+        let read = read(vec![structured], "- AXStaticText \"Result\" = \"702\"");
+        let check = |raw: Value| Check::parse(&raw, 0).unwrap();
+        for raw in [
+            json!({"role":"AXStaticText","name":"Result","value":"702"}),
+            json!({"role":"AXStaticText","name":"Result","value_contains":"70"}),
+            json!({"role":"AXStaticText","name":"Result","enabled":true}),
+            json!({"role":"AXStaticText","name":"Result","selected":false}),
+        ] {
+            assert!(evaluate(&check(raw.clone()), &read).is_ok(), "{raw}");
+        }
+        for raw in [
+            json!({"role":"AXStaticText","name":"Result","value":"703"}),
+            json!({"role":"AXStaticText","name":"Result","enabled":false}),
+            json!({"role":"AXStaticText","name":"Result","selected":true}),
+        ] {
+            assert!(evaluate(&check(raw.clone()), &read).is_err(), "{raw}");
+        }
+        let out_of_range = check(json!({
+            "role":"AXStaticText","name":"Result","value":"702","nth":1
+        }));
+        assert!(evaluate(&out_of_range, &read).is_err());
+    }
+
+    #[test]
+    fn role_only_display_rows_participate_in_presence_and_selected_state() {
+        let read = read(
+            vec![],
+            "- AXStaticText \"Result\" = \"702\"\n- AXCheckBox \"Enabled\" = \"1\"",
+        );
+        let check = |raw: Value| Check::parse(&raw, 0).unwrap();
+        assert!(evaluate(&check(json!({"role":"AXStaticText","value":"702"})), &read).is_ok());
+        assert!(evaluate(&check(json!({"role":"AXStaticText","gone":true})), &read).is_err());
+        assert!(evaluate(&check(json!({"role":"AXCheckBox","selected":true})), &read).is_ok());
+        assert!(evaluate(&check(json!({"role":"AXCheckBox","selected":false})), &read).is_err());
+    }
+
+    #[test]
+    fn role_and_text_display_rows_participate_in_presence_and_fallback() {
+        let read = read(vec![], "- AXStaticText \"Result\" = \"702\"");
+        let check = |raw: Value| Check::parse(&raw, 0).unwrap();
+        assert!(evaluate(
+            &check(json!({"role":"AXStaticText","text":"Result","value":"702"})),
+            &read
+        )
+        .is_ok());
+        assert!(evaluate(
+            &check(json!({"role":"AXStaticText","text":"Result","value":"703"})),
+            &read
+        )
+        .is_err());
+        assert!(evaluate(
+            &check(json!({"role":"AXStaticText","text":"Result","gone":true})),
+            &read
+        )
+        .is_err());
     }
 
     #[test]

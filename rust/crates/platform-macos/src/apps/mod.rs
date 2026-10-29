@@ -141,6 +141,16 @@ fn is_background_bundle(app_path: &str) -> bool {
     })
 }
 
+fn is_background_only_bundle(app_path: &str) -> bool {
+    let path = std::path::Path::new(app_path).join("Contents/Info.plist");
+    read_bundle_plist(&path).is_some_and(|plist| plist_flag(&plist, "LSBackgroundOnly"))
+}
+
+fn is_ui_element_bundle(app_path: &str) -> bool {
+    let path = std::path::Path::new(app_path).join("Contents/Info.plist");
+    read_bundle_plist(&path).is_some_and(|plist| plist_flag(&plist, "LSUIElement"))
+}
+
 /// Where a user-launchable application lives. Mirrors the roots
 /// `scan_installed_apps` walks, so "running" and "installed" agree on what
 /// counts as an app.
@@ -203,6 +213,9 @@ fn running_apps_from_processes(
     app_roots: &[String],
 ) -> Vec<AppInfo> {
     let mut background: std::collections::HashMap<String, bool> = std::collections::HashMap::new();
+    let mut background_only: std::collections::HashMap<String, bool> =
+        std::collections::HashMap::new();
+    let mut ui_elements: std::collections::HashMap<String, bool> = std::collections::HashMap::new();
     let mut meta: std::collections::HashMap<String, Option<AppInfo>> =
         std::collections::HashMap::new();
     // bundle path -> the pids of its live, user-facing processes.
@@ -215,10 +228,20 @@ fn running_apps_from_processes(
             continue; // not an app bundle: a daemon, a CLI, a helper tool
         };
         let app_path = app_path.to_owned();
-        if *background
+        if *background_only
             .entry(app_path.clone())
-            .or_insert_with(|| is_background_bundle(&app_path))
+            .or_insert_with(|| is_background_only_bundle(&app_path))
         {
+            continue;
+        }
+        let is_background = *background
+            .entry(app_path.clone())
+            .or_insert_with(|| is_background_bundle(&app_path));
+        let windowed_ui_element = windowed.contains(pid)
+            && *ui_elements
+                .entry(app_path.clone())
+                .or_insert_with(|| is_ui_element_bundle(&app_path));
+        if is_background && !windowed_ui_element {
             continue;
         }
         meta.entry(app_path.clone()).or_insert_with(|| {
@@ -289,6 +312,36 @@ fn list_running_apps_native() -> Vec<AppInfo> {
 
 /// Live `(pid, active, bundle path)` entries per bundle identifier.
 type RunningAppStates = std::collections::HashMap<String, Vec<(i32, bool, Option<String>)>>;
+
+fn merge_kernel_running_states(
+    running_states: &mut RunningAppStates,
+    processes: &[(i32, String)],
+    front: Option<i32>,
+) {
+    let mut resolved = Vec::new();
+    for (pid, executable) in processes {
+        let Some(app_path) = bundle_root_of_executable(executable) else {
+            continue;
+        };
+        let Some(bundle_id) = bundle_id_for_app_path(app_path).filter(|id| !id.is_empty()) else {
+            continue;
+        };
+        resolved.push((*pid, app_path, bundle_id));
+    }
+    let kernel_pids: std::collections::HashSet<i32> =
+        resolved.iter().map(|(pid, _, _)| *pid).collect();
+    for entries in running_states.values_mut() {
+        entries.retain(|(pid, _, _)| !kernel_pids.contains(pid));
+    }
+    running_states.retain(|_, entries| !entries.is_empty());
+    for (pid, app_path, bundle_id) in resolved.into_iter() {
+        let entries = running_states.entry(bundle_id).or_default();
+        entries.retain(|(other_pid, _, _)| *other_pid != pid);
+        entries.push((pid, front == Some(pid), Some(app_path.to_owned())));
+        entries.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.2.cmp(&b.2)));
+        entries.dedup();
+    }
+}
 
 /// Single walk over `NSWorkspace.runningApplications` producing both views the
 /// app listing needs from ONE snapshot:
@@ -616,7 +669,13 @@ pub fn list_all_apps() -> Vec<AppInfo> {
     // accessories (#3060), kept only for pids the kernel still has, since
     // its cache can go stale in a long-lived daemon.
     let running = list_running_apps();
-    let live: std::collections::HashSet<i32> = all_pids().into_iter().collect();
+    let pids = all_pids();
+    let live: std::collections::HashSet<i32> = pids.iter().copied().collect();
+    let processes: Vec<(i32, String)> = pids
+        .into_iter()
+        .filter_map(|pid| path_of_pid(pid).map(|path| (pid, path)))
+        .collect();
+    let front = frontmost_pid().filter(|pid| live.contains(pid));
     let (_, mut running_states) = enumerate_running_apps();
     if !live.is_empty() {
         for entries in running_states.values_mut() {
@@ -624,6 +683,7 @@ pub fn list_all_apps() -> Vec<AppInfo> {
         }
         running_states.retain(|_, entries| !entries.is_empty());
     }
+    merge_kernel_running_states(&mut running_states, &processes, front);
     let installed = scan_installed_apps();
     merge_app_lists(running, installed, &running_states)
 }
@@ -698,9 +758,13 @@ pub(crate) fn merge_app_lists(
                 .find(|(_, _, live_path)| live_path.as_deref() == Some(installed_path))
         });
         let selected = exact.or_else(|| {
-            (installed_bundle_counts.get(bundle_id) == Some(&1))
-                .then(|| candidates.last())
-                .flatten()
+            let live_paths_unknown = candidates
+                .iter()
+                .all(|(_, _, live_path)| live_path.is_none());
+            ((app.launch_path.is_none() || live_paths_unknown)
+                && installed_bundle_counts.get(bundle_id) == Some(&1))
+            .then(|| candidates.last())
+            .flatten()
         });
         if let Some(&(pid, active, _)) = selected {
             app.running = true;
@@ -709,14 +773,15 @@ pub(crate) fn merge_app_lists(
         }
     }
 
-    let running_bundles: std::collections::HashSet<String> =
-        running.iter().filter_map(|a| a.bundle_id.clone()).collect();
-
     // Remove apps already in running list.
     installed.retain(|a| {
-        !a.bundle_id
-            .as_ref()
-            .is_some_and(|b| running_bundles.contains(b))
+        !running.iter().any(|running_app| {
+            running_app.bundle_id == a.bundle_id
+                && match (&a.launch_path, &running_app.launch_path) {
+                    (Some(installed_path), Some(running_path)) => installed_path == running_path,
+                    _ => true,
+                }
+        })
     });
 
     running.extend(installed);
@@ -1078,8 +1143,8 @@ mod plist_tests {
 #[cfg(test)]
 mod tests {
     use super::{
-        all_pids, bundle_root_of_executable, merge_app_lists, path_of_pid,
-        running_apps_from_processes, AppInfo,
+        all_pids, bundle_root_of_executable, merge_app_lists, merge_kernel_running_states,
+        path_of_pid, running_apps_from_processes, AppInfo,
     };
     use std::collections::HashSet;
 
@@ -1378,6 +1443,143 @@ mod tests {
         );
         let apps = running_apps_from_processes(&processes, None, &HashSet::from([12]), &elsewhere);
         assert_eq!(pid_of(&apps, "CuaService"), Some(12));
+    }
+
+    #[test]
+    fn windowed_ui_elements_are_listed_but_background_only_bundles_stay_excluded() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let agent = synthetic_bundle(
+            temp.path(),
+            "CuaWindowedAgent",
+            "<key>LSUIElement</key><true/>",
+        );
+        let background = synthetic_bundle(
+            temp.path(),
+            "CuaWindowedBackground",
+            "<key>LSBackgroundOnly</key><true/>",
+        );
+        let dual = synthetic_bundle(
+            temp.path(),
+            "CuaDualBackground",
+            "<key>LSUIElement</key><true/><key>LSBackgroundOnly</key><true/>",
+        );
+        let processes = [(10, agent), (11, background), (12, dual)];
+        let roots = [format!("{}/", temp.path().display())];
+        let windowed = HashSet::from([10, 11, 12]);
+        let apps = running_apps_from_processes(&processes, None, &windowed, &roots);
+        assert_eq!(pid_of(&apps, "CuaWindowedAgent"), Some(10));
+        assert_eq!(pid_of(&apps, "CuaWindowedBackground"), None);
+        assert_eq!(pid_of(&apps, "CuaDualBackground"), None);
+    }
+
+    #[test]
+    fn kernel_processes_supply_live_accessory_running_state() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let executable =
+            synthetic_bundle(temp.path(), "CuaLiveAgent", "<key>LSUIElement</key><true/>");
+        let app_path = bundle_root_of_executable(&executable)
+            .expect("bundle path")
+            .to_owned();
+        let bundle_id = "com.trycua.test.CuaLiveAgent";
+        let mut running_states =
+            states(&[(bundle_id, 31438, false, Some("/ stale /CuaLiveAgent.app"))]);
+        merge_kernel_running_states(&mut running_states, &[(31438, executable)], Some(31438));
+        let entries = running_states.get(bundle_id).expect("kernel entry");
+        assert_eq!(
+            entries,
+            &vec![(31438, true, Some(app_path.clone()))],
+            "kernel truth must replace the same-pid AppKit entry"
+        );
+
+        let mut installed = app("CuaLiveAgent", 0, Some(bundle_id), false);
+        installed.launch_path = Some(app_path);
+        let merged = merge_app_lists(vec![], vec![installed], &running_states);
+        assert!(merged[0].running);
+        assert_eq!(merged[0].pid, 31438);
+        assert!(merged[0].active);
+    }
+
+    #[test]
+    fn known_bundle_paths_do_not_cross_upgrade_or_remove_other_installs() {
+        let bundle_id = "com.trycua.test.CuaLiveAgent";
+        let mut release = app("CuaLiveAgent", 0, Some(bundle_id), false);
+        release.launch_path = Some("/Applications/CuaLiveAgent.app".to_owned());
+        let running_states =
+            states(&[(bundle_id, 42, false, Some("/Users/test/CuaLiveAgent.app"))]);
+        let merged = merge_app_lists(vec![], vec![release.clone()], &running_states);
+        assert!(
+            !merged[0].running,
+            "a different known path must not upgrade"
+        );
+
+        let mut running_copy = app("CuaLiveAgent", 42, Some(bundle_id), true);
+        running_copy.launch_path = Some("/Applications/CuaLiveAgent.app".to_owned());
+        let mut other_install = release;
+        other_install.launch_path = Some("/Users/test/CuaLiveAgent.app".to_owned());
+        let merged = merge_app_lists(vec![running_copy], vec![other_install], &states(&[]));
+        assert_eq!(merged.len(), 2, "a different installed copy must survive");
+    }
+
+    #[test]
+    fn unknown_live_paths_keep_the_bundle_id_fallback() {
+        let bundle_id = "com.trycua.test.CuaLiveAgent";
+        let mut installed = app("CuaLiveAgent", 0, Some(bundle_id), false);
+        installed.launch_path = Some("/Applications/CuaLiveAgent.app".to_owned());
+        let merged = merge_app_lists(
+            vec![],
+            vec![installed],
+            &states(&[(bundle_id, 42, false, None)]),
+        );
+        assert!(merged[0].running);
+        assert_eq!(merged[0].pid, 42);
+    }
+
+    #[test]
+    fn kernel_pid_reuse_removes_stale_state_from_every_bundle() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let old_executable =
+            synthetic_bundle(temp.path(), "CuaOldAgent", "<key>LSUIElement</key><true/>");
+        let new_executable =
+            synthetic_bundle(temp.path(), "CuaNewAgent", "<key>LSUIElement</key><true/>");
+        let old_path = bundle_root_of_executable(&old_executable).unwrap();
+        let new_path = bundle_root_of_executable(&new_executable)
+            .unwrap()
+            .to_owned();
+        let old_bundle = "com.trycua.test.CuaOldAgent";
+        let new_bundle = "com.trycua.test.CuaNewAgent";
+        let mut running_states = states(&[(old_bundle, 42, false, Some(old_path))]);
+        merge_kernel_running_states(&mut running_states, &[(42, new_executable)], None);
+        assert!(!running_states.contains_key(old_bundle));
+        assert_eq!(
+            running_states.get(new_bundle),
+            Some(&vec![(42, false, Some(new_path))])
+        );
+    }
+
+    #[test]
+    fn unidentified_kernel_processes_preserve_appkit_state() {
+        let bundle_id = "com.trycua.test.CuaLiveAgent";
+        let mut running_states = states(&[(bundle_id, 42, false, None)]);
+        merge_kernel_running_states(&mut running_states, &[(42, "/usr/bin/ssh".into())], None);
+        assert_eq!(
+            running_states.get(bundle_id),
+            Some(&vec![(42, false, None)])
+        );
+
+        let temp = tempfile::tempdir().expect("temp dir");
+        let macos = temp.path().join("NoId.app/Contents/MacOS");
+        std::fs::create_dir_all(&macos).unwrap();
+        std::fs::write(
+            temp.path().join("NoId.app/Contents/Info.plist"),
+            "<plist><dict></dict></plist>",
+        )
+        .unwrap();
+        let executable = macos.join("NoId").to_string_lossy().into_owned();
+        merge_kernel_running_states(&mut running_states, &[(42, executable)], None);
+        assert_eq!(
+            running_states.get(bundle_id),
+            Some(&vec![(42, false, None)])
+        );
     }
 
     /// The process-table readers see this very process at its own path. This
