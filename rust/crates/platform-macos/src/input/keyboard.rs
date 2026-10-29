@@ -278,12 +278,20 @@ pub fn run_pasteboard_transaction<B: PasteboardBackend>(
     let written_count = backend.write_items(&[transient_item])?;
 
     if let Err(err) = trigger_paste() {
-        let clipboard_restored = backend.change_count() != written_count
-            || restore_pasteboard_snapshot(backend, &snapshot).is_ok();
-        // changeCount differing means another writer changed the clipboard:
-        // restoration was SKIPPED, not "restored". Distinguish that from a
-        // successful restore and from a failed one.
+        // ONE ownership check, then at most ONE restore attempt: a
+        // successful restore changes the count, and a failed one is not
+        // retried.
         let concurrent_change = backend.change_count() != written_count;
+        let restored_once =
+            !concurrent_change && restore_pasteboard_snapshot(backend, &snapshot).is_ok();
+        let outcome = if concurrent_change {
+            PasteRestoration::SkippedConcurrentChange
+        } else if restored_once {
+            PasteRestoration::Restored
+        } else {
+            PasteRestoration::Failed
+        };
+        let clipboard_restored = restored_once;
         if let Some(abort) = err.downcast_ref::<PasteSequenceAbort>() {
             // A pre-dispatch abort keeps its typed reason AND the
             // restoration outcome instead of becoming PasteMayHaveLanded.
@@ -293,14 +301,7 @@ pub fn run_pasteboard_transaction<B: PasteboardBackend>(
             return Err(PasteSequenceAbort {
                 posted: abort.posted,
                 reason: abort.reason.clone(),
-                clipboard_restored: if concurrent_change {
-                    PasteRestoration::SkippedConcurrentChange
-                } else {
-                    match restore_pasteboard_snapshot(backend, &snapshot) {
-                        Ok(()) => PasteRestoration::Restored,
-                        Err(_) => PasteRestoration::Failed,
-                    }
-                },
+                clipboard_restored: outcome,
             }
             .into());
         }
