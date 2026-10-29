@@ -14,7 +14,9 @@ fn def() -> &'static ToolDef {
         name: "list_windows".into(),
         description: "List top-level windows known to WindowServer, including off-screen ones (minimized, other Space, hidden): layer-0 only without `pid`, every layer with `pid`. Use it to find a `pid` and `window_id` for get_window_state; filter with `app` or `pid`, because an unfiltered call lists every window on the host. AppKit-internal helper windows and the driver's own overlay are omitted.\n\
             \n\
-            Per record: window_id, pid, app_name, title, bounds, layer, z_index, is_on_screen, space_ids, current_space_id, on_current_space. For the frontmost window take the maximum integer z_index; null means stacking is unavailable, so do not infer it from array order.".into(),
+            Per record: window_id, pid, app_name, title, bounds, layer, z_index, is_on_screen, space_ids, current_space_id, on_current_space. For the frontmost window take the maximum integer z_index; null means stacking is unavailable, so do not infer it from array order.\n\
+            \n\
+            To confirm a window closed, call with its `pid`: when enumeration_complete is true, authoritative_window_ids lists every window id WindowServer still has for that pid, hidden and helper windows included, and a window_id missing from it no longer exists. When enumeration_complete is false, a missing window proves nothing.".into(),
         input_schema: serde_json::json!({
             "type": "object",
             "properties": {
@@ -48,7 +50,10 @@ impl Tool for ListWindowsTool {
 
     async fn invoke(&self, args: Value) -> ToolResult {
         use cua_driver_core::tool_args::ArgsExt;
-        let pid_filter: Option<i32> = args.opt_i64("pid").map(|v| v as i32);
+        let pid_filter = match parse_pid_filter(&args) {
+            Ok(pid) => pid,
+            Err(message) => return ToolResult::error(message),
+        };
         let on_screen_only = args.bool_or("on_screen_only", false);
 
         let enumeration = match pid_filter {
@@ -57,6 +62,12 @@ impl Tool for ListWindowsTool {
             None => crate::windows::all_windows_with_space_snapshot(),
         };
         let current_space_id = enumeration.current_space_id;
+        // Read the pid's full window-id set before any filtering below, so a
+        // caller can tell a closed window from one this listing leaves out.
+        let (enumeration_complete, authoritative_window_ids) = closure_fields(
+            enumeration.complete,
+            pid_filter.map(crate::windows::pid_window_id_snapshot),
+        );
         let mut windows = enumeration.windows;
 
         // The driver's own windows (the agent cursor overlay) are not targets.
@@ -77,13 +88,62 @@ impl Tool for ListWindowsTool {
         }
         crate::windows::retain_ax_reachable(&mut windows, current_space_id);
 
-        let windows_json: Vec<Value> = windows.iter().map(window_record_json).collect();
-
-        ToolResult::text(format_window_list(&windows)).with_structured(serde_json::json!({
-            "windows": windows_json,
-            "current_space_id": current_space_id
-        }))
+        ToolResult::text(format_window_list(&windows)).with_structured(list_windows_structured(
+            &windows,
+            current_space_id,
+            enumeration_complete,
+            authoritative_window_ids,
+        ))
     }
+}
+
+/// The optional pid filter: absent or null lists every app; anything else must
+/// be a positive pid that fits macOS's pid_t, never a wrapped or unscoped query.
+fn parse_pid_filter(args: &Value) -> Result<Option<i32>, String> {
+    match args.get("pid") {
+        None | Some(Value::Null) => Ok(None),
+        Some(value) => value
+            .as_i64()
+            .and_then(|pid| i32::try_from(pid).ok())
+            .filter(|pid| *pid > 0)
+            .map(Some)
+            .ok_or_else(|| {
+                "pid must be a positive process ID no greater than 2147483647".to_owned()
+            }),
+    }
+}
+
+/// enumeration_complete and, with a pid, the authoritative id set. Both
+/// snapshots must be complete; an incomplete one publishes no id set, so a
+/// caller never reads an unreadable window as a closed one.
+fn closure_fields(
+    listing_complete: bool,
+    identity: Option<crate::windows::WindowIdSnapshot>,
+) -> (bool, Option<Vec<u32>>) {
+    match identity {
+        None => (listing_complete, None),
+        Some(identity) if listing_complete && identity.complete => {
+            (true, Some(identity.window_ids))
+        }
+        Some(_) => (false, None),
+    }
+}
+
+fn list_windows_structured(
+    windows: &[crate::windows::WindowInfo],
+    current_space_id: Option<u64>,
+    enumeration_complete: bool,
+    authoritative_window_ids: Option<Vec<u32>>,
+) -> Value {
+    let mut structured = serde_json::json!({
+        "windows": windows.iter().map(window_record_json).collect::<Vec<_>>(),
+        "current_space_id": current_space_id,
+        "enumeration_complete": enumeration_complete,
+    });
+    if let Some(ids) = authoritative_window_ids {
+        structured["authoritative_window_ids"] = serde_json::json!(ids);
+    }
+    structured
 }
 
 fn format_window_list(windows: &[crate::windows::WindowInfo]) -> String {
@@ -190,6 +250,139 @@ mod tests {
     #[test]
     fn empty_list_keeps_the_count_only_header() {
         assert_eq!(format_window_list(&[]), "Found 0 window(s).");
+    }
+
+    #[test]
+    fn pid_filter_accepts_only_a_positive_i32_pid() {
+        assert_eq!(parse_pid_filter(&serde_json::json!({})), Ok(None));
+        assert_eq!(
+            parse_pid_filter(&serde_json::json!({"pid": null})),
+            Ok(None)
+        );
+        assert_eq!(
+            parse_pid_filter(&serde_json::json!({"pid": 42})),
+            Ok(Some(42))
+        );
+        assert_eq!(
+            parse_pid_filter(&serde_json::json!({"pid": i32::MAX})),
+            Ok(Some(i32::MAX))
+        );
+        for pid in [
+            serde_json::json!(0),
+            serde_json::json!(-1),
+            serde_json::json!(3_000_000_000_u64),
+            serde_json::json!(u64::MAX),
+            serde_json::json!("7"),
+            serde_json::json!(1.5),
+            serde_json::json!(true),
+        ] {
+            assert!(
+                parse_pid_filter(&serde_json::json!({ "pid": pid.clone() })).is_err(),
+                "{pid} must not become an unscoped or wrapped query"
+            );
+        }
+    }
+
+    /// Live WindowServer check of the real adapter, run by hand:
+    /// cargo test -p platform-macos --lib live_listing -- --ignored
+    #[tokio::test]
+    #[ignore = "reads the live WindowServer of the current user session"]
+    async fn live_listing_is_covered_by_the_authoritative_ids() {
+        let mut pids: Vec<i32> = crate::windows::all_windows_any_layer()
+            .iter()
+            .map(|window| window.pid)
+            .filter(|pid| *pid > 0)
+            .collect();
+        pids.sort_unstable();
+        pids.dedup();
+        assert!(
+            !pids.is_empty(),
+            "the session has at least one window to observe"
+        );
+        for pid in pids {
+            assert_listing_is_covered(pid).await;
+        }
+    }
+
+    async fn assert_listing_is_covered(pid: i32) {
+        let result = ListWindowsTool
+            .invoke(serde_json::json!({ "pid": pid }))
+            .await;
+        let structured = result.structured_content.expect("structured listing");
+        assert_eq!(structured["enumeration_complete"], true, "{structured}");
+        let ids: Vec<u64> = structured["authoritative_window_ids"]
+            .as_array()
+            .expect("ids with pid and a complete enumeration")
+            .iter()
+            .map(|id| id.as_u64().expect("integer id"))
+            .collect();
+        assert!(ids.windows(2).all(|pair| pair[0] < pair[1]), "{ids:?}");
+        for window in structured["windows"].as_array().expect("windows") {
+            let id = window["window_id"].as_u64().expect("window_id");
+            assert!(ids.contains(&id), "listed window {id} missing from {ids:?}");
+        }
+        eprintln!(
+            "pid {pid}: {} listed, {} authoritative ids",
+            structured["windows"].as_array().map_or(0, Vec::len),
+            ids.len()
+        );
+        assert!(cua_driver_contract::validate_success_output("list_windows", structured).unwrap());
+    }
+
+    #[tokio::test]
+    async fn an_out_of_range_pid_is_refused_before_enumeration() {
+        let result = ListWindowsTool
+            .invoke(serde_json::json!({"pid": 3_000_000_000_u64}))
+            .await;
+        assert_eq!(result.is_error, Some(true));
+    }
+
+    #[test]
+    fn closure_ids_need_a_complete_listing_and_a_complete_identity_snapshot() {
+        let snapshot = |complete: bool, window_ids: Vec<u32>| crate::windows::WindowIdSnapshot {
+            complete,
+            window_ids,
+        };
+        assert_eq!(closure_fields(true, None), (true, None));
+        assert_eq!(closure_fields(false, None), (false, None));
+        assert_eq!(
+            closure_fields(true, Some(snapshot(true, vec![41, 42]))),
+            (true, Some(vec![41, 42]))
+        );
+        assert_eq!(
+            closure_fields(true, Some(snapshot(true, vec![]))),
+            (true, Some(vec![]))
+        );
+        assert_eq!(
+            closure_fields(false, Some(snapshot(true, vec![41]))),
+            (false, None)
+        );
+        assert_eq!(
+            closure_fields(true, Some(snapshot(false, vec![]))),
+            (false, None)
+        );
+    }
+
+    #[test]
+    fn authoritative_ids_cover_windows_the_listing_filters_out() {
+        // The listing kept one window after own-pid, app, on_screen_only and
+        // AX-helper filtering; the identity snapshot still names the overlay,
+        // the helper, the off-screen and the non-zero-layer windows.
+        let listed = [window(42, 7, "Example", "Document", true)];
+        let structured =
+            list_windows_structured(&listed, Some(1), true, Some(vec![42, 77, 78, 79]));
+        assert_eq!(structured["enumeration_complete"], true);
+        assert_eq!(
+            structured["authoritative_window_ids"],
+            serde_json::json!([42, 77, 78, 79])
+        );
+        assert_eq!(structured["windows"].as_array().map(Vec::len), Some(1));
+        assert!(cua_driver_contract::validate_success_output("list_windows", structured).unwrap());
+
+        let unscoped = list_windows_structured(&listed, None, false, None);
+        assert_eq!(unscoped["enumeration_complete"], false);
+        assert!(unscoped.get("authoritative_window_ids").is_none());
+        assert!(cua_driver_contract::validate_success_output("list_windows", unscoped).unwrap());
     }
 
     #[test]

@@ -239,6 +239,40 @@
               "null"
             ]
           },
+          "hit": {
+            "additionalProperties": false,
+            "properties": {
+              "identifier": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "index": {
+                "minimum": 0,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "label": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "role": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              }
+            },
+            "type": [
+              "object",
+              "null"
+            ]
+          },
           "menu_items": {
             "items": {
               "type": "string"
@@ -267,6 +301,31 @@
             "required": [
               "tool",
               "arguments"
+            ],
+            "type": [
+              "object",
+              "null"
+            ]
+          },
+          "point": {
+            "additionalProperties": false,
+            "properties": {
+              "coordinate_space": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "x": {
+                "type": "number"
+              },
+              "y": {
+                "type": "number"
+              }
+            },
+            "required": [
+              "x",
+              "y"
             ],
             "type": [
               "object",
@@ -738,6 +797,40 @@
               "null"
             ]
           },
+          "hit": {
+            "additionalProperties": false,
+            "properties": {
+              "identifier": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "index": {
+                "minimum": 0,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "label": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "role": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              }
+            },
+            "type": [
+              "object",
+              "null"
+            ]
+          },
           "menu_items": {
             "items": {
               "type": "string"
@@ -766,6 +859,31 @@
             "required": [
               "tool",
               "arguments"
+            ],
+            "type": [
+              "object",
+              "null"
+            ]
+          },
+          "point": {
+            "additionalProperties": false,
+            "properties": {
+              "coordinate_space": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "x": {
+                "type": "number"
+              },
+              "y": {
+                "type": "number"
+              }
+            },
+            "required": [
+              "x",
+              "y"
             ],
             "type": [
               "object",
@@ -2362,6 +2480,40 @@
               "null"
             ]
           },
+          "hit": {
+            "additionalProperties": false,
+            "properties": {
+              "identifier": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "index": {
+                "minimum": 0,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "label": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "role": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              }
+            },
+            "type": [
+              "object",
+              "null"
+            ]
+          },
           "menu_items": {
             "items": {
               "type": "string"
@@ -2390,6 +2542,31 @@
             "required": [
               "tool",
               "arguments"
+            ],
+            "type": [
+              "object",
+              "null"
+            ]
+          },
+          "point": {
+            "additionalProperties": false,
+            "properties": {
+              "coordinate_space": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "x": {
+                "type": "number"
+              },
+              "y": {
+                "type": "number"
+              }
+            },
+            "required": [
+              "x",
+              "y"
             ],
             "type": [
               "object",
@@ -2651,6 +2828,40 @@
               "null"
             ]
           },
+          "hit": {
+            "additionalProperties": false,
+            "properties": {
+              "identifier": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "index": {
+                "minimum": 0,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "label": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "role": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              }
+            },
+            "type": [
+              "object",
+              "null"
+            ]
+          },
           "menu_items": {
             "items": {
               "type": "string"
@@ -2679,6 +2890,31 @@
             "required": [
               "tool",
               "arguments"
+            ],
+            "type": [
+              "object",
+              "null"
+            ]
+          },
+          "point": {
+            "additionalProperties": false,
+            "properties": {
+              "coordinate_space": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "x": {
+                "type": "number"
+              },
+              "y": {
+                "type": "number"
+              }
+            },
+            "required": [
+              "x",
+              "y"
             ],
             "type": [
               "object",
@@ -3010,12 +3246,24 @@
       "success_output_schema": {
         "additionalProperties": true,
         "properties": {
+          "authoritative_window_ids": {
+            "description": "Present only with pid and enumeration_complete true: every window id WindowServer reported for that pid at snapshot time, on every layer and Space, on or off screen, before the listing dropped helper windows, the driver's overlay and app-filtered windows. Ascending. An id seen earlier for this pid and absent here was no longer a WindowServer window of that pid at snapshot time; pair it with process identity and timing, because the process may have exited.",
+            "items": {
+              "minimum": 1,
+              "type": "integer"
+            },
+            "type": "array"
+          },
           "current_space_id": {
             "minimum": 0,
             "type": [
               "integer",
               "null"
             ]
+          },
+          "enumeration_complete": {
+            "description": "True when the window listing, and with pid the identity snapshot below, were read from the current user session's WindowServer in full. False means a missing window may only be unreadable, so its absence proves nothing.",
+            "type": "boolean"
           },
           "windows": {
             "items": {
@@ -3339,6 +3587,40 @@
               "null"
             ]
           },
+          "hit": {
+            "additionalProperties": false,
+            "properties": {
+              "identifier": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "index": {
+                "minimum": 0,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "label": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "role": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              }
+            },
+            "type": [
+              "object",
+              "null"
+            ]
+          },
           "menu_items": {
             "items": {
               "type": "string"
@@ -3367,6 +3649,31 @@
             "required": [
               "tool",
               "arguments"
+            ],
+            "type": [
+              "object",
+              "null"
+            ]
+          },
+          "point": {
+            "additionalProperties": false,
+            "properties": {
+              "coordinate_space": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "x": {
+                "type": "number"
+              },
+              "y": {
+                "type": "number"
+              }
+            },
+            "required": [
+              "x",
+              "y"
             ],
             "type": [
               "object",
@@ -4140,6 +4447,40 @@
               "null"
             ]
           },
+          "hit": {
+            "additionalProperties": false,
+            "properties": {
+              "identifier": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "index": {
+                "minimum": 0,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "label": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "role": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              }
+            },
+            "type": [
+              "object",
+              "null"
+            ]
+          },
           "menu_items": {
             "items": {
               "type": "string"
@@ -4168,6 +4509,31 @@
             "required": [
               "tool",
               "arguments"
+            ],
+            "type": [
+              "object",
+              "null"
+            ]
+          },
+          "point": {
+            "additionalProperties": false,
+            "properties": {
+              "coordinate_space": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "x": {
+                "type": "number"
+              },
+              "y": {
+                "type": "number"
+              }
+            },
+            "required": [
+              "x",
+              "y"
             ],
             "type": [
               "object",
@@ -4473,6 +4839,40 @@
               "null"
             ]
           },
+          "hit": {
+            "additionalProperties": false,
+            "properties": {
+              "identifier": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "index": {
+                "minimum": 0,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "label": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "role": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              }
+            },
+            "type": [
+              "object",
+              "null"
+            ]
+          },
           "menu_items": {
             "items": {
               "type": "string"
@@ -4501,6 +4901,31 @@
             "required": [
               "tool",
               "arguments"
+            ],
+            "type": [
+              "object",
+              "null"
+            ]
+          },
+          "point": {
+            "additionalProperties": false,
+            "properties": {
+              "coordinate_space": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "x": {
+                "type": "number"
+              },
+              "y": {
+                "type": "number"
+              }
+            },
+            "required": [
+              "x",
+              "y"
             ],
             "type": [
               "object",
@@ -5179,6 +5604,40 @@
               "null"
             ]
           },
+          "hit": {
+            "additionalProperties": false,
+            "properties": {
+              "identifier": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "index": {
+                "minimum": 0,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "label": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "role": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              }
+            },
+            "type": [
+              "object",
+              "null"
+            ]
+          },
           "menu_items": {
             "items": {
               "type": "string"
@@ -5207,6 +5666,31 @@
             "required": [
               "tool",
               "arguments"
+            ],
+            "type": [
+              "object",
+              "null"
+            ]
+          },
+          "point": {
+            "additionalProperties": false,
+            "properties": {
+              "coordinate_space": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "x": {
+                "type": "number"
+              },
+              "y": {
+                "type": "number"
+              }
+            },
+            "required": [
+              "x",
+              "y"
             ],
             "type": [
               "object",
@@ -5883,6 +6367,40 @@
               "null"
             ]
           },
+          "hit": {
+            "additionalProperties": false,
+            "properties": {
+              "identifier": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "index": {
+                "minimum": 0,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "label": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "role": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              }
+            },
+            "type": [
+              "object",
+              "null"
+            ]
+          },
           "menu_items": {
             "items": {
               "type": "string"
@@ -5911,6 +6429,31 @@
             "required": [
               "tool",
               "arguments"
+            ],
+            "type": [
+              "object",
+              "null"
+            ]
+          },
+          "point": {
+            "additionalProperties": false,
+            "properties": {
+              "coordinate_space": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "x": {
+                "type": "number"
+              },
+              "y": {
+                "type": "number"
+              }
+            },
+            "required": [
+              "x",
+              "y"
             ],
             "type": [
               "object",
