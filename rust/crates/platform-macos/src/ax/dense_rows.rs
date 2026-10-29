@@ -12,7 +12,7 @@ use std::collections::HashMap;
 
 thread_local! {
     static ROWS_WINDOWED: Cell<bool> = const { Cell::new(false) };
-    static VISIBLE_CLIP: Cell<Option<[f64; 4]>> = const { Cell::new(None) };
+    static VISIBLE_CLIP: Cell<ClipSource> = const { Cell::new(ClipSource::Unset) };
 }
 
 /// A container with at least this many children is windowed like a dense
@@ -33,26 +33,54 @@ pub(crate) fn windows_children(
         && (DENSE_COLLECTION_ROLES.contains(&role) || child_count >= MANY_CHILDREN)
 }
 
-/// Scope the screen rectangle (x, y, width, height) of the top-level surface
-/// being walked: a child wholly outside it is offscreen when the app does not
-/// list its visible children.
-pub(crate) fn with_visible_clip<T>(clip: Option<[f64; 4]>, walk: impl FnOnce() -> T) -> T {
-    struct Restore(Option<[f64; 4]>);
+/// Where the frame of the top-level surface being walked comes from. It is
+/// read only when a container first needs it.
+#[derive(Clone, Copy)]
+enum ClipSource {
+    Unset,
+    Surface(usize),
+    Known(Option<[f64; 4]>),
+}
+
+/// Scope the top-level surface being walked: a child wholly outside its frame
+/// is offscreen when the app does not list its visible children. The frame is
+/// read on first use, so a surface without a large container pays nothing.
+pub(crate) fn with_visible_clip<T>(surface: Option<usize>, walk: impl FnOnce() -> T) -> T {
+    struct Restore(ClipSource);
     impl Drop for Restore {
         fn drop(&mut self) {
             VISIBLE_CLIP.with(|cell| cell.set(self.0));
         }
     }
-    let _restore = Restore(VISIBLE_CLIP.with(|cell| cell.replace(clip)));
+    let source = surface.map_or(ClipSource::Unset, ClipSource::Surface);
+    let _restore = Restore(VISIBLE_CLIP.with(|cell| cell.replace(source)));
     walk()
 }
 
-/// Whether a child at `rect` can be on screen inside `clip`. Unknown geometry
-/// counts as visible, so it is walked rather than dropped.
+/// The walked surface's frame, read once per surface.
+unsafe fn visible_clip() -> Option<[f64; 4]> {
+    match VISIBLE_CLIP.with(Cell::get) {
+        ClipSource::Unset => None,
+        ClipSource::Known(clip) => clip,
+        ClipSource::Surface(element) => {
+            let element = element as AXUIElementRef;
+            set_messaging_timeout(element);
+            let clip = element_screen_rect(element);
+            VISIBLE_CLIP.with(|cell| cell.set(ClipSource::Known(clip)));
+            clip
+        }
+    }
+}
+
+/// Whether a child at `rect` can be on screen inside `clip`. Unknown or
+/// non-finite geometry counts as visible, so it is walked rather than dropped.
 pub(crate) fn rect_visible(rect: Option<[f64; 4]>, clip: Option<[f64; 4]>) -> bool {
     let (Some([x, y, w, h]), Some([cx, cy, cw, ch])) = (rect, clip) else {
         return true;
     };
+    if ![x, y, w, h, cx, cy, cw, ch].iter().all(|v| v.is_finite()) {
+        return true;
+    }
     x < cx + cw && cx < x + w && y < cy + ch && cy < y + h
 }
 
@@ -168,12 +196,15 @@ pub(crate) unsafe fn plan_collection_children(
     };
     // Without a visible-children list (absent or empty), each child's frame
     // against the walked surface decides.
-    let clip = VISIBLE_CLIP.with(Cell::get);
+    let clip = std::cell::OnceCell::new();
     let is_visible = |i: usize| match &visible {
         Some(set) => set.contains(children[i]),
         None => {
             set_messaging_timeout(children[i]);
-            rect_visible(element_screen_rect(children[i]), clip)
+            rect_visible(
+                element_screen_rect(children[i]),
+                *clip.get_or_init(|| visible_clip()),
+            )
         }
     };
     plan_children(
@@ -193,7 +224,9 @@ pub(crate) unsafe fn plan_collection_children(
                     && !matches!(child_role.as_str(), "AXScrollBar" | "AXColumn" | "AXHeader"))
         },
         Some(&is_visible as &dyn Fn(usize) -> bool),
-        || rows.is_none() && budget.expired(),
+        // Classification that asks the app (a role, or a frame when no
+        // visible-row list answers) stops at the walk's deadline.
+        || (rows.is_none() || visible.is_none()) && budget.expired(),
     )
 }
 
@@ -655,6 +688,18 @@ mod tests {
             rect_visible(Some([900.0, 900.0, 1.0, 1.0]), None),
             "no clip: walked"
         );
+        assert!(
+            rect_visible(Some([900.0, 900.0, f64::NAN, 1.0]), clip),
+            "NaN size: walked"
+        );
+        assert!(
+            rect_visible(Some([f64::INFINITY, 0.0, 1.0, 1.0]), clip),
+            "infinite: walked"
+        );
+        assert!(rect_visible(
+            Some([10.0, 10.0, 5.0, 5.0]),
+            Some([0.0, 0.0, f64::NAN, 1.0])
+        ));
     }
 
     #[test]

@@ -589,16 +589,12 @@ fn walk_tree_with_web_content(
             break (top_level, walk);
         };
 
-        // Walk each top-level child at depth 0. Its own frame bounds what is
-        // on screen for children whose app does not list the visible ones.
+        // Walk each top-level child at depth 0. Its own frame, read only if
+        // a large container needs it, bounds what is on screen for children
+        // whose app does not list the visible ones.
         for child in walk_these {
-            let clip = if rows_windowed() {
-                set_messaging_timeout(child);
-                element_screen_rect(child)
-            } else {
-                None
-            };
-            dense_rows::with_visible_clip(clip, || {
+            let surface = rows_windowed().then_some(child as usize);
+            dense_rows::with_visible_clip(surface, || {
                 walk_element(
                     child,
                     0,

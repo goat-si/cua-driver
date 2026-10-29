@@ -545,19 +545,16 @@ impl Tool for GetWindowStateTool {
         // ScreenCaptureKit and the accessibility walk use independent system
         // services, and the read otherwise pays for them one after the other.
         // Which browser owns the window decides two notes at the end of the
-        // read. Naming the app spawns `ps`, so answer it beside the walk and
-        // the capture instead of after them. Started only once the arguments
-        // are accepted, so a refused request spawns nothing.
-        let chromium_probe = tokio::task::spawn_blocking(move || chromium_browser_window(pid));
-        // A capture-only read has no walk for its capture to overlap, so the
-        // background-input facts are gathered beside the capture instead of
-        // after it. A read that walks gathers them after the walk, as before:
-        // they ask the same app over accessibility.
-        let prefetched_facts = (!want_tree && !display_only).then(|| {
-            tokio::task::spawn_blocking(move || {
-                crate::ax::exact_target::gather_background_facts(pid, window_id, None)
-            })
-        });
+        // read. Naming the app spawns `ps`, so it is answered on a scoped
+        // thread beside the walk, or beside a capture-only read's capture,
+        // and joined there: no request leaves it running.
+        let mut chromium_answer: Option<bool> = None;
+        // A capture-only read has no walk for its capture to overlap, so its
+        // background-input facts are gathered beside the capture the same
+        // way. A read that walks gathers them after the walk, as before: they
+        // ask the same app over accessibility.
+        let mut prefetched_facts: Option<cua_driver_core::background_input::BackgroundTargetFacts> =
+            None;
         let abandon_events_before_prefetch = crate::capture::native_capture_abandon_events();
         let prefetched_capture = prefetch_capture(should_capture, want_tree, move || {
             crate::capture::screenshot_window_image(window_id)
@@ -588,32 +585,39 @@ impl Tool for GetWindowStateTool {
                         window_scope: Some(crate::ax::window_scope::WindowScope::Matched),
                     };
                     let payload = crate::ax::snapshot::AxSnapshot::from_nodes(&tree.nodes);
-                    return (tree, payload, std::collections::HashMap::new());
+                    return (tree, payload, std::collections::HashMap::new(), None);
                 }
-                let tree = crate::ax::tree::with_menus_collapsed(collapse_menus, || {
-                    crate::ax::dense_rows::with_dense_rows_windowed(window_dense_rows, || {
-                        crate::ax::tree::with_exhaustive_nodes(verify_read, || {
-                            crate::ax::tree::walk_tree_budgeted(
-                                pid,
-                                Some(window_id),
-                                q.as_deref(),
-                                max_depth,
-                                budget,
-                            )
+                let (tree, chromium) = std::thread::scope(|scope| {
+                    let chromium = scope.spawn(move || chromium_browser_window(pid));
+                    let tree = crate::ax::tree::with_menus_collapsed(collapse_menus, || {
+                        crate::ax::dense_rows::with_dense_rows_windowed(window_dense_rows, || {
+                            crate::ax::tree::with_exhaustive_nodes(verify_read, || {
+                                crate::ax::tree::walk_tree_budgeted(
+                                    pid,
+                                    Some(window_id),
+                                    q.as_deref(),
+                                    max_depth,
+                                    budget,
+                                )
+                            })
                         })
-                    })
+                    });
+                    (tree, chromium.join().ok())
                 });
                 HUNG_TARGET_BREAKER.record_outcome(target_key, &tree.walk);
                 let payload = crate::ax::snapshot::AxSnapshot::from_nodes(&tree.nodes);
                 let selection = selection_observation_for_nodes(pid, &tree.nodes, shared_deadline);
-                (tree, payload, selection)
+                (tree, payload, selection, chromium)
             });
             // A launching app is waited on for up to `timeout_ms` before the
             // walk's own `timeout_ms` starts (see `ax::launch`).
             let backstop =
                 std::time::Duration::from_millis(timeout_ms) * 2 + AX_WALK_BACKSTOP_GRACE;
             match tokio::time::timeout(backstop, walk_future).await {
-                Ok(Ok((tree, payload, selection))) => (Some(tree), Some(payload), selection),
+                Ok(Ok((tree, payload, selection, chromium))) => {
+                    chromium_answer = chromium;
+                    (Some(tree), Some(payload), selection)
+                }
                 Ok(Err(e)) => return ToolResult::error(format!("AX tree walk failed: {e}")),
                 Err(_elapsed) => {
                     // The walk never returned: an AX call ignored its
@@ -677,7 +681,19 @@ impl Tool for GetWindowStateTool {
         let screenshot = if should_capture {
             let out_file = screenshot_out_file.clone();
             let panel_args = args.clone();
-            let res = tokio::task::spawn_blocking(move || -> Result<
+            let side_facts = !want_tree && !display_only;
+            let side_chromium = !want_tree;
+            let res = tokio::task::spawn_blocking(move || {
+                std::thread::scope(|scope| {
+                let side = side_chromium.then(|| {
+                    scope.spawn(move || {
+                        let facts = side_facts.then(|| {
+                            crate::ax::exact_target::gather_background_facts(pid, window_id, None)
+                        });
+                        (facts, chromium_browser_window(pid))
+                    })
+                });
+                let captured = (move || -> Result<
                 (
                     Vec<u8>,
                     Option<String>,
@@ -747,7 +763,20 @@ impl Tool for GetWindowStateTool {
                         scale,
                     ))
                 }
+            })();
+                (captured, side.and_then(|side| side.join().ok()))
+                })
             }).await;
+            let res = match res {
+                Ok((captured, side)) => {
+                    if let Some((facts, chromium)) = side {
+                        prefetched_facts = facts;
+                        chromium_answer = Some(chromium);
+                    }
+                    Ok(captured)
+                }
+                Err(e) => Err(e),
+            };
             match res {
                 Ok(Ok((png, file_path, w, h, orig_w, orig_h, bounds, scale))) => {
                     if !observation_only {
@@ -1128,10 +1157,7 @@ impl Tool for GetWindowStateTool {
         // previews poll several times a second.
         if !display_only {
             let capture_available = screenshot_dims.is_some();
-            let prefetched = match prefetched_facts {
-                Some(handle) => handle.await.ok(),
-                None => None,
-            };
+            let prefetched = prefetched_facts;
             let report = tokio::task::spawn_blocking(move || {
                 let facts = prefetched.unwrap_or_else(|| {
                     crate::ax::exact_target::gather_background_facts(pid, window_id, None)
@@ -1192,10 +1218,7 @@ impl Tool for GetWindowStateTool {
         if on_current_space == Some(false) {
             structured["on_current_space"] = serde_json::json!(false);
         }
-        let chromium = match chromium_probe.await {
-            Ok(chromium) => chromium,
-            Err(_) => chromium_browser_window(pid),
-        };
+        let chromium = chromium_answer.unwrap_or_else(|| chromium_browser_window(pid));
         if let Some(note) = off_space_staleness_note(on_current_space, chromium) {
             structured["off_space_staleness"] = serde_json::json!(note);
             content.push(Content::text(note));

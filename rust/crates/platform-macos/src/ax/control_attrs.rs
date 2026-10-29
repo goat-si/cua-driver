@@ -62,18 +62,23 @@ impl ControlAttrs {
     }
 }
 
-/// A failed batch replays single reads, as the walk did before batching. An
-/// app that rejects batching outright is not asked to batch again.
-fn note_batch_failure(
+/// Whether a failed batch replays single reads. An app that rejects batching
+/// outright is not asked to batch again; past the walk's deadline nothing is
+/// replayed and the walk stops, as for content attributes.
+fn replay_after_batch_failure(
     kind: super::batch_attrs::BatchFailure,
-    budget: &WalkBudget,
+    budget: &mut WalkBudget,
     batching_disabled: &mut bool,
-) {
-    if batch_failure_action(kind, budget.expired(), *batching_disabled)
-        == BatchFailureAction::DisableAndReplay
-    {
-        *batching_disabled = true;
+) -> bool {
+    match batch_failure_action(kind, budget.expired(), *batching_disabled) {
+        BatchFailureAction::DisableAndReplay => *batching_disabled = true,
+        BatchFailureAction::Replay => {}
+        BatchFailureAction::StopForTimeout => {
+            budget.stop_for_timeout();
+            return false;
+        }
     }
+    true
 }
 
 /// The control state and frame of an element that may be indexed.
@@ -82,13 +87,17 @@ fn note_batch_failure(
 /// `element` must be a live AX element.
 pub(crate) unsafe fn read_control_attrs(
     element: AXUIElementRef,
-    budget: &WalkBudget,
+    budget: &mut WalkBudget,
     batching_disabled: &mut bool,
 ) -> ControlAttrs {
     if !*batching_disabled {
         match copy_attrs_batch(element, &CONTROL_ATTRIBUTES) {
             BatchRead::Slots(slots) => return ControlAttrs::from_slots(&slots),
-            BatchRead::Fallback(kind) => note_batch_failure(kind, budget, batching_disabled),
+            BatchRead::Fallback(kind) => {
+                if !replay_after_batch_failure(kind, budget, batching_disabled) {
+                    return ControlAttrs::default();
+                }
+            }
         }
     }
     ControlAttrs::from_singles(element)
@@ -100,7 +109,7 @@ pub(crate) unsafe fn read_control_attrs(
 /// `element` must be a live AX element.
 pub(crate) unsafe fn read_frame(
     element: AXUIElementRef,
-    budget: &WalkBudget,
+    budget: &mut WalkBudget,
     batching_disabled: &mut bool,
 ) -> Option<[f64; 4]> {
     if !*batching_disabled {
@@ -111,7 +120,11 @@ pub(crate) unsafe fn read_frame(
                     slots.raw(1).and_then(|v| size_from_cf(v)),
                 )
             }
-            BatchRead::Fallback(kind) => note_batch_failure(kind, budget, batching_disabled),
+            BatchRead::Fallback(kind) => {
+                if !replay_after_batch_failure(kind, budget, batching_disabled) {
+                    return None;
+                }
+            }
         }
     }
     element_screen_rect(element)
@@ -155,6 +168,36 @@ mod tests {
             panic!("valid control state must decode");
         };
         slots
+    }
+
+    #[test]
+    fn a_batch_failing_after_the_deadline_replays_no_single_reads() {
+        use super::super::batch_attrs::BatchFailure;
+        let mut expired = WalkBudget::new(0, 10);
+        let _ = expired.admit();
+        assert!(expired.expired());
+        let mut disabled = false;
+        assert!(!replay_after_batch_failure(
+            BatchFailure::Decode,
+            &mut expired,
+            &mut disabled
+        ));
+        assert_eq!(expired.outcome().reason(), Some("timeout"));
+
+        let mut live = WalkBudget::nodes_only(10);
+        let _ = live.admit();
+        assert!(replay_after_batch_failure(
+            BatchFailure::Decode,
+            &mut live,
+            &mut disabled
+        ));
+        assert!(!disabled, "a decode failure keeps batching on");
+        assert!(replay_after_batch_failure(
+            BatchFailure::WholeCall(kAXErrorNotImplemented),
+            &mut live,
+            &mut disabled
+        ));
+        assert!(disabled, "an app that rejects batching is not asked again");
     }
 
     #[test]
