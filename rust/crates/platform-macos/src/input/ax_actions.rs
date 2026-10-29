@@ -249,16 +249,81 @@ fn action_key(action: &str) -> String {
     key.strip_prefix("ax").unwrap_or(&key).to_owned()
 }
 
+/// Extract the human-readable name from AppKit's NSAccessibilityCustomAction
+/// string. The complete raw value is still required when performing the action.
+pub fn custom_action_display_name(raw: &str) -> Option<&str> {
+    let (name, rest) = raw.split_once('\n')?;
+    let name = name.strip_prefix("Name:")?.trim();
+    let (target, selector) = rest.split_once('\n')?;
+    let target = target.strip_prefix("Target:")?;
+    let selector = selector.strip_prefix("Selector:")?;
+    if name.is_empty() || target.is_empty() || selector.is_empty() || selector.contains('\n') {
+        return None;
+    }
+    Some(name)
+}
+
 /// Whether `requested` names an action the target currently exposes. Tree rows
 /// omit `AX` and lowercase names; matching that spelling makes custom and
 /// increment/decrement actions callable without guessing their capitalization.
-pub fn advertised_action<'a>(requested: &str, advertised: &'a [String]) -> Option<&'a str> {
+enum AdvertisedActionMatch<'a> {
+    Matched(&'a str),
+    Ambiguous,
+    NotFound,
+}
+
+fn match_advertised_action<'a>(
+    requested: &str,
+    advertised: &'a [String],
+) -> AdvertisedActionMatch<'a> {
     let key = action_key(requested);
     let shown = requested.to_lowercase();
-    advertised
-        .iter()
-        .find(|candidate| action_key(candidate) == key || displayed_action(candidate) == shown)
-        .map(String::as_str)
+    if let Some(action) = advertised.iter().find(|candidate| {
+        action_key(candidate) == key || legacy_displayed_action(candidate) == shown
+    }) {
+        return AdvertisedActionMatch::Matched(action.as_str());
+    }
+
+    let mut exact = advertised.iter().filter(|candidate| {
+        custom_action_display_name(candidate).is_some_and(|name| name == requested)
+    });
+    if let Some(first) = exact.next() {
+        return if exact.next().is_some() {
+            AdvertisedActionMatch::Ambiguous
+        } else {
+            AdvertisedActionMatch::Matched(first.as_str())
+        };
+    }
+
+    let mut displayed = advertised.iter().filter(|candidate| {
+        custom_action_display_name(candidate).is_some_and(|name| displayed_action(name) == shown)
+    });
+    if let Some(first) = displayed.next() {
+        return if displayed.next().is_some() {
+            AdvertisedActionMatch::Ambiguous
+        } else {
+            AdvertisedActionMatch::Matched(first.as_str())
+        };
+    }
+
+    let mut normalized = advertised.iter().filter(|candidate| {
+        custom_action_display_name(candidate).is_some_and(|name| action_key(name) == key)
+    });
+    if let Some(first) = normalized.next() {
+        return if normalized.next().is_some() {
+            AdvertisedActionMatch::Ambiguous
+        } else {
+            AdvertisedActionMatch::Matched(first.as_str())
+        };
+    }
+    AdvertisedActionMatch::NotFound
+}
+
+pub fn advertised_action<'a>(requested: &str, advertised: &'a [String]) -> Option<&'a str> {
+    match match_advertised_action(requested, advertised) {
+        AdvertisedActionMatch::Matched(action) => Some(action),
+        AdvertisedActionMatch::Ambiguous | AdvertisedActionMatch::NotFound => None,
+    }
 }
 
 /// An action name as a tree row shows it: no `AX` prefix, lower case, with
@@ -266,6 +331,17 @@ pub fn advertised_action<'a>(requested: &str, advertised: &'a [String]) -> Optio
 /// split or confuse the row. Other text, Korean included, is shown as is.
 /// Agents copy this spelling.
 pub fn displayed_action(action: &str) -> String {
+    let action = custom_action_display_name(action).unwrap_or(action);
+    display_action_name(action)
+}
+
+/// The pre-custom-name tree spelling, retained as an input alias so older
+/// copied markdown rows still resolve to the original action.
+fn legacy_displayed_action(action: &str) -> String {
+    display_action_name(action)
+}
+
+fn display_action_name(action: &str) -> String {
     let mut shown = String::new();
     for c in action
         .strip_prefix("AX")
@@ -327,8 +403,17 @@ pub fn resolve_element_action<'a>(
             ),
         ));
     }
-    if let Some(action) = advertised_action(requested, advertised) {
-        return Ok(action);
+    match match_advertised_action(requested, advertised) {
+        AdvertisedActionMatch::Matched(action) => return Ok(action),
+        AdvertisedActionMatch::Ambiguous => {
+            return Err(element_action_refusal(
+                "ambiguous",
+                format!(
+                    "refusing {requested}: multiple custom actions share this name or normalized key"
+                ),
+            ));
+        }
+        AdvertisedActionMatch::NotFound => {}
     }
     match map_action(requested)
         .map_err(|error| element_action_refusal("invalid_arguments", error.to_string()))?
@@ -585,12 +670,11 @@ mod tests {
         );
         assert!(resolve_element_action("AXDelete", &advertised, false).is_err());
         // The escaped spelling a tree row shows also names the action.
-        let korean = vec!["Name:보관\nTarget:list".to_string()];
+        let korean = vec!["Name:보관\nTarget:list\nSelector:perform:".to_string()];
         let shown = displayed_action(&korean[0]);
-        assert!(shown.contains("\\n"));
         // Only what could split or confuse a row is escaped: Korean and other
         // non-ASCII text stays readable, so an agent can copy it back.
-        assert_eq!(shown, "name:보관\\ntarget:list");
+        assert_eq!(shown, "보관");
         assert_eq!(
             displayed_action("Say \"hi\"\\now\t✓"),
             "say \\\"hi\\\"\\\\now\\t✓"
@@ -623,6 +707,99 @@ mod tests {
         assert_eq!(
             element_action_refusal_code(&focus),
             Some("invalid_arguments")
+        );
+    }
+
+    #[test]
+    fn wave_400b_custom_actions_display_and_match_by_their_clean_name() {
+        let raw = "Name:Move Next\nTarget:0x0\nSelector:(null)";
+        assert_eq!(custom_action_display_name(raw), Some("Move Next"));
+        assert_eq!(displayed_action(raw), "move next");
+
+        let advertised = vec![raw.to_owned()];
+        assert_eq!(
+            advertised_action("mOvE nExT", &advertised),
+            Some(raw),
+            "matching must return the raw value AXUIElementPerformAction requires"
+        );
+        for malformed in [
+            "Name:Missing selector\nTarget:0x0",
+            "Name:\nTarget:0x0\nSelector:(null)",
+            "Move Next\nTarget:0x0\nSelector:(null)",
+            "Name:Extra\nTarget:0x0\nSelector:(null)\nTrailing:value",
+        ] {
+            assert_eq!(custom_action_display_name(malformed), None, "{malformed:?}");
+        }
+    }
+
+    #[test]
+    fn wave_400b_builtin_actions_win_over_a_custom_name_collision() {
+        let custom = "Name:Press\nTarget:0x0\nSelector:(null)".to_owned();
+        let builtin = "AXPress".to_owned();
+        for advertised in [
+            vec![custom.clone(), builtin.clone()],
+            vec![builtin.clone(), custom.clone()],
+        ] {
+            assert_eq!(advertised_action("press", &advertised), Some("AXPress"));
+            assert_eq!(advertised_action("AXPress", &advertised), Some("AXPress"));
+        }
+    }
+
+    #[test]
+    fn wave_400b_custom_matching_rejects_ambiguity_and_accepts_legacy_alias() {
+        let dash = "Name:Move-Next\nTarget:0x1\nSelector:first:";
+        let underscore = "Name:Move_Next\nTarget:0x2\nSelector:second:";
+        for advertised in [
+            vec![dash.to_owned(), underscore.to_owned()],
+            vec![underscore.to_owned(), dash.to_owned()],
+        ] {
+            assert_eq!(advertised_action("movenext", &advertised), None);
+            assert_eq!(
+                advertised_action("Move_Next", &advertised),
+                Some(underscore),
+                "an exact displayed spelling wins before normalized matching"
+            );
+        }
+
+        let same_name = vec![
+            "Name:Move Next\nTarget:0x1\nSelector:first:".to_owned(),
+            "Name:Move Next\nTarget:0x2\nSelector:second:".to_owned(),
+        ];
+        assert_eq!(advertised_action("Move Next", &same_name), None);
+
+        let raw = "Name:Move Next\nTarget:0x0\nSelector:(null)";
+        let advertised = vec![raw.to_owned()];
+        let legacy = "name:move next\\ntarget:0x0\\nselector:(null)";
+        assert_eq!(advertised_action(legacy, &advertised), Some(raw));
+        assert_eq!(advertised_action(raw, &advertised), Some(raw));
+        assert_eq!(advertised_action("Move Next", &advertised), Some(raw));
+    }
+
+    #[test]
+    fn wave_400b_resolve_refuses_ambiguous_custom_names_before_builtin_fallback() {
+        for requested in ["Open", "Press", "Cancel"] {
+            let advertised = vec![
+                format!("Name:{requested}\nTarget:0x1\nSelector:first:"),
+                format!("Name:{requested}\nTarget:0x2\nSelector:second:"),
+            ];
+            let error = resolve_element_action(requested, &advertised, false).unwrap_err();
+            assert_eq!(element_action_refusal_code(&error), Some("ambiguous"));
+            assert!(error.to_string().contains("multiple custom actions"));
+        }
+
+        let advertised = vec![
+            "Name:Press\nTarget:0x1\nSelector:first:".to_owned(),
+            "AXPress".to_owned(),
+        ];
+        assert_eq!(
+            resolve_element_action("press", &advertised, false).unwrap(),
+            "AXPress",
+            "an advertised builtin still wins"
+        );
+        assert_eq!(
+            resolve_element_action("press", &[], false).unwrap(),
+            "AXPress",
+            "the existing hollow-press fallback remains"
         );
     }
 

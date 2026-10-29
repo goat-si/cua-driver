@@ -11,6 +11,13 @@
 
 use crate::windows::WindowOwner;
 
+pub(crate) fn is_window_like_role(role: &str) -> bool {
+    matches!(
+        role,
+        "AXWindow" | "AXSheet" | "AXPopover" | "AXDialog" | "AXSystemDialog"
+    )
+}
+
 /// What the requested `window_id` turned out to be.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WindowScope {
@@ -60,8 +67,8 @@ pub struct TopLevelCandidate {
     /// report `AXStandardWindow` rather than a dialog subrole, but identify
     /// themselves as `open-panel` / `save-panel`.
     pub identifier: Option<String>,
-    /// `_AXUIElementGetWindow` result, when the SPI resolved one. Only read
-    /// for `AXWindow` roles.
+    /// Window-id SPI result, when it resolves one. Read for top-level
+    /// window-like roles.
     pub ax_window_id: Option<u32>,
 }
 
@@ -86,11 +93,13 @@ impl TopLevelCandidate {
     }
 
     fn is_dialog_like(&self) -> bool {
-        self.role == "AXSheet"
-            || self
-                .subrole
-                .as_deref()
-                .is_some_and(|s| matches!(s, "AXDialog" | "AXSystemDialog" | "AXSheet"))
+        matches!(
+            self.role.as_str(),
+            "AXSheet" | "AXPopover" | "AXDialog" | "AXSystemDialog"
+        ) || self
+            .subrole
+            .as_deref()
+            .is_some_and(|s| matches!(s, "AXDialog" | "AXSystemDialog" | "AXSheet"))
             || self
                 .identifier
                 .as_deref()
@@ -140,7 +149,7 @@ where
     let matched: Vec<usize> = candidates
         .iter()
         .enumerate()
-        .filter(|(_, c)| c.role == "AXWindow" && c.ax_window_id == Some(requested))
+        .filter(|(_, c)| is_window_like_role(&c.role) && c.ax_window_id == Some(requested))
         .map(|(i, _)| i)
         .collect();
 
@@ -172,8 +181,12 @@ where
         .iter()
         .enumerate()
         .filter(|(i, c)| {
-            (c.role != "AXWindow" || matched.contains(i))
-                && !(dialog_scope && c.role == "AXMenuBar")
+            let must_match =
+                c.role == "AXWindow" || (is_window_like_role(&c.role) && c.ax_window_id.is_some());
+            // Preserve the existing sibling-sheet contract when a non-AXWindow
+            // element does not expose a CGWindowID of its own.
+            let in_scope = !must_match || matched.contains(i);
+            in_scope && !(dialog_scope && c.role == "AXMenuBar")
         })
         .map(|(i, _)| i)
         .collect();
@@ -211,6 +224,48 @@ mod tests {
         let d = decide_window_scope(&candidates, 22, never_called);
         assert_eq!(d.scope, WindowScope::Matched);
         assert_eq!(d.walk, vec![0, 2], "menu bar + requested window only");
+    }
+
+    #[test]
+    fn wave_400b_window_like_roles_can_match_the_requested_id() {
+        for role in [
+            "AXWindow",
+            "AXSheet",
+            "AXPopover",
+            "AXDialog",
+            "AXSystemDialog",
+        ] {
+            let candidates = [
+                TopLevelCandidate::new("AXMenuBar", None),
+                TopLevelCandidate::new(role, Some(22)),
+            ];
+            let decision = decide_window_scope(&candidates, 22, never_called);
+            assert_eq!(decision.scope, WindowScope::Matched, "{role}");
+            let expected = if role == "AXWindow" {
+                vec![0, 1]
+            } else {
+                vec![1]
+            };
+            assert_eq!(decision.walk, expected, "{role}");
+        }
+    }
+
+    #[test]
+    fn wave_400b_other_window_like_surfaces_do_not_join_a_dialog_scope() {
+        let candidates = [
+            TopLevelCandidate::new("AXMenuBar", None),
+            TopLevelCandidate::new("AXPopover", Some(22)),
+            TopLevelCandidate::new("AXDialog", Some(33)),
+            TopLevelCandidate::new("AXSheet", None),
+            TopLevelCandidate::new("AXWindow", Some(44)),
+        ];
+        let decision = decide_window_scope(&candidates, 22, never_called);
+        assert_eq!(decision.scope, WindowScope::Matched);
+        assert_eq!(
+            decision.walk,
+            vec![1, 3],
+            "the requested popover and an id-less sibling sheet remain"
+        );
     }
 
     #[test]
