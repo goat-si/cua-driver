@@ -371,12 +371,11 @@ impl Tool for GetWindowStateTool {
             Err(refusal) => return refusal,
         };
         use cua_driver_core::tool_args::ArgsExt;
-        let requested_pid;
         let mut pid = match args.require_i32("pid") {
             Ok(v) => v,
             Err(e) => return e,
         };
-        requested_pid = pid;
+        let requested_pid = pid;
         let window_id = match args.require_u32("window_id") {
             Ok(v) => v,
             Err(e) => return e,

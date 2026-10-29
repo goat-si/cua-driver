@@ -1276,8 +1276,7 @@ fn ax_show_menu(
         },
         || {
             let _ = dispatch.send(ActionEvent::Dispatching(Instant::now()));
-            let result = pixel_right_click(element, idx, &role, &title, pid, wid);
-            result
+            pixel_right_click(element, idx, &role, &title, pid, wid)
         },
     )
 }
