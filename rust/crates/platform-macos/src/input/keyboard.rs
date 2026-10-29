@@ -2043,6 +2043,35 @@ mod tests {
         }
     }
 
+    #[derive(Clone)]
+    struct SharedMock(std::rc::Rc<std::cell::RefCell<MockPasteboard>>);
+
+    impl SharedMock {
+        fn new(pb: MockPasteboard) -> Self {
+            Self(std::rc::Rc::new(std::cell::RefCell::new(pb)))
+        }
+        fn apply_concurrent(&self, items: Vec<PasteboardItemSnapshot>) {
+            let pb = self.0.borrow_mut();
+            pb.count.set(pb.count.get() + 1);
+            *pb.items.borrow_mut() = items;
+        }
+    }
+
+    impl PasteboardBackend for SharedMock {
+        fn change_count(&self) -> isize {
+            self.0.borrow().change_count()
+        }
+        fn snapshot_items(&self) -> anyhow::Result<Vec<PasteboardItemSnapshot>> {
+            self.0.borrow().snapshot_items()
+        }
+        fn write_items(&mut self, items: &[PasteboardItemSnapshot]) -> anyhow::Result<isize> {
+            self.0.borrow_mut().write_items(items)
+        }
+        fn clear(&mut self) -> anyhow::Result<isize> {
+            self.0.borrow_mut().clear()
+        }
+    }
+
     #[test]
     fn pasteboard_transaction_writes_transient_markers_and_restores_all_items() {
         let original = vec![
@@ -2110,16 +2139,28 @@ mod tests {
         let user_new = vec![PasteboardItemSnapshot {
             representations: vec![("public.utf8-plain-text".to_owned(), b"user new".to_vec())],
         }];
-        let mut pb = MockPasteboard {
+        let pb = MockPasteboard {
             count: std::cell::Cell::new(5),
             items: std::cell::RefCell::new(original),
             writes: Vec::new(),
             concurrent_copy_during_paste: std::cell::RefCell::new(Some(user_new.clone())),
             fail_restore: false,
         };
-        run_pasteboard_transaction(&mut pb, "agent text", || Ok(()), std::time::Duration::ZERO)
-            .unwrap();
-        assert_eq!(pb.items_now(), user_new);
+        let shared = SharedMock::new(pb);
+        let other = shared.clone();
+        run_pasteboard_transaction(
+            &mut shared.clone(),
+            "agent text",
+            || {
+                // The concurrent writer lands DURING the trigger, through
+                // shared state (no aliased &mut).
+                other.apply_concurrent(user_new.clone());
+                Ok(())
+            },
+            std::time::Duration::ZERO,
+        )
+        .unwrap();
+        assert_eq!(shared.0.borrow().items_now(), user_new);
     }
 
     #[test]
@@ -2130,22 +2171,27 @@ mod tests {
         let user_new = vec![PasteboardItemSnapshot {
             representations: vec![("public.utf8-plain-text".to_owned(), b"user new".to_vec())],
         }];
-        let mut pb = MockPasteboard {
+        let pb = MockPasteboard {
             count: std::cell::Cell::new(5),
             items: std::cell::RefCell::new(original),
             writes: Vec::new(),
             concurrent_copy_during_paste: std::cell::RefCell::new(Some(user_new.clone())),
             fail_restore: false,
         };
+        let shared = SharedMock::new(pb);
+        let other = shared.clone();
         let err = run_pasteboard_transaction(
-            &mut pb,
+            &mut shared.clone(),
             "agent text",
-            || anyhow::bail!("trigger failed"),
+            || {
+                other.apply_concurrent(user_new.clone());
+                anyhow::bail!("trigger failed")
+            },
             std::time::Duration::ZERO,
         )
         .unwrap_err();
         assert_eq!(
-            pb.items_now(),
+            shared.0.borrow().items_now(),
             user_new,
             "the other writer's content survives"
         );
@@ -2162,17 +2208,20 @@ mod tests {
         let user_new = vec![PasteboardItemSnapshot {
             representations: vec![("public.utf8-plain-text".to_owned(), b"user new".to_vec())],
         }];
-        let mut pb = MockPasteboard {
+        let pb = MockPasteboard {
             count: std::cell::Cell::new(5),
             items: std::cell::RefCell::new(original),
             writes: Vec::new(),
             concurrent_copy_during_paste: std::cell::RefCell::new(Some(user_new.clone())),
             fail_restore: false,
         };
+        let shared = SharedMock::new(pb);
+        let other = shared.clone();
         let err = run_pasteboard_transaction(
-            &mut pb,
+            &mut shared.clone(),
             "agent text",
             || {
+                other.apply_concurrent(user_new.clone());
                 Err(anyhow::Error::new(PasteSequenceAbort {
                     posted: 0,
                     reason: "not_editable: focus changed".into(),
@@ -2183,7 +2232,7 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(
-            pb.items_now(),
+            shared.0.borrow().items_now(),
             user_new,
             "the other writer's content survives"
         );
