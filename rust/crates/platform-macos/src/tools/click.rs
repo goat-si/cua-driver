@@ -2405,32 +2405,32 @@ fn ancestor_action_kind(
     chain: &[(Option<String>, Vec<String>, bool)],
     is_finder: bool,
 ) -> Option<(usize, &'static str)> {
-    // Selection first, across the WHOLE chain — but only on a selection
-    // container (AXRow/AXCell): an enclosing actionable control's AXPress
-    // would activate that control instead of selecting the hit item.
     if !is_finder {
         return None;
     }
+    // Every fallback action requires the Finder sidebar: the FIRST outline
+    // above the candidate must be described as "sidebar". A press anywhere
+    // else (content outlines, other apps, other controls) is not selection
+    // evidence and falls through to the pixel route.
+    let sidebar_above = |index: usize| {
+        chain[index + 1..]
+            .iter()
+            .find(|(role, _, _)| role.as_deref() == Some("AXOutline"))
+            .is_some_and(|(_, _, sidebar)| *sidebar)
+    };
+    // Selection first, across the whole chain.
     for (index, (role, actions, _)) in chain.iter().enumerate() {
         if matches!(role.as_deref(), Some("AXRow" | "AXCell"))
             && actions.iter().any(|a| a == "AXPress")
+            && sidebar_above(index)
         {
             return Some((index, "AXPress"));
         }
     }
-    // AXOpen only for a Finder SIDEBAR cell: AXCell with AXOpen whose parent
-    // is an AXRow and whose grandparent is an AXOutline described as
-    // "sidebar". The description must come from the candidate's OWN outline,
-    // not from any outline in the chain.
     for (index, (role, actions, _)) in chain.iter().enumerate() {
-        if role.as_deref() == Some("AXCell")
+        if matches!(role.as_deref(), Some("AXRow" | "AXCell"))
             && actions.iter().any(|a| a == "AXOpen")
-            && chain
-                .get(index + 1)
-                .is_some_and(|(role, _, _)| role.as_deref() == Some("AXRow"))
-            && chain
-                .get(index + 2)
-                .is_some_and(|(role, _, sidebar)| role.as_deref() == Some("AXOutline") && *sidebar)
+            && sidebar_above(index)
         {
             return Some((index, "AXOpen"));
         }
@@ -2522,14 +2522,14 @@ unsafe fn ax_press_with_ancestors(
 mod ancestor_action_tests {
     use super::ancestor_action_kind;
 
-    fn chain(items: &[(&str, &[&str])]) -> Vec<(Option<String>, Vec<String>, bool)> {
+    fn chain(items: &[(&str, &[&str], bool)]) -> Vec<(Option<String>, Vec<String>, bool)> {
         items
             .iter()
-            .map(|(role, actions)| {
+            .map(|(role, actions, sidebar)| {
                 (
                     Some((*role).to_owned()),
                     actions.iter().map(|a| (*a).to_owned()).collect(),
-                    role == &"AXOutline",
+                    *sidebar,
                 )
             })
             .collect()
@@ -2537,22 +2537,43 @@ mod ancestor_action_tests {
 
     #[test]
     fn a_finder_sidebar_cell_opens_but_a_file_row_only_selects() {
-        // Finder sidebar: AXCell(AXOpen) under AXRow under AXOutline.
         let sidebar = chain(&[
-            ("AXRow", &[]),
-            ("AXCell", &["AXOpen"]),
-            ("AXRow", &[]),
-            ("AXOutline", &[]),
+            ("AXRow", &[], false),
+            ("AXCell", &["AXOpen"], false),
+            ("AXRow", &[], false),
+            ("AXOutline", &[], true),
         ]);
         assert_eq!(ancestor_action_kind(&sidebar, true), Some((1, "AXOpen")));
-        // The same shape in another app's outline is NOT an open gesture.
         assert_eq!(ancestor_action_kind(&sidebar, false), None);
-        // A file row with AXOpen is never opened by a single click.
-        let file_row = chain(&[("AXRow", &["AXOpen"]), ("AXTable", &[])]);
+        let file_row = chain(&[("AXRow", &["AXOpen"], false), ("AXTable", &[], false)]);
         assert_eq!(ancestor_action_kind(&file_row, true), None);
-        // AXPress always wins as the selection-equivalent action.
-        let row = chain(&[("AXCell", &["AXOpen"]), ("AXRow", &["AXPress"])]);
+        let row = chain(&[
+            ("AXCell", &["AXOpen"], false),
+            ("AXRow", &["AXPress"], false),
+            ("AXOutline", &[], true),
+        ]);
         assert_eq!(ancestor_action_kind(&row, true), Some((1, "AXPress")));
+    }
+
+    #[test]
+    fn a_content_outline_under_a_sidebar_does_not_open_and_other_controls_do_not_select() {
+        let nested = chain(&[
+            ("AXCell", &["AXOpen"], false),
+            ("AXRow", &[], false),
+            ("AXOutline", &[], false),
+            ("AXOutline", &[], true),
+        ]);
+        assert_eq!(ancestor_action_kind(&nested, true), None);
+        let button = chain(&[("AXButton", &["AXPress"], false)]);
+        assert_eq!(ancestor_action_kind(&button, true), None);
+        let row = chain(&[("AXRow", &["AXPress"], false)]);
+        assert_eq!(ancestor_action_kind(&row, false), None);
+        // A row press without any outline above is not used either.
+        let no_outline = chain(&[
+            ("AXCell", &["AXOpen"], false),
+            ("AXRow", &["AXPress"], false),
+        ]);
+        assert_eq!(ancestor_action_kind(&no_outline, true), None);
     }
 }
 

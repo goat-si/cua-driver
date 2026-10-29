@@ -794,6 +794,12 @@ pub(crate) async fn focus_by_pixel(
     } else {
         click.await
     };
+    if focus.is_error == Some(true) {
+        // An AX focus task failure is indeterminate, not a fallback signal:
+        // stop instead of escalating to a real click (foreground) or
+        // pretending the focus failed cleanly (background).
+        return Err(focus);
+    }
     let landed = if focus.is_error != Some(true) {
         // AXFocused is non-destructive: unlike a second real click, it keeps a
         // Cmd+A selection intact before a follow-up type_text or Cmd+V.
