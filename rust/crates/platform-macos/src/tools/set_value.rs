@@ -493,38 +493,48 @@ async fn minimized_set_value(
         };
         let element_ptr = element_guard.as_ptr();
         // Focus the field here, with the front app read in the same step
-        // right before the write, so the TOKEN rule below finds it focused
-        // and writes no focus of its own.
+        // right before the write, then judge its editability read-only (the
+        // TOKEN helper may write focus again without a front check, so this
+        // route does not call it).
         let focus_guard = element_guard.clone();
         let focused = latency::spawn_action_blocking(move || {
+            let ptr = focus_guard.as_ptr();
             if crate::input::skylight::front_process_matches(pid as libc::pid_t, window_id)
                 != Some(false)
             {
-                return Err(());
+                return RestoredFocus::FrontChanged;
             }
-            let _ = crate::input::ax_actions::focus_element(focus_guard.as_ptr());
-            Ok(unsafe {
-                crate::ax::bindings::copy_bool_attr(
-                    focus_guard.as_ptr() as AXUIElementRef,
-                    "AXFocused",
-                )
-            } == Some(true))
+            let _ = crate::input::ax_actions::focus_element(ptr);
+            let holds_focus =
+                unsafe { crate::ax::bindings::copy_bool_attr(ptr as AXUIElementRef, "AXFocused") }
+                    == Some(true)
+                    && crate::input::ax_actions::is_element_focused(pid, ptr);
+            if !holds_focus {
+                return RestoredFocus::NotFocused;
+            }
+            if unsafe { super::not_editable::sync_focused_cell_allows(pid, Some(window_id)) } {
+                RestoredFocus::Editable
+            } else {
+                RestoredFocus::NotEditable
+            }
         })
         .await
-        .unwrap_or(Ok(false));
+        .unwrap_or(RestoredFocus::NotFocused);
         let token_refusal = match focused {
-            Ok(true) => {
-                super::not_editable::token_not_editable_refusal(pid, element_ptr, window_id).await
-            }
-            // A focus write was sent: the receipt says so.
-            Ok(false) => Some(super::not_editable::not_editable_result(
+            RestoredFocus::Editable => None,
+            // A focus write was sent: the receipts say so.
+            RestoredFocus::NotFocused => Some(super::not_editable::not_editable_result(
                 format!(
                     "the field in restored window {window_id} did not read back as focused after \
                      the focus attempt; AXValue was not written."
                 ),
                 super::not_editable::FocusDispatch::Indeterminate,
             )),
-            Err(()) => Some(super::pre_dispatch_refusal(
+            RestoredFocus::NotEditable => Some(super::not_editable::not_editable_result(
+                "the target element is not being edited; AXValue was not written.".to_owned(),
+                super::not_editable::FocusDispatch::SentAx,
+            )),
+            RestoredFocus::FrontChanged => Some(super::pre_dispatch_refusal(
                 cua_driver_core::background_input::refusal_codes::MINIMIZED_OR_HIDDEN,
                 format!(
                     "window {window_id} was restored, but its app came to the front or which app \
@@ -621,6 +631,14 @@ fn attach_restore_cleanup(
         }
     }
     result
+}
+
+/// The restored-window route's own focus step.
+enum RestoredFocus {
+    Editable,
+    NotFocused,
+    NotEditable,
+    FrontChanged,
 }
 
 // ── File name cells ──────────────────────────────────────────────────────────
@@ -921,12 +939,15 @@ fn set_value_blocking_with(
                 crate::input::skylight::front_process_matches(pid as libc::pid_t, window_id)
                     == Some(false)
             };
-            if restored_window && !front_ok() {
+            let needs_focus =
+                !restored_window || unsafe { copy_bool_attr(element, "AXFocused") } != Some(true);
+            // Read right before the write itself.
+            if needs_focus && restored_window && !front_ok() {
                 anyhow::bail!(
                     "the app came to the front, or which app is in front could not be read; AXValue was not written"
                 )
             }
-            if !restored_window || unsafe { copy_bool_attr(element, "AXFocused") } != Some(true) {
+            if needs_focus {
                 crate::input::ax_actions::focus_element(element_ptr)?;
             }
             let own_focus = unsafe { copy_bool_attr(element, "AXFocused") } == Some(true);
