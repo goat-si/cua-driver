@@ -57,17 +57,18 @@ pub(crate) fn with_visible_clip<T>(surface: Option<usize>, walk: impl FnOnce() -
     walk()
 }
 
-/// The walked surface's frame, read once per surface.
-unsafe fn visible_clip() -> Option<[f64; 4]> {
+/// The walked surface's frame, read once per surface; `None` when its read
+/// would start, or ended, past the deadline (nothing is cached then).
+unsafe fn visible_clip(budget: &WalkBudget) -> Option<Option<[f64; 4]>> {
     match VISIBLE_CLIP.with(Cell::get) {
-        ClipSource::Unset => None,
-        ClipSource::Known(clip) => clip,
+        ClipSource::Unset => Some(None),
+        ClipSource::Known(clip) => Some(clip),
         ClipSource::Surface(element) => {
             let element = element as AXUIElementRef;
             set_messaging_timeout(element);
-            let clip = element_screen_rect(element);
+            let clip = super::control_attrs::frame_batched(element, budget)?;
             VISIBLE_CLIP.with(|cell| cell.set(ClipSource::Known(clip)));
-            clip
+            Some(clip)
         }
     }
 }
@@ -207,23 +208,17 @@ pub(crate) unsafe fn plan_collection_children(
     // (visible), so the walker refuses it as pending rather than calling it
     // offscreen.
     let cut_by_frame = children.len() >= MANY_CHILDREN;
-    let clip = std::cell::OnceCell::new();
     let is_visible = |i: usize| match &visible {
         Some(set) => set.contains(children[i]),
         None if !cut_by_frame => true,
         None => {
-            if budget.expired() {
-                return true;
-            }
             set_messaging_timeout(children[i]);
-            let rect = super::control_attrs::frame_batched(children[i]);
-            if budget.expired() {
+            let Some(rect) = super::control_attrs::frame_batched(children[i], budget) else {
                 return true;
-            }
-            let clip = *clip.get_or_init(|| visible_clip());
-            if budget.expired() {
+            };
+            let Some(clip) = visible_clip(budget) else {
                 return true;
-            }
+            };
             rect_visible(rect, clip)
         }
     };

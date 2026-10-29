@@ -50,16 +50,49 @@ impl ControlAttrs {
         }
     }
 
-    unsafe fn from_singles(element: AXUIElementRef) -> Self {
-        Self {
-            enabled: copy_bool_attr(element, "AXEnabled"),
-            frame: element_screen_rect(element),
-            value_description: copy_string_attr(element, "AXValueDescription"),
-            min_value: copy_number_attr(element, "AXMinValue"),
-            max_value: copy_number_attr(element, "AXMaxValue"),
-            selected: copy_bool_attr(element, "AXSelected"),
-        }
+    /// The single reads, each started only before the deadline. `None` when
+    /// one would start past it.
+    unsafe fn from_singles(element: AXUIElementRef, step: &Stepper) -> Option<Self> {
+        Some(Self {
+            enabled: step.read(|| copy_bool_attr(element, "AXEnabled"))?,
+            frame: frame_from_singles(element, step)?,
+            value_description: step.read(|| copy_string_attr(element, "AXValueDescription"))?,
+            min_value: step.read(|| copy_number_attr(element, "AXMinValue"))?,
+            max_value: step.read(|| copy_number_attr(element, "AXMaxValue"))?,
+            selected: step.read(|| copy_bool_attr(element, "AXSelected"))?,
+        })
     }
+}
+
+fn frame_from_slots(slots: &BatchSlots) -> Option<[f64; 4]> {
+    unsafe {
+        rect_from_parts(
+            slots.raw(0).and_then(|v| point_from_cf(v)),
+            slots.raw(1).and_then(|v| size_from_cf(v)),
+        )
+    }
+}
+
+/// Starts one AX read after another, none past the walk's deadline.
+pub(crate) struct Stepper<'a> {
+    expired: &'a dyn Fn() -> bool,
+}
+
+impl Stepper<'_> {
+    /// Run `read` unless the deadline has passed.
+    pub(crate) fn read<T>(&self, read: impl FnOnce() -> T) -> Option<T> {
+        (!(self.expired)()).then(read)
+    }
+}
+
+/// [`element_screen_rect`]'s two reads, each started only before the
+/// deadline: `Some(frame)` as it reads, `None` when a read would start past it.
+unsafe fn frame_from_singles(element: AXUIElementRef, step: &Stepper) -> Option<Option<[f64; 4]>> {
+    let Some(position) = step.read(|| copy_position_attr(element))? else {
+        return Some(None);
+    };
+    let size = step.read(|| copy_size_attr(element))?;
+    Some(rect_from_parts(Some(position), size))
 }
 
 /// Whether a failed batch replays single reads. An app that rejects batching
@@ -81,38 +114,66 @@ fn replay_after_batch_failure(
     true
 }
 
-/// Single reads run only within the walk's deadline: one that would start, or
-/// that ran, past it stops the walk and returns nothing.
-fn singles_within_deadline<T>(budget: &mut WalkBudget, read: impl FnOnce() -> T) -> Option<T> {
-    if budget.expired() {
+/// One batched read, or its single reads, within the walk's deadline. No read
+/// starts past it, and a read that ends past it is discarded: the walk stops
+/// and the caller keeps the row's role only.
+fn read_within_deadline<T>(
+    budget: &mut WalkBudget,
+    batching_disabled: &mut bool,
+    batch: impl FnOnce() -> BatchRead,
+    from_slots: impl FnOnce(&BatchSlots) -> T,
+    singles: impl FnOnce(&Stepper) -> Option<T>,
+) -> Option<T> {
+    let read = 'read: {
+        if !*batching_disabled {
+            let batched = {
+                let budget = &*budget;
+                let expired = || budget.expired();
+                Stepper { expired: &expired }.read(batch)
+            };
+            match batched {
+                None => break 'read None,
+                Some(BatchRead::Slots(slots)) => break 'read Some(from_slots(&slots)),
+                Some(BatchRead::Fallback(kind)) => {
+                    if !replay_after_batch_failure(kind, budget, batching_disabled) {
+                        return None;
+                    }
+                }
+            }
+        }
+        let budget = &*budget;
+        let expired = || budget.expired();
+        singles(&Stepper { expired: &expired })
+    };
+    if read.is_none() || budget.expired() {
         budget.stop_for_timeout();
         return None;
     }
-    let value = read();
-    if budget.expired() {
-        budget.stop_for_timeout();
-        return None;
-    }
-    Some(value)
+    read
 }
 
 /// A frame read for planning, outside the walk's per-node accounting: one
-/// batched call, with the two single reads only when the batch fails.
+/// batched call, with the two single reads only when the batch fails. `None`
+/// when a read would start, or ended, past the deadline.
 ///
 /// # Safety
 /// `element` must be a live AX element.
-pub(crate) unsafe fn frame_batched(element: AXUIElementRef) -> Option<[f64; 4]> {
-    match copy_attrs_batch(element, &FRAME_ATTRIBUTES) {
-        BatchRead::Slots(slots) => rect_from_parts(
-            slots.raw(0).and_then(|v| point_from_cf(v)),
-            slots.raw(1).and_then(|v| size_from_cf(v)),
-        ),
-        BatchRead::Fallback(_) => element_screen_rect(element),
-    }
+pub(crate) unsafe fn frame_batched(
+    element: AXUIElementRef,
+    budget: &WalkBudget,
+) -> Option<Option<[f64; 4]>> {
+    let expired = || budget.expired();
+    let step = Stepper { expired: &expired };
+    let frame = match step.read(|| copy_attrs_batch(element, &FRAME_ATTRIBUTES))? {
+        BatchRead::Slots(slots) => Some(frame_from_slots(&slots)),
+        BatchRead::Fallback(_) => frame_from_singles(element, &step),
+    }?;
+    step.read(|| frame)
 }
 
 /// The control state and frame of an element that may be indexed, or `None`
-/// when its read ran past the walk's deadline (the walk is stopped).
+/// when a read would start, or ended, past the walk's deadline (the walk is
+/// stopped).
 ///
 /// # Safety
 /// `element` must be a live AX element.
@@ -121,21 +182,17 @@ pub(crate) unsafe fn read_control_attrs(
     budget: &mut WalkBudget,
     batching_disabled: &mut bool,
 ) -> Option<ControlAttrs> {
-    if !*batching_disabled {
-        match copy_attrs_batch(element, &CONTROL_ATTRIBUTES) {
-            BatchRead::Slots(slots) => return Some(ControlAttrs::from_slots(&slots)),
-            BatchRead::Fallback(kind) => {
-                if !replay_after_batch_failure(kind, budget, batching_disabled) {
-                    return None;
-                }
-            }
-        }
-    }
-    singles_within_deadline(budget, || ControlAttrs::from_singles(element))
+    read_within_deadline(
+        budget,
+        batching_disabled,
+        || copy_attrs_batch(element, &CONTROL_ATTRIBUTES),
+        ControlAttrs::from_slots,
+        |step| ControlAttrs::from_singles(element, step),
+    )
 }
 
 /// The frame of an element, as [`element_screen_rect`] reads it, or `None` when
-/// a failed batch ran past the walk's deadline (the walk is stopped).
+/// a read would start, or ended, past the walk's deadline (the walk is stopped).
 ///
 /// # Safety
 /// `element` must be a live AX element.
@@ -144,22 +201,13 @@ pub(crate) unsafe fn read_frame(
     budget: &mut WalkBudget,
     batching_disabled: &mut bool,
 ) -> Option<Option<[f64; 4]>> {
-    if !*batching_disabled {
-        match copy_attrs_batch(element, &FRAME_ATTRIBUTES) {
-            BatchRead::Slots(slots) => {
-                return Some(rect_from_parts(
-                    slots.raw(0).and_then(|v| point_from_cf(v)),
-                    slots.raw(1).and_then(|v| size_from_cf(v)),
-                ))
-            }
-            BatchRead::Fallback(kind) => {
-                if !replay_after_batch_failure(kind, budget, batching_disabled) {
-                    return None;
-                }
-            }
-        }
-    }
-    singles_within_deadline(budget, || element_screen_rect(element))
+    read_within_deadline(
+        budget,
+        batching_disabled,
+        || copy_attrs_batch(element, &FRAME_ATTRIBUTES),
+        frame_from_slots,
+        |step| frame_from_singles(element, step),
+    )
 }
 
 #[cfg(test)]
@@ -203,18 +251,56 @@ mod tests {
     }
 
     #[test]
-    fn single_reads_never_start_past_the_deadline() {
+    fn no_read_starts_past_the_deadline_and_a_late_read_is_discarded() {
+        use super::super::batch_attrs::BatchFailure;
+        let never = || -> BatchRead { panic!("no batch past the deadline") };
         let mut expired = WalkBudget::new(0, 10);
         let _ = expired.admit();
-        let mut read = false;
-        assert_eq!(singles_within_deadline(&mut expired, || read = true), None);
-        assert!(!read, "no single read is issued past the deadline");
+        let mut disabled = false;
+        let read = read_within_deadline(
+            &mut expired,
+            &mut disabled,
+            never,
+            |_| 1,
+            |_| panic!("no single read past the deadline"),
+        );
+        assert_eq!(read, None);
         assert_eq!(expired.outcome().reason(), Some("timeout"));
 
+        // Batching off: the stepper refuses every single read.
+        let mut disabled = true;
+        let read = read_within_deadline(
+            &mut expired,
+            &mut disabled,
+            never,
+            |_| 1,
+            |step| step.read(|| panic!("no single read past the deadline")),
+        );
+        assert_eq!(read, None);
+
+        // Within the deadline the single reads run and their value is kept.
         let mut live = WalkBudget::nodes_only(10);
         let _ = live.admit();
-        assert_eq!(singles_within_deadline(&mut live, || 7), Some(7));
+        let read = read_within_deadline(
+            &mut live,
+            &mut disabled,
+            never,
+            |_| 1,
+            |step| step.read(|| 7),
+        );
+        assert_eq!(read, Some(7));
         assert!(!live.outcome().truncated());
+
+        // A rejected batch replays the single reads within the deadline.
+        let mut disabled = false;
+        let read = read_within_deadline(
+            &mut live,
+            &mut disabled,
+            || BatchRead::Fallback(BatchFailure::Decode),
+            |_| 1,
+            |step| step.read(|| 9),
+        );
+        assert_eq!(read, Some(9));
     }
 
     #[test]

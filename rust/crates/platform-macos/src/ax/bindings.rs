@@ -546,27 +546,41 @@ pub unsafe fn element_screen_center(element: AXUIElementRef) -> Option<(f64, f64
 ///
 /// `element` must be a valid, live `AXUIElementRef` for the duration of the call.
 pub unsafe fn element_screen_rect(element: AXUIElementRef) -> Option<[f64; 4]> {
-    // AXPosition → CGPoint
-    let pos_attr = CFStr::new("AXPosition");
-    let mut pos_ref: CFTypeRef = std::ptr::null();
-    let err = AXUIElementCopyAttributeValue(element, pos_attr.as_concrete_TypeRef(), &mut pos_ref);
-    if err != kAXErrorSuccess || pos_ref.is_null() {
-        return None;
-    }
-    let pos = point_from_cf(pos_ref);
-    CFRelease(pos_ref);
-    let pos = pos?;
+    // The size is read only when the position is.
+    let position = copy_position_attr(element)?;
+    rect_from_parts(Some(position), copy_size_attr(element))
+}
 
-    // AXSize → CGSize
-    let sz_attr = CFStr::new("AXSize");
-    let mut sz_ref: CFTypeRef = std::ptr::null();
-    let err2 = AXUIElementCopyAttributeValue(element, sz_attr.as_concrete_TypeRef(), &mut sz_ref);
-    if err2 != kAXErrorSuccess || sz_ref.is_null() {
+/// Copy `AXPosition` as (x, y).
+///
+/// # Safety
+/// `element` must be a valid, live `AXUIElementRef` for the duration of the call.
+pub(crate) unsafe fn copy_position_attr(element: AXUIElementRef) -> Option<(f64, f64)> {
+    copy_attr_with(element, "AXPosition", |value| point_from_cf(value))
+}
+
+/// Copy `AXSize` as (width, height).
+///
+/// # Safety
+/// `element` must be a valid, live `AXUIElementRef` for the duration of the call.
+pub(crate) unsafe fn copy_size_attr(element: AXUIElementRef) -> Option<(f64, f64)> {
+    copy_attr_with(element, "AXSize", |value| size_from_cf(value))
+}
+
+unsafe fn copy_attr_with<T>(
+    element: AXUIElementRef,
+    name: &str,
+    convert: impl FnOnce(CFTypeRef) -> Option<T>,
+) -> Option<T> {
+    let attr = CFStr::new(name);
+    let mut value: CFTypeRef = std::ptr::null();
+    let err = AXUIElementCopyAttributeValue(element, attr.as_concrete_TypeRef(), &mut value);
+    if err != kAXErrorSuccess || value.is_null() {
         return None;
     }
-    let size = size_from_cf(sz_ref);
-    CFRelease(sz_ref);
-    rect_from_parts(Some(pos), size)
+    let converted = convert(value);
+    CFRelease(value);
+    converted
 }
 
 /// A borrowed AXPosition value as (x, y).
