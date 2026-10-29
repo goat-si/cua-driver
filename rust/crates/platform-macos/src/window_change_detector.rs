@@ -533,6 +533,65 @@ impl Snapshot {
         })
     }
 
+    /// [`detect_async`](Self::detect_async) for an action whose result must
+    /// not wait for a window it did not open (a click): one sample right
+    /// away, a change in it reported; otherwise the result returns at once
+    /// and the whole deadline runs detached, so a window that shows later is
+    /// reported on the next action's result. `post_action_wait: "none"`
+    /// skips even the sample.
+    pub async fn detect_sampled_async(self) -> Changes {
+        let skip = matches!(
+            cua_driver_core::post_action_wait::current(),
+            cua_driver_core::post_action_wait::PostActionWait::None
+        );
+        latency::spawn_blocking(move || {
+            if skip {
+                self.detect_bounded_reporting(
+                    host_observation_bounds(),
+                    Duration::ZERO,
+                    observe_host,
+                )
+            } else {
+                self.detect_bounded_sampled(host_observation_bounds(), observe_host)
+            }
+        })
+        .await
+        .unwrap_or_else(|_| {
+            latency::detector_exit("join_error");
+            Changes::not_polled()
+        })
+    }
+
+    /// One immediate sample against the snapshot, with no sleep: its change,
+    /// or no change with the deadline handed to the detached watch.
+    fn detect_bounded_sampled(
+        mut self,
+        bounds: WindowObservationBounds,
+        mut observe: impl FnMut() -> (Vec<WindowInfo>, Option<i32>) + Send + 'static,
+    ) -> Changes {
+        let _latency = latency::span(latency::Stage::Detector);
+        let earlier = self.earlier.take();
+        if bounds.skips_observation() {
+            latency::detector_exit("skipped");
+            drop(self);
+            return Changes::not_polled().with_earlier(earlier);
+        }
+        let started = Instant::now();
+        let changes = match self.observe_once(&mut observe) {
+            Some(changes) => {
+                latency::detector_exit("change");
+                drop(self);
+                changes
+            }
+            None => {
+                latency::detector_exit("report_window");
+                self.continue_detached(started + bounds.timeout, bounds.poll, observe);
+                Changes::no_change()
+            }
+        };
+        changes.with_earlier(earlier)
+    }
+
     /// One observation against the snapshot: the change it shows, if any.
     fn observe_once(
         &self,
@@ -1101,6 +1160,52 @@ mod tests {
                 (vec![win(1, 7, "App", "Main")], Some(7))
             });
         assert!(!changes.needs_restore());
+        assert!(lock(&TAIL).is_none());
+    }
+
+    /// A click's sampled observation reads once, without sleeping first, and
+    /// returns a quiet result at once with the deadline running detached.
+    #[test]
+    fn a_sampled_quiet_observation_reads_once_and_returns_with_a_detached_tail() {
+        let _serial = lock(&TAIL_TEST_LOCK);
+        end_tail();
+        let observations = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = observations.clone();
+        let snap = WindowChangeDetector::capture_from(HashSet::from([1]), Some(7), false, None);
+        // The detached watch sleeps a whole poll (1 s) before its first read,
+        // so every read counted at return is the result's own.
+        let changes = snap.detect_bounded_sampled(
+            observation_bounds_from(Some("2000"), Some("1000")),
+            move || {
+                counter.fetch_add(1, Ordering::SeqCst);
+                (vec![win(1, 7, "App", "Main")], Some(7))
+            },
+        );
+        assert_eq!(observations.load(Ordering::SeqCst), 1);
+        assert!(changes.polled && !changes.deferred);
+        assert!(changes.new_windows.is_empty() && !changes.foreground_changed);
+        assert_eq!(changes.result_suffix(), "");
+        assert!(lock(&TAIL).is_some(), "the deadline runs detached");
+        end_tail();
+    }
+
+    /// A window already listed at the sample is reported on this result,
+    /// with no tail left behind.
+    #[test]
+    fn a_sampled_observation_reports_a_window_seen_in_its_sample() {
+        let _serial = lock(&TAIL_TEST_LOCK);
+        end_tail();
+        let snap = WindowChangeDetector::capture_from(HashSet::from([1]), Some(7), false, None);
+        let changes = snap.detect_bounded_sampled(
+            observation_bounds_from(Some("2000"), Some("1000")),
+            || {
+                (
+                    vec![win(1, 7, "App", "Main"), win(2, 7, "App", "Save")],
+                    Some(7),
+                )
+            },
+        );
+        assert_eq!(changes.new_windows.len(), 1);
         assert!(lock(&TAIL).is_none());
     }
 

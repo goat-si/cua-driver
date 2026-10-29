@@ -145,16 +145,6 @@ fn is_toggle_press(ax_action: &str, role: &str, advertised: &[String]) -> bool {
         && advertised.iter().any(|action| action == "AXPress")
 }
 
-/// AX errors that AppKit apps return from a press they performed (#3835), so
-/// a toggle's value read-back may confirm the press. Illegal argument,
-/// invalid element and API disabled mean the request never reached the app;
-/// cannot complete means the app did not answer in time, so a short read-back
-/// proves nothing. Neither qualifies; an unresolved error after dispatch is
-/// reported as unverifiable by `unresolved_perform_error`.
-/// How long a changed window title must hold before it counts. A window
-/// that navigated does not flip its title back.
-const WINDOW_TITLE_STABILITY: std::time::Duration = std::time::Duration::from_millis(60);
-
 /// The window an element is in, its title before the action, and the
 /// element's own name. Only a title that changed TO that name is evidence:
 /// any other change could be the app's own doing.
@@ -261,6 +251,12 @@ impl Drop for WindowTitleProbe {
     }
 }
 
+/// AX errors that AppKit apps return from a press they performed (#3835), so
+/// a toggle's value read-back may confirm the press. Illegal argument,
+/// invalid element and API disabled mean the request never reached the app;
+/// cannot complete means the app did not answer in time, so a short read-back
+/// proves nothing. Neither qualifies; an unresolved error after dispatch is
+/// reported as unverifiable by `unresolved_perform_error`.
 fn press_error_may_have_acted(err: crate::ax::bindings::AXError) -> bool {
     use crate::ax::bindings::{
         kAXErrorActionUnsupported, kAXErrorAttributeUnsupported, kAXErrorFailure,
@@ -297,11 +293,6 @@ pub(super) enum ClickEvidence {
     TitleNamesTarget,
     /// A checkbox or radio button changed value on two reads.
     ToggleChanged,
-    /// A sheet was newly attached to the clicked window.
-    SheetAttached,
-    /// A window of the clicked app, named for the clicked item or owned by
-    /// the clicked window, opened.
-    WindowOpened,
 }
 
 impl ClickEvidence {
@@ -312,19 +303,11 @@ impl ClickEvidence {
             ClickEvidence::Deselected => "row changed from selected to unselected",
             ClickEvidence::TitleNamesTarget => "window title changed to the pressed item's name",
             ClickEvidence::ToggleChanged => "control value changed on two reads",
-            ClickEvidence::SheetAttached => "a sheet was newly attached to the clicked window",
-            ClickEvidence::WindowOpened => "a window named for the clicked item opened",
         }
     }
 
     fn kind(self) -> cua_driver_core::action_record::EvidenceKind {
-        use cua_driver_core::action_record::EvidenceKind;
-        match self {
-            ClickEvidence::SheetAttached | ClickEvidence::WindowOpened => {
-                EvidenceKind::WindowChange
-            }
-            _ => EvidenceKind::AccessibilityReadback,
-        }
+        cua_driver_core::action_record::EvidenceKind::AccessibilityReadback
     }
 
     fn kind_name(self) -> &'static str {
@@ -399,10 +382,6 @@ impl Retained {
         core_foundation::base::CFRetain(element as CFTypeRef);
         Retained(element)
     }
-
-    fn same_as(&self, other: AXUIElementRef) -> bool {
-        unsafe { core_foundation::base::CFEqual(self.0 as CFTypeRef, other as CFTypeRef) != 0 }
-    }
 }
 
 impl Drop for Retained {
@@ -421,6 +400,8 @@ fn is_selectable_item_role(role: &str) -> bool {
 /// another row cannot pass as this one.
 struct SelectionSnapshot {
     items: Vec<(Retained, bool)>,
+    /// The element is, or sits in, a selectable item role.
+    in_item: bool,
 }
 
 impl SelectionSnapshot {
@@ -429,10 +410,12 @@ impl SelectionSnapshot {
     /// `element` must be a valid, live `AXUIElementRef`.
     unsafe fn capture(element: AXUIElementRef) -> Self {
         let mut items = Vec::new();
+        let mut in_item = false;
         let mut current = Retained::retain(element);
         for _ in 0..8 {
             let role = copy_string_attr(current.0, "AXRole").unwrap_or_default();
             if is_selectable_item_role(&role) {
+                in_item = true;
                 if let Some(selected) = copy_bool_attr(current.0, "AXSelected") {
                     items.push((Retained::retain(current.0), selected));
                 }
@@ -442,7 +425,7 @@ impl SelectionSnapshot {
             };
             current = Retained(parent);
         }
-        Self { items }
+        Self { items, in_item }
     }
 
     fn before(&self) -> Vec<bool> {
@@ -469,122 +452,87 @@ fn selection_transition_confirms(before: &[bool], after: &[Option<bool>]) -> boo
         .any(|(before, after)| !*before && *after == Some(true))
 }
 
-#[link(name = "CoreGraphics", kind = "framework")]
-extern "C" {
-    fn CGWindowListCopyWindowInfo(
-        option: u32,
-        relative_to_window: u32,
-    ) -> core_foundation::array::CFArrayRef;
+/// The longest a click's effect is polled for after delivery. A click
+/// spends at most this on its read-back, inside the click budget (200 ms
+/// for an element click, 100 ms for a point click); an effect that appears
+/// later leaves the click unverifiable.
+const CLICK_OBSERVATION: std::time::Duration = std::time::Duration::from_millis(60);
+const CLICK_OBSERVATION_POLL: std::time::Duration = std::time::Duration::from_millis(10);
+
+/// How long a click's effects are watched for after delivery.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ObservationScope {
+    /// Something the click targets can still change (an unselected item,
+    /// a toggle, a window title that may come to name the item): poll only
+    /// those properties, returning as soon as one changes, for at most
+    /// [`CLICK_OBSERVATION`].
+    Watch,
+    /// Nothing the click targets holds state (a plain button): the click is
+    /// unverifiable at once, with no read and no wait.
+    Nothing,
 }
 
-/// One CGWindowList entry as (owner pid, window number, layer); `None` when
-/// the entry is not a dictionary or misses one of them.
-type WindowEntry = Option<(i64, i64, i64)>;
+/// Which scope a click's probe needs. `selection_before` is each retained
+/// selectable item's AXSelected before the click, `toggle` whether a toggle
+/// value is watched, `title_candidate` whether a window title probe was
+/// taken.
+fn observation_scope(
+    selection_before: &[bool],
+    toggle: bool,
+    title_candidate: bool,
+) -> ObservationScope {
+    // Only an item read unselected can turn selected (a modified click's
+    // deselection is judged by its own snapshot, not by this probe).
+    let can_select = selection_before.iter().any(|selected| !selected);
+    if can_select || toggle || title_candidate {
+        ObservationScope::Watch
+    } else {
+        ObservationScope::Nothing
+    }
+}
 
-/// The layer-0 window ids of `pid`, or `None` when the list could not be
-/// read or held an entry that could not be parsed: an unreadable list is
-/// never an empty one.
-fn layer_zero_ids(pid: i32, entries: Option<Vec<WindowEntry>>) -> Option<Vec<u32>> {
-    let mut ids = Vec::new();
-    for entry in entries? {
-        let (owner, number, layer) = entry?;
-        if owner == i64::from(pid) && layer == 0 {
-            ids.push(u32::try_from(number).ok()?);
+/// Poll `read` from `delivered` until it shows evidence, then return it at
+/// once if an immediate second read agrees (no settle wait); give up after
+/// [`CLICK_OBSERVATION`]. A change first seen after the deadline, or read by
+/// a call that returned after it, is not the click's. `Nothing` reads
+/// nothing.
+fn watch_for_change<C: crate::ax::scroll_area::Clock>(
+    scope: ObservationScope,
+    delivered: std::time::Instant,
+    clock: &C,
+    mut read: impl FnMut() -> Option<ClickEvidence>,
+) -> Option<ClickEvidence> {
+    if scope == ObservationScope::Nothing {
+        return None;
+    }
+    let deadline = delivered + CLICK_OBSERVATION;
+    loop {
+        if clock.now() > deadline {
+            return None;
         }
-    }
-    ids.sort_unstable();
-    Some(ids)
-}
-
-/// `pid`'s layer-0 windows, on screen or not.
-fn app_window_ids(pid: i32) -> Option<Vec<u32>> {
-    use core_foundation::{
-        array::CFArray, base::CFGetTypeID, dictionary::CFDictionary, number::CFNumber,
-        string::CFString,
-    };
-    use std::os::raw::c_void;
-    // kCGWindowListOptionAll (0) | kCGWindowListExcludeDesktopElements (1 << 4)
-    let raw = unsafe { CGWindowListCopyWindowInfo(1 << 4, 0) };
-    let entries = (!raw.is_null()).then(|| {
-        let list: CFArray<CFTypeRef> = unsafe { CFArray::wrap_under_create_rule(raw) };
-        list.iter()
-            .map(|item| {
-                let item = *item;
-                let dictionary = CFDictionary::<*const c_void, *const c_void>::type_id();
-                if unsafe { CFGetTypeID(item) } != dictionary {
-                    return None;
-                }
-                let dict: CFDictionary<*const c_void, *const c_void> =
-                    unsafe { CFDictionary::wrap_under_get_rule(item as _) };
-                let number = |key: &str| {
-                    let key = CFString::new(key);
-                    dict.find(key.as_concrete_TypeRef() as *const c_void)
-                        .and_then(|value| unsafe {
-                            let value = *value;
-                            if CFGetTypeID(value) == CFNumber::type_id() {
-                                CFNumber::wrap_under_get_rule(value as _).to_i64()
-                            } else {
-                                None
-                            }
-                        })
-                };
-                Some((
-                    number("kCGWindowOwnerPID")?,
-                    number("kCGWindowNumber")?,
-                    number("kCGWindowLayer")?,
-                ))
-            })
-            .collect()
-    });
-    layer_zero_ids(pid, entries)
-}
-
-/// Two reads that agree; `None` (no window evidence) when either failed or
-/// the app's windows were already changing before the click.
-fn stable_window_baseline(first: Option<Vec<u32>>, second: Option<Vec<u32>>) -> Option<Vec<u32>> {
-    match (first, second) {
-        (Some(first), Some(second)) if first == second => Some(first),
-        _ => None,
+        let seen = read();
+        if clock.now() > deadline {
+            return None;
+        }
+        if let Some(evidence) = seen {
+            if read() == Some(evidence) {
+                return Some(evidence);
+            }
+        }
+        clock.sleep(CLICK_OBSERVATION_POLL);
     }
 }
 
-/// Window ids present now and absent from the baseline.
-fn new_window_ids(before: &[u32], now: &[u32]) -> Vec<u32> {
-    now.iter()
-        .copied()
-        .filter(|id| !before.contains(id))
-        .collect()
-}
-
-/// A new window is tied to the click when the clicked window owns it or its
-/// title is the clicked item's name.
-fn window_tied_to_click(owned_by_clicked: bool, title: Option<&str>, target: Option<&str>) -> bool {
-    owned_by_clicked
-        || matches!(
-            (title, target),
-            (Some(title), Some(target))
-                if !target.trim().is_empty()
-                    && title.trim().to_lowercase() == target.trim().to_lowercase()
-        )
-}
-
-/// How long a click's effect is watched for.
-const CLICK_OBSERVATION: std::time::Duration = std::time::Duration::from_millis(300);
-const CLICK_OBSERVATION_POLL: std::time::Duration = std::time::Duration::from_millis(25);
-/// The gap between the two baseline reads of the app's windows.
-const WINDOW_BASELINE_GAP: std::time::Duration = std::time::Duration::from_millis(80);
-
-/// What a click may change, read immediately before it is dispatched.
+/// What a click may change, read immediately before it is dispatched: the
+/// target's own properties only (its selection, toggle value and window
+/// title), never the window's tree.
 pub(super) struct ClickProbe {
-    pid: i32,
-    window: Option<Retained>,
-    /// `None` when the clicked window's children could not be read.
-    sheets_before: Option<Vec<Retained>>,
-    windows_before: Option<Vec<u32>>,
     title: Option<WindowTitleProbe>,
-    target_name: Option<String>,
     toggle: Option<(Retained, String, String)>,
     selection: Option<SelectionSnapshot>,
+    scope: ObservationScope,
+    /// The element under the point for a pixel click, as the public `hit`.
+    hit: Option<serde_json::Value>,
     /// The physical-input clock, read before any baseline: input during the
     /// baseline reads also disqualifies evidence.
     idle_before: Option<u64>,
@@ -602,84 +550,93 @@ pub(super) struct ClickProbe {
 // at a time (captured on one blocking task, observed on another).
 unsafe impl Send for ClickProbe {}
 
-/// The AXSheet children of a window.
-///
-/// # Safety
-///
-/// `window` must be a valid, live `AXUIElementRef`.
-unsafe fn sheets_of(window: AXUIElementRef) -> Option<Vec<Retained>> {
-    // Every child is owned (and released) before any role is read.
-    let children: Vec<Retained> = crate::ax::bindings::copy_children_checked(window)?
-        .into_iter()
-        .map(Retained)
-        .collect();
-    let mut sheets = Vec::new();
-    for child in children {
-        // A child whose role cannot be read could be a sheet: the list is
-        // unknown then, never one without it.
-        if copy_string_attr(child.0, "AXRole")? == "AXSheet" {
-            sheets.push(child);
-        }
-    }
-    Some(sheets)
-}
-
-/// The exact AX window `window_id` of `pid`, retained.
+/// The element under a screen point, and whether it is proven inside the
+/// exact window (its window id read back as `window_id`). An element whose
+/// window id cannot be read is kept, unproven; one read back in another
+/// window is dropped.
 ///
 /// # Safety
 ///
 /// Calls into Accessibility for `pid`.
-unsafe fn ax_window_by_id(pid: i32, window_id: u32) -> Option<Retained> {
-    let app = crate::ax::bindings::AXUIElementCreateApplication(pid);
-    if app.is_null() {
-        return None;
+unsafe fn element_in_window_at(
+    pid: i32,
+    window_id: u32,
+    x: f64,
+    y: f64,
+) -> Option<(Retained, bool)> {
+    let element = Retained(element_at_screen_position(pid, x, y)?);
+    match crate::ax::exact_target::element_window_id(element.0) {
+        Some(id) if id == window_id => Some((element, true)),
+        Some(_) => None,
+        None => Some((element, false)),
     }
-    let app = Retained(app);
-    crate::ax::bindings::copy_ax_windows(app.0)
-        .into_iter()
-        .map(Retained)
-        .find(|window| crate::ax::bindings::ax_get_window_id(window.0) == Some(window_id))
+}
+
+/// The public `hit` record of an element a pointer route hit: its role,
+/// name and identifier, each omitted when unreadable; `None` when none is.
+///
+/// # Safety
+///
+/// `element` must be a valid, live `AXUIElementRef`.
+unsafe fn pointer_hit(element: AXUIElementRef) -> Option<serde_json::Value> {
+    pointer_hit_record(
+        copy_string_attr(element, "AXRole"),
+        element_name(element),
+        copy_string_attr(element, "AXIdentifier"),
+    )
+}
+
+fn pointer_hit_record(
+    role: Option<String>,
+    label: Option<String>,
+    identifier: Option<String>,
+) -> Option<serde_json::Value> {
+    let mut hit = serde_json::Map::new();
+    for (key, value) in [("role", role), ("label", label), ("identifier", identifier)] {
+        if let Some(value) = value.filter(|value| !value.trim().is_empty()) {
+            hit.insert(key.into(), serde_json::Value::String(value));
+        }
+    }
+    (!hit.is_empty()).then_some(serde_json::Value::Object(hit))
 }
 
 impl ClickProbe {
     /// Read what the click may change. `element` is the element the click is
-    /// dispatched to (`None`: only the window and the app's windows are
-    /// watched); `toggle` when it is a checkbox or radio button whose value
-    /// shows the press.
+    /// dispatched to (`None`: nothing is watched); `toggle` when it is a
+    /// checkbox or radio button whose value shows the press.
     ///
     /// # Safety
     ///
     /// `element`, when given, must be a valid, live `AXUIElementRef`.
-    pub(super) unsafe fn capture(
-        pid: i32,
-        window_id: u32,
-        element: Option<AXUIElementRef>,
-        toggle: bool,
-    ) -> Self {
+    pub(super) unsafe fn capture(element: Option<AXUIElementRef>, toggle: bool) -> Self {
         let idle_before = super::physical_input_idle_ms();
         let input_from = std::time::Instant::now();
-        let window = ax_window_by_id(pid, window_id);
-        let sheets_before = window.as_ref().and_then(|w| sheets_of(w.0));
-        let first = app_window_ids(pid);
-        std::thread::sleep(WINDOW_BASELINE_GAP);
-        let windows_before = stable_window_baseline(first, app_window_ids(pid));
-        let title = element.and_then(|element| WindowTitleProbe::of(element));
-        let target_name = element.and_then(|element| element_name(element));
+        let selection = element.map(|element| SelectionSnapshot::capture(element));
         let toggle = element.filter(|_| toggle).and_then(|element| {
             let role = copy_string_attr(element, "AXRole")?;
             let value = crate::ax::bindings::copy_stringish_attr(element, "AXValue")?.state_value;
             Some((Retained::retain(element), role, value))
         });
-        let selection = element.map(|element| SelectionSnapshot::capture(element));
+        // A window retitles to an item's name when the item navigates (a
+        // sidebar location, a folder opened in place): only an element that
+        // is or sits in a selectable item gets a title probe.
+        let title = element
+            .filter(|_| selection.as_ref().is_some_and(|s| s.in_item))
+            .and_then(|element| WindowTitleProbe::of(element));
+        let scope = observation_scope(
+            &selection
+                .as_ref()
+                .map(SelectionSnapshot::before)
+                .unwrap_or_default(),
+            toggle.is_some(),
+            title.is_some(),
+        );
         Self {
-            pid,
-            window,
-            sheets_before,
-            windows_before,
             title,
-            target_name,
             toggle,
             selection,
+            scope,
+            hit: None,
             idle_before,
             input_from,
             started: std::time::Instant::now(),
@@ -700,24 +657,34 @@ impl ClickProbe {
     }
 
     /// [`capture`](Self::capture) for a pixel click at a screen point: the
-    /// element there counts only when it is inside the exact window.
+    /// element there counts only when it is inside the exact window, and is
+    /// reported as the click's `hit`.
     ///
     /// # Safety
     ///
     /// Calls into Accessibility for `pid`.
     pub(super) unsafe fn at_point(pid: i32, window_id: u32, x: f64, y: f64) -> Self {
-        let hit = element_at_screen_position(pid, x, y).map(Retained);
+        let hit = element_in_window_at(pid, window_id, x, y);
+        // The hit is reported either way; only a proven element is probed
+        // for evidence.
         let element = hit
             .as_ref()
-            .filter(|hit| crate::ax::exact_target::element_window_id(hit.0) == Some(window_id))
-            .map(|hit| hit.0);
+            .filter(|(_, proven)| *proven)
+            .map(|(hit, _)| hit.0);
         let toggle = element.is_some_and(|element| {
             matches!(
                 copy_string_attr(element, "AXRole").as_deref(),
                 Some("AXCheckBox" | "AXRadioButton")
             )
         });
-        Self::capture(pid, window_id, element, toggle)
+        let mut probe = Self::capture(element, toggle);
+        probe.hit = hit.and_then(|(hit, _)| pointer_hit(hit.0));
+        probe
+    }
+
+    /// The element under the point of a pixel click, as the public `hit`.
+    pub(super) fn hit(&self) -> Option<serde_json::Value> {
+        self.hit.clone()
     }
 
     fn read_once(&self) -> Option<ClickEvidence> {
@@ -740,67 +707,11 @@ impl ClickProbe {
                 return Some(ClickEvidence::TitleNamesTarget);
             }
         }
-        if let (Some(window), Some(before)) = (&self.window, &self.sheets_before) {
-            let now = unsafe { sheets_of(window.0) }.unwrap_or_default();
-            if now
-                .iter()
-                .any(|sheet| !before.iter().any(|old| old.same_as(sheet.0)))
-            {
-                return Some(ClickEvidence::SheetAttached);
-            }
-        }
-        if self.window_opened() {
-            return Some(ClickEvidence::WindowOpened);
-        }
         None
     }
 
-    /// A new layer-0 window of the app, tied to the click (see
-    /// [`window_tied_to_click`]).
-    fn window_opened(&self) -> bool {
-        let Some(before) = &self.windows_before else {
-            return false;
-        };
-        let Some(now) = app_window_ids(self.pid) else {
-            return false;
-        };
-        let new = new_window_ids(before, &now);
-        if new.is_empty() {
-            return false;
-        }
-        unsafe {
-            let app = crate::ax::bindings::AXUIElementCreateApplication(self.pid);
-            if app.is_null() {
-                return false;
-            }
-            let app = Retained(app);
-            let windows: Vec<Retained> = crate::ax::bindings::copy_ax_windows(app.0)
-                .into_iter()
-                .map(Retained)
-                .collect();
-            windows.iter().any(|window| {
-                let is_new = crate::ax::bindings::ax_get_window_id(window.0)
-                    .is_some_and(|id| new.contains(&id));
-                let owned = copy_element_attr(window.0, "AXParent")
-                    .map(Retained)
-                    .is_some_and(|parent| {
-                        self.window
-                            .as_ref()
-                            .is_some_and(|clicked| clicked.same_as(parent.0))
-                    });
-                is_new
-                    && window_tied_to_click(
-                        owned,
-                        copy_string_attr(window.0, "AXTitle").as_deref(),
-                        self.target_name.as_deref(),
-                    )
-            })
-        }
-    }
-
-    /// Watch for an effect for up to [`CLICK_OBSERVATION`]; a change counts
-    /// when it holds on a second read and no physical input happened since
-    /// dispatch.
+    /// Watch for an effect (see [`watch_for_change`]); a change counts when
+    /// no physical input happened from the baseline reads on.
     pub(super) fn observe(self) -> Option<ClickEvidence> {
         // A click that posts its own events observes from the end of that
         // post; a post whose end was not recorded never confirms.
@@ -817,33 +728,16 @@ impl ClickProbe {
         // From delivery: the end of the click's own post when it made one
         // (a double click's two clicks take a while), else dispatch.
         let delivered = self.own_post.flatten().unwrap_or(self.started);
-        let deadline = delivered + CLICK_OBSERVATION;
-        let found = loop {
-            // A change first seen after the deadline is not this click's.
-            if std::time::Instant::now() > deadline {
-                break None;
-            }
-            let seen = self.read_once();
-            // A read that returned after the deadline may show a later change.
-            if std::time::Instant::now() > deadline {
-                break None;
-            }
-            if let Some(evidence) = seen {
-                let stability = match evidence {
-                    ClickEvidence::ToggleChanged => SELECTION_READBACK_STABILITY,
-                    _ => WINDOW_TITLE_STABILITY,
-                };
-                std::thread::sleep(stability);
-                if self.read_once() == Some(evidence) {
-                    break Some(evidence);
-                }
-            }
-            std::thread::sleep(CLICK_OBSERVATION_POLL);
-        };
+        let found = watch_for_change(
+            self.scope,
+            delivered,
+            &crate::ax::scroll_area::SystemClock,
+            || self.read_once(),
+        );
         tracing::debug!(
             ?found,
+            scope = ?self.scope,
             title_probe = self.title.is_some(),
-            target_name = self.target_name.is_some(),
             since_delivery_ms = elapsed_ms(delivered),
             "click observation"
         );
@@ -1099,8 +993,36 @@ impl Tool for ClickTool {
             .get("x")
             .and_then(Value::as_f64)
             .zip(args.get("y").and_then(Value::as_f64));
-        super::window_points::annotate(self.invoke_in(args, space).await, space, point)
+        let result =
+            super::window_points::annotate(self.invoke_in(args, space).await, space, point);
+        with_screenshot_point(result, space, point)
     }
+}
+
+/// A pixel click addressed in screenshot pixels reports the point it aimed
+/// at in that space (window-points calls get theirs from
+/// `window_points::annotate`); refusals and element clicks carry none.
+fn with_screenshot_point(
+    mut result: ToolResult,
+    space: super::window_points::PointSpace,
+    point: Option<(f64, f64)>,
+) -> ToolResult {
+    let (super::window_points::PointSpace::Screenshot, Some((x, y))) = (space, point) else {
+        return result;
+    };
+    if result.is_error == Some(true) {
+        return result;
+    }
+    if let Some(object) = result
+        .structured_content
+        .as_mut()
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        object
+            .entry("point")
+            .or_insert_with(|| serde_json::json!({"x": x, "y": y, "unit": "screenshot"}));
+    }
+    result
 }
 
 impl ClickTool {
@@ -1586,7 +1508,6 @@ impl ClickTool {
                                         &selection_modifiers,
                                         foreground,
                                     )?);
-                                    std::thread::sleep(std::time::Duration::from_millis(150));
                                     Ok(())
                                 };
                                 let fronted = if has_modifiers {
@@ -1633,7 +1554,7 @@ impl ClickTool {
 
             // Drop the wildcard lease + detect window/foreground side-effects.
             let acted_at = std::time::Instant::now();
-            let changes = super::finish_window_observation(snapshot).await;
+            let changes = snapshot.detect_sampled_async().await;
 
             match result {
                 Ok(Ok((
@@ -1980,6 +1901,8 @@ impl ClickTool {
                         CFRelease(element as _);
                         return Ok(PxAxPress::FallThrough);
                     }
+                    // The element the point resolved to, read before the press.
+                    let hit = pointer_hit(element);
                     // An element that does not advertise AXPress can still
                     // accept it as a no-op. On a toolkit that drops routed
                     // mouse events (LibreOffice's Calc cells) that no-op used
@@ -2003,14 +1926,14 @@ impl ClickTool {
                     }
                     let delivered = if focus_only {
                         if crate::input::ax_actions::focus_element(element as usize).is_ok() {
-                            PxAxPress::Delivered(None)
+                            PxAxPress::Delivered(None, hit)
                         } else {
                             PxAxPress::FallThrough
                         }
                     } else {
-                        match ax_press_with_ancestors(element, &dispatch_guard, pid, hit_test_wid) {
+                        match ax_press_with_ancestors(element, &dispatch_guard, pid) {
                             Ok(AxPressOutcome::Delivered(evidence)) => {
-                                PxAxPress::Delivered(evidence)
+                                PxAxPress::Delivered(evidence, hit)
                             }
                             Ok(AxPressOutcome::Unavailable) => PxAxPress::FallThrough,
                             Ok(AxPressOutcome::Indeterminate) => {
@@ -2033,7 +1956,7 @@ impl ClickTool {
                     }
                 }
                 match ax_result {
-                    Ok(Ok(PxAxPress::Delivered(evidence))) => {
+                    Ok(Ok(PxAxPress::Delivered(evidence, hit))) => {
                         crate::cursor::overlay::send_command(
                             cursor_key.clone(),
                             cursor_overlay::OverlayCommand::ClickPulse {
@@ -2042,7 +1965,7 @@ impl ClickTool {
                             },
                         );
                         let label = if focus_only { "focused" } else { "pressed" };
-                        return px_ax_press_result(label, evidence);
+                        return px_ax_press_result(label, evidence, hit);
                     }
                     Ok(Ok(PxAxPress::FallThrough)) if focus_only => {
                         return ToolResult::error(
@@ -2298,6 +2221,14 @@ impl ClickTool {
                                 route != PixelClickRoute::ForegroundHid && button_kind == "left"
                             })
                             .map(|wid| unsafe { ClickProbe::at_point(pid, wid, screen_x, screen_y) });
+                        // The element under the point, read before the post.
+                        let hit = match probe.as_ref() {
+                            Some(probe) => probe.hit(),
+                            None => window_id.and_then(|wid| unsafe {
+                                element_in_window_at(pid, wid, screen_x, screen_y)
+                                    .and_then(|(element, _)| pointer_hit(element.0))
+                            }),
+                        };
                         if let Some(probe) = probe.as_mut() {
                             probe.own_post_starts();
                         }
@@ -2370,7 +2301,7 @@ impl ClickTool {
                             if let Some(probe) = probe.as_mut() {
                                 probe.own_post_finished();
                             }
-                            probe
+                            (probe, hit)
                         })
                     })
                     .await
@@ -2378,14 +2309,17 @@ impl ClickTool {
             )
             .await;
             // Watch the click's effect from now, while the focus restore and
-            // the window watch below run: the observation has its own 300 ms
-            // deadline from dispatch.
+            // the window watch below run: the observation has its own
+            // deadline from delivery.
+            let mut hit = None;
             let (result, observing) = match result {
-                Ok(Ok(Some(probe))) => (
-                    Ok(Ok(())),
-                    Some(latency::spawn_action_blocking(move || probe.observe())),
-                ),
-                Ok(Ok(None)) => (Ok(Ok(())), None),
+                Ok(Ok((probe, posted_hit))) => {
+                    hit = posted_hit;
+                    (
+                        Ok(Ok(())),
+                        probe.map(|probe| latency::spawn_action_blocking(move || probe.observe())),
+                    )
+                }
                 Ok(Err(error)) => (Ok(Err(error)), None),
                 Err(error) => (Err(error), None),
             };
@@ -2401,7 +2335,7 @@ impl ClickTool {
                 .await;
             }
 
-            let changes = super::finish_window_observation(snapshot).await;
+            let changes = snapshot.detect_sampled_async().await;
             if let Ok(Err(error)) = &result {
                 if let Some(refusal) = super::window_points::moved_refusal(error, space) {
                     return refusal;
@@ -2434,6 +2368,9 @@ impl ClickTool {
                         "effect": if evidence.is_some() { "confirmed" } else { "unverifiable" },
                         "focus_without_raise": focus_without_raise
                     });
+                    if let Some(hit) = hit {
+                        structured["hit"] = hit;
+                    }
                     let result = ToolResult::text(format!(
                         "✅ Posted {button_label} {target} ({}).{read_back}{}",
                         super::pixel_route::delivery_note(route),
@@ -3105,7 +3042,7 @@ fn perform_ax_click(
     // read right before dispatch so nothing earlier (a navigation still
     // finishing during the priming) counts. A row whose press is refused is
     // selected by the fallback below; its own snapshot ties that write.
-    let probe = unsafe { ClickProbe::capture(pid, window_id, Some(element), toggle) };
+    let probe = unsafe { ClickProbe::capture(Some(element), toggle) };
     let fallback_selection = (ax_action == "AXPress" && modifiers.is_empty()).then(|| {
         let idle_before = super::physical_input_idle_ms();
         let started = std::time::Instant::now();
@@ -3274,10 +3211,11 @@ fn ancestor_press_outcome(evidence: Option<ClickEvidence>) -> AxPressOutcome {
 }
 
 /// What the background PX hit-test route did.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum PxAxPress {
-    /// Delivered through AX, with the evidence read after it, if any.
-    Delivered(Option<ClickEvidence>),
+    /// Delivered through AX, with the evidence read after it, if any, and
+    /// the element the point resolved to as the public `hit`.
+    Delivered(Option<ClickEvidence>, Option<serde_json::Value>),
     /// Nothing was sent through AX: the routed pixel click goes next.
     FallThrough,
     /// An AX action may have been delivered without evidence: stop.
@@ -3286,15 +3224,19 @@ enum PxAxPress {
 
 /// The result of a background PX click delivered through AX: confirmed
 /// with its evidence and a typed record, or unverifiable when the press
-/// showed no readable change.
-fn px_ax_press_result(label: &str, evidence: Option<ClickEvidence>) -> ToolResult {
+/// showed no readable change. `hit` is the element under the point.
+fn px_ax_press_result(
+    label: &str,
+    evidence: Option<ClickEvidence>,
+    hit: Option<serde_json::Value>,
+) -> ToolResult {
     use cua_driver_core::action_record::{ActionTransport, ActualDelivery, RequestedDelivery};
     let (transport, requested, actual) = (
         ActionTransport::MacosAxAction,
         RequestedDelivery::Background,
         ActualDelivery::Background,
     );
-    match evidence {
+    let mut result = match evidence {
         Some(evidence) => ToolResult::text(format!(
             "✅ PX hit-test {label} the background element via AX; {}.",
             evidence.detail()
@@ -3316,7 +3258,11 @@ fn px_ax_press_result(label: &str, evidence: Option<ClickEvidence>) -> ToolResul
             "effect": "unverifiable"
         }))
         .with_action_record(unverifiable_click_record(transport, requested, actual)),
+    };
+    if let (Some(hit), Some(structured)) = (hit, result.structured_content.as_mut()) {
+        structured["hit"] = hit;
     }
+    result
 }
 
 /// Outcome of the AX press route for a point click.
@@ -3386,7 +3332,6 @@ unsafe fn ax_press_with_ancestors(
     element: crate::ax::bindings::AXUIElementRef,
     dispatch_guard: &Option<super::window_points::DispatchGuard>,
     pid: i32,
-    window_id: u32,
 ) -> Result<AxPressOutcome, super::window_points::WindowMoved> {
     use crate::ax::bindings::{copy_action_names, copy_element_attr, copy_string_attr};
     use core_foundation::base::CFRelease;
@@ -3396,8 +3341,6 @@ unsafe fn ax_press_with_ancestors(
     if leaf_actions.iter().any(|a| a == "AXPress") {
         let role = copy_string_attr(element, "AXRole").unwrap_or_default();
         let probe = ClickProbe::capture(
-            pid,
-            window_id,
             Some(element),
             is_toggle_press("AXPress", &role, &leaf_actions),
         );
@@ -3458,7 +3401,7 @@ unsafe fn ax_press_with_ancestors(
     let target = chain[index].2;
     // What the press may change, read on the pressed row or cell itself
     // (its selection, the window retitled to its name: Finder's sidebar).
-    let probe = ClickProbe::capture(pid, window_id, Some(target), false);
+    let probe = ClickProbe::capture(Some(target), false);
     if let Err(moved) = super::window_points::check_guard(dispatch_guard) {
         for (_, _, el, _) in chain {
             CFRelease(el as _);
@@ -3551,7 +3494,7 @@ mod ancestor_action_tests {
         for evidence in [
             ClickEvidence::Selected,
             ClickEvidence::TitleNamesTarget,
-            ClickEvidence::WindowOpened,
+            ClickEvidence::ToggleChanged,
         ] {
             assert_eq!(
                 ancestor_press_outcome(Some(evidence)),
@@ -4086,6 +4029,121 @@ mod tests {
 #[cfg(test)]
 mod click_evidence_tests {
     use super::*;
+    use std::cell::{Cell, RefCell};
+    use std::time::{Duration, Instant};
+
+    /// A clock that advances only when slept on.
+    struct FakeClock {
+        now: Cell<Instant>,
+        sleeps: RefCell<Vec<Duration>>,
+    }
+
+    impl crate::ax::scroll_area::Clock for FakeClock {
+        fn now(&self) -> Instant {
+            self.now.get()
+        }
+        fn sleep(&self, duration: Duration) {
+            self.sleeps.borrow_mut().push(duration);
+            self.now.set(self.now.get() + duration);
+        }
+    }
+
+    /// Watch with `read(elapsed)`: the result, the reads made, the time the
+    /// watch took and its sleeps.
+    fn run_watch(
+        scope: ObservationScope,
+        read: impl Fn(Duration) -> Option<ClickEvidence>,
+    ) -> (Option<ClickEvidence>, usize, Duration, Vec<Duration>) {
+        let start = Instant::now();
+        let clock = FakeClock {
+            now: Cell::new(start),
+            sleeps: RefCell::new(Vec::new()),
+        };
+        let reads = Cell::new(0);
+        let found = watch_for_change(scope, start, &clock, || {
+            reads.set(reads.get() + 1);
+            read(clock.now.get() - start)
+        });
+        let elapsed = clock.now.get() - start;
+        (found, reads.get(), elapsed, clock.sleeps.take())
+    }
+
+    #[test]
+    fn a_click_on_a_plain_button_is_unverifiable_without_a_read_or_a_wait() {
+        // Calculator's All Clear: no selectable item, no toggle, no title probe.
+        let scope = observation_scope(&[], false, false);
+        assert_eq!(scope, ObservationScope::Nothing);
+        let (found, reads, elapsed, sleeps) = run_watch(scope, |_| None);
+        assert_eq!(found, None);
+        assert_eq!(reads, 0);
+        assert_eq!(elapsed, Duration::ZERO);
+        assert!(sleeps.is_empty(), "{sleeps:?}");
+    }
+
+    #[test]
+    fn only_a_probe_that_can_still_change_is_watched() {
+        assert_eq!(
+            observation_scope(&[true], false, false),
+            ObservationScope::Nothing,
+            "an already selected item cannot turn selected"
+        );
+        assert_eq!(
+            observation_scope(&[true, false], false, false),
+            ObservationScope::Watch
+        );
+        assert_eq!(observation_scope(&[], true, false), ObservationScope::Watch);
+        assert_eq!(observation_scope(&[], false, true), ObservationScope::Watch);
+    }
+
+    #[test]
+    fn a_change_returns_at_once_with_no_settle_wait() {
+        // Visible on the first read: two reads, no sleep at all.
+        let (found, reads, elapsed, sleeps) = run_watch(ObservationScope::Watch, |_| {
+            Some(ClickEvidence::ToggleChanged)
+        });
+        assert_eq!(found, Some(ClickEvidence::ToggleChanged));
+        assert_eq!(reads, 2, "the sighting and its immediate second read");
+        assert_eq!(elapsed, Duration::ZERO);
+        assert!(sleeps.is_empty(), "{sleeps:?}");
+        // Visible from 20 ms: returned at 20 ms, every sleep one poll step.
+        let at = Duration::from_millis(20);
+        let (found, reads, elapsed, sleeps) = run_watch(ObservationScope::Watch, |elapsed| {
+            (elapsed >= at).then_some(ClickEvidence::Selected)
+        });
+        assert_eq!(found, Some(ClickEvidence::Selected));
+        assert_eq!(reads, 4, "reads at 0, 10 and 20 ms, then the second read");
+        assert_eq!(elapsed, at);
+        assert!(sleeps.iter().all(|sleep| *sleep == CLICK_OBSERVATION_POLL));
+    }
+
+    #[test]
+    fn a_sighting_the_second_read_does_not_repeat_is_not_evidence() {
+        let reads = Cell::new(0);
+        let (found, _, elapsed, _) = run_watch(ObservationScope::Watch, |_| {
+            reads.set(reads.get() + 1);
+            (reads.get() == 1).then_some(ClickEvidence::TitleNamesTarget)
+        });
+        assert_eq!(found, None);
+        assert!(elapsed <= CLICK_OBSERVATION + CLICK_OBSERVATION_POLL);
+    }
+
+    #[test]
+    fn an_unchanged_watch_stops_inside_the_click_budget_and_late_changes_do_not_count() {
+        // Point clicks have 100 ms in all; the read-back takes well under it.
+        assert!(CLICK_OBSERVATION + CLICK_OBSERVATION_POLL < Duration::from_millis(100));
+        let (found, _, elapsed, sleeps) = run_watch(ObservationScope::Watch, |_| None);
+        assert_eq!(found, None);
+        assert!(elapsed > CLICK_OBSERVATION, "{elapsed:?}");
+        assert!(
+            elapsed <= CLICK_OBSERVATION + CLICK_OBSERVATION_POLL,
+            "{elapsed:?}"
+        );
+        assert!(sleeps.iter().all(|sleep| *sleep == CLICK_OBSERVATION_POLL));
+        let (found, _, _, _) = run_watch(ObservationScope::Watch, |elapsed| {
+            (elapsed > CLICK_OBSERVATION).then_some(ClickEvidence::Selected)
+        });
+        assert_eq!(found, None);
+    }
 
     #[test]
     fn evidence_needs_known_idle_and_no_input_since_dispatch() {
@@ -4139,68 +4197,6 @@ mod click_evidence_tests {
     }
 
     #[test]
-    fn window_lists_fail_closed() {
-        assert_eq!(layer_zero_ids(5, None), None, "unreadable list");
-        assert_eq!(
-            layer_zero_ids(5, Some(vec![Some((5, 10, 0)), None])),
-            None,
-            "an unparsable entry"
-        );
-        assert_eq!(
-            layer_zero_ids(5, Some(vec![])),
-            Some(vec![]),
-            "an empty list is empty"
-        );
-        assert_eq!(
-            layer_zero_ids(
-                5,
-                Some(vec![
-                    Some((5, 12, 0)),
-                    Some((5, 10, 0)),
-                    Some((5, 11, 3)),
-                    Some((6, 13, 0)),
-                ])
-            ),
-            Some(vec![10, 12])
-        );
-        assert_eq!(layer_zero_ids(5, Some(vec![Some((5, -1, 0))])), None);
-    }
-
-    #[test]
-    fn a_window_counts_only_from_a_stable_baseline_and_when_tied_to_the_click() {
-        assert_eq!(
-            stable_window_baseline(Some(vec![1, 2]), Some(vec![1, 2])),
-            Some(vec![1, 2])
-        );
-        assert_eq!(
-            stable_window_baseline(Some(vec![1]), Some(vec![1, 2])),
-            None,
-            "changing"
-        );
-        assert_eq!(
-            stable_window_baseline(None, Some(vec![1])),
-            None,
-            "failed read"
-        );
-        assert_eq!(new_window_ids(&[1, 2], &[1, 2, 3]), vec![3]);
-        assert!(
-            new_window_ids(&[1, 2], &[1, 2]).is_empty(),
-            "already present"
-        );
-        assert!(
-            window_tied_to_click(true, None, None),
-            "owned by the clicked window"
-        );
-        assert!(window_tied_to_click(false, Some(" Fonts "), Some("fonts")));
-        assert!(
-            !window_tied_to_click(false, Some("Untitled"), Some("Fonts")),
-            "unrelated"
-        );
-        assert!(!window_tied_to_click(false, Some(""), Some(" ")), "no name");
-        assert!(!window_tied_to_click(false, None, Some("Fonts")));
-    }
-
-    #[test]
     fn evidence_maps_to_public_kinds_without_app_text() {
         use cua_driver_core::action_record::{
             ActionEffect, ActionTransport, ActualDelivery, EvidenceKind, RequestedDelivery,
@@ -4220,8 +4216,6 @@ mod click_evidence_tests {
                 ClickEvidence::ToggleChanged,
                 EvidenceKind::AccessibilityReadback,
             ),
-            (ClickEvidence::SheetAttached, EvidenceKind::WindowChange),
-            (ClickEvidence::WindowOpened, EvidenceKind::WindowChange),
         ] {
             assert_eq!(evidence.kind(), kind);
             let record = evidence.record(
@@ -4240,21 +4234,43 @@ mod click_evidence_tests {
     #[test]
     fn a_px_ax_press_without_evidence_stays_unverifiable() {
         use cua_driver_core::action_record::ActionEffect;
-        let plain = px_ax_press_result("pressed", None);
+        let hit = pointer_hit_record(
+            Some("AXButton".into()),
+            Some("All Clear".into()),
+            Some("AllClear".into()),
+        );
+        let plain = px_ax_press_result("pressed", None, hit);
         let structured = plain.structured_content.as_ref().expect("structured");
         assert_eq!(structured["effect"], "unverifiable");
+        assert_eq!(
+            structured["hit"],
+            serde_json::json!({"role": "AXButton", "label": "All Clear", "identifier": "AllClear"})
+        );
         assert_eq!(
             plain.action_record.as_ref().map(|r| r.effect),
             Some(ActionEffect::Unverifiable)
         );
-        let sidebar = px_ax_press_result("pressed", Some(ClickEvidence::TitleNamesTarget));
+        let sidebar = px_ax_press_result("pressed", Some(ClickEvidence::TitleNamesTarget), None);
         let structured = sidebar.structured_content.as_ref().expect("structured");
         assert_eq!(structured["effect"], "confirmed");
         assert_eq!(structured["verified"], true);
+        assert!(
+            structured.get("hit").is_none(),
+            "no hit reported, none published"
+        );
         assert_eq!(
             sidebar.action_record.as_ref().map(|r| r.effect),
             Some(ActionEffect::Confirmed)
         );
+    }
+
+    #[test]
+    fn a_pointer_hit_names_role_label_and_identifier_and_omits_blanks() {
+        assert_eq!(
+            pointer_hit_record(Some("AXButton".into()), Some(" ".into()), None),
+            Some(serde_json::json!({"role": "AXButton"}))
+        );
+        assert_eq!(pointer_hit_record(None, Some(String::new()), None), None);
     }
 }
 
