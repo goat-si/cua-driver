@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Cua AI, Inc.
 
-use crate::{schema_settings, CaptureScope, EscalationReason, Platform};
+use crate::{schema_settings, ActionHit, ActionPoint, CaptureScope, EscalationReason, Platform};
 use schemars::JsonSchema;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -676,7 +676,8 @@ pub struct ActionEscalation {
     pub reason: ActionEscalationReason,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq, uniffi::Record)]
+// `PartialEq` only: `point` carries floating-point coordinates.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, uniffi::Record)]
 #[serde(deny_unknown_fields)]
 pub struct ActionResult {
     pub effect: ActionEffect,
@@ -720,6 +721,20 @@ pub struct ActionResult {
     pub menu_opened: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub menu_items: Option<Vec<String>>,
+    /// The point a pointer action (click, double_click, right_click,
+    /// move_cursor, scroll, drag) aimed at, in `coordinate_space`, as its
+    /// producer reports it; for drag, the end point. It says where the input
+    /// was aimed, not that anything changed there: `effect` and `evidence`
+    /// carry the outcome. Absent when the producer reported no point (macOS
+    /// reports one for window-points calls, which cannot also name an
+    /// element_token).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub point: Option<ActionPoint>,
+    /// The element the pointer route reported hitting at dispatch time.
+    /// Absent when the route reported none; never inferred from an earlier
+    /// snapshot.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hit: Option<ActionHit>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq, uniffi::Record)]
@@ -777,6 +792,7 @@ pub enum ActionResultValidationError {
     ErrorRequiresRefused,
     VerifiedEffectMismatch,
     ReadbackEffectMismatch,
+    PointNotFinite,
 }
 
 impl std::fmt::Display for ActionResultValidationError {
@@ -791,6 +807,7 @@ impl std::fmt::Display for ActionResultValidationError {
             Self::ReadbackEffectMismatch => {
                 "selection_changed/menu_opened true requires a confirmed effect"
             }
+            Self::PointNotFinite => "point coordinates must be finite",
         })
     }
 }
@@ -799,6 +816,13 @@ impl std::error::Error for ActionResultValidationError {}
 
 impl ActionResult {
     pub fn validate_invariants(&self) -> Result<(), ActionResultValidationError> {
+        if self
+            .point
+            .as_ref()
+            .is_some_and(|point| !point.x.is_finite() || !point.y.is_finite())
+        {
+            return Err(ActionResultValidationError::PointNotFinite);
+        }
         match self.effect {
             ActionEffect::Confirmed
                 if self
@@ -951,6 +975,8 @@ mod tests {
             selected_text: None,
             menu_opened: None,
             menu_items: None,
+            point: None,
+            hit: None,
         }
     }
 
@@ -1012,9 +1038,11 @@ mod tests {
                 "escalation",
                 "evidence",
                 "hint",
+                "hit",
                 "menu_items",
                 "menu_opened",
                 "next_call",
+                "point",
                 "route",
                 "selected_text",
                 "selected_text_range",
@@ -1209,6 +1237,110 @@ mod tests {
             serde_json::from_value::<LegacyStrictActionResult>(value).is_err(),
             "documented compatibility limit: old strict clients must tolerate or learn the additive fields"
         );
+    }
+
+    #[test]
+    fn pointer_point_and_hit_round_trip_as_closed_nested_records() {
+        let wire = json!({
+            "effect": "unverifiable",
+            "route": "synthetic_events",
+            "point": {"x": 80.0, "y": 75.5, "coordinate_space": "window_points"},
+            "hit": {"index": 3, "role": "AXButton", "label": "OK", "identifier": "ok"}
+        });
+        let result = serde_json::from_value::<ActionResult>(wire.clone()).expect("point and hit");
+        assert_eq!(result.validate_invariants(), Ok(()));
+        let point = result.point.as_ref().expect("point");
+        assert_eq!((point.x, point.y), (80.0, 75.5));
+        assert_eq!(result.hit.as_ref().and_then(|hit| hit.index), Some(3));
+        assert_eq!(serde_json::to_value(&result).expect("serialize"), wire);
+
+        let mut extra = wire.clone();
+        extra["point"]["unit"] = json!("window_points");
+        assert!(serde_json::from_value::<ActionResult>(extra).is_err());
+        let mut extra = wire;
+        extra["hit"]["name"] = json!("OK");
+        assert!(serde_json::from_value::<ActionResult>(extra).is_err());
+
+        let schema = ActionResult::output_schema();
+        let point = object_variant(&schema["properties"]["point"]);
+        assert_eq!(point["additionalProperties"], false);
+        assert_eq!(point["required"], json!(["x", "y"]));
+        assert_eq!(point["properties"]["x"]["type"], "number");
+        let hit = object_variant(&schema["properties"]["hit"]);
+        assert_eq!(hit["additionalProperties"], false);
+        assert!(hit
+            .get("required")
+            .is_none_or(|required| required == &json!([])));
+        for name in ["click", "drag", "scroll"] {
+            let advertised = crate::advertised_tool_output_schema(name).expect("action schema");
+            // The success arm a proxy compares against its daemon's schema.
+            let success = &advertised["anyOf"][0]["properties"];
+            assert!(success.get("point").is_some(), "{name}");
+            assert!(success.get("hit").is_some(), "{name}");
+        }
+    }
+
+    #[test]
+    fn pointer_point_and_hit_are_additive_with_the_documented_strict_client_limit() {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct LegacyStrictActionResult {
+            #[allow(dead_code)]
+            effect: ActionEffect,
+            #[allow(dead_code)]
+            route: ActionRoute,
+        }
+        let base = json!({"effect": "unverifiable", "route": "synthetic_events"});
+        assert!(
+            serde_json::from_value::<LegacyStrictActionResult>(base.clone()).is_ok(),
+            "the fixture is a payload an old strict client accepts"
+        );
+        for (key, value) in [
+            (
+                "point",
+                json!({"x": 1.0, "y": 2.0, "coordinate_space": "window_points"}),
+            ),
+            ("hit", json!({"role": "push button", "label": "OK"})),
+        ] {
+            let mut extended = base.clone();
+            extended[key] = value;
+            assert!(
+                serde_json::from_value::<LegacyStrictActionResult>(extended.clone()).is_err(),
+                "documented compatibility limit: an old strict client rejects {key}"
+            );
+            let current = serde_json::from_value::<ActionResult>(extended.clone())
+                .unwrap_or_else(|error| panic!("{key} is part of the contract: {error}"));
+            assert_eq!(serde_json::to_value(current).unwrap(), extended);
+        }
+    }
+
+    #[test]
+    fn action_result_rejects_a_non_finite_point() {
+        let mut result = confirmed_result();
+        result.point = Some(ActionPoint {
+            x: f64::NAN,
+            y: 1.0,
+            coordinate_space: None,
+        });
+        assert_eq!(
+            result.validate_invariants(),
+            Err(ActionResultValidationError::PointNotFinite)
+        );
+        result.point = Some(ActionPoint {
+            x: 1.0,
+            y: f64::INFINITY,
+            coordinate_space: None,
+        });
+        assert_eq!(
+            result.validate_invariants(),
+            Err(ActionResultValidationError::PointNotFinite)
+        );
+        result.point = Some(ActionPoint {
+            x: -4.0,
+            y: 1.0,
+            coordinate_space: Some("window_points".into()),
+        });
+        assert_eq!(result.validate_invariants(), Ok(()));
     }
 
     #[test]

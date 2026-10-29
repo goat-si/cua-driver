@@ -3730,6 +3730,154 @@ fn preserve_wave400c_readback_fields(
     Ok(())
 }
 
+/// Pointer actions whose producers report the point they aimed at and, on
+/// some routes, the element hit. Their public result carries both.
+const POINTER_RESULT_TOOLS: &[&str] = &[
+    "click",
+    "double_click",
+    "right_click",
+    "move_cursor",
+    "scroll",
+    "drag",
+];
+
+/// A string member of a producer object: absent, null or blank is None; any
+/// other non-string is an error.
+fn pointer_string_member(
+    object: &serde_json::Map<String, Value>,
+    field: &str,
+    key: &str,
+) -> Result<Option<String>, String> {
+    match object.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(text)) if text.trim().is_empty() => Ok(None),
+        Some(Value::String(text)) => Ok(Some(text.clone())),
+        Some(_) => Err(format!("{field}.{key} must be a string")),
+    }
+}
+
+fn reject_unknown_pointer_members(
+    object: &serde_json::Map<String, Value>,
+    field: &str,
+    known: &[&str],
+) -> Result<(), String> {
+    match object.keys().find(|key| !known.contains(&key.as_str())) {
+        Some(key) => Err(format!("{field} has an unknown member {key:?}")),
+        None => Ok(()),
+    }
+}
+
+/// One of two aliases for the same value; both present and different is an
+/// error rather than a guess.
+fn pointer_alias(
+    field: &str,
+    canonical: Option<String>,
+    legacy: Option<String>,
+    names: (&str, &str),
+) -> Result<Option<String>, String> {
+    match (canonical, legacy) {
+        (Some(canonical), Some(legacy)) if canonical != legacy => Err(format!(
+            "{field}.{} {canonical:?} conflicts with {field}.{} {legacy:?}",
+            names.0, names.1
+        )),
+        (canonical, legacy) => Ok(canonical.or(legacy)),
+    }
+}
+
+/// The point the producer reports aiming at. The macOS window-points
+/// annotation writes {x, y, unit} for calls addressed in window points (which
+/// refuse an element_token, window_points::point_space); the public record
+/// names the space coordinate_space.
+fn parse_action_point(
+    producer: &Value,
+) -> Result<Option<cua_driver_contract::ActionPoint>, String> {
+    let object = match producer.get("point") {
+        None | Some(Value::Null) => return Ok(None),
+        Some(Value::Object(object)) => object,
+        Some(_) => return Err("point must be an object".into()),
+    };
+    reject_unknown_pointer_members(object, "point", &["x", "y", "unit", "coordinate_space"])?;
+    let coordinate = |key: &str| {
+        object
+            .get(key)
+            .and_then(Value::as_f64)
+            .filter(|value| value.is_finite())
+            .ok_or_else(|| format!("point.{key} must be a finite number"))
+    };
+    let (x, y) = (coordinate("x")?, coordinate("y")?);
+    let coordinate_space = pointer_alias(
+        "point",
+        pointer_string_member(object, "point", "coordinate_space")?,
+        pointer_string_member(object, "point", "unit")?,
+        ("coordinate_space", "unit"),
+    )?;
+    Ok(Some(cua_driver_contract::ActionPoint {
+        x,
+        y,
+        coordinate_space,
+    }))
+}
+
+/// The element the route reported hitting. The Linux AT-SPI route writes
+/// {role, name, action, path}: name is the label, and the fired action and the
+/// D-Bus path are route internals the public record does not carry.
+fn parse_action_hit(producer: &Value) -> Result<Option<cua_driver_contract::ActionHit>, String> {
+    let object = match producer.get("hit") {
+        None | Some(Value::Null) => return Ok(None),
+        Some(Value::Object(object)) => object,
+        Some(_) => return Err("hit must be an object".into()),
+    };
+    reject_unknown_pointer_members(
+        object,
+        "hit",
+        &[
+            "index",
+            "role",
+            "label",
+            "identifier",
+            "name",
+            "action",
+            "path",
+        ],
+    )?;
+    let index = match object.get("index") {
+        None | Some(Value::Null) => None,
+        Some(value) => Some(
+            value
+                .as_u64()
+                .ok_or_else(|| "hit.index must be a non-negative integer".to_owned())?,
+        ),
+    };
+    // Typed even though dropped: a malformed route payload is not published.
+    pointer_string_member(object, "hit", "action")?;
+    pointer_string_member(object, "hit", "path")?;
+    let hit = cua_driver_contract::ActionHit {
+        index,
+        role: pointer_string_member(object, "hit", "role")?,
+        label: pointer_alias(
+            "hit",
+            pointer_string_member(object, "hit", "label")?,
+            pointer_string_member(object, "hit", "name")?,
+            ("label", "name"),
+        )?,
+        identifier: pointer_string_member(object, "hit", "identifier")?,
+    };
+    Ok((hit != cua_driver_contract::ActionHit::default()).then_some(hit))
+}
+
+/// Carry the producer's point and hit into the closed pointer result. A
+/// malformed value fails the projection, which the dispatcher
+/// reports as an outcome mismatch with an unknown execution state, because
+/// the input may already have been delivered.
+fn preserve_pointer_fields(
+    public: &mut cua_driver_contract::ActionResult,
+    producer: &Value,
+) -> Result<(), String> {
+    public.point = parse_action_point(producer)?;
+    public.hit = parse_action_hit(producer)?;
+    Ok(())
+}
+
 fn publish_action_result(result: &mut ToolResult, tool_name: &str) -> Result<(), String> {
     let producer_structured = result.structured_content.clone();
     let action = result
@@ -3751,6 +3899,11 @@ fn publish_action_result(result: &mut ToolResult, tool_name: &str) -> Result<(),
     if cfg!(target_os = "macos") && matches!(tool_name, "drag" | "right_click") {
         if let Some(producer) = producer_structured.as_ref() {
             preserve_wave400c_readback_fields(&mut public, producer)?;
+        }
+    }
+    if POINTER_RESULT_TOOLS.contains(&tool_name) {
+        if let Some(producer) = producer_structured.as_ref() {
+            preserve_pointer_fields(&mut public, producer)?;
         }
     }
     public
@@ -6335,6 +6488,291 @@ resources:
                     if text.contains("browser_ref_stale")
             )
         }));
+    }
+
+    fn pointer_projection_input(producer: serde_json::Value) -> crate::protocol::ToolResult {
+        use crate::action_record::{
+            ActionEffect, ActionExecutionRecord, ActionTransport, ActualDelivery, RequestedDelivery,
+        };
+        crate::protocol::ToolResult::text("Clicked.")
+            .with_structured(producer)
+            .with_action_record(
+                ActionExecutionRecord::builder(
+                    ActionEffect::Unverifiable,
+                    ActionTransport::MacosCgEventPid,
+                    RequestedDelivery::Background,
+                )
+                .actual_delivery(ActualDelivery::Background)
+                .build()
+                .unwrap(),
+            )
+    }
+
+    fn published_pointer(
+        tool_name: &str,
+        producer: serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
+        let mut result = pointer_projection_input(producer);
+        publish_action_result(&mut result, tool_name)?;
+        Ok(result.structured_content.expect("published action result"))
+    }
+
+    #[test]
+    fn pointer_tools_publish_the_producer_point_in_its_coordinate_space() {
+        for tool_name in [
+            "click",
+            "double_click",
+            "right_click",
+            "move_cursor",
+            "scroll",
+            "drag",
+        ] {
+            // The macOS window-points annotation (window_points::annotate).
+            let structured = published_pointer(
+                tool_name,
+                serde_json::json!({"point": {"x": 80.0, "y": 75.5, "unit": "window_points"}}),
+            )
+            .unwrap_or_else(|error| panic!("{tool_name}: {error}"));
+            assert_eq!(
+                structured["point"],
+                serde_json::json!({"x": 80.0, "y": 75.5, "coordinate_space": "window_points"}),
+                "{tool_name}"
+            );
+            assert!(
+                structured.get("hit").is_none(),
+                "{tool_name}: no hit unless the route reported one"
+            );
+            cua_driver_contract::validate_success_output(tool_name, structured)
+                .unwrap_or_else(|error| panic!("{tool_name}: {error}"));
+        }
+    }
+
+    #[test]
+    fn pointer_hit_maps_the_atspi_name_to_label_and_drops_route_internals() {
+        // The Linux AT-SPI pointer route (PointerRoute::structured).
+        let structured = published_pointer(
+            "click",
+            serde_json::json!({
+                "verified": false,
+                "effect": "unverifiable",
+                "path": "x11_atspi",
+                "hit": {
+                    "role": "push button",
+                    "name": "OK",
+                    "action": "click",
+                    "path": "/org/a11y/atspi/accessible/12"
+                }
+            }),
+        )
+        .unwrap();
+        assert_eq!(
+            structured["hit"],
+            serde_json::json!({"role": "push button", "label": "OK"})
+        );
+        assert!(structured.get("point").is_none());
+        cua_driver_contract::validate_success_output("click", structured).unwrap();
+    }
+
+    #[test]
+    fn pointer_fields_in_canonical_form_pass_through() {
+        let structured = published_pointer(
+            "drag",
+            serde_json::json!({
+                "point": {"x": 1, "y": -2, "coordinate_space": "screen_points", "unit": "screen_points"},
+                "hit": {"index": 7, "role": "AXButton", "label": "OK", "identifier": "ok-button"}
+            }),
+        )
+        .unwrap();
+        assert_eq!(
+            structured["point"],
+            serde_json::json!({"x": 1.0, "y": -2.0, "coordinate_space": "screen_points"})
+        );
+        assert_eq!(
+            structured["hit"],
+            serde_json::json!({"index": 7, "role": "AXButton", "label": "OK", "identifier": "ok-button"})
+        );
+        let bare =
+            published_pointer("scroll", serde_json::json!({"point": {"x": 3, "y": 4}})).unwrap();
+        assert_eq!(bare["point"], serde_json::json!({"x": 3.0, "y": 4.0}));
+    }
+
+    #[test]
+    fn pointer_hit_normalizes_empty_strings_before_choosing_the_label() {
+        for (hit, expected) in [
+            (
+                serde_json::json!({"label": "", "name": "OK"}),
+                Some(serde_json::json!({"label": "OK"})),
+            ),
+            (
+                serde_json::json!({"label": "OK", "name": ""}),
+                Some(serde_json::json!({"label": "OK"})),
+            ),
+            (
+                serde_json::json!({"label": "OK", "name": "OK"}),
+                Some(serde_json::json!({"label": "OK"})),
+            ),
+            (
+                serde_json::json!({"role": " ", "name": "", "action": "click"}),
+                None,
+            ),
+            (serde_json::json!({}), None),
+            (
+                serde_json::json!({"index": null, "role": null, "label": null, "identifier": null}),
+                None,
+            ),
+            (serde_json::Value::Null, None),
+        ] {
+            let structured = published_pointer("click", serde_json::json!({ "hit": hit.clone() }))
+                .unwrap_or_else(|error| panic!("{hit}: {error}"));
+            assert_eq!(structured.get("hit").cloned(), expected, "{hit}");
+        }
+        let structured = published_pointer("click", serde_json::json!({"point": null})).unwrap();
+        assert!(structured.get("point").is_none());
+    }
+
+    #[test]
+    fn malformed_pointer_fields_fail_the_projection() {
+        for producer in [
+            serde_json::json!({"point": "80,75"}),
+            serde_json::json!({"point": {"x": "80", "y": 75}}),
+            serde_json::json!({"point": {"x": 80}}),
+            serde_json::json!({"point": {"x": 80, "y": 75, "z": 1}}),
+            serde_json::json!({"point": {"x": 80, "y": 75, "unit": 7}}),
+            serde_json::json!({"point": {"x": 80, "y": 75, "unit": "window_points", "coordinate_space": "screenshot"}}),
+            serde_json::json!({"hit": "OK"}),
+            serde_json::json!({"hit": {"index": -1}}),
+            serde_json::json!({"hit": {"index": "3"}}),
+            serde_json::json!({"hit": {"role": 5}}),
+            serde_json::json!({"hit": {"action": 5}}),
+            serde_json::json!({"hit": {"value": "OK"}}),
+            serde_json::json!({"hit": {"label": "OK", "name": "Cancel"}}),
+        ] {
+            assert!(
+                published_pointer("click", producer.clone()).is_err(),
+                "{producer} must not publish"
+            );
+        }
+    }
+
+    #[test]
+    fn non_pointer_actions_do_not_publish_pointer_fields() {
+        let structured = published_pointer(
+            "type_text",
+            serde_json::json!({
+                "point": {"x": 80.0, "y": 75.0, "unit": "window_points"},
+                "hit": {"role": "AXTextField", "label": "Name"}
+            }),
+        )
+        .unwrap();
+        assert!(structured.get("point").is_none());
+        assert!(structured.get("hit").is_none());
+    }
+
+    #[test]
+    fn list_windows_advertised_schema_rejects_mistyped_closure_metadata() {
+        let schema = cua_driver_contract::advertised_tool_output_schema("list_windows")
+            .expect("list_windows schema");
+        let validator = jsonschema::validator_for(&schema).expect("schema compiles");
+        assert!(validator.is_valid(&serde_json::json!({
+            "windows": [],
+            "enumeration_complete": true,
+            "authoritative_window_ids": []
+        })));
+        for wrong in [
+            serde_json::json!({"windows": [], "enumeration_complete": "yes"}),
+            serde_json::json!({"windows": [], "authoritative_window_ids": [0]}),
+            serde_json::json!({"windows": [], "authoritative_window_ids": ["41"]}),
+            serde_json::json!({"windows": [], "authoritative_window_ids": 41}),
+        ] {
+            assert!(!validator.is_valid(&wrong), "{wrong}");
+        }
+    }
+
+    /// A "click" whose producer returns a fixed structured payload.
+    struct StructuredClickProbe {
+        structured: serde_json::Value,
+        def: super::ToolDef,
+    }
+
+    #[async_trait::async_trait]
+    impl super::Tool for StructuredClickProbe {
+        fn def(&self) -> &super::ToolDef {
+            &self.def
+        }
+
+        async fn invoke(&self, _args: serde_json::Value) -> crate::protocol::ToolResult {
+            crate::protocol::ToolResult::text("Clicked.").with_structured(self.structured.clone())
+        }
+    }
+
+    async fn dispatch_structured_click(
+        structured: serde_json::Value,
+    ) -> crate::protocol::ToolResult {
+        let mut registry = super::ToolRegistry::new_with_protected_consent_provider(None);
+        registry.register(Box::new(StructuredClickProbe {
+            structured,
+            def: super::ToolDef {
+                name: "click".into(),
+                description: "test pointer input".into(),
+                input_schema: serde_json::json!({"type": "object"}),
+                read_only: false,
+                destructive: false,
+                idempotent: false,
+                open_world: false,
+            },
+        }));
+        let registry = Arc::new(registry);
+        let context = standard_context();
+        let runtime_session = context.runtime_session_key("pointer-projection");
+        registry
+            .protected_resource_ownership()
+            .mark_driver_owned_pid(&runtime_session, 42);
+        registry
+            .invoke_with_context(
+                "click",
+                serde_json::json!({
+                    "pid": 42,
+                    "window_id": 7,
+                    "session": "pointer-projection",
+                    "x": 10,
+                    "y": 20
+                }),
+                context,
+            )
+            .await
+    }
+
+    #[tokio::test]
+    async fn dispatch_publishes_producer_point_and_hit_on_the_closed_click_result() {
+        let result = dispatch_structured_click(serde_json::json!({
+            "point": {"x": 10.0, "y": 20.0, "unit": "window_points"},
+            "hit": {"role": "push button", "name": "OK", "action": "click", "path": "/a/1"}
+        }))
+        .await;
+        assert_ne!(result.is_error, Some(true));
+        let structured = result.structured_content.expect("ActionResult");
+        assert_eq!(
+            structured["point"],
+            serde_json::json!({"x": 10.0, "y": 20.0, "coordinate_space": "window_points"})
+        );
+        assert_eq!(
+            structured["hit"],
+            serde_json::json!({"role": "push button", "label": "OK"})
+        );
+        cua_driver_contract::validate_success_output("click", structured).unwrap();
+    }
+
+    #[tokio::test]
+    async fn dispatch_reports_malformed_pointer_fields_as_an_outcome_mismatch() {
+        let result = dispatch_structured_click(serde_json::json!({
+            "point": {"x": "10", "y": 20.0, "unit": "window_points"}
+        }))
+        .await;
+        assert_eq!(result.is_error, Some(true));
+        let structured = result.structured_content.expect("structured mismatch");
+        let text = serde_json::to_string(&structured).unwrap();
+        assert!(text.contains("action_outcome_mismatch"), "{text}");
+        assert!(text.contains("\"execution_state\":\"unknown\""), "{text}");
     }
 
     fn wave400c_projection_input() -> crate::protocol::ToolResult {

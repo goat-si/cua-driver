@@ -33,6 +33,10 @@ pub struct WindowInfo {
 pub(crate) struct WindowEnumeration {
     pub(crate) windows: Vec<WindowInfo>,
     pub(crate) current_space_id: Option<u64>,
+    /// WindowServer returned a list and every entry carried a readable window
+    /// number and owner pid. False means a window can be missing only because
+    /// it was unreadable.
+    pub(crate) complete: bool,
 }
 
 // ── CGWindow option flags ─────────────────────────────────────────────────────
@@ -216,18 +220,21 @@ fn enumerate_windows(
         return WindowEnumeration {
             windows: vec![],
             current_space_id,
+            complete: false,
         };
     }
 
     let raw: CFArray<CFTypeRef> = unsafe { CFArray::wrap_under_create_rule(raw_ref as _) };
     let total = raw.len() as usize;
     let mut results = Vec::new();
+    let mut complete = true;
 
     for (idx, item) in raw.iter().enumerate() {
         let item = *item;
         // Each item should be a CFDictionary.
         let dict_type = CFDictionary::<*const c_void, *const c_void>::type_id();
         if unsafe { CFGetTypeID(item) } != dict_type {
+            complete = false;
             continue;
         }
 
@@ -235,7 +242,7 @@ fn enumerate_windows(
             unsafe { CFDictionary::wrap_under_get_rule(item as _) };
 
         // Helper: get number from dict by key string.
-        let get_num = |key: &str| -> i64 {
+        let find_num = |key: &str| -> Option<i64> {
             let k = CFString::new(key);
             dict.find(k.as_concrete_TypeRef() as *const c_void)
                 .and_then(|v| unsafe {
@@ -246,8 +253,8 @@ fn enumerate_windows(
                         None
                     }
                 })
-                .unwrap_or(0)
         };
+        let get_num = |key: &str| -> i64 { find_num(key).unwrap_or(0) };
 
         let get_str = |key: &str| -> String {
             let k = CFString::new(key);
@@ -277,8 +284,13 @@ fn enumerate_windows(
                 .unwrap_or(false)
         };
 
-        let window_id = get_num("kCGWindowNumber") as u32;
-        let pid = get_num("kCGWindowOwnerPID") as i32;
+        let window_number = find_num("kCGWindowNumber");
+        let owner_pid = find_num("kCGWindowOwnerPID");
+        if window_number.is_none() || owner_pid.is_none() {
+            complete = false;
+        }
+        let window_id = window_number.unwrap_or(0) as u32;
+        let pid = owner_pid.unwrap_or(0) as i32;
         let app_name = get_str("kCGWindowOwnerName");
         let title = get_str("kCGWindowName");
         let layer = get_num("kCGWindowLayer") as i32;
@@ -354,7 +366,126 @@ fn enumerate_windows(
     WindowEnumeration {
         windows: results,
         current_space_id,
+        complete,
     }
+}
+
+/// One CGWindowList entry, reduced to the identity fields closure needs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RawWindowIdentity {
+    NotADictionary,
+    Entry {
+        window_id: Option<i64>,
+        pid: Option<i64>,
+    },
+}
+
+/// Every window id WindowServer reported for one pid at one moment.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct WindowIdSnapshot {
+    /// The list was returned and every entry that could belong to the pid was
+    /// readable. Only then does a missing id mean the window is gone.
+    pub(crate) complete: bool,
+    /// Ascending, deduplicated. Empty when incomplete.
+    pub(crate) window_ids: Vec<u32>,
+}
+
+/// The pid's window ids from raw WindowServer entries. Any entry whose owner
+/// is unreadable could be the pid's, and any of the pid's entries without a
+/// valid id could be the window being asked about, so either makes the
+/// snapshot incomplete rather than silently short.
+pub(crate) fn window_ids_for_pid(
+    entries: Option<Vec<RawWindowIdentity>>,
+    pid: i32,
+) -> WindowIdSnapshot {
+    let incomplete = || WindowIdSnapshot {
+        complete: false,
+        window_ids: Vec::new(),
+    };
+    let Some(entries) = entries else {
+        return incomplete();
+    };
+    let mut window_ids = Vec::new();
+    for entry in entries {
+        let RawWindowIdentity::Entry {
+            window_id,
+            pid: owner,
+        } = entry
+        else {
+            return incomplete();
+        };
+        let Some(owner) = owner.and_then(|owner| i32::try_from(owner).ok()) else {
+            return incomplete();
+        };
+        if owner != pid {
+            continue;
+        }
+        match window_id
+            .and_then(|id| u32::try_from(id).ok())
+            .filter(|id| *id > 0)
+        {
+            Some(id) => window_ids.push(id),
+            None => return incomplete(),
+        }
+    }
+    window_ids.sort_unstable();
+    window_ids.dedup();
+    WindowIdSnapshot {
+        complete: true,
+        window_ids,
+    }
+}
+
+/// Every window id the current user session's WindowServer lists for 'pid'
+/// right now: every layer and Space, on or off screen, desktop elements
+/// included, before any of list_windows' filtering. A window the app closed
+/// is no longer listed; a hidden, minimized or other-Space window still is.
+pub(crate) fn pid_window_id_snapshot(pid: i32) -> WindowIdSnapshot {
+    use core_foundation::{
+        array::CFArray,
+        base::{CFGetTypeID, CFTypeRef, TCFType},
+        dictionary::CFDictionary,
+        number::CFNumber,
+        string::CFString,
+    };
+    use std::os::raw::c_void;
+
+    // kCGWindowListOptionAll: no on-screen or desktop-element restriction.
+    let raw_ref = unsafe { CGWindowListCopyWindowInfo(0, kCGNullWindowID) };
+    if raw_ref.is_null() {
+        return window_ids_for_pid(None, pid);
+    }
+    let raw: CFArray<CFTypeRef> = unsafe { CFArray::wrap_under_create_rule(raw_ref as _) };
+    let dict_type = CFDictionary::<*const c_void, *const c_void>::type_id();
+    let window_number_key = CFString::new("kCGWindowNumber");
+    let owner_pid_key = CFString::new("kCGWindowOwnerPID");
+    let entries = raw
+        .iter()
+        .map(|item| {
+            let item = *item;
+            if unsafe { CFGetTypeID(item) } != dict_type {
+                return RawWindowIdentity::NotADictionary;
+            }
+            let dict: CFDictionary<*const c_void, *const c_void> =
+                unsafe { CFDictionary::wrap_under_get_rule(item as _) };
+            let number = |key: &CFString| {
+                dict.find(key.as_concrete_TypeRef() as *const c_void)
+                    .and_then(|value| unsafe {
+                        let value = *value;
+                        if CFGetTypeID(value) == CFNumber::type_id() {
+                            CFNumber::wrap_under_get_rule(value as _).to_i64()
+                        } else {
+                            None
+                        }
+                    })
+            };
+            RawWindowIdentity::Entry {
+                window_id: number(&window_number_key),
+                pid: number(&owner_pid_key),
+            }
+        })
+        .collect();
+    window_ids_for_pid(Some(entries), pid)
 }
 
 fn apply_window_space_metadata(
@@ -447,8 +578,21 @@ pub(crate) fn retain_ax_reachable_with(
 /// membership, and an off-Space window, which `AXWindows` also omits, would be
 /// indistinguishable from a helper.
 pub(crate) fn retain_ax_reachable(windows: &mut Vec<WindowInfo>, current_space_id: Option<u64>) {
+    retain_ax_reachable_using(
+        windows,
+        current_space_id,
+        crate::ax::bindings::ax_window_ids_of_pid,
+    );
+}
+
+/// [`retain_ax_reachable`] with the AXWindows lookup supplied by the caller.
+pub(crate) fn retain_ax_reachable_using(
+    windows: &mut Vec<WindowInfo>,
+    current_space_id: Option<u64>,
+    ax_window_ids: impl FnMut(i32) -> Option<std::collections::HashSet<u32>>,
+) {
     if current_space_id.is_some() {
-        retain_ax_reachable_with(windows, crate::ax::bindings::ax_window_ids_of_pid);
+        retain_ax_reachable_with(windows, ax_window_ids);
     }
 }
 
@@ -612,6 +756,91 @@ fn poll_until_no_menu(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pid_window_id_snapshot_lists_every_id_of_the_pid_and_flags_unreadable_entries() {
+        use RawWindowIdentity::{Entry, NotADictionary};
+        let entry = |window_id: i64, pid: i64| Entry {
+            window_id: Some(window_id),
+            pid: Some(pid),
+        };
+
+        // Every layer, Space and on/off-screen state arrives as an entry; the
+        // snapshot keeps every id of the pid, ascending and deduplicated.
+        let listed = window_ids_for_pid(
+            Some(vec![entry(12, 7), entry(5, 7), entry(9, 8), entry(12, 7)]),
+            7,
+        );
+        assert!(listed.complete);
+        assert_eq!(listed.window_ids, [5, 12]);
+
+        // A complete snapshot without the pid's windows is meaningful.
+        let none_left = window_ids_for_pid(Some(vec![entry(9, 8)]), 7);
+        assert!(none_left.complete);
+        assert!(none_left.window_ids.is_empty());
+
+        // An id with an unreadable owner elsewhere does not matter only when
+        // the owner is readable.
+        let other_owner = window_ids_for_pid(
+            Some(vec![
+                entry(5, 7),
+                Entry {
+                    window_id: None,
+                    pid: Some(8),
+                },
+            ]),
+            7,
+        );
+        assert!(other_owner.complete);
+        assert_eq!(other_owner.window_ids, [5]);
+
+        for (case, entries) in [
+            ("WindowServer returned no list", None),
+            (
+                "an entry is not a dictionary",
+                Some(vec![entry(5, 7), NotADictionary]),
+            ),
+            (
+                "an owner pid is missing",
+                Some(vec![
+                    entry(5, 7),
+                    Entry {
+                        window_id: Some(6),
+                        pid: None,
+                    },
+                ]),
+            ),
+            (
+                "an owner pid is out of range",
+                Some(vec![entry(6, i64::from(i32::MAX) + 1)]),
+            ),
+            (
+                "the pid's window id is missing",
+                Some(vec![Entry {
+                    window_id: None,
+                    pid: Some(7),
+                }]),
+            ),
+            ("the pid's window id is zero", Some(vec![entry(0, 7)])),
+            ("the pid's window id is negative", Some(vec![entry(-1, 7)])),
+            (
+                "the pid's window id is out of range",
+                Some(vec![entry(i64::from(u32::MAX) + 1, 7)]),
+            ),
+        ] {
+            let snapshot = window_ids_for_pid(entries, 7);
+            assert!(!snapshot.complete, "{case}");
+            assert!(snapshot.window_ids.is_empty(), "{case}: no partial id set");
+        }
+    }
+
+    #[test]
+    fn live_pid_window_id_snapshot_reads_window_server() {
+        // The test process owns no windows. A complete live snapshot therefore
+        // lists none for it; an unavailable WindowServer reports incomplete.
+        let snapshot = pid_window_id_snapshot(std::process::id() as i32);
+        assert!(snapshot.window_ids.is_empty(), "{snapshot:?}");
+    }
 
     #[test]
     fn bounds_numbers_preserve_finite_values_and_default_non_finite_or_missing_values() {

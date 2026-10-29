@@ -248,8 +248,53 @@ impl ToolOutput for ListWindowsOutput {
         // Stacking semantics are part of the existing live discovery contract.
         schema["properties"]["windows"]["items"]["properties"]["z_index"]["description"] =
             serde_json::json!("Higher values are closer to the front. Null means the provider cannot observe stacking order; callers must not infer an order from array position or treat null as zero.");
+        // Window-closure evidence. These keys are part of the wire contract
+        // only, not of the record: adding them to the struct would change its
+        // UniFFI layout under the checked-in bindings. The typed SDK record
+        // ignores them; MCP clients read them from structuredContent.
+        schema["properties"]["enumeration_complete"] = serde_json::json!({
+            "type": "boolean",
+            "description": "True when the window listing, and with pid the identity snapshot below, were read from the current user session's WindowServer in full. False means a missing window may only be unreadable, so its absence proves nothing."
+        });
+        schema["properties"]["authoritative_window_ids"] = serde_json::json!({
+            "type": "array",
+            "items": {"type": "integer", "minimum": 1},
+            "description": "Present only with pid and enumeration_complete true: every window id WindowServer reported for that pid at snapshot time, on every layer and Space, on or off screen, before the listing dropped helper windows, the driver's overlay and app-filtered windows. Ascending. An id seen earlier for this pid and absent here was no longer a WindowServer window of that pid at snapshot time; pair it with process identity and timing, because the process may have exited."
+        });
         schema
     }
+}
+
+/// The point a pointer action aimed at, as its producer reports it.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, uniffi::Record)]
+#[serde(deny_unknown_fields)]
+pub struct ActionPoint {
+    pub x: f64,
+    pub y: f64,
+    /// The space `x`/`y` are in, such as `window_points`. Absent when the
+    /// producer did not say.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub coordinate_space: Option<String>,
+}
+
+/// The element a pointer route reported hitting when it dispatched.
+#[derive(
+    Debug, Clone, Default, Serialize, Deserialize, JsonSchema, PartialEq, Eq, uniffi::Record,
+)]
+#[serde(deny_unknown_fields)]
+pub struct ActionHit {
+    /// Element index in the snapshot the route resolved against.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub index: Option<u64>,
+    /// Accessibility role, in the platform's vocabulary.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
+    /// Accessible name or label.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    /// Stable accessibility identifier, when the element has one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identifier: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, uniffi::Record)]
@@ -539,5 +584,68 @@ mod tests {
             let output: WindowStateOutput = serde_json::from_value(value).unwrap();
             assert!(output.validate().is_err());
         }
+    }
+
+    #[test]
+    fn action_point_and_hit_are_closed_window_relative_records() {
+        let point: ActionPoint = serde_json::from_value(
+            json!({"x": 10.5, "y": 20.0, "coordinate_space": "window_points"}),
+        )
+        .unwrap();
+        assert_eq!(point.coordinate_space.as_deref(), Some("window_points"));
+        assert_eq!(
+            serde_json::to_value(&point).unwrap(),
+            json!({"x": 10.5, "y": 20.0, "coordinate_space": "window_points"})
+        );
+        let bare: ActionPoint = serde_json::from_value(json!({"x": 1, "y": 2})).unwrap();
+        assert_eq!(
+            serde_json::to_value(&bare).unwrap(),
+            json!({"x": 1.0, "y": 2.0})
+        );
+        assert!(serde_json::from_value::<ActionPoint>(json!({"x": 1})).is_err());
+        assert!(
+            serde_json::from_value::<ActionPoint>(json!({"x": 1, "y": 2, "unit": "px"})).is_err(),
+            "the public point is closed; legacy unit is mapped by the dispatch seam"
+        );
+
+        let hit: ActionHit = serde_json::from_value(json!({
+            "index": 4, "role": "AXButton", "label": "OK", "identifier": "ok-button"
+        }))
+        .unwrap();
+        assert_eq!(hit.index, Some(4));
+        assert_eq!(hit.label.as_deref(), Some("OK"));
+        assert_eq!(
+            serde_json::to_value(ActionHit::default()).unwrap(),
+            json!({})
+        );
+        assert!(serde_json::from_value::<ActionHit>(json!({"name": "OK"})).is_err());
+    }
+
+    #[test]
+    fn list_windows_schema_documents_closure_metadata_without_changing_the_record() {
+        let schema = crate::advertised_tool_output_schema("list_windows").expect("schema");
+        let schema = &schema["anyOf"][0];
+        let properties = &schema["properties"];
+        assert_eq!(properties["enumeration_complete"]["type"], "boolean");
+        assert_eq!(properties["authoritative_window_ids"]["type"], "array");
+        assert_eq!(
+            properties["authoritative_window_ids"]["items"],
+            json!({"type": "integer", "minimum": 1})
+        );
+        let required = schema["required"].as_array().cloned().unwrap_or_default();
+        assert!(!required.contains(&json!("enumeration_complete")));
+        assert!(!required.contains(&json!("authoritative_window_ids")));
+
+        // The typed record keeps its layout (UniFFI bindings stay compatible)
+        // and accepts the additive keys.
+        let payload = json!({
+            "windows": [],
+            "current_space_id": 3,
+            "enumeration_complete": true,
+            "authoritative_window_ids": [41, 42]
+        });
+        assert!(crate::validate_success_output("list_windows", payload.clone()).unwrap());
+        let output: ListWindowsOutput = serde_json::from_value(payload).unwrap();
+        assert_eq!(output.current_space_id, Some(3));
     }
 }

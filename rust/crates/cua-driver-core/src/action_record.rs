@@ -466,6 +466,8 @@ impl ActionExecutionRecord {
             selected_text: None,
             menu_opened: None,
             menu_items: None,
+            point: None,
+            hit: None,
         })
     }
 
