@@ -1335,6 +1335,17 @@ impl ClickTool {
                         CFRelease(element as _);
                         return Ok(Some(false));
                     }
+                    if !background_hit_uses_ax(
+                        focus_only,
+                        super::type_text::target_in_web_area(
+                            pid,
+                            Some((element as usize, None)),
+                            Some(hit_test_wid),
+                        ),
+                    ) {
+                        CFRelease(element as _);
+                        return Ok(Some(false));
+                    }
                     // An element that does not advertise AXPress can still
                     // accept it as a no-op. On a toolkit that drops routed
                     // mouse events (LibreOffice's Calc cells) that no-op used
@@ -1526,7 +1537,6 @@ impl ClickTool {
                 Err(refusal) => return refusal,
             };
             let activation_policy = pixel_activation_policy(&button_str, fg, window_id.is_some());
-
             // ── Focus-suppression wrap (Swift WindowChangeDetector + FocusGuard) ──
             // A pixel click can land on a "Sign In" button that opens a sheet
             // or a Safari link that activates a new tab — same side-effect
@@ -2220,6 +2230,55 @@ fn perform_ax_click(
             prime_key_window_for_background_press(pid, window_id, ax_action)
         });
     }
+    if action_str == "press"
+        && ax_action == "AXPress"
+        && modifiers.is_empty()
+        && text_input_click_role(&role)
+        && !unsafe { super::set_value::file_name_cell(element) }
+    {
+        let in_web_area = super::type_text::target_requires_pointer_focus(
+            pid,
+            Some((element_ptr, Some(idx))),
+            Some(window_id),
+        );
+        if in_web_area {
+            super::type_text::click_element_center_for_focus_checked(
+                pid,
+                window_id,
+                element_ptr,
+                foreground,
+            )?;
+        } else {
+            crate::input::ax_actions::focus_element(element_ptr)?;
+        }
+        let focused = unsafe { copy_bool_attr(element, "AXFocused") } == Some(true)
+            && super::type_text::element_in_requested_window(pid, window_id, element_ptr)
+            && crate::input::ax_actions::is_element_focused(pid, element_ptr)
+            && super::type_text::focused_window_matches_element(pid, window_id, element_ptr);
+        if !focused {
+            if in_web_area {
+                return Ok((
+                    format!(
+                        "⚠️ Sent a window-local pointer focus to [{idx}] {role} \"{title}\", but focus could not be confirmed."
+                    ),
+                    false,
+                    false,
+                    false,
+                    true,
+                ));
+            }
+            anyhow::bail!("text input [{idx}] did not become the application's focused element; AXPress was not sent")
+        }
+        let settle =
+            needs_web_focus_settle(ax_action, &role, || unsafe { ancestor_roles(element) });
+        return Ok((
+            format!("✅ Focused [{idx}] {role} \"{title}\" with AXFocused=true; focus read-back confirmed."),
+            settle,
+            false,
+            true,
+            in_web_area,
+        ));
+    }
     // A press or open that navigates (Finder's sidebar) can retitle the
     // window after its element's name while the app still returns an AX
     // error. Read the title right before dispatch, so nothing earlier
@@ -2384,6 +2443,17 @@ fn perform_ax_click(
     let _ = window_id; // used by caller context
 
     Ok((summary, needs_webkit_delay, suspected_noop, false, false))
+}
+
+fn background_hit_uses_ax(focus_only: bool, in_web_area: bool) -> bool {
+    focus_only || !in_web_area
+}
+
+fn text_input_click_role(role: &str) -> bool {
+    matches!(
+        role,
+        "AXTextField" | "AXTextArea" | "AXSearchField" | "AXSecureTextField" | "AXComboBox"
+    )
 }
 
 /// Selection evidence from a before/after pair: only a real
@@ -2681,6 +2751,35 @@ mod web_focus_settle_tests {
             assert!(!needs_web_focus_settle(action, role, || {
                 panic!("ancestors are not read for {action} on {role}")
             }));
+        }
+    }
+}
+
+#[cfg(test)]
+mod text_and_web_routing_tests {
+    use super::{background_hit_uses_ax, text_input_click_role};
+
+    #[test]
+    fn web_pixel_presses_fall_through_but_native_and_focus_paths_stay_ax() {
+        assert!(!background_hit_uses_ax(false, true));
+        assert!(background_hit_uses_ax(false, false));
+        assert!(background_hit_uses_ax(true, true));
+        assert!(background_hit_uses_ax(true, false));
+    }
+
+    #[test]
+    fn every_text_input_role_uses_focus_instead_of_a_hollow_press() {
+        for role in [
+            "AXTextField",
+            "AXTextArea",
+            "AXSearchField",
+            "AXSecureTextField",
+            "AXComboBox",
+        ] {
+            assert!(text_input_click_role(role), "{role}");
+        }
+        for role in ["AXButton", "AXRow", "AXStaticText", "AXPopUpButton"] {
+            assert!(!text_input_click_role(role), "{role}");
         }
     }
 }
