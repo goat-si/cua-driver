@@ -972,7 +972,7 @@ where
 }
 
 #[allow(clippy::too_many_arguments)]
-fn drag_at_xy_background_with_origin<F, G>(
+pub(crate) fn drag_at_xy_background_with_origin<F, G>(
     pid: i32,
     from: (f64, f64),
     to: (f64, f64),

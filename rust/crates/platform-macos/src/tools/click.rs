@@ -1434,6 +1434,8 @@ impl ClickTool {
                             }));
                     }
                     Ok(Ok(None)) => {
+                        // (path and record below)
+
                         // An AX action may have been delivered: do NOT fall
                         // through to a second (pixel) click.
                         return ToolResult::text(
@@ -1441,9 +1443,42 @@ impl ClickTool {
                                 .to_owned(),
                         )
                         .with_structured(serde_json::json!({
+                            "path": "ax",
                             "effect": "unverifiable",
                             "code": "ax_action_unverified",
-                        }));
+                        }))
+                        .with_action_record(
+                            cua_driver_core::action_record::ActionExecutionRecord::builder(
+                                cua_driver_core::action_record::ActionEffect::Unverifiable,
+                                cua_driver_core::action_record::ActionTransport::MacosAxAction,
+                                cua_driver_core::action_record::RequestedDelivery::Background,
+                            )
+                            .actual_delivery(cua_driver_core::action_record::ActualDelivery::Background)
+                            .build()
+                            .expect("ax unverifiable record is valid"),
+                        );
+                    }
+                    Err(error) if !focus_only => {
+                        // The task itself failed: it may have run an AX
+                        // action first, so no pixel retry either.
+                        return ToolResult::text(format!(
+                            "The accessibility click task failed ({error}); it may have run.                              Read fresh state before clicking again."
+                        ))
+                        .with_structured(serde_json::json!({
+                            "path": "ax",
+                            "effect": "unverifiable",
+                            "code": "ax_action_unverified",
+                        }))
+                        .with_action_record(
+                            cua_driver_core::action_record::ActionExecutionRecord::builder(
+                                cua_driver_core::action_record::ActionEffect::Unverifiable,
+                                cua_driver_core::action_record::ActionTransport::MacosAxAction,
+                                cua_driver_core::action_record::RequestedDelivery::Background,
+                            )
+                            .actual_delivery(cua_driver_core::action_record::ActualDelivery::Background)
+                            .build()
+                            .expect("ax unverifiable record is valid"),
+                        );
                     }
                     _ => {}
                 }
@@ -2344,19 +2379,28 @@ fn ancestor_action_kind(
     chain: &[(Option<String>, Vec<String>)],
     is_finder: bool,
 ) -> Option<(usize, &'static str)> {
-    for (index, (role, actions)) in chain.iter().enumerate() {
+    // Selection first, across the WHOLE chain: any ancestor's AXPress beats
+    // an earlier cell's AXOpen.
+    for (index, (_, actions)) in chain.iter().enumerate() {
         if actions.iter().any(|a| a == "AXPress") {
             return Some((index, "AXPress"));
         }
-        if is_finder
-            && role.as_deref() == Some("AXCell")
+    }
+    if !is_finder {
+        return None;
+    }
+    // AXOpen only for a Finder SIDEBAR cell: AXCell with AXOpen whose parent
+    // is an AXRow and whose grandparent is an AXOutline. File/content
+    // outlines do not have this exact cell-row-outline nesting.
+    for (index, (role, actions)) in chain.iter().enumerate() {
+        if role.as_deref() == Some("AXCell")
             && actions.iter().any(|a| a == "AXOpen")
-            && chain[index + 1..]
-                .iter()
-                .any(|(role, _)| role.as_deref() == Some("AXRow"))
             && chain
-                .iter()
-                .any(|(role, _)| role.as_deref() == Some("AXOutline"))
+                .get(index + 1)
+                .is_some_and(|(role, _)| role.as_deref() == Some("AXRow"))
+            && chain
+                .get(index + 2)
+                .is_some_and(|(role, _)| role.as_deref() == Some("AXOutline"))
         {
             return Some((index, "AXOpen"));
         }
@@ -2400,16 +2444,12 @@ unsafe fn ax_press_with_ancestors(
         let Some(parent) = copy_element_attr(current, "AXParent") else {
             break;
         };
-        if current != element {
-            CFRelease(current as _);
-        }
+        // Every parent stays retained in the chain until the single cleanup
+        // below: no entry is used after release, and nothing is freed twice.
         current = parent;
         let role = copy_string_attr(current, "AXRole");
         let actions = copy_action_names(current);
         chain.push((role, actions, current));
-    }
-    if current != element && !chain.iter().any(|(_, _, el)| *el == current) {
-        CFRelease(current as _);
     }
     let roles_actions: Vec<(Option<String>, Vec<String>)> = chain
         .iter()
@@ -2424,7 +2464,12 @@ unsafe fn ax_press_with_ancestors(
         return Ok(AxPressOutcome::Unavailable);
     };
     let target = chain[index].2;
-    super::window_points::check_guard(dispatch_guard)?;
+    if let Err(moved) = super::window_points::check_guard(dispatch_guard) {
+        for (_, _, el) in chain {
+            CFRelease(el as _);
+        }
+        return Err(moved);
+    }
     let action = CFString::new(action_name);
     let err = AXUIElementPerformAction(target, action.as_concrete_TypeRef());
     for (_, _, el) in chain {
