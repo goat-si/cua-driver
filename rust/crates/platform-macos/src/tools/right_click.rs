@@ -1600,7 +1600,6 @@ mod tests {
             "a read completing after the deadline cannot confirm"
         );
     }
-
     /// Observation clock whose time moves only when the observer sleeps or a
     /// test advances it. Messages are awaited without a wall-clock timeout, so
     /// thread scheduling cannot move a deadline.
@@ -1608,6 +1607,8 @@ mod tests {
     struct FakeClock {
         now: Arc<std::sync::Mutex<Instant>>,
         sleeps: Arc<std::sync::Mutex<Vec<Duration>>>,
+        waits: Arc<std::sync::atomic::AtomicUsize>,
+        dropped_at_result_wait: Arc<std::sync::Mutex<Option<std::sync::mpsc::Sender<()>>>>,
     }
 
     impl FakeClock {
@@ -1615,6 +1616,8 @@ mod tests {
             Self {
                 now: Arc::new(std::sync::Mutex::new(Instant::now())),
                 sleeps: Arc::new(std::sync::Mutex::new(Vec::new())),
+                waits: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                dropped_at_result_wait: Arc::new(std::sync::Mutex::new(None)),
             }
         }
 
@@ -1642,6 +1645,13 @@ mod tests {
             receiver: &std::sync::mpsc::Receiver<M>,
             _timeout: Duration,
         ) -> Result<M, std::sync::mpsc::RecvTimeoutError> {
+            // The observer waits first for the dispatch event and then, after
+            // polling, for the action result. Dropping the parked sender at
+            // the result wait unblocks an action the observer never released,
+            // so a fixture regression fails instead of deadlocking.
+            if self.waits.fetch_add(1, std::sync::atomic::Ordering::SeqCst) >= 1 {
+                drop(self.dropped_at_result_wait.lock().unwrap().take());
+            }
             receiver
                 .recv()
                 .map_err(|_| std::sync::mpsc::RecvTimeoutError::Disconnected)
@@ -1649,17 +1659,19 @@ mod tests {
     }
 
     /// The action reports Sent, waits for the sent baseline read, adds menu
-    /// window 2, and then stays blocked until the observer releases it. With
-    /// `stall_after_first_sighting`, the observer is held up for 151ms while
-    /// reading the first sighting, so the deadline passes before the second
-    /// consistent read.
+    /// window 2, and then stays blocked until the observer's second sighting
+    /// releases it. The action returns whether that release came from the
+    /// observer. With `stall_on_second_sighting`, the second sighting read is
+    /// held up for 151ms, so it completes after the 150ms deadline although
+    /// the first sighting completed inside the window.
     fn observe_while_action_is_blocked(
-        stall_after_first_sighting: bool,
-    ) -> (ObservedAction<i32>, MenuObservation, Vec<Duration>) {
+        stall_on_second_sighting: bool,
+    ) -> (ObservedAction<bool>, MenuObservation, Vec<Duration>) {
         let clock = FakeClock::new();
         let (baseline_tx, baseline_rx) = std::sync::mpsc::channel();
         let (inserted_tx, inserted_rx) = std::sync::mpsc::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel();
+        *clock.dropped_at_result_wait.lock().unwrap() = Some(release_tx);
         let before = MenuSnapshot {
             window_ids: Some(HashSet::new()),
             ax_menus: None,
@@ -1668,7 +1680,6 @@ mod tests {
         let action_ids = menu_ids.clone();
         let action_clock = clock.clone();
         let read_clock = clock.clone();
-        let mut release = Some(release_tx);
         let mut reads = 0;
         let (result, observation) = observe_right_click_action_with(
             &clock,
@@ -1678,11 +1689,13 @@ mod tests {
                 baseline_rx.recv().unwrap();
                 action_ids.lock().unwrap().insert(2);
                 inserted_tx.send(()).unwrap();
-                release_rx.recv().unwrap();
-                42
+                release_rx.recv().is_ok()
             },
             move || {
                 reads += 1;
+                if reads == 3 && stall_on_second_sighting {
+                    read_clock.advance(Duration::from_millis(151));
+                }
                 let snapshot = MenuSnapshot {
                     window_ids: Some(menu_ids.lock().unwrap().clone()),
                     ax_menus: None,
@@ -1692,11 +1705,10 @@ mod tests {
                         baseline_tx.send(()).unwrap();
                         inserted_rx.recv().unwrap();
                     }
-                    2 if stall_after_first_sighting => {
-                        read_clock.advance(Duration::from_millis(151));
-                        release.take().unwrap().send(()).unwrap();
+                    3 => {
+                        let release = read_clock.dropped_at_result_wait.lock().unwrap().take();
+                        release.unwrap().send(()).unwrap();
                     }
-                    3 => release.take().unwrap().send(()).unwrap(),
                     _ => {}
                 }
                 snapshot
@@ -1708,7 +1720,10 @@ mod tests {
     #[test]
     fn wave400c_observation_runs_while_the_action_is_blocked() {
         let (result, observation, sleeps) = observe_while_action_is_blocked(false);
-        assert_eq!(result.unwrap(), 42);
+        assert!(
+            result.unwrap(),
+            "the action must stay blocked until the second sighting"
+        );
         assert!(observation.opened);
         assert!(observation.continuous);
         assert_eq!(observation.evidence, MenuEvidence::Window);
@@ -1719,11 +1734,12 @@ mod tests {
     #[test]
     fn wave400c_deadline_passing_before_the_second_sighting_does_not_confirm() {
         // The ordering a loaded runner produced in tag run 40895615773: the
-        // menu appears, but the 150ms window closes before it is read twice.
+        // first sighting lands inside the 150ms window, but the deadline
+        // passes before the second consistent sighting completes.
         let (result, observation, sleeps) = observe_while_action_is_blocked(true);
-        assert_eq!(result.unwrap(), 42);
+        assert!(result.unwrap());
         assert!(!observation.opened);
-        assert!(sleeps.is_empty());
+        assert_eq!(sleeps, vec![Duration::from_millis(15)]);
     }
 
     #[test]
