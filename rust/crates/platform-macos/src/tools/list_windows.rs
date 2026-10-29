@@ -16,7 +16,7 @@ fn def() -> &'static ToolDef {
             \n\
             Per record: window_id, pid, app_name, title, bounds, layer, z_index, is_on_screen, space_ids, current_space_id, on_current_space. For the frontmost window take the maximum integer z_index; null means stacking is unavailable, so do not infer it from array order.\n\
             \n\
-            To confirm a window closed, call with its `pid`: when enumeration_complete is true, authoritative_window_ids lists every window id WindowServer still has for that pid, hidden and helper windows included, and a window_id missing from it no longer exists. When enumeration_complete is false, a missing window proves nothing.".into(),
+            To check whether a window closed, call with its `pid`: when enumeration_complete is true, authoritative_window_ids lists every window id WindowServer reported for that pid at that moment, hidden and helper windows included. A window_id missing from it was no longer a window of that pid then: the window closed or the process exited, so check the process too. When enumeration_complete is false, a missing window proves nothing.".into(),
         input_schema: serde_json::json!({
             "type": "object",
             "properties": {
@@ -61,40 +61,62 @@ impl Tool for ListWindowsTool {
             None if on_screen_only => crate::windows::visible_windows_with_space_snapshot(),
             None => crate::windows::all_windows_with_space_snapshot(),
         };
-        let current_space_id = enumeration.current_space_id;
-        // Read the pid's full window-id set before any filtering below, so a
-        // caller can tell a closed window from one this listing leaves out.
-        let (enumeration_complete, authoritative_window_ids) = closure_fields(
-            enumeration.complete,
-            pid_filter.map(crate::windows::pid_window_id_snapshot),
+        // The pid's full window-id set, read independently of on_screen_only
+        // and of every filter the listing applies.
+        let identity = pid_filter.map(crate::windows::pid_window_id_snapshot);
+        let (windows, structured) = compose_listing(
+            enumeration,
+            identity,
+            args.opt_str("app").as_deref(),
+            std::process::id() as i32,
+            crate::apps::bundle_id_for_pid,
+            crate::ax::bindings::ax_window_ids_of_pid,
         );
-        let mut windows = enumeration.windows;
-
-        // The driver's own windows (the agent cursor overlay) are not targets.
-        let own_pid = std::process::id() as i32;
-        windows.retain(|w| w.pid != own_pid);
-        if let Some(filter) = args.opt_str("app") {
-            let mut bundle_ids = std::collections::HashMap::new();
-            windows.retain(|w| {
-                let bundle_id = bundle_ids
-                    .entry(w.pid)
-                    .or_insert_with(|| crate::apps::bundle_id_for_pid(w.pid));
-                cua_driver_core::tool_args::app_filter_matches(
-                    &filter,
-                    &w.app_name,
-                    bundle_id.as_deref(),
-                )
-            });
-        }
-        crate::windows::retain_ax_reachable(&mut windows, current_space_id);
-
-        ToolResult::text(format_window_list(&windows)).with_structured(list_windows_structured(
-            &windows,
-            current_space_id,
-            enumeration_complete,
-            authoritative_window_ids,
-        ))
+        ToolResult::text(format_window_list(&windows)).with_structured(structured)
     }
+}
+
+/// Filter the listing and attach the closure fields. The identity snapshot
+/// is never filtered: a window this listing leaves out (the driver's overlay,
+/// an app-filtered or AX-less helper window) is still a live window, so its
+/// id stays in authoritative_window_ids.
+fn compose_listing(
+    enumeration: crate::windows::WindowEnumeration,
+    identity: Option<crate::windows::WindowIdSnapshot>,
+    app_filter: Option<&str>,
+    own_pid: i32,
+    mut bundle_id_of: impl FnMut(i32) -> Option<String>,
+    ax_window_ids_of: impl FnMut(i32) -> Option<std::collections::HashSet<u32>>,
+) -> (Vec<crate::windows::WindowInfo>, Value) {
+    let current_space_id = enumeration.current_space_id;
+    let (enumeration_complete, authoritative_window_ids) =
+        closure_fields(enumeration.complete, identity);
+    let mut windows = enumeration.windows;
+
+    // The driver's own windows (the agent cursor overlay) are not targets.
+    windows.retain(|w| w.pid != own_pid);
+    if let Some(filter) = app_filter {
+        let mut bundle_ids = std::collections::HashMap::new();
+        windows.retain(|w| {
+            let bundle_id = bundle_ids
+                .entry(w.pid)
+                .or_insert_with(|| bundle_id_of(w.pid));
+            cua_driver_core::tool_args::app_filter_matches(
+                filter,
+                &w.app_name,
+                bundle_id.as_deref(),
+            )
+        });
+    }
+    crate::windows::retain_ax_reachable_using(&mut windows, current_space_id, ax_window_ids_of);
+
+    let structured = list_windows_structured(
+        &windows,
+        current_space_id,
+        enumeration_complete,
+        authoritative_window_ids,
+    );
+    (windows, structured)
 }
 
 /// The optional pid filter: absent or null lists every app; anything else must
@@ -321,6 +343,27 @@ mod tests {
             let id = window["window_id"].as_u64().expect("window_id");
             assert!(ids.contains(&id), "listed window {id} missing from {ids:?}");
         }
+        // Off-screen, other-Space and non-zero-layer windows (which the
+        // listing may drop as helpers) are all in the id set.
+        for window in crate::windows::all_windows_any_layer() {
+            if window.pid == pid {
+                let id = u64::from(window.window_id);
+                assert!(
+                    ids.contains(&id),
+                    "any-layer window {id} missing from {ids:?}"
+                );
+            }
+        }
+        // on_screen_only narrows the listing, never the id set.
+        let on_screen = ListWindowsTool
+            .invoke(serde_json::json!({ "pid": pid, "on_screen_only": true }))
+            .await
+            .structured_content
+            .expect("structured on-screen listing");
+        assert_eq!(
+            on_screen["authoritative_window_ids"], structured["authoritative_window_ids"],
+            "pid {pid}"
+        );
         eprintln!(
             "pid {pid}: {} listed, {} authoritative ids",
             structured["windows"].as_array().map_or(0, Vec::len),
@@ -363,22 +406,131 @@ mod tests {
         );
     }
 
+    fn composition_fixture() -> Vec<crate::windows::WindowInfo> {
+        let mut minimized = window(43, 7, "Example", "Hidden draft", false);
+        minimized.on_current_space = Some(false);
+        let mut popover = window(44, 7, "Example", "", true);
+        popover.layer = 25;
+        // AppKit helper shape: off screen, untitled, in no Space, not in AXWindows.
+        let mut helper = window(45, 7, "Example", "", false);
+        helper.space_ids = None;
+        helper.on_current_space = None;
+        vec![
+            window(42, 7, "Example", "Document", true),
+            minimized,
+            popover,
+            helper,
+        ]
+    }
+
+    fn identity_of(
+        windows: &[crate::windows::WindowInfo],
+        pid: i32,
+    ) -> crate::windows::WindowIdSnapshot {
+        crate::windows::window_ids_for_pid(
+            Some(
+                windows
+                    .iter()
+                    .map(|w| crate::windows::RawWindowIdentity::Entry {
+                        window_id: Some(i64::from(w.window_id)),
+                        pid: Some(i64::from(w.pid)),
+                    })
+                    .collect(),
+            ),
+            pid,
+        )
+    }
+
+    fn compose(
+        listed: Vec<crate::windows::WindowInfo>,
+        raw: &[crate::windows::WindowInfo],
+        pid: i32,
+        app: Option<&str>,
+        own_pid: i32,
+    ) -> (Vec<u32>, serde_json::Value) {
+        let enumeration = crate::windows::WindowEnumeration {
+            windows: listed,
+            current_space_id: Some(1),
+            complete: true,
+        };
+        let (windows, structured) = compose_listing(
+            enumeration,
+            Some(identity_of(raw, pid)),
+            app,
+            own_pid,
+            |_| Some("com.example.app".to_owned()),
+            |pid| (pid == 7).then(|| [42, 43, 44].into_iter().collect()),
+        );
+        assert!(
+            cua_driver_contract::validate_success_output("list_windows", structured.clone())
+                .unwrap()
+        );
+        (windows.iter().map(|w| w.window_id).collect(), structured)
+    }
+
     #[test]
-    fn authoritative_ids_cover_windows_the_listing_filters_out() {
-        // The listing kept one window after own-pid, app, on_screen_only and
-        // AX-helper filtering; the identity snapshot still names the overlay,
-        // the helper, the off-screen and the non-zero-layer windows.
-        let listed = [window(42, 7, "Example", "Document", true)];
-        let structured =
-            list_windows_structured(&listed, Some(1), true, Some(vec![42, 77, 78, 79]));
+    fn authoritative_ids_survive_every_listing_filter() {
+        let raw = composition_fixture();
+
+        // The AX-less helper leaves the listing; its id stays authoritative,
+        // as do the off-screen and non-zero-layer windows.
+        let (listed, structured) = compose(raw.clone(), &raw, 7, None, 999);
+        assert_eq!(listed, [42, 43, 44]);
         assert_eq!(structured["enumeration_complete"], true);
         assert_eq!(
             structured["authoritative_window_ids"],
-            serde_json::json!([42, 77, 78, 79])
+            serde_json::json!([42, 43, 44, 45])
         );
-        assert_eq!(structured["windows"].as_array().map(Vec::len), Some(1));
-        assert!(cua_driver_contract::validate_success_output("list_windows", structured).unwrap());
 
+        // An app filter that matches nothing empties the listing only.
+        let (listed, structured) = compose(raw.clone(), &raw, 7, Some("Other"), 999);
+        assert!(listed.is_empty());
+        assert_eq!(
+            structured["authoritative_window_ids"],
+            serde_json::json!([42, 43, 44, 45])
+        );
+        let (listed, _) = compose(raw.clone(), &raw, 7, Some("com.example.app"), 999);
+        assert_eq!(listed, [42, 43, 44]);
+
+        // on_screen_only shrinks the listing; the identity snapshot is a
+        // separate full read, so the off-screen ids remain.
+        let on_screen: Vec<_> = raw.iter().filter(|w| w.is_on_screen).cloned().collect();
+        let (listed, structured) = compose(on_screen, &raw, 7, None, 999);
+        assert_eq!(listed, [42, 44]);
+        assert_eq!(
+            structured["authoritative_window_ids"],
+            serde_json::json!([42, 43, 44, 45])
+        );
+
+        // The driver's own overlay is never listed but is still a live window.
+        let overlay = vec![window(50, 999, "cua-driver", "", true)];
+        let (listed, structured) = compose(overlay.clone(), &overlay, 999, None, 999);
+        assert!(listed.is_empty());
+        assert_eq!(
+            structured["authoritative_window_ids"],
+            serde_json::json!([50])
+        );
+
+        // An incomplete listing publishes no id set.
+        let (windows, structured) = compose_listing(
+            crate::windows::WindowEnumeration {
+                windows: Vec::new(),
+                current_space_id: None,
+                complete: false,
+            },
+            Some(identity_of(&raw, 7)),
+            None,
+            999,
+            |_| None,
+            |_| None,
+        );
+        assert!(windows.is_empty());
+        assert_eq!(structured["enumeration_complete"], false);
+        assert!(structured.get("authoritative_window_ids").is_none());
+    }
+    #[test]
+    fn unscoped_listing_reports_completeness_without_ids() {
+        let listed = [window(42, 7, "Example", "Document", true)];
         let unscoped = list_windows_structured(&listed, None, false, None);
         assert_eq!(unscoped["enumeration_complete"], false);
         assert!(unscoped.get("authoritative_window_ids").is_none());

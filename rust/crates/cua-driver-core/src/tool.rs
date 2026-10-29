@@ -3730,8 +3730,8 @@ fn preserve_wave400c_readback_fields(
     Ok(())
 }
 
-/// Pointer actions whose producers report the dispatch point and, on some
-/// routes, the element hit. Their public result carries both.
+/// Pointer actions whose producers report the point they aimed at and, on
+/// some routes, the element hit. Their public result carries both.
 const POINTER_RESULT_TOOLS: &[&str] = &[
     "click",
     "double_click",
@@ -3784,8 +3784,10 @@ fn pointer_alias(
     }
 }
 
-/// The producer's dispatch point. The macOS window-points annotation writes
-/// {x, y, unit}; the public record names the space coordinate_space.
+/// The point the producer reports aiming at. The macOS window-points
+/// annotation writes {x, y, unit} for calls addressed in window points (which
+/// refuse an element_token, window_points::point_space); the public record
+/// names the space coordinate_space.
 fn parse_action_point(
     producer: &Value,
 ) -> Result<Option<cua_driver_contract::ActionPoint>, String> {
@@ -3863,8 +3865,8 @@ fn parse_action_hit(producer: &Value) -> Result<Option<cua_driver_contract::Acti
     Ok((hit != cua_driver_contract::ActionHit::default()).then_some(hit))
 }
 
-/// Carry the producer's dispatch point and hit into the closed pointer
-/// result. A malformed value fails the projection, which the dispatcher
+/// Carry the producer's point and hit into the closed pointer result. A
+/// malformed value fails the projection, which the dispatcher
 /// reports as an outcome mismatch with an unknown execution state, because
 /// the input may already have been delivered.
 fn preserve_pointer_fields(

@@ -578,8 +578,21 @@ pub(crate) fn retain_ax_reachable_with(
 /// membership, and an off-Space window, which `AXWindows` also omits, would be
 /// indistinguishable from a helper.
 pub(crate) fn retain_ax_reachable(windows: &mut Vec<WindowInfo>, current_space_id: Option<u64>) {
+    retain_ax_reachable_using(
+        windows,
+        current_space_id,
+        crate::ax::bindings::ax_window_ids_of_pid,
+    );
+}
+
+/// [`retain_ax_reachable`] with the AXWindows lookup supplied by the caller.
+pub(crate) fn retain_ax_reachable_using(
+    windows: &mut Vec<WindowInfo>,
+    current_space_id: Option<u64>,
+    ax_window_ids: impl FnMut(i32) -> Option<std::collections::HashSet<u32>>,
+) {
     if current_space_id.is_some() {
-        retain_ax_reachable_with(windows, crate::ax::bindings::ax_window_ids_of_pid);
+        retain_ax_reachable_with(windows, ax_window_ids);
     }
 }
 

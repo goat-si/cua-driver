@@ -265,7 +265,7 @@ impl ToolOutput for ListWindowsOutput {
     }
 }
 
-/// Where a pointer action was dispatched, as the producer resolved it.
+/// The point a pointer action aimed at, as its producer reports it.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, uniffi::Record)]
 #[serde(deny_unknown_fields)]
 pub struct ActionPoint {

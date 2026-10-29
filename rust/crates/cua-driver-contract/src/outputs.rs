@@ -721,9 +721,13 @@ pub struct ActionResult {
     pub menu_opened: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub menu_items: Option<Vec<String>>,
-    /// Where a pointer action (click, double_click, right_click, move_cursor,
-    /// scroll, drag) was dispatched, as its producer resolved it. Absent when
-    /// the producer did not report one.
+    /// The point a pointer action (click, double_click, right_click,
+    /// move_cursor, scroll, drag) aimed at, in `coordinate_space`, as its
+    /// producer reports it; for drag, the end point. It says where the input
+    /// was aimed, not that anything changed there: `effect` and `evidence`
+    /// carry the outcome. Absent when the producer reported no point (macOS
+    /// reports one for window-points calls, which cannot also name an
+    /// element_token).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub point: Option<ActionPoint>,
     /// The element the pointer route reported hitting at dispatch time.
