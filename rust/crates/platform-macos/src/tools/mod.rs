@@ -798,13 +798,20 @@ pub(crate) async fn focus_by_pixel(
         // An INDETERMINATE focus task failure stops the ladder. A proven
         // refusal (no element at the point, background_unavailable) keeps
         // the existing foreground real-click fallback.
-        let indeterminate = focus
+        let effect = focus
             .structured_content
             .as_ref()
-            .and_then(|v| v["effect"].as_str())
-            == Some("unverifiable");
-        if indeterminate {
-            return Err(focus);
+            .and_then(|v| v["effect"].as_str());
+        let code = focus
+            .structured_content
+            .as_ref()
+            .and_then(|v| v["code"].as_str());
+        // Only an EXPLICIT proof of non-dispatch allows the real-click
+        // fallback: a refusal result, or background_unavailable. Any other
+        // error (unverifiable, unclassified, post-dispatch) stops here.
+        let proven_refusal = effect == Some("refused") || code == Some("background_unavailable");
+        if !proven_refusal {
+            return Err(pixel_focus_unconfirmed(pid, window_id, x, y));
         }
     }
     let landed = if focus.is_error != Some(true) {

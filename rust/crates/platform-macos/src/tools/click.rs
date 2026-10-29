@@ -2469,6 +2469,14 @@ unsafe fn ax_press_with_ancestors(
             return Ok(AxPressOutcome::Indeterminate);
         }
     }
+    // The hit's OWN outline role counts in the boundary decision (it is
+    // not part of the ancestor chain). Returning here retains nothing.
+    if copy_string_attr(element, "AXRole").as_deref() == Some("AXOutline")
+        && !copy_string_attr(element, "AXDescription")
+            .is_some_and(|d| d.eq_ignore_ascii_case("sidebar"))
+    {
+        return Ok(AxPressOutcome::Unavailable);
+    }
     // Collect the ancestor chain first, so an AXOpen decision can see the
     // outline above the cell rather than only the ancestors visited so far.
     let mut chain: Vec<(
@@ -2496,14 +2504,6 @@ unsafe fn ax_press_with_ancestors(
         .iter()
         .map(|(role, actions, _, sidebar)| (role.clone(), actions.clone(), *sidebar))
         .collect();
-    // The hit's OWN outline role counts in the boundary decision (it is
-    // not part of the ancestor chain).
-    if copy_string_attr(element, "AXRole").as_deref() == Some("AXOutline")
-        && !copy_string_attr(element, "AXDescription")
-            .is_some_and(|d| d.eq_ignore_ascii_case("sidebar"))
-    {
-        return Ok(AxPressOutcome::Unavailable);
-    }
     let is_finder = crate::apps::bundle_id_for_pid(pid).as_deref() == Some("com.apple.finder");
     let chosen = ancestor_action_kind(&roles_actions, is_finder);
     let Some((index, action_name)) = chosen else {
@@ -2537,8 +2537,8 @@ unsafe fn ax_press_with_ancestors(
     if err == kAXErrorSuccess {
         if action_name == "AXPress" {
             return Ok(match (before_selected, selected) {
-                (Some(true), _) | (_, Some(false)) | (_, None) => AxPressOutcome::Indeterminate,
-                (_, Some(true)) => AxPressOutcome::Delivered,
+                (Some(false), Some(true)) => AxPressOutcome::Delivered,
+                _ => AxPressOutcome::Indeterminate,
             });
         }
         return Ok(AxPressOutcome::Delivered);
