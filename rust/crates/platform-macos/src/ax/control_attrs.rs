@@ -81,8 +81,38 @@ fn replay_after_batch_failure(
     true
 }
 
+/// Single reads run only within the walk's deadline: one that would start, or
+/// that ran, past it stops the walk and returns nothing.
+fn singles_within_deadline<T>(budget: &mut WalkBudget, read: impl FnOnce() -> T) -> Option<T> {
+    if budget.expired() {
+        budget.stop_for_timeout();
+        return None;
+    }
+    let value = read();
+    if budget.expired() {
+        budget.stop_for_timeout();
+        return None;
+    }
+    Some(value)
+}
+
+/// A frame read for planning, outside the walk's per-node accounting: one
+/// batched call, with the two single reads only when the batch fails.
+///
+/// # Safety
+/// `element` must be a live AX element.
+pub(crate) unsafe fn frame_batched(element: AXUIElementRef) -> Option<[f64; 4]> {
+    match copy_attrs_batch(element, &FRAME_ATTRIBUTES) {
+        BatchRead::Slots(slots) => rect_from_parts(
+            slots.raw(0).and_then(|v| point_from_cf(v)),
+            slots.raw(1).and_then(|v| size_from_cf(v)),
+        ),
+        BatchRead::Fallback(_) => element_screen_rect(element),
+    }
+}
+
 /// The control state and frame of an element that may be indexed, or `None`
-/// when a failed batch ran past the walk's deadline (the walk is stopped).
+/// when its read ran past the walk's deadline (the walk is stopped).
 ///
 /// # Safety
 /// `element` must be a live AX element.
@@ -101,7 +131,7 @@ pub(crate) unsafe fn read_control_attrs(
             }
         }
     }
-    Some(ControlAttrs::from_singles(element))
+    singles_within_deadline(budget, || ControlAttrs::from_singles(element))
 }
 
 /// The frame of an element, as [`element_screen_rect`] reads it, or `None` when
@@ -129,7 +159,7 @@ pub(crate) unsafe fn read_frame(
             }
         }
     }
-    Some(element_screen_rect(element))
+    singles_within_deadline(budget, || element_screen_rect(element))
 }
 
 #[cfg(test)]
@@ -170,6 +200,21 @@ mod tests {
             panic!("valid control state must decode");
         };
         slots
+    }
+
+    #[test]
+    fn single_reads_never_start_past_the_deadline() {
+        let mut expired = WalkBudget::new(0, 10);
+        let _ = expired.admit();
+        let mut read = false;
+        assert_eq!(singles_within_deadline(&mut expired, || read = true), None);
+        assert!(!read, "no single read is issued past the deadline");
+        assert_eq!(expired.outcome().reason(), Some("timeout"));
+
+        let mut live = WalkBudget::nodes_only(10);
+        let _ = live.admit();
+        assert_eq!(singles_within_deadline(&mut live, || 7), Some(7));
+        assert!(!live.outcome().truncated());
     }
 
     #[test]

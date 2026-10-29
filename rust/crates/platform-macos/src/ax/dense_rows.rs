@@ -192,26 +192,39 @@ pub(crate) unsafe fn plan_collection_children(
         None
     };
     let visible = if dense && !budget.expired() {
-        ElementSet::copy(element, "AXVisibleRows")
-            .or_else(|| ElementSet::copy(element, "AXVisibleChildren"))
+        ElementSet::copy(element, "AXVisibleRows").or_else(|| {
+            (!budget.expired())
+                .then(|| ElementSet::copy(element, "AXVisibleChildren"))
+                .flatten()
+        })
     } else {
         None
     };
-    // Without a visible-children list (absent or empty), each child's frame
-    // against the walked surface decides.
+    // Without a visible-children list (absent or empty), a parent with many
+    // children is cut by each child's frame against the walked surface. A
+    // small collection keeps every row, as before. A child whose frame or
+    // the surface's frame is read past the deadline stays unclassified
+    // (visible), so the walker refuses it as pending rather than calling it
+    // offscreen.
+    let cut_by_frame = children.len() >= MANY_CHILDREN;
     let clip = std::cell::OnceCell::new();
     let is_visible = |i: usize| match &visible {
         Some(set) => set.contains(children[i]),
+        None if !cut_by_frame => true,
         None => {
             if budget.expired() {
                 return true;
             }
             set_messaging_timeout(children[i]);
-            let rect = element_screen_rect(children[i]);
+            let rect = super::control_attrs::frame_batched(children[i]);
             if budget.expired() {
                 return true;
             }
-            rect_visible(rect, *clip.get_or_init(|| visible_clip()))
+            let clip = *clip.get_or_init(|| visible_clip());
+            if budget.expired() {
+                return true;
+            }
+            rect_visible(rect, clip)
         }
     };
     plan_children(
@@ -663,7 +676,7 @@ mod tests {
     }
 
     #[test]
-    fn many_children_or_a_dense_role_are_windowed_by_frame_when_no_visible_list() {
+    fn dense_roles_are_scheduled_and_many_children_are_cut_by_frame() {
         assert!(windows_children(true, false, "AXTable", 3));
         assert!(windows_children(true, false, "AXGroup", MANY_CHILDREN));
         assert!(!windows_children(true, false, "AXGroup", MANY_CHILDREN - 1));
