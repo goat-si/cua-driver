@@ -36,6 +36,79 @@ pub(crate) enum FocusDispatch {
 /// The not_editable result. A refusal after a focus attempt never claims
 /// nothing was sent: the focus action is reported as delivered (partial)
 /// or possibly delivered (unverifiable, delivery unknown).
+/// Attach a focus receipt to a later result. A refusal or an unverifiable
+/// outcome that follows a delivered focus action must not read as though
+/// nothing happened: it becomes partial, with the actual focus route in the
+/// public record. An error whose message starts with "not_editable" and has
+/// no receipt becomes the structured not_editable refusal.
+pub(crate) fn account_focus_receipt(
+    mut result: ToolResult,
+    receipt: Option<FocusDispatch>,
+) -> ToolResult {
+    let Some(focus) = receipt else {
+        if result.is_error == Some(true) {
+            let message = text_of_result(&result);
+            if message.starts_with("not_editable") {
+                return not_editable_result(message, FocusDispatch::None);
+            }
+        }
+        return result;
+    };
+    if !matches!(focus, FocusDispatch::SentAx | FocusDispatch::SentClick) {
+        return result;
+    }
+    if result.is_error != Some(true) || result.action_record.is_some() {
+        return result;
+    }
+    let effect = result
+        .structured_content
+        .as_ref()
+        .and_then(|v| v["effect"].as_str())
+        .unwrap_or("");
+    if !matches!(effect, "refused" | "unverifiable" | "") {
+        return result;
+    }
+    let (transport, delivery) = if matches!(focus, FocusDispatch::SentClick) {
+        (ActionTransport::MacosCgEventHid, ActualDelivery::Foreground)
+    } else {
+        (ActionTransport::MacosAxAction, ActualDelivery::Background)
+    };
+    if let Some(serde_json::Value::Object(fields)) = result.structured_content.as_mut() {
+        fields.insert("effect".into(), serde_json::json!("partial"));
+        fields.insert("focus_action".into(), serde_json::json!("sent"));
+    } else {
+        let message = text_of_result(&result);
+        result.structured_content = Some(serde_json::json!({
+            "effect": "partial",
+            "focus_action": "sent",
+            "message": message,
+        }));
+    }
+    result.action_record = Some(
+        ActionExecutionRecord::builder(
+            ActionEffect::Partial,
+            transport,
+            RequestedDelivery::Background,
+        )
+        .actual_delivery(delivery)
+        .delivered_count(1)
+        .build()
+        .expect("focus receipt record is valid"),
+    );
+    result
+}
+
+fn text_of_result(result: &ToolResult) -> String {
+    result
+        .content
+        .iter()
+        .filter_map(|c| match c {
+            cua_driver_core::protocol::Content::Text { text, .. } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect()
+}
+
 pub(crate) fn not_editable_result(message: String, focus: FocusDispatch) -> ToolResult {
     match focus {
         FocusDispatch::None => {
@@ -287,6 +360,13 @@ pub(crate) async fn token_not_editable_refusal(
                 focus,
             ));
         };
+        if facts.role.is_none() {
+            return Some(not_editable_result(
+                "the target element's role could not be read after the focus attempt; no text                  or keys were sent."
+                    .into(),
+                focus,
+            ));
+        }
         if matches!(focus, FocusDispatch::Indeterminate) && facts.focused == Some(true) {
             // The read-back proves the focus action landed.
             focus = FocusDispatch::SentAx;
@@ -325,6 +405,57 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    #[test]
+    fn a_later_refusal_after_a_sent_focus_action_becomes_partial() {
+        let refusal = ToolResult::error("focus conflict").with_structured(serde_json::json!({
+            "code": "window_not_key",
+            "effect": "refused",
+        }));
+        let result = account_focus_receipt(refusal, Some(FocusDispatch::SentAx));
+        let data = result.structured_content.clone().unwrap();
+        assert_eq!(data["effect"], "partial");
+        assert_eq!(data["focus_action"], "sent");
+        assert_eq!(data["code"], "window_not_key");
+        let public = result
+            .action_record
+            .as_ref()
+            .unwrap()
+            .public_result()
+            .expect("valid record");
+        let public = serde_json::to_value(public).unwrap();
+        assert_eq!(public["effect"], "partial");
+        assert_eq!(public["delivery"]["mode"], "background");
+    }
+
+    #[test]
+    fn an_unverifiable_focus_outcome_is_projected_as_partial_when_sent() {
+        let unconfirmed = ToolResult::error("focus click sent, not confirmed")
+            .with_structured(serde_json::json!({"effect": "unverifiable"}));
+        let result = account_focus_receipt(unconfirmed, Some(FocusDispatch::SentClick));
+        assert_eq!(
+            result.structured_content.clone().unwrap()["effect"],
+            "partial"
+        );
+        let public = result
+            .action_record
+            .as_ref()
+            .unwrap()
+            .public_result()
+            .expect("valid record");
+        let public = serde_json::to_value(public).unwrap();
+        assert_eq!(public["delivery"]["mode"], "foreground");
+    }
+
+    #[test]
+    fn a_not_editable_error_without_a_receipt_becomes_the_structured_refusal() {
+        let error = ToolResult::error("not_editable: cell at delivery");
+        let result = account_focus_receipt(error, None);
+        let data = result.structured_content.unwrap();
+        assert_eq!(data["code"], "not_editable");
+        assert_eq!(data["effect"], "refused");
+        assert_eq!(data["dispatched"], false);
     }
 
     #[test]

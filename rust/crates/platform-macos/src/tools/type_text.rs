@@ -277,6 +277,7 @@ impl Tool for TypeTextTool {
             .as_ref()
             .map(|(g, idx)| (g.as_ptr(), Some(*idx)));
         let used_pixel_focus = px.is_some() && py.is_some();
+        let mut px_receipt = None;
 
         let electron_background_ax_unsafe = element_ptr.is_some()
             && crate::browser::electron_js::ElectronJs::is_electron(pid)
@@ -372,6 +373,7 @@ impl Tool for TypeTextTool {
                 Ok(receipt) => receipt,
                 Err(e) => return e,
             };
+            px_receipt = Some(focus_receipt);
             // Verify the focus the click produced before typing: if it
             // landed on a non-editing cell, no text is sent and the result
             // reports the focus action truthfully.
@@ -475,7 +477,10 @@ impl Tool for TypeTextTool {
         let result = match result {
             Ok(Ok(TypeTextDelivery::Refused(refusal))) => {
                 let wid = window_id.expect("background refusals require a window target");
-                return super::background_refusal_result(pid, wid, &refusal);
+                return super::not_editable::account_focus_receipt(
+                    super::background_refusal_result(pid, wid, &refusal),
+                    px_receipt,
+                );
             }
             Ok(Ok(TypeTextDelivery::SynthesisRefused {
                 path,
@@ -487,7 +492,7 @@ impl Tool for TypeTextTool {
             Err(error) => Err(error),
         };
 
-        match result {
+        let result = match result {
             Ok(Ok(outcome)) if outcome.delivered_chars.is_some_and(|n| n < char_count) => {
                 let delivered_chars = outcome.delivered_chars.unwrap_or_default();
                 ToolResult::error(format!(
@@ -644,7 +649,9 @@ impl Tool for TypeTextTool {
             }
             Ok(Err(e)) => text_delivery_failure("type_text failed", &e),
             Err(e) => ToolResult::error(format!("Task error: {e}")),
-        }
+        };
+        // Any refusal after a delivered focus action carries its receipt.
+        super::not_editable::account_focus_receipt(result, px_receipt)
     }
 }
 

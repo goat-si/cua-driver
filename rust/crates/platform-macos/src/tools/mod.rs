@@ -784,8 +784,14 @@ pub(crate) async fn focus_by_pixel(
     // The not_editable cell guard runs before ANY focus action: a
     // non-editing cell (or an unclassifiable hit) refuses the whole call, so
     // no focus action or key can reach it (handoff 3.7 point route). The
-    // frame is kept so the actuator can revalidate the same geometry.
+    // classified frame becomes the click's window_points basis, so the
+    // actuator itself refuses if the geometry changes before posting — the
+    // classification and the dispatch are bound to the same frame.
+    let mut guarded_click_args: Option<serde_json::Value> = None;
     if guard_editable {
+        if from_zoom {
+            return Err(not_editable::unresolved_point_refusal());
+        }
         let Some(wid) = window_id else {
             return Err(not_editable::unresolved_point_refusal());
         };
@@ -798,6 +804,16 @@ pub(crate) async fn focus_by_pixel(
         {
             return Err(refusal);
         }
+        click_args["coordinate_space"] = serde_json::json!("window_points");
+        click_args["x"] = serde_json::json!(native_x / frame.scale);
+        click_args["y"] = serde_json::json!(native_y / frame.scale);
+        click_args["window_basis"] = serde_json::json!({
+            "x": frame.bounds.x,
+            "y": frame.bounds.y,
+            "w": frame.bounds.width,
+            "h": frame.bounds.height,
+        });
+        guarded_click_args = Some(click_args.clone());
     }
     // The requested field may already hold keyboard focus, for example after
     // a pixel hotkey Cmd+A. Any focus action is then redundant, and the real
@@ -861,7 +877,10 @@ pub(crate) async fn focus_by_pixel(
                 )));
             }
             PixelFocusStep::Unconfirmed => {
-                return Err(pixel_focus_unconfirmed(pid, window_id, x, y))
+                return Err(not_editable::account_focus_receipt(
+                    pixel_focus_unconfirmed(pid, window_id, x, y),
+                    Some(not_editable::FocusDispatch::SentAx),
+                ))
             }
         },
     }
@@ -869,11 +888,15 @@ pub(crate) async fn focus_by_pixel(
     // Some renderer surfaces do not expose a usable AX focus action. The
     // explicit foreground rung retains its real-click fallback for them.
     gate_foreground_physical_idle(pid, window_id)?;
-    let mut click_args = serde_json::json!({
-        "pid": pid, "x": x, "y": y,
-        "delivery_mode": "foreground",
-        "action": "press",
+    let mut click_args = guarded_click_args.unwrap_or_else(|| {
+        serde_json::json!({
+            "pid": pid, "x": x, "y": y,
+            "delivery_mode": "foreground",
+            "action": "press",
+        })
     });
+    click_args["delivery_mode"] = serde_json::json!("foreground");
+    click_args["action"] = serde_json::json!("press");
     if let Some(wid) = window_id {
         click_args["window_id"] = serde_json::json!(wid);
     }
@@ -917,6 +940,7 @@ fn focus_readback_is_negative(landed: Option<bool>) -> bool {
     matches!(landed, Some(false))
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FocusDecision {
     Proceed(PixelFocusStep),
     StopOriginalError,
@@ -938,6 +962,80 @@ fn decide_focus_next(
         return FocusDecision::StopUnconfirmed;
     }
     FocusDecision::Proceed(pixel_focus_step(landed, foreground))
+}
+
+/// The point was classified against one frame; if the window moved or its
+/// scale changed before the actuator finished, the focus action may have
+/// landed on a different element. Refuse the keys and account for the focus
+/// action that was already sent.
+async fn revalidate_guard_geometry(
+    window_id: Option<u32>,
+    guard_editable: bool,
+    frame: Option<&px_frame::WindowPxFrame>,
+    clicked: bool,
+) -> Result<(), cua_driver_core::protocol::ToolResult> {
+    if !guard_editable {
+        return Ok(());
+    }
+    let (Some(wid), Some(before)) = (window_id, frame) else {
+        return Ok(());
+    };
+    let after = match px_frame::resolve_or_refuse(wid).await {
+        Ok(frame) => frame,
+        Err(_) => {
+            return Err(not_editable::not_editable_result(
+                "the window's geometry could not be revalidated after the focus action; no keys                  were sent."
+                    .into(),
+                if clicked {
+                    not_editable::FocusDispatch::SentClick
+                } else {
+                    not_editable::FocusDispatch::SentAx
+                },
+            ))
+        }
+    };
+    let same = before.scale == after.scale
+        && before.bounds.x == after.bounds.x
+        && before.bounds.y == after.bounds.y
+        && before.bounds.width == after.bounds.width
+        && before.bounds.height == after.bounds.height;
+    if !same {
+        return Err(not_editable::not_editable_result(
+            "the window moved or changed scale during the focus action, so the classified point              no longer matches; no keys were sent."
+                .into(),
+            if clicked {
+                not_editable::FocusDispatch::SentClick
+            } else {
+                not_editable::FocusDispatch::SentAx
+            },
+        ));
+    }
+    Ok(())
+}
+
+/// The focus action may have been sent but its outcome is unknown: no keys
+/// are sent, and no further focus fallback runs after the indeterminate
+/// mutation.
+fn focus_dispatch_unverified(
+    pid: i32,
+    window_id: Option<u32>,
+    x: f64,
+    y: f64,
+) -> cua_driver_core::protocol::ToolResult {
+    let message = format!(
+        "The focus action at ({x:.0},{y:.0}) may have been sent, but its outcome is unknown, so          no key or text was sent. Read fresh state before retrying."
+    );
+    cua_driver_core::protocol::ToolResult::error(message.clone()).with_structured(
+        serde_json::json!({
+            "code": "focus_dispatch_unverified",
+            "effect": "unverifiable",
+            "keys_sent": false,
+            "retryable": false,
+            "pid": pid,
+            "window_id": window_id,
+            "message": message,
+        }),
+    )
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

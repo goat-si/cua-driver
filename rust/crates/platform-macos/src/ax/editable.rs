@@ -13,8 +13,8 @@
 //! fail closed: they never classify as NotCell or Editing.
 
 use crate::ax::bindings::{
-    copy_bool_attr, copy_children, copy_element_attr, copy_string_attr, is_attribute_settable,
-    AXUIElementRef, AXUIElementSetMessagingTimeout,
+    copy_bool_attr, copy_children_checked, copy_element_attr, copy_string_attr,
+    is_attribute_settable, AXUIElementRef, AXUIElementSetMessagingTimeout,
 };
 use core_foundation::base::{CFRelease, CFTypeRef};
 
@@ -128,6 +128,7 @@ pub unsafe fn facts_for_element(element: AXUIElementRef) -> Option<ElementFacts>
     if element.is_null() {
         return None;
     }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(800);
     let _ = AXUIElementSetMessagingTimeout(element, AX_TIMEOUT_SECONDS);
     let mut facts = ElementFacts {
         role: copy_string_attr(element, "AXRole"),
@@ -139,6 +140,13 @@ pub unsafe fn facts_for_element(element: AXUIElementRef) -> Option<ElementFacts>
     let mut current = element;
     let mut complete = false;
     for _ in 0..MAX_ANCESTORS {
+        if std::time::Instant::now() >= deadline {
+            facts.ancestry_complete = false;
+            if current != element {
+                CFRelease(current as CFTypeRef);
+            }
+            return Some(facts);
+        }
         let Some(parent) = copy_element_attr(current, "AXParent") else {
             break;
         };
@@ -201,7 +209,11 @@ unsafe fn scan_focused_text_descendant(
     }
     let mut found = false;
     let mut finished = true;
-    for child in copy_children(element) {
+    let Some(children) = copy_children_checked(element) else {
+        // A failed children read is an unfinished scan, never an empty one.
+        return (false, false);
+    };
+    for child in children {
         if !found {
             if *budget == 0 || std::time::Instant::now() >= deadline {
                 finished = false;

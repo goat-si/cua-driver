@@ -685,6 +685,7 @@ impl Tool for PressKeyTool {
         // px form: pixel-click to focus, then the key goes to the focused element.
         // Reuses click's translation + delivery_mode; after it, deliver via the
         // plain background path (the focus-click already handled fronting if fg).
+        let mut px_receipt = None;
         let px_focus = {
             if let (Some(cx), Some(cy)) = (px, py) {
                 let from_zoom = args
@@ -709,6 +710,7 @@ impl Tool for PressKeyTool {
                     Ok(receipt) => receipt,
                     Err(e) => return e,
                 };
+                px_receipt = Some(focus_receipt);
                 if printable
                     && !super::not_editable::focused_cell_allows_typing(pid, window_id).await
                 {
@@ -820,10 +822,7 @@ impl Tool for PressKeyTool {
                     }
                     // background (default): auth-envelope post, no raise.
                     dispatch_with_ax_oracle(pid, window_id, pre_focus_ptr, || {
-                        if let Some(wid) = window_id.filter(|_| !px_focus) {
-                            // After a confirmed px focus + post-focus verify
-                            // the exact focus delivery is already proven;
-                            // the conflict gate is redundant.
+                        if let Some(wid) = window_id {
                             let conflict = crate::ax::exact_target::check_window_focus_conflict(
                                 pid,
                                 wid,
@@ -877,7 +876,7 @@ impl Tool for PressKeyTool {
             }
         };
 
-        match delivery_outcome {
+        let result = match delivery_outcome {
             outcome @ (PressKeyDeliveryOutcome::Confirmed
             | PressKeyDeliveryOutcome::Unverifiable) => {
                 let confirmed = matches!(outcome, PressKeyDeliveryOutcome::Confirmed);
@@ -899,7 +898,9 @@ impl Tool for PressKeyTool {
                 .with_action_record(action_record(confirmed, fg))
             }
             PressKeyDeliveryOutcome::Failed(error) => delivery_failed(error),
-        }
+        };
+        // Any refusal after a delivered focus action carries its receipt.
+        super::not_editable::account_focus_receipt(result, px_receipt)
     }
 }
 
