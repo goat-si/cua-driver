@@ -279,6 +279,43 @@ fn with_confirmed_key_focus_or_fallback<T>(
     dispatch()
 }
 
+/// Late CELL recheck inside the delivery context: activation may have
+/// replaced the first responder since the early guard, so the actual focused
+/// element is re-read immediately before the key is posted.
+fn late_cell_refusal(
+    pid: i32,
+    window_id: Option<u32>,
+    printable: bool,
+    element_targeted: bool,
+) -> anyhow::Result<()> {
+    if printable && !element_targeted {
+        // Fail closed at the final check: the earlier classification cannot
+        // establish the focus that activation or a focus change produced.
+        if !unsafe { super::not_editable::sync_focused_cell_allows(pid, window_id) } {
+            anyhow::bail!(
+                "not_editable: the focused element at delivery is a non-editing cell or is                  unreadable; no keys were sent"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Whether the resolved key+modifiers is a printable insertion (a single
+/// non-control character with no modifiers, or Shift only). Guard
+/// eligibility is decided here, independent of the keycode/unicode
+/// transport: printable names and shift chords count, named keys do not.
+pub(super) fn printable_request(key: &str, modifiers: &[String]) -> bool {
+    // The resolver keeps named space as "space"; it inserts a character.
+    if key == "space" {
+        return modifiers.iter().all(|m| m == "shift");
+    }
+    let mut chars = key.chars();
+    match (chars.next(), chars.next()) {
+        (Some(ch), None) if !ch.is_control() => modifiers.iter().all(|m| m == "shift"),
+        _ => false,
+    }
+}
+
 /// The key a call names, as typed and resolved with its modifiers, or the
 /// refusal for a missing or unknown one. Pure: it reads only the arguments.
 pub(super) fn requested_key(args: &Value) -> Result<(String, String, Vec<String>), ToolResult> {
@@ -439,7 +476,31 @@ impl Tool for PressKeyTool {
             };
             let key_for_input = key.clone();
             let display_key = pressed_key_display(&input.key, &key, &modifiers);
+            let early_front_pid = crate::apps::frontmost_pid();
+            if printable_request(&key, &modifiers) {
+                // Desktop scope dispatches globally: check the frontmost
+                // app's focused element and fail closed before any key.
+                match early_front_pid {
+                    Some(front_pid) => {
+                        if let Some(refusal) =
+                            super::not_editable::guard_untargeted(front_pid, None).await
+                        {
+                            return refusal;
+                        }
+                    }
+                    None => {
+                        return super::not_editable::not_editable_result(
+                            "the frontmost application could not be determined, so editability                              is unknown; no keys were sent."
+                                .into(),
+                            super::not_editable::FocusDispatch::None,
+                        )
+                    }
+                }
+            }
+            let checked_pid = early_front_pid.unwrap_or_default();
+            let printable_desktop = printable_request(&key, &modifiers);
             let result = latency::spawn_action_blocking(move || {
+                super::not_editable::desktop_dispatch_guard(checked_pid, printable_desktop)?;
                 let modifier_refs: Vec<&str> = modifiers.iter().map(String::as_str).collect();
                 crate::input::keyboard::press_key_global(&key_for_input, &modifier_refs)
             })
@@ -451,8 +512,14 @@ impl Tool for PressKeyTool {
                         "path": "hid",
                         "effect": "unverifiable"
                     })),
-                Ok(Err(error)) => ToolResult::error(format!("desktop press_key failed: {error}")),
-                Err(error) => ToolResult::error(format!("desktop press_key task failed: {error}")),
+                Ok(Err(error)) => super::not_editable::account_focus_receipt(
+                    ToolResult::error(format!("desktop press_key failed: {error}")),
+                    None,
+                ),
+                Err(error) => super::not_editable::account_focus_receipt(
+                    ToolResult::error(format!("desktop press_key task failed: {error}")),
+                    None,
+                ),
             };
         }
         // Resolve the key first: an unknown name is refused before any
@@ -616,16 +683,26 @@ impl Tool for PressKeyTool {
             }
         }
 
+        let printable = printable_request(&key, &modifiers);
+        // CELL rule for untargeted printable keys: a non-editing cell (or an
+        // unreadable focused element) refuses the call before any key.
+        if printable && pre_focus_guard.is_none() && px.is_none() {
+            if let Some(refusal) = super::not_editable::guard_untargeted(pid, window_id).await {
+                return refusal;
+            }
+        }
+
         // px form: pixel-click to focus, then the key goes to the focused element.
         // Reuses click's translation + delivery_mode; after it, deliver via the
         // plain background path (the focus-click already handled fronting if fg).
+        let mut px_receipt = None;
         let px_focus = {
             if let (Some(cx), Some(cy)) = (px, py) {
                 let from_zoom = args
                     .get("from_zoom")
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false);
-                if let Err(e) = super::focus_by_pixel(
+                let focus_receipt = match super::focus_by_pixel(
                     &self.state,
                     pid,
                     window_id,
@@ -636,10 +713,22 @@ impl Tool for PressKeyTool {
                     args.opt_str("_session_id"),
                     from_zoom,
                     _mutation_lease.as_ref(),
+                    printable,
                 )
                 .await
                 {
-                    return e;
+                    Ok(receipt) => receipt,
+                    Err(e) => return e,
+                };
+                px_receipt = Some(focus_receipt);
+                if printable
+                    && !super::not_editable::focused_cell_allows_typing(pid, window_id).await
+                {
+                    return super::not_editable::not_editable_result(
+                        "the element focused by the click is not being edited; no keys were sent."
+                            .into(),
+                        focus_receipt,
+                    );
                 }
                 true
             } else {
@@ -732,7 +821,10 @@ impl Tool for PressKeyTool {
                                                 Ok(false)
                                             }
                                         },
-                                        || crate::input::keyboard::press_key_bare_global(&key, &m),
+                                        || {
+                                late_cell_refusal(pid, Some(wid), printable, pre_focus_ptr.is_some())?;
+                                crate::input::keyboard::press_key_bare_global(&key, &m)
+                            },
                                     )
                                 },
                             )
@@ -773,7 +865,10 @@ impl Tool for PressKeyTool {
                                 }
                                 Ok(false)
                             },
-                            || crate::input::keyboard::press_key(pid, &key, &m),
+                            || {
+                            late_cell_refusal(pid, window_id, printable, pre_focus_ptr.is_some())?;
+                            crate::input::keyboard::press_key(pid, &key, &m)
+                        },
                         )
                     })
                 })
@@ -791,7 +886,7 @@ impl Tool for PressKeyTool {
             }
         };
 
-        match delivery_outcome {
+        let result = match delivery_outcome {
             outcome @ (PressKeyDeliveryOutcome::Confirmed
             | PressKeyDeliveryOutcome::Unverifiable) => {
                 let confirmed = matches!(outcome, PressKeyDeliveryOutcome::Confirmed);
@@ -813,13 +908,42 @@ impl Tool for PressKeyTool {
                 .with_action_record(action_record(confirmed, fg))
             }
             PressKeyDeliveryOutcome::Failed(error) => delivery_failed(error),
-        }
+        };
+        // Any refusal after a delivered focus action carries its receipt.
+        super::not_editable::account_focus_receipt(result, px_receipt)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn printable_guard_eligibility_covers_names_and_chords() {
+        let shift = |m: &[&str]| m.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        // A plain character and a Shift chord are printable.
+        assert!(printable_request("x", &[]));
+        assert!(printable_request("x", &shift(&["shift"])));
+        assert!(printable_request(" ", &[]), "space is printable");
+        assert!(
+            printable_request("8", &shift(&["shift"])),
+            "asterisk resolves to shift+8"
+        );
+        // Named non-printable keys and other combos are not guarded.
+        assert!(!printable_request("\n", &[]), "return is not printable");
+        assert!(!printable_request("x", &shift(&["cmd"])));
+        assert!(!printable_request("return", &[]));
+        // The resolved shape of real requests.
+        let (key, mods) = crate::input::keyboard::resolve_key_press("shift+x", &[]).unwrap();
+        assert!(printable_request(&key, &mods));
+        let (key, mods) = crate::input::keyboard::resolve_key_press("space", &[]).unwrap();
+        assert!(printable_request(&key, &mods));
+        let (key, mods) = crate::input::keyboard::resolve_key_press("asterisk", &[]).unwrap();
+        assert!(printable_request(&key, &mods));
+        let (key, mods) = crate::input::keyboard::resolve_key_press("return", &[]).unwrap();
+        assert!(!printable_request(&key, &mods));
+        let (key, mods) = crate::input::keyboard::resolve_key_press("escape", &[]).unwrap();
+        assert!(!printable_request(&key, &mods));
+    }
 
     #[test]
     fn the_summary_names_the_chord_that_was_sent() {

@@ -139,6 +139,13 @@ fn deliver_text_runs(
                     if error.downcast_ref::<PasteMayHaveLanded>().is_some() {
                         return Err(error);
                     }
+                    if error.downcast_ref::<DesktopSequenceAbort>().is_some()
+                        || error.downcast_ref::<PasteSequenceAbort>().is_some()
+                    {
+                        // A guard abort is not a paste failure: never resume
+                        // typing after it, even if focus comes back.
+                        return Err(error);
+                    }
                     type_run(run)?;
                 }
             }
@@ -203,6 +210,9 @@ pub trait PasteboardBackend {
 pub struct PasteMayHaveLanded {
     source: anyhow::Error,
     clipboard_restored: bool,
+    /// Another writer changed the clipboard during the transaction, so its
+    /// current contents belong to that writer (not to this paste).
+    clipboard_changed_externally: bool,
 }
 
 impl PasteMayHaveLanded {
@@ -219,7 +229,9 @@ impl std::fmt::Display for PasteMayHaveLanded {
             "the text may already have been pasted, so it was not typed again ({:#})",
             self.source
         )?;
-        if !self.clipboard_restored {
+        if self.clipboard_changed_externally {
+            write!(f, "; another writer changed the clipboard during the paste")?;
+        } else if !self.clipboard_restored {
             write!(f, "; the clipboard still holds the pasted text")?;
         }
         Ok(())
@@ -271,11 +283,39 @@ pub fn run_pasteboard_transaction<B: PasteboardBackend>(
     let written_count = backend.write_items(&[transient_item])?;
 
     if let Err(err) = trigger_paste() {
-        let clipboard_restored = backend.change_count() != written_count
-            || restore_pasteboard_snapshot(backend, &snapshot).is_ok();
+        // Read AFTER the trigger returns: a concurrent copy during the
+        // trigger must never be overwritten by restoring the old snapshot.
+        let concurrent_change = backend.change_count() != written_count;
+        // ONE ownership check, then at most ONE restore attempt: a
+        // successful restore changes the count, and a failed one is not
+        // retried.
+        let restored_once =
+            !concurrent_change && restore_pasteboard_snapshot(backend, &snapshot).is_ok();
+        let outcome = if concurrent_change {
+            PasteRestoration::SkippedConcurrentChange
+        } else if restored_once {
+            PasteRestoration::Restored
+        } else {
+            PasteRestoration::Failed
+        };
+        let clipboard_restored = restored_once;
+        if let Some(abort) = err.downcast_ref::<PasteSequenceAbort>() {
+            // A pre-dispatch abort keeps its typed reason AND the
+            // restoration outcome instead of becoming PasteMayHaveLanded.
+            // The tri-state comes from ONE ownership check and ONE restore
+            // attempt: a successful restore itself changes the count, and a
+            // failed restore is never retried.
+            return Err(PasteSequenceAbort {
+                posted: abort.posted,
+                reason: abort.reason.clone(),
+                clipboard_restored: outcome,
+            }
+            .into());
+        }
         return Err(PasteMayHaveLanded {
             source: err,
             clipboard_restored,
+            clipboard_changed_externally: concurrent_change,
         }
         .into());
     }
@@ -289,6 +329,7 @@ pub fn run_pasteboard_transaction<B: PasteboardBackend>(
             return Err(PasteMayHaveLanded {
                 source: err,
                 clipboard_restored: false,
+                clipboard_changed_externally: false,
             }
             .into());
         }
@@ -795,21 +836,140 @@ fn release_pid_modifiers(
 /// Type Unicode text into the frontmost application through the global HID
 /// queue. This is the desktop-scope counterpart to PID-routed `type_text` and
 /// mirrors computer-server's frontmost pynput typing behavior.
+/// A guarded desktop sequence stopped mid-way: how many characters were
+/// already posted before the guard refused.
+#[derive(Debug)]
+pub struct DesktopSequenceAbort {
+    pub posted: usize,
+    pub reason: String,
+}
+
+/// A pre-dispatch paste abort with the clipboard restoration outcome.
+/// What happened to the user's pasteboard after a paste abort.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PasteRestoration {
+    Unknown,
+    Restored,
+    SkippedConcurrentChange,
+    Failed,
+}
+
+impl std::fmt::Display for PasteRestoration {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let text = match self {
+            PasteRestoration::Unknown => "unknown",
+            PasteRestoration::Restored => "restored",
+            PasteRestoration::SkippedConcurrentChange => "restoration skipped (concurrent change)",
+            PasteRestoration::Failed => "restoration failed",
+        };
+        f.write_str(text)
+    }
+}
+
+#[derive(Debug)]
+pub struct PasteSequenceAbort {
+    pub posted: usize,
+    pub reason: String,
+    pub clipboard_restored: PasteRestoration,
+}
+
+impl std::fmt::Display for PasteSequenceAbort {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} (clipboard_restored={})",
+            self.reason, self.clipboard_restored
+        )
+    }
+}
+
+impl std::error::Error for PasteSequenceAbort {}
+
+impl std::fmt::Display for DesktopSequenceAbort {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} ({} character(s) already sent)",
+            self.reason, self.posted
+        )
+    }
+}
+
+impl std::error::Error for DesktopSequenceAbort {}
+
 pub fn type_text_global(text: &str, inter_char_delay_ms: u64) -> anyhow::Result<()> {
+    type_text_global_with_guard(
+        text,
+        inter_char_delay_ms,
+        || true,
+        &std::sync::atomic::AtomicUsize::new(0),
+    )
+    .map(|_| ())
+}
+
+/// type_text_global with a per-character guard: the frontmost pid and its
+/// focused element are revalidated between events, so a mid-sequence focus
+/// change stops the remaining characters instead of typing into an
+/// unchecked app. The abort carries the already-posted count.
+pub fn type_text_global_with_guard(
+    text: &str,
+    inter_char_delay_ms: u64,
+    guard: impl FnMut() -> bool,
+    posted: &std::sync::atomic::AtomicUsize,
+) -> anyhow::Result<usize> {
     use core_graphics::event::CGEventTapLocation;
 
     let source = CGEventSource::new(CGEventSourceStateID::HIDSystemState)
         .map_err(|_| anyhow::anyhow!("CGEventSource::new failed"))?;
+    let guard = std::cell::RefCell::new(guard);
     deliver_text_runs(
         text,
         || !text_target_may_be_secret(None),
-        |run| paste_text_preserving_clipboard(run, || press_key_global("v", &["cmd"])),
+        |run| {
+            if !guard.borrow_mut()() {
+                return Err(anyhow::Error::new(DesktopSequenceAbort {
+                    posted: posted.load(std::sync::atomic::Ordering::SeqCst),
+                    reason: "not_editable: the frontmost application or its focus changed                              during desktop typing"
+                        .into(),
+                }));
+            }
+            let count = run.chars().count();
+            paste_text_preserving_clipboard(run, || {
+                // Revalidate at the trigger boundary: the transaction
+                // locked, snapshotted and wrote the pasteboard first, so
+                // focus may have changed during that work.
+                if !guard.borrow_mut()() {
+                    return Err(anyhow::Error::new(PasteSequenceAbort {
+                        posted: posted.load(std::sync::atomic::Ordering::SeqCst),
+                        reason: "not_editable: the frontmost application or its focus changed                                  before the paste went out"
+                            .into(),
+                        clipboard_restored: PasteRestoration::Unknown,
+                    }));
+                }
+                press_key_global("v", &["cmd"])
+            })?;
+            posted.fetch_add(count, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        },
         |run| {
             for ch in run.chars() {
-                let (down, up) = char_key_events(&source, ch)?;
+                if !guard.borrow_mut()() {
+                    return Err(anyhow::Error::new(DesktopSequenceAbort {
+                        posted: posted.load(std::sync::atomic::Ordering::SeqCst),
+                        reason: "not_editable: the frontmost application or its focus changed                                  during desktop typing"
+                            .into(),
+                    }));
+                }
+                let (down, up) = char_key_events(&source, ch).map_err(|error| {
+                anyhow::Error::new(DesktopSequenceAbort {
+                    posted: posted.load(std::sync::atomic::Ordering::SeqCst),
+                    reason: format!("desktop key event construction failed: {error}"),
+                })
+            })?;
                 down.post(CGEventTapLocation::HID);
                 key_gap_sleep();
                 up.post(CGEventTapLocation::HID);
+                posted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 std::thread::sleep(
                     std::time::Duration::from_millis(inter_char_delay_ms).max(key_gap()),
                 );
@@ -817,14 +977,28 @@ pub fn type_text_global(text: &str, inter_char_delay_ms: u64) -> anyhow::Result<
             Ok(())
         },
         |ch| {
-            let (down, up) = char_key_events(&source, ch)?;
+            if !guard.borrow_mut()() {
+                return Err(anyhow::Error::new(DesktopSequenceAbort {
+                    posted: posted.load(std::sync::atomic::Ordering::SeqCst),
+                    reason: "not_editable: the frontmost application or its focus changed                              during desktop typing"
+                        .into(),
+                }));
+            }
+            let (down, up) = char_key_events(&source, ch).map_err(|error| {
+                anyhow::Error::new(DesktopSequenceAbort {
+                    posted: posted.load(std::sync::atomic::Ordering::SeqCst),
+                    reason: format!("desktop key event construction failed: {error}"),
+                })
+            })?;
             down.post(CGEventTapLocation::HID);
             key_gap_sleep();
             up.post(CGEventTapLocation::HID);
+            posted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             key_gap_sleep();
             Ok(())
         },
     )
+    .map(|_| posted.load(std::sync::atomic::Ordering::SeqCst))
 }
 
 /// Type ASCII text through the global HID queue as physical US-keyboard
@@ -1821,35 +1995,80 @@ mod tests {
     }
 
     struct MockPasteboard {
-        count: isize,
-        items: Vec<PasteboardItemSnapshot>,
+        count: std::cell::Cell<isize>,
+        items: std::cell::RefCell<Vec<PasteboardItemSnapshot>>,
         writes: Vec<Vec<PasteboardItemSnapshot>>,
-        concurrent_copy_during_paste: Option<Vec<PasteboardItemSnapshot>>,
+        concurrent_copy_during_paste: std::cell::RefCell<Option<Vec<PasteboardItemSnapshot>>>,
         /// Fail every write after the transient one, i.e. the restore.
         fail_restore: bool,
     }
 
+    impl MockPasteboard {
+        fn items_now(&self) -> Vec<PasteboardItemSnapshot> {
+            self.items.borrow().clone()
+        }
+    }
+
     impl PasteboardBackend for MockPasteboard {
         fn change_count(&self) -> isize {
-            self.count
+            // A concurrent writer lands when the transaction re-reads the
+            // count after the trigger, with no aliased &mut anywhere.
+            // Only after the transient write: a concurrent writer during
+            // the trigger, not before it.
+            if !self.writes.is_empty() {
+                if let Some(new_items) = self.concurrent_copy_during_paste.borrow_mut().take() {
+                    self.count.set(self.count.get() + 1);
+                    *self.items.borrow_mut() = new_items;
+                }
+            }
+            self.count.get()
         }
         fn snapshot_items(&self) -> anyhow::Result<Vec<PasteboardItemSnapshot>> {
-            Ok(self.items.clone())
+            Ok(self.items.borrow().clone())
         }
         fn write_items(&mut self, items: &[PasteboardItemSnapshot]) -> anyhow::Result<isize> {
             if self.fail_restore && !self.writes.is_empty() {
                 anyhow::bail!("pasteboard restore write failed");
             }
-            self.count += 1;
-            self.items = items.to_vec();
+            self.count.set(self.count.get() + 1);
+            *self.items.borrow_mut() = items.to_vec();
             self.writes.push(items.to_vec());
-            Ok(self.count)
+            Ok(self.count.get())
         }
         fn clear(&mut self) -> anyhow::Result<isize> {
-            self.count += 1;
-            self.items.clear();
+            self.count.set(self.count.get() + 1);
+            self.items.borrow_mut().clear();
             self.writes.push(Vec::new());
-            Ok(self.count)
+            Ok(self.count.get())
+        }
+    }
+
+    #[derive(Clone)]
+    struct SharedMock(std::rc::Rc<std::cell::RefCell<MockPasteboard>>);
+
+    impl SharedMock {
+        fn new(pb: MockPasteboard) -> Self {
+            Self(std::rc::Rc::new(std::cell::RefCell::new(pb)))
+        }
+        fn apply_concurrent(&self, items: Vec<PasteboardItemSnapshot>) {
+            let pb = self.0.borrow_mut();
+            pb.count.set(pb.count.get() + 1);
+            *pb.items.borrow_mut() = items;
+        }
+    }
+
+    impl PasteboardBackend for SharedMock {
+        fn change_count(&self) -> isize {
+            self.0.borrow().change_count()
+        }
+        fn snapshot_items(&self) -> anyhow::Result<Vec<PasteboardItemSnapshot>> {
+            self.0.borrow().snapshot_items()
+        }
+        fn write_items(&mut self, items: &[PasteboardItemSnapshot]) -> anyhow::Result<isize> {
+            self.0.borrow_mut().write_items(items)
+        }
+        fn clear(&mut self) -> anyhow::Result<isize> {
+            self.0.borrow_mut().clear()
         }
     }
 
@@ -1867,10 +2086,10 @@ mod tests {
             },
         ];
         let mut pb = MockPasteboard {
-            count: 10,
-            items: original.clone(),
+            count: std::cell::Cell::new(10),
+            items: std::cell::RefCell::new(original.clone()),
             writes: Vec::new(),
-            concurrent_copy_during_paste: None,
+            concurrent_copy_during_paste: std::cell::RefCell::new(None),
             fail_restore: false,
         };
         let mut pasted = false;
@@ -1900,14 +2119,14 @@ mod tests {
             .iter()
             .any(|(k, v)| k == PASTEBOARD_UTF8_TEXT_TYPE && v == "한글 입력 테스트".as_bytes()));
         // Restored items preserve every original representation plus transient/auto-generated markers.
-        assert_eq!(pb.items.len(), 2);
-        assert!(pb.items[0]
+        assert_eq!(pb.items_now().len(), 2);
+        assert!(pb.items_now()[0]
             .representations
             .contains(&("public.utf8-plain-text".to_owned(), b"user copied".to_vec())));
-        assert!(pb.items[0]
+        assert!(pb.items_now()[0]
             .representations
             .contains(&("public.html".to_owned(), b"<b>user</b>".to_vec())));
-        assert!(pb.items[1]
+        assert!(pb.items_now()[1]
             .representations
             .contains(&("public.png".to_owned(), vec![1, 2, 3, 4])));
     }
@@ -1920,30 +2139,108 @@ mod tests {
         let user_new = vec![PasteboardItemSnapshot {
             representations: vec![("public.utf8-plain-text".to_owned(), b"user new".to_vec())],
         }];
-        let mut pb = MockPasteboard {
-            count: 5,
-            items: original,
+        let pb = MockPasteboard {
+            count: std::cell::Cell::new(5),
+            items: std::cell::RefCell::new(original),
             writes: Vec::new(),
-            concurrent_copy_during_paste: Some(user_new.clone()),
+            concurrent_copy_during_paste: std::cell::RefCell::new(None),
             fail_restore: false,
         };
-        let ptr = &mut pb as *mut MockPasteboard;
+        let shared = SharedMock::new(pb);
+        let other = shared.clone();
         run_pasteboard_transaction(
-            &mut pb,
+            &mut shared.clone(),
             "agent text",
             || {
-                unsafe {
-                    if let Some(new_items) = (*ptr).concurrent_copy_during_paste.take() {
-                        (*ptr).count += 1;
-                        (*ptr).items = new_items;
-                    }
-                }
+                // The concurrent writer lands DURING the trigger, through
+                // shared state (no aliased &mut).
+                other.apply_concurrent(user_new.clone());
                 Ok(())
             },
             std::time::Duration::ZERO,
         )
         .unwrap();
-        assert_eq!(pb.items, user_new);
+        assert_eq!(shared.0.borrow().items_now(), user_new);
+    }
+
+    #[test]
+    fn a_concurrent_copy_then_a_trigger_error_skips_restoration() {
+        let original = vec![PasteboardItemSnapshot {
+            representations: vec![("public.utf8-plain-text".to_owned(), b"old".to_vec())],
+        }];
+        let user_new = vec![PasteboardItemSnapshot {
+            representations: vec![("public.utf8-plain-text".to_owned(), b"user new".to_vec())],
+        }];
+        let pb = MockPasteboard {
+            count: std::cell::Cell::new(5),
+            items: std::cell::RefCell::new(original),
+            writes: Vec::new(),
+            concurrent_copy_during_paste: std::cell::RefCell::new(None),
+            fail_restore: false,
+        };
+        let shared = SharedMock::new(pb);
+        let other = shared.clone();
+        let err = run_pasteboard_transaction(
+            &mut shared.clone(),
+            "agent text",
+            || {
+                other.apply_concurrent(user_new.clone());
+                anyhow::bail!("trigger failed")
+            },
+            std::time::Duration::ZERO,
+        )
+        .unwrap_err();
+        assert_eq!(
+            shared.0.borrow().items_now(),
+            user_new,
+            "the other writer's content survives"
+        );
+        let landed = err.downcast_ref::<PasteMayHaveLanded>().expect("landed");
+        assert!(landed.clipboard_changed_externally);
+        assert!(!landed.clipboard_restored());
+    }
+
+    #[test]
+    fn a_concurrent_copy_then_a_guard_abort_skips_restoration() {
+        let original = vec![PasteboardItemSnapshot {
+            representations: vec![("public.utf8-plain-text".to_owned(), b"old".to_vec())],
+        }];
+        let user_new = vec![PasteboardItemSnapshot {
+            representations: vec![("public.utf8-plain-text".to_owned(), b"user new".to_vec())],
+        }];
+        let pb = MockPasteboard {
+            count: std::cell::Cell::new(5),
+            items: std::cell::RefCell::new(original),
+            writes: Vec::new(),
+            concurrent_copy_during_paste: std::cell::RefCell::new(None),
+            fail_restore: false,
+        };
+        let shared = SharedMock::new(pb);
+        let other = shared.clone();
+        let err = run_pasteboard_transaction(
+            &mut shared.clone(),
+            "agent text",
+            || {
+                other.apply_concurrent(user_new.clone());
+                Err(anyhow::Error::new(PasteSequenceAbort {
+                    posted: 0,
+                    reason: "not_editable: focus changed".into(),
+                    clipboard_restored: PasteRestoration::Unknown,
+                }))
+            },
+            std::time::Duration::ZERO,
+        )
+        .unwrap_err();
+        assert_eq!(
+            shared.0.borrow().items_now(),
+            user_new,
+            "the other writer's content survives"
+        );
+        let abort = err.downcast_ref::<PasteSequenceAbort>().expect("abort");
+        assert_eq!(
+            abort.clipboard_restored,
+            PasteRestoration::SkippedConcurrentChange
+        );
     }
 
     #[test]
@@ -1952,10 +2249,10 @@ mod tests {
             representations: vec![("public.utf8-plain-text".to_owned(), b"keep me".to_vec())],
         }];
         let mut pb = MockPasteboard {
-            count: 1,
-            items: original,
+            count: std::cell::Cell::new(1),
+            items: std::cell::RefCell::new(original),
             writes: Vec::new(),
-            concurrent_copy_during_paste: None,
+            concurrent_copy_during_paste: std::cell::RefCell::new(None),
             fail_restore: false,
         };
         let err = run_pasteboard_transaction(
@@ -1971,7 +2268,7 @@ mod tests {
             .downcast_ref::<PasteMayHaveLanded>()
             .expect("a failed trigger may still have pasted");
         assert!(landed.clipboard_restored());
-        assert!(pb.items[0]
+        assert!(pb.items_now()[0]
             .representations
             .contains(&("public.utf8-plain-text".to_owned(), b"keep me".to_vec())));
     }
@@ -1982,12 +2279,12 @@ mod tests {
     #[test]
     fn a_paste_that_was_sent_is_never_typed_again() {
         let mut pb = MockPasteboard {
-            count: 1,
-            items: vec![PasteboardItemSnapshot {
+            count: std::cell::Cell::new(1),
+            items: std::cell::RefCell::new(vec![PasteboardItemSnapshot {
                 representations: vec![("public.utf8-plain-text".to_owned(), b"keep".to_vec())],
-            }],
+            }]),
             writes: Vec::new(),
-            concurrent_copy_during_paste: None,
+            concurrent_copy_during_paste: std::cell::RefCell::new(None),
             fail_restore: true,
         };
         let mut triggered = 0;

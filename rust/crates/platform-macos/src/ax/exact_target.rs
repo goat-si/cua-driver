@@ -15,6 +15,7 @@ use cua_driver_core::background_input::{
 use super::bindings::{
     ax_get_window_id, copy_ax_windows_including, copy_bool_attr, copy_element_attr,
     copy_string_attr, focused_element_of_pid, AXUIElementCreateApplication, AXUIElementRef,
+    AXUIElementSetMessagingTimeout,
 };
 use super::snapshot::RetainedElement;
 use crate::windows::{all_windows_without_spaces, resolve_window_owner, WindowOwner};
@@ -466,6 +467,135 @@ pub fn gather_background_facts(
         element: element.unwrap_or(ElementAncestry::NotAddressed),
         screen_locked: crate::session::screen_locked(),
     }
+}
+
+/// owning_window_id under the caller's deadline: the role, parent and
+/// window-id reads stop when the shared budget expires.
+unsafe fn owning_window_id_with_deadline(
+    window: AXUIElementRef,
+    deadline: std::time::Instant,
+) -> Option<u32> {
+    resolve_owning_window(
+        RetainedElement::retain(window as usize),
+        MAX_SHEET_NESTING,
+        |element| {
+            if std::time::Instant::now() >= deadline {
+                None
+            } else {
+                let _ = AXUIElementSetMessagingTimeout(element.as_ptr() as AXUIElementRef, 0.5);
+                copy_string_attr(element.as_ptr() as AXUIElementRef, "AXRole")
+            }
+        },
+        |element| {
+            if std::time::Instant::now() >= deadline {
+                None
+            } else {
+                copy_element_attr(element.as_ptr() as AXUIElementRef, "AXParent").map(|parent| {
+                    let retained = RetainedElement::retain(parent as usize);
+                    CFRelease(parent as CFTypeRef);
+                    retained
+                })
+            }
+        },
+        |element| {
+            if std::time::Instant::now() >= deadline {
+                None
+            } else {
+                let _ = AXUIElementSetMessagingTimeout(element.as_ptr() as AXUIElementRef, 0.5);
+                ax_get_window_id(element.as_ptr() as AXUIElementRef)
+            }
+        },
+    )
+}
+
+/// focused_element_in_window under the caller's deadline: each acquisition
+/// and ownership read is checked so a stalled app cannot outrun the guard's
+/// budget.
+///
+/// # Safety
+///
+/// Caller must release the returned element exactly once with CFRelease.
+pub unsafe fn focused_element_in_window_with_deadline(
+    pid: i32,
+    window_id: u32,
+    deadline: std::time::Instant,
+) -> Option<AXUIElementRef> {
+    if std::time::Instant::now() >= deadline {
+        return None;
+    }
+    let element = focused_element_of_pid(pid)?;
+    if std::time::Instant::now() >= deadline {
+        CFRelease(element as CFTypeRef);
+        return None;
+    }
+    if element_window_id_with_deadline(element, deadline) == Some(window_id) {
+        Some(element)
+    } else {
+        CFRelease(element as CFTypeRef);
+        None
+    }
+}
+
+/// element_window_id under the caller's deadline: every read in the
+/// ownership walk is checked so a stalled app cannot outrun the guard.
+///
+/// # Safety
+///
+/// Caller must release the returned element exactly once with CFRelease.
+pub unsafe fn element_window_id_with_deadline(
+    element: AXUIElementRef,
+    deadline: std::time::Instant,
+) -> Option<u32> {
+    if std::time::Instant::now() >= deadline {
+        return None;
+    }
+    let _ = AXUIElementSetMessagingTimeout(element, 0.5);
+    if let Some(window) = copy_element_attr(element, "AXWindow") {
+        let window_id = owning_window_id_with_deadline(window, deadline);
+        CFRelease(window as CFTypeRef);
+        if window_id.is_some() {
+            return window_id;
+        }
+    }
+    let mut current: AXUIElementRef = element;
+    let mut owned = false;
+    let mut resolved = None;
+    for _ in 0..MAX_ANCESTRY_DEPTH {
+        if std::time::Instant::now() >= deadline {
+            if owned {
+                CFRelease(current as CFTypeRef);
+            }
+            return None;
+        }
+        match copy_string_attr(current, "AXRole").as_deref() {
+            Some("AXWindow") | Some("AXSheet") => {
+                resolved = owning_window_id_with_deadline(current, deadline);
+                break;
+            }
+            Some("AXApplication") | None => break,
+            _ => {}
+        }
+        if std::time::Instant::now() >= deadline {
+            if owned {
+                CFRelease(current as CFTypeRef);
+            }
+            return None;
+        }
+        let parent = copy_element_attr(current, "AXParent");
+        if owned {
+            CFRelease(current as CFTypeRef);
+        }
+        {
+            let parent = parent?;
+            let _ = AXUIElementSetMessagingTimeout(parent, 0.5);
+            current = parent;
+            owned = true;
+        }
+    }
+    if owned {
+        CFRelease(current as CFTypeRef);
+    }
+    resolved
 }
 
 #[cfg(test)]

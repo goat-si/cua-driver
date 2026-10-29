@@ -156,21 +156,138 @@ impl Tool for TypeTextTool {
             ) {
                 return synthesis_refusal_result("hid", &refusal, AxAttempt::NotAttempted);
             }
+            // Desktop scope dispatches globally: check the frontmost app's
+            // focused element and fail closed before any key is sent.
+            let early_front_pid = crate::apps::frontmost_pid();
+            let initial_focus = early_front_pid
+                .and_then(|pid| unsafe { crate::ax::bindings::focused_element_of_pid(pid) })
+                .map(|ptr| unsafe {
+                    // focused_element_of_pid already returned +1: adopt it
+                    // into the wrapper and balance with one CFRelease, so
+                    // exactly one release happens on drop.
+                    let owned = crate::ax::snapshot::RetainedElement::retain(ptr as usize);
+                    core_foundation::base::CFRelease(ptr as core_foundation::base::CFTypeRef);
+                    owned
+                });
+            match early_front_pid {
+                Some(front_pid) => {
+                    if let Some(refusal) =
+                        super::not_editable::guard_untargeted(front_pid, None).await
+                    {
+                        return refusal;
+                    }
+                }
+                None => {
+                    return super::not_editable::not_editable_result(
+                        "the frontmost application could not be determined, so editability is                          unknown; nothing was sent."
+                            .into(),
+                        super::not_editable::FocusDispatch::None,
+                    )
+                }
+            }
+            let checked_pid = early_front_pid.unwrap_or_default();
+            let posted = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let posted_ref = posted.clone();
+
             let result = latency::spawn_action_blocking(move || {
-                crate::input::keyboard::type_text_global(&text, delay_ms)
+                super::not_editable::desktop_dispatch_guard(checked_pid, true)?;
+                crate::input::keyboard::type_text_global_with_guard(
+                    &text,
+                    delay_ms,
+                    || {
+                        // The focused-element read can be slow: the pid is
+                        // checked again AFTER it, so a switch during that read
+                        // cannot redirect the next character.
+                        crate::apps::frontmost_pid() == Some(checked_pid)
+                            && unsafe {
+                                super::not_editable::sync_focused_cell_allows(checked_pid, None)
+                            }
+                            && crate::apps::frontmost_pid() == Some(checked_pid)
+                            && initial_focus
+                                .as_ref()
+                                .map(|el| {
+                                    crate::input::ax_actions::is_element_focused(
+                                        checked_pid,
+                                        el.as_ptr(),
+                                    )
+                                })
+                                .unwrap_or(false)
+                            && crate::apps::frontmost_pid() == Some(checked_pid)
+                    },
+                    posted_ref.as_ref(),
+                )
             })
             .await;
-            return match result {
-                Ok(Ok(())) => {
-                    ToolResult::text("Typed text into the frontmost desktop application.")
-                        .with_structured(serde_json::json!({
-                            "scope": "desktop",
-                            "path": "hid",
-                            "effect": "unverifiable"
-                        }))
+            if let Ok(Err(error)) = &result {
+                if let Some(abort) =
+                    error.downcast_ref::<crate::input::keyboard::PasteSequenceAbort>()
+                {
+                    let restored = match abort.clipboard_restored {
+                        crate::input::keyboard::PasteRestoration::Unknown => "unknown",
+                        crate::input::keyboard::PasteRestoration::Restored => "restored",
+                        crate::input::keyboard::PasteRestoration::SkippedConcurrentChange => {
+                            "restoration skipped (concurrent change)"
+                        }
+                        crate::input::keyboard::PasteRestoration::Failed => "restoration failed",
+                    };
+                    let count = abort.posted;
+                    return ToolResult::text(format!(
+                        "Desktop typing stopped before the paste went out: {}. At least {}                          character(s) were sent earlier (clipboard_restored={}). Read fresh                          state before retrying.",
+                        abort.reason, count, restored
+                    ))
+                    .with_structured(serde_json::json!({
+                        "code": "not_editable",
+                        "effect": "unverifiable",
+                        "clipboard_restored": restored,
+                    }));
                 }
-                Ok(Err(error)) => text_delivery_failure("desktop type_text failed", &error),
-                Err(error) => ToolResult::error(format!("desktop type_text task failed: {error}")),
+            }
+            if result.is_err() || matches!(result, Ok(Err(_))) {
+                let count = posted.load(std::sync::atomic::Ordering::SeqCst);
+                if count > 0 {
+                    // Every failure after some characters were posted keeps
+                    // that count, including event-construction and task
+                    // failures.
+                    return ToolResult::text(format!(
+                        "Desktop typing stopped after at least {count} character(s) were sent.                          Any event or paste in flight is unverifiable; read fresh state before                          retrying."
+                    ))
+                    .with_structured(serde_json::json!({
+                        "code": "not_editable",
+                        "effect": "partial",
+                        "dispatched": true,
+                        "delivered_count": count,
+                    }))
+                    .with_action_record(
+                        cua_driver_core::action_record::ActionExecutionRecord::builder(
+                            cua_driver_core::action_record::ActionEffect::Partial,
+                            cua_driver_core::action_record::ActionTransport::MacosCgEventHid,
+                            cua_driver_core::action_record::RequestedDelivery::Foreground,
+                        )
+                        .actual_delivery(cua_driver_core::action_record::ActualDelivery::Foreground)
+                        .delivered_count(count as u32)
+                        .build()
+                        .expect("desktop partial record is valid"),
+                    );
+                }
+            }
+            return match result {
+                Ok(Ok(_)) => ToolResult::text("Typed text into the frontmost desktop application.")
+                    .with_structured(serde_json::json!({
+                        "scope": "desktop",
+                        "path": "hid",
+                        "effect": "unverifiable"
+                    })),
+                Ok(Err(error)) => super::not_editable::account_focus_receipt(
+                    text_delivery_failure("desktop type_text failed", &error),
+                    None,
+                ),
+                Err(error) => ToolResult::text(format!(
+                    "The desktop typing task failed ({error}); it may have posted input before                      failing. Read fresh state before retrying."
+                ))
+                .with_structured(serde_json::json!({
+                    "code": "desktop_sequence_unverified",
+                    "effect": "unverifiable",
+                })),
             };
         }
         let pid = match super::target_pid(&self.state, &args) {
@@ -246,6 +363,63 @@ impl Tool for TypeTextTool {
             _ => (None, BackgroundKeyboardPolicy::Allowed),
         };
 
+        // CELL rule for untargeted typing: a non-editing cell of a
+        // row/outline/table (or an unreadable focused element) refuses the
+        // call before any key.
+        if element_guard.is_none() && px.is_none() {
+            if let Some(refusal) = super::not_editable::guard_untargeted(pid, window_id).await {
+                return refusal;
+            }
+        }
+
+        let element_ptr = element_guard
+            .as_ref()
+            .map(|(g, idx)| (g.as_ptr(), Some(*idx)));
+        let used_pixel_focus = px.is_some() && py.is_some();
+        let mut px_receipt = None;
+
+        let electron_background_ax_unsafe = element_ptr.is_some()
+            && crate::browser::electron_js::ElectronJs::is_electron(pid)
+            && electron_background_ax_ancestry_is_unsafe(classify_target_web_area(
+                pid,
+                element_ptr,
+                window_id,
+            ));
+        if let Some(refusal) = electron_background_ax_refusal(
+            delivery_mode,
+            element_ptr.is_some(),
+            used_pixel_focus,
+            electron_background_ax_unsafe,
+        ) {
+            let wid = window_id.expect("AX element targets require window_id");
+            return super::background_refusal_result(pid, wid, &refusal);
+        }
+        // A Chromium browser's own text fields (the address bar) take an AX
+        // insert as display text only: Return, background or foreground, does
+        // not submit it, and background keystrokes never reach the browser.
+        let chromium_native_field = !delivery_mode.is_foreground()
+            && !used_pixel_focus
+            && is_chromium_identity(&apps::bundle_id_for_pid(pid).unwrap_or_default())
+            && matches!(
+                classify_target_web_area(pid, element_ptr, window_id),
+                WebAreaClassification::NonWebContent
+            );
+        if let Some(refusal) = chromium_native_field_submit_refusal(chromium_native_field, &text) {
+            return match window_id {
+                Some(wid) => super::background_refusal_result(pid, wid, &refusal),
+                None => ToolResult::error(refusal.reason.clone()),
+            };
+        }
+        // TOKEN rule: after the gate, attempt focus and refuse a text-role
+        // element that shows no editing evidence (handoff 3.7).
+        if let (Some((guard, _)), Some(wid)) = (&element_guard, window_id) {
+            if let Some(refusal) =
+                super::not_editable::token_not_editable_refusal(pid, guard.as_ptr(), wid).await
+            {
+                return refusal;
+            }
+        }
+
         // ── px form: focus by pixel-click, then type into the focused element ──
         // Pass x,y (no element_token) for an *element px action*: pixel-click the
         // field to give the Chromium/Electron renderer the real keyboard focus the
@@ -253,7 +427,6 @@ impl Tool for TypeTextTool {
         // escalates AX → CGEvent and lands once focused). Reuses ClickTool's exact
         // coordinate translation + delivery_mode, so it lands on the same pixel a
         // px-click would.
-        let used_pixel_focus = px.is_some() && py.is_some();
         // A background px insert makes the window key before the focus click
         // and keeps it so through delivery, as press_key and hotkey do: the
         // focus read-back then reads this window's focused element, and the
@@ -281,7 +454,7 @@ impl Tool for TypeTextTool {
                 .get("from_zoom")
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
-            if let Err(e) = super::focus_by_pixel(
+            let focus_receipt = match super::focus_by_pixel(
                 &self.state,
                 pid,
                 window_id,
@@ -292,50 +465,26 @@ impl Tool for TypeTextTool {
                 args.opt_str("_session_id"),
                 from_zoom,
                 _mutation_lease.as_ref(),
+                true,
             )
             .await
             {
-                return e;
+                Ok(receipt) => receipt,
+                Err(e) => return e,
+            };
+            px_receipt = Some(focus_receipt);
+            // Verify the focus the click produced before typing: if it
+            // landed on a non-editing cell, no text is sent and the result
+            // reports the focus action truthfully.
+            if !super::not_editable::focused_cell_allows_typing(pid, window_id).await {
+                return super::not_editable::not_editable_result(
+                    "the element focused by the click is not being edited; no text was sent."
+                        .into(),
+                    focus_receipt,
+                );
             }
             // element_index stays None → the type path below writes to the now-
             // focused element via the CGEvent (key_events) rung.
-        }
-        let element_ptr = element_guard
-            .as_ref()
-            .map(|(g, idx)| (g.as_ptr(), Some(*idx)));
-
-        let electron_background_ax_unsafe = element_ptr.is_some()
-            && crate::browser::electron_js::ElectronJs::is_electron(pid)
-            && electron_background_ax_ancestry_is_unsafe(classify_target_web_area(
-                pid,
-                element_ptr,
-                window_id,
-            ));
-        if let Some(refusal) = electron_background_ax_refusal(
-            delivery_mode,
-            element_ptr.is_some(),
-            used_pixel_focus,
-            electron_background_ax_unsafe,
-        ) {
-            let wid = window_id.expect("AX element targets require window_id");
-            return super::background_refusal_result(pid, wid, &refusal);
-        }
-
-        // A Chromium browser's own text fields (the address bar) take an AX
-        // insert as display text only: Return, background or foreground, does
-        // not submit it, and background keystrokes never reach the browser.
-        let chromium_native_field = !delivery_mode.is_foreground()
-            && !used_pixel_focus
-            && is_chromium_identity(&apps::bundle_id_for_pid(pid).unwrap_or_default())
-            && matches!(
-                classify_target_web_area(pid, element_ptr, window_id),
-                WebAreaClassification::NonWebContent
-            );
-        if let Some(refusal) = chromium_native_field_submit_refusal(chromium_native_field, &text) {
-            return match window_id {
-                Some(wid) => super::background_refusal_result(pid, wid, &refusal),
-                None => ToolResult::error(refusal.reason.clone()),
-            };
         }
 
         if let (Some((element, _)), Some(wid)) = (element_guard.as_ref(), window_id) {
@@ -427,19 +576,27 @@ impl Tool for TypeTextTool {
         let result = match result {
             Ok(Ok(TypeTextDelivery::Refused(refusal))) => {
                 let wid = window_id.expect("background refusals require a window target");
-                return super::background_refusal_result(pid, wid, &refusal);
+                return super::not_editable::account_focus_receipt(
+                    super::background_refusal_result(pid, wid, &refusal),
+                    px_receipt,
+                );
             }
             Ok(Ok(TypeTextDelivery::SynthesisRefused {
                 path,
                 refusal,
                 ax_attempt,
-            })) => return synthesis_refusal_result(path, &refusal, ax_attempt),
+            })) => {
+                return super::not_editable::account_focus_receipt(
+                    synthesis_refusal_result(path, &refusal, ax_attempt),
+                    px_receipt,
+                )
+            }
             Ok(Ok(TypeTextDelivery::Typed(outcome))) => Ok(Ok(outcome)),
             Ok(Err(error)) => Ok(Err(error)),
             Err(error) => Err(error),
         };
 
-        match result {
+        let result = match result {
             Ok(Ok(outcome)) if outcome.delivered_chars.is_some_and(|n| n < char_count) => {
                 let delivered_chars = outcome.delivered_chars.unwrap_or_default();
                 ToolResult::error(format!(
@@ -596,7 +753,9 @@ impl Tool for TypeTextTool {
             }
             Ok(Err(e)) => text_delivery_failure("type_text failed", &e),
             Err(e) => ToolResult::error(format!("Task error: {e}")),
-        }
+        };
+        // Any refusal after a delivered focus action carries its receipt.
+        super::not_editable::account_focus_receipt(result, px_receipt)
     }
 }
 
@@ -1461,6 +1620,40 @@ fn type_text_in_key_window(
             });
         }
     }
+    // Late CELL recheck inside the delivery context: key-window/foreground
+    // activation may have replaced the first responder since the early
+    // guard, so the actual focused element is re-read before any rung types.
+    // Unreadable fails closed through the existing no_focused_text_input
+    // refusal; a PID-only target uses an error instead of the window-bound
+    // structured refusal (which would panic on window_id.expect).
+    if element_ptr_and_idx.is_none() {
+        match unsafe { super::not_editable::classify_untargeted(pid, window_id) } {
+            crate::ax::editable::CellVerdict::NotEditing => {
+                if window_id.is_none() {
+                    anyhow::bail!(
+                        "not_editable: the focused element at delivery is a non-editing cell;                          no text was sent"
+                    );
+                }
+                return Ok(TypeTextDelivery::Refused(BackgroundRefusal {
+                    code: "not_editable",
+                    reason: "the focused element at delivery is a non-editing cell; no text                              was sent."
+                        .into(),
+                    advice: None,
+                }));
+            }
+            crate::ax::editable::CellVerdict::Unreadable => {
+                if window_id.is_none() {
+                    anyhow::bail!(
+                        "no_focused_text_input: the focused element at delivery could not be                          read; no text was sent"
+                    );
+                }
+                return Ok(TypeTextDelivery::Refused(no_focused_text_input_refusal(
+                    false,
+                )));
+            }
+            _ => {}
+        }
+    }
     let before = read_axvalue_bound(pid, element_ptr_and_idx, window_id);
 
     // --- Foreground rung: explicit agent request (skip AX/background ladder). ---
@@ -1517,6 +1710,7 @@ fn type_text_in_key_window(
                     pid as libc::pid_t,
                     wid,
                     || {
+                        late_fg_cell_check(pid, Some(wid), element_ptr_and_idx.is_some())?;
                         if foreground_settle_ms > 0 {
                             std::thread::sleep(std::time::Duration::from_millis(
                                 foreground_settle_ms,
@@ -1561,6 +1755,7 @@ fn type_text_in_key_window(
                                 unsafe { set_raw_attr(element, SELECTED_RANGE, selection) };
                             }
                         }
+                        late_fg_cell_check(pid, Some(wid), element_ptr_and_idx.is_some())?;
                         // The remembered field is focused again; the read-back
                         // follows the focused element.
                         typed_delivery = do_type(element_ptr_and_idx)?;
@@ -1589,6 +1784,7 @@ fn type_text_in_key_window(
                     pid as libc::pid_t,
                     wid,
                     || {
+                        late_fg_cell_check(pid, Some(wid), element_ptr_and_idx.is_some())?;
                         typed_delivery = do_type(element_ptr_and_idx)?;
                         Ok(())
                     },
@@ -1854,6 +2050,26 @@ unsafe fn focused_is_editor_surface(pid: i32, element: AXUIElementRef) -> bool {
 }
 
 const NO_FOCUSED_TEXT_INPUT: &str = "no_focused_text_input";
+
+/// Recheck the focused element inside an activated foreground delivery
+/// closure, before typing. Fails closed on a non-editing cell or an
+/// unreadable focus.
+fn late_fg_cell_check(pid: i32, window_id: Option<u32>, targeted: bool) -> anyhow::Result<()> {
+    if targeted {
+        return Ok(());
+    }
+    match unsafe { super::not_editable::classify_untargeted(pid, window_id) } {
+        crate::ax::editable::CellVerdict::NotCell | crate::ax::editable::CellVerdict::Editing => {
+            Ok(())
+        }
+        crate::ax::editable::CellVerdict::NotEditing => anyhow::bail!(
+            "not_editable: the focused element after activation is a non-editing cell; no text              was sent"
+        ),
+        crate::ax::editable::CellVerdict::Unreadable => anyhow::bail!(
+            "no_focused_text_input: the focused element after activation could not be read; no              text was sent"
+        ),
+    }
+}
 
 fn no_focused_text_input_refusal(
     something_focused: bool,
