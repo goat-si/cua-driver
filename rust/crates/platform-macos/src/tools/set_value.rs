@@ -1015,6 +1015,17 @@ fn set_value_blocking_with(
                 if e == kAXErrorSuccess {
                     e
                 } else {
+                    // A second write: the front app is read again first.
+                    if restored_window
+                        && crate::input::skylight::front_process_matches(
+                            pid as libc::pid_t,
+                            window_id,
+                        ) != Some(false)
+                    {
+                        anyhow::bail!(
+                            "the app came to the front after a numeric AXValue write returned AX error {e}, which may have applied; the text write was not sent"
+                        )
+                    }
                     unsafe { set_string_attr(element, "AXValue", value) }
                 }
             }

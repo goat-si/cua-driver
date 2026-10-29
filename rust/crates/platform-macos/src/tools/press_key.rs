@@ -1203,16 +1203,22 @@ fn minimized_key_worker(
         }
     };
     let m: Vec<&str> = modifiers.iter().map(String::as_str).collect();
+    let focus_writes = std::cell::Cell::new(0u32);
     let outcome = dispatch_with_ax_oracle(pid, Some(wid), ptr, || {
         with_confirmed_key_focus_or_fallback(
             ptr,
             // Every focus write, retries included, reads the front app first.
             |target| {
                 if !restore.front_still_ok() {
+                    let earlier = match focus_writes.get() {
+                        0 => "no focus write was sent".to_owned(),
+                        n => format!("{n} earlier focus write(s) may have reached the element"),
+                    };
                     anyhow::bail!(
-                        "the app came to the front, or which app is in front could not be read; no focus or key was sent"
+                        "the app came to the front, or which app is in front could not be read; {earlier} and no key was sent"
                     );
                 }
+                focus_writes.set(focus_writes.get() + 1);
                 crate::input::ax_actions::focus_element(target)
             },
             |target| {
