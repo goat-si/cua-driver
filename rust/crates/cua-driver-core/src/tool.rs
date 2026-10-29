@@ -38,6 +38,62 @@ tokio::task_local! {
     static DISPATCH_RUNTIME_SCOPE: String;
 }
 
+/// Trusted task-local dispatch state captured before an owned worker is
+/// spawned. Fields stay private so callers cannot manufacture authority.
+#[derive(Clone)]
+pub(crate) struct CapturedDispatchContext {
+    authorization: Arc<crate::session_authorization::EffectiveAuthorizationContext>,
+    evidence: TrustedInvocationEvidence,
+    runtime_scope: String,
+}
+
+#[derive(Debug)]
+pub(crate) struct DispatchContextError;
+
+impl std::fmt::Display for DispatchContextError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("dispatch context is incomplete")
+    }
+}
+
+impl std::error::Error for DispatchContextError {}
+
+pub(crate) fn capture_dispatch_context(
+) -> Result<Option<CapturedDispatchContext>, DispatchContextError> {
+    let authorization = DISPATCH_AUTHORIZATION_CONTEXT.try_with(Arc::clone).ok();
+    let evidence = DISPATCH_TRUSTED_INVOCATION_EVIDENCE
+        .try_with(Clone::clone)
+        .ok();
+    let runtime_scope = DISPATCH_RUNTIME_SCOPE.try_with(Clone::clone).ok();
+    match (authorization, evidence, runtime_scope) {
+        (Some(authorization), Some(evidence), Some(runtime_scope)) => {
+            Ok(Some(CapturedDispatchContext {
+                authorization,
+                evidence,
+                runtime_scope,
+            }))
+        }
+        (None, None, None) => Ok(None),
+        _ => Err(DispatchContextError),
+    }
+}
+
+impl CapturedDispatchContext {
+    pub(crate) async fn scope<F: std::future::Future>(self, future: F) -> F::Output {
+        DISPATCH_RUNTIME_SCOPE
+            .scope(self.runtime_scope, async {
+                DISPATCH_TRUSTED_INVOCATION_EVIDENCE
+                    .scope(self.evidence.clone(), async {
+                        DISPATCH_AUTHORIZATION_CONTEXT
+                            .scope(self.authorization, future)
+                            .await
+                    })
+                    .await
+            })
+            .await
+    }
+}
+
 /// Return the immutable authorization context bound to the current dispatch.
 ///
 /// Resource adapters use this instead of consulting process-global
@@ -3704,7 +3760,8 @@ mod runtime_isolation_tests {
     use super::{
         canonical_proposed_path, desktop_action_coordinator, namespace_runtime_args,
         publish_action_result, restore_public_runtime_result, try_admit_text_input,
-        TrustedInvocationEvidence, DISPATCH_RUNTIME_SCOPE,
+        TrustedInvocationEvidence, DISPATCH_AUTHORIZATION_CONTEXT, DISPATCH_RUNTIME_SCOPE,
+        DISPATCH_TRUSTED_INVOCATION_EVIDENCE,
     };
     use crate::{
         authorization::PermissionMode,
@@ -4956,6 +5013,59 @@ resources:
                 .invoke("click", serde_json::json!({}))
                 .await
         }
+    }
+
+    #[tokio::test]
+    async fn dispatch_context_capture_restores_all_trusted_task_locals() {
+        let context = standard_context();
+        let mut args = serde_json::json!({"_input_origin": "human"});
+        let evidence = TrustedInvocationEvidence::extract_from_adapter_args(&mut args);
+        DISPATCH_RUNTIME_SCOPE
+            .scope("captured-runtime".to_owned(), async {
+                DISPATCH_TRUSTED_INVOCATION_EVIDENCE
+                    .scope(evidence, async {
+                        DISPATCH_AUTHORIZATION_CONTEXT
+                            .scope(context.clone(), async {
+                                let captured = super::capture_dispatch_context()
+                                    .expect("complete context")
+                                    .expect("present context");
+                                captured
+                                    .scope(async {
+                                        let restored =
+                                            super::current_dispatch_authorization_context()
+                                                .expect("authorization");
+                                        assert!(Arc::ptr_eq(&restored, &context));
+                                        assert_eq!(
+                                            super::current_dispatch_runtime_scope().as_deref(),
+                                            Some("captured-runtime")
+                                        );
+                                        let origin = DISPATCH_TRUSTED_INVOCATION_EVIDENCE
+                                            .try_with(|evidence| evidence.input_origin)
+                                            .expect("evidence");
+                                        assert_eq!(
+                                            origin,
+                                            Some(crate::agent_cursor::InputOrigin::Human)
+                                        );
+                                    })
+                                    .await;
+                            })
+                            .await;
+                    })
+                    .await;
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn dispatch_context_capture_supports_legacy_absence_and_rejects_partial_state() {
+        assert!(super::capture_dispatch_context()
+            .expect("legacy absence")
+            .is_none());
+        DISPATCH_RUNTIME_SCOPE
+            .scope("partial-runtime".to_owned(), async {
+                assert!(super::capture_dispatch_context().is_err());
+            })
+            .await;
     }
 
     #[tokio::test]

@@ -11,6 +11,7 @@
 //! not remember, so they never become the baseline of the caller's next
 //! `since:"latest"` diff.
 
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use serde_json::{json, Map, Value};
@@ -475,7 +476,7 @@ pub(crate) struct Checked {
 
 /// Window and element lookup through the registry.
 pub(crate) struct Locator<'a> {
-    registry: &'a ToolRegistry,
+    registry: LocatorRegistry<'a>,
     session: Option<String>,
     /// Hard stop for every poll loop (the batch's own time budget).
     deadline: Instant,
@@ -493,18 +494,57 @@ pub(crate) struct Locator<'a> {
     /// Every driver call made through this locator since the last
     /// [`Self::take_journal`], in order: {tool, pid, window_id, ok, effect, code}.
     journal: std::sync::Mutex<Vec<Value>>,
+    read_admission: Option<ReadAdmission>,
+    read_outcome: Option<ReadOutcome>,
 }
+
+enum LocatorRegistry<'a> {
+    Borrowed(&'a ToolRegistry),
+    Owned(Arc<ToolRegistry>),
+}
+
+pub(crate) type ReadAdmission = Arc<dyn Fn() -> bool + Send + Sync>;
+pub(crate) type ReadOutcome = Arc<dyn Fn(Option<&'static str>) + Send + Sync>;
 
 impl<'a> Locator<'a> {
     pub fn new(registry: &'a ToolRegistry, session: Option<String>, deadline: Instant) -> Self {
         Self {
-            registry,
+            registry: LocatorRegistry::Borrowed(registry),
             session,
             deadline,
             baseline_max_elements: None,
             baselined: Default::default(),
             scope_refusal: Default::default(),
             journal: Default::default(),
+            read_admission: None,
+            read_outcome: None,
+        }
+    }
+
+    pub fn new_owned(
+        registry: Arc<ToolRegistry>,
+        session: Option<String>,
+        deadline: Instant,
+        read_admission: Option<ReadAdmission>,
+        read_outcome: Option<ReadOutcome>,
+    ) -> Locator<'static> {
+        Locator {
+            registry: LocatorRegistry::Owned(registry),
+            session,
+            deadline,
+            baseline_max_elements: None,
+            baselined: Default::default(),
+            scope_refusal: Default::default(),
+            journal: Default::default(),
+            read_admission,
+            read_outcome,
+        }
+    }
+
+    fn registry(&self) -> &ToolRegistry {
+        match &self.registry {
+            LocatorRegistry::Borrowed(registry) => registry,
+            LocatorRegistry::Owned(registry) => registry.as_ref(),
         }
     }
 
@@ -564,21 +604,29 @@ impl<'a> Locator<'a> {
                 "{tool}: not sent, because an earlier read was refused by the batch scope ({code})"
             ));
         }
+        if self.read_admission.as_ref().is_some_and(|admit| !admit()) {
+            return Err(format!("{tool}: read admission closed"));
+        }
         let (pid, window_id) = call_target(&args);
-        let result = self.registry.invoke(tool, self.with_session(args)).await;
+        let result = self.registry().invoke(tool, self.with_session(args)).await;
+        let scope_code = result
+            .structured_content
+            .as_ref()
+            .and_then(|value| value.get("code"))
+            .and_then(Value::as_str)
+            .and_then(|code| {
+                [
+                    crate::batch_scope::OUTSIDE_SCOPE,
+                    crate::batch_scope::FOREGROUND_NOT_ALLOWED,
+                ]
+                .into_iter()
+                .find(|known| *known == code)
+            });
+        if let Some(outcome) = &self.read_outcome {
+            outcome(scope_code);
+        }
         self.record(journal_entry(tool, pid, window_id, &result));
         if result.is_error == Some(true) {
-            let code = result
-                .structured_content
-                .as_ref()
-                .and_then(|value| value.get("code"))
-                .and_then(Value::as_str);
-            let scope_code = [
-                crate::batch_scope::OUTSIDE_SCOPE,
-                crate::batch_scope::FOREGROUND_NOT_ALLOWED,
-            ]
-            .into_iter()
-            .find(|known| Some(*known) == code);
             if let Some(scope_code) = scope_code {
                 *self
                     .scope_refusal
