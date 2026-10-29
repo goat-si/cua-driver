@@ -174,7 +174,9 @@ impl Tool for TypeTextTool {
                     )
                 }
             }
+            let checked_pid = crate::apps::frontmost_pid().unwrap_or_default();
             let result = latency::spawn_action_blocking(move || {
+                super::not_editable::desktop_dispatch_guard(checked_pid, true)?;
                 crate::input::keyboard::type_text_global(&text, delay_ms)
             })
             .await;

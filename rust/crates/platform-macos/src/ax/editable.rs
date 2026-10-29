@@ -125,10 +125,24 @@ const AX_TIMEOUT_SECONDS: f32 = 0.5;
 /// # Safety
 /// The element reference must be valid and live, owned by the caller.
 pub unsafe fn facts_for_element(element: AXUIElementRef) -> Option<ElementFacts> {
+    facts_for_element_with_deadline(
+        element,
+        std::time::Instant::now() + std::time::Duration::from_millis(800),
+    )
+}
+
+/// facts_for_element with the caller's own deadline, so acquisition,
+/// ownership and classification share one budget.
+///
+/// # Safety
+/// The element reference must be valid and live, owned by the caller.
+pub unsafe fn facts_for_element_with_deadline(
+    element: AXUIElementRef,
+    deadline: std::time::Instant,
+) -> Option<ElementFacts> {
     if element.is_null() {
         return None;
     }
-    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(800);
     let _ = AXUIElementSetMessagingTimeout(element, AX_TIMEOUT_SECONDS);
     let mut facts = ElementFacts {
         role: copy_string_attr(element, "AXRole"),
@@ -164,6 +178,11 @@ pub unsafe fn facts_for_element(element: AXUIElementRef) -> Option<ElementFacts>
         };
         if current != element {
             CFRelease(current as CFTypeRef);
+        }
+        if std::time::Instant::now() >= deadline {
+            facts.ancestry_complete = false;
+            CFRelease(parent as CFTypeRef);
+            return Some(facts);
         }
         let _ = AXUIElementSetMessagingTimeout(parent, AX_TIMEOUT_SECONDS);
         match copy_string_attr(parent, "AXRole") {
@@ -231,10 +250,15 @@ unsafe fn scan_focused_text_descendant(
             } else {
                 *budget -= 1;
                 let _ = AXUIElementSetMessagingTimeout(child, AX_TIMEOUT_SECONDS);
-                found = copy_string_attr(child, "AXRole")
+                let is_text = copy_string_attr(child, "AXRole")
                     .as_deref()
-                    .is_some_and(is_text_role)
-                    && copy_bool_attr(child, "AXFocused") == Some(true);
+                    .is_some_and(is_text_role);
+                if std::time::Instant::now() >= deadline {
+                    finished = false;
+                    CFRelease(child as CFTypeRef);
+                    continue;
+                }
+                found = is_text && copy_bool_attr(child, "AXFocused") == Some(true);
                 if !found {
                     let (nested, nested_finished) =
                         scan_focused_text_descendant(child, depth + 1, budget, deadline);

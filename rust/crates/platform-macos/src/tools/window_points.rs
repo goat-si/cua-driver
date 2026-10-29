@@ -493,6 +493,44 @@ mod tests {
         .is_ok());
     }
 
+    #[test]
+    fn the_actuator_guard_refuses_a_sub_point_move_for_an_exact_basis() {
+        fn reader(bounds: WindowBounds) -> fn(u32) -> Option<WindowBounds> {
+            fn still(_: u32) -> Option<WindowBounds> {
+                Some(WindowBounds {
+                    x: 100.005,
+                    y: 100.0,
+                    width: 800.0,
+                    height: 600.0,
+                })
+            }
+            let _ = bounds;
+            still
+        }
+        let mut exact = basis(100.0, 100.0, 800.0, 600.0);
+        exact.exact = true;
+        let space = PointSpace::WindowPoints(exact);
+        let resolved = resolve_window_points(
+            7,
+            &match space {
+                PointSpace::WindowPoints(basis) => basis,
+                _ => unreachable!(),
+            },
+            &[(10.0, 10.0)],
+            Some(bounds(100.0, 100.0, 800.0, 600.0)),
+        )
+        .expect("resolve");
+        let guard =
+            DispatchGuard::with_reader(space, Some(7), resolved.frame, reader(live_bounds()))
+                .expect("guard")
+                .expect("some");
+        assert!(guard.check().is_err(), "a 0.005 pt move must refuse");
+    }
+
+    fn live_bounds() -> WindowBounds {
+        bounds(100.005, 100.0, 800.0, 600.0)
+    }
+
     fn bounds(x: f64, y: f64, width: f64, height: f64) -> WindowBounds {
         WindowBounds {
             x,

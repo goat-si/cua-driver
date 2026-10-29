@@ -15,7 +15,7 @@ use crate::ax::bindings::{
     AXUIElementRef, AXUIElementSetMessagingTimeout,
 };
 use crate::ax::editable::{
-    cell_verdict, facts_for_element, is_text_role, token_refused, CellVerdict,
+    cell_verdict, facts_for_element_with_deadline, is_text_role, token_refused, CellVerdict,
 };
 use crate::goat::action_latency as latency;
 use core_foundation::base::{CFRelease, CFTypeRef};
@@ -118,9 +118,9 @@ pub(crate) fn account_focus_receipt(
     );
     // The public summary is the result text: it must not keep saying
     // "nothing was sent" when the focus action was delivered.
-    let original = text_of_result(&result);
     let summary =
-        format!("The focus action was delivered; the key or text was refused. {original}");
+        "The focus action was delivered; the key or text was refused. Read fresh state before          retrying."
+            .to_owned();
     for content in result.content.iter_mut() {
         if let cua_driver_core::protocol::Content::Text { text, .. } = content {
             *text = summary.clone();
@@ -235,6 +235,7 @@ fn verdict_allows(verdict: CellVerdict) -> bool {
 /// Classify the focused element (untargeted route). Blocking, unsafe AX
 /// context; Unreadable on any failure.
 pub(crate) unsafe fn classify_untargeted(pid: i32, window_id: Option<u32>) -> CellVerdict {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(800);
     let element = match window_id {
         Some(wid) => crate::ax::exact_target::focused_element_in_window(pid, wid),
         None => crate::ax::bindings::focused_element_of_pid(pid),
@@ -242,7 +243,7 @@ pub(crate) unsafe fn classify_untargeted(pid: i32, window_id: Option<u32>) -> Ce
     let Some(element) = element else {
         return CellVerdict::Unreadable;
     };
-    let verdict = facts_for_element(element)
+    let verdict = facts_for_element_with_deadline(element, deadline)
         .map(|facts| cell_verdict(&facts))
         .unwrap_or(CellVerdict::Unreadable);
     CFRelease(element as CFTypeRef);
@@ -346,7 +347,7 @@ unsafe fn classify_point_screen(pid: i32, x: f64, y: f64, window_id: u32) -> Cel
         CFRelease(element as CFTypeRef);
         return CellVerdict::Unreadable;
     }
-    let verdict = facts_for_element(element)
+    let verdict = facts_for_element_with_deadline(element, deadline)
         .map(|facts| cell_verdict(&facts))
         .unwrap_or(CellVerdict::Unreadable);
     CFRelease(element as CFTypeRef);
@@ -373,7 +374,8 @@ pub(crate) async fn token_not_editable_refusal(
 ) -> Option<ToolResult> {
     match latency::spawn_action_blocking(move || unsafe {
         let element = element as AXUIElementRef;
-        let Some(initial) = facts_for_element(element) else {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(800);
+        let Some(initial) = facts_for_element_with_deadline(element, deadline) else {
             return Some(not_editable_result(
                 "the target element could not be read; no text or keys were sent.".into(),
                 FocusDispatch::None,
@@ -393,7 +395,7 @@ pub(crate) async fn token_not_editable_refusal(
             let _ = crate::input::ax_actions::focus_element(element as usize);
             focus = FocusDispatch::Indeterminate;
         }
-        let Some(facts) = facts_for_element(element) else {
+        let Some(facts) = facts_for_element_with_deadline(element, deadline) else {
             return Some(not_editable_result(
                 "the target element could not be read; no text or keys were sent.".into(),
                 focus,
@@ -429,6 +431,24 @@ pub(crate) async fn token_not_editable_refusal(
             FocusDispatch::Indeterminate,
         )),
     }
+}
+
+/// Desktop-scope dispatch recheck, inside the posting closure: the
+/// frontmost app may have changed since the early guard, so the pid and its
+/// focused element are re-read immediately before the global post.
+pub(crate) fn desktop_dispatch_guard(expected_pid: i32, printable: bool) -> anyhow::Result<()> {
+    let front = crate::apps::frontmost_pid();
+    if front != Some(expected_pid) {
+        anyhow::bail!(
+            "not_editable: the frontmost application changed before the key was posted; no keys              were sent"
+        );
+    }
+    if printable && !unsafe { sync_focused_cell_allows(expected_pid, None) } {
+        anyhow::bail!(
+            "not_editable: the frontmost focused element is a non-editing cell or is              unreadable; no keys were sent"
+        );
+    }
+    Ok(())
 }
 
 #[cfg(test)]

@@ -496,7 +496,10 @@ impl Tool for PressKeyTool {
                     }
                 }
             }
+            let checked_pid = crate::apps::frontmost_pid().unwrap_or_default();
+            let printable_desktop = printable_request(&key, &modifiers);
             let result = latency::spawn_action_blocking(move || {
+                super::not_editable::desktop_dispatch_guard(checked_pid, printable_desktop)?;
                 let modifier_refs: Vec<&str> = modifiers.iter().map(String::as_str).collect();
                 crate::input::keyboard::press_key_global(&key_for_input, &modifier_refs)
             })
