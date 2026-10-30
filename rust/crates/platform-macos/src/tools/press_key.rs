@@ -226,7 +226,7 @@ struct KeyFocusUnconfirmedAfterClick;
 
 #[derive(Debug, thiserror::Error)]
 enum WindowFocusConflictError {
-    #[error("addressed element does not belong to target window {target_window_id} (resolved: {actual_window_id:?})")]
+    #[error("addressed element does not belong to target window {target_window_id}")]
     AddressedElementOutsideWindow {
         pid: i32,
         target_window_id: u32,
@@ -1620,6 +1620,7 @@ enum ChordStep {
         scope: crate::input::skylight::WindowKeyScope,
         validation: crate::input::skylight::ValidationPost,
         path: String,
+        note: String,
     },
     /// The chord was posted as keys to the held key window.
     KeysPosted {
@@ -1888,13 +1889,7 @@ fn chord_in_scope(pid: i32, wid: u32, combo: super::menu_equivalent::Combo) -> C
         validation: ValidationPost::default(),
         action: None,
         disabled_note: None,
-        is_close: unsafe {
-            copy_string_attr(element, "AXMenuItemCmdChar")
-                .is_some_and(|ch| ch.eq_ignore_ascii_case("w"))
-                && crate::ax::bindings::copy_number_attr(element, "AXMenuItemCmdModifiers")
-                    .unwrap_or(0.0)
-                    == 0.0
-        },
+        evidence: None,
     };
     let decision = decide_chord(&mut env);
     let note = env.disabled_note.as_deref().unwrap_or("");
@@ -1924,13 +1919,8 @@ fn chord_in_scope(pid: i32, wid: u32, combo: super::menu_equivalent::Combo) -> C
         ChordDecision::Keys(initial_error) => ChordStep::NeedsKeys {
             scope,
             validation: env.validation,
-            path: match initial_error {
-                Some(err) => format!(
-                    "{} (an AX action returned error {err}; no menu action was sent). {note}",
-                    found.path.join(" > ")
-                ),
-                None => found.path.join(" > "),
-            },
+            path: found.path.join(" > "),
+            note: format!("{} {}", initial_error.map(|err| format!("An earlier AX action returned error {err}; no menu action was sent.")).unwrap_or_default(), note).trim().to_owned(),
         },
         ChordDecision::Pressed { err, initial_error } => chord_press_outcome(
             scope,
@@ -1950,7 +1940,8 @@ trait ChordEnv {
     fn frontmost(&mut self) -> bool;
     fn bound(&mut self) -> bool;
     fn validate(&mut self) -> Option<bool>;
-    fn press(&mut self, disabled: bool) -> Option<crate::ax::bindings::AXError>;
+    fn prepare_press(&mut self, disabled: bool) -> bool;
+    fn press(&mut self, disabled: bool) -> crate::ax::bindings::AXError;
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -1971,15 +1962,20 @@ fn decide_chord(env: &mut impl ChordEnv) -> ChordDecision {
         return ChordDecision::Save;
     }
     let initial = env.enabled();
+    let frontmost = initial != Some(true) && env.frontmost();
+    if initial.is_none() && frontmost {
+        return ChordDecision::Unreadable;
+    }
     let mut initial_error = None;
-    let early = initial == Some(true) || env.frontmost();
+    let early = initial == Some(true) || frontmost;
     if early {
+        if !env.prepare_press(initial == Some(false)) {
+            return ChordDecision::NoAction;
+        }
         if !env.bound() {
             return ChordDecision::Unbound;
         }
-        let Some(err) = env.press(initial == Some(false)) else {
-            return ChordDecision::NoAction;
-        };
+        let err = env.press(initial == Some(false));
         if err == crate::ax::bindings::kAXErrorSuccess
             || !super::click::perform_error_proves_nothing_was_sent(err)
         {
@@ -1997,12 +1993,13 @@ fn decide_chord(env: &mut impl ChordEnv) -> ChordDecision {
             NotEnabledRoute::NowEnabled => {}
         }
     }
+    if !env.prepare_press(false) {
+        return ChordDecision::NoAction;
+    }
     if !env.bound() {
         return ChordDecision::Unbound;
     }
-    let Some(err) = env.press(false) else {
-        return ChordDecision::NoAction;
-    };
+    let err = env.press(false);
     ChordDecision::Pressed { err, initial_error }
 }
 
@@ -2013,29 +2010,44 @@ struct LiveChordEnv {
     validation: crate::input::skylight::ValidationPost,
     action: Option<&'static str>,
     disabled_note: Option<String>,
+    evidence: Option<PressEvidence>,
+}
+
+struct PressEvidence {
     is_close: bool,
+    title: Option<String>,
+    sheet: Option<bool>,
+    windows: Option<std::collections::HashSet<u32>>,
 }
 
 /// Returns None when the target window or its children could not be read.
 fn window_has_sheet(pid: i32, wid: u32) -> Option<bool> {
     use crate::ax::bindings::{
         ax_get_window_id, copy_ax_windows, copy_children_checked, AXUIElementCreateApplication,
+        AXUIElementSetMessagingTimeout,
     };
     unsafe {
         let app = AXUIElementCreateApplication(pid);
         if app.is_null() {
             return None;
         }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(150);
+        AXUIElementSetMessagingTimeout(app, 0.05);
         let windows = copy_ax_windows(app);
         CFRelease(app as _);
         let mut result = None;
         for window in windows {
-            if ax_get_window_id(window) == Some(wid) {
+            AXUIElementSetMessagingTimeout(window, 0.05);
+            if std::time::Instant::now() < deadline && ax_get_window_id(window) == Some(wid) {
                 if let Some(children) = copy_children_checked(window) {
                     let mut found = false;
                     let mut unknown = false;
                     for child in children {
-                        match copy_string_attr(child, "AXRole") {
+                        AXUIElementSetMessagingTimeout(child, 0.05);
+                        match (std::time::Instant::now() < deadline)
+                            .then(|| copy_string_attr(child, "AXRole"))
+                            .flatten()
+                        {
                             Some(role) if role == "AXSheet" => found = true,
                             Some(_) => {}
                             None => unknown = true,
@@ -2054,6 +2066,33 @@ fn window_has_sheet(pid: i32, wid: u32) -> Option<bool> {
             CFRelease(window as _);
         }
         result
+    }
+}
+
+impl LiveChordEnv {
+    fn record_disabled(
+        &mut self,
+        evidence: PressEvidence,
+        after_title: Option<String>,
+        after_windows: Option<std::collections::HashSet<u32>>,
+        after_sheet: Option<bool>,
+        after_enabled: Option<bool>,
+    ) {
+        self.disabled_note = Some(disabled_observation(
+            self.wid,
+            (evidence.title, after_title),
+            (
+                evidence
+                    .windows
+                    .as_ref()
+                    .map(|windows| windows.contains(&self.wid)),
+                after_windows
+                    .as_ref()
+                    .map(|windows| windows.contains(&self.wid)),
+            ),
+            (evidence.sheet, after_sheet),
+            after_enabled,
+        ));
     }
 }
 
@@ -2081,53 +2120,70 @@ impl ChordEnv for LiveChordEnv {
         }
         last
     }
-    fn press(&mut self, disabled: bool) -> Option<crate::ax::bindings::AXError> {
+    fn prepare_press(&mut self, disabled: bool) -> bool {
         let actions = unsafe { crate::ax::bindings::copy_action_names(self.element) };
-        let action = ["AXPress", "AXPick"]
+        let Some(action) = ["AXPress", "AXPick"]
             .into_iter()
-            .find(|name| actions.iter().any(|candidate| candidate == name))?;
-        self.action = Some(action);
-        let before_title = disabled
-            .then(|| unsafe { copy_string_attr(self.element, "AXTitle") })
-            .flatten();
-        let before_sheet = if disabled && self.is_close {
-            window_has_sheet(self.pid, self.wid)
-        } else {
-            None
+            .find(|name| actions.iter().any(|candidate| candidate == name))
+        else {
+            return false;
         };
-        let before_windows = (disabled && self.is_close)
-            .then(|| crate::ax::bindings::ax_window_ids_of_pid(self.pid))
-            .flatten();
+        self.action = Some(action);
+        let is_close = disabled
+            && unsafe {
+                copy_string_attr(self.element, "AXMenuItemCmdChar")
+                    .is_some_and(|ch| ch.eq_ignore_ascii_case("w"))
+                    && crate::ax::bindings::copy_number_attr(self.element, "AXMenuItemCmdModifiers")
+                        .unwrap_or(0.0)
+                        == 0.0
+            };
+        self.evidence = Some(PressEvidence {
+            is_close,
+            title: disabled
+                .then(|| unsafe { copy_string_attr(self.element, "AXTitle") })
+                .flatten(),
+            sheet: if is_close {
+                window_has_sheet(self.pid, self.wid)
+            } else {
+                None
+            },
+            windows: if is_close {
+                crate::ax::bindings::ax_window_ids_of_pid(self.pid)
+            } else {
+                None
+            },
+        });
+        true
+    }
+    fn press(&mut self, disabled: bool) -> crate::ax::bindings::AXError {
+        if !disabled {
+            self.disabled_note = None;
+        }
+        let action = self.action.expect("prepared action");
         let err = unsafe { crate::ax::bindings::perform_action(self.element, action) };
         if disabled {
+            let evidence = self.evidence.take().expect("prepared evidence");
             let after_enabled = self.enabled();
             let after_title = unsafe { copy_string_attr(self.element, "AXTitle") };
-            let after_windows = if self.is_close {
+            let after_windows = if evidence.is_close {
                 crate::ax::bindings::ax_window_ids_of_pid(self.pid)
             } else {
                 None
             };
-            let after_sheet = if self.is_close {
+            let after_sheet = if evidence.is_close {
                 window_has_sheet(self.pid, self.wid)
             } else {
                 None
             };
-            self.disabled_note = Some(disabled_observation(
-                self.wid,
-                (before_title, after_title),
-                (
-                    before_windows
-                        .as_ref()
-                        .map(|windows| windows.contains(&self.wid)),
-                    after_windows
-                        .as_ref()
-                        .map(|windows| windows.contains(&self.wid)),
-                ),
-                (before_sheet, after_sheet),
+            self.record_disabled(
+                evidence,
+                after_title,
+                after_windows,
+                after_sheet,
                 after_enabled,
-            ));
+            );
         }
-        Some(err)
+        err
     }
 }
 
@@ -2145,7 +2201,7 @@ fn disabled_observation(
     if let (Some(before), Some(after)) = (before_title, after_title) {
         if before != after {
             observations.push(format!(
-                "The item title changed from {before:?} to {after:?}."
+                "The item title changed from ‘{before}’ to ‘{after}’."
             ));
         }
     }
@@ -2157,8 +2213,13 @@ fn disabled_observation(
     if before_sheet == Some(false) && after_sheet == Some(true) {
         observations.push("A sheet appeared on the target window.".to_owned());
     }
+    let enabled = match after_enabled {
+        Some(true) => "enabled",
+        Some(false) => "disabled",
+        None => "unreadable",
+    };
     observations.push(format!(
-        "The item read disabled before the press; afterwards AXEnabled was {after_enabled:?}."
+        "The item read disabled before the press; afterwards enablement was {enabled}."
     ));
     observations.join(" ")
 }
@@ -2207,7 +2268,7 @@ fn chord_press_step(
     if err == crate::ax::bindings::kAXErrorSuccess && disabled_note.is_some() {
         ChordStep::Pressed {
             text: format!(
-                "Sent {action} to {path} for window {wid}; its effect is unverified.{notes}"
+                "Sent {action} to {path} for window {wid}; the requested chord was not sent as keys. Its effect is unverified.{notes}"
             ),
             may_have_run: false,
             validation,
@@ -2325,7 +2386,7 @@ fn chord_result(step: ChordStep) -> ToolResult {
 
 /// The window-only native chord: everything from the key scope to the
 /// hand-back runs in a task that owns the lease.
-async fn native_menu_chord(
+pub(super) async fn native_menu_chord(
     lease: super::BackgroundMutationLease,
     wid: u32,
     combo: super::menu_equivalent::Combo,
@@ -2374,6 +2435,7 @@ async fn native_menu_chord(
                 scope,
                 validation,
                 path,
+                note,
             } => {
                 // Raw keys need the keyboard class's facts (a visible, not
                 // minimized window of a visible app), on the same lease.
@@ -2388,7 +2450,19 @@ async fn native_menu_chord(
                 let gate_refused = gate.is_err();
                 let (key, modifiers) = chord;
                 let step = latency::spawn_action_blocking(move || {
-                    keys_under_scope(pid, wid, scope, gate, validation, path, &key, &modifiers)
+                    let mut step =
+                        keys_under_scope(pid, wid, scope, gate, validation, path, &key, &modifiers);
+                    if !note.is_empty() {
+                        match &mut step {
+                            ChordStep::KeysPosted { text, .. }
+                            | ChordStep::Refused { text, .. } => {
+                                text.push(' ');
+                                text.push_str(&note);
+                            }
+                            _ => {}
+                        }
+                    }
+                    step
                 })
                 .await;
                 match step {
@@ -2425,7 +2499,7 @@ async fn native_menu_chord(
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     struct FakeChord {
         save: bool,
         initial: Option<bool>,
@@ -2463,11 +2537,146 @@ mod tests {
             self.validations += 1;
             self.after
         }
-        fn press(&mut self, disabled: bool) -> Option<crate::ax::bindings::AXError> {
+        fn prepare_press(&mut self, _: bool) -> bool {
+            true
+        }
+        fn press(&mut self, disabled: bool) -> crate::ax::bindings::AXError {
             self.presses += 1;
             self.disabled_presses += usize::from(disabled);
-            Some(self.error)
+            self.error
         }
+    }
+
+    pub(crate) fn frontmost_disabled_decision() -> bool {
+        let mut env = FakeChord {
+            save: false,
+            initial: Some(false),
+            after: Some(false),
+            front: true,
+            bound: true,
+            flip_after_first: false,
+            bound_reads: 0,
+            error: crate::ax::bindings::kAXErrorSuccess,
+            presses: 0,
+            validations: 0,
+            reads: 0,
+            disabled_presses: 0,
+        };
+        matches!(
+            super::decide_chord(&mut env),
+            super::ChordDecision::Pressed { .. }
+        ) && env.presses == 1
+            && env.disabled_presses == 1
+            && env.validations == 0
+    }
+
+    #[test]
+    fn binding_flip_during_evidence_refuses_without_press() {
+        struct Flip {
+            bound: bool,
+            presses: usize,
+        }
+        impl super::ChordEnv for Flip {
+            fn is_save(&mut self) -> bool {
+                false
+            }
+            fn enabled(&mut self) -> Option<bool> {
+                Some(true)
+            }
+            fn frontmost(&mut self) -> bool {
+                true
+            }
+            fn bound(&mut self) -> bool {
+                self.bound
+            }
+            fn validate(&mut self) -> Option<bool> {
+                Some(true)
+            }
+            fn prepare_press(&mut self, _: bool) -> bool {
+                self.bound = false; // Evidence gathering changes the binding.
+                true
+            }
+            fn press(&mut self, _: bool) -> crate::ax::bindings::AXError {
+                self.presses += 1;
+                crate::ax::bindings::kAXErrorSuccess
+            }
+        }
+        let mut env = Flip {
+            bound: true,
+            presses: 0,
+        };
+        assert_eq!(super::decide_chord(&mut env), super::ChordDecision::Unbound);
+        assert_eq!(env.presses, 0);
+    }
+
+    #[test]
+    fn unreadable_frontmost_enablement_is_refused_without_press() {
+        let mut env = FakeChord {
+            save: false,
+            initial: None,
+            after: None,
+            front: true,
+            bound: true,
+            flip_after_first: false,
+            bound_reads: 0,
+            error: crate::ax::bindings::kAXErrorSuccess,
+            presses: 0,
+            validations: 0,
+            reads: 0,
+            disabled_presses: 0,
+        };
+        assert_eq!(
+            super::decide_chord(&mut env),
+            super::ChordDecision::Unreadable
+        );
+        assert_eq!(env.presses, 0);
+    }
+
+    #[test]
+    fn live_disabled_note_flows_into_unverified_chord_result() {
+        let mut env = super::LiveChordEnv {
+            pid: 1,
+            wid: 42,
+            element: std::ptr::null_mut(),
+            validation: crate::input::skylight::ValidationPost::default(),
+            action: Some("AXPress"),
+            disabled_note: None,
+            evidence: None,
+        };
+        env.record_disabled(
+            super::PressEvidence {
+                is_close: false,
+                title: Some("Undo".into()),
+                sheet: None,
+                windows: None,
+            },
+            Some("Redo".into()),
+            None,
+            None,
+            Some(false),
+        );
+        let step = super::chord_press_step(
+            "Edit > Undo".into(),
+            42,
+            "AXPress",
+            crate::ax::bindings::kAXErrorSuccess,
+            env.validation,
+            (None, env.disabled_note.take()),
+            String::new(),
+        );
+        match &step {
+            super::ChordStep::Pressed { text, .. } => {
+                assert!(text.contains("item read disabled before the press"));
+                assert!(text.contains("requested chord was not sent as keys"));
+                assert!(!text.starts_with("Pressed"));
+                assert!(!text.contains("Some("));
+            }
+            _ => panic!("expected unverified press"),
+        }
+        assert_eq!(
+            super::chord_result(step).structured_content.unwrap()["effect"],
+            "unverifiable"
+        );
     }
 
     #[test]
@@ -2624,90 +2833,183 @@ mod tests {
 
     #[test]
     fn chord_decisions_cover_ax_results_enabled_save_front_and_binding() {
-        use super::ChordDecision;
+        use super::ChordDecision as D;
         use crate::ax::bindings::{
-            kAXErrorActionUnsupported, kAXErrorCannotComplete, kAXErrorInvalidUIElement,
-            kAXErrorSuccess,
+            kAXErrorCannotComplete as ambiguous, kAXErrorInvalidUIElement as invalid,
+            kAXErrorSuccess as ok,
         };
-        for error in [
-            kAXErrorSuccess,
-            kAXErrorCannotComplete,
-            kAXErrorActionUnsupported,
-            kAXErrorInvalidUIElement,
-        ] {
-            for initial in [Some(true), Some(false), None] {
-                for after in [Some(true), Some(false), None] {
-                    for save in [false, true] {
-                        for front in [false, true] {
-                            for bound in [false, true] {
-                                let mut env = FakeChord {
-                                    save,
-                                    initial,
-                                    after,
-                                    front,
-                                    bound,
-                                    flip_after_first: false,
-                                    bound_reads: 0,
-                                    error,
-                                    presses: 0,
-                                    validations: 0,
-                                    reads: 0,
-                                    disabled_presses: 0,
-                                };
-                                let decision = super::decide_chord(&mut env);
-                                let label = format!("error={error} initial={initial:?} after={after:?} save={save} front={front} bound={bound}");
-                                assert_chord_projection(&decision, bound, &label);
-                                if save {
-                                    assert_eq!(decision, ChordDecision::Save, "{label}");
-                                    assert_eq!((env.presses, env.validations), (0, 0), "{label}");
-                                    continue;
-                                }
-                                let early = initial == Some(true) || front;
-                                if early && !bound {
-                                    assert_eq!(decision, ChordDecision::Unbound, "{label}");
-                                    assert_eq!((env.presses, env.validations), (0, 0), "{label}");
-                                    continue;
-                                }
-                                if early && error != kAXErrorInvalidUIElement {
-                                    assert_eq!(
-                                        decision,
-                                        ChordDecision::Pressed {
-                                            err: error,
-                                            initial_error: None
-                                        },
-                                        "{label}"
-                                    );
-                                    assert_eq!((env.presses, env.validations), (1, 0), "{label}");
-                                    assert_eq!(
-                                        env.disabled_presses,
-                                        usize::from(initial == Some(false)),
-                                        "{label}"
-                                    );
-                                    continue;
-                                }
-                                let validation = usize::from(!early || after != Some(true));
-                                assert_eq!(env.validations, validation, "{label}");
-                                let prior = early.then_some(error);
-                                let expected = match after {
-                                    Some(false) => ChordDecision::Keys(prior),
-                                    None => ChordDecision::Unreadable,
-                                    Some(true) if !bound => ChordDecision::Unbound,
-                                    Some(true) => ChordDecision::Pressed {
-                                        err: error,
-                                        initial_error: prior,
-                                    },
-                                };
-                                assert_eq!(decision, expected, "{label}");
-                                assert_eq!(
-                                    env.presses,
-                                    usize::from(early) + usize::from(after == Some(true) && bound),
-                                    "{label}"
-                                );
-                            }
-                        }
-                    }
-                }
-            }
+        let cases = [
+            (
+                true,
+                Some(false),
+                Some(false),
+                false,
+                true,
+                ok,
+                D::Save,
+                0,
+                0,
+            ),
+            (false, None, None, true, true, ok, D::Unreadable, 0, 0),
+            (
+                false,
+                None,
+                Some(true),
+                false,
+                true,
+                ok,
+                D::Pressed {
+                    err: ok,
+                    initial_error: None,
+                },
+                1,
+                1,
+            ),
+            (
+                false,
+                Some(true),
+                Some(true),
+                false,
+                true,
+                ok,
+                D::Pressed {
+                    err: ok,
+                    initial_error: None,
+                },
+                1,
+                0,
+            ),
+            (
+                false,
+                Some(false),
+                Some(false),
+                true,
+                true,
+                ok,
+                D::Pressed {
+                    err: ok,
+                    initial_error: None,
+                },
+                1,
+                0,
+            ),
+            (
+                false,
+                Some(false),
+                Some(false),
+                false,
+                true,
+                ok,
+                D::Keys(None),
+                0,
+                1,
+            ),
+            (
+                false,
+                Some(false),
+                None,
+                false,
+                true,
+                ok,
+                D::Unreadable,
+                0,
+                1,
+            ),
+            (
+                false,
+                Some(false),
+                Some(true),
+                false,
+                true,
+                ok,
+                D::Pressed {
+                    err: ok,
+                    initial_error: None,
+                },
+                1,
+                1,
+            ),
+            (
+                false,
+                Some(true),
+                Some(true),
+                true,
+                false,
+                ok,
+                D::Unbound,
+                0,
+                0,
+            ),
+            (
+                false,
+                Some(false),
+                Some(true),
+                false,
+                false,
+                ok,
+                D::Unbound,
+                0,
+                1,
+            ),
+            (
+                false,
+                Some(true),
+                Some(true),
+                true,
+                true,
+                ambiguous,
+                D::Pressed {
+                    err: ambiguous,
+                    initial_error: None,
+                },
+                1,
+                0,
+            ),
+            (
+                false,
+                Some(true),
+                Some(false),
+                true,
+                true,
+                invalid,
+                D::Keys(Some(invalid)),
+                1,
+                1,
+            ),
+            (
+                false,
+                Some(true),
+                Some(true),
+                true,
+                true,
+                invalid,
+                D::Pressed {
+                    err: invalid,
+                    initial_error: Some(invalid),
+                },
+                2,
+                0,
+            ),
+        ];
+        for (save, initial, after, front, bound, error, expected, presses, validations) in cases {
+            let mut env = FakeChord {
+                save,
+                initial,
+                after,
+                front,
+                bound,
+                flip_after_first: false,
+                bound_reads: 0,
+                error,
+                presses: 0,
+                validations: 0,
+                reads: 0,
+                disabled_presses: 0,
+            };
+            let decision = super::decide_chord(&mut env);
+            assert_eq!(decision, expected);
+            assert_eq!((env.presses, env.validations), (presses, validations));
+            assert_chord_projection(&decision, bound, "explicit case");
         }
     }
     use super::*;

@@ -102,8 +102,10 @@ result says so; TextEdit disables Save whenever it is behind the user's window.
 For a window-only native `press_key` chord with a matching menu item, the
 menu route also applies when the app is frontmost. Save keeps its existing
 on-disk verification route. For other items, the driver tries an advertised
-`AXPress` or `AXPick` immediately if the item reads enabled or the app is
-frontmost. Otherwise it primes menu validation and checks enablement again;
+`AXPress` or `AXPick` immediately if the item reads enabled, or reads disabled
+and the app is frontmost. An unreadable initial enablement in a frontmost app is refused without a press.
+Otherwise it primes menu
+validation and checks enablement again;
 a disabled read can fall back to keys with `effect: "suspected_noop"`, while
 an unreadable state is refused. An ambiguous AX error may mean the command
 ran, so inspect the window before retrying; keys are not sent after such an
@@ -113,10 +115,12 @@ confirm the effect. Validation keys and the requested chord are reported
 separately. A window-only native `hotkey` with a matching menu item also uses
 its menu route for both frontmost and background apps.
 Save uses the existing menu route, which checks the document on disk after an
-AX press when its path is known. Validation can instead refuse a disabled Save.
+AX press when its path is known. A disabled Save uses the scripting route when
+the window has a document, and is refused when it has no document.
 A background `hotkey` whose combo is a menu item's
-key equivalent (⌘S, ⌘W, ⌘C, ...) in a native app takes the same route, because
-background key events never reach an app's menus; no keys are sent. macOS asks
+key equivalent (⌘S, ⌘W, ⌘C, ...) in a native app takes the same chord route;
+a disabled item can fall back to keys after validation. Element-targeted hotkeys
+keep their separate menu route and can refuse a disabled item. macOS asks
 the user once to allow Cua Driver to control the app (Automation) the first
 time a scripting route runs; when that is off, the call refuses and nothing is
 saved.
