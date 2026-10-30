@@ -144,6 +144,9 @@ pub mod tool_schema;
 pub mod video;
 pub mod video_ffmpeg;
 pub mod walk_budget;
+pub mod window_basis;
+#[cfg(test)]
+mod window_basis_tests;
 pub mod window_inspection;
 pub mod window_observation;
 pub mod window_state_view;

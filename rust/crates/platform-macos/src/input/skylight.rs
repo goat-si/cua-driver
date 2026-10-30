@@ -378,8 +378,7 @@ impl KeyEnv for LiveKeyEnv {
             wid,
             focus,
             || crate::ax::enablement::process_start_stamp(ticket.pid) == Some(ticket.stamp),
-            || super::key_belief_ax::is_proven_standard_window(ticket.pid, wid),
-            || key_focus_of_pid(ticket.pid),
+            || super::key_belief_ax::is_proven_standard_window(ticket, wid, focus.window),
             || {
                 let _ = BELIEFS.publish(ticket, wid, false, confirmed_at, focus_generation());
             },
@@ -392,7 +391,6 @@ fn publish_belief_with(
     focus: KeyFocus,
     process_matches: impl FnOnce() -> bool,
     standard_window: impl FnOnce() -> bool,
-    final_focus: impl FnOnce() -> KeyFocus,
     publish: impl FnOnce(),
 ) {
     if focus.window != Some(wid)
@@ -402,11 +400,7 @@ fn publish_belief_with(
     {
         return;
     }
-    let final_evidence = final_focus();
-    if final_evidence.window == Some(wid) && final_evidence.element_window == Some(wid) {
-        // Visible frontmost state does not prove synthetic activation.
-        publish();
-    }
+    publish();
 }
 
 /// Hand key inside `pid` back from `target` to `previous`. Whether the app is
@@ -1191,10 +1185,18 @@ fn enter_scope_with(
     // focus, so a window that is key is used as it is and any other window
     // is made key with records addressed to this app only.
     let initial_entry = KeyEntry::default();
+    crate::goat::action_latency::key_belief(
+        matches!(eligibility, FastPathEligibility::Eligible),
+        false,
+    );
     if matches!(eligibility, FastPathEligibility::Eligible) {
         let cached = env.belief_match(pid, target_wid);
-        let usable = matches!(cached, BeliefMatch::FreshKeyAndActive);
+        let usable = matches!(
+            cached,
+            BeliefMatch::FreshKeyAndActive | BeliefMatch::FreshKeyInactive
+        );
         if usable {
+            crate::goat::action_latency::key_belief(true, true);
             return Ok(WindowKeyScope {
                 pid,
                 target: target_wid,
@@ -1210,6 +1212,10 @@ fn enter_scope_with(
         }
     }
     let entry = std::cell::Cell::new(initial_entry);
+    let ticket = matches!(eligibility, FastPathEligibility::Eligible)
+        .then(|| env.belief_ticket(pid))
+        .flatten();
+    let confirmed_at = env.belief_now();
     let before = env.key_focus(pid);
     let previous = before.window;
     // The window order is only used to pick the window key goes back to, and
@@ -1311,10 +1317,8 @@ fn enter_scope_with(
         }
     };
     if matches!(eligibility, FastPathEligibility::Eligible) && primed == KeyPrime::AlreadyKey {
-        if let Some(ticket) = env.belief_ticket(pid) {
-            let confirmed_at = env.belief_now();
-            let confirmed = env.key_focus(pid);
-            env.publish_belief(ticket, target_wid, confirmed, confirmed_at);
+        if let Some(ticket) = ticket {
+            env.publish_belief(ticket, target_wid, before, confirmed_at);
         }
     }
     Ok(WindowKeyScope {

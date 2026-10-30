@@ -19,6 +19,7 @@ pub(super) fn final_window_sample(
                 crate::input::skylight::enter_exact_window_key_inline_detailed(pid, wid)
                     .map_err(|error| anyhow::anyhow!(error.reason))?,
             );
+            crate::goat::action_latency::key_belief(true, false);
             Ok(())
         },
     )

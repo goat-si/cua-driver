@@ -209,3 +209,29 @@ async fn untraced_work_has_no_context_or_timer_and_keeps_its_result() {
     assert_eq!(result.is_error, Some(true));
     assert!(current().is_none());
 }
+
+#[test]
+fn key_belief_trace_reports_hit_and_scope() {
+    let trace = Trace::new("press_key");
+    BLOCKING.with(|slot| slot.replace(Some(trace.clone())));
+    key_belief(true, true);
+    BLOCKING.with(|slot| slot.replace(None));
+    let line = trace.finish("ok");
+    assert!(line.contains("key_belief=hit scope=skipped"), "{line}");
+}
+
+#[test]
+fn key_belief_trace_reports_miss_and_ineligible() {
+    let trace = Trace::new("hotkey");
+    BLOCKING.with(|slot| slot.replace(Some(trace.clone())));
+    key_belief(true, false);
+    {
+        let metrics = trace.metrics.lock().unwrap();
+        assert_eq!((metrics.key_belief, metrics.key_scope), ("miss", "entered"));
+    }
+    key_belief(false, false);
+    BLOCKING.with(|slot| slot.replace(None));
+    assert!(trace
+        .finish("ok")
+        .contains("key_belief=ineligible scope=entered"));
+}

@@ -98,7 +98,7 @@ struct FakeEnv {
     now: std::cell::Cell<std::time::Instant>,
     focus_epoch: std::cell::Cell<u64>,
     seen_notification: std::cell::Cell<u64>,
-    beliefs: super::super::key_belief::BeliefStore,
+    beliefs: crate::input::key_belief::BeliefStore,
     state: RefCell<State>,
 }
 
@@ -115,12 +115,12 @@ impl FakeEnv {
             mutation_during_focus_read: std::cell::Cell::new(0),
             observer_registered: std::cell::Cell::new(true),
             standard_window: std::cell::Cell::new(true),
-            app_active: std::cell::Cell::new(true),
+            app_active: std::cell::Cell::new(false),
             activation_posts: std::cell::Cell::new(0),
             now: std::cell::Cell::new(std::time::Instant::now()),
             focus_epoch: std::cell::Cell::new(0),
             seen_notification: std::cell::Cell::new(0),
-            beliefs: super::super::key_belief::BeliefStore::default(),
+            beliefs: crate::input::key_belief::BeliefStore::default(),
             state: RefCell::new(State {
                 window: Some(key_window),
                 element_window: Some(key_window),
@@ -525,36 +525,24 @@ fn priming_moved_focus_does_not_publish_belief() {
 }
 
 #[test]
-fn live_publication_seam_rechecks_process_window_and_final_focus() {
+fn live_publication_seam_checks_process_window_and_focus() {
     let valid = KeyFocus {
         window: Some(2),
         element_window: Some(2),
     };
-    let moved = KeyFocus {
-        window: Some(1),
-        element_window: Some(1),
-    };
-    for (process, standard, final_sample, should_publish) in [
-        (false, true, valid, false),
-        (true, false, valid, false),
-        (true, true, moved, false),
-        (true, true, valid, true),
+    for (process, standard, should_publish) in [
+        (false, true, false),
+        (true, false, false),
+        (true, true, true),
     ] {
         let published = std::cell::Cell::new(false);
-        publish_belief_with(
-            2,
-            valid,
-            || process,
-            || standard,
-            || final_sample,
-            || published.set(true),
-        );
+        publish_belief_with(2, valid, || process, || standard, || published.set(true));
         assert_eq!(published.get(), should_publish);
     }
 }
 
 #[test]
-fn inactive_fresh_belief_uses_normal_path_without_activation() {
+fn inactive_fresh_belief_uses_fast_path_without_activation() {
     let _serial = key_scope_tests_serial();
     let env = FakeEnv::new(2);
     let warmed = warm_eligible_belief(&env);
@@ -567,7 +555,7 @@ fn inactive_fresh_belief_uses_normal_path_without_activation() {
     assert!(env.state.borrow().posts.is_empty());
     assert_eq!(scope.finish(), HandBack::NotMoved);
     assert!(warmed);
-    assert!(reads > 0, "inactive belief must sample focus");
+    assert_eq!(reads, 0, "fresh settled focus must use the fast path");
     assert_eq!(activations, 0, "inactive belief must not post activation");
 }
 
@@ -578,7 +566,7 @@ fn notification_during_confirmation_prevents_belief_publication() {
     let warmed = warm_eligible_belief(&env);
     env.notification_generation
         .set(env.notification_generation.get() + 1);
-    env.notify_during_focus_read.set(2);
+    env.notify_during_focus_read.set(1);
     assert_eq!(enter_eligible(&env).unwrap().finish(), HandBack::NotMoved);
     env.state.borrow_mut().key_focus_reads = 0;
     assert_eq!(enter_eligible(&env).unwrap().finish(), HandBack::NotMoved);
@@ -595,7 +583,7 @@ fn driver_mutation_during_confirmation_prevents_belief_publication() {
     let env = FakeEnv::new(2);
     let warmed = warm_eligible_belief(&env);
     env.focus_epoch.set(env.focus_epoch.get() + 1);
-    env.mutation_during_focus_read.set(2);
+    env.mutation_during_focus_read.set(1);
     assert_eq!(enter_eligible(&env).unwrap().finish(), HandBack::NotMoved);
     env.state.borrow_mut().key_focus_reads = 0;
     assert_eq!(enter_eligible(&env).unwrap().finish(), HandBack::NotMoved);
@@ -798,4 +786,43 @@ fn an_unconfirmed_key_window_still_refuses() {
     );
     assert!(error.entry.records_posted > 0 && error.entry.ax_write);
     assert!(error.hand_back.is_some(), "what was moved is handed back");
+}
+
+#[test]
+fn live_publication_with_inactive_app_is_usable_on_second_key() {
+    let _serial = key_scope_tests_serial();
+    let env = FakeEnv::new(2);
+    let stamp = env.incarnation.get().unwrap();
+    env.beliefs.set_observing(-78_001, stamp, true);
+    let ticket = env.beliefs.begin(-78_001, stamp, 0);
+    let focus = KeyFocus {
+        window: Some(2),
+        element_window: Some(2),
+    };
+    publish_belief_with(
+        2,
+        focus,
+        || true,
+        || true,
+        || {
+            assert!(env.beliefs.publish(ticket, 2, false, env.now.get(), 0));
+        },
+    );
+    let scope = enter_eligible(&env).unwrap();
+    assert!(scope.used_belief());
+    assert_eq!(env.state.borrow().key_focus_reads, 0);
+    assert_eq!(scope.finish(), HandBack::NotMoved);
+}
+
+#[test]
+fn already_key_entry_reuses_initial_focus_read_for_publication() {
+    let _serial = key_scope_tests_serial();
+    let env = FakeEnv::new(2);
+    let scope = enter_eligible(&env).unwrap();
+    assert_eq!(
+        env.state.borrow().key_focus_reads,
+        1,
+        "publication must reuse the entry read"
+    );
+    assert_eq!(scope.finish(), HandBack::NotMoved);
 }

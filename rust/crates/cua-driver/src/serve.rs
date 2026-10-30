@@ -29,12 +29,67 @@ pub use cua_driver_core::daemon::{
     ToolObservationOrigin,
 };
 
-// Await a call while retaining the next request for ordered processing.
+// Bound buffered pipelined data while the call is running. At the limit,
+// apply backpressure and resume the partial line after the call completes.
+const MAX_PIPELINED_BYTES: usize = 64 * 1024;
+
+async fn read_pipeline<R: tokio::io::AsyncRead + Unpin>(
+    reader: &mut tokio::io::BufReader<R>,
+    partial: &mut Vec<u8>,
+    remaining: usize,
+) -> std::io::Result<Option<bool>> {
+    use tokio::io::AsyncBufReadExt;
+    loop {
+        if partial.len() >= remaining {
+            return Ok(Some(false));
+        }
+        let available = reader.fill_buf().await?;
+        if available.is_empty() {
+            return Ok(None);
+        }
+        let count = available
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .map_or(available.len(), |index| index + 1)
+            .min(remaining - partial.len());
+        let complete = available[count - 1] == b'\n';
+        partial.extend_from_slice(&available[..count]);
+        reader.consume(count);
+        if complete {
+            return Ok(Some(true));
+        }
+    }
+}
+
+fn decode_pipeline_line(mut bytes: Vec<u8>) -> std::io::Result<String> {
+    if bytes.last() == Some(&b'\n') {
+        bytes.pop();
+    }
+    if bytes.last() == Some(&b'\r') {
+        bytes.pop();
+    }
+    String::from_utf8(bytes)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+}
+
+async fn next_connection_line<R: tokio::io::AsyncRead + Unpin>(
+    lines: &mut tokio::io::Lines<tokio::io::BufReader<R>>,
+    prefix: &mut Vec<u8>,
+) -> std::io::Result<Option<String>> {
+    use tokio::io::AsyncBufReadExt;
+    if prefix.is_empty() {
+        return lines.next_line().await;
+    }
+    lines.get_mut().read_until(b'\n', prefix).await?;
+    decode_pipeline_line(std::mem::take(prefix)).map(Some)
+}
+
 async fn call_until_disconnect<R, F, T>(
     lines: &mut tokio::io::Lines<tokio::io::BufReader<R>>,
     call: F,
     signal_key_cancellation: bool,
-) -> (T, VecDeque<String>)
+    read_limit: usize,
+) -> (T, VecDeque<String>, Vec<u8>)
 where
     R: tokio::io::AsyncRead + Unpin,
     F: std::future::Future<Output = T>,
@@ -43,18 +98,36 @@ where
     let call = cua_driver_core::key_cancellation::scope(receiver, call);
     tokio::pin!(call);
     let mut pending = VecDeque::new();
+    let mut partial = Vec::new();
+    let mut buffered = 0usize;
+    let mut can_read = read_limit > 0;
     loop {
         tokio::select! {
-        result = &mut call => return (result, pending),
-        next = lines.next_line() => match next {
-            Ok(Some(line)) => pending.push_back(line),
-            Ok(None) | Err(_) => {
-                if signal_key_cancellation {
-                    let _ = disconnect.send(true);
-                }
-                return (call.await, pending);
-            },
-        }
+            result = &mut call => return (result, pending, partial),
+            next = read_pipeline(lines.get_mut(), &mut partial, read_limit - buffered), if can_read => match next {
+                Ok(Some(true)) => {
+                    buffered += partial.len();
+                    match decode_pipeline_line(std::mem::take(&mut partial)) {
+                        Ok(line) => pending.push_back(line),
+                        Err(_) => return (call.await, pending, Vec::new()),
+                    }
+                    can_read = buffered < read_limit;
+                },
+                Ok(Some(false)) => can_read = false,
+                Ok(None) => {
+                    if !partial.is_empty() {
+                        if let Ok(line) = decode_pipeline_line(std::mem::take(&mut partial)) { pending.push_back(line); }
+                    }
+                    if signal_key_cancellation { let _ = disconnect.send(true); }
+                    return (call.await, pending, Vec::new());
+                },
+                Err(error) => {
+                    if signal_key_cancellation && matches!(error.kind(), std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionAborted | std::io::ErrorKind::NotConnected | std::io::ErrorKind::UnexpectedEof) {
+                        let _ = disconnect.send(true);
+                    }
+                    return (call.await, pending, partial);
+                },
+            }
         }
     }
 }
@@ -88,6 +161,7 @@ mod call_disconnect_tests {
                 42
             },
             false,
+            MAX_PIPELINED_BYTES,
         ));
         assert!(
             std::future::poll_fn(|cx| std::task::Poll::Ready(call.as_mut().poll(cx).is_pending()))
@@ -104,7 +178,7 @@ mod call_disconnect_tests {
             "scope released before completion"
         );
         finish.send(()).unwrap();
-        assert_eq!(call.await, (42, VecDeque::new()));
+        assert_eq!(call.await, (42, VecDeque::new(), Vec::new()));
         assert!(release_seen.try_recv().is_ok());
     }
 
@@ -128,8 +202,10 @@ mod call_disconnect_tests {
                 let _guard = guard;
                 let mut disconnect = cua_driver_core::key_cancellation::subscribe().unwrap();
                 disconnect.changed().await.unwrap();
+                assert!(*disconnect.borrow(), "EOF must set the signal");
             },
             true,
+            MAX_PIPELINED_BYTES,
         ));
         assert!(
             std::future::poll_fn(|cx| std::task::Poll::Ready(call.as_mut().poll(cx).is_pending()))
@@ -141,8 +217,10 @@ mod call_disconnect_tests {
                 .await,
             "connection EOF must signal the call"
         );
-        drop(call);
-        assert!(rx.try_recv().is_ok(), "in-flight call must be dropped");
+        assert!(
+            rx.try_recv().is_ok(),
+            "completed call must release its guard"
+        );
     }
     #[tokio::test]
     async fn pipelined_request_is_retained_until_the_call_finishes() {
@@ -153,6 +231,7 @@ mod call_disconnect_tests {
             &mut lines,
             async move { rx.await.unwrap() },
             true,
+            MAX_PIPELINED_BYTES,
         ));
         assert!(
             std::future::poll_fn(|cx| std::task::Poll::Ready(call.as_mut().poll(cx).is_pending()))
@@ -166,7 +245,7 @@ mod call_disconnect_tests {
         tx.send(42).unwrap();
         assert_eq!(
             call.await,
-            (42, VecDeque::from(["next request".to_owned()]))
+            (42, VecDeque::from(["next request".to_owned()]), Vec::new())
         );
     }
 
@@ -182,6 +261,7 @@ mod call_disconnect_tests {
                 42
             },
             true,
+            MAX_PIPELINED_BYTES,
         ));
         assert!(
             std::future::poll_fn(|cx| std::task::Poll::Ready(call.as_mut().poll(cx).is_pending()))
@@ -191,8 +271,75 @@ mod call_disconnect_tests {
         client.shutdown().await.unwrap();
         assert_eq!(
             call.await,
-            (42, VecDeque::from(["first".into(), "second".into()]))
+            (
+                42,
+                VecDeque::from(["first".into(), "second".into()]),
+                Vec::new()
+            )
         );
+    }
+
+    #[tokio::test]
+    async fn oversized_pipeline_is_backpressured_and_resumed() {
+        let (mut client, server) = tokio::io::duplex(MAX_PIPELINED_BYTES * 2);
+        let mut lines = BufReader::new(server).lines();
+        let (finish, finished) = tokio::sync::oneshot::channel();
+        let payload = format!("{}\n", "x".repeat(MAX_PIPELINED_BYTES + 13));
+        client.write_all(payload.as_bytes()).await.unwrap();
+        let mut call = Box::pin(call_until_disconnect(
+            &mut lines,
+            async { finished.await.unwrap() },
+            true,
+            MAX_PIPELINED_BYTES,
+        ));
+        assert!(
+            std::future::poll_fn(|cx| std::task::Poll::Ready(call.as_mut().poll(cx).is_pending()))
+                .await
+        );
+        finish.send(42).unwrap();
+        let (result, pending, mut prefix) = call.await;
+        assert_eq!(result, 42);
+        assert!(pending.is_empty());
+        assert_eq!(prefix.len(), MAX_PIPELINED_BYTES);
+        assert_eq!(
+            next_connection_line(&mut lines, &mut prefix)
+                .await
+                .unwrap()
+                .unwrap(),
+            payload.trim_end()
+        );
+    }
+
+    #[tokio::test]
+    async fn read_error_does_not_cancel_key_call() {
+        struct ErrorReader;
+        impl tokio::io::AsyncRead for ErrorReader {
+            fn poll_read(
+                self: std::pin::Pin<&mut Self>,
+                _: &mut std::task::Context<'_>,
+                _: &mut tokio::io::ReadBuf<'_>,
+            ) -> std::task::Poll<std::io::Result<()>> {
+                std::task::Poll::Ready(Err(std::io::Error::other("injected")))
+            }
+        }
+        let mut lines = BufReader::new(ErrorReader).lines();
+        let (finish, finished) = tokio::sync::oneshot::channel();
+        let mut call = Box::pin(call_until_disconnect(
+            &mut lines,
+            async {
+                let receiver = cua_driver_core::key_cancellation::subscribe().unwrap();
+                finished.await.unwrap();
+                assert!(!*receiver.borrow());
+            },
+            true,
+            MAX_PIPELINED_BYTES,
+        ));
+        assert!(
+            std::future::poll_fn(|cx| std::task::Poll::Ready(call.as_mut().poll(cx).is_pending()))
+                .await
+        );
+        finish.send(()).unwrap();
+        call.await;
     }
 
     #[tokio::test]
@@ -200,8 +347,8 @@ mod call_disconnect_tests {
         let (_client, server) = tokio::io::duplex(64);
         let mut lines = BufReader::new(server).lines();
         assert_eq!(
-            call_until_disconnect(&mut lines, async { 42 }, true).await,
-            (42, VecDeque::new())
+            call_until_disconnect(&mut lines, async { 42 }, true, MAX_PIPELINED_BYTES).await,
+            (42, VecDeque::new(), Vec::new())
         );
     }
 }
@@ -1194,10 +1341,11 @@ pub async fn run_serve(
                     let mut trusted_session: Option<TrustedConnectionSession> = None;
 
                     let mut pending_lines = VecDeque::new();
+                    let mut pending_prefix = Vec::new();
                     loop {
                         let line = match pending_lines.pop_front() {
                             Some(line) => line,
-                            None => match lines.next_line().await {
+                            None => match next_connection_line(&mut lines, &mut pending_prefix).await {
                                 Ok(Some(line)) => line,
                                 Ok(None) | Err(_) => break,
                             },
@@ -1345,8 +1493,9 @@ pub async fn run_serve(
                                 let proxy_call = matches!(req.observation_origin, Some(ToolObservationOrigin::McpProxy));
                                 let resp = if proxy_call {
                                     let signal_key_cancellation = matches!(req.name.as_deref(), Some("press_key" | "hotkey"));
-                                    let (response, next) = call_until_disconnect(&mut lines, invoke_daemon_tool(&reg, req), signal_key_cancellation).await;
+                                    let (response, next, prefix) = call_until_disconnect(&mut lines, invoke_daemon_tool(&reg, req), signal_key_cancellation, if pending_prefix.is_empty() { MAX_PIPELINED_BYTES.saturating_sub(pending_lines.iter().map(|line: &String| line.len() + 1).sum::<usize>()) } else { 0 }).await;
                                     pending_lines.extend(next);
+                                    if pending_prefix.is_empty() { pending_prefix = prefix; }
                                     response
                                 } else {
                                     invoke_daemon_tool(&reg, req).await
@@ -2023,10 +2172,11 @@ pub async fn run_serve(
                     let mut trusted_session: Option<TrustedConnectionSession> = None;
 
                     let mut pending_lines = VecDeque::new();
+                    let mut pending_prefix = Vec::new();
                     loop {
                         let line = match pending_lines.pop_front() {
                             Some(line) => line,
-                            None => match lines.next_line().await {
+                            None => match next_connection_line(&mut lines, &mut pending_prefix).await {
                                 Ok(Some(line)) => line,
                                 Ok(None) | Err(_) => break,
                             },
@@ -2154,8 +2304,9 @@ pub async fn run_serve(
                                 let proxy_call = matches!(req.observation_origin, Some(ToolObservationOrigin::McpProxy));
                                 let resp = if proxy_call {
                                     let signal_key_cancellation = matches!(req.name.as_deref(), Some("press_key" | "hotkey"));
-                                    let (response, next) = call_until_disconnect(&mut lines, invoke_daemon_tool(&reg, req), signal_key_cancellation).await;
+                                    let (response, next, prefix) = call_until_disconnect(&mut lines, invoke_daemon_tool(&reg, req), signal_key_cancellation, if pending_prefix.is_empty() { MAX_PIPELINED_BYTES.saturating_sub(pending_lines.iter().map(|line: &String| line.len() + 1).sum::<usize>()) } else { 0 }).await;
                                     pending_lines.extend(next);
+                                    if pending_prefix.is_empty() { pending_prefix = prefix; }
                                     response
                                 } else {
                                     invoke_daemon_tool(&reg, req).await

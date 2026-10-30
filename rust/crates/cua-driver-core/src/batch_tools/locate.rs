@@ -1764,6 +1764,48 @@ fn role_matches(wanted: &str, actual: &str) -> bool {
     role_family(wanted) == role_family(actual)
 }
 
+/// One driver call as the run_script journal records it.
+pub(crate) fn journal_entry(
+    tool: &str,
+    pid: Option<i64>,
+    window_id: Option<u64>,
+    result: &crate::protocol::ToolResult,
+) -> Value {
+    let field = |key: &str| {
+        result
+            .structured_content
+            .as_ref()
+            .and_then(|value| value.get(key))
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+    };
+    json!({
+        "tool": tool,
+        "pid": pid,
+        "window_id": window_id,
+        "ok": result.is_error != Some(true),
+        "effect": field("effect"),
+        "code": field("code"),
+    })
+}
+
+/// The window a call targets, from flat `pid`/`window_id` or a typed
+/// `target: {kind: "window", pid, window_id}`.
+pub(crate) fn call_target(args: &Value) -> (Option<i64>, Option<u64>) {
+    let target = args.get("target");
+    let pid = args.get("pid").and_then(Value::as_i64).or_else(|| {
+        target
+            .and_then(|target| target.get("pid"))
+            .and_then(Value::as_i64)
+    });
+    let window_id = args.get("window_id").and_then(Value::as_u64).or_else(|| {
+        target
+            .and_then(|target| target.get("window_id"))
+            .and_then(Value::as_u64)
+    });
+    (pid, window_id)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2138,46 +2180,4 @@ mod tests {
         assert_eq!(element.name.as_deref(), Some("Go"));
         assert_eq!(args.keys().collect::<Vec<_>>(), ["count", "pid"]);
     }
-}
-
-/// One driver call as the run_script journal records it.
-pub(crate) fn journal_entry(
-    tool: &str,
-    pid: Option<i64>,
-    window_id: Option<u64>,
-    result: &crate::protocol::ToolResult,
-) -> Value {
-    let field = |key: &str| {
-        result
-            .structured_content
-            .as_ref()
-            .and_then(|value| value.get(key))
-            .and_then(Value::as_str)
-            .map(str::to_owned)
-    };
-    json!({
-        "tool": tool,
-        "pid": pid,
-        "window_id": window_id,
-        "ok": result.is_error != Some(true),
-        "effect": field("effect"),
-        "code": field("code"),
-    })
-}
-
-/// The window a call targets, from flat `pid`/`window_id` or a typed
-/// `target: {kind: "window", pid, window_id}`.
-pub(crate) fn call_target(args: &Value) -> (Option<i64>, Option<u64>) {
-    let target = args.get("target");
-    let pid = args.get("pid").and_then(Value::as_i64).or_else(|| {
-        target
-            .and_then(|target| target.get("pid"))
-            .and_then(Value::as_i64)
-    });
-    let window_id = args.get("window_id").and_then(Value::as_u64).or_else(|| {
-        target
-            .and_then(|target| target.get("window_id"))
-            .and_then(Value::as_u64)
-    });
-    (pid, window_id)
 }

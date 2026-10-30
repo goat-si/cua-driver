@@ -31,9 +31,10 @@ struct Entry {
     active: Option<bool>,
     focus_generation: Option<u64>,
     belief: Option<Belief>,
+    standard_window: Option<(u32, u64, u64)>,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Hash, PartialEq, Eq)]
 pub(super) struct Ticket {
     pub(super) pid: i32,
     pub(super) stamp: ProcessStartStamp,
@@ -55,6 +56,7 @@ impl BeliefStore {
             active: None,
             focus_generation: None,
             belief: None,
+            standard_window: None,
         });
         if entry.stamp != stamp {
             *entry = Entry {
@@ -64,6 +66,7 @@ impl BeliefStore {
                 active: None,
                 focus_generation: None,
                 belief: None,
+                standard_window: None,
             };
         }
         entry
@@ -140,6 +143,29 @@ impl BeliefStore {
         true
     }
 
+    pub(super) fn standard_proven(&self, ticket: Ticket, wid: u32) -> bool {
+        let map = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        map.get(&ticket.pid).is_some_and(|entry| {
+            entry.observing
+                && entry.stamp == ticket.stamp
+                && entry.generation == ticket.generation
+                && entry.focus_generation == Some(ticket.focus_generation)
+                && entry.standard_window == Some((wid, ticket.generation, ticket.focus_generation))
+        })
+    }
+
+    pub(super) fn remember_standard(&self, ticket: Ticket, wid: u32) {
+        let mut map = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(entry) = map.get_mut(&ticket.pid).filter(|entry| {
+            entry.observing
+                && entry.stamp == ticket.stamp
+                && entry.generation == ticket.generation
+                && entry.focus_generation == Some(ticket.focus_generation)
+        }) {
+            entry.standard_window = Some((wid, ticket.generation, ticket.focus_generation));
+        }
+    }
+
     pub(super) fn invalidate(&self, pid: i32, stamp: ProcessStartStamp) {
         let mut map = self.0.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(entry) = map.get_mut(&pid).filter(|entry| entry.stamp == stamp) {
@@ -214,6 +240,23 @@ impl BeliefStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn standard_proof_is_scoped_to_entry_and_focus_generation() {
+        let store = BeliefStore::default();
+        let stamp = (1, 1);
+        store.set_observing(4, stamp, true);
+        let ticket = store.begin(4, stamp, 0);
+        store.remember_standard(ticket, 700);
+        assert!(store.standard_proven(ticket, 700));
+        assert!(!store.standard_proven(ticket, 701));
+        let next = store.begin(4, stamp, 1);
+        assert!(!store.standard_proven(next, 700));
+        store.forget(4);
+        store.set_observing(4, stamp, true);
+        let recreated = store.begin(4, stamp, 0);
+        assert!(!store.standard_proven(recreated, 700));
+    }
 
     #[test]
     fn generation_and_incarnation_fence_publication_and_lookup() {

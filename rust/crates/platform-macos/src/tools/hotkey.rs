@@ -54,10 +54,10 @@ fn def() -> &'static ToolDef {
                 raise the window.\n\
                 • `background` (default): posts the combo to the target pid as trusted input (Chromium/Electron \
                 accept it); with an AX target, that element is focused first. When the combo is a menu item's \
-                key equivalent (cmd+s, cmd+w, ...) and the app is not in front, the menu item runs through \
-                accessibility instead (a disabled Save is saved through the app's scripting interface and \
-                verified on disk); a menu item macOS keeps disabled in the background is refused with \
-                `background_unavailable` and no keys are sent.\n\
+                key equivalent (cmd+s, cmd+w, ...) in a native app, a window-only request uses the same \
+                menu chord route as press_key, including frontmost apps. Disabled Save uses the scripting \
+                route for a document window. Another disabled item can fall back to keys after validation; \
+                an element-targeted menu request can instead be refused.\n\
                 • `foreground`: briefly fronts the window so native menu key equivalents dispatch, then restores \
                 the prior frontmost app; with an AX target or x,y the focused field receives the chord (native \
                 Chromium fields such as the omnibox need this). Requires window_id.\n\
@@ -356,33 +356,62 @@ impl Tool for HotkeyTool {
             return error;
         }
 
-        // ── Menu key equivalents in a background app ──
-        // Background key events reach a window's views but never its app's
-        // menu key equivalents, so a background cmd+s to TextEdit saved
-        // nothing while reporting "Pressed". When the combo is a menu item's
-        // key equivalent in a native app that is not in front, run that menu
-        // item in the background instead (verified for Save), or refuse when
-        // macOS keeps it disabled. No key events are sent on this route.
+        // Window-only native Command equivalents use the app's menu route
+        // whether or not the app is frontmost. That route checks the held
+        // target window and returns its own result without posting the chord.
         let mut key_scope: Option<crate::input::skylight::WindowKeyScope> = None;
         if !fg && px.is_none() {
             if let (Some(wid), Some(combo)) = (
                 window_id,
                 super::menu_equivalent::Combo::parse(&modifiers, &key),
             ) {
+                let lookup = combo.clone();
                 let menu_item = latency::spawn_action_blocking(move || {
                     let native = !super::type_text::is_browser_pid(pid)
                         && !crate::browser::electron_js::ElectronJs::is_electron(pid);
-                    let in_front = apps::frontmost_pid() == Some(pid);
-                    if native && !in_front {
-                        super::menu_equivalent::find(pid, &combo)
-                    } else {
-                        None
-                    }
+                    lookup_native_menu(native, || super::menu_equivalent::find(pid, &lookup))
                 })
                 .await
                 .ok()
                 .flatten();
                 if let Some(item) = menu_item {
+                    let shared_combo = combo.clone();
+                    let shared_display = key_display.clone();
+                    let shared_key = key.clone();
+                    let shared_modifiers = modifiers.clone();
+                    if let Some(route) = window_menu_route(element_ptr, || async move {
+                        let lease = super::acquire_background_mutation(pid).await;
+                        if let Err(refusal) = lease
+                            .gate_again(
+                                wid,
+                                None,
+                                cua_driver_core::background_input::BackgroundAction::AxSemantic,
+                            )
+                            .await
+                        {
+                            return refusal;
+                        }
+                        let result = super::press_key::native_menu_chord(
+                            lease,
+                            wid,
+                            shared_combo,
+                            shared_display,
+                            (shared_key, shared_modifiers),
+                            duration,
+                        )
+                        .await;
+                        let physical = result
+                            .structured_content
+                            .as_ref()
+                            .is_some_and(|value| value["path"] == "keys_under_scope");
+                        if physical {
+                            result
+                        } else {
+                            super::key_delivery_guard::semantic_duration(result, duration)
+                        }
+                    }) {
+                        return route.await;
+                    }
                     // The menu command acts on the app's key window. Make the
                     // addressed window key first, confirmed, or refuse: never
                     // act on another window (CUA-1767).
@@ -624,10 +653,12 @@ impl Tool for HotkeyTool {
                         if let Some(wid) = window_id {
                             let cached = key_scope.as_ref().is_some_and(|scope| scope.used_belief());
                             let sample = super::key_delivery_guard::final_window_sample(pid, wid, key_scope)?;
-                            super::press_key::verify_final_key_sample_with(pid, wid, false, cached, sample, |sample| match sample {
-                                Some(window) => crate::ax::exact_target::check_window_focus_conflict_with_sample(pid, wid, None, window),
-                                None => crate::ax::exact_target::check_window_focus_conflict(pid, wid, None),
-                            })?;
+                            if super::press_key::should_check_belief_conflict(cached) {
+                                super::press_key::verify_final_key_sample_with(pid, wid, false, cached, sample, |sample| match sample {
+                                    Some(window) => crate::ax::exact_target::check_window_focus_conflict_with_sample(pid, wid, None, window),
+                                    None => crate::ax::exact_target::check_window_focus_conflict(pid, wid, None),
+                                })?;
+                            }
                         }
                     }
                     match (fg, coordinate_focus, window_id, element_ptr) {
@@ -712,10 +743,20 @@ impl Tool for HotkeyTool {
     }
 }
 
-/// The menu route's answer, with a menu macOS keeps unavailable in the
-/// background marked as a refusal that sent nothing. Keys are not tried
-/// instead: a background key event never reaches a native app's menus, so it
-/// would report delivery and change nothing (a background cmd+[ to Finder).
+fn window_menu_route<T>(element: Option<usize>, route: impl FnOnce() -> T) -> Option<T> {
+    element.is_none().then(route)
+}
+
+/// Only native applications use this menu lookup.
+fn lookup_native_menu<T>(native: bool, find: impl FnOnce() -> Option<T>) -> Option<T> {
+    if native {
+        find()
+    } else {
+        None
+    }
+}
+
+/// Mark an unavailable background menu as a refusal without trying keys.
 pub(super) fn menu_refusal_without_keys(mut result: ToolResult) -> ToolResult {
     let unavailable = result.is_error == Some(true)
         && result
@@ -749,6 +790,23 @@ fn delivered_structured(foreground: bool) -> Value {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn window_hotkey_reaches_frontmost_disabled_chord_decision() {
+        let result = super::lookup_native_menu(true, || Some(())).and_then(|()| {
+            super::window_menu_route(None, || {
+                super::super::press_key::tests::frontmost_disabled_decision()
+            })
+        });
+        assert_eq!(result, Some(true));
+        assert!(super::window_menu_route::<()>(Some(1), || panic!(
+            "element route must stay separate"
+        ))
+        .is_none());
+        assert!(
+            super::lookup_native_menu::<()>(false, || panic!("non-native menu lookup")).is_none()
+        );
+    }
+
     use super::*;
 
     async fn cancel_real_desktop_hotkey(base_down: bool) {

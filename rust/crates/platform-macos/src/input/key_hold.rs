@@ -105,7 +105,10 @@ pub(crate) fn deliver(
         key,
         modifiers,
         duration.unwrap_or_else(keyboard::key_gap),
-        matches!(route, KeyRoute::Global | KeyRoute::BareGlobal),
+        (
+            matches!(route, KeyRoute::Global | KeyRoute::BareGlobal),
+            matches!(route, KeyRoute::BareGlobal),
+        ),
         |code, down, flags| match route {
             KeyRoute::Pid(pid) => keyboard::post_key(pid, code, down, flags),
             KeyRoute::Global => keyboard::post_global_key(
@@ -136,18 +139,27 @@ pub(crate) fn deliver_with(
     cancelled: impl FnMut() -> bool,
     wait: impl FnMut(Duration) -> bool,
 ) -> anyhow::Result<()> {
-    deliver_with_pacing(key, modifiers, duration, false, post, cancelled, wait)
+    deliver_with_pacing(
+        key,
+        modifiers,
+        duration,
+        (false, false),
+        post,
+        cancelled,
+        wait,
+    )
 }
 
 fn deliver_with_pacing(
     key: &str,
     modifiers: &[&str],
     duration: Duration,
-    pace_modifiers: bool,
+    pacing: (bool, bool),
     mut post: impl FnMut(u16, bool, CGEventFlags) -> anyhow::Result<()>,
     mut cancelled: impl FnMut() -> bool,
     mut wait: impl FnMut(Duration) -> bool,
 ) -> anyhow::Result<()> {
+    let (pace_modifiers, pace_base_up) = pacing;
     let plus = key == "+" || key.eq_ignore_ascii_case("plus");
     let base = keyboard::key_name_to_code(if plus { "=" } else { key })?;
     let mut keys = Vec::new();
@@ -192,6 +204,9 @@ fn deliver_with_pacing(
             }
         }
     }
+    if base_attempted && pace_base_up {
+        wait(keyboard::key_gap());
+    }
     for (code, flag) in pressed.into_iter().rev() {
         flags.remove(flag);
         if let Err(error) = post(code, false, flags) {
@@ -221,7 +236,7 @@ mod tests {
             "a",
             &["cmd", "shift"],
             Duration::from_millis(99),
-            true,
+            (true, false),
             |_, _, _| Ok(()),
             || false,
             |duration| {
@@ -239,6 +254,31 @@ mod tests {
                 keyboard::key_gap(),
                 keyboard::key_gap()
             ]
+        );
+    }
+
+    #[test]
+    fn bare_global_paces_after_base_up() {
+        let events = std::cell::RefCell::new(Vec::new());
+        deliver_with_pacing(
+            "a",
+            &["cmd"],
+            Duration::from_millis(9),
+            (true, true),
+            |_, down, _| {
+                events.borrow_mut().push(if down { "down" } else { "up" });
+                Ok(())
+            },
+            || false,
+            |_| {
+                events.borrow_mut().push("wait");
+                false
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            *events.borrow(),
+            vec!["down", "wait", "down", "wait", "up", "wait", "up", "wait"]
         );
     }
 

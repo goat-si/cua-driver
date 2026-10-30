@@ -763,7 +763,9 @@ pub(crate) async fn acquire_key_scope_with_eligibility(
     let Some(wid) = window_id.filter(|_| !foreground) else {
         return Ok(None);
     };
-    match tokio::task::spawn_blocking(move || {
+    // The latency trace's key_belief/scope fields are recorded inside the
+    // scope entry, so the blocking prime must carry the trace with it.
+    match crate::goat::action_latency::spawn_blocking(move || {
         if eligible && crate::input::skylight::is_focus_without_raise_available() {
             crate::input::skylight::enter_untargeted_key_scope(pid, wid)
                 .map(Some)

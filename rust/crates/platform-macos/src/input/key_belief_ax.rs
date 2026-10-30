@@ -2,12 +2,24 @@
 
 use core_foundation::base::{CFRelease, CFTypeRef};
 
+use super::key_belief::{Ticket, BELIEFS};
 use crate::ax::bindings::{
     ax_get_window_id, copy_ax_windows_including, copy_string_attr, AXUIElementCreateApplication,
 };
-use crate::ax::exact_target::{check_window_focus_conflict, WindowFocusConflict};
+use crate::ax::exact_target::{check_window_focus_conflict_with_sample, WindowFocusConflict};
 
-pub(super) fn is_proven_standard_window(pid: i32, wid: u32) -> bool {
+pub(super) fn is_proven_standard_window(ticket: Ticket, wid: u32, sample: Option<u32>) -> bool {
+    let cached = BELIEFS.standard_proven(ticket, wid);
+    let standard = cached || read_standard_window(ticket.pid, wid);
+    if standard && !cached {
+        BELIEFS.remember_standard(ticket, wid);
+    }
+    standard_window_with(standard, || {
+        check_window_focus_conflict_with_sample(ticket.pid, wid, None, sample)
+    })
+}
+
+fn read_standard_window(pid: i32, wid: u32) -> bool {
     unsafe {
         let app = AXUIElementCreateApplication(pid);
         if app.is_null() {
@@ -25,7 +37,7 @@ pub(super) fn is_proven_standard_window(pid: i32, wid: u32) -> bool {
             CFRelease(window as CFTypeRef);
         }
         CFRelease(app as CFTypeRef);
-        standard_window_with(standard, || check_window_focus_conflict(pid, wid, None))
+        standard
     }
 }
 

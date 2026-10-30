@@ -208,7 +208,11 @@ impl Tool for PidOnlyWindowTargetGuard {
             self.snapshot_resolver.clone(),
             args.get("snapshot_id")
                 .and_then(Value::as_str)
-                .map(str::to_owned),
+                .map(|handle| {
+                    crate::window_basis::parse_basis_id(handle)
+                        .map(|(id, _)| crate::element_token::format_snapshot_id(id))
+                        .unwrap_or_else(|| handle.to_owned())
+                }),
         ) {
             if let Some(window_id) = resolver(pid, &handle) {
                 if let Some(object) = args.as_object_mut() {
@@ -806,6 +810,12 @@ mod visibility_tests {
             .with_snapshot_resolver(resolver);
         let result = guard
             .invoke(serde_json::json!({"pid": 5, "element_index": 12, "snapshot_id": "s00000004"}))
+            .await;
+        assert_ne!(result.is_error, Some(true));
+        assert_eq!(seen.load(Ordering::SeqCst), 8395475);
+        seen.store(0, Ordering::SeqCst);
+        let result = guard
+            .invoke(serde_json::json!({"pid":5,"x":1,"y":2,"snapshot_id":"s00000004.f3"}))
             .await;
         assert_ne!(result.is_error, Some(true));
         assert_eq!(seen.load(Ordering::SeqCst), 8395475);
