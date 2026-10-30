@@ -2296,12 +2296,6 @@
       "input_schema": {
         "additionalProperties": false,
         "properties": {
-          "duration_ms": {
-            "description": "Key-down hold in milliseconds. Omission uses the configured key gap.",
-            "maximum": 30000,
-            "minimum": 0,
-            "type": "integer"
-          },
           "keys": {
             "items": {
               "type": "string"
@@ -4267,12 +4261,6 @@
       "input_schema": {
         "additionalProperties": false,
         "properties": {
-          "duration_ms": {
-            "description": "Key-down hold in milliseconds. Omission uses the configured key gap.",
-            "maximum": 30000,
-            "minimum": 0,
-            "type": "integer"
-          },
           "key": {
             "type": "string"
           },

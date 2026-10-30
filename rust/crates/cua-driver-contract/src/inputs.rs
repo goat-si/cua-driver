@@ -143,22 +143,6 @@ fn drag_duration_schema(_: &mut SchemaGenerator) -> Schema {
     json_schema!({ "type": "integer", "minimum": 0, "maximum": 10000 })
 }
 
-fn key_duration_schema(_: &mut SchemaGenerator) -> Schema {
-    json_schema!({ "type": "integer", "minimum": 0, "maximum": 30000 })
-}
-
-fn key_duration<'de, D: serde::Deserializer<'de>>(
-    deserializer: D,
-) -> Result<Option<u64>, D::Error> {
-    let duration = u64::deserialize(deserializer)?;
-    if duration > 30_000 {
-        return Err(serde::de::Error::custom(
-            "duration_ms must be between 0 and 30000",
-        ));
-    }
-    Ok(Some(duration))
-}
-
 fn drag_steps_schema(_: &mut SchemaGenerator) -> Schema {
     json_schema!({ "type": "integer", "minimum": 1, "maximum": 200 })
 }
@@ -1097,14 +1081,6 @@ impl ToolInput for ClipboardWriteInput {
 #[serde(deny_unknown_fields)]
 pub struct PressKeyInput {
     pub key: String,
-    /// Key-down hold in milliseconds. Omission uses the configured key gap.
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        deserialize_with = "key_duration"
-    )]
-    #[schemars(schema_with = "key_duration_schema")]
-    pub duration_ms: Option<u64>,
     /// Preferred per-call target: an exact window (`kind="window"`, `pid`, `window_id`) or the
     /// primary desktop (`kind="desktop"`, `display_id="primary"`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1137,14 +1113,6 @@ pub struct HotkeyInput {
     #[schemars(length(min = 2))]
     #[serde(deserialize_with = "at_least_two_keys")]
     pub keys: Vec<String>,
-    /// Key-down hold in milliseconds. Omission uses the configured key gap.
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        deserialize_with = "key_duration"
-    )]
-    #[schemars(schema_with = "key_duration_schema")]
-    pub duration_ms: Option<u64>,
     /// Preferred per-call target: an exact window (`kind="window"`, `pid`, `window_id`) or the
     /// primary desktop (`kind="desktop"`, `display_id="primary"`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1181,43 +1149,6 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-
-    #[test]
-    fn key_duration_contract_accepts_bounds_and_rejects_invalid_values() {
-        let mut outcomes = Vec::new();
-        for value in [json!(0), json!(30000)] {
-            let press = serde_json::from_value::<PressKeyInput>(json!({
-                "key": "a", "duration_ms": value
-            }))
-            .is_ok();
-            let hotkey = serde_json::from_value::<HotkeyInput>(json!({
-                "keys": ["cmd", "a"], "duration_ms": value
-            }))
-            .is_ok();
-            outcomes.push((value, press, hotkey));
-        }
-        for value in [json!(-1), json!(30001), json!(1.5)] {
-            let press = serde_json::from_value::<PressKeyInput>(json!({
-                "key": "a", "duration_ms": value
-            }))
-            .is_ok();
-            let hotkey = serde_json::from_value::<HotkeyInput>(json!({
-                "keys": ["cmd", "a"], "duration_ms": value
-            }))
-            .is_ok();
-            outcomes.push((value, press, hotkey));
-        }
-        assert_eq!(
-            outcomes,
-            vec![
-                (json!(0), true, true),
-                (json!(30000), true, true),
-                (json!(-1), false, false),
-                (json!(30001), false, false),
-                (json!(1.5), false, false),
-            ]
-        );
-    }
 
     /// Found by the tool-call boundary fuzzer: the published schema and every
     /// platform runtime require at least two keys, but the contract parser
