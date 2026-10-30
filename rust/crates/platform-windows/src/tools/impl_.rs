@@ -441,6 +441,7 @@ fn pid_window_target_candidates(pid: i64) -> Vec<WindowTargetCandidate> {
 
 struct ExactPidWindowTargetGuard {
     inner: Box<dyn Tool>,
+    snapshot_resolver: cua_driver_core::window_target::SnapshotWindowResolver,
 }
 
 fn exact_window_ownership_result(
@@ -514,6 +515,31 @@ impl Tool for ExactPidWindowTargetGuard {
             return invalid_basis_arguments();
         }
 
+        if crate::basis_decision::select_click_basis(&self.inner.def().name, &args)
+            == crate::basis_decision::BasisSelection::Basis
+            && args.get("window_id").is_none_or(Value::is_null)
+        {
+            if let (Some(pid), Some(id)) = (
+                args.get("pid").and_then(Value::as_i64),
+                args.get("snapshot_id").and_then(Value::as_str),
+            ) {
+                let found =
+                    cua_driver_core::window_basis::parse_basis_id(id).and_then(|(id, _)| {
+                        (self.snapshot_resolver)(
+                            pid,
+                            &cua_driver_core::element_token::format_snapshot_id(id),
+                        )
+                    });
+                if found.is_none() {
+                    return cua_driver_core::window_basis::basis_refusal(
+                        "stale_basis",
+                        "unknown_snapshot",
+                        None,
+                        None,
+                    );
+                }
+            }
+        }
         if args.get("scope").and_then(Value::as_str) != Some("desktop") {
             if let (Some(pid), Some(window_id)) = (
                 args.get("pid").and_then(Value::as_u64),
@@ -553,6 +579,7 @@ fn pid_window_guarded<T: Tool + 'static>(
     (candidates, token_pid_resolver, snapshot_resolver): &PidWindowGuardParts,
 ) -> Box<dyn Tool> {
     Box::new(ExactPidWindowTargetGuard {
+        snapshot_resolver: snapshot_resolver.clone(),
         inner: Box::new(
             PidOnlyWindowTargetGuard::new(Box::new(tool), candidates.clone())
                 .with_token_pid_resolver(token_pid_resolver.clone())
@@ -3456,6 +3483,7 @@ async fn basis_click(state: &ToolState, tool: &str, args: &Value) -> Option<Tool
         })
         .unwrap_or_default();
     let unavailable = crate::input::delivery::is_winui3_target_window(hwnd)
+        || crate::input::has_chromium_descendant(hwnd)
         || crate::input::delivery::would_be_silently_dropped(
             hwnd,
             crate::input::delivery::EventKind::MouseClick,
@@ -3487,6 +3515,7 @@ async fn basis_click(state: &ToolState, tool: &str, args: &Value) -> Option<Tool
         }
     };
     let button = button.to_owned();
+    crate::recording_hooks::capture_dispatch_click_target(hwnd, pid as u32, sx32, sy32);
     let cursor_key = resolve_cursor_key(args);
     pin_overlay_above(&cursor_key, hwnd);
     overlay_glide_to(&cursor_key, sx as f64, sy as f64).await;

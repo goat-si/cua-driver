@@ -651,3 +651,25 @@ return save.element_token;"#,
     assert_eq!(click["element_token"], "s00000009:2");
     assert!(click.get("role").is_none() && click.get("label").is_none());
 }
+
+#[tokio::test]
+async fn click_entry_points_forward_point_basis() {
+    let harness = Harness::new();
+    let result = harness
+        .run(
+            r#"
+        const app = await cua.getApp('Notes');
+        await app.click({x: 1, y: 2, snapshot_id: 's00000009.f3'});
+        await app.doubleClick({x: 1, y: 2, snapshot_id: 's00000009.f3'});
+        await app.rightClick({x: 1, y: 2, snapshot_id: 's00000009.f3'});
+    "#,
+        )
+        .await;
+    assert_ne!(result.is_error, Some(true), "{result:?}");
+    let calls = harness.calls.lock().unwrap();
+    for name in ["click", "double_click", "right_click"] {
+        let (_, args) = calls.iter().find(|(tool, _)| tool == name).unwrap();
+        assert_eq!(args["snapshot_id"], "s00000009.f3");
+        assert_eq!((args["x"].as_i64(), args["y"].as_i64()), (Some(1), Some(2)));
+    }
+}

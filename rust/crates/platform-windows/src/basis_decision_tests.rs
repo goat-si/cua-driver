@@ -72,5 +72,23 @@ fn click_argument_wiring_selects_basis_and_refuses_conflicts() {
             ),
             super::basis_decision::BasisSelection::Invalid
         );
+        for conflict in [
+            json!({"element_token":"s00000001:1"}),
+            json!({"capture_id":"c"}),
+            json!({"from_zoom":true}),
+        ] {
+            let mut args = json!({"snapshot_id":"s00000001.f1","x":1,"y":2});
+            args.as_object_mut()
+                .unwrap()
+                .extend(conflict.as_object().unwrap().clone());
+            assert_eq!(
+                super::basis_decision::select_click_basis(tool, &args),
+                BasisSelection::Invalid
+            );
+        }
+        assert_eq!(
+            super::basis_decision::select_click_basis(tool, &json!({"x":1,"y":2})),
+            BasisSelection::Legacy
+        );
     }
 }

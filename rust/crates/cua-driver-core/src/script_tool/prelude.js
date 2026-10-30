@@ -81,6 +81,14 @@
     throw new Error(`cannot target ${show(value)}`);
   };
 
+  const clickTarget = (app, value) => {
+    const out = target(app, value);
+    if (value && typeof value === "object" && !Array.isArray(value) && value.snapshot_id !== undefined) {
+      out.snapshot_id = value.snapshot_id;
+    }
+    return out;
+  };
+
   const keysOf = (keys) =>
     Array.isArray(keys) ? keys : String(keys).split("+").map((key) => key.trim()).filter(Boolean);
 
@@ -126,13 +134,13 @@
       });
     }
     async click(on, options = {}) {
-      return call("click", { ...this.where(), ...target(this, on), ...options });
+      return call("click", { ...this.where(), ...clickTarget(this, on), ...options });
     }
     async doubleClick(on, options = {}) {
-      return call("double_click", { ...this.where(), ...target(this, on), ...options });
+      return call("double_click", { ...this.where(), ...clickTarget(this, on), ...options });
     }
     async rightClick(on, options = {}) {
-      return call("right_click", { ...this.where(), ...target(this, on), ...options });
+      return call("right_click", { ...this.where(), ...clickTarget(this, on), ...options });
     }
     async typeText(text, on, options = {}) {
       return call("type_text", { ...this.where(), ...target(this, on), text: String(text), ...options });
