@@ -10,6 +10,7 @@
 
 pub mod ax_actions;
 pub mod electron_drag;
+pub(crate) mod hid_history;
 pub mod hover;
 pub mod interactive;
 mod key_belief;

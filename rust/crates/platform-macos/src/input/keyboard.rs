@@ -748,7 +748,11 @@ pub(super) fn post_global_key(
         .map_err(|_| anyhow::anyhow!("CGEvent keyboard event creation failed"))?;
     event.set_flags(flags);
     super::tag_synthetic_event(&event);
-    event.post(tap);
+    if matches!(tap, core_graphics::event::CGEventTapLocation::HID) {
+        super::hid_history::post(|| event.post(tap));
+    } else {
+        event.post(tap);
+    }
     Ok(())
 }
 
@@ -763,7 +767,11 @@ fn release_global_modifiers(
         if let Ok(event) = CGEvent::new_keyboard_event(source.clone(), key_code, false) {
             event.set_flags(active_flags);
             super::tag_synthetic_event(&event);
-            event.post(tap);
+            if matches!(tap, core_graphics::event::CGEventTapLocation::HID) {
+                super::hid_history::post(|| event.post(tap));
+            } else {
+                event.post(tap);
+            }
         }
         key_gap_sleep();
     }
@@ -966,9 +974,9 @@ pub fn type_text_global_with_guard(
                     reason: format!("desktop key event construction failed: {error}"),
                 })
             })?;
-                down.post(CGEventTapLocation::HID);
+                super::hid_history::post(|| down.post(CGEventTapLocation::HID));
                 key_gap_sleep();
-                up.post(CGEventTapLocation::HID);
+                super::hid_history::post(|| up.post(CGEventTapLocation::HID));
                 posted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 std::thread::sleep(
                     std::time::Duration::from_millis(inter_char_delay_ms).max(key_gap()),
@@ -990,9 +998,9 @@ pub fn type_text_global_with_guard(
                     reason: format!("desktop key event construction failed: {error}"),
                 })
             })?;
-            down.post(CGEventTapLocation::HID);
+            super::hid_history::post(|| down.post(CGEventTapLocation::HID));
             key_gap_sleep();
-            up.post(CGEventTapLocation::HID);
+            super::hid_history::post(|| up.post(CGEventTapLocation::HID));
             posted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             key_gap_sleep();
             Ok(())
@@ -1024,7 +1032,7 @@ pub fn type_text_physical_global(text: &str, inter_char_delay_ms: u64) -> anyhow
             .map(|event| create_bare_keyboard_event(event.key_code, event.key_down))
             .collect::<anyhow::Result<Vec<_>>>()?;
         for cg_event in native_events {
-            cg_event.post(CGEventTapLocation::HID);
+            super::hid_history::post(|| cg_event.post(CGEventTapLocation::HID));
             key_gap_sleep();
         }
         let extra = std::time::Duration::from_millis(inter_char_delay_ms).saturating_sub(key_gap());
@@ -1069,7 +1077,7 @@ pub fn press_key_bare_global(key: &str, modifiers: &[&str]) -> anyhow::Result<()
         })
         .collect::<anyhow::Result<Vec<_>>>()?;
     for event in events {
-        event.post(CGEventTapLocation::HID);
+        super::hid_history::post(|| event.post(CGEventTapLocation::HID));
         key_gap_sleep();
     }
     Ok(())

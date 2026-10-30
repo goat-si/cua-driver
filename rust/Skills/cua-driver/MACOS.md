@@ -18,6 +18,29 @@ you (no cursor warp, no Space switch, no window raise) stops
 mattering: you just shipped the Accessibility Inspector with extra
 steps.
 
+For a background left pixel click addressed by pid and window ID, the driver
+posts one down/up pair per requested click, with increasing click state and a
+short gap between pairs. Delivery remains unverifiable unless read-back
+confirms an effect. Focus restoration runs separately and waits for tracked
+actions to finish and a 50 ms quiet interval. Browser tools and
+`get_browser_state` are tracked because they can reconnect or launch a
+browser; `page` setup (`enable_javascript_apple_events`) is tracked while it
+quits the browser and patches preferences, but the subsequent relaunch can
+outlive that call. `insert_text`, `type_keystrokes`, and targeted
+`execute_javascript` are tracked because they can open a connection. Other
+admitted `page` actions do not hold the wait open.
+Restoration retains the original app
+across later actions, and is abandoned on physical user input, a frontmost
+app other than the original or target, or a two-second timeout. A target
+activation alone does not abandon it. The next input or observation result
+for the last target pid in a click chain reports the outcome once. A panic
+is reported as `status:"abandoned", reason:"panic"`; a click that joins a
+hand-back already attempted without confirmation reports `reason:"unconfirmed"`.
+If the target process start stamp cannot be read, no outcome note is delivered.
+An admission that cannot acquire the restoration commit lock within two
+seconds returns `pixel_restore_pending` before dispatch. This can also refuse
+`get_browser_state`; its admission restarts the 50 ms quiet interval.
+
 Before running any shell command, ask: **"does this raise,
 activate, foreground, or make-key any app?"** If yes, don't run it.
 Every one of the commands below activates the target on macOS and

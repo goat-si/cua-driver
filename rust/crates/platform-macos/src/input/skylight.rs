@@ -2307,6 +2307,7 @@ pub fn restore_focus_after_without_raise(
     previous_key_wid: Option<u32>,
     target_pid: pid_t,
     target_wid: u32,
+    may_post: impl Fn() -> bool,
 ) -> bool {
     let Some(post_fn) = post_event_record_to_fn() else {
         return false;
@@ -2322,17 +2323,59 @@ pub fn restore_focus_after_without_raise(
         return false;
     }
 
-    let mut buf = focus_record(target_wid);
-    buf[0x8A] = 0x02;
-    let defocus_ok =
-        note_post_status(unsafe { post_fn(target_psn.as_ptr() as *const c_void, buf.as_ptr()) });
+    guarded_focus_posts(
+        may_post,
+        || {
+            let mut buf = focus_record(target_wid);
+            buf[0x8A] = 0x02;
+            note_post_status(unsafe { post_fn(target_psn.as_ptr() as *const c_void, buf.as_ptr()) })
+        },
+        || {
+            let mut buf = focus_record(previous_wid);
+            buf[0x8A] = 0x01;
+            note_post_status(unsafe {
+                post_fn(previous_psn.as_ptr() as *const c_void, buf.as_ptr())
+            })
+        },
+    )
+}
 
-    let mut buf = focus_record(previous_wid);
-    buf[0x8A] = 0x01;
-    let focus_ok =
-        note_post_status(unsafe { post_fn(previous_psn.as_ptr() as *const c_void, buf.as_ptr()) });
-
+fn guarded_focus_posts(
+    may_post: impl Fn() -> bool,
+    defocus: impl FnOnce() -> bool,
+    focus: impl FnOnce() -> bool,
+) -> bool {
+    if !may_post() {
+        return false;
+    }
+    let defocus_ok = defocus();
+    if !may_post() {
+        return false;
+    }
+    let focus_ok = focus();
     defocus_ok && focus_ok
+}
+
+#[cfg(test)]
+#[test]
+fn pixel_focus_posts_stop_after_takeover_between_posts() {
+    use std::cell::Cell;
+    let fresh = Cell::new(true);
+    let posts = Cell::new(0);
+    let result = guarded_focus_posts(
+        || fresh.get(),
+        || {
+            posts.set(posts.get() + 1);
+            fresh.set(false);
+            true
+        },
+        || {
+            posts.set(posts.get() + 1);
+            true
+        },
+    );
+    assert!(!result);
+    assert_eq!(posts.get(), 1);
 }
 
 /// The 248-byte focus/defocus event record with `wid` stamped little-endian at
