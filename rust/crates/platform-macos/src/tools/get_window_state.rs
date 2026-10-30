@@ -156,6 +156,11 @@ fn def() -> &'static ToolDef {
                     "enum": ["png", "jpeg"],
                     "description": "Encoding of the returned screenshot. Default \"png\". \"jpeg\" is smaller, drops alpha, and mints no capture_id (capture_id-bound tools need a PNG read); pixel coordinates are unchanged."
                 },
+                "screenshot_fit": {
+                    "type": "string",
+                    "enum": ["native", "model"],
+                    "description": "Default \"native\": the capture at its own pixel size, limited only by max_dimension and the configured ceiling. \"model\": point resolution (the window's pixels divided by its backing scale), the long side capped at 2048 and the short side at 768, never enlarged, JPEG at quality 80 unless screenshot_format or screenshot_quality say otherwise. It is the smallest image that keeps a window readable, and the cheapest to encode and send. Pixel coordinates for click map back to the window through the returned size."
+                },
                 "screenshot_quality": {
                     "type": "integer",
                     "minimum": 1,
@@ -213,6 +218,31 @@ fn published_read_frame<B>(
     screenshot: Option<(B, (u32, u32))>,
 ) -> Option<(B, (u32, u32))> {
     screenshot.filter(|_| published)
+}
+
+/// The screenshot encoding for the call. The model-sized screenshot is JPEG
+/// at quality 80 unless the caller chose a format (or only a quality).
+fn screenshot_encoding(
+    fit_model: bool,
+    format: Option<&Value>,
+    quality: Option<&Value>,
+) -> Result<cua_driver_core::image_utils::ScreenshotEncoding, String> {
+    let jpeg = serde_json::json!("jpeg");
+    let q80 = serde_json::json!(80);
+    let (format, quality) = if fit_model {
+        (
+            format.or(Some(&jpeg)),
+            quality.or_else(|| format.is_none().then_some(&q80)),
+        )
+    } else {
+        (format, quality)
+    };
+    cua_driver_core::image_utils::ScreenshotEncoding::from_args(
+        "screenshot_format",
+        format,
+        "screenshot_quality",
+        quality,
+    )
 }
 
 fn verified_capture(
@@ -509,10 +539,24 @@ impl Tool for GetWindowStateTool {
             .get("max_image_dimension")
             .and_then(|v| v.as_u64())
             .map(|v| v as u32);
-        let encoding = match cua_driver_core::image_utils::ScreenshotEncoding::from_args(
-            "screenshot_format",
+        let fit_model = match args.get("screenshot_fit").and_then(|v| v.as_str()) {
+            None | Some("native") => false,
+            Some("model") => true,
+            Some(other) => {
+                let detail =
+                    format!("screenshot_fit must be \"native\" or \"model\", got \"{other}\"");
+                return ToolResult::error(format!("get_window_state: {detail}")).with_structured(
+                    serde_json::json!({
+                        "code": "invalid_arguments",
+                        "tool": "get_window_state",
+                        "detail": detail,
+                    }),
+                );
+            }
+        };
+        let encoding = match screenshot_encoding(
+            fit_model,
             args.get("screenshot_format"),
-            "screenshot_quality",
             args.get("screenshot_quality"),
         ) {
             Ok(encoding) => encoding,
@@ -720,7 +764,21 @@ impl Tool for GetWindowStateTool {
                 )?;
                 // Resize and encode once from the raw pixels; the PNG bytes
                 // are identical to the former encode-decode-resize round trip.
-                let (png, w, h) = raw.encode(max_dim, encoding).map_err(|e| {
+                // The model-sized screenshot is capped at point resolution by
+                // 2048 x 768 (never enlarged), and the tighter of that and any
+                // other ceiling wins.
+                let (cap, filter) = if fit_model {
+                    let fit = cua_driver_core::image_utils::model_fit_long_edge(
+                        orig_w, orig_h, scale,
+                    );
+                    (
+                        if max_dim == 0 { fit } else { fit.min(max_dim) },
+                        image::imageops::FilterType::Triangle,
+                    )
+                } else {
+                    (max_dim, image::imageops::FilterType::Lanczos3)
+                };
+                let (png, w, h) = raw.encode_with(cap, encoding, filter).map_err(|e| {
                     super::px_frame::PxFrameError::CaptureUnavailable {
                         window_id,
                         reason: e.to_string(),
@@ -2896,5 +2954,35 @@ mod tests {
             "observation-only entries must not emit unregistered element_token: {}",
             entries[0]
         );
+    }
+
+    #[test]
+    fn a_model_sized_screenshot_defaults_to_jpeg_80_and_honours_what_the_caller_chose() {
+        use cua_driver_core::image_utils::ScreenshotEncoding as E;
+        let png = serde_json::json!("png");
+        let jpeg = serde_json::json!("jpeg");
+        let q90 = serde_json::json!(90);
+        assert_eq!(screenshot_encoding(false, None, None), Ok(E::Png));
+        assert_eq!(
+            screenshot_encoding(true, None, None),
+            Ok(E::Jpeg { quality: 80 })
+        );
+        assert_eq!(
+            screenshot_encoding(true, None, Some(&q90)),
+            Ok(E::Jpeg { quality: 90 })
+        );
+        assert_eq!(screenshot_encoding(true, Some(&png), None), Ok(E::Png));
+        assert_eq!(
+            screenshot_encoding(true, Some(&jpeg), None),
+            Ok(E::Jpeg { quality: 85 }),
+            "an explicit format keeps the format's own default quality"
+        );
+        assert!(screenshot_encoding(true, Some(&png), Some(&q90)).is_err());
+    }
+
+    #[test]
+    fn the_schema_advertises_the_model_fit() {
+        let props = &def().input_schema["properties"]["screenshot_fit"];
+        assert_eq!(props["enum"], serde_json::json!(["native", "model"]));
     }
 }

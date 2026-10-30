@@ -346,6 +346,12 @@ impl Tool for TypeTextTool {
             }
         });
         let delivery_mode = super::DeliveryMode::parse(args.opt_str("delivery_mode").as_deref());
+        // The person is working in this app: nothing is sent.
+        if !delivery_mode.is_foreground() {
+            if let Err(refusal) = super::gate_user_takeover(pid, window_id) {
+                return refusal;
+            }
+        }
         if replace && crate::input::keyboard::is_screen_sharing_pid(pid) {
             return super::invalid_arguments(
                 "type_text replace:true is not supported for Screen Sharing because whole-field replacement cannot be verified.",

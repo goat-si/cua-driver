@@ -493,6 +493,51 @@ pub(crate) fn gate_foreground_physical_idle(
     )
 }
 
+/// Whether the person is working in the app an action targets: its app is
+/// frontmost and their last physical input is within `threshold_ms`. Pure, so
+/// the rule is tested without a desktop. `Some(idle_ms)` means refuse.
+pub(crate) fn user_takeover_idle(
+    target_is_front: Option<bool>,
+    observed_idle_ms: Option<u64>,
+    threshold_ms: u64,
+) -> Option<u64> {
+    if threshold_ms == 0 || target_is_front != Some(true) {
+        return None;
+    }
+    observed_idle_ms.filter(|idle| *idle < threshold_ms)
+}
+
+/// Refuse a background action while the person is using the target app: the
+/// app is frontmost and they typed or moved the pointer a moment ago. Nothing
+/// is sent. An app that is not frontmost (the person is elsewhere) is never
+/// refused, and neither is an unreadable state.
+pub(crate) fn gate_user_takeover(
+    pid: i32,
+    window_id: Option<u32>,
+) -> Result<(), cua_driver_core::protocol::ToolResult> {
+    let threshold = cua_driver_core::delivery::user_takeover_threshold_ms();
+    if threshold == 0 {
+        return Ok(());
+    }
+    let idle = physical_input_idle_ms();
+    // The front app is read only when there was recent input to refuse for.
+    if idle.is_none_or(|idle| idle >= threshold) {
+        return Ok(());
+    }
+    let front = match window_id {
+        Some(wid) => crate::input::skylight::front_process_matches(pid as libc::pid_t, wid),
+        None => Some(crate::apps::frontmost_pid() == Some(pid)),
+    };
+    match user_takeover_idle(front, idle, threshold) {
+        Some(idle_ms) => Err(cua_driver_core::delivery::user_interacting_result(
+            idle_ms,
+            threshold,
+            serde_json::json!({ "pid": pid, "window_id": window_id }),
+        )),
+        None => Ok(()),
+    }
+}
+
 /// Convert a pure background-input refusal into the structured refusal result
 /// shape shared by exact-target tools: `code`, `effect: "refused"`, the
 /// requested target, and the safe next route when one exists. No actuator ran.
@@ -2121,5 +2166,29 @@ mod wave400f2_registry_tests {
             .expect("menu_bar_extras");
         assert!(extras["inputSchema"]["properties"]["pid"].is_object());
         assert!(extras["inputSchema"]["properties"]["window_id"].is_null());
+    }
+}
+
+#[cfg(test)]
+mod user_takeover_tests {
+    use super::user_takeover_idle;
+
+    /// Refuse only when the person is in the target app and typed or moved a
+    /// moment ago.
+    #[test]
+    fn the_person_using_the_target_app_is_refused_and_nobody_else() {
+        // In the app, input 200 ms ago, threshold 750: refuse.
+        assert_eq!(user_takeover_idle(Some(true), Some(200), 750), Some(200));
+        // Input long ago: the person is not at the keyboard.
+        assert_eq!(user_takeover_idle(Some(true), Some(750), 750), None);
+        assert_eq!(user_takeover_idle(Some(true), Some(60_000), 750), None);
+        // Another app is in front (the person is elsewhere): never refused,
+        // whatever their input.
+        assert_eq!(user_takeover_idle(Some(false), Some(10), 750), None);
+        // Unreadable front or idle time: nothing is refused on a guess.
+        assert_eq!(user_takeover_idle(None, Some(10), 750), None);
+        assert_eq!(user_takeover_idle(Some(true), None, 750), None);
+        // A zero threshold turns the refusal off.
+        assert_eq!(user_takeover_idle(Some(true), Some(0), 0), None);
     }
 }
