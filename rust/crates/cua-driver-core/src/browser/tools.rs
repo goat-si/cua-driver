@@ -314,10 +314,24 @@ pub(crate) async fn browser_protected_resource_scope(
     let runtime_session = crate::tool::current_dispatch_authorization_context()
         .map(|context| context.runtime_session_key(session))
         .unwrap_or_else(|| session.to_owned());
+    let scope = super::origin_scope::OriginScope::from_args(args)?;
+    if tool_name == "browser_navigate" {
+        if let Some(destination) = args.get("url").and_then(Value::as_str) {
+            super::origin_scope::authorize_navigation_destination(scope.as_ref(), destination)
+                .map_err(BrowserRefusal::into_scope_error)?;
+        }
+    }
+    // Scope refusals keep their browser code through consent admission and
+    // the re-proof before dispatch; other failures keep today's messages.
     let (validated, live_origin) = engine
-        .attest_protected_tab(&runtime_session, target_id, tab_id)
+        .attest_protected_tab(&runtime_session, target_id, tab_id, scope.as_ref())
         .await
-        .map_err(|error| error.message)?;
+        .map_err(|refusal| match refusal.code {
+            BrowserRefusalCode::BrowserOriginOutsideScope
+            | BrowserRefusalCode::BrowserOriginScopeRequired
+            | BrowserRefusalCode::BrowserBatchRefused => refusal.into_scope_error(),
+            _ => refusal.message,
+        })?;
     let target = validated.record;
     let tab = validated.tab;
     let requested_origin = if tool_name == "browser_navigate" {
@@ -415,6 +429,27 @@ pub struct GetBrowserStateTool {
     engine: Arc<BrowserEngine>,
 }
 
+/// Argument checks of snapshot mode that need no browser state, run before
+/// the document proof so a malformed call fails without touching the tab.
+fn validate_snapshot_arguments(args: &Value) -> Result<(), ToolResult> {
+    if args
+        .get("include_screenshot")
+        .is_some_and(|value| !value.is_boolean())
+    {
+        return Err(ToolResult::error(
+            "Field include_screenshot has wrong type: expected boolean",
+        ));
+    }
+    if let Some(format) = args.opt_str("snapshot_format") {
+        if format != "dom_refs_v1" && format != "semantic_v2" {
+            return Err(ToolResult::error(format!(
+                "snapshot_format must be \"dom_refs_v1\" or \"semantic_v2\", got {format:?}"
+            )));
+        }
+    }
+    Ok(())
+}
+
 impl GetBrowserStateTool {
     pub fn new(engine: Arc<BrowserEngine>) -> Self {
         let def = ToolDef {
@@ -436,6 +471,7 @@ impl GetBrowserStateTool {
                     "target_id": schema_target_id(),
                     "tab_id": schema_tab_id(),
                     "session": schema_session(),
+                    "origin_scope": super::origin_scope::schema(),
                     "snapshot_format": {
                         "type": "string",
                         "enum": ["dom_refs_v1", "semantic_v2"],
@@ -470,106 +506,72 @@ impl GetBrowserStateTool {
     }
 }
 
-#[async_trait]
-impl Tool for GetBrowserStateTool {
-    fn def(&self) -> &ToolDef {
-        &self.def
-    }
-
-    async fn protected_resource_ownership(
+impl GetBrowserStateTool {
+    /// Snapshot mode after the caller proved the document (when a scope or a
+    /// capability manifest applies). `require_document_identity` ties cached
+    /// semantic continuations to that proved document.
+    async fn snapshot_mode(
         &self,
-        adapter_id: &str,
         args: &Value,
-    ) -> ProtectedResourceOwnership {
-        if adapter_id == "private_observation" {
-            browser_resource_ownership(&self.engine, args)
-        } else {
-            ProtectedResourceOwnership::UserOwned
-        }
-    }
-
-    async fn protected_resource_scope(
-        &self,
-        adapter_id: &str,
-        args: &Value,
-    ) -> Result<Option<Value>, String> {
-        if adapter_id == "private_observation"
-            && args.get("target_id").and_then(Value::as_str).is_some()
-        {
-            browser_protected_resource_scope(&self.engine, args, "get_browser_state").await
-        } else {
-            Ok(None)
-        }
-    }
-
-    async fn invoke(&self, args: Value) -> ToolResult {
-        // Snapshot mode: target_id (+ tab_id) — uses existing capabilities.
-        if let Some(target_id) = args.opt_str("target_id") {
-            let session = match require_explicit_session(&args) {
-                Ok(s) => s,
-                Err(e) => return e,
-            };
-            let tab_id = match args.opt_str("tab_id") {
-                Some(t) => t,
-                None => {
-                    return BrowserRefusal::new(
-                        BrowserRefusalCode::BrowserTabRequired,
-                        "snapshot mode requires a tab_id from a prior bind",
-                    )
-                    .to_tool_result()
-                }
-            };
-            let snapshot_format = args
-                .opt_str("snapshot_format")
-                .unwrap_or_else(|| "dom_refs_v1".into());
-            let include_screenshot = match args.get("include_screenshot") {
-                None => false,
-                Some(Value::Bool(include)) => *include,
-                Some(_) => {
-                    return ToolResult::error(
-                        "Field include_screenshot has wrong type: expected boolean",
-                    )
-                }
-            };
-            if snapshot_format != "dom_refs_v1" && snapshot_format != "semantic_v2" {
-                return ToolResult::error(format!(
+        session: &str,
+        target_id: &str,
+        tab_id: &str,
+        require_document_identity: bool,
+    ) -> ToolResult {
+        let (session, target_id, tab_id) =
+            (session.to_owned(), target_id.to_owned(), tab_id.to_owned());
+        let snapshot_format = args
+            .opt_str("snapshot_format")
+            .unwrap_or_else(|| "dom_refs_v1".into());
+        let include_screenshot = match args.get("include_screenshot") {
+            None => false,
+            Some(Value::Bool(include)) => *include,
+            Some(_) => {
+                return ToolResult::error(
+                    "Field include_screenshot has wrong type: expected boolean",
+                )
+            }
+        };
+        if snapshot_format != "dom_refs_v1" && snapshot_format != "semantic_v2" {
+            return ToolResult::error(format!(
                     "snapshot_format must be \"dom_refs_v1\" or \"semantic_v2\", got {snapshot_format:?}"
                 ));
-            }
-            if snapshot_format == "dom_refs_v1"
-                && (args.opt_str("scope_ref").is_some()
-                    || args.opt_str("query").is_some()
-                    || args.opt_str("continuation").is_some())
+        }
+        if snapshot_format == "dom_refs_v1"
+            && (args.opt_str("scope_ref").is_some()
+                || args.opt_str("query").is_some()
+                || args.opt_str("continuation").is_some())
+        {
+            return ToolResult::error(
+                "scope_ref, query, and continuation require snapshot_format=\"semantic_v2\"",
+            );
+        }
+        if snapshot_format == "semantic_v2" {
+            let snapshot = match self
+                .engine
+                .snapshot_tab_semantic(
+                    &session,
+                    &target_id,
+                    &tab_id,
+                    args.opt_str("scope_ref").as_deref(),
+                    args.opt_str("query").as_deref(),
+                    args.opt_str("continuation").as_deref(),
+                    require_document_identity,
+                )
+                .await
             {
-                return ToolResult::error(
-                    "scope_ref, query, and continuation require snapshot_format=\"semantic_v2\"",
-                );
-            }
-            if snapshot_format == "semantic_v2" {
-                let snapshot = match self
-                    .engine
-                    .snapshot_tab_semantic(
-                        &session,
-                        &target_id,
-                        &tab_id,
-                        args.opt_str("scope_ref").as_deref(),
-                        args.opt_str("query").as_deref(),
-                        args.opt_str("continuation").as_deref(),
-                    )
-                    .await
-                {
-                    Ok(outcome) => {
-                        let refs = outcome
-                            .refs
-                            .iter()
-                            .map(semantic_ref_value)
-                            .collect::<Vec<_>>();
-                        let content_refs = outcome
-                            .content_refs
-                            .iter()
-                            .map(semantic_ref_value)
-                            .collect::<Vec<_>>();
-                        ToolResult::text(format!(
+                Ok(outcome) => {
+                    let refs = outcome
+                        .refs
+                        .iter()
+                        .map(semantic_ref_value)
+                        .collect::<Vec<_>>();
+                    let content_refs = outcome
+                        .content_refs
+                        .iter()
+                        .map(semantic_ref_value)
+                        .collect::<Vec<_>>();
+                    ToolResult::text(format!(
                             "semantic snapshot p{} of {}: {} action ref(s), {} content ref(s)",
                             outcome.snapshot_id,
                             outcome.url,
@@ -614,59 +616,6 @@ impl Tool for GetBrowserStateTool {
                                 "frames": outcome.oopif.frames(),
                             },
                         }))
-                    }
-                    Err(refusal) => return refusal.to_tool_result(),
-                };
-                if include_screenshot {
-                    return match self
-                        .engine
-                        .capture_tab_screenshot(&session, &target_id, &tab_id)
-                        .await
-                    {
-                        Ok(screenshot) => with_tab_screenshot(snapshot, screenshot),
-                        Err(refusal) => refusal.to_tool_result(),
-                    };
-                }
-                return snapshot;
-            }
-            let snapshot = match self
-                .engine
-                .snapshot_tab(&session, &target_id, &tab_id)
-                .await
-            {
-                Ok(outcome) => {
-                    let ref_list: Vec<Value> = outcome
-                        .refs
-                        .iter()
-                        .map(|(ext, entry)| {
-                            json!({
-                                "ref": ext,
-                                "node": entry.node_name,
-                                "label": entry.label,
-                                "frame": entry.frame.kind.as_str(),
-                            })
-                        })
-                        .collect();
-                    ToolResult::text(format!(
-                        "snapshot p{} of {}: {} interactive element(s)",
-                        outcome.snapshot_id,
-                        outcome.url,
-                        ref_list.len()
-                    ))
-                    .with_structured(json!({
-                        "status": "ok",
-                        "mode": "snapshot",
-                        "target_id": target_id,
-                        "tab_id": tab_id,
-                        "snapshot_id": format!("p{}", outcome.snapshot_id),
-                        "url": outcome.url,
-                        "refs": ref_list,
-                        "truncated": outcome.truncated,
-                        "oopif": {
-                            "status": outcome.oopif.as_str(),
-                            "frames": outcome.oopif.frames(),
-                        },
-                    }))
                 }
                 Err(refusal) => return refusal.to_tool_result(),
             };
@@ -681,6 +630,153 @@ impl Tool for GetBrowserStateTool {
                 };
             }
             return snapshot;
+        }
+        let snapshot = match self
+            .engine
+            .snapshot_tab(&session, &target_id, &tab_id)
+            .await
+        {
+            Ok(outcome) => {
+                let ref_list: Vec<Value> = outcome
+                    .refs
+                    .iter()
+                    .map(|(ext, entry)| {
+                        json!({
+                            "ref": ext,
+                            "node": entry.node_name,
+                            "label": entry.label,
+                            "frame": entry.frame.kind.as_str(),
+                        })
+                    })
+                    .collect();
+                ToolResult::text(format!(
+                    "snapshot p{} of {}: {} interactive element(s)",
+                    outcome.snapshot_id,
+                    outcome.url,
+                    ref_list.len()
+                ))
+                .with_structured(json!({
+                    "status": "ok",
+                    "mode": "snapshot",
+                    "target_id": target_id,
+                    "tab_id": tab_id,
+                    "snapshot_id": format!("p{}", outcome.snapshot_id),
+                    "url": outcome.url,
+                    "refs": ref_list,
+                    "truncated": outcome.truncated,
+                    "oopif": {
+                        "status": outcome.oopif.as_str(),
+                        "frames": outcome.oopif.frames(),
+                    },
+                }))
+            }
+            Err(refusal) => return refusal.to_tool_result(),
+        };
+        if include_screenshot {
+            return match self
+                .engine
+                .capture_tab_screenshot(&session, &target_id, &tab_id)
+                .await
+            {
+                Ok(screenshot) => with_tab_screenshot(snapshot, screenshot),
+                Err(refusal) => refusal.to_tool_result(),
+            };
+        }
+        return snapshot;
+    }
+}
+
+#[async_trait]
+impl Tool for GetBrowserStateTool {
+    fn def(&self) -> &ToolDef {
+        &self.def
+    }
+
+    async fn protected_resource_ownership(
+        &self,
+        adapter_id: &str,
+        args: &Value,
+    ) -> ProtectedResourceOwnership {
+        if adapter_id == "private_observation" {
+            browser_resource_ownership(&self.engine, args)
+        } else {
+            ProtectedResourceOwnership::UserOwned
+        }
+    }
+
+    async fn protected_resource_scope(
+        &self,
+        adapter_id: &str,
+        args: &Value,
+    ) -> Result<Option<Value>, String> {
+        if adapter_id == "private_observation"
+            && args.get("target_id").and_then(Value::as_str).is_some()
+        {
+            browser_protected_resource_scope(&self.engine, args, "get_browser_state").await
+        } else {
+            Ok(None)
+        }
+    }
+
+    async fn invoke(&self, args: Value) -> ToolResult {
+        let scope = match super::origin_scope::parse(&args) {
+            Ok(scope) => scope,
+            Err(error) => return error,
+        };
+        // Snapshot mode: target_id (+ tab_id) — uses existing capabilities.
+        if let Some(target_id) = args.opt_str("target_id") {
+            let session = match require_explicit_session(&args) {
+                Ok(s) => s,
+                Err(e) => return e,
+            };
+            let tab_id = match args.opt_str("tab_id") {
+                Some(t) => t,
+                None => {
+                    return BrowserRefusal::new(
+                        BrowserRefusalCode::BrowserTabRequired,
+                        "snapshot mode requires a tab_id from a prior bind",
+                    )
+                    .to_tool_result()
+                }
+            };
+            if let Err(error) = validate_snapshot_arguments(&args) {
+                return error;
+            }
+            let proof = match self
+                .engine
+                .prove_tab_document(&session, &target_id, &tab_id, scope.as_ref())
+                .await
+            {
+                Ok(proof) => proof,
+                Err(refusal) => return refusal.to_tool_result(),
+            };
+            let result = self
+                .snapshot_mode(&args, &session, &target_id, &tab_id, proof.is_some())
+                .await;
+            if result.is_error == Some(true)
+                || result
+                    .structured_content
+                    .as_ref()
+                    .is_some_and(|value| value["status"] == "refused")
+            {
+                return result;
+            }
+            // Nothing read from a document that changed or left the scope
+            // during the read is returned.
+            if let Err(refusal) = self
+                .engine
+                .confirm_tab_document(
+                    &session,
+                    &target_id,
+                    &tab_id,
+                    scope.as_ref(),
+                    proof.as_ref(),
+                )
+                .await
+            {
+                return refusal.to_tool_result();
+            }
+            return result;
         }
 
         // Bind mode: pid + window_id.
@@ -700,22 +796,46 @@ impl Tool for GetBrowserStateTool {
         let transport_session = args.opt_str("_transport_session_id");
         match self
             .engine
-            .bind_native(&session, transport_session.as_deref(), pid, window_id)
+            .bind_native(
+                &session,
+                transport_session.as_deref(),
+                pid,
+                window_id,
+                scope.as_ref(),
+            )
             .await
         {
             Ok((target_id, record)) => {
+                // With an origin scope, a tab whose address (read fresh from
+                // the browser by this bind) is outside the scope is listed by
+                // id and selection only: never its origin, address or title.
+                let in_scope = |url: &str| scope.as_ref().is_none_or(|scope| scope.allows_url(url));
                 let tabs: Vec<Value> = record
                     .tabs
                     .values()
                     .map(|t| {
-                        json!({
-                            "tab_id": t.tab_id,
-                            "title": t.title,
-                            "url": t.url,
-                            "active": t.active,
-                        })
+                        if in_scope(&t.url) {
+                            json!({
+                                "tab_id": t.tab_id,
+                                "title": t.title,
+                                "url": t.url,
+                                "active": t.active,
+                            })
+                        } else {
+                            json!({
+                                "tab_id": t.tab_id,
+                                "active": t.active,
+                            })
+                        }
                     })
                     .collect();
+                // The native window title is usually the selected tab's
+                // title: show it only when every tab is inside the scope.
+                let native_title = record
+                    .tabs
+                    .values()
+                    .all(|t| in_scope(&t.url))
+                    .then(|| record.native_title.clone());
                 let quality = match record.quality {
                     BindingQuality::Exact => "exact",
                     BindingQuality::Heuristic => "heuristic",
@@ -738,7 +858,7 @@ impl Tool for GetBrowserStateTool {
                     "endpoint_transport": record.endpoint_transport,
                     "endpoint_access_class": record.endpoint_access_class,
                     "mutation_allowed": record.quality == BindingQuality::Exact,
-                    "native_title": record.native_title,
+                    "native_title": native_title,
                     "tabs": tabs,
                 }))
             }
@@ -1007,6 +1127,7 @@ impl BrowserNavigateTool {
                     "tab_id": schema_tab_id(),
                     "url": { "type": "string", "description": "Destination URL (http:, https:, or about:)." },
                     "session": schema_session(),
+                    "origin_scope": super::origin_scope::schema(),
                 },
                 "required": ["target_id", "tab_id", "url"],
                 "additionalProperties": true
@@ -1051,6 +1172,10 @@ impl Tool for BrowserNavigateTool {
     }
 
     async fn invoke(&self, args: Value) -> ToolResult {
+        let scope = match super::origin_scope::parse(&args) {
+            Ok(scope) => scope,
+            Err(error) => return error,
+        };
         let (target_id, tab_id, url) = match (
             args.require_str("target_id"),
             args.require_str("tab_id"),
@@ -1072,6 +1197,11 @@ impl Tool for BrowserNavigateTool {
                 "browser_navigate only accepts http/https/about URLs, got: {url}"
             ));
         }
+        if let Err(refusal) =
+            super::origin_scope::authorize_navigation_destination(scope.as_ref(), &url)
+        {
+            return refusal.to_tool_result();
+        }
 
         let _mutation = match self
             .engine
@@ -1083,7 +1213,7 @@ impl Tool for BrowserNavigateTool {
         };
         let validated = match self
             .engine
-            .revalidate_for_mutation(&session, &target_id, Some(&tab_id))
+            .revalidate_for_mutation(&session, &target_id, Some(&tab_id), scope.as_ref())
             .await
         {
             Ok(v) => v,
@@ -1107,6 +1237,19 @@ impl Tool for BrowserNavigateTool {
                 self.engine
                     .store
                     .invalidate_tab_snapshots(&session, &target_id, &tab_id);
+                // Post-redirect check: the committed document must still be
+                // inside the call's scope and the manifest.
+                if let Err(refusal) = self
+                    .engine
+                    .confirm_navigation(
+                        &validated,
+                        result.get("loaderId").and_then(Value::as_str),
+                        scope.as_ref(),
+                    )
+                    .await
+                {
+                    return refusal.to_tool_result();
+                }
                 ToolResult::text(format!("navigated {tab_id} to {url}")).with_structured(json!({
                     "status": "ok",
                     "target_id": target_id,
@@ -1150,6 +1293,7 @@ impl BrowserClickTool {
                     "target_id": schema_target_id(),
                     "tab_id": schema_tab_id(),
                     "session": schema_session(),
+                    "origin_scope": super::origin_scope::schema(),
                     "ref": schema_ref(),
                     "x": { "type": "number", "description": "Viewport x (CSS px) — alternative to ref." },
                     "y": { "type": "number", "description": "Viewport y (CSS px) — alternative to ref." },
@@ -1208,6 +1352,10 @@ impl Tool for BrowserClickTool {
     }
 
     async fn invoke(&self, args: Value) -> ToolResult {
+        let scope = match super::origin_scope::parse(&args) {
+            Ok(scope) => scope,
+            Err(error) => return error,
+        };
         let (target_id, tab_id) = match (args.require_str("target_id"), args.require_str("tab_id"))
         {
             (Ok(t), Ok(tab)) => (t, tab),
@@ -1254,7 +1402,7 @@ impl Tool for BrowserClickTool {
         };
         let validated = match self
             .engine
-            .revalidate_for_mutation(&session, &target_id, Some(&tab_id))
+            .revalidate_for_mutation(&session, &target_id, Some(&tab_id), scope.as_ref())
             .await
         {
             Ok(v) => v,
@@ -1812,6 +1960,7 @@ impl BrowserTypeTool {
                     "target_id": schema_target_id(),
                     "tab_id": schema_tab_id(),
                     "session": schema_session(),
+                    "origin_scope": super::origin_scope::schema(),
                     "text": { "type": "string", "description": "Text to type." },
                     "ref": schema_ref(),
                     "mode": {
@@ -1873,6 +2022,10 @@ impl Tool for BrowserTypeTool {
     }
 
     async fn invoke(&self, args: Value) -> ToolResult {
+        let scope = match super::origin_scope::parse(&args) {
+            Ok(scope) => scope,
+            Err(error) => return error,
+        };
         let (target_id, tab_id, text) = match (
             args.require_str("target_id"),
             args.require_str("tab_id"),
@@ -1903,7 +2056,7 @@ impl Tool for BrowserTypeTool {
         };
         let validated = match self
             .engine
-            .revalidate_for_mutation(&session, &target_id, Some(&tab_id))
+            .revalidate_for_mutation(&session, &target_id, Some(&tab_id), scope.as_ref())
             .await
         {
             Ok(v) => v,
@@ -2414,6 +2567,7 @@ impl BrowserSelectTool {
                     "target_id": schema_target_id(),
                     "tab_id": schema_tab_id(),
                     "session": schema_session(),
+                    "origin_scope": super::origin_scope::schema(),
                     "ref": schema_ref(),
                     "label": {
                         "type": "string",
@@ -2467,6 +2621,10 @@ impl Tool for BrowserSelectTool {
     }
 
     async fn invoke(&self, args: Value) -> ToolResult {
+        let scope = match super::origin_scope::parse(&args) {
+            Ok(scope) => scope,
+            Err(error) => return error,
+        };
         let (target_id, tab_id, ext_ref) = match (
             args.require_str("target_id"),
             args.require_str("tab_id"),
@@ -2494,7 +2652,7 @@ impl Tool for BrowserSelectTool {
         };
         let validated = match self
             .engine
-            .revalidate_for_mutation(&session, &target_id, Some(&tab_id))
+            .revalidate_for_mutation(&session, &target_id, Some(&tab_id), scope.as_ref())
             .await
         {
             Ok(validated) => validated,
@@ -2609,6 +2767,7 @@ impl BrowserDialogTool {
                         "target_id": schema_target_id(),
                         "tab_id": schema_tab_id(),
                         "session": schema_session(),
+                        "origin_scope": super::origin_scope::schema(),
                         "action": { "type": "string", "enum": ["inspect", "accept", "dismiss"], "description": "inspect returns the current dialog and its dialog_id; accept or dismiss resolves that exact dialog." },
                         "dialog_id": { "type": "string", "description": "Opaque current dialog generation returned by action=inspect." },
                         "prompt_text": { "type": "string", "description": "Sensitive response text, valid only when accepting a prompt dialog." },
@@ -2669,6 +2828,10 @@ impl Tool for BrowserDialogTool {
     }
 
     async fn invoke(&self, args: Value) -> ToolResult {
+        let scope = match super::origin_scope::parse(&args) {
+            Ok(scope) => scope,
+            Err(error) => return error,
+        };
         let (target_id, tab_id, action) = match (
             args.require_str("target_id"),
             args.require_str("tab_id"),
@@ -2700,7 +2863,7 @@ impl Tool for BrowserDialogTool {
         };
         let validated = match self
             .engine
-            .revalidate_for_mutation(&session, &target_id, Some(&tab_id))
+            .revalidate_for_mutation(&session, &target_id, Some(&tab_id), scope.as_ref())
             .await
         {
             Ok(validated) => validated,
@@ -2823,6 +2986,7 @@ impl BrowserSetInputFilesTool {
                         "target_id": schema_target_id(),
                         "tab_id": schema_tab_id(),
                         "session": schema_session(),
+                        "origin_scope": super::origin_scope::schema(),
                         "ref": schema_ref(),
                         "files": {
                             "type": "array", "minItems": 1, "maxItems": 32,
@@ -2885,6 +3049,10 @@ impl Tool for BrowserSetInputFilesTool {
     }
 
     async fn invoke(&self, args: Value) -> ToolResult {
+        let scope = match super::origin_scope::parse(&args) {
+            Ok(scope) => scope,
+            Err(error) => return error,
+        };
         let (target_id, tab_id, ext_ref) = match (
             args.require_str("target_id"),
             args.require_str("tab_id"),
@@ -2911,7 +3079,7 @@ impl Tool for BrowserSetInputFilesTool {
         };
         let validated = match self
             .engine
-            .revalidate_for_mutation(&session, &target_id, Some(&tab_id))
+            .revalidate_for_mutation(&session, &target_id, Some(&tab_id), scope.as_ref())
             .await
         {
             Ok(validated) => validated,

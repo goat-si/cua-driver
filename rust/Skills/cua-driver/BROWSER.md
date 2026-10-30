@@ -285,6 +285,52 @@ Never:
 - copy a personal profile into a driver-owned directory;
 - terminate or restart the user's browser as a hidden setup step.
 
+### Origin scope
+
+Every page tool (`get_browser_state`, `browser_navigate`, `browser_click`,
+`browser_type`, `browser_pointer`, `browser_select`, `browser_dialog`,
+`browser_set_input_files`, `browser_download`) accepts `origin_scope`: 1 to
+64 exact origins such as `["https://app.example"]` (scheme, host and optional
+port, no path; `about:blank` is accepted like in the capability manifest).
+With it, the call reads or acts only while the tab's live top-level origin is
+in the list as well as in the capability manifest:
+
+- Before input, the live origin is re-proven; outside the scope the call is
+  refused with `browser_origin_outside_scope` and nothing is sent.
+- `browser_navigate` refuses a destination outside the scope before
+  navigating, then checks the document the navigation committed (after
+  redirects) and refuses with `detail.navigation_committed` when it landed
+  outside.
+- Snapshots and screenshots prove the document before and after the read; if
+  the tab navigated or left the scope meanwhile, nothing from that read is
+  returned.
+- A bind with `origin_scope` lists tabs outside the scope as `{tab_id, active}`
+  only (no address or title) and omits `native_title` unless every tab is in
+  the scope.
+
+A browser attached with the person's **existing profile** requires
+`origin_scope` on every page-tool call (`browser_origin_scope_required`,
+nothing sent) and takes direct calls only: a page tool nested in
+`run_steps` or `run_script` is refused with `browser_batch_refused`. Driver-owned
+isolated profiles and embedded browsers work with or without a scope.
+
+Under a capability manifest, a browser process that holds an origin-scoped
+attachment (an existing-profile browser, listed or attached, or a driver-owned
+isolated browser) is reachable only through these browser tools. Desktop tools
+aimed at any of its windows, and desktop-scope pointer or key input that would
+land on it, are refused with `browser_process_protected`; listing a window in
+`existing_profiles` grants no desktop access to it.
+
+The host may rewrite its capability manifest file while the driver runs
+(write a temporary file, then rename it over the original). The next call is
+authorized against the new version without a restart, existing DevTools
+connections and sessions are kept, and existing-profile attachments for
+windows the new version no longer lists end at their next use. An invalid
+replacement keeps the previous version. `get_config` and `health_report`
+report the applied version as `capability_manifest_sha256`,
+`capability_manifest_file_sha256` (SHA-256 of the applied file's bytes) and
+`capability_manifest_reload_error`.
+
 ## 3. Snapshot the selected tab
 
 Choose a returned `tab_id`, then request the page snapshot. `active` is

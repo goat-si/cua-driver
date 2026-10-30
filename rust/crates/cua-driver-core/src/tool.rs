@@ -104,6 +104,15 @@ pub(crate) fn current_dispatch_authorization_context(
     DISPATCH_AUTHORIZATION_CONTEXT.try_with(Arc::clone).ok()
 }
 
+/// Run `future` as if the registry dispatched it under `context`.
+#[cfg(test)]
+pub(crate) async fn with_test_dispatch_context<F: std::future::Future>(
+    context: Arc<crate::session_authorization::EffectiveAuthorizationContext>,
+    future: F,
+) -> F::Output {
+    DISPATCH_AUTHORIZATION_CONTEXT.scope(context, future).await
+}
+
 #[doc(hidden)]
 pub fn current_dispatch_runtime_scope() -> Option<String> {
     DISPATCH_RUNTIME_SCOPE
@@ -1975,6 +1984,15 @@ impl ToolRegistry {
         // Transports may still reject earlier for defense in depth, but those
         // checks must remain side-effect free. Active consent/grant adapters
         // run only downstream of this boundary so a call cannot prompt twice.
+        //
+        // A browser page tool's own origin_scope is checked first, so a
+        // malformed scope or a navigation outside it gets its typed refusal
+        // even when the capability manifest would also refuse the call.
+        if let Some(refusal) =
+            crate::browser::origin_scope::pre_admission_refusal(resolved_name, &args)
+        {
+            return refusal;
+        }
         if let Err(error) =
             crate::authorization::authorize_tool_call_with_context(resolved_name, &args, context)
         {
@@ -2837,6 +2855,11 @@ impl ToolRegistry {
             )
         };
 
+        if let Some(refusal) = protected_browser_process_refusal(tool_name, &resource, context) {
+            return Err(crate::consent::ConsentError::Provider(
+                refusal.into_scope_error(),
+            ));
+        }
         if context.capability_manifest().is_some() {
             if let Some(pid) = resource.get("pid").and_then(Value::as_i64) {
                 self.enrich_application_resource(&mut resource, pid).await;
@@ -2949,6 +2972,11 @@ impl ToolRegistry {
             )
         };
 
+        if let Some(refusal) = protected_browser_process_refusal(tool_name, &resource, context) {
+            return Err(crate::consent::ConsentError::Provider(
+                refusal.into_scope_error(),
+            ));
+        }
         if context.capability_manifest().is_some() {
             if let Some(pid) = resource.get("pid").and_then(Value::as_i64) {
                 self.enrich_application_resource(&mut resource, pid).await;
@@ -3273,10 +3301,8 @@ impl ToolRegistry {
             ) {
                 self.approval_broker.revoke(&grant).await;
             }
-            return Err(protected_refusal(
-                "protected_resource_scope_stale",
-                &message,
-            ));
+            return Err(crate::browser::BrowserRefusal::from_scope_error(&message)
+                .unwrap_or_else(|| protected_refusal("protected_resource_scope_stale", &message)));
         }
         Ok(())
     }
@@ -7428,6 +7454,11 @@ fn permission_denied_result(message: String) -> ToolResult {
 }
 
 fn protected_consent_refusal(error: crate::consent::ConsentError) -> ToolResult {
+    if let crate::consent::ConsentError::Provider(message) = &error {
+        if let Some(refusal) = crate::browser::BrowserRefusal::from_scope_error(message) {
+            return refusal;
+        }
+    }
     let code = match &error {
         crate::consent::ConsentError::Unavailable => "authorization_required",
         crate::consent::ConsentError::Declined => "authorization_declined",
@@ -7448,7 +7479,35 @@ fn protected_consent_refusal(error: crate::consent::ConsentError) -> ToolResult 
 }
 
 fn protected_scope_refusal(message: &str) -> ToolResult {
-    protected_refusal("protected_resource_scope_invalid", message)
+    crate::browser::BrowserRefusal::from_scope_error(message)
+        .unwrap_or_else(|| protected_refusal("protected_resource_scope_invalid", message))
+}
+
+/// Under a capability manifest, a desktop tool may not observe or act on a
+/// browser process that holds an origin-scoped browser attachment, and
+/// desktop-scope input is refused where its points cannot be checked while
+/// such a process exists. The browser tools are that process's only route.
+fn protected_browser_process_refusal(
+    tool_name: &str,
+    resource: &Value,
+    context: &crate::session_authorization::EffectiveAuthorizationContext,
+) -> Option<crate::browser::BrowserRefusal> {
+    let manifest = context.capability_manifest()?;
+    if tool_name == "browser_prepare"
+        || crate::browser::origin_scope::PAGE_TOOLS.contains(&tool_name)
+    {
+        return None;
+    }
+    match resource.get("kind").and_then(Value::as_str)? {
+        "window" | "application" | "window_input" | "application_input" => {
+            let pid = resource.get("pid").and_then(Value::as_i64)?;
+            crate::browser::protection::process_refusal(manifest, tool_name, pid)
+        }
+        "display_input" => {
+            crate::browser::protection::unguarded_desktop_refusal(manifest, tool_name)
+        }
+        _ => None,
+    }
 }
 
 /// Recovery text for a call on an ended lifecycle episode. A named session is
