@@ -955,7 +955,9 @@ impl InputSink for ForegroundClick {
             }
             vec![self.move_input, self.down_input, self.up_input]
         };
-        let sent = crate::input::delivery::send_input(&events) as usize;
+        // SAFETY: `events` is a fully initialised slice of INPUT records, as
+        // SendInput requires.
+        let sent = unsafe { crate::input::delivery::send_input(&events) } as usize;
         self.batch_failed = sent < events.len();
         if sent == 0 {
             return Err("SendInput inserted fewer modifier or mouse events than expected for the foreground click".into());
@@ -973,7 +975,8 @@ impl ForegroundClick {
         let mods = sent.min(self.downs.len());
         let mouse_sent = sent.saturating_sub(self.downs.len());
         if mouse_sent % 3 == 2 {
-            if crate::input::delivery::send_input(&[self.up_input]) != 1 {
+            // SAFETY: one initialised INPUT record.
+            if unsafe { crate::input::delivery::send_input(&[self.up_input]) } != 1 {
                 errors.push(json!({"error":"failed to release mouse button"}));
             } else {
                 errors.push(json!({"release_button": true}));
@@ -981,8 +984,10 @@ impl ForegroundClick {
         }
         if mods > 0 {
             let ups = &self.ups[self.ups.len() - mods..];
-            if crate::input::delivery::send_input(ups) as usize != ups.len() {
-                let _ = crate::input::delivery::send_input(ups);
+            // SAFETY: `ups` is a sub-slice of initialised INPUT records.
+            if unsafe { crate::input::delivery::send_input(ups) } as usize != ups.len() {
+                // SAFETY: as above.
+                let _ = unsafe { crate::input::delivery::send_input(ups) };
                 errors.push(json!({"error":"failed to release modifiers"}));
             } else {
                 errors.push(json!({"release_modifiers": mods}));
