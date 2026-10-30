@@ -282,17 +282,19 @@ pub(super) struct TargetChanged {
 
 impl std::fmt::Display for TargetChanged {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let sent = match (self.events_sent, self.primer) {
+            (0, _) => "Nothing had been handed to the event transport yet",
+            (_, true) => {
+                "The pointer move and an off-screen primer click had already been handed to the \
+                 event transport"
+            }
+            (_, false) => "The pointer move had already been handed to the event transport",
+        };
         write!(
             f,
-            "What is under the element's center changed right before the clicks ({}). The \
-             pointer move{} had already been handed to the event transport; no click on the \
-             element was sent. Read the window again before retrying.",
-            self.code,
-            if self.primer {
-                " and an off-screen primer click"
-            } else {
-                ""
-            }
+            "What is under the element's center changed right before the clicks ({}). {sent}; \
+             no click on the element was sent. Read the window again before retrying.",
+            self.code
         )
     }
 }
@@ -432,17 +434,41 @@ pub(super) fn performed_result(
     }
 }
 
-fn error_result(count: usize, error: anyhow::Error) -> ToolResult {
+/// The result of a multi-click that sent no click on the element.
+/// `activation_sent`: the background prologue already made the target
+/// window active (a focus record went out), so a later refusal cannot claim
+/// that nothing was sent.
+fn error_result(count: usize, error: anyhow::Error, activation_sent: bool) -> ToolResult {
     if let Some(changed) = error.downcast_ref::<TargetChanged>() {
+        let dispatched = changed.events_sent > 0 || activation_sent;
         return ToolResult::error(format!("click: {changed}")).with_structured(json!({
             "code": "element_changed_before_click",
             "reason": changed.code,
+            "effect": if dispatched { "unverifiable" } else { "refused" },
+            "dispatched": dispatched,
+            "count": count,
+            "clicks_posted": 0,
+            "primer_clicks": if changed.events_sent > 0 { u8::from(changed.primer) } else { 0 },
+            "events_sent": changed.events_sent,
+            "activation_sent": activation_sent,
+        }));
+    }
+    if let (Some(refusal), true) = (error.downcast_ref::<NotDispatched>(), activation_sent) {
+        return ToolResult::error(format!(
+            "click: {}. No click was sent, but the target window had already been made active \
+             in the background. Read the window again before retrying.",
+            refusal
+                .message
+                .trim_end_matches("; nothing was sent.")
+                .trim_end_matches('.')
+        ))
+        .with_structured(json!({
+            "code": refusal.code,
             "effect": "unverifiable",
             "dispatched": true,
             "count": count,
             "clicks_posted": 0,
-            "primer_clicks": u8::from(changed.primer),
-            "events_sent": changed.events_sent,
+            "activation_sent": true,
         }));
     }
     if let Some(refusal) = error.downcast_ref::<NotDispatched>() {
@@ -525,6 +551,24 @@ pub(super) async fn click_element(state: &ToolState, request: ElementClick) -> T
             WindowChangeDetector::snapshot(prior_front)
         };
         let prologue = if background_pointer {
+            // Prove the point before the prologue sends a focus record, so a
+            // bad point is refused with nothing sent; it is proven again
+            // after activation and right before the first click.
+            let preflight_target = action_target.clone();
+            match latency::spawn_action_blocking(move || {
+                checked_point(&*preflight_target, false).map(|_| ())
+            })
+            .await
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(refusal)) => return Err(error_result(count, refusal.into(), false)),
+                Err(error) => {
+                    return Err(super::pre_dispatch_refusal(
+                        "background_unavailable",
+                        format!("The point check task failed ({error}); nothing was sent."),
+                    ))
+                }
+            }
             match action_target.background_pointer_prologue(prior_front).await {
                 Ok(prologue) => Some(prologue),
                 Err(refusal) => return Err(refusal),
@@ -532,6 +576,7 @@ pub(super) async fn click_element(state: &ToolState, request: ElementClick) -> T
         } else {
             None
         };
+        let activation_sent = prologue.is_some();
         let blocking_target = action_target.clone();
         let result = crate::focus_guard::with_focus_suppressed(
             (!foreground && !background_pointer).then_some(pid),
@@ -566,9 +611,9 @@ pub(super) async fn click_element(state: &ToolState, request: ElementClick) -> T
             );
         }
         let result = result.map(|(outcome, _held)| outcome);
-        Ok((result, changes.result_suffix()))
+        Ok((result, changes.result_suffix(), activation_sent))
     });
-    let (result, suffix) = match action.await {
+    let (result, suffix, activation_sent) = match action.await {
         Ok(Ok(done)) => done,
         Ok(Err(refusal)) => return refusal,
         Err(error) => {
@@ -583,7 +628,7 @@ pub(super) async fn click_element(state: &ToolState, request: ElementClick) -> T
         Ok(Ok(performed)) => {
             performed_result(idx, window_id, count, foreground, &performed, &suffix)
         }
-        Ok(Err(error)) => error_result(count, error),
+        Ok(Err(error)) => error_result(count, error, activation_sent),
         Err(error) => ToolResult::error(format!(
             "The click task failed ({error}); the clicks may have been sent. Read fresh state \
              before clicking again."

@@ -363,7 +363,7 @@ fn a_target_that_changes_while_the_clicks_are_prepared_gets_no_click() {
             "foreground {foreground}"
         );
         assert_eq!(posts[0].3.len(), events_sent);
-        let result = error_result(2, error);
+        let result = error_result(2, error, false);
         let structured = result.structured_content.unwrap();
         assert_eq!(structured["code"], "element_changed_before_click");
         assert_eq!(structured["dispatched"], true);
@@ -464,6 +464,68 @@ async fn an_element_axopen_double_click_skips_the_pointer_prologue() {
 }
 
 #[tokio::test]
+async fn a_point_off_the_element_is_refused_before_the_prologue() {
+    let pid = 1_000_108;
+    let mut fake = Fake::new(pid);
+    fake.hit = Hit::Elsewhere("AXRow in another window".into());
+    let fake = Arc::new(fake);
+    let _registered = test_targets::register(pid, fake.clone());
+    let (tool, token, _state) = tool_with_token(pid);
+    let result = tool
+        .invoke(json!({ "pid": pid, "element_token": token, "count": 2 }))
+        .await;
+    let structured = result
+        .structured_content
+        .clone()
+        .expect("structured refusal");
+    assert_eq!(structured["code"], "element_not_at_point", "{result:?}");
+    assert_eq!(structured["dispatched"], false);
+    assert!(!fake.calls().contains(&"prologue"));
+    assert!(fake.posts().is_empty());
+}
+
+#[tokio::test]
+async fn a_point_that_fails_after_activation_is_unverifiable() {
+    let pid = 1_000_109;
+    let mut fake = Fake::new(pid);
+    // The preflight passes; the check after the prologue does not.
+    fake.hit_later = Some(Hit::Elsewhere("a sheet".into()));
+    let fake = Arc::new(fake);
+    let _registered = test_targets::register(pid, fake.clone());
+    let (tool, token, _state) = tool_with_token(pid);
+    let result = tool
+        .invoke(json!({ "pid": pid, "element_token": token, "count": 2 }))
+        .await;
+    let structured = result
+        .structured_content
+        .clone()
+        .expect("structured result");
+    assert_eq!(structured["code"], "element_not_at_point", "{result:?}");
+    assert_eq!(structured["effect"], "unverifiable");
+    assert_eq!(structured["dispatched"], true);
+    assert_eq!(structured["clicks_posted"], 0);
+    assert!(fake.calls().contains(&"prologue"));
+    assert!(fake.posts().is_empty());
+    let text = format!("{result:?}");
+    assert!(!text.contains("nothing was sent"), "{text}");
+}
+
+#[test]
+fn a_recheck_failure_with_nothing_sent_is_a_refusal() {
+    let changed = TargetChanged {
+        code: "element_not_at_point",
+        events_sent: 0,
+        primer: false,
+    };
+    assert!(changed.to_string().contains("Nothing had been handed"));
+    let result = error_result(2, changed.into(), false);
+    let structured = result.structured_content.unwrap();
+    assert_eq!(structured["dispatched"], false);
+    assert_eq!(structured["effect"], "refused");
+    assert_eq!(structured["primer_clicks"], 0);
+}
+
+#[tokio::test]
 async fn a_refused_pointer_prologue_sends_nothing() {
     let pid = 1_000_107;
     let mut fake = Fake::new(pid);
@@ -479,7 +541,11 @@ async fn a_refused_pointer_prologue_sends_nothing() {
         .clone()
         .expect("structured refusal");
     assert_eq!(structured["effect"], "refused", "{result:?}");
-    assert_eq!(fake.calls(), ["gate", "prologue"]);
+    // The point is proven first, then the prologue refuses.
+    assert_eq!(
+        fake.calls(),
+        ["gate", "pointer_permitted", "rect", "rect", "prologue"]
+    );
     assert!(fake.posts().is_empty());
 }
 

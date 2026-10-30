@@ -929,7 +929,8 @@ fn def() -> &'static ToolDef {
     DEF.get_or_init(|| ToolDef {
         name: "click".into(),
         description: "Click a target pid. Prefer `element_token` (from get_window_state): it addresses one snapshot \
-            element, works on backgrounded, minimized or off-Space windows, and moves no cursor or focus; \
+            element, works on backgrounded, minimized or off-Space windows, and with count 1 moves no cursor or focus \
+            (count 2-3 may click the element's center; see `count`); \
             tokens are scoped to (pid, window_id) and go stale when that window is snapshotted again. `x, y` \
             are window-local pixels of the get_window_state screenshot, sent as CGEvent mouse events to a \
             visible window, for surfaces missing from the tree; `modifier` takes cmd/shift/option/ctrl, and \
