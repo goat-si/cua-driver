@@ -969,7 +969,7 @@ fn def() -> &'static ToolDef {
                     "type": "integer",
                     "minimum": 1,
                     "maximum": 3,
-                    "description": "Left clicks in one gesture, 1-3. Default 1. With element_token, count 2 sends AXOpen when the element lists it (no mouse clicks; works wherever AX actions work); otherwise, and for count 3, it hands that many left clicks (clickCount 1..N) to the element's center, only after checking that point is on the element in its window (the window must be on screen; refused with nothing sent otherwise). Needs action press, the left button and no modifier. Nothing reads back what the clicks opened."
+                    "description": "Left clicks in one gesture, 1-3. Default 1. With element_token, count 2 sends AXOpen when the element lists it (no mouse clicks; works wherever AX actions work); otherwise, and for count 3, it hands that many left clicks (clickCount 1..N) to the element's center. That point is checked to be on the element in its window (the window must be on screen) before anything is sent, or the call is refused with nothing sent; it is checked again right before the first click, after the pointer move, and if it changed there no click reaches the element and the result is unverifiable with code element_changed_before_click. Needs action press, the left button and no modifier. Nothing reads back what the clicks opened."
                 },
                 "modifier": {
                     "type": "array",

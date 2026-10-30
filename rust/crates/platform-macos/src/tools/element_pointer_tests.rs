@@ -365,7 +365,7 @@ fn a_coordinate_click_reports_target_clicks_and_the_primer_separately() {
 
 // ── Through the click tool ────────────────────────────────────────────────
 
-fn tool_with_token(pid: i32) -> (super::super::click::ClickTool, String) {
+fn tool_with_token(pid: i32) -> (super::super::click::ClickTool, String, Arc<ToolState>) {
     let state = Arc::new(ToolState::new(false, false, None));
     // A real AX element (of an app that does not exist), owned by the
     // snapshot; the registered fake answers for it.
@@ -378,7 +378,11 @@ fn tool_with_token(pid: i32) -> (super::super::click::ClickTool, String) {
         },
     );
     let token = cua_driver_core::element_token::token_for(snapshot, 0);
-    (super::super::click::ClickTool::new(state), token)
+    (
+        super::super::click::ClickTool::new(state.clone()),
+        token,
+        state,
+    )
 }
 
 #[tokio::test]
@@ -386,7 +390,7 @@ async fn an_element_count_two_takes_the_checked_pointer_route() {
     let pid = 1_000_101;
     let fake = Arc::new(Fake::new(pid));
     let _registered = test_targets::register(pid, fake.clone());
-    let (tool, token) = tool_with_token(pid);
+    let (tool, token, _state) = tool_with_token(pid);
     let result = tool
         .invoke(json!({ "pid": pid, "element_token": token, "count": 2 }))
         .await;
@@ -409,7 +413,7 @@ async fn an_element_count_one_keeps_the_existing_route() {
     let pid = 1_000_102;
     let fake = Arc::new(Fake::new(pid));
     let _registered = test_targets::register(pid, fake.clone());
-    let (tool, token) = tool_with_token(pid);
+    let (tool, token, _state) = tool_with_token(pid);
     let result = tool
         .invoke(json!({ "pid": pid, "element_token": token, "count": 1 }))
         .await;
@@ -425,7 +429,7 @@ async fn a_bad_count_is_refused_before_anything_is_sent() {
     let pid = 1_000_103;
     let fake = Arc::new(Fake::new(pid));
     let _registered = test_targets::register(pid, fake.clone());
-    let (tool, token) = tool_with_token(pid);
+    let (tool, token, _state) = tool_with_token(pid);
     for bad in [
         json!(0),
         json!(-1),
@@ -455,7 +459,7 @@ async fn an_element_multi_click_needs_a_plain_left_press() {
     let pid = 1_000_104;
     let fake = Arc::new(Fake::new(pid));
     let _registered = test_targets::register(pid, fake.clone());
-    let (tool, token) = tool_with_token(pid);
+    let (tool, token, _state) = tool_with_token(pid);
     for extra in [
         json!({ "button": "right" }),
         json!({ "button": "middle" }),
@@ -499,10 +503,15 @@ async fn cancelling_an_element_multi_click_keeps_the_lease_until_input_finishes(
     let (release_tx, release_rx) = mpsc::channel();
     *fake.block.lock().unwrap() = Some((entered_tx, release_rx));
     let _registered = test_targets::register(pid, fake.clone());
-    let (tool, token) = tool_with_token(pid);
+    let (tool, token, state) = tool_with_token(pid);
     let call = tokio::spawn(async move {
-        tool.invoke(json!({ "pid": pid, "element_token": token, "count": 2 }))
-            .await
+        tool.invoke(json!({
+            "pid": pid,
+            "element_token": token,
+            "count": 2,
+            "session": "ecc-cancelled-click",
+        }))
+        .await
     });
     // Bounded so a route that never reaches post fails instead of hanging.
     tokio::task::spawn_blocking(move || {
@@ -534,4 +543,11 @@ async fn cancelling_an_element_multi_click_keeps_the_lease_until_input_finishes(
     .await
     .expect("the lease is released once input finishes");
     assert_eq!(fake.posts().len(), 1);
+    // The cursor followed the clicks the cancelled call still sent.
+    let position = state
+        .cursor_registry
+        .get("ecc-cancelled-click")
+        .and_then(|cursor| cursor.position)
+        .expect("cursor moved");
+    assert_eq!((position.x, position.y), CENTER);
 }

@@ -492,6 +492,7 @@ pub(super) async fn click_element(state: &ToolState, request: ElementClick) -> T
     // handle, while the lease, the focus-steal guards and the window
     // observation stay armed until the input has finished.
     let action_target = target.clone();
+    let cursor_registry = state.cursor_registry.clone();
     let action = tokio::spawn(async move {
         let prior_front = crate::apps::frontmost_pid();
         let snapshot = if foreground {
@@ -517,10 +518,19 @@ pub(super) async fn click_element(state: &ToolState, request: ElementClick) -> T
         )
         .await;
         let changes = super::finish_window_observation(snapshot).await;
-        (
-            result.map(|(outcome, _held)| outcome),
-            changes.result_suffix(),
-        )
+        // The cursor follows clicks that went out, even for a cancelled
+        // caller; it moves before the lease is released below.
+        if let Ok((Ok(Performed::Clicks(clicks)), _held)) = &result {
+            let (x, y) = clicks.point.screen;
+            cursor_registry.update_position(&cursor_key, x, y);
+            cursor_registry.note_press(&cursor_key, x, y);
+            crate::cursor::overlay::send_command(
+                cursor_key.clone(),
+                cursor_overlay::OverlayCommand::ClickPulse { x, y },
+            );
+        }
+        let result = result.map(|(outcome, _held)| outcome);
+        (result, changes.result_suffix())
     });
     let (result, suffix) = match action.await {
         Ok(done) => done,
@@ -534,15 +544,6 @@ pub(super) async fn click_element(state: &ToolState, request: ElementClick) -> T
     };
     match result {
         Ok(Ok(performed)) => {
-            if let Performed::Clicks(clicks) = &performed {
-                let (x, y) = clicks.point.screen;
-                state.cursor_registry.update_position(&cursor_key, x, y);
-                state.cursor_registry.note_press(&cursor_key, x, y);
-                crate::cursor::overlay::send_command(
-                    cursor_key.clone(),
-                    cursor_overlay::OverlayCommand::ClickPulse { x, y },
-                );
-            }
             performed_result(idx, window_id, count, foreground, &performed, &suffix)
         }
         Ok(Err(error)) => error_result(count, error),
