@@ -199,7 +199,8 @@ pub fn begin_suppression(
     FocusStealPreventer::begin_suppression(target_pid, restore_to, origin)
 }
 
-/// Whether a suppression entry targets `pid` right now.
+/// Whether a suppression entry guards an action on `pid` right now: one
+/// targeting it, or a wildcard that allows its intentional activation.
 #[cfg(test)]
 pub(crate) fn suppression_armed_for(pid: i32) -> bool {
     FocusStealPreventer::shared()
@@ -208,7 +209,7 @@ pub(crate) fn suppression_armed_for(pid: i32) -> bool {
         .lock()
         .unwrap()
         .values()
-        .any(|entry| entry.target_pid == Some(pid))
+        .any(|entry| entry.target_pid == Some(pid) || entry.allowed_pid == Some(pid))
 }
 
 /// Begin wildcard suppression while permitting `allowed_pid` to activate.

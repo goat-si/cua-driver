@@ -31,6 +31,7 @@ struct Fake {
     lists_ax_open: bool,
     ax_open_result: AXError,
     activates: bool,
+    prologue_refuses: bool,
     rect_reads: AtomicUsize,
     calls: Mutex<Vec<&'static str>>,
     posts: Mutex<Vec<Post>>,
@@ -52,6 +53,7 @@ impl Fake {
             lists_ax_open: false,
             ax_open_result: kAXErrorSuccess,
             activates: true,
+            prologue_refuses: false,
             rect_reads: AtomicUsize::new(0),
             calls: Mutex::new(Vec::new()),
             posts: Mutex::new(Vec::new()),
@@ -150,6 +152,34 @@ impl ElementTarget for Fake {
             anyhow::bail!("the window did not become focused")
         }
     }
+    async fn background_pointer_prologue(
+        &self,
+        _prior_front: Option<i32>,
+    ) -> Result<PointerPrologue, ToolResult> {
+        self.note("prologue");
+        if self.prologue_refuses {
+            return Err(crate::tools::key_restore_pending_refusal(
+                "click",
+                Some(self.pid),
+                Some(WINDOW),
+            ));
+        }
+        Ok(PointerPrologue {
+            activated: true,
+            prior_key_wid: None,
+            key_focus: None,
+        })
+    }
+    async fn restore_after_pointer(&self, _prior_front: Option<i32>, _prologue: PointerPrologue) {
+        self.note("restore");
+    }
+}
+
+fn position(calls: &[&str], call: &str) -> usize {
+    calls
+        .iter()
+        .position(|seen| *seen == call)
+        .unwrap_or_else(|| panic!("{call} not in {calls:?}"))
 }
 
 /// The down/up pairs a capture shows at the element's center, with their
@@ -406,6 +436,51 @@ async fn an_element_count_two_takes_the_checked_pointer_route() {
     assert_eq!(posts.len(), 1, "{result:?}");
     assert_eq!(posts[0].0.screen, CENTER);
     assert_eq!(target_pairs(&posts[0].3), pairs(2));
+    // The background pixel-click prologue runs before the clicks and focus
+    // is handed back after them.
+    let calls = fake.calls();
+    assert!(position(&calls, "gate") < position(&calls, "prologue"));
+    assert!(position(&calls, "prologue") < position(&calls, "post"));
+    assert!(position(&calls, "post") < position(&calls, "restore"));
+}
+
+#[tokio::test]
+async fn an_element_axopen_double_click_skips_the_pointer_prologue() {
+    let pid = 1_000_106;
+    let mut fake = Fake::new(pid);
+    fake.lists_ax_open = true;
+    let fake = Arc::new(fake);
+    let _registered = test_targets::register(pid, fake.clone());
+    let (tool, token, _state) = tool_with_token(pid);
+    let result = tool
+        .invoke(json!({ "pid": pid, "element_token": token, "count": 2 }))
+        .await;
+    let structured = result
+        .structured_content
+        .clone()
+        .expect("structured result");
+    assert_eq!(structured["performed"], "ax_open", "{result:?}");
+    assert_eq!(fake.calls(), ["gate", "ax_open"]);
+}
+
+#[tokio::test]
+async fn a_refused_pointer_prologue_sends_nothing() {
+    let pid = 1_000_107;
+    let mut fake = Fake::new(pid);
+    fake.prologue_refuses = true;
+    let fake = Arc::new(fake);
+    let _registered = test_targets::register(pid, fake.clone());
+    let (tool, token, _state) = tool_with_token(pid);
+    let result = tool
+        .invoke(json!({ "pid": pid, "element_token": token, "count": 2 }))
+        .await;
+    let structured = result
+        .structured_content
+        .clone()
+        .expect("structured refusal");
+    assert_eq!(structured["effect"], "refused", "{result:?}");
+    assert_eq!(fake.calls(), ["gate", "prologue"]);
+    assert!(fake.posts().is_empty());
 }
 
 #[tokio::test]

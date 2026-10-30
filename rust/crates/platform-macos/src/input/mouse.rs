@@ -520,7 +520,7 @@ fn click_at_xy_inner(
                 ))
             })
             .collect::<anyhow::Result<Vec<_>>>()?;
-        post_mouse_moved_primer(
+        let moved = post_mouse_moved_primer(
             pid,
             &source,
             point,
@@ -532,7 +532,7 @@ fn click_at_xy_inner(
         std::thread::sleep(std::time::Duration::from_millis(12));
         if let Err(source) = before_target() {
             return Err(TargetCheckFailed {
-                events_sent: 1,
+                events_sent: usize::from(moved),
                 source,
             }
             .into());
@@ -1824,15 +1824,17 @@ fn post_mouse_moved_primer(
     wid: Option<u32>,
     click_group_id: Option<i64>,
     mode: MousePostMode,
-) {
-    if let Ok(mv) = CGEvent::new_mouse_event(
+) -> bool {
+    let Ok(mv) = CGEvent::new_mouse_event(
         source.clone(),
         CGEventType::MouseMoved,
         point,
         CGMouseButton::Left,
-    ) {
-        post_mouse_event_with_mode(pid, &mv, window_local, wid, click_group_id, 0, 0, 3, mode);
-    }
+    ) else {
+        return false;
+    };
+    post_mouse_event_with_mode(pid, &mv, window_local, wid, click_group_id, 0, 0, 3, mode);
+    true
 }
 
 /// Synthesize a targeted mouse-wheel scroll at `(screen_x, screen_y)`,

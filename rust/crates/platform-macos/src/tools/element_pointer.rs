@@ -113,6 +113,24 @@ pub(super) trait ElementTarget: Send + Sync {
     /// Run `body` with the exact window frontmost and focused; refuse without
     /// running it when that cannot be proven.
     fn in_foreground(&self, body: &mut dyn FnMut() -> anyhow::Result<()>) -> anyhow::Result<()>;
+    /// The background pixel-click prologue: guard the user's key focus,
+    /// remember their key window, and make the target AppKit-active without
+    /// raising it (Chromium gates and remote-HID proxies drop clicks to an
+    /// inactive window). Refuses, with nothing sent, while a key hand-back is
+    /// pending or WindowServer refuses the connection.
+    async fn background_pointer_prologue(
+        &self,
+        prior_front: Option<i32>,
+    ) -> Result<PointerPrologue, ToolResult>;
+    /// Hand focus back to the user's app and key window after the clicks.
+    async fn restore_after_pointer(&self, prior_front: Option<i32>, prologue: PointerPrologue);
+}
+
+/// What the background prologue armed; held until focus is restored.
+pub(super) struct PointerPrologue {
+    pub(super) activated: bool,
+    pub(super) prior_key_wid: Option<u32>,
+    pub(super) key_focus: Option<crate::key_focus_guard::Lease>,
 }
 
 /// The element's center, only when it is on that element in the requested
@@ -493,30 +511,48 @@ pub(super) async fn click_element(state: &ToolState, request: ElementClick) -> T
     // observation stay armed until the input has finished.
     let action_target = target.clone();
     let cursor_registry = state.cursor_registry.clone();
+    // A background pointer gesture lets the target become AppKit-active
+    // without raising (the pixel-click prologue); AXOpen keeps it suppressed.
+    let background_pointer = !foreground && !use_ax_open;
     let action = tokio::spawn(async move {
+        use crate::window_change_detector::WindowChangeDetector;
         let prior_front = crate::apps::frontmost_pid();
         let snapshot = if foreground {
-            crate::window_change_detector::WindowChangeDetector::snapshot_without_suppression(
-                prior_front,
-            )
+            WindowChangeDetector::snapshot_without_suppression(prior_front)
+        } else if background_pointer {
+            WindowChangeDetector::snapshot_allowing_activation(prior_front, pid)
         } else {
-            crate::window_change_detector::WindowChangeDetector::snapshot(prior_front)
+            WindowChangeDetector::snapshot(prior_front)
         };
+        let prologue = if background_pointer {
+            match action_target.background_pointer_prologue(prior_front).await {
+                Ok(prologue) => Some(prologue),
+                Err(refusal) => return Err(refusal),
+            }
+        } else {
+            None
+        };
+        let blocking_target = action_target.clone();
         let result = crate::focus_guard::with_focus_suppressed(
-            (!foreground).then_some(pid),
+            (!foreground && !background_pointer).then_some(pid),
             prior_front,
             "click.element_count",
             || async move {
                 latency::spawn_action_blocking(move || {
                     let held = lease;
                     let outcome =
-                        run_blocking(&*action_target, idx, count, use_ax_open, foreground);
+                        run_blocking(&*blocking_target, idx, count, use_ax_open, foreground);
                     (outcome, held)
                 })
                 .await
             },
         )
         .await;
+        if let Some(prologue) = prologue {
+            action_target
+                .restore_after_pointer(prior_front, prologue)
+                .await;
+        }
         let changes = super::finish_window_observation(snapshot).await;
         // The cursor follows clicks that went out, even for a cancelled
         // caller; it moves before the lease is released below.
@@ -530,10 +566,11 @@ pub(super) async fn click_element(state: &ToolState, request: ElementClick) -> T
             );
         }
         let result = result.map(|(outcome, _held)| outcome);
-        (result, changes.result_suffix())
+        Ok((result, changes.result_suffix()))
     });
     let (result, suffix) = match action.await {
-        Ok(done) => done,
+        Ok(Ok(done)) => done,
+        Ok(Err(refusal)) => return refusal,
         Err(error) => {
             return ToolResult::error(format!(
                 "The click task failed ({error}); the clicks may have been sent. Read fresh \
@@ -695,6 +732,65 @@ impl ElementTarget for LiveTarget {
 
     fn in_foreground(&self, body: &mut dyn FnMut() -> anyhow::Result<()>) -> anyhow::Result<()> {
         crate::input::skylight::with_foreground_hid_activation(self.pid, self.window_id, body)
+    }
+
+    async fn background_pointer_prologue(
+        &self,
+        prior_front: Option<i32>,
+    ) -> Result<PointerPrologue, ToolResult> {
+        let (pid, wid) = (self.pid, self.window_id);
+        // The same prologue as a background pixel click (click.rs).
+        let key_focus = latency::spawn_blocking(move || crate::key_focus_guard::protect(pid))
+            .await
+            .ok()
+            .flatten();
+        let prior_key_wid = match prior_front {
+            Some(prior) if prior != pid => latency::spawn_action_blocking(move || {
+                crate::input::skylight::key_window_of_pid(prior)
+            })
+            .await
+            .ok()
+            .flatten(),
+            _ => None,
+        };
+        match latency::spawn_action_blocking(move || {
+            crate::input::skylight::await_key_restores()
+                .then(|| crate::input::mouse::prepare_background_pixel_click(pid, wid))
+        })
+        .await
+        {
+            Ok(None) => Err(super::key_restore_pending_refusal(
+                "click",
+                Some(pid),
+                Some(wid),
+            )),
+            Ok(Some(activated)) => {
+                if !activated && crate::input::skylight::windowserver_connection_invalid() {
+                    return Err(super::windowserver_connection_refusal(pid, Some(wid)));
+                }
+                Ok(PointerPrologue {
+                    activated,
+                    prior_key_wid,
+                    key_focus,
+                })
+            }
+            Err(error) => Err(super::pre_dispatch_refusal(
+                "background_unavailable",
+                format!("Background click activation task failed ({error}); nothing was sent."),
+            )),
+        }
+    }
+
+    async fn restore_after_pointer(&self, prior_front: Option<i32>, prologue: PointerPrologue) {
+        super::click::restore_user_focus_after_background_pixel(
+            self.pid,
+            prior_front,
+            prologue.prior_key_wid,
+            Some(self.window_id),
+            prologue.activated,
+        )
+        .await;
+        drop(prologue.key_focus);
     }
 }
 
