@@ -43,10 +43,14 @@ seconds returns `pixel_restore_pending` before dispatch. This can also refuse
 
 For `click` with an `element_token`, `simulate:true` uses the element frame's
 center on the window pixel route instead of its AX action. The default remains
-the AX action. An unreadable or empty frame, or a center outside the window,
-returns `element_frame_unavailable` before dispatch. The result includes a
-`note` identifying the pointer route. `double_click` and `right_click` do not
-accept `simulate`.
+the AX action. Before anything is sent, the element (or one of its descendants)
+must be what the window's hit test finds at that center; otherwise the call
+returns `element_not_at_point`. An unreadable or empty frame, a center outside
+the window, or a frame that changed during the check returns
+`element_frame_unavailable`. `simulate` needs an `element_token`, `count` 1,
+and an unmodified left press with no x/y, zoom or debug image; anything else is
+rejected as invalid arguments. The result summary says the pointer route was
+used. `double_click` and `right_click` do not accept `simulate`.
 
 Before running any shell command, ask: **"does this raise,
 activate, foreground, or make-key any app?"** If yes, don't run it.

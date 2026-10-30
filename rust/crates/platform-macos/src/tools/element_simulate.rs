@@ -105,9 +105,20 @@ pub(super) fn pixel_args(
 }
 
 pub(super) fn note(mut result: ToolResult) -> ToolResult {
+    const NOTE: &str = "Element click used the pointer route.";
+    // A successful click is published as the closed action result, whose
+    // summary is the first text block; state the route there as well.
+    if let Some(cua_driver_core::protocol::Content::Text { text, .. }) = result
+        .content
+        .iter_mut()
+        .find(|content| matches!(content, cua_driver_core::protocol::Content::Text { .. }))
+    {
+        text.push(' ');
+        text.push_str(NOTE);
+    }
     let structured = result.structured_content.get_or_insert_with(|| json!({}));
     if let Some(object) = structured.as_object_mut() {
-        let note = "Element click used the pointer route.";
+        let note = NOTE;
         let combined = match object.get("note").and_then(Value::as_str) {
             Some(existing) if !existing.is_empty() => format!("{existing} {note}"),
             _ => note.to_owned(),
@@ -218,6 +229,22 @@ mod tests {
         assert_eq!(
             result.structured_content.unwrap()["note"],
             "Existing. Element click used the pointer route."
+        );
+    }
+
+    /// A successful click's structured content is replaced by the published
+    /// action result, whose summary is the first text block: the route must
+    /// be stated there too or a client never sees it.
+    #[test]
+    fn pointer_route_is_stated_in_the_summary_text() {
+        let result = note(ToolResult::text("✅ Sent click.").with_structured(json!({})));
+        let first = result.content.iter().find_map(|content| match content {
+            cua_driver_core::protocol::Content::Text { text, .. } => Some(text.clone()),
+            _ => None,
+        });
+        assert_eq!(
+            first.as_deref(),
+            Some("✅ Sent click. Element click used the pointer route.")
         );
     }
 
