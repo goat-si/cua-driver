@@ -41,6 +41,13 @@ An admission that cannot acquire the restoration commit lock within two
 seconds returns `pixel_restore_pending` before dispatch. This can also refuse
 `get_browser_state`; its admission restarts the 50 ms quiet interval.
 
+For `click` with an `element_token`, `simulate:true` uses the element frame's
+center on the window pixel route instead of its AX action. The default remains
+the AX action. An unreadable or empty frame, or a center outside the window,
+returns `element_frame_unavailable` before dispatch. The result includes a
+`note` identifying the pointer route. `double_click` and `right_click` do not
+accept `simulate`.
+
 Before running any shell command, ask: **"does this raise,
 activate, foreground, or make-key any app?"** If yes, don't run it.
 Every one of the commands below activates the target on macOS and

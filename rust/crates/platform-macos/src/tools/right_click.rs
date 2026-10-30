@@ -104,6 +104,11 @@ impl Tool for RightClickTool {
     }
 
     async fn invoke(&self, args: Value) -> ToolResult {
+        if args.get("simulate").is_some() {
+            return super::invalid_arguments(
+                "right_click does not support simulate; nothing was sent.",
+            );
+        }
         let space = match super::window_points::point_space(&args) {
             Ok(space) => space,
             Err(refusal) => return refusal,

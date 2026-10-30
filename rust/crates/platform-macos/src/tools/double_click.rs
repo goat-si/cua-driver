@@ -76,6 +76,11 @@ impl Tool for DoubleClickTool {
     }
 
     async fn invoke(&self, args: Value) -> ToolResult {
+        if args.get("simulate").is_some() {
+            return super::invalid_arguments(
+                "double_click does not support simulate; nothing was sent.",
+            );
+        }
         // Checked before any route, element or pixel: window points need a
         // window target and x, y (the pixel path re-checks in click).
         if let Err(refusal) = super::window_points::point_space(&args) {
