@@ -1,47 +1,24 @@
 //! Live reload of the trusted, host-owned capability manifest file.
 //!
 //! The host that launched the driver owns the manifest file and replaces it
-//! atomically when its grants change. Every tool admission asks
-//! [`ConfiguredManifest::current`] for the manifest to authorize against; the
-//! file is re-read only when its identity (size, modification time and, on
-//! Unix, device and inode) changed, and re-parsed only when its bytes changed.
-//! An invalid replacement keeps the previously applied manifest and is
-//! reported through [`ConfiguredManifest::status_json`]. Nothing an agent can
-//! call triggers a reload except a change to that host-owned file.
+//! when its grants change. Every tool admission asks
+//! [`ConfiguredManifest::current`] for the manifest to authorize against;
+//! the file's bytes are read and hashed every time (a manifest is small), and
+//! re-parsed only when the hash differs from the applied version and from a
+//! version already found invalid. File metadata never decides on its own: a
+//! same-size rewrite within one modification-time tick, or on a platform
+//! without a stable file id, is still seen. An invalid replacement keeps the
+//! previously applied manifest and is reported through
+//! [`ConfiguredManifest::status_json`]. Nothing an agent can call triggers a
+//! reload except a change to that host-owned file.
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use std::time::SystemTime;
 
 use sha2::{Digest, Sha256};
 
 use super::{parse_manifest_bytes, SessionManifest};
 use crate::authorization::PermissionMode;
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct FileIdentity {
-    len: u64,
-    modified: Option<SystemTime>,
-    #[cfg(unix)]
-    dev: u64,
-    #[cfg(unix)]
-    ino: u64,
-}
-
-impl FileIdentity {
-    fn of(metadata: &std::fs::Metadata) -> Self {
-        #[cfg(unix)]
-        use std::os::unix::fs::MetadataExt as _;
-        Self {
-            len: metadata.len(),
-            modified: metadata.modified().ok(),
-            #[cfg(unix)]
-            dev: metadata.dev(),
-            #[cfg(unix)]
-            ino: metadata.ino(),
-        }
-    }
-}
 
 /// One applied manifest version. `generation` increases by one for every
 /// version applied by the same store, so holders can order versions.
@@ -53,13 +30,13 @@ pub struct AppliedManifest {
 
 #[derive(Debug)]
 struct ReloadState {
-    identity: Option<FileIdentity>,
+    /// SHA-256 of the applied version's file bytes.
     file_sha256: String,
+    /// SHA-256 of the latest version found invalid, so it is not re-parsed
+    /// at every call while it stays in place.
+    rejected_sha256: Option<String>,
     applied: AppliedManifest,
     last_error: Option<String>,
-    /// `last_error` came from reading the file (it may succeed next time),
-    /// not from an invalid version.
-    error_is_transient: bool,
     parses: u64,
 }
 
@@ -80,12 +57,6 @@ impl ConfiguredManifest {
     /// exactly as for a manifest that is never reloaded. When `mode` is
     /// known every version must validate for it before it is applied.
     pub fn load(path: PathBuf, mode: Option<PermissionMode>) -> Result<Self, String> {
-        let metadata = std::fs::metadata(&path).map_err(|error| {
-            format!(
-                "failed to read capability manifest {}: {error}",
-                path.display()
-            )
-        })?;
         let bytes = std::fs::read(&path).map_err(|error| {
             format!(
                 "failed to read capability manifest {}: {error}",
@@ -95,14 +66,13 @@ impl ConfiguredManifest {
         let manifest = parse_manifest_bytes(&path, &bytes)?;
         Ok(Self {
             state: Mutex::new(ReloadState {
-                identity: Some(FileIdentity::of(&metadata)),
                 file_sha256: sha256_hex(&bytes),
+                rejected_sha256: None,
                 applied: AppliedManifest {
                     generation: 1,
                     manifest: Arc::new(manifest),
                 },
                 last_error: None,
-                error_is_transient: false,
                 parses: 1,
             }),
             path,
@@ -120,78 +90,51 @@ impl ConfiguredManifest {
     }
 
     fn refresh(&self, state: &mut ReloadState) {
-        let before = match std::fs::metadata(&self.path) {
-            Ok(metadata) => FileIdentity::of(&metadata),
-            Err(error) => {
-                // Transient (for example mid-replacement): keep the applied
-                // version and look again on the next call.
-                state.last_error = Some(format!(
-                    "failed to read capability manifest {}: {error}",
-                    self.path.display()
-                ));
-                state.error_is_transient = true;
-                return;
-            }
-        };
-        if state.identity.as_ref() == Some(&before) {
-            // The file is readable again and unchanged: a read failure no
-            // longer applies, while an invalid version's error still does.
-            if state.error_is_transient {
-                state.last_error = None;
-                state.error_is_transient = false;
-            }
-            return;
-        }
         let bytes = match std::fs::read(&self.path) {
             Ok(bytes) => bytes,
             Err(error) => {
+                // For example mid-replacement: keep the applied version and
+                // look again on the next call.
                 state.last_error = Some(format!(
                     "failed to read capability manifest {}: {error}",
                     self.path.display()
                 ));
-                state.error_is_transient = true;
                 return;
             }
         };
-        // The file changed while it was read: apply nothing and look again
-        // on the next call, so one version is never mixed with another.
-        match std::fs::metadata(&self.path) {
-            Ok(metadata) if FileIdentity::of(&metadata) == before => {}
-            _ => return,
-        }
         let file_sha256 = sha256_hex(&bytes);
         if file_sha256 == state.file_sha256 {
-            state.identity = Some(before);
+            // The applied version is in place: no error applies.
             state.last_error = None;
-            state.error_is_transient = false;
+            state.rejected_sha256 = None;
             return;
         }
-        // An invalid version is not retried until the file changes again.
-        state.identity = Some(before);
+        if state.rejected_sha256.as_deref() == Some(file_sha256.as_str()) {
+            return;
+        }
         state.parses += 1;
-        let mut manifest = match parse_manifest_bytes(&self.path, &bytes) {
-            Ok(manifest) => manifest,
-            Err(error) => {
-                state.last_error = Some(error);
-                state.error_is_transient = false;
-                return;
+        let parsed = parse_manifest_bytes(&self.path, &bytes).and_then(|mut manifest| {
+            manifest.inherit_lease(&state.applied.manifest);
+            if let Some(mode) = self.mode {
+                manifest.validate_for_mode(mode)?;
             }
-        };
-        manifest.inherit_lease(&state.applied.manifest);
-        if let Some(mode) = self.mode {
-            if let Err(error) = manifest.validate_for_mode(mode) {
+            Ok(manifest)
+        });
+        match parsed {
+            Ok(manifest) => {
+                state.applied = AppliedManifest {
+                    generation: state.applied.generation + 1,
+                    manifest: Arc::new(manifest),
+                };
+                state.file_sha256 = file_sha256;
+                state.rejected_sha256 = None;
+                state.last_error = None;
+            }
+            Err(error) => {
+                state.rejected_sha256 = Some(file_sha256);
                 state.last_error = Some(error);
-                state.error_is_transient = false;
-                return;
             }
         }
-        state.applied = AppliedManifest {
-            generation: state.applied.generation + 1,
-            manifest: Arc::new(manifest),
-        };
-        state.file_sha256 = file_sha256;
-        state.last_error = None;
-        state.error_is_transient = false;
     }
 
     /// Content-free reload status for health and configuration output.
@@ -303,17 +246,60 @@ mod tests {
     }
 
     #[test]
-    fn an_unchanged_file_is_not_read_or_parsed_again() {
+    fn an_unchanged_file_is_not_parsed_again() {
         let (_dir, path, store) = store(NARROW);
         for _ in 0..3 {
             store.current();
         }
         assert_eq!(store.parses(), 1);
-        // Same bytes under a new identity: read, hashed, never parsed.
+        // Same bytes under a new file: hashed, never parsed.
         replace(&path, NARROW);
         let applied = store.current();
         assert_eq!(applied.generation, 1);
         assert_eq!(store.parses(), 1);
+    }
+
+    #[test]
+    fn a_same_size_rewrite_in_place_applies_at_the_next_call() {
+        // Same length, same file, same whole-second modification time (as a
+        // coarse clock records two quick writes): only the bytes differ.
+        let tick = std::time::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let pin = |path: &std::path::Path| {
+            std::fs::File::options()
+                .write(true)
+                .open(path)
+                .unwrap()
+                .set_modified(tick)
+                .unwrap();
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("capability-manifest.yaml");
+        std::fs::write(
+            &path,
+            "version: 3\nexpires_after: 2h\nallow:\n  tools: [get_config]\n",
+        )
+        .unwrap();
+        pin(&path);
+        let store = ConfiguredManifest::load(path.clone(), Some(PermissionMode::Standard)).unwrap();
+        let before = std::fs::metadata(&path).unwrap();
+        let first = store.current();
+        std::fs::write(
+            &path,
+            "version: 3\nexpires_after: 1h\nallow:\n  tools: [get_config]\n",
+        )
+        .unwrap();
+        pin(&path);
+        let rewritten = std::fs::metadata(&path).unwrap();
+        assert_eq!(rewritten.len(), before.len());
+        assert_eq!(rewritten.modified().unwrap(), before.modified().unwrap());
+
+        let after = store.current();
+        assert_eq!(after.generation, first.generation + 1);
+        // The narrowed lease counts from the original approval.
+        assert_eq!(
+            after.manifest.expires_unix_ms(),
+            Some(first.manifest.loaded_unix_ms + Duration::from_secs(3600).as_millis())
+        );
     }
 
     #[test]
