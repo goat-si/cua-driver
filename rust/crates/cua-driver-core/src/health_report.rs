@@ -229,6 +229,11 @@ pub struct Report {
     /// `schema_version="1"`; absent from older drivers.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub build: Option<crate::build_info::BuildInfo>,
+    /// The capability manifest this call is authorized against:
+    /// `{sha256, file_sha256, reload_error}`, all null without one. Additive
+    /// under `schema_version="1"`; absent from older drivers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capability_manifest: Option<Value>,
 }
 
 // ── Provider trait ───────────────────────────────────────────────────────────
@@ -449,6 +454,7 @@ impl Tool for HealthReportTool {
             overall: compute_overall(&checks),
             checks,
             build: Some(crate::build_info::current()),
+            capability_manifest: Some(crate::session_manifest::applied_capability_manifest_json()),
         };
 
         let text = text_summary(&report);
@@ -647,6 +653,48 @@ mod tests {
     }
 
     // ── invoke end-to-end via the fixture provider ───────────────────
+
+    #[tokio::test]
+    async fn the_report_names_the_capability_manifest_the_call_is_authorized_against() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("manifest.yaml");
+        std::fs::write(&path, "version: 3\nallow:\n  tools: [health_report]\n").unwrap();
+        let manifest = Arc::new(crate::session_manifest::load_manifest(&path).unwrap());
+        let context = crate::session_authorization::SessionAuthorizationRegistry::with_ceiling(
+            crate::session_authorization::SessionModeCeiling::for_trusted_sessions(
+                [crate::authorization::PermissionMode::Standard],
+                false,
+                std::time::Duration::from_secs(60),
+                std::time::Duration::from_secs(30),
+            )
+            .unwrap(),
+        )
+        .compatibility_context(
+            crate::authorization::PermissionMode::Standard,
+            Some(manifest.clone()),
+        )
+        .unwrap();
+        let provider = Arc::new(FixtureProvider {
+            names: macos_names(),
+            platform: "darwin",
+            fail_names: BTreeSet::new(),
+        });
+        let tool = HealthReportTool::new(provider);
+        let result = crate::tool::with_test_dispatch_context(context, tool.invoke(json!({}))).await;
+        let structured = result.structured_content.expect("structured payload");
+        assert_eq!(
+            structured["capability_manifest"]["sha256"],
+            manifest.sha256()
+        );
+        assert!(structured["capability_manifest"]
+            .as_object()
+            .is_some_and(
+                |status| status.contains_key("file_sha256") && status.contains_key("reload_error")
+            ));
+
+        let unbound = tool.invoke(json!({})).await;
+        assert!(unbound.structured_content.unwrap()["capability_manifest"]["sha256"].is_null());
+    }
 
     #[tokio::test]
     async fn invoke_no_args_produces_documented_schema() {

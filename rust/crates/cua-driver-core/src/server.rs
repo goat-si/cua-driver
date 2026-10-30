@@ -190,6 +190,9 @@ pub enum ToolRefusalCode {
     BrowserInputIncomplete,
     BrowserActionUnavailable,
     BrowserOriginOutsideScope,
+    BrowserOriginScopeRequired,
+    BrowserBatchRefused,
+    BrowserProcessProtected,
     Other,
 }
 
@@ -213,6 +216,9 @@ impl ToolRefusalCode {
             Self::BrowserInputIncomplete => "browser_input_incomplete",
             Self::BrowserActionUnavailable => "browser_action_unavailable",
             Self::BrowserOriginOutsideScope => "browser_origin_outside_scope",
+            Self::BrowserOriginScopeRequired => "browser_origin_scope_required",
+            Self::BrowserBatchRefused => "browser_batch_refused",
+            Self::BrowserProcessProtected => "browser_process_protected",
             Self::Other => "other",
         }
     }
@@ -239,6 +245,9 @@ impl ToolRefusalCode {
             Some("browser_input_incomplete") => Self::BrowserInputIncomplete,
             Some("browser_action_unavailable") => Self::BrowserActionUnavailable,
             Some("browser_origin_outside_scope") => Self::BrowserOriginOutsideScope,
+            Some("browser_origin_scope_required") => Self::BrowserOriginScopeRequired,
+            Some("browser_batch_refused") => Self::BrowserBatchRefused,
+            Some("browser_process_protected") => Self::BrowserProcessProtected,
             Some(_) | None => Self::Other,
         }
     }
@@ -264,6 +273,9 @@ impl From<crate::browser::refusal::BrowserRefusalCode> for ToolRefusalCode {
             BrowserRefusalCode::BrowserInputIncomplete => Self::BrowserInputIncomplete,
             BrowserRefusalCode::BrowserActionUnavailable => Self::BrowserActionUnavailable,
             BrowserRefusalCode::BrowserOriginOutsideScope => Self::BrowserOriginOutsideScope,
+            BrowserRefusalCode::BrowserOriginScopeRequired => Self::BrowserOriginScopeRequired,
+            BrowserRefusalCode::BrowserBatchRefused => Self::BrowserBatchRefused,
+            BrowserRefusalCode::BrowserProcessProtected => Self::BrowserProcessProtected,
             // Not a browser-specific code: the shared background refusal is
             // classified through `ToolErrorClass::BackgroundUnavailable`.
             BrowserRefusalCode::BackgroundUnavailable => Self::Other,

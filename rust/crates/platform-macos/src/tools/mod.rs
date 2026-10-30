@@ -13,6 +13,7 @@ mod element_simulate;
 mod get_window_state;
 mod hotkey;
 mod invoke_menu;
+mod key_delivery_guard;
 mod kill_app;
 mod launch_app;
 mod list_apps;
@@ -20,11 +21,12 @@ mod list_windows;
 mod menu_bar_extras;
 mod menu_equivalent;
 pub(crate) mod not_editable;
-mod press_key;
+pub(crate) mod press_key;
 mod right_click;
 mod scroll;
 mod select_text;
 mod set_value;
+mod set_value_autosubmit;
 mod set_window_frame;
 mod sheet_close;
 mod type_text;
@@ -753,10 +755,31 @@ pub(crate) async fn acquire_key_scope(
     window_id: Option<u32>,
     foreground: bool,
 ) -> Result<Option<crate::input::skylight::WindowKeyScope>, cua_driver_core::protocol::ToolResult> {
+    acquire_key_scope_with_eligibility(pid, window_id, foreground, false).await
+}
+
+pub(crate) async fn acquire_key_scope_with_eligibility(
+    pid: i32,
+    window_id: Option<u32>,
+    foreground: bool,
+    eligible: bool,
+) -> Result<Option<crate::input::skylight::WindowKeyScope>, cua_driver_core::protocol::ToolResult> {
     let Some(wid) = window_id.filter(|_| !foreground) else {
         return Ok(None);
     };
-    match tokio::task::spawn_blocking(move || key_scope(pid, Some(wid))).await {
+    // The latency trace's key_belief/scope fields are recorded inside the
+    // scope entry, so the blocking prime must carry the trace with it.
+    match crate::goat::action_latency::spawn_blocking(move || {
+        if eligible && crate::input::skylight::is_focus_without_raise_available() {
+            crate::input::skylight::enter_untargeted_key_scope(pid, wid)
+                .map(Some)
+                .map_err(|error| error.reason)
+        } else {
+            key_scope(pid, Some(wid))
+        }
+    })
+    .await
+    {
         Ok(Ok(scope)) => Ok(scope),
         Ok(Err(_)) if crate::input::skylight::windowserver_connection_invalid() => {
             Err(windowserver_connection_refusal(pid, Some(wid)))
@@ -1621,6 +1644,9 @@ pub fn register_all(
     host_bundle_id: Option<String>,
 ) {
     let registry = &mut latency::Registry::new(registry);
+    // Desktop-scope pointer tools check where every point lands
+    // (desktop_pointer_guard) and desktop-scope keys check the frontmost app.
+    cua_driver_core::browser::protection::declare_desktop_point_guard();
     let state = Arc::new(ToolState::new_with_capture_service(
         registry.capture_service(),
         cursor_overlay_available,

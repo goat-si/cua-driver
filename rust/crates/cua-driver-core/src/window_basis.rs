@@ -197,6 +197,17 @@ impl DispatchOutcome {
         if self.effect == DispatchEffect::Refused && self.events_sent == 0 {
             result["nothing_sent"] = json!(true);
         }
+        // A cleanup step that could not undo a visible side effect carries a
+        // short "warning"; surface it at the top level so it reaches the
+        // caller even when the cleanup details are not shown.
+        let warnings: Vec<&str> = self
+            .cleanup_results
+            .iter()
+            .filter_map(|entry| entry.get("warning").and_then(Value::as_str))
+            .collect();
+        if !warnings.is_empty() {
+            result["warning"] = json!(warnings.join("; "));
+        }
         result
     }
 }

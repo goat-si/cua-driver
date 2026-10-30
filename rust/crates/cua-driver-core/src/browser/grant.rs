@@ -61,7 +61,20 @@ impl ExistingProfileGrant {
     }
 
     fn authorization_context_matches(&self) -> bool {
-        crate::tool::current_dispatch_authorization_context()
+        let context = crate::tool::current_dispatch_authorization_context();
+        // A manifest that no longer lists this window (for example after the
+        // host narrowed its manifest file) ends the attachment at the next
+        // call that uses it, before anything is sent to the browser.
+        if context
+            .as_deref()
+            .and_then(|context| context.capability_manifest())
+            .is_some_and(|manifest| {
+                !manifest.allows_existing_profile_window(self.pid, self.window_id)
+            })
+        {
+            return false;
+        }
+        context
             .map(|context| context.mode())
             .map(Ok)
             .unwrap_or_else(crate::authorization::configured_permission_mode)
@@ -175,6 +188,19 @@ impl ExistingProfileGrants {
         let mut removed = grants.remove(&Self::key(public_session, transport_session, pid))?;
         transfer_cleanup_ownership(&mut grants, &mut removed);
         Some(removed)
+    }
+
+    /// Whether any grant (live or not yet reaped) attaches browser `pid`.
+    pub fn holds_pid(&self, pid: i64) -> bool {
+        self.inner
+            .lock()
+            .unwrap()
+            .values()
+            .any(|grant| grant.pid == pid)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.inner.lock().unwrap().is_empty()
     }
 
     pub fn remove_session(&self, session: &str) -> Vec<ExistingProfileGrant> {

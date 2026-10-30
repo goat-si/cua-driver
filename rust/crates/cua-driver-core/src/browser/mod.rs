@@ -45,9 +45,11 @@ mod keyed_gates;
 #[cfg(test)]
 pub(crate) mod mock_cdp;
 mod mutation;
+pub mod origin_scope;
 pub mod platform;
 pub mod pointer;
 mod prepare;
+pub mod protection;
 mod reconnect;
 pub mod refusal;
 mod semantic;

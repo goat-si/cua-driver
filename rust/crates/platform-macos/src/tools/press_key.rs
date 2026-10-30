@@ -225,7 +225,7 @@ struct KeyFocusUnconfirmed;
 struct KeyFocusUnconfirmedAfterClick;
 
 #[derive(Debug, thiserror::Error)]
-enum WindowFocusConflictError {
+pub(super) enum WindowFocusConflictError {
     #[error("addressed element does not belong to target window {target_window_id}")]
     AddressedElementOutsideWindow {
         pid: i32,
@@ -347,7 +347,7 @@ fn late_cell_refusal(
     Ok(())
 }
 
-fn verify_raw_key_target(
+pub(super) fn verify_raw_key_target(
     pid: i32,
     window_id: Option<u32>,
     pre_focus_ptr: Option<usize>,
@@ -356,6 +356,20 @@ fn verify_raw_key_target(
     let Some(wid) = window_id else {
         return Ok(());
     };
+    if pre_focus_ptr.is_none() {
+        return verify_untargeted_key_with(
+            pid,
+            wid,
+            focused_key_route,
+            || crate::ax::bindings::focused_window_id_of_pid(pid),
+            |sample| match sample {
+                Some(window) => crate::ax::exact_target::check_window_focus_conflict_with_sample(
+                    pid, wid, None, window,
+                ),
+                None => crate::ax::exact_target::check_window_focus_conflict(pid, wid, None),
+            },
+        );
+    }
     if focused_key_route {
         if let Some(ptr) = pre_focus_ptr {
             let exact_focus = super::type_text::element_in_requested_window(pid, wid, ptr)
@@ -380,6 +394,52 @@ fn verify_raw_key_target(
     let conflict = crate::ax::exact_target::check_window_focus_conflict(pid, wid, pre_focus_ptr);
     if let Some(err) = map_focus_conflict_to_refusal(pid, conflict) {
         return Err(err.into());
+    }
+    Ok(())
+}
+
+pub(crate) fn verify_untargeted_key_with(
+    pid: i32,
+    wid: u32,
+    focused_key_route: bool,
+    read_window: impl FnOnce() -> Option<u32>,
+    conflict: impl FnOnce(Option<Option<u32>>) -> crate::ax::exact_target::WindowFocusConflict,
+) -> anyhow::Result<()> {
+    let sample = if focused_key_route {
+        let window = read_window();
+        if window != Some(wid) {
+            anyhow::bail!(
+                "window {wid} is not the application's positively confirmed key window; no key was sent"
+            );
+        }
+        Some(window)
+    } else {
+        None
+    };
+    if let Some(err) = map_focus_conflict_to_refusal(pid, conflict(sample)) {
+        return Err(err.into());
+    }
+    Ok(())
+}
+
+pub(super) fn should_check_belief_conflict(used_belief: bool) -> bool {
+    used_belief
+}
+
+pub(super) fn verify_final_key_sample_with(
+    pid: i32,
+    wid: u32,
+    focused_key_route: bool,
+    cached: bool,
+    sample: Option<u32>,
+    conflict: impl FnOnce(Option<Option<u32>>) -> crate::ax::exact_target::WindowFocusConflict,
+) -> anyhow::Result<()> {
+    let require_match = focused_key_route || cached;
+    if require_match && sample != Some(wid) {
+        anyhow::bail!("window {wid} is not the application's positively confirmed key window; no key was sent");
+    }
+    if let Some(error) = map_focus_conflict_to_refusal(pid, conflict(Some(sample))) {
+        return Err(error.into());
     }
     Ok(())
 }
@@ -443,7 +503,7 @@ pub(super) fn invalid_key(error: anyhow::Error) -> ToolResult {
     }))
 }
 
-fn delivery_failed(error: anyhow::Error) -> ToolResult {
+pub(super) fn delivery_failed(error: anyhow::Error) -> ToolResult {
     if let Some(conflict) = error.downcast_ref::<WindowFocusConflictError>() {
         return match *conflict {
             WindowFocusConflictError::AddressedElementOutsideWindow {
@@ -525,6 +585,7 @@ fn def() -> &'static ToolDef {
                 "session": { "type": "string", "description": "For multi-call work, prefer a short public session label and repeat it on every call that accepts it." },
                 "pid": { "type": "integer", "description": "Target process ID." },
                 "key": { "type": "string", "description": "Key name." },
+                "duration_ms": { "type": "integer", "minimum": 0, "maximum": 30000, "description": "Key-down hold in milliseconds; omitted uses the configured key gap." },
                 "modifiers": {
                     "type": "array",
                     "items": { "type": "string" },
@@ -554,6 +615,10 @@ impl Tool for PressKeyTool {
 
     async fn invoke(&self, args: Value) -> ToolResult {
         use cua_driver_core::tool_args::ArgsExt;
+        let duration = match super::key_delivery_guard::duration_from_args(&args) {
+            Ok(duration) => duration,
+            Err(refusal) => return refusal,
+        };
         if args.opt_str("scope").as_deref() == Some("desktop")
             && args.get("pid").is_none()
             && args.get("window_id").is_none()
@@ -562,6 +627,12 @@ impl Tool for PressKeyTool {
                 Ok(input) => input,
                 Err(result) => return result,
             };
+            if let Some(refusal) = cua_driver_core::browser::protection::frontmost_app_refusal(
+                "press_key",
+                crate::apps::frontmost_pid().map(i64::from),
+            ) {
+                return refusal;
+            }
             let (key, modifiers) = match crate::input::keyboard::resolve_key_press(
                 &input.key,
                 &input.modifiers.unwrap_or_default(),
@@ -594,12 +665,23 @@ impl Tool for PressKeyTool {
             }
             let checked_pid = early_front_pid.unwrap_or_default();
             let printable_desktop = printable_request(&key, &modifiers);
-            let result = latency::spawn_action_blocking(move || {
-                super::not_editable::desktop_dispatch_guard(checked_pid, printable_desktop)?;
-                let modifier_refs: Vec<&str> = modifiers.iter().map(String::as_str).collect();
-                crate::input::keyboard::press_key_global(&key_for_input, &modifier_refs)
-            })
-            .await;
+            let control = Arc::new(crate::input::key_hold::HoldControl::default());
+            let result =
+                super::key_delivery_guard::run_owned((), (), control, move |control, _scope| {
+                    if control.is_cancelled() {
+                        anyhow::bail!("key delivery cancelled");
+                    }
+                    super::not_editable::desktop_dispatch_guard(checked_pid, printable_desktop)?;
+                    let modifier_refs: Vec<&str> = modifiers.iter().map(String::as_str).collect();
+                    crate::input::key_hold::deliver(
+                        crate::input::key_hold::KeyRoute::Global,
+                        &key_for_input,
+                        &modifier_refs,
+                        duration,
+                        &control,
+                    )
+                })
+                .await;
             return match result {
                 Ok(Ok(())) => ToolResult::text(format!("Pressed {display_key} on the desktop."))
                     .with_structured(serde_json::json!({
@@ -717,7 +799,7 @@ impl Tool for PressKeyTool {
                         )
                         .await
                     {
-                        return refusal;
+                        return super::key_delivery_guard::semantic_duration(refusal, duration);
                     }
                     let result = latency::spawn_action_blocking(move || {
                         let sheet = super::sheet_close::SheetWatch::for_window(pid, wid);
@@ -740,21 +822,24 @@ impl Tool for PressKeyTool {
                         ))
                     })
                     .await;
-                    return match result {
-                        Ok(Ok((_, Some(sheet)))) => sheet_closed_result(
-                            format!("✅ Performed {action} for {display_key} on pid {pid}."),
-                            "ax_semantic",
-                            sheet,
-                            ActionTransport::MacosAxAction,
-                        ),
-                        Ok(Ok((confirmed, None))) => {
-                            semantic_press_result(&display_key, action, pid, confirmed)
-                        }
-                        Ok(Err(error)) => delivery_failed(error),
-                        Err(error) => {
-                            delivery_failed(anyhow::anyhow!("semantic key task failed: {error}"))
-                        }
-                    };
+                    return super::key_delivery_guard::semantic_duration(
+                        match result {
+                            Ok(Ok((_, Some(sheet)))) => sheet_closed_result(
+                                format!("✅ Performed {action} for {display_key} on pid {pid}."),
+                                "ax_semantic",
+                                sheet,
+                                ActionTransport::MacosAxAction,
+                            ),
+                            Ok(Ok((confirmed, None))) => {
+                                semantic_press_result(&display_key, action, pid, confirmed)
+                            }
+                            Ok(Err(error)) => delivery_failed(error),
+                            Err(error) => delivery_failed(anyhow::anyhow!(
+                                "semantic key task failed: {error}"
+                            )),
+                        },
+                        duration,
+                    );
                 }
             }
         }
@@ -820,14 +905,24 @@ impl Tool for PressKeyTool {
                     let lease = _mutation_lease
                         .take()
                         .expect("background window actions hold the per-pid lease");
-                    return native_menu_chord(
+                    let result = native_menu_chord(
                         lease,
                         wid,
                         combo,
                         display_key.clone(),
                         (key.clone(), modifiers.clone()),
+                        duration,
                     )
                     .await;
+                    let physical = result
+                        .structured_content
+                        .as_ref()
+                        .is_some_and(|value| value["path"] == "keys_under_scope");
+                    return if physical {
+                        result
+                    } else {
+                        super::key_delivery_guard::semantic_duration(result, duration)
+                    };
                 }
             }
         }
@@ -872,6 +967,7 @@ impl Tool for PressKeyTool {
                         key.clone(),
                         modifiers.clone(),
                         display_key.clone(),
+                        duration,
                     )
                     .await;
                 }
@@ -910,7 +1006,14 @@ impl Tool for PressKeyTool {
 
         // The addressed window must be the app's confirmed key window before
         // any key (or focus click) goes out; otherwise refuse (window_not_key).
-        let _key_scope = match super::acquire_key_scope(pid, window_id, fg).await {
+        let _key_scope = match super::acquire_key_scope_with_eligibility(
+            pid,
+            window_id,
+            fg,
+            pre_focus_ptr.is_none() && px.is_none() && py.is_none(),
+        )
+        .await
+        {
             Ok(scope) => scope,
             Err(refusal) => return refusal,
         };
@@ -1021,12 +1124,14 @@ impl Tool for PressKeyTool {
         // When the background key post returned: the sheet watch counts from it.
         let posted_at = std::sync::Arc::new(std::sync::Mutex::new(None::<std::time::Instant>));
         let posted_in = posted_at.clone();
+        let control = Arc::new(crate::input::key_hold::HoldControl::default());
         let result = focus_guard::with_focus_suppressed(
             Some(pid),
             prior_front,
             "press_key.CGEvent",
             || async move {
-                latency::spawn_action_blocking(move || {
+                super::key_delivery_guard::run_owned(_mutation_lease, _key_scope, control, move |control, key_scope| {
+                    if control.is_cancelled() { anyhow::bail!("key delivery cancelled"); }
                     let pre_focus_ptr = pre_focus_guard.as_ref().map(|guard| guard.as_ptr());
                     let m: Vec<&str> = modifiers.iter().map(String::as_str).collect();
                     // Foreground rung: keep the exact target frontmost through a genuine
@@ -1074,7 +1179,7 @@ impl Tool for PressKeyTool {
                                         || {
                                 verify_raw_key_target(pid, Some(wid), pre_focus_ptr, false)?;
                                 late_cell_refusal(pid, Some(wid), printable, pre_focus_ptr.is_some())?;
-                                crate::input::keyboard::press_key_bare_global(&key, &m)
+                                crate::input::key_hold::deliver(crate::input::key_hold::KeyRoute::BareGlobal, &key, &m, duration, &control)
                             },
                                     )
                                 },
@@ -1107,9 +1212,18 @@ impl Tool for PressKeyTool {
                                 Ok(false)
                             },
                             || {
-                            verify_raw_key_target(pid, window_id, pre_focus_ptr, focused_key_route)?;
+                            if let (Some(wid), None) = (window_id, pre_focus_ptr) {
+                                let cached = key_scope.as_ref().is_some_and(|scope| scope.used_belief());
+                                let sample = super::key_delivery_guard::final_window_sample(pid, wid, key_scope)?;
+                                verify_final_key_sample_with(pid, wid, focused_key_route, cached, sample, |sample| match sample {
+                                    Some(window) => crate::ax::exact_target::check_window_focus_conflict_with_sample(pid, wid, None, window),
+                                    None => crate::ax::exact_target::check_window_focus_conflict(pid, wid, None),
+                                })?;
+                            } else {
+                                verify_raw_key_target(pid, window_id, pre_focus_ptr, focused_key_route)?;
+                            }
                             late_cell_refusal(pid, window_id, printable, pre_focus_ptr.is_some())?;
-                            let posted = crate::input::keyboard::press_key(pid, &key, &m);
+                            let posted = crate::input::key_hold::deliver(crate::input::key_hold::KeyRoute::Pid(pid), &key, &m, duration, &control);
                             if posted.is_ok() {
                                 *posted_in.lock().unwrap_or_else(|e| e.into_inner()) =
                                     Some(std::time::Instant::now());
@@ -1121,8 +1235,7 @@ impl Tool for PressKeyTool {
                 })
                 .await
             },
-        )
-        .await;
+        ).await;
 
         let posted = *posted_at.lock().unwrap_or_else(|e| e.into_inner());
         let sheet_closed = match (&result, sheet_watch, posted) {
@@ -1223,6 +1336,8 @@ fn minimized_key_worker(
     guard: Option<crate::ax::snapshot::RetainedElement>,
     key: String,
     modifiers: Vec<String>,
+    duration: Option<std::time::Duration>,
+    control: &crate::input::key_hold::HoldControl,
 ) -> MinimizedKeyStep {
     use super::type_text::{AxMinimizeOps, MinimizedRestore};
     use cua_driver_core::background_input::{
@@ -1307,7 +1422,13 @@ fn minimized_key_worker(
             |_| Ok(false),
             || {
                 verify_raw_key_target(pid, Some(wid), ptr, true)?;
-                crate::input::keyboard::press_key(pid, &key, &m)
+                crate::input::key_hold::deliver(
+                    crate::input::key_hold::KeyRoute::Pid(pid),
+                    &key,
+                    &m,
+                    duration,
+                    control,
+                )
             },
         )
     });
@@ -1328,15 +1449,21 @@ async fn minimized_key_route(
     key: String,
     modifiers: Vec<String>,
     display_key: String,
+    duration: Option<std::time::Duration>,
 ) -> ToolResult {
     let pid = lease.pid();
-    let step = run_detached(async move {
-        let _lease = lease;
-        latency::spawn_action_blocking(move || {
-            minimized_key_worker(pid, wid, guard, key, modifiers)
-        })
-        .await
-    })
+    let control = Arc::new(crate::input::key_hold::HoldControl::default());
+    let worker_control = control.clone();
+    let step = super::key_delivery_guard::with_disconnect_control(
+        control,
+        run_detached(async move {
+            latency::spawn_action_blocking(move || {
+                let _lease = lease;
+                minimized_key_worker(pid, wid, guard, key, modifiers, duration, &worker_control)
+            })
+            .await
+        }),
+    )
     .await;
     let step = match step {
         Ok(Ok(step)) => step,
@@ -1522,8 +1649,12 @@ fn app_is_frontmost(pid: i32, wid: u32) -> bool {
 /// The app's focused and main windows are both `wid`: its menu commands
 /// apply to that window.
 fn menu_bound_to(pid: i32, wid: u32) -> bool {
+    menu_bound_to_with_sample(pid, wid, crate::ax::bindings::focused_window_id_of_pid(pid))
+}
+
+fn menu_bound_to_with_sample(pid: i32, wid: u32, sample: Option<u32>) -> bool {
     use crate::ax::bindings::{ax_get_window_id, copy_element_attr, AXUIElementCreateApplication};
-    if crate::ax::bindings::focused_window_id_of_pid(pid) != Some(wid) {
+    if sample != Some(wid) {
         return false;
     }
     unsafe {
@@ -1627,6 +1758,10 @@ enum ChordStep {
         text: String,
         validation: crate::input::skylight::ValidationPost,
     },
+    KeysUncertain {
+        text: String,
+        validation: crate::input::skylight::ValidationPost,
+    },
 }
 
 /// What a chord whose item does not read enabled after validation does:
@@ -1673,6 +1808,10 @@ fn keys_posted_step(
             ),
             validation,
         },
+        crate::input::keyboard::ChordPost::Uncertain(reason) => ChordStep::KeysUncertain {
+            text: format!("{path}: key delivery or release was not confirmed ({reason}); keys may have been sent. Check the window.{notes}"),
+            validation,
+        },
     }
 }
 
@@ -1715,13 +1854,26 @@ fn keys_under_scope(
     path: String,
     key: &str,
     modifiers: &[String],
+    duration: Option<std::time::Duration>,
+    control: &crate::input::key_hold::HoldControl,
 ) -> ChordStep {
     let mods: Vec<&str> = modifiers.iter().map(String::as_str).collect();
+    let check_conflict = should_check_belief_conflict(scope.used_belief());
     let (outcome, hand_back_note) = run_keys_under_scope(
         scope,
         gate,
-        || menu_bound_to(pid, wid),
-        || crate::input::keyboard::press_chord_no_auth(pid, key, &mods),
+        || {
+            let sample = crate::ax::bindings::focused_window_id_of_pid(pid);
+            menu_bound_to_with_sample(pid, wid, sample)
+                && (!check_conflict
+                    || matches!(
+                        crate::ax::exact_target::check_window_focus_conflict_with_sample(
+                            pid, wid, None, sample
+                        ),
+                        crate::ax::exact_target::WindowFocusConflict::Clear
+                    ))
+        },
+        || crate::input::key_hold::deliver_menu(pid, key, &mods, duration, control),
         |scope| {
             let entry = scope.entry();
             let hand_back = scope.finish();
@@ -2381,6 +2533,12 @@ fn chord_result(step: ChordStep) -> ToolResult {
                 .build()
                 .expect("a suspected no-op key record is valid"),
             ),
+        ChordStep::KeysUncertain { text, validation } => ToolResult::error(text.clone())
+            .with_structured(serde_json::json!({
+                "path": "keys_under_scope", "effect": "unverifiable", "message": text,
+                "keys_may_have_been_sent": true, "key_release": "released",
+                "validation_keys_sent": validation.key_attempts > 0,
+            })),
     }
 }
 
@@ -2392,12 +2550,19 @@ pub(super) async fn native_menu_chord(
     combo: super::menu_equivalent::Combo,
     display_key: String,
     chord: (String, Vec<String>),
+    duration: Option<std::time::Duration>,
 ) -> ToolResult {
     let pid = lease.pid();
-    let outcome = run_detached(async move {
-        let lease = lease;
-        let step =
-            match latency::spawn_action_blocking(move || chord_in_scope(pid, wid, combo)).await {
+    let control = Arc::new(crate::input::key_hold::HoldControl::default());
+    let worker_control = control.clone();
+    let outcome = super::key_delivery_guard::with_disconnect_control(
+        control,
+        run_detached(async move {
+            let control = worker_control;
+            let lease = lease;
+            let step = match latency::spawn_action_blocking(move || chord_in_scope(pid, wid, combo))
+                .await
+            {
                 Ok(step) => step,
                 Err(error) => {
                     return task_failure(format!(
@@ -2406,89 +2571,96 @@ pub(super) async fn native_menu_chord(
                 ))
                 }
             };
-        match step {
-            ChordStep::Save { scope, path } => {
-                let entry = scope.entry();
-                let result = super::invoke_menu::run_in_background_with_lease(
-                    &lease,
-                    wid,
-                    path,
-                    super::invoke_menu::MenuRequest::KeyEquivalent(display_key),
-                    super::invoke_menu::KeyOwner::Caller,
-                )
-                .await;
-                let hand_back = latency::spawn_action_blocking(move || scope.finish())
-                    .await
-                    .unwrap_or(crate::input::skylight::HandBack::NotConfirmed);
-                let mut result = super::hotkey::menu_refusal_without_keys(result);
-                let disclosure = crate::input::skylight::scope_disclosure(entry, Some(hand_back));
-                append_to_summary(&mut result, &disclosure);
-                if let Some(serde_json::Value::Object(fields)) = result.structured_content.as_mut()
-                {
-                    if !disclosure.is_empty() {
-                        fields.insert("hand_back_note".into(), serde_json::json!(disclosure));
-                    }
-                }
-                result
-            }
-            ChordStep::NeedsKeys {
-                scope,
-                validation,
-                path,
-                note,
-            } => {
-                // Raw keys need the keyboard class's facts (a visible, not
-                // minimized window of a visible app), on the same lease.
-                let gate = lease
-                    .gate_again(
+            match step {
+                ChordStep::Save { scope, path } => {
+                    let entry = scope.entry();
+                    let result = super::invoke_menu::run_in_background_with_lease(
+                        &lease,
                         wid,
-                        None,
-                        cua_driver_core::background_input::BackgroundAction::ExactWindowKeys,
+                        path,
+                        super::invoke_menu::MenuRequest::KeyEquivalent(display_key),
+                        super::invoke_menu::KeyOwner::Caller,
                     )
-                    .await
-                    .map_err(|refusal| refusal_text(&refusal));
-                let gate_refused = gate.is_err();
-                let (key, modifiers) = chord;
-                let step = latency::spawn_action_blocking(move || {
-                    let mut step =
-                        keys_under_scope(pid, wid, scope, gate, validation, path, &key, &modifiers);
-                    if !note.is_empty() {
-                        match &mut step {
-                            ChordStep::KeysPosted { text, .. }
-                            | ChordStep::Refused { text, .. } => {
-                                text.push(' ');
-                                text.push_str(&note);
-                            }
-                            _ => {}
+                    .await;
+                    let hand_back = latency::spawn_action_blocking(move || scope.finish())
+                        .await
+                        .unwrap_or(crate::input::skylight::HandBack::NotConfirmed);
+                    let mut result = super::hotkey::menu_refusal_without_keys(result);
+                    let disclosure =
+                        crate::input::skylight::scope_disclosure(entry, Some(hand_back));
+                    append_to_summary(&mut result, &disclosure);
+                    if let Some(serde_json::Value::Object(fields)) =
+                        result.structured_content.as_mut()
+                    {
+                        if !disclosure.is_empty() {
+                            fields.insert("hand_back_note".into(), serde_json::json!(disclosure));
                         }
                     }
-                    step
-                })
-                .await;
-                match step {
-                    Ok(step) => chord_result(step),
-                    Err(error) if gate_refused => chord_task_failure(
-                        format!(
+                    result
+                }
+                ChordStep::NeedsKeys {
+                    scope,
+                    validation,
+                    path,
+                    note,
+                } => {
+                    // Raw keys need the keyboard class's facts (a visible, not
+                    // minimized window of a visible app), on the same lease.
+                    let gate = lease
+                        .gate_again(
+                            wid,
+                            None,
+                            cua_driver_core::background_input::BackgroundAction::ExactWindowKeys,
+                        )
+                        .await
+                        .map_err(|refusal| refusal_text(&refusal));
+                    let gate_refused = gate.is_err();
+                    let (key, modifiers) = chord;
+                    let step = latency::spawn_action_blocking(move || {
+                        let _lease = lease;
+                        let mut step = keys_under_scope(
+                            pid, wid, scope, gate, validation, path, &key, &modifiers, duration,
+                            &control,
+                        );
+                        if !note.is_empty() {
+                            match &mut step {
+                                ChordStep::KeysPosted { text, .. }
+                                | ChordStep::KeysUncertain { text, .. }
+                                | ChordStep::Refused { text, .. } => {
+                                    text.push(' ');
+                                    text.push_str(&note);
+                                }
+                                _ => {}
+                            }
+                        }
+                        step
+                    })
+                    .await;
+                    match step {
+                        Ok(step) => chord_result(step),
+                        Err(error) if gate_refused => chord_task_failure(
+                            format!(
                             "press_key: the key hand-back task failed ({error}); the requested \
                              chord and its menu action were not sent, and key focus inside the \
                              app may remain on the target window."
                         ),
-                        validation,
-                        false,
-                    ),
-                    Err(error) => chord_task_failure(
-                        format!(
+                            validation,
+                            false,
+                        ),
+                        Err(error) => chord_task_failure(
+                            format!(
                             "press_key: the key task failed ({error}); the requested chord may \
                              have been sent. Read the window before repeating it."
                         ),
-                        validation,
-                        true,
-                    ),
+                            validation,
+                            true,
+                        ),
+                    }
                 }
+                step => chord_result(step),
             }
-            step => chord_result(step),
-        }
-    })
+        }),
+    )
     .await;
     outcome.unwrap_or_else(|error| {
         task_failure(format!(
@@ -3013,6 +3185,175 @@ pub(super) mod tests {
         }
     }
     use super::*;
+
+    #[test]
+    fn uncertain_menu_chord_reports_key_up_completed() {
+        let result = chord_result(ChordStep::KeysUncertain {
+            text: "cancelled after posting".into(),
+            validation: crate::input::skylight::ValidationPost::default(),
+        });
+        assert_eq!(
+            result.structured_content.unwrap()["key_release"],
+            "released"
+        );
+    }
+
+    #[test]
+    fn new_conflict_checks_only_apply_to_belief_scopes() {
+        assert!(
+            !should_check_belief_conflict(false),
+            "normal hotkey and menu scopes keep existing behaviour"
+        );
+        assert!(
+            should_check_belief_conflict(true),
+            "belief scopes must retain the conflict guard"
+        );
+    }
+
+    #[test]
+    fn final_sample_is_reused_without_required_match() {
+        let samples = std::cell::Cell::new(0);
+        verify_final_key_sample_with(123, 700, false, false, Some(700), |sample| {
+            assert_eq!(sample, Some(Some(700)));
+            samples.set(samples.get() + 1);
+            crate::ax::exact_target::WindowFocusConflict::Clear
+        })
+        .unwrap();
+        assert_eq!(samples.get(), 1);
+    }
+
+    #[test]
+    fn focused_route_mismatch_precedes_sibling_conflict() {
+        let error = verify_final_key_sample_with(123, 700, true, false, Some(888), |_| {
+            crate::ax::exact_target::WindowFocusConflict::SiblingWindowFocused {
+                target_window_id: 700,
+                sibling_window_id: 888,
+            }
+        })
+        .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "window 700 is not the application's positively confirmed key window; no key was sent"
+        );
+        let receipt = delivery_failed(error);
+        assert_eq!(
+            receipt.structured_content.unwrap()["code"],
+            "delivery_failed"
+        );
+    }
+
+    #[test]
+    fn uncached_unfocused_route_preserves_typed_sibling_refusal() {
+        let result = verify_final_key_sample_with(123, 700, false, false, Some(888), |_| {
+            crate::ax::exact_target::WindowFocusConflict::SiblingWindowFocused {
+                target_window_id: 700,
+                sibling_window_id: 888,
+            }
+        })
+        .unwrap_err();
+        assert!(result.is::<WindowFocusConflictError>(), "{result}");
+        let receipt = delivery_failed(result);
+        assert_eq!(
+            receipt.structured_content.unwrap()["code"],
+            cua_driver_core::background_input::refusal_codes::SAME_PID_KEYBOARD_AMBIGUITY
+        );
+    }
+
+    #[test]
+    fn duration_schema_accepts_only_bounded_integer_holds() {
+        let duration = &def().input_schema["properties"]["duration_ms"];
+        assert_eq!(duration["type"], "integer");
+        assert_eq!(duration["minimum"], 0);
+        assert_eq!(duration["maximum"], 30_000);
+    }
+
+    #[test]
+    fn final_window_match_still_refuses_a_focused_sibling_element() {
+        use crate::ax::exact_target::decide_window_focus_conflict;
+        let reads = std::cell::Cell::new(0);
+        let result = verify_untargeted_key_with(
+            123,
+            700,
+            true,
+            || {
+                reads.set(reads.get() + 1);
+                Some(700)
+            },
+            |sample| {
+                if sample.is_none() {
+                    reads.set(reads.get() + 1);
+                }
+                decide_window_focus_conflict(700, None, false, Some(888), sample.flatten(), false)
+            },
+        );
+        assert!(
+            result.is_err(),
+            "a matching window does not excuse a sibling focused element"
+        );
+        assert_eq!(reads.get(), 1);
+    }
+
+    #[test]
+    fn final_window_mismatch_refuses_before_any_key_post() {
+        let posts = std::cell::Cell::new(0);
+        let conflict_reads = std::cell::Cell::new(0);
+        let result = verify_untargeted_key_with(
+            123,
+            700,
+            true,
+            || Some(888),
+            |_| {
+                conflict_reads.set(conflict_reads.get() + 1);
+                crate::ax::exact_target::WindowFocusConflict::Clear
+            },
+        )
+        .map(|()| posts.set(posts.get() + 1));
+        assert!(result.is_err());
+        assert_eq!(posts.get(), 0);
+        assert_eq!(conflict_reads.get(), 0);
+    }
+
+    #[tokio::test]
+    async fn invalid_duration_is_refused_before_target_resolution() {
+        let tool = PressKeyTool::new(std::sync::Arc::new(ToolState::new(false, false, None)));
+        let mut receipts = Vec::new();
+        for duration in [
+            serde_json::json!(-1),
+            serde_json::json!(30001),
+            serde_json::json!(1.5),
+        ] {
+            let result = tool
+                .invoke(serde_json::json!({
+                    "key": "a", "element_token": "s7fffffff:0", "duration_ms": duration
+                }))
+                .await;
+            let structured = result.structured_content.expect("structured refusal");
+            receipts.push(structured);
+        }
+        assert!(
+            receipts.iter().all(|r| r["code"] == "invalid_arguments"
+                && r["effect"] == "refused"
+                && r["dispatched"] == false),
+            "{receipts:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn valid_duration_bounds_reach_target_resolution_without_dispatch() {
+        let tool = PressKeyTool::new(std::sync::Arc::new(ToolState::new(false, false, None)));
+        for duration in [0, 30_000] {
+            let result = tool
+                .invoke(serde_json::json!({
+                    "key": "a", "element_token": "s7fffffff:0", "duration_ms": duration
+                }))
+                .await;
+            let structured = result.structured_content.expect("structured refusal");
+            assert_eq!(
+                structured["refusal"]["code"], "stale_element_token",
+                "{duration}: {structured}"
+            );
+        }
+    }
 
     /// A key is posted once and returns: no read before it, no wait after it
     /// (the old oracle slept 60 ms to read the focused element back), and the

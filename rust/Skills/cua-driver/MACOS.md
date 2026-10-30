@@ -881,6 +881,25 @@ There is no backgrounded path that reaches these apps today.
   AX-addressable elements (links, buttons, toolbar items), use
   `right_click({pid, element_token})` instead.
 
+### Submitting a search value
+
+`set_value` accepts `autosubmit:true` for a search field. After the value
+write, it posts Return to the field's process only if the user-interaction,
+exact-window and focused-element checks allow it. The default is false.
+Return delivery and the value's effect are reported separately: the
+structured `note` says whether Return was posted, refused, or uncertain;
+posting it does not verify that the search ran. If the target is not
+identifiable as a search field, the call refuses before writing anything,
+avoiding an unintended submission on another control. Return is posted only
+after a write whose effect is `confirmed` or `unverifiable` and whose
+read-back did not still show the old text (on web content that case reads
+`unverifiable`, and Return is still withheld), so the field's previous text
+is never submitted. A field in a minimized window is refused with
+`minimized_or_hidden_window` before anything is written: the write minimizes the
+window again, and Return needs it visible. Once the write has finished,
+cancelling the call does not stop the Return post; it still passes every
+check above, and only the result is lost.
+
 ### A value write the app does not apply (LibreOffice)
 
 Some apps accept an accessibility value write and ignore it. LibreOffice
@@ -1046,6 +1065,16 @@ window, use the menu-bar flow from "Navigating native menu bars"
 above (`invoke_menu` with a path such as `["Go", "Downloads"]`).
 
 ### LibreOffice, Numbers and other editors in the background
+
+`press_key` and `hotkey` accept `duration_ms` from 0 through 30000 for the
+physical key-down hold. When omitted, the configured `CUA_DRIVER_KEY_GAP_MS`
+is used, or 8 ms by default. A semantic accessibility or menu action does not
+hold a key and reports `duration_applied: false` when a duration was given.
+Window-addressed keys may reuse a recent focus confirmation; the driver still
+checks the focused window and conflicting element immediately before posting.
+An unconfirmed result remains `unverifiable` unless a read-back establishes it.
+If an MCP key call is cancelled during a hold, key release is requested before
+focus hand-back; its cancellation receipt reports `key_release: pending`.
 
 With `window_id`, `type_text`, `press_key` and `hotkey` target that exact window: the driver makes it the app's key window through in-app key-window records (no raise, no activation, real pointer untouched), confirms focus, and hands key back. This also covers another window or dialog of the app holding focus, and a LibreOffice that was never activated. An already-key window needs no focus move; when another window of the app is key, the records move key to the exact window and hand it back afterwards. When the switch cannot be confirmed the call is refused with `window_not_key`. For a window-only native Command chord with a matching menu item, `press_key` and `hotkey` use their menu routes even when the app is frontmost; a `press_key` disabled-item key fallback reports `suspected_noop`. Recipe: pass `window_id` on every call; go to the cell with Name Box navigation (`type_text` `A1\n`), type with `\n` and `\t`, read the cell back; run commands (Paste Special, Format, Save) with `invoke_menu({pid, window_id, path})` rather than clicking the menu bar. A `background_unavailable` refusal here means use `get_window_state` and act by element, not stop.
 

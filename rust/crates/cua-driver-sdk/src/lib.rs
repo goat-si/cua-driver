@@ -1131,6 +1131,7 @@ impl CuaDriver {
             register_host_tools: options.register_host_tools,
             authorization_ceiling: None,
             compatibility_authorization: None,
+            compatibility_manifest_source: None,
             authorization_host: authorization_host::SdkDriverAuthorizationHost::adapt(
                 options.authorization_host,
             ),
@@ -1276,6 +1277,7 @@ impl CuaDriver {
                     register_host_tools: options.register_host_tools,
                     authorization_ceiling: None,
                     compatibility_authorization: None,
+                    compatibility_manifest_source: None,
                     authorization_host: authorization_host::SdkDriverAuthorizationHost::adapt(
                         options.authorization_host,
                     ),
@@ -1301,10 +1303,13 @@ impl CuaDriver {
                     reason: format!("authorization configuration is invalid: {error}"),
                 }
             })?;
-        let manifest = cua_driver_core::session_manifest::configured_capability_manifest()
-            .map_err(|error| DriverError::Configuration { reason: error })?
-            .cloned()
-            .map(Arc::new);
+        // The service follows its configured manifest file: a changed valid
+        // version applies to the next call without a restart.
+        let manifest_source = cua_driver_core::session_manifest::configured_manifest_store()
+            .map_err(|error| DriverError::Configuration { reason: error })?;
+        let manifest = manifest_source
+            .as_ref()
+            .map(|source| source.current().manifest);
         let ceiling =
             cua_driver_core::session_authorization::SessionModeCeiling::for_trusted_sessions(
                 [mode],
@@ -1324,6 +1329,7 @@ impl CuaDriver {
                     register_host_tools: options.register_host_tools,
                     authorization_ceiling: Some(ceiling),
                     compatibility_authorization: Some((mode, manifest)),
+                    compatibility_manifest_source: manifest_source,
                     authorization_host: authorization_host::SdkDriverAuthorizationHost::adapt(
                         options.authorization_host,
                     ),

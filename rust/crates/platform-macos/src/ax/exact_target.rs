@@ -570,6 +570,29 @@ pub fn check_window_focus_conflict(
     target_window_id: u32,
     addressed_element_ptr: Option<usize>,
 ) -> WindowFocusConflict {
+    check_window_focus_conflict_impl(pid, target_window_id, addressed_element_ptr, None)
+}
+
+pub(crate) fn check_window_focus_conflict_with_sample(
+    pid: i32,
+    target_window_id: u32,
+    addressed_element_ptr: Option<usize>,
+    focused_window_id: Option<u32>,
+) -> WindowFocusConflict {
+    check_window_focus_conflict_impl(
+        pid,
+        target_window_id,
+        addressed_element_ptr,
+        Some(focused_window_id),
+    )
+}
+
+fn check_window_focus_conflict_impl(
+    pid: i32,
+    target_window_id: u32,
+    addressed_element_ptr: Option<usize>,
+    focused_window_sample: Option<Option<u32>>,
+) -> WindowFocusConflict {
     unsafe {
         let app = AXUIElementCreateApplication(pid);
         if app.is_null() {
@@ -596,10 +619,12 @@ pub fn check_window_focus_conflict(
             CFRelease(focused as CFTypeRef);
             win
         });
-        let focused_window_id = copy_element_attr(app, "AXFocusedWindow").and_then(|window| {
-            let wid = ax_get_window_id(window);
-            CFRelease(window as CFTypeRef);
-            wid
+        let focused_window_id = focused_window_sample.unwrap_or_else(|| {
+            copy_element_attr(app, "AXFocusedWindow").and_then(|window| {
+                let wid = ax_get_window_id(window);
+                CFRelease(window as CFTypeRef);
+                wid
+            })
         });
         CFRelease(app as CFTypeRef);
         decide_window_focus_conflict(
