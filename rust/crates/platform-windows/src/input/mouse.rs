@@ -136,90 +136,220 @@ fn deepest_child(root: HWND, screen_pt: POINT) -> (HWND, POINT) {
 /// Resolves to the deepest child HWND at the click point before posting,
 /// so top-level browser/chrome windows don't activate in response.
 pub fn post_click(root: u64, x: i32, y: i32, count: usize, button: &str) -> Result<()> {
-    let root_hwnd = HWND(root as *mut _);
-
-    // Convert root-local client → screen.
-    let mut screen_pt = POINT { x, y };
+    let mut point = POINT { x, y };
     unsafe {
-        let _ = ClientToScreen(root_hwnd, &mut screen_pt);
+        let _ = ClientToScreen(HWND(root as *mut _), &mut point);
     }
-
-    // Find deepest child and its local client coordinates.
-    let (target, client) = deepest_child(root_hwnd, screen_pt);
-
-    post_click_on(target, client.x, client.y, count, button)
+    legacy_guarded_result(post_click_guarded(
+        root,
+        point.x,
+        point.y,
+        count,
+        button,
+        || Ok(()),
+    ))
 }
 
-/// Post a click at **screen** coordinates, resolving the deepest child of
-/// `root_hwnd` at that point.  Call this when you already have screen coords.
+/// Post a click at screen coordinates.
 pub fn post_click_screen(root: u64, sx: i32, sy: i32, count: usize, button: &str) -> Result<()> {
-    let root_hwnd = HWND(root as *mut _);
-    let screen_pt = POINT { x: sx, y: sy };
-    let (target, client) = deepest_child(root_hwnd, screen_pt);
-    post_click_on(target, client.x, client.y, count, button)
+    legacy_guarded_result(post_click_guarded(root, sx, sy, count, button, || Ok(())))
 }
 
-/// Internal: post click messages to `hwnd` using its own client coordinates.
-fn post_click_on(hwnd: HWND, x: i32, y: i32, count: usize, button: &str) -> Result<()> {
-    // UIPI check — Medium-IL daemon → High-IL target silently drops mouse
-    // messages just like keyboard ones. Surface an actionable error before
-    // PostMessage returns its misleading TRUE. See post_message_blocked_by_uipi.
-    if let Some(msg) = crate::input::post_message_blocked_by_uipi(hwnd.0 as u64) {
-        anyhow::bail!(msg);
-    }
+use crate::input::guarded_dispatch::{run_guarded, GuardedResult, InputSink};
+use cua_driver_core::window_basis::{BasisRefusal, DispatchEffect};
+use serde_json::{json, Value};
 
-    let (down_msg, double_msg, up_msg, mk_flag) = match button {
-        "right" => (WM_RBUTTONDOWN, WM_RBUTTONDBLCLK, WM_RBUTTONUP, MK_RBUTTON),
-        "middle" => (WM_MBUTTONDOWN, WM_MBUTTONDBLCLK, WM_MBUTTONUP, MK_MBUTTON),
-        _ => (WM_LBUTTONDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONUP, MK_LBUTTON),
-    };
-    let lparam = make_lparam(x, y);
-    let wdown = WPARAM(mk_flag as usize);
-    let wup = WPARAM(0);
-    let wants_double = unsafe { (GetClassLongPtrW(hwnd, GCL_STYLE) as u32 & CS_DBLCLKS.0) != 0 };
-    let prev_fg = unsafe { GetForegroundWindow() };
-    let target_root = unsafe {
-        let root = GetAncestor(hwnd, GA_ROOT);
-        if root.0.is_null() {
-            hwnd
-        } else {
-            root
+fn legacy_guarded_result(result: GuardedResult) -> Result<()> {
+    match result {
+        GuardedResult::Refused { refusal, .. } => bail!("{}: {}", refusal.code, refusal.reason),
+        GuardedResult::Sent { outcome } if outcome.effect != DispatchEffect::Unverifiable => {
+            let error = outcome
+                .cleanup_results
+                .iter()
+                .find_map(|v| v.get("error").and_then(Value::as_str))
+                .unwrap_or("input dispatch failed");
+            bail!("{error}")
         }
-    };
+        GuardedResult::Sent { .. } => Ok(()),
+    }
+}
 
-    // Posted pointer messages are normally non-activating, but WebView hosts can
-    // call SetForegroundWindow from their event handlers. Keep the top-level
-    // categorically non-activatable until the complete burst has settled.
-    let _noact = crate::input::NoActivateGuard::arm(hwnd)?;
-    let unavailable = |error: Error| anyhow!("target thread: {error}");
-    for i in 0..count {
-        let press_msg = posted_press_message(down_msg, double_msg, i, wants_double);
-        let suspended = SuspendedThread::suspend(hwnd).map_err(unavailable)?;
-        let posted = unsafe {
-            // WM_MOUSEMOVE first so hover state is correct before the click.
-            PostMessageW(hwnd, WM_MOUSEMOVE, WPARAM(0), lparam)
-                // Win32 controls do not infer a double-click from two posted DOWN
-                // messages. The second press must use WM_*BUTTONDBLCLK.
-                .and_then(|()| PostMessageW(hwnd, press_msg, wdown, lparam))
-                .and_then(|()| PostMessageW(hwnd, up_msg, wup, lparam))
+struct PostedClick<'a> {
+    root: HWND,
+    screen: POINT,
+    button: &'a str,
+    target: HWND,
+    client: POINT,
+    prev_fg: HWND,
+    target_root: HWND,
+    down: u32,
+    double: u32,
+    up: u32,
+    flag: u32,
+    wants_double: bool,
+    noact: Option<crate::input::NoActivateGuard>,
+    suspended: Option<SuspendedThread>,
+    error: Option<String>,
+}
+impl InputSink for PostedClick<'_> {
+    fn prepare(&mut self) -> Vec<&'static str> {
+        (self.target, self.client) = deepest_child(self.root, self.screen);
+        if let Some(error) = crate::input::post_message_blocked_by_uipi(self.target.0 as u64) {
+            self.error = Some(error);
+            return vec![];
+        }
+        (self.down, self.double, self.up, self.flag) = match self.button {
+            "right" => (WM_RBUTTONDOWN, WM_RBUTTONDBLCLK, WM_RBUTTONUP, MK_RBUTTON),
+            "middle" => (WM_MBUTTONDOWN, WM_MBUTTONDBLCLK, WM_MBUTTONUP, MK_MBUTTON),
+            _ => (WM_LBUTTONDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONUP, MK_LBUTTON),
         };
-        if let Some(suspended) = suspended {
-            suspended.resume().map_err(unavailable)?;
+        self.wants_double =
+            unsafe { (GetClassLongPtrW(self.target, GCL_STYLE) as u32 & CS_DBLCLKS.0) != 0 };
+        self.prev_fg = unsafe { GetForegroundWindow() };
+        self.target_root = unsafe {
+            let root = GetAncestor(self.target, GA_ROOT);
+            if root.0.is_null() {
+                self.target
+            } else {
+                root
+            }
+        };
+        match crate::input::NoActivateGuard::arm(self.target) {
+            Ok(guard) => self.noact = Some(guard),
+            Err(error) => {
+                self.error = Some(error.to_string());
+                return vec![];
+            }
         }
-        posted?;
-        if i + 1 < count {
+        match SuspendedThread::suspend(self.target) {
+            Ok(thread) => self.suspended = thread,
+            Err(error) => {
+                self.error = Some(format!("target thread: {error}"));
+            }
+        }
+        let mut effects = vec!["no_activate"];
+        if self.suspended.is_some() {
+            effects.push("thread_suspended");
+        }
+        effects
+    }
+    fn send(&mut self, index: usize) -> std::result::Result<(), String> {
+        if let Some(error) = self.error.take() {
+            return Err(error);
+        }
+        let part = index % 3;
+        if index > 0 && part == 0 {
+            if let Some(thread) = self.suspended.take() {
+                thread.resume().map_err(|e| format!("target thread: {e}"))?;
+            }
             sleep(Duration::from_millis(80));
+            self.suspended =
+                SuspendedThread::suspend(self.target).map_err(|e| format!("target thread: {e}"))?;
+        }
+        let (message, wparam) = match part {
+            0 => (WM_MOUSEMOVE, WPARAM(0)),
+            1 => (
+                posted_press_message(self.down, self.double, index / 3, self.wants_double),
+                WPARAM(self.flag as usize),
+            ),
+            _ => (self.up, WPARAM(0)),
+        };
+        unsafe {
+            PostMessageW(
+                self.target,
+                message,
+                wparam,
+                make_lparam(self.client.x, self.client.y),
+            )
+        }
+        .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+    fn cleanup(&mut self, sent: usize) -> Vec<Value> {
+        let mut results = vec![];
+        if sent % 3 == 2 {
+            let result = unsafe {
+                PostMessageW(
+                    self.target,
+                    self.up,
+                    WPARAM(0),
+                    make_lparam(self.client.x, self.client.y),
+                )
+            };
+            results.push(json!({"release_button": result.is_ok(), "error": result.err().map(|e| e.to_string())}));
+        }
+        if let Some(thread) = self.suspended.take() {
+            let result = thread.resume();
+            results.push(json!({"resume_thread": result.is_ok(), "error": result.err().map(|e| e.to_string())}));
+        }
+        self.restore();
+        results
+    }
+}
+impl PostedClick<'_> {
+    fn restore(&mut self) {
+        if self.noact.is_some() {
+            sleep(Duration::from_millis(50));
+            unsafe {
+                if !self.prev_fg.0.is_null()
+                    && self.prev_fg != self.target_root
+                    && GetForegroundWindow() == self.target_root
+                {
+                    crate::input::force_foreground_attached(self.prev_fg);
+                    sleep(Duration::from_millis(12));
+                    crate::input::force_foreground_attached(self.prev_fg);
+                }
+            }
+        }
+        self.noact.take();
+    }
+}
+
+/// Post guarded mouse messages at screen coordinates.
+pub fn post_click_guarded(
+    root: u64,
+    sx: i32,
+    sy: i32,
+    count: usize,
+    button: &str,
+    guard: impl FnOnce() -> std::result::Result<(), BasisRefusal>,
+) -> GuardedResult {
+    let mut sink = PostedClick {
+        root: HWND(root as *mut _),
+        screen: POINT { x: sx, y: sy },
+        button,
+        target: HWND::default(),
+        client: POINT::default(),
+        prev_fg: HWND::default(),
+        target_root: HWND::default(),
+        down: 0,
+        double: 0,
+        up: 0,
+        flag: 0,
+        wants_double: false,
+        noact: None,
+        suspended: None,
+        error: None,
+    };
+    let mut result = run_guarded(&mut sink, count.saturating_mul(3), guard);
+    if let GuardedResult::Sent { outcome } = &mut result {
+        if outcome.effect == DispatchEffect::Unverifiable {
+            if let Some(error) = sink.error.take() {
+                outcome.effect = DispatchEffect::Refused;
+                outcome.cleanup_results.push(json!({"error": error}));
+            }
+            if let Some(thread) = sink.suspended.take() {
+                if let Err(error) = thread.resume() {
+                    outcome.effect = DispatchEffect::Uncertain;
+                    outcome
+                        .cleanup_results
+                        .push(json!({"error": format!("target thread: {error}")}));
+                }
+            }
+            sink.restore();
         }
     }
-    sleep(Duration::from_millis(50));
-    unsafe {
-        if !prev_fg.0.is_null() && prev_fg != target_root && GetForegroundWindow() == target_root {
-            crate::input::force_foreground_attached(prev_fg);
-            sleep(Duration::from_millis(12));
-            crate::input::force_foreground_attached(prev_fg);
-        }
-    }
-    Ok(())
+    result
 }
 
 /// Post a press-drag-release gesture via PostMessage.
@@ -530,7 +660,15 @@ pub fn send_click_synthesized_active_mods(
     button: &str,
     modifiers: &[&str],
 ) -> Result<()> {
-    send_click_synthesized_mods_impl(target, sx, sy, count, button, modifiers, ClickMode::Window)
+    legacy_guarded_result(send_click_guarded(
+        target,
+        sx,
+        sy,
+        count,
+        button,
+        modifiers,
+        || Ok(()),
+    )?)
 }
 
 /// Explicit desktop clicks leave the hardware cursor at the requested point.
@@ -561,7 +699,50 @@ fn send_click_synthesized_mods_impl(
     modifiers: &[&str],
     mode: ClickMode,
 ) -> Result<()> {
-    let activate = mode != ClickMode::NonActivating;
+    legacy_guarded_result(send_click_guarded_impl(
+        target,
+        sx,
+        sy,
+        count,
+        button,
+        modifiers,
+        mode,
+        || Ok(()),
+    )?)
+}
+
+/// Send a foreground click after a caller-provided basis check.
+pub fn send_click_guarded(
+    target: u64,
+    sx: i32,
+    sy: i32,
+    count: usize,
+    button: &str,
+    modifiers: &[&str],
+    guard: impl FnOnce() -> std::result::Result<(), BasisRefusal>,
+) -> Result<GuardedResult> {
+    send_click_guarded_impl(
+        target,
+        sx,
+        sy,
+        count,
+        button,
+        modifiers,
+        ClickMode::Window,
+        guard,
+    )
+}
+
+fn send_click_guarded_impl(
+    target: u64,
+    sx: i32,
+    sy: i32,
+    count: usize,
+    button: &str,
+    modifiers: &[&str],
+    mode: ClickMode,
+    guard: impl FnOnce() -> std::result::Result<(), BasisRefusal>,
+) -> Result<GuardedResult> {
     let target = HWND(target as *mut _);
     if target.0.is_null() {
         bail!("invalid target hwnd");
@@ -644,131 +825,167 @@ fn send_click_synthesized_mods_impl(
         },
     };
 
-    unsafe {
-        // Save previous foreground + cursor position so we can restore.
-        let prev_fg = GetForegroundWindow();
-        let mut prev_cursor = POINT::default();
-        let prev_cursor_valid = GetCursorPos(&mut prev_cursor).is_ok();
-
-        // Bring the target to the top of the VISIBLE z-order so the
-        // coordinate-routed SendInput mouse click lands on it — WITHOUT stealing
-        // focus. `SetWindowPos(HWND_TOPMOST, SWP_NOACTIVATE)` is **lock-free**:
-        // it works from a non-UIAccess process even on a maxed foreground-lock
-        // (unlike `SetForegroundWindow`, which the lock denies), and sends no
-        // WM_ACTIVATE. `NoActivateGuard` then keeps the click itself from
-        // activating the target. This is the macOS-aligned "front → act →
-        // restore" for pointer input, done the one Windows way that doesn't
-        // need UIAccess — the technique the OG GTK path used. (Keyboard
-        // foreground still needs *real* focus; only pointer can be z-routed.)
-        // Capture whether the target was ALREADY always-on-top so we don't strip
-        // that state on restore — only demote below if WE promoted it.
-        let was_topmost = (GetWindowLongPtrW(target, GWL_EXSTYLE) as u32) & WS_EX_TOPMOST.0 != 0;
-        if activate && !crate::input::force_foreground_assisted(target).0 {
-            let actual = GetForegroundWindow();
-            bail!(
-                "foreground_unavailable: Windows did not activate exact target HWND {:?} \
-                 (actual foreground HWND {:?}); no mouse input was sent",
-                target.0,
-                actual.0
-            );
-        }
-        let foreground_target = if activate {
-            match crate::win32::capture_foreground_target(target.0 as usize as u64) {
-                Some(target) => Some(target),
-                None => bail!(
-                    "foreground_unavailable: exact target HWND {:?} disappeared before mouse \
-                     input could be sent",
-                    target.0
-                ),
+    let (downs, ups) = crate::input::keyboard::modifier_hold_inputs(modifiers);
+    let mut sink = ForegroundClick {
+        target,
+        sx,
+        sy,
+        mode,
+        count: count.max(1),
+        downs,
+        ups,
+        move_input,
+        down_input,
+        up_input,
+        prev_fg: HWND::default(),
+        prev_cursor: POINT::default(),
+        prev_cursor_valid: false,
+        was_topmost: false,
+        noactivate: None,
+        foreground_target: None,
+        error: None,
+    };
+    let planned = sink.downs.len() + sink.count * 3;
+    let mut result = run_guarded(&mut sink, planned, guard);
+    if let GuardedResult::Sent { outcome } = &mut result {
+        if outcome.effect == DispatchEffect::Unverifiable {
+            let errors = sink.finish(planned);
+            if !errors.is_empty() {
+                outcome.effect = DispatchEffect::Uncertain;
+                outcome.cleanup_results = errors;
             }
-        } else {
-            None
-        };
-        let noactivate = if activate {
-            None
-        } else {
-            Some(crate::input::NoActivateGuard::arm(target)?)
-        };
-        if !activate {
-            let _ = SetWindowPos(
-                target,
-                HWND_TOPMOST,
-                0,
-                0,
-                0,
-                0,
-                SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE,
-            );
         }
+    }
+    Ok(result)
+}
 
-        // Move the cursor so the OS hover state matches before the click; the
-        // MOUSEEVENTF_MOVE input ensures Chromium's input filter sees a
-        // coordinated move event.
-        let _ = SetCursorPos(sx, sy);
-
-        // Hold modifier keys (ctrl/shift/alt/win) across the click — the macOS
-        // `modifier` surface. Pressed via the system input queue so apps that
-        // poll GetKeyState (WPF, Chromium) observe the held state, then released
-        // after the click loop below.
-        let (mod_downs, mod_ups) = crate::input::keyboard::modifier_hold_inputs(modifiers);
-        let mut sent_ok = true;
-        if !mod_downs.is_empty() {
-            let sent = crate::input::delivery::send_input(&mod_downs);
-            sent_ok = sent as usize == mod_downs.len();
+struct ForegroundClick {
+    target: HWND,
+    sx: i32,
+    sy: i32,
+    mode: ClickMode,
+    count: usize,
+    downs: Vec<INPUT>,
+    ups: Vec<INPUT>,
+    move_input: INPUT,
+    down_input: INPUT,
+    up_input: INPUT,
+    prev_fg: HWND,
+    prev_cursor: POINT,
+    prev_cursor_valid: bool,
+    was_topmost: bool,
+    noactivate: Option<crate::input::NoActivateGuard>,
+    foreground_target: Option<crate::win32::windows::ForegroundTarget>,
+    error: Option<String>,
+}
+impl InputSink for ForegroundClick {
+    fn prepare(&mut self) -> Vec<&'static str> {
+        let mut effects = vec![];
+        unsafe {
+            self.prev_fg = GetForegroundWindow();
+            self.prev_cursor_valid = GetCursorPos(&mut self.prev_cursor).is_ok();
+            self.was_topmost =
+                (GetWindowLongPtrW(self.target, GWL_EXSTYLE) as u32) & WS_EX_TOPMOST.0 != 0;
+            if self.mode != ClickMode::NonActivating {
+                if !crate::input::force_foreground_assisted(self.target).0 {
+                    self.error = Some(format!("foreground_unavailable: Windows did not activate exact target HWND {:?} (actual foreground HWND {:?}); no mouse input was sent", self.target.0, GetForegroundWindow().0));
+                    return effects;
+                }
+                effects.push("activation");
+                self.foreground_target =
+                    crate::win32::capture_foreground_target(self.target.0 as usize as u64);
+                if self.foreground_target.is_none() {
+                    self.error =
+                        Some("foreground_unavailable: target disappeared before input".into());
+                    return effects;
+                }
+            } else {
+                match crate::input::NoActivateGuard::arm(self.target) {
+                    Ok(guard) => self.noactivate = Some(guard),
+                    Err(error) => {
+                        self.error = Some(error.to_string());
+                        return effects;
+                    }
+                }
+                effects.push("no_activate");
+                if SetWindowPos(
+                    self.target,
+                    HWND_TOPMOST,
+                    0,
+                    0,
+                    0,
+                    0,
+                    SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE,
+                )
+                .is_ok()
+                {
+                    effects.push("z_order");
+                }
+            }
+            if SetCursorPos(self.sx, self.sy).is_ok() {
+                effects.push("cursor_move");
+            }
+        }
+        effects
+    }
+    fn send(&mut self, index: usize) -> std::result::Result<(), String> {
+        if let Some(error) = self.error.take() {
+            return Err(error);
+        }
+        let n = self.downs.len();
+        if index == n && n > 0 {
             sleep(Duration::from_millis(5));
         }
-
-        let count = count.max(1);
-        for i in 0..count {
-            if !sent_ok {
-                break;
+        if index > n && (index - n) % 3 == 0 {
+            sleep(Duration::from_millis(80));
+        }
+        let input = if index < n {
+            self.downs[index]
+        } else {
+            match (index - n) % 3 {
+                0 => self.move_input,
+                1 => self.down_input,
+                _ => self.up_input,
             }
-            // Only the move record carries absolute coordinates. Button-only
-            // records act at the current pointer position; adding ABSOLUTE to
-            // them can prevent retained-mode controls from seeing the press.
-            let events = [move_input, down_input, up_input];
-            let sent = crate::input::delivery::send_input(&events);
-            if sent as usize != events.len() {
-                sent_ok = false;
-                break;
-            }
-            if i + 1 < count {
-                sleep(Duration::from_millis(80));
+        };
+        if crate::input::delivery::send_input(&[input]) != 1 {
+            return Err("SendInput inserted fewer modifier or mouse events than expected for the foreground click".into());
+        }
+        Ok(())
+    }
+    fn cleanup(&mut self, sent: usize) -> Vec<Value> {
+        self.finish(sent)
+    }
+}
+impl ForegroundClick {
+    fn finish(&mut self, sent: usize) -> Vec<Value> {
+        let mut errors = vec![];
+        let mods = sent.min(self.downs.len());
+        let mouse_sent = sent.saturating_sub(self.downs.len());
+        if mouse_sent % 3 == 2 && crate::input::delivery::send_input(&[self.up_input]) != 1 {
+            errors.push(json!({"error":"failed to release mouse button"}));
+        }
+        if mods > 0 {
+            let ups = &self.ups[self.ups.len() - mods..];
+            if crate::input::delivery::send_input(ups) as usize != ups.len() {
+                let _ = crate::input::delivery::send_input(ups);
+                errors.push(json!({"error":"failed to release modifiers"}));
             }
         }
-
-        // Release any held modifiers (reverse order) before restoring z-order.
-        if !mod_ups.is_empty() {
-            let released = crate::input::delivery::send_input(&mod_ups);
-            if released as usize != mod_ups.len() {
-                // A second release attempt is safe and reduces the chance of a
-                // partially inserted chord leaving system modifier state held.
-                let _ = crate::input::delivery::send_input(&mod_ups);
-                sent_ok = false;
+        unsafe {
+            if sent > 0 {
+                sleep(Duration::from_millis(
+                    if self.mode == ClickMode::NonActivating {
+                        40
+                    } else {
+                        120
+                    },
+                ));
             }
-        }
-
-        // Let the target process mouse-up before any background-route restore.
-        // Retained-mode frameworks establish capture/focus on mouse-down and can
-        // lose the click if the real cursor is warped away while those queued
-        // messages are still being dispatched.
-        sleep(Duration::from_millis(if activate { 120 } else { 40 }));
-        if !was_topmost && !activate {
-            let _ = SetWindowPos(
-                target,
-                HWND_NOTOPMOST,
-                0,
-                0,
-                0,
-                0,
-                SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE,
-            );
-        }
-        if !activate {
-            if !prev_fg.0.is_null() && prev_fg != target {
+            if self.noactivate.is_some() && !self.was_topmost {
                 let _ = SetWindowPos(
-                    prev_fg,
-                    HWND_TOP,
+                    self.target,
+                    HWND_NOTOPMOST,
                     0,
                     0,
                     0,
@@ -776,43 +993,50 @@ fn send_click_synthesized_mods_impl(
                     SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE,
                 );
             }
-            if prev_cursor_valid {
-                let _ = SetCursorPos(prev_cursor.x, prev_cursor.y);
+            if self.mode == ClickMode::NonActivating {
+                if !self.prev_fg.0.is_null() && self.prev_fg != self.target {
+                    let _ = SetWindowPos(
+                        self.prev_fg,
+                        HWND_TOP,
+                        0,
+                        0,
+                        0,
+                        0,
+                        SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE,
+                    );
+                }
+                if self.prev_cursor_valid {
+                    let _ = SetCursorPos(self.prev_cursor.x, self.prev_cursor.y);
+                }
+            } else if self.prev_cursor_valid && (self.mode == ClickMode::Window || sent == 0) {
+                let mut current = POINT::default();
+                if GetCursorPos(&mut current).is_ok()
+                    && cursor_still_at_injected_click(current.x, current.y, self.sx, self.sy)
+                {
+                    let _ = SetCursorPos(self.prev_cursor.x, self.prev_cursor.y);
+                }
             }
-        } else if mode == ClickMode::Window && prev_cursor_valid {
-            // Restore our injected movement, but leave a later user/app move alone.
-            let mut current_cursor = POINT::default();
-            if GetCursorPos(&mut current_cursor).is_ok()
-                && cursor_still_at_injected_click(current_cursor.x, current_cursor.y, sx, sy)
+            if sent == 0
+                && self.mode != ClickMode::NonActivating
+                && !self.prev_fg.0.is_null()
+                && self.prev_fg != self.target
             {
-                let _ = SetCursorPos(prev_cursor.x, prev_cursor.y);
+                crate::input::force_foreground_attached(self.prev_fg);
+            }
+            self.noactivate.take();
+            if sent > 0 && self.mode != ClickMode::NonActivating {
+                if let Some(target) = self.foreground_target {
+                    if !crate::win32::foreground_matches_target_or_owned_window(
+                        target,
+                        GetForegroundWindow().0 as usize as u64,
+                    ) {
+                        errors.push(json!({"error":"foreground_unavailable: target or owned window was not foreground after the click"}));
+                    }
+                }
             }
         }
-        drop(noactivate);
-        if !sent_ok {
-            bail!(
-                "SendInput inserted fewer modifier or mouse events than expected for the \
-                 foreground click."
-            );
-        }
-        if activate {
-            let actual = GetForegroundWindow();
-            if !crate::win32::foreground_matches_target_or_owned_window(
-                foreground_target.expect("foreground target captured before input"),
-                actual.0 as usize as u64,
-            ) {
-                bail!(
-                    "foreground_unavailable: exact target HWND {:?} or a verified same-process \
-                     post-action window was not foreground after the click \
-                     (actual foreground HWND {:?})",
-                    target.0,
-                    actual.0
-                );
-            }
-        }
+        errors
     }
-
-    Ok(())
 }
 
 fn cursor_still_at_injected_click(x: i32, y: i32, click_x: i32, click_y: i32) -> bool {
