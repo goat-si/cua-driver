@@ -3423,8 +3423,18 @@ fn background_element_click_result(
 }
 
 fn invalid_basis_arguments() -> ToolResult {
-    ToolResult::error("snapshot_id requires x and y and cannot be combined with element_token, capture_id, from_zoom, or desktop scope.")
-        .with_structured(json!({"code":"invalid_arguments", "effect":"refused", "nothing_sent":true}))
+    basis_argument_error(
+        "snapshot_id requires x and y and cannot be combined with element_token, capture_id, \
+         from_zoom, or desktop scope.",
+    )
+}
+
+/// A basis-path argument refusal: nothing was sent, and the message names
+/// the argument that was actually wrong.
+fn basis_argument_error(message: impl Into<String>) -> ToolResult {
+    ToolResult::error(message.into()).with_structured(
+        json!({"code":"invalid_arguments", "effect":"refused", "nothing_sent":true}),
+    )
 }
 
 async fn basis_click(state: &ToolState, tool: &str, args: &Value) -> Option<ToolResult> {
@@ -3443,10 +3453,15 @@ async fn basis_click(state: &ToolState, tool: &str, args: &Value) -> Option<Tool
         .and_then(Value::as_i64)
         .and_then(|p| i32::try_from(p).ok())
     else {
-        return Some(invalid_basis_arguments());
+        return Some(basis_argument_error(
+            "snapshot_id needs the pid of the window it was read from: pass pid from \
+             get_window_state.",
+        ));
     };
     let Some(snapshot_id) = args.get("snapshot_id").and_then(Value::as_str) else {
-        return Some(invalid_basis_arguments());
+        return Some(basis_argument_error(
+            "snapshot_id must be the window_basis.snapshot_id string from get_window_state.",
+        ));
     };
     let hwnd = args.get("window_id").and_then(Value::as_u64).or_else(|| {
         let (id, _) = cua_driver_core::window_basis::parse_basis_id(snapshot_id)?;
@@ -3515,11 +3530,15 @@ async fn basis_click(state: &ToolState, tool: &str, args: &Value) -> Option<Tool
         _ => {
             let count = args.get("count").and_then(Value::as_u64).unwrap_or(1);
             if !(1..=3).contains(&count) {
-                return Some(invalid_basis_arguments());
+                return Some(basis_argument_error(
+                    "click: count must be 1 (single), 2 (double) or 3 (triple).",
+                ));
             }
             let button = args.get("button").and_then(Value::as_str).unwrap_or("left");
             if !matches!(button, "left" | "right" | "middle") {
-                return Some(invalid_basis_arguments());
+                return Some(basis_argument_error(format!(
+                    "click: unknown button \"{button}\" — expected one of left, right, middle."
+                )));
             }
             (count as usize, button)
         }
