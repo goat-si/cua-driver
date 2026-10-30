@@ -81,6 +81,32 @@ fn dispatch_mouse_event(route: PostRoute, pid: i32, event: &CGEvent) {
     }
 }
 
+/// The check a caller runs right before the first target click failed. The
+/// events before it (the pointer move, and the off-screen primer pair on the
+/// background route) were already handed to the transport; no target click
+/// was.
+#[derive(Debug)]
+pub struct TargetCheckFailed {
+    pub events_sent: usize,
+    pub source: anyhow::Error,
+}
+
+impl std::fmt::Display for TargetCheckFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "target check before the clicks failed after {} event(s): {}",
+            self.events_sent, self.source
+        )
+    }
+}
+
+impl std::error::Error for TargetCheckFailed {}
+
+fn no_target_check() -> anyhow::Result<()> {
+    Ok(())
+}
+
 #[derive(Clone, Copy)]
 pub enum WindowClickDelivery {
     Background,
@@ -126,6 +152,7 @@ pub fn click_at_xy(
         count,
         modifiers,
         MousePostMode::Both,
+        &mut no_target_check,
     )
 }
 
@@ -393,10 +420,43 @@ pub fn click_at_xy_with_window_local(
     modifiers: &[&str],
     delivery: WindowClickDelivery,
 ) -> anyhow::Result<()> {
+    click_at_xy_with_window_local_checked(
+        pid,
+        (x, y),
+        (wx, wy),
+        wid,
+        count,
+        modifiers,
+        delivery,
+        &mut no_target_check,
+    )
+}
+
+/// [`click_at_xy_with_window_local`] that runs `before_target` right before
+/// the first target down, after the pointer move (and the background
+/// primer). When it fails, no target click is sent and the error is a
+/// [`TargetCheckFailed`] counting the events already handed over.
+#[allow(clippy::too_many_arguments)]
+pub fn click_at_xy_with_window_local_checked(
+    pid: i32,
+    (x, y): (f64, f64),
+    (wx, wy): (f64, f64),
+    wid: u32,
+    count: usize,
+    modifiers: &[&str],
+    delivery: WindowClickDelivery,
+    before_target: &mut dyn FnMut() -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
     match delivery {
-        WindowClickDelivery::Background => {
-            click_at_xy_chromium(pid, x, y, wx, wy, wid, count, modifiers)
-        }
+        WindowClickDelivery::Background => click_at_xy_chromium_checked(
+            pid,
+            (x, y),
+            (wx, wy),
+            wid,
+            count,
+            modifiers,
+            before_target,
+        ),
         WindowClickDelivery::Foreground => click_at_xy_inner(
             pid,
             (x, y),
@@ -405,11 +465,13 @@ pub fn click_at_xy_with_window_local(
             count,
             modifiers,
             MousePostMode::PublicOnly,
+            before_target,
         ),
     }
 }
 
 /// `screen` is the click point in screen coordinates.
+#[allow(clippy::too_many_arguments)]
 fn click_at_xy_inner(
     pid: i32,
     screen: (f64, f64),
@@ -418,6 +480,7 @@ fn click_at_xy_inner(
     count: usize,
     modifiers: &[&str],
     post_mode: MousePostMode,
+    before_target: &mut dyn FnMut() -> anyhow::Result<()>,
 ) -> anyhow::Result<()> {
     let (x, y) = screen;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -467,6 +530,13 @@ fn click_at_xy_inner(
             post_mode,
         );
         std::thread::sleep(std::time::Duration::from_millis(12));
+        if let Err(source) = before_target() {
+            return Err(TargetCheckFailed {
+                events_sent: 1,
+                source,
+            }
+            .into());
+        }
 
         for (pair_index, (down, up)) in pairs.into_iter().enumerate() {
             let click_state = (pair_index + 1) as i64;
@@ -674,15 +744,36 @@ pub fn click_at_xy_chromium(
     count: usize,
     modifiers: &[&str],
 ) -> anyhow::Result<()> {
-    let source = CGEventSource::new(CGEventSourceStateID::HIDSystemState)
-        .map_err(|_| anyhow::anyhow!("CGEventSource::new failed"))?;
-    click_at_xy_chromium_with(
+    click_at_xy_chromium_checked(
         pid,
         (screen_x, screen_y),
         (win_local_x, win_local_y),
         wid,
         count,
         modifiers,
+        &mut no_target_check,
+    )
+}
+
+fn click_at_xy_chromium_checked(
+    pid: i32,
+    screen: (f64, f64),
+    window_local: (f64, f64),
+    wid: u32,
+    count: usize,
+    modifiers: &[&str],
+    before_target: &mut dyn FnMut() -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    let source = CGEventSource::new(CGEventSourceStateID::HIDSystemState)
+        .map_err(|_| anyhow::anyhow!("CGEventSource::new failed"))?;
+    click_at_xy_chromium_with(
+        pid,
+        screen,
+        window_local,
+        wid,
+        count,
+        modifiers,
+        before_target,
         |event_type, location| {
             CGEvent::new_mouse_event(
                 source.clone(),
@@ -698,7 +789,8 @@ pub fn click_at_xy_chromium(
 /// [`click_at_xy_chromium`] with the event factory passed in. Every event of
 /// the route plan is created and stamped before the first is posted, so a
 /// factory failure hands nothing to the transport (posting itself cannot
-/// fail).
+/// fail). `before_target` runs right before the first target down.
+#[allow(clippy::too_many_arguments)]
 fn click_at_xy_chromium_with(
     pid: i32,
     (screen_x, screen_y): (f64, f64),
@@ -706,6 +798,7 @@ fn click_at_xy_chromium_with(
     wid: u32,
     count: usize,
     modifiers: &[&str],
+    before_target: &mut dyn FnMut() -> anyhow::Result<()>,
     mut make_event: impl FnMut(CGEventType, (f64, f64)) -> Result<CGEvent, ()>,
 ) -> anyhow::Result<()> {
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -766,7 +859,18 @@ fn click_at_xy_chromium_with(
         events.push((event, step));
     }
 
-    for (event, step) in events {
+    let mut target_checked = false;
+    for (sent, (event, step)) in events.into_iter().enumerate() {
+        if step.phase == 3 && !target_checked {
+            target_checked = true;
+            if let Err(source) = before_target() {
+                return Err(TargetCheckFailed {
+                    events_sent: sent,
+                    source,
+                }
+                .into());
+            }
+        }
         dispatch_mouse_event(
             post_route(MousePostMode::SkyLightPreferred, skylight_available()),
             pid,
@@ -2342,6 +2446,74 @@ mod tests {
         assert!(posted.iter().all(|p| p.route == PostRoute::PublicPid));
     }
 
+    /// The check before the first target down sees the move and primer
+    /// already sent; when it fails no target down goes out.
+    #[test]
+    fn a_failed_target_check_stops_before_the_first_target_click() {
+        for (delivery, sent) in [
+            (WindowClickDelivery::Background, 3),
+            (WindowClickDelivery::Foreground, 1),
+        ] {
+            let capture = Capture::start(true);
+            let mut checks = 0;
+            let error = click_at_xy_with_window_local_checked(
+                1,
+                (100.0, 100.0),
+                (10.0, 10.0),
+                7,
+                2,
+                &[],
+                delivery,
+                &mut || {
+                    checks += 1;
+                    anyhow::bail!("moved")
+                },
+            )
+            .unwrap_err();
+            let failed = error
+                .downcast_ref::<TargetCheckFailed>()
+                .expect("check failure");
+            assert_eq!(failed.events_sent, sent);
+            assert_eq!(checks, 1);
+            assert_eq!(capture.posted().len(), sent);
+            // Only the move (click state 0) reached the target point.
+            assert!(capture
+                .clicks()
+                .iter()
+                .all(|(state, location)| *location != (100.0, 100.0) || *state == 0));
+        }
+    }
+
+    #[test]
+    fn a_passing_target_check_runs_once_before_the_target_clicks() {
+        let capture = Capture::start(true);
+        let mut seen = None;
+        click_at_xy_with_window_local_checked(
+            1,
+            (100.0, 100.0),
+            (10.0, 10.0),
+            7,
+            2,
+            &[],
+            WindowClickDelivery::Background,
+            &mut || {
+                seen = Some(capture.posted().len());
+                Ok(())
+            },
+        )
+        .unwrap();
+        // Checked once, after the move and the primer pair.
+        assert_eq!(seen, Some(3));
+        let targets: Vec<i64> = capture
+            .clicks()
+            .iter()
+            .filter(|(_, location)| *location == (100.0, 100.0))
+            .map(|(state, _)| *state)
+            .collect();
+        // The move at the target (state 0), then two pairs.
+        assert_eq!(targets, [0, 1, 1, 2, 2]);
+    }
+
     /// A background click asks for 1, 2 or 3 target pairs and gets exactly
     /// that many, with click state 1..N, after the one off-screen primer pair.
     #[test]
@@ -2385,6 +2557,7 @@ mod tests {
                 7,
                 2,
                 &[],
+                &mut no_target_check,
                 |event_type, location| {
                     made += 1;
                     if made == failing + 1 {

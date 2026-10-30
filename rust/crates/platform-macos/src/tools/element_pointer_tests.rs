@@ -24,6 +24,10 @@ struct Fake {
     rect_later: Option<Option<[f64; 4]>>,
     bounds: Option<[f64; 4]>,
     hit: Hit,
+    /// Hit returned from the second hit test on (what the pointer move or
+    /// primer changed under the point).
+    hit_later: Option<Hit>,
+    hit_reads: AtomicUsize,
     lists_ax_open: bool,
     ax_open_result: AXError,
     activates: bool,
@@ -43,6 +47,8 @@ impl Fake {
             rect_later: None,
             bounds: Some(BOUNDS),
             hit: Hit::Target,
+            hit_later: None,
+            hit_reads: AtomicUsize::new(0),
             lists_ax_open: false,
             ax_open_result: kAXErrorSuccess,
             activates: true,
@@ -99,9 +105,19 @@ impl ElementTarget for Fake {
     }
     fn hit_at(&self, point: (f64, f64)) -> Hit {
         assert_eq!(point, CENTER);
-        self.hit.clone()
+        let read = self.hit_reads.fetch_add(1, Ordering::SeqCst);
+        match (read, &self.hit_later) {
+            (0, _) | (_, None) => self.hit.clone(),
+            (_, Some(later)) => later.clone(),
+        }
     }
-    fn post(&self, point: &ElementPoint, count: usize, foreground: bool) -> anyhow::Result<()> {
+    fn post(
+        &self,
+        point: &ElementPoint,
+        count: usize,
+        foreground: bool,
+        before_target: &mut dyn FnMut() -> anyhow::Result<()>,
+    ) -> anyhow::Result<()> {
         self.note("post");
         if let Some((entered, release)) = self.block.lock().unwrap().take() {
             entered.send(()).unwrap();
@@ -109,16 +125,15 @@ impl ElementTarget for Fake {
         }
         // The real primitive, with the transport captured.
         let (result, events) = capture_events(true, || {
-            crate::input::mouse::click_at_xy_with_window_local(
+            crate::input::mouse::click_at_xy_with_window_local_checked(
                 self.pid,
-                point.screen.0,
-                point.screen.1,
-                point.window_local.0,
-                point.window_local.1,
+                point.screen,
+                point.window_local,
                 WINDOW,
                 count,
                 &[],
                 crate::input::mouse::WindowClickDelivery::from_foreground(foreground),
+                before_target,
             )
         });
         self.posts
@@ -291,6 +306,40 @@ fn a_foreground_click_whose_window_cannot_be_fronted_checks_and_sends_nothing() 
     }
     assert!(fake.calls().iter().all(|call| *call == "activate"));
     assert!(fake.posts().is_empty());
+}
+
+#[test]
+fn a_target_that_changes_while_the_clicks_are_prepared_gets_no_click() {
+    for (foreground, events_sent) in [(false, 3), (true, 1)] {
+        let mut fake = Fake::new(1);
+        fake.hit_later = Some(Hit::Elsewhere("a hover button".into()));
+        let error = run_blocking(&fake, 3, 2, false, foreground).unwrap_err();
+        let changed = error
+            .downcast_ref::<TargetChanged>()
+            .expect("target changed");
+        assert_eq!(
+            changed,
+            &TargetChanged {
+                code: "element_not_at_point",
+                events_sent,
+                primer: !foreground,
+            }
+        );
+        let posts = fake.posts();
+        assert_eq!(posts.len(), 1);
+        // The move (and background primer) went out; no target pair did.
+        assert!(
+            target_pairs(&posts[0].3).is_empty(),
+            "foreground {foreground}"
+        );
+        assert_eq!(posts[0].3.len(), events_sent);
+        let result = error_result(2, error);
+        let structured = result.structured_content.unwrap();
+        assert_eq!(structured["code"], "element_changed_before_click");
+        assert_eq!(structured["dispatched"], true);
+        assert_eq!(structured["clicks_posted"], 0);
+        assert_eq!(structured["effect"], "unverifiable");
+    }
 }
 
 #[test]
@@ -468,6 +517,14 @@ async fn cancelling_an_element_multi_click_keeps_the_lease_until_input_finishes(
         crate::background_mutation::try_acquire(pid).is_none(),
         "the lease outlives the cancelled caller while input runs"
     );
+    // Focus-steal protection is armed for a background target whenever
+    // another app is frontmost to restore to.
+    if crate::apps::frontmost_pid().is_some_and(|front| front != pid) {
+        assert!(
+            crate::focus_steal::suppression_armed_for(pid),
+            "focus protection outlives the cancelled caller while input runs"
+        );
+    }
     release_tx.send(()).unwrap();
     // Waits only until the blocking action returns and drops the lease.
     tokio::time::timeout(

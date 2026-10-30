@@ -99,9 +99,17 @@ pub(super) trait ElementTarget: Send + Sync {
     fn element_rect(&self) -> Option<[f64; 4]>;
     fn window_bounds(&self) -> Option<[f64; 4]>;
     fn hit_at(&self, point: (f64, f64)) -> Hit;
-    /// Hand `count` down/up pairs to the event transport. Every event is built
-    /// before the first is posted, so an error means nothing was handed over.
-    fn post(&self, point: &ElementPoint, count: usize, foreground: bool) -> anyhow::Result<()>;
+    /// Hand `count` down/up pairs to the event transport, running
+    /// `before_target` right before the first target down (after the pointer
+    /// move and any primer). Every event is built before the first is posted,
+    /// so any other error means nothing was handed over.
+    fn post(
+        &self,
+        point: &ElementPoint,
+        count: usize,
+        foreground: bool,
+        before_target: &mut dyn FnMut() -> anyhow::Result<()>,
+    ) -> anyhow::Result<()>;
     /// Run `body` with the exact window frontmost and focused; refuse without
     /// running it when that cannot be proven.
     fn in_foreground(&self, body: &mut dyn FnMut() -> anyhow::Result<()>) -> anyhow::Result<()>;
@@ -209,17 +217,69 @@ fn pointer_clicks(
     foreground: bool,
 ) -> anyhow::Result<PointerClicks> {
     let point = checked_point(target, foreground)?;
-    target.post(&point, count, foreground).map_err(|error| {
-        refuse(
-            "pointer_events_unavailable",
-            format!("The click events could not be built ({error}); nothing was sent."),
-        )
-    })?;
+    // The pointer move (and the background primer) can change what is under
+    // the point: prove it again right before the first target click.
+    let mut recheck = || -> anyhow::Result<()> {
+        match checked_point(target, foreground) {
+            Ok(now) if now == point => Ok(()),
+            Ok(_) => Err(refuse("element_moved", "the element moved").into()),
+            Err(refusal) => Err(refusal.into()),
+        }
+    };
+    if let Err(error) = target.post(&point, count, foreground, &mut recheck) {
+        return Err(
+            match error.downcast::<crate::input::mouse::TargetCheckFailed>() {
+                Ok(failed) => TargetChanged {
+                    code: failed
+                        .source
+                        .downcast_ref::<NotDispatched>()
+                        .map_or("element_not_at_point", |refusal| refusal.code),
+                    events_sent: failed.events_sent,
+                    primer: !foreground,
+                }
+                .into(),
+                Err(error) => refuse(
+                    "pointer_events_unavailable",
+                    format!("The click events could not be built ({error}); nothing was sent."),
+                )
+                .into(),
+            },
+        );
+    }
     Ok(PointerClicks {
         point,
         primer: !foreground,
     })
 }
+
+/// The point stopped being on the element between the first check and the
+/// first target click. The pointer move (and background primer) were handed
+/// over; no click on the element was.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct TargetChanged {
+    pub(super) code: &'static str,
+    pub(super) events_sent: usize,
+    pub(super) primer: bool,
+}
+
+impl std::fmt::Display for TargetChanged {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "What is under the element's center changed right before the clicks ({}). The \
+             pointer move{} had already been handed to the event transport; no click on the \
+             element was sent. Read the window again before retrying.",
+            self.code,
+            if self.primer {
+                " and an off-screen primer click"
+            } else {
+                ""
+            }
+        )
+    }
+}
+
+impl std::error::Error for TargetChanged {}
 
 /// AXOpen or pointer clicks, decided as `double_click` decides for count 2.
 fn dispatch(
@@ -355,6 +415,18 @@ pub(super) fn performed_result(
 }
 
 fn error_result(count: usize, error: anyhow::Error) -> ToolResult {
+    if let Some(changed) = error.downcast_ref::<TargetChanged>() {
+        return ToolResult::error(format!("click: {changed}")).with_structured(json!({
+            "code": "element_changed_before_click",
+            "reason": changed.code,
+            "effect": "unverifiable",
+            "dispatched": true,
+            "count": count,
+            "clicks_posted": 0,
+            "primer_clicks": u8::from(changed.primer),
+            "events_sent": changed.events_sent,
+        }));
+    }
     if let Some(refusal) = error.downcast_ref::<NotDispatched>() {
         let mut result = super::pre_dispatch_refusal(refusal.code, format!("click: {refusal}"));
         if let Some(structured) = result.structured_content.as_mut() {
@@ -416,34 +488,52 @@ pub(super) async fn click_element(state: &ToolState, request: ElementClick) -> T
         }
     };
 
-    let prior_front = crate::apps::frontmost_pid();
-    let snapshot = if foreground {
-        crate::window_change_detector::WindowChangeDetector::snapshot_without_suppression(
-            prior_front,
-        )
-    } else {
-        crate::window_change_detector::WindowChangeDetector::snapshot(prior_front)
-    };
+    // The action runs on its own task: a cancelled caller drops only the
+    // handle, while the lease, the focus-steal guards and the window
+    // observation stay armed until the input has finished.
     let action_target = target.clone();
-    // The lease rides into the blocking action and comes back with its
-    // result, so a cancelled caller cannot release it while input still runs.
-    let result = crate::focus_guard::with_focus_suppressed(
-        (!foreground).then_some(pid),
-        prior_front,
-        "click.element_count",
-        || async move {
-            latency::spawn_action_blocking(move || {
-                let held = lease;
-                let outcome = run_blocking(&*action_target, idx, count, use_ax_open, foreground);
-                (outcome, held)
-            })
-            .await
-        },
-    )
-    .await;
-    let changes = super::finish_window_observation(snapshot).await;
+    let action = tokio::spawn(async move {
+        let prior_front = crate::apps::frontmost_pid();
+        let snapshot = if foreground {
+            crate::window_change_detector::WindowChangeDetector::snapshot_without_suppression(
+                prior_front,
+            )
+        } else {
+            crate::window_change_detector::WindowChangeDetector::snapshot(prior_front)
+        };
+        let result = crate::focus_guard::with_focus_suppressed(
+            (!foreground).then_some(pid),
+            prior_front,
+            "click.element_count",
+            || async move {
+                latency::spawn_action_blocking(move || {
+                    let held = lease;
+                    let outcome =
+                        run_blocking(&*action_target, idx, count, use_ax_open, foreground);
+                    (outcome, held)
+                })
+                .await
+            },
+        )
+        .await;
+        let changes = super::finish_window_observation(snapshot).await;
+        (
+            result.map(|(outcome, _held)| outcome),
+            changes.result_suffix(),
+        )
+    });
+    let (result, suffix) = match action.await {
+        Ok(done) => done,
+        Err(error) => {
+            return ToolResult::error(format!(
+                "The click task failed ({error}); the clicks may have been sent. Read fresh \
+                 state before clicking again."
+            ))
+            .with_structured(json!({ "count": count, "effect": "unverifiable" }))
+        }
+    };
     match result {
-        Ok((Ok(performed), _held)) => {
+        Ok(Ok(performed)) => {
             if let Performed::Clicks(clicks) = &performed {
                 let (x, y) = clicks.point.screen;
                 state.cursor_registry.update_position(&cursor_key, x, y);
@@ -453,16 +543,9 @@ pub(super) async fn click_element(state: &ToolState, request: ElementClick) -> T
                     cursor_overlay::OverlayCommand::ClickPulse { x, y },
                 );
             }
-            performed_result(
-                idx,
-                window_id,
-                count,
-                foreground,
-                &performed,
-                &changes.result_suffix(),
-            )
+            performed_result(idx, window_id, count, foreground, &performed, &suffix)
         }
-        Ok((Err(error), _held)) => error_result(count, error),
+        Ok(Err(error)) => error_result(count, error),
         Err(error) => ToolResult::error(format!(
             "The click task failed ({error}); the clicks may have been sent. Read fresh state \
              before clicking again."
@@ -590,17 +673,22 @@ impl ElementTarget for LiveTarget {
         outcome
     }
 
-    fn post(&self, point: &ElementPoint, count: usize, foreground: bool) -> anyhow::Result<()> {
-        crate::input::mouse::click_at_xy_with_window_local(
+    fn post(
+        &self,
+        point: &ElementPoint,
+        count: usize,
+        foreground: bool,
+        before_target: &mut dyn FnMut() -> anyhow::Result<()>,
+    ) -> anyhow::Result<()> {
+        crate::input::mouse::click_at_xy_with_window_local_checked(
             self.pid,
-            point.screen.0,
-            point.screen.1,
-            point.window_local.0,
-            point.window_local.1,
+            point.screen,
+            point.window_local,
             self.window_id,
             count,
             &[],
             crate::input::mouse::WindowClickDelivery::from_foreground(foreground),
+            before_target,
         )
     }
 
