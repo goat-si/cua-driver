@@ -18,6 +18,32 @@ pub enum GuardedResult {
     },
 }
 
+/// Activate a foreground click's target during preparation.
+///
+/// `activate` must change the foreground without emitting input.
+/// `assist` may emit synthetic input (the no-name key that earns the
+/// foreground token) and is only used when `allow_input_assist` is set:
+/// a guarded dispatch must not emit input before its guard runs, so it never
+/// assists. Returns whether the target became foreground and the side
+/// effects preparation performed.
+pub fn prepare_activation(
+    allow_input_assist: bool,
+    activate: impl FnOnce() -> bool,
+    assist: impl FnOnce() -> bool,
+) -> (bool, Vec<&'static str>) {
+    if activate() {
+        return (true, vec!["activation"]);
+    }
+    if !allow_input_assist {
+        return (false, vec![]);
+    }
+    if assist() {
+        (true, vec!["activation_input_assist", "activation"])
+    } else {
+        (false, vec!["activation_input_assist"])
+    }
+}
+
 pub fn run_guarded(
     sink: &mut impl InputSink,
     planned: usize,
@@ -148,5 +174,52 @@ mod tests {
             );
             assert_eq!(outcome.prepared_side_effects, ["cursor"]);
         }
+    }
+}
+
+#[cfg(test)]
+mod activation_tests {
+    use super::prepare_activation;
+    use std::cell::Cell;
+
+    #[test]
+    fn guarded_activation_never_emits_assist_input() {
+        let assisted = Cell::new(false);
+        let (active, effects) = prepare_activation(
+            false,
+            || false,
+            || {
+                assisted.set(true);
+                true
+            },
+        );
+        assert!(!active);
+        assert!(effects.is_empty());
+        assert!(
+            !assisted.get(),
+            "assist emits input and must not run before the guard"
+        );
+    }
+
+    #[test]
+    fn legacy_activation_reports_assist_input_as_a_side_effect() {
+        let (active, effects) = prepare_activation(true, || false, || true);
+        assert!(active);
+        assert_eq!(effects, ["activation_input_assist", "activation"]);
+        let (active, effects) = prepare_activation(true, || false, || false);
+        assert!(!active);
+        assert_eq!(effects, ["activation_input_assist"]);
+        let assisted = Cell::new(false);
+        let (active, effects) = prepare_activation(
+            true,
+            || true,
+            || {
+                assisted.set(true);
+                true
+            },
+        );
+        assert!(active);
+        assert_eq!(effects, ["activation"]);
+        assert!(!assisted.get());
     }
 }

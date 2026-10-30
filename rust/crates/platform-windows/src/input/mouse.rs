@@ -702,13 +702,15 @@ pub fn send_click_synthesized_active_mods(
     button: &str,
     modifiers: &[&str],
 ) -> Result<()> {
-    legacy_guarded_result(send_click_guarded(
+    legacy_guarded_result(send_click_guarded_impl(
         target,
         sx,
         sy,
         count,
         button,
         modifiers,
+        ClickMode::Window,
+        true,
         || Ok(()),
     )?)
 }
@@ -749,6 +751,7 @@ fn send_click_synthesized_mods_impl(
         button,
         modifiers,
         mode,
+        true,
         || Ok(()),
     )?)
 }
@@ -771,6 +774,7 @@ pub fn send_click_guarded(
         button,
         modifiers,
         ClickMode::Window,
+        false,
         guard,
     )
 }
@@ -783,6 +787,7 @@ fn send_click_guarded_impl(
     button: &str,
     modifiers: &[&str],
     mode: ClickMode,
+    allow_input_assist: bool,
     guard: impl FnOnce() -> std::result::Result<(), BasisRefusal>,
 ) -> Result<GuardedResult> {
     let target = HWND(target as *mut _);
@@ -889,6 +894,7 @@ fn send_click_guarded_impl(
         batch_remaining: 0,
         batch_failed: false,
         activated: false,
+        allow_input_assist,
     };
     let planned = sink.downs.len() + sink.count * 3;
     let mut result = run_guarded(&mut sink, planned, guard);
@@ -927,6 +933,9 @@ struct ForegroundClick {
     /// Preparation activated the target (only then is the previous
     /// foreground restored after a click that sent nothing).
     activated: bool,
+    /// Whether activation may emit synthetic input before the guard runs.
+    /// Only legacy callers, whose guard always accepts, allow it.
+    allow_input_assist: bool,
 }
 impl InputSink for ForegroundClick {
     fn prepare(&mut self) -> Vec<&'static str> {
@@ -937,11 +946,18 @@ impl InputSink for ForegroundClick {
             self.was_topmost =
                 (GetWindowLongPtrW(self.target, GWL_EXSTYLE) as u32) & WS_EX_TOPMOST.0 != 0;
             if self.mode != ClickMode::NonActivating {
-                if !crate::input::force_foreground_assisted(self.target).0 {
+                let target = self.target;
+                let (active, activation_effects) =
+                    crate::input::guarded_dispatch::prepare_activation(
+                        self.allow_input_assist,
+                        || crate::input::force_foreground_attached(target),
+                        || crate::input::force_foreground_assisted(target).0,
+                    );
+                effects.extend(activation_effects);
+                if !active {
                     self.error = Some(format!("foreground_unavailable: Windows did not activate exact target HWND {:?} (actual foreground HWND {:?}); no mouse input was sent", self.target.0, GetForegroundWindow().0));
                     return effects;
                 }
-                effects.push("activation");
                 self.activated = true;
                 self.foreground_target =
                     crate::win32::capture_foreground_target(self.target.0 as usize as u64);
