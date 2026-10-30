@@ -238,7 +238,10 @@
             "properties": {
               "prior_pid": {
                 "format": "int32",
-                "type": "integer"
+                "type": [
+                  "integer",
+                  "null"
+                ]
               },
               "reason": {
                 "enum": [
@@ -842,7 +845,10 @@
             "properties": {
               "prior_pid": {
                 "format": "int32",
-                "type": "integer"
+                "type": [
+                  "integer",
+                  "null"
+                ]
               },
               "reason": {
                 "enum": [
@@ -2571,7 +2577,10 @@
             "properties": {
               "prior_pid": {
                 "format": "int32",
-                "type": "integer"
+                "type": [
+                  "integer",
+                  "null"
+                ]
               },
               "reason": {
                 "enum": [
@@ -2965,7 +2974,10 @@
             "properties": {
               "prior_pid": {
                 "format": "int32",
-                "type": "integer"
+                "type": [
+                  "integer",
+                  "null"
+                ]
               },
               "reason": {
                 "enum": [
@@ -3770,7 +3782,10 @@
             "properties": {
               "prior_pid": {
                 "format": "int32",
-                "type": "integer"
+                "type": [
+                  "integer",
+                  "null"
+                ]
               },
               "reason": {
                 "enum": [
@@ -4676,7 +4691,10 @@
             "properties": {
               "prior_pid": {
                 "format": "int32",
-                "type": "integer"
+                "type": [
+                  "integer",
+                  "null"
+                ]
               },
               "reason": {
                 "enum": [
@@ -5114,7 +5132,10 @@
             "properties": {
               "prior_pid": {
                 "format": "int32",
-                "type": "integer"
+                "type": [
+                  "integer",
+                  "null"
+                ]
               },
               "reason": {
                 "enum": [
@@ -5925,7 +5946,10 @@
             "properties": {
               "prior_pid": {
                 "format": "int32",
-                "type": "integer"
+                "type": [
+                  "integer",
+                  "null"
+                ]
               },
               "reason": {
                 "enum": [
@@ -6734,7 +6758,10 @@
             "properties": {
               "prior_pid": {
                 "format": "int32",
-                "type": "integer"
+                "type": [
+                  "integer",
+                  "null"
+                ]
               },
               "reason": {
                 "enum": [

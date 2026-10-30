@@ -704,8 +704,12 @@ pub struct ActionFocusRestoration {
     pub reason: Option<ActionFocusRestorationReason>,
     /// The producer reports null when the previous process was unknown.
     #[serde(deserialize_with = "deserialize_prior_pid")]
-    #[schemars(required)]
+    #[schemars(required, schema_with = "nullable_prior_pid_schema")]
     pub prior_pid: Option<i32>,
+}
+
+fn nullable_prior_pid_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    schemars::json_schema!({ "type": ["integer", "null"], "format": "int32" })
 }
 
 fn deserialize_prior_pid<'de, D: serde::Deserializer<'de>>(

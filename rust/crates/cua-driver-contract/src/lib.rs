@@ -685,6 +685,39 @@ mod tests {
         );
     }
 
+    /// The driver reports `prior_pid: null` when the previous process is
+    /// unknown, so every advertised copy must allow null.
+    #[test]
+    fn focus_restoration_prior_pid_is_advertised_nullable_and_required() {
+        fn find<'a>(value: &'a serde_json::Value, found: &mut Vec<&'a serde_json::Value>) {
+            match value {
+                serde_json::Value::Object(map) => {
+                    if let Some(focus) = map.get("focus_restoration") {
+                        found.push(focus);
+                    }
+                    map.values().for_each(|child| find(child, found));
+                }
+                serde_json::Value::Array(items) => {
+                    items.iter().for_each(|child| find(child, found))
+                }
+                _ => {}
+            }
+        }
+        let schema = tool_success_output_schema("click").expect("click output schema");
+        let mut found = Vec::new();
+        find(&schema, &mut found);
+        assert!(!found.is_empty(), "click advertises focus_restoration");
+        for focus in found {
+            assert_eq!(
+                focus["properties"]["prior_pid"]["type"],
+                serde_json::json!(["integer", "null"])
+            );
+            assert!(focus["required"]
+                .as_array()
+                .is_some_and(|required| required.contains(&serde_json::json!("prior_pid"))));
+        }
+    }
+
     #[test]
     fn list_windows_defines_nullable_higher_is_frontmost_z_index() {
         assert!(tool_contract("list_windows").is_some());
