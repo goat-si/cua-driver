@@ -1553,7 +1553,7 @@ impl Tool for GetWindowStateTool {
                         let (native_w, native_h) = crate::capture::png_dimensions_pub(&raw)?;
                         let png = crate::capture::resize_png_if_needed(&raw, max_dim)?;
                         let (w, h) = crate::capture::png_dimensions_pub(&png)?;
-                        basis_result = Some(crate::basis_capture::build_capture_basis(
+                        basis_result = Some(cua_driver_core::basis_capture::build_capture_basis(
                             hwnd,
                             pid as i32,
                             pre,
@@ -1832,7 +1832,7 @@ impl Tool for GetWindowStateTool {
                 if let Some(basis) = &stored_basis {
                     structured["window_basis"] = basis.to_json();
                 } else if screenshot_opt.is_some() && !observation_only {
-                    if let Some(reason) = crate::basis_capture::basis_unavailable_reason(
+                    if let Some(reason) = cua_driver_core::basis_capture::basis_unavailable_reason(
                         basis_result.as_ref(),
                         capture_published,
                         false,

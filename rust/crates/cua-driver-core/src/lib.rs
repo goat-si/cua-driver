@@ -75,6 +75,7 @@ pub mod agent_cursor;
 mod application_identity;
 pub mod authorization;
 pub mod background_input;
+pub mod basis_capture;
 pub mod batch_nudge;
 pub mod batch_scope;
 pub mod batch_tools;
