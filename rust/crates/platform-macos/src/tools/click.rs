@@ -1009,6 +1009,7 @@ fn def() -> &'static ToolDef {
                 "pid":           { "type": "integer", "description": "Target process ID. Optional with element_token (it carries the pid)." },
                 "window_id":     { "type": "integer", "description": "Target window ID. Omit with element_token." },
                 "element_token": cua_driver_core::tool_schema::element_token_schema(),
+                "simulate": { "type": "boolean", "description": "With element_token, use a pointer click at the element center instead of an AX action. Default false." },
                 "capture_id": { "type": "string", "description": "Optional capture ID from get_window_state or get_desktop_state. With x,y it is consumed atomically; stale or mismatched captures are refused." },
                 "x":             { "type": "number",  "description": "X in screenshot pixels (get_window_state PNG, or get_desktop_state PNG for a desktop target)." },
                 "y":             { "type": "number",  "description": "Y in screenshot pixels from the image selected by target." },
@@ -1071,6 +1072,10 @@ impl Tool for ClickTool {
     }
 
     async fn invoke(&self, args: Value) -> ToolResult {
+        match super::element_simulate::validate(&args) {
+            Ok(_) => {}
+            Err(refusal) => return refusal,
+        }
         if !super::pixel_restore::current_is("click") {
             return super::pixel_restore::invoke(self, args).await;
         }
@@ -1083,7 +1088,7 @@ impl Tool for ClickTool {
             .and_then(Value::as_f64)
             .zip(args.get("y").and_then(Value::as_f64));
         let result =
-            super::window_points::annotate(self.invoke_in(args, space).await, space, point);
+            super::window_points::annotate(self.invoke_in(args, space, false).await, space, point);
         with_screenshot_point(result, space, point)
     }
 }
@@ -1115,8 +1120,17 @@ fn with_screenshot_point(
 }
 
 impl ClickTool {
-    async fn invoke_in(&self, args: Value, space: super::window_points::PointSpace) -> ToolResult {
+    async fn invoke_in(
+        &self,
+        args: Value,
+        space: super::window_points::PointSpace,
+        simulated: bool,
+    ) -> ToolResult {
         use cua_driver_core::tool_args::ArgsExt;
+
+        if let Err(refusal) = super::element_simulate::validate(&args) {
+            return refusal;
+        }
 
         // Every route reads one validated count; nothing is sent for a bad one.
         let count = match super::element_pointer::click_count(&args) {
@@ -1332,6 +1346,46 @@ impl ClickTool {
         let from_zoom = args.bool_or("from_zoom", false);
         let debug_image_out = args.opt_str("debug_image_out");
         let modifiers: Vec<String> = args.str_array("modifier");
+
+        if !simulated && matches!(super::element_simulate::option(&args), Ok(true)) {
+            let (Some(idx), Some(wid), Some(element)) =
+                (element_index, window_id, element_guard.as_ref())
+            else {
+                return super::invalid_arguments(
+                    "click.simulate requires element_token; nothing was sent.",
+                );
+            };
+            if x.is_some()
+                || y.is_some()
+                || action != "press"
+                || button_str != "left"
+                || !modifiers.is_empty()
+                || from_zoom
+                || debug_image_out.is_some()
+            {
+                return super::invalid_arguments("click.simulate requires an unmodified left press on an element; nothing was sent.");
+            }
+            let target = super::element_pointer::target_for(pid, wid, idx, element.clone());
+            let prepared = latency::spawn_action_blocking(move || {
+                super::element_simulate::checked_pixel_args(args, pid, wid, &*target)
+            })
+            .await;
+            let prepared = match prepared {
+                Ok(value) => value,
+                Err(_) => Err(super::pre_dispatch_refusal(
+                    "element_frame_unavailable",
+                    "click: the element frame could not be read; nothing was sent.",
+                )),
+            };
+            return super::element_simulate::dispatch(prepared, |pixel_args| async move {
+                let pixel_space = match super::window_points::point_space(&pixel_args) {
+                    Ok(value) => value,
+                    Err(refusal) => return refusal,
+                };
+                Box::pin(self.invoke_in(pixel_args, pixel_space, true)).await
+            })
+            .await;
+        }
 
         // PID-routed key transitions can look correct for one AX poll and then
         // collapse to a plain click once AppKit resolves the gesture. Refuse
@@ -1992,13 +2046,15 @@ impl ClickTool {
             // targeting (PX) orthogonal to delivery (AX) and avoids making a
             // Chromium/AppKit window key merely to satisfy first-mouse rules.
             if let Some(hit_test_wid) = window_id.filter(|_| {
-                background_pixel_ax_eligible(
-                    delivery_mode.is_foreground(),
-                    &button_str,
-                    count,
-                    modifiers.is_empty(),
-                    &action,
-                )
+                // Keep simulated presses on the pointer route if AX eligibility expands.
+                !simulated
+                    && background_pixel_ax_eligible(
+                        delivery_mode.is_foreground(),
+                        &button_str,
+                        count,
+                        modifiers.is_empty(),
+                        &action,
+                    )
             }) {
                 let focus_only = action == "focus";
                 if let Err(refusal) =
