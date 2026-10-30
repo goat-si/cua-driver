@@ -21,10 +21,14 @@ steps.
 For a background left pixel click addressed by pid and window ID, the driver
 posts one down/up pair per requested click, with increasing click state and a
 short gap between pairs. Delivery remains unverifiable unless read-back
-confirms an effect. Any focus restoration runs separately and is abandoned
-when a later input action or a change of frontmost app makes it stale; a new
-input action wakes stale pending restorations instead of waiting for their
-settle interval.
+confirms an effect. Focus restoration runs separately and waits for admitted
+actions to finish and a 50 ms quiet interval. It retains the original app
+across later actions, and is abandoned on physical user input, a frontmost
+app other than the original or target, or a two-second timeout. A target
+activation alone does not abandon it. The next input or observation result
+for the target pid reports the restoration outcome once. An admission that
+cannot acquire the restoration commit lock within two seconds returns
+`pixel_restore_pending` without sending input.
 
 Before running any shell command, ask: **"does this raise,
 activate, foreground, or make-key any app?"** If yes, don't run it.

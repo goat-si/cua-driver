@@ -609,8 +609,8 @@ fn prepare_background_pixel_click_with_settle(pid: i32, wid: u32, settle: bool) 
         // until the driver lets it go (see `skylight::note_primed_key`).
         crate::input::skylight::note_primed_key(pid as libc::pid_t, wid);
     }
-    // Match Swift's settle interval so AppKit updates its active/key-window
-    // routing before the mouseMoved + primer + target stream arrives.
+    // The legacy route waits for AppKit routing; the fast pixel-click route
+    // posts immediately after the focus record.
     if settle {
         std::thread::sleep(std::time::Duration::from_millis(50));
     }

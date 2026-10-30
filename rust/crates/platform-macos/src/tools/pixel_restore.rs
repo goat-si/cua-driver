@@ -1,9 +1,9 @@
 //! Admission and detached pixel-focus restoration coordination.
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet, VecDeque},
     future::Future,
     sync::{
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicU64, AtomicUsize, Ordering},
         Mutex, OnceLock,
     },
 };
@@ -11,8 +11,12 @@ use tokio::sync::{watch, Mutex as AsyncMutex};
 
 pub(super) struct Fence {
     epoch: AtomicU64,
+    in_flight: AtomicUsize,
     commit: AsyncMutex<()>,
     pending: Mutex<HashMap<(i32, u64), usize>>,
+    obligations: Mutex<HashMap<i32, (u64, Option<i32>)>>,
+    superseded: Mutex<HashSet<(i32, u64)>>,
+    outcomes: Mutex<HashMap<i32, VecDeque<serde_json::Value>>>,
     changes: watch::Sender<u64>,
     epochs: watch::Sender<u64>,
 }
@@ -21,8 +25,12 @@ impl Default for Fence {
     fn default() -> Self {
         Self {
             epoch: AtomicU64::new(0),
+            in_flight: AtomicUsize::new(0),
             commit: AsyncMutex::new(()),
             pending: Mutex::new(HashMap::new()),
+            obligations: Mutex::new(HashMap::new()),
+            superseded: Mutex::new(HashSet::new()),
+            outcomes: Mutex::new(HashMap::new()),
             changes: watch::channel(0).0,
             epochs: watch::channel(0).0,
         }
@@ -41,6 +49,7 @@ impl Fence {
         self.notify_epoch_change();
         epoch
     }
+    #[cfg(test)]
     pub(super) async fn admit(&self) -> u64 {
         let epoch = self.bump_epoch();
         let lock = self.commit.lock();
@@ -64,10 +73,46 @@ impl Fence {
         }
         epoch
     }
+    pub(super) async fn admit_action(&self) -> (u64, InFlight<'_>) {
+        let epoch = self.bump_epoch();
+        self.notify_epoch_change();
+        let guard = self.commit.lock().await;
+        self.in_flight.fetch_add(1, Ordering::SeqCst);
+        drop(guard);
+        (epoch, InFlight(self))
+    }
+    fn record_outcome(&self, pid: i32, prior: Option<i32>, status: &str, reason: Option<&str>) {
+        let mut note = serde_json::json!({"status": status, "prior_pid": prior});
+        if let Some(reason) = reason {
+            note["reason"] = reason.into();
+        }
+        self.outcomes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(pid)
+            .or_default()
+            .push_back(note);
+    }
+    fn take_outcome(&self, pid: i32) -> Option<serde_json::Value> {
+        let mut outcomes = self.outcomes.lock().unwrap_or_else(|e| e.into_inner());
+        let queue = outcomes.get_mut(&pid)?;
+        let note = queue.pop_front();
+        if queue.is_empty() {
+            outcomes.remove(&pid);
+        }
+        note
+    }
+    fn superseded(&self, pid: i32, epoch: u64) -> bool {
+        self.superseded
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(&(pid, epoch))
+    }
     fn notify_epoch_change(&self) {
         self.epochs
             .send_modify(|version| *version = version.wrapping_add(1));
     }
+    #[cfg(test)]
     async fn commit<F, W, Fut>(&self, epoch: u64, front_unchanged: F, work: W)
     where
         F: FnOnce() -> bool,
@@ -81,6 +126,7 @@ impl Fence {
         }
         work().await;
     }
+    #[cfg(test)]
     fn register(&self, pid: i32, epoch: u64) -> Pending<'_> {
         let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
         *pending.entry((pid, epoch)).or_default() += 1;
@@ -90,6 +136,7 @@ impl Fence {
             epoch,
         }
     }
+    #[cfg(test)]
     fn is_pending(&self, pid: i32) -> bool {
         self.pending
             .lock()
@@ -97,9 +144,11 @@ impl Fence {
             .keys()
             .any(|(pending_pid, _)| *pending_pid == pid)
     }
+    #[cfg(test)]
     async fn await_pending(&self, pid: i32) -> bool {
         self.await_matching_pending(Some(pid)).await
     }
+    #[cfg(test)]
     async fn await_matching_pending(&self, pid: Option<i32>) -> bool {
         let mut changed = self.changes.subscribe();
         tokio::time::timeout(std::time::Duration::from_secs(2), async {
@@ -121,6 +170,14 @@ impl Fence {
         .unwrap_or(false)
     }
 }
+pub(super) struct InFlight<'a>(&'a Fence);
+impl Drop for InFlight<'_> {
+    fn drop(&mut self) {
+        self.0.in_flight.fetch_sub(1, Ordering::SeqCst);
+        self.0.notify_epoch_change();
+    }
+}
+
 struct Pending<'a> {
     fence: &'a Fence,
     pid: i32,
@@ -135,6 +192,22 @@ impl Drop for Pending<'_> {
             if *count == 0 {
                 pending.remove(&key);
             }
+        }
+        self.fence
+            .superseded
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&key);
+        let mut obligations = self
+            .fence
+            .obligations
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if obligations
+            .get(&self.pid)
+            .is_some_and(|(epoch, _)| *epoch == self.epoch)
+        {
+            obligations.remove(&self.pid);
         }
         self.fence
             .changes
@@ -193,26 +266,65 @@ impl cua_driver_core::tool::Tool for AdmittedTool {
             .await
     }
     async fn invoke(&self, args: serde_json::Value) -> cua_driver_core::protocol::ToolResult {
-        if self.0.def().name == "page"
-            && matches!(
-                args.get("action").and_then(serde_json::Value::as_str),
-                Some("get_text" | "query_dom")
-            )
-        {
-            return self.0.invoke(args).await;
-        }
-        invoke(self.0.as_ref(), args).await
+        invoke_with_outcome(global(), self.0.as_ref(), args).await
     }
+}
+
+async fn invoke_with_outcome(
+    fence: &Fence,
+    tool: &dyn cua_driver_core::tool::Tool,
+    args: serde_json::Value,
+) -> cua_driver_core::protocol::ToolResult {
+    let pid = args
+        .get("pid")
+        .and_then(serde_json::Value::as_i64)
+        .and_then(|p| i32::try_from(p).ok());
+    let page_observation = tool.def().name == "page"
+        && matches!(
+            args.get("action").and_then(serde_json::Value::as_str),
+            Some("get_text" | "query_dom")
+        );
+    let admitted = requires_admission(&tool.def().name) && !page_observation;
+    let eligible = admitted || page_observation || tool.def().read_only;
+    let mut result = if !admitted {
+        tool.invoke(args).await
+    } else {
+        invoke_with_fence(fence, tool, args).await
+    };
+    let admission_refused = admitted
+        && result
+            .structured_content
+            .as_ref()
+            .and_then(|value| value.get("code"))
+            .and_then(serde_json::Value::as_str)
+            == Some("pixel_restore_pending");
+    if let Some(note) = (eligible && !admission_refused)
+        .then(|| pid.and_then(|pid| fence.take_outcome(pid)))
+        .flatten()
+    {
+        if result.structured_content.is_none() {
+            result.structured_content = Some(serde_json::json!({}));
+        }
+        if let Some(object) = result
+            .structured_content
+            .as_mut()
+            .and_then(serde_json::Value::as_object_mut)
+        {
+            object.insert("focus_restoration".into(), note.clone());
+        }
+        result
+            .content
+            .push(cua_driver_core::protocol::Content::text(format!(
+                "focus_restoration: {note}"
+            )));
+    }
+    result
 }
 
 pub(crate) fn wrap(
     tool: Box<dyn cua_driver_core::tool::Tool>,
 ) -> Box<dyn cua_driver_core::tool::Tool> {
-    if requires_admission(&tool.def().name) {
-        Box::new(AdmittedTool(tool))
-    } else {
-        tool
-    }
+    Box::new(AdmittedTool(tool))
 }
 
 pub(super) fn requires_admission(name: &str) -> bool {
@@ -258,22 +370,9 @@ async fn invoke_with_fence(
     tool: &dyn cua_driver_core::tool::Tool,
     args: serde_json::Value,
 ) -> cua_driver_core::protocol::ToolResult {
-    let pid = args
-        .get("pid")
-        .and_then(serde_json::Value::as_i64)
-        .and_then(|p| i32::try_from(p).ok());
-    let admission = tokio::time::timeout(std::time::Duration::from_secs(2), async {
-        let epoch = fence.admit().await;
-        let ready = match pid {
-            Some(pid) => fence.await_pending(pid).await,
-            None => fence.await_matching_pending(None).await,
-        };
-        ready.then_some(epoch)
-    })
-    .await
-    .ok()
-    .flatten();
-    let Some(epoch) = admission else {
+    let Ok((epoch, _in_flight)) =
+        tokio::time::timeout(std::time::Duration::from_secs(2), fence.admit_action()).await
+    else {
         return super::pre_dispatch_refusal(
             "pixel_restore_pending",
             "A previous pixel focus restoration is still pending; no input was sent.",
@@ -283,6 +382,7 @@ async fn invoke_with_fence(
     ACTION_EPOCH.scope((name, epoch), tool.invoke(args)).await
 }
 
+#[cfg(test)]
 async fn wait_for_settle_or_stale(
     fence: &Fence,
     epoch: u64,
@@ -313,6 +413,21 @@ async fn wait_for_settle_or_stale(
         return false;
     }
     true
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum RestoreCheck {
+    Valid,
+    Retry,
+    Abandon(&'static str),
+}
+impl RestoreCheck {
+    fn timeout_reason(self) -> &'static str {
+        match self {
+            Self::Abandon(reason) => reason,
+            Self::Valid | Self::Retry => "timeout",
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -351,15 +466,67 @@ impl RestoreBaseline {
         }
     }
 
-    pub(super) fn valid(&self, expected: Option<i32>, target: i32) -> bool {
+    fn abandon_reason(&self, expected: Option<i32>, target: i32) -> RestoreCheck {
         let elapsed = u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX);
-        let valid = self.valid_sample(
+        self.abandon_sample(
+            expected,
+            target,
+            crate::apps::frontmost_pid(),
             super::physical_input_idle_ms(),
+            elapsed,
+        )
+    }
+
+    fn abandon_sample(
+        &self,
+        expected: Option<i32>,
+        target: i32,
+        front: Option<i32>,
+        idle: Option<u64>,
+        elapsed: u64,
+    ) -> RestoreCheck {
+        if expected.is_none() || front.is_none() {
+            return RestoreCheck::Retry;
+        }
+        if front != expected && front != Some(target) {
+            return RestoreCheck::Abandon("third_app");
+        }
+        if self.idle.is_none() || idle.is_none() {
+            return RestoreCheck::Retry;
+        }
+        if !self.valid_sample(idle, elapsed, front, expected, target, self.epoch) {
+            return RestoreCheck::Abandon("user_input");
+        }
+        RestoreCheck::Valid
+    }
+
+    pub(super) fn valid_after_reactivation(&self, expected: Option<i32>, target: i32) -> bool {
+        self.valid_during_restore(expected, target, true)
+    }
+
+    fn restore_epoch(&self, observed: u64, reactivated: bool) -> u64 {
+        // The commit lock still excludes admission after reactivation. An
+        // admission may bump the epoch while waiting, but cannot dispatch.
+        if reactivated {
+            self.epoch
+        } else {
+            observed
+        }
+    }
+
+    fn valid_during_restore(&self, expected: Option<i32>, target: i32, reactivated: bool) -> bool {
+        let elapsed = u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        let idle = super::physical_input_idle_ms();
+        if self.idle.is_none() || idle.is_none() {
+            return false;
+        }
+        let valid = self.valid_sample(
+            idle,
             elapsed,
             crate::apps::frontmost_pid(),
             expected,
             target,
-            global().epoch(),
+            self.restore_epoch(global().epoch(), reactivated),
         );
         if !valid && global().epoch() == self.epoch {
             global().bump();
@@ -376,414 +543,126 @@ pub(super) fn spawn_restore<F, Fut>(
     work: F,
 ) where
     F: FnOnce() -> Fut + Send + 'static,
-    Fut: Future<Output = ()> + Send + 'static,
+    Fut: Future<Output = bool> + Send + 'static,
 {
-    let fence = global();
-    let epochs = fence.epochs.subscribe();
-    let pending = fence.register(pid, epoch);
-    tokio::spawn(async move {
-        let _pending = pending;
-        if !wait_for_settle_or_stale(fence, epoch, epochs).await {
+    spawn_restore_with(
+        global(),
+        pid,
+        epoch,
+        expected_front,
+        move || baseline.abandon_reason(expected_front, pid),
+        work,
+    );
+}
+
+pub(super) fn spawn_restore_with<F, Fut, V>(
+    fence: &'static Fence,
+    pid: i32,
+    epoch: u64,
+    prior: Option<i32>,
+    valid: V,
+    work: F,
+) where
+    F: FnOnce() -> Fut + Send + 'static,
+    Fut: Future<Output = bool> + Send + 'static,
+    V: Fn() -> RestoreCheck + Send + 'static,
+{
+    let pending = {
+        let mut entries = fence.pending.lock().unwrap_or_else(|e| e.into_inner());
+        let mut obligations = fence.obligations.lock().unwrap_or_else(|e| e.into_inner());
+        if obligations
+            .get(&pid)
+            .is_some_and(|(existing_epoch, _)| *existing_epoch <= epoch)
+        {
             return;
         }
-        fence
-            .commit(epoch, || baseline.valid(expected_front, pid), work)
-            .await;
+        obligations.insert(pid, (epoch, prior));
+        let mut superseded = fence.superseded.lock().unwrap_or_else(|e| e.into_inner());
+        superseded.extend(
+            entries
+                .keys()
+                .filter(|(existing_pid, existing_epoch)| {
+                    *existing_pid == pid && *existing_epoch > epoch
+                })
+                .copied(),
+        );
+        entries.insert((pid, epoch), 1);
+        Pending { fence, pid, epoch }
+    };
+    let mut epochs = fence.epochs.subscribe();
+    fence.notify_epoch_change();
+    let deadline_at = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+    tokio::spawn(async move {
+        let _pending = pending;
+        let deadline = tokio::time::sleep_until(deadline_at);
+        tokio::pin!(deadline);
+        let mut work = Some(work);
+        loop {
+            let observed = fence.epoch();
+            if fence.in_flight.load(Ordering::SeqCst) != 0 {
+                tokio::select! {
+                    _ = &mut deadline => { tracing::debug!(pid, "pixel focus restoration timed out"); if !fence.superseded(pid, epoch) { fence.record_outcome(pid, prior, "abandoned", Some(valid().timeout_reason())); } return; }
+                    changed = epochs.changed() => if changed.is_err() { return; },
+                }
+                continue;
+            }
+            tokio::select! {
+                _ = &mut deadline => { tracing::debug!(pid, "pixel focus restoration timed out"); if !fence.superseded(pid, epoch) { fence.record_outcome(pid, prior, "abandoned", Some(valid().timeout_reason())); } return; }
+                changed = epochs.changed() => { if changed.is_err() { return; } continue; }
+                _ = tokio::time::sleep(std::time::Duration::from_millis(50)) => {}
+            }
+            let guard = tokio::select! {
+                _ = &mut deadline => { tracing::debug!(pid, "pixel focus restoration timed out"); if !fence.superseded(pid, epoch) { fence.record_outcome(pid, prior, "abandoned", Some(valid().timeout_reason())); } return; }
+                guard = fence.commit.lock() => guard,
+            };
+            if fence.epoch() != observed || fence.in_flight.load(Ordering::SeqCst) != 0 {
+                drop(guard);
+                continue;
+            }
+            if fence.superseded(pid, epoch) {
+                return;
+            }
+            match valid() {
+                RestoreCheck::Retry => {
+                    drop(guard);
+                    continue;
+                }
+                RestoreCheck::Abandon(reason) => {
+                    fence.record_outcome(pid, prior, "abandoned", Some(reason))
+                }
+                RestoreCheck::Valid => {
+                    if work.take().expect("restore called once")().await {
+                        fence.record_outcome(pid, prior, "restored", None);
+                    } else {
+                        // The hand-back could not be confirmed. Keep the
+                        // obligation until a takeover or its original deadline;
+                        // never post the focus operation a second time.
+                        drop(guard);
+                        loop {
+                            if fence.superseded(pid, epoch) {
+                                return;
+                            }
+                            if let RestoreCheck::Abandon(reason) = valid() {
+                                fence.record_outcome(pid, prior, "abandoned", Some(reason));
+                                return;
+                            }
+                            tokio::select! {
+                                _ = &mut deadline => {
+                                    fence.record_outcome(pid, prior, "abandoned", Some(valid().timeout_reason()));
+                                    return;
+                                }
+                                changed = epochs.changed() => if changed.is_err() { return; },
+                                _ = tokio::time::sleep(std::time::Duration::from_millis(50)) => {}
+                            }
+                        }
+                    }
+                }
+            }
+            return;
+        }
     });
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use std::sync::{
-        atomic::{AtomicUsize, Ordering},
-        Arc,
-    };
-    use tokio::sync::oneshot;
-
-    struct FakeTool(cua_driver_core::tool::ToolDef);
-    impl FakeTool {
-        fn new() -> Self {
-            Self(cua_driver_core::tool::ToolDef {
-                name: "pixel_fake".into(),
-                description: String::new(),
-                input_schema: serde_json::json!({}),
-                read_only: false,
-                destructive: false,
-                idempotent: false,
-                open_world: false,
-            })
-        }
-    }
-    #[async_trait::async_trait]
-    impl cua_driver_core::tool::Tool for FakeTool {
-        fn def(&self) -> &cua_driver_core::tool::ToolDef {
-            &self.0
-        }
-        async fn invoke(&self, _: serde_json::Value) -> cua_driver_core::protocol::ToolResult {
-            panic!("input dispatched")
-        }
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn pixel_admission_lock_has_deadline() {
-        let fence = Fence::default();
-        let lock = fence.commit.lock().await;
-        let tool = FakeTool::new();
-        let outcome = tokio::time::timeout(
-            std::time::Duration::from_millis(2100),
-            invoke_with_fence(&fence, &tool, serde_json::json!({"pid": -2000000010})),
-        )
-        .await;
-        let result = outcome.expect("admission exceeded its two-second deadline");
-        let data = result
-            .structured_content
-            .expect("structured timeout refusal");
-        assert_eq!(data["code"], "pixel_restore_pending");
-        assert_eq!(data["effect"], "refused");
-        assert_eq!(data["dispatched"], false);
-        assert!(
-            fence.commit.try_lock().is_err(),
-            "restoration retains its lock after refusal"
-        );
-        drop(lock);
-        assert!(
-            fence.commit.try_lock().is_ok(),
-            "timed out admission leaves no lock held"
-        );
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn pixel_timeout_is_structured_refusal() {
-        let fence = Fence::default();
-        let _pending = fence.register(-2000000011, fence.epoch());
-        let result = invoke_with_fence(
-            &fence,
-            &FakeTool::new(),
-            serde_json::json!({"pid": -2000000011}),
-        )
-        .await;
-        let data = result
-            .structured_content
-            .expect("structured timeout refusal");
-        assert_eq!(data["code"], "pixel_restore_pending");
-        assert_eq!(data["effect"], "refused");
-        assert_eq!(data["dispatched"], false);
-    }
-
-    #[test]
-    fn pixel_target_front_without_physical_input_allows_restore() {
-        let baseline = RestoreBaseline {
-            idle: Some(1000),
-            started: std::time::Instant::now(),
-            epoch: 7,
-        };
-        assert!(
-            baseline.valid_sample(Some(1050), 50, Some(2), Some(1), 2, 7),
-            "driver-caused target activation must allow restoration"
-        );
-    }
-
-    #[test]
-    fn pixel_pre_dispatch_baseline_detects_takeover_and_front_change() {
-        let baseline = RestoreBaseline {
-            idle: Some(1000),
-            started: std::time::Instant::now(),
-            epoch: 7,
-        };
-        assert!(baseline.valid_sample(Some(1050), 50, Some(1), Some(1), 2, 7));
-        // Input during dispatch reset the idle clock even if the target is now frontmost.
-        assert!(!baseline.valid_sample(Some(20), 50, Some(2), Some(1), 2, 7));
-        assert!(!baseline.valid_sample(Some(1050), 50, Some(3), Some(1), 2, 7));
-        assert!(!baseline.valid_sample(Some(1050), 50, Some(1), Some(1), 2, 8));
-        // A second focus post must sample again after the first post or an await.
-        assert!(!baseline.valid_sample(Some(1), 70, Some(1), Some(1), 2, 7));
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn stale_restore_clears_pending_before_settle_deadline() {
-        let fence = global();
-        let pid = -2_000_000_000;
-        let epoch = fence.admit().await;
-        spawn_restore(
-            pid,
-            epoch,
-            None,
-            RestoreBaseline::capture(epoch),
-            || async { panic!("stale restoration ran") },
-        );
-        assert!(fence.is_pending(pid));
-        fence.admit().await;
-        let result = tokio::time::timeout(
-            std::time::Duration::from_millis(1),
-            fence.await_pending(pid),
-        )
-        .await;
-        assert!(
-            matches!(result, Ok(true)),
-            "stale pending entry must clear without waiting 50 ms: {result:?}"
-        );
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn detected_takeover_clears_pending_before_settle_deadline() {
-        let fence = global();
-        let pid = -1_999_999_999;
-        let epoch = fence.admit().await;
-        spawn_restore(
-            pid,
-            epoch,
-            None,
-            RestoreBaseline::capture(epoch),
-            || async { panic!("stale restoration ran") },
-        );
-        user_takeover();
-        let result = tokio::time::timeout(
-            std::time::Duration::from_millis(1),
-            fence.await_pending(pid),
-        )
-        .await;
-        assert!(
-            matches!(result, Ok(true)),
-            "takeover must release the pending entry: {result:?}"
-        );
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn stale_pending_clears_while_new_admission_waits_for_commit_lock() {
-        let fence = Arc::new(Fence::default());
-        let epoch = fence.admit().await;
-        let (registered_tx, registered_rx) = oneshot::channel();
-        let waiting_fence = fence.clone();
-        let restore = tokio::spawn(async move {
-            let epochs = waiting_fence.epochs.subscribe();
-            let _pending = waiting_fence.register(42, epoch);
-            registered_tx.send(()).unwrap();
-            assert!(!wait_for_settle_or_stale(&waiting_fence, epoch, epochs).await);
-        });
-        registered_rx.await.unwrap();
-        let (held_tx, held_rx) = oneshot::channel();
-        let (release_tx, release_rx) = oneshot::channel();
-        let holding_fence = fence.clone();
-        let holder = tokio::spawn(async move {
-            holding_fence
-                .commit(
-                    epoch,
-                    || true,
-                    || async move {
-                        held_tx.send(()).unwrap();
-                        release_rx.await.unwrap();
-                    },
-                )
-                .await;
-        });
-        held_rx.await.unwrap();
-        let admitting_fence = fence.clone();
-        let admission = tokio::spawn(async move { admitting_fence.admit().await });
-        while fence.epoch() == epoch {
-            tokio::task::yield_now().await;
-        }
-        assert!(!admission.is_finished());
-        let cleared =
-            tokio::time::timeout(std::time::Duration::from_millis(1), fence.await_pending(42))
-                .await;
-        assert!(
-            matches!(cleared, Ok(true)),
-            "stale entry must clear while admission is blocked"
-        );
-        release_tx.send(()).unwrap();
-        holder.await.unwrap();
-        admission.await.unwrap();
-        restore.await.unwrap();
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn uncontested_restoration_runs_once_after_settle() {
-        use std::task::Poll;
-        let fence = Fence::default();
-        let epoch = fence.admit().await;
-        let mut wait = Box::pin(wait_for_settle_or_stale(
-            &fence,
-            epoch,
-            fence.epochs.subscribe(),
-        ));
-        std::future::poll_fn(|cx| {
-            assert!(wait.as_mut().poll(cx).is_pending());
-            Poll::Ready(())
-        })
-        .await;
-        tokio::time::advance(std::time::Duration::from_millis(49)).await;
-        std::future::poll_fn(|cx| {
-            assert!(wait.as_mut().poll(cx).is_pending());
-            Poll::Ready(())
-        })
-        .await;
-        tokio::time::advance(std::time::Duration::from_millis(1)).await;
-        assert!(wait.await);
-        let called = AtomicUsize::new(0);
-        fence
-            .commit(
-                epoch,
-                || true,
-                || async {
-                    called.fetch_add(1, Ordering::SeqCst);
-                },
-            )
-            .await;
-        assert_eq!(called.load(Ordering::SeqCst), 1);
-    }
-
-    #[tokio::test]
-    async fn action_admitted_before_click_returns_aborts_old_restore() {
-        let fence = Fence::default();
-        let click_epoch = fence.admit().await;
-        let _other_epoch = fence.admit().await;
-        let called = AtomicUsize::new(0);
-        fence
-            .commit(
-                click_epoch,
-                || true,
-                || async {
-                    called.fetch_add(1, Ordering::SeqCst);
-                },
-            )
-            .await;
-        assert_eq!(called.load(Ordering::SeqCst), 0);
-    }
-    #[tokio::test]
-    async fn uncontested_restore_runs_once() {
-        let fence = Fence::default();
-        let click_epoch = fence.admit().await;
-        let called = AtomicUsize::new(0);
-        fence
-            .commit(
-                click_epoch,
-                || true,
-                || async {
-                    called.fetch_add(1, Ordering::SeqCst);
-                },
-            )
-            .await;
-        assert_eq!(called.load(Ordering::SeqCst), 1);
-    }
-
-    #[tokio::test]
-    async fn changed_frontmost_drops_restore() {
-        let fence = Fence::default();
-        let epoch = fence.admit().await;
-        let called = AtomicUsize::new(0);
-        fence
-            .commit(
-                epoch,
-                || false,
-                || async {
-                    called.fetch_add(1, Ordering::SeqCst);
-                },
-            )
-            .await;
-        assert_eq!(called.load(Ordering::SeqCst), 0);
-    }
-
-    #[tokio::test]
-    async fn admission_while_restore_waits_aborts_before_lock() {
-        let fence = Arc::new(Fence::default());
-        let epoch = fence.admit().await;
-        let (tick_tx, tick_rx) = oneshot::channel();
-        let called = Arc::new(AtomicUsize::new(0));
-        let f = fence.clone();
-        let output = called.clone();
-        let task = tokio::spawn(async move {
-            tick_rx.await.unwrap();
-            f.commit(
-                epoch,
-                || true,
-                || async {
-                    output.fetch_add(1, Ordering::SeqCst);
-                },
-            )
-            .await;
-        });
-        fence.admit().await;
-        tick_tx.send(()).unwrap();
-        task.await.unwrap();
-        assert_eq!(called.load(Ordering::SeqCst), 0);
-    }
-    #[tokio::test]
-    async fn admission_after_restore_check_waits_for_restore_commit() {
-        let fence = Arc::new(Fence::default());
-        let click_epoch = fence.admit().await;
-        let _click_pending = fence.register(42, click_epoch);
-        assert!(!fence.is_pending(99), "the next action targets another pid");
-        let (started_tx, started_rx) = oneshot::channel();
-        let (release_tx, release_rx) = oneshot::channel();
-        let worker = fence.clone();
-        let restore = tokio::spawn(async move {
-            worker
-                .commit(
-                    click_epoch,
-                    || true,
-                    || async move {
-                        started_tx.send(()).unwrap();
-                        release_rx.await.unwrap();
-                    },
-                )
-                .await;
-        });
-        started_rx.await.unwrap();
-        let (done_tx, mut done_rx) = oneshot::channel();
-        let worker = fence.clone();
-        let admit = tokio::spawn(async move {
-            worker.admit().await;
-            assert!(worker.await_pending(99).await);
-            done_tx.send(()).unwrap();
-        });
-        while fence.epoch() == click_epoch {
-            tokio::task::yield_now().await;
-        }
-        assert!(done_rx.try_recv().is_err());
-        release_tx.send(()).unwrap();
-        restore.await.unwrap();
-        admit.await.unwrap();
-        assert!(done_rx.try_recv().is_ok());
-    }
-    #[test]
-    fn pending_registration_is_cleared_on_drop() {
-        let fence = Fence::default();
-        let guard = fence.register(42, 7);
-        assert!(fence.is_pending(42));
-        drop(guard);
-        assert!(!fence.is_pending(42));
-    }
-
-    #[tokio::test]
-    async fn same_pid_admission_waits_until_pending_guard_drops() {
-        use std::task::Poll;
-        let fence = Fence::default();
-        let guard = fence.register(42, 7);
-        let mut waiter = Box::pin(fence.await_pending(42));
-        std::future::poll_fn(|cx| {
-            assert!(waiter.as_mut().poll(cx).is_pending());
-            Poll::Ready(())
-        })
-        .await;
-        drop(guard);
-        assert!(waiter.await);
-    }
-
-    #[tokio::test]
-    async fn cancellation_clears_pending_registration() {
-        let fence = Arc::new(Fence::default());
-        let worker = fence.clone();
-        let (ready_tx, ready_rx) = oneshot::channel();
-        let task = tokio::spawn(async move {
-            let _pending = worker.register(42, 7);
-            ready_tx.send(()).unwrap();
-            std::future::pending::<()>().await;
-        });
-        ready_rx.await.unwrap();
-        assert!(fence.is_pending(42));
-        task.abort();
-        let _ = task.await;
-        assert!(!fence.is_pending(42));
-    }
-}
+#[path = "pixel_restore_tests.rs"]
+mod tests;

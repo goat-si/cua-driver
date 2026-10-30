@@ -956,6 +956,21 @@ fn pixel_activation_policy(
     }
 }
 
+async fn capture_before_pixel_prelude<B, P, Fut, T>(
+    front: impl FnOnce() -> Option<i32>,
+    baseline: impl FnOnce() -> B,
+    prelude: P,
+) -> (Option<i32>, B, T)
+where
+    P: FnOnce(Option<i32>) -> Fut,
+    Fut: std::future::Future<Output = T>,
+{
+    let prior = front();
+    let captured = baseline();
+    let prepared = prelude(prior).await;
+    (prior, captured, prepared)
+}
+
 /// Return the prior foreground pid that should be restored after a raw
 /// background pixel click.
 ///
@@ -1012,6 +1027,59 @@ pub(super) async fn restore_user_focus_after_background_pixel(
     .await;
 }
 
+#[async_trait::async_trait]
+trait PixelRestoreOps: Sync {
+    fn front(&self) -> Option<i32>;
+    fn key_focus(&self) -> Option<i32>;
+    fn allowed(&self, expected: Option<i32>) -> bool;
+    async fn activate(&self, pid: i32);
+    async fn focus(&self, previous_pid: i32, prior_key_wid: Option<u32>, pid: i32, wid: u32);
+    fn key_window(&self, pid: i32) -> Option<u32>;
+}
+
+struct SystemPixelRestoreOps {
+    pid: i32,
+    baseline: Option<(super::pixel_restore::RestoreBaseline, Option<i32>)>,
+}
+
+#[async_trait::async_trait]
+impl PixelRestoreOps for SystemPixelRestoreOps {
+    fn front(&self) -> Option<i32> {
+        apps::frontmost_pid()
+    }
+    fn key_focus(&self) -> Option<i32> {
+        crate::input::skylight::key_focus_pid()
+    }
+    fn key_window(&self, pid: i32) -> Option<u32> {
+        crate::input::skylight::key_window_of_pid(pid)
+    }
+    fn allowed(&self, expected: Option<i32>) -> bool {
+        self.baseline
+            .is_none_or(|(guard, _)| guard.valid_after_reactivation(expected, self.pid))
+    }
+    async fn activate(&self, pid: i32) {
+        let _ = apps::activate_pid(pid);
+        wait_until_frontmost(pid, std::time::Duration::from_millis(300)).await;
+    }
+    async fn focus(&self, previous_pid: i32, prior_key_wid: Option<u32>, pid: i32, wid: u32) {
+        let baseline = self.baseline;
+        let _ = latency::spawn_action_blocking(move || {
+            crate::input::skylight::restore_focus_after_without_raise(
+                previous_pid,
+                prior_key_wid,
+                pid,
+                wid,
+                || {
+                    baseline.is_none_or(|(guard, _)| {
+                        guard.valid_after_reactivation(Some(previous_pid), pid)
+                    })
+                },
+            )
+        })
+        .await;
+    }
+}
+
 async fn restore_user_focus_after_background_pixel_now(
     pid: i32,
     prior_front: Option<i32>,
@@ -1019,53 +1087,62 @@ async fn restore_user_focus_after_background_pixel_now(
     window_id: Option<u32>,
     focus_without_raise: bool,
     baseline: Option<(super::pixel_restore::RestoreBaseline, Option<i32>)>,
-) {
+) -> bool {
+    let ops = SystemPixelRestoreOps { pid, baseline };
+    restore_user_focus_with(
+        &ops,
+        pid,
+        prior_front,
+        prior_key_wid,
+        window_id,
+        focus_without_raise,
+        baseline.and_then(|(_, expected)| expected),
+    )
+    .await
+}
+
+async fn restore_user_focus_with(
+    ops: &impl PixelRestoreOps,
+    pid: i32,
+    prior_front: Option<i32>,
+    prior_key_wid: Option<u32>,
+    window_id: Option<u32>,
+    focus_without_raise: bool,
+    expected_front: Option<i32>,
+) -> bool {
     if prior_front == Some(pid) {
-        return;
+        return false;
     }
-    let allowed = move |expected| baseline.is_none_or(|(guard, _)| guard.valid(expected, pid));
     let reactivated = if let Some(previous_pid) = background_pixel_restore_pid(
         PixelActivationPolicy::AllowTargetWithoutRaise,
         prior_front,
         pid,
-        apps::frontmost_pid(),
+        ops.front(),
     ) {
-        if !allowed(baseline.and_then(|(_, expected)| expected)) {
-            return;
+        if !ops.allowed(expected_front) {
+            return false;
         }
-        let _ = apps::activate_pid(previous_pid);
-        wait_until_frontmost(previous_pid, std::time::Duration::from_millis(300)).await;
+        ops.activate(previous_pid).await;
         true
     } else {
         false
     };
-    // The prologue leaves the user's window key, but the input can still make
-    // the target self-activate, and re-activating the prior app does not by
-    // itself make its window key again. Post the focus record to the user's
-    // window only then, or when WindowServer's key focus left the user's app.
-    // Posting it while their window is still key re-activates their app
-    // (AppKit sends it didBecomeActive), which Bench v2 counted as a
-    // disturbance after every background pixel click.
     if let (Some(previous_pid), Some(wid)) = (prior_front, window_id) {
         let key_moved = user_focus_needs_restore(
             reactivated,
             focus_without_raise,
-            crate::input::skylight::key_focus_pid(),
+            ops.key_focus(),
             previous_pid,
         );
-        if key_moved && apps::frontmost_pid() == Some(previous_pid) && allowed(Some(previous_pid)) {
-            let _ = latency::spawn_action_blocking(move || {
-                crate::input::skylight::restore_focus_after_without_raise(
-                    previous_pid,
-                    prior_key_wid,
-                    pid,
-                    wid,
-                    || allowed(Some(previous_pid)),
-                )
-            })
-            .await;
+        if key_moved && ops.front() == Some(previous_pid) && ops.allowed(Some(previous_pid)) {
+            ops.focus(previous_pid, prior_key_wid, pid, wid).await;
         }
     }
+    prior_front.is_some_and(|previous_pid| {
+        ops.front() == Some(previous_pid)
+            && ops.key_focus() == Some(previous_pid)
+            && prior_key_wid.is_none_or(|wid| ops.key_window(previous_pid) == Some(wid))
+    })
 }
 
 /// Whether the user's window needs the focus record back after a background
@@ -2145,14 +2222,7 @@ impl ClickTool {
                         CFRelease(element as _);
                         return Ok(PxAxPress::FallThrough);
                     }
-                    if !background_hit_uses_ax(
-                        focus_only,
-                        super::type_text::target_in_web_area(
-                            pid,
-                            Some((element as usize, None)),
-                            Some(hit_test_wid),
-                        ),
-                    ) {
+                    if !background_hit_uses_ax(focus_only) {
                         CFRelease(element as _);
                         return Ok(PxAxPress::FallThrough);
                     }
@@ -2358,90 +2428,115 @@ impl ClickTool {
             // A pixel click can land on a "Sign In" button that opens a sheet
             // or a Safari link that activates a new tab — same side-effect
             // shape as the AX path, so we wrap identically.
-            let prior_front = apps::frontmost_pid();
-            let restore_baseline = super::pixel_restore::RestoreBaseline::capture(
-                super::pixel_restore::current_epoch().expect("input admission"),
-            );
-            let snapshot = match activation_policy {
-                PixelActivationPolicy::SuppressTarget => {
-                    WindowChangeDetector::snapshot(prior_front)
-                }
-                PixelActivationPolicy::AllowTargetWithoutRaise => {
-                    WindowChangeDetector::snapshot_allowing_activation(prior_front, pid)
-                }
-                PixelActivationPolicy::ForegroundAssist => {
-                    WindowChangeDetector::snapshot_without_suppression(prior_front)
-                }
-            };
-
-            // A raw click can open a menu (a popup drawn without AX, a canvas
-            // context menu); keep the user's key focus if it does.
-            let _key_focus = if fg {
-                None
-            } else {
-                latency::spawn_blocking(move || crate::key_focus_guard::protect(pid))
-                    .await
-                    .ok()
-                    .flatten()
-            };
-
-            // The user's key window, read before the click, so the restore
-            // below hands key status back to exactly that window.
-            let prior_key_wid = match prior_front {
-                Some(prior)
-                    if activation_policy == PixelActivationPolicy::AllowTargetWithoutRaise
-                        && prior != pid =>
-                {
-                    latency::spawn_action_blocking(move || {
-                        crate::input::skylight::key_window_of_pid(prior)
-                    })
-                    .await
-                    .ok()
-                    .flatten()
-                }
-                _ => None,
-            };
-
-            // Restore the Swift background-click prologue that was left
-            // disconnected in the original Rust port. It makes an opaque
-            // target AppKit-active without raising/restacking its window, which
-            // is required by Chromium gates and remote-HID proxies such as
-            // iPhone Mirroring. Re-pin after the focus record because changing
-            // AppKit active state can disturb overlay ordering.
-            let focus_without_raise = if activation_policy
-                == PixelActivationPolicy::AllowTargetWithoutRaise
-            {
-                let wid = window_id.expect("activation policy requires window_id");
-                match latency::spawn_action_blocking(move || {
-                    // A key hand-back still running would move key focus under
-                    // this action's focus record: send nothing instead.
-                    crate::input::skylight::await_key_restores()
-                        .then(|| crate::input::mouse::prepare_background_pixel_click_fast(pid, wid))
-                })
-                .await
-                {
-                    Ok(None) => {
-                        return super::key_restore_pending_refusal("click", Some(pid), Some(wid));
-                    }
-                    Ok(Some(activated)) => {
-                        if !activated && crate::input::skylight::windowserver_connection_invalid() {
-                            return super::windowserver_connection_refusal(pid, Some(wid));
+            let prelude_cursor = cursor_key.clone();
+            let (prior_front, restore_baseline, prepared) = capture_before_pixel_prelude(
+                apps::frontmost_pid,
+                || {
+                    super::pixel_restore::RestoreBaseline::capture(
+                        super::pixel_restore::current_epoch().expect("input admission"),
+                    )
+                },
+                |prior_front| async move {
+                    let snapshot = match activation_policy {
+                        PixelActivationPolicy::SuppressTarget => {
+                            WindowChangeDetector::snapshot(prior_front)
                         }
-                        crate::cursor::overlay::send_command(
-                            cursor_key.clone(),
-                            cursor_overlay::OverlayCommand::PinAbove(wid as u64),
-                        );
-                        activated
-                    }
-                    Err(error) => {
-                        return ToolResult::error(format!(
-                            "Background click activation task failed: {error}"
-                        ));
-                    }
-                }
-            } else {
-                false
+                        PixelActivationPolicy::AllowTargetWithoutRaise => {
+                            WindowChangeDetector::snapshot_allowing_activation(prior_front, pid)
+                        }
+                        PixelActivationPolicy::ForegroundAssist => {
+                            WindowChangeDetector::snapshot_without_suppression(prior_front)
+                        }
+                    };
+
+                    // A raw click can open a menu (a popup drawn without AX, a canvas
+                    // context menu); keep the user's key focus if it does.
+                    let _key_focus = if fg {
+                        None
+                    } else {
+                        latency::spawn_blocking(move || crate::key_focus_guard::protect(pid))
+                            .await
+                            .ok()
+                            .flatten()
+                    };
+
+                    // The user's key window, read before the click, so the restore
+                    // below hands key status back to exactly that window.
+                    let prior_key_wid = match prior_front {
+                        Some(prior)
+                            if activation_policy
+                                == PixelActivationPolicy::AllowTargetWithoutRaise
+                                && prior != pid =>
+                        {
+                            latency::spawn_action_blocking(move || {
+                                crate::input::skylight::key_window_of_pid(prior)
+                            })
+                            .await
+                            .ok()
+                            .flatten()
+                        }
+                        _ => None,
+                    };
+
+                    // Restore the Swift background-click prologue that was left
+                    // disconnected in the original Rust port. It makes an opaque
+                    // target AppKit-active without raising/restacking its window.
+                    // Re-pin after the focus record because changing AppKit
+                    // active state can disturb overlay ordering.
+                    let focus_without_raise = if activation_policy
+                        == PixelActivationPolicy::AllowTargetWithoutRaise
+                    {
+                        let wid = window_id.expect("activation policy requires window_id");
+                        match latency::spawn_action_blocking(move || {
+                            // A key hand-back still running would move key focus under
+                            // this action's focus record: send nothing instead.
+                            crate::input::skylight::await_key_restores().then(|| {
+                                crate::input::mouse::prepare_background_pixel_click_fast(pid, wid)
+                            })
+                        })
+                        .await
+                        {
+                            Ok(None) => {
+                                return Err(super::key_restore_pending_refusal(
+                                    "click",
+                                    Some(pid),
+                                    Some(wid),
+                                ));
+                            }
+                            Ok(Some(activated)) => {
+                                if !activated
+                                    && crate::input::skylight::windowserver_connection_invalid()
+                                {
+                                    return Err(super::windowserver_connection_refusal(
+                                        pid,
+                                        Some(wid),
+                                    ));
+                                }
+                                crate::cursor::overlay::send_command(
+                                    prelude_cursor.clone(),
+                                    cursor_overlay::OverlayCommand::PinAbove(wid as u64),
+                                );
+                                activated
+                            }
+                            Err(error) => {
+                                return Err(ToolResult::error(format!(
+                                    "Background click activation task failed: {error}"
+                                )));
+                            }
+                        }
+                    } else {
+                        false
+                    };
+
+                    Ok::<_, ToolResult>((snapshot, _key_focus, prior_key_wid, focus_without_raise))
+                },
+            )
+            .await;
+            let (snapshot, _key_focus, prior_key_wid, focus_without_raise) = match prepared {
+                Ok(prepared) => prepared,
+                Err(refusal) => return refusal,
             };
+            let expected_front = prior_front;
 
             // Pulse only after the activation settle so it visually coincides
             // with the real target click rather than the private focus prelude.
@@ -2466,7 +2561,6 @@ impl ClickTool {
                 Ok(guard) => guard,
                 Err(refusal) => return refusal,
             };
-            let expected_front = apps::frontmost_pid();
             let result = focus_guard::with_focus_suppressed(
                 if activation_policy == PixelActivationPolicy::SuppressTarget {
                     Some(pid)
@@ -2620,7 +2714,7 @@ impl ClickTool {
                             focus_without_raise,
                             Some((restore_baseline, expected_front)),
                         )
-                        .await;
+                        .await
                     },
                 );
             }
@@ -3553,7 +3647,7 @@ fn background_pixel_ax_eligible(
     !foreground && button == "left" && count == 1 && no_modifiers && action == "focus"
 }
 
-fn background_hit_uses_ax(focus_only: bool, _in_web_area: bool) -> bool {
+fn background_hit_uses_ax(focus_only: bool) -> bool {
     focus_only
 }
 
@@ -3948,10 +4042,8 @@ mod text_and_web_routing_tests {
 
     #[test]
     fn pixel_presses_use_events_while_focus_uses_ax() {
-        assert!(!background_hit_uses_ax(false, true));
-        assert!(!background_hit_uses_ax(false, false));
-        assert!(background_hit_uses_ax(true, true));
-        assert!(background_hit_uses_ax(true, false));
+        assert!(!background_hit_uses_ax(false));
+        assert!(background_hit_uses_ax(true));
     }
 
     #[test]
@@ -4029,6 +4121,102 @@ fn validate_click_action(action: &str, element_target: bool) -> anyhow::Result<(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn capture_precedes_prelude_front_change() {
+        use std::cell::Cell;
+        let front = Cell::new(1);
+        let (expected, _, ()) =
+            capture_before_pixel_prelude(|| Some(front.get()), || (), |_| async { front.set(2) })
+                .await;
+        assert_eq!(expected, Some(1));
+        assert_eq!(front.get(), 2);
+    }
+
+    #[tokio::test]
+    async fn baseline_capture_precedes_dispatch_reset() {
+        use std::cell::Cell;
+        let idle = Cell::new(1000);
+        let (_, baseline, ()) =
+            capture_before_pixel_prelude(|| Some(1), || idle.get(), |_| async { idle.set(0) })
+                .await;
+        assert_eq!(baseline, 1000);
+        assert_eq!(idle.get(), 0);
+    }
+
+    struct FakeRestore {
+        front: std::sync::atomic::AtomicI32,
+        key: std::sync::atomic::AtomicI32,
+        focus_posts: std::sync::atomic::AtomicUsize,
+    }
+    #[async_trait::async_trait]
+    impl PixelRestoreOps for FakeRestore {
+        fn front(&self) -> Option<i32> {
+            Some(self.front.load(std::sync::atomic::Ordering::SeqCst))
+        }
+        fn key_focus(&self) -> Option<i32> {
+            Some(self.key.load(std::sync::atomic::Ordering::SeqCst))
+        }
+        fn key_window(&self, _: i32) -> Option<u32> {
+            Some(7)
+        }
+        fn allowed(&self, _: Option<i32>) -> bool {
+            true
+        }
+        async fn activate(&self, pid: i32) {
+            self.front.store(pid, std::sync::atomic::Ordering::SeqCst);
+        }
+        async fn focus(&self, previous_pid: i32, _: Option<u32>, _: i32, _: u32) {
+            self.key
+                .store(previous_pid, std::sync::atomic::Ordering::SeqCst);
+            self.focus_posts
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn two_background_clicks_restore_original_app_and_window() {
+        use std::sync::{atomic::Ordering, Arc};
+        let fence = Box::leak(Box::new(super::super::pixel_restore::Fence::default()));
+        let ops = Arc::new(FakeRestore {
+            front: 2.into(),
+            key: 2.into(),
+            focus_posts: 0.into(),
+        });
+        let epoch = fence.admit().await;
+        let worker = ops.clone();
+        super::super::pixel_restore::spawn_restore_with(
+            fence,
+            2,
+            epoch,
+            Some(1),
+            || super::super::pixel_restore::RestoreCheck::Valid,
+            move || async move {
+                restore_user_focus_with(
+                    worker.as_ref(),
+                    2,
+                    Some(1),
+                    Some(7),
+                    Some(9),
+                    true,
+                    Some(1),
+                )
+                .await
+            },
+        );
+        tokio::task::yield_now().await;
+        let (_, action) = fence.admit_action().await;
+        drop(action);
+        let (_, click_b) = fence.admit_action().await;
+        assert_eq!(ops.front(), Some(2)); // B observes its target already frontmost.
+        drop(click_b);
+        tokio::task::yield_now().await;
+        tokio::time::advance(std::time::Duration::from_millis(50)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(ops.front(), Some(1));
+        assert_eq!(ops.key_focus(), Some(1));
+        assert_eq!(ops.focus_posts.load(Ordering::SeqCst), 1);
+    }
 
     /// The pixel focus rung keeps working after unknown AX action names
     /// started refusing: background pixel typing into Electron depended on it.

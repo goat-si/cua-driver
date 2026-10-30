@@ -838,7 +838,7 @@ final class ClickTargetButton: NSButton {
 
 // Opt-in windows for the persistent exact-window activation certification.
 // Ordinary harness launches remain byte-for-byte and behaviorally unchanged.
-final class B3SecondaryView: NSView {
+final class BackgroundClickSecondaryView: NSView {
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
     override func mouseDown(with event: NSEvent) {
         appendClickJournal(["action": "wrong_window", "window_id": event.windowNumber])
@@ -857,8 +857,8 @@ final class BringToFrontMatrixWindows {
         secondary.title = kSecondaryWindowTitle
         secondary.isReleasedWhenClosed = false
         secondary.isRestorable = false
-        if mode == "b3" {
-            secondary.contentView = B3SecondaryView(frame: NSRect(x: 0, y: 0, width: 420, height: 240))
+        if mode == "background-click" {
+            secondary.contentView = BackgroundClickSecondaryView(frame: NSRect(x: 0, y: 0, width: 420, height: 240))
         } else {
             secondary.contentView = NSTextField(labelWithString: "bring_to_front secondary ordinary window")
         }
@@ -1032,12 +1032,12 @@ struct CuaAppKitHarness {
         if ProcessInfo.processInfo.environment["CUA_HARNESS_NO_ACTIVATE"] != "1" {
             app.activate(ignoringOtherApps: true)
         }
-        if ProcessInfo.processInfo.environment["CUA_HARNESS_BRING_TO_FRONT_MODE"] == "b3" {
+        if ProcessInfo.processInfo.environment["CUA_HARNESS_BRING_TO_FRONT_MODE"] == "background-click" {
             matrixWindows?.secondary.makeKeyAndOrderFront(nil)
         }
         var rekeySource: DispatchSourceSignal?
         var b3StatusSource: DispatchSourceSignal?
-        if ProcessInfo.processInfo.environment["CUA_HARNESS_BRING_TO_FRONT_MODE"] == "b3",
+        if ProcessInfo.processInfo.environment["CUA_HARNESS_BRING_TO_FRONT_MODE"] == "background-click",
            let secondary = matrixWindows?.secondary {
             controller.window.contentView?.layoutSubtreeIfNeeded()
             if let button = controller.clickTargetButton, let screen = NSScreen.screens.first {
@@ -1071,7 +1071,7 @@ struct CuaAppKitHarness {
             signal(SIGUSR2, SIG_IGN)
             let status = DispatchSource.makeSignalSource(signal: SIGUSR2, queue: .main)
             status.setEventHandler {
-                let companion = ProcessInfo.processInfo.environment["CUA_B3_COMPANION"] == "1"
+                let companion = ProcessInfo.processInfo.environment["CUA_BACKGROUND_CLICK_COMPANION"] == "1"
                 if companion {
                     app.activate(ignoringOtherApps: true)
                     secondary.makeKeyAndOrderFront(nil)
