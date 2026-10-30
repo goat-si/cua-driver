@@ -37,9 +37,11 @@ struct Snapshot<S> {
     basis: Option<crate::window_basis::WindowBasis>,
     frame_generation: u32,
     basis_exhausted: bool,
-    /// The newest capture ticket issued when this snapshot or its current frame
-    /// was published. A ticket at or below it began before that publication, so
-    /// it can no longer attach a frame here.
+    /// Tickets at or below this one can no longer attach a frame here. A
+    /// ticketed publication or refresh sets it to its own ticket, so captures
+    /// that began later still land; a plain publication or screenshot refresh
+    /// sets it to the newest ticket issued, since every capture in flight began
+    /// before it.
     ticket_floor: u64,
 }
 
