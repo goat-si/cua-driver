@@ -414,6 +414,8 @@ mod tests {
             assert!(!child.wait().unwrap().success());
         } else {
             std::io::Read::read_exact(&mut std::io::stdin(), &mut [0u8]).unwrap();
+            drop(lifetime);
+            assert!(!child.wait().unwrap().success());
         }
     }
 
