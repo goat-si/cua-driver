@@ -1,4 +1,5 @@
 //! Admission and detached pixel-focus restoration coordination.
+use futures_util::FutureExt;
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     future::Future,
@@ -9,16 +10,30 @@ use std::{
 };
 use tokio::sync::{watch, Mutex as AsyncMutex};
 
+type ProcessStamp = crate::ax::enablement::ProcessStartStamp;
+
 pub(super) struct Fence {
     epoch: AtomicU64,
     in_flight: AtomicUsize,
     commit: AsyncMutex<()>,
     pending: Mutex<HashMap<(i32, u64), usize>>,
-    obligations: Mutex<HashMap<i32, (u64, Option<i32>)>>,
+    obligations: Mutex<HashMap<i32, Obligation>>,
     superseded: Mutex<HashSet<(i32, u64)>>,
-    outcomes: Mutex<HashMap<i32, VecDeque<serde_json::Value>>>,
-    changes: watch::Sender<u64>,
+    outcomes: Mutex<HashMap<i32, VecDeque<(ProcessStamp, serde_json::Value)>>>,
+    identity: fn(i32) -> Option<ProcessStamp>,
     epochs: watch::Sender<u64>,
+}
+
+#[derive(Clone, Debug)]
+struct Obligation {
+    epoch: u64,
+    prior: Option<i32>,
+    targets: Vec<(i32, Option<u32>, Option<ProcessStamp>)>,
+}
+struct RestoreTarget {
+    pid: i32,
+    window_id: Option<u32>,
+    stamp: Option<ProcessStamp>,
 }
 
 impl Default for Fence {
@@ -31,7 +46,7 @@ impl Default for Fence {
             obligations: Mutex::new(HashMap::new()),
             superseded: Mutex::new(HashSet::new()),
             outcomes: Mutex::new(HashMap::new()),
-            changes: watch::channel(0).0,
+            identity: crate::ax::enablement::process_start_stamp,
             epochs: watch::channel(0).0,
         }
     }
@@ -44,44 +59,34 @@ impl Fence {
     fn bump_epoch(&self) -> u64 {
         self.epoch.fetch_add(1, Ordering::SeqCst).wrapping_add(1)
     }
-    pub(super) fn bump(&self) -> u64 {
-        let epoch = self.bump_epoch();
-        self.notify_epoch_change();
-        epoch
-    }
-    #[cfg(test)]
-    pub(super) async fn admit(&self) -> u64 {
-        let epoch = self.bump_epoch();
-        let lock = self.commit.lock();
-        tokio::pin!(lock);
-        let mut notified = false;
-        // Try the commit boundary immediately after the bump. If an older
-        // restore already owns it, wake stale pending restores while this
-        // admission waits; otherwise unlock before notifying them.
-        let guard = std::future::poll_fn(|cx| {
-            let result = lock.as_mut().poll(cx);
-            if result.is_pending() && !notified {
-                self.notify_epoch_change();
-                notified = true;
-            }
-            result
-        })
-        .await;
-        drop(guard);
-        if !notified {
-            self.notify_epoch_change();
-        }
-        epoch
-    }
-    pub(super) async fn admit_action(&self) -> (u64, InFlight<'_>) {
+    pub(super) async fn admit_action(&self, tracked: bool) -> (u64, InFlight<'_>) {
         let epoch = self.bump_epoch();
         self.notify_epoch_change();
         let guard = self.commit.lock().await;
-        self.in_flight.fetch_add(1, Ordering::SeqCst);
+        if tracked {
+            self.in_flight.fetch_add(1, Ordering::SeqCst);
+        }
         drop(guard);
-        (epoch, InFlight(self))
+        (
+            epoch,
+            InFlight {
+                fence: self,
+                tracked,
+            },
+        )
     }
-    fn record_outcome(&self, pid: i32, prior: Option<i32>, status: &str, reason: Option<&str>) {
+    fn record_outcome(
+        &self,
+        pid: i32,
+        stamp: Option<ProcessStamp>,
+        prior: Option<i32>,
+        status: &str,
+        reason: Option<&str>,
+    ) {
+        let Some(stamp) = stamp else {
+            tracing::debug!(pid, "cannot bind restoration outcome to process");
+            return;
+        };
         let mut note = serde_json::json!({"status": status, "prior_pid": prior});
         if let Some(reason) = reason {
             note["reason"] = reason.into();
@@ -91,16 +96,72 @@ impl Fence {
             .unwrap_or_else(|e| e.into_inner())
             .entry(pid)
             .or_default()
-            .push_back(note);
+            .push_back((stamp, note));
     }
     fn take_outcome(&self, pid: i32) -> Option<serde_json::Value> {
+        if !self
+            .outcomes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains_key(&pid)
+        {
+            return None;
+        }
+        self.take_outcome_for(pid, (self.identity)(pid))
+    }
+    fn take_outcome_for(
+        &self,
+        pid: i32,
+        current: Option<ProcessStamp>,
+    ) -> Option<serde_json::Value> {
         let mut outcomes = self.outcomes.lock().unwrap_or_else(|e| e.into_inner());
         let queue = outcomes.get_mut(&pid)?;
-        let note = queue.pop_front();
+        queue.retain(|(stamp, _)| Some(*stamp) == current && current.is_some());
+        let note = queue.pop_front().map(|(_, note)| note);
         if queue.is_empty() {
             outcomes.remove(&pid);
         }
         note
+    }
+    fn chain_target(&self, root: i32, epoch: u64, front: Option<i32>) -> (i32, Option<u32>) {
+        let obligations = self.obligations.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(chain) = obligations.get(&root).filter(|chain| chain.epoch == epoch) else {
+            return (root, None);
+        };
+        chain
+            .targets
+            .iter()
+            .copied()
+            .find(|(pid, _, _)| Some(*pid) == front)
+            .or_else(|| chain.targets.last().copied())
+            .map(|(pid, wid, _)| (pid, wid))
+            .unwrap_or((root, None))
+    }
+    fn outcome_identity(&self, root: i32, epoch: u64) -> (i32, Option<ProcessStamp>) {
+        let obligations = self.obligations.lock().unwrap_or_else(|e| e.into_inner());
+        obligations
+            .get(&root)
+            .filter(|chain| chain.epoch == epoch)
+            .and_then(|chain| chain.targets.last())
+            .map_or((root, None), |(pid, _, stamp)| (*pid, *stamp))
+    }
+    fn record_chain_outcome(
+        &self,
+        root: i32,
+        epoch: u64,
+        prior: Option<i32>,
+        status: &str,
+        reason: Option<&str>,
+    ) {
+        let (pid, stamp) = self.outcome_identity(root, epoch);
+        self.record_outcome(pid, stamp, prior, status, reason);
+    }
+    fn is_pending_target(&self, pid: i32) -> bool {
+        self.obligations
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+            .any(|chain| chain.targets.iter().any(|(target, _, _)| *target == pid))
     }
     fn superseded(&self, pid: i32, epoch: u64) -> bool {
         self.superseded
@@ -112,69 +173,17 @@ impl Fence {
         self.epochs
             .send_modify(|version| *version = version.wrapping_add(1));
     }
-    #[cfg(test)]
-    async fn commit<F, W, Fut>(&self, epoch: u64, front_unchanged: F, work: W)
-    where
-        F: FnOnce() -> bool,
-        W: FnOnce() -> Fut,
-        Fut: Future<Output = ()>,
-    {
-        let _guard = self.commit.lock().await;
-        if self.epoch() != epoch || !front_unchanged() {
-            tracing::debug!(epoch, "dropping stale pixel focus restoration");
-            return;
-        }
-        work().await;
-    }
-    #[cfg(test)]
-    fn register(&self, pid: i32, epoch: u64) -> Pending<'_> {
-        let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
-        *pending.entry((pid, epoch)).or_default() += 1;
-        Pending {
-            fence: self,
-            pid,
-            epoch,
-        }
-    }
-    #[cfg(test)]
-    fn is_pending(&self, pid: i32) -> bool {
-        self.pending
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .keys()
-            .any(|(pending_pid, _)| *pending_pid == pid)
-    }
-    #[cfg(test)]
-    async fn await_pending(&self, pid: i32) -> bool {
-        self.await_matching_pending(Some(pid)).await
-    }
-    #[cfg(test)]
-    async fn await_matching_pending(&self, pid: Option<i32>) -> bool {
-        let mut changed = self.changes.subscribe();
-        tokio::time::timeout(std::time::Duration::from_secs(2), async {
-            while match pid {
-                Some(pid) => self.is_pending(pid),
-                None => !self
-                    .pending
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .is_empty(),
-            } {
-                if changed.changed().await.is_err() {
-                    return false;
-                }
-            }
-            true
-        })
-        .await
-        .unwrap_or(false)
-    }
 }
-pub(super) struct InFlight<'a>(&'a Fence);
+pub(super) struct InFlight<'a> {
+    fence: &'a Fence,
+    tracked: bool,
+}
 impl Drop for InFlight<'_> {
     fn drop(&mut self) {
-        self.0.in_flight.fetch_sub(1, Ordering::SeqCst);
-        self.0.notify_epoch_change();
+        if self.tracked {
+            self.fence.in_flight.fetch_sub(1, Ordering::SeqCst);
+            self.fence.notify_epoch_change();
+        }
     }
 }
 
@@ -205,13 +214,10 @@ impl Drop for Pending<'_> {
             .unwrap_or_else(|e| e.into_inner());
         if obligations
             .get(&self.pid)
-            .is_some_and(|(epoch, _)| *epoch == self.epoch)
+            .is_some_and(|obligation| obligation.epoch == self.epoch)
         {
             obligations.remove(&self.pid);
         }
-        self.fence
-            .changes
-            .send_modify(|version| *version = version.wrapping_add(1));
     }
 }
 static FENCE: OnceLock<Fence> = OnceLock::new();
@@ -226,9 +232,6 @@ pub(super) fn current_is(tool: &str) -> bool {
     ACTION_EPOCH
         .try_with(|(name, _)| name == tool)
         .unwrap_or(false)
-}
-pub(super) fn user_takeover() {
-    global().bump();
 }
 
 struct AdmittedTool(Box<dyn cua_driver_core::tool::Tool>);
@@ -370,49 +373,22 @@ async fn invoke_with_fence(
     tool: &dyn cua_driver_core::tool::Tool,
     args: serde_json::Value,
 ) -> cua_driver_core::protocol::ToolResult {
-    let Ok((epoch, _in_flight)) =
-        tokio::time::timeout(std::time::Duration::from_secs(2), fence.admit_action()).await
+    let name = tool.def().name.clone();
+    // CDP commands do not directly manipulate the native frontmost app.
+    // Preparation may launch a process, so it remains tracked.
+    let tracked = !(name == "page" || (name.starts_with("browser_") && name != "browser_prepare"));
+    let Ok((epoch, _in_flight)) = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        fence.admit_action(tracked),
+    )
+    .await
     else {
         return super::pre_dispatch_refusal(
             "pixel_restore_pending",
             "A previous pixel focus restoration is still pending; no input was sent.",
         );
     };
-    let name = tool.def().name.clone();
     ACTION_EPOCH.scope((name, epoch), tool.invoke(args)).await
-}
-
-#[cfg(test)]
-async fn wait_for_settle_or_stale(
-    fence: &Fence,
-    epoch: u64,
-    mut epochs: watch::Receiver<u64>,
-) -> bool {
-    let settle = tokio::time::sleep(std::time::Duration::from_millis(50));
-    tokio::pin!(settle);
-    loop {
-        if fence.epoch() != epoch {
-            tracing::debug!(
-                epoch,
-                "dropping stale pixel focus restoration before commit"
-            );
-            return false;
-        }
-        tokio::select! {
-            _ = &mut settle => break,
-            changed = epochs.changed() => {
-                if changed.is_err() { return false; }
-            }
-        }
-    }
-    if fence.epoch() != epoch {
-        tracing::debug!(
-            epoch,
-            "dropping stale pixel focus restoration before commit"
-        );
-        return false;
-    }
-    true
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -434,15 +410,13 @@ impl RestoreCheck {
 pub(super) struct RestoreBaseline {
     idle: Option<u64>,
     started: std::time::Instant,
-    epoch: u64,
 }
 
 impl RestoreBaseline {
-    pub(super) fn capture(epoch: u64) -> Self {
+    pub(super) fn capture() -> Self {
         Self {
             idle: super::physical_input_idle_ms(),
             started: std::time::Instant::now(),
-            epoch,
         }
     }
 
@@ -453,9 +427,8 @@ impl RestoreBaseline {
         front: Option<i32>,
         expected: Option<i32>,
         target: i32,
-        epoch: u64,
     ) -> bool {
-        if self.epoch != epoch || (front != expected && front != Some(target)) {
+        if front != expected && front != Some(target) {
             return false;
         }
         match (self.idle, idle) {
@@ -466,15 +439,40 @@ impl RestoreBaseline {
         }
     }
 
+    fn valid_sample_with_driver_hid(
+        &self,
+        idle: Option<u64>,
+        elapsed: u64,
+        front: Option<i32>,
+        expected: Option<i32>,
+        target: i32,
+        own_hid: bool,
+    ) -> bool {
+        if own_hid {
+            front == expected || front == Some(target)
+        } else {
+            self.valid_sample(idle, elapsed, front, expected, target)
+        }
+    }
+
     fn abandon_reason(&self, expected: Option<i32>, target: i32) -> RestoreCheck {
-        let elapsed = u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX);
-        self.abandon_sample(
-            expected,
-            target,
-            crate::apps::frontmost_pid(),
-            super::physical_input_idle_ms(),
-            elapsed,
-        )
+        let front = crate::apps::frontmost_pid();
+        let idle = super::physical_input_idle_ms();
+        let now = std::time::Instant::now();
+        let elapsed =
+            u64::try_from(now.duration_since(self.started).as_millis()).unwrap_or(u64::MAX);
+        let sample = self.abandon_sample(expected, target, front, idle, elapsed);
+        if matches!(
+            sample,
+            RestoreCheck::Retry | RestoreCheck::Abandon("third_app")
+        ) {
+            return sample;
+        }
+        match crate::input::hid_history::quiet_since(self.started, self.idle, now, idle) {
+            Some(true) => RestoreCheck::Valid,
+            Some(false) => RestoreCheck::Abandon("user_input"),
+            None => RestoreCheck::Retry,
+        }
     }
 
     fn abandon_sample(
@@ -494,44 +492,20 @@ impl RestoreBaseline {
         if self.idle.is_none() || idle.is_none() {
             return RestoreCheck::Retry;
         }
-        if !self.valid_sample(idle, elapsed, front, expected, target, self.epoch) {
+        if !self.valid_sample_with_driver_hid(idle, elapsed, front, expected, target, false) {
             return RestoreCheck::Abandon("user_input");
         }
         RestoreCheck::Valid
     }
 
     pub(super) fn valid_after_reactivation(&self, expected: Option<i32>, target: i32) -> bool {
-        self.valid_during_restore(expected, target, true)
-    }
-
-    fn restore_epoch(&self, observed: u64, reactivated: bool) -> u64 {
-        // The commit lock still excludes admission after reactivation. An
-        // admission may bump the epoch while waiting, but cannot dispatch.
-        if reactivated {
-            self.epoch
-        } else {
-            observed
-        }
-    }
-
-    fn valid_during_restore(&self, expected: Option<i32>, target: i32, reactivated: bool) -> bool {
-        let elapsed = u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX);
         let idle = super::physical_input_idle_ms();
-        if self.idle.is_none() || idle.is_none() {
-            return false;
-        }
-        let valid = self.valid_sample(
-            idle,
-            elapsed,
-            crate::apps::frontmost_pid(),
-            expected,
-            target,
-            self.restore_epoch(global().epoch(), reactivated),
-        );
-        if !valid && global().epoch() == self.epoch {
-            global().bump();
-        }
-        valid
+        let front = crate::apps::frontmost_pid();
+        let now = std::time::Instant::now();
+        let elapsed =
+            u64::try_from(now.duration_since(self.started).as_millis()).unwrap_or(u64::MAX);
+        crate::input::hid_history::quiet_since(self.started, self.idle, now, idle) == Some(true)
+            && self.valid_sample_with_driver_hid(idle, elapsed, front, expected, target, true)
     }
 }
 
@@ -540,21 +514,43 @@ pub(super) fn spawn_restore<F, Fut>(
     epoch: u64,
     expected_front: Option<i32>,
     baseline: RestoreBaseline,
+    window_id: Option<u32>,
+    target_stamp: Option<ProcessStamp>,
     work: F,
 ) where
-    F: FnOnce() -> Fut + Send + 'static,
+    F: FnOnce(i32, Option<u32>) -> Fut + Send + 'static,
     Fut: Future<Output = bool> + Send + 'static,
 {
-    spawn_restore_with(
+    spawn_restore_with_window(
         global(),
-        pid,
+        RestoreTarget {
+            pid,
+            window_id,
+            stamp: target_stamp,
+        },
         epoch,
         expected_front,
-        move || baseline.abandon_reason(expected_front, pid),
-        work,
+        move || {
+            let front = crate::apps::frontmost_pid();
+            let (target, _) = global().chain_target(pid, epoch, front);
+            if front.is_some_and(|front| {
+                Some(front) != expected_front
+                    && front != target
+                    && global().is_pending_target(front)
+            }) {
+                RestoreCheck::Retry
+            } else {
+                baseline.abandon_reason(expected_front, target)
+            }
+        },
+        move || {
+            let (target, wid) = global().chain_target(pid, epoch, crate::apps::frontmost_pid());
+            work(target, wid)
+        },
     );
 }
 
+#[cfg(test)]
 pub(super) fn spawn_restore_with<F, Fut, V>(
     fence: &'static Fence,
     pid: i32,
@@ -567,17 +563,81 @@ pub(super) fn spawn_restore_with<F, Fut, V>(
     Fut: Future<Output = bool> + Send + 'static,
     V: Fn() -> RestoreCheck + Send + 'static,
 {
+    spawn_restore_with_window(
+        fence,
+        RestoreTarget {
+            pid,
+            window_id: None,
+            stamp: (fence.identity)(pid),
+        },
+        epoch,
+        prior,
+        valid,
+        work,
+    );
+}
+
+fn spawn_restore_with_window<F, Fut, V>(
+    fence: &'static Fence,
+    target: RestoreTarget,
+    epoch: u64,
+    prior: Option<i32>,
+    valid: V,
+    work: F,
+) where
+    F: FnOnce() -> Fut + Send + 'static,
+    Fut: Future<Output = bool> + Send + 'static,
+    V: Fn() -> RestoreCheck + Send + 'static,
+{
+    let RestoreTarget {
+        pid,
+        window_id,
+        stamp: target_stamp,
+    } = target;
     let pending = {
         let mut entries = fence.pending.lock().unwrap_or_else(|e| e.into_inner());
         let mut obligations = fence.obligations.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(parent) = prior.and_then(|previous| {
+            obligations.values_mut().find(|root| {
+                root.epoch < epoch
+                    && root
+                        .targets
+                        .iter()
+                        .any(|(target, _, _)| *target == previous)
+            })
+        }) {
+            parent.targets.push((pid, window_id, target_stamp));
+            fence.notify_epoch_change();
+            return;
+        }
         if obligations
             .get(&pid)
-            .is_some_and(|(existing_epoch, _)| *existing_epoch <= epoch)
+            .is_some_and(|existing| existing.epoch <= epoch)
         {
             return;
         }
-        obligations.insert(pid, (epoch, prior));
         let mut superseded = fence.superseded.lock().unwrap_or_else(|e| e.into_inner());
+        let mut targets = vec![(pid, window_id, target_stamp)];
+        let descendants: Vec<i32> = obligations
+            .iter()
+            .filter_map(|(root, child)| {
+                (child.epoch > epoch && child.prior == Some(pid)).then_some(*root)
+            })
+            .collect();
+        for descendant in descendants {
+            if let Some(child) = obligations.remove(&descendant) {
+                superseded.insert((descendant, child.epoch));
+                targets.extend(child.targets);
+            }
+        }
+        obligations.insert(
+            pid,
+            Obligation {
+                epoch,
+                prior,
+                targets,
+            },
+        );
         superseded.extend(
             entries
                 .keys()
@@ -601,18 +661,18 @@ pub(super) fn spawn_restore_with<F, Fut, V>(
             let observed = fence.epoch();
             if fence.in_flight.load(Ordering::SeqCst) != 0 {
                 tokio::select! {
-                    _ = &mut deadline => { tracing::debug!(pid, "pixel focus restoration timed out"); if !fence.superseded(pid, epoch) { fence.record_outcome(pid, prior, "abandoned", Some(valid().timeout_reason())); } return; }
+                    _ = &mut deadline => { tracing::debug!(pid, "pixel focus restoration timed out"); if !fence.superseded(pid, epoch) { fence.record_chain_outcome(pid, epoch, prior, "abandoned", Some(valid().timeout_reason())); } return; }
                     changed = epochs.changed() => if changed.is_err() { return; },
                 }
                 continue;
             }
             tokio::select! {
-                _ = &mut deadline => { tracing::debug!(pid, "pixel focus restoration timed out"); if !fence.superseded(pid, epoch) { fence.record_outcome(pid, prior, "abandoned", Some(valid().timeout_reason())); } return; }
+                _ = &mut deadline => { tracing::debug!(pid, "pixel focus restoration timed out"); if !fence.superseded(pid, epoch) { fence.record_chain_outcome(pid, epoch, prior, "abandoned", Some(valid().timeout_reason())); } return; }
                 changed = epochs.changed() => { if changed.is_err() { return; } continue; }
                 _ = tokio::time::sleep(std::time::Duration::from_millis(50)) => {}
             }
             let guard = tokio::select! {
-                _ = &mut deadline => { tracing::debug!(pid, "pixel focus restoration timed out"); if !fence.superseded(pid, epoch) { fence.record_outcome(pid, prior, "abandoned", Some(valid().timeout_reason())); } return; }
+                _ = &mut deadline => { tracing::debug!(pid, "pixel focus restoration timed out"); if !fence.superseded(pid, epoch) { fence.record_chain_outcome(pid, epoch, prior, "abandoned", Some(valid().timeout_reason())); } return; }
                 guard = fence.commit.lock() => guard,
             };
             if fence.epoch() != observed || fence.in_flight.load(Ordering::SeqCst) != 0 {
@@ -628,11 +688,19 @@ pub(super) fn spawn_restore_with<F, Fut, V>(
                     continue;
                 }
                 RestoreCheck::Abandon(reason) => {
-                    fence.record_outcome(pid, prior, "abandoned", Some(reason))
+                    fence.record_chain_outcome(pid, epoch, prior, "abandoned", Some(reason))
                 }
                 RestoreCheck::Valid => {
-                    if work.take().expect("restore called once")().await {
-                        fence.record_outcome(pid, prior, "restored", None);
+                    let result = std::panic::AssertUnwindSafe(async {
+                        work.take().expect("restore called once")().await
+                    })
+                    .catch_unwind()
+                    .await;
+                    if result.is_err() {
+                        tracing::error!(pid, "pixel focus restoration panicked");
+                        fence.record_chain_outcome(pid, epoch, prior, "abandoned", Some("panic"));
+                    } else if matches!(result, Ok(true)) {
+                        fence.record_chain_outcome(pid, epoch, prior, "restored", None);
                     } else {
                         // The hand-back could not be confirmed. Keep the
                         // obligation until a takeover or its original deadline;
@@ -643,12 +711,18 @@ pub(super) fn spawn_restore_with<F, Fut, V>(
                                 return;
                             }
                             if let RestoreCheck::Abandon(reason) = valid() {
-                                fence.record_outcome(pid, prior, "abandoned", Some(reason));
+                                fence.record_chain_outcome(
+                                    pid,
+                                    epoch,
+                                    prior,
+                                    "abandoned",
+                                    Some(reason),
+                                );
                                 return;
                             }
                             tokio::select! {
                                 _ = &mut deadline => {
-                                    fence.record_outcome(pid, prior, "abandoned", Some(valid().timeout_reason()));
+                                    fence.record_chain_outcome(pid, epoch, prior, "abandoned", Some(valid().timeout_reason()));
                                     return;
                                 }
                                 changed = epochs.changed() => if changed.is_err() { return; },

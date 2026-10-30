@@ -1001,7 +1001,7 @@ impl ElementTarget for LiveTarget {
     }
 
     async fn restore_after_pointer(&self, prior_front: Option<i32>, prologue: PointerPrologue) {
-        super::click::restore_user_focus_after_background_pixel(
+        super::pixel_focus::restore_user_focus_after_background_pixel(
             self.pid,
             prior_front,
             prologue.prior_key_wid,

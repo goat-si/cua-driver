@@ -73,7 +73,9 @@ fn dispatch_mouse_event(route: PostRoute, pid: i32, event: &CGEvent) {
             crate::input::skylight::post_to_pid(pid as libc::pid_t, event_ptr, false);
         }
         PostRoute::PublicPid => event.post_to_pid(pid as libc::pid_t),
-        PostRoute::Hid => event.post(core_graphics::event::CGEventTapLocation::HID),
+        PostRoute::Hid => {
+            super::hid_history::post(|| event.post(core_graphics::event::CGEventTapLocation::HID))
+        }
         PostRoute::SkyLightAndPublic => {
             crate::input::skylight::post_to_pid(pid as libc::pid_t, event_ptr, false);
             event.post_to_pid(pid as libc::pid_t);
@@ -257,7 +259,7 @@ fn click_at_xy_desktop_inner(
             .map_err(|_| anyhow::anyhow!("CGEvent::new_mouse_event(move) failed"))?;
             moved.set_flags(flags);
             super::tag_synthetic_event(&moved);
-            moved.post(CGEventTapLocation::HID);
+            super::hid_history::post(|| moved.post(CGEventTapLocation::HID));
             std::thread::sleep(std::time::Duration::from_millis(12));
         }
 
@@ -278,9 +280,9 @@ fn click_at_xy_desktop_inner(
             .map(|state| Ok((event(down_ty, state)?, event(up_ty, state)?)))
             .collect::<anyhow::Result<Vec<_>>>()?;
         for (down, up) in pairs {
-            down.post(CGEventTapLocation::HID);
+            super::hid_history::post(|| down.post(CGEventTapLocation::HID));
             std::thread::sleep(std::time::Duration::from_millis(28));
-            up.post(CGEventTapLocation::HID);
+            super::hid_history::post(|| up.post(CGEventTapLocation::HID));
             if count > 1 {
                 std::thread::sleep(std::time::Duration::from_millis(80));
             }
@@ -370,7 +372,7 @@ pub fn scroll_wheel_desktop(
         }
         let event = unsafe { CGEvent::from_ptr(event_ref) };
         super::tag_synthetic_event(&event);
-        event.post(CGEventTapLocation::HID);
+        super::hid_history::post(|| event.post(CGEventTapLocation::HID));
         std::thread::sleep(std::time::Duration::from_millis(30));
     }
     Ok(())
@@ -1554,7 +1556,7 @@ where
                     anyhow::anyhow!("foreground drag {:?} event creation failed", spec.kind)
                 })?;
             event.set_flags(flags);
-            event.post(CGEventTapLocation::HID);
+            super::hid_history::post(|| event.post(CGEventTapLocation::HID));
 
             match spec.kind {
                 ForegroundDragEventKind::Move => {

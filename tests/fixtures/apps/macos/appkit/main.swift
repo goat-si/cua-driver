@@ -1036,7 +1036,7 @@ struct CuaAppKitHarness {
             matrixWindows?.secondary.makeKeyAndOrderFront(nil)
         }
         var rekeySource: DispatchSourceSignal?
-        var b3StatusSource: DispatchSourceSignal?
+        var backgroundClickStatusSource: DispatchSourceSignal?
         if ProcessInfo.processInfo.environment["CUA_HARNESS_BRING_TO_FRONT_MODE"] == "background-click",
            let secondary = matrixWindows?.secondary {
             controller.window.contentView?.layoutSubtreeIfNeeded()
@@ -1083,7 +1083,7 @@ struct CuaAppKitHarness {
                 ])
             }
             status.resume()
-            b3StatusSource = status
+            backgroundClickStatusSource = status
             appendClickJournal(["action": "armed"])
         }
         writeBringToFrontWindowReport(main: controller.window, matrix: matrixWindows)
@@ -1097,7 +1097,7 @@ struct CuaAppKitHarness {
         }
         app.run()
         _ = rekeySource
-        _ = b3StatusSource
+        _ = backgroundClickStatusSource
         _ = matrixWindows
     }
 }

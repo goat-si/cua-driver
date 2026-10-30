@@ -44,6 +44,7 @@ pub(crate) mod get_screen_size;
 mod health_report;
 mod move_cursor;
 mod page;
+mod pixel_focus;
 pub(crate) mod pixel_restore;
 mod pixel_route;
 pub(crate) mod px_frame;
@@ -530,14 +531,11 @@ pub(crate) fn gate_user_takeover(
         None => Some(crate::apps::frontmost_pid() == Some(pid)),
     };
     match user_takeover_idle(front, idle, threshold) {
-        Some(idle_ms) => {
-            pixel_restore::user_takeover();
-            Err(cua_driver_core::delivery::user_interacting_result(
-                idle_ms,
-                threshold,
-                serde_json::json!({ "pid": pid, "window_id": window_id }),
-            ))
-        }
+        Some(idle_ms) => Err(cua_driver_core::delivery::user_interacting_result(
+            idle_ms,
+            threshold,
+            serde_json::json!({ "pid": pid, "window_id": window_id }),
+        )),
         None => Ok(()),
     }
 }
