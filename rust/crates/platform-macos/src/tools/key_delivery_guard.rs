@@ -88,7 +88,12 @@ where
         crate::goat::action_latency::spawn_action_blocking(move || {
             let _lease = lease;
             let mut scope = scope;
-            work(worker_control, &mut scope)
+            let result = work(worker_control, &mut scope);
+            crate::goat::action_latency::section(
+                crate::goat::action_latency::Stage::KeyHandBack,
+                || drop(scope),
+            );
+            result
         }),
     )
     .await

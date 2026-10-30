@@ -2,6 +2,78 @@ use crate::input::guarded_dispatch::GuardedResult;
 use cua_driver_core::window_basis::{BasisRefusal, DispatchEffect, LiveFrame, WindowBasis};
 use serde_json::{json, Value};
 
+#[derive(Debug)]
+pub(crate) struct ClickArguments<'a> {
+    pub pid: i32,
+    pub snapshot_id: &'a str,
+    pub count: usize,
+    pub button: &'a str,
+}
+
+pub(crate) fn basis_argument_error(
+    message: impl Into<String>,
+) -> cua_driver_core::protocol::ToolResult {
+    cua_driver_core::protocol::ToolResult::error(message.into()).with_structured(
+        json!({"code":"invalid_arguments", "effect":"refused", "nothing_sent":true}),
+    )
+}
+
+pub(crate) fn invalid_basis_arguments() -> cua_driver_core::protocol::ToolResult {
+    basis_argument_error(
+        "snapshot_id requires x and y and cannot be combined with element_token, capture_id, \
+         from_zoom, or desktop scope.",
+    )
+}
+
+pub(crate) fn validate_arguments<'a>(
+    tool: &str,
+    args: &'a Value,
+) -> Result<ClickArguments<'a>, cua_driver_core::protocol::ToolResult> {
+    let pid = args
+        .get("pid")
+        .and_then(Value::as_i64)
+        .and_then(|p| i32::try_from(p).ok())
+        .ok_or_else(|| {
+            basis_argument_error(
+                "snapshot_id needs the pid of the window it was read from: pass pid from \
+             get_window_state.",
+            )
+        })?;
+    let snapshot_id = args
+        .get("snapshot_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            basis_argument_error(
+                "snapshot_id must be the window_basis.snapshot_id string from get_window_state.",
+            )
+        })?;
+    let (count, button) = match tool {
+        "double_click" => (2, "left"),
+        "right_click" => (1, "right"),
+        _ => {
+            let count = args.get("count").and_then(Value::as_u64).unwrap_or(1);
+            if !(1..=3).contains(&count) {
+                return Err(basis_argument_error(
+                    "click: count must be 1 (single), 2 (double) or 3 (triple).",
+                ));
+            }
+            let button = args.get("button").and_then(Value::as_str).unwrap_or("left");
+            if !matches!(button, "left" | "right" | "middle") {
+                return Err(basis_argument_error(format!(
+                    "click: unknown button \"{button}\" — expected one of left, right, middle."
+                )));
+            }
+            (count as usize, button)
+        }
+    };
+    Ok(ClickArguments {
+        pid,
+        snapshot_id,
+        count,
+        button,
+    })
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Transport {
     Foreground,
@@ -87,6 +159,86 @@ mod tests {
     use crate::input::guarded_dispatch::{run_guarded, InputSink};
     use cua_driver_core::window_basis::DispatchOutcome;
     use std::cell::RefCell;
+    fn assert_refusal(args: Value, expected: &str) {
+        let result = validate_arguments("click", &args).unwrap_err();
+        assert_eq!(result.is_error, Some(true));
+        assert_eq!(
+            serde_json::to_value(&result.content).unwrap(),
+            json!([{"type":"text", "text":expected}])
+        );
+        assert_eq!(
+            result.structured_content,
+            Some(json!({"code":"invalid_arguments", "effect":"refused", "nothing_sent":true}))
+        );
+    }
+
+    #[test]
+    fn invalid_pid_refusal() {
+        for pid in [
+            json!(null),
+            json!("1"),
+            json!(i64::from(i32::MAX) + 1),
+            json!(i64::from(i32::MIN) - 1),
+        ] {
+            assert_refusal(json!({"pid":pid,"snapshot_id":"s"}), "snapshot_id needs the pid of the window it was read from: pass pid from get_window_state.");
+        }
+    }
+
+    #[test]
+    fn invalid_snapshot_refusal() {
+        for snapshot in [json!(null), json!(42)] {
+            assert_refusal(
+                json!({"pid":1,"snapshot_id":snapshot}),
+                "snapshot_id must be the window_basis.snapshot_id string from get_window_state.",
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_count_refusal() {
+        for count in [0, 4] {
+            assert_refusal(
+                json!({"pid":1,"snapshot_id":"s","count":count}),
+                "click: count must be 1 (single), 2 (double) or 3 (triple).",
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_button_refusal() {
+        assert_refusal(
+            json!({"pid":1,"snapshot_id":"s","button":"other"}),
+            "click: unknown button \"other\" — expected one of left, right, middle.",
+        );
+    }
+
+    #[test]
+    fn accepts_boundaries_and_buttons() {
+        for pid in [i32::MIN, 0, i32::MAX] {
+            for count in [1, 3] {
+                for button in ["left", "right", "middle"] {
+                    let args = json!({"pid":pid,"snapshot_id":"s","count":count,"button":button});
+                    let parsed = validate_arguments("click", &args).unwrap();
+                    assert_eq!(
+                        (parsed.pid, parsed.snapshot_id, parsed.count, parsed.button),
+                        (pid, "s", count as usize, button)
+                    );
+                }
+            }
+        }
+        let args = json!({"pid":1,"snapshot_id":"s", "count":-1, "button": 42});
+        let parsed = validate_arguments("click", &args).unwrap();
+        assert_eq!((parsed.count, parsed.button), (1, "left"));
+    }
+
+    #[test]
+    fn specialized_clicks_ignore_count_and_button() {
+        let args = json!({"pid":1,"snapshot_id":"s","count":4,"button":"other"});
+        for (tool, count, button) in [("double_click", 2, "left"), ("right_click", 1, "right")] {
+            let parsed = validate_arguments(tool, &args).unwrap();
+            assert_eq!((parsed.count, parsed.button), (count, button));
+        }
+    }
     fn basis() -> WindowBasis {
         WindowBasis {
             window_id: 2,
