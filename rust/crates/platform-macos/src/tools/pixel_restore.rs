@@ -357,6 +357,8 @@ mod tests {
     async fn admission_after_restore_check_waits_for_restore_commit() {
         let fence = Arc::new(Fence::default());
         let click_epoch = fence.admit().await;
+        let _click_pending = fence.register(42, click_epoch);
+        assert!(!fence.is_pending(99), "the next action targets another pid");
         let (started_tx, started_rx) = oneshot::channel();
         let (release_tx, release_rx) = oneshot::channel();
         let worker = fence.clone();
@@ -377,6 +379,7 @@ mod tests {
         let worker = fence.clone();
         let admit = tokio::spawn(async move {
             worker.admit().await;
+            assert!(worker.await_pending(99).await);
             done_tx.send(()).unwrap();
         });
         while fence.epoch() == click_epoch {
