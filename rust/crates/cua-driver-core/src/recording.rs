@@ -1834,6 +1834,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn basis_sent_keeps_supplemental_click_point() {
+        use crate::action_record::{
+            ActionEffect, ActionExecutionRecord, ActionTransport, ActualDelivery, RequestedDelivery,
+        };
+        let root = tempfile::tempdir().unwrap();
+        let mut pending = dispatch_pending(root.path());
+        pending.args = serde_json::json!({"snapshot_id":"s00000001.f1", "x":1, "y":1});
+        let source = crate::image_utils::encode_rgba_to_png(&[255; 16], 2, 2).unwrap();
+        scope_dispatch_click_capture(Some(&pending), async {
+            capture_dispatch_click_target(902, 901, || Some((source, 1.0, 0.5)));
+        })
+        .await;
+        let record = ActionExecutionRecord::builder(
+            ActionEffect::Unverifiable,
+            ActionTransport::WindowsPostMessage,
+            RequestedDelivery::Background,
+        )
+        .actual_delivery(ActualDelivery::Background)
+        .build()
+        .unwrap();
+        write_turn(pending, "sent", Some(&record), false).unwrap();
+        let action: Value =
+            serde_json::from_slice(&std::fs::read(root.path().join("action.json")).unwrap())
+                .unwrap();
+        assert_eq!(action["click_point"], serde_json::json!({"x":1.0,"y":0.5}));
+    }
+
+    #[tokio::test]
     async fn supplemental_click_preserves_before_and_rejects_invalid_capture() {
         setup_test_marker();
         for point in [

@@ -2,7 +2,7 @@ use crate::input::guarded_dispatch::GuardedResult;
 use cua_driver_core::window_basis::{BasisRefusal, DispatchEffect, LiveFrame, WindowBasis};
 use serde_json::{json, Value};
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Transport {
     Foreground,
     Background,
@@ -50,13 +50,23 @@ pub(crate) fn background_refusal(
     result
 }
 
-pub(crate) fn result_json(result: &GuardedResult, snapshot_id: &str, point: (i64, i64)) -> Value {
+pub(crate) fn result_json(
+    result: &GuardedResult,
+    snapshot_id: &str,
+    point: (i64, i64),
+    mode: Transport,
+) -> Value {
     let (outcome, refusal) = match result {
         GuardedResult::Refused { outcome, refusal } => (outcome, Some(refusal)),
         GuardedResult::Sent { outcome } => (outcome, None),
     };
     let mut value = outcome.to_json();
     value["path"] = json!("pixel_basis");
+    value["delivery_mode"] = json!(match mode {
+        Transport::Foreground => "foreground",
+        Transport::Background => "background",
+        Transport::Unavailable => unreachable!("unavailable transport cannot dispatch"),
+    });
     value["basis_checked_at_dispatch"] = json!(true);
     value["snapshot_id"] = json!(snapshot_id);
     value["screen_point"] = json!({"x":point.0,"y":point.1});
@@ -186,37 +196,42 @@ mod tests {
             } else {
                 GuardedResult::Sent { outcome }
             };
-            let value = result_json(&result, "s00000001.f1", (11, 22));
-            assert_eq!(value["delivery_mode"], "foreground");
-            assert_eq!(value["path"], "pixel_basis");
-            assert_eq!(
-                value["effect"],
-                match effect {
-                    DispatchEffect::Refused => "refused",
-                    DispatchEffect::Partial => "partial",
-                    DispatchEffect::Uncertain => "uncertain",
-                    DispatchEffect::Unverifiable => "unverifiable",
+            for (mode, delivery) in [
+                (Transport::Foreground, "foreground"),
+                (Transport::Background, "background"),
+            ] {
+                let value = result_json(&result, "s00000001.f1", (11, 22), mode);
+                assert_eq!(value["delivery_mode"], delivery);
+                assert_eq!(value["path"], "pixel_basis");
+                assert_eq!(
+                    value["effect"],
+                    match effect {
+                        DispatchEffect::Refused => "refused",
+                        DispatchEffect::Partial => "partial",
+                        DispatchEffect::Uncertain => "uncertain",
+                        DispatchEffect::Unverifiable => "unverifiable",
+                    }
+                );
+                if effect == DispatchEffect::Refused {
+                    assert_eq!(
+                        value,
+                        json!({"events_planned":2,"events_sent":0,"prepared_side_effects":[],"effect":"refused","cleanup_results":[],"nothing_sent":true,"path":"pixel_basis","delivery_mode":delivery,"basis_checked_at_dispatch":true,"snapshot_id":"s00000001.f1","screen_point":{"x":11,"y":22},"code":"stale_basis","reason":"window_moved"})
+                    );
+                    assert_eq!(value["nothing_sent"], true);
+                    assert_eq!(value["code"], "stale_basis");
                 }
-            );
-            if effect == DispatchEffect::Refused {
-                assert_eq!(
-                    value,
-                    json!({"events_planned":2,"events_sent":0,"prepared_side_effects":[],"effect":"refused","cleanup_results":[],"nothing_sent":true,"path":"pixel_basis","basis_checked_at_dispatch":true,"snapshot_id":"s00000001.f1","screen_point":{"x":11,"y":22},"code":"stale_basis","reason":"window_moved"})
-                );
-                assert_eq!(value["nothing_sent"], true);
-                assert_eq!(value["code"], "stale_basis");
-            }
-            if effect == DispatchEffect::Unverifiable {
-                assert_eq!(
-                    value,
-                    json!({"events_planned":2,"events_sent":2,"prepared_side_effects":[],"effect":"unverifiable","cleanup_results":[],"path":"pixel_basis","basis_checked_at_dispatch":true,"snapshot_id":"s00000001.f1","screen_point":{"x":11,"y":22}})
-                );
-            }
-            if effect == DispatchEffect::Partial {
-                assert_eq!(value["code"], "partial_delivery");
-            }
-            if effect == DispatchEffect::Uncertain {
-                assert_eq!(value["code"], "uncertain");
+                if effect == DispatchEffect::Unverifiable {
+                    assert_eq!(
+                        value,
+                        json!({"events_planned":2,"events_sent":2,"prepared_side_effects":[],"effect":"unverifiable","cleanup_results":[],"path":"pixel_basis","delivery_mode":delivery,"basis_checked_at_dispatch":true,"snapshot_id":"s00000001.f1","screen_point":{"x":11,"y":22}})
+                    );
+                }
+                if effect == DispatchEffect::Partial {
+                    assert_eq!(value["code"], "partial_delivery");
+                }
+                if effect == DispatchEffect::Uncertain {
+                    assert_eq!(value["code"], "uncertain");
+                }
             }
         }
     }
