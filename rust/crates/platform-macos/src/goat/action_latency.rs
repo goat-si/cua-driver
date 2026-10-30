@@ -357,6 +357,7 @@ impl<'a> Registry<'a> {
         Self(registry)
     }
     pub(crate) fn register(&mut self, tool: Box<dyn Tool>) {
+        let tool = crate::tools::pixel_restore::wrap(tool);
         static ENABLED: OnceLock<bool> = OnceLock::new();
         let enabled = *ENABLED.get_or_init(|| {
             std::env::var_os("CUA_DRIVER_GOAT_LATENCY_TRACE").is_some_and(|v| v == "1")

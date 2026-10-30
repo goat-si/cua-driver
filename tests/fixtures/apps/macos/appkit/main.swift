@@ -37,6 +37,16 @@
 // Rust tests can find it via NSWorkspace / accessibility queries.
 
 import AppKit
+import Dispatch
+
+func appendClickJournal(_ record: [String: Any]) {
+    guard let path = ProcessInfo.processInfo.environment["CUA_APPKIT_CLICK_JOURNAL"],
+          let data = try? JSONSerialization.data(withJSONObject: record),
+          let file = try? FileHandle(forWritingTo: URL(fileURLWithPath: path)) else { return }
+    defer { try? file.close() }
+    _ = try? file.seekToEnd()
+    try? file.write(contentsOf: data + Data([0x0a]))
+}
 
 // MARK: - Constants (must match ../scenarios/scenarios.json `appkit`)
 let kWindowTitle = "CuaTestHarness AppKit"
@@ -133,6 +143,7 @@ final class HarnessWindowController: NSObject, NSTextFieldDelegate, NSTableViewD
     let textInputCommit = NSTextField(labelWithString: "committed=none")
     let lastActionLabel = NSTextField(labelWithString: "last_action=none")
     let clickCountLabel = NSTextField(labelWithString: "clicks=0")
+    var clickTargetButton: NSButton?
     var clicks = 0
     let sliderValueLabel = NSTextField(labelWithString: "slider_value=0")
     let checkStateLabel = NSTextField(labelWithString: "agreed=false")
@@ -265,6 +276,7 @@ final class HarnessWindowController: NSObject, NSTextFieldDelegate, NSTableViewD
         let clickTarget = ClickTargetButton(title: "Click target (left / right / double)",
                                              target: self, action: #selector(onClickTarget))
         clickTarget.harness = self
+        clickTargetButton = clickTarget
         clickTarget.setAccessibilityIdentifier(kClickTargetAID)
         lastActionLabel.setAccessibilityIdentifier(kLastActionAID)
         lastActionLabel.font = NSFont.monospacedSystemFont(ofSize: 14, weight: .regular)
@@ -775,6 +787,12 @@ final class HarnessWindowController: NSObject, NSTextFieldDelegate, NSTableViewD
         clicks += 1
         lastActionLabel.stringValue = "last_action=\(action)"
         clickCountLabel.stringValue = "clicks=\(clicks)"
+        appendClickJournal([
+            "action": action,
+            "window_id": window.windowNumber,
+            "key_window_id": NSApp.keyWindow?.windowNumber ?? 0,
+            "count": clicks,
+        ])
     }
 }
 
@@ -820,6 +838,13 @@ final class ClickTargetButton: NSButton {
 
 // Opt-in windows for the persistent exact-window activation certification.
 // Ordinary harness launches remain byte-for-byte and behaviorally unchanged.
+final class BackgroundClickSecondaryView: NSView {
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+    override func mouseDown(with event: NSEvent) {
+        appendClickJournal(["action": "wrong_window", "window_id": event.windowNumber])
+    }
+}
+
 final class BringToFrontMatrixWindows {
     let secondary: NSWindow
     var sheet: NSWindow?
@@ -832,7 +857,11 @@ final class BringToFrontMatrixWindows {
         secondary.title = kSecondaryWindowTitle
         secondary.isReleasedWhenClosed = false
         secondary.isRestorable = false
-        secondary.contentView = NSTextField(labelWithString: "bring_to_front secondary ordinary window")
+        if mode == "background-click" {
+            secondary.contentView = BackgroundClickSecondaryView(frame: NSRect(x: 0, y: 0, width: 420, height: 240))
+        } else {
+            secondary.contentView = NSTextField(labelWithString: "bring_to_front secondary ordinary window")
+        }
         secondary.orderFront(nil)
 
         if mode == "sheet" {
@@ -999,7 +1028,64 @@ struct CuaAppKitHarness {
         if let mode = ProcessInfo.processInfo.environment["CUA_HARNESS_BRING_TO_FRONT_MODE"] {
             matrixWindows = BringToFrontMatrixWindows(parent: controller.window, mode: mode)
         }
-        app.activate(ignoringOtherApps: true)
+        // Measurement runs on a Mac someone is using opt out of taking focus at launch.
+        if ProcessInfo.processInfo.environment["CUA_HARNESS_NO_ACTIVATE"] != "1" {
+            app.activate(ignoringOtherApps: true)
+        }
+        if ProcessInfo.processInfo.environment["CUA_HARNESS_BRING_TO_FRONT_MODE"] == "background-click" {
+            matrixWindows?.secondary.makeKeyAndOrderFront(nil)
+        }
+        var rekeySource: DispatchSourceSignal?
+        var backgroundClickStatusSource: DispatchSourceSignal?
+        if ProcessInfo.processInfo.environment["CUA_HARNESS_BRING_TO_FRONT_MODE"] == "background-click",
+           let secondary = matrixWindows?.secondary {
+            controller.window.contentView?.layoutSubtreeIfNeeded()
+            if let button = controller.clickTargetButton, let screen = NSScreen.screens.first {
+                let rect = button.convert(button.bounds, to: nil)
+                let frame = controller.window.frame
+                appendClickJournal([
+                    "action": "ready",
+                    "window_id": controller.window.windowNumber,
+                    "secondary_id": secondary.windowNumber,
+                    "x": rect.midX,
+                    "y": frame.height - rect.midY,
+                    "basis": ["x": frame.minX, "y": screen.frame.maxY - frame.maxY,
+                              "w": frame.width, "h": frame.height],
+                    "target_is_key": controller.window.isKeyWindow,
+                ])
+            }
+            signal(SIGUSR1, SIG_IGN)
+            let source = DispatchSource.makeSignalSource(signal: SIGUSR1, queue: .main)
+            source.setEventHandler {
+                secondary.makeKeyAndOrderFront(nil)
+                appendClickJournal([
+                    "action": "rekey",
+                    "window_id": secondary.windowNumber,
+                    "key_window_id": NSApp.keyWindow?.windowNumber ?? 0,
+                    "target_is_key": controller.window.isKeyWindow,
+                    "frontmost_pid": NSWorkspace.shared.frontmostApplication?.processIdentifier ?? 0,
+                ])
+            }
+            source.resume()
+            rekeySource = source
+            signal(SIGUSR2, SIG_IGN)
+            let status = DispatchSource.makeSignalSource(signal: SIGUSR2, queue: .main)
+            status.setEventHandler {
+                let companion = ProcessInfo.processInfo.environment["CUA_BACKGROUND_CLICK_COMPANION"] == "1"
+                if companion {
+                    app.activate(ignoringOtherApps: true)
+                    secondary.makeKeyAndOrderFront(nil)
+                }
+                appendClickJournal([
+                    "action": companion ? "activate" : "status",
+                    "target_is_key": controller.window.isKeyWindow,
+                    "frontmost_pid": NSWorkspace.shared.frontmostApplication?.processIdentifier ?? 0,
+                ])
+            }
+            status.resume()
+            backgroundClickStatusSource = status
+            appendClickJournal(["action": "armed"])
+        }
         writeBringToFrontWindowReport(main: controller.window, matrix: matrixWindows)
         if let delay = ProcessInfo.processInfo.environment["CUA_APPKIT_LAUNCH_DELAY_MS"]
             .flatMap(Double.init), delay > 0 {
@@ -1010,6 +1096,8 @@ struct CuaAppKitHarness {
             Thread.sleep(forTimeInterval: delay / 1000)
         }
         app.run()
+        _ = rekeySource
+        _ = backgroundClickStatusSource
         _ = matrixWindows
     }
 }

@@ -176,6 +176,17 @@ impl DragTool {
             let (from_x, from_y, to_x, to_y) = (input.from_x, input.from_y, input.to_x, input.to_y);
             let (from_x, from_y) = super::desktop_screenshot_point(from_x, from_y);
             let (to_x, to_y) = super::desktop_screenshot_point(to_x, to_y);
+            let duration_ms = input.duration_ms.unwrap_or(500).min(10_000);
+            let steps = input.steps.unwrap_or(20).clamp(1, 200) as usize;
+            // Every point the gesture is delivered at, not only its ends.
+            if let Some(refusal) = super::desktop_pointer_guard::protected_refusal(
+                "drag",
+                &crate::input::mouse::foreground_drag_points(from_x, from_y, to_x, to_y, steps),
+            )
+            .await
+            {
+                return refusal;
+            }
             if let Some(refusal) = super::desktop_pointer_guard::check(
                 "drag",
                 &args,
@@ -185,8 +196,6 @@ impl DragTool {
             {
                 return refusal;
             }
-            let duration_ms = input.duration_ms.unwrap_or(500).min(10_000);
-            let steps = input.steps.unwrap_or(20).clamp(1, 200) as usize;
             let modifiers = input.modifier.unwrap_or_default();
             let button = match input.button.unwrap_or(ClickButton::Left) {
                 ClickButton::Left => DragButton::Left,
@@ -637,7 +646,7 @@ impl DragTool {
         }
 
         if !fg {
-            super::click::restore_user_focus_after_background_pixel(
+            super::pixel_focus::restore_user_focus_after_background_pixel(
                 pid,
                 prior_front,
                 prior_key_wid,

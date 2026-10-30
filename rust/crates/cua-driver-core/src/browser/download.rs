@@ -48,6 +48,7 @@ impl BrowserDownloadTool {
                     "type": "object",
                     "properties": {
                         "session": required_session_schema(),
+                        "origin_scope": super::origin_scope::schema(),
                         "target_id": {
                             "type": "string",
                             "description": "Opaque exact browser target id from get_browser_state."
@@ -276,6 +277,10 @@ impl Tool for BrowserDownloadTool {
     }
 
     async fn invoke(&self, args: Value) -> ToolResult {
+        let scope = match super::origin_scope::parse(&args) {
+            Ok(scope) => scope,
+            Err(error) => return error,
+        };
         let (session, target_id, tab_id, ext_ref, destination_raw) = match (
             explicit_session(&args),
             args.require_str("target_id"),
@@ -319,7 +324,7 @@ impl Tool for BrowserDownloadTool {
         let _download_mutation = browser_download_gate().lock().await;
         let validated = match self
             .engine
-            .revalidate_for_mutation(&session, &target_id, Some(&tab_id))
+            .revalidate_for_mutation(&session, &target_id, Some(&tab_id), scope.as_ref())
             .await
         {
             Ok(validated) => validated,

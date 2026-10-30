@@ -354,7 +354,7 @@ fn select_frontmost_pid(
     }
 }
 
-fn live_frontmost_pid(pid: i32, window_id: u32) -> Option<i32> {
+pub(super) fn live_frontmost_pid(pid: i32, window_id: u32) -> Option<i32> {
     select_frontmost_pid(
         crate::input::skylight::front_process_matches(pid, window_id),
         crate::apps::frontmost_pid,
@@ -867,6 +867,8 @@ fn unbound_menu_window(
     focused: Option<u32>,
     main: Option<u32>,
 ) -> ToolResult {
+    let focused = focused.map_or_else(|| "unknown".to_owned(), |id| id.to_string());
+    let main = main.map_or_else(|| "unknown".to_owned(), |id| id.to_string());
     let mut result = super::background_refusal_result(
         pid,
         requested,
@@ -874,7 +876,7 @@ fn unbound_menu_window(
             code: super::WINDOW_NOT_KEY,
             reason: format!(
                 "invoke_menu: requested window {requested} is not the confirmed document menu context \
-                 (focused={focused:?}, main={main:?}); no menu action was dispatched"
+                 (focused={focused}, main={main}); no menu action was dispatched"
             ),
             advice: Some("foreground"),
         },
@@ -1062,7 +1064,7 @@ unsafe fn press_bound_path(
             initial_enablement,
             copy_bool_attr(target, "AXEnabled"),
             format!(
-                "invoke_menu: path segment {} is disabled while the app is in the background",
+                "invoke_menu: path segment {} is disabled",
                 path.len().saturating_sub(1)
             ),
             is_save,
@@ -1216,8 +1218,7 @@ pub(super) async fn run_in_background_with_lease(
             if written {
                 background_success(
                     format!(
-                        "{preface}Pressed {} through accessibility with the app in the \
-                         background (not activated). Verified: {} was written to disk.",
+                        "{preface}Pressed {} through accessibility without activating the app. Verified: {} was written to disk.",
                         path.join(" > "),
                         file.display()
                     ),
@@ -1228,8 +1229,7 @@ pub(super) async fn run_in_background_with_lease(
             } else {
                 background_success(
                     format!(
-                        "{preface}Pressed {} through accessibility with the app in the \
-                         background (not activated), but {} did not change on disk within 2 s. \
+                        "{preface}Pressed {} through accessibility without activating the app, but {} did not change on disk within 2 s. \
                          The document may have had no unsaved changes, or the save did not run; \
                          verify from fresh state.",
                         path.join(" > "),
@@ -1243,8 +1243,7 @@ pub(super) async fn run_in_background_with_lease(
         }
         Ok(Ok(_)) => background_success(
             format!(
-                "{preface}Invoked {} through accessibility with the app in the background (not \
-                 activated); verify the command's semantic effect from fresh state.",
+                "{preface}Invoked {} through accessibility without activating the app; verify the command's semantic effect from fresh state.",
                 path.join(" > ")
             ),
             ActionEffect::Unverifiable,
@@ -1272,8 +1271,7 @@ pub(super) async fn run_in_background_with_lease(
                 Ok(Err(gate)) => gate_refusal(pid, window_id, gate),
                 Ok(Ok(Ok(saved))) => background_success(
                     format!(
-                        "{preface}{} is disabled while {app_name} is in the background, so the \
-                         document was saved through {app_name}'s scripting interface instead \
+                        "{preface}{} is disabled, so the document was saved through {app_name}'s scripting interface instead \
                          (not activated). Verified: {app_name} reports no unsaved changes{}.",
                         path.join(" > "),
                         if saved.file_written {
@@ -1387,7 +1385,7 @@ pub(super) async fn run_in_background_with_lease(
 }
 
 /// The refusal for a dispatch gate that failed: nothing was dispatched.
-fn gate_refusal(pid: i32, window_id: u32, error: BackgroundPressError) -> ToolResult {
+fn gate_refusal(pid: i32, _window_id: u32, error: BackgroundPressError) -> ToolResult {
     match error {
         BackgroundPressError::UnboundWindow {
             requested,
@@ -1395,12 +1393,7 @@ fn gate_refusal(pid: i32, window_id: u32, error: BackgroundPressError) -> ToolRe
             main,
         } => unbound_menu_window(pid, requested, focused, main),
         BackgroundPressError::Other(message) => refusal(message),
-        other => {
-            let _ = (pid, window_id);
-            refusal(format!(
-                "invoke_menu: the dispatch check refused: {other:?}"
-            ))
-        }
+        _ => refusal("invoke_menu: the dispatch check refused; no menu action was sent".to_owned()),
     }
 }
 
@@ -1512,7 +1505,7 @@ fn save_failure_result(
         preface,
         path,
         &format!(
-            "it is disabled in the background, and saving through {app_name}'s scripting \
+            "it is disabled, and saving through {app_name}'s scripting \
              interface did not confirm ({detail})"
         ),
         dispatch,
@@ -1595,7 +1588,7 @@ fn uncertain_dispatch(
     };
     let mut result = background_success(
         format!(
-            "{preface}{lead} {} with the app in the background (not activated), but {error}. The \
+            "{preface}{lead} {} without activating the app, but {error}. The \
              command may have run: read fresh state before retrying it.",
             path.join(" > ")
         ),

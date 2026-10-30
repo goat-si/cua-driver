@@ -13582,7 +13582,8 @@ impl Tool for GetConfigTool {
                 "badges": cursor_overlay::badge_mode::read_saved().as_str(),
             },
             "experimental_pip": pip_enabled,
-            "experimental_pip_geometry": pip_geometry
+            "experimental_pip_geometry": pip_geometry,
+            "capability_manifest": cua_driver_core::session_manifest::applied_capability_manifest_json(),
         }))
     }
 }

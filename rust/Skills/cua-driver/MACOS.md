@@ -18,6 +18,29 @@ you (no cursor warp, no Space switch, no window raise) stops
 mattering: you just shipped the Accessibility Inspector with extra
 steps.
 
+For a background left pixel click addressed by pid and window ID, the driver
+posts one down/up pair per requested click, with increasing click state and a
+short gap between pairs. Delivery remains unverifiable unless read-back
+confirms an effect. Focus restoration runs separately and waits for tracked
+actions to finish and a 50 ms quiet interval. Browser tools and
+`get_browser_state` are tracked because they can reconnect or launch a
+browser; `page` setup (`enable_javascript_apple_events`) is tracked while it
+quits the browser and patches preferences, but the subsequent relaunch can
+outlive that call. `insert_text`, `type_keystrokes`, and targeted
+`execute_javascript` are tracked because they can open a connection. Other
+admitted `page` actions do not hold the wait open.
+Restoration retains the original app
+across later actions, and is abandoned on physical user input, a frontmost
+app other than the original or target, or a two-second timeout. A target
+activation alone does not abandon it. The next input or observation result
+for the last target pid in a click chain reports the outcome once. A panic
+is reported as `status:"abandoned", reason:"panic"`; a click that joins a
+hand-back already attempted without confirmation reports `reason:"unconfirmed"`.
+If the target process start stamp cannot be read, no outcome note is delivered.
+An admission that cannot acquire the restoration commit lock within two
+seconds returns `pixel_restore_pending` before dispatch. This can also refuse
+`get_browser_state`; its admission restarts the 50 ms quiet interval.
+
 Before running any shell command, ask: **"does this raise,
 activate, foreground, or make-key any app?"** If yes, don't run it.
 Every one of the commands below activates the target on macOS and
@@ -99,9 +122,28 @@ for a background app it refuses with `background_unavailable`, effect
 One exception: a disabled Save (the ⌘S item) of a document window is saved
 through the app's scripting interface instead, still in the background, and the
 result says so; TextEdit disables Save whenever it is behind the user's window.
-A Save is verified on disk. A background `hotkey` whose combo is a menu item's
-key equivalent (⌘S, ⌘W, ⌘C, ...) in a native app takes the same route, because
-background key events never reach an app's menus; no keys are sent. macOS asks
+For a window-only native `press_key` chord with a matching menu item, the
+menu route also applies when the app is frontmost. Save keeps its existing
+on-disk verification route. For other items, the driver tries an advertised
+`AXPress` or `AXPick` immediately if the item reads enabled, or reads disabled
+and the app is frontmost. An unreadable initial enablement in a frontmost app is refused without a press.
+Otherwise it primes menu
+validation and checks enablement again;
+a disabled read can fall back to keys with `effect: "suspected_noop"`, while
+an unreadable state is refused. An ambiguous AX error may mean the command
+ran, so inspect the window before retrying; keys are not sent after such an
+error or a successful action. When the item read disabled before a press, the
+result says so and reports any observed change; AX success alone does not
+confirm the effect. Validation keys and the requested chord are reported
+separately. A window-only native `hotkey` with a matching menu item also uses
+its menu route for both frontmost and background apps.
+Save uses the existing menu route, which checks the document on disk after an
+AX press when its path is known. A disabled Save uses the scripting route when
+the window has a document, and is refused when it has no document.
+A background `hotkey` whose combo is a menu item's
+key equivalent (⌘S, ⌘W, ⌘C, ...) in a native app takes the same chord route;
+a disabled item can fall back to keys after validation. Element-targeted hotkeys
+keep their separate menu route and can refuse a disabled item. macOS asks
 the user once to allow Cua Driver to control the app (Automation) the first
 time a scripting route runs; when that is off, the call refuses and nothing is
 saved.
@@ -828,6 +870,25 @@ There is no backgrounded path that reaches these apps today.
   AX-addressable elements (links, buttons, toolbar items), use
   `right_click({pid, element_token})` instead.
 
+### Submitting a search value
+
+`set_value` accepts `autosubmit:true` for a search field. After the value
+write, it posts Return to the field's process only if the user-interaction,
+exact-window and focused-element checks allow it. The default is false.
+Return delivery and the value's effect are reported separately: the
+structured `note` says whether Return was posted, refused, or uncertain;
+posting it does not verify that the search ran. If the target is not
+identifiable as a search field, the call refuses before writing anything,
+avoiding an unintended submission on another control. Return is posted only
+after a write whose effect is `confirmed` or `unverifiable` and whose
+read-back did not still show the old text (on web content that case reads
+`unverifiable`, and Return is still withheld), so the field's previous text
+is never submitted. A field in a minimized window is refused with
+`minimized_or_hidden_window` before anything is written: the write minimizes the
+window again, and Return needs it visible. Once the write has finished,
+cancelling the call does not stop the Return post; it still passes every
+check above, and only the result is lost.
+
 ### A value write the app does not apply (LibreOffice)
 
 Some apps accept an accessibility value write and ignore it. LibreOffice
@@ -994,7 +1055,7 @@ above (`invoke_menu` with a path such as `["Go", "Downloads"]`).
 
 ### LibreOffice, Numbers and other editors in the background
 
-With `window_id`, `type_text`, `press_key` and `hotkey` post keys to that exact window: the driver makes it the app's key window through in-app key-window records (no raise, no activation, real pointer untouched), confirms that the app's focused window and focused element are in that window, posts, and hands key back. This also covers another window or dialog of the app holding focus, and a LibreOffice that was never activated. Which app is frontmost does not change this: keys and chords, Command chords such as cmd+z, cmd+w and cmd+q included, reach a target app that is already frontmost (an app the agent just opened too). The window is already key then and nothing is posted to move focus; when another window of the app is key, the same records move key to the exact window and hand it back afterwards. When the switch cannot be confirmed the call is refused with `window_not_key` and no key is sent. A second window of the same app (Find & Replace, another document) is no longer `same_pid_keyboard_ambiguity`. A command key whose menu route is refused (item disabled while the app is in the background) falls through to key events in that window. Recipe: pass `window_id` on every call; go to the cell with Name Box navigation (`type_text` `A1\n`), type with `\n` and `\t`, read the cell back; run commands (Paste Special, Format, Save) with `invoke_menu({pid, window_id, path})` rather than clicking the menu bar. A `background_unavailable` refusal here means use `get_window_state` and act by element, not stop.
+With `window_id`, `type_text`, `press_key` and `hotkey` target that exact window: the driver makes it the app's key window through in-app key-window records (no raise, no activation, real pointer untouched), confirms focus, and hands key back. This also covers another window or dialog of the app holding focus, and a LibreOffice that was never activated. An already-key window needs no focus move; when another window of the app is key, the records move key to the exact window and hand it back afterwards. When the switch cannot be confirmed the call is refused with `window_not_key`. For a window-only native Command chord with a matching menu item, `press_key` and `hotkey` use their menu routes even when the app is frontmost; a `press_key` disabled-item key fallback reports `suspected_noop`. Recipe: pass `window_id` on every call; go to the cell with Name Box navigation (`type_text` `A1\n`), type with `\n` and `\t`, read the cell back; run commands (Paste Special, Format, Save) with `invoke_menu({pid, window_id, path})` rather than clicking the menu bar. A `background_unavailable` refusal here means use `get_window_state` and act by element, not stop.
 
 ### Preview: export before resizing
 

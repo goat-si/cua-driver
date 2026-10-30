@@ -511,9 +511,7 @@ impl SessionAuthorizationRegistry {
 
     pub fn legacy_context(&self) -> Result<Arc<EffectiveAuthorizationContext>, String> {
         let mode = crate::authorization::configured_permission_mode()?;
-        let capability_manifest = crate::session_manifest::configured_capability_manifest()?
-            .cloned()
-            .map(Arc::new);
+        let capability_manifest = crate::session_manifest::configured_capability_manifest()?;
         self.compatibility_context(mode, capability_manifest)
     }
 

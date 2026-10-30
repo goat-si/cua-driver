@@ -13,7 +13,7 @@ use cua_driver_core::{
         SessionAuthorizationError, SessionAuthorizationRegistry, SessionModeCeiling,
         TrustedHostLease,
     },
-    session_manifest::SessionManifest,
+    session_manifest::{ConfiguredManifest, SessionManifest},
     tool::ToolRegistry,
 };
 use cursor_overlay::CursorConfig;
@@ -60,6 +60,12 @@ pub(crate) struct RuntimeOptions {
     pub register_host_tools: Option<fn(&mut ToolRegistry)>,
     pub authorization_ceiling: Option<SessionModeCeiling>,
     pub compatibility_authorization: Option<(PermissionMode, Option<Arc<SessionManifest>>)>,
+    /// The host-owned file `compatibility_authorization`'s manifest came
+    /// from. When set, the compatibility context follows that file: a changed
+    /// valid version applies to the next call without a restart. Runtimes
+    /// without explicit compatibility authorization follow the process's
+    /// configured manifest file automatically.
+    pub compatibility_manifest_source: Option<Arc<ConfiguredManifest>>,
     /// Constructor-only authorization host. This object is never reachable from
     /// public tool arguments or transport metadata.
     pub authorization_host: Option<Arc<dyn cua_driver_core::consent::ProtectedConsentProvider>>,
@@ -80,6 +86,7 @@ impl RuntimeOptions {
             register_host_tools: None,
             authorization_ceiling: None,
             compatibility_authorization: None,
+            compatibility_manifest_source: None,
             authorization_host: None,
             activity_observer: None,
         }
@@ -160,7 +167,7 @@ impl Drop for RuntimeSession {
 pub(crate) struct DriverRuntime {
     registry: Arc<ToolRegistry>,
     authorization_registry: Arc<SessionAuthorizationRegistry>,
-    compatibility_context: Arc<EffectiveAuthorizationContext>,
+    compatibility_context: CompatibilityContext,
     shutdown: AtomicBool,
     last_activity: AtomicU64,
     /// Calls hold a read guard; shutdown takes the write guard after closing
@@ -169,6 +176,54 @@ pub(crate) struct DriverRuntime {
     lifecycle: tokio::sync::RwLock<()>,
     lifecycle_maintenance: Mutex<Option<LifecycleMaintenance>>,
     activity_observer: Option<Arc<dyn DriverActivityObserver>>,
+}
+
+/// The process-compatibility authorization context, optionally following a
+/// host-owned manifest file. Every rebuilt context comes from the same
+/// authorization registry, so the runtime scope key (and with it sessions,
+/// browser bindings, DevTools connections and grants) survives a reload.
+/// A call keeps the context it was admitted with; versions are applied in
+/// store-generation order.
+struct CompatibilityContext {
+    registry: Arc<SessionAuthorizationRegistry>,
+    follows: Option<(PermissionMode, Arc<ConfiguredManifest>)>,
+    state: Mutex<(u64, Arc<EffectiveAuthorizationContext>)>,
+}
+
+impl CompatibilityContext {
+    fn current(&self) -> Arc<EffectiveAuthorizationContext> {
+        let Some((mode, source)) = self.follows.as_ref() else {
+            return self.state.lock().unwrap().1.clone();
+        };
+        let applied = source.current();
+        let mut state = self.state.lock().unwrap();
+        if applied.generation > state.0 {
+            match self
+                .registry
+                .compatibility_context(*mode, Some(applied.manifest))
+            {
+                Ok(context) => *state = (applied.generation, context),
+                Err(error) => tracing::warn!(
+                    %error,
+                    "capability manifest reload was not applied to the runtime"
+                ),
+            }
+        }
+        state.1.clone()
+    }
+
+    fn runtime_scope_key(&self) -> String {
+        self.state.lock().unwrap().1.runtime_scope_key()
+    }
+
+    #[cfg(test)]
+    fn runtime_session_key(&self, public_session: &str) -> String {
+        self.state
+            .lock()
+            .unwrap()
+            .1
+            .runtime_session_key(public_session)
+    }
 }
 
 struct LifecycleMaintenance {
@@ -189,13 +244,48 @@ impl DriverRuntime {
             None => SessionAuthorizationRegistry::process()
                 .map_err(RuntimeCreateError::Authorization)?,
         });
-        let compatibility_context = match options.compatibility_authorization.clone() {
-            Some((mode, manifest)) => authorization_registry
-                .compatibility_context(mode, manifest)
-                .map_err(RuntimeCreateError::Authorization)?,
-            None => authorization_registry
-                .legacy_context()
-                .map_err(RuntimeCreateError::Authorization)?,
+        // Generation 0 is older than every applied version, so a context built
+        // from an explicitly passed manifest catches up with its source file
+        // at the first call.
+        let (context, follows, generation) = match options.compatibility_authorization.clone() {
+            Some((mode, manifest)) => (
+                authorization_registry
+                    .compatibility_context(mode, manifest)
+                    .map_err(RuntimeCreateError::Authorization)?,
+                options
+                    .compatibility_manifest_source
+                    .clone()
+                    .map(|source| (mode, source)),
+                0,
+            ),
+            None => match cua_driver_core::session_manifest::configured_manifest_store()
+                .map_err(RuntimeCreateError::Authorization)?
+            {
+                Some(source) => {
+                    let mode = cua_driver_core::authorization::configured_permission_mode()
+                        .map_err(RuntimeCreateError::Authorization)?;
+                    let applied = source.current();
+                    (
+                        authorization_registry
+                            .compatibility_context(mode, Some(applied.manifest))
+                            .map_err(RuntimeCreateError::Authorization)?,
+                        Some((mode, source)),
+                        applied.generation,
+                    )
+                }
+                None => (
+                    authorization_registry
+                        .legacy_context()
+                        .map_err(RuntimeCreateError::Authorization)?,
+                    None,
+                    0,
+                ),
+            },
+        };
+        let compatibility_context = CompatibilityContext {
+            registry: authorization_registry.clone(),
+            follows,
+            state: Mutex::new((generation, context)),
         };
         let registry = Arc::new(cua_driver_core::tool::with_runtime_scope(
             compatibility_context.runtime_scope_key(),
@@ -268,7 +358,7 @@ impl DriverRuntime {
     }
 
     pub(crate) async fn invoke(&self, name: &str, args: Value) -> Option<CoreToolResult> {
-        self.invoke_with_context(name, args, self.compatibility_context.clone())
+        self.invoke_with_context(name, args, self.compatibility_context.current())
             .await
     }
 
@@ -282,7 +372,7 @@ impl DriverRuntime {
         self.invoke_with_context_and_evidence(
             name,
             args,
-            self.compatibility_context.clone(),
+            self.compatibility_context.current(),
             evidence,
         )
         .await
@@ -777,6 +867,55 @@ mod tests {
         ];
         let violations = registry.input_conformance_violations(&open);
         assert!(violations.is_empty(), "{violations:#?}");
+    }
+
+    #[tokio::test]
+    async fn the_compatibility_context_follows_its_manifest_file_without_restart() {
+        let _runtime_test = TEST_RUNTIME_LOCK.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("capability-manifest.yaml");
+        let first = "version: 3\nallow:\n  tools: [get_config, list_apps]\n";
+        std::fs::write(&path, first).unwrap();
+        let source = Arc::new(
+            ConfiguredManifest::load(path.clone(), Some(PermissionMode::Standard)).unwrap(),
+        );
+        let mut options = standard_options();
+        options.compatibility_authorization =
+            Some((PermissionMode::Standard, Some(source.current().manifest)));
+        options.compatibility_manifest_source = Some(source.clone());
+        let runtime = DriverRuntime::create(options).unwrap();
+        let scope = runtime.runtime_scope_key();
+        let applied = |runtime: &DriverRuntime| {
+            runtime
+                .compatibility_context
+                .current()
+                .capability_manifest_sha256()
+                .map(str::to_owned)
+        };
+        let before = applied(&runtime);
+        assert_eq!(before.as_deref(), Some(source.current().manifest.sha256()));
+
+        // The host replaces its file (temp + rename): the next call uses it.
+        let temp = path.with_extension("tmp");
+        std::fs::write(&temp, "version: 3\nallow:\n  tools: [get_config]\n").unwrap();
+        std::fs::rename(&temp, &path).unwrap();
+        let after = applied(&runtime);
+        assert_ne!(after, before);
+        assert_eq!(after.as_deref(), Some(source.current().manifest.sha256()));
+        let refused = runtime
+            .invoke("list_apps", serde_json::json!({}))
+            .await
+            .expect("runtime is running");
+        assert_eq!(refused.is_error, Some(true), "a narrowed tool refuses");
+        // Same runtime scope: sessions, bindings and connections survive.
+        assert_eq!(runtime.runtime_scope_key(), scope);
+
+        // An invalid replacement keeps the applied version.
+        std::fs::write(&temp, "version: 3\nallow:\n  tools: [no_such_tool]\n").unwrap();
+        std::fs::rename(&temp, &path).unwrap();
+        assert_eq!(applied(&runtime), after);
+        assert!(source.status_json()["last_error"].is_string());
+        runtime.shutdown().await;
     }
 
     #[test]

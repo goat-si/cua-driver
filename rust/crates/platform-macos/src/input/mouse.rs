@@ -73,7 +73,9 @@ fn dispatch_mouse_event(route: PostRoute, pid: i32, event: &CGEvent) {
             crate::input::skylight::post_to_pid(pid as libc::pid_t, event_ptr, false);
         }
         PostRoute::PublicPid => event.post_to_pid(pid as libc::pid_t),
-        PostRoute::Hid => event.post(core_graphics::event::CGEventTapLocation::HID),
+        PostRoute::Hid => {
+            super::hid_history::post(|| event.post(core_graphics::event::CGEventTapLocation::HID))
+        }
         PostRoute::SkyLightAndPublic => {
             crate::input::skylight::post_to_pid(pid as libc::pid_t, event_ptr, false);
             event.post_to_pid(pid as libc::pid_t);
@@ -257,7 +259,7 @@ fn click_at_xy_desktop_inner(
             .map_err(|_| anyhow::anyhow!("CGEvent::new_mouse_event(move) failed"))?;
             moved.set_flags(flags);
             super::tag_synthetic_event(&moved);
-            moved.post(CGEventTapLocation::HID);
+            super::hid_history::post(|| moved.post(CGEventTapLocation::HID));
             std::thread::sleep(std::time::Duration::from_millis(12));
         }
 
@@ -278,9 +280,9 @@ fn click_at_xy_desktop_inner(
             .map(|state| Ok((event(down_ty, state)?, event(up_ty, state)?)))
             .collect::<anyhow::Result<Vec<_>>>()?;
         for (down, up) in pairs {
-            down.post(CGEventTapLocation::HID);
+            super::hid_history::post(|| down.post(CGEventTapLocation::HID));
             std::thread::sleep(std::time::Duration::from_millis(28));
-            up.post(CGEventTapLocation::HID);
+            super::hid_history::post(|| up.post(CGEventTapLocation::HID));
             if count > 1 {
                 std::thread::sleep(std::time::Duration::from_millis(80));
             }
@@ -370,7 +372,7 @@ pub fn scroll_wheel_desktop(
         }
         let event = unsafe { CGEvent::from_ptr(event_ref) };
         super::tag_synthetic_event(&event);
-        event.post(CGEventTapLocation::HID);
+        super::hid_history::post(|| event.post(CGEventTapLocation::HID));
         std::thread::sleep(std::time::Duration::from_millis(30));
     }
     Ok(())
@@ -589,6 +591,15 @@ fn click_at_xy_inner(
 /// Returns whether the private focus-without-raise recipe succeeded. Event
 /// posting remains best-effort when the private APIs are unavailable.
 pub fn prepare_background_pixel_click(pid: i32, wid: u32) -> bool {
+    prepare_background_pixel_click_with_settle(pid, wid, true)
+}
+
+/// Prepare the pixel click tool's background left-click route without a settle delay.
+pub fn prepare_background_pixel_click_fast(pid: i32, wid: u32) -> bool {
+    prepare_background_pixel_click_with_settle(pid, wid, false)
+}
+
+fn prepare_background_pixel_click_with_settle(pid: i32, wid: u32, settle: bool) -> bool {
     // Post only the focus record to the target. The defocus record to the
     // current front process made the user's key window resign key, and
     // re-activating that process afterwards did not make the window key
@@ -600,9 +611,11 @@ pub fn prepare_background_pixel_click(pid: i32, wid: u32) -> bool {
         // until the driver lets it go (see `skylight::note_primed_key`).
         crate::input::skylight::note_primed_key(pid as libc::pid_t, wid);
     }
-    // Match Swift's settle interval so AppKit updates its active/key-window
-    // routing before the mouseMoved + primer + target stream arrives.
-    std::thread::sleep(std::time::Duration::from_millis(50));
+    // The legacy route waits for AppKit routing; the fast pixel-click route
+    // posts immediately after the focus record.
+    if settle {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
     activated
 }
 
@@ -728,6 +741,28 @@ fn chromium_click_route_plan(
     steps
 }
 
+fn background_pixel_tool_route_plan(
+    screen_x: f64,
+    screen_y: f64,
+    win_local_x: f64,
+    win_local_y: f64,
+    count: usize,
+) -> Vec<ChromiumClickRouteStep> {
+    let mut plan = chromium_click_route_plan(screen_x, screen_y, win_local_x, win_local_y, count);
+    let pairs = count.clamp(1, 3);
+    let mut finished = 0;
+    for step in &mut plan {
+        step.delay_after_ms = 0;
+        if step.phase == 3 && step.kind == ChromiumClickEventKind::Up {
+            finished += 1;
+            if finished < pairs {
+                step.delay_after_ms = 1;
+            }
+        }
+    }
+    plan
+}
+
 /// Post the route plan for the Chromium-compatible background left-click
 /// recipe. `CGEvent::new_mouse_event` starts with the screen-space location.
 /// `CGEventSetWindowLocation` uses the screen point for both SkyLight and the
@@ -764,6 +799,52 @@ fn click_at_xy_chromium_checked(
     modifiers: &[&str],
     before_target: &mut dyn FnMut() -> anyhow::Result<()>,
 ) -> anyhow::Result<()> {
+    click_at_xy_chromium_plan(
+        pid,
+        screen,
+        window_local,
+        wid,
+        count,
+        modifiers,
+        before_target,
+        false,
+    )
+}
+
+/// The click tool's window-addressed background left-click route.
+#[allow(clippy::too_many_arguments)]
+pub fn click_background_pixel_fast(
+    pid: i32,
+    screen: (f64, f64),
+    window_local: (f64, f64),
+    wid: u32,
+    count: usize,
+    modifiers: &[&str],
+    before_target: &mut dyn FnMut() -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    click_at_xy_chromium_plan(
+        pid,
+        screen,
+        window_local,
+        wid,
+        count,
+        modifiers,
+        before_target,
+        true,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn click_at_xy_chromium_plan(
+    pid: i32,
+    screen: (f64, f64),
+    window_local: (f64, f64),
+    wid: u32,
+    count: usize,
+    modifiers: &[&str],
+    before_target: &mut dyn FnMut() -> anyhow::Result<()>,
+    fast: bool,
+) -> anyhow::Result<()> {
     let source = CGEventSource::new(CGEventSourceStateID::HIDSystemState)
         .map_err(|_| anyhow::anyhow!("CGEventSource::new failed"))?;
     click_at_xy_chromium_with(
@@ -774,6 +855,8 @@ fn click_at_xy_chromium_checked(
         count,
         modifiers,
         before_target,
+        fast,
+        &mut std::thread::sleep,
         |event_type, location| {
             CGEvent::new_mouse_event(
                 source.clone(),
@@ -799,11 +882,17 @@ fn click_at_xy_chromium_with(
     count: usize,
     modifiers: &[&str],
     before_target: &mut dyn FnMut() -> anyhow::Result<()>,
+    fast: bool,
+    sleep: &mut dyn FnMut(std::time::Duration),
     mut make_event: impl FnMut(CGEventType, (f64, f64)) -> Result<CGEvent, ()>,
 ) -> anyhow::Result<()> {
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    let route_plan = chromium_click_route_plan(screen_x, screen_y, win_local_x, win_local_y, count);
+    let route_plan = if fast {
+        background_pixel_tool_route_plan(screen_x, screen_y, win_local_x, win_local_y, count)
+    } else {
+        chromium_click_route_plan(screen_x, screen_y, win_local_x, win_local_y, count)
+    };
     let flags = parse_modifier_flags(modifiers);
     let window_id = wid as i64;
 
@@ -877,7 +966,7 @@ fn click_at_xy_chromium_with(
             &event,
         );
         if step.delay_after_ms > 0 {
-            std::thread::sleep(std::time::Duration::from_millis(step.delay_after_ms));
+            sleep(std::time::Duration::from_millis(step.delay_after_ms));
         }
     }
 
@@ -1467,7 +1556,7 @@ where
                     anyhow::anyhow!("foreground drag {:?} event creation failed", spec.kind)
                 })?;
             event.set_flags(flags);
-            event.post(CGEventTapLocation::HID);
+            super::hid_history::post(|| event.post(CGEventTapLocation::HID));
 
             match spec.kind {
                 ForegroundDragEventKind::Move => {
@@ -1510,6 +1599,30 @@ struct ForegroundDragEvent {
 }
 
 fn foreground_drag_events(
+    from_x: f64,
+    from_y: f64,
+    to_x: f64,
+    to_y: f64,
+    steps: usize,
+) -> Vec<ForegroundDragEvent> {
+    foreground_drag_event_plan(from_x, from_y, to_x, to_y, steps)
+}
+
+/// Every screen point a desktop drag of `steps` delivers an event at.
+pub(crate) fn foreground_drag_points(
+    from_x: f64,
+    from_y: f64,
+    to_x: f64,
+    to_y: f64,
+    steps: usize,
+) -> Vec<(f64, f64)> {
+    foreground_drag_event_plan(from_x, from_y, to_x, to_y, steps)
+        .into_iter()
+        .map(|event| (event.point.x, event.point.y))
+        .collect()
+}
+
+fn foreground_drag_event_plan(
     from_x: f64,
     from_y: f64,
     to_x: f64,
@@ -2316,6 +2429,13 @@ mod tests {
 
     #[test]
     fn foreground_drag_plan_is_one_coherent_gesture() {
+        // The protection hit test sees every delivered point, not only the
+        // ends: a protected window between them is found.
+        let points = foreground_drag_points(0.0, 0.0, 400.0, 0.0, 4);
+        assert!(points.contains(&(200.0, 0.0)), "{points:?}");
+        assert_eq!(points.first(), Some(&(0.0, 0.0)));
+        assert_eq!(points.last(), Some(&(400.0, 0.0)));
+
         let events = foreground_drag_events(10.0, 20.0, 40.0, 80.0, 3);
         let kinds: Vec<_> = events.iter().map(|event| event.kind).collect();
         assert_eq!(
@@ -2543,6 +2663,109 @@ mod tests {
         }
     }
 
+    #[test]
+    fn background_pixel_tool_route_only_delays_between_target_pairs() {
+        for count in 1..=3 {
+            let plan = background_pixel_tool_route_plan(100.0, 100.0, 10.0, 10.0, count);
+            let delays: Vec<u64> = plan
+                .iter()
+                .filter_map(|step| (step.delay_after_ms != 0).then_some(step.delay_after_ms))
+                .collect();
+            assert_eq!(delays, vec![1; count - 1], "count {count}");
+        }
+    }
+
+    #[test]
+    fn background_pixel_tool_posts_target_pairs_with_window_fields() {
+        for available in [true, false] {
+            for count in [1, 3] {
+                let capture = Capture::start(available);
+                click_background_pixel_fast(
+                    1,
+                    (100.0, 100.0),
+                    (10.0, 10.0),
+                    7,
+                    count,
+                    &[],
+                    &mut no_target_check,
+                )
+                .unwrap();
+                let clicks = capture.clicks();
+                let target_states: Vec<_> = clicks
+                    .iter()
+                    .filter(|(_, location)| *location == (100.0, 100.0))
+                    .map(|(state, _)| *state)
+                    .collect();
+                let expected: Vec<_> = std::iter::once(0)
+                    .chain((1..=count as i64).flat_map(|state| [state, state]))
+                    .collect();
+                assert_eq!(target_states, expected);
+                assert!(capture
+                    .window_routing()
+                    .iter()
+                    .all(|fields| fields[..3] == [7, 7, 7]));
+                let route = if available {
+                    PostRoute::SkyLight
+                } else {
+                    PostRoute::PublicPid
+                };
+                assert!(capture.posted().iter().all(|event| event.route == route));
+            }
+        }
+    }
+
+    #[test]
+    fn fast_background_pixel_target_check_refuses_before_target_down() {
+        let capture = Capture::start(true);
+        let mut checks = 0;
+        let error =
+            click_background_pixel_fast(1, (100.0, 100.0), (10.0, 10.0), 7, 2, &[], &mut || {
+                checks += 1;
+                anyhow::bail!("moved")
+            })
+            .unwrap_err();
+        assert_eq!(checks, 1);
+        assert_eq!(
+            error
+                .downcast_ref::<TargetCheckFailed>()
+                .unwrap()
+                .events_sent,
+            3
+        );
+        assert_eq!(capture.posted().len(), 3);
+    }
+
+    #[test]
+    fn background_pixel_tool_records_only_inter_pair_sleeps() {
+        let source = CGEventSource::new(CGEventSourceStateID::HIDSystemState).unwrap();
+        for count in [1, 3] {
+            let _capture = Capture::start(true);
+            let mut sleeps = Vec::new();
+            click_at_xy_chromium_with(
+                1,
+                (100.0, 100.0),
+                (10.0, 10.0),
+                7,
+                count,
+                &[],
+                &mut no_target_check,
+                true,
+                &mut |duration| sleeps.push(duration),
+                |kind, location| {
+                    CGEvent::new_mouse_event(
+                        source.clone(),
+                        kind,
+                        CGPoint::new(location.0, location.1),
+                        CGMouseButton::Left,
+                    )
+                    .map_err(|_| ())
+                },
+            )
+            .unwrap();
+            assert_eq!(sleeps, vec![std::time::Duration::from_millis(1); count - 1]);
+        }
+    }
+
     /// Every event is built before the first is handed over: a factory that
     /// fails at any position leaves the transport untouched.
     #[test]
@@ -2560,6 +2783,8 @@ mod tests {
                 2,
                 &[],
                 &mut no_target_check,
+                false,
+                &mut std::thread::sleep,
                 |event_type, location| {
                     made += 1;
                     if made == failing + 1 {
