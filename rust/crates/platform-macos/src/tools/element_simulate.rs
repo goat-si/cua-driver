@@ -2,6 +2,7 @@
 use cua_driver_core::protocol::ToolResult;
 use serde_json::{json, Value};
 
+use super::element_pointer::{ElementTarget, Hit};
 use crate::windows::WindowBounds;
 
 pub(super) fn option(args: &Value) -> Result<bool, ToolResult> {
@@ -12,6 +13,45 @@ pub(super) fn option(args: &Value) -> Result<bool, ToolResult> {
             "click.simulate must be a boolean; nothing was sent.",
         )),
     }
+}
+
+pub(super) fn validate(args: &Value) -> Result<bool, ToolResult> {
+    let simulate = option(args)?;
+    if !simulate {
+        return Ok(false);
+    }
+    let count = super::element_pointer::click_count(args)?;
+    if count != 1 {
+        return Err(super::invalid_arguments(
+            "click.simulate requires count 1; nothing was sent.",
+        ));
+    }
+    let token = args
+        .get("element_token")
+        .and_then(Value::as_str)
+        .is_some_and(|s| !s.trim().is_empty());
+    let incompatible = ["x", "y", "capture_id", "debug_image_out"]
+        .iter()
+        .any(|key| args.get(*key).is_some_and(|value| !value.is_null()))
+        || args
+            .get("from_zoom")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        || args
+            .get("action")
+            .is_some_and(|v| v.as_str() != Some("press"))
+        || args
+            .get("button")
+            .is_some_and(|v| !matches!(v.as_str(), Some("left" | "")))
+        || args
+            .get("modifier")
+            .is_some_and(|v| !matches!(v.as_array(), Some(a) if a.is_empty()));
+    if !token || incompatible {
+        return Err(super::invalid_arguments(
+            "click.simulate requires an unmodified left press on an element; nothing was sent.",
+        ));
+    }
+    Ok(true)
 }
 
 pub(super) fn pixel_args(
@@ -77,19 +117,45 @@ pub(super) fn note(mut result: ToolResult) -> ToolResult {
     result
 }
 
-pub(super) async fn dispatch<F, Fut>(
+pub(super) fn checked_pixel_args(
     args: Value,
     pid: i32,
     window_id: u32,
-    rect: Option<[f64; 4]>,
-    bounds: Option<WindowBounds>,
-    send: F,
-) -> ToolResult
+    target: &dyn ElementTarget,
+) -> Result<Value, ToolResult> {
+    let rect = target.element_rect();
+    let raw_bounds = target.window_bounds();
+    let bounds = raw_bounds.map(|[x, y, width, height]| WindowBounds {
+        x,
+        y,
+        width,
+        height,
+    });
+    let pixel = pixel_args(args, pid, window_id, rect, bounds)?;
+    let Some([x, y, w, h]) = rect else {
+        return Err(super::pre_dispatch_refusal(
+            "element_frame_unavailable",
+            "click: the element frame is unreadable; nothing was sent.",
+        ));
+    };
+    let center = (x + w / 2.0, y + h / 2.0);
+    match target.hit_at(center) {
+        Hit::Target => {},
+        Hit::Elsewhere(_) | Hit::Nothing => return Err(super::pre_dispatch_refusal(
+            "element_not_at_point", "The element's center does not hit the element or its descendant in the requested window; nothing was sent.")),
+    }
+    if target.element_rect() != rect || target.window_bounds() != raw_bounds {
+        return Err(super::pre_dispatch_refusal("element_frame_unavailable", "click: the element or window frame changed while checking the target; nothing was sent."));
+    }
+    Ok(pixel)
+}
+
+pub(super) async fn dispatch<F, Fut>(prepared: Result<Value, ToolResult>, send: F) -> ToolResult
 where
     F: FnOnce(Value) -> Fut,
     Fut: std::future::Future<Output = ToolResult>,
 {
-    match pixel_args(args, pid, window_id, rect, bounds) {
+    match prepared {
         Ok(pixel) => note(send(pixel).await),
         Err(refusal) => refusal,
     }
@@ -154,29 +220,33 @@ mod tests {
             "Existing. Element click used the pointer route."
         );
     }
+
     #[tokio::test]
     async fn dispatch_sends_exactly_one_translated_pixel_call() {
         let calls = std::cell::Cell::new(0);
-        let result = dispatch(
-            json!({"element_token":"s00000001:0", "simulate":true}),
+        let args = json!({"element_token":"s00000001:0", "simulate":true});
+        let prepared = pixel_args(
+            args.clone(),
             7,
             9,
             Some([30.0, 40.0, 20.0, 10.0]),
             Some(bounds()),
-            |args| {
-                calls.set(calls.get() + 1);
-                assert_eq!(args["x"], 30.0);
-                assert_eq!(args["y"], 25.0);
-                async { ToolResult::text("sent").with_structured(json!({"effect":"unverifiable"})) }
-            },
-        )
+        );
+        let result = dispatch(prepared, |pixel| {
+            calls.set(calls.get() + 1);
+            assert_eq!(
+                (pixel["x"].as_f64(), pixel["y"].as_f64()),
+                (Some(30.0), Some(25.0))
+            );
+            async { ToolResult::text("sent").with_structured(json!({"effect":"unverifiable"})) }
+        })
         .await;
         assert_eq!(calls.get(), 1);
         assert_eq!(
             result.structured_content.unwrap()["note"],
             "Element click used the pointer route."
         );
-        let refused = dispatch(json!({}), 7, 9, None, Some(bounds()), |_| {
+        let refused = dispatch(pixel_args(args, 7, 9, None, Some(bounds())), |_| {
             calls.set(calls.get() + 1);
             async { ToolResult::text("sent") }
         })

@@ -234,6 +234,11 @@ impl cua_driver_core::tool::Tool for AdmittedTool {
             .await
     }
     async fn invoke(&self, args: serde_json::Value) -> cua_driver_core::protocol::ToolResult {
+        if self.0.def().name == "click" {
+            if let Err(refusal) = super::element_simulate::validate(&args) {
+                return refusal;
+            }
+        }
         invoke_with_outcome(global(), self.0.as_ref(), args).await
     }
 }

@@ -823,7 +823,7 @@ pub(super) async fn click_element(state: &ToolState, request: ElementClick) -> T
     }
 }
 
-fn target_for(
+pub(super) fn target_for(
     pid: i32,
     window_id: u32,
     idx: usize,

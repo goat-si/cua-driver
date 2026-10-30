@@ -67,6 +67,7 @@
             "type": "string"
           },
           "simulate": {
+            "description": "Send a single pointer click at the element center instead of its AX action (macOS).",
             "type": "boolean"
           },
           "target": {

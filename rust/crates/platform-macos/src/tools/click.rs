@@ -1071,19 +1071,10 @@ impl Tool for ClickTool {
         def()
     }
 
-    async fn invoke(&self, mut args: Value) -> ToolResult {
-        let simulate = match super::element_simulate::option(&args) {
-            Ok(value) => value,
+    async fn invoke(&self, args: Value) -> ToolResult {
+        match super::element_simulate::validate(&args) {
+            Ok(_) => {}
             Err(refusal) => return refusal,
-        };
-        if simulate && args.get("pid").is_none_or(Value::is_null) {
-            let pid = match super::target_pid(&self.state, &args) {
-                Ok(pid) => pid,
-                Err(refusal) => return refusal,
-            };
-            if let Some(object) = args.as_object_mut() {
-                object.insert("pid".into(), serde_json::json!(pid));
-            }
         }
         if !super::pixel_restore::current_is("click") {
             return super::pixel_restore::invoke(self, args).await;
@@ -1136,6 +1127,10 @@ impl ClickTool {
         simulated: bool,
     ) -> ToolResult {
         use cua_driver_core::tool_args::ArgsExt;
+
+        if let Err(refusal) = super::element_simulate::validate(&args) {
+            return refusal;
+        }
 
         // Every route reads one validated count; nothing is sent for a bad one.
         let count = match super::element_pointer::click_count(&args) {
@@ -1353,7 +1348,7 @@ impl ClickTool {
         let modifiers: Vec<String> = args.str_array("modifier");
 
         if !simulated && matches!(super::element_simulate::option(&args), Ok(true)) {
-            let (Some(_), Some(wid), Some(element)) =
+            let (Some(idx), Some(wid), Some(element)) =
                 (element_index, window_id, element_guard.as_ref())
             else {
                 return super::invalid_arguments(
@@ -1370,37 +1365,25 @@ impl ClickTool {
             {
                 return super::invalid_arguments("click.simulate requires an unmodified left press on an element; nothing was sent.");
             }
-            let element = element.clone();
-            let geometry = latency::spawn_action_blocking(move || unsafe {
-                (
-                    element_screen_rect(element.as_ptr() as AXUIElementRef),
-                    crate::windows::window_bounds_by_id(wid),
-                )
+            let target = super::element_pointer::target_for(pid, wid, idx, element.clone());
+            let prepared = latency::spawn_action_blocking(move || {
+                super::element_simulate::checked_pixel_args(args, pid, wid, &*target)
             })
             .await;
-            let (rect, bounds) = match geometry {
+            let prepared = match prepared {
                 Ok(value) => value,
-                Err(_) => {
-                    return super::pre_dispatch_refusal(
-                        "element_frame_unavailable",
-                        "click: the element frame could not be read; nothing was sent.",
-                    )
-                }
+                Err(_) => Err(super::pre_dispatch_refusal(
+                    "element_frame_unavailable",
+                    "click: the element frame could not be read; nothing was sent.",
+                )),
             };
-            return super::element_simulate::dispatch(
-                args,
-                pid,
-                wid,
-                rect,
-                bounds,
-                |pixel_args| async move {
-                    let pixel_space = match super::window_points::point_space(&pixel_args) {
-                        Ok(value) => value,
-                        Err(refusal) => return refusal,
-                    };
-                    Box::pin(self.invoke_in(pixel_args, pixel_space, true)).await
-                },
-            )
+            return super::element_simulate::dispatch(prepared, |pixel_args| async move {
+                let pixel_space = match super::window_points::point_space(&pixel_args) {
+                    Ok(value) => value,
+                    Err(refusal) => return refusal,
+                };
+                Box::pin(self.invoke_in(pixel_args, pixel_space, true)).await
+            })
             .await;
         }
 
@@ -2063,6 +2046,7 @@ impl ClickTool {
             // targeting (PX) orthogonal to delivery (AX) and avoids making a
             // Chromium/AppKit window key merely to satisfy first-mouse rules.
             if let Some(hit_test_wid) = window_id.filter(|_| {
+                // Keep simulated presses on the pointer route if AX eligibility expands.
                 !simulated
                     && background_pixel_ax_eligible(
                         delivery_mode.is_foreground(),

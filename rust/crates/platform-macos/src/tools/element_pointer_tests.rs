@@ -473,6 +473,54 @@ fn tool_with_token(pid: i32) -> (super::super::click::ClickTool, String, Arc<Too
 }
 
 #[tokio::test]
+async fn b4_review_simulate_refuses_a_different_hit_before_dispatch() {
+    let pid = 1_000_151;
+    let mut fake = Fake::new(pid);
+    fake.hit = Hit::Elsewhere("overlay".into());
+    let fake = Arc::new(fake);
+    let _registered = test_targets::register(pid, fake.clone());
+    let (tool, token, _) = tool_with_token(pid);
+    let result = tool
+        .invoke(json!({"pid":pid,"element_token":token,"simulate":true}))
+        .await;
+    let structured = result.structured_content.expect("refusal");
+    assert_eq!(structured["code"], "element_not_at_point");
+    assert_eq!(structured["dispatched"], false);
+    assert!(fake.posts().is_empty());
+}
+
+#[tokio::test]
+async fn b4_review_simulate_invalid_combinations_precede_token_resolution() {
+    let tool = super::super::click::ClickTool::new(Arc::new(ToolState::new(false, false, None)));
+    for extra in [
+        json!({"count":2}),
+        json!({"action":"open"}),
+        json!({"button":"right"}),
+    ] {
+        let mut args = json!({"element_token":"s00000001:0", "simulate":true});
+        args.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        let result = tool.invoke(args).await;
+        let structured = result.structured_content.expect("refusal");
+        assert_eq!(structured["code"], "invalid_arguments");
+        assert_eq!(structured["dispatched"], false);
+    }
+}
+
+#[test]
+fn b4_review_checked_matching_hit_is_accepted() {
+    let fake = Fake::new(1_000_152);
+    let args = json!({"pid":fake.pid, "element_token":"s00000001:0", "simulate":true});
+    let pixel =
+        super::super::element_simulate::checked_pixel_args(args, fake.pid, WINDOW, &fake).unwrap();
+    assert_eq!(pixel["x"], CENTER.0);
+    assert_eq!(pixel["y"], CENTER.1);
+    assert_eq!(fake.hit_reads.load(Ordering::SeqCst), 1);
+    assert!(fake.posts().is_empty());
+}
+
+#[tokio::test]
 async fn an_element_count_two_takes_the_checked_pointer_route() {
     let pid = 1_000_101;
     let fake = Arc::new(Fake::new(pid));

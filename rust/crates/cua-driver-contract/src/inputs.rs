@@ -821,6 +821,7 @@ pub struct ClickInput {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub count: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    /// Send a single pointer click at the element center instead of its AX action (macOS).
     pub simulate: Option<bool>,
 }
 
@@ -859,6 +860,7 @@ struct ClickWireInput {
     #[serde(default)]
     #[schemars(schema_with = "click_count_schema")]
     count: Option<u32>,
+    /// Send a single pointer click at the element center instead of its AX action (macOS).
     #[serde(default, deserialize_with = "present_click_field")]
     simulate: Option<bool>,
 }
@@ -908,6 +910,12 @@ impl JsonSchema for ClickInput {
 impl ToolInput for ClickInput {
     const TOOL_NAME: &'static str = "click";
     fn validate(&self) -> Result<(), String> {
+        if self.simulate.is_some() && !matches!(self.position, ClickPosition::Element { .. }) {
+            return Err("click.simulate requires element_token".into());
+        }
+        if self.simulate == Some(true) && self.count.is_some_and(|count| count != 1) {
+            return Err("click.simulate requires count 1".into());
+        }
         match &self.position {
             ClickPosition::Coordinates { x, y } if !x.is_finite() || !y.is_finite() => {
                 return Err("click coordinates must be finite".into())
@@ -1154,6 +1162,21 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[test]
+    fn b4_review_simulate_requires_element_and_one_click() {
+        let base = json!({"target":{"kind":"window","pid":7,"window_id":9},"delivery_mode":"background","simulate":true});
+        let mut coordinates = base.clone();
+        coordinates["x"] = json!(1);
+        coordinates["y"] = json!(2);
+        assert!(serde_json::from_value::<ClickInput>(coordinates.clone()).is_err());
+        coordinates["simulate"] = json!(false);
+        assert!(serde_json::from_value::<ClickInput>(coordinates).is_err());
+        let mut multiple = base;
+        multiple["element_token"] = json!("s00000001:0");
+        multiple["count"] = json!(2);
+        assert!(serde_json::from_value::<ClickInput>(multiple).is_err());
+    }
 
     #[test]
     fn typed_element_click_accepts_simulate_boolean() {
