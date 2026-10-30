@@ -2171,7 +2171,28 @@ mod wave400f2_registry_tests {
 
 #[cfg(test)]
 mod user_takeover_tests {
-    use super::user_takeover_idle;
+    use super::{physical_input_idle_ms, user_takeover_idle};
+
+    /// The gate reads the HID system-state idle clock, which the driver's own
+    /// events must not reset: a key it posts to a pid leaves the clock
+    /// running. Run by hand on a machine whose user is not typing:
+    /// cargo test -p platform-macos --lib driver_input_does_not_reset -- --ignored --nocapture
+    #[test]
+    #[ignore = "reads the live HID idle clock and posts a key to this process"]
+    fn driver_input_does_not_reset_the_physical_idle_clock() {
+        let before = physical_input_idle_ms().expect("the idle clock is readable");
+        for _ in 0..5 {
+            // F12 to this test process: no window, nothing to receive it.
+            crate::input::keyboard::press_key(std::process::id() as i32, "f12", &[])
+                .expect("the key posts");
+        }
+        let after = physical_input_idle_ms().expect("the idle clock is readable");
+        println!("idle before {before} ms, after five driver keys {after} ms");
+        assert!(
+            after >= before,
+            "the driver's own keys reset the physical idle clock ({before} -> {after} ms)"
+        );
+    }
 
     /// Refuse only when the person is in the target app and typed or moved a
     /// moment ago.
