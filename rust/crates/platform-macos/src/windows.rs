@@ -197,6 +197,20 @@ enum LayerFilter {
     AnyLayer,
 }
 
+/// Whether one WindowServer entry was read well enough for the enumeration
+/// to stay complete. An unreadable id or owner could be any window. For an
+/// every-layer read, an unreadable layer of a wanted window could hide a
+/// window the caller filters by layer (a menu window at layer 101), so it
+/// counts too; a layer-0 read keeps its old behaviour.
+fn entry_readable(
+    has_window_number: bool,
+    has_owner_pid: bool,
+    has_layer: bool,
+    layer_matters: bool,
+) -> bool {
+    has_window_number && has_owner_pid && (has_layer || !layer_matters)
+}
+
 fn enumerate_windows(
     options: u32,
     layers: LayerFilter,
@@ -291,7 +305,15 @@ fn enumerate_windows(
 
         let window_number = find_num("kCGWindowNumber");
         let owner_pid = find_num("kCGWindowOwnerPID");
-        if window_number.is_none() || owner_pid.is_none() {
+        let layer_number = find_num("kCGWindowLayer");
+        let wanted_pid = owner_pid
+            .is_some_and(|owner| pid_filter.is_none_or(|wanted| i64::from(wanted) == owner));
+        if !entry_readable(
+            window_number.is_some(),
+            owner_pid.is_some(),
+            layer_number.is_some(),
+            layers == LayerFilter::AnyLayer && wanted_pid,
+        ) {
             complete = false;
         }
         let window_id = window_number.unwrap_or(0) as u32;
@@ -876,6 +898,16 @@ mod tests {
             assert!(!snapshot.complete, "{case}");
             assert!(snapshot.window_ids.is_empty(), "{case}: no partial id set");
         }
+    }
+
+    #[test]
+    fn an_unreadable_layer_makes_an_every_layer_read_incomplete() {
+        assert!(entry_readable(true, true, true, true));
+        assert!(!entry_readable(true, true, false, true));
+        // A layer-0 read, or another app's window, keeps its behaviour.
+        assert!(entry_readable(true, true, false, false));
+        assert!(!entry_readable(false, true, true, false));
+        assert!(!entry_readable(true, false, true, false));
     }
 
     #[test]
