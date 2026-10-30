@@ -304,13 +304,9 @@ impl Tool for HotkeyTool {
             return error;
         }
 
-        // ── Menu key equivalents in a background app ──
-        // Background key events reach a window's views but never its app's
-        // menu key equivalents, so a background cmd+s to TextEdit saved
-        // nothing while reporting "Pressed". When the combo is a menu item's
-        // key equivalent in a native app that is not in front, run that menu
-        // item in the background instead (verified for Save), or refuse when
-        // macOS keeps it disabled. No key events are sent on this route.
+        // Window-only native Command equivalents use the app's menu route
+        // whether or not the app is frontmost. That route checks the held
+        // target window and returns its own result without posting the chord.
         let mut key_scope: Option<crate::input::skylight::WindowKeyScope> = None;
         if !fg && px.is_none() {
             if let (Some(wid), Some(combo)) = (
@@ -320,12 +316,7 @@ impl Tool for HotkeyTool {
                 let menu_item = latency::spawn_action_blocking(move || {
                     let native = !super::type_text::is_browser_pid(pid)
                         && !crate::browser::electron_js::ElectronJs::is_electron(pid);
-                    let in_front = apps::frontmost_pid() == Some(pid);
-                    if native && !in_front {
-                        super::menu_equivalent::find(pid, &combo)
-                    } else {
-                        None
-                    }
+                    lookup_native_menu(native, || super::menu_equivalent::find(pid, &combo))
                 })
                 .await
                 .ok()
@@ -640,6 +631,14 @@ impl Tool for HotkeyTool {
 /// background marked as a refusal that sent nothing. Keys are not tried
 /// instead: a background key event never reaches a native app's menus, so it
 /// would report delivery and change nothing (a background cmd+[ to Finder).
+fn lookup_native_menu<T>(native: bool, find: impl FnOnce() -> Option<T>) -> Option<T> {
+    if native {
+        find()
+    } else {
+        None
+    }
+}
+
 pub(super) fn menu_refusal_without_keys(mut result: ToolResult) -> ToolResult {
     let unavailable = result.is_error == Some(true)
         && result
@@ -673,6 +672,26 @@ fn delivered_structured(foreground: bool) -> Value {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn hotkey_looks_up_native_menus_for_frontmost_and_background_apps() {
+        for frontmost in [false, true] {
+            let calls = std::cell::Cell::new(0);
+            let found = super::lookup_native_menu(true, || {
+                calls.set(calls.get() + 1);
+                Some(frontmost)
+            });
+            assert_eq!(found, Some(frontmost));
+            assert_eq!(calls.get(), 1);
+        }
+        let calls = std::cell::Cell::new(0);
+        let found = super::lookup_native_menu::<()>(false, || {
+            calls.set(calls.get() + 1);
+            Some(())
+        });
+        assert_eq!(found, None);
+        assert_eq!(calls.get(), 0);
+    }
+
     use super::*;
 
     /// A refusal after menu validation posted Cmd+F20 keeps saying so.

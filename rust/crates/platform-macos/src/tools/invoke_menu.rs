@@ -354,7 +354,7 @@ fn select_frontmost_pid(
     }
 }
 
-fn live_frontmost_pid(pid: i32, window_id: u32) -> Option<i32> {
+pub(super) fn live_frontmost_pid(pid: i32, window_id: u32) -> Option<i32> {
     select_frontmost_pid(
         crate::input::skylight::front_process_matches(pid, window_id),
         crate::apps::frontmost_pid,

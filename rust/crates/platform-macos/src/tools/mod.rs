@@ -4,7 +4,6 @@ use crate::goat::action_latency as latency;
 
 mod bring_to_front;
 mod capture_binding;
-mod chord_disabled;
 mod click;
 mod clipboard;
 mod double_click;
