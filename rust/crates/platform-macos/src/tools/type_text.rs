@@ -379,7 +379,7 @@ impl Tool for TypeTextTool {
         // AX write only (exact element, no CGEvent fallback), or a structured
         // refusal. delivery_mode:"foreground" stays the caller's explicit
         // last resort and is not gated here.
-        let (_mutation_lease, keyboard_policy) = match window_id {
+        let (mut _mutation_lease, keyboard_policy) = match window_id {
             Some(wid) if !delivery_mode.is_foreground() => {
                 let gate_element_ptr = element_guard.as_ref().map(|(g, _)| g.as_ptr());
                 match background_keyboard_policy(pid, wid, gate_element_ptr).await {
@@ -393,6 +393,46 @@ impl Tool for TypeTextTool {
         // CELL rule for untargeted typing: a non-editing cell of a
         // row/outline/table (or an unreadable focused element) refuses the
         // call before any key.
+        //
+        // A bound window that is not its app's key window has no focused
+        // element to judge yet: hold it as key (only while another app is in
+        // front) and insert there in one detached worker (type_text_hold).
+        if let Some(wid) = window_id {
+            let untargeted = element_guard.is_none() && px.is_none() && !replace;
+            let background_allowed = !delivery_mode.is_foreground()
+                && matches!(keyboard_policy, BackgroundKeyboardPolicy::Allowed);
+            let spi = crate::input::skylight::is_focus_without_raise_available();
+            // Terminals take text from their pty (an AX write never reaches
+            // it) and Chromium native fields have their own submission
+            // route: both keep the ordinary path.
+            let ax_insert_route = super::type_text_hold::ax_insert_route(
+                crate::terminal::is_terminal_pid(pid),
+                &apps::bundle_id_for_pid(pid).unwrap_or_default(),
+            );
+            if untargeted && background_allowed && spi && ax_insert_route {
+                let routes = latency::spawn_action_blocking(move || {
+                    crate::input::skylight::window_routes_keys(pid as libc::pid_t, wid)
+                })
+                .await
+                .unwrap_or(true);
+                if super::type_text_hold::hold_needed(untargeted, background_allowed, spi, routes) {
+                    super::cursor_tools::position_keyboard_cursor(
+                        &self.state,
+                        &args,
+                        window_id,
+                        None,
+                    )
+                    .await;
+                    return super::type_text_hold::held_window_insert(
+                        _mutation_lease.take(),
+                        pid,
+                        wid,
+                        text.clone(),
+                    )
+                    .await;
+                }
+            }
+        }
         if element_guard.is_none() && px.is_none() && !replace {
             if let Some(refusal) = super::not_editable::guard_untargeted(pid, window_id).await {
                 return refusal;
@@ -1211,6 +1251,13 @@ fn read_axvalue_bound(
 /// browser's OWN native chrome (address bar, toolbar) has no `AXWebArea`
 /// ancestor, so it stays trusted. Walks a bounded ancestor chain; each
 /// `AXParent` copy is released, and it stops at the window/app boundary.
+/// The element's ancestry was read to its window and has no web area: only
+/// then is an AXValue read-back evidence of the insert.
+pub(super) fn target_is_proven_native(pid: i32, element_ptr: usize, window_id: u32) -> bool {
+    classify_target_web_area(pid, Some((element_ptr, None)), Some(window_id))
+        == WebAreaClassification::NonWebContent
+}
+
 pub(super) fn target_in_web_area(
     pid: i32,
     element_ptr_and_idx: Option<(usize, Option<usize>)>,
@@ -2585,7 +2632,7 @@ fn type_text_in_key_window(
 ///
 /// # Safety
 /// `element` must be a live `AXUIElementRef`.
-unsafe fn focused_accepts_text(element: AXUIElementRef) -> bool {
+pub(super) unsafe fn focused_accepts_text(element: AXUIElementRef) -> bool {
     let role = copy_string_attr(element, "AXRole").unwrap_or_default();
     is_text_input_role(&role)
         || copy_raw_attr(element, SELECTED_RANGE).is_some_and(|range| {

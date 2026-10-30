@@ -723,6 +723,12 @@ fn key_focus_of_pid(pid: pid_t) -> KeyFocus {
     }
 }
 
+/// Whether keys posted to `pid` go to `target` now (its AXFocusedWindow).
+/// Read-only.
+pub(crate) fn window_routes_keys(pid: pid_t, target: u32) -> bool {
+    key_focus_of_pid(pid).routes_to(target)
+}
+
 /// Settle time between the key-window records. Without it the app can drop
 /// the focus record while it is still handling the defocus (measured on
 /// LibreOffice 26.8: about half the switches failed without a pause).
