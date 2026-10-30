@@ -17,9 +17,7 @@ use serde_json::Value;
 use std::sync::Arc;
 
 use crate::apps;
-use crate::ax::bindings::{
-    copy_bool_attr, copy_string_attr, focused_element_of_pid, AXUIElementRef,
-};
+use crate::ax::bindings::{copy_bool_attr, copy_string_attr, AXUIElementRef};
 use crate::focus_guard;
 use crate::window_change_detector::WindowChangeDetector;
 
@@ -36,12 +34,6 @@ impl PressKeyTool {
 }
 
 static DEF: std::sync::OnceLock<ToolDef> = std::sync::OnceLock::new();
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct AxKeyState {
-    value: Option<String>,
-    selected: Option<bool>,
-}
 
 #[derive(Debug)]
 enum PressKeyDeliveryOutcome {
@@ -164,56 +156,17 @@ fn validate_post_target(pid: i32) -> anyhow::Result<()> {
     }
 }
 
-fn read_ax_key_state(pid: i32, window_id: Option<u32>, element_ptr: usize) -> Option<AxKeyState> {
-    if super::type_text::target_in_web_area(pid, Some((element_ptr, None)), window_id) {
-        return None;
-    }
-    let element = element_ptr as AXUIElementRef;
-    let state = AxKeyState {
-        value: unsafe { copy_string_attr(element, "AXValue") },
-        selected: unsafe { copy_bool_attr(element, "AXSelected") },
-    };
-    (state.value.is_some() || state.selected.is_some()).then_some(state)
-}
-
+/// Post the key (or action) once. Nothing is read before or after it: whether
+/// the key changed anything is not checked here, so the result is always
+/// unverifiable, and a caller that needs the effect observes the window.
 fn dispatch_with_ax_oracle(
-    pid: i32,
-    window_id: Option<u32>,
-    explicit_element_ptr: Option<usize>,
+    _pid: i32,
+    _window_id: Option<u32>,
+    _explicit_element_ptr: Option<usize>,
     dispatch: impl FnOnce() -> anyhow::Result<()>,
 ) -> anyhow::Result<bool> {
-    let (element_ptr, owns_element) = match explicit_element_ptr {
-        Some(ptr) => (Some(ptr), false),
-        None => unsafe {
-            match window_id {
-                Some(wid) => crate::ax::exact_target::focused_element_in_window(pid, wid),
-                None => focused_element_of_pid(pid),
-            }
-        }
-        .map(|element| (Some(element as usize), true))
-        .unwrap_or((None, false)),
-    };
-    let before = element_ptr.and_then(|ptr| read_ax_key_state(pid, window_id, ptr));
-    let result = dispatch();
-    // Native controls normally publish their new value/selection on the next
-    // run-loop turn. Keep this bounded and reuse the exact retained element so
-    // a focus move cannot become false confirmation from a different control.
-    if before.is_some() {
-        std::thread::sleep(std::time::Duration::from_millis(60));
-    }
-    let after = element_ptr.and_then(|ptr| read_ax_key_state(pid, window_id, ptr));
-    if owns_element {
-        if let Some(ptr) = element_ptr {
-            unsafe { CFRelease(ptr as _) };
-        }
-    }
-    result?;
-    Ok(matches!((before, after), (Some(before), Some(after)) if ax_state_changed(&before, &after)))
-}
-
-fn ax_state_changed(before: &AxKeyState, after: &AxKeyState) -> bool {
-    matches!((&before.value, &after.value), (Some(before), Some(after)) if before != after)
-        || matches!((before.selected, after.selected), (Some(before), Some(after)) if before != after)
+    dispatch()?;
+    Ok(false)
 }
 
 fn action_record(confirmed: bool, foreground: bool) -> ActionExecutionRecord {
@@ -2216,6 +2169,29 @@ async fn native_menu_chord(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A key is posted once and returns: no read before it, no wait after it
+    /// (the old oracle slept 60 ms to read the focused element back), and the
+    /// result is unverifiable.
+    #[test]
+    fn a_key_is_posted_once_without_a_read_back_wait() {
+        let posts = std::cell::Cell::new(0);
+        let started = std::time::Instant::now();
+        let confirmed = dispatch_with_ax_oracle(1, Some(2), Some(3), || {
+            posts.set(posts.get() + 1);
+            Ok(())
+        })
+        .expect("posted");
+        assert!(!confirmed, "nothing is read back, so nothing is confirmed");
+        assert_eq!(posts.get(), 1);
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(30),
+            "returned after {:?}",
+            started.elapsed()
+        );
+        let failed = dispatch_with_ax_oracle(1, None, None, || anyhow::bail!("not posted"));
+        assert!(failed.is_err());
+    }
 
     /// Coordinator decision keys_under_scope: only a confirmed disabled read
     /// sends the chord as keys; an unreadable one sends nothing.

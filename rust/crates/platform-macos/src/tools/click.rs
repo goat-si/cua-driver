@@ -1062,6 +1062,10 @@ fn def() -> &'static ToolDef {
                     "type": "integer",
                     "description": "Left clicks in one gesture, 1-3. Default 1. With element_token, count 2 sends AXOpen when the element lists it (no mouse clicks; works wherever AX actions work); otherwise, and for count 3, it hands that many left clicks (clickCount 1..N) to the element's center. On the pointer route the point is checked to be on the element in its window (the window must be on screen) before the window is activated; if that check fails with nothing sent yet, the call is refused. The window is then made active (without raising it in the background, where an activation that cannot be confirmed still goes on and is reported as uncertain; fronted in the foreground) and the point is checked again, and once more right before the first click, after the pointer move. A foreground count 2 whose AXOpen provably did nothing falls back to this pointer route after the window was fronted, so its first point check already counts as a later one. A failure after activation, or of the activation itself, sends no click on the element but returns an unverifiable result whose activation field (and events_sent, code element_changed_before_click for the last check) says what had already gone out. Needs action press, the left button and no modifier. Nothing reads back what the clicks opened."
                 },
+                "read_back": {
+                    "type": "boolean",
+                    "description": "Default false. With element_token and action press, true also watches whether the sheet holding a pressed button closes (extra accessibility reads and a wait of up to 600 ms), so the result can be confirmed instead of unverifiable. Leave it off to send the press and return."
+                },
                 "modifier": {
                     "type": "array",
                     "items": { "type": "string" },
@@ -1653,6 +1657,7 @@ impl ClickTool {
             // and stomp default for a non-default session).
             let ck = cursor_key.clone();
             let selection_modifiers = modifiers.clone();
+            let read_back = args.bool_or("read_back", false);
             // The lease travels with the blocking action and comes back with
             // its result: a cancelled caller cannot release it while the
             // action (and a text input's key hand-back) still runs.
@@ -1678,6 +1683,7 @@ impl ClickTool {
                                         selection_pixel,
                                         &selection_modifiers,
                                         foreground,
+                                        read_back,
                                     )?);
                                     Ok(())
                                 };
@@ -1708,6 +1714,7 @@ impl ClickTool {
                                     selection_pixel,
                                     &selection_modifiers,
                                     false,
+                                    read_back,
                                 )
                                 .map(|outcome| (outcome, false))
                             }
@@ -2928,6 +2935,7 @@ unsafe fn ancestor_roles(element: AXUIElementRef) -> Vec<String> {
     roles
 }
 
+#[allow(clippy::too_many_arguments)]
 fn perform_ax_click(
     element: (usize, usize),
     window: (i32, u32),
@@ -2936,6 +2944,7 @@ fn perform_ax_click(
     selection_pixel: Option<SelectionPixelTarget>,
     modifiers: &[String],
     foreground: bool,
+    read_back: bool,
 ) -> anyhow::Result<AxClickOutcome> {
     let (element_ptr, idx) = element;
     let (pid, window_id) = window;
@@ -3223,9 +3232,13 @@ fn perform_ax_click(
     // read right before dispatch so nothing earlier (a navigation still
     // finishing during the priming) counts. A row whose press is refused is
     // selected by the fallback below; its own snapshot ties that write.
-    let mut probe = unsafe {
-        ClickProbe::capture(Some(element), toggle).watching_sheet_for_press(element, ax_action)
-    };
+    let mut probe = unsafe { ClickProbe::capture(Some(element), toggle) };
+    if read_back {
+        // Reading the ancestors up to a sheet and watching its window for up
+        // to 600 ms exist only to turn a pressed sheet button into a
+        // confirmed click: they run when the caller asks for the read-back.
+        probe = unsafe { probe.watching_sheet_for_press(element, ax_action) };
+    }
     let fallback_selection = (ax_action == "AXPress" && modifiers.is_empty()).then(|| {
         let idle_before = super::physical_input_idle_ms();
         let started = std::time::Instant::now();
@@ -4009,6 +4022,15 @@ mod tests {
             "click",
             serde_json::to_value(result).expect("a tool result serializes"),
         )
+    }
+
+    #[test]
+    fn a_click_reads_nothing_back_unless_the_caller_asks() {
+        let read_back = &def().input_schema["properties"]["read_back"];
+        assert_eq!(read_back["type"], "boolean");
+        assert!(read_back["description"]
+            .as_str()
+            .is_some_and(|text| text.contains("Default false")));
     }
 
     /// Calendar's toolbar view switcher reads AXEnabled=false while its window

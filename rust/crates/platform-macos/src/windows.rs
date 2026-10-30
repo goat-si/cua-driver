@@ -1205,4 +1205,66 @@ mod tests {
         );
         assert_eq!(resolve_window_owner_in(&[], 900, 42), WindowOwner::Unknown);
     }
+
+    /// Per-call cost of the WindowServer reads the tools make around an
+    /// input (goat.15 added one of them to every window walk). Reads the live
+    /// WindowServer only; operates no app. Run with:
+    /// cargo test -p platform-macos --release --lib bench_window_enumeration -- --ignored --nocapture
+    #[test]
+    #[ignore = "timing benchmark over the live WindowServer"]
+    fn bench_window_enumeration_cost() {
+        fn median_ms(mut f: impl FnMut()) -> (f64, f64) {
+            for _ in 0..5 {
+                f();
+            }
+            let mut samples: Vec<f64> = (0..40)
+                .map(|_| {
+                    let start = std::time::Instant::now();
+                    f();
+                    start.elapsed().as_secs_f64() * 1000.0
+                })
+                .collect();
+            samples.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            (samples[samples.len() / 2], samples[samples.len() * 9 / 10])
+        }
+        let pid = std::process::id() as i32;
+        let total = all_windows_without_spaces().len();
+        let raw = median_ms(|| {
+            let raw = unsafe {
+                CGWindowListCopyWindowInfo(
+                    kCGWindowListOptionOnScreenOnly | kCGWindowListExcludeDesktopElements,
+                    kCGNullWindowID,
+                )
+            };
+            assert!(!raw.is_null());
+            unsafe { core_foundation::base::CFRelease(raw as _) };
+        });
+        let any_layer = median_ms(|| {
+            let _ = pid_on_screen_windows_any_layer_enumeration(pid);
+        });
+        let visible = median_ms(|| {
+            let _ = visible_windows_without_spaces();
+        });
+        let visible_spaces = median_ms(|| {
+            let _ = visible_windows_with_space_snapshot();
+        });
+        let all_spaces = median_ms(|| {
+            let _ = all_windows_with_space_snapshot();
+        });
+        println!("layer-0 windows listed: {total}");
+        println!(
+            "CGWindowListCopyWindowInfo alone (on-screen): median {:.2} ms, p90 {:.2} ms",
+            raw.0, raw.1
+        );
+        println!("pid_on_screen_windows_any_layer_enumeration (goat.15 per-walk read): median {:.2} ms, p90 {:.2} ms", any_layer.0, any_layer.1);
+        println!(
+            "visible_windows_without_spaces: median {:.2} ms, p90 {:.2} ms",
+            visible.0, visible.1
+        );
+        println!("visible_windows_with_space_snapshot (app_window_order before): median {:.2} ms, p90 {:.2} ms", visible_spaces.0, visible_spaces.1);
+        println!(
+            "all_windows_with_space_snapshot (list_windows, no pid): median {:.2} ms, p90 {:.2} ms",
+            all_spaces.0, all_spaces.1
+        );
+    }
 }

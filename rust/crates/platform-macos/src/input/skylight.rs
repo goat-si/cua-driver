@@ -372,7 +372,8 @@ fn restore_target(
 
 /// `pid`'s on-screen layer-0 windows, front to back.
 fn app_window_order(pid: pid_t) -> Vec<u32> {
-    let mut windows: Vec<_> = crate::windows::visible_windows()
+    // Order, owner and layer only: the Space snapshot is not read.
+    let mut windows: Vec<_> = crate::windows::visible_windows_without_spaces()
         .into_iter()
         .filter(|w| w.pid == pid && w.layer == 0 && w.is_on_screen)
         .collect();
@@ -847,7 +848,7 @@ pub(crate) fn hand_key_back(pid: pid_t, current: Option<u32>, target: u32) -> bo
 fn await_key_focus(pid: pid_t, target: u32, budget: std::time::Duration) {
     let deadline = std::time::Instant::now() + KEY_RECORD_SETTLE + budget;
     while !key_focus_of_pid(pid).settled_on(target) && std::time::Instant::now() < deadline {
-        std::thread::sleep(std::time::Duration::from_millis(10));
+        std::thread::sleep(std::time::Duration::from_millis(4));
     }
 }
 
