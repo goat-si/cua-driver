@@ -144,7 +144,7 @@ fn drag_duration_schema(_: &mut SchemaGenerator) -> Schema {
 }
 
 fn key_duration_schema(_: &mut SchemaGenerator) -> Schema {
-    json_schema!({ "type": "integer", "minimum": 0, "maximum": 30000, "default": 8 })
+    json_schema!({ "type": "integer", "minimum": 0, "maximum": 30000 })
 }
 
 fn key_duration<'de, D: serde::Deserializer<'de>>(

@@ -15,6 +15,7 @@ fn fast_confirmation_polls_every_two_ms_and_stops_at_forty_ms() {
     let sleeps = RefCell::new(Vec::new());
     await_key_focus_with(
         Duration::from_millis(40),
+        FocusPollMode::Fast,
         || false,
         || start + elapsed.get(),
         |duration| {
@@ -34,11 +35,32 @@ fn fast_confirmation_stops_as_soon_as_focus_settles() {
     let elapsed = Cell::new(Duration::ZERO);
     await_key_focus_with(
         Duration::from_millis(40),
+        FocusPollMode::Fast,
         || elapsed.get() >= Duration::from_millis(6),
         || start + elapsed.get(),
         |duration| elapsed.set(elapsed.get() + duration),
     );
     assert_eq!(elapsed.get(), Duration::from_millis(6));
+}
+
+#[test]
+fn full_poll_mode_keeps_four_ms_steps_even_with_fast_budget() {
+    use std::cell::Cell;
+    use std::time::{Duration, Instant};
+    let start = Instant::now();
+    let elapsed = Cell::new(Duration::ZERO);
+    let count = Cell::new(0);
+    await_key_focus_with(
+        Duration::from_millis(40),
+        FocusPollMode::Full,
+        || false,
+        || start + elapsed.get(),
+        |duration| {
+            count.set(count.get() + 1);
+            elapsed.set(elapsed.get() + duration);
+        },
+    );
+    assert_eq!(count.get(), 10);
 }
 
 #[derive(Default)]
@@ -50,6 +72,7 @@ struct State {
     posts: Vec<(Option<u32>, u32, RecordStyle)>,
     ax_writes: Vec<u32>,
     order_reads: usize,
+    publications: usize,
 }
 
 /// An app whose AX focus follows records and focused-window writes when
@@ -158,7 +181,7 @@ impl KeyEnv for FakeEnv {
             failed: 0,
         })
     }
-    fn await_focus(&self, _: pid_t, _: u32, duration: std::time::Duration) {
+    fn await_focus(&self, _: pid_t, _: u32, duration: std::time::Duration, _: FocusPollMode) {
         self.state.borrow_mut().waits.push(duration);
     }
     fn needs_full_records(&self, pid: pid_t) -> bool {
@@ -211,6 +234,7 @@ impl KeyEnv for FakeEnv {
         focus: KeyFocus,
         confirmed_at: std::time::Instant,
     ) {
+        self.state.borrow_mut().publications += 1;
         self.sync_notifications(ticket.pid);
         if self.standard_window.get()
             && self.incarnation.get() == Some(ticket.stamp)
@@ -225,12 +249,6 @@ impl KeyEnv for FakeEnv {
                 self.focus_epoch.get(),
             );
         }
-    }
-    fn activate_believed_window(&self, _: pid_t, _: u32) -> bool {
-        self.activation_posts.set(self.activation_posts.get() + 1);
-        self.app_active.set(true);
-        self.focus_epoch.set(self.focus_epoch.get() + 1);
-        true
     }
 }
 
@@ -497,19 +515,60 @@ fn stale_mismatching_belief_runs_fast_records_to_target() {
 }
 
 #[test]
-fn inactive_fresh_belief_posts_activation_only() {
+fn priming_moved_focus_does_not_publish_belief() {
+    let _serial = key_scope_tests_serial();
+    let env = FakeEnv::new(1);
+    let mut scope = enter_eligible(&env).expect("target is primed");
+    assert_eq!(scope.primed(), KeyPrime::KeyRecords);
+    assert_eq!(env.state.borrow().publications, 0);
+    scope.done = true;
+}
+
+#[test]
+fn live_publication_seam_rechecks_process_window_and_final_focus() {
+    let valid = KeyFocus {
+        window: Some(2),
+        element_window: Some(2),
+    };
+    let moved = KeyFocus {
+        window: Some(1),
+        element_window: Some(1),
+    };
+    for (process, standard, final_sample, should_publish) in [
+        (false, true, valid, false),
+        (true, false, valid, false),
+        (true, true, moved, false),
+        (true, true, valid, true),
+    ] {
+        let published = std::cell::Cell::new(false);
+        publish_belief_with(
+            2,
+            valid,
+            || process,
+            || standard,
+            || final_sample,
+            || published.set(true),
+        );
+        assert_eq!(published.get(), should_publish);
+    }
+}
+
+#[test]
+fn inactive_fresh_belief_uses_normal_path_without_activation() {
     let _serial = key_scope_tests_serial();
     let env = FakeEnv::new(2);
     let warmed = warm_eligible_belief(&env);
     env.app_active.set(false);
     env.state.borrow_mut().key_focus_reads = 0;
-    let scope = enter_eligible(&env).expect("activation-only path succeeds");
+    let scope = enter_eligible(&env).expect("normal path succeeds");
     assert_eq!(scope.primed(), KeyPrime::AlreadyKey);
     let reads = env.state.borrow().key_focus_reads;
     let activations = env.activation_posts.get();
     assert!(env.state.borrow().posts.is_empty());
     assert_eq!(scope.finish(), HandBack::NotMoved);
-    assert_eq!((warmed, reads, activations), (true, 0, 1));
+    assert!(warmed);
+    assert!(reads > 0, "inactive belief must sample focus");
+    assert_eq!(activations, 0, "inactive belief must not post activation");
 }
 
 #[test]

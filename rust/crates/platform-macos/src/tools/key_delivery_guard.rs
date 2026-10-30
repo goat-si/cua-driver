@@ -81,19 +81,75 @@ where
     F: FnOnce(Arc<crate::input::key_hold::HoldControl>, &mut S) -> R + Send + 'static,
     R: Send + 'static,
 {
-    let _cancel_on_drop = crate::input::key_hold::CancelOnDrop(control.clone());
-    crate::goat::action_latency::spawn_action_blocking(move || {
-        let _lease = lease;
-        let mut scope = scope;
-        work(control, &mut scope)
-    })
+    let worker_control = control.clone();
+    with_disconnect_control(
+        control,
+        crate::goat::action_latency::spawn_action_blocking(move || {
+            let _lease = lease;
+            let mut scope = scope;
+            work(worker_control, &mut scope)
+        }),
+    )
     .await
+}
+
+/// Signal the worker without dropping its future or releasing its guards early.
+pub(super) async fn with_disconnect_control<F: std::future::Future>(
+    control: Arc<crate::input::key_hold::HoldControl>,
+    future: F,
+) -> F::Output {
+    let _cancel_on_drop = crate::input::key_hold::CancelOnDrop(control.clone());
+    let Some(mut disconnect) = cua_driver_core::key_cancellation::subscribe() else {
+        return future.await;
+    };
+    tokio::pin!(future);
+    if *disconnect.borrow() {
+        control.cancel();
+    } else {
+        tokio::select! {
+            result = &mut future => return result,
+            changed = disconnect.changed() => {
+                if changed.is_ok() && *disconnect.borrow() {
+                    control.cancel();
+                }
+            }
+        }
+    }
+    future.await
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::{Arc, Mutex};
+
+    #[tokio::test]
+    async fn disconnect_signals_worker_without_dropping_its_future() {
+        let (disconnect, receiver) = tokio::sync::watch::channel(false);
+        let control = Arc::new(crate::input::key_hold::HoldControl::default());
+        let (finish, finished) = tokio::sync::oneshot::channel::<()>();
+        let mut delivery = Box::pin(cua_driver_core::key_cancellation::scope(
+            receiver,
+            with_disconnect_control(control.clone(), async { finished.await.unwrap() }),
+        ));
+        use std::future::Future;
+        assert!(
+            std::future::poll_fn(|cx| std::task::Poll::Ready(
+                delivery.as_mut().poll(cx).is_pending()
+            ))
+            .await
+        );
+        disconnect.send(true).unwrap();
+        assert!(
+            std::future::poll_fn(|cx| std::task::Poll::Ready(
+                delivery.as_mut().poll(cx).is_pending()
+            ))
+            .await
+        );
+        assert!(control.is_cancelled());
+        finish.send(()).unwrap();
+        delivery.await;
+    }
 
     #[test]
     fn explicit_duration_on_semantic_action_is_disclosed_as_unapplied() {
@@ -157,6 +213,23 @@ mod tests {
         assert_eq!(reads.get(), 1);
     }
 
+    #[test]
+    fn final_mismatch_propagates_reprime_failure_without_resampling() {
+        let reads = std::cell::Cell::new(0);
+        let result = final_window_sample_with(
+            700,
+            true,
+            || {
+                reads.set(reads.get() + 1);
+                Some(888)
+            },
+            || {},
+            || anyhow::bail!("reprime failed"),
+        );
+        assert_eq!(result.unwrap_err().to_string(), "reprime failed");
+        assert_eq!(reads.get(), 1);
+    }
+
     struct TrackedScope(Arc<Mutex<Vec<&'static str>>>);
     impl Drop for TrackedScope {
         fn drop(&mut self) {
@@ -174,7 +247,7 @@ mod tests {
         }
     }
 
-    async fn cancel_invoking_future(base_down: bool, pid: i32) {
+    async fn cancel_invoking_future(base_down: bool, pid: i32, hotkey: bool) {
         let events = Arc::new(Mutex::new(Vec::new()));
         let lease = TrackedLease {
             _guard: crate::background_mutation::acquire(pid).await,
@@ -186,7 +259,8 @@ mod tests {
         let (resume_tx, resume_rx) = std::sync::mpsc::channel();
         let worker_events = events.clone();
         let control = Arc::new(crate::input::key_hold::HoldControl::default());
-        let invoking = tokio::spawn(run_owned(lease, scope, control, move |control, _scope| {
+        let work = move |control: Arc<crate::input::key_hold::HoldControl>,
+                         _scope: &mut TrackedScope| {
             let mut ready = Some(ready_tx);
             let result = crate::input::key_hold::deliver_with(
                 "a",
@@ -211,7 +285,14 @@ mod tests {
             );
             assert!(result.is_err());
             let _ = done_tx.send(());
-        }));
+        };
+        let invoking = tokio::spawn(async move {
+            if hotkey {
+                super::super::hotkey::run_hotkey_owned(lease, scope, control, work).await
+            } else {
+                run_owned(lease, scope, control, work).await
+            }
+        });
         ready_rx.await.expect("worker reached the barrier");
         invoking.abort();
         assert!(matches!(invoking.await, Err(error) if error.is_cancelled()));
@@ -237,22 +318,22 @@ mod tests {
 
     #[tokio::test]
     async fn cancelling_invoking_future_after_modifier_down_releases_before_hand_back() {
-        cancel_invoking_future(false, -92_001).await;
+        cancel_invoking_future(false, -92_001, false).await;
     }
 
     #[tokio::test]
     async fn cancelling_invoking_future_after_base_down_releases_before_hand_back() {
-        cancel_invoking_future(true, -92_002).await;
+        cancel_invoking_future(true, -92_002, false).await;
     }
 
     #[tokio::test]
     async fn cancelling_hotkey_future_after_modifier_down_releases_before_hand_back() {
-        cancel_invoking_future(false, -92_003).await;
+        cancel_invoking_future(false, -92_003, true).await;
     }
 
     #[tokio::test]
     async fn cancelling_hotkey_future_after_base_down_releases_before_hand_back() {
-        cancel_invoking_future(true, -92_004).await;
+        cancel_invoking_future(true, -92_004, true).await;
     }
 
     #[tokio::test]

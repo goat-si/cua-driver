@@ -58,7 +58,7 @@ unsafe extern "C" fn notify(
 static REGISTRATIONS: LazyLock<Mutex<HashMap<i32, (ProcessStartStamp, bool)>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
-/// Register once per process incarnation. Failure remains fail-closed for that incarnation.
+/// Start registration once per incarnation without waiting on AX from the key path.
 pub(super) fn ensure_observer(pid: i32, stamp: ProcessStartStamp) -> bool {
     let mut registrations = REGISTRATIONS.lock().unwrap_or_else(|e| e.into_inner());
     if let Some((prior, ok)) = registrations.get(&pid) {
@@ -66,18 +66,29 @@ pub(super) fn ensure_observer(pid: i32, stamp: ProcessStartStamp) -> bool {
             return *ok;
         }
     }
-    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
-    let spawned = std::thread::Builder::new()
-        .name(format!("cua-ax-key-{pid}"))
-        .spawn(move || observer_thread(pid, stamp, sender));
-    let ok = spawned.is_ok()
-        && receiver
-            .recv_timeout(Duration::from_millis(500))
-            .unwrap_or(false)
-        && process_start_stamp(pid) == Some(stamp);
-    registrations.insert(pid, (stamp, ok));
-    BELIEFS.set_observing(pid, stamp, ok);
-    ok
+    registrations.insert(pid, (stamp, false));
+    drop(registrations);
+    let _ = std::thread::Builder::new()
+        .name(format!("cua-ax-register-{pid}"))
+        .spawn(move || {
+            let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+            let spawned = std::thread::Builder::new()
+                .name(format!("cua-ax-key-{pid}"))
+                .spawn(move || observer_thread(pid, stamp, sender));
+            let ok = spawned.is_ok()
+                && receiver
+                    .recv_timeout(Duration::from_millis(500))
+                    .unwrap_or(false)
+                && process_start_stamp(pid) == Some(stamp);
+            let mut registrations = REGISTRATIONS.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some((current, ready)) = registrations.get_mut(&pid) {
+                if *current == stamp {
+                    *ready = ok;
+                    BELIEFS.set_observing(pid, stamp, ok);
+                }
+            }
+        });
+    false
 }
 
 fn observer_thread(pid: i32, stamp: ProcessStartStamp, sender: std::sync::mpsc::SyncSender<bool>) {
@@ -95,12 +106,12 @@ fn observer_thread(pid: i32, stamp: ProcessStartStamp, sender: std::sync::mpsc::
         }
         let mut context = Box::new(Context { pid, stamp });
         let context_ptr = &mut *context as *mut Context as *mut c_void;
+        // These invalidate the window, element and process evidence on which
+        // a fresh belief depends. Optional activation and sheet notifications
+        // are not required; live publication never asserts activation.
         let notifications = [
             "AXFocusedWindowChanged",
             "AXFocusedUIElementChanged",
-            "AXApplicationActivated",
-            "AXApplicationDeactivated",
-            "AXSheetCreated",
             "AXUIElementDestroyed",
         ];
         let ok = notifications.iter().all(|name| {

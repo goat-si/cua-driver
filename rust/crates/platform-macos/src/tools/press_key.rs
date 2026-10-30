@@ -422,6 +422,26 @@ pub(crate) fn verify_untargeted_key_with(
     Ok(())
 }
 
+pub(super) fn verify_final_key_sample_with(
+    pid: i32,
+    wid: u32,
+    focused_key_route: bool,
+    cached: bool,
+    sample: Option<u32>,
+    conflict: impl FnOnce(Option<Option<u32>>) -> crate::ax::exact_target::WindowFocusConflict,
+) -> anyhow::Result<()> {
+    let require_match = focused_key_route || cached;
+    if let Some(error) =
+        map_focus_conflict_to_refusal(pid, conflict(require_match.then_some(sample)))
+    {
+        return Err(error.into());
+    }
+    if require_match && sample != Some(wid) {
+        anyhow::bail!("window {wid} is not the application's positively confirmed key window; no key was sent");
+    }
+    Ok(())
+}
+
 /// Whether the resolved key+modifiers is a printable insertion (a single
 /// non-control character with no modifiers, or Shift only). Guard
 /// eligibility is decided here, independent of the keycode/unicode
@@ -563,7 +583,7 @@ fn def() -> &'static ToolDef {
                 "session": { "type": "string", "description": "For multi-call work, prefer a short public session label and repeat it on every call that accepts it." },
                 "pid": { "type": "integer", "description": "Target process ID." },
                 "key": { "type": "string", "description": "Key name." },
-                "duration_ms": { "type": "integer", "minimum": 0, "maximum": 30000, "default": 8, "description": "Key-down hold in milliseconds; omitted uses the configured key gap." },
+                "duration_ms": { "type": "integer", "minimum": 0, "maximum": 30000, "description": "Key-down hold in milliseconds; omitted uses the configured key gap." },
                 "modifiers": {
                     "type": "array",
                     "items": { "type": "string" },
@@ -1186,8 +1206,9 @@ impl Tool for PressKeyTool {
                             },
                             || {
                             if let (Some(wid), None) = (window_id, pre_focus_ptr) {
+                                let cached = key_scope.as_ref().is_some_and(|scope| scope.used_belief());
                                 let sample = super::key_delivery_guard::final_window_sample(pid, wid, key_scope)?;
-                                verify_untargeted_key_with(pid, wid, true, || sample, |sample| match sample {
+                                verify_final_key_sample_with(pid, wid, focused_key_route, cached, sample, |sample| match sample {
                                     Some(window) => crate::ax::exact_target::check_window_focus_conflict_with_sample(pid, wid, None, window),
                                     None => crate::ax::exact_target::check_window_focus_conflict(pid, wid, None),
                                 })?;
@@ -1425,14 +1446,17 @@ async fn minimized_key_route(
 ) -> ToolResult {
     let pid = lease.pid();
     let control = Arc::new(crate::input::key_hold::HoldControl::default());
-    let _cancel = crate::input::key_hold::CancelOnDrop(control.clone());
-    let step = run_detached(async move {
-        latency::spawn_action_blocking(move || {
-            let _lease = lease;
-            minimized_key_worker(pid, wid, guard, key, modifiers, duration, &control)
-        })
-        .await
-    })
+    let worker_control = control.clone();
+    let step = super::key_delivery_guard::with_disconnect_control(
+        control,
+        run_detached(async move {
+            latency::spawn_action_blocking(move || {
+                let _lease = lease;
+                minimized_key_worker(pid, wid, guard, key, modifiers, duration, &worker_control)
+            })
+            .await
+        }),
+    )
     .await;
     let step = match step {
         Ok(Ok(step)) => step,
@@ -1621,8 +1645,12 @@ fn app_is_frontmost(pid: i32, wid: u32) -> bool {
 /// The app's focused and main windows are both `wid`: its menu commands
 /// apply to that window.
 fn menu_bound_to(pid: i32, wid: u32) -> bool {
+    menu_bound_to_with_sample(pid, wid, crate::ax::bindings::focused_window_id_of_pid(pid))
+}
+
+fn menu_bound_to_with_sample(pid: i32, wid: u32, sample: Option<u32>) -> bool {
     use crate::ax::bindings::{ax_get_window_id, copy_element_attr, AXUIElementCreateApplication};
-    if crate::ax::bindings::focused_window_id_of_pid(pid) != Some(wid) {
+    if sample != Some(wid) {
         return false;
     }
     unsafe {
@@ -1829,27 +1857,16 @@ fn keys_under_scope(
         scope,
         gate,
         || {
-            menu_bound_to(pid, wid)
+            let sample = crate::ax::bindings::focused_window_id_of_pid(pid);
+            menu_bound_to_with_sample(pid, wid, sample)
                 && matches!(
                     crate::ax::exact_target::check_window_focus_conflict_with_sample(
-                        pid,
-                        wid,
-                        None,
-                        Some(wid)
+                        pid, wid, None, sample
                     ),
                     crate::ax::exact_target::WindowFocusConflict::Clear
                 )
         },
-        || match crate::input::key_hold::deliver(
-            crate::input::key_hold::KeyRoute::PidNoAuth(pid),
-            key,
-            &mods,
-            duration,
-            control,
-        ) {
-            Ok(()) => crate::input::keyboard::ChordPost::Posted,
-            Err(error) => crate::input::keyboard::ChordPost::Uncertain(error.to_string()),
-        },
+        || crate::input::key_hold::deliver_menu(pid, key, &mods, duration, control),
         |scope| {
             let entry = scope.entry();
             let hand_back = scope.finish();
@@ -2214,11 +2231,15 @@ async fn native_menu_chord(
 ) -> ToolResult {
     let pid = lease.pid();
     let control = Arc::new(crate::input::key_hold::HoldControl::default());
-    let _cancel = crate::input::key_hold::CancelOnDrop(control.clone());
-    let outcome = run_detached(async move {
-        let lease = lease;
-        let step =
-            match latency::spawn_action_blocking(move || chord_in_scope(pid, wid, combo)).await {
+    let worker_control = control.clone();
+    let outcome = super::key_delivery_guard::with_disconnect_control(
+        control,
+        run_detached(async move {
+            let control = worker_control;
+            let lease = lease;
+            let step = match latency::spawn_action_blocking(move || chord_in_scope(pid, wid, combo))
+                .await
+            {
                 Ok(step) => step,
                 Err(error) => {
                     return task_failure(format!(
@@ -2227,80 +2248,83 @@ async fn native_menu_chord(
                 ))
                 }
             };
-        match step {
-            ChordStep::Save { scope, path } => {
-                let entry = scope.entry();
-                let result = super::invoke_menu::run_in_background_with_lease(
-                    &lease,
-                    wid,
-                    path,
-                    super::invoke_menu::MenuRequest::KeyEquivalent(display_key),
-                    super::invoke_menu::KeyOwner::Caller,
-                )
-                .await;
-                let hand_back = latency::spawn_action_blocking(move || scope.finish())
-                    .await
-                    .unwrap_or(crate::input::skylight::HandBack::NotConfirmed);
-                let mut result = super::hotkey::menu_refusal_without_keys(result);
-                let disclosure = crate::input::skylight::scope_disclosure(entry, Some(hand_back));
-                append_to_summary(&mut result, &disclosure);
-                if let Some(serde_json::Value::Object(fields)) = result.structured_content.as_mut()
-                {
-                    if !disclosure.is_empty() {
-                        fields.insert("hand_back_note".into(), serde_json::json!(disclosure));
-                    }
-                }
-                result
-            }
-            ChordStep::NeedsKeys {
-                scope,
-                validation,
-                path,
-            } => {
-                // Raw keys need the keyboard class's facts (a visible, not
-                // minimized window of a visible app), on the same lease.
-                let gate = lease
-                    .gate_again(
+            match step {
+                ChordStep::Save { scope, path } => {
+                    let entry = scope.entry();
+                    let result = super::invoke_menu::run_in_background_with_lease(
+                        &lease,
                         wid,
-                        None,
-                        cua_driver_core::background_input::BackgroundAction::ExactWindowKeys,
+                        path,
+                        super::invoke_menu::MenuRequest::KeyEquivalent(display_key),
+                        super::invoke_menu::KeyOwner::Caller,
                     )
-                    .await
-                    .map_err(|refusal| refusal_text(&refusal));
-                let gate_refused = gate.is_err();
-                let (key, modifiers) = chord;
-                let step = latency::spawn_action_blocking(move || {
-                    let _lease = lease;
-                    keys_under_scope(
-                        pid, wid, scope, gate, validation, path, &key, &modifiers, duration,
-                        &control,
-                    )
-                })
-                .await;
-                match step {
-                    Ok(step) => chord_result(step),
-                    Err(error) if gate_refused => chord_task_failure(
-                        format!(
+                    .await;
+                    let hand_back = latency::spawn_action_blocking(move || scope.finish())
+                        .await
+                        .unwrap_or(crate::input::skylight::HandBack::NotConfirmed);
+                    let mut result = super::hotkey::menu_refusal_without_keys(result);
+                    let disclosure =
+                        crate::input::skylight::scope_disclosure(entry, Some(hand_back));
+                    append_to_summary(&mut result, &disclosure);
+                    if let Some(serde_json::Value::Object(fields)) =
+                        result.structured_content.as_mut()
+                    {
+                        if !disclosure.is_empty() {
+                            fields.insert("hand_back_note".into(), serde_json::json!(disclosure));
+                        }
+                    }
+                    result
+                }
+                ChordStep::NeedsKeys {
+                    scope,
+                    validation,
+                    path,
+                } => {
+                    // Raw keys need the keyboard class's facts (a visible, not
+                    // minimized window of a visible app), on the same lease.
+                    let gate = lease
+                        .gate_again(
+                            wid,
+                            None,
+                            cua_driver_core::background_input::BackgroundAction::ExactWindowKeys,
+                        )
+                        .await
+                        .map_err(|refusal| refusal_text(&refusal));
+                    let gate_refused = gate.is_err();
+                    let (key, modifiers) = chord;
+                    let step = latency::spawn_action_blocking(move || {
+                        let _lease = lease;
+                        keys_under_scope(
+                            pid, wid, scope, gate, validation, path, &key, &modifiers, duration,
+                            &control,
+                        )
+                    })
+                    .await;
+                    match step {
+                        Ok(step) => chord_result(step),
+                        Err(error) if gate_refused => chord_task_failure(
+                            format!(
                             "press_key: the key hand-back task failed ({error}); the requested \
                              chord and its menu action were not sent, and key focus inside the \
                              app may remain on the target window."
                         ),
-                        validation,
-                        false,
-                    ),
-                    Err(error) => chord_task_failure(
-                        format!(
+                            validation,
+                            false,
+                        ),
+                        Err(error) => chord_task_failure(
+                            format!(
                             "press_key: the key task failed ({error}); the requested chord may \
                              have been sent. Read the window before repeating it."
                         ),
-                        validation,
-                        true,
-                    ),
+                            validation,
+                            true,
+                        ),
+                    }
                 }
+                step => chord_result(step),
             }
-            step => chord_result(step),
-        }
-    })
+        }),
+    )
     .await;
     outcome.unwrap_or_else(|error| {
         task_failure(format!(
@@ -2313,6 +2337,23 @@ async fn native_menu_chord(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn uncached_unfocused_route_preserves_typed_sibling_refusal() {
+        let result = verify_final_key_sample_with(123, 700, false, false, Some(888), |_| {
+            crate::ax::exact_target::WindowFocusConflict::SiblingWindowFocused {
+                target_window_id: 700,
+                sibling_window_id: 888,
+            }
+        })
+        .unwrap_err();
+        assert!(result.is::<WindowFocusConflictError>(), "{result}");
+        let receipt = delivery_failed(result);
+        assert_eq!(
+            receipt.structured_content.unwrap()["code"],
+            cua_driver_core::background_input::refusal_codes::SAME_PID_KEYBOARD_AMBIGUITY
+        );
+    }
 
     #[test]
     fn duration_schema_accepts_only_bounded_integer_holds() {

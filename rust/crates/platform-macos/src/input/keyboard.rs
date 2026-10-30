@@ -1318,7 +1318,7 @@ pub fn press_chord_no_auth(pid: i32, key: &str, modifiers: &[&str]) -> ChordPost
     )
 }
 
-fn chord_events(key: &str, modifiers: &[&str]) -> anyhow::Result<(CGEvent, CGEvent)> {
+pub(super) fn chord_events(key: &str, modifiers: &[&str]) -> anyhow::Result<(CGEvent, CGEvent)> {
     let key_code = key_name_to_code(key)?;
     let flags = modifier_flags(modifiers);
     let make = |down: bool| -> anyhow::Result<CGEvent> {
@@ -1330,6 +1330,14 @@ fn chord_events(key: &str, modifiers: &[&str]) -> anyhow::Result<(CGEvent, CGEve
         Ok(event)
     };
     Ok((make(true)?, make(false)?))
+}
+
+pub(super) fn post_chord_event_no_auth(pid: i32, event: &CGEvent) {
+    super::tag_synthetic_event(event);
+    let event_ptr = event.as_ptr() as *mut std::ffi::c_void;
+    if !crate::input::skylight::post_to_pid(pid as libc::pid_t, event_ptr, false) {
+        event.post_to_pid(pid as libc::pid_t);
+    }
 }
 
 fn post_chord_with<E>(
@@ -1658,97 +1666,6 @@ fn unknown_key_message(key: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn physical_chord_posts_modifiers_and_releases_in_reverse_order() {
-        let events = std::cell::RefCell::new(Vec::new());
-        super::super::key_hold::deliver_with(
-            "a",
-            &["cmd", "shift"],
-            std::time::Duration::ZERO,
-            |code, down, _| {
-                events.borrow_mut().push((code, down));
-                Ok(())
-            },
-            || false,
-            |_| false,
-        )
-        .unwrap();
-        assert_eq!(
-            *events.borrow(),
-            vec![
-                (55, true),
-                (56, true),
-                (0, true),
-                (0, false),
-                (56, false),
-                (55, false)
-            ]
-        );
-    }
-
-    #[test]
-    fn failed_base_key_down_releases_pressed_modifiers() {
-        let events = std::cell::RefCell::new(Vec::new());
-        let result = super::super::key_hold::deliver_with(
-            "a",
-            &["cmd", "shift"],
-            std::time::Duration::ZERO,
-            |code, down, _| {
-                events.borrow_mut().push((code, down));
-                if code == 0 && down {
-                    anyhow::bail!("injected failure");
-                }
-                Ok(())
-            },
-            || false,
-            |_| false,
-        );
-        assert!(result.is_err());
-        assert_eq!(
-            *events.borrow(),
-            vec![
-                (55, true),
-                (56, true),
-                (0, true),
-                (0, false),
-                (56, false),
-                (55, false)
-            ]
-        );
-    }
-
-    #[test]
-    fn failed_base_key_up_still_releases_modifiers_in_reverse_order() {
-        let events = std::cell::RefCell::new(Vec::new());
-        let result = super::super::key_hold::deliver_with(
-            "a",
-            &["cmd", "shift"],
-            std::time::Duration::ZERO,
-            |code, down, _| {
-                events.borrow_mut().push((code, down));
-                if code == 0 && !down {
-                    anyhow::bail!("injected failure");
-                }
-                Ok(())
-            },
-            || false,
-            |_| false,
-        );
-        assert!(result.is_err());
-        assert_eq!(
-            *events.borrow(),
-            vec![
-                (55, true),
-                (56, true),
-                (0, true),
-                (0, false),
-                (0, false),
-                (56, false),
-                (55, false)
-            ]
-        );
-    }
 
     #[test]
     fn a_chord_that_cannot_be_built_posts_nothing() {

@@ -44,9 +44,46 @@ impl Drop for CancelOnDrop {
 #[derive(Clone, Copy)]
 pub(crate) enum KeyRoute {
     Pid(i32),
-    PidNoAuth(i32),
     Global,
     BareGlobal,
+}
+
+pub(crate) fn deliver_menu(
+    pid: i32,
+    key: &str,
+    modifiers: &[&str],
+    duration: Option<Duration>,
+    control: &HoldControl,
+) -> keyboard::ChordPost {
+    deliver_menu_with(
+        keyboard::chord_events(key, modifiers),
+        |event| keyboard::post_chord_event_no_auth(pid, event),
+        || control.is_cancelled(),
+        || control.wait(duration.unwrap_or_else(keyboard::key_gap)),
+    )
+}
+
+fn deliver_menu_with<E>(
+    built: anyhow::Result<(E, E)>,
+    mut post: impl FnMut(&E),
+    cancelled: impl FnOnce() -> bool,
+    wait: impl FnOnce() -> bool,
+) -> keyboard::ChordPost {
+    let (down, up) = match built {
+        Ok(events) => events,
+        Err(error) => return keyboard::ChordPost::NotPosted(error.to_string()),
+    };
+    if cancelled() {
+        return keyboard::ChordPost::NotPosted("key delivery cancelled".into());
+    }
+    post(&down);
+    let interrupted = wait();
+    post(&up);
+    if interrupted {
+        keyboard::ChordPost::Uncertain("key delivery cancelled after posting".into())
+    } else {
+        keyboard::ChordPost::Posted
+    }
 }
 
 pub(crate) fn deliver(
@@ -64,13 +101,13 @@ pub(crate) fn deliver(
     } else {
         None
     };
-    deliver_with(
+    deliver_with_pacing(
         key,
         modifiers,
         duration.unwrap_or_else(keyboard::key_gap),
+        matches!(route, KeyRoute::Global | KeyRoute::BareGlobal),
         |code, down, flags| match route {
             KeyRoute::Pid(pid) => keyboard::post_key(pid, code, down, flags),
-            KeyRoute::PidNoAuth(pid) => keyboard::post_key_no_auth(pid, code, down, flags),
             KeyRoute::Global => keyboard::post_global_key(
                 source.as_ref().expect("global source"),
                 code,
@@ -90,10 +127,23 @@ pub(crate) fn deliver(
     )
 }
 
+#[cfg(test)]
 pub(crate) fn deliver_with(
     key: &str,
     modifiers: &[&str],
     duration: Duration,
+    post: impl FnMut(u16, bool, CGEventFlags) -> anyhow::Result<()>,
+    cancelled: impl FnMut() -> bool,
+    wait: impl FnMut(Duration) -> bool,
+) -> anyhow::Result<()> {
+    deliver_with_pacing(key, modifiers, duration, false, post, cancelled, wait)
+}
+
+fn deliver_with_pacing(
+    key: &str,
+    modifiers: &[&str],
+    duration: Duration,
+    pace_modifiers: bool,
     mut post: impl FnMut(u16, bool, CGEventFlags) -> anyhow::Result<()>,
     mut cancelled: impl FnMut() -> bool,
     mut wait: impl FnMut(Duration) -> bool,
@@ -122,6 +172,9 @@ pub(crate) fn deliver_with(
             result = Err(error);
             break;
         }
+        if pace_modifiers && wait(keyboard::key_gap()) {
+            break;
+        }
     }
     if result.is_ok() && !cancelled() {
         base_attempted = true;
@@ -147,6 +200,9 @@ pub(crate) fn deliver_with(
                 result = Err(error);
             }
         }
+        if pace_modifiers {
+            wait(keyboard::key_gap());
+        }
     }
     if result.is_ok() && cancelled() {
         return Err(anyhow::anyhow!("key delivery cancelled"));
@@ -157,6 +213,58 @@ pub(crate) fn deliver_with(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn global_chord_paces_each_modifier_transition() {
+        let waits = std::cell::RefCell::new(Vec::new());
+        deliver_with_pacing(
+            "a",
+            &["cmd", "shift"],
+            Duration::from_millis(99),
+            true,
+            |_, _, _| Ok(()),
+            || false,
+            |duration| {
+                waits.borrow_mut().push(duration);
+                false
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            *waits.borrow(),
+            vec![
+                keyboard::key_gap(),
+                keyboard::key_gap(),
+                Duration::from_millis(99),
+                keyboard::key_gap(),
+                keyboard::key_gap()
+            ]
+        );
+    }
+
+    #[test]
+    fn menu_construction_failure_is_clean_and_interruption_releases() {
+        let events = std::cell::RefCell::new(Vec::new());
+        let failed = deliver_menu_with::<u8>(
+            Err(anyhow::anyhow!("build failed")),
+            |event| events.borrow_mut().push(*event),
+            || false,
+            || false,
+        );
+        assert_eq!(
+            failed,
+            keyboard::ChordPost::NotPosted("build failed".into())
+        );
+        assert!(events.borrow().is_empty());
+        let interrupted = deliver_menu_with(
+            Ok((1, 2)),
+            |event| events.borrow_mut().push(*event),
+            || false,
+            || true,
+        );
+        assert!(matches!(interrupted, keyboard::ChordPost::Uncertain(_)));
+        assert_eq!(*events.borrow(), vec![1, 2]);
+    }
 
     #[test]
     fn explicit_hold_is_passed_unclamped_to_the_waiter() {
@@ -198,5 +306,95 @@ mod tests {
         );
         assert!(result.is_err());
         assert_eq!(*events.borrow(), vec![(55, true), (55, false)]);
+    }
+    #[test]
+    fn physical_chord_posts_modifiers_and_releases_in_reverse_order() {
+        let events = std::cell::RefCell::new(Vec::new());
+        deliver_with(
+            "a",
+            &["cmd", "shift"],
+            std::time::Duration::ZERO,
+            |code, down, _| {
+                events.borrow_mut().push((code, down));
+                Ok(())
+            },
+            || false,
+            |_| false,
+        )
+        .unwrap();
+        assert_eq!(
+            *events.borrow(),
+            vec![
+                (55, true),
+                (56, true),
+                (0, true),
+                (0, false),
+                (56, false),
+                (55, false)
+            ]
+        );
+    }
+
+    #[test]
+    fn failed_base_key_down_releases_pressed_modifiers() {
+        let events = std::cell::RefCell::new(Vec::new());
+        let result = deliver_with(
+            "a",
+            &["cmd", "shift"],
+            std::time::Duration::ZERO,
+            |code, down, _| {
+                events.borrow_mut().push((code, down));
+                if code == 0 && down {
+                    anyhow::bail!("injected failure");
+                }
+                Ok(())
+            },
+            || false,
+            |_| false,
+        );
+        assert!(result.is_err());
+        assert_eq!(
+            *events.borrow(),
+            vec![
+                (55, true),
+                (56, true),
+                (0, true),
+                (0, false),
+                (56, false),
+                (55, false)
+            ]
+        );
+    }
+
+    #[test]
+    fn failed_base_key_up_still_releases_modifiers_in_reverse_order() {
+        let events = std::cell::RefCell::new(Vec::new());
+        let result = deliver_with(
+            "a",
+            &["cmd", "shift"],
+            std::time::Duration::ZERO,
+            |code, down, _| {
+                events.borrow_mut().push((code, down));
+                if code == 0 && !down {
+                    anyhow::bail!("injected failure");
+                }
+                Ok(())
+            },
+            || false,
+            |_| false,
+        );
+        assert!(result.is_err());
+        assert_eq!(
+            *events.borrow(),
+            vec![
+                (55, true),
+                (56, true),
+                (0, true),
+                (0, false),
+                (0, false),
+                (56, false),
+                (55, false)
+            ]
+        );
     }
 }

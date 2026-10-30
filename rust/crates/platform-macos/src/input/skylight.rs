@@ -280,7 +280,7 @@ trait KeyEnv {
         style: RecordStyle,
     ) -> Option<RecordPosts>;
     /// Wait at most `total` for the app's focus to settle on `target`.
-    fn await_focus(&self, pid: pid_t, target: u32, total: std::time::Duration);
+    fn await_focus(&self, pid: pid_t, target: u32, total: std::time::Duration, mode: FocusPollMode);
     /// This app did not show the window as key after the short record form,
     /// so entering and handing back use the full sequence at once.
     fn needs_full_records(&self, pid: pid_t) -> bool;
@@ -296,7 +296,6 @@ trait KeyEnv {
         focus: KeyFocus,
         confirmed_at: std::time::Instant,
     );
-    fn activate_believed_window(&self, pid: pid_t, wid: u32) -> bool;
 }
 
 struct LiveKeyEnv;
@@ -321,8 +320,14 @@ impl KeyEnv for LiveKeyEnv {
     ) -> Option<RecordPosts> {
         post_key_records(pid, current, target, style)
     }
-    fn await_focus(&self, pid: pid_t, target: u32, total: std::time::Duration) {
-        await_key_focus_within(pid, target, total);
+    fn await_focus(
+        &self,
+        pid: pid_t,
+        target: u32,
+        total: std::time::Duration,
+        mode: FocusPollMode,
+    ) {
+        await_key_focus_within(pid, target, total, mode);
     }
     fn needs_full_records(&self, pid: pid_t) -> bool {
         NEEDS_FULL_RECORDS
@@ -369,30 +374,38 @@ impl KeyEnv for LiveKeyEnv {
         focus: KeyFocus,
         confirmed_at: std::time::Instant,
     ) {
-        if focus.window != Some(wid)
-            || focus.element_window != Some(wid)
-            || crate::ax::enablement::process_start_stamp(ticket.pid) != Some(ticket.stamp)
-            || !super::key_belief_ax::is_proven_standard_window(ticket.pid, wid)
-        {
-            return;
-        }
-        let final_evidence = key_focus_of_pid(ticket.pid);
-        if final_evidence.window != Some(wid) || final_evidence.element_window != Some(wid) {
-            return;
-        }
-        // Visible frontmost state does not establish the app's synthetic
-        // activation state. Without a notification or a successful activation
-        // record, conservatively require activation on the next cache hit.
-        let _ = BELIEFS.publish(ticket, wid, false, confirmed_at, focus_generation());
+        publish_belief_with(
+            wid,
+            focus,
+            || crate::ax::enablement::process_start_stamp(ticket.pid) == Some(ticket.stamp),
+            || super::key_belief_ax::is_proven_standard_window(ticket.pid, wid),
+            || key_focus_of_pid(ticket.pid),
+            || {
+                let _ = BELIEFS.publish(ticket, wid, false, confirmed_at, focus_generation());
+            },
+        );
     }
-    fn activate_believed_window(&self, pid: pid_t, wid: u32) -> bool {
-        let activated = activate_without_raise_with(pid, wid, false);
-        if activated {
-            if let Some(stamp) = crate::ax::enablement::process_start_stamp(pid) {
-                BELIEFS.note_activation(pid, stamp, true);
-            }
-        }
-        activated
+}
+
+fn publish_belief_with(
+    wid: u32,
+    focus: KeyFocus,
+    process_matches: impl FnOnce() -> bool,
+    standard_window: impl FnOnce() -> bool,
+    final_focus: impl FnOnce() -> KeyFocus,
+    publish: impl FnOnce(),
+) {
+    if focus.window != Some(wid)
+        || focus.element_window != Some(wid)
+        || !process_matches()
+        || !standard_window()
+    {
+        return;
+    }
+    let final_evidence = final_focus();
+    if final_evidence.window == Some(wid) && final_evidence.element_window == Some(wid) {
+        // Visible frontmost state does not prove synthetic activation.
+        publish();
     }
 }
 
@@ -414,6 +427,7 @@ fn run_hand_back_with(
             pid,
             previous,
             KEY_RECORD_SETTLE + std::time::Duration::from_millis(200),
+            FocusPollMode::Full,
         );
         env.key_focus(pid).routes_to(previous)
     };
@@ -425,7 +439,7 @@ fn run_hand_back_with(
             if !env.needs_full_records(pid) {
                 let fast = env.post_records(pid, Some(target), previous, RecordStyle::Fast);
                 if fast.is_some_and(RecordPosts::complete) {
-                    env.await_focus(pid, previous, FAST_CONFIRM);
+                    env.await_focus(pid, previous, FAST_CONFIRM, FocusPollMode::Fast);
                     if env.key_focus(pid).routes_to(previous) {
                         return HandBack::Restored;
                     }
@@ -1022,17 +1036,29 @@ pub(crate) fn hand_key_back(pid: pid_t, current: Option<u32>, target: u32) -> bo
 /// Polled from the start: a read that still shows the old focus keeps the
 /// wait going, so no fixed settle is needed before the first read.
 fn await_key_focus(pid: pid_t, target: u32, budget: std::time::Duration) {
-    await_key_focus_within(pid, target, KEY_RECORD_SETTLE + budget);
+    await_key_focus_within(pid, target, KEY_RECORD_SETTLE + budget, FocusPollMode::Full);
+}
+
+#[derive(Clone, Copy)]
+enum FocusPollMode {
+    Fast,
+    Full,
 }
 
 /// [`await_key_focus`] with the whole wait given: at most `total`, polled in
 /// 2 ms steps for fast confirmation and 4 ms for the full sequence,
 /// returning as soon as the app's focus has settled on `target`.
-fn await_key_focus_within(pid: pid_t, target: u32, total: std::time::Duration) {
+fn await_key_focus_within(
+    pid: pid_t,
+    target: u32,
+    total: std::time::Duration,
+    mode: FocusPollMode,
+) {
     await_key_focus_with(
         total,
+        mode,
         || {
-            if total == FAST_CONFIRM {
+            if matches!(mode, FocusPollMode::Fast) {
                 crate::ax::bindings::focused_window_id_of_pid(pid) == Some(target)
             } else {
                 key_focus_of_pid(pid).settled_on(target)
@@ -1045,12 +1071,13 @@ fn await_key_focus_within(pid: pid_t, target: u32, total: std::time::Duration) {
 
 fn await_key_focus_with(
     total: std::time::Duration,
+    mode: FocusPollMode,
     mut settled: impl FnMut() -> bool,
     mut now: impl FnMut() -> std::time::Instant,
     mut sleep: impl FnMut(std::time::Duration),
 ) {
     let deadline = now() + total;
-    let step = if total == FAST_CONFIRM {
+    let step = if matches!(mode, FocusPollMode::Fast) {
         std::time::Duration::from_millis(2)
     } else {
         std::time::Duration::from_millis(4)
@@ -1163,22 +1190,10 @@ fn enter_scope_with(
     // The app being frontmost changes nothing here: it already owns key
     // focus, so a window that is key is used as it is and any other window
     // is made key with records addressed to this app only.
-    let mut initial_entry = KeyEntry::default();
+    let initial_entry = KeyEntry::default();
     if matches!(eligibility, FastPathEligibility::Eligible) {
         let cached = env.belief_match(pid, target_wid);
-        let usable = match cached {
-            BeliefMatch::FreshKeyAndActive => true,
-            BeliefMatch::FreshKeyInactive => {
-                if env.activate_believed_window(pid, target_wid) {
-                    initial_entry.records_posted = 1;
-                    true
-                } else {
-                    initial_entry.records_uncertain = true;
-                    false
-                }
-            }
-            BeliefMatch::Stale => false,
-        };
+        let usable = matches!(cached, BeliefMatch::FreshKeyAndActive);
         if usable {
             return Ok(WindowKeyScope {
                 pid,
@@ -1233,7 +1248,7 @@ fn enter_scope_with(
             if ok {
                 // The app is given FAST_CONFIRM, polled in 2 ms steps, to show
                 // the window as key.
-                env.await_focus(pid, target_wid, FAST_CONFIRM);
+                env.await_focus(pid, target_wid, FAST_CONFIRM, FocusPollMode::Fast);
             }
             ok
         },
@@ -1249,6 +1264,7 @@ fn enter_scope_with(
                     pid,
                     target_wid,
                     KEY_RECORD_SETTLE + std::time::Duration::from_millis(400),
+                    FocusPollMode::Full,
                 );
             }
             ok
@@ -1263,6 +1279,7 @@ fn enter_scope_with(
                     pid,
                     target_wid,
                     KEY_RECORD_SETTLE + std::time::Duration::from_millis(200),
+                    FocusPollMode::Full,
                 );
             }
             ok
@@ -1293,7 +1310,7 @@ fn enter_scope_with(
             });
         }
     };
-    if matches!(eligibility, FastPathEligibility::Eligible) {
+    if matches!(eligibility, FastPathEligibility::Eligible) && primed == KeyPrime::AlreadyKey {
         if let Some(ticket) = env.belief_ticket(pid) {
             let confirmed_at = env.belief_now();
             let confirmed = env.key_focus(pid);

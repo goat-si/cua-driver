@@ -21,7 +21,7 @@
 //! Source-installed local builds use the corresponding `cua-driver-local`
 //! namespace on every platform.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Mutex, OnceLock};
 
 pub use cua_driver_core::daemon::{
@@ -33,17 +33,28 @@ pub use cua_driver_core::daemon::{
 async fn call_until_disconnect<R, F, T>(
     lines: &mut tokio::io::Lines<tokio::io::BufReader<R>>,
     call: F,
-) -> Option<(T, Option<String>)>
+    signal_key_cancellation: bool,
+) -> (T, VecDeque<String>)
 where
     R: tokio::io::AsyncRead + Unpin,
     F: std::future::Future<Output = T>,
 {
+    let (disconnect, receiver) = tokio::sync::watch::channel(false);
+    let call = cua_driver_core::key_cancellation::scope(receiver, call);
     tokio::pin!(call);
-    tokio::select! {
-        result = &mut call => Some((result, None)),
+    let mut pending = VecDeque::new();
+    loop {
+        tokio::select! {
+        result = &mut call => return (result, pending),
         next = lines.next_line() => match next {
-            Ok(Some(line)) => Some((call.await, Some(line))),
-            Ok(None) | Err(_) => None,
+            Ok(Some(line)) => pending.push_back(line),
+            Ok(None) | Err(_) => {
+                if signal_key_cancellation {
+                    let _ = disconnect.send(true);
+                }
+                return (call.await, pending);
+            },
+        }
         }
     }
 }
@@ -55,7 +66,50 @@ mod call_disconnect_tests {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
     #[tokio::test]
-    async fn disconnect_drops_in_flight_call() {
+    async fn non_drop_safe_call_keeps_scope_until_completion_after_eof() {
+        let (mut client, server) = tokio::io::duplex(64);
+        let mut lines = BufReader::new(server).lines();
+        let (finish, finished) = tokio::sync::oneshot::channel::<()>();
+        let (released, mut release_seen) = tokio::sync::oneshot::channel();
+        struct Scope(Option<tokio::sync::oneshot::Sender<()>>);
+        impl Drop for Scope {
+            fn drop(&mut self) {
+                if let Some(sender) = self.0.take() {
+                    let _ = sender.send(());
+                }
+            }
+        }
+        let scope = Scope(Some(released));
+        let mut call = Box::pin(call_until_disconnect(
+            &mut lines,
+            async move {
+                let _scope = scope;
+                finished.await.unwrap();
+                42
+            },
+            false,
+        ));
+        assert!(
+            std::future::poll_fn(|cx| std::task::Poll::Ready(call.as_mut().poll(cx).is_pending()))
+                .await
+        );
+        client.shutdown().await.unwrap();
+        assert!(
+            std::future::poll_fn(|cx| std::task::Poll::Ready(call.as_mut().poll(cx).is_pending()))
+                .await,
+            "EOF must not drop a non-drop-safe call"
+        );
+        assert!(
+            release_seen.try_recv().is_err(),
+            "scope released before completion"
+        );
+        finish.send(()).unwrap();
+        assert_eq!(call.await, (42, VecDeque::new()));
+        assert!(release_seen.try_recv().is_ok());
+    }
+
+    #[tokio::test]
+    async fn disconnect_signals_physical_key_call() {
         struct Dropped(Option<tokio::sync::oneshot::Sender<()>>);
         impl Drop for Dropped {
             fn drop(&mut self) {
@@ -68,10 +122,15 @@ mod call_disconnect_tests {
         let mut lines = BufReader::new(server).lines();
         let (tx, mut rx) = tokio::sync::oneshot::channel();
         let guard = Dropped(Some(tx));
-        let mut call = Box::pin(call_until_disconnect(&mut lines, async move {
-            let _guard = guard;
-            std::future::pending::<()>().await
-        }));
+        let mut call = Box::pin(call_until_disconnect(
+            &mut lines,
+            async move {
+                let _guard = guard;
+                let mut disconnect = cua_driver_core::key_cancellation::subscribe().unwrap();
+                disconnect.changed().await.unwrap();
+            },
+            true,
+        ));
         assert!(
             std::future::poll_fn(|cx| std::task::Poll::Ready(call.as_mut().poll(cx).is_pending()))
                 .await
@@ -80,7 +139,7 @@ mod call_disconnect_tests {
         assert!(
             std::future::poll_fn(|cx| std::task::Poll::Ready(call.as_mut().poll(cx).is_ready()))
                 .await,
-            "connection EOF must end the call"
+            "connection EOF must signal the call"
         );
         drop(call);
         assert!(rx.try_recv().is_ok(), "in-flight call must be dropped");
@@ -90,9 +149,11 @@ mod call_disconnect_tests {
         let (mut client, server) = tokio::io::duplex(64);
         let mut lines = BufReader::new(server).lines();
         let (tx, rx) = tokio::sync::oneshot::channel();
-        let mut call = Box::pin(call_until_disconnect(&mut lines, async move {
-            rx.await.unwrap()
-        }));
+        let mut call = Box::pin(call_until_disconnect(
+            &mut lines,
+            async move { rx.await.unwrap() },
+            true,
+        ));
         assert!(
             std::future::poll_fn(|cx| std::task::Poll::Ready(call.as_mut().poll(cx).is_pending()))
                 .await
@@ -103,7 +164,35 @@ mod call_disconnect_tests {
                 .await
         );
         tx.send(42).unwrap();
-        assert_eq!(call.await, Some((42, Some("next request".to_owned()))));
+        assert_eq!(
+            call.await,
+            (42, VecDeque::from(["next request".to_owned()]))
+        );
+    }
+
+    #[tokio::test]
+    async fn eof_after_pipelined_requests_still_signals_key_delivery() {
+        let (mut client, server) = tokio::io::duplex(64);
+        let mut lines = BufReader::new(server).lines();
+        let mut call = Box::pin(call_until_disconnect(
+            &mut lines,
+            async {
+                let mut disconnect = cua_driver_core::key_cancellation::subscribe().unwrap();
+                disconnect.changed().await.unwrap();
+                42
+            },
+            true,
+        ));
+        assert!(
+            std::future::poll_fn(|cx| std::task::Poll::Ready(call.as_mut().poll(cx).is_pending()))
+                .await
+        );
+        client.write_all(b"first\nsecond\n").await.unwrap();
+        client.shutdown().await.unwrap();
+        assert_eq!(
+            call.await,
+            (42, VecDeque::from(["first".into(), "second".into()]))
+        );
     }
 
     #[tokio::test]
@@ -111,8 +200,8 @@ mod call_disconnect_tests {
         let (_client, server) = tokio::io::duplex(64);
         let mut lines = BufReader::new(server).lines();
         assert_eq!(
-            call_until_disconnect(&mut lines, async { 42 }).await,
-            Some((42, None))
+            call_until_disconnect(&mut lines, async { 42 }, true).await,
+            (42, VecDeque::new())
         );
     }
 }
@@ -1104,9 +1193,9 @@ pub async fn run_serve(
                     let mut control_session_id: Option<String> = None;
                     let mut trusted_session: Option<TrustedConnectionSession> = None;
 
-                    let mut pending_line = None;
+                    let mut pending_lines = VecDeque::new();
                     loop {
-                        let line = match pending_line.take() {
+                        let line = match pending_lines.pop_front() {
                             Some(line) => line,
                             None => match lines.next_line().await {
                                 Ok(Some(line)) => line,
@@ -1255,13 +1344,10 @@ pub async fn run_serve(
                             "call" => {
                                 let proxy_call = matches!(req.observation_origin, Some(ToolObservationOrigin::McpProxy));
                                 let resp = if proxy_call {
-                                    match call_until_disconnect(&mut lines, invoke_daemon_tool(&reg, req)).await {
-                                        Some((response, next)) => {
-                                            pending_line = next;
-                                            response
-                                        }
-                                        None => break,
-                                    }
+                                    let signal_key_cancellation = matches!(req.name.as_deref(), Some("press_key" | "hotkey"));
+                                    let (response, next) = call_until_disconnect(&mut lines, invoke_daemon_tool(&reg, req), signal_key_cancellation).await;
+                                    pending_lines.extend(next);
+                                    response
                                 } else {
                                     invoke_daemon_tool(&reg, req).await
                                 };
@@ -1936,9 +2022,9 @@ pub async fn run_serve(
                     let mut control_session_id: Option<String> = None;
                     let mut trusted_session: Option<TrustedConnectionSession> = None;
 
-                    let mut pending_line = None;
+                    let mut pending_lines = VecDeque::new();
                     loop {
-                        let line = match pending_line.take() {
+                        let line = match pending_lines.pop_front() {
                             Some(line) => line,
                             None => match lines.next_line().await {
                                 Ok(Some(line)) => line,
@@ -2067,13 +2153,10 @@ pub async fn run_serve(
                             "call" => {
                                 let proxy_call = matches!(req.observation_origin, Some(ToolObservationOrigin::McpProxy));
                                 let resp = if proxy_call {
-                                    match call_until_disconnect(&mut lines, invoke_daemon_tool(&reg, req)).await {
-                                        Some((response, next)) => {
-                                            pending_line = next;
-                                            response
-                                        }
-                                        None => break,
-                                    }
+                                    let signal_key_cancellation = matches!(req.name.as_deref(), Some("press_key" | "hotkey"));
+                                    let (response, next) = call_until_disconnect(&mut lines, invoke_daemon_tool(&reg, req), signal_key_cancellation).await;
+                                    pending_lines.extend(next);
+                                    response
                                 } else {
                                     invoke_daemon_tool(&reg, req).await
                                 };
