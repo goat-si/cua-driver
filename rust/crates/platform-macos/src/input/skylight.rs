@@ -275,24 +275,81 @@ fn hand_back_outcome(posts: Option<RecordPosts>, confirmed: impl FnOnce() -> boo
     }
 }
 
+/// The live reads and posts a key scope's entry and hand-back make. The live
+/// environment is [`LiveKeyEnv`]; tests drive the same code with a fake.
+trait KeyEnv {
+    /// Whether WindowServer reports `pid` (through `wid`) frontmost.
+    fn front(&self, pid: pid_t, wid: u32) -> Option<bool>;
+    fn key_focus(&self, pid: pid_t) -> KeyFocus;
+    fn window_order(&self, pid: pid_t) -> Vec<u32>;
+    fn post_records(
+        &self,
+        pid: pid_t,
+        current: Option<u32>,
+        target: u32,
+        proceed: &mut dyn FnMut() -> bool,
+    ) -> Option<RecordPosts>;
+    fn await_focus(&self, pid: pid_t, target: u32, budget: std::time::Duration);
+    fn set_focused_window(&self, pid: pid_t, wid: u32) -> bool;
+}
+
+struct LiveKeyEnv;
+
+impl KeyEnv for LiveKeyEnv {
+    fn front(&self, pid: pid_t, wid: u32) -> Option<bool> {
+        front_process_matches(pid, wid)
+    }
+    fn key_focus(&self, pid: pid_t) -> KeyFocus {
+        key_focus_of_pid(pid)
+    }
+    fn window_order(&self, pid: pid_t) -> Vec<u32> {
+        app_window_order(pid)
+    }
+    fn post_records(
+        &self,
+        pid: pid_t,
+        current: Option<u32>,
+        target: u32,
+        proceed: &mut dyn FnMut() -> bool,
+    ) -> Option<RecordPosts> {
+        post_key_records(pid, current, target, proceed)
+    }
+    fn await_focus(&self, pid: pid_t, target: u32, budget: std::time::Duration) {
+        await_key_focus(pid, target, budget);
+    }
+    fn set_focused_window(&self, pid: pid_t, wid: u32) -> bool {
+        set_app_focused_window(pid, wid)
+    }
+}
+
 /// Hand key inside `pid` back from `target` to `previous`, re-reading the
 /// front app before every record (and before an AXFocusedWindow write).
 fn run_hand_back(pid: pid_t, target: u32, primed: KeyPrime, previous: u32) -> HandBack {
-    let allowed = || hand_back_allowed(front_process_matches(pid, target));
+    run_hand_back_with(&LiveKeyEnv, pid, target, primed, previous)
+}
+
+fn run_hand_back_with(
+    env: &dyn KeyEnv,
+    pid: pid_t,
+    target: u32,
+    primed: KeyPrime,
+    previous: u32,
+) -> HandBack {
+    let allowed = || hand_back_allowed(env.front(pid, target));
     let confirmed = || {
-        await_key_focus(pid, previous, std::time::Duration::from_millis(200));
-        key_focus_of_pid(pid).routes_to(previous)
+        env.await_focus(pid, previous, std::time::Duration::from_millis(200));
+        env.key_focus(pid).routes_to(previous)
     };
     match primed {
         KeyPrime::AlreadyKey => HandBack::NotMoved,
         KeyPrime::KeyRecords => hand_back_outcome(
-            post_key_records(pid, Some(target), previous, allowed),
+            env.post_records(pid, Some(target), previous, &mut { allowed }),
             confirmed,
         ),
         KeyPrime::AxFocusedWindow => {
             if !allowed() {
                 HandBack::LeftForPerson
-            } else if set_app_focused_window(pid, previous) && confirmed() {
+            } else if env.set_focused_window(pid, previous) && confirmed() {
                 HandBack::Restored
             } else {
                 HandBack::NotConfirmed
@@ -905,6 +962,16 @@ fn enter_scope(
     target_wid: u32,
     inline: bool,
 ) -> Result<WindowKeyScope, ScopeEntryError> {
+    enter_scope_with(&LiveKeyEnv, LIVE_SCOPE_OPS, pid, target_wid, inline)
+}
+
+fn enter_scope_with(
+    env: &dyn KeyEnv,
+    ops: ScopeOps,
+    pid: pid_t,
+    target_wid: u32,
+    inline: bool,
+) -> Result<WindowKeyScope, ScopeEntryError> {
     // Wait for the previous scope's hand-back to finish; refuse (nothing
     // sent) when it does not.
     if !await_key_restores() {
@@ -917,24 +984,24 @@ fn enter_scope(
     // entering stops once it differs from what it was at the start (the
     // person switched apps). An inline scope also requires another app in
     // front from the start.
-    let entry_front = front_process_matches(pid, target_wid);
+    let entry_front = env.front(pid, target_wid);
     if inline && entry_front != Some(false) {
         return Err(untouched(format!(
             "window {target_wid}: its app is frontmost, or which app is frontmost could not be \
              read, so key focus inside it was not moved and no keys were sent"
         )));
     }
-    let front_unchanged = || front_process_matches(pid, target_wid) == entry_front;
+    let front_unchanged = || env.front(pid, target_wid) == entry_front;
     let entry = std::cell::Cell::new(KeyEntry::default());
-    let before = key_focus_of_pid(pid);
+    let before = env.key_focus(pid);
     let previous = before.window;
-    let order_before = app_window_order(pid);
+    let order_before = env.window_order(pid);
     let primed = match prime_exact_window_key(
         target_wid,
-        || key_focus_of_pid(pid),
+        || env.key_focus(pid),
         || {
             crate::window_change_detector::end_tail();
-            let posts = post_key_records(pid, previous, target_wid, front_unchanged);
+            let posts = env.post_records(pid, previous, target_wid, &mut { front_unchanged });
             let mut noted = entry.get();
             if let Some(posts) = posts {
                 noted.records_posted = noted.records_posted.saturating_add(posts.posted);
@@ -943,7 +1010,7 @@ fn enter_scope(
             entry.set(noted);
             let ok = posts.is_some_and(RecordPosts::complete);
             if ok {
-                await_key_focus(pid, target_wid, std::time::Duration::from_millis(400));
+                env.await_focus(pid, target_wid, std::time::Duration::from_millis(400));
             }
             ok
         },
@@ -954,9 +1021,9 @@ fn enter_scope(
             let mut noted = entry.get();
             noted.ax_write = true;
             entry.set(noted);
-            let ok = set_app_focused_window(pid, target_wid);
+            let ok = env.set_focused_window(pid, target_wid);
             if ok {
-                await_key_focus(pid, target_wid, std::time::Duration::from_millis(200));
+                env.await_focus(pid, target_wid, std::time::Duration::from_millis(200));
             }
             ok
         },
@@ -968,8 +1035,8 @@ fn enter_scope(
             // scope's hand-back uses, and say what happened.
             let noted = entry.get();
             let hand_back = entry_hand_back_kind(noted).map(|primed| {
-                match restore_target(target_wid, previous, &order_before, &app_window_order(pid)) {
-                    Some(previous) => run_hand_back(pid, target_wid, primed, previous),
+                match restore_target(target_wid, previous, &order_before, &env.window_order(pid)) {
+                    Some(previous) => run_hand_back_with(env, pid, target_wid, primed, previous),
                     None => HandBack::NoTarget,
                 }
             });
@@ -995,7 +1062,7 @@ fn enter_scope(
         entry: entry.get(),
         inline,
         done: false,
-        ops: LIVE_SCOPE_OPS,
+        ops,
     })
 }
 
