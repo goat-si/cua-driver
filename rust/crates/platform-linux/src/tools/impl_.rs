@@ -1353,6 +1353,8 @@ impl Tool for GetWindowStateTool {
                 == Some(true);
         let state = self.state.clone();
         let state_for_capture = state.clone();
+        let ticket = (should_capture && !observation_only)
+            .then(|| state.snapshots.begin_capture(pid as i32, xid));
         let query_for_walk = query.clone();
 
         let result = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
@@ -1389,6 +1391,7 @@ impl Tool for GetWindowStateTool {
             // binding must identify the bytes returned to the caller, including
             // any max-dimension resize, rather than the backend's raw frame.
             let mut screenshot_error = None;
+            let mut basis_result = None;
             // Same-pid popups (menus, combo lists) and transient dialogs mapped
             // over this window: listed for the caller, and when one overlaps
             // the window the screenshot is taken from the screen, since the
@@ -1407,8 +1410,11 @@ impl Tool for GetWindowStateTool {
                 } else {
                     None
                 };
+                let wayland = crate::wayland::is_wayland();
+                let eligible = !wayland && !overlays.covers_window;
+                let pre = eligible.then(|| crate::capture::read_live_frame(xid).ok()).flatten();
                 let captured = if let Some((png, width, height)) = preview {
-                    Ok((png, Some((width, height))))
+                    Ok((png, Some((width, height)), None))
                 } else if overlays.covers_window {
                     overlays
                         .window_rect
@@ -1417,12 +1423,17 @@ impl Tool for GetWindowStateTool {
                             crate::capture::screenshot_root_region_png(x, y, w, h)
                         })
                         .or_else(|_| crate::wayland::screenshot_dispatch_with_pid(xid, pid))
-                        .map(|png| (png, None))
+                        .map(|png| (png, None, None))
+                } else if wayland {
+                    crate::wayland::screenshot_dispatch_with_pid(xid, pid).map(|png| (png, None, None))
                 } else {
-                    crate::wayland::screenshot_dispatch_with_pid(xid, pid).map(|png| (png, None))
+                    crate::capture::screenshot_window_with_geometry(xid).map(|(png, geometry)| (png, None, geometry))
                 };
+                let post = eligible.then(|| crate::capture::read_live_frame(xid).ok()).flatten();
+                let captured_at_ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default().as_millis().min(u128::from(u64::MAX)) as u64;
                 match captured {
-                    Ok((raw, original_size)) => {
+                    Ok((raw, original_size, geometry)) => {
                         let (orig_w, orig_h) = match original_size {
                             Some(size) => size,
                             None => crate::capture::png_dimensions_pub(&raw)?,
@@ -1441,6 +1452,9 @@ impl Tool for GetWindowStateTool {
                             None => png,
                         };
                         let (w, h) = crate::capture::png_dimensions_pub(&png)?;
+                        basis_result = Some(cua_driver_core::basis_capture::build_capture_basis(
+                            xid, pid as i32, pre, post, geometry, (orig_w, orig_h), (w, h), captured_at_ms,
+                        ));
                         let original_w = if w < orig_w { Some(orig_w) } else { None };
                         let (b64, file_path) = if let Some(ref path) = screenshot_out_file {
                             std::fs::write(path, &png)?;
@@ -1493,12 +1507,26 @@ impl Tool for GetWindowStateTool {
                 screenshot_error,
                 overlays,
                 binds_window,
+                basis_result,
             ))
         })
         .await;
 
         match result {
-            Ok(Ok((tree_opt, shot_opt, bounds, screenshot_error, overlays, binds_window))) => {
+            Ok(Ok((
+                tree_opt,
+                shot_opt,
+                bounds,
+                screenshot_error,
+                overlays,
+                binds_window,
+                basis_result,
+            ))) => {
+                let candidate_basis = basis_result
+                    .as_ref()
+                    .and_then(|result| result.as_ref().ok().cloned());
+                let mut capture_published = false;
+                let mut stored_basis = None;
                 let mut content = Vec::new();
                 let mut structured = json!({ "window_id": xid, "pid": pid });
                 let screenshot_scale = shot_opt.as_ref().map(|(_, _, w, _, original_w, _)| {
@@ -1564,15 +1592,36 @@ impl Tool for GetWindowStateTool {
                     }
                     let (snapshot_id, replaced) = (!observation_only && target_scoped)
                         .then(|| {
-                            state.snapshots.publish_for_session(
-                                pid as i32,
-                                xid,
-                                crate::atspi::snapshot::update_snapshot(
-                                    pid, xid, &tr.nodes, &tr.bounds,
-                                ),
-                                session_id.as_deref(),
-                                screenshot_scale,
-                            )
+                            let payload = crate::atspi::snapshot::update_snapshot(
+                                pid, xid, &tr.nodes, &tr.bounds,
+                            );
+                            let publication = if let Some(ticket) = ticket {
+                                state.snapshots.publish_basis_for_session(
+                                    pid as i32,
+                                    xid,
+                                    payload,
+                                    session_id.as_deref(),
+                                    screenshot_scale,
+                                    candidate_basis.clone(),
+                                    ticket,
+                                )
+                            } else {
+                                state
+                                    .snapshots
+                                    .publish_for_session(
+                                        pid as i32,
+                                        xid,
+                                        payload,
+                                        session_id.as_deref(),
+                                        screenshot_scale,
+                                    )
+                                    .map(|(id, replaced)| (id, replaced, None))
+                            };
+                            publication.map(|(id, replaced, basis)| {
+                                capture_published = ticket.is_some();
+                                stored_basis = basis;
+                                (id, replaced)
+                            })
                         })
                         .flatten()
                         .unzip();
@@ -1722,22 +1771,37 @@ impl Tool for GetWindowStateTool {
                 if let (false, false, Some(scale)) =
                     (observation_only, published_snapshot, screenshot_scale)
                 {
-                    refreshed = state.snapshots.refresh_screenshot_for_session(
+                    let ticket = ticket.expect("screenshot ticket reserved");
+                    if let Some((id, basis)) = state.snapshots.refresh_basis_for_session(
                         pid as i32,
                         xid,
                         session_id.as_deref(),
                         scale,
                         None,
-                    );
+                        candidate_basis.clone(),
+                        ticket,
+                    ) {
+                        refreshed = Some(id);
+                        stored_basis = basis;
+                        capture_published = true;
+                    }
                     if refreshed.is_none() {
-                        if let Some((_, replaced)) = state.snapshots.publish_capture_for_session(
-                            pid as i32,
-                            xid,
-                            crate::atspi::snapshot::AtspiSnapshot::from_nodes(&[]),
-                            session_id.as_deref(),
-                            screenshot_scale,
-                        ) {
+                        if let Some((id, replaced, basis)) =
+                            state.snapshots.publish_capture_basis_for_session(
+                                pid as i32,
+                                xid,
+                                crate::atspi::snapshot::AtspiSnapshot::from_nodes(&[]),
+                                session_id.as_deref(),
+                                screenshot_scale,
+                                candidate_basis.clone(),
+                                ticket,
+                            )
+                        {
                             invalidated.extend(replaced);
+                            stored_basis = basis;
+                            capture_published = true;
+                            structured["snapshot_id"] =
+                                json!(cua_driver_core::element_token::format_snapshot_id(id));
                         }
                     }
                 }
@@ -1762,6 +1826,17 @@ impl Tool for GetWindowStateTool {
                     structured["invalidated_snapshot_ids"] = json!(ids);
                 }
 
+                if let Some(basis) = &stored_basis {
+                    structured["window_basis"] = basis.to_json();
+                } else if shot_opt.is_some() && !observation_only {
+                    if let Some(reason) = cua_driver_core::basis_capture::basis_unavailable_reason(
+                        basis_result.as_ref(),
+                        capture_published,
+                        false,
+                    ) {
+                        structured["basis_unavailable_reason"] = json!(reason);
+                    }
+                }
                 if let Some((b64_opt, file_path, w, h, orig_w, capture_id)) = shot_opt {
                     // ax mode + screenshot_out_file writes the PNG to disk and
                     // returns b64=None — never embed the image bytes in that case.

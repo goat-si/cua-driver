@@ -34,6 +34,72 @@ const MAX_CAPTURE_BYTES: usize = 1 << 30;
 /// after this backoff. Request/capture failures never use this path.
 const XSHM_INIT_RETRY_BACKOFF: Duration = Duration::from_secs(30);
 
+/// Read client-drawable geometry in physical root coordinates.
+pub fn read_live_frame(xid: u64) -> Result<cua_driver_core::window_basis::LiveFrame> {
+    use x11rb::protocol::xproto::ConnectionExt as _;
+    let window = xid_to_window(xid)?;
+    let (conn, _) = x11rb::connect(None)?;
+    let geom = conn.get_geometry(window)?.reply()?;
+    let origin = conn
+        .translate_coordinates(window, geom.root, 0, 0)?
+        .reply()?;
+    Ok(cua_driver_core::window_basis::LiveFrame {
+        x: i64::from(origin.dst_x),
+        y: i64::from(origin.dst_y),
+        width: u32::from(geom.width),
+        height: u32::from(geom.height),
+        display_scale: None,
+    })
+}
+
+/// Capture with provenance only when an exact client drawable supplied the pixels.
+pub fn screenshot_window_with_geometry(
+    xid: u64,
+) -> Result<(Vec<u8>, Option<cua_driver_core::window_basis::LiveFrame>)> {
+    use crate::basis_eligibility::{capture_eligibility, CaptureBackend, SessionKind};
+    let geometry = std::cell::Cell::new(None);
+    let bytes = capture_window_with_backends(
+        xid,
+        |id| {
+            let (png, frame) = capture_via_xshm_with_geometry(id)?;
+            geometry.set(
+                if !png.is_empty()
+                    && capture_eligibility(SessionKind::X11, CaptureBackend::XShm, frame.is_some())
+                        .is_ok()
+                {
+                    frame
+                } else {
+                    None
+                },
+            );
+            Ok(png)
+        },
+        |id| {
+            let (png, frame) = capture_via_xgetimage_with_geometry(id)?;
+            geometry.set(
+                if !png.is_empty()
+                    && capture_eligibility(
+                        SessionKind::X11,
+                        CaptureBackend::XGetImage,
+                        frame.is_some(),
+                    )
+                    .is_ok()
+                {
+                    frame
+                } else {
+                    None
+                },
+            );
+            Ok(png)
+        },
+        |id| {
+            geometry.set(None);
+            capture_via_import(id)
+        },
+    )?;
+    Ok((bytes, geometry.get()))
+}
+
 /// Capture a window by X11 XID. Returns raw PNG bytes.
 pub fn screenshot_window_bytes(xid: u64) -> Result<Vec<u8>> {
     capture_window_with_backends(
@@ -629,6 +695,18 @@ impl XShmSession {
             .map_err(|e| anyhow!("get_geometry reply: {e}"))?;
         let w = u32::from(geom.width);
         let h = u32::from(geom.height);
+        let origin = self
+            .conn
+            .translate_coordinates(window, geom.root, 0, 0)
+            .ok()
+            .and_then(|cookie| cookie.reply().ok());
+        let geometry = origin.map(|origin| cua_driver_core::window_basis::LiveFrame {
+            x: i64::from(origin.dst_x),
+            y: i64::from(origin.dst_y),
+            width: w,
+            height: h,
+            display_scale: None,
+        });
         let layout = self.pixels.packed_layout(w, h, geom.depth)?;
         let need = layout.len;
 
@@ -688,6 +766,7 @@ impl XShmSession {
             buf.map[..size].to_vec()
         };
         Ok(RawFrame {
+            geometry,
             data,
             w,
             h,
@@ -701,6 +780,7 @@ impl XShmSession {
 }
 
 struct RawFrame {
+    geometry: Option<cua_driver_core::window_basis::LiveFrame>,
     data: Vec<u8>,
     w: u32,
     h: u32,
@@ -713,13 +793,22 @@ fn xshm_state() -> &'static Mutex<XShmState> {
 }
 
 fn capture_via_xshm(xid: u64) -> Result<Vec<u8>> {
+    capture_via_xshm_with_geometry(xid).map(|(png, _)| png)
+}
+
+fn capture_via_xshm_with_geometry(
+    xid: u64,
+) -> Result<(Vec<u8>, Option<cua_driver_core::window_basis::LiveFrame>)> {
     let display = current_display();
     let mut guard = lock_mutex(xshm_state());
     let frame = capture_raw_via_xshm_state(&mut guard, &display, xid)?;
 
     // Release the session mutex before pixel conversion and PNG encode.
     drop(guard);
-    packed_zpixmap_to_png(&frame.data, frame.w, frame.h, frame.decoder)
+    Ok((
+        packed_zpixmap_to_png(&frame.data, frame.w, frame.h, frame.decoder)?,
+        frame.geometry,
+    ))
 }
 
 fn capture_raw_via_xshm_state(guard: &mut XShmState, display: &str, xid: u64) -> Result<RawFrame> {
@@ -818,6 +907,12 @@ fn xgetimage_state() -> &'static Mutex<Option<XGetImageSession>> {
 }
 
 fn capture_via_persistent_xgetimage(xid: u64) -> Result<Vec<u8>> {
+    capture_via_xgetimage_with_geometry(xid).map(|(png, _)| png)
+}
+
+fn capture_via_xgetimage_with_geometry(
+    xid: u64,
+) -> Result<(Vec<u8>, Option<cua_driver_core::window_basis::LiveFrame>)> {
     let display = current_display();
     let mut guard = lock_mutex(xgetimage_state());
 
@@ -848,7 +943,10 @@ fn capture_via_persistent_xgetimage(xid: u64) -> Result<Vec<u8>> {
     };
 
     drop(guard);
-    packed_zpixmap_to_png(&frame.data, frame.w, frame.h, frame.decoder)
+    Ok((
+        packed_zpixmap_to_png(&frame.data, frame.w, frame.h, frame.decoder)?,
+        frame.geometry,
+    ))
 }
 
 fn ensure_xgetimage_ready(guard: &mut Option<XGetImageSession>, display: &str) -> Result<()> {
@@ -886,6 +984,18 @@ impl XGetImageSession {
             .map_err(|e| anyhow!("get_geometry reply: {e}"))?;
         let w = u32::from(geom.width);
         let h = u32::from(geom.height);
+        let origin = self
+            .conn
+            .translate_coordinates(window, geom.root, 0, 0)
+            .ok()
+            .and_then(|cookie| cookie.reply().ok());
+        let geometry = origin.map(|origin| cua_driver_core::window_basis::LiveFrame {
+            x: i64::from(origin.dst_x),
+            y: i64::from(origin.dst_y),
+            width: w,
+            height: h,
+            display_scale: None,
+        });
         let layout = self.pixels.packed_layout(w, h, geom.depth)?;
         let need = layout.len;
 
@@ -918,6 +1028,7 @@ impl XGetImageSession {
         }
 
         Ok(RawFrame {
+            geometry,
             data: img.data,
             w,
             h,
