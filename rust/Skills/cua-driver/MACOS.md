@@ -847,6 +847,21 @@ There is no backgrounded path that reaches these apps today.
   AX-addressable elements (links, buttons, toolbar items), use
   `right_click({pid, element_token})` instead.
 
+### Submitting a search value
+
+`set_value` accepts `autosubmit:true` for a search field. After the value
+write, it posts Return to the field's process only if the user-interaction,
+exact-window and focused-element checks allow it. The default is false.
+Return delivery and the value's effect are reported separately: the
+structured `note` says whether Return was posted, refused, or uncertain;
+posting it does not verify that the search ran. If the target is not
+identifiable as a search field, the call refuses before writing anything,
+avoiding an unintended submission on another control. When the value write
+itself reports `suspected_noop` or `refused`, Return is not posted, so the
+field's previous text is never submitted. A minimized window
+may be restored for the value write and then fail the key gate after it is
+minimized again; in that case the note reports that Return was not posted.
+
 ### A value write the app does not apply (LibreOffice)
 
 Some apps accept an accessibility value write and ignore it. LibreOffice

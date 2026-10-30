@@ -24,6 +24,7 @@ mod right_click;
 mod scroll;
 mod select_text;
 mod set_value;
+mod set_value_autosubmit;
 mod set_window_frame;
 mod sheet_close;
 mod type_text;
