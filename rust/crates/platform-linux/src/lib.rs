@@ -20,6 +20,7 @@
 
 use cua_driver_core::tool::ToolRegistry;
 
+pub mod basis_eligibility;
 pub mod health_report;
 pub mod overlay;
 pub mod overlay_capture;
