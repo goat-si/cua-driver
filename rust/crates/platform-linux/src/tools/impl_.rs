@@ -1411,7 +1411,12 @@ impl Tool for GetWindowStateTool {
                     None
                 };
                 let wayland = crate::wayland::is_wayland();
-                let eligible = !wayland && !overlays.covers_window;
+                let session = crate::basis_eligibility::session_kind(
+                    wayland,
+                    std::env::var_os("WAYLAND_DISPLAY").is_some(),
+                    std::env::var("XDG_SESSION_TYPE").is_ok_and(|value| value.eq_ignore_ascii_case("wayland")),
+                );
+                let eligible = session == crate::basis_eligibility::SessionKind::X11 && !overlays.covers_window;
                 let pre = eligible.then(|| crate::capture::read_live_frame(xid).ok()).flatten();
                 let captured = if let Some((png, width, height)) = preview {
                     Ok((png, Some((width, height)), None))
@@ -1453,7 +1458,7 @@ impl Tool for GetWindowStateTool {
                         };
                         let (w, h) = crate::capture::png_dimensions_pub(&png)?;
                         basis_result = Some(cua_driver_core::basis_capture::build_capture_basis(
-                            xid, pid as i32, pre, post, geometry, (orig_w, orig_h), (w, h), captured_at_ms,
+                            xid, pid as i32, pre, post, if eligible { geometry } else { None }, (orig_w, orig_h), (w, h), captured_at_ms,
                         ));
                         let original_w = if w < orig_w { Some(orig_w) } else { None };
                         let (b64, file_path) = if let Some(ref path) = screenshot_out_file {

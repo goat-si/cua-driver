@@ -4,6 +4,19 @@ pub enum SessionKind {
     X11,
     Wayland,
 }
+/// Session identity is independent of whether the native backend was enabled.
+pub fn session_kind(
+    native_wayland: bool,
+    wayland_display: bool,
+    session_type_wayland: bool,
+) -> SessionKind {
+    if native_wayland || wayland_display || session_type_wayland {
+        SessionKind::Wayland
+    } else {
+        SessionKind::X11
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CaptureBackend {
     XShm,
