@@ -304,9 +304,10 @@ in the list as well as in the capability manifest:
 - Snapshots and screenshots prove the document before and after the read; if
   the tab navigated or left the scope meanwhile, nothing from that read is
   returned.
-- A bind with `origin_scope` lists tabs outside the scope as `{tab_id, active}`
-  only (no address or title) and omits `native_title` unless every tab is in
-  the scope.
+- A bind lists a tab with its address and title only when it is inside the
+  call's `origin_scope` (if given) and inside the capability manifest's origins
+  (if any); other tabs are `{tab_id, active}` only, and `native_title` is
+  omitted unless every tab qualifies.
 
 A browser attached with the person's **existing profile** requires
 `origin_scope` on every page-tool call (`browser_origin_scope_required`,
@@ -318,7 +319,9 @@ Under a capability manifest, a browser process that holds an origin-scoped
 attachment (an existing-profile browser, listed or attached, or a driver-owned
 isolated browser) is reachable only through these browser tools. Desktop tools
 aimed at any of its windows, and desktop-scope pointer or key input that would
-land on it, are refused with `browser_process_protected`; listing a window in
+land on it, are refused with `browser_process_protected`, and so is a
+whole-desktop observation such as an unfiltered `list_windows` (`list_apps`,
+which returns application names only, stays available); listing a window in
 `existing_profiles` grants no desktop access to it.
 
 The host may rewrite its capability manifest file while the driver runs
@@ -327,9 +330,8 @@ authorized against the new version without a restart, existing DevTools
 connections and sessions are kept, and existing-profile attachments for
 windows the new version no longer lists end at their next use. An invalid
 replacement keeps the previous version. `get_config` and `health_report`
-report the applied version as `capability_manifest_sha256`,
-`capability_manifest_file_sha256` (SHA-256 of the applied file's bytes) and
-`capability_manifest_reload_error`.
+report the applied version as `capability_manifest: {sha256, file_sha256,
+reload_error}`, where `file_sha256` is the SHA-256 of the applied file's bytes.
 
 ## 3. Snapshot the selected tab
 
