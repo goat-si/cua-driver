@@ -35,6 +35,17 @@ pub(crate) fn dispatch_check(
     basis.check(&frame?)
 }
 
+pub(crate) fn background_refusal(
+    mut result: cua_driver_core::protocol::ToolResult,
+) -> cua_driver_core::protocol::ToolResult {
+    if let Some(value) = result.structured_content.as_mut() {
+        value["effect"] = json!("refused");
+        value["nothing_sent"] = json!(true);
+        value["prepared_side_effects"] = json!([]);
+    }
+    result
+}
+
 pub(crate) fn result_json(result: &GuardedResult, snapshot_id: &str, point: (i64, i64)) -> Value {
     let (outcome, refusal) = match result {
         GuardedResult::Refused { outcome, refusal } => (outcome, Some(refusal)),
@@ -128,6 +139,14 @@ mod tests {
     }
     #[test]
     fn transport_and_result_contract() {
+        let unavailable = background_refusal(
+            cua_driver_core::protocol::ToolResult::error("unavailable")
+                .with_structured(json!({"code":"background_unavailable"})),
+        );
+        assert_eq!(
+            unavailable.structured_content.unwrap(),
+            json!({"code":"background_unavailable","effect":"refused","nothing_sent":true,"prepared_side_effects":[]})
+        );
         assert_eq!(transport(false, false, false), Transport::Background);
         assert_eq!(transport(false, false, true), Transport::Unavailable);
         assert_eq!(transport(false, true, true), Transport::Foreground);

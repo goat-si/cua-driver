@@ -3494,9 +3494,11 @@ async fn basis_click(state: &ToolState, tool: &str, args: &Value) -> Option<Tool
         unavailable,
     );
     if mode == Transport::Unavailable {
-        return Some(crate::input::delivery::background_unavailable_error(
-            hwnd,
-            crate::input::delivery::EventKind::MouseClick,
+        return Some(basis_click::background_refusal(
+            crate::input::delivery::background_unavailable_error(
+                hwnd,
+                crate::input::delivery::EventKind::MouseClick,
+            ),
         ));
     }
     let (count, button) = match tool {
