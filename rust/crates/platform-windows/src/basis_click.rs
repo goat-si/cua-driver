@@ -172,8 +172,18 @@ mod tests {
                 }
             );
             if effect == DispatchEffect::Refused {
+                assert_eq!(
+                    value,
+                    json!({"events_planned":2,"events_sent":0,"prepared_side_effects":[],"effect":"refused","cleanup_results":[],"nothing_sent":true,"path":"pixel_basis","basis_checked_at_dispatch":true,"snapshot_id":"s00000001.f1","screen_point":{"x":11,"y":22},"code":"stale_basis","reason":"window_moved"})
+                );
                 assert_eq!(value["nothing_sent"], true);
                 assert_eq!(value["code"], "stale_basis");
+            }
+            if effect == DispatchEffect::Unverifiable {
+                assert_eq!(
+                    value,
+                    json!({"events_planned":2,"events_sent":1,"prepared_side_effects":[],"effect":"unverifiable","cleanup_results":[],"path":"pixel_basis","basis_checked_at_dispatch":true,"snapshot_id":"s00000001.f1","screen_point":{"x":11,"y":22}})
+                );
             }
             if effect == DispatchEffect::Partial {
                 assert_eq!(value["code"], "partial_delivery");

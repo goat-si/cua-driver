@@ -378,3 +378,12 @@ fn old_ticket_refresh_after_a_newer_publication_changes_nothing() {
         Some(id)
     );
 }
+
+#[test]
+fn basis_refusal_reports_no_prepared_side_effects() {
+    let result = crate::window_basis::basis_refusal("stale_basis", "unknown_snapshot", None, None);
+    let value = result.structured_content.unwrap();
+    assert_eq!(value["effect"], "refused");
+    assert_eq!(value["nothing_sent"], true);
+    assert_eq!(value["prepared_side_effects"], serde_json::json!([]));
+}
