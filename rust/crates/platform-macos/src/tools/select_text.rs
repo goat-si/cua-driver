@@ -38,7 +38,7 @@ fn def() -> &'static ToolDef {
             "type": "object",
             "required": ["pid", "window_id", "element_token", "text"],
             "properties": {
-                "session": { "type": "string", "description": "Multi-call session label." },
+                "session": { "type": "string", "description": "For multi-call work, prefer a short public session label and repeat it on every call that accepts it." },
                 "pid": { "type": "integer", "description": "Target process ID. Required for exact-window authorization." },
                 "window_id": { "type": "integer", "description": "Target CGWindowID. Required for exact-window authorization." },
                 "element_token": cua_driver_core::tool_schema::element_token_schema(),

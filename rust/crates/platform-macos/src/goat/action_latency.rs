@@ -74,6 +74,8 @@ struct Metrics {
     detector_exit: &'static str,
     tail: &'static str,
     finished: bool,
+    key_belief: &'static str,
+    key_scope: &'static str,
 }
 
 struct Trace {
@@ -97,6 +99,8 @@ impl Trace {
                 detector_exit: "not_run",
                 tail: "none",
                 finished: false,
+                key_belief: "ineligible",
+                key_scope: "skipped",
             }),
         })
     }
@@ -111,7 +115,7 @@ impl Trace {
         let measured = interval_union(&mut metrics.primary_intervals, total);
         let d = &metrics.durations;
         format!(
-            "cua_goat_latency request_id={} tool={} outcome={} total_us={} ax_resolve_us={} snapshot_us={} protect_us={} focus_settle_us={} action_guarded_us={} action_blocking_us={} lease_drop_us={} detector_us={} detector_sleep_us={} detector_enumerations={} detector_enumeration_us={} detector_exit={} tail={} glide_us={} preflight_us={} key_prime_us={} ax_perform_us={} read_owner_us={} read_walk_us={} measured_us={} other_us={}",
+            "cua_goat_latency request_id={} tool={} outcome={} total_us={} ax_resolve_us={} snapshot_us={} protect_us={} focus_settle_us={} action_guarded_us={} action_blocking_us={} lease_drop_us={} detector_us={} detector_sleep_us={} detector_enumerations={} detector_enumeration_us={} detector_exit={} tail={} glide_us={} preflight_us={} key_prime_us={} ax_perform_us={} read_owner_us={} read_walk_us={} measured_us={} other_us={} key_belief={} scope={}",
             self.id, self.tool, outcome, total.as_micros(),
             d[Stage::AxResolve as usize].as_micros(),
             d[Stage::Snapshot as usize].as_micros(),
@@ -133,6 +137,7 @@ impl Trace {
             d[Stage::ReadWalk as usize].as_micros(),
             measured.as_micros(),
             total.as_micros() - measured.as_micros(),
+            metrics.key_belief, metrics.key_scope,
         )
     }
 }
@@ -154,6 +159,22 @@ fn current() -> Option<Arc<Trace>> {
         .try_with(Arc::clone)
         .ok()
         .or_else(|| BLOCKING.with(|slot| slot.borrow().clone()))
+}
+
+pub(crate) fn key_belief(eligible: bool, hit: bool) {
+    if let Some(trace) = current() {
+        let mut metrics = trace.metrics.lock().unwrap_or_else(|e| e.into_inner());
+        if !metrics.finished {
+            metrics.key_belief = if hit {
+                "hit"
+            } else if eligible {
+                "miss"
+            } else {
+                "ineligible"
+            };
+            metrics.key_scope = if hit { "skipped" } else { "entered" };
+        }
+    }
 }
 
 pub(crate) struct Span(Option<(Arc<Trace>, Stage, Instant)>);

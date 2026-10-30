@@ -84,6 +84,19 @@ pub(crate) fn quiet_since(
     quiet_samples(start, before, now, idle, history.posts.iter().copied())
 }
 
+/// Posts recorded at or after `since` (tests only).
+#[cfg(test)]
+pub(crate) fn recorded_since(since: Instant) -> usize {
+    HISTORY
+        .get_or_init(|| Mutex::new(History::default()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .posts
+        .iter()
+        .filter(|post| post.at >= since)
+        .count()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
