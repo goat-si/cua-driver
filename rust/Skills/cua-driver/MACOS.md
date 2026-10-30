@@ -1055,6 +1055,16 @@ above (`invoke_menu` with a path such as `["Go", "Downloads"]`).
 
 ### LibreOffice, Numbers and other editors in the background
 
+`press_key` and `hotkey` accept `duration_ms` from 0 through 30000 for the
+physical key-down hold. When omitted, the configured `CUA_DRIVER_KEY_GAP_MS`
+is used, or 8 ms by default. A semantic accessibility or menu action does not
+hold a key and reports `duration_applied: false` when a duration was given.
+Window-addressed keys may reuse a recent focus confirmation; the driver still
+checks the focused window and conflicting element immediately before posting.
+An unconfirmed result remains `unverifiable` unless a read-back establishes it.
+If an MCP key call is cancelled during a hold, key release is requested before
+focus hand-back; its cancellation receipt reports `key_release: pending`.
+
 With `window_id`, `type_text`, `press_key` and `hotkey` target that exact window: the driver makes it the app's key window through in-app key-window records (no raise, no activation, real pointer untouched), confirms focus, and hands key back. This also covers another window or dialog of the app holding focus, and a LibreOffice that was never activated. An already-key window needs no focus move; when another window of the app is key, the records move key to the exact window and hand it back afterwards. When the switch cannot be confirmed the call is refused with `window_not_key`. For a window-only native Command chord with a matching menu item, `press_key` and `hotkey` use their menu routes even when the app is frontmost; a `press_key` disabled-item key fallback reports `suspected_noop`. Recipe: pass `window_id` on every call; go to the cell with Name Box navigation (`type_text` `A1\n`), type with `\n` and `\t`, read the cell back; run commands (Paste Special, Format, Save) with `invoke_menu({pid, window_id, path})` rather than clicking the menu bar. A `background_unavailable` refusal here means use `get_window_state` and act by element, not stop.
 
 ### Preview: export before resizing

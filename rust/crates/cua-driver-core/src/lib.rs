@@ -103,6 +103,7 @@ pub mod health_report;
 pub mod history;
 pub mod image_utils;
 pub mod interactive_input;
+pub mod key_cancellation;
 pub mod key_pacing;
 pub mod launch_guard;
 pub mod mcp_result;
