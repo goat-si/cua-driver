@@ -637,7 +637,7 @@ impl DragTool {
         }
 
         if !fg {
-            super::click::restore_user_focus_after_background_pixel(
+            super::pixel_focus::restore_user_focus_after_background_pixel(
                 pid,
                 prior_front,
                 prior_key_wid,
