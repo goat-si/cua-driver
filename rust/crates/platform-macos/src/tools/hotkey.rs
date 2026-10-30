@@ -56,6 +56,7 @@ fn def() -> &'static ToolDef {
             "properties": {
                 "session": { "type": "string", "description": "For multi-call work, prefer a short public session label and repeat it on every call that accepts it. Omit it to use the authenticated transport's implicit lifecycle session." },
                 "pid": { "type": "integer", "description": "Target process ID. Required with x, y; optional with element_token (the token carries the pid)." },
+                "duration_ms": { "type": "integer", "minimum": 0, "maximum": 30000, "default": 8, "description": "Key-down hold in milliseconds; omitted uses the configured key gap." },
                 "keys": {
                     "type": "array",
                     "items": { "type": "string" },
@@ -211,6 +212,10 @@ impl Tool for HotkeyTool {
 
     async fn invoke(&self, args: Value) -> ToolResult {
         use cua_driver_core::tool_args::ArgsExt;
+        let duration = match super::key_delivery_guard::duration_from_args(&args) {
+            Ok(duration) => duration,
+            Err(refusal) => return refusal,
+        };
         if args.opt_str("scope").as_deref() == Some("desktop")
             && args.get("pid").is_none()
             && args.get("window_id").is_none()
@@ -234,11 +239,22 @@ impl Tool for HotkeyTool {
                 );
             };
             let display = raw_keys.join("+");
-            let result = latency::spawn_action_blocking(move || {
-                let modifier_refs: Vec<&str> = modifiers.iter().map(String::as_str).collect();
-                crate::input::keyboard::press_key_global(&key, &modifier_refs)
-            })
-            .await;
+            let control = Arc::new(crate::input::key_hold::HoldControl::default());
+            let result =
+                super::key_delivery_guard::run_owned((), (), control, move |control, _scope| {
+                    if control.is_cancelled() {
+                        anyhow::bail!("key delivery cancelled");
+                    }
+                    let modifier_refs: Vec<&str> = modifiers.iter().map(String::as_str).collect();
+                    crate::input::key_hold::deliver(
+                        crate::input::key_hold::KeyRoute::Global,
+                        &key,
+                        &modifier_refs,
+                        duration,
+                        &control,
+                    )
+                })
+                .await;
             return match result {
                 Ok(Ok(())) => ToolResult::text(format!("Pressed desktop hotkey {display}."))
                     .with_structured(serde_json::json!({
@@ -363,7 +379,10 @@ impl Tool for HotkeyTool {
                     // Background key events never reach a native app's menus, so a menu
                     // that cannot run in the background is refused without sending keys
                     // that would only look delivered.
-                    return menu_refusal_without_keys(menu_result);
+                    return super::key_delivery_guard::semantic_duration(
+                        menu_refusal_without_keys(menu_result),
+                        duration,
+                    );
                 }
             }
         }
@@ -428,7 +447,14 @@ impl Tool for HotkeyTool {
 
         // Key post: the addressed window must be the confirmed key window.
         if key_scope.is_none() {
-            match super::acquire_key_scope(pid, window_id, fg).await {
+            match super::acquire_key_scope_with_eligibility(
+                pid,
+                window_id,
+                fg,
+                element_ptr.is_none() && px.is_none() && py.is_none(),
+            )
+            .await
+            {
                 Ok(scope) => key_scope = scope,
                 Err(refusal) => return refusal,
             }
@@ -515,8 +541,6 @@ impl Tool for HotkeyTool {
             }
         };
 
-        let _hold_key_scope = &key_scope;
-
         // A focus click already moved the cursor. Otherwise place a named
         // session's cursor on the element, its remembered position, or the
         // window centre, so a keyboard-first session stays visible.
@@ -550,14 +574,27 @@ impl Tool for HotkeyTool {
         let prior_front = apps::frontmost_pid();
         let snapshot = WindowChangeDetector::snapshot(prior_front);
 
+        let control = Arc::new(crate::input::key_hold::HoldControl::default());
         let result = focus_guard::with_focus_suppressed(
             Some(pid),
             prior_front,
             "hotkey.CGEvent",
             || async move {
-                latency::spawn_action_blocking(move || {
+                super::key_delivery_guard::run_owned(_mutation_lease, key_scope, control, move |control, key_scope| {
+                    if control.is_cancelled() { anyhow::bail!("key delivery cancelled"); }
                     let element_ptr = element_guard.as_ref().map(|guard| guard.as_ptr());
                     let m: Vec<&str> = modifiers.iter().map(String::as_str).collect();
+                    if !fg && element_ptr.is_none() {
+                        if let Some(wid) = window_id {
+                            let sample = super::key_delivery_guard::final_window_sample(pid, wid, key_scope)?;
+                            super::press_key::verify_untargeted_key_with(pid, wid, true, || sample, |sample| match sample {
+                                Some(window) => crate::ax::exact_target::check_window_focus_conflict_with_sample(pid, wid, None, window),
+                                None => crate::ax::exact_target::check_window_focus_conflict(pid, wid, None),
+                            })?;
+                        }
+                    } else if !fg && coordinate_focus {
+                        super::press_key::verify_raw_key_target(pid, window_id, element_ptr, true)?;
+                    }
                     match (fg, coordinate_focus, window_id, element_ptr) {
                         // Chrome's native omnibox and Chromium/Electron inputs
                         // require a genuine foreground HID chord. Keep the exact
@@ -568,10 +605,11 @@ impl Tool for HotkeyTool {
                                 pid as libc::pid_t,
                                 wid,
                                 || {
+                                    super::press_key::verify_raw_key_target(pid, Some(wid), element_ptr, true)?;
                                     if screen_sharing_target {
-                                        crate::input::keyboard::press_key_bare_global(&key, &m)
+                                        crate::input::key_hold::deliver(crate::input::key_hold::KeyRoute::BareGlobal, &key, &m, duration, &control)
                                     } else {
-                                        crate::input::keyboard::press_key_global(&key, &m)
+                                        crate::input::key_hold::deliver(crate::input::key_hold::KeyRoute::Global, &key, &m, duration, &control)
                                     }
                                 },
                             )?;
@@ -587,7 +625,8 @@ impl Tool for HotkeyTool {
                                 wid,
                                 || {
                                     focus_hotkey_element(pid, ptr)?;
-                                    crate::input::keyboard::press_key_bare_global(&key, &m)
+                                    super::press_key::verify_raw_key_target(pid, Some(wid), Some(ptr), true)?;
+                                    crate::input::key_hold::deliver(crate::input::key_hold::KeyRoute::BareGlobal, &key, &m, duration, &control)
                                 },
                             )?;
                             Ok(())
@@ -596,7 +635,10 @@ impl Tool for HotkeyTool {
                             crate::input::skylight::with_foreground_hid_activation(
                                 pid as libc::pid_t,
                                 wid,
-                                || crate::input::keyboard::press_key_bare_global(&key, &m),
+                                || {
+                                    super::press_key::verify_raw_key_target(pid, Some(wid), None, true)?;
+                                    crate::input::key_hold::deliver(crate::input::key_hold::KeyRoute::BareGlobal, &key, &m, duration, &control)
+                                },
                             )?;
                             Ok(())
                         }
@@ -604,15 +646,15 @@ impl Tool for HotkeyTool {
                         // raise — even when window_id was supplied for targeting.
                         (false, false, _, Some(ptr)) => {
                             focus_hotkey_element(pid, ptr)?;
-                            crate::input::keyboard::hotkey(pid, &key, &m)
+                            super::press_key::verify_raw_key_target(pid, window_id, Some(ptr), true)?;
+                            crate::input::key_hold::deliver(crate::input::key_hold::KeyRoute::Pid(pid), &key, &m, duration, &control)
                         }
-                        _ => crate::input::keyboard::hotkey(pid, &key, &m),
+                        _ => crate::input::key_hold::deliver(crate::input::key_hold::KeyRoute::Pid(pid), &key, &m, duration, &control),
                     }
                 })
                 .await
             },
-        )
-        .await;
+        ).await;
 
         let changes = super::finish_window_observation(snapshot).await;
 
@@ -629,6 +671,9 @@ impl Tool for HotkeyTool {
                     changes.result_suffix()
                 ))
                 .with_structured(delivered_structured(fg))
+            }
+            Ok(Err(e)) if e.is::<super::press_key::WindowFocusConflictError>() => {
+                super::press_key::delivery_failed(e)
             }
             Ok(Err(e)) => ToolResult::error(format!("hotkey failed: {e}")),
             Err(e) => ToolResult::error(format!("Task error: {e}")),
@@ -674,6 +719,56 @@ fn delivered_structured(foreground: bool) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn duration_schema_accepts_only_bounded_integer_holds() {
+        let duration = &def().input_schema["properties"]["duration_ms"];
+        assert_eq!(duration["type"], "integer");
+        assert_eq!(duration["minimum"], 0);
+        assert_eq!(duration["maximum"], 30_000);
+    }
+
+    #[tokio::test]
+    async fn invalid_duration_is_refused_before_target_resolution() {
+        let tool = HotkeyTool::new(Arc::new(ToolState::new(false, false, None)));
+        let mut receipts = Vec::new();
+        for duration in [
+            serde_json::json!(-1),
+            serde_json::json!(30001),
+            serde_json::json!(1.5),
+        ] {
+            let result = tool
+                .invoke(serde_json::json!({
+                    "keys": ["cmd", "a"], "element_token": "s7fffffff:0", "duration_ms": duration
+                }))
+                .await;
+            let structured = result.structured_content.expect("structured refusal");
+            receipts.push(structured);
+        }
+        assert!(
+            receipts.iter().all(|r| r["code"] == "invalid_arguments"
+                && r["effect"] == "refused"
+                && r["dispatched"] == false),
+            "{receipts:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn valid_duration_bounds_reach_target_resolution_without_dispatch() {
+        let tool = HotkeyTool::new(Arc::new(ToolState::new(false, false, None)));
+        for duration in [0, 30_000] {
+            let result = tool
+                .invoke(serde_json::json!({
+                    "keys": ["cmd", "a"], "element_token": "s7fffffff:0", "duration_ms": duration
+                }))
+                .await;
+            let structured = result.structured_content.expect("structured refusal");
+            assert_eq!(
+                structured["refusal"]["code"], "stale_element_token",
+                "{duration}: {structured}"
+            );
+        }
+    }
 
     /// A refusal after menu validation posted Cmd+F20 keeps saying so.
     #[test]

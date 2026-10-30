@@ -28,7 +28,7 @@ fn def() -> &'static ToolDef {
             "type": "object",
             "required": ["operation"],
             "properties": {
-                "session": { "type": "string", "description": "Optional multi-call session label. Open handles are valid only within this session episode and are invalidated by end or revival." },
+                "session": { "type": "string", "description": "For multi-call work, prefer a short public session label and repeat it on every call that accepts it. Open handles are valid only within this session episode and are invalidated by end or revival." },
                 "operation": { "type": "string", "enum": ["system", "list", "open", "click", "close"], "description": "system discovers SystemUIServer pid; list enumerates one host; open opens a status item; click presses an enabled menu item; close cancels only the opener-owned menu." },
                 "pid": { "type": "integer", "description": "Exact host process. Required except operation=system." },
                 "owner_pid": { "type": "integer", "description": "Optional independently evidenced status-item owner filter." },

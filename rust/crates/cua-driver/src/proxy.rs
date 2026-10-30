@@ -210,7 +210,7 @@ impl Drop for ToolCallTelemetry {
 
 fn cancelled_response(pending: &PendingRequest) -> Response {
     if let Some(tool) = pending.tool_name.as_deref() {
-        let result = cua_driver_core::protocol::ToolResult::error(format!(
+        let mut result = cua_driver_core::protocol::ToolResult::error(format!(
             "{tool} was cancelled; its effect is unknown. Inspect target state before another action."
         ))
         .with_structured(serde_json::json!({
@@ -218,6 +218,11 @@ fn cancelled_response(pending: &PendingRequest) -> Response {
             "effect": "unknown",
             "tool": tool,
         }));
+        if matches!(tool, "press_key" | "hotkey") {
+            if let Some(serde_json::Value::Object(fields)) = result.structured_content.as_mut() {
+                fields.insert("key_release".into(), serde_json::json!("pending"));
+            }
+        }
         return Response::ok(
             pending.id.clone(),
             serde_json::to_value(result).unwrap_or(serde_json::Value::Null),
@@ -1513,6 +1518,8 @@ mod tests {
         drop(client_write);
         run.await.unwrap().unwrap();
     }
+
+    include!("proxy_key_cancel_tests.rs");
 
     #[tokio::test]
     async fn duplicate_pending_request_id_does_not_replace_original() {

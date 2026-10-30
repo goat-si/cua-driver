@@ -452,7 +452,7 @@ const DEFAULT_KEY_GAP: std::time::Duration = std::time::Duration::from_millis(8)
 /// Key down→up gap and inter-key pacing: `DEFAULT_KEY_GAP`, or the
 /// host's `CUA_DRIVER_KEY_GAP_MS` clamped by `cua_driver_core::key_pacing`.
 /// Read once: pacing is a launch-time knob, not a per-call one.
-fn key_gap() -> std::time::Duration {
+pub(super) fn key_gap() -> std::time::Duration {
     static GAP: std::sync::OnceLock<std::time::Duration> = std::sync::OnceLock::new();
     *GAP.get_or_init(|| cua_driver_core::key_pacing::key_gap_from_env(DEFAULT_KEY_GAP))
 }
@@ -737,7 +737,7 @@ pub(super) fn with_global_modifier_keys<T>(
     result
 }
 
-fn post_global_key(
+pub(super) fn post_global_key(
     source: &CGEventSource,
     key_code: u16,
     key_down: bool,
@@ -769,7 +769,7 @@ fn release_global_modifiers(
     }
 }
 
-fn modifier_key_code_and_flag(modifier: &str) -> Option<(u16, CGEventFlags)> {
+pub(super) fn modifier_key_code_and_flag(modifier: &str) -> Option<(u16, CGEventFlags)> {
     match modifier.to_lowercase().as_str() {
         "cmd" | "command" | "super" | "meta" | "win" => {
             Some((55, CGEventFlags::CGEventFlagCommand))
@@ -1097,7 +1097,7 @@ fn bare_chord_transitions(
     transitions
 }
 
-fn create_bare_keyboard_event(key_code: u16, key_down: bool) -> anyhow::Result<CGEvent> {
+pub(super) fn create_bare_keyboard_event(key_code: u16, key_down: bool) -> anyhow::Result<CGEvent> {
     unsafe {
         let event_ref = CGEventCreateKeyboardEvent(std::ptr::null_mut(), key_code, key_down);
         if event_ref.is_null() {
@@ -1245,7 +1245,12 @@ pub(super) fn post_keyboard_event(pid: i32, event: &CGEvent) {
     }
 }
 
-fn post_key(pid: i32, key_code: u16, key_down: bool, flags: CGEventFlags) -> anyhow::Result<()> {
+pub(super) fn post_key(
+    pid: i32,
+    key_code: u16,
+    key_down: bool,
+    flags: CGEventFlags,
+) -> anyhow::Result<()> {
     let source = CGEventSource::new(CGEventSourceStateID::HIDSystemState)
         .map_err(|_| anyhow::anyhow!("CGEventSource::new failed"))?;
     let event = CGEvent::new_keyboard_event(source, key_code, key_down)
@@ -1259,7 +1264,7 @@ fn post_key(pid: i32, key_code: u16, key_down: bool, flags: CGEventFlags) -> any
     Ok(())
 }
 
-fn post_key_no_auth(
+pub(super) fn post_key_no_auth(
     pid: i32,
     key_code: u16,
     key_down: bool,
@@ -1290,6 +1295,8 @@ pub enum ChordPost {
     NotPosted(String),
     /// The key-down and the key-up were both posted.
     Posted,
+    /// A transition may have been sent before delivery or cleanup failed.
+    Uncertain(String),
 }
 
 /// Press and release `key` with `modifiers` for `pid` on the no-auth
@@ -1651,6 +1658,97 @@ fn unknown_key_message(key: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn physical_chord_posts_modifiers_and_releases_in_reverse_order() {
+        let events = std::cell::RefCell::new(Vec::new());
+        super::super::key_hold::deliver_with(
+            "a",
+            &["cmd", "shift"],
+            std::time::Duration::ZERO,
+            |code, down, _| {
+                events.borrow_mut().push((code, down));
+                Ok(())
+            },
+            || false,
+            |_| false,
+        )
+        .unwrap();
+        assert_eq!(
+            *events.borrow(),
+            vec![
+                (55, true),
+                (56, true),
+                (0, true),
+                (0, false),
+                (56, false),
+                (55, false)
+            ]
+        );
+    }
+
+    #[test]
+    fn failed_base_key_down_releases_pressed_modifiers() {
+        let events = std::cell::RefCell::new(Vec::new());
+        let result = super::super::key_hold::deliver_with(
+            "a",
+            &["cmd", "shift"],
+            std::time::Duration::ZERO,
+            |code, down, _| {
+                events.borrow_mut().push((code, down));
+                if code == 0 && down {
+                    anyhow::bail!("injected failure");
+                }
+                Ok(())
+            },
+            || false,
+            |_| false,
+        );
+        assert!(result.is_err());
+        assert_eq!(
+            *events.borrow(),
+            vec![
+                (55, true),
+                (56, true),
+                (0, true),
+                (0, false),
+                (56, false),
+                (55, false)
+            ]
+        );
+    }
+
+    #[test]
+    fn failed_base_key_up_still_releases_modifiers_in_reverse_order() {
+        let events = std::cell::RefCell::new(Vec::new());
+        let result = super::super::key_hold::deliver_with(
+            "a",
+            &["cmd", "shift"],
+            std::time::Duration::ZERO,
+            |code, down, _| {
+                events.borrow_mut().push((code, down));
+                if code == 0 && !down {
+                    anyhow::bail!("injected failure");
+                }
+                Ok(())
+            },
+            || false,
+            |_| false,
+        );
+        assert!(result.is_err());
+        assert_eq!(
+            *events.borrow(),
+            vec![
+                (55, true),
+                (56, true),
+                (0, true),
+                (0, false),
+                (0, false),
+                (56, false),
+                (55, false)
+            ]
+        );
+    }
 
     #[test]
     fn a_chord_that_cannot_be_built_posts_nothing() {

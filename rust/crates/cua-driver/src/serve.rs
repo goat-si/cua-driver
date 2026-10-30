@@ -29,6 +29,94 @@ pub use cua_driver_core::daemon::{
     ToolObservationOrigin,
 };
 
+// Await a call while retaining the next request for ordered processing.
+async fn call_until_disconnect<R, F, T>(
+    lines: &mut tokio::io::Lines<tokio::io::BufReader<R>>,
+    call: F,
+) -> Option<(T, Option<String>)>
+where
+    R: tokio::io::AsyncRead + Unpin,
+    F: std::future::Future<Output = T>,
+{
+    tokio::pin!(call);
+    tokio::select! {
+        result = &mut call => Some((result, None)),
+        next = lines.next_line() => match next {
+            Ok(Some(line)) => Some((call.await, Some(line))),
+            Ok(None) | Err(_) => None,
+        }
+    }
+}
+
+#[cfg(test)]
+mod call_disconnect_tests {
+    use super::*;
+    use std::future::Future;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+    #[tokio::test]
+    async fn disconnect_drops_in_flight_call() {
+        struct Dropped(Option<tokio::sync::oneshot::Sender<()>>);
+        impl Drop for Dropped {
+            fn drop(&mut self) {
+                if let Some(tx) = self.0.take() {
+                    let _ = tx.send(());
+                }
+            }
+        }
+        let (mut client, server) = tokio::io::duplex(64);
+        let mut lines = BufReader::new(server).lines();
+        let (tx, mut rx) = tokio::sync::oneshot::channel();
+        let guard = Dropped(Some(tx));
+        let mut call = Box::pin(call_until_disconnect(&mut lines, async move {
+            let _guard = guard;
+            std::future::pending::<()>().await
+        }));
+        assert!(
+            std::future::poll_fn(|cx| std::task::Poll::Ready(call.as_mut().poll(cx).is_pending()))
+                .await
+        );
+        client.shutdown().await.unwrap();
+        assert!(
+            std::future::poll_fn(|cx| std::task::Poll::Ready(call.as_mut().poll(cx).is_ready()))
+                .await,
+            "connection EOF must end the call"
+        );
+        drop(call);
+        assert!(rx.try_recv().is_ok(), "in-flight call must be dropped");
+    }
+    #[tokio::test]
+    async fn pipelined_request_is_retained_until_the_call_finishes() {
+        let (mut client, server) = tokio::io::duplex(64);
+        let mut lines = BufReader::new(server).lines();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let mut call = Box::pin(call_until_disconnect(&mut lines, async move {
+            rx.await.unwrap()
+        }));
+        assert!(
+            std::future::poll_fn(|cx| std::task::Poll::Ready(call.as_mut().poll(cx).is_pending()))
+                .await
+        );
+        client.write_all(b"next request\n").await.unwrap();
+        assert!(
+            std::future::poll_fn(|cx| std::task::Poll::Ready(call.as_mut().poll(cx).is_pending()))
+                .await
+        );
+        tx.send(42).unwrap();
+        assert_eq!(call.await, Some((42, Some("next request".to_owned()))));
+    }
+
+    #[tokio::test]
+    async fn completed_call_returns_without_waiting_for_more_input() {
+        let (_client, server) = tokio::io::duplex(64);
+        let mut lines = BufReader::new(server).lines();
+        assert_eq!(
+            call_until_disconnect(&mut lines, async { 42 }).await,
+            Some((42, None))
+        );
+    }
+}
+
 static ACTIVE_PROXY_SESSIONS: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
 
 #[derive(Clone, Debug)]
@@ -1016,7 +1104,15 @@ pub async fn run_serve(
                     let mut control_session_id: Option<String> = None;
                     let mut trusted_session: Option<TrustedConnectionSession> = None;
 
-                    while let Ok(Some(line)) = lines.next_line().await {
+                    let mut pending_line = None;
+                    loop {
+                        let line = match pending_line.take() {
+                            Some(line) => line,
+                            None => match lines.next_line().await {
+                                Ok(Some(line)) => line,
+                                Ok(None) | Err(_) => break,
+                            },
+                        };
                         let req: DaemonRequest = match serde_json::from_str(&line) {
                             Ok(r) => r,
                             Err(e) => {
@@ -1157,7 +1253,18 @@ pub async fn run_serve(
                                 ).await;
                             }
                             "call" => {
-                                let resp = invoke_daemon_tool(&reg, req).await;
+                                let proxy_call = matches!(req.observation_origin, Some(ToolObservationOrigin::McpProxy));
+                                let resp = if proxy_call {
+                                    match call_until_disconnect(&mut lines, invoke_daemon_tool(&reg, req)).await {
+                                        Some((response, next)) => {
+                                            pending_line = next;
+                                            response
+                                        }
+                                        None => break,
+                                    }
+                                } else {
+                                    invoke_daemon_tool(&reg, req).await
+                                };
                                 let _ = writer.write_all(
                                     (serde_json::to_string(&resp).unwrap() + "\n").as_bytes()
                                 ).await;
@@ -1829,7 +1936,15 @@ pub async fn run_serve(
                     let mut control_session_id: Option<String> = None;
                     let mut trusted_session: Option<TrustedConnectionSession> = None;
 
-                    while let Ok(Some(line)) = lines.next_line().await {
+                    let mut pending_line = None;
+                    loop {
+                        let line = match pending_line.take() {
+                            Some(line) => line,
+                            None => match lines.next_line().await {
+                                Ok(Some(line)) => line,
+                                Ok(None) | Err(_) => break,
+                            },
+                        };
                         let req: DaemonRequest = match serde_json::from_str(&line) {
                             Ok(r) => r,
                             Err(e) => {
@@ -1950,7 +2065,18 @@ pub async fn run_serve(
                                 ).await;
                             }
                             "call" => {
-                                let resp = invoke_daemon_tool(&reg, req).await;
+                                let proxy_call = matches!(req.observation_origin, Some(ToolObservationOrigin::McpProxy));
+                                let resp = if proxy_call {
+                                    match call_until_disconnect(&mut lines, invoke_daemon_tool(&reg, req)).await {
+                                        Some((response, next)) => {
+                                            pending_line = next;
+                                            response
+                                        }
+                                        None => break,
+                                    }
+                                } else {
+                                    invoke_daemon_tool(&reg, req).await
+                                };
                                 let _ = writer.write_all(
                                     (serde_json::to_string(&resp).unwrap() + "\n").as_bytes()
                                 ).await;

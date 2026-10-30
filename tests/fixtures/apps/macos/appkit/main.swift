@@ -832,7 +832,14 @@ final class BringToFrontMatrixWindows {
         secondary.title = kSecondaryWindowTitle
         secondary.isReleasedWhenClosed = false
         secondary.isRestorable = false
-        secondary.contentView = NSTextField(labelWithString: "bring_to_front secondary ordinary window")
+        if mode == "key-oracle" {
+            let input = NSTextField(string: "")
+            input.setAccessibilityIdentifier("secondary-key-input")
+            secondary.contentView = input
+            secondary.initialFirstResponder = input
+        } else {
+            secondary.contentView = NSTextField(labelWithString: "bring_to_front secondary ordinary window")
+        }
         secondary.orderFront(nil)
 
         if mode == "sheet" {
@@ -854,6 +861,36 @@ final class BringToFrontMatrixWindows {
             candidate.orderFront(nil)
             floating = candidate
         }
+    }
+}
+
+/// Opt-in event journal for exact-window key delivery measurements.
+/// The caller creates the file before launch, and each line records one event
+/// accepted by this fixture's AppKit event loop.
+func installKeyOracle() -> Any? {
+    guard let path = ProcessInfo.processInfo.environment["CUA_APPKIT_KEY_ORACLE"] else {
+        return nil
+    }
+    let url = URL(fileURLWithPath: path)
+    return NSEvent.addLocalMonitorForEvents(matching: [.keyDown, .keyUp, .flagsChanged]) { event in
+        let row: [String: Any] = [
+            "kind": event.type == .keyDown ? "down" : event.type == .keyUp ? "up" : "flags",
+            "window_id": event.windowNumber,
+            "key_window_id": NSApp.keyWindow?.windowNumber ?? 0,
+            "key_code": event.keyCode,
+            "timestamp": event.timestamp,
+        ]
+        do {
+            var data = try JSONSerialization.data(withJSONObject: row, options: [.sortedKeys])
+            data.append(0x0a)
+            let file = try FileHandle(forWritingTo: url)
+            defer { try? file.close() }
+            try file.seekToEnd()
+            try file.write(contentsOf: data)
+        } catch {
+            fputs("key oracle journal failed: \(error)\n", stderr)
+        }
+        return event
     }
 }
 
@@ -998,7 +1035,11 @@ struct CuaAppKitHarness {
         var matrixWindows: BringToFrontMatrixWindows?
         if let mode = ProcessInfo.processInfo.environment["CUA_HARNESS_BRING_TO_FRONT_MODE"] {
             matrixWindows = BringToFrontMatrixWindows(parent: controller.window, mode: mode)
+            if mode == "key-oracle" {
+                controller.window.makeFirstResponder(controller.textInput)
+            }
         }
+        let keyOracle = installKeyOracle()
         app.activate(ignoringOtherApps: true)
         writeBringToFrontWindowReport(main: controller.window, matrix: matrixWindows)
         if let delay = ProcessInfo.processInfo.environment["CUA_APPKIT_LAUNCH_DELAY_MS"]
@@ -1010,6 +1051,7 @@ struct CuaAppKitHarness {
             Thread.sleep(forTimeInterval: delay / 1000)
         }
         app.run()
+        if let keyOracle { NSEvent.removeMonitor(keyOracle) }
         _ = matrixWindows
     }
 }
