@@ -48,7 +48,6 @@ mod keycodes;
 // pass that lives in this commit).
 pub mod lparam;
 
-#[cfg(test)]
 mod basis_decision;
 #[cfg(test)]
 mod basis_decision_tests;
@@ -129,6 +128,7 @@ pub mod input;
 #[cfg(not(target_os = "windows"))]
 pub mod input {
     pub mod delivery;
+    pub mod guarded_dispatch;
 }
 
 #[cfg(any(target_os = "windows", test))]
