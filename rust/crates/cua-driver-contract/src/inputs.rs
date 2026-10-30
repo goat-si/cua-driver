@@ -820,9 +820,6 @@ pub struct ClickInput {
     pub button: Option<ClickButton>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub count: Option<u32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    /// Send a single pointer click at the element center instead of its AX action (macOS).
-    pub simulate: Option<bool>,
 }
 
 impl ClickInput {
@@ -860,9 +857,6 @@ struct ClickWireInput {
     #[serde(default)]
     #[schemars(schema_with = "click_count_schema")]
     count: Option<u32>,
-    /// Send a single pointer click at the element center instead of its AX action (macOS).
-    #[serde(default, deserialize_with = "present_click_field")]
-    simulate: Option<bool>,
 }
 
 fn present_click_field<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
@@ -891,7 +885,6 @@ impl TryFrom<ClickWireInput> for ClickInput {
             session: wire.session,
             button: wire.button,
             count: wire.count,
-            simulate: wire.simulate,
         };
         input.validate()?;
         Ok(input)
@@ -910,12 +903,6 @@ impl JsonSchema for ClickInput {
 impl ToolInput for ClickInput {
     const TOOL_NAME: &'static str = "click";
     fn validate(&self) -> Result<(), String> {
-        if self.simulate.is_some() && !matches!(self.position, ClickPosition::Element { .. }) {
-            return Err("click.simulate requires element_token".into());
-        }
-        if self.simulate == Some(true) && self.count.is_some_and(|count| count != 1) {
-            return Err("click.simulate requires count 1".into());
-        }
         match &self.position {
             ClickPosition::Coordinates { x, y } if !x.is_finite() || !y.is_finite() => {
                 return Err("click coordinates must be finite".into())
@@ -1163,34 +1150,6 @@ mod tests {
 
     use super::*;
 
-    #[test]
-    fn b4_review_simulate_requires_element_and_one_click() {
-        let base = json!({"target":{"kind":"window","pid":7,"window_id":9},"delivery_mode":"background","simulate":true});
-        let mut coordinates = base.clone();
-        coordinates["x"] = json!(1);
-        coordinates["y"] = json!(2);
-        assert!(serde_json::from_value::<ClickInput>(coordinates.clone()).is_err());
-        coordinates["simulate"] = json!(false);
-        assert!(serde_json::from_value::<ClickInput>(coordinates).is_err());
-        let mut multiple = base;
-        multiple["element_token"] = json!("s00000001:0");
-        multiple["count"] = json!(2);
-        assert!(serde_json::from_value::<ClickInput>(multiple).is_err());
-    }
-
-    #[test]
-    fn typed_element_click_accepts_simulate_boolean() {
-        let wire = json!({"target":{"kind":"window","pid":7,"window_id":9},"delivery_mode":"background","element_token":"s00000001:0","simulate":true});
-        let input: ClickInput =
-            serde_json::from_value(wire.clone()).expect("simulate must be accepted");
-        assert_eq!(serde_json::to_value(input).unwrap(), wire);
-        for invalid in [json!(null), json!("true"), json!(1)] {
-            let mut args = wire.clone();
-            args["simulate"] = invalid;
-            assert!(serde_json::from_value::<ClickInput>(args).is_err());
-        }
-    }
-
     /// Found by the tool-call boundary fuzzer: the published schema and every
     /// platform runtime require at least two keys, but the contract parser
     /// accepted any count, so `{"keys": []}` passed typed validation.
@@ -1272,7 +1231,6 @@ mod tests {
             session: None,
             button: None,
             count: None,
-            simulate: None,
         };
         assert!(input.validate().is_ok());
         input.position = ClickPosition::Coordinates {
