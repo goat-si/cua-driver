@@ -751,9 +751,9 @@ async fn an_element_multi_click_needs_a_plain_left_press() {
 fn the_count_schema_matches_the_element_behavior() {
     let tool = super::super::click::ClickTool::new(Arc::new(ToolState::new(false, false, None)));
     let count = &tool.def().input_schema["properties"]["count"];
-    assert_eq!(count["minimum"], 1);
-    assert_eq!(count["maximum"], 3);
+    assert_eq!(count["type"], "integer");
     let description = count["description"].as_str().unwrap();
+    assert!(description.contains("1-3"), "{description}");
     assert!(!description.contains("pixel path only"), "{description}");
     assert!(description.contains("element_token"), "{description}");
     assert!(description.contains("AXOpen"), "{description}");

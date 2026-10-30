@@ -966,10 +966,11 @@ fn def() -> &'static ToolDef {
                     "enum": ["left", "right", "middle"],
                     "description": "Mouse button. Default left."
                 },
+                // The 1-3 range is enforced before dispatch (element_pointer::
+                // click_count) and stated in the description; bounds in the
+                // schema would narrow the protocol GOAT's pinned release speaks.
                 "count":         {
                     "type": "integer",
-                    "minimum": 1,
-                    "maximum": 3,
                     "description": "Left clicks in one gesture, 1-3. Default 1. With element_token, count 2 sends AXOpen when the element lists it (no mouse clicks; works wherever AX actions work); otherwise, and for count 3, it hands that many left clicks (clickCount 1..N) to the element's center. On the pointer route the point is checked to be on the element in its window (the window must be on screen) before the window is activated; if that check fails with nothing sent yet, the call is refused. The window is then made active (without raising it in the background, where an activation that cannot be confirmed still goes on and is reported as uncertain; fronted in the foreground) and the point is checked again, and once more right before the first click, after the pointer move. A foreground count 2 whose AXOpen provably did nothing falls back to this pointer route after the window was fronted, so its first point check already counts as a later one. A failure after activation, or of the activation itself, sends no click on the element but returns an unverifiable result whose activation field (and events_sent, code element_changed_before_click for the last check) says what had already gone out. Needs action press, the left button and no modifier. Nothing reads back what the clicks opened."
                 },
                 "modifier": {
