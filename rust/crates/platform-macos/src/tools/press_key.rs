@@ -347,7 +347,7 @@ fn late_cell_refusal(
     Ok(())
 }
 
-fn verify_raw_key_target(
+pub(super) fn verify_raw_key_target(
     pid: i32,
     window_id: Option<u32>,
     pre_focus_ptr: Option<usize>,

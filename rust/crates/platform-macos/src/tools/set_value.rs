@@ -72,7 +72,8 @@ fn def() -> &'static ToolDef {
                 "value": {
                     "type": "string",
                     "description": "New value, coerced to the element's type."
-                }
+                },
+                "autosubmit": { "type": "boolean", "description": "For a search field, post Return after setting the value. Default false; submission is not verified." }
             },
             "additionalProperties": false
         }),
@@ -91,6 +92,10 @@ impl Tool for SetValueTool {
 
     async fn invoke(&self, args: Value) -> ToolResult {
         use cua_driver_core::tool_args::ArgsExt;
+        let autosubmit = match super::set_value_autosubmit::enabled(&args) {
+            Ok(value) => value,
+            Err(reason) => return super::invalid_arguments(reason),
+        };
         let pid = match super::target_pid(&self.state, &args) {
             Ok(v) => v,
             Err(e) => return e,
@@ -170,6 +175,9 @@ impl Tool for SetValueTool {
                 return file_name_needs_rename(pid, window_id, reason)
             }
             Some(NameTarget::FinderItem(path)) => {
+                if autosubmit {
+                    return super::set_value_autosubmit::non_search_refusal();
+                }
                 let new_name = value.clone();
                 let rename_path = path.clone();
                 let renamed = latency::spawn_action_blocking(move || {
@@ -196,6 +204,25 @@ impl Tool for SetValueTool {
             return address_field_refusal(pid, window_id);
         }
 
+        if autosubmit {
+            let guard = element_guard.clone();
+            let search = latency::spawn_action_blocking(move || unsafe {
+                let element = guard.as_ptr() as AXUIElementRef;
+                let role = copy_string_attr(element, "AXRole");
+                let subrole = copy_string_attr(element, "AXSubrole");
+                super::set_value_autosubmit::search_field(role.as_deref(), subrole.as_deref())
+            })
+            .await;
+            match search {
+                Ok(true) => {}
+                Ok(false) => return super::set_value_autosubmit::non_search_refusal(),
+                Err(error) => return super::pre_dispatch_refusal(
+                    "autosubmit_target_unreadable",
+                    format!("Could not classify the autosubmit target ({error}); no value or key was sent."),
+                ),
+            }
+        }
+
         // A text field in a minimized window: restore the window for the
         // write (its key priming and focus need a visible window), then
         // minimize it again, all under this lease.
@@ -212,6 +239,11 @@ impl Tool for SetValueTool {
         .await
         .unwrap_or(false);
         if restore_needed {
+            // Return would go to a window minimized again right after the
+            // write; refuse before anything is written.
+            if autosubmit {
+                return super::set_value_autosubmit::minimized_refusal(window_id);
+            }
             return minimized_set_value(
                 _mutation_lease,
                 element_guard,
@@ -277,6 +309,7 @@ impl Tool for SetValueTool {
         let prior_front = apps::frontmost_pid();
         let snapshot = WindowChangeDetector::snapshot(prior_front);
 
+        let post_guard = element_guard.clone();
         let result = focus_guard::with_focus_suppressed(
             Some(pid),
             prior_front,
@@ -298,13 +331,32 @@ impl Tool for SetValueTool {
 
         let changes = snapshot.detect_async().await;
 
-        set_value_tool_result(
+        // Read before the result is built: on web content an unchanged
+        // read-back is reported as unverifiable, not as not applied.
+        let write_not_applied = matches!(&result, Ok(Ok(outcome)) if outcome.not_applied);
+        let result = set_value_tool_result(
             result.map_err(|error| error.to_string()),
             ax_echo_surface,
             changes.result_suffix(),
             pid,
             element_index,
+        );
+        super::set_value_autosubmit::finish(
+            autosubmit,
+            pid,
+            result,
+            write_not_applied,
+            |_, key| async move {
+                super::set_value_autosubmit::post_return(
+                    _mutation_lease,
+                    window_id,
+                    post_guard,
+                    key,
+                )
+                .await
+            },
         )
+        .await
     }
 }
 
@@ -1848,6 +1900,24 @@ mod tests {
     };
 
     #[test]
+    fn autosubmit_schema_matches_shared_contract() {
+        let schema = &super::def().input_schema;
+        assert_eq!(schema["properties"]["autosubmit"]["type"], "boolean");
+        assert!(
+            cua_driver_core::tool_schema::shared_schema_violations("set_value", schema).is_empty()
+        );
+        if let Some(contract) = cua_driver_contract::tool_contract("set_value") {
+            assert!(
+                cua_driver_contract::compatibility::schema_subset_violations(
+                    &contract.input_schema,
+                    schema
+                )
+                .is_empty()
+            );
+        }
+    }
+
+    #[test]
     fn only_safaris_address_field_is_an_address_field() {
         let id = Some("WEB_BROWSER_ADDRESS_AND_SEARCH_FIELD");
         assert!(is_safari_address_field(Some("com.apple.Safari"), id));
@@ -2113,6 +2183,43 @@ mod tests {
         assert_eq!(outcome.verified, Some(false));
         assert_eq!(outcome.changed, None);
         assert!(outcome.detail.contains("not trusted for web content"));
+    }
+
+    /// On web content an unchanged read-back is reported as unverifiable, so
+    /// autosubmit must use the outcome itself: Return would submit the old text.
+    #[tokio::test]
+    async fn autosubmit_skips_return_after_a_web_write_that_did_not_apply() {
+        let write_not_applied = true;
+        let result = super::set_value_tool_result(
+            Ok(Ok(SetValueOutcome {
+                detail: "✅ Set value.".to_owned(),
+                verified: Some(false),
+                changed: Some(false),
+                not_applied: write_not_applied,
+                document_edited: None,
+            })),
+            true,
+            String::new(),
+            42,
+            3,
+        );
+        assert_eq!(
+            result.structured_content.as_ref().unwrap()["effect"],
+            "unverifiable"
+        );
+        let result = super::super::set_value_autosubmit::finish(
+            true,
+            42,
+            result,
+            write_not_applied,
+            |_, _| async { panic!("Return after a write that did not apply") },
+        )
+        .await;
+        let note = result.structured_content.unwrap()["note"].clone();
+        assert!(
+            note.as_str().unwrap().contains("Return was not posted"),
+            "{note}"
+        );
     }
 
     #[test]
