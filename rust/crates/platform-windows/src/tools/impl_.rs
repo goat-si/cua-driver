@@ -3493,6 +3493,14 @@ async fn basis_click(state: &ToolState, tool: &str, args: &Value) -> Option<Tool
         !modifiers.is_empty(),
         unavailable,
     );
+    let background_only = cua_driver_core::batch_scope::current().is_some_and(|scope| {
+        scope.delivery() == cua_driver_core::batch_scope::ScopeDelivery::Background
+    });
+    if !basis_click::transport_allowed(&mode, background_only) {
+        return Some(ToolResult::error("This batch allows background delivery only.").with_structured(json!({
+            "code": "foreground_not_allowed", "effect": "refused", "nothing_sent": true, "prepared_side_effects": []
+        })));
+    }
     if mode == Transport::Unavailable {
         return Some(basis_click::background_refusal(
             crate::input::delivery::background_unavailable_error(

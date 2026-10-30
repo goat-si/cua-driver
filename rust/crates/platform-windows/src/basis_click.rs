@@ -19,6 +19,10 @@ pub(crate) fn transport(foreground: bool, modifiers: bool, posted_unavailable: b
     }
 }
 
+pub(crate) fn transport_allowed(mode: &Transport, background_only: bool) -> bool {
+    !background_only || *mode != Transport::Foreground
+}
+
 pub(crate) fn early_point(
     basis: &WindowBasis,
     frame: Result<LiveFrame, BasisRefusal>,
@@ -147,6 +151,9 @@ mod tests {
             unavailable.structured_content.unwrap(),
             json!({"code":"background_unavailable","effect":"refused","nothing_sent":true,"prepared_side_effects":[]})
         );
+        assert!(!transport_allowed(&Transport::Foreground, true));
+        assert!(transport_allowed(&Transport::Background, true));
+        assert!(transport_allowed(&Transport::Foreground, false));
         assert_eq!(transport(false, false, false), Transport::Background);
         assert_eq!(transport(false, false, true), Transport::Unavailable);
         assert_eq!(transport(false, true, true), Transport::Foreground);

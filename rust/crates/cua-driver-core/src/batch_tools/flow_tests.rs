@@ -137,6 +137,7 @@ impl Tool for Fake {
                     "tree_markdown": markdown,
                 }))
             }
+            "click" if args.get("snapshot_id").is_some() => ToolResult::text("click done"),
             "click" | "set_value" => {
                 let token = args["element_token"].as_str().unwrap_or_default();
                 let label = ui
@@ -186,6 +187,7 @@ impl Harness {
                         "properties": {
                             "pid": {"type": "integer"},
                             "window_id": {"type": "integer"},
+                            "snapshot_id": {"type": "string"},
                             "element_token": {"type": "string"},
                             "value": {"type": "string"},
                             "key": {"type": "string"},
@@ -660,4 +662,18 @@ async fn a_substring_match_or_an_observe_with_the_lookup_budget_uses_the_full_re
         lookups.iter().all(|read| read["full_output"] == true),
         "the observation's own view is never read by a lookup: {reads:?}"
     );
+}
+
+#[tokio::test]
+async fn app_named_basis_clicks_leave_window_routing_to_the_snapshot() {
+    for tool in ["click", "double_click", "right_click"] {
+        let harness = Harness::new();
+        let result = harness.run(json!({"app":"Demo", "steps":[{"tool":tool,"args":{"snapshot_id":"s00000009.f3","x":1,"y":2}}]})).await;
+        assert_ne!(result.is_error, Some(true), "{result:?}");
+        let calls = harness.calls(tool);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0]["pid"], 42);
+        assert_eq!(calls[0]["snapshot_id"], "s00000009.f3");
+        assert!(calls[0].get("window_id").is_none(), "{:?}", calls[0]);
+    }
 }
