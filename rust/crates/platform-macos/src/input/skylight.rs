@@ -106,11 +106,18 @@ impl KeyFocus {
 pub fn prime_exact_window_key(
     target: u32,
     mut focus: impl FnMut() -> KeyFocus,
+    mut fast_records: impl FnMut() -> bool,
     mut key_records: impl FnMut() -> bool,
     mut ax_focus: impl FnMut() -> bool,
 ) -> Result<KeyPrime, String> {
     if focus().settled_on(target) {
         return Ok(KeyPrime::AlreadyKey);
+    }
+    // The short record form first: most apps take it, and it is confirmed
+    // by the same focus read as the full sequence below, which still runs
+    // when it does not show the window as key.
+    if fast_records() && focus().routes_to(target) {
+        return Ok(KeyPrime::KeyRecords);
     }
     // The records go out at most twice: WindowServer delivers them
     // asynchronously, and the second pass catches an app that was still
@@ -133,13 +140,15 @@ pub fn prime_exact_window_key(
     ))
 }
 
-/// Holds an exact window as the app's key window; hands key back on drop
-/// (with the same in-app records, so the app is never activated or raised).
+/// Holds an exact window as the app's key window; hands key back when it is
+/// dropped or [`finish`](WindowKeyScope::finish)ed (with the same in-app
+/// records, so the app is never activated or raised).
 ///
-/// A scope made with [`enter_exact_window_key_inline`] hands key back on the
-/// thread that drops (or [`finish`](WindowKeyScope::finish)es) it, so the
-/// caller's next local (a re-minimize, the mutation lease) is released only
-/// after the hand-back finished, also while unwinding from a panic.
+/// The hand-back runs on its own thread and nothing waits for it: the call
+/// that held the scope returns first, also while unwinding from a panic, and
+/// a hand-back that fails is only logged. The next scope's entry waits for a
+/// running hand-back ([`await_key_restores`]) so two never interleave their
+/// records.
 pub struct WindowKeyScope {
     pid: pid_t,
     target: u32,
@@ -149,8 +158,6 @@ pub struct WindowKeyScope {
     primed: KeyPrime,
     /// What entering did inside the app, whatever confirmed key at the end.
     entry: KeyEntry,
-    /// Hand key back on the dropping thread instead of a restore thread.
-    inline: bool,
     /// The hand-back already ran through `finish`.
     done: bool,
     /// The live reads and posts the hand-back uses (fakes in tests).
@@ -193,11 +200,9 @@ pub enum HandBack {
     NotMoved,
     /// The previous window reads back as the app's key window.
     Restored,
-    /// Nothing was posted: the app became frontmost (the person is using it)
-    /// or WindowServer could not say which app is.
-    LeftForPerson,
-    /// Stopped part-way for the same reason.
-    Partial,
+    /// The hand-back was started on its own thread and nothing waited for it:
+    /// the call returned first, and a hand-back that fails is only logged.
+    Deferred,
     /// No window of the app is left to hand key back to.
     NoTarget,
     /// Posted, but the previous window does not read back as key.
@@ -210,13 +215,9 @@ impl HandBack {
         match self {
             HandBack::NotMoved => "Key focus inside the app was not moved.",
             HandBack::Restored => "Key focus went back to the app's previous window.",
-            HandBack::LeftForPerson => {
-                "Key focus was left on the target window because the app is now frontmost or \
-                 which app is frontmost could not be read; nothing was posted to hand it back."
-            }
-            HandBack::Partial => {
-                "The key hand-back stopped part-way because the app became frontmost or which \
-                 app is frontmost could not be read; key may remain on the target window."
+            HandBack::Deferred => {
+                "Key focus is being handed back to the app's previous window in the background; \
+                 its outcome is not waited for."
             }
             HandBack::NoTarget => "No other window of the app was left to hand key focus back to.",
             HandBack::NotConfirmed => {
@@ -225,13 +226,6 @@ impl HandBack {
             }
         }
     }
-}
-
-/// A hand-back may post into the app only while WindowServer reports another
-/// app frontmost. `Some(true)` is the person working in the app now;
-/// `None` cannot rule that out.
-pub(crate) fn hand_back_allowed(front_is_target_app: Option<bool>) -> bool {
-    front_is_target_app == Some(false)
 }
 
 /// What a scope did to the app's key focus, for a receipt that otherwise
@@ -265,34 +259,119 @@ pub fn scope_disclosure(entry: KeyEntry, hand_back: Option<HandBack>) -> String 
 /// records could not be addressed (no SPI, no PSN): nothing was posted.
 fn hand_back_outcome(posts: Option<RecordPosts>, confirmed: impl FnOnce() -> bool) -> HandBack {
     match posts {
-        None => HandBack::NotConfirmed,
-        Some(posts) if posts.stopped && posts.posted == 0 && posts.failed == 0 => {
-            HandBack::LeftForPerson
-        }
-        Some(posts) if posts.stopped => HandBack::Partial,
         Some(_) if confirmed() => HandBack::Restored,
-        Some(_) => HandBack::NotConfirmed,
+        Some(_) | None => HandBack::NotConfirmed,
     }
 }
 
-/// Hand key inside `pid` back from `target` to `previous`, re-reading the
-/// front app before every record (and before an AXFocusedWindow write).
+/// The live reads and posts a key scope's entry and hand-back make. The live
+/// environment is [`LiveKeyEnv`]; tests drive the same code with a fake.
+trait KeyEnv {
+    fn key_focus(&self, pid: pid_t) -> KeyFocus;
+    fn window_order(&self, pid: pid_t) -> Vec<u32>;
+    fn post_records(
+        &self,
+        pid: pid_t,
+        current: Option<u32>,
+        target: u32,
+        style: RecordStyle,
+    ) -> Option<RecordPosts>;
+    /// Wait at most `total` for the app's focus to settle on `target`.
+    fn await_focus(&self, pid: pid_t, target: u32, total: std::time::Duration);
+    /// This app did not show the window as key after the short record form,
+    /// so entering and handing back use the full sequence at once.
+    fn needs_full_records(&self, pid: pid_t) -> bool;
+    fn note_needs_full_records(&self, pid: pid_t);
+    fn set_focused_window(&self, pid: pid_t, wid: u32) -> bool;
+}
+
+struct LiveKeyEnv;
+
+/// Apps that did not show a window as key after the short record form. A
+/// reused pid only costs it the short attempt's saving, never correctness.
+static NEEDS_FULL_RECORDS: std::sync::Mutex<Vec<pid_t>> = std::sync::Mutex::new(Vec::new());
+
+impl KeyEnv for LiveKeyEnv {
+    fn key_focus(&self, pid: pid_t) -> KeyFocus {
+        key_focus_of_pid(pid)
+    }
+    fn window_order(&self, pid: pid_t) -> Vec<u32> {
+        app_window_order(pid)
+    }
+    fn post_records(
+        &self,
+        pid: pid_t,
+        current: Option<u32>,
+        target: u32,
+        style: RecordStyle,
+    ) -> Option<RecordPosts> {
+        post_key_records(pid, current, target, style)
+    }
+    fn await_focus(&self, pid: pid_t, target: u32, total: std::time::Duration) {
+        await_key_focus_within(pid, target, total);
+    }
+    fn needs_full_records(&self, pid: pid_t) -> bool {
+        NEEDS_FULL_RECORDS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(&pid)
+    }
+    fn note_needs_full_records(&self, pid: pid_t) {
+        let mut apps = NEEDS_FULL_RECORDS.lock().unwrap_or_else(|e| e.into_inner());
+        if !apps.contains(&pid) {
+            if apps.len() >= 256 {
+                apps.remove(0);
+            }
+            apps.push(pid);
+        }
+    }
+    fn set_focused_window(&self, pid: pid_t, wid: u32) -> bool {
+        set_app_focused_window(pid, wid)
+    }
+}
+
+/// Hand key inside `pid` back from `target` to `previous`. Whether the app is
+/// frontmost does not matter: the records go to `pid` only.
 fn run_hand_back(pid: pid_t, target: u32, primed: KeyPrime, previous: u32) -> HandBack {
-    let allowed = || hand_back_allowed(front_process_matches(pid, target));
+    run_hand_back_with(&LiveKeyEnv, pid, target, primed, previous)
+}
+
+fn run_hand_back_with(
+    env: &dyn KeyEnv,
+    pid: pid_t,
+    target: u32,
+    primed: KeyPrime,
+    previous: u32,
+) -> HandBack {
     let confirmed = || {
-        await_key_focus(pid, previous, std::time::Duration::from_millis(200));
-        key_focus_of_pid(pid).routes_to(previous)
+        env.await_focus(
+            pid,
+            previous,
+            KEY_RECORD_SETTLE + std::time::Duration::from_millis(200),
+        );
+        env.key_focus(pid).routes_to(previous)
     };
     match primed {
         KeyPrime::AlreadyKey => HandBack::NotMoved,
-        KeyPrime::KeyRecords => hand_back_outcome(
-            post_key_records(pid, Some(target), previous, allowed),
-            confirmed,
-        ),
+        KeyPrime::KeyRecords => {
+            // The short form first, like entering; the full sequence when the
+            // app does not show the previous window as key after it.
+            if !env.needs_full_records(pid) {
+                let fast = env.post_records(pid, Some(target), previous, RecordStyle::Fast);
+                if fast.is_some_and(RecordPosts::complete) {
+                    env.await_focus(pid, previous, FAST_CONFIRM);
+                    if env.key_focus(pid).routes_to(previous) {
+                        return HandBack::Restored;
+                    }
+                }
+            }
+            hand_back_outcome(
+                env.post_records(pid, Some(target), previous, RecordStyle::Full),
+                confirmed,
+            )
+        }
         KeyPrime::AxFocusedWindow => {
-            if !allowed() {
-                HandBack::LeftForPerson
-            } else if set_app_focused_window(pid, previous) && confirmed() {
+            if env.set_focused_window(pid, previous) && confirmed() {
                 HandBack::Restored
             } else {
                 HandBack::NotConfirmed
@@ -312,7 +391,8 @@ impl WindowKeyScope {
         self.entry
     }
 
-    /// Hand key back now, on this thread, and report how it went.
+    /// Start handing key back and return at once with
+    /// [`HandBack::Deferred`] (or why there is nothing to hand back).
     pub fn finish(mut self) -> HandBack {
         let outcome = self.hand_back_now();
         self.done = true;
@@ -333,11 +413,41 @@ impl WindowKeyScope {
             return HandBack::NoTarget;
         };
         let live = self.live.take();
-        *KEY_RESTORES.0.lock().unwrap_or_else(|e| e.into_inner()) += 1;
-        let outcome = (self.ops.hand_back)(self.pid, self.target, self.primed, previous);
+        spawn_hand_back(self.ops, self.pid, self.target, self.primed, previous, live)
+    }
+}
+
+/// Hand key back to `previous` on its own thread. The records' pauses and
+/// the confirmation read are not part of the action, so nothing waits for
+/// them; the next scope's entry does ([`await_key_restores`]). A hand-back
+/// that does not complete is logged, never turned into a refusal.
+fn spawn_hand_back(
+    ops: ScopeOps,
+    pid: pid_t,
+    target: u32,
+    primed: KeyPrime,
+    previous: u32,
+    live: Option<LiveKeyScope>,
+) -> HandBack {
+    *KEY_RESTORES.0.lock().unwrap_or_else(|e| e.into_inner()) += 1;
+    let restore = move || {
+        let outcome = (ops.hand_back)(pid, target, primed, previous);
+        if outcome != HandBack::Restored {
+            tracing::debug!(pid, target, ?outcome, "key hand-back did not complete");
+        }
         drop(live);
         key_restore_done();
-        outcome
+    };
+    match std::thread::Builder::new()
+        .name("cua-key-restore".into())
+        .spawn(restore)
+    {
+        Ok(_) => HandBack::Deferred,
+        Err(error) => {
+            tracing::warn!("key restore thread failed to start: {error}");
+            key_restore_done();
+            HandBack::NotConfirmed
+        }
     }
 }
 
@@ -361,7 +471,8 @@ fn restore_target(
 
 /// `pid`'s on-screen layer-0 windows, front to back.
 fn app_window_order(pid: pid_t) -> Vec<u32> {
-    let mut windows: Vec<_> = crate::windows::visible_windows()
+    // Order, owner and layer only: the Space snapshot is not read.
+    let mut windows: Vec<_> = crate::windows::visible_windows_without_spaces()
         .into_iter()
         .filter(|w| w.pid == pid && w.layer == 0 && w.is_on_screen)
         .collect();
@@ -374,41 +485,7 @@ impl Drop for WindowKeyScope {
         if self.done || self.primed == KeyPrime::AlreadyKey {
             return;
         }
-        if self.inline {
-            let _ = self.hand_back_now();
-            return;
-        }
-        let Some(previous) = restore_target(
-            self.target,
-            self.previous,
-            &self.order_before,
-            &(self.ops.window_order)(self.pid),
-        ) else {
-            return;
-        };
-        let (pid, target, primed, hand_back) =
-            (self.pid, self.target, self.primed, self.ops.hand_back);
-        let live = self.live.take();
-        // The records' settle pauses (240 ms) are not part of the action:
-        // hand key back on a thread. The next `enter_exact_window_key` waits
-        // for it, so two scopes never interleave their records. Every record
-        // still re-reads the front app first (`run_hand_back`).
-        let restore = move || {
-            let outcome = hand_back(pid, target, primed, previous);
-            if outcome != HandBack::Restored {
-                tracing::debug!(pid, target, ?outcome, "key hand-back did not complete");
-            }
-            drop(live);
-            key_restore_done();
-        };
-        *KEY_RESTORES.0.lock().unwrap_or_else(|e| e.into_inner()) += 1;
-        if let Err(error) = std::thread::Builder::new()
-            .name("cua-key-restore".into())
-            .spawn(restore)
-        {
-            tracing::warn!("key restore thread failed to start: {error}");
-            key_restore_done();
-        }
+        let _ = self.hand_back_now();
     }
 }
 
@@ -748,7 +825,39 @@ const KEY_RECORD_SETTLE: std::time::Duration = std::time::Duration::from_millis(
 /// is for the caller to confirm.
 pub fn post_window_key_records(pid: pid_t, current: Option<u32>, target: u32) -> bool {
     crate::window_change_detector::end_tail();
-    post_key_records(pid, current, target, || true).is_some_and(RecordPosts::complete)
+    post_key_records(pid, current, target, RecordStyle::Full).is_some_and(RecordPosts::complete)
+}
+
+/// Which key-window records a move of key focus posts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RecordStyle {
+    /// Defocus, focus and the make-key pair with a short pause after the
+    /// first two ([`FAST_RECORD_PAUSE`]). Measured on a two-window AppKit
+    /// app: every switch took it with pauses of 5 ms and up, while leaving
+    /// the defocus record out failed from the second switch on. The caller
+    /// confirms by polling the app's focus ([`FAST_CONFIRM`]) and falls back to
+    /// [`RecordStyle::Full`] when it does not show the window as key.
+    Fast,
+    /// The same records with [`KEY_RECORD_SETTLE`] after the first two (an app
+    /// can drop the focus record while it is still handling the defocus:
+    /// about half the switches failed on LibreOffice 26.8 without it).
+    Full,
+}
+
+/// Pause between the first records of the short form.
+const FAST_RECORD_PAUSE: std::time::Duration = std::time::Duration::from_millis(10);
+
+/// How long the short form is given to show the window as key before the
+/// full sequence runs.
+const FAST_CONFIRM: std::time::Duration = std::time::Duration::from_millis(80);
+
+impl RecordStyle {
+    fn pause(self) -> std::time::Duration {
+        match self {
+            RecordStyle::Fast => FAST_RECORD_PAUSE,
+            RecordStyle::Full => KEY_RECORD_SETTLE,
+        }
+    }
 }
 
 /// The posts of one key-record sequence.
@@ -758,23 +867,20 @@ pub(crate) struct RecordPosts {
     pub(crate) posted: u8,
     /// Post calls that returned failure (delivery unknown).
     pub(crate) failed: u8,
-    /// `proceed` turned false before a record; the rest was not posted.
-    pub(crate) stopped: bool,
 }
 
 impl RecordPosts {
     pub(crate) fn complete(self) -> bool {
-        self.failed == 0 && !self.stopped
+        self.failed == 0
     }
 }
 
 /// Post the key-window records (see [`post_window_key_records`]) through
-/// `send`, asking `proceed` before every one of them. Pure over its
-/// closures, so the stop points are tested without a desktop.
+/// `send`. Pure over its closures, so the sequence is tested without a
+/// desktop.
 fn post_record_sequence(
     current: Option<u32>,
     target: u32,
-    mut proceed: impl FnMut() -> bool,
     mut send: impl FnMut(&[u8; 0xF8]) -> bool,
     mut settle: impl FnMut(),
 ) -> RecordPosts {
@@ -792,10 +898,6 @@ fn post_record_sequence(
     }
     let mut posts = RecordPosts::default();
     for (record, settle_after) in records {
-        if !proceed() {
-            posts.stopped = true;
-            break;
-        }
         if send(&record) {
             posts.posted += 1;
         } else {
@@ -814,7 +916,7 @@ fn post_key_records(
     pid: pid_t,
     current: Option<u32>,
     target: u32,
-    proceed: impl FnMut() -> bool,
+    style: RecordStyle,
 ) -> Option<RecordPosts> {
     note_focus_change();
     let post = post_event_record_to_fn()?;
@@ -825,9 +927,8 @@ fn post_key_records(
     Some(post_record_sequence(
         current,
         target,
-        proceed,
         |record| note_post_status(unsafe { post(psn.as_ptr() as *const c_void, record.as_ptr()) }),
-        || std::thread::sleep(KEY_RECORD_SETTLE),
+        || std::thread::sleep(style.pause()),
     ))
 }
 
@@ -837,7 +938,7 @@ fn post_key_records(
 /// returned, and its post-action focus hold must outlast it.
 #[cfg(test)]
 pub(crate) fn hand_key_back(pid: pid_t, current: Option<u32>, target: u32) -> bool {
-    post_key_records(pid, current, target, || true).is_some_and(RecordPosts::complete)
+    post_key_records(pid, current, target, RecordStyle::Full).is_some_and(RecordPosts::complete)
 }
 
 /// Wait until the app's focus has settled on `target`, for at most `budget`.
@@ -848,9 +949,15 @@ pub(crate) fn hand_key_back(pid: pid_t, current: Option<u32>, target: u32) -> bo
 /// Polled from the start: a read that still shows the old focus keeps the
 /// wait going, so no fixed settle is needed before the first read.
 fn await_key_focus(pid: pid_t, target: u32, budget: std::time::Duration) {
-    let deadline = std::time::Instant::now() + KEY_RECORD_SETTLE + budget;
+    await_key_focus_within(pid, target, KEY_RECORD_SETTLE + budget);
+}
+
+/// [`await_key_focus`] with the whole wait given: at most `total`, polled in
+/// 4 ms steps, returning as soon as the app's focus has settled on `target`.
+fn await_key_focus_within(pid: pid_t, target: u32, total: std::time::Duration) {
+    let deadline = std::time::Instant::now() + total;
     while !key_focus_of_pid(pid).settled_on(target) && std::time::Instant::now() < deadline {
-        std::thread::sleep(std::time::Duration::from_millis(10));
+        std::thread::sleep(std::time::Duration::from_millis(4));
     }
 }
 
@@ -858,19 +965,18 @@ fn await_key_focus(pid: pid_t, target: u32, budget: std::time::Duration) {
 /// pointer), confirmed by re-reading the app's focus, and return a guard that
 /// hands key back. `Err` when it cannot be confirmed.
 pub fn enter_exact_window_key(pid: pid_t, target_wid: u32) -> Result<WindowKeyScope, String> {
-    enter_scope(pid, target_wid, false).map_err(|error| error.reason)
+    enter_scope(pid, target_wid).map_err(|error| error.reason)
 }
 
-/// [`enter_exact_window_key`] for an action that must not touch the app
-/// while the person may be using it: it starts only while WindowServer
-/// reports another app frontmost, stops before any record or write once
-/// that changes, and returns a scope that hands key back on the thread
-/// that drops or [`finish`](WindowKeyScope::finish)es it.
+/// [`enter_exact_window_key`] under the name its callers that also hold a
+/// minimized-window restore, a mutation lease or a menu route use. It behaves
+/// the same: whether the app is frontmost does not change what it does, and
+/// the hand-back runs on its own thread after the call returns.
 pub fn enter_exact_window_key_inline(
     pid: pid_t,
     target_wid: u32,
 ) -> Result<WindowKeyScope, String> {
-    enter_scope(pid, target_wid, true).map_err(|error| error.reason)
+    enter_scope(pid, target_wid).map_err(|error| error.reason)
 }
 
 /// Why entering a key scope failed, with what entering did before it
@@ -889,7 +995,7 @@ pub fn enter_exact_window_key_inline_detailed(
     pid: pid_t,
     target_wid: u32,
 ) -> Result<WindowKeyScope, ScopeEntryError> {
-    enter_scope(pid, target_wid, true)
+    enter_scope(pid, target_wid)
 }
 
 fn untouched(reason: String) -> ScopeEntryError {
@@ -900,10 +1006,15 @@ fn untouched(reason: String) -> ScopeEntryError {
     }
 }
 
-fn enter_scope(
+fn enter_scope(pid: pid_t, target_wid: u32) -> Result<WindowKeyScope, ScopeEntryError> {
+    enter_scope_with(&LiveKeyEnv, LIVE_SCOPE_OPS, pid, target_wid)
+}
+
+fn enter_scope_with(
+    env: &dyn KeyEnv,
+    ops: ScopeOps,
     pid: pid_t,
     target_wid: u32,
-    inline: bool,
 ) -> Result<WindowKeyScope, ScopeEntryError> {
     // Wait for the previous scope's hand-back to finish; refuse (nothing
     // sent) when it does not.
@@ -913,50 +1024,79 @@ fn enter_scope(
              2 s, so no keys were sent"
         )));
     }
-    // Every record and the accessibility fallback re-read the front app:
-    // entering stops once it differs from what it was at the start (the
-    // person switched apps). An inline scope also requires another app in
-    // front from the start.
-    let entry_front = front_process_matches(pid, target_wid);
-    if inline && entry_front != Some(false) {
-        return Err(untouched(format!(
-            "window {target_wid}: its app is frontmost, or which app is frontmost could not be \
-             read, so key focus inside it was not moved and no keys were sent"
-        )));
-    }
-    let front_unchanged = || front_process_matches(pid, target_wid) == entry_front;
+    // The app being frontmost changes nothing here: it already owns key
+    // focus, so a window that is key is used as it is and any other window
+    // is made key with records addressed to this app only.
     let entry = std::cell::Cell::new(KeyEntry::default());
-    let before = key_focus_of_pid(pid);
+    let before = env.key_focus(pid);
     let previous = before.window;
-    let order_before = app_window_order(pid);
+    // The window order is only used to pick the window key goes back to, and
+    // nothing is handed back when the target is already key: skip the
+    // all-windows enumeration then.
+    let order_before = if before.settled_on(target_wid) {
+        Vec::new()
+    } else {
+        env.window_order(pid)
+    };
+    // The first confirmation reads the focus just read above, not again.
+    let mut first_read = Some(before);
+    // Posts one record sequence and notes what reached the app, for the
+    // receipt of a refusal.
+    let post_noted = |style: RecordStyle| {
+        crate::window_change_detector::end_tail();
+        let posts = env.post_records(pid, previous, target_wid, style);
+        let mut noted = entry.get();
+        if let Some(posts) = posts {
+            noted.records_posted = noted.records_posted.saturating_add(posts.posted);
+            noted.records_uncertain |= posts.failed > 0;
+        }
+        entry.set(noted);
+        posts.is_some_and(RecordPosts::complete)
+    };
+    let fast_tried = std::cell::Cell::new(false);
     let primed = match prime_exact_window_key(
         target_wid,
-        || key_focus_of_pid(pid),
+        || first_read.take().unwrap_or_else(|| env.key_focus(pid)),
         || {
-            crate::window_change_detector::end_tail();
-            let posts = post_key_records(pid, previous, target_wid, front_unchanged);
-            let mut noted = entry.get();
-            if let Some(posts) = posts {
-                noted.records_posted = noted.records_posted.saturating_add(posts.posted);
-                noted.records_uncertain |= posts.failed > 0;
+            if env.needs_full_records(pid) {
+                return false;
             }
-            entry.set(noted);
-            let ok = posts.is_some_and(RecordPosts::complete);
+            fast_tried.set(true);
+            let ok = post_noted(RecordStyle::Fast);
             if ok {
-                await_key_focus(pid, target_wid, std::time::Duration::from_millis(400));
+                // The app is given FAST_CONFIRM, polled in 4 ms steps, to show
+                // the window as key.
+                env.await_focus(pid, target_wid, FAST_CONFIRM);
             }
             ok
         },
         || {
-            if !front_unchanged() {
-                return false;
+            if fast_tried.get() {
+                // The short form did not do it for this app: its next entry
+                // and hand-back go straight to the full sequence.
+                env.note_needs_full_records(pid);
             }
+            let ok = post_noted(RecordStyle::Full);
+            if ok {
+                env.await_focus(
+                    pid,
+                    target_wid,
+                    KEY_RECORD_SETTLE + std::time::Duration::from_millis(400),
+                );
+            }
+            ok
+        },
+        || {
             let mut noted = entry.get();
             noted.ax_write = true;
             entry.set(noted);
-            let ok = set_app_focused_window(pid, target_wid);
+            let ok = env.set_focused_window(pid, target_wid);
             if ok {
-                await_key_focus(pid, target_wid, std::time::Duration::from_millis(200));
+                env.await_focus(
+                    pid,
+                    target_wid,
+                    KEY_RECORD_SETTLE + std::time::Duration::from_millis(200),
+                );
             }
             ok
         },
@@ -964,12 +1104,12 @@ fn enter_scope(
         Ok(primed) => primed,
         Err(error) => {
             // Records or a focused-window write may still have moved key
-            // inside the app: hand it back under the same front rule a
-            // scope's hand-back uses, and say what happened.
+            // inside the app: hand it back like a scope's hand-back does, and
+            // say what happened.
             let noted = entry.get();
             let hand_back = entry_hand_back_kind(noted).map(|primed| {
-                match restore_target(target_wid, previous, &order_before, &app_window_order(pid)) {
-                    Some(previous) => run_hand_back(pid, target_wid, primed, previous),
+                match restore_target(target_wid, previous, &order_before, &env.window_order(pid)) {
+                    Some(previous) => spawn_hand_back(ops, pid, target_wid, primed, previous, None),
                     None => HandBack::NoTarget,
                 }
             });
@@ -993,9 +1133,8 @@ fn enter_scope(
         live: (primed != KeyPrime::AlreadyKey).then(LiveKeyScope::new),
         primed,
         entry: entry.get(),
-        inline,
         done: false,
-        ops: LIVE_SCOPE_OPS,
+        ops,
     })
 }
 
@@ -1502,13 +1641,11 @@ impl ValidationPost {
     }
 }
 
-/// The guarded validation sequence over its side effects (tests drive it
-/// with fakes). `front_ok` is asked before each key-window record and before
-/// the Cmd+F20 pair; `confirm_key` must show the target as the app's key
-/// window before the pair. Once the key-down was posted the key-up always
-/// follows, so no key is left down.
-fn menu_validation_guarded_with<E>(
-    mut front_ok: impl FnMut() -> bool,
+/// The validation sequence over its side effects (tests drive it with
+/// fakes). `confirm_key` must show the target as the app's key window before
+/// the Cmd+F20 pair. Once the key-down was posted the key-up always follows,
+/// so no key is left down.
+fn menu_validation_with<E>(
     resolve_psn: impl FnOnce() -> bool,
     mut post_record: impl FnMut(u8) -> bool,
     confirm_key: impl FnOnce() -> bool,
@@ -1520,9 +1657,6 @@ fn menu_validation_guarded_with<E>(
         return out;
     }
     for event_kind in [0x01, 0x02] {
-        if !front_ok() {
-            return out;
-        }
         out.called = true;
         if post_record(event_kind) {
             out.records += 1;
@@ -1536,9 +1670,6 @@ fn menu_validation_guarded_with<E>(
     let Some((down, up)) = make_events() else {
         return out;
     };
-    if !front_ok() {
-        return out;
-    }
     for event in [&down, &up] {
         out.key_attempts += 1;
         if post_event(event) {
@@ -1552,16 +1683,10 @@ fn menu_validation_guarded_with<E>(
 
 /// Wake AppKit's menu validation for `wid` while a [`WindowKeyScope`]
 /// already holds it as the app's key window: the key-window records and one
-/// Cmd+F20 pair, each only while `front_ok` still holds (another app is
-/// frontmost). No activation is used. The caller reads AXEnabled afterwards.
-pub fn prime_menu_validation_guarded(
-    pid: pid_t,
-    wid: u32,
-    front_ok: impl FnMut() -> bool,
-) -> ValidationPost {
+/// Cmd+F20 pair. No activation is used. The caller reads AXEnabled afterwards.
+pub fn prime_menu_validation(pid: pid_t, wid: u32) -> ValidationPost {
     let target_psn = std::cell::Cell::new([0u8; 8]);
-    menu_validation_guarded_with(
-        front_ok,
+    menu_validation_with(
         || {
             if post_event_record_to_fn().is_none() {
                 return false;
@@ -2760,6 +2885,17 @@ mod tests {
     }
 }
 
+/// Tests that create key scopes or read the process-wide scope, restore and
+/// primed-key registries run one at a time: a hand-back still running on its
+/// own thread counts there until it finishes.
+#[cfg(test)]
+static KEY_SCOPE_TESTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(test)]
+fn key_scope_tests_serial() -> std::sync::MutexGuard<'static, ()> {
+    KEY_SCOPE_TESTS.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 #[cfg(test)]
 mod key_prime_tests {
     use super::{prime_exact_window_key, restore_target, KeyFocus, KeyPrime};
@@ -2777,6 +2913,7 @@ mod key_prime_tests {
         let r = prime_exact_window_key(
             7,
             || at(Some(7), Some(7)),
+            || panic!("fast"),
             || panic!("record"),
             || panic!("ax"),
         );
@@ -2792,6 +2929,7 @@ mod key_prime_tests {
         let r = prime_exact_window_key(
             7,
             || focus.get(),
+            || false,
             || {
                 records.set(records.get() + 1);
                 focus.set(at(Some(7), Some(7)));
@@ -2809,6 +2947,7 @@ mod key_prime_tests {
         let r = prime_exact_window_key(
             7,
             || focus.get(),
+            || false,
             || {
                 focus.set(at(Some(7), Some(7)));
                 true
@@ -2826,6 +2965,7 @@ mod key_prime_tests {
         let r = prime_exact_window_key(
             7,
             || focus.get(),
+            || false,
             || {
                 passes.set(passes.get() + 1);
                 if passes.get() == 2 {
@@ -2845,6 +2985,7 @@ mod key_prime_tests {
         let r = prime_exact_window_key(
             7,
             || focus.get(),
+            || false,
             || true, // records posted but the app ignored them
             || {
                 focus.set(at(Some(7), None));
@@ -2862,6 +3003,7 @@ mod key_prime_tests {
         let r = prime_exact_window_key(
             7,
             || focus.get(),
+            || false,
             || {
                 focus.set(at(Some(7), Some(9)));
                 true
@@ -2869,6 +3011,49 @@ mod key_prime_tests {
             || panic!("ax"),
         );
         assert_eq!(r, Ok(KeyPrime::KeyRecords));
+    }
+
+    /// The short record form is tried first and, when the re-read names the
+    /// target, is all that runs.
+    #[test]
+    fn a_confirmed_fast_make_key_skips_the_full_sequence() {
+        let focus = Cell::new(at(Some(9), Some(9)));
+        let r = prime_exact_window_key(
+            7,
+            || focus.get(),
+            || {
+                focus.set(at(Some(7), Some(7)));
+                true
+            },
+            || panic!("the full sequence must not run"),
+            || panic!("ax"),
+        );
+        assert_eq!(r, Ok(KeyPrime::KeyRecords));
+    }
+
+    /// An app that does not take the short form still gets today's full
+    /// sequence, and keys go out only after that is confirmed.
+    #[test]
+    fn an_unconfirmed_fast_make_key_falls_back_to_the_full_sequence() {
+        let focus = Cell::new(at(Some(9), Some(9)));
+        let fast = Cell::new(0);
+        let full = Cell::new(0);
+        let r = prime_exact_window_key(
+            7,
+            || focus.get(),
+            || {
+                fast.set(fast.get() + 1);
+                true // posted, the app ignored it
+            },
+            || {
+                full.set(full.get() + 1);
+                focus.set(at(Some(7), Some(7)));
+                true
+            },
+            || panic!("ax"),
+        );
+        assert_eq!(r, Ok(KeyPrime::KeyRecords));
+        assert_eq!((fast.get(), full.get()), (1, 1));
     }
 
     #[test]
@@ -2894,7 +3079,7 @@ mod key_prime_tests {
     #[test]
     fn unconfirmed_key_window_refuses_instead_of_leaking() {
         for focused in [at(Some(9), Some(9)), at(None, None), at(Some(9), Some(7))] {
-            let r = prime_exact_window_key(7, || focused, || true, || true);
+            let r = prime_exact_window_key(7, || focused, || false, || true, || true);
             assert!(r.unwrap_err().contains("no keys were sent"));
         }
     }
@@ -3004,11 +3189,9 @@ mod primed_key_tests {
     }
 
     /// Tests that publish, sweep or count into the process-wide registry
-    /// run one at a time.
-    static REGISTRY_TESTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
+    /// run one at a time, with the key-scope tests that count into it.
     fn serial() -> std::sync::MutexGuard<'static, ()> {
-        REGISTRY_TESTS.lock().unwrap_or_else(|e| e.into_inner())
+        super::key_scope_tests_serial()
     }
 
     /// The release takes the app's mutation lease itself, so an action that
@@ -3069,50 +3252,60 @@ mod primed_key_tests {
 mod wp2_scope_tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::Mutex;
 
     #[test]
-    fn a_hand_back_posts_only_while_another_app_is_in_front() {
-        assert!(hand_back_allowed(Some(false)));
-        assert!(!hand_back_allowed(Some(true)));
-        assert!(!hand_back_allowed(None));
-    }
-
-    #[test]
-    fn record_sequence_stops_before_the_record_where_the_front_changed() {
-        for stop_before in 0..4 {
-            let mut asked = 0;
-            let mut sent = 0;
-            let posts = post_record_sequence(
-                Some(7),
-                8,
-                || {
-                    asked += 1;
-                    asked <= stop_before
-                },
-                |_| {
-                    sent += 1;
-                    true
-                },
-                || {},
-            );
-            assert_eq!(sent, stop_before);
-            assert_eq!(posts.posted as usize, stop_before);
-            assert!(posts.stopped);
-            assert!(!posts.complete());
-        }
-        let posts = post_record_sequence(Some(7), 8, || true, |_| true, || {});
+    fn the_record_sequence_posts_every_record_in_order() {
+        let mut sent = 0;
+        let mut settles = 0;
+        let posts = post_record_sequence(
+            Some(7),
+            8,
+            |_| {
+                sent += 1;
+                true
+            },
+            || settles += 1,
+        );
+        assert_eq!(sent, 4);
+        assert_eq!(settles, 2, "a pause after the defocus and the focus record");
         assert_eq!(
             posts,
             RecordPosts {
                 posted: 4,
-                failed: 0,
-                stopped: false
+                failed: 0
             }
         );
+        assert!(posts.complete());
         // No previous key window: no defocus record.
-        let posts = post_record_sequence(None, 8, || true, |_| true, || {});
+        let posts = post_record_sequence(None, 8, |_| true, || {});
         assert_eq!(posts.posted, 3);
+    }
+
+    /// Both forms post the same records; they differ in the pause between
+    /// them, and the short pause is what the short form saves. The defocus
+    /// record must stay: without it an AppKit app took the switch once and
+    /// ignored it from then on.
+    #[test]
+    fn the_short_form_differs_from_the_full_one_only_in_its_pause() {
+        let mut order = Vec::new();
+        let _ = post_record_sequence(
+            Some(7),
+            8,
+            |record| {
+                order.push(record[0x8A]);
+                true
+            },
+            || {},
+        );
+        assert_eq!(order[0], 0x02, "the defocus record leads");
+        assert_eq!(order[1], 0x01, "then the focus record");
+        assert!(RecordStyle::Fast.pause() < RecordStyle::Full.pause());
+        assert!(
+            RecordStyle::Fast.pause() >= std::time::Duration::from_millis(5),
+            "pauses of 5 ms and up were measured to work, none was not"
+        );
+        assert_eq!(RecordStyle::Full.pause(), KEY_RECORD_SETTLE);
+        assert!(FAST_CONFIRM < KEY_RECORD_SETTLE);
     }
 
     #[test]
@@ -3121,7 +3314,6 @@ mod wp2_scope_tests {
         let posts = post_record_sequence(
             Some(7),
             8,
-            || true,
             |_| {
                 n += 1;
                 n != 2
@@ -3132,8 +3324,7 @@ mod wp2_scope_tests {
             posts,
             RecordPosts {
                 posted: 3,
-                failed: 1,
-                stopped: false
+                failed: 1
             }
         );
         assert!(!posts.complete());
@@ -3141,29 +3332,10 @@ mod wp2_scope_tests {
 
     #[test]
     fn hand_back_outcomes() {
-        let stopped_first = RecordPosts {
-            posted: 0,
-            failed: 0,
-            stopped: true,
-        };
-        let stopped_late = RecordPosts {
-            posted: 2,
-            failed: 0,
-            stopped: true,
-        };
         let full = RecordPosts {
             posted: 4,
             failed: 0,
-            stopped: false,
         };
-        assert_eq!(
-            hand_back_outcome(Some(stopped_first), || unreachable!()),
-            HandBack::LeftForPerson
-        );
-        assert_eq!(
-            hand_back_outcome(Some(stopped_late), || unreachable!()),
-            HandBack::Partial
-        );
         assert_eq!(hand_back_outcome(Some(full), || true), HandBack::Restored);
         assert_eq!(
             hand_back_outcome(Some(full), || false),
@@ -3192,10 +3364,10 @@ mod wp2_scope_tests {
             ax_write: true,
             ..KeyEntry::default()
         };
-        let text = scope_disclosure(ax_only, Some(HandBack::LeftForPerson));
+        let text = scope_disclosure(ax_only, Some(HandBack::NotConfirmed));
         assert!(!text.contains("record"));
         assert!(text.contains("through accessibility"));
-        assert!(text.contains("left on the target window"));
+        assert!(text.contains("does not read back"));
         let both = KeyEntry {
             records_posted: 2,
             records_uncertain: true,
@@ -3208,20 +3380,34 @@ mod wp2_scope_tests {
         assert!(!text.contains("Key focus"));
     }
 
-    static LEASE: Mutex<()> = Mutex::new(());
-    static HANDED_BACK_UNDER_LEASE: AtomicBool = AtomicBool::new(false);
+    static SLOW_BACK_DONE: AtomicBool = AtomicBool::new(false);
+    static FAILED_BACK_RAN: AtomicBool = AtomicBool::new(false);
+    static UNWOUND_BACK_RAN: AtomicBool = AtomicBool::new(false);
 
     fn order_with_previous(_: pid_t) -> Vec<u32> {
         vec![1]
     }
 
-    fn hand_back_checking_lease(_: pid_t, _: u32, _: KeyPrime, previous: u32) -> HandBack {
+    /// A hand-back that takes 300 ms.
+    fn slow_hand_back(_: pid_t, _: u32, _: KeyPrime, previous: u32) -> HandBack {
         assert_eq!(previous, 1);
-        HANDED_BACK_UNDER_LEASE.store(LEASE.try_lock().is_err(), Ordering::SeqCst);
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        SLOW_BACK_DONE.store(true, Ordering::SeqCst);
         HandBack::Restored
     }
 
-    fn scope(inline: bool) -> WindowKeyScope {
+    /// A hand-back that does not confirm.
+    fn failing_hand_back(_: pid_t, _: u32, _: KeyPrime, _: u32) -> HandBack {
+        FAILED_BACK_RAN.store(true, Ordering::SeqCst);
+        HandBack::NotConfirmed
+    }
+
+    fn unwound_hand_back(_: pid_t, _: u32, _: KeyPrime, _: u32) -> HandBack {
+        UNWOUND_BACK_RAN.store(true, Ordering::SeqCst);
+        HandBack::Restored
+    }
+
+    fn scope_with(hand_back: fn(pid_t, u32, KeyPrime, u32) -> HandBack) -> WindowKeyScope {
         WindowKeyScope {
             pid: -77_001,
             target: 2,
@@ -3229,88 +3415,106 @@ mod wp2_scope_tests {
             order_before: vec![2, 1],
             primed: KeyPrime::KeyRecords,
             entry: KeyEntry::default(),
-            inline,
             done: false,
             ops: ScopeOps {
                 window_order: order_with_previous,
-                hand_back: hand_back_checking_lease,
+                hand_back,
             },
             live: Some(LiveKeyScope::new()),
         }
     }
 
+    /// The result returns before the hand-back finishes, for every caller:
+    /// the hand-back runs on its own thread.
     #[test]
-    fn an_inline_scope_hands_back_before_the_lease_drops_even_on_panic() {
-        HANDED_BACK_UNDER_LEASE.store(false, Ordering::SeqCst);
+    fn finish_returns_before_the_hand_back_finishes() {
+        let _serial = super::key_scope_tests_serial();
+        SLOW_BACK_DONE.store(false, Ordering::SeqCst);
+        let started = std::time::Instant::now();
+        let outcome = scope_with(slow_hand_back).finish();
+        assert_eq!(outcome, HandBack::Deferred);
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(150),
+            "finish waited {:?}",
+            started.elapsed()
+        );
+        assert!(
+            !SLOW_BACK_DONE.load(Ordering::SeqCst),
+            "the hand-back had already finished"
+        );
+        // The next scope's entry waits for it, so two never interleave.
+        assert!(await_key_restores());
+        assert!(SLOW_BACK_DONE.load(Ordering::SeqCst));
+    }
+
+    /// Dropping a scope returns just as fast.
+    #[test]
+    fn dropping_a_scope_does_not_wait_for_the_hand_back() {
+        let _serial = super::key_scope_tests_serial();
+        SLOW_BACK_DONE.store(false, Ordering::SeqCst);
+        let started = std::time::Instant::now();
+        drop(scope_with(slow_hand_back));
+        assert!(started.elapsed() < std::time::Duration::from_millis(150));
+        assert!(!SLOW_BACK_DONE.load(Ordering::SeqCst));
+        assert!(await_key_restores());
+        assert!(SLOW_BACK_DONE.load(Ordering::SeqCst));
+    }
+
+    /// A hand-back that fails is only logged: nothing turns it into a
+    /// refusal or a wait.
+    #[test]
+    fn a_failed_hand_back_is_neither_waited_for_nor_reported_as_a_refusal() {
+        let _serial = super::key_scope_tests_serial();
+        FAILED_BACK_RAN.store(false, Ordering::SeqCst);
+        let outcome = scope_with(failing_hand_back).finish();
+        assert_eq!(outcome, HandBack::Deferred);
+        assert!(await_key_restores());
+        assert!(FAILED_BACK_RAN.load(Ordering::SeqCst));
+    }
+
+    /// A scope dropped while unwinding from a panic still hands key back.
+    #[test]
+    fn a_dropped_scope_still_hands_back_even_on_panic() {
+        let _serial = super::key_scope_tests_serial();
+        UNWOUND_BACK_RAN.store(false, Ordering::SeqCst);
         let unwound = std::panic::catch_unwind(|| {
-            let _lease = LEASE.lock().unwrap_or_else(|e| e.into_inner());
-            let _scope = scope(true);
+            let _scope = scope_with(unwound_hand_back);
             panic!("action failed mid-way");
         });
         assert!(unwound.is_err());
-        assert!(HANDED_BACK_UNDER_LEASE.load(Ordering::SeqCst));
+        assert!(await_key_restores());
+        assert!(UNWOUND_BACK_RAN.load(Ordering::SeqCst));
     }
 
     #[test]
-    fn finish_reports_the_hand_back_and_drop_does_not_repeat_it() {
-        HANDED_BACK_UNDER_LEASE.store(false, Ordering::SeqCst);
-        let lease = LEASE.lock().unwrap_or_else(|e| e.into_inner());
-        assert_eq!(scope(true).finish(), HandBack::Restored);
-        assert!(HANDED_BACK_UNDER_LEASE.load(Ordering::SeqCst));
-        drop(lease);
-        let mut already_key = scope(true);
+    fn a_scope_that_never_moved_key_has_nothing_to_hand_back() {
+        let _serial = super::key_scope_tests_serial();
+        let mut already_key = scope_with(failing_hand_back);
         already_key.primed = KeyPrime::AlreadyKey;
         assert_eq!(already_key.finish(), HandBack::NotMoved);
     }
 
     #[test]
-    fn validation_stops_where_the_front_changed_and_reports_what_was_posted() {
-        // Front changes before the second record.
-        let mut asks = 0;
-        let post = menu_validation_guarded_with(
-            || {
-                asks += 1;
-                asks < 2
-            },
+    fn validation_posts_the_records_and_the_pair_and_reports_what_was_posted() {
+        // Records, the key confirmation and the Cmd+F20 pair, whichever app
+        // is in front.
+        let mut posted = Vec::new();
+        let post = menu_validation_with(
             || true,
             |_| true,
-            || unreachable!(),
+            || true,
             || Some((1u8, 2u8)),
-            |_| unreachable!(),
+            |e| {
+                posted.push(*e);
+                true
+            },
         );
-        assert_eq!(
-            post,
-            ValidationPost {
-                records: 1,
-                keys: 0,
-                key_attempts: 0,
-                uncertain: false,
-                called: true
-            }
-        );
+        assert_eq!(posted, vec![1, 2]);
+        assert_eq!((post.records, post.keys), (2, 2));
         assert_eq!(post.delivery(), ValidationDelivery::Sent);
-        assert!(post.disclosure().contains("1 of 2 key-window records"));
-        assert!(!post.disclosure().contains("Cmd+F20"));
-
-        // Front changes before the Cmd+F20 pair.
-        let mut asks = 0;
-        let post = menu_validation_guarded_with(
-            || {
-                asks += 1;
-                asks < 3
-            },
-            || true,
-            |_| true,
-            || true,
-            || Some((1u8, 2u8)),
-            |_| unreachable!(),
-        );
-        assert_eq!(post.records, 2);
-        assert_eq!(post.keys, 0);
 
         // Key not confirmed: no Cmd+F20.
-        let post = menu_validation_guarded_with(
-            || true,
+        let post = menu_validation_with(
             || true,
             |_| true,
             || false,
@@ -3320,8 +3524,7 @@ mod wp2_scope_tests {
         assert_eq!((post.records, post.keys), (2, 0));
 
         // Nothing resolvable: nothing called.
-        let post = menu_validation_guarded_with(
-            || true,
+        let post = menu_validation_with(
             || false,
             |_| unreachable!(),
             || unreachable!(),
@@ -3333,8 +3536,7 @@ mod wp2_scope_tests {
 
         // A failed record post stops before the pair and is uncertain.
         let mut n = 0;
-        let post = menu_validation_guarded_with(
-            || true,
+        let post = menu_validation_with(
             || true,
             |_| {
                 n += 1;
@@ -3359,8 +3561,7 @@ mod wp2_scope_tests {
 
         // A failed key-down is followed by the key-up.
         let mut posted = Vec::new();
-        let post = menu_validation_guarded_with(
-            || true,
+        let post = menu_validation_with(
             || true,
             |_| true,
             || true,
@@ -3377,14 +3578,7 @@ mod wp2_scope_tests {
         );
         assert!(post.disclosure().contains("1 of 2 Cmd+F20"));
 
-        let post = menu_validation_guarded_with(
-            || true,
-            || true,
-            |_| true,
-            || true,
-            || Some((1u8, 2u8)),
-            |_| true,
-        );
+        let post = menu_validation_with(|| true, |_| true, || true, || Some((1u8, 2u8)), |_| true);
         assert_eq!(
             post,
             ValidationPost {
@@ -3395,31 +3589,6 @@ mod wp2_scope_tests {
                 called: true
             }
         );
-    }
-
-    #[test]
-    fn the_accessibility_fallback_is_skipped_when_entering_must_stop() {
-        // Records fail to confirm, then the fallback closure refuses (as
-        // enter_scope's does once the front changed): no write, Err.
-        let mut wrote = false;
-        let result = prime_exact_window_key(
-            2,
-            || KeyFocus {
-                window: Some(1),
-                element_window: Some(1),
-            },
-            || false,
-            || {
-                let front_unchanged = false;
-                if !front_unchanged {
-                    return false;
-                }
-                wrote = true;
-                true
-            },
-        );
-        assert!(result.is_err());
-        assert!(!wrote);
     }
 }
 
@@ -3458,5 +3627,258 @@ mod entry_hand_back_tests {
             ax_write: true,
         };
         assert_eq!(entry_hand_back_kind(both), Some(KeyPrime::KeyRecords));
+    }
+}
+
+/// A key scope's entry and hand-back while the target's app is frontmost:
+/// keys and chords reach it like any other app.
+#[cfg(test)]
+mod frontmost_scope_tests {
+    use super::*;
+    use std::cell::RefCell;
+
+    #[derive(Default)]
+    struct State {
+        window: Option<u32>,
+        element_window: Option<u32>,
+        posts: Vec<(Option<u32>, u32, RecordStyle)>,
+        ax_writes: Vec<u32>,
+        order_reads: usize,
+    }
+
+    /// An app whose AX focus follows records and focused-window writes when
+    /// `obeys` is set, and ignores them otherwise. Which app is
+    /// frontmost is not something entering or handing back can read, so the
+    /// fake has no such field: the tests below hold for either answer.
+    struct FakeEnv {
+        /// The app takes the short record form.
+        obeys_fast: bool,
+        /// Apps remembered as needing the full sequence.
+        needs_full: RefCell<Vec<pid_t>>,
+        /// The app takes the full record sequence.
+        obeys_records: bool,
+        obeys_ax: bool,
+        state: RefCell<State>,
+    }
+
+    impl FakeEnv {
+        fn new(key_window: u32) -> Self {
+            Self {
+                obeys_fast: true,
+                needs_full: RefCell::new(Vec::new()),
+                obeys_records: true,
+                obeys_ax: true,
+                state: RefCell::new(State {
+                    window: Some(key_window),
+                    element_window: Some(key_window),
+                    ..State::default()
+                }),
+            }
+        }
+    }
+
+    impl KeyEnv for FakeEnv {
+        fn key_focus(&self, _: pid_t) -> KeyFocus {
+            let state = self.state.borrow();
+            KeyFocus {
+                window: state.window,
+                element_window: state.element_window,
+            }
+        }
+        fn window_order(&self, _: pid_t) -> Vec<u32> {
+            self.state.borrow_mut().order_reads += 1;
+            vec![2, 1]
+        }
+        fn post_records(
+            &self,
+            _: pid_t,
+            current: Option<u32>,
+            target: u32,
+            style: RecordStyle,
+        ) -> Option<RecordPosts> {
+            let mut state = self.state.borrow_mut();
+            state.posts.push((current, target, style));
+            let obeys = match style {
+                RecordStyle::Fast => self.obeys_fast,
+                RecordStyle::Full => self.obeys_records,
+            };
+            if obeys {
+                state.window = Some(target);
+                state.element_window = Some(target);
+            }
+            Some(RecordPosts {
+                posted: 4,
+                failed: 0,
+            })
+        }
+        fn await_focus(&self, _: pid_t, _: u32, _: std::time::Duration) {}
+        fn needs_full_records(&self, pid: pid_t) -> bool {
+            self.needs_full.borrow().contains(&pid)
+        }
+        fn note_needs_full_records(&self, pid: pid_t) {
+            self.needs_full.borrow_mut().push(pid);
+        }
+        fn set_focused_window(&self, _: pid_t, wid: u32) -> bool {
+            let mut state = self.state.borrow_mut();
+            state.ax_writes.push(wid);
+            if self.obeys_ax {
+                state.window = Some(wid);
+            }
+            true
+        }
+    }
+
+    fn ops() -> ScopeOps {
+        ScopeOps {
+            window_order: |_| vec![2, 1],
+            hand_back: |_, _, _, _| HandBack::Restored,
+        }
+    }
+
+    fn enter(env: &FakeEnv) -> Result<WindowKeyScope, ScopeEntryError> {
+        enter_scope_with(env, ops(), -78_001, 2)
+    }
+
+    #[test]
+    fn a_frontmost_app_whose_other_window_is_key_gets_the_target_window_key() {
+        let _serial = key_scope_tests_serial();
+        // The entry reads no front state: it enters an app that is
+        // frontmost (or whose front state is unreadable) like any other.
+        let env = FakeEnv::new(1);
+        let mut scope = enter(&env).unwrap_or_else(|e| panic!("{}", e.reason));
+        assert_eq!(scope.primed(), KeyPrime::KeyRecords);
+        assert_eq!(
+            env.state.borrow().posts,
+            vec![(Some(1), 2, RecordStyle::Fast)],
+            "the short form alone makes the window key"
+        );
+        assert_eq!(scope.entry().records_posted, 4);
+        scope.done = true;
+    }
+
+    /// An app that ignores the short form still gets the full sequence, and
+    /// the scope enters only once that is confirmed.
+    #[test]
+    fn an_app_that_ignores_the_fast_form_gets_the_full_sequence() {
+        let _serial = key_scope_tests_serial();
+        let mut env = FakeEnv::new(1);
+        env.obeys_fast = false;
+        let mut scope = enter(&env).expect("the full sequence confirms");
+        assert_eq!(scope.primed(), KeyPrime::KeyRecords);
+        assert_eq!(
+            env.state.borrow().posts,
+            vec![
+                (Some(1), 2, RecordStyle::Fast),
+                (Some(1), 2, RecordStyle::Full)
+            ]
+        );
+        assert_eq!(scope.entry().records_posted, 8);
+        scope.done = true;
+    }
+
+    /// An app that needed the full sequence once is not asked for the short
+    /// form again: its next entry and its hand-back go straight to the full
+    /// one, so a slow app pays the short attempt only once.
+    #[test]
+    fn an_app_that_needed_the_full_sequence_skips_the_short_form_next_time() {
+        let _serial = key_scope_tests_serial();
+        let mut env = FakeEnv::new(1);
+        env.obeys_fast = false;
+        let mut first = enter(&env).expect("the full sequence confirms");
+        first.done = true;
+        env.state.borrow_mut().window = Some(1);
+        env.state.borrow_mut().element_window = Some(1);
+        env.state.borrow_mut().posts.clear();
+        let mut second = enter(&env).expect("the full sequence confirms");
+        assert_eq!(
+            env.state.borrow().posts,
+            vec![(Some(1), 2, RecordStyle::Full)],
+            "no short attempt for an app that did not take it"
+        );
+        second.done = true;
+        // The hand-back skips it too.
+        env.state.borrow_mut().posts.clear();
+        let outcome = run_hand_back_with(&env, -78_001, 2, KeyPrime::KeyRecords, 1);
+        assert_eq!(outcome, HandBack::Restored);
+        assert_eq!(
+            env.state.borrow().posts,
+            vec![(Some(2), 1, RecordStyle::Full)]
+        );
+    }
+
+    /// An app that took the short form is never remembered as slow.
+    #[test]
+    fn an_app_that_took_the_short_form_is_not_marked_slow() {
+        let _serial = key_scope_tests_serial();
+        let env = FakeEnv::new(1);
+        let mut scope = enter(&env).expect("the short form confirms");
+        scope.done = true;
+        assert!(!env.needs_full_records(-78_001));
+    }
+
+    #[test]
+    fn a_target_window_that_is_already_key_posts_nothing_and_reads_no_window_order() {
+        let _serial = key_scope_tests_serial();
+        let env = FakeEnv::new(2);
+        let scope = enter(&env).expect("a key window enters");
+        assert_eq!(scope.primed(), KeyPrime::AlreadyKey);
+        assert!(env.state.borrow().posts.is_empty());
+        assert!(env.state.borrow().ax_writes.is_empty());
+        assert_eq!(env.state.borrow().order_reads, 0);
+        assert_eq!(scope.finish(), HandBack::NotMoved);
+    }
+
+    #[test]
+    fn a_hand_back_is_posted_whichever_app_is_frontmost() {
+        let env = FakeEnv::new(2);
+        let outcome = run_hand_back_with(&env, -78_002, 2, KeyPrime::KeyRecords, 1);
+        assert_eq!(outcome, HandBack::Restored);
+        assert_eq!(
+            env.state.borrow().posts,
+            vec![(Some(2), 1, RecordStyle::Fast)]
+        );
+        // An app that ignores the short form is handed key back with the
+        // full sequence.
+        let mut slow = FakeEnv::new(2);
+        slow.obeys_fast = false;
+        let outcome = run_hand_back_with(&slow, -78_002, 2, KeyPrime::KeyRecords, 1);
+        assert_eq!(outcome, HandBack::Restored);
+        assert_eq!(
+            slow.state.borrow().posts,
+            vec![
+                (Some(2), 1, RecordStyle::Fast),
+                (Some(2), 1, RecordStyle::Full)
+            ]
+        );
+        let env = FakeEnv::new(2);
+        let outcome = run_hand_back_with(&env, -78_002, 2, KeyPrime::AxFocusedWindow, 1);
+        assert_eq!(outcome, HandBack::Restored);
+        assert_eq!(env.state.borrow().ax_writes, vec![1]);
+    }
+
+    /// The rest of entering is unchanged: a window that cannot be confirmed
+    /// as key refuses with no key sent, and hands key back what it moved.
+    #[test]
+    fn an_unconfirmed_key_window_still_refuses() {
+        let _serial = key_scope_tests_serial();
+        let mut env = FakeEnv::new(1);
+        env.obeys_fast = false;
+        env.obeys_records = false;
+        env.obeys_ax = false;
+        let error = enter(&env).err().expect("unconfirmed key refuses");
+        assert!(
+            error
+                .reason
+                .contains("could not be confirmed as the app's key window"),
+            "{}",
+            error.reason
+        );
+        assert!(
+            error.reason.contains("no keys were sent"),
+            "{}",
+            error.reason
+        );
+        assert!(error.entry.records_posted > 0 && error.entry.ax_write);
+        assert!(error.hand_back.is_some(), "what was moved is handed back");
     }
 }

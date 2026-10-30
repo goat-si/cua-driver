@@ -592,9 +592,6 @@ enum BackgroundPressError {
     },
     /// The window could not be held as the app's key window (Direct).
     KeyNotHeld(String),
-    /// Right before the dispatch the app came to the front, or which app is
-    /// in front could not be read.
-    FrontChanged,
     /// The item's enablement could not be read; it was not dispatched.
     EnablementUnknown(String),
 }
@@ -742,10 +739,8 @@ trait MenuKeyOps {
     /// The app's focused and main windows are the requested window.
     fn bound(&mut self) -> Result<(), BackgroundPressError>;
     /// Hold the requested window as the app's key window inside the app
-    /// only, while another app stays in front.
+    /// only, whichever app is in front.
     fn hold_key(&mut self) -> Result<Self::Scope, crate::input::skylight::ScopeEntryError>;
-    /// WindowServer reports another app in front: `Some(true)`.
-    fn front_is_other_app(&mut self) -> Option<bool>;
 }
 
 /// Why the route could not hold the requested window as the menu context.
@@ -774,16 +769,10 @@ fn hold_menu_window<O: MenuKeyOps>(
     }
 }
 
-/// The checks immediately before the route's one dispatch (an AX press or
-/// the scripted Save): the window is still the menu context and another app
-/// is still in front. Unknown front is a refusal.
+/// The check immediately before the route's one dispatch (an AX press or
+/// the scripted Save): the window is still the menu context.
 fn gate_before_dispatch<O: MenuKeyOps>(ops: &mut O) -> Result<(), BackgroundPressError> {
-    ops.bound()?;
-    if ops.front_is_other_app() == Some(true) {
-        Ok(())
-    } else {
-        Err(BackgroundPressError::FrontChanged)
-    }
+    ops.bound()
 }
 
 struct LiveMenuKey {
@@ -815,14 +804,6 @@ impl MenuKeyOps for LiveMenuKey {
             self.window_id,
         )
     }
-
-    fn front_is_other_app(&mut self) -> Option<bool> {
-        front_is_other_app(self.pid, self.window_id)
-    }
-}
-
-fn front_is_other_app(pid: i32, window_id: u32) -> Option<bool> {
-    crate::input::skylight::front_process_matches(pid as libc::pid_t, window_id).map(|same| !same)
 }
 
 /// A Direct route's enablement: an item that does not read enabled gets one
@@ -1022,17 +1003,15 @@ unsafe fn press_bound_path(
     let result = (|| {
         let segment = path.len().saturating_sub(1);
         if owner == KeyOwner::Direct {
-            // The window is held as key: validate only under that hold, each
-            // post only while another app is in front.
+            // The window is held as key: validate only under that hold.
             let initial = copy_bool_attr(target, "AXEnabled");
             if let Err(last) = held_window_enablement(
                 initial,
                 || {
                     *validation_post = Some(RouteValidation::Guarded(
-                        crate::input::skylight::prime_menu_validation_guarded(
+                        crate::input::skylight::prime_menu_validation(
                             pid as libc::pid_t,
                             window_id,
-                            || front_is_other_app(pid, window_id) == Some(true),
                         ),
                     ));
                 },
@@ -1097,8 +1076,7 @@ unsafe fn press_bound_path(
             )
         })?;
         // Revalidate after path resolution, immediately before the only
-        // dispatch, and require another app still in front. Never fix a
-        // mismatch by silently switching documents.
+        // dispatch. Never fix a mismatch by silently switching documents.
         gate_before_dispatch(ops)?;
         dispatch_final_item(|| perform_action(target, action), is_save)
     })();
@@ -1283,8 +1261,8 @@ pub(super) async fn run_in_background_with_lease(
                 crate::apps::get_app_name_for_pid(pid).unwrap_or_else(|| "the app".into());
             let save_file = file.clone();
             let save_app = app_name.clone();
-            // The scripted Save is a dispatch too: the same window and
-            // front-app checks, in the same step as the Apple Event.
+            // The scripted Save is a dispatch too: the same window check, in
+            // the same step as the Apple Event.
             let saved = latency::spawn_action_blocking(move || {
                 gate_before_dispatch(&mut LiveMenuKey { pid, window_id })
                     .map(|()| crate::apple_events::save_document(&bundle_id, &save_app, &save_file))
@@ -1376,7 +1354,6 @@ pub(super) async fn run_in_background_with_lease(
             }
             refused
         }
-        Ok(Err(BackgroundPressError::FrontChanged)) => front_changed_refusal(pid, window_id),
         Ok(Err(BackgroundPressError::EnablementUnknown(message))) => {
             let message = format!("{preface}{message}. The menu action was not dispatched.");
             ToolResult::error(message.clone()).with_structured(serde_json::json!({
@@ -1409,20 +1386,6 @@ pub(super) async fn run_in_background_with_lease(
     result
 }
 
-fn front_changed_refusal(pid: i32, window_id: u32) -> ToolResult {
-    super::background_refusal_result(
-        pid,
-        window_id,
-        &cua_driver_core::background_input::BackgroundRefusal {
-            code: super::WINDOW_NOT_KEY,
-            reason: "invoke_menu: right before the press the app came to the front, or which app \
-                     is in front could not be read; no menu action was dispatched"
-                .to_owned(),
-            advice: Some("foreground"),
-        },
-    )
-}
-
 /// The refusal for a dispatch gate that failed: nothing was dispatched.
 fn gate_refusal(pid: i32, window_id: u32, error: BackgroundPressError) -> ToolResult {
     match error {
@@ -1432,7 +1395,12 @@ fn gate_refusal(pid: i32, window_id: u32, error: BackgroundPressError) -> ToolRe
             main,
         } => unbound_menu_window(pid, requested, focused, main),
         BackgroundPressError::Other(message) => refusal(message),
-        _ => front_changed_refusal(pid, window_id),
+        other => {
+            let _ = (pid, window_id);
+            refusal(format!(
+                "invoke_menu: the dispatch check refused: {other:?}"
+            ))
+        }
     }
 }
 
@@ -1798,26 +1766,23 @@ impl Tool for InvokeMenuTool {
 mod tests {
     use super::*;
 
-    /// A fake app: which window is its menu context, whether the key hold
-    /// works, and which app is in front. It has no way to activate the app or
-    /// change the front app, so no route decision can do either.
+    /// A fake app: which window is its menu context and whether the key hold
+    /// works. It has no way to activate the app or change the front app, so no
+    /// route decision can do either.
     struct FakeApp {
         bound: bool,
         hold_binds: bool,
         hold_fails: bool,
-        front_other: Option<bool>,
         holds: usize,
     }
 
     impl FakeApp {
-        /// A document window that is not its app's key window, with the
-        /// person's app in front.
+        /// A document window that is not its app's key window.
         fn non_key_window() -> Self {
             FakeApp {
                 bound: false,
                 hold_binds: true,
                 hold_fails: false,
-                front_other: Some(true),
                 holds: 0,
             }
         }
@@ -1853,23 +1818,15 @@ mod tests {
             }
             Ok("scope")
         }
-        fn front_is_other_app(&mut self) -> Option<bool> {
-            self.front_other
-        }
     }
 
     #[test]
-    fn a_non_key_window_is_held_as_key_and_its_menu_dispatches_with_the_front_app_unchanged() {
+    fn a_non_key_window_is_held_as_key_and_its_menu_dispatches() {
         let mut app = FakeApp::non_key_window();
         let held = hold_menu_window(KeyOwner::Direct, &mut app);
         assert!(matches!(held, Ok(Some("scope"))));
         assert_eq!(app.holds, 1);
         assert!(gate_before_dispatch(&mut app).is_ok());
-        assert_eq!(
-            app.front_other,
-            Some(true),
-            "the person's app stays in front"
-        );
     }
 
     #[test]
@@ -1939,19 +1896,15 @@ mod tests {
         ));
     }
 
+    /// Which app is in front does not gate the dispatch; the window being the
+    /// app's menu context does.
     #[test]
-    fn the_dispatch_waits_for_the_window_and_another_app_in_front() {
-        for front in [Some(false), None] {
-            let mut app = FakeApp {
-                bound: true,
-                front_other: front,
-                ..FakeApp::non_key_window()
-            };
-            assert!(matches!(
-                gate_before_dispatch(&mut app),
-                Err(BackgroundPressError::FrontChanged)
-            ));
-        }
+    fn the_dispatch_waits_for_the_window_only() {
+        let mut app = FakeApp {
+            bound: true,
+            ..FakeApp::non_key_window()
+        };
+        assert!(gate_before_dispatch(&mut app).is_ok());
         let mut lost = FakeApp::non_key_window();
         assert!(matches!(
             gate_before_dispatch(&mut lost),
@@ -1973,14 +1926,14 @@ mod tests {
 
     #[test]
     fn a_caller_validation_is_reported_on_a_later_refusal() {
-        let mut refused = front_changed_refusal(1, 7);
+        let mut refused = unbound_menu_window(1, 7, Some(8), Some(8));
         annotate_route(&mut refused, Some(RouteValidation::Legacy(true)), "", None);
         let structured = refused.structured_content.clone().expect("structured");
         assert_eq!(structured["keys_sent"], true);
         assert_eq!(structured["dispatch"], "validation_posted");
         assert!(text_of(&refused).contains("Cmd+F20"));
 
-        let mut uncertain = front_changed_refusal(1, 7);
+        let mut uncertain = unbound_menu_window(1, 7, Some(8), Some(8));
         annotate_route(
             &mut uncertain,
             Some(RouteValidation::Legacy(false)),
@@ -2007,9 +1960,6 @@ mod tests {
             unbound.structured_content.unwrap()["code"],
             "window_not_key"
         );
-        let front = gate_refusal(1, 7, BackgroundPressError::FrontChanged);
-        let text = text_of(&front);
-        assert!(text.contains("came to the front"), "{text}");
     }
 
     #[test]
@@ -2085,7 +2035,7 @@ mod tests {
             "{text}"
         );
 
-        let mut refused = front_changed_refusal(1, 7);
+        let mut refused = unbound_menu_window(1, 7, Some(8), Some(8));
         annotate_route(
             &mut refused,
             Some(RouteValidation::Guarded(sent)),

@@ -4,12 +4,12 @@
 //! The untargeted route types into the window's focused element, and AppKit
 //! reports a focused element only for the app's key window. For a window that
 //! is not key, the window is held as key inside the app (the #109/#113 inline
-//! scope: no activation, no raise, only while another app is in front), its
+//! scope: no activation, no raise, whether or not its app is frontmost), its
 //! focused element is read and judged under the hold, and the text goes in as
 //! one accessibility write. Right before that write the element must still be
-//! the window's focused element, the window must still take keys and another
-//! app must still be in front. A document is then marked edited with a
-//! net-zero key edit under the same checks before each key, and key is handed
+//! the window's focused element and the window must still take keys. A document
+//! is then marked edited with a net-zero key edit under the same checks before
+//! each key, and key is handed
 //! back. One blocking worker does all of it, so a dropped caller cannot cut
 //! the hold short, and every outcome reports what the hold posted and how key
 //! went back.
@@ -62,8 +62,6 @@ pub(super) enum Dispatch {
     /// The element is no longer the focused element of the held window, or
     /// the window no longer takes keys.
     FocusMoved,
-    /// The app is in front, or which app is in front could not be read.
-    FrontChanged,
 }
 
 /// The value and selection read right before the write.
@@ -178,8 +176,7 @@ pub(super) trait HoldOps {
     fn focused(&mut self) -> Option<Self::Element>;
     fn assess(&mut self, element: &Self::Element) -> Assessment;
     fn before(&mut self, element: &Self::Element) -> Option<Before>;
-    /// Focus first, the front app last, with nothing between them and the
-    /// next post.
+    /// The last check, with nothing between it and the next post.
     fn can_dispatch(&mut self, element: &Self::Element) -> Dispatch;
     /// The one AXSelectedText write; the AX error (0 on success).
     fn write(&mut self, element: &Self::Element, text: &str) -> i32;
@@ -246,8 +243,7 @@ fn hand_back_label(hand_back: HandBack) -> &'static str {
     match hand_back {
         HandBack::NotMoved => "not_moved",
         HandBack::Restored => "restored",
-        HandBack::LeftForPerson => "left_for_person",
-        HandBack::Partial => "partial",
+        HandBack::Deferred => "deferred",
         HandBack::NoTarget => "no_target",
         HandBack::NotConfirmed => "not_confirmed",
     }
@@ -370,14 +366,9 @@ pub(super) fn hold_result(step: HoldStep, pid: i32, wid: u32, char_count: usize)
             "the focused text input's value or selection could not be read, so the insert could not be checked."
                 .to_owned(),
         ),
-        HoldOutcome::Stopped(Dispatch::FocusMoved) => refused(
+        HoldOutcome::Stopped(_) => refused(
             "no_focused_text_input",
             "focus left the element, or the window stopped taking keys, right before the insert, so it was not written."
-                .to_owned(),
-        ),
-        HoldOutcome::Stopped(_) => refused(
-            super::WINDOW_NOT_KEY,
-            "the app came to the front, or which app is in front could not be read, right before the insert, so it was not written."
                 .to_owned(),
         ),
         HoldOutcome::Inserted {
@@ -591,11 +582,6 @@ impl HoldOps for LiveHoldOps {
         {
             return Dispatch::FocusMoved;
         }
-        if crate::input::skylight::front_process_matches(self.pid as libc::pid_t, self.wid)
-            != Some(false)
-        {
-            return Dispatch::FrontChanged;
-        }
         Dispatch::Ok
     }
 
@@ -690,7 +676,7 @@ mod tests {
         fn enter(&mut self) -> Result<(), ScopeEntryError> {
             self.log.push("enter");
             self.enter.map_err(|(entry, hand_back)| ScopeEntryError {
-                reason: "window 7: its app is frontmost".into(),
+                reason: "window 7 could not be confirmed as the app's key window".into(),
                 entry,
                 hand_back,
             })
@@ -864,10 +850,6 @@ mod tests {
             (
                 "no_focused_text_input",
                 Box::new(|f| f.dispatch = Dispatch::FocusMoved),
-            ),
-            (
-                "window_not_key",
-                Box::new(|f| f.dispatch = Dispatch::FrontChanged),
             ),
         ];
         for (code, setup) in cases {

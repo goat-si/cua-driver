@@ -485,6 +485,44 @@ fn selection_transition_confirms(before: &[bool], after: &[Option<bool>]) -> boo
 const CLICK_OBSERVATION: std::time::Duration = std::time::Duration::from_millis(60);
 const CLICK_OBSERVATION_POLL: std::time::Duration = std::time::Duration::from_millis(10);
 
+/// What a click reads around its input to find an effect to report: the
+/// selection of the pressed item, a toggle's value, the window title, and
+/// the sheet a pressed button sits in. Each read costs accessibility round
+/// trips, and the watch that follows costs time, to turn an unverifiable
+/// click into a confirmed one. A click reads them only when the caller asks
+/// (`read_back`); otherwise it is one action.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct ClickReads {
+    selection: bool,
+    toggle: bool,
+    title: bool,
+    sheet: bool,
+}
+
+impl ClickReads {
+    const ALL: Self = Self {
+        selection: true,
+        toggle: true,
+        title: true,
+        sheet: true,
+    };
+    const NONE: Self = Self {
+        selection: false,
+        toggle: false,
+        title: false,
+        sheet: false,
+    };
+
+    /// The reads a click makes for the caller's `read_back` argument.
+    pub(super) fn for_click(read_back: bool) -> Self {
+        if read_back {
+            Self::ALL
+        } else {
+            Self::NONE
+        }
+    }
+}
+
 /// How long a click's effects are watched for after delivery.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ObservationScope {
@@ -671,20 +709,29 @@ impl ClickProbe {
     /// # Safety
     ///
     /// `element`, when given, must be a valid, live `AXUIElementRef`.
-    pub(super) unsafe fn capture(element: Option<AXUIElementRef>, toggle: bool) -> Self {
+    pub(super) unsafe fn capture(
+        element: Option<AXUIElementRef>,
+        toggle: bool,
+        reads: ClickReads,
+    ) -> Self {
         let idle_before = super::physical_input_idle_ms();
         let input_from = std::time::Instant::now();
-        let selection = element.map(|element| SelectionSnapshot::capture(element));
-        let toggle = element.filter(|_| toggle).and_then(|element| {
-            let role = copy_string_attr(element, "AXRole")?;
-            let value = crate::ax::bindings::copy_stringish_attr(element, "AXValue")?.state_value;
-            Some((Retained::retain(element), role, value))
-        });
+        let selection = element
+            .filter(|_| reads.selection)
+            .map(|element| SelectionSnapshot::capture(element));
+        let toggle = element
+            .filter(|_| toggle && reads.toggle)
+            .and_then(|element| {
+                let role = copy_string_attr(element, "AXRole")?;
+                let value =
+                    crate::ax::bindings::copy_stringish_attr(element, "AXValue")?.state_value;
+                Some((Retained::retain(element), role, value))
+            });
         // A window retitles to an item's name when the item navigates (a
         // sidebar location, a folder opened in place): only an element that
         // is or sits in a selectable item gets a title probe.
         let title = element
-            .filter(|_| selection.as_ref().is_some_and(|s| s.in_item))
+            .filter(|_| reads.title && selection.as_ref().is_some_and(|s| s.in_item))
             .and_then(|element| WindowTitleProbe::of(element));
         let scope = observation_scope(
             &selection
@@ -753,7 +800,13 @@ impl ClickProbe {
     /// # Safety
     ///
     /// Calls into Accessibility for `pid`.
-    pub(super) unsafe fn at_point(pid: i32, window_id: u32, x: f64, y: f64) -> Self {
+    pub(super) unsafe fn at_point(
+        pid: i32,
+        window_id: u32,
+        x: f64,
+        y: f64,
+        reads: ClickReads,
+    ) -> Self {
         let hit = element_in_window_at(pid, window_id, x, y);
         // The hit is reported either way; only a proven element is probed
         // for evidence.
@@ -761,13 +814,14 @@ impl ClickProbe {
             .as_ref()
             .filter(|(_, proven)| *proven)
             .map(|(hit, _)| hit.0);
-        let toggle = element.is_some_and(|element| {
-            matches!(
-                copy_string_attr(element, "AXRole").as_deref(),
-                Some("AXCheckBox" | "AXRadioButton")
-            )
-        });
-        let mut probe = Self::capture(element, toggle);
+        let toggle = reads.toggle
+            && element.is_some_and(|element| {
+                matches!(
+                    copy_string_attr(element, "AXRole").as_deref(),
+                    Some("AXCheckBox" | "AXRadioButton")
+                )
+            });
+        let mut probe = Self::capture(element, toggle, reads);
         probe.hit = hit.and_then(|(hit, _)| pointer_hit(hit.0));
         probe
     }
@@ -1062,6 +1116,10 @@ fn def() -> &'static ToolDef {
                     "type": "integer",
                     "description": "Left clicks in one gesture, 1-3. Default 1. With element_token, count 2 sends AXOpen when the element lists it (no mouse clicks; works wherever AX actions work); otherwise, and for count 3, it hands that many left clicks (clickCount 1..N) to the element's center. On the pointer route the point is checked to be on the element in its window (the window must be on screen) before the window is activated; if that check fails with nothing sent yet, the call is refused. The window is then made active (without raising it in the background, where an activation that cannot be confirmed still goes on and is reported as uncertain; fronted in the foreground) and the point is checked again, and once more right before the first click, after the pointer move. A foreground count 2 whose AXOpen provably did nothing falls back to this pointer route after the window was fronted, so its first point check already counts as a later one. A failure after activation, or of the activation itself, sends no click on the element but returns an unverifiable result whose activation field (and events_sent, code element_changed_before_click for the last check) says what had already gone out. Needs action press, the left button and no modifier. Nothing reads back what the clicks opened."
                 },
+                "read_back": {
+                    "type": "boolean",
+                    "description": "Default false: the click is one action. It reads nothing before it and watches nothing after it, and a click that was sent returns unverifiable (observe the window to see its effect). true reads the pressed item's selection, a toggle's value, the window title and the sheet holding a pressed button around the input, and watches them for up to 60 ms (600 ms for a sheet), so a click that shows its effect returns confirmed. It costs accessibility reads and that wait."
+                },
                 "modifier": {
                     "type": "array",
                     "items": { "type": "string" },
@@ -1153,6 +1211,9 @@ impl ClickTool {
             Ok(count) => count,
             Err(refusal) => return refusal,
         };
+        // What the click reads around its input: nothing unless asked.
+        let read_back = args.bool_or("read_back", false);
+        let reads = ClickReads::for_click(read_back);
 
         // ── Window-less screen-absolute branch (scope="desktop") ──────
         // x,y given with NO pid and NO window_id → the coordinates are TRUE
@@ -1678,6 +1739,7 @@ impl ClickTool {
                                         selection_pixel,
                                         &selection_modifiers,
                                         foreground,
+                                        read_back,
                                     )?);
                                     Ok(())
                                 };
@@ -1708,6 +1770,7 @@ impl ClickTool {
                                     selection_pixel,
                                     &selection_modifiers,
                                     false,
+                                    read_back,
                                 )
                                 .map(|outcome| (outcome, false))
                             }
@@ -2084,7 +2147,7 @@ impl ClickTool {
                             PxAxPress::FallThrough
                         }
                     } else {
-                        match ax_press_with_ancestors(element, &dispatch_guard, pid) {
+                        match ax_press_with_ancestors(element, &dispatch_guard, pid, reads) {
                             Ok(AxPressOutcome::Delivered(evidence)) => {
                                 PxAxPress::Delivered(evidence, hit)
                             }
@@ -2383,7 +2446,9 @@ impl ClickTool {
                                     && button_kind == "left"
                                     && count == 1
                             })
-                            .map(|wid| unsafe { ClickProbe::at_point(pid, wid, screen_x, screen_y) });
+                            .map(|wid| unsafe {
+                                ClickProbe::at_point(pid, wid, screen_x, screen_y, reads)
+                            });
                         // The element under the point, read before the post.
                         let hit = match probe.as_ref() {
                             Some(probe) => probe.hit(),
@@ -2928,6 +2993,7 @@ unsafe fn ancestor_roles(element: AXUIElementRef) -> Vec<String> {
     roles
 }
 
+#[allow(clippy::too_many_arguments)]
 fn perform_ax_click(
     element: (usize, usize),
     window: (i32, u32),
@@ -2936,10 +3002,12 @@ fn perform_ax_click(
     selection_pixel: Option<SelectionPixelTarget>,
     modifiers: &[String],
     foreground: bool,
+    read_back: bool,
 ) -> anyhow::Result<AxClickOutcome> {
     let (element_ptr, idx) = element;
     let (pid, window_id) = window;
     let element = element_ptr as AXUIElementRef;
+    let reads = ClickReads::for_click(read_back);
 
     // Read live capabilities before dispatch: custom actions and
     // AXIncrement/AXDecrement are valid only on elements that expose them.
@@ -2974,11 +3042,15 @@ fn perform_ax_click(
         if modifiers.is_empty() {
             let idle_before = super::physical_input_idle_ms();
             let started = std::time::Instant::now();
-            let snapshot = unsafe { SelectionSnapshot::capture(element) };
+            let snapshot = reads
+                .selection
+                .then(|| unsafe { SelectionSnapshot::capture(element) });
             if let Some(selected_role) =
                 crate::input::ax_actions::select_nearest_container(element_ptr)
             {
-                let tied = snapshot.transitioned()
+                let tied = snapshot
+                    .as_ref()
+                    .is_some_and(SelectionSnapshot::transitioned)
                     && input_quiet(
                         idle_before,
                         super::physical_input_idle_ms(),
@@ -3028,6 +3100,14 @@ fn perform_ax_click(
                     &modifier_refs,
                     crate::input::mouse::WindowClickDelivery::from_foreground(foreground),
                 )?;
+            }
+            if !reads.selection {
+                return Ok(unconfirmed_selection_click(
+                    &selected_role,
+                    (idx, &role, &title),
+                    !modifiers.is_empty(),
+                    "no read-back was requested",
+                ));
             }
             // Poll the selection from delivery and return on the sample that
             // shows the expected state, held on an immediate second read; a
@@ -3095,16 +3175,13 @@ fn perform_ax_click(
             Some((element_ptr, Some(idx))),
             Some(window_id),
         );
-    // A native text input in a background app whose key window is another
-    // of its windows (a second document) takes AXFocused only while its own
-    // window is key: hold that window as the app's key window for the focus
-    // and its checks, then hand key back. The focus stays the window's first
-    // responder for the next type_text, which takes its own key scope.
-    let text_key_scope = text_input_press
-        && !text_in_web_area
-        && !foreground
-        && crate::input::skylight::front_process_matches(pid as libc::pid_t, window_id)
-            == Some(false);
+    // A native text input whose app's key window is another of its windows (a
+    // second document) takes AXFocused only while its own window is key: hold
+    // that window as the app's key window for the focus and its checks, then
+    // hand key back. A window that is already key is held without posting
+    // anything. The focus stays the window's first responder for the next
+    // type_text, which takes its own key scope.
+    let text_key_scope = text_input_press && !text_in_web_area && !foreground;
     if !foreground && !text_key_scope {
         latency::section(latency::Stage::KeyPrime, || {
             prime_key_window_for_background_press(pid, window_id, ax_action)
@@ -3118,7 +3195,12 @@ fn perform_ax_click(
         // focusing the field during the read also disqualifies it.
         let focus_idle_before = super::physical_input_idle_ms();
         let focus_input_from = std::time::Instant::now();
-        let focused_before = unsafe { copy_bool_attr(element, "AXFocused") };
+        // Only evidence reads it; a click that was not asked to read back
+        // skips the read.
+        let focused_before = reads
+            .selection
+            .then(|| unsafe { copy_bool_attr(element, "AXFocused") })
+            .flatten();
         let scope = if text_key_scope {
             match crate::input::skylight::enter_exact_window_key_inline(
                 pid as libc::pid_t,
@@ -3143,16 +3225,6 @@ fn perform_ax_click(
                     foreground,
                 )?;
             } else {
-                // The person may have activated the app since the scope was
-                // entered: read the front app right before the focus write.
-                if text_key_scope
-                    && crate::input::skylight::front_process_matches(pid as libc::pid_t, window_id)
-                        != Some(false)
-                {
-                    anyhow::bail!(
-                        "text input [{idx}]: its app came to the front, or which app is in front could not be read; AXFocused was not written and AXPress was not sent"
-                    );
-                }
                 crate::input::ax_actions::focus_element(element_ptr)?;
             }
             // Focus can land shortly after delivery (a web field's DOM
@@ -3236,14 +3308,20 @@ fn perform_ax_click(
     // read right before dispatch so nothing earlier (a navigation still
     // finishing during the priming) counts. A row whose press is refused is
     // selected by the fallback below; its own snapshot ties that write.
-    let mut probe = unsafe {
-        ClickProbe::capture(Some(element), toggle).watching_sheet_for_press(element, ax_action)
-    };
+    let mut probe = unsafe { ClickProbe::capture(Some(element), toggle, reads) };
+    if reads.sheet {
+        // Reading the ancestors up to a sheet and watching its window for up
+        // to 600 ms exist only to turn a pressed sheet button into a
+        // confirmed click: they run when the caller asks for the read-back.
+        probe = unsafe { probe.watching_sheet_for_press(element, ax_action) };
+    }
     let fallback_selection = (ax_action == "AXPress" && modifiers.is_empty()).then(|| {
         let idle_before = super::physical_input_idle_ms();
         let started = std::time::Instant::now();
         (
-            unsafe { SelectionSnapshot::capture(element) },
+            reads
+                .selection
+                .then(|| unsafe { SelectionSnapshot::capture(element) }),
             idle_before,
             started,
         )
@@ -3282,7 +3360,9 @@ fn perform_ax_click(
             if let Some(selected_role) =
                 crate::input::ax_actions::select_nearest_container(element_ptr)
             {
-                let tied = snapshot.transitioned()
+                let tied = snapshot
+                    .as_ref()
+                    .is_some_and(SelectionSnapshot::transitioned)
                     && input_quiet(
                         idle_before,
                         super::physical_input_idle_ms(),
@@ -3544,6 +3624,7 @@ unsafe fn ax_press_with_ancestors(
     element: crate::ax::bindings::AXUIElementRef,
     dispatch_guard: &Option<super::window_points::DispatchGuard>,
     pid: i32,
+    reads: ClickReads,
 ) -> Result<AxPressOutcome, super::window_points::WindowMoved> {
     use crate::ax::bindings::{copy_action_names, copy_element_attr, copy_string_attr};
     use core_foundation::base::CFRelease;
@@ -3555,6 +3636,7 @@ unsafe fn ax_press_with_ancestors(
         let probe = ClickProbe::capture(
             Some(element),
             is_toggle_press("AXPress", &role, &leaf_actions),
+            reads,
         );
         super::window_points::check_guard(dispatch_guard)?;
         let action = CFString::new("AXPress");
@@ -3613,7 +3695,7 @@ unsafe fn ax_press_with_ancestors(
     let target = chain[index].2;
     // What the press may change, read on the pressed row or cell itself
     // (its selection, the window retitled to its name: Finder's sidebar).
-    let probe = ClickProbe::capture(Some(target), false);
+    let probe = ClickProbe::capture(Some(target), false, reads);
     if let Err(moved) = super::window_points::check_guard(dispatch_guard) {
         for (_, _, el, _) in chain {
             CFRelease(el as _);
@@ -4022,6 +4104,96 @@ mod tests {
             "click",
             serde_json::to_value(result).expect("a tool result serializes"),
         )
+    }
+
+    /// What the default click path no longer reads, timed on the Dock's
+    /// accessibility tree (read-only; nothing is pressed or focused). Run:
+    /// BENCH_AX_PID=<pid> cargo test -p platform-macos --release --lib bench_click_reads -- --ignored --nocapture
+    #[test]
+    #[ignore = "timing benchmark over a live accessibility tree"]
+    fn bench_click_reads() {
+        use crate::ax::bindings::{
+            copy_children, copy_element_attr, AXIsProcessTrusted, AXUIElementCreateApplication,
+        };
+        if !unsafe { AXIsProcessTrusted() } {
+            println!("accessibility is not granted to this process: NOT MEASURED");
+            return;
+        }
+        // The pid of a process whose accessibility tree is read (the Dock is
+        // enough): BENCH_AX_PID. Nothing in it is pressed or focused.
+        let Some(dock_pid) = std::env::var("BENCH_AX_PID")
+            .ok()
+            .and_then(|pid| pid.parse::<i32>().ok())
+        else {
+            println!("BENCH_AX_PID is not set: NOT MEASURED");
+            return;
+        };
+        fn median_ms(mut f: impl FnMut()) -> f64 {
+            for _ in 0..5 {
+                f();
+            }
+            let mut samples: Vec<f64> = (0..60)
+                .map(|_| {
+                    let start = std::time::Instant::now();
+                    f();
+                    start.elapsed().as_secs_f64() * 1000.0
+                })
+                .collect();
+            samples.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            samples[samples.len() / 2]
+        }
+        unsafe {
+            let app = AXUIElementCreateApplication(dock_pid);
+            let Some(list) = copy_children(app).into_iter().next() else {
+                println!("the Dock exposes no children: NOT MEASURED");
+                return;
+            };
+            let Some(item) = copy_children(list).into_iter().next() else {
+                println!("the Dock list has no items: NOT MEASURED");
+                return;
+            };
+            let role_read = median_ms(|| {
+                let _ = copy_string_attr(item, "AXRole");
+            });
+            let parent_read = median_ms(|| {
+                if let Some(parent) = copy_element_attr(item, "AXParent") {
+                    CFRelease(parent as _);
+                }
+            });
+            // The old default: probe capture with every read, the sheet
+            // ancestor walk, and the fallback selection snapshot.
+            let old_reads = median_ms(|| {
+                let probe = ClickProbe::capture(Some(item), false, ClickReads::ALL)
+                    .watching_sheet_for_press(item, "AXPress");
+                let _snapshot = SelectionSnapshot::capture(item);
+                drop(probe);
+            });
+            // The new default: no read at all.
+            let new_reads = median_ms(|| {
+                let probe = ClickProbe::capture(Some(item), false, ClickReads::NONE);
+                drop(probe);
+            });
+            println!("one AXRole read: median {role_read:.3} ms; one AXParent read: median {parent_read:.3} ms");
+            println!("old default click reads (probe + sheet walk + fallback snapshot) on a depth-2 element: median {old_reads:.3} ms");
+            println!("new default click reads: median {new_reads:.3} ms");
+        }
+    }
+
+    #[test]
+    fn a_click_that_was_not_asked_to_read_back_reads_nothing() {
+        // No selection, toggle, title or sheet read, and so no watch after
+        // the input: the click is one action.
+        assert_eq!(ClickReads::for_click(false), ClickReads::NONE);
+        assert_eq!(ClickReads::for_click(true), ClickReads::ALL);
+    }
+
+    #[test]
+    fn a_click_reads_nothing_back_unless_the_caller_asks() {
+        let read_back = &def().input_schema["properties"]["read_back"];
+        assert_eq!(read_back["type"], "boolean");
+        assert!(read_back["description"]
+            .as_str()
+            .is_some_and(|text| text.contains("Default false")));
     }
 
     /// Calendar's toolbar view switcher reads AXEnabled=false while its window

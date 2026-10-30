@@ -382,6 +382,20 @@ unsafe fn sheet_parent_window_id(
     sheet_window_id: u32,
 ) -> Option<u32> {
     let windows = copy_ax_windows_including(app, pid, sheet_window_id);
+    // A window AX lists with the role AXWindow is a plain window and never a
+    // sheet (a sheet is an AXSheet child of its window): there is no parent to
+    // find, so skip reading the children of every window. This runs before
+    // every key and in every background gate.
+    let plain_window = windows.iter().any(|&window| {
+        ax_get_window_id(window) == Some(sheet_window_id)
+            && copy_string_attr(window, "AXRole").as_deref() == Some("AXWindow")
+    });
+    if plain_window {
+        for window in windows {
+            CFRelease(window as CFTypeRef);
+        }
+        return None;
+    }
     let mut found = None;
     for window in windows {
         if found.is_none() {

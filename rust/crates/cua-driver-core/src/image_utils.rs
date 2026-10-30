@@ -713,4 +713,115 @@ mod tests {
         decoder.read_image(&mut decoded).unwrap();
         assert_eq!(decoded, vec![30u8, 20, 10, 40]); // RGBA: R=30, G=20, B=10, A=40
     }
+
+    /// Where a screenshot's encode time goes, on a synthetic window-shaped
+    /// image (no window is captured). Run:
+    /// cargo test -p cua-driver-core --release --lib bench_screenshot_encode -- --ignored --nocapture
+    #[test]
+    #[ignore = "timing benchmark on a synthetic image"]
+    fn bench_screenshot_encode() {
+        use std::time::Instant;
+        // A 1400 x 900 pt window at 2x: flat panels, gradients and dense
+        // text-like noise, deterministic.
+        let (w, h) = (2800u32, 1800u32);
+        let mut state = 0x2545_f491_4f6c_dd1du64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let mut rgba = vec![255u8; (w * h * 4) as usize];
+        for y in 0..h {
+            for x in 0..w {
+                let i = ((y * w + x) * 4) as usize;
+                let panel = (x / 700 + y / 450) as u8;
+                let (mut r, mut g, mut b) = (240 - panel * 12, 242 - panel * 10, 246 - panel * 8);
+                if y % 36 < 20 && (x / 24) % 3 != 0 && (x + y) % 5 < 3 {
+                    let v = (next() & 0x7f) as u8;
+                    (r, g, b) = (v, v, v);
+                }
+                rgba[i] = r;
+                rgba[i + 1] = g;
+                rgba[i + 2] = b;
+            }
+        }
+        fn median_ms(mut f: impl FnMut()) -> f64 {
+            f();
+            let mut samples: Vec<f64> = (0..7)
+                .map(|_| {
+                    let start = Instant::now();
+                    f();
+                    start.elapsed().as_secs_f64() * 1000.0
+                })
+                .collect();
+            samples.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            samples[samples.len() / 2]
+        }
+        let frame = || {
+            CapturedImage::Rgba(RgbaFrame {
+                width: w,
+                height: h,
+                rgba: rgba.clone(),
+            })
+        };
+        let clone_cost = median_ms(|| {
+            let _ = frame();
+        });
+        let row = |label: &str, max_dim: u32, encoding: ScreenshotEncoding| {
+            let mut bytes = 0;
+            let mut dims = (0, 0);
+            let total = median_ms(|| {
+                let (out, ow, oh) = frame().encode(max_dim, encoding).unwrap();
+                bytes = out.len();
+                dims = (ow, oh);
+            });
+            println!(
+                "{label}: {:.1} ms, {} KiB, {}x{}",
+                total - clone_cost,
+                bytes / 1024,
+                dims.0,
+                dims.1
+            );
+        };
+        println!("synthetic capture {w}x{h} (2x window of 1400x900 pt)");
+        row("PNG native", 0, ScreenshotEncoding::Png);
+        row(
+            "PNG long edge 2048 (Lanczos3)",
+            2048,
+            ScreenshotEncoding::Png,
+        );
+        row(
+            "JPEG 85 native",
+            0,
+            ScreenshotEncoding::Jpeg { quality: 85 },
+        );
+        row(
+            "JPEG 85 long edge 2048 (Lanczos3)",
+            2048,
+            ScreenshotEncoding::Jpeg { quality: 85 },
+        );
+        row(
+            "JPEG 80 long edge 1400 = point resolution (Lanczos3)",
+            1400,
+            ScreenshotEncoding::Jpeg { quality: 80 },
+        );
+        // The resize step alone, per filter, to the same 2048 / 1400 targets.
+        for (label, filter) in [
+            ("Lanczos3", image::imageops::FilterType::Lanczos3),
+            ("CatmullRom", image::imageops::FilterType::CatmullRom),
+            ("Triangle", image::imageops::FilterType::Triangle),
+            ("Nearest", image::imageops::FilterType::Nearest),
+        ] {
+            for target in [2048u32, 1400] {
+                let (nw, nh) = resized_dimensions(w, h, target);
+                let ms = median_ms(|| {
+                    let buffer: ImageBuffer<image::Rgba<u8>, Vec<u8>> =
+                        ImageBuffer::from_raw(w, h, rgba.clone()).unwrap();
+                    let _ = DynamicImage::ImageRgba8(buffer).resize(nw, nh, filter);
+                }) - clone_cost;
+                println!("resize {w}x{h} -> {nw}x{nh} with {label}: {ms:.1} ms");
+            }
+        }
+    }
 }

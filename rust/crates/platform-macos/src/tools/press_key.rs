@@ -17,9 +17,7 @@ use serde_json::Value;
 use std::sync::Arc;
 
 use crate::apps;
-use crate::ax::bindings::{
-    copy_bool_attr, copy_string_attr, focused_element_of_pid, AXUIElementRef,
-};
+use crate::ax::bindings::{copy_bool_attr, copy_string_attr, AXUIElementRef};
 use crate::focus_guard;
 use crate::window_change_detector::WindowChangeDetector;
 
@@ -36,12 +34,6 @@ impl PressKeyTool {
 }
 
 static DEF: std::sync::OnceLock<ToolDef> = std::sync::OnceLock::new();
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct AxKeyState {
-    value: Option<String>,
-    selected: Option<bool>,
-}
 
 #[derive(Debug)]
 enum PressKeyDeliveryOutcome {
@@ -164,56 +156,17 @@ fn validate_post_target(pid: i32) -> anyhow::Result<()> {
     }
 }
 
-fn read_ax_key_state(pid: i32, window_id: Option<u32>, element_ptr: usize) -> Option<AxKeyState> {
-    if super::type_text::target_in_web_area(pid, Some((element_ptr, None)), window_id) {
-        return None;
-    }
-    let element = element_ptr as AXUIElementRef;
-    let state = AxKeyState {
-        value: unsafe { copy_string_attr(element, "AXValue") },
-        selected: unsafe { copy_bool_attr(element, "AXSelected") },
-    };
-    (state.value.is_some() || state.selected.is_some()).then_some(state)
-}
-
+/// Post the key (or action) once. Nothing is read before or after it: whether
+/// the key changed anything is not checked here, so the result is always
+/// unverifiable, and a caller that needs the effect observes the window.
 fn dispatch_with_ax_oracle(
-    pid: i32,
-    window_id: Option<u32>,
-    explicit_element_ptr: Option<usize>,
+    _pid: i32,
+    _window_id: Option<u32>,
+    _explicit_element_ptr: Option<usize>,
     dispatch: impl FnOnce() -> anyhow::Result<()>,
 ) -> anyhow::Result<bool> {
-    let (element_ptr, owns_element) = match explicit_element_ptr {
-        Some(ptr) => (Some(ptr), false),
-        None => unsafe {
-            match window_id {
-                Some(wid) => crate::ax::exact_target::focused_element_in_window(pid, wid),
-                None => focused_element_of_pid(pid),
-            }
-        }
-        .map(|element| (Some(element as usize), true))
-        .unwrap_or((None, false)),
-    };
-    let before = element_ptr.and_then(|ptr| read_ax_key_state(pid, window_id, ptr));
-    let result = dispatch();
-    // Native controls normally publish their new value/selection on the next
-    // run-loop turn. Keep this bounded and reuse the exact retained element so
-    // a focus move cannot become false confirmation from a different control.
-    if before.is_some() {
-        std::thread::sleep(std::time::Duration::from_millis(60));
-    }
-    let after = element_ptr.and_then(|ptr| read_ax_key_state(pid, window_id, ptr));
-    if owns_element {
-        if let Some(ptr) = element_ptr {
-            unsafe { CFRelease(ptr as _) };
-        }
-    }
-    result?;
-    Ok(matches!((before, after), (Some(before), Some(after)) if ax_state_changed(&before, &after)))
-}
-
-fn ax_state_changed(before: &AxKeyState, after: &AxKeyState) -> bool {
-    matches!((&before.value, &after.value), (Some(before), Some(after)) if before != after)
-        || matches!((before.selected, after.selected), (Some(before), Some(after)) if before != after)
+    dispatch()?;
+    Ok(false)
 }
 
 fn action_record(confirmed: bool, foreground: bool) -> ActionExecutionRecord {
@@ -833,7 +786,7 @@ impl Tool for PressKeyTool {
                 let menu_item = latency::spawn_action_blocking(move || {
                     let native = !super::type_text::is_browser_pid(pid)
                         && !crate::browser::electron_js::ElectronJs::is_electron(pid);
-                    let in_front = apps::frontmost_pid() == Some(pid);
+                    let in_front = app_is_frontmost(pid, wid);
                     if native && !in_front {
                         super::menu_equivalent::find(pid, &lookup)
                     } else {
@@ -1335,17 +1288,7 @@ fn minimized_key_worker(
     let outcome = dispatch_with_ax_oracle(pid, Some(wid), ptr, || {
         with_confirmed_key_focus_or_fallback(
             ptr,
-            // Every focus write, retries included, reads the front app first.
             |target| {
-                if !restore.front_still_ok() {
-                    let earlier = match focus_writes.get() {
-                        0 => "no focus write was sent".to_owned(),
-                        n => format!("{n} earlier focus write(s) may have reached the element"),
-                    };
-                    anyhow::bail!(
-                        "the app came to the front, or which app is in front could not be read; {earlier} and no key was sent"
-                    );
-                }
                 focus_writes.set(focus_writes.get() + 1);
                 crate::input::ax_actions::focus_element(target)
             },
@@ -1359,12 +1302,6 @@ fn minimized_key_worker(
             |_| Ok(false),
             || {
                 verify_raw_key_target(pid, Some(wid), ptr, true)?;
-                // The last read before the post.
-                if !restore.front_still_ok() {
-                    anyhow::bail!(
-                        "the app came to the front, or which app is in front could not be read; no key was sent"
-                    );
-                }
                 crate::input::keyboard::press_key(pid, &key, &m)
             },
         )
@@ -1570,9 +1507,14 @@ where
     tokio::spawn(work).await
 }
 
-/// Another app is frontmost (the person is not using the target app).
-fn front_is_other_app(pid: i32, wid: u32) -> bool {
-    crate::input::skylight::front_process_matches(pid as libc::pid_t, wid) == Some(false)
+/// The target app is frontmost now. WindowServer's answer is used when it
+/// has one: AppKit's frontmost app lags behind it for an app that was just
+/// opened or activated.
+fn app_is_frontmost(pid: i32, wid: u32) -> bool {
+    match crate::input::skylight::front_process_matches(pid as libc::pid_t, wid) {
+        Some(front) => front,
+        None => apps::frontmost_pid() == Some(pid),
+    }
 }
 
 /// The app's focused and main windows are both `wid`: its menu commands
@@ -1732,9 +1674,9 @@ fn keys_posted_step(
 }
 
 /// Post the chord to the held key window: only while it is still the app's
-/// focused and main window and another app is in front, then hand key back.
+/// focused and main window, then hand key back.
 /// Why the chord fallback did not post: the keyboard gate refused, or right
-/// before the post the window or the front app changed.
+/// before the post the window stopped being the app's focused and main window.
 #[derive(Debug, PartialEq, Eq)]
 enum KeysHeld {
     GateRefused(String),
@@ -1775,7 +1717,7 @@ fn keys_under_scope(
     let (outcome, hand_back_note) = run_keys_under_scope(
         scope,
         gate,
-        || menu_bound_to(pid, wid) && front_is_other_app(pid, wid),
+        || menu_bound_to(pid, wid),
         || crate::input::keyboard::press_chord_no_auth(pid, key, &mods),
         |scope| {
             let entry = scope.entry();
@@ -1815,8 +1757,7 @@ fn keys_step(
             code: "window_not_key",
             text: format!(
                 "press_key: before the keys, the window stopped being the app's focused and \
-                 main window, or the app came to the front or which app is in front could not \
-                 be read. The requested chord was not sent and no menu action was sent.{notes}"
+                 main window. The requested chord was not sent and no menu action was sent.{notes}"
             ),
             validation,
         },
@@ -1898,7 +1839,7 @@ fn refusal_text(result: &ToolResult) -> String {
 /// The chord's menu route on one blocking thread: hold the target window as
 /// the app's key window, find and validate the item for that window, and
 /// press it only while the window is still the app's focused and main
-/// window and another app is still in front.
+/// window.
 fn chord_in_scope(pid: i32, wid: u32, combo: super::menu_equivalent::Combo) -> ChordStep {
     use crate::input::skylight::ValidationPost;
     let scope = match crate::input::skylight::enter_exact_window_key_inline(pid as libc::pid_t, wid)
@@ -1947,10 +1888,7 @@ fn chord_in_scope(pid: i32, wid: u32, combo: super::menu_equivalent::Combo) -> C
     let enabled = || unsafe { copy_bool_attr(element, "AXEnabled") } == Some(true);
     let mut validation = ValidationPost::default();
     if !enabled() {
-        validation =
-            crate::input::skylight::prime_menu_validation_guarded(pid as libc::pid_t, wid, || {
-                front_is_other_app(pid, wid)
-            });
+        validation = crate::input::skylight::prime_menu_validation(pid as libc::pid_t, wid);
         let deadline = std::time::Instant::now() + std::time::Duration::from_millis(200);
         while !enabled() && std::time::Instant::now() < deadline {
             std::thread::sleep(std::time::Duration::from_millis(20));
@@ -1992,12 +1930,11 @@ fn chord_in_scope(pid: i32, wid: u32, combo: super::menu_equivalent::Combo) -> C
             validation,
         );
     };
-    // The last checks, immediately before the one dispatch.
-    if !(menu_bound_to(pid, wid) && front_is_other_app(pid, wid)) {
+    // The last check, immediately before the one dispatch.
+    if !menu_bound_to(pid, wid) {
         return chord_refusal(
             "window_not_key",
-            "before the press, the window stopped being the app's focused and main window, or \
-             the app came to the front or which app is in front could not be read.",
+            "before the press, the window stopped being the app's focused and main window.",
             scope,
             validation,
         );
@@ -2140,36 +2077,18 @@ async fn native_menu_chord(
     let pid = lease.pid();
     let outcome = run_detached(async move {
         let lease = lease;
-        let step = match latency::spawn_action_blocking(move || chord_in_scope(pid, wid, combo)).await {
-            Ok(step) => step,
-            Err(error) => {
-                return task_failure(format!(
+        let step =
+            match latency::spawn_action_blocking(move || chord_in_scope(pid, wid, combo)).await {
+                Ok(step) => step,
+                Err(error) => {
+                    return task_failure(format!(
                     "press_key: the menu task failed ({error}); it may have run. Read the window \
                      before repeating it."
                 ))
-            }
-        };
+                }
+            };
         match step {
             ChordStep::Save { scope, path } => {
-                if !front_is_other_app(pid, wid) {
-                    let step = latency::spawn_action_blocking(move || {
-                        chord_refusal(
-                            "window_not_key",
-                            "the app came to the front, or which app is in front could not be read.",
-                            scope,
-                            crate::input::skylight::ValidationPost::default(),
-                        )
-                    })
-                    .await;
-                    return match step {
-                        Ok(step) => chord_result(step),
-                        Err(error) => task_failure(format!(
-                            "press_key: the key hand-back task failed ({error}); no menu action \
-                             was sent, and key focus inside the app may remain on the target \
-                             window."
-                        )),
-                    };
-                }
                 let entry = scope.entry();
                 let result = super::invoke_menu::run_in_background_with_lease(
                     &lease,
@@ -2185,7 +2104,8 @@ async fn native_menu_chord(
                 let mut result = super::hotkey::menu_refusal_without_keys(result);
                 let disclosure = crate::input::skylight::scope_disclosure(entry, Some(hand_back));
                 append_to_summary(&mut result, &disclosure);
-                if let Some(serde_json::Value::Object(fields)) = result.structured_content.as_mut() {
+                if let Some(serde_json::Value::Object(fields)) = result.structured_content.as_mut()
+                {
                     if !disclosure.is_empty() {
                         fields.insert("hand_back_note".into(), serde_json::json!(disclosure));
                     }
@@ -2249,6 +2169,29 @@ async fn native_menu_chord(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A key is posted once and returns: no read before it, no wait after it
+    /// (the old oracle slept 60 ms to read the focused element back), and the
+    /// result is unverifiable.
+    #[test]
+    fn a_key_is_posted_once_without_a_read_back_wait() {
+        let posts = std::cell::Cell::new(0);
+        let started = std::time::Instant::now();
+        let confirmed = dispatch_with_ax_oracle(1, Some(2), Some(3), || {
+            posts.set(posts.get() + 1);
+            Ok(())
+        })
+        .expect("posted");
+        assert!(!confirmed, "nothing is read back, so nothing is confirmed");
+        assert_eq!(posts.get(), 1);
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(30),
+            "returned after {:?}",
+            started.elapsed()
+        );
+        let failed = dispatch_with_ax_oracle(1, None, None, || anyhow::bail!("not posted"));
+        assert!(failed.is_err());
+    }
 
     /// Coordinator decision keys_under_scope: only a confirmed disabled read
     /// sends the chord as keys; an unreadable one sends nothing.
@@ -2319,7 +2262,7 @@ mod tests {
             outcome,
             Err(KeysHeld::GateRefused("window 7 is minimized.".into()))
         );
-        // Binding lost, or the person's app is no longer in front (or unknown).
+        // Binding lost.
         let (outcome, posts) = run(Ok(()), false);
         assert_eq!(posts, 0);
         assert_eq!(outcome, Err(KeysHeld::NoLongerTargeted));
