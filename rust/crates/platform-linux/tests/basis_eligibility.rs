@@ -24,3 +24,12 @@ fn only_exact_x11_drawable_capture_is_eligible() {
         );
     }
 }
+
+#[test]
+fn wayland_session_stays_ineligible_when_native_backend_is_disabled() {
+    use platform_linux::basis_eligibility::session_kind;
+    assert_eq!(session_kind(false, true, false), SessionKind::Wayland);
+    assert_eq!(session_kind(false, false, true), SessionKind::Wayland);
+    assert_eq!(session_kind(true, false, false), SessionKind::Wayland);
+    assert_eq!(session_kind(false, false, false), SessionKind::X11);
+}
