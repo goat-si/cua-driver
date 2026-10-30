@@ -163,9 +163,12 @@ fn legacy_guarded_result(result: GuardedResult) -> Result<()> {
     match result {
         GuardedResult::Refused { refusal, .. } => bail!("{}: {}", refusal.code, refusal.reason),
         GuardedResult::Sent { outcome } if outcome.effect != DispatchEffect::Unverifiable => {
+            // run_guarded appends the failing send's own error after the
+            // cleanup results, so the last error is the original cause.
             let error = outcome
                 .cleanup_results
                 .iter()
+                .rev()
                 .find_map(|v| v.get("error").and_then(Value::as_str))
                 .unwrap_or("input dispatch failed");
             bail!("{error}")
@@ -885,6 +888,7 @@ fn send_click_guarded_impl(
         error: None,
         batch_remaining: 0,
         batch_failed: false,
+        activated: false,
     };
     let planned = sink.downs.len() + sink.count * 3;
     let mut result = run_guarded(&mut sink, planned, guard);
@@ -920,6 +924,9 @@ struct ForegroundClick {
     error: Option<String>,
     batch_remaining: usize,
     batch_failed: bool,
+    /// Preparation activated the target (only then is the previous
+    /// foreground restored after a click that sent nothing).
+    activated: bool,
 }
 impl InputSink for ForegroundClick {
     fn prepare(&mut self) -> Vec<&'static str> {
@@ -935,11 +942,15 @@ impl InputSink for ForegroundClick {
                     return effects;
                 }
                 effects.push("activation");
+                self.activated = true;
                 self.foreground_target =
                     crate::win32::capture_foreground_target(self.target.0 as usize as u64);
                 if self.foreground_target.is_none() {
-                    self.error =
-                        Some("foreground_unavailable: target disappeared before input".into());
+                    self.error = Some(format!(
+                        "foreground_unavailable: exact target HWND {:?} disappeared before mouse \
+                         input could be sent",
+                        self.target.0
+                    ));
                     return effects;
                 }
             } else {
@@ -1053,7 +1064,9 @@ impl ForegroundClick {
                     SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE,
                 );
             }
-            if self.mode == ClickMode::NonActivating {
+            // Only undo what preparation did: without an armed no-activate
+            // guard nothing was promoted and the cursor was not moved.
+            if self.mode == ClickMode::NonActivating && self.noactivate.is_some() {
                 if !self.prev_fg.0.is_null() && self.prev_fg != self.target {
                     let _ = SetWindowPos(
                         self.prev_fg,
@@ -1077,11 +1090,19 @@ impl ForegroundClick {
                 }
             }
             if sent == 0
-                && self.mode != ClickMode::NonActivating
+                && self.activated
                 && !self.prev_fg.0.is_null()
                 && self.prev_fg != self.target
+                && !crate::input::force_foreground_attached(self.prev_fg)
             {
-                crate::input::force_foreground_attached(self.prev_fg);
+                // No input was sent, but the activation done in preparation
+                // could not be undone: report it next to that side effect.
+                errors.push(json!({"error": format!(
+                    "foreground_restore_failed: previous foreground HWND {:?} was not restored \
+                     (actual foreground HWND {:?})",
+                    self.prev_fg.0,
+                    GetForegroundWindow().0
+                )}));
             }
             self.noactivate.take();
             if sent > 0 && self.mode != ClickMode::NonActivating {
@@ -1090,7 +1111,13 @@ impl ForegroundClick {
                         target,
                         GetForegroundWindow().0 as usize as u64,
                     ) {
-                        errors.push(json!({"error":"foreground_unavailable: target or owned window was not foreground after the click"}));
+                        errors.push(json!({"error": format!(
+                            "foreground_unavailable: exact target HWND {:?} or a verified \
+                             same-process post-action window was not foreground after the \
+                             click (actual foreground HWND {:?})",
+                            self.target.0,
+                            GetForegroundWindow().0
+                        )}));
                     }
                 }
             }
