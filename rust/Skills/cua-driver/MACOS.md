@@ -18,6 +18,12 @@ you (no cursor warp, no Space switch, no window raise) stops
 mattering: you just shipped the Accessibility Inspector with extra
 steps.
 
+For a background left pixel click addressed by pid and window ID, the driver
+posts one down/up pair per requested click, with increasing click state and a
+short gap between pairs. Delivery remains unverifiable unless read-back
+confirms an effect. Any focus restoration runs separately and is abandoned
+when a later input action or a change of frontmost app makes it stale.
+
 Before running any shell command, ask: **"does this raise,
 activate, foreground, or make-key any app?"** If yes, don't run it.
 Every one of the commands below activates the target on macOS and

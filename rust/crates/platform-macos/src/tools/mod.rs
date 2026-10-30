@@ -44,6 +44,7 @@ pub(crate) mod get_screen_size;
 mod health_report;
 mod move_cursor;
 mod page;
+pub(crate) mod pixel_restore;
 mod pixel_route;
 pub(crate) mod px_frame;
 mod set_config;
@@ -529,11 +530,14 @@ pub(crate) fn gate_user_takeover(
         None => Some(crate::apps::frontmost_pid() == Some(pid)),
     };
     match user_takeover_idle(front, idle, threshold) {
-        Some(idle_ms) => Err(cua_driver_core::delivery::user_interacting_result(
-            idle_ms,
-            threshold,
-            serde_json::json!({ "pid": pid, "window_id": window_id }),
-        )),
+        Some(idle_ms) => {
+            pixel_restore::user_takeover();
+            Err(cua_driver_core::delivery::user_interacting_result(
+                idle_ms,
+                threshold,
+                serde_json::json!({ "pid": pid, "window_id": window_id }),
+            ))
+        }
         None => Ok(()),
     }
 }
@@ -1797,7 +1801,28 @@ pub fn register_all(
         registry.approval_broker(),
         registry.protected_resource_ownership(),
     );
-    cua_driver_core::browser::register_browser_tools(&browser_engine, registry);
+    // Register through the platform facade so browser input enters the same
+    // admission fence as native input.
+    use cua_driver_core::browser::{
+        download::BrowserDownloadTool,
+        pointer::BrowserPointerTool,
+        tools::{
+            BrowserClickTool, BrowserDialogTool, BrowserNavigateTool, BrowserPrepareTool,
+            BrowserSelectTool, BrowserSetInputFilesTool, BrowserTypeTool, GetBrowserStateTool,
+        },
+    };
+    registry.register(Box::new(GetBrowserStateTool::new(browser_engine.clone())));
+    registry.register(Box::new(BrowserPrepareTool::new(browser_engine.clone())));
+    registry.register(Box::new(BrowserNavigateTool::new(browser_engine.clone())));
+    registry.register(Box::new(BrowserClickTool::new(browser_engine.clone())));
+    registry.register(Box::new(BrowserTypeTool::new(browser_engine.clone())));
+    registry.register(Box::new(BrowserSelectTool::new(browser_engine.clone())));
+    registry.register(Box::new(BrowserDialogTool::new(browser_engine.clone())));
+    registry.register(Box::new(BrowserSetInputFilesTool::new(
+        browser_engine.clone(),
+    )));
+    registry.register(Box::new(BrowserDownloadTool::new(browser_engine.clone())));
+    registry.register(Box::new(BrowserPointerTool::new(browser_engine)));
     // Recording / replay + session-lifecycle tools are platform-independent.
     registry.register_recording_tools();
     registry.register_session_tools();

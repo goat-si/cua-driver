@@ -1001,6 +1001,26 @@ pub(super) async fn restore_user_focus_after_background_pixel(
         return;
     }
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    restore_user_focus_after_background_pixel_now(
+        pid,
+        prior_front,
+        prior_key_wid,
+        window_id,
+        focus_without_raise,
+    )
+    .await;
+}
+
+async fn restore_user_focus_after_background_pixel_now(
+    pid: i32,
+    prior_front: Option<i32>,
+    prior_key_wid: Option<u32>,
+    window_id: Option<u32>,
+    focus_without_raise: bool,
+) {
+    if prior_front == Some(pid) {
+        return;
+    }
     let reactivated = if let Some(previous_pid) = background_pixel_restore_pid(
         PixelActivationPolicy::AllowTargetWithoutRaise,
         prior_front,
@@ -1162,6 +1182,9 @@ impl Tool for ClickTool {
     }
 
     async fn invoke(&self, args: Value) -> ToolResult {
+        if !super::pixel_restore::current_is("click") {
+            return super::pixel_restore::invoke(self, args).await;
+        }
         let space = match super::window_points::point_space(&args) {
             Ok(space) => space,
             Err(refusal) => return refusal,
@@ -2084,6 +2107,7 @@ impl ClickTool {
                     && button_str == "left"
                     && count == 1
                     && modifiers.is_empty()
+                    && action == "focus"
             }) {
                 let focus_only = action == "focus";
                 if let Err(refusal) =
@@ -2380,7 +2404,7 @@ impl ClickTool {
                     // A key hand-back still running would move key focus under
                     // this action's focus record: send nothing instead.
                     crate::input::skylight::await_key_restores()
-                        .then(|| crate::input::mouse::prepare_background_pixel_click(pid, wid))
+                        .then(|| crate::input::mouse::prepare_background_pixel_click_fast(pid, wid))
                 })
                 .await
                 {
@@ -2506,6 +2530,13 @@ impl ClickTool {
                                     // background delivery can retain the translated screen point
                                     // while adding Chromium routing fields (f40, f51, f58, f91, f92).
                                     if let Some(wid) = window_id {
+                                        if !fg {
+                                            return crate::input::mouse::click_background_pixel_fast(
+                                                pid, (screen_x, screen_y), (win_local_x, win_local_y),
+                                                wid, count, &m,
+                                                &mut || super::window_points::check_guard(&dispatch_guard).map_err(Into::into),
+                                            );
+                                        }
                                         return crate::input::mouse::click_at_xy_with_window_local(
                                             pid, screen_x, screen_y,
                                             win_local_x, win_local_y,
@@ -2558,15 +2589,26 @@ impl ClickTool {
                 Err(error) => (Err(error), None),
             };
 
-            if activation_policy == PixelActivationPolicy::AllowTargetWithoutRaise {
-                restore_user_focus_after_background_pixel(
+            if activation_policy == PixelActivationPolicy::AllowTargetWithoutRaise
+                && prior_front != Some(pid)
+            {
+                let epoch = super::pixel_restore::current_epoch().expect("input admission");
+                let expected_front = apps::frontmost_pid();
+                super::pixel_restore::spawn_restore(
                     pid,
-                    prior_front,
-                    prior_key_wid,
-                    window_id,
-                    focus_without_raise,
-                )
-                .await;
+                    epoch,
+                    expected_front,
+                    move || async move {
+                        restore_user_focus_after_background_pixel_now(
+                            pid,
+                            prior_front,
+                            prior_key_wid,
+                            window_id,
+                            focus_without_raise,
+                        )
+                        .await;
+                    },
+                );
             }
 
             let changes = snapshot.detect_sampled_async().await;
@@ -3485,8 +3527,8 @@ fn perform_ax_click(
     Ok((summary, suspected_noop, evidence, false))
 }
 
-fn background_hit_uses_ax(focus_only: bool, in_web_area: bool) -> bool {
-    focus_only || !in_web_area
+fn background_hit_uses_ax(focus_only: bool, _in_web_area: bool) -> bool {
+    focus_only
 }
 
 fn text_input_click_role(role: &str) -> bool {
@@ -3857,9 +3899,9 @@ mod text_and_web_routing_tests {
     use super::{background_hit_uses_ax, text_input_click_role};
 
     #[test]
-    fn web_pixel_presses_fall_through_but_native_and_focus_paths_stay_ax() {
+    fn pixel_presses_use_events_while_focus_uses_ax() {
         assert!(!background_hit_uses_ax(false, true));
-        assert!(background_hit_uses_ax(false, false));
+        assert!(!background_hit_uses_ax(false, false));
         assert!(background_hit_uses_ax(true, true));
         assert!(background_hit_uses_ax(true, false));
     }
