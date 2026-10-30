@@ -1028,7 +1028,10 @@ struct CuaAppKitHarness {
         if let mode = ProcessInfo.processInfo.environment["CUA_HARNESS_BRING_TO_FRONT_MODE"] {
             matrixWindows = BringToFrontMatrixWindows(parent: controller.window, mode: mode)
         }
-        app.activate(ignoringOtherApps: true)
+        // Measurement runs on a Mac someone is using opt out of taking focus at launch.
+        if ProcessInfo.processInfo.environment["CUA_HARNESS_NO_ACTIVATE"] != "1" {
+            app.activate(ignoringOtherApps: true)
+        }
         if ProcessInfo.processInfo.environment["CUA_HARNESS_BRING_TO_FRONT_MODE"] == "b3" {
             matrixWindows?.secondary.makeKeyAndOrderFront(nil)
         }
