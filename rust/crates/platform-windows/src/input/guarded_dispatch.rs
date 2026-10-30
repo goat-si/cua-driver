@@ -50,6 +50,20 @@ pub fn prepare_activation(
     (active, effects)
 }
 
+/// The foreground sequence reserves event 0 for the pointer move. When that
+/// move failed, the slot sent nothing: drop it from `events_sent`, and when
+/// nothing else was sent either, the dispatch was refused with nothing sent
+/// rather than partially delivered.
+pub fn discount_unmoved_pointer(outcome: &mut DispatchOutcome, pointer_moved: bool) {
+    if pointer_moved || outcome.events_sent == 0 {
+        return;
+    }
+    outcome.events_sent -= 1;
+    if outcome.events_sent == 0 && outcome.effect == DispatchEffect::Partial {
+        outcome.effect = DispatchEffect::Refused;
+    }
+}
+
 pub fn run_guarded(
     sink: &mut impl InputSink,
     planned: usize,
@@ -232,5 +246,46 @@ mod activation_tests {
         assert!(active);
         assert_eq!(effects, ["activation"]);
         assert!(!assisted.get());
+    }
+}
+
+#[cfg(test)]
+mod pointer_slot_tests {
+    use super::discount_unmoved_pointer;
+    use cua_driver_core::window_basis::{DispatchEffect, DispatchOutcome};
+
+    fn outcome(events_sent: u32, effect: DispatchEffect) -> DispatchOutcome {
+        DispatchOutcome {
+            events_planned: 4,
+            events_sent,
+            prepared_side_effects: vec![],
+            effect,
+            cleanup_results: vec![],
+        }
+    }
+
+    #[test]
+    fn failed_pointer_move_with_nothing_else_sent_is_a_refusal() {
+        let mut o = outcome(1, DispatchEffect::Partial);
+        discount_unmoved_pointer(&mut o, false);
+        assert_eq!((o.events_sent, o.effect), (0, DispatchEffect::Refused));
+        assert_eq!(o.to_json()["nothing_sent"], true);
+    }
+
+    #[test]
+    fn failed_pointer_move_is_not_counted_when_input_followed() {
+        let mut o = outcome(3, DispatchEffect::Partial);
+        discount_unmoved_pointer(&mut o, false);
+        assert_eq!((o.events_sent, o.effect), (2, DispatchEffect::Partial));
+        let mut o = outcome(4, DispatchEffect::Unverifiable);
+        discount_unmoved_pointer(&mut o, false);
+        assert_eq!((o.events_sent, o.effect), (3, DispatchEffect::Unverifiable));
+    }
+
+    #[test]
+    fn a_moved_pointer_keeps_its_slot() {
+        let mut o = outcome(1, DispatchEffect::Partial);
+        discount_unmoved_pointer(&mut o, true);
+        assert_eq!((o.events_sent, o.effect), (1, DispatchEffect::Partial));
     }
 }

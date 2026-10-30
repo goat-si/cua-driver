@@ -901,6 +901,9 @@ fn send_click_guarded_impl(
     let planned = 1 + sink.downs.len() + sink.count * 3;
     let mut result = run_guarded(&mut sink, planned, guard);
     if let GuardedResult::Sent { outcome } = &mut result {
+        crate::input::guarded_dispatch::discount_unmoved_pointer(outcome, sink.cursor_moved);
+    }
+    if let GuardedResult::Sent { outcome } = &mut result {
         if outcome.effect == DispatchEffect::Unverifiable {
             let errors = sink.finish(planned);
             if errors.iter().any(|entry| entry.get("error").is_some()) {

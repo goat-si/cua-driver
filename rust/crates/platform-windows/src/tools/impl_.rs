@@ -3489,7 +3489,7 @@ async fn basis_click(state: &ToolState, tool: &str, args: &Value) -> Option<Tool
             crate::input::delivery::EventKind::MouseClick,
         );
     let mode = basis_click::transport(
-        args.get("delivery_mode").and_then(Value::as_str) == Some("foreground"),
+        cua_driver_core::delivery::DeliveryMode::from_args(args).is_foreground(),
         !modifiers.is_empty(),
         unavailable,
     );
