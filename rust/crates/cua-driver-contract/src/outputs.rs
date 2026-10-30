@@ -676,6 +676,48 @@ pub struct ActionEscalation {
     pub reason: ActionEscalationReason,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq, uniffi::Enum)]
+#[serde(rename_all = "snake_case")]
+pub enum ActionFocusRestorationStatus {
+    Restored,
+    Abandoned,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq, uniffi::Enum)]
+#[serde(rename_all = "snake_case")]
+pub enum ActionFocusRestorationReason {
+    UserInput,
+    ThirdApp,
+    Timeout,
+    Panic,
+    Unconfirmed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq, uniffi::Record)]
+#[serde(deny_unknown_fields)]
+pub struct ActionFocusRestoration {
+    pub status: ActionFocusRestorationStatus,
+    /// Present only with `status: abandoned`. Advertised as a plain string
+    /// enum (no null member): the field is omitted when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "ActionFocusRestorationReason")]
+    pub reason: Option<ActionFocusRestorationReason>,
+    /// The producer reports null when the previous process was unknown.
+    #[serde(deserialize_with = "deserialize_prior_pid")]
+    #[schemars(required, schema_with = "nullable_prior_pid_schema")]
+    pub prior_pid: Option<i32>,
+}
+
+fn nullable_prior_pid_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    schemars::json_schema!({ "type": ["integer", "null"], "format": "int32" })
+}
+
+fn deserialize_prior_pid<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<i32>, D::Error> {
+    Option::<i32>::deserialize(deserializer)
+}
+
 // `PartialEq` only: `point` carries floating-point coordinates.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, uniffi::Record)]
 #[serde(deny_unknown_fields)]
@@ -694,6 +736,12 @@ pub struct ActionResult {
     /// text content says.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub summary: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub warning: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub focus_restoration: Option<ActionFocusRestoration>,
     /// Present only with `effect: refused`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<ActionError>,
@@ -793,6 +841,7 @@ pub enum ActionResultValidationError {
     VerifiedEffectMismatch,
     ReadbackEffectMismatch,
     PointNotFinite,
+    FocusRestorationReasonRequiresAbandoned,
 }
 
 impl std::fmt::Display for ActionResultValidationError {
@@ -808,6 +857,9 @@ impl std::fmt::Display for ActionResultValidationError {
                 "selection_changed/menu_opened true requires a confirmed effect"
             }
             Self::PointNotFinite => "point coordinates must be finite",
+            Self::FocusRestorationReasonRequiresAbandoned => {
+                "focus restoration reason requires abandoned status"
+            }
         })
     }
 }
@@ -822,6 +874,11 @@ impl ActionResult {
             .is_some_and(|point| !point.x.is_finite() || !point.y.is_finite())
         {
             return Err(ActionResultValidationError::PointNotFinite);
+        }
+        if self.focus_restoration.as_ref().is_some_and(|focus| {
+            focus.status != ActionFocusRestorationStatus::Abandoned && focus.reason.is_some()
+        }) {
+            return Err(ActionResultValidationError::FocusRestorationReasonRequiresAbandoned);
         }
         match self.effect {
             ActionEffect::Confirmed
@@ -966,6 +1023,9 @@ mod tests {
             }]),
             escalation: None,
             summary: None,
+            note: None,
+            warning: None,
+            focus_restoration: None,
             error: None,
             hint: None,
             next_call: None,
@@ -978,6 +1038,33 @@ mod tests {
             point: None,
             hit: None,
         }
+    }
+
+    #[test]
+    fn action_disclosures_round_trip_and_validate_restoration_reason() {
+        for focus in [
+            serde_json::json!({"status":"restored", "prior_pid":1}),
+            serde_json::json!({"status":"abandoned", "reason":"third_app", "prior_pid":1}),
+            serde_json::json!({"status":"abandoned", "prior_pid":null}),
+        ] {
+            let mut value = serde_json::to_value(confirmed_result()).unwrap();
+            value["note"] = "note".into();
+            value["warning"] = "warning".into();
+            value["focus_restoration"] = focus;
+            let result: ActionResult = serde_json::from_value(value.clone()).unwrap();
+            assert_eq!(result.validate_invariants(), Ok(()));
+            assert_eq!(serde_json::to_value(result).unwrap(), value);
+        }
+        let mut result = confirmed_result();
+        result.focus_restoration = Some(ActionFocusRestoration {
+            status: ActionFocusRestorationStatus::Restored,
+            reason: Some(ActionFocusRestorationReason::ThirdApp),
+            prior_pid: Some(1),
+        });
+        assert_eq!(
+            result.validate_invariants(),
+            Err(ActionResultValidationError::FocusRestorationReasonRequiresAbandoned)
+        );
     }
 
     #[test]
@@ -1037,18 +1124,21 @@ mod tests {
                 "error",
                 "escalation",
                 "evidence",
+                "focus_restoration",
                 "hint",
                 "hit",
                 "menu_items",
                 "menu_opened",
                 "next_call",
+                "note",
                 "point",
                 "route",
                 "selected_text",
                 "selected_text_range",
                 "selection_changed",
                 "summary",
-                "verified"
+                "verified",
+                "warning"
             ]
         );
         assert_eq!(

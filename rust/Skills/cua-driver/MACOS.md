@@ -145,7 +145,10 @@ an unreadable state is refused. An ambiguous AX error may mean the command
 ran, so inspect the window before retrying; keys are not sent after such an
 error or a successful action. When the item read disabled before a press, the
 result says so and reports any observed change; AX success alone does not
-confirm the effect. Validation keys and the requested chord are reported
+confirm the effect. Such sent or unverified presses include the structured
+`warning` string `menu item read disabled before the press; effect unverified`.
+If the disabled item falls back to sent keys, `warning` is
+`menu item read disabled; keys sent; likely no-op`. Validation keys and the requested chord are reported
 separately. A window-only native `hotkey` with a matching menu item also uses
 its menu route for both frontmost and background apps.
 Save uses the existing menu route, which checks the document on disk after an
@@ -887,7 +890,9 @@ There is no backgrounded path that reaches these apps today.
 write, it posts Return to the field's process only if the user-interaction,
 exact-window and focused-element checks allow it. The default is false.
 Return delivery and the value's effect are reported separately: the
-structured `note` says whether Return was posted, refused, or uncertain;
+structured `note` says whether Return was posted, refused, or uncertain when
+the write result is not an error. On an error such as `write_not_applied` or
+`set_value failed`, Return is not posted and no autosubmit note is added;
 posting it does not verify that the search ran. If the target is not
 identifiable as a search field, the call refuses before writing anything,
 avoiding an unintended submission on another control. Return is posted only

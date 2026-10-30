@@ -800,10 +800,17 @@ mod tests {
     fn window_hotkey_reaches_frontmost_disabled_chord_decision() {
         let result = super::lookup_native_menu(true, || Some(())).and_then(|()| {
             super::window_menu_route(None, || {
-                super::super::press_key::tests::frontmost_disabled_decision()
+                super::super::press_key::tests::frontmost_disabled_result()
             })
         });
-        assert_eq!(result, Some(true));
+        let fields = result
+            .expect("window chord route")
+            .structured_content
+            .unwrap();
+        assert_eq!(
+            fields["warning"],
+            "menu item read disabled before the press; effect unverified"
+        );
         assert!(super::window_menu_route::<()>(Some(1), || panic!(
             "element route must stay separate"
         ))

@@ -233,6 +233,43 @@
               "null"
             ]
           },
+          "focus_restoration": {
+            "additionalProperties": false,
+            "properties": {
+              "prior_pid": {
+                "format": "int32",
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "reason": {
+                "enum": [
+                  "user_input",
+                  "third_app",
+                  "timeout",
+                  "panic",
+                  "unconfirmed"
+                ],
+                "type": "string"
+              },
+              "status": {
+                "enum": [
+                  "restored",
+                  "abandoned"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "status",
+              "prior_pid"
+            ],
+            "type": [
+              "object",
+              "null"
+            ]
+          },
           "hint": {
             "type": [
               "string",
@@ -304,6 +341,12 @@
             ],
             "type": [
               "object",
+              "null"
+            ]
+          },
+          "note": {
+            "type": [
+              "string",
               "null"
             ]
           },
@@ -389,6 +432,12 @@
           "verified": {
             "type": [
               "boolean",
+              "null"
+            ]
+          },
+          "warning": {
+            "type": [
+              "string",
               "null"
             ]
           }
@@ -791,6 +840,43 @@
               "null"
             ]
           },
+          "focus_restoration": {
+            "additionalProperties": false,
+            "properties": {
+              "prior_pid": {
+                "format": "int32",
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "reason": {
+                "enum": [
+                  "user_input",
+                  "third_app",
+                  "timeout",
+                  "panic",
+                  "unconfirmed"
+                ],
+                "type": "string"
+              },
+              "status": {
+                "enum": [
+                  "restored",
+                  "abandoned"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "status",
+              "prior_pid"
+            ],
+            "type": [
+              "object",
+              "null"
+            ]
+          },
           "hint": {
             "type": [
               "string",
@@ -862,6 +948,12 @@
             ],
             "type": [
               "object",
+              "null"
+            ]
+          },
+          "note": {
+            "type": [
+              "string",
               "null"
             ]
           },
@@ -947,6 +1039,12 @@
           "verified": {
             "type": [
               "boolean",
+              "null"
+            ]
+          },
+          "warning": {
+            "type": [
+              "string",
               "null"
             ]
           }
@@ -2474,6 +2572,43 @@
               "null"
             ]
           },
+          "focus_restoration": {
+            "additionalProperties": false,
+            "properties": {
+              "prior_pid": {
+                "format": "int32",
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "reason": {
+                "enum": [
+                  "user_input",
+                  "third_app",
+                  "timeout",
+                  "panic",
+                  "unconfirmed"
+                ],
+                "type": "string"
+              },
+              "status": {
+                "enum": [
+                  "restored",
+                  "abandoned"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "status",
+              "prior_pid"
+            ],
+            "type": [
+              "object",
+              "null"
+            ]
+          },
           "hint": {
             "type": [
               "string",
@@ -2545,6 +2680,12 @@
             ],
             "type": [
               "object",
+              "null"
+            ]
+          },
+          "note": {
+            "type": [
+              "string",
               "null"
             ]
           },
@@ -2630,6 +2771,12 @@
           "verified": {
             "type": [
               "boolean",
+              "null"
+            ]
+          },
+          "warning": {
+            "type": [
+              "string",
               "null"
             ]
           }
@@ -2822,6 +2969,43 @@
               "null"
             ]
           },
+          "focus_restoration": {
+            "additionalProperties": false,
+            "properties": {
+              "prior_pid": {
+                "format": "int32",
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "reason": {
+                "enum": [
+                  "user_input",
+                  "third_app",
+                  "timeout",
+                  "panic",
+                  "unconfirmed"
+                ],
+                "type": "string"
+              },
+              "status": {
+                "enum": [
+                  "restored",
+                  "abandoned"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "status",
+              "prior_pid"
+            ],
+            "type": [
+              "object",
+              "null"
+            ]
+          },
           "hint": {
             "type": [
               "string",
@@ -2893,6 +3077,12 @@
             ],
             "type": [
               "object",
+              "null"
+            ]
+          },
+          "note": {
+            "type": [
+              "string",
               "null"
             ]
           },
@@ -2978,6 +3168,12 @@
           "verified": {
             "type": [
               "boolean",
+              "null"
+            ]
+          },
+          "warning": {
+            "type": [
+              "string",
               "null"
             ]
           }
@@ -3581,6 +3777,43 @@
               "null"
             ]
           },
+          "focus_restoration": {
+            "additionalProperties": false,
+            "properties": {
+              "prior_pid": {
+                "format": "int32",
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "reason": {
+                "enum": [
+                  "user_input",
+                  "third_app",
+                  "timeout",
+                  "panic",
+                  "unconfirmed"
+                ],
+                "type": "string"
+              },
+              "status": {
+                "enum": [
+                  "restored",
+                  "abandoned"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "status",
+              "prior_pid"
+            ],
+            "type": [
+              "object",
+              "null"
+            ]
+          },
           "hint": {
             "type": [
               "string",
@@ -3652,6 +3885,12 @@
             ],
             "type": [
               "object",
+              "null"
+            ]
+          },
+          "note": {
+            "type": [
+              "string",
               "null"
             ]
           },
@@ -3737,6 +3976,12 @@
           "verified": {
             "type": [
               "boolean",
+              "null"
+            ]
+          },
+          "warning": {
+            "type": [
+              "string",
               "null"
             ]
           }
@@ -4441,6 +4686,43 @@
               "null"
             ]
           },
+          "focus_restoration": {
+            "additionalProperties": false,
+            "properties": {
+              "prior_pid": {
+                "format": "int32",
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "reason": {
+                "enum": [
+                  "user_input",
+                  "third_app",
+                  "timeout",
+                  "panic",
+                  "unconfirmed"
+                ],
+                "type": "string"
+              },
+              "status": {
+                "enum": [
+                  "restored",
+                  "abandoned"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "status",
+              "prior_pid"
+            ],
+            "type": [
+              "object",
+              "null"
+            ]
+          },
           "hint": {
             "type": [
               "string",
@@ -4512,6 +4794,12 @@
             ],
             "type": [
               "object",
+              "null"
+            ]
+          },
+          "note": {
+            "type": [
+              "string",
               "null"
             ]
           },
@@ -4597,6 +4885,12 @@
           "verified": {
             "type": [
               "boolean",
+              "null"
+            ]
+          },
+          "warning": {
+            "type": [
+              "string",
               "null"
             ]
           }
@@ -4833,6 +5127,43 @@
               "null"
             ]
           },
+          "focus_restoration": {
+            "additionalProperties": false,
+            "properties": {
+              "prior_pid": {
+                "format": "int32",
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "reason": {
+                "enum": [
+                  "user_input",
+                  "third_app",
+                  "timeout",
+                  "panic",
+                  "unconfirmed"
+                ],
+                "type": "string"
+              },
+              "status": {
+                "enum": [
+                  "restored",
+                  "abandoned"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "status",
+              "prior_pid"
+            ],
+            "type": [
+              "object",
+              "null"
+            ]
+          },
           "hint": {
             "type": [
               "string",
@@ -4904,6 +5235,12 @@
             ],
             "type": [
               "object",
+              "null"
+            ]
+          },
+          "note": {
+            "type": [
+              "string",
               "null"
             ]
           },
@@ -4989,6 +5326,12 @@
           "verified": {
             "type": [
               "boolean",
+              "null"
+            ]
+          },
+          "warning": {
+            "type": [
+              "string",
               "null"
             ]
           }
@@ -5598,6 +5941,43 @@
               "null"
             ]
           },
+          "focus_restoration": {
+            "additionalProperties": false,
+            "properties": {
+              "prior_pid": {
+                "format": "int32",
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "reason": {
+                "enum": [
+                  "user_input",
+                  "third_app",
+                  "timeout",
+                  "panic",
+                  "unconfirmed"
+                ],
+                "type": "string"
+              },
+              "status": {
+                "enum": [
+                  "restored",
+                  "abandoned"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "status",
+              "prior_pid"
+            ],
+            "type": [
+              "object",
+              "null"
+            ]
+          },
           "hint": {
             "type": [
               "string",
@@ -5669,6 +6049,12 @@
             ],
             "type": [
               "object",
+              "null"
+            ]
+          },
+          "note": {
+            "type": [
+              "string",
               "null"
             ]
           },
@@ -5754,6 +6140,12 @@
           "verified": {
             "type": [
               "boolean",
+              "null"
+            ]
+          },
+          "warning": {
+            "type": [
+              "string",
               "null"
             ]
           }
@@ -6361,6 +6753,43 @@
               "null"
             ]
           },
+          "focus_restoration": {
+            "additionalProperties": false,
+            "properties": {
+              "prior_pid": {
+                "format": "int32",
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "reason": {
+                "enum": [
+                  "user_input",
+                  "third_app",
+                  "timeout",
+                  "panic",
+                  "unconfirmed"
+                ],
+                "type": "string"
+              },
+              "status": {
+                "enum": [
+                  "restored",
+                  "abandoned"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "status",
+              "prior_pid"
+            ],
+            "type": [
+              "object",
+              "null"
+            ]
+          },
           "hint": {
             "type": [
               "string",
@@ -6432,6 +6861,12 @@
             ],
             "type": [
               "object",
+              "null"
+            ]
+          },
+          "note": {
+            "type": [
+              "string",
               "null"
             ]
           },
@@ -6517,6 +6952,12 @@
           "verified": {
             "type": [
               "boolean",
+              "null"
+            ]
+          },
+          "warning": {
+            "type": [
+              "string",
               "null"
             ]
           }

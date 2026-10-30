@@ -64,10 +64,11 @@ pub use outputs::{
     advertised_output_schema, conforming_error_envelope, is_refusal_envelope,
     refusal_envelope_schema, ActionDelivery, ActionDeliveryMode, ActionEffect, ActionError,
     ActionEscalation, ActionEscalationReason, ActionEscalationTarget, ActionEvidence,
-    ActionEvidenceKind, ActionNextCall, ActionResult, ActionResultValidationError, ActionRoute,
-    AgentOverlayCapture, AgentOverlayCaptureStatus, ClipboardReadOutput, ClipboardWriteOutput,
-    CursorMotionOutput, CursorPointOutput, CursorPositionOutput, CursorThemeOutput,
-    CursorVisualOutput, DesktopStateOutput, EffectiveScope, EndSessionOutput,
+    ActionEvidenceKind, ActionFocusRestoration, ActionFocusRestorationReason,
+    ActionFocusRestorationStatus, ActionNextCall, ActionResult, ActionResultValidationError,
+    ActionRoute, AgentOverlayCapture, AgentOverlayCaptureStatus, ClipboardReadOutput,
+    ClipboardWriteOutput, CursorMotionOutput, CursorPointOutput, CursorPositionOutput,
+    CursorThemeOutput, CursorVisualOutput, DesktopStateOutput, EffectiveScope, EndSessionOutput,
     GetAgentCursorStateOutput, ListSessionsOutput, ScreenSizeOutput, SessionClientKindOutput,
     SessionLifecycleState, SessionOutput, SessionStateOutput, SessionTransportOutput,
     SetAgentCursorEnabledOutput, SetAgentCursorMotionOutput, SetAgentCursorThemeOutput,
@@ -682,6 +683,39 @@ mod tests {
             contract.capabilities,
             vec!["menu.path.invoke", "accessibility.menu.native"]
         );
+    }
+
+    /// The driver reports `prior_pid: null` when the previous process is
+    /// unknown, so every advertised copy must allow null.
+    #[test]
+    fn focus_restoration_prior_pid_is_advertised_nullable_and_required() {
+        fn find<'a>(value: &'a serde_json::Value, found: &mut Vec<&'a serde_json::Value>) {
+            match value {
+                serde_json::Value::Object(map) => {
+                    if let Some(focus) = map.get("focus_restoration") {
+                        found.push(focus);
+                    }
+                    map.values().for_each(|child| find(child, found));
+                }
+                serde_json::Value::Array(items) => {
+                    items.iter().for_each(|child| find(child, found))
+                }
+                _ => {}
+            }
+        }
+        let schema = tool_success_output_schema("click").expect("click output schema");
+        let mut found = Vec::new();
+        find(&schema, &mut found);
+        assert!(!found.is_empty(), "click advertises focus_restoration");
+        for focus in found {
+            assert_eq!(
+                focus["properties"]["prior_pid"]["type"],
+                serde_json::json!(["integer", "null"])
+            );
+            assert!(focus["required"]
+                .as_array()
+                .is_some_and(|required| required.contains(&serde_json::json!("prior_pid"))));
+        }
     }
 
     #[test]

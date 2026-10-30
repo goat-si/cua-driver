@@ -54,6 +54,96 @@ pub(super) fn safe_tool(name: &str) -> SafeTool {
     SafeTool(def)
 }
 
+struct RecordedClick {
+    def: cua_driver_core::tool::ToolDef,
+}
+
+#[async_trait::async_trait]
+impl cua_driver_core::tool::Tool for RecordedClick {
+    fn def(&self) -> &cua_driver_core::tool::ToolDef {
+        &self.def
+    }
+    async fn invoke(&self, _: serde_json::Value) -> cua_driver_core::protocol::ToolResult {
+        use cua_driver_core::action_record::{
+            ActionEffect, ActionExecutionRecord, ActionTransport, ActualDelivery, RequestedDelivery,
+        };
+        cua_driver_core::protocol::ToolResult::text("Clicked.")
+            .with_structured(serde_json::json!({"effect":"unverifiable"}))
+            .with_action_record(
+                ActionExecutionRecord::builder(
+                    ActionEffect::Unverifiable,
+                    ActionTransport::MacosCgEventPid,
+                    RequestedDelivery::Background,
+                )
+                .actual_delivery(ActualDelivery::Background)
+                .build()
+                .unwrap(),
+            )
+    }
+}
+
+struct ClickWithRestoration {
+    fence: Fence,
+    inner: RecordedClick,
+}
+
+#[async_trait::async_trait]
+impl cua_driver_core::tool::Tool for ClickWithRestoration {
+    fn def(&self) -> &cua_driver_core::tool::ToolDef {
+        &self.inner.def
+    }
+    async fn invoke(&self, args: serde_json::Value) -> cua_driver_core::protocol::ToolResult {
+        invoke_with_outcome(&self.fence, &self.inner, args).await
+    }
+}
+
+#[tokio::test]
+async fn successful_click_publishes_attached_restoration_outcome() {
+    use cua_driver_core::authorization::PermissionMode;
+    use cua_driver_core::session_authorization::{
+        SessionAuthorizationRegistry, SessionModeCeiling,
+    };
+    use std::time::Duration;
+
+    for (status, reason) in [("abandoned", Some("third_app")), ("restored", None)] {
+        let fence = test_fence();
+        fence.record_outcome(42, Some((42, 1)), Some(1), status, reason);
+        let mut def = FakeTool::new().0;
+        def.name = "click".into();
+        def.input_schema = serde_json::json!({"type":"object"});
+        let mut registry =
+            cua_driver_core::tool::ToolRegistry::new_with_protected_consent_provider(None);
+        registry.register(Box::new(ClickWithRestoration {
+            fence,
+            inner: RecordedClick { def },
+        }));
+        let ceiling = SessionModeCeiling::for_trusted_sessions(
+            [PermissionMode::Standard],
+            false,
+            Duration::from_secs(60),
+            Duration::from_secs(30),
+        )
+        .unwrap();
+        let context = SessionAuthorizationRegistry::with_ceiling(ceiling)
+            .compatibility_context(PermissionMode::Standard, None)
+            .unwrap();
+        registry
+            .protected_resource_ownership()
+            .mark_driver_owned_pid(&context.runtime_session_key("restoration-test"), 42);
+        let result = registry.invoke_with_context("click", serde_json::json!({"pid":42,"window_id":7,"session":"restoration-test","x":10,"y":20,"post_action_wait":"none"}), context).await;
+        assert_ne!(result.is_error, Some(true), "{result:?}");
+        let data = result.structured_content.unwrap();
+        let mut expected = serde_json::json!({"status":status,"prior_pid":1});
+        if let Some(reason) = reason {
+            expected["reason"] = reason.into();
+        }
+        assert_eq!(data["focus_restoration"], expected);
+        assert_eq!(data["effect"], "unverifiable");
+        assert_eq!(data["summary"], "Clicked.");
+        assert!(result.content.iter().any(|block| matches!(block, cua_driver_core::protocol::Content::Text { text, .. } if text.starts_with("focus_restoration: "))));
+    }
+}
+
 #[tokio::test(start_paused = true)]
 async fn restoration_outcomes_are_delivered_once_to_next_input_or_observation() {
     let fence = Box::leak(Box::new(test_fence()));

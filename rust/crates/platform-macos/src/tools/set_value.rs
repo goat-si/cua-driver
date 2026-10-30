@@ -2222,6 +2222,23 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn autosubmit_preserves_native_not_applied_error() {
+        let result = not_applied_result(3, false);
+        assert_eq!(result.is_error, Some(true));
+        assert_eq!(
+            result.structured_content.as_ref().unwrap()["code"],
+            "write_not_applied"
+        );
+        let before = serde_json::to_value(&result).unwrap();
+        let after =
+            super::super::set_value_autosubmit::finish(true, 42, result, true, |_, _| async {
+                panic!("Return after a native write that did not apply")
+            })
+            .await;
+        assert_eq!(serde_json::to_value(&after).unwrap(), before);
+    }
+
     #[test]
     fn native_read_back_remains_trusted() {
         let mut outcome = SetValueOutcome {
