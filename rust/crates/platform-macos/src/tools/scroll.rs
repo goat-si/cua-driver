@@ -215,6 +215,12 @@ impl ScrollTool {
             Ok(window_id) => window_id,
             Err(error) => return error,
         };
+        // The person is working in this app: nothing is sent.
+        if !delivery_mode.is_foreground() {
+            if let Err(refusal) = super::gate_user_takeover(pid, window_id) {
+                return refusal;
+            }
+        }
         let pre_focus_ptr: Option<usize> = pre_focus_guard.as_ref().map(|g| g.as_ptr());
 
         let mut _mutation_lease: Option<super::BackgroundMutationLease> = None;

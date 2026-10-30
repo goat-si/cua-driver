@@ -245,6 +245,13 @@ impl RightClickTool {
             );
         }
 
+        // The person is working in this app: nothing is sent.
+        if !delivery_mode.is_foreground() {
+            if let Err(refusal) = super::gate_user_takeover(pid, window_id) {
+                return refusal;
+            }
+        }
+
         // ── AX element path ──────────────────────────────────────────────────
         if let (Some(idx), Some(wid), Some(element_guard)) =
             (element_index, window_id, element_guard)
