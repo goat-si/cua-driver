@@ -1551,6 +1551,65 @@ pub(crate) fn cursor_overlay_unavailable() -> cua_driver_core::protocol::ToolRes
     }))
 }
 
+fn register_platform_browser_tools(
+    registry: &mut latency::Registry<'_>,
+    engine: &Arc<cua_driver_core::browser::BrowserEngine>,
+) {
+    // Register through the platform facade so browser input enters the same
+    // admission fence as native input.
+    use cua_driver_core::browser::{
+        download::BrowserDownloadTool,
+        pointer::BrowserPointerTool,
+        tools::{
+            BrowserClickTool, BrowserDialogTool, BrowserNavigateTool, BrowserPrepareTool,
+            BrowserSelectTool, BrowserSetInputFilesTool, BrowserTypeTool, GetBrowserStateTool,
+        },
+    };
+    registry.register(Box::new(GetBrowserStateTool::new(engine.clone())));
+    registry.register(Box::new(BrowserPrepareTool::new(engine.clone())));
+    registry.register(Box::new(BrowserNavigateTool::new(engine.clone())));
+    registry.register(Box::new(BrowserClickTool::new(engine.clone())));
+    registry.register(Box::new(BrowserTypeTool::new(engine.clone())));
+    registry.register(Box::new(BrowserSelectTool::new(engine.clone())));
+    registry.register(Box::new(BrowserDialogTool::new(engine.clone())));
+    registry.register(Box::new(BrowserSetInputFilesTool::new(engine.clone())));
+    registry.register(Box::new(BrowserDownloadTool::new(engine.clone())));
+    registry.register(Box::new(BrowserPointerTool::new(engine.clone())));
+}
+
+#[cfg(test)]
+mod browser_registration_tests {
+    use super::*;
+    use std::collections::BTreeSet;
+
+    #[test]
+    fn platform_browser_registration_matches_core_tool_set() {
+        let mut core = ToolRegistry::new();
+        let engine = cua_driver_core::browser::BrowserEngine::new_with_runtime_services(
+            Arc::new(crate::browser::MacOsBrowserPlatform::new(Arc::new(
+                CursorRegistry::new(),
+            ))),
+            core.approval_broker(),
+            core.protected_resource_ownership(),
+        );
+        cua_driver_core::browser::register_browser_tools(&engine, &mut core);
+        let mut platform = ToolRegistry::new();
+        register_platform_browser_tools(&mut latency::Registry::new(&mut platform), &engine);
+        let expected: BTreeSet<_> = core.tool_names().collect();
+        let actual: BTreeSet<_> = platform.tool_names().collect();
+        assert_eq!(actual, expected);
+        let missing_admission: Vec<_> = core
+            .iter_defs()
+            .filter(|(name, def)| !def.read_only && !pixel_restore::requires_admission(name))
+            .map(|(name, _)| name)
+            .collect();
+        assert!(
+            missing_admission.is_empty(),
+            "mutating browser tools lack admission: {missing_admission:?}"
+        );
+    }
+}
+
 /// Register all macOS tools into the registry. `compat=true` swaps the
 /// regular `screenshot` tool for the Claude Code computer-use compat
 /// variant — same name, stricter args, window-scoped JPEG @ 85% + a text
@@ -1801,28 +1860,7 @@ pub fn register_all(
         registry.approval_broker(),
         registry.protected_resource_ownership(),
     );
-    // Register through the platform facade so browser input enters the same
-    // admission fence as native input.
-    use cua_driver_core::browser::{
-        download::BrowserDownloadTool,
-        pointer::BrowserPointerTool,
-        tools::{
-            BrowserClickTool, BrowserDialogTool, BrowserNavigateTool, BrowserPrepareTool,
-            BrowserSelectTool, BrowserSetInputFilesTool, BrowserTypeTool, GetBrowserStateTool,
-        },
-    };
-    registry.register(Box::new(GetBrowserStateTool::new(browser_engine.clone())));
-    registry.register(Box::new(BrowserPrepareTool::new(browser_engine.clone())));
-    registry.register(Box::new(BrowserNavigateTool::new(browser_engine.clone())));
-    registry.register(Box::new(BrowserClickTool::new(browser_engine.clone())));
-    registry.register(Box::new(BrowserTypeTool::new(browser_engine.clone())));
-    registry.register(Box::new(BrowserSelectTool::new(browser_engine.clone())));
-    registry.register(Box::new(BrowserDialogTool::new(browser_engine.clone())));
-    registry.register(Box::new(BrowserSetInputFilesTool::new(
-        browser_engine.clone(),
-    )));
-    registry.register(Box::new(BrowserDownloadTool::new(browser_engine.clone())));
-    registry.register(Box::new(BrowserPointerTool::new(browser_engine)));
+    register_platform_browser_tools(registry, &browser_engine);
     // Recording / replay + session-lifecycle tools are platform-independent.
     registry.register_recording_tools();
     registry.register_session_tools();

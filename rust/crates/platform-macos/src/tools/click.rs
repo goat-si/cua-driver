@@ -1007,6 +1007,7 @@ pub(super) async fn restore_user_focus_after_background_pixel(
         prior_key_wid,
         window_id,
         focus_without_raise,
+        None,
     )
     .await;
 }
@@ -1017,16 +1018,21 @@ async fn restore_user_focus_after_background_pixel_now(
     prior_key_wid: Option<u32>,
     window_id: Option<u32>,
     focus_without_raise: bool,
+    baseline: Option<(super::pixel_restore::RestoreBaseline, Option<i32>)>,
 ) {
     if prior_front == Some(pid) {
         return;
     }
+    let allowed = move |expected| baseline.is_none_or(|(guard, _)| guard.valid(expected, pid));
     let reactivated = if let Some(previous_pid) = background_pixel_restore_pid(
         PixelActivationPolicy::AllowTargetWithoutRaise,
         prior_front,
         pid,
         apps::frontmost_pid(),
     ) {
+        if !allowed(baseline.and_then(|(_, expected)| expected)) {
+            return;
+        }
         let _ = apps::activate_pid(previous_pid);
         wait_until_frontmost(previous_pid, std::time::Duration::from_millis(300)).await;
         true
@@ -1047,13 +1053,14 @@ async fn restore_user_focus_after_background_pixel_now(
             crate::input::skylight::key_focus_pid(),
             previous_pid,
         );
-        if key_moved && apps::frontmost_pid() == Some(previous_pid) {
+        if key_moved && apps::frontmost_pid() == Some(previous_pid) && allowed(Some(previous_pid)) {
             let _ = latency::spawn_action_blocking(move || {
                 crate::input::skylight::restore_focus_after_without_raise(
                     previous_pid,
                     prior_key_wid,
                     pid,
                     wid,
+                    || allowed(Some(previous_pid)),
                 )
             })
             .await;
@@ -2103,11 +2110,13 @@ impl ClickTool {
             // targeting (PX) orthogonal to delivery (AX) and avoids making a
             // Chromium/AppKit window key merely to satisfy first-mouse rules.
             if let Some(hit_test_wid) = window_id.filter(|_| {
-                !delivery_mode.is_foreground()
-                    && button_str == "left"
-                    && count == 1
-                    && modifiers.is_empty()
-                    && action == "focus"
+                background_pixel_ax_eligible(
+                    delivery_mode.is_foreground(),
+                    &button_str,
+                    count,
+                    modifiers.is_empty(),
+                    &action,
+                )
             }) {
                 let focus_only = action == "focus";
                 if let Err(refusal) =
@@ -2350,6 +2359,9 @@ impl ClickTool {
             // or a Safari link that activates a new tab — same side-effect
             // shape as the AX path, so we wrap identically.
             let prior_front = apps::frontmost_pid();
+            let restore_baseline = super::pixel_restore::RestoreBaseline::capture(
+                super::pixel_restore::current_epoch().expect("input admission"),
+            );
             let snapshot = match activation_policy {
                 PixelActivationPolicy::SuppressTarget => {
                     WindowChangeDetector::snapshot(prior_front)
@@ -2454,6 +2466,7 @@ impl ClickTool {
                 Ok(guard) => guard,
                 Err(refusal) => return refusal,
             };
+            let expected_front = apps::frontmost_pid();
             let result = focus_guard::with_focus_suppressed(
                 if activation_policy == PixelActivationPolicy::SuppressTarget {
                     Some(pid)
@@ -2593,11 +2606,11 @@ impl ClickTool {
                 && prior_front != Some(pid)
             {
                 let epoch = super::pixel_restore::current_epoch().expect("input admission");
-                let expected_front = apps::frontmost_pid();
                 super::pixel_restore::spawn_restore(
                     pid,
                     epoch,
                     expected_front,
+                    restore_baseline,
                     move || async move {
                         restore_user_focus_after_background_pixel_now(
                             pid,
@@ -2605,6 +2618,7 @@ impl ClickTool {
                             prior_key_wid,
                             window_id,
                             focus_without_raise,
+                            Some((restore_baseline, expected_front)),
                         )
                         .await;
                     },
@@ -3527,6 +3541,18 @@ fn perform_ax_click(
     Ok((summary, suspected_noop, evidence, false))
 }
 
+fn background_pixel_ax_eligible(
+    foreground: bool,
+    button: &str,
+    count: usize,
+    no_modifiers: bool,
+    action: &str,
+) -> bool {
+    // Focus is a distinct request; a pixel press uses the window-addressed
+    // event route so its requested click count reaches the target.
+    !foreground && button == "left" && count == 1 && no_modifiers && action == "focus"
+}
+
 fn background_hit_uses_ax(focus_only: bool, _in_web_area: bool) -> bool {
     focus_only
 }
@@ -3896,7 +3922,29 @@ mod web_focus_settle_tests {
 
 #[cfg(test)]
 mod text_and_web_routing_tests {
-    use super::{background_hit_uses_ax, text_input_click_role};
+    use super::{background_hit_uses_ax, background_pixel_ax_eligible, text_input_click_role};
+
+    #[test]
+    fn only_unmodified_background_focus_uses_pixel_ax_prelude() {
+        assert!(background_pixel_ax_eligible(
+            false, "left", 1, true, "focus"
+        ));
+        assert!(!background_pixel_ax_eligible(
+            false, "left", 1, true, "press"
+        ));
+        assert!(!background_pixel_ax_eligible(
+            true, "left", 1, true, "focus"
+        ));
+        assert!(!background_pixel_ax_eligible(
+            false, "left", 2, true, "focus"
+        ));
+        assert!(!background_pixel_ax_eligible(
+            false, "right", 1, true, "focus"
+        ));
+        assert!(!background_pixel_ax_eligible(
+            false, "left", 1, false, "focus"
+        ));
+    }
 
     #[test]
     fn pixel_presses_use_events_while_focus_uses_ax() {

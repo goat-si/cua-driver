@@ -22,7 +22,9 @@ For a background left pixel click addressed by pid and window ID, the driver
 posts one down/up pair per requested click, with increasing click state and a
 short gap between pairs. Delivery remains unverifiable unless read-back
 confirms an effect. Any focus restoration runs separately and is abandoned
-when a later input action or a change of frontmost app makes it stale.
+when a later input action or a change of frontmost app makes it stale; a new
+input action wakes stale pending restorations instead of waiting for their
+settle interval.
 
 Before running any shell command, ask: **"does this raise,
 activate, foreground, or make-key any app?"** If yes, don't run it.

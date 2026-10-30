@@ -1033,6 +1033,7 @@ struct CuaAppKitHarness {
             matrixWindows?.secondary.makeKeyAndOrderFront(nil)
         }
         var rekeySource: DispatchSourceSignal?
+        var b3StatusSource: DispatchSourceSignal?
         if ProcessInfo.processInfo.environment["CUA_HARNESS_BRING_TO_FRONT_MODE"] == "b3",
            let secondary = matrixWindows?.secondary {
             controller.window.contentView?.layoutSubtreeIfNeeded()
@@ -1064,6 +1065,23 @@ struct CuaAppKitHarness {
             }
             source.resume()
             rekeySource = source
+            signal(SIGUSR2, SIG_IGN)
+            let status = DispatchSource.makeSignalSource(signal: SIGUSR2, queue: .main)
+            status.setEventHandler {
+                let companion = ProcessInfo.processInfo.environment["CUA_B3_COMPANION"] == "1"
+                if companion {
+                    app.activate(ignoringOtherApps: true)
+                    secondary.makeKeyAndOrderFront(nil)
+                }
+                appendClickJournal([
+                    "action": companion ? "activate" : "status",
+                    "target_is_key": controller.window.isKeyWindow,
+                    "frontmost_pid": NSWorkspace.shared.frontmostApplication?.processIdentifier ?? 0,
+                ])
+            }
+            status.resume()
+            b3StatusSource = status
+            appendClickJournal(["action": "armed"])
         }
         writeBringToFrontWindowReport(main: controller.window, matrix: matrixWindows)
         if let delay = ProcessInfo.processInfo.environment["CUA_APPKIT_LAUNCH_DELAY_MS"]
@@ -1076,6 +1094,7 @@ struct CuaAppKitHarness {
         }
         app.run()
         _ = rekeySource
+        _ = b3StatusSource
         _ = matrixWindows
     }
 }
