@@ -895,8 +895,10 @@ fn send_click_guarded_impl(
         batch_failed: false,
         activated: false,
         allow_input_assist,
+        cursor_moved: false,
     };
-    let planned = sink.downs.len() + sink.count * 3;
+    // One pointer move, then the modifier downs, then move/down/up per click.
+    let planned = 1 + sink.downs.len() + sink.count * 3;
     let mut result = run_guarded(&mut sink, planned, guard);
     if let GuardedResult::Sent { outcome } = &mut result {
         if outcome.effect == DispatchEffect::Unverifiable {
@@ -936,6 +938,8 @@ struct ForegroundClick {
     /// Whether activation may emit synthetic input before the guard runs.
     /// Only legacy callers, whose guard always accepts, allow it.
     allow_input_assist: bool,
+    /// Event 0 moved the pointer (restored in cleanup only when it did).
+    cursor_moved: bool,
 }
 impl InputSink for ForegroundClick {
     fn prepare(&mut self) -> Vec<&'static str> {
@@ -951,7 +955,7 @@ impl InputSink for ForegroundClick {
                     crate::input::guarded_dispatch::prepare_activation(
                         self.allow_input_assist,
                         || crate::input::force_foreground_attached(target),
-                        || crate::input::force_foreground_assisted(target).0,
+                        || crate::input::force_foreground_assisted(target),
                     );
                 effects.extend(activation_effects);
                 if !active {
@@ -992,9 +996,6 @@ impl InputSink for ForegroundClick {
                     effects.push("z_order");
                 }
             }
-            if SetCursorPos(self.sx, self.sy).is_ok() {
-                effects.push("cursor_move");
-            }
         }
         effects
     }
@@ -1002,6 +1003,14 @@ impl InputSink for ForegroundClick {
         if let Some(error) = self.error.take() {
             return Err(error);
         }
+        // Event 0 positions the pointer: moving it can deliver WM_MOUSEMOVE
+        // to the window beneath it, so it runs only after the guard accepted
+        // and counts as a sent event.
+        if index == 0 {
+            self.cursor_moved = unsafe { SetCursorPos(self.sx, self.sy) }.is_ok();
+            return Ok(());
+        }
+        let index = index - 1;
         if self.batch_remaining > 0 {
             self.batch_remaining -= 1;
             return Ok(());
@@ -1038,8 +1047,10 @@ impl InputSink for ForegroundClick {
 impl ForegroundClick {
     fn finish(&mut self, sent: usize) -> Vec<Value> {
         let mut errors = vec![];
-        let mods = sent.min(self.downs.len());
-        let mouse_sent = sent.saturating_sub(self.downs.len());
+        // Event 0 is the pointer move; the rest are modifier and mouse input.
+        let input_sent = sent.saturating_sub(1);
+        let mods = input_sent.min(self.downs.len());
+        let mouse_sent = input_sent.saturating_sub(self.downs.len());
         if mouse_sent % 3 == 2 {
             // SAFETY: one initialised INPUT record.
             if unsafe { crate::input::delivery::send_input(&[self.up_input]) } != 1 {
@@ -1060,7 +1071,7 @@ impl ForegroundClick {
             }
         }
         unsafe {
-            if sent > 0 {
+            if input_sent > 0 {
                 sleep(Duration::from_millis(
                     if self.mode == ClickMode::NonActivating {
                         40
@@ -1080,8 +1091,8 @@ impl ForegroundClick {
                     SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE,
                 );
             }
-            // Only undo what preparation did: without an armed no-activate
-            // guard nothing was promoted and the cursor was not moved.
+            // Only undo what was done: without an armed no-activate guard
+            // nothing was promoted, and the cursor is restored only if it moved.
             if self.mode == ClickMode::NonActivating && self.noactivate.is_some() {
                 if !self.prev_fg.0.is_null() && self.prev_fg != self.target {
                     let _ = SetWindowPos(
@@ -1094,10 +1105,13 @@ impl ForegroundClick {
                         SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE,
                     );
                 }
-                if self.prev_cursor_valid {
+                if self.prev_cursor_valid && self.cursor_moved {
                     let _ = SetCursorPos(self.prev_cursor.x, self.prev_cursor.y);
                 }
-            } else if self.prev_cursor_valid && (self.mode == ClickMode::Window || sent == 0) {
+            } else if self.prev_cursor_valid
+                && self.cursor_moved
+                && (self.mode == ClickMode::Window || input_sent == 0)
+            {
                 let mut current = POINT::default();
                 if GetCursorPos(&mut current).is_ok()
                     && cursor_still_at_injected_click(current.x, current.y, self.sx, self.sy)
@@ -1105,7 +1119,7 @@ impl ForegroundClick {
                     let _ = SetCursorPos(self.prev_cursor.x, self.prev_cursor.y);
                 }
             }
-            if sent == 0
+            if input_sent == 0
                 && self.activated
                 && !self.prev_fg.0.is_null()
                 && self.prev_fg != self.target
@@ -1128,7 +1142,7 @@ impl ForegroundClick {
                 }));
             }
             self.noactivate.take();
-            if sent > 0 && self.mode != ClickMode::NonActivating {
+            if input_sent > 0 && self.mode != ClickMode::NonActivating {
                 if let Some(target) = self.foreground_target {
                     if !crate::win32::foreground_matches_target_or_owned_window(
                         target,

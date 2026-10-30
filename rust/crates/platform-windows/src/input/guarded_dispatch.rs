@@ -22,14 +22,14 @@ pub enum GuardedResult {
 ///
 /// `activate` must change the foreground without emitting input.
 /// `assist` may emit synthetic input (the no-name key that earns the
-/// foreground token) and is only used when `allow_input_assist` is set:
-/// a guarded dispatch must not emit input before its guard runs, so it never
-/// assists. Returns whether the target became foreground and the side
-/// effects preparation performed.
+/// foreground token) and returns (activated, emitted input). It is used only
+/// when `allow_input_assist` is set: a guarded dispatch must not emit input
+/// before its guard runs, so it never assists. Returns whether the target
+/// became foreground and the side effects preparation performed.
 pub fn prepare_activation(
     allow_input_assist: bool,
     activate: impl FnOnce() -> bool,
-    assist: impl FnOnce() -> bool,
+    assist: impl FnOnce() -> (bool, bool),
 ) -> (bool, Vec<&'static str>) {
     if activate() {
         return (true, vec!["activation"]);
@@ -37,11 +37,17 @@ pub fn prepare_activation(
     if !allow_input_assist {
         return (false, vec![]);
     }
-    if assist() {
-        (true, vec!["activation_input_assist", "activation"])
-    } else {
-        (false, vec!["activation_input_assist"])
+    // `assist` reports whether it activated and whether it emitted input;
+    // record the input side effect only when input was actually emitted.
+    let (active, emitted) = assist();
+    let mut effects = vec![];
+    if emitted {
+        effects.push("activation_input_assist");
     }
+    if active {
+        effects.push("activation");
+    }
+    (active, effects)
 }
 
 pub fn run_guarded(
@@ -190,7 +196,7 @@ mod activation_tests {
             || false,
             || {
                 assisted.set(true);
-                true
+                (true, true)
             },
         );
         assert!(!active);
@@ -203,19 +209,24 @@ mod activation_tests {
 
     #[test]
     fn legacy_activation_reports_assist_input_as_a_side_effect() {
-        let (active, effects) = prepare_activation(true, || false, || true);
+        let (active, effects) = prepare_activation(true, || false, || (true, true));
         assert!(active);
         assert_eq!(effects, ["activation_input_assist", "activation"]);
-        let (active, effects) = prepare_activation(true, || false, || false);
+        let (active, effects) = prepare_activation(true, || false, || (false, true));
         assert!(!active);
         assert_eq!(effects, ["activation_input_assist"]);
+        // The assist helper retries plain activation first; when that wins,
+        // no input was emitted and none is reported.
+        let (active, effects) = prepare_activation(true, || false, || (true, false));
+        assert!(active);
+        assert_eq!(effects, ["activation"]);
         let assisted = Cell::new(false);
         let (active, effects) = prepare_activation(
             true,
             || true,
             || {
                 assisted.set(true);
-                true
+                (true, true)
             },
         );
         assert!(active);
