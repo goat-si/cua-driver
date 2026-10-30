@@ -7506,6 +7506,13 @@ fn protected_browser_process_refusal(
         "display_input" => {
             crate::browser::protection::unguarded_desktop_refusal(manifest, tool_name)
         }
+        // A whole-desktop observation would show the protected browser's
+        // windows, and no platform capture here can prove they are left
+        // out. list_apps returns application names and pids only, no
+        // window or page content.
+        "display" if tool_name != "list_apps" => {
+            crate::browser::protection::display_observation_refusal(manifest, tool_name)
+        }
         _ => None,
     }
 }

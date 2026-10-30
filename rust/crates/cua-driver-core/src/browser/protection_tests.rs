@@ -21,11 +21,13 @@ resources:
     existing_profiles:
       - {pid: 4343, window_id: 9}
   desktop:
+    display: true
+    applications: [4242]
     windows:
       - {pid: 4242, window_id: 7}
       - {pid: 4343, window_id: 9}
 allow:
-  tools: [click, get_window_state, get_accessibility_tree, set_value, type_text, run_steps]
+  tools: [click, get_window_state, get_accessibility_tree, set_value, type_text, run_steps, run_script, list_windows, list_apps]
 "#;
 
 fn manifest(source: &str) -> Result<crate::session_manifest::SessionManifest, String> {
@@ -99,17 +101,21 @@ const DESKTOP_TOOLS: [&str; 5] = [
     "set_value",
     "type_text",
 ];
+const LISTING_TOOLS: [&str; 2] = ["list_windows", "list_apps"];
 
 fn registry() -> (Arc<ToolRegistry>, Arc<Mutex<Vec<String>>>) {
     let calls = Arc::new(Mutex::new(Vec::new()));
     let mut registry = ToolRegistry::new();
-    for name in DESKTOP_TOOLS {
+    for name in DESKTOP_TOOLS.into_iter().chain(LISTING_TOOLS) {
         registry.register(Box::new(Probe {
             def: ToolDef {
                 name: name.into(),
                 description: "probe".into(),
                 input_schema: json!({"type": "object", "additionalProperties": true}),
-                read_only: matches!(name, "get_window_state" | "get_accessibility_tree"),
+                read_only: matches!(
+                    name,
+                    "get_window_state" | "get_accessibility_tree" | "list_windows" | "list_apps"
+                ),
                 destructive: false,
                 idempotent: false,
                 open_world: false,
@@ -119,6 +125,7 @@ fn registry() -> (Arc<ToolRegistry>, Arc<Mutex<Vec<String>>>) {
     }
     registry.register(Box::new(ScreenSize));
     registry.register_session_tools();
+    registry.register_script_tool();
     let registry = Arc::new(registry);
     registry.init_self_weak();
     (registry, calls)
@@ -183,7 +190,15 @@ async fn desktop_tools_never_reach_a_protected_browser_process() {
             allowed.content
         );
     }
-    assert_eq!(calls.lock().unwrap().len(), DESKTOP_TOOLS.len());
+    // list_apps also runs inside the dispatcher to identify an application.
+    let sent: Vec<String> = calls
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|tool| *tool != "list_apps")
+        .cloned()
+        .collect();
+    assert_eq!(sent, DESKTOP_TOOLS);
 }
 
 #[tokio::test]
@@ -272,4 +287,81 @@ fn origin_scoped_manifests_allow_desktop_tools_but_not_whole_page_or_desktop_rea
             &json!({"kind": "window", "pid": 4343, "window_id": 9}),
         )
         .is_err());
+}
+
+#[tokio::test]
+async fn whole_desktop_observation_is_refused_while_a_protected_browser_exists() {
+    let (registry, calls) = registry();
+    // Every window's title and owner, the protected browser's included.
+    let listed = registry
+        .invoke_with_context("list_windows", json!({"session": "protect"}), context())
+        .await;
+    assert_eq!(
+        code(&listed).as_deref(),
+        Some("browser_process_protected"),
+        "{:?}",
+        listed.structured_content
+    );
+    // Nested in a script: same refusal, nothing read.
+    let scripted = registry
+        .invoke_with_context(
+            "run_script",
+            json!({"session": "protect", "script": "await cua.listWindows();\nreturn 1;"}),
+            context(),
+        )
+        .await;
+    assert_eq!(scripted.is_error, Some(true));
+    assert!(
+        format!("{:?}", scripted.content).contains("browser_process_protected"),
+        "{:?}",
+        scripted.content
+    );
+    assert!(calls.lock().unwrap().is_empty(), "nothing was read");
+
+    // Other processes' windows stay listable by pid; app names carry no
+    // window or page content.
+    let other = registry
+        .invoke_with_context(
+            "list_windows",
+            json!({"session": "protect", "pid": OTHER_PID}),
+            context(),
+        )
+        .await;
+    assert_ne!(other.is_error, Some(true), "{:?}", other.content);
+    let apps = registry
+        .invoke_with_context("list_apps", json!({"session": "protect"}), context())
+        .await;
+    assert_ne!(apps.is_error, Some(true), "{:?}", apps.content);
+    let calls = calls.lock().unwrap();
+    assert_eq!(
+        calls.iter().filter(|tool| *tool == "list_windows").count(),
+        1
+    );
+    assert!(calls.iter().any(|tool| tool == "list_apps"));
+}
+
+#[tokio::test]
+async fn a_batch_observation_never_reads_a_protected_browser_window() {
+    let (registry, calls) = registry();
+    let result = registry
+        .invoke_with_context(
+            "run_steps",
+            json!({"session": "protect", "steps": [
+                {"tool": "click", "args": {"pid": OTHER_PID, "window_id": 7, "x": 1, "y": 1}},
+            ], "observe": {"pid": BROWSER_PID, "window_id": 9}}),
+            context(),
+        )
+        .await;
+    assert!(
+        format!("{:?}", result).contains("browser_process_protected"),
+        "{result:?}"
+    );
+    assert!(
+        !calls
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|tool| tool == "get_window_state"),
+        "the protected window was not read"
+    );
 }

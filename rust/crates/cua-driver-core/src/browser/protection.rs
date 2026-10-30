@@ -168,6 +168,23 @@ pub(crate) fn unguarded_desktop_refusal(
     })
 }
 
+/// The refusal for a whole-desktop observation while a protected browser
+/// process exists: its windows would be part of what is observed.
+pub(crate) fn display_observation_refusal(
+    manifest: &SessionManifest,
+    tool: &str,
+) -> Option<BrowserRefusal> {
+    any_protected(manifest).then(|| {
+        refusal(
+            tool,
+            "a whole-desktop observation would include a protected browser's windows; \
+             observe another application by pid and window_id instead"
+                .to_owned(),
+            None,
+        )
+    })
+}
+
 fn refusal(tool: &str, reason: String, pid: Option<i64>) -> BrowserRefusal {
     BrowserRefusal::new(
         BrowserRefusalCode::BrowserProcessProtected,

@@ -604,3 +604,34 @@ async fn an_existing_profile_bind_is_admitted_as_a_browser_window_only_with_a_sc
         .is_err());
     crate::session::fire_session_end(TRANSPORT);
 }
+
+#[tokio::test]
+async fn an_unscoped_bind_under_a_manifest_redacts_tabs_outside_the_manifest() {
+    let f = fixture().await;
+    let tool = GetBrowserStateTool::new(f.engine.clone());
+    let result = crate::tool::with_test_dispatch_context(
+        manifest_context(&["https://other.example"], ""),
+        tool.invoke(json!({ "pid": 1, "window_id": 7, "session": SESSION })),
+    )
+    .await;
+    let s = structured(&result);
+    assert_eq!(s["status"], "ok", "{s}");
+    let tab = s["tabs"][0].as_object().unwrap();
+    let mut keys: Vec<_> = tab.keys().cloned().collect();
+    keys.sort();
+    assert_eq!(keys, ["active", "tab_id"], "{s}");
+    assert!(s["native_title"].is_null(), "{s}");
+    assert!(!s.to_string().contains("fixture.test"), "{s}");
+
+    // A tab inside the manifest keeps its address without a scope.
+    let inside = crate::tool::with_test_dispatch_context(
+        manifest_context(&[SCOPE_FIXTURE], ""),
+        GetBrowserStateTool::new(f.engine.clone())
+            .invoke(json!({ "pid": 1, "window_id": 7, "session": SESSION })),
+    )
+    .await;
+    assert_eq!(
+        structured(&inside)["tabs"][0]["url"],
+        "https://fixture.test/"
+    );
+}

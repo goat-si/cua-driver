@@ -846,21 +846,19 @@ impl Tool for GetBrowserStateTool {
             .await
         {
             Ok((target_id, record)) => {
-                // With an origin scope, a tab whose address (read fresh from
-                // the browser by this bind) is outside the scope is listed by
-                // id and selection only: never its origin, address or title.
-                // Under a capability manifest the tab must also be in the
-                // manifest's origins, whatever the caller's scope lists.
+                // A tab is listed with its address and title only when it is
+                // inside the call's origin_scope (if any) AND inside the
+                // capability manifest's origins (if any), each checked on
+                // its own; otherwise by id and selection only. The address is
+                // read fresh from the browser by this bind.
                 let manifest_context = crate::tool::current_dispatch_authorization_context()
                     .filter(|context| context.capability_manifest().is_some());
                 let in_scope = |url: &str| {
-                    scope.as_ref().is_none_or(|scope| {
-                        scope.allows_url(url)
-                            && manifest_context
-                                .as_deref()
-                                .and_then(|context| context.capability_manifest())
-                                .is_none_or(|manifest| manifest.authorize_browser_url(url).is_ok())
-                    })
+                    scope.as_ref().is_none_or(|scope| scope.allows_url(url))
+                        && manifest_context
+                            .as_deref()
+                            .and_then(|context| context.capability_manifest())
+                            .is_none_or(|manifest| manifest.authorize_browser_url(url).is_ok())
                 };
                 let tabs: Vec<Value> = record
                     .tabs
