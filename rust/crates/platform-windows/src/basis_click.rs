@@ -140,10 +140,10 @@ mod tests {
         ] {
             let outcome = DispatchOutcome {
                 events_planned: 2,
-                events_sent: if effect == DispatchEffect::Refused {
-                    0
-                } else {
-                    1
+                events_sent: match effect {
+                    DispatchEffect::Refused => 0,
+                    DispatchEffect::Unverifiable => 2,
+                    _ => 1,
                 },
                 prepared_side_effects: vec![],
                 effect,
@@ -182,7 +182,7 @@ mod tests {
             if effect == DispatchEffect::Unverifiable {
                 assert_eq!(
                     value,
-                    json!({"events_planned":2,"events_sent":1,"prepared_side_effects":[],"effect":"unverifiable","cleanup_results":[],"path":"pixel_basis","basis_checked_at_dispatch":true,"snapshot_id":"s00000001.f1","screen_point":{"x":11,"y":22}})
+                    json!({"events_planned":2,"events_sent":2,"prepared_side_effects":[],"effect":"unverifiable","cleanup_results":[],"path":"pixel_basis","basis_checked_at_dispatch":true,"snapshot_id":"s00000001.f1","screen_point":{"x":11,"y":22}})
                 );
             }
             if effect == DispatchEffect::Partial {
