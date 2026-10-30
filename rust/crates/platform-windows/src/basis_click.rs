@@ -187,6 +187,7 @@ mod tests {
                 GuardedResult::Sent { outcome }
             };
             let value = result_json(&result, "s00000001.f1", (11, 22));
+            assert_eq!(value["delivery_mode"], "foreground");
             assert_eq!(value["path"], "pixel_basis");
             assert_eq!(
                 value["effect"],

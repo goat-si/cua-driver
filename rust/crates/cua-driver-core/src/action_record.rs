@@ -2064,6 +2064,52 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "windows")]
+    fn pixel_basis_results_normalize_using_actual_transport() {
+        for (effect, mode, expected_effect, transport, delivery) in [
+            (
+                "refused",
+                "foreground",
+                ActionEffect::Refused,
+                ActionTransport::WindowsSendInput,
+                None,
+            ),
+            (
+                "unverifiable",
+                "background",
+                ActionEffect::Unverifiable,
+                ActionTransport::WindowsPostMessage,
+                Some(ActualDelivery::Background),
+            ),
+            (
+                "partial",
+                "foreground",
+                ActionEffect::Partial,
+                ActionTransport::WindowsSendInput,
+                Some(ActualDelivery::Foreground),
+            ),
+            (
+                "uncertain",
+                "background",
+                ActionEffect::Unverifiable,
+                ActionTransport::WindowsPostMessage,
+                Some(ActualDelivery::Background),
+            ),
+        ] {
+            let record = ActionExecutionRecord::from_legacy("click", &serde_json::json!({"delivery_mode":"foreground"}), &serde_json::json!({"path":"pixel_basis", "effect":effect, "nothing_sent":effect == "refused", "code":"stale_basis", "events_sent":if effect == "refused" {0} else {2}, "delivery_mode":mode})).unwrap();
+            assert_eq!(record.effect, expected_effect);
+            assert_eq!(record.transport, transport);
+            assert_eq!(record.actual_delivery, delivery);
+        }
+    }
+
+    #[test]
+    #[cfg(not(target_os = "windows"))]
+    fn pixel_basis_is_not_normalized_on_other_platforms() {
+        assert!(ActionExecutionRecord::from_legacy("click", &serde_json::json!({}), &serde_json::json!({"path":"pixel_basis","effect":"refused","delivery_mode":"foreground"})).is_none());
+    }
+
+    #[test]
     fn every_known_legacy_action_path_normalizes() {
         let paths = [
             "ax",
