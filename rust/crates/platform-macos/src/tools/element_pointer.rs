@@ -338,21 +338,113 @@ pub(super) fn run_blocking(
     if !foreground {
         return dispatch(target, idx, count, use_ax_open, false);
     }
+    // Prove the point before fronting the window, so a bad point is refused
+    // with nothing sent. It is proven again after activation.
+    if !use_ax_open {
+        checked_point(target, true)?;
+    }
     let mut outcome = None;
     let activation = target.in_foreground(&mut || {
         outcome = Some(dispatch(target, idx, count, use_ax_open, true));
         Ok(())
     });
+    // From here the window may have been fronted, keyed or raised, even when
+    // activation then failed: no failure can claim that nothing was sent.
+    let after = |source: anyhow::Error| -> anyhow::Error {
+        AfterActivation {
+            activation: Activation::Foreground,
+            source,
+        }
+        .into()
+    };
     match (outcome, activation) {
-        (Some(outcome), _) => outcome,
-        (None, Err(error)) => Err(refuse(
-            "foreground_unavailable",
-            format!("The window could not be brought to the front ({error}); nothing was sent."),
-        )
-        .into()),
-        (None, Ok(())) => Err(anyhow::anyhow!("foreground element click did not run")),
+        (Some(Ok(performed)), _) => Ok(performed),
+        (Some(Err(error)), _) => Err(after(error)),
+        (None, Err(error)) => Err(after(
+            refuse(
+                "foreground_unavailable",
+                format!("The window could not be proven frontmost ({error})"),
+            )
+            .into(),
+        )),
+        (None, Ok(())) => Err(after(anyhow::anyhow!(
+            "foreground element click did not run"
+        ))),
     }
 }
+
+/// What a multi-click did to the target window's activation before it
+/// failed. Every failure result is built from it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Activation {
+    /// Nothing was attempted.
+    None,
+    /// The background prologue made the target window active (a focus
+    /// record was posted).
+    Background,
+    /// The background prologue tried and could not confirm it; part of it
+    /// may have reached the window server.
+    BackgroundUncertain,
+    /// The foreground helper ran: the window may have been fronted, keyed or
+    /// raised.
+    Foreground,
+}
+
+impl Activation {
+    fn label(self) -> &'static str {
+        match self {
+            Activation::None => "none",
+            Activation::Background => "background",
+            Activation::BackgroundUncertain => "background_uncertain",
+            Activation::Foreground => "foreground_attempted",
+        }
+    }
+
+    /// The sentence a failure result adds about it.
+    fn note(self) -> &'static str {
+        match self {
+            Activation::None => "",
+            Activation::Background => {
+                " The target window had already been made active in the background."
+            }
+            Activation::BackgroundUncertain => {
+                " An attempt to make the target window active in the background had already \
+                 been made and may have reached it."
+            }
+            Activation::Foreground => " The window may already have been brought to the front.",
+        }
+    }
+
+    /// Whether something was certainly sent (true), certainly not (false),
+    /// or cannot be known (None).
+    fn dispatched(self) -> Option<bool> {
+        match self {
+            Activation::None => Some(false),
+            Activation::Background => Some(true),
+            Activation::BackgroundUncertain | Activation::Foreground => None,
+        }
+    }
+}
+
+/// A failure that happened after an activation attempt.
+#[derive(Debug)]
+pub(super) struct AfterActivation {
+    pub(super) activation: Activation,
+    pub(super) source: anyhow::Error,
+}
+
+impl std::fmt::Display for AfterActivation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} (activation: {})",
+            self.source,
+            self.activation.label()
+        )
+    }
+}
+
+impl std::error::Error for AfterActivation {}
 
 /// The public result of a multi-click.
 pub(super) fn performed_result(
@@ -434,53 +526,78 @@ pub(super) fn performed_result(
     }
 }
 
-/// The result of a multi-click that sent no click on the element.
-/// `activation_sent`: the background prologue already made the target
-/// window active (a focus record went out), so a later refusal cannot claim
-/// that nothing was sent.
-fn error_result(count: usize, error: anyhow::Error, activation_sent: bool) -> ToolResult {
+/// The result of a multi-click that sent no click on the element, built
+/// from the events and the activation that had already gone out.
+fn error_result(count: usize, error: anyhow::Error) -> ToolResult {
+    let (activation, error) = match error.downcast::<AfterActivation>() {
+        Ok(after) => (after.activation, after.source),
+        Err(error) => (Activation::None, error),
+    };
+    let with_dispatched = |mut structured: Value, dispatched: Option<bool>| {
+        if let Some(dispatched) = dispatched {
+            structured["dispatched"] = json!(dispatched);
+        }
+        structured
+    };
     if let Some(changed) = error.downcast_ref::<TargetChanged>() {
-        let dispatched = changed.events_sent > 0 || activation_sent;
-        return ToolResult::error(format!("click: {changed}")).with_structured(json!({
-            "code": "element_changed_before_click",
-            "reason": changed.code,
-            "effect": if dispatched { "unverifiable" } else { "refused" },
-            "dispatched": dispatched,
-            "count": count,
-            "clicks_posted": 0,
-            "primer_clicks": if changed.events_sent > 0 { u8::from(changed.primer) } else { 0 },
-            "events_sent": changed.events_sent,
-            "activation_sent": activation_sent,
-        }));
+        let dispatched = if changed.events_sent > 0 {
+            Some(true)
+        } else {
+            activation.dispatched()
+        };
+        return ToolResult::error(format!("click: {changed}{}", activation.note()))
+            .with_structured(with_dispatched(
+                json!({
+                    "code": "element_changed_before_click",
+                    "reason": changed.code,
+                    "effect": if dispatched == Some(false) { "refused" } else { "unverifiable" },
+                    "count": count,
+                    "clicks_posted": 0,
+                    "primer_clicks": if changed.events_sent > 0 { u8::from(changed.primer) } else { 0 },
+                    "events_sent": changed.events_sent,
+                    "activation": activation.label(),
+                }),
+                dispatched,
+            ));
     }
-    if let (Some(refusal), true) = (error.downcast_ref::<NotDispatched>(), activation_sent) {
+    if let Some(refusal) = error.downcast_ref::<NotDispatched>() {
+        if activation == Activation::None {
+            let mut result = super::pre_dispatch_refusal(refusal.code, format!("click: {refusal}"));
+            if let Some(structured) = result.structured_content.as_mut() {
+                structured["count"] = json!(count);
+                structured["clicks_posted"] = json!(0);
+                structured["activation"] = json!(activation.label());
+            }
+            return result;
+        }
         return ToolResult::error(format!(
-            "click: {}. No click was sent, but the target window had already been made active \
-             in the background. Read the window again before retrying.",
+            "click: {}. No click was sent.{} Read the window again before retrying.",
             refusal
                 .message
                 .trim_end_matches("; nothing was sent.")
-                .trim_end_matches('.')
+                .trim_end_matches('.'),
+            activation.note()
         ))
-        .with_structured(json!({
-            "code": refusal.code,
-            "effect": "unverifiable",
-            "dispatched": true,
-            "count": count,
-            "clicks_posted": 0,
-            "activation_sent": true,
-        }));
+        .with_structured(with_dispatched(
+            json!({
+                "code": refusal.code,
+                "effect": "unverifiable",
+                "count": count,
+                "clicks_posted": 0,
+                "activation": activation.label(),
+            }),
+            activation.dispatched(),
+        ));
     }
-    if let Some(refusal) = error.downcast_ref::<NotDispatched>() {
-        let mut result = super::pre_dispatch_refusal(refusal.code, format!("click: {refusal}"));
-        if let Some(structured) = result.structured_content.as_mut() {
-            structured["count"] = json!(count);
-            structured["clicks_posted"] = json!(0);
-        }
-        return result;
-    }
-    ToolResult::error(format!("click (count {count}) failed: {error}"))
-        .with_structured(json!({ "count": count, "clicks_posted": 0 }))
+    ToolResult::error(format!(
+        "click (count {count}) failed: {error}.{}",
+        activation.note()
+    ))
+    .with_structured(json!({
+        "count": count,
+        "clicks_posted": 0,
+        "activation": activation.label(),
+    }))
 }
 
 /// An element click with count 2 or 3.
@@ -561,7 +678,7 @@ pub(super) async fn click_element(state: &ToolState, request: ElementClick) -> T
             .await
             {
                 Ok(Ok(())) => {}
-                Ok(Err(refusal)) => return Err(error_result(count, refusal.into(), false)),
+                Ok(Err(refusal)) => return Err(error_result(count, refusal.into())),
                 Err(error) => {
                     return Err(super::pre_dispatch_refusal(
                         "background_unavailable",
@@ -576,7 +693,11 @@ pub(super) async fn click_element(state: &ToolState, request: ElementClick) -> T
         } else {
             None
         };
-        let activation_sent = prologue.is_some();
+        let activation = match &prologue {
+            None => Activation::None,
+            Some(prologue) if prologue.activated => Activation::Background,
+            Some(_) => Activation::BackgroundUncertain,
+        };
         let blocking_target = action_target.clone();
         let result = crate::focus_guard::with_focus_suppressed(
             (!foreground && !background_pointer).then_some(pid),
@@ -610,10 +731,20 @@ pub(super) async fn click_element(state: &ToolState, request: ElementClick) -> T
                 cursor_overlay::OverlayCommand::ClickPulse { x, y },
             );
         }
-        let result = result.map(|(outcome, _held)| outcome);
-        Ok((result, changes.result_suffix(), activation_sent))
+        // Background failures after the prologue carry what it sent; the
+        // foreground route tags its own.
+        let result = result.map(|(outcome, _held)| {
+            outcome.map_err(|source| {
+                if activation == Activation::None || source.is::<AfterActivation>() {
+                    source
+                } else {
+                    AfterActivation { activation, source }.into()
+                }
+            })
+        });
+        Ok((result, changes.result_suffix()))
     });
-    let (result, suffix, activation_sent) = match action.await {
+    let (result, suffix) = match action.await {
         Ok(Ok(done)) => done,
         Ok(Err(refusal)) => return refusal,
         Err(error) => {
@@ -628,7 +759,7 @@ pub(super) async fn click_element(state: &ToolState, request: ElementClick) -> T
         Ok(Ok(performed)) => {
             performed_result(idx, window_id, count, foreground, &performed, &suffix)
         }
-        Ok(Err(error)) => error_result(count, error, activation_sent),
+        Ok(Err(error)) => error_result(count, error),
         Err(error) => ToolResult::error(format!(
             "The click task failed ({error}); the clicks may have been sent. Read fresh state \
              before clicking again."

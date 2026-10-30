@@ -27,6 +27,10 @@ struct Fake {
     /// Hit returned from the second hit test on (what the pointer move or
     /// primer changed under the point).
     hit_later: Option<Hit>,
+    /// The hit-test read from which hit_later answers.
+    hit_change_at: usize,
+    /// Whether the background prologue reports that it activated the window.
+    prologue_activates: bool,
     hit_reads: AtomicUsize,
     lists_ax_open: bool,
     ax_open_result: AXError,
@@ -49,6 +53,8 @@ impl Fake {
             bounds: Some(BOUNDS),
             hit: Hit::Target,
             hit_later: None,
+            hit_change_at: 1,
+            prologue_activates: true,
             hit_reads: AtomicUsize::new(0),
             lists_ax_open: false,
             ax_open_result: kAXErrorSuccess,
@@ -108,9 +114,9 @@ impl ElementTarget for Fake {
     fn hit_at(&self, point: (f64, f64)) -> Hit {
         assert_eq!(point, CENTER);
         let read = self.hit_reads.fetch_add(1, Ordering::SeqCst);
-        match (read, &self.hit_later) {
-            (0, _) | (_, None) => self.hit.clone(),
-            (_, Some(later)) => later.clone(),
+        match &self.hit_later {
+            Some(later) if read >= self.hit_change_at => later.clone(),
+            _ => self.hit.clone(),
         }
     }
     fn post(
@@ -165,7 +171,7 @@ impl ElementTarget for Fake {
             ));
         }
         Ok(PointerPrologue {
-            activated: true,
+            activated: self.prologue_activates,
             prior_key_wid: None,
             key_focus: None,
         })
@@ -198,10 +204,17 @@ fn pairs(count: i64) -> Vec<(&'static str, i64)> {
         .collect()
 }
 
-fn refusal_code(error: anyhow::Error) -> &'static str {
+/// The error under any activation tag.
+fn inner(error: &anyhow::Error) -> &anyhow::Error {
     error
+        .downcast_ref::<AfterActivation>()
+        .map_or(error, |after| &after.source)
+}
+
+fn refusal_code(error: anyhow::Error) -> &'static str {
+    inner(&error)
         .downcast_ref::<NotDispatched>()
-        .expect("a no-send refusal")
+        .expect("a refusal")
         .code
 }
 
@@ -332,10 +345,51 @@ fn a_foreground_click_whose_window_cannot_be_fronted_checks_and_sends_nothing() 
     fake.activates = false;
     for use_ax_open in [false, true] {
         let error = run_blocking(&fake, 3, 2, use_ax_open, true).unwrap_err();
-        assert_eq!(refusal_code(error), "foreground_unavailable");
+        // The activation helper may have fronted the window before it gave
+        // up: the result says so and claims no clean refusal.
+        let result = error_result(2, error);
+        let structured = result.structured_content.clone().unwrap();
+        assert_eq!(structured["code"], "foreground_unavailable");
+        assert_eq!(structured["effect"], "unverifiable");
+        assert_eq!(structured["activation"], "foreground_attempted");
+        assert!(structured.get("dispatched").is_none(), "{structured}");
+        let text = format!("{result:?}");
+        assert!(text.contains("may already have been brought"), "{text}");
+        assert!(!text.contains("nothing was sent"), "{text}");
     }
-    assert!(fake.calls().iter().all(|call| *call == "activate"));
+    assert_eq!(fake.calls().last(), Some(&"activate"));
+    assert!(!fake.calls().contains(&"post"));
+    assert!(!fake.calls().contains(&"ax_open"));
     assert!(fake.posts().is_empty());
+}
+
+#[test]
+fn a_foreground_point_off_the_element_is_refused_before_activation() {
+    let mut fake = Fake::new(1);
+    fake.hit = Hit::Nothing;
+    let error = run_blocking(&fake, 3, 2, false, true).unwrap_err();
+    let result = error_result(2, error);
+    let structured = result.structured_content.unwrap();
+    assert_eq!(structured["code"], "element_not_at_point");
+    assert_eq!(structured["dispatched"], false);
+    assert!(!fake.calls().contains(&"activate"));
+}
+
+#[test]
+fn a_foreground_point_that_fails_after_activation_is_unverifiable() {
+    let mut fake = Fake::new(1);
+    // The preflight passes; the check after activation does not.
+    fake.hit_later = Some(Hit::Elsewhere("a sheet".into()));
+    let error = run_blocking(&fake, 3, 2, false, true).unwrap_err();
+    let result = error_result(2, error);
+    let structured = result.structured_content.clone().unwrap();
+    assert_eq!(structured["code"], "element_not_at_point");
+    assert_eq!(structured["effect"], "unverifiable");
+    assert_eq!(structured["activation"], "foreground_attempted");
+    assert!(structured.get("dispatched").is_none(), "{structured}");
+    assert!(fake.posts().is_empty());
+    let text = format!("{result:?}");
+    assert!(!text.contains("nothing was sent"), "{text}");
 }
 
 #[test]
@@ -343,8 +397,11 @@ fn a_target_that_changes_while_the_clicks_are_prepared_gets_no_click() {
     for (foreground, events_sent) in [(false, 3), (true, 1)] {
         let mut fake = Fake::new(1);
         fake.hit_later = Some(Hit::Elsewhere("a hover button".into()));
+        // Changes at the recheck before the first click: the background has
+        // one check before it, the foreground a preflight and one more.
+        fake.hit_change_at = if foreground { 2 } else { 1 };
         let error = run_blocking(&fake, 3, 2, false, foreground).unwrap_err();
-        let changed = error
+        let changed = inner(&error)
             .downcast_ref::<TargetChanged>()
             .expect("target changed");
         assert_eq!(
@@ -363,7 +420,7 @@ fn a_target_that_changes_while_the_clicks_are_prepared_gets_no_click() {
             "foreground {foreground}"
         );
         assert_eq!(posts[0].3.len(), events_sent);
-        let result = error_result(2, error, false);
+        let result = error_result(2, error);
         let structured = result.structured_content.unwrap();
         assert_eq!(structured["code"], "element_changed_before_click");
         assert_eq!(structured["dispatched"], true);
@@ -518,11 +575,35 @@ fn a_recheck_failure_with_nothing_sent_is_a_refusal() {
         primer: false,
     };
     assert!(changed.to_string().contains("Nothing had been handed"));
-    let result = error_result(2, changed.into(), false);
+    let result = error_result(2, changed.into());
     let structured = result.structured_content.unwrap();
     assert_eq!(structured["dispatched"], false);
     assert_eq!(structured["effect"], "refused");
     assert_eq!(structured["primer_clicks"], 0);
+}
+
+#[tokio::test]
+async fn an_unconfirmed_background_activation_is_reported_as_uncertain() {
+    let pid = 1_000_110;
+    let mut fake = Fake::new(pid);
+    fake.prologue_activates = false;
+    fake.hit_later = Some(Hit::Elsewhere("a sheet".into()));
+    let fake = Arc::new(fake);
+    let _registered = test_targets::register(pid, fake.clone());
+    let (tool, token, _state) = tool_with_token(pid);
+    let result = tool
+        .invoke(json!({ "pid": pid, "element_token": token, "count": 2 }))
+        .await;
+    let structured = result
+        .structured_content
+        .clone()
+        .expect("structured result");
+    assert_eq!(structured["effect"], "unverifiable", "{result:?}");
+    assert_eq!(structured["activation"], "background_uncertain");
+    assert!(structured.get("dispatched").is_none(), "{structured}");
+    let text = format!("{result:?}");
+    assert!(text.contains("may have reached it"), "{text}");
+    assert!(!text.contains("had already been made active"), "{text}");
 }
 
 #[tokio::test]
