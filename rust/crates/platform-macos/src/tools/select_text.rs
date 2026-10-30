@@ -60,10 +60,34 @@ fn def() -> &'static ToolDef {
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum OptionalStringAttr {
     Value(Option<String>),
+    /// kAXErrorFailure on two reads in a row: the app answers the
+    /// attribute with a failure every time (TextEdit's text view does so
+    /// for AXDescription), as opposed to a busy app or a timeout.
+    StableFailure,
     Unreadable,
 }
 
+/// kAXErrorFailure.
+const AX_ERROR_FAILURE: i32 = -25200;
+
 unsafe fn optional_string_attr(element: AXUIElementRef, name: &str) -> OptionalStringAttr {
+    match optional_string_attr_once(element, name) {
+        Err(AX_ERROR_FAILURE) => match optional_string_attr_once(element, name) {
+            Err(AX_ERROR_FAILURE) => OptionalStringAttr::StableFailure,
+            Err(_) => OptionalStringAttr::Unreadable,
+            Ok(value) => value,
+        },
+        Err(_) => OptionalStringAttr::Unreadable,
+        Ok(value) => value,
+    }
+}
+
+/// One read: the value or absence, else the AX error (0 for a value that is
+/// not a string).
+unsafe fn optional_string_attr_once(
+    element: AXUIElementRef,
+    name: &str,
+) -> Result<OptionalStringAttr, i32> {
     let attr = CFString::new(name);
     let mut value: CFTypeRef = std::ptr::null();
     let error = AXUIElementCopyAttributeValue(element, attr.as_concrete_TypeRef(), &mut value);
@@ -71,37 +95,85 @@ unsafe fn optional_string_attr(element: AXUIElementRef, name: &str) -> OptionalS
         if !value.is_null() {
             CFRelease(value);
         }
-        return OptionalStringAttr::Value(None);
+        return Ok(OptionalStringAttr::Value(None));
     }
     if error != kAXErrorSuccess || value.is_null() {
         if !value.is_null() {
             CFRelease(value);
         }
-        return OptionalStringAttr::Unreadable;
+        return Err(if error == kAXErrorSuccess { 0 } else { error });
     }
     if CFGetTypeID(value) != CFString::type_id() {
         CFRelease(value);
-        return OptionalStringAttr::Unreadable;
+        return Err(0);
     }
-    OptionalStringAttr::Value(Some(
+    Ok(OptionalStringAttr::Value(Some(
         CFString::wrap_under_create_rule(value as _).to_string(),
-    ))
+    )))
 }
 
-fn selection_exposure_allowed(attributes: &[OptionalStringAttr; 7]) -> bool {
-    if attributes
-        .iter()
-        .any(|attr| matches!(attr, OptionalStringAttr::Unreadable))
+/// Whether a selection may be made in an element with these attributes:
+/// role, subrole, title, description, placeholder, identifier, help, then
+/// the role description.
+///
+/// Secure entry is marked by role or subrole (AXSecureTextField), which must
+/// read. The five name hints carry a "password"-style label, the only signal
+/// of a custom field; a failed read of one refuses. One exception, for
+/// TextEdit's document text view (its AXDescription fails with
+/// kAXErrorFailure on every read): an AXTextArea whose role, subrole, role
+/// description and other four hints read cleanly with no security marking
+/// may have exactly one hint that fails that way. Such an element's value is
+/// already published unredacted by get_window_state, which reads a failed
+/// hint as absent under the same classifier. A field whose only protection
+/// signal sits in that one failing hint would be admitted.
+fn selection_exposure_allowed(attributes: &[OptionalStringAttr; 8]) -> bool {
+    if !matches!(attributes[0], OptionalStringAttr::Value(_))
+        || !matches!(attributes[1], OptionalStringAttr::Value(_))
+        || attributes[2..7]
+            .iter()
+            .any(|attr| matches!(attr, OptionalStringAttr::Unreadable))
     {
         return false;
     }
     let value = |index: usize| match &attributes[index] {
         OptionalStringAttr::Value(value) => value.as_deref(),
-        OptionalStringAttr::Unreadable => None,
+        OptionalStringAttr::StableFailure | OptionalStringAttr::Unreadable => None,
     };
     let Some(role) = value(0).filter(|role| !role.trim().is_empty()) else {
         return false;
     };
+    let failed_hints = attributes[2..7]
+        .iter()
+        .filter(|attr| matches!(attr, OptionalStringAttr::StableFailure))
+        .count();
+    if failed_hints > 0 {
+        let role_description_clean = match &attributes[7] {
+            OptionalStringAttr::Value(Some(text)) => {
+                let lower = text.to_ascii_lowercase();
+                // The shared classifier's full keyword set (password,
+                // passcode, verification/one-time/security code, secure,
+                // otp/totp), plus "protected".
+                !lower.trim().is_empty()
+                    && !lower.contains("protected")
+                    && !cua_driver_core::snapshot_compaction::is_secure_text_field(
+                        &cua_driver_core::snapshot_compaction::FieldSecurityMeta {
+                            role,
+                            subrole: None,
+                            title: Some(text),
+                            description: None,
+                            placeholder: None,
+                            identifier: None,
+                            help: None,
+                            is_password_flag: false,
+                        },
+                    )
+            }
+            _ => false,
+        };
+        if role != "AXTextArea" || failed_hints > 1 || !role_description_clean {
+            return false;
+        }
+    }
     !cua_driver_core::snapshot_compaction::is_secure_text_field(
         &cua_driver_core::snapshot_compaction::FieldSecurityMeta {
             role,
@@ -222,9 +294,13 @@ unsafe fn select_text_blocking(
         optional_string_attr(element, "AXPlaceholderValue"),
         optional_string_attr(element, "AXIdentifier"),
         optional_string_attr(element, "AXHelp"),
+        optional_string_attr(element, "AXRoleDescription"),
     ];
     if !selection_exposure_allowed(&attributes) {
-        return Err("select_text refuses secure fields or unreadable security metadata".into());
+        return Err(
+            "select_text refuses secure fields, and fields whose security attributes could not be read"
+                .into(),
+        );
     }
     if !is_attribute_settable(element, "AXSelectedTextRange") {
         return Err("AXSelectedTextRange is not settable on this element".into());
@@ -446,8 +522,12 @@ mod tests {
 
     #[test]
     fn security_metadata_fails_closed() {
-        let ordinary: [OptionalStringAttr; 7] = std::array::from_fn(|index| {
-            OptionalStringAttr::Value((index == 0).then(|| "AXTextField".into()))
+        let ordinary: [OptionalStringAttr; 8] = std::array::from_fn(|index| {
+            OptionalStringAttr::Value(match index {
+                0 => Some("AXTextField".into()),
+                7 => Some("text field".into()),
+                _ => None,
+            })
         });
         assert!(selection_exposure_allowed(&ordinary));
         let mut secure = ordinary.clone();
@@ -456,5 +536,101 @@ mod tests {
         let mut unreadable = ordinary;
         unreadable[6] = OptionalStringAttr::Unreadable;
         assert!(!selection_exposure_allowed(&unreadable));
+    }
+
+    /// TextEdit's document text view as read live (this Mac, 30 Oct 2026):
+    /// AXSubrole, AXTitle and AXPlaceholderValue unsupported, AXDescription
+    /// kAXErrorFailure on every read, AXIdentifier "First Text View", AXHelp
+    /// no value, AXRoleDescription "text entry area".
+    fn textedit_text_area() -> [OptionalStringAttr; 8] {
+        [
+            OptionalStringAttr::Value(Some("AXTextArea".into())),
+            OptionalStringAttr::Value(None),
+            OptionalStringAttr::Value(None),
+            OptionalStringAttr::StableFailure,
+            OptionalStringAttr::Value(None),
+            OptionalStringAttr::Value(Some("First Text View".into())),
+            OptionalStringAttr::Value(None),
+            OptionalStringAttr::Value(Some("text entry area".into())),
+        ]
+    }
+
+    #[test]
+    fn textedit_text_area_is_selectable() {
+        assert!(selection_exposure_allowed(&textedit_text_area()));
+        // Ordinary text area and text field with every hint absent.
+        for role in ["AXTextArea", "AXTextField"] {
+            let mut plain = textedit_text_area();
+            plain[0] = OptionalStringAttr::Value(Some(role.into()));
+            plain[3] = OptionalStringAttr::Value(None);
+            assert!(selection_exposure_allowed(&plain), "{role}");
+        }
+    }
+
+    #[test]
+    fn failed_hint_reads_refuse_outside_the_one_stable_text_area_case() {
+        let refused = |change: &dyn Fn(&mut [OptionalStringAttr; 8])| {
+            let mut attrs = textedit_text_area();
+            change(&mut attrs);
+            !selection_exposure_allowed(&attrs)
+        };
+        // A transient or other error (cannot complete, timeout) on a hint.
+        assert!(refused(&|a| a[3] = OptionalStringAttr::Unreadable));
+        // Two hints failing.
+        assert!(refused(&|a| a[6] = OptionalStringAttr::StableFailure));
+        // The same failure on a single-line field.
+        assert!(refused(
+            &|a| a[0] = OptionalStringAttr::Value(Some("AXTextField".into()))
+        ));
+        // Role description missing, unreadable or naming secure entry.
+        assert!(refused(&|a| a[7] = OptionalStringAttr::Value(None)));
+        assert!(refused(&|a| a[7] = OptionalStringAttr::Unreadable));
+        for marking in [
+            "secure text field",
+            "password",
+            "passcode entry",
+            "verification code",
+            "one-time code",
+            "security code",
+            "OTP",
+            "totp field",
+            "protected text",
+        ] {
+            assert!(
+                refused(&|a| a[7] = OptionalStringAttr::Value(Some(marking.into()))),
+                "{marking}"
+            );
+        }
+        // Role or subrole not read cleanly.
+        assert!(refused(&|a| a[0] = OptionalStringAttr::Unreadable));
+        assert!(refused(&|a| a[1] = OptionalStringAttr::Unreadable));
+        assert!(refused(&|a| a[1] = OptionalStringAttr::StableFailure));
+        assert!(refused(&|a| a[0] = OptionalStringAttr::Value(None)));
+    }
+
+    #[test]
+    fn secure_and_password_marked_fields_are_refused() {
+        let refused = |change: &dyn Fn(&mut [OptionalStringAttr; 8])| {
+            let mut attrs = textedit_text_area();
+            change(&mut attrs);
+            !selection_exposure_allowed(&attrs)
+        };
+        assert!(refused(
+            &|a| a[0] = OptionalStringAttr::Value(Some("AXSecureTextField".into()))
+        ));
+        for role in ["AXTextField", "AXTextArea"] {
+            assert!(refused(&|a| {
+                a[0] = OptionalStringAttr::Value(Some(role.into()));
+                a[3] = OptionalStringAttr::Value(None);
+                a[1] = OptionalStringAttr::Value(Some("AXSecureTextField".into()));
+            }));
+        }
+        // A readable password label next to the failing description.
+        assert!(refused(
+            &|a| a[4] = OptionalStringAttr::Value(Some("Password".into()))
+        ));
+        assert!(refused(
+            &|a| a[5] = OptionalStringAttr::Value(Some("one-time-code".into()))
+        ));
     }
 }

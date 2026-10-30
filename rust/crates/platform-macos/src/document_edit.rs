@@ -172,6 +172,125 @@ unsafe fn document_path(element: AXUIElementRef) -> Option<std::path::PathBuf> {
     crate::apple_events::file_url_to_path(&url?)
 }
 
+/// What the document mark did inside a window held as key for one insert.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HeldMark {
+    /// The element is not in a document window, so there is nothing to save.
+    NotADocument,
+    /// Whether the element sits in a document window could not be read;
+    /// no key was sent.
+    DocumentUnknown,
+    /// The space was seen landing and the backspace removed it again.
+    Marked,
+    /// A check stopped it, or the text or caret could not be read, before
+    /// any key: no key was sent.
+    NothingSent,
+    /// The space went out (or its post failed and may still have landed)
+    /// and no backspace followed: a space may remain in the text.
+    SpaceMayRemain,
+    /// The backspace went out but the text did not read back as before.
+    Unconfirmed,
+}
+
+impl HeldMark {
+    /// A sentence for the tool result, or nothing.
+    pub fn note(self) -> &'static str {
+        match self {
+            HeldMark::NotADocument => "",
+            HeldMark::DocumentUnknown => {
+                " Warning: whether this window holds a saved document could not be read, so no \
+                 key edit was sent to mark it edited; saving or closing it may keep the old text."
+            }
+            HeldMark::Marked => DocumentEdited::Marked.note(),
+            HeldMark::NothingSent => {
+                " Warning: the document is not marked edited (no key edit was sent), so saving or \
+                 closing it may keep the old text."
+            }
+            HeldMark::SpaceMayRemain => {
+                " Warning: a space sent to mark the document edited may remain in the text after \
+                 the insert, and the document may not be marked edited; read the window."
+            }
+            HeldMark::Unconfirmed => {
+                " Warning: the space and backspace sent to mark the document edited did not read \
+                 back as a net-zero edit, so the text may differ; read the window."
+            }
+        }
+    }
+
+    /// A stable label for structured results.
+    pub fn label(self) -> &'static str {
+        match self {
+            HeldMark::NotADocument => "not_a_document",
+            HeldMark::DocumentUnknown => "document_unknown",
+            HeldMark::Marked => "marked",
+            HeldMark::NothingSent => "nothing_sent",
+            HeldMark::SpaceMayRemain => "space_may_remain",
+            HeldMark::Unconfirmed => "unconfirmed",
+        }
+    }
+}
+
+/// [`ensure_marked_after_ax_write`] for a window the caller holds as key
+/// with another app in front. It never makes a window key itself: when keys
+/// do not reach the element's window it sends nothing. `can_post` (the
+/// element still focused in the held window, the window still key, another
+/// app still in front) is read before the caret focus and before each key.
+///
+/// # Safety
+/// `element` must be a live `AXUIElementRef` for the duration of the call.
+pub unsafe fn ensure_marked_in_held_window(
+    pid: i32,
+    element: AXUIElementRef,
+    mut can_post: impl FnMut() -> bool,
+) -> HeldMark {
+    match document_window_state(element) {
+        Some(false) => return HeldMark::NotADocument,
+        None => return HeldMark::DocumentUnknown,
+        Some(true) => {}
+    }
+    if !keys_reach_element_window(pid, element) || !can_post() {
+        return HeldMark::NothingSent;
+    }
+    let _ = crate::input::ax_actions::focus_element(element as usize);
+    net_zero_edit_held(
+        collapsed_caret_of(element),
+        can_post,
+        |key| crate::input::keyboard::press_key(pid, key, &[]),
+        || copy_string_attr(element, "AXValue"),
+        || std::thread::sleep(NET_ZERO_POLL_INTERVAL),
+    )
+}
+
+/// `Some(true)` when the element's window has an `AXDocument` URL,
+/// `Some(false)` when the window reads and has none (no value or the
+/// attribute unsupported), `None` when the window or the attribute cannot
+/// be read.
+///
+/// # Safety
+/// `element` must be a live `AXUIElementRef`.
+unsafe fn document_window_state(element: AXUIElementRef) -> Option<bool> {
+    use core_foundation::{base::TCFType, string::CFString};
+    let window = copy_element_attr(element, "AXWindow")?;
+    let attr = CFString::new("AXDocument");
+    let mut value: core_foundation::base::CFTypeRef = std::ptr::null();
+    let error = crate::ax::bindings::AXUIElementCopyAttributeValue(
+        window,
+        attr.as_concrete_TypeRef(),
+        &mut value,
+    );
+    core_foundation::base::CFRelease(window as _);
+    let url = crate::ax::bindings::string_from_cf(value);
+    if !value.is_null() {
+        core_foundation::base::CFRelease(value);
+    }
+    match error {
+        crate::ax::bindings::kAXErrorSuccess => url.map(|url| !url.is_empty()),
+        crate::ax::bindings::kAXErrorNoValue
+        | crate::ax::bindings::kAXErrorAttributeUnsupported => Some(false),
+        _ => None,
+    }
+}
+
 /// Type a space and a backspace into `element`, reading each one back.
 unsafe fn send_net_zero_edit(
     pid: i32,
@@ -242,6 +361,55 @@ fn with_space_at(text: &str, caret: usize) -> Option<String> {
 const NET_ZERO_POLL_INTERVAL: Duration = Duration::from_millis(10);
 /// Reads per key before giving up on it (about 500 ms at the interval above).
 const NET_ZERO_POLLS: usize = 50;
+
+/// [`net_zero_edit`] with `can_post` read right before each key, and an
+/// outcome that says whether a space may be left in the text.
+fn net_zero_edit_held(
+    caret: Option<usize>,
+    mut can_post: impl FnMut() -> bool,
+    mut press: impl FnMut(&str) -> anyhow::Result<()>,
+    mut read: impl FnMut() -> Option<String>,
+    mut pause: impl FnMut(),
+) -> HeldMark {
+    let Some(before) = read() else {
+        return HeldMark::NothingSent;
+    };
+    let Some(expected) = caret.and_then(|caret| with_space_at(&before, caret)) else {
+        return HeldMark::NothingSent;
+    };
+    if !can_post() {
+        return HeldMark::NothingSent;
+    }
+    if press("space").is_err() {
+        return HeldMark::SpaceMayRemain;
+    }
+    let mut await_change = |from: &str| {
+        for poll in 0..NET_ZERO_POLLS {
+            if poll > 0 {
+                pause();
+            }
+            match read() {
+                Some(now) if now != from => return Some(now),
+                _ => {}
+            }
+        }
+        None
+    };
+    match await_change(&before) {
+        Some(now) if now == expected => {}
+        _ => return HeldMark::SpaceMayRemain,
+    }
+    if !can_post() {
+        return HeldMark::SpaceMayRemain;
+    }
+    if press("delete").is_err() {
+        return HeldMark::Unconfirmed;
+    }
+    match await_change(&expected) {
+        Some(now) if now == before => HeldMark::Marked,
+        _ => HeldMark::Unconfirmed,
+    }
+}
 
 /// The net-zero edit against injected keys, value reads and pacing.
 ///
@@ -326,7 +494,7 @@ unsafe fn caret_to_end_of(element: AXUIElementRef) {
 
 #[cfg(test)]
 mod tests {
-    use super::{net_zero_edit, with_space_at, DocumentEdited};
+    use super::{net_zero_edit, net_zero_edit_held, with_space_at, DocumentEdited, HeldMark};
     use std::cell::RefCell;
 
     /// A text field that applies the keys it is given, after `lag` reads.
@@ -489,5 +657,88 @@ mod tests {
         assert_eq!(DocumentEdited::NotADocument.structured(), None);
         assert_eq!(DocumentEdited::Marked.structured(), Some(true));
         assert_eq!(DocumentEdited::NotMarked.structured(), Some(false));
+    }
+
+    /// Run the held mark with `can_post` answering from `checks` in order
+    /// (true when the list runs out).
+    fn run_held(field: &Field, checks: &[bool]) -> (HeldMark, usize) {
+        let caret = field.value.borrow().encode_utf16().count();
+        let reads = std::cell::Cell::new(0usize);
+        let mark = net_zero_edit_held(
+            Some(caret),
+            || {
+                let n = reads.get();
+                reads.set(n + 1);
+                checks.get(n).copied().unwrap_or(true)
+            },
+            |key| field.press(key),
+            || field.read(),
+            || {},
+        );
+        (mark, reads.get())
+    }
+
+    #[test]
+    fn held_mark_reads_the_checks_before_each_key() {
+        let field = Field::new("hello", 1, &[]);
+        let (mark, checks) = run_held(&field, &[]);
+        assert_eq!(mark, HeldMark::Marked);
+        assert_eq!(
+            checks, 2,
+            "one check before the space, one before the backspace"
+        );
+        assert_eq!(field.read().as_deref(), Some("hello"));
+    }
+
+    /// Focus moved to a sibling window or field, or the app came to the
+    /// front, before the space: nothing is sent.
+    #[test]
+    fn held_mark_sends_nothing_when_the_first_check_fails() {
+        let field = Field::new("hello", 0, &[]);
+        assert_eq!(run_held(&field, &[false]).0, HeldMark::NothingSent);
+        assert!(field.sent.borrow().is_empty());
+    }
+
+    /// The check fails between the keys: the space stays and is reported.
+    #[test]
+    fn held_mark_reports_a_space_left_when_the_second_check_fails() {
+        let field = Field::new("hello", 0, &[]);
+        assert_eq!(run_held(&field, &[true, false]).0, HeldMark::SpaceMayRemain);
+        assert_eq!(*field.sent.borrow(), vec!["space".to_owned()]);
+        assert_eq!(field.read().as_deref(), Some("hello "));
+        assert!(HeldMark::SpaceMayRemain.note().contains("may remain"));
+    }
+
+    #[test]
+    fn held_mark_failures_after_a_key_are_never_nothing_sent() {
+        // The space never shows: it may still land later.
+        let lost = Field::new("hello", 0, &["space"]);
+        assert_eq!(run_held(&lost, &[]).0, HeldMark::SpaceMayRemain);
+        // The backspace is lost: the text differs.
+        let stuck = Field::new("hello", 0, &["delete"]);
+        assert_eq!(run_held(&stuck, &[]).0, HeldMark::Unconfirmed);
+        assert!(HeldMark::Unconfirmed.note().contains("may differ"));
+        // A failed space post may still have reached the app.
+        let failed = net_zero_edit_held(
+            Some(5),
+            || true,
+            |_| anyhow::bail!("post failed"),
+            || Some("hello".to_owned()),
+            || {},
+        );
+        assert_eq!(failed, HeldMark::SpaceMayRemain);
+        // No caret: nothing is sent and no check is spent.
+        let field = Field::new("hello", 0, &[]);
+        assert_eq!(
+            net_zero_edit_held(
+                None,
+                || true,
+                |key| field.press(key),
+                || field.read(),
+                || {}
+            ),
+            HeldMark::NothingSent
+        );
+        assert!(field.sent.borrow().is_empty());
     }
 }

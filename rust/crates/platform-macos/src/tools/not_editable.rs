@@ -249,8 +249,13 @@ fn verdict_message(verdict: CellVerdict, point: bool) -> &'static str {
 }
 
 fn cell_refusal(verdict: CellVerdict, point: bool) -> ToolResult {
+    let advice = if matches!((verdict, point), (CellVerdict::Unreadable, false)) {
+        " Pass the text field's element_token (from get_window_state) to type into it."
+    } else {
+        ""
+    };
     let message = format!(
-        "{}; no focus action and no keys were sent.",
+        "{}; no focus action and no keys were sent.{advice}",
         verdict_message(verdict, point)
     );
     not_editable_result(message, FocusDispatch::None)
@@ -278,6 +283,15 @@ pub(crate) unsafe fn classify_untargeted(pid: i32, window_id: Option<u32>) -> Ce
         .unwrap_or(CellVerdict::Unreadable);
     CFRelease(element as CFTypeRef);
     verdict
+}
+
+/// Classify one element the caller already holds. Blocking, unsafe AX
+/// context; Unreadable on any failure.
+pub(crate) unsafe fn classify_element(element: AXUIElementRef) -> CellVerdict {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(800);
+    facts_for_element_with_deadline(element, deadline)
+        .map(|facts| cell_verdict(&facts))
+        .unwrap_or(CellVerdict::Unreadable)
 }
 
 /// Late recheck inside a delivery context: the focused element may have
@@ -540,6 +554,23 @@ mod tests {
         let public = serde_json::to_value(public).unwrap();
         assert_eq!(public["effect"], "partial");
         assert_eq!(public["delivery"]["mode"], "background");
+    }
+
+    /// An untargeted refusal for an unreadable focus names the next action;
+    /// a point refusal and a cell refusal keep their text.
+    #[test]
+    fn an_unreadable_focus_refusal_asks_for_the_element_token() {
+        let untargeted = text_of(&cell_refusal(CellVerdict::Unreadable, false));
+        assert!(
+            untargeted.contains("editability is unknown"),
+            "{untargeted}"
+        );
+        assert!(untargeted.contains("no focus action and no keys were sent"));
+        assert!(untargeted.contains("element_token"), "{untargeted}");
+        let point = text_of(&cell_refusal(CellVerdict::Unreadable, true));
+        assert!(!point.contains("element_token"), "{point}");
+        let cell = text_of(&cell_refusal(CellVerdict::NotEditing, false));
+        assert!(!cell.contains("element_token"), "{cell}");
     }
 
     #[test]
