@@ -251,6 +251,10 @@ fn key_trace_exposes_each_breakdown_field() {
         "guard_untargeted_us",
         "conflict_us",
         "key_hold_us",
+        "pixel_admission_us",
+        "cursor_work_us",
+        "window_setup_us",
+        "result_build_us",
     ] {
         assert!(
             line.split_whitespace()

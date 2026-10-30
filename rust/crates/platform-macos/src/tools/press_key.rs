@@ -980,6 +980,16 @@ impl Tool for PressKeyTool {
             }
         }
 
+        // Exact-window key gate reads (all are currently retained):
+        // WindowServer owner | kept | stale/foreign-window refusal.
+        // Session lock | kept | lock-screen refusal.
+        // AXWindows and sheet ancestry | kept | target existence and sheets.
+        // AXMinimized and AXHidden | kept | visibility refusal.
+        // Addressed element ancestry | kept | element-target refusal.
+        // AXFocusedWindow and competing WindowServer rows | kept | generic-key
+        // ambiguity; exact-window keys do not use the competing count.
+        // The final focused-window sample and conflict check are separate and
+        // still run immediately before key delivery.
         if !fg {
             if let (Some(wid), Some(lease)) = (window_id, _mutation_lease.as_ref()) {
                 if pre_focus_ptr.is_some_and(|ptr| {
@@ -1091,6 +1101,7 @@ impl Tool for PressKeyTool {
         // a named session's cursor on the element, or its remembered position,
         // or the window centre, so a keyboard-first session stays visible.
         if !px_focus {
+            let _cursor_span = latency::span(latency::Stage::CursorWork);
             let element_center = match pre_focus_guard.clone() {
                 Some(guard) => latency::spawn_action_blocking(move || unsafe {
                     crate::ax::bindings::element_screen_center(
@@ -1119,8 +1130,10 @@ impl Tool for PressKeyTool {
         // The AX focus_element() pre-write also runs inside the closure
         // so any reflex activations it triggers are caught by both the
         // wildcard snapshot suppressor and the targeted FocusGuard lease.
-        let prior_front = apps::frontmost_pid();
-        let snapshot = WindowChangeDetector::snapshot(prior_front);
+        let (prior_front, snapshot) = latency::section(latency::Stage::WindowSetup, || {
+            let prior_front = apps::frontmost_pid();
+            (prior_front, WindowChangeDetector::snapshot(prior_front))
+        });
         // Return/Escape to a sheet: its window closing is the key's
         // read-back. The baseline is read before the post.
         let sheet_watch = match window_id {
@@ -1271,6 +1284,7 @@ impl Tool for PressKeyTool {
         };
         let changes = super::finish_window_observation(snapshot).await;
 
+        let _result_span = latency::span(latency::Stage::ResultBuild);
         let delivery_outcome = match result {
             Ok(result) => map_delivery_outcome(result),
             Err(error) => {

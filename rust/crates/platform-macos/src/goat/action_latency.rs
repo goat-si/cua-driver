@@ -61,10 +61,14 @@ pub(crate) enum Stage {
     KeyGuardUntargeted,
     KeyConflict,
     KeyHold,
+    PixelAdmission,
+    CursorWork,
+    WindowSetup,
+    ResultBuild,
 }
 
 impl Stage {
-    const COUNT: usize = 26;
+    const COUNT: usize = 30;
     fn is_primary(self) -> bool {
         !matches!(
             self,
@@ -125,7 +129,7 @@ impl Trace {
         let measured = interval_union(&mut metrics.primary_intervals, total);
         let d = &metrics.durations;
         format!(
-            "cua_goat_latency request_id={} tool={} outcome={} total_us={} ax_resolve_us={} snapshot_us={} protect_us={} focus_settle_us={} action_guarded_us={} action_blocking_us={} lease_drop_us={} detector_us={} detector_sleep_us={} detector_enumerations={} detector_enumeration_us={} detector_exit={} tail={} glide_us={} preflight_us={} key_prime_us={} ax_perform_us={} read_owner_us={} read_walk_us={} entry_us={} prime_us={} final_sample_us={} post_us={} hand_back_us={} lease_us={} gate_again_us={} guard_untargeted_us={} conflict_us={} key_hold_us={} measured_us={} other_us={} key_belief={} scope={}",
+            "cua_goat_latency request_id={} tool={} outcome={} total_us={} ax_resolve_us={} snapshot_us={} protect_us={} focus_settle_us={} action_guarded_us={} action_blocking_us={} lease_drop_us={} detector_us={} detector_sleep_us={} detector_enumerations={} detector_enumeration_us={} detector_exit={} tail={} glide_us={} preflight_us={} key_prime_us={} ax_perform_us={} read_owner_us={} read_walk_us={} entry_us={} prime_us={} final_sample_us={} post_us={} hand_back_us={} lease_us={} gate_again_us={} guard_untargeted_us={} conflict_us={} key_hold_us={} pixel_admission_us={} cursor_work_us={} window_setup_us={} result_build_us={} measured_us={} other_us={} key_belief={} scope={}",
             self.id, self.tool, outcome, total.as_micros(),
             d[Stage::AxResolve as usize].as_micros(),
             d[Stage::Snapshot as usize].as_micros(),
@@ -155,6 +159,10 @@ impl Trace {
             d[Stage::KeyGuardUntargeted as usize].as_micros(),
             d[Stage::KeyConflict as usize].as_micros(),
             d[Stage::KeyHold as usize].as_micros(),
+            d[Stage::PixelAdmission as usize].as_micros(),
+            d[Stage::CursorWork as usize].as_micros(),
+            d[Stage::WindowSetup as usize].as_micros(),
+            d[Stage::ResultBuild as usize].as_micros(),
             measured.as_micros(),
             total.as_micros() - measured.as_micros(),
             metrics.key_belief, metrics.key_scope,
