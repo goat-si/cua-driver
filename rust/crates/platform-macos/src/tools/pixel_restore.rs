@@ -30,6 +30,7 @@ struct Obligation {
     prior: Option<i32>,
     targets: Vec<(i32, Option<u32>, Option<ProcessStamp>, u64)>,
     attempted: bool,
+    notified: HashSet<(i32, Option<ProcessStamp>)>,
 }
 struct RestoreTarget {
     pid: i32,
@@ -76,54 +77,6 @@ impl Fence {
             },
         )
     }
-    fn record_outcome(
-        &self,
-        pid: i32,
-        stamp: Option<ProcessStamp>,
-        prior: Option<i32>,
-        status: &str,
-        reason: Option<&str>,
-    ) {
-        let Some(stamp) = stamp else {
-            tracing::debug!(pid, "cannot bind restoration outcome to process");
-            return;
-        };
-        let mut note = serde_json::json!({"status": status, "prior_pid": prior});
-        if let Some(reason) = reason {
-            note["reason"] = reason.into();
-        }
-        self.outcomes
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .entry(pid)
-            .or_default()
-            .push_back((stamp, note));
-    }
-    fn take_outcome(&self, pid: i32) -> Option<serde_json::Value> {
-        if !self
-            .outcomes
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .contains_key(&pid)
-        {
-            return None;
-        }
-        self.take_outcome_for(pid, (self.identity)(pid))
-    }
-    fn take_outcome_for(
-        &self,
-        pid: i32,
-        current: Option<ProcessStamp>,
-    ) -> Option<serde_json::Value> {
-        let mut outcomes = self.outcomes.lock().unwrap_or_else(|e| e.into_inner());
-        let queue = outcomes.get_mut(&pid)?;
-        queue.retain(|(stamp, _)| Some(*stamp) == current && current.is_some());
-        let note = queue.pop_front().map(|(_, note)| note);
-        if queue.is_empty() {
-            outcomes.remove(&pid);
-        }
-        note
-    }
     fn chain_target(&self, root: i32, epoch: u64, front: Option<i32>) -> (i32, Option<u32>) {
         let obligations = self.obligations.lock().unwrap_or_else(|e| e.into_inner());
         let Some(chain) = obligations.get(&root).filter(|chain| chain.epoch == epoch) else {
@@ -145,30 +98,6 @@ impl Fence {
             .map(|(pid, wid, _, _)| (pid, wid))
             .unwrap_or((root, None))
     }
-    fn outcome_identity(&self, root: i32, epoch: u64) -> (i32, Option<ProcessStamp>) {
-        let obligations = self.obligations.lock().unwrap_or_else(|e| e.into_inner());
-        obligations
-            .get(&root)
-            .filter(|chain| chain.epoch == epoch)
-            .and_then(|chain| {
-                chain
-                    .targets
-                    .iter()
-                    .max_by_key(|(_, _, _, event_epoch)| *event_epoch)
-            })
-            .map_or((root, None), |(pid, _, stamp, _)| (*pid, *stamp))
-    }
-    fn record_chain_outcome(
-        &self,
-        root: i32,
-        epoch: u64,
-        prior: Option<i32>,
-        status: &str,
-        reason: Option<&str>,
-    ) {
-        let (pid, stamp) = self.outcome_identity(root, epoch);
-        self.record_outcome(pid, stamp, prior, status, reason);
-    }
     fn is_pending_target(&self, pid: i32) -> bool {
         self.obligations
             .lock()
@@ -186,11 +115,13 @@ impl Fence {
         let mut obligations = self.obligations.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(chain) = obligations.values_mut().find(|chain| {
             chain.targets.iter().any(|(target, _, prior_stamp, _)| {
-                *target == pid && stamp.is_some() && *prior_stamp == stamp
+                *target == pid && (stamp.is_none() || *prior_stamp == stamp)
             })
         }) {
             if chain.attempted {
-                self.record_outcome(pid, stamp, chain.prior, "abandoned", Some("unconfirmed"));
+                if chain.notified.insert((pid, stamp)) {
+                    self.record_outcome(pid, stamp, chain.prior, "abandoned", Some("unconfirmed"));
+                }
                 return;
             }
             chain.targets.push((pid, wid, stamp, epoch));
@@ -383,15 +314,6 @@ pub(super) fn requires_admission(name: &str) -> bool {
                 | "move_cursor"
                 | "page"
                 | "get_browser_state"
-                | "browser_click"
-                | "browser_type"
-                | "browser_select"
-                | "browser_dialog"
-                | "browser_pointer"
-                | "browser_set_input_files"
-                | "browser_download"
-                | "browser_prepare"
-                | "browser_navigate"
                 | "bring_to_front"
                 | "launch_app"
         )
@@ -410,12 +332,18 @@ async fn invoke_with_fence(
     args: serde_json::Value,
 ) -> cua_driver_core::protocol::ToolResult {
     let name = tool.def().name.clone();
-    // Browser operations can reconnect or launch a process and change the
-    // native frontmost app. Ordinary page calls do not use that reconnect
-    // path; the setup action itself relaunches the browser.
+    // Browser tools may reconnect. Page text input and targeted evaluation
+    // can also open a connection; setup may quit and relaunch the browser.
+    let page_action = args.get("action").and_then(serde_json::Value::as_str);
+    let targeted = ["cdp_port", "target_url_contains"]
+        .iter()
+        .any(|key| args.get(*key).is_some_and(|value| !value.is_null()));
     let tracked = name != "page"
-        || args.get("action").and_then(serde_json::Value::as_str)
-            == Some("enable_javascript_apple_events");
+        || matches!(
+            page_action,
+            Some("enable_javascript_apple_events" | "insert_text" | "type_keystrokes")
+        )
+        || (page_action == Some("execute_javascript") && targeted);
     let Ok((epoch, _in_flight)) = tokio::time::timeout(
         std::time::Duration::from_secs(2),
         fence.admit_action(tracked),
@@ -424,7 +352,7 @@ async fn invoke_with_fence(
     else {
         return super::pre_dispatch_refusal(
             "pixel_restore_pending",
-            "A previous pixel focus restoration is still pending; no input was sent.",
+            "A previous pixel focus restoration is still pending; the operation was not dispatched.",
         );
     };
     ACTION_EPOCH.scope((name, epoch), tool.invoke(args)).await
@@ -690,13 +618,15 @@ fn spawn_restore_with_window<F, Fut, V>(
             })
         }) {
             if parent.attempted {
-                fence.record_outcome(
-                    pid,
-                    target_stamp,
-                    parent.prior,
-                    "abandoned",
-                    Some("unconfirmed"),
-                );
+                if parent.notified.insert((pid, target_stamp)) {
+                    fence.record_outcome(
+                        pid,
+                        target_stamp,
+                        parent.prior,
+                        "abandoned",
+                        Some("unconfirmed"),
+                    );
+                }
                 return;
             }
             parent.targets.push((pid, window_id, target_stamp, epoch));
@@ -730,6 +660,7 @@ fn spawn_restore_with_window<F, Fut, V>(
                 prior,
                 targets,
                 attempted: false,
+                notified: HashSet::new(),
             },
         );
         superseded.extend(
@@ -840,6 +771,12 @@ fn spawn_restore_with_window<F, Fut, V>(
     });
 }
 
+#[path = "pixel_restore_outcomes.rs"]
+mod outcomes;
+
+#[cfg(test)]
+#[path = "pixel_restore_debounce_tests.rs"]
+mod debounce_tests;
 #[cfg(test)]
 #[path = "pixel_restore_tests.rs"]
 mod tests;
