@@ -2689,6 +2689,7 @@ impl BrowserEngine {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn snapshot_tab_semantic(
         &self,
         session: &str,

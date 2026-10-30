@@ -720,7 +720,7 @@ impl GetBrowserStateTool {
                 Err(refusal) => refusal.to_tool_result(),
             };
         }
-        return snapshot;
+        snapshot
     }
 }
 
