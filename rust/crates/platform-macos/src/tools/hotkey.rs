@@ -219,6 +219,12 @@ impl Tool for HotkeyTool {
                 Ok(input) => input,
                 Err(result) => return result,
             };
+            if let Some(refusal) = cua_driver_core::browser::protection::frontmost_app_refusal(
+                "hotkey",
+                crate::apps::frontmost_pid().map(i64::from),
+            ) {
+                return refusal;
+            }
             let raw_keys = input.keys;
             if raw_keys.len() < 2 {
                 return super::invalid_arguments("hotkey.keys must contain at least two keys.");

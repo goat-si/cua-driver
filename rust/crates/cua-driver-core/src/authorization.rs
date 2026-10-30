@@ -1396,11 +1396,17 @@ pub fn status_json_with_provider(authorization_host: Option<&'static str>) -> se
         .as_ref()
         .map(|mode| adapter_ids_with_state_for_mode(*mode, RiskEnforcement::NotExposed))
         .unwrap_or_default();
+    let manifest_store = crate::session_manifest::configured_manifest_store();
+    let capability_manifest_reload = manifest_store
+        .as_ref()
+        .ok()
+        .and_then(Option::as_ref)
+        .map(|store| store.status_json());
     let capability_manifest = crate::session_manifest::configured_capability_manifest();
     let capability_manifest_status = capability_manifest
         .as_ref()
         .ok()
-        .and_then(|manifest| *manifest)
+        .and_then(Option::as_ref)
         .map(|manifest| {
             let (allow, deny, ask) = manifest.counts();
             serde_json::json!({
@@ -1447,6 +1453,18 @@ pub fn status_json_with_provider(authorization_host: Option<&'static str>) -> se
         "capability_manifest_approved_at_startup": crate::session_manifest::capability_manifest_approved(),
         "capability_manifest_valid": capability_manifest.is_ok(),
         "capability_manifest": capability_manifest_status,
+        // The manifest the next call is authorized against. A host that
+        // rewrites its manifest file compares capability_manifest_file_sha256
+        // with the SHA-256 of the bytes it wrote.
+        "capability_manifest_sha256": capability_manifest_reload
+            .as_ref()
+            .map(|reload| reload["applied_sha256"].clone()),
+        "capability_manifest_file_sha256": capability_manifest_reload
+            .as_ref()
+            .map(|reload| reload["applied_file_sha256"].clone()),
+        "capability_manifest_reload_error": capability_manifest_reload
+            .as_ref()
+            .map(|reload| reload["last_error"].clone()),
         // Deprecated status aliases retained for one compatibility window.
         "session_policy_configured": crate::session_manifest::capability_manifest_configured(),
         "session_policy_approved_at_startup": crate::session_manifest::capability_manifest_approved(),

@@ -704,9 +704,10 @@ fn legacy_effect(structured: &serde_json::Value) -> ActionEffect {
 
 fn browser_refusal_escalation(code: &str) -> Option<ActionEscalation> {
     let kind = match code {
-        "browser_consent_required" | "browser_consent_revoked" | "browser_origin_outside_scope" => {
-            EscalationKind::RequestPermission
-        }
+        "browser_consent_required"
+        | "browser_consent_revoked"
+        | "browser_origin_outside_scope"
+        | "browser_origin_scope_required" => EscalationKind::RequestPermission,
         "browser_requires_setup"
         | "browser_route_unavailable"
         | "browser_endpoint_owner_mismatch"

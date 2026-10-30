@@ -40,6 +40,7 @@ use super::binding::{
 use super::cdp_ws::{CdpConnection, CdpPool, SharedSocketRelease};
 use super::grant::{ExistingProfileGrant, ExistingProfileGrants, GrantLookup};
 use super::mutation::{MutationGates, MutationKey};
+use super::origin_scope::{self, OriginScope};
 use super::platform::{
     BrowserConsentOutcome, BrowserConsentRequest, BrowserPlatform, BrowserVisualAction,
     BrowserVisualActionKind, ExistingProfileSetupRequest,
@@ -257,6 +258,13 @@ pub(crate) struct ValidatedTab {
     pub native: NativeWindowInfo,
     /// Flattened CDP session id attached to the tab's target.
     pub cdp_session: String,
+}
+
+/// The document a page read proved before it ran; see
+/// [`BrowserEngine::prove_tab_document`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DocumentProof {
+    loader_id: String,
 }
 
 fn viewport_point_to_screen(
@@ -671,6 +679,7 @@ impl BrowserEngine {
             session_end_hook: Mutex::new(None),
         });
         let weak: Weak<Self> = Arc::downgrade(&engine);
+        super::protection::register_engine(weak.clone());
         let registration =
             register_scoped_fallible_session_end_hook("browser_state", move |session_id| {
                 let mut cleanup_errors = Vec::new();
@@ -1280,6 +1289,7 @@ impl BrowserEngine {
         transport_session: Option<&str>,
         pid: i64,
         window_id: u64,
+        scope: Option<&OriginScope>,
     ) -> Result<(String, TargetRecord), BrowserRefusal> {
         let class = self.platform.classify_browser(pid).await?;
         if !class.is_browser {
@@ -1300,6 +1310,9 @@ impl BrowserEngine {
                 .is_some_and(|owner| self.is_driver_owned_pid_for_session(owner, pid));
         let access_class = endpoint_access_class(grant.is_some(), driver_owned, class.process_role)
             .map_err(|refusal| with_existing_profile_next_call(refusal, session, pid, window_id))?;
+        // A person's own profile lists their tabs' addresses: refuse before
+        // reading anything when the call did not say which origins it needs.
+        origin_scope::require_scope(access_class, scope)?;
 
         let native = self.native_window_checked(pid, window_id).await?;
         let fingerprint = self.platform.process_fingerprint(pid).await?;
@@ -1458,8 +1471,10 @@ impl BrowserEngine {
         session: &str,
         target_id: &str,
         tab_id: Option<&str>,
+        scope: Option<&OriginScope>,
     ) -> Result<ValidatedTab, BrowserRefusal> {
         let record = self.store.get_target(session, target_id)?;
+        origin_scope::require_scope(record.endpoint_access_class, scope)?;
 
         if record.quality != BindingQuality::Exact {
             return Err(refuse(
@@ -1639,25 +1654,28 @@ impl BrowserEngine {
 
         let cdp_session = self.attach(&conn, &tab.cdp_target_id).await?;
         let dispatch_context = crate::tool::current_dispatch_authorization_context();
-        if dispatch_context
+        let manifest_bound = dispatch_context
             .as_deref()
-            .is_some_and(|context| context.capability_manifest().is_some())
-        {
+            .is_some_and(|context| context.capability_manifest().is_some());
+        if manifest_bound || scope.is_some() {
             let live_url = self.live_top_level_url(&conn, &cdp_session).await?;
-            // A browser mutation admitted for a delegated session must use
-            // that exact session's capability manifest. Falling back to the
-            // process compatibility manifest would let a missing task-local
-            // context borrow unrelated authority.
-            let manifest = dispatch_context
-                .as_deref()
-                .ok_or_else(|| {
-                    refuse(
-                        BrowserRefusalCode::BrowserOriginOutsideScope,
-                        "the browser authorization context is unavailable",
-                    )
-                })?
-                .capability_manifest();
-            authorize_live_browser_origin(manifest, &live_url)?;
+            origin_scope::authorize_live_url(scope, &live_url)?;
+            if manifest_bound {
+                // A browser mutation admitted for a delegated session must use
+                // that exact session's capability manifest. Falling back to the
+                // process compatibility manifest would let a missing task-local
+                // context borrow unrelated authority.
+                let manifest = dispatch_context
+                    .as_deref()
+                    .ok_or_else(|| {
+                        refuse(
+                            BrowserRefusalCode::BrowserOriginOutsideScope,
+                            "the browser authorization context is unavailable",
+                        )
+                    })?
+                    .capability_manifest();
+                authorize_live_browser_origin(manifest, &live_url)?;
+            }
         }
         Ok(ValidatedTab {
             conn,
@@ -1697,15 +1715,162 @@ impl BrowserEngine {
         session: &str,
         target_id: &str,
         tab_id: &str,
+        scope: Option<&OriginScope>,
     ) -> Result<(ValidatedTab, String), BrowserRefusal> {
         let validated = self
-            .revalidate_for_mutation(session, target_id, Some(tab_id))
+            .revalidate_for_mutation(session, target_id, Some(tab_id), scope)
             .await?;
         let live_url = self
             .live_top_level_url(&validated.conn, &validated.cdp_session)
             .await?;
         let live_origin = protected_live_origin_scope(&live_url)?;
         Ok((validated, live_origin))
+    }
+
+    /// Prove which document a page read is about to observe: the tab's live
+    /// top-level document must be inside the call's `origin_scope` and the
+    /// dispatch capability manifest, and must carry a loader identity. Returns
+    /// `None` (nothing to prove, today's behaviour) when neither a scope nor a
+    /// manifest applies. Run it before the read and pass the result to
+    /// [`Self::confirm_tab_document`] after it.
+    pub(crate) async fn prove_tab_document(
+        &self,
+        session: &str,
+        target_id: &str,
+        tab_id: &str,
+        scope: Option<&OriginScope>,
+    ) -> Result<Option<DocumentProof>, BrowserRefusal> {
+        let record = self.store.get_target(session, target_id)?;
+        origin_scope::require_scope(record.endpoint_access_class, scope)?;
+        let manifest_context = crate::tool::current_dispatch_authorization_context()
+            .filter(|context| context.capability_manifest().is_some());
+        if scope.is_none() && manifest_context.is_none() {
+            return Ok(None);
+        }
+        let tab = record.tabs.get(tab_id).cloned().ok_or_else(|| {
+            refuse(
+                BrowserRefusalCode::BrowserTabNotFound,
+                format!("tab {tab_id} is not known for target {target_id}"),
+            )
+        })?;
+        let conn = self.connection_for_record(session, &record).await?;
+        let cdp_session = self.attach(&conn, &tab.cdp_target_id).await?;
+        let (url, loader_id) = self.live_top_level_document(&conn, &cdp_session).await?;
+        origin_scope::authorize_live_url(scope, &url)?;
+        if let Some(context) = manifest_context.as_deref() {
+            authorize_live_browser_origin(context.capability_manifest(), &url)?;
+        }
+        Ok(Some(DocumentProof { loader_id }))
+    }
+
+    /// After a page read: the tab must still show the document
+    /// [`Self::prove_tab_document`] proved, still inside the scope and the
+    /// manifest. Otherwise the read's refs and continuations are discarded
+    /// and the caller must return no page content.
+    pub(crate) async fn confirm_tab_document(
+        &self,
+        session: &str,
+        target_id: &str,
+        tab_id: &str,
+        scope: Option<&OriginScope>,
+        proof: Option<&DocumentProof>,
+    ) -> Result<(), BrowserRefusal> {
+        let Some(proof) = proof else {
+            return Ok(());
+        };
+        let confirmed = match self
+            .prove_tab_document(session, target_id, tab_id, scope)
+            .await
+        {
+            Ok(Some(after)) if after == *proof => Ok(()),
+            Ok(_) => Err(refuse(
+                BrowserRefusalCode::BrowserRefStale,
+                "the page navigated while it was being read; nothing from that read is \
+                 returned. Re-run get_browser_state",
+            )),
+            Err(refusal) => Err(refusal),
+        };
+        if confirmed.is_err() {
+            self.store
+                .invalidate_tab_snapshots(session, target_id, tab_id);
+        }
+        confirmed
+    }
+
+    /// The live top-level document's URL and loader identity; refuses when
+    /// either is missing.
+    async fn live_top_level_document(
+        &self,
+        conn: &CdpConnection,
+        cdp_session: &str,
+    ) -> Result<(String, String), BrowserRefusal> {
+        let frame_tree = conn
+            .call(Some(cdp_session), "Page.getFrameTree", json!({}))
+            .await
+            .map_err(|error| {
+                route_err("could not prove the live top-level browser document", error)
+            })?;
+        let frame = frame_tree.pointer("/frameTree/frame");
+        let field = |name: &str| {
+            frame
+                .and_then(|frame| frame.get(name))
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned)
+        };
+        match (field("url"), field("loaderId")) {
+            (Some(url), Some(loader_id)) => Ok((url, loader_id)),
+            _ => Err(refuse(
+                BrowserRefusalCode::BrowserOriginOutsideScope,
+                "the live top-level browser document could not be proven",
+            )),
+        }
+    }
+
+    /// After `Page.navigate`: the main frame must show the navigation's own
+    /// committed document (its returned loader) and that document must be
+    /// inside the scope and the manifest. Same-document navigations return no
+    /// loader and are checked by URL. A short bounded wait covers a commit the
+    /// browser reports just after answering `Page.navigate`.
+    pub(crate) async fn confirm_navigation(
+        &self,
+        validated: &ValidatedTab,
+        navigation_loader: Option<&str>,
+        scope: Option<&OriginScope>,
+    ) -> Result<(), BrowserRefusal> {
+        const ATTEMPTS: usize = 5;
+        const RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(100);
+        let manifest_context = crate::tool::current_dispatch_authorization_context()
+            .filter(|context| context.capability_manifest().is_some());
+        if scope.is_none() && manifest_context.is_none() {
+            return Ok(());
+        }
+        let mut attempt = 0;
+        let url = loop {
+            attempt += 1;
+            let (url, loader_id) = self
+                .live_top_level_document(&validated.conn, &validated.cdp_session)
+                .await?;
+            if navigation_loader.is_none_or(|expected| expected == loader_id) {
+                break url;
+            }
+            if attempt == ATTEMPTS {
+                return Err(refuse(
+                    BrowserRefusalCode::BrowserOriginOutsideScope,
+                    "the navigation's committed document could not be proven, so the tab is \
+                     treated as outside the approved origins",
+                )
+                .with_detail(json!({ "navigation_committed": "unproven" })));
+            }
+            tokio::time::sleep(RETRY_DELAY).await;
+        };
+        let outside =
+            |refusal: BrowserRefusal| refusal.with_detail(json!({ "navigation_committed": true }));
+        origin_scope::authorize_live_url(scope, &url).map_err(outside)?;
+        if let Some(context) = manifest_context.as_deref() {
+            authorize_live_browser_origin(context.capability_manifest(), &url).map_err(outside)?;
+        }
+        Ok(())
     }
 
     /// Animate platform-owned browser feedback without coupling it to input
@@ -2524,6 +2689,7 @@ impl BrowserEngine {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn snapshot_tab_semantic(
         &self,
         session: &str,
@@ -2532,6 +2698,7 @@ impl BrowserEngine {
         scope_ref: Option<&str>,
         query: Option<&str>,
         continuation: Option<&str>,
+        require_document_identity: bool,
     ) -> Result<SemanticSnapshotOutcome, BrowserRefusal> {
         if let Some(token) = continuation {
             if scope_ref.is_some() || query.is_some() {
@@ -2543,6 +2710,16 @@ impl BrowserEngine {
             let (snapshot, continuation) = self
                 .store
                 .resolve_semantic_continuation(session, target_id, tab_id, token)?;
+            // Under an origin scope or a capability manifest, cached content
+            // is returned only when it provably belongs to the document the
+            // caller just proved.
+            if require_document_identity && snapshot.semantic_root_identity.is_none() {
+                return Err(refuse(
+                    BrowserRefusalCode::BrowserRefStale,
+                    "this continuation's document identity was not recorded, so it cannot be \
+                     tied to the current page; re-run get_browser_state",
+                ));
+            }
             let record = self.store.get_target(session, target_id)?;
             let tab = record.tabs.get(tab_id).cloned().ok_or_else(|| {
                 refuse(

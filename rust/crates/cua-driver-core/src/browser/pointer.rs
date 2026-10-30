@@ -307,6 +307,7 @@ impl BrowserPointerTool {
                         "target_id": { "type": "string", "description": "Opaque target id minted by get_browser_state." },
                         "tab_id": { "type": "string", "description": "Opaque tab id minted by get_browser_state." },
                         "session": required_session_schema(),
+                        "origin_scope": super::origin_scope::schema(),
                         "action": { "type": "string", "enum": ["hover", "right_click", "double_click", "scroll", "drag"], "description": "Pointer gesture. scroll needs delta_x or delta_y; drag needs destination_ref or to_x/to_y." },
                         "input_route": { "type": "string", "enum": ["trusted", "dom_event"], "default": "trusted", "description": "trusted sends CDP Input events; dom_event synthesizes DOM events in the page and requires ref." },
                         "delivery_mode": { "type": "string", "enum": ["background", "foreground"], "default": "background", "description": "background (default) refuses trusted input where it would activate the browser window, including Linux Chromium and macOS Chromium configurations whose trusted route cannot stay in the background. foreground accepts that activation, for a browser whose window nobody else is using (for example inside a sandbox)." },
@@ -788,6 +789,10 @@ impl Tool for BrowserPointerTool {
     }
 
     async fn invoke(&self, args: Value) -> ToolResult {
+        let scope = match super::origin_scope::parse(&args) {
+            Ok(scope) => scope,
+            Err(error) => return error,
+        };
         let target_id = match args.require_str("target_id") {
             Ok(value) => value,
             Err(error) => return error,
@@ -815,7 +820,7 @@ impl Tool for BrowserPointerTool {
         };
         let validated = match self
             .engine
-            .revalidate_for_mutation(&session, &target_id, Some(&tab_id))
+            .revalidate_for_mutation(&session, &target_id, Some(&tab_id), scope.as_ref())
             .await
         {
             Ok(value) => value,
