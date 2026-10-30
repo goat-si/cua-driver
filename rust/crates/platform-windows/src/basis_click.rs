@@ -80,13 +80,24 @@ mod tests {
     fn assert_refusal(args: Value, expected: &str) {
         let result = validate_arguments("click", &args).unwrap_err();
         assert_eq!(result.is_error, Some(true));
-        assert_eq!(serde_json::to_value(&result.content).unwrap(), json!([{"type":"text", "text":expected}]));
-        assert_eq!(result.structured_content, Some(json!({"code":"invalid_arguments", "effect":"refused", "nothing_sent":true})));
+        assert_eq!(
+            serde_json::to_value(&result.content).unwrap(),
+            json!([{"type":"text", "text":expected}])
+        );
+        assert_eq!(
+            result.structured_content,
+            Some(json!({"code":"invalid_arguments", "effect":"refused", "nothing_sent":true}))
+        );
     }
 
     #[test]
     fn invalid_pid_refusal() {
-        for pid in [json!(null), json!("1"), json!(i64::from(i32::MAX) + 1), json!(i64::from(i32::MIN) - 1)] {
+        for pid in [
+            json!(null),
+            json!("1"),
+            json!(i64::from(i32::MAX) + 1),
+            json!(i64::from(i32::MIN) - 1),
+        ] {
             assert_refusal(json!({"pid":pid,"snapshot_id":"s"}), "snapshot_id needs the pid of the window it was read from: pass pid from get_window_state.");
         }
     }
@@ -94,20 +105,29 @@ mod tests {
     #[test]
     fn invalid_snapshot_refusal() {
         for snapshot in [json!(null), json!(42)] {
-            assert_refusal(json!({"pid":1,"snapshot_id":snapshot}), "snapshot_id must be the window_basis.snapshot_id string from get_window_state.");
+            assert_refusal(
+                json!({"pid":1,"snapshot_id":snapshot}),
+                "snapshot_id must be the window_basis.snapshot_id string from get_window_state.",
+            );
         }
     }
 
     #[test]
     fn invalid_count_refusal() {
         for count in [0, 4] {
-            assert_refusal(json!({"pid":1,"snapshot_id":"s","count":count}), "click: count must be 1 (single), 2 (double) or 3 (triple).");
+            assert_refusal(
+                json!({"pid":1,"snapshot_id":"s","count":count}),
+                "click: count must be 1 (single), 2 (double) or 3 (triple).",
+            );
         }
     }
 
     #[test]
     fn invalid_button_refusal() {
-        assert_refusal(json!({"pid":1,"snapshot_id":"s","button":"other"}), "click: unknown button \"other\" — expected one of left, right, middle.");
+        assert_refusal(
+            json!({"pid":1,"snapshot_id":"s","button":"other"}),
+            "click: unknown button \"other\" — expected one of left, right, middle.",
+        );
     }
 
     #[test]
@@ -117,7 +137,10 @@ mod tests {
                 for button in ["left", "right", "middle"] {
                     let args = json!({"pid":pid,"snapshot_id":"s","count":count,"button":button});
                     let parsed = validate_arguments("click", &args).unwrap();
-                    assert_eq!((parsed.pid, parsed.snapshot_id, parsed.count, parsed.button), (pid, "s", count as usize, button));
+                    assert_eq!(
+                        (parsed.pid, parsed.snapshot_id, parsed.count, parsed.button),
+                        (pid, "s", count as usize, button)
+                    );
                 }
             }
         }
