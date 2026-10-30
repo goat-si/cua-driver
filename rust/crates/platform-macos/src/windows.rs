@@ -134,13 +134,18 @@ pub(crate) fn pid_windows_with_space_snapshot(pid: i32, on_screen_only: bool) ->
 /// Cheap enough to poll during a gesture (the drag tool watches for a
 /// drag-image window at the dragging level).
 pub(crate) fn pid_on_screen_windows_any_layer(pid: i32) -> Vec<WindowInfo> {
+    pid_on_screen_windows_any_layer_enumeration(pid).windows
+}
+
+/// [`pid_on_screen_windows_any_layer`] with its completeness: an empty list
+/// from a failed WindowServer read is not "no windows".
+pub(crate) fn pid_on_screen_windows_any_layer_enumeration(pid: i32) -> WindowEnumeration {
     enumerate_windows(
         kCGWindowListOptionOnScreenOnly | kCGWindowListExcludeDesktopElements,
         LayerFilter::AnyLayer,
         Some(pid),
         false,
     )
-    .windows
 }
 
 /// On-screen windows of every app on every layer, front to back, without the
@@ -190,6 +195,20 @@ enum LayerFilter {
     ZeroOnly,
     /// Every layer, accessory windows included.
     AnyLayer,
+}
+
+/// Whether one WindowServer entry was read well enough for the enumeration
+/// to stay complete. An unreadable id or owner could be any window. For an
+/// every-layer read, an unreadable layer of a wanted window could hide a
+/// window the caller filters by layer (a menu window at layer 101), so it
+/// counts too; a layer-0 read keeps its old behaviour.
+fn entry_readable(
+    has_window_number: bool,
+    has_owner_pid: bool,
+    has_layer: bool,
+    layer_matters: bool,
+) -> bool {
+    has_window_number && has_owner_pid && (has_layer || !layer_matters)
 }
 
 fn enumerate_windows(
@@ -286,7 +305,15 @@ fn enumerate_windows(
 
         let window_number = find_num("kCGWindowNumber");
         let owner_pid = find_num("kCGWindowOwnerPID");
-        if window_number.is_none() || owner_pid.is_none() {
+        let layer_number = find_num("kCGWindowLayer");
+        let wanted_pid = owner_pid
+            .is_some_and(|owner| pid_filter.is_none_or(|wanted| i64::from(wanted) == owner));
+        if !entry_readable(
+            window_number.is_some(),
+            owner_pid.is_some(),
+            layer_number.is_some(),
+            layers == LayerFilter::AnyLayer && wanted_pid,
+        ) {
             complete = false;
         }
         let window_id = window_number.unwrap_or(0) as u32;
@@ -874,6 +901,17 @@ mod tests {
     }
 
     #[test]
+    fn an_unreadable_layer_makes_an_every_layer_read_incomplete() {
+        assert!(entry_readable(true, true, true, true));
+        assert!(!entry_readable(true, true, false, true));
+        // A layer-0 read, or another app's window, keeps its behaviour.
+        assert!(entry_readable(true, true, false, false));
+        assert!(!entry_readable(false, true, true, false));
+        assert!(!entry_readable(true, false, true, false));
+    }
+
+    #[test]
+    #[ignore = "reads the live WindowServer; window_ids_for_pid covers the logic with fake entries"]
     fn live_pid_window_id_snapshot_reads_window_server() {
         // The test process owns no windows. A complete live snapshot therefore
         // lists none for it; an unavailable WindowServer reports incomplete.

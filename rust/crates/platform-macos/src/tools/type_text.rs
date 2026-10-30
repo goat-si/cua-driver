@@ -1736,8 +1736,29 @@ fn element_has_exact_app_focus(pid: i32, window_id: u32, element_ptr: usize) -> 
 /// follow the latter.
 pub(super) fn focused_window_matches_element(pid: i32, window_id: u32, element_ptr: usize) -> bool {
     let focused = crate::ax::bindings::focused_window_id_of_pid(pid);
-    focused == Some(window_id)
-        || focused == Some(gate_window_id_for_element(element_ptr, window_id))
+    key_window_matches(
+        focused,
+        window_id,
+        || gate_window_id_for_element(element_ptr, window_id),
+        || crate::ax::exact_target::sheet_parent_of(pid, window_id).is_some(),
+    )
+}
+
+/// A sheet's element maps to the sheet's parent. That parent stands in for
+/// the requested window only when the request named the parent (a sheet
+/// token from the parent's snapshot); a request that names the sheet itself
+/// needs the sheet as the key window.
+fn key_window_matches(
+    focused: Option<u32>,
+    window_id: u32,
+    element_window: impl FnOnce() -> u32,
+    requested_is_sheet: impl FnOnce() -> bool,
+) -> bool {
+    match focused {
+        Some(focused) if focused == window_id => true,
+        Some(focused) => focused == element_window() && !requested_is_sheet(),
+        None => false,
+    }
 }
 
 /// Prove actual window/sheet ancestry, including #104's sheet token contract.
@@ -3004,6 +3025,19 @@ impl MinimizeOps for AxMinimizeOps {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_request_naming_a_sheet_needs_the_sheet_as_key_window() {
+        use super::key_window_matches;
+        // Sheet 900 attached to window 700; its elements map to 700.
+        assert!(key_window_matches(Some(900), 900, || 700, || true));
+        assert!(!key_window_matches(Some(700), 900, || 700, || true));
+        assert!(!key_window_matches(None, 900, || 700, || true));
+        // A sheet token addressed through the parent keeps working.
+        assert!(key_window_matches(Some(700), 700, || 700, || false));
+        assert!(key_window_matches(Some(700), 701, || 700, || false));
+        assert!(!key_window_matches(Some(888), 701, || 700, || false));
+    }
+
     /// DSH-03: a paste that may have landed is not reported as a plain
     /// failure an agent would answer by typing the text again.
     #[test]

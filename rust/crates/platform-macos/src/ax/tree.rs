@@ -523,7 +523,7 @@ fn walk_tree_with_web_content(
         // A window-scoped walk of an app that is still launching waits, within
         // the caller's budget, for the app to answer AX (see `super::launch`).
         let mut launch_wait = LaunchWait::new(budget.time_limit());
-        let (top_level, walk_these) = loop {
+        let (mut top_level, walk_these) = loop {
             // Chromium/Electron apps (Arc, VS Code, Electron shells) ship their
             // web-content AX tree OFF and only build it once an assistive client
             // asks for it. Without this, the first walk of such an app returns an
@@ -610,6 +610,88 @@ fn walk_tree_with_web_content(
                     &mut deferred,
                 )
             });
+        }
+
+        // An open context menu of the walked window hangs off a view that
+        // does not list it as a child: publish it after the window, each
+        // under the same budget, so its items get element tokens. A menu
+        // window that could not be examined in time (or past the cap) makes
+        // the walk partial, never silently complete.
+        // A WindowServer list that could not be read leaves open menus
+        // unknown: partial.
+        let menu_frames = match window_id {
+            Some(_) if !nodes.is_empty() => super::context_menus::open_menu_window_frames(pid)
+                .unwrap_or_else(|| {
+                    budget.stop_for_timeout();
+                    Vec::new()
+                }),
+            _ => Vec::new(),
+        };
+        let discovery = (!menu_frames.is_empty())
+            .then(|| {
+                super::context_menus::discovery_deadline(
+                    Instant::now(),
+                    budget.outcome().truncated(),
+                    budget.remaining(),
+                )
+            })
+            .flatten();
+        if !menu_frames.is_empty() && discovery.is_none() {
+            budget.stop_for_timeout();
+        }
+        if let (Some(wid), Some(deadline)) = (window_id, discovery) {
+            let mut incomplete = menu_frames.len() > super::context_menus::MAX_MENU_WINDOWS;
+            let mut walked_menus: Vec<[f64; 4]> = nodes
+                .iter()
+                .filter(|node| node.role == "AXMenu")
+                .filter_map(|node| node.frame)
+                .collect();
+            for &frame in menu_frames
+                .iter()
+                .take(super::context_menus::MAX_MENU_WINDOWS)
+            {
+                let Some((menu, menu_frame, owner)) =
+                    super::context_menus::menu_in_window(pid, frame, deadline)
+                else {
+                    // Nothing readable reached a menu in this menu window.
+                    incomplete = true;
+                    continue;
+                };
+                // Released with the other top-level elements after the walk.
+                top_level.push(menu);
+                match super::context_menus::decide_menu(
+                    menu_frame,
+                    frame,
+                    owner,
+                    wid,
+                    &walked_menus,
+                ) {
+                    super::context_menus::MenuDecision::Publish => {}
+                    super::context_menus::MenuDecision::Skip => continue,
+                    super::context_menus::MenuDecision::Unknown => {
+                        incomplete = true;
+                        continue;
+                    }
+                }
+                walked_menus.extend(menu_frame);
+                walk_element(
+                    menu,
+                    0,
+                    None,
+                    false,
+                    &mut nodes,
+                    &mut lines,
+                    &mut index_counter,
+                    &mut budget,
+                    &mut batching_disabled,
+                    max_depth,
+                    include_web_content,
+                    &mut deferred,
+                );
+            }
+            if incomplete {
+                budget.stop_for_timeout();
+            }
         }
 
         if !deferred.is_empty() {

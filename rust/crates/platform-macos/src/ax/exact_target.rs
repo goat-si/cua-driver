@@ -401,6 +401,21 @@ unsafe fn sheet_parent_window_id(
     found
 }
 
+/// The window `sheet_window_id` is attached to as an `AXSheet`, or `None`
+/// when it is not a sheet of one of `pid`'s windows.
+pub fn sheet_parent_of(pid: i32, sheet_window_id: u32) -> Option<u32> {
+    // SAFETY: the application element is created and released here.
+    unsafe {
+        let app = AXUIElementCreateApplication(pid);
+        if app.is_null() {
+            return None;
+        }
+        let parent = sheet_parent_window_id(app, pid, sheet_window_id);
+        CFRelease(app as CFTypeRef);
+        parent
+    }
+}
+
 unsafe fn element_in_requested_sheet(element: AXUIElementRef, sheet_window_id: u32) -> bool {
     let mut current = element;
     let mut owned = false;
@@ -450,15 +465,27 @@ pub enum WindowFocusConflict {
         target_window_id: u32,
         sibling_window_id: u32,
     },
+    /// The target is a sheet and the process's focused element could not be
+    /// proven to sit inside it (unreadable, or in the sheet's parent outside
+    /// the sheet): a key could reach the parent's content.
+    SheetFocusUnproven { sheet_window_id: u32 },
 }
 
 /// Pure decision for [`check_window_focus_conflict`].
+///
+/// `target_is_sheet`: the target is an `AXSheet` with its own CGWindowID.
+/// AX maps every element of a sheet to the window it is attached to, so the
+/// caller reports an element proven inside the requested sheet as
+/// `target_window_id`. For a sheet target that proof is required: an
+/// unreadable focused element refuses instead of passing as "no conflict".
+/// `AXFocusedWindow` must still name the sheet itself.
 pub fn decide_window_focus_conflict(
     target_window_id: u32,
     addressed_element_window: Option<Option<u32>>,
     addressed_in_menu_bar: bool,
     focused_element_window: Option<u32>,
     focused_window_id: Option<u32>,
+    target_is_sheet: bool,
 ) -> WindowFocusConflict {
     if let Some(actual) = addressed_element_window {
         match actual {
@@ -473,9 +500,25 @@ pub fn decide_window_focus_conflict(
         }
     }
     if let Some(sibling_window_id) = focused_element_window.filter(|&w| w != target_window_id) {
+        if target_is_sheet {
+            return WindowFocusConflict::SheetFocusUnproven {
+                sheet_window_id: target_window_id,
+            };
+        }
         return WindowFocusConflict::SiblingWindowFocused {
             target_window_id,
             sibling_window_id,
+        };
+    }
+    if target_is_sheet && focused_element_window.is_none() {
+        return WindowFocusConflict::SheetFocusUnproven {
+            sheet_window_id: target_window_id,
+        };
+    }
+    // A sheet's key window must be read as the sheet itself.
+    if target_is_sheet && focused_window_id.is_none() {
+        return WindowFocusConflict::SheetFocusUnproven {
+            sheet_window_id: target_window_id,
         };
     }
     if let Some(sibling_window_id) = focused_window_id.filter(|&w| w != target_window_id) {
@@ -485,6 +528,24 @@ pub fn decide_window_focus_conflict(
         };
     }
     WindowFocusConflict::Clear
+}
+
+/// The window an element counts toward for a keyboard target: the requested
+/// sheet itself when the element is proven inside it, else its owning window
+/// (which for any sheet element is the sheet's parent).
+unsafe fn keyboard_element_window(
+    element: AXUIElementRef,
+    target_window_id: u32,
+    sheet_parent: Option<u32>,
+) -> Option<u32> {
+    let window = element_window_id(element);
+    if sheet_parent.is_some()
+        && window == sheet_parent
+        && element_in_requested_sheet(element, target_window_id)
+    {
+        return Some(target_window_id);
+    }
+    window
 }
 
 /// Inspect live AX state immediately before a window-scoped keyboard dispatch
@@ -506,17 +567,18 @@ pub fn check_window_focus_conflict(
                 None => WindowFocusConflict::Clear,
             };
         }
+        let sheet_parent = sheet_parent_window_id(app, pid, target_window_id);
         let (addressed_window, in_menu_bar) = match addressed_element_ptr {
             Some(ptr) => {
                 let el = ptr as AXUIElementRef;
-                let win = element_window_id(el);
+                let win = keyboard_element_window(el, target_window_id, sheet_parent);
                 let menu = win.is_none() && element_in_app_menu_bar(app, el);
                 (Some(win), menu)
             }
             None => (None, false),
         };
         let focused_element_window = focused_element_of_pid(pid).and_then(|focused| {
-            let win = element_window_id(focused);
+            let win = keyboard_element_window(focused, target_window_id, sheet_parent);
             CFRelease(focused as CFTypeRef);
             win
         });
@@ -532,6 +594,7 @@ pub fn check_window_focus_conflict(
             in_menu_bar,
             focused_element_window,
             focused_window_id,
+            sheet_parent.is_some(),
         )
     }
 }
@@ -658,6 +721,16 @@ pub fn gather_background_facts(
                     Some(parent) if element_in_requested_sheet(element, window_id) => parent,
                     _ => window_id,
                 };
+                // An item of an open context menu reports the menu's own
+                // window; the menu itself hangs off a view of the requested
+                // window (Finder's list view), proven through AXParent.
+                let window = if window != Some(requested)
+                    && super::context_menus::element_in_context_menu_of(element, requested)
+                {
+                    Some(requested)
+                } else {
+                    window
+                };
                 element_ancestry(window, in_menu_bar || in_recorded_menu, requested)
             });
             let focused_window_id = copy_element_attr(app, "AXFocusedWindow").and_then(|window| {
@@ -678,18 +751,24 @@ pub fn gather_background_facts(
     };
 
     let target = records.iter().find(|record| record.window_id == window_id);
+    // A sheet is not in AXWindows; its minimized state is the minimized
+    // state of the window it is attached to.
+    let target_minimized = target_minimized_state(&records, window_id, sheet_parent);
+    let competing_rows = all_windows_without_spaces()
+        .iter()
+        .filter(|window| Some(window.window_id) != sheet_parent)
+        .map(|window| WindowServerRow {
+            pid: window.pid,
+            window_id: window.window_id,
+            visible: window.is_on_screen
+                && window.bounds.width >= 2.0
+                && window.bounds.height >= 2.0,
+        })
+        .collect::<Vec<_>>();
     let competing_keyboard_destinations = count_competing_keyboard_destinations(
         pid,
         window_id,
-        all_windows_without_spaces()
-            .iter()
-            .map(|window| WindowServerRow {
-                pid: window.pid,
-                window_id: window.window_id,
-                visible: window.is_on_screen
-                    && window.bounds.width >= 2.0
-                    && window.bounds.height >= 2.0,
-            }),
+        competing_rows,
         &records,
         target.is_some() && focused_window_id == Some(window_id),
     );
@@ -697,11 +776,31 @@ pub fn gather_background_facts(
     BackgroundTargetFacts {
         window_server,
         ax_window_present: target.is_some() || sheet_parent.is_some(),
-        target_minimized: target.and_then(|record| record.minimized),
+        target_minimized,
         app_hidden,
         competing_keyboard_destinations,
         element: element.unwrap_or(ElementAncestry::NotAddressed),
         screen_locked: crate::session::screen_locked(),
+    }
+}
+
+/// `AXMinimized` of the requested window. A sheet has no `AXMinimized` and
+/// is not listed in `AXWindows`: it is shown exactly when the window it is
+/// attached to is, so it takes that window's state. Unknown stays unknown.
+fn target_minimized_state(
+    records: &[AxWindowRecord],
+    window_id: u32,
+    sheet_parent: Option<u32>,
+) -> Option<bool> {
+    let minimized_of = |id: u32| {
+        records
+            .iter()
+            .find(|record| record.window_id == id)
+            .and_then(|record| record.minimized)
+    };
+    match records.iter().any(|record| record.window_id == window_id) {
+        true => minimized_of(window_id),
+        false => sheet_parent.and_then(minimized_of),
     }
 }
 
@@ -1003,33 +1102,121 @@ mod tests {
         use super::{decide_window_focus_conflict, WindowFocusConflict};
 
         assert_eq!(
-            decide_window_focus_conflict(700, Some(Some(700)), false, Some(700), Some(700)),
+            decide_window_focus_conflict(700, Some(Some(700)), false, Some(700), Some(700), false),
             WindowFocusConflict::Clear
         );
         assert_eq!(
-            decide_window_focus_conflict(700, Some(None), true, None, Some(700)),
+            decide_window_focus_conflict(700, Some(None), true, None, Some(700), false),
             WindowFocusConflict::Clear
         );
         assert_eq!(
-            decide_window_focus_conflict(700, Some(Some(888)), false, Some(700), Some(700)),
+            decide_window_focus_conflict(700, Some(Some(888)), false, Some(700), Some(700), false),
             WindowFocusConflict::AddressedElementOutsideWindow {
                 target_window_id: 700,
                 actual_window_id: Some(888),
             }
         );
         assert_eq!(
-            decide_window_focus_conflict(700, None, false, Some(888), Some(700)),
+            decide_window_focus_conflict(700, None, false, Some(888), Some(700), false),
             WindowFocusConflict::SiblingWindowFocused {
                 target_window_id: 700,
                 sibling_window_id: 888,
             }
         );
         assert_eq!(
-            decide_window_focus_conflict(700, None, false, None, Some(888)),
+            decide_window_focus_conflict(700, None, false, None, Some(888), false),
             WindowFocusConflict::SiblingWindowFocused {
                 target_window_id: 700,
                 sibling_window_id: 888,
             }
+        );
+    }
+
+    #[test]
+    fn a_sheet_target_needs_its_focused_element_proven_inside_it() {
+        use super::{decide_window_focus_conflict, WindowFocusConflict};
+        // Sheet 900 is attached to window 700. The caller reports an element
+        // proven inside the sheet as 900; any other element of the parent
+        // keeps the parent's id.
+        assert_eq!(
+            decide_window_focus_conflict(900, None, false, Some(900), Some(900), true),
+            WindowFocusConflict::Clear
+        );
+        let unproven = WindowFocusConflict::SheetFocusUnproven {
+            sheet_window_id: 900,
+        };
+        // The sheet's element focused, the key window unreadable.
+        assert_eq!(
+            decide_window_focus_conflict(900, None, false, Some(900), None, true),
+            unproven
+        );
+        // Unreadable focus: refused, where a plain window passes.
+        assert_eq!(
+            decide_window_focus_conflict(900, None, false, None, Some(900), true),
+            unproven
+        );
+        assert_eq!(
+            decide_window_focus_conflict(900, None, false, None, Some(900), false),
+            WindowFocusConflict::Clear
+        );
+        // A parent control outside the sheet, or another sheet's window.
+        assert_eq!(
+            decide_window_focus_conflict(900, None, false, Some(700), Some(900), true),
+            unproven
+        );
+        assert_eq!(
+            decide_window_focus_conflict(900, None, false, Some(901), Some(900), true),
+            unproven
+        );
+        // The sheet's element focused while the parent (or a sibling) is
+        // the app's focused window: keys would follow that window.
+        for focused_window in [700, 888] {
+            assert_eq!(
+                decide_window_focus_conflict(
+                    900,
+                    None,
+                    false,
+                    Some(900),
+                    Some(focused_window),
+                    true
+                ),
+                WindowFocusConflict::SiblingWindowFocused {
+                    target_window_id: 900,
+                    sibling_window_id: focused_window,
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn a_sheet_takes_the_minimized_state_of_the_window_it_is_attached_to() {
+        let records = [
+            ax_window(700, Some(false)),
+            ax_window(701, Some(true)),
+            ax_window(702, None),
+        ];
+        // A listed window keeps its own state.
+        assert_eq!(
+            super::target_minimized_state(&records, 701, None),
+            Some(true)
+        );
+        // A sheet (not in AXWindows) reads its parent; unknown stays unknown.
+        assert_eq!(
+            super::target_minimized_state(&records, 900, Some(700)),
+            Some(false)
+        );
+        assert_eq!(
+            super::target_minimized_state(&records, 900, Some(701)),
+            Some(true)
+        );
+        assert_eq!(
+            super::target_minimized_state(&records, 900, Some(702)),
+            None
+        );
+        assert_eq!(super::target_minimized_state(&records, 900, None), None);
+        assert_eq!(
+            super::target_minimized_state(&records, 900, Some(999)),
+            None
         );
     }
 }

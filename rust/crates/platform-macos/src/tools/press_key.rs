@@ -110,6 +110,40 @@ fn semantic_press_result(display_key: &str, action: &str, pid: i32, confirmed: b
     .with_action_record(record.build().expect("semantic key record is valid"))
 }
 
+/// A Return/Escape whose addressed sheet window is gone afterwards: the
+/// sheet's dismissal is the key's read-back.
+fn sheet_closed_result(
+    summary: String,
+    path: &str,
+    sheet_window_id: u32,
+    transport: ActionTransport,
+) -> ToolResult {
+    let record = ActionExecutionRecord::builder(
+        ActionEffect::Confirmed,
+        transport,
+        RequestedDelivery::Background,
+    )
+    .actual_delivery(ActualDelivery::Background)
+    .evidence(ActionEvidence {
+        kind: EvidenceKind::WindowChange,
+        detail: format!(
+            "sheet window {sheet_window_id} is no longer listed by WindowServer after the key"
+        ),
+    })
+    .build()
+    .expect("a sheet-closed key record carries evidence");
+    ToolResult::text(format!(
+        "{summary} The sheet window {sheet_window_id} closed."
+    ))
+    .with_structured(serde_json::json!({
+        "path": path,
+        "verified": true,
+        "effect": "confirmed",
+        "sheet_closed": sheet_window_id,
+    }))
+    .with_action_record(record)
+}
+
 fn validate_post_target(pid: i32) -> anyhow::Result<()> {
     if pid <= 0 {
         anyhow::bail!("target pid {pid} is invalid");
@@ -251,6 +285,8 @@ enum WindowFocusConflictError {
         target_window_id: u32,
         sibling_window_id: u32,
     },
+    #[error("sheet window {sheet_window_id} cannot receive process-scoped keys safely: the app's focused element could not be proven to be inside that sheet")]
+    SheetFocusUnproven { pid: i32, sheet_window_id: u32 },
 }
 
 fn map_focus_conflict_to_refusal(
@@ -275,6 +311,12 @@ fn map_focus_conflict_to_refusal(
             target_window_id,
             sibling_window_id,
         }),
+        crate::ax::exact_target::WindowFocusConflict::SheetFocusUnproven { sheet_window_id } => {
+            Some(WindowFocusConflictError::SheetFocusUnproven {
+                pid,
+                sheet_window_id,
+            })
+        }
     }
 }
 
@@ -475,6 +517,17 @@ fn delivery_failed(error: anyhow::Error) -> ToolResult {
                 "pid": pid,
                 "window_id": target_window_id,
                 "sibling_window_id": sibling_window_id,
+                "message": conflict.to_string(),
+            })),
+            WindowFocusConflictError::SheetFocusUnproven {
+                pid,
+                sheet_window_id,
+            } => ToolResult::error(conflict.to_string()).with_structured(serde_json::json!({
+                "code": cua_driver_core::background_input::refusal_codes::SAME_PID_KEYBOARD_AMBIGUITY,
+                "effect": "refused",
+                "dispatched": false,
+                "pid": pid,
+                "window_id": sheet_window_id,
                 "message": conflict.to_string(),
             })),
         };
@@ -708,13 +761,34 @@ impl Tool for PressKeyTool {
                         return refusal;
                     }
                     let result = latency::spawn_action_blocking(move || {
-                        dispatch_with_ax_oracle(pid, Some(wid), Some(ptr), || {
-                            crate::input::ax_actions::perform_ax_action(ptr, action)
-                        })
+                        let sheet = super::sheet_close::SheetWatch::for_window(pid, wid);
+                        // The observation counts from the action itself, not
+                        // from the end of the oracle's own read-back.
+                        let posted = std::cell::Cell::new(None);
+                        let confirmed = dispatch_with_ax_oracle(pid, Some(wid), Some(ptr), || {
+                            let result = crate::input::ax_actions::perform_ax_action(ptr, action);
+                            posted.set(Some(std::time::Instant::now()));
+                            result
+                        })?;
+                        Ok::<_, anyhow::Error>((
+                            confirmed,
+                            sheet
+                                .filter(|sheet| {
+                                    !confirmed
+                                        && posted.get().is_some_and(|at| sheet.closed_after(at))
+                                })
+                                .map(|sheet| sheet.sheet_window_id()),
+                        ))
                     })
                     .await;
                     return match result {
-                        Ok(Ok(confirmed)) => {
+                        Ok(Ok((_, Some(sheet)))) => sheet_closed_result(
+                            format!("✅ Performed {action} for {display_key} on pid {pid}."),
+                            "ax_semantic",
+                            sheet,
+                            ActionTransport::MacosAxAction,
+                        ),
+                        Ok(Ok((confirmed, None))) => {
                             semantic_press_result(&display_key, action, pid, confirmed)
                         }
                         Ok(Err(error)) => delivery_failed(error),
@@ -970,7 +1044,25 @@ impl Tool for PressKeyTool {
         // wildcard snapshot suppressor and the targeted FocusGuard lease.
         let prior_front = apps::frontmost_pid();
         let snapshot = WindowChangeDetector::snapshot(prior_front);
+        // Return/Escape to a sheet: its window closing is the key's
+        // read-back. The baseline is read before the post.
+        let sheet_watch = match window_id {
+            Some(wid)
+                if !fg && !px_focus && semantic_action_for_request(&key, &modifiers).is_some() =>
+            {
+                latency::spawn_action_blocking(move || {
+                    super::sheet_close::SheetWatch::for_window(pid, wid)
+                })
+                .await
+                .ok()
+                .flatten()
+            }
+            _ => None,
+        };
 
+        // When the background key post returned: the sheet watch counts from it.
+        let posted_at = std::sync::Arc::new(std::sync::Mutex::new(None::<std::time::Instant>));
+        let posted_in = posted_at.clone();
         let result = focus_guard::with_focus_suppressed(
             Some(pid),
             prior_front,
@@ -1059,7 +1151,12 @@ impl Tool for PressKeyTool {
                             || {
                             verify_raw_key_target(pid, window_id, pre_focus_ptr, focused_key_route)?;
                             late_cell_refusal(pid, window_id, printable, pre_focus_ptr.is_some())?;
-                            crate::input::keyboard::press_key(pid, &key, &m)
+                            let posted = crate::input::keyboard::press_key(pid, &key, &m);
+                            if posted.is_ok() {
+                                *posted_in.lock().unwrap_or_else(|e| e.into_inner()) =
+                                    Some(std::time::Instant::now());
+                            }
+                            posted
                         },
                         )
                     })
@@ -1069,6 +1166,18 @@ impl Tool for PressKeyTool {
         )
         .await;
 
+        let posted = *posted_at.lock().unwrap_or_else(|e| e.into_inner());
+        let sheet_closed = match (&result, sheet_watch, posted) {
+            (Ok(Ok(false)), Some(watch), Some(posted)) => {
+                latency::spawn_action_blocking(move || {
+                    watch.closed_after(posted).then(|| watch.sheet_window_id())
+                })
+                .await
+                .ok()
+                .flatten()
+            }
+            _ => None,
+        };
         let changes = super::finish_window_observation(snapshot).await;
 
         let delivery_outcome = match result {
@@ -1079,6 +1188,15 @@ impl Tool for PressKeyTool {
         };
 
         let result = match delivery_outcome {
+            PressKeyDeliveryOutcome::Unverifiable if sheet_closed.is_some() => sheet_closed_result(
+                format!(
+                    "✅ Pressed {display_key} on pid {pid}.{}",
+                    changes.result_suffix()
+                ),
+                "key_events",
+                sheet_closed.expect("checked above"),
+                ActionTransport::MacosCgEventPid,
+            ),
             outcome @ (PressKeyDeliveryOutcome::Confirmed
             | PressKeyDeliveryOutcome::Unverifiable) => {
                 let confirmed = matches!(outcome, PressKeyDeliveryOutcome::Confirmed);

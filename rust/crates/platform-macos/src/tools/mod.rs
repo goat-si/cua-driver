@@ -24,6 +24,7 @@ mod scroll;
 mod select_text;
 mod set_value;
 mod set_window_frame;
+mod sheet_close;
 mod type_text;
 mod type_text_hold;
 // `screenshot` / `screenshot_compat` modules removed in PR #1692 —
@@ -417,6 +418,38 @@ pub(crate) fn physical_input_idle_ms() -> Option<u64> {
             (secs.is_finite() && secs >= 0.0).then_some((secs * 1_000.0) as u64)
         })
         .min()
+}
+
+/// Milliseconds since the last physical mouse-button press (left, right or
+/// other), or `None` when unreadable. A context menu opens only from a
+/// press, so typing or moving the mouse elsewhere cannot open one.
+pub(crate) fn physical_mouse_down_idle_ms() -> Option<u64> {
+    idle_ms_of(&[
+        1,  // kCGEventLeftMouseDown (control-click)
+        3,  // kCGEventRightMouseDown
+        25, // kCGEventOtherMouseDown
+    ])
+}
+
+/// Milliseconds since the last physical key press, or `None` when unreadable.
+pub(crate) fn physical_key_down_idle_ms() -> Option<u64> {
+    idle_ms_of(&[10]) // kCGEventKeyDown
+}
+
+/// The shortest time since any of `kinds` arrived from hardware, `None`
+/// when any of them is unreadable.
+fn idle_ms_of(kinds: &[u32]) -> Option<u64> {
+    const HID_SYSTEM_STATE: i32 = 1;
+    let mut idle = None;
+    for &kind in kinds {
+        let secs = unsafe { CGEventSourceSecondsSinceLastEventType(HID_SYSTEM_STATE, kind) };
+        if !(secs.is_finite() && secs >= 0.0) {
+            return None;
+        }
+        let ms = (secs * 1_000.0) as u64;
+        idle = Some(idle.map_or(ms, |current: u64| current.min(ms)));
+    }
+    idle
 }
 
 /// Pure preflight evaluation for a macOS foreground delivery request.

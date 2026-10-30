@@ -309,6 +309,10 @@ pub(super) enum ClickEvidence {
     TitleNamesTarget,
     /// A checkbox or radio button changed value on two reads.
     ToggleChanged,
+    /// The sheet holding the pressed button closed: its window, listed
+    /// before the press, is gone from a complete snapshot that still lists
+    /// the window it was attached to.
+    SheetClosed,
 }
 
 impl ClickEvidence {
@@ -319,11 +323,17 @@ impl ClickEvidence {
             ClickEvidence::Deselected => "row changed from selected to unselected",
             ClickEvidence::TitleNamesTarget => "window title changed to the pressed item's name",
             ClickEvidence::ToggleChanged => "control value changed on two reads",
+            ClickEvidence::SheetClosed => "the sheet holding the pressed button closed",
         }
     }
 
     fn kind(self) -> cua_driver_core::action_record::EvidenceKind {
-        cua_driver_core::action_record::EvidenceKind::AccessibilityReadback
+        match self {
+            ClickEvidence::SheetClosed => {
+                cua_driver_core::action_record::EvidenceKind::WindowChange
+            }
+            _ => cua_driver_core::action_record::EvidenceKind::AccessibilityReadback,
+        }
     }
 
     fn kind_name(self) -> &'static str {
@@ -486,6 +496,10 @@ enum ObservationScope {
     /// Nothing the click targets holds state (a plain button): the click is
     /// unverifiable at once, with no read and no wait.
     Nothing,
+    /// A button inside a sheet: as [`Watch`](Self::Watch), for up to
+    /// [`super::sheet_close::SHEET_CLOSE_OBSERVATION`], since the sheet's
+    /// window takes longer to go than a property takes to change.
+    WatchSheet,
 }
 
 /// Which scope a click's probe needs. `selection_before` is each retained
@@ -507,6 +521,23 @@ fn observation_scope(
     }
 }
 
+/// Where a click's observation window starts: the end of its own pointer
+/// post when it made one; for a watched sheet, when its `AXPress` returned
+/// (the sheet's window takes a while to go, and the preparation reads must
+/// not eat the window); otherwise dispatch.
+fn observation_start(
+    scope: ObservationScope,
+    started: std::time::Instant,
+    own_post_finished: Option<std::time::Instant>,
+    sheet_press_at: Option<std::time::Instant>,
+) -> std::time::Instant {
+    match (own_post_finished, scope, sheet_press_at) {
+        (Some(finished), _, _) => finished,
+        (None, ObservationScope::WatchSheet, Some(pressed)) => pressed,
+        _ => started,
+    }
+}
+
 /// Poll `read` from `delivered` until it shows evidence, then return it at
 /// once if an immediate second read agrees (no settle wait); give up after
 /// [`CLICK_OBSERVATION`]. A change first seen after the deadline, or read by
@@ -521,7 +552,11 @@ fn watch_for_change<C: crate::ax::scroll_area::Clock>(
     if scope == ObservationScope::Nothing {
         return None;
     }
-    let deadline = delivered + CLICK_OBSERVATION;
+    let deadline = delivered
+        + match scope {
+            ObservationScope::WatchSheet => super::sheet_close::SHEET_CLOSE_OBSERVATION,
+            _ => CLICK_OBSERVATION,
+        };
     loop {
         if clock.now() > deadline {
             return None;
@@ -553,6 +588,11 @@ pub(super) struct ClickProbe {
     title: Option<WindowTitleProbe>,
     toggle: Option<(Retained, String, String)>,
     selection: Option<SelectionSnapshot>,
+    /// The sheet a pressed button sits in, listed before the click.
+    sheet: Option<super::sheet_close::SheetWatch>,
+    /// When the `AXPress` a sheet watch observes returned: the sheet's
+    /// window is watched from there, not from before the preparation reads.
+    sheet_press_at: Option<std::time::Instant>,
     scope: ObservationScope,
     /// The element under the point for a pixel click, as the public `hit`.
     hit: Option<serde_json::Value>,
@@ -658,6 +698,8 @@ impl ClickProbe {
             title,
             toggle,
             selection,
+            sheet: None,
+            sheet_press_at: None,
             scope,
             hit: None,
             idle_before,
@@ -670,6 +712,31 @@ impl ClickProbe {
     /// Right before the click posts its own pointer events.
     pub(super) fn own_post_starts(&mut self) {
         self.own_post = Some(None);
+    }
+
+    /// Also watch the sheet a button sits in, for an `AXPress` sent to that
+    /// button through accessibility (the only route its closing may confirm).
+    ///
+    /// # Safety
+    ///
+    /// `element` must be a valid, live `AXUIElementRef`.
+    unsafe fn watching_sheet_for_press(mut self, element: AXUIElementRef, ax_action: &str) -> Self {
+        if ax_action == "AXPress"
+            && copy_string_attr(element, "AXRole").as_deref() == Some("AXButton")
+        {
+            self.sheet = super::sheet_close::SheetWatch::for_element(element);
+            if self.sheet.is_some() {
+                self.scope = ObservationScope::WatchSheet;
+            }
+        }
+        self
+    }
+
+    /// Right after the `AXPress` returned, for a watched sheet.
+    fn press_returned(&mut self) {
+        if self.sheet.is_some() {
+            self.sheet_press_at = Some(std::time::Instant::now());
+        }
     }
 
     /// Right after the click's own pointer events were posted.
@@ -730,6 +797,13 @@ impl ClickProbe {
                 return Some(ClickEvidence::TitleNamesTarget);
             }
         }
+        if self
+            .sheet
+            .as_ref()
+            .is_some_and(|sheet| sheet.presence_now() == super::sheet_close::SheetPresence::Gone)
+        {
+            return Some(ClickEvidence::SheetClosed);
+        }
         None
     }
 
@@ -741,8 +815,18 @@ impl ClickProbe {
         if self.own_post.is_some_and(|finished| finished.is_none()) {
             return None;
         }
+        let sheet_front = self
+            .sheet
+            .as_ref()
+            .map(super::sheet_close::SheetWatch::front);
         let (evidence, window) = self.observe_change()?;
-        window.quiet().then_some(evidence)
+        let quiet = window.quiet();
+        match (evidence, sheet_front) {
+            (ClickEvidence::SheetClosed, Some(front)) => {
+                super::sheet_close::no_person_could_act(quiet, &front).then_some(evidence)
+            }
+            _ => quiet.then_some(evidence),
+        }
     }
 
     /// The change read within the deadline, with the input window still to
@@ -750,7 +834,12 @@ impl ClickProbe {
     pub(super) fn observe_change(self) -> Option<(ClickEvidence, InputWindow)> {
         // From delivery: the end of the click's own post when it made one
         // (a double click's two clicks take a while), else dispatch.
-        let delivered = self.own_post.flatten().unwrap_or(self.started);
+        let delivered = observation_start(
+            self.scope,
+            self.started,
+            self.own_post.flatten(),
+            self.sheet_press_at,
+        );
         let found = watch_for_change(
             self.scope,
             delivered,
@@ -3099,7 +3188,9 @@ fn perform_ax_click(
     // read right before dispatch so nothing earlier (a navigation still
     // finishing during the priming) counts. A row whose press is refused is
     // selected by the fallback below; its own snapshot ties that write.
-    let probe = unsafe { ClickProbe::capture(Some(element), toggle) };
+    let mut probe = unsafe {
+        ClickProbe::capture(Some(element), toggle).watching_sheet_for_press(element, ax_action)
+    };
     let fallback_selection = (ax_action == "AXPress" && modifiers.is_empty()).then(|| {
         let idle_before = super::physical_input_idle_ms();
         let started = std::time::Instant::now();
@@ -3112,12 +3203,18 @@ fn perform_ax_click(
     let err = latency::section(latency::Stage::AxPerform, || unsafe {
         crate::ax::bindings::perform_action(element, ax_action)
     });
+    probe.press_returned();
     if err != crate::ax::bindings::kAXErrorSuccess {
         // Checked before the row-selection fallback, which writes AXSelected
         // on an ancestor: a press that landed (a toggle, a navigation) needs
         // no other write. Same evidence and input rules as a success.
         if press_error_may_have_acted(err) {
-            if let Some(evidence) = probe.observe() {
+            // A press the app reported as failed never claims the sheet's
+            // closing: only a delivered AXPress may.
+            if let Some(evidence) = probe
+                .observe()
+                .filter(|evidence| *evidence != ClickEvidence::SheetClosed)
+            {
                 return Ok((
                     format!(
                         "✅ Performed {ax_action} on [{idx}] {role} \"{title}\"; {}, although \
@@ -4368,6 +4465,56 @@ mod click_evidence_tests {
             (elapsed > CLICK_OBSERVATION).then_some(ClickEvidence::Selected)
         });
         assert_eq!(found, None);
+    }
+
+    #[test]
+    fn a_sheet_button_watch_waits_for_the_sheet_window_up_to_its_own_bound() {
+        let started = std::time::Instant::now();
+        let pressed = started + Duration::from_millis(450);
+        // Slow preparation: the sheet is watched from the press, not from
+        // the reads before it.
+        assert_eq!(
+            observation_start(ObservationScope::WatchSheet, started, None, Some(pressed)),
+            pressed
+        );
+        // Other probes keep counting from dispatch, and a pointer post's end
+        // still wins.
+        assert_eq!(
+            observation_start(ObservationScope::Watch, started, None, Some(pressed)),
+            started
+        );
+        let posted = started + Duration::from_millis(30);
+        assert_eq!(
+            observation_start(
+                ObservationScope::WatchSheet,
+                started,
+                Some(posted),
+                Some(pressed)
+            ),
+            posted
+        );
+        assert_eq!(
+            observation_start(ObservationScope::WatchSheet, started, None, None),
+            started
+        );
+        use super::super::sheet_close::SHEET_CLOSE_OBSERVATION;
+        let late = CLICK_OBSERVATION + Duration::from_millis(40);
+        let (found, _, elapsed, _) = run_watch(ObservationScope::WatchSheet, |elapsed| {
+            (elapsed >= late).then_some(ClickEvidence::SheetClosed)
+        });
+        assert_eq!(found, Some(ClickEvidence::SheetClosed));
+        assert!(elapsed < SHEET_CLOSE_OBSERVATION, "{elapsed:?}");
+        let (found, _, elapsed, _) = run_watch(ObservationScope::WatchSheet, |_| None);
+        assert_eq!(found, None);
+        assert_eq!(elapsed, SHEET_CLOSE_OBSERVATION);
+        let (found, _, _, _) = run_watch(ObservationScope::WatchSheet, |elapsed| {
+            (elapsed > SHEET_CLOSE_OBSERVATION).then_some(ClickEvidence::SheetClosed)
+        });
+        assert_eq!(found, None);
+        assert_eq!(
+            ClickEvidence::SheetClosed.kind(),
+            cua_driver_core::action_record::EvidenceKind::WindowChange
+        );
     }
 
     #[test]

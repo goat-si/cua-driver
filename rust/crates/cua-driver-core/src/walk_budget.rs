@@ -119,6 +119,14 @@ impl WalkBudget {
             .is_some_and(|started| started.elapsed() >= self.timeout)
     }
 
+    /// Wall-clock time left for a time-bounded walk that has started; `None`
+    /// for a node-only budget or one not started yet.
+    pub fn remaining(&self) -> Option<Duration> {
+        let started = self.started?;
+        self.time_bounded
+            .then(|| self.timeout.saturating_sub(started.elapsed()))
+    }
+
     /// Record that the walk ran out of time outside [`WalkBudget::admit`]
     /// (a bulk fetch that returned after the deadline).
     pub fn stop_for_timeout(&mut self) {
@@ -380,6 +388,21 @@ impl HungTargetCircuitBreaker {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn remaining_time_is_known_only_for_a_started_time_bounded_walk() {
+        let mut timed = WalkBudget::new(1_000, 10);
+        assert_eq!(timed.remaining(), None, "not started");
+        assert!(timed.admit());
+        let left = timed.remaining().expect("started and time-bounded");
+        assert!(left <= Duration::from_millis(1_000));
+        let mut nodes = WalkBudget::nodes_only(10);
+        assert!(nodes.admit());
+        assert_eq!(nodes.remaining(), None);
+        let mut spent = WalkBudget::new(0, 10);
+        let _ = spent.admit();
+        assert_eq!(spent.remaining(), Some(Duration::ZERO));
+    }
 
     #[test]
     fn node_budget_stops_and_counts_pending() {

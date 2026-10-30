@@ -282,6 +282,7 @@ impl RightClickTool {
             let result = latency::spawn_blocking(move || -> anyhow::Result<_> {
                 let _action = latency::span(latency::Stage::ActionBlocking);
                 let element_ptr = element_guard.as_ptr();
+                let input_watch = MenuInputWatch::start(pid);
                 let before = MenuSnapshot::read(pid, Some(element_ptr), Some(wid));
                 let action = move |dispatch| {
                     let _mutation_lease = mutation_lease;
@@ -297,9 +298,10 @@ impl RightClickTool {
                     }
                     result
                 };
-                let (completion, menu) = observe_right_click_action(before, action, || {
+                let (completion, mut menu) = observe_right_click_action(before, action, || {
                     MenuSnapshot::read(pid, Some(element_ptr), Some(wid))
                 });
+                menu.input_quiet = input_watch.no_person_could_open();
                 let result = match completion {
                     ObservedAction::Completed(result) => result,
                     ObservedAction::TimedOut if menu.opened => {
@@ -493,7 +495,13 @@ impl RightClickTool {
             // Foreground rung: front the exact window → HID right-click →
             // restore the prior frontmost. No input is sent unless the exact
             // window is proven focused.
-            let before = MenuSnapshot::read(pid, None, window_id);
+            let input_watch = MenuInputWatch::start(pid);
+            // The element under the click point, when it is inside the exact
+            // window: its menu hangs off it or one of its ancestors.
+            let anchor = window_id
+                .and_then(|wid| unsafe { element_in_window_at(pid, wid, screen_x, screen_y) });
+            let anchor_ptr = anchor.as_ref().map(|anchor| anchor.0);
+            let before = MenuSnapshot::read(pid, anchor_ptr, window_id);
             let action = move |dispatch| match (route, window_id) {
                 (super::pixel_route::PixelClickRoute::ForegroundHid, Some(wid)) => {
                     crate::input::skylight::with_foreground_hid_activation(
@@ -504,9 +512,11 @@ impl RightClickTool {
                 }
                 _ => do_it(dispatch),
             };
-            let (completion, menu) = observe_right_click_action(before, action, || {
-                MenuSnapshot::read(pid, None, window_id)
+            let (completion, mut menu) = observe_right_click_action(before, action, || {
+                MenuSnapshot::read(pid, anchor_ptr, window_id)
             });
+            menu.input_quiet = input_watch.no_person_could_open();
+            drop(anchor);
             let result = match completion {
                 ObservedAction::Completed(result) => result,
                 ObservedAction::TimedOut if menu.opened => {
@@ -586,19 +596,106 @@ impl Drop for RetainedAxElement {
     }
 }
 
+impl RetainedAxElement {
+    /// # Safety
+    ///
+    /// `element` must be a valid, live `AXUIElementRef`.
+    unsafe fn retain(element: usize) -> Self {
+        core_foundation::base::CFRetain(element as CFTypeRef);
+        Self(element)
+    }
+}
+
 #[derive(Debug)]
 struct MenuSnapshot {
     window_ids: Option<HashSet<u32>>,
     ax_menus: Option<Vec<RetainedAxElement>>,
+    /// The first `linked` entries of `ax_menus` hang off the right-clicked
+    /// element or one of its AX ancestors inside the window: AppKit attaches
+    /// a view's context menu there (Finder's list view holds a row's menu).
+    linked: usize,
 }
 
 impl MenuSnapshot {
     fn read(pid: i32, target: Option<usize>, window_id: Option<u32>) -> Self {
+        let (ax_menus, linked) = match unsafe { ax_menus_linked(pid, target, window_id) } {
+            Some((menus, linked)) => (Some(menus), linked),
+            None => (None, 0),
+        };
         Self {
             window_ids: menu_window_ids(pid),
-            ax_menus: unsafe { ax_menus(pid, target, window_id) },
+            ax_menus,
+            linked,
         }
     }
+
+    fn is_linked(&self, menu: &RetainedAxElement) -> bool {
+        self.ax_menus.as_ref().is_some_and(|menus| {
+            menus[..self.linked.min(menus.len())]
+                .iter()
+                .any(|linked| unsafe { CFEqual(linked.0 as CFTypeRef, menu.0 as CFTypeRef) != 0 })
+        })
+    }
+}
+
+/// The element under a screen point when it is proven inside `window_id`.
+///
+/// # Safety
+///
+/// Calls into Accessibility for `pid`.
+unsafe fn element_in_window_at(
+    pid: i32,
+    window_id: u32,
+    x: f64,
+    y: f64,
+) -> Option<RetainedAxElement> {
+    let element =
+        RetainedAxElement(crate::ax::bindings::element_at_screen_position(pid, x, y)? as usize);
+    (crate::ax::exact_target::element_window_id(element.0 as AXUIElementRef) == Some(window_id))
+        .then_some(element)
+}
+
+/// Physical input that could have opened a context menu instead of the
+/// right-click: a mouse-button press anywhere, or a key press while the
+/// target app could have received it (it was frontmost, or an app
+/// activation happened). Pointer movement never counts, and typing counts
+/// only when another app was not proven frontmost throughout.
+struct MenuInputWatch {
+    mouse_before: Option<u64>,
+    key_before: Option<u64>,
+    from: Instant,
+    front: super::sheet_close::OtherAppFront,
+}
+
+impl MenuInputWatch {
+    fn start(pid: i32) -> Self {
+        Self {
+            front: super::sheet_close::OtherAppFront::capture(pid),
+            mouse_before: super::physical_mouse_down_idle_ms(),
+            key_before: super::physical_key_down_idle_ms(),
+            from: Instant::now(),
+        }
+    }
+
+    fn no_person_could_open(&self) -> bool {
+        let elapsed = u64::try_from(self.from.elapsed().as_millis()).unwrap_or(u64::MAX);
+        let quiet = |before: Option<u64>, now: Option<u64>| {
+            before.is_some() && now.is_some_and(|idle| idle >= elapsed)
+        };
+        menu_input_attributable(
+            quiet(self.mouse_before, super::physical_mouse_down_idle_ms()),
+            quiet(self.key_before, super::physical_key_down_idle_ms()),
+            || self.front.held_throughout(),
+        )
+    }
+}
+
+fn menu_input_attributable(
+    mouse_quiet: bool,
+    key_quiet: bool,
+    other_app_front_throughout: impl FnOnce() -> bool,
+) -> bool {
+    mouse_quiet && (key_quiet || other_app_front_throughout())
 }
 
 unsafe fn collect_direct_menus(root: AXUIElementRef, menus: &mut Vec<RetainedAxElement>) -> bool {
@@ -670,6 +767,21 @@ unsafe fn ax_menus(
     target: Option<usize>,
     window_id: Option<u32>,
 ) -> Option<Vec<RetainedAxElement>> {
+    ax_menus_linked(pid, target, window_id).map(|(menus, _)| menus)
+}
+
+/// AX parents above the right-clicked element searched for its menu.
+const MAX_MENU_ANCHOR_ANCESTRY: usize = 12;
+
+/// The open `AXMenu`s that could be this right-click's: first those that are
+/// direct children of `target` or of its AX ancestors below its window
+/// (the count is returned), then direct children of the application and of
+/// the window. `None` when a read failed.
+unsafe fn ax_menus_linked(
+    pid: i32,
+    target: Option<usize>,
+    window_id: Option<u32>,
+) -> Option<(Vec<RetainedAxElement>, usize)> {
     let app = AXUIElementCreateApplication(pid);
     if app.is_null() {
         return None;
@@ -684,20 +796,34 @@ unsafe fn ax_menus(
         None
     };
     let mut menus = Vec::new();
+    if let Some(target) = target {
+        let mut current = RetainedAxElement::retain(target);
+        for _ in 0..=MAX_MENU_ANCHOR_ANCESTRY {
+            if matches!(
+                copy_string_attr(current.0 as AXUIElementRef, "AXRole").as_deref(),
+                Some("AXWindow") | Some("AXSheet") | Some("AXApplication") | None
+            ) {
+                break;
+            }
+            if !collect_direct_menus(current.0 as AXUIElementRef, &mut menus) {
+                return None;
+            }
+            let Some(parent) = copy_element_attr(current.0 as AXUIElementRef, "AXParent") else {
+                break;
+            };
+            current = RetainedAxElement(parent as usize);
+        }
+    }
+    let linked = menus.len();
     if !collect_direct_menus(app.0 as AXUIElementRef, &mut menus) {
         return None;
-    }
-    if let Some(target) = target {
-        if !collect_direct_menus(target as AXUIElementRef, &mut menus) {
-            return None;
-        }
     }
     if let Some(window) = window {
         if !collect_direct_menus(window.0 as AXUIElementRef, &mut menus) {
             return None;
         }
     }
-    Some(menus)
+    Some((menus, linked))
 }
 
 #[link(name = "CoreGraphics", kind = "framework")]
@@ -805,6 +931,8 @@ fn new_menu_observation(before: &MenuSnapshot, after: &MenuSnapshot) -> Option<M
                 unique_ax_menu: true,
                 unique_window: false,
                 completion_indeterminate: false,
+                linked: false,
+                input_quiet: false,
                 continuous: false,
                 window_id: match (&before.window_ids, &after.window_ids) {
                     (Some(before_ids), Some(after_ids)) => {
@@ -825,6 +953,8 @@ fn new_menu_observation(before: &MenuSnapshot, after: &MenuSnapshot) -> Option<M
                 unique_ax_menu: false,
                 unique_window: false,
                 completion_indeterminate: false,
+                linked: false,
+                input_quiet: false,
                 continuous: false,
                 window_id: after_ids.difference(before_ids).next().copied(),
             });
@@ -865,6 +995,8 @@ fn new_menu_observation_between(
                 unique_window,
                 continuous: false,
                 completion_indeterminate: false,
+                linked: after.is_linked(candidate),
+                input_quiet: false,
                 window_id: new_window_id,
             });
         }
@@ -885,6 +1017,8 @@ fn new_menu_observation_between(
                 unique_window,
                 continuous: false,
                 completion_indeterminate: false,
+                linked: false,
+                input_quiet: false,
                 window_id: new_window_id,
             });
         }
@@ -1029,7 +1163,7 @@ fn observe_right_click_action_with<T: Send + 'static>(
         _ => return (ObservedAction::TimedOut, MenuObservation::none()),
     };
     let sent_baseline = read();
-    let deadline = sent_at + Duration::from_millis(150);
+    let deadline = sent_at + MENU_OBSERVATION;
     let mut previous: Option<MenuObservation> = None;
     let observation = poll_until_deadline(
         deadline,
@@ -1082,6 +1216,12 @@ struct MenuObservation {
     continuous: bool,
     completion_indeterminate: bool,
     window_id: Option<u32>,
+    /// The menu hangs off the right-clicked element or one of its AX
+    /// ancestors in the window (see [`MenuSnapshot::linked`]).
+    linked: bool,
+    /// No physical keyboard or mouse input from the baseline read until the
+    /// observation ended: the person did not open it.
+    input_quiet: bool,
 }
 
 impl MenuObservation {
@@ -1095,6 +1235,8 @@ impl MenuObservation {
             unique_window: false,
             continuous: false,
             completion_indeterminate: false,
+            linked: false,
+            input_quiet: false,
             window_id: None,
         }
     }
@@ -1124,6 +1266,18 @@ fn spatially_attributed(menu: &MenuObservation, ownership: &OpenOwnership) -> bo
     else {
         return false;
     };
+    // A new AX menu borrows a new menu window's position only when it is
+    // that window's menu: its frame matches the window's.
+    let ax_frame = menu.menu.as_ref().and_then(|native| unsafe {
+        crate::ax::bindings::element_screen_rect(native.0 as AXUIElementRef)
+    });
+    if !spatial_evidence_is_one_menu(
+        menu.evidence,
+        ax_frame,
+        [frame.x, frame.y, frame.width, frame.height],
+    ) {
+        return false;
+    }
     if let Some((x, y)) = ownership.click {
         return (frame.x - x).abs() <= 96.0 && (frame.y - y).abs() <= 96.0;
     }
@@ -1137,6 +1291,23 @@ fn spatially_attributed(menu: &MenuObservation, ownership: &OpenOwnership) -> bo
     false
 }
 
+/// Window evidence is the menu window itself. Accessibility evidence pairs
+/// an AX menu with a separately found new menu window, so it counts only
+/// when the AX menu's frame matches that window's.
+fn spatial_evidence_is_one_menu(
+    evidence: MenuEvidence,
+    ax_frame: Option<[f64; 4]>,
+    window_frame: [f64; 4],
+) -> bool {
+    match evidence {
+        MenuEvidence::Window => true,
+        MenuEvidence::Accessibility => {
+            ax_frame.is_some_and(|ax| crate::ax::context_menus::menu_fits_window(ax, window_frame))
+        }
+        MenuEvidence::None => false,
+    }
+}
+
 #[allow(dead_code)]
 fn right_click_result(
     message: &str,
@@ -1147,6 +1318,23 @@ fn right_click_result(
     right_click_result_with_ownership(message, path, menu, foreground, None)
 }
 
+/// How long after the right-click is sent a new menu is looked for. The
+/// observation returns at the second consistent sighting; Finder showed its
+/// list-view menu about 130 ms after the call started, past the old 150 ms
+/// bound once the reads themselves were counted.
+const MENU_OBSERVATION: Duration = Duration::from_millis(400);
+
+/// A new menu confirms the right-click only when it is tied to it: it hangs
+/// off the clicked element or an ancestor (`linked`), or its menu window
+/// opened at the click (`spatial`), and no physical input arrived while it
+/// was watched. Any other new menu of the app stays unverifiable.
+fn menu_confirms(menu: &MenuObservation, spatial: bool) -> bool {
+    menu.opened
+        && menu.evidence != MenuEvidence::None
+        && menu.input_quiet
+        && (menu.linked || spatial)
+}
+
 fn right_click_result_with_ownership(
     message: &str,
     path: &str,
@@ -1154,7 +1342,10 @@ fn right_click_result_with_ownership(
     foreground: bool,
     ownership: Option<OpenOwnership>,
 ) -> ToolResult {
-    let confirmed = menu.opened && menu.evidence != MenuEvidence::None;
+    let spatial = ownership
+        .as_ref()
+        .is_some_and(|ownership| spatially_attributed(&menu, ownership));
+    let confirmed = menu_confirms(&menu, spatial);
     let mut text = message.to_owned();
     if confirmed {
         text.push_str(" Context menu opened");
@@ -1446,6 +1637,8 @@ mod tests {
                     opened: true,
                     items: vec!["Copy".into()],
                     evidence: MenuEvidence::Accessibility,
+                    linked: true,
+                    input_quiet: true,
                     ..MenuObservation::none()
                 },
                 false,
@@ -1481,6 +1674,8 @@ mod tests {
                 opened: true,
                 items: vec!["Copy".into(), "Paste".into()],
                 evidence: MenuEvidence::Accessibility,
+                linked: true,
+                input_quiet: true,
                 ..MenuObservation::none()
             },
             false,
@@ -1507,15 +1702,18 @@ mod tests {
         let before = MenuSnapshot {
             window_ids: Some(HashSet::from([7])),
             ax_menus: None,
+            linked: 0,
         };
         let reexposed = MenuSnapshot {
             window_ids: Some(HashSet::from([7])),
             ax_menus: None,
+            linked: 0,
         };
         assert!(new_menu_observation(&before, &reexposed).is_none());
         let new_window = MenuSnapshot {
             window_ids: Some(HashSet::from([7, 8])),
             ax_menus: None,
+            linked: 0,
         };
         assert_eq!(
             new_menu_observation(&before, &new_window).unwrap().evidence,
@@ -1524,16 +1722,19 @@ mod tests {
         let incomplete = MenuSnapshot {
             window_ids: None,
             ax_menus: None,
+            linked: 0,
         };
         assert!(new_menu_observation(&incomplete, &new_window).is_none());
 
         let crossed_after = MenuSnapshot {
             window_ids: Some(HashSet::from([7, 8])),
             ax_menus: None,
+            linked: 0,
         };
         let other_baseline = MenuSnapshot {
             window_ids: Some(HashSet::from([8])),
             ax_menus: None,
+            linked: 0,
         };
         assert!(
             new_menu_observation_between(&before, &other_baseline, &crossed_after, true).is_none()
@@ -1541,6 +1742,7 @@ mod tests {
         let common_new = MenuSnapshot {
             window_ids: Some(HashSet::from([7, 8, 9])),
             ax_menus: None,
+            linked: 0,
         };
         assert!(
             new_menu_observation_between(&before, &other_baseline, &common_new, true).is_some()
@@ -1675,6 +1877,7 @@ mod tests {
         let before = MenuSnapshot {
             window_ids: Some(HashSet::new()),
             ax_menus: None,
+            linked: 0,
         };
         let menu_ids = Arc::new(std::sync::Mutex::new(HashSet::from([1])));
         let action_ids = menu_ids.clone();
@@ -1694,11 +1897,12 @@ mod tests {
             move || {
                 reads += 1;
                 if reads == 3 && stall_on_second_sighting {
-                    read_clock.advance(Duration::from_millis(151));
+                    read_clock.advance(MENU_OBSERVATION + Duration::from_millis(1));
                 }
                 let snapshot = MenuSnapshot {
                     window_ids: Some(menu_ids.lock().unwrap().clone()),
                     ax_menus: None,
+                    linked: 0,
                 };
                 match reads {
                     1 => {
@@ -1747,6 +1951,7 @@ mod tests {
         let before = MenuSnapshot {
             window_ids: Some(HashSet::new()),
             ax_menus: None,
+            linked: 0,
         };
         let menu_ids = Arc::new(std::sync::Mutex::new(HashSet::from([1])));
         let action_ids = menu_ids.clone();
@@ -1762,11 +1967,19 @@ mod tests {
             || MenuSnapshot {
                 window_ids: Some(menu_ids.lock().unwrap().clone()),
                 ax_menus: None,
+                linked: 0,
             },
         );
         result.unwrap();
         assert!(!observation.opened);
-        assert_eq!(clock.sleeps(), vec![Duration::from_millis(15); 10]);
+        let sleeps = clock.sleeps();
+        assert!(
+            sleeps
+                .iter()
+                .all(|sleep| *sleep <= Duration::from_millis(15)),
+            "{sleeps:?}"
+        );
+        assert_eq!(sleeps.iter().sum::<Duration>(), MENU_OBSERVATION);
     }
 
     #[test]
@@ -1774,14 +1987,17 @@ mod tests {
         let before = MenuSnapshot {
             window_ids: Some(HashSet::new()),
             ax_menus: None,
+            linked: 0,
         };
         let sent = MenuSnapshot {
             window_ids: Some(HashSet::from([101])),
             ax_menus: None,
+            linked: 0,
         };
         let after = MenuSnapshot {
             window_ids: Some(HashSet::from([101])),
             ax_menus: None,
+            linked: 0,
         };
         let (window_id, unique) = novel_window_between(&before, &sent, &after, false);
         assert!(unique);
@@ -1820,6 +2036,7 @@ mod tests {
         let before = MenuSnapshot {
             window_ids: Some(HashSet::new()),
             ax_menus: None,
+            linked: 0,
         };
         let clock = FakeClock::new();
         let action_clock = clock.clone();
@@ -1839,11 +2056,140 @@ mod tests {
                         HashSet::from([1])
                     }),
                     ax_menus: None,
+                    linked: 0,
                 }
             },
         );
         result.unwrap();
         assert!(observation.opened);
         assert_eq!(clock.sleeps(), vec![Duration::from_millis(15)]);
+    }
+
+    #[test]
+    fn a_menu_that_shows_after_the_old_150ms_bound_is_still_observed() {
+        // Finder's list-view menu window appeared about 130 ms after the call
+        // started, past the old bound once the reads were counted.
+        let before = MenuSnapshot {
+            window_ids: Some(HashSet::new()),
+            ax_menus: None,
+            linked: 0,
+        };
+        let clock = FakeClock::new();
+        let start = clock.now();
+        let action_clock = clock.clone();
+        let read_clock = clock.clone();
+        let (result, observation) = observe_right_click_action_with(
+            &clock,
+            before,
+            move |sent| {
+                let _ = sent.send(ActionEvent::Sent(action_clock.now()));
+            },
+            move || MenuSnapshot {
+                window_ids: Some(if read_clock.now() - start >= Duration::from_millis(250) {
+                    HashSet::from([1])
+                } else {
+                    HashSet::new()
+                }),
+                ax_menus: None,
+                linked: 0,
+            },
+        );
+        result.unwrap();
+        assert!(observation.opened);
+        assert!(observation.continuous);
+        let waited: Duration = clock.sleeps().iter().sum();
+        assert!(
+            waited < MENU_OBSERVATION,
+            "returns at the second sighting: {waited:?}"
+        );
+    }
+
+    #[test]
+    fn only_a_menu_tied_to_the_click_with_no_physical_input_confirms() {
+        let seen = |evidence, linked, input_quiet| MenuObservation {
+            opened: true,
+            evidence,
+            linked,
+            input_quiet,
+            ..MenuObservation::none()
+        };
+        // Hangs off the clicked element or an ancestor.
+        assert!(menu_confirms(
+            &seen(MenuEvidence::Accessibility, true, true),
+            false
+        ));
+        // A menu window that opened at the click point.
+        assert!(menu_confirms(
+            &seen(MenuEvidence::Window, false, true),
+            true
+        ));
+        // Any other new menu of the app: seen, not attributed.
+        assert!(!menu_confirms(
+            &seen(MenuEvidence::Accessibility, false, true),
+            false
+        ));
+        assert!(!menu_confirms(
+            &seen(MenuEvidence::Window, false, true),
+            false
+        ));
+        // A person typed or clicked meanwhile, or the idle clock was unreadable.
+        assert!(!menu_confirms(
+            &seen(MenuEvidence::Accessibility, true, false),
+            true
+        ));
+        assert!(!menu_confirms(&MenuObservation::none(), true));
+
+        let result = right_click_result(
+            "menu delivered",
+            "cgevent",
+            seen(MenuEvidence::Accessibility, false, true),
+            false,
+        );
+        let structured = result.structured_content.unwrap();
+        assert_eq!(structured["effect"], "unverifiable", "{structured}");
+    }
+
+    #[test]
+    fn a_key_press_counts_unless_another_app_was_in_front_throughout() {
+        // No press of any kind.
+        assert!(menu_input_attributable(true, true, || false));
+        // Typing in another app that stayed frontmost.
+        assert!(menu_input_attributable(true, false, || true));
+        // Typing while the target app could have received it (a keyboard
+        // shortcut can open a contextual menu).
+        assert!(!menu_input_attributable(true, false, || false));
+        // A mouse press anywhere: the person may have right-clicked.
+        assert!(!menu_input_attributable(false, true, || true));
+    }
+
+    #[test]
+    fn an_ax_menu_does_not_borrow_an_unrelated_menu_window_position() {
+        let window = [2002.0, 198.0, 391.0, 552.0];
+        assert!(spatial_evidence_is_one_menu(
+            MenuEvidence::Window,
+            None,
+            window
+        ));
+        assert!(spatial_evidence_is_one_menu(
+            MenuEvidence::Accessibility,
+            Some([2003.0, 199.0, 391.0, 552.0]),
+            window
+        ));
+        // A different menu opened elsewhere at the same time.
+        assert!(!spatial_evidence_is_one_menu(
+            MenuEvidence::Accessibility,
+            Some([300.0, 400.0, 200.0, 120.0]),
+            window
+        ));
+        assert!(!spatial_evidence_is_one_menu(
+            MenuEvidence::Accessibility,
+            None,
+            window
+        ));
+        assert!(!spatial_evidence_is_one_menu(
+            MenuEvidence::None,
+            None,
+            window
+        ));
     }
 }
