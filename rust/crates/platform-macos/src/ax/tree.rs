@@ -523,7 +523,7 @@ fn walk_tree_with_web_content(
         // A window-scoped walk of an app that is still launching waits, within
         // the caller's budget, for the app to answer AX (see `super::launch`).
         let mut launch_wait = LaunchWait::new(budget.time_limit());
-        let (top_level, walk_these) = loop {
+        let (mut top_level, walk_these) = loop {
             // Chromium/Electron apps (Arc, VS Code, Electron shells) ship their
             // web-content AX tree OFF and only build it once an assistive client
             // asks for it. Without this, the first walk of such an app returns an
@@ -610,6 +610,50 @@ fn walk_tree_with_web_content(
                     &mut deferred,
                 )
             });
+        }
+
+        // An open context menu of the walked window hangs off a view that
+        // does not list it as a child: publish it after the window, each
+        // under the same budget, so its items get element tokens.
+        let discovery = super::context_menus::discovery_deadline(
+            Instant::now(),
+            budget.outcome().truncated(),
+            budget.remaining(),
+        );
+        if let (Some(wid), Some(deadline)) = (window_id.filter(|_| !nodes.is_empty()), discovery) {
+            let mut walked_menus: Vec<[f64; 4]> = nodes
+                .iter()
+                .filter(|node| node.role == "AXMenu")
+                .filter_map(|node| node.frame)
+                .collect();
+            for frame in super::context_menus::open_menu_window_frames(pid) {
+                let Some((menu, menu_frame, owner)) =
+                    super::context_menus::menu_in_window(pid, frame, deadline)
+                else {
+                    continue;
+                };
+                // Released with the other top-level elements after the walk.
+                top_level.push(menu);
+                if !super::context_menus::publish_menu(menu_frame, frame, owner, wid, &walked_menus)
+                {
+                    continue;
+                }
+                walked_menus.extend(menu_frame);
+                walk_element(
+                    menu,
+                    0,
+                    None,
+                    false,
+                    &mut nodes,
+                    &mut lines,
+                    &mut index_counter,
+                    &mut budget,
+                    &mut batching_disabled,
+                    max_depth,
+                    include_web_content,
+                    &mut deferred,
+                );
+            }
         }
 
         if !deferred.is_empty() {

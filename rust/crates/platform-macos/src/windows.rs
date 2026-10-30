@@ -874,6 +874,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "reads the live WindowServer; window_ids_for_pid covers the logic with fake entries"]
     fn live_pid_window_id_snapshot_reads_window_server() {
         // The test process owns no windows. A complete live snapshot therefore
         // lists none for it; an unavailable WindowServer reports incomplete.
