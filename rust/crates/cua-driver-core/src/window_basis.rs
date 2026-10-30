@@ -65,6 +65,16 @@ impl WindowBasis {
             None => Ok(()),
         }
     }
+    pub fn check_and_map(
+        &self,
+        live: &LiveFrame,
+        x: f64,
+        y: f64,
+    ) -> Result<(i64, i64), BasisRefusal> {
+        self.check(live)?;
+        self.to_screen(x, y)
+    }
+
     pub fn to_screen(&self, x: f64, y: f64) -> Result<(i64, i64), BasisRefusal> {
         if !x.is_finite()
             || !y.is_finite()
@@ -164,8 +174,20 @@ pub struct DispatchOutcome {
     pub cleanup_results: Vec<Value>,
 }
 impl DispatchOutcome {
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.effect == DispatchEffect::Refused && self.events_sent != 0 {
+            return Err("refused dispatch cannot have sent events");
+        }
+        Ok(())
+    }
+
     pub fn to_json(&self) -> Value {
+        // A "refused" outcome that nevertheless sent events is contradictory.
+        // Report it as uncertain rather than claiming nothing was sent, and
+        // never panic in the tool path.
+        let contradictory = self.validate().is_err();
         let effect = match self.effect {
+            DispatchEffect::Refused if contradictory => "uncertain",
             DispatchEffect::Refused => "refused",
             DispatchEffect::Partial => "partial",
             DispatchEffect::Uncertain => "uncertain",

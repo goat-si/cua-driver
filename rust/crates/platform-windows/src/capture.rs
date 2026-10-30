@@ -221,6 +221,61 @@ pub fn screenshot_window_bytes_with_occlusion(hwnd: u64) -> Result<(Vec<u8>, boo
     screenshot_window_mapped(hwnd).map(|(png, occluded, _)| (png, occluded))
 }
 
+#[cfg(target_os = "windows")]
+pub(crate) fn screenshot_window_with_geometry(
+    hwnd: u64,
+) -> Result<(Vec<u8>, Option<cua_driver_core::window_basis::LiveFrame>)> {
+    let (png, _, geometry) = screenshot_window_mapped(hwnd)?;
+    Ok((png, geometry.map(|g| geometry_frame(g, None))))
+}
+
+#[cfg(target_os = "windows")]
+fn geometry_frame(
+    g: FrameGeometry,
+    display_scale: Option<f64>,
+) -> cua_driver_core::window_basis::LiveFrame {
+    cua_driver_core::window_basis::LiveFrame {
+        x: i64::from(g.left),
+        y: i64::from(g.top),
+        width: g.width as u32,
+        height: g.height as u32,
+        display_scale,
+    }
+}
+
+/// Read the physical frame using the same crop rule as PrintWindow.
+#[cfg(target_os = "windows")]
+pub(crate) fn read_live_frame(hwnd: u64) -> Result<cua_driver_core::window_basis::LiveFrame> {
+    use windows::Win32::Foundation::RECT;
+    use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_EXTENDED_FRAME_BOUNDS};
+    use windows::Win32::UI::HiDpi::GetDpiForWindow;
+    use windows::Win32::UI::WindowsAndMessaging::GetWindowRect;
+    let hwnd = HWND(hwnd as *mut _);
+    unsafe {
+        let mut rect = RECT::default();
+        GetWindowRect(hwnd, &mut rect)?;
+        let frame = FrameGeometry::from_bounds((rect.left, rect.top, rect.right, rect.bottom))
+            .ok_or_else(|| anyhow::anyhow!("Window has invalid bounds"))?;
+        let mut dwm = RECT::default();
+        let bounds = DwmGetWindowAttribute(
+            hwnd,
+            DWMWA_EXTENDED_FRAME_BOUNDS,
+            &mut dwm as *mut _ as *mut _,
+            std::mem::size_of::<RECT>() as u32,
+        )
+        .ok()
+        .map(|_| (dwm.left, dwm.top, dwm.right, dwm.bottom));
+        let dpi = GetDpiForWindow(hwnd);
+        if dpi == 0 {
+            bail!("GetDpiForWindow failed");
+        }
+        Ok(geometry_frame(
+            frame.cropped(bounds),
+            Some(f64::from(dpi) / 96.0),
+        ))
+    }
+}
+
 /// Capture the final input point against the exact source frame. WGC supplies
 /// no proven screen origin, so it cannot produce mapped click evidence yet.
 #[cfg(target_os = "windows")]

@@ -269,6 +269,7 @@ struct TicketState {
 struct StoreState<S> {
     snapshots: HashMap<i32, Vec<Snapshot<S>>>,
     tickets: HashMap<(i32, u64), TicketState>,
+    next_ticket: u64,
 }
 impl<S> std::ops::Deref for StoreState<S> {
     type Target = HashMap<i32, Vec<Snapshot<S>>>;
@@ -294,6 +295,7 @@ impl<S: SnapshotPayload> SnapshotStore<S> {
             inner: Mutex::new(StoreState {
                 snapshots: HashMap::new(),
                 tickets: HashMap::new(),
+                next_ticket: 0,
             }),
         }
     }
@@ -327,6 +329,7 @@ impl<S: SnapshotPayload> SnapshotStore<S> {
             (screenshot_scale, None),
             (true, None),
         )
+        .map(|(id, invalidated, _)| (id, invalidated))
     }
 
     /// [`Self::publish_for_session`] that also records the window's size in
@@ -357,6 +360,7 @@ impl<S: SnapshotPayload> SnapshotStore<S> {
             (screenshot_scale, window_size),
             (true, None),
         )
+        .map(|(id, invalidated, _)| (id, invalidated))
     }
 
     /// Refresh the screenshot frame of the window's current snapshot in place,
@@ -389,7 +393,11 @@ impl<S: SnapshotPayload> SnapshotStore<S> {
         snapshot.screenshot_scale = Some(screenshot_scale);
         snapshot.screenshot_window_size = window_size;
         snapshot.zoom = None;
-        Some(snapshot.id)
+        let id = snapshot.id;
+        if let Some(state) = inner.tickets.get_mut(&(pid, window_id)) {
+            state.applied = state.next;
+        }
+        Some(id)
     }
 
     /// Publish screenshot/capture state without claiming that an accessibility
@@ -410,9 +418,12 @@ impl<S: SnapshotPayload> SnapshotStore<S> {
             (screenshot_scale, None),
             (false, None),
         )
+        .map(|(id, invalidated, _)| (id, invalidated))
     }
 
-    fn publish_snapshot(
+    /// The single publication path. With a capture ticket the basis is applied
+    /// under the same lock; the stored basis (with its basis id) is returned.
+    pub(super) fn publish_snapshot(
         &self,
         pid: i32,
         window_id: u64,
@@ -425,8 +436,8 @@ impl<S: SnapshotPayload> SnapshotStore<S> {
             bool,
             Option<(u64, Option<crate::window_basis::WindowBasis>)>,
         ),
-    ) -> Option<(u32, Vec<u32>)> {
-        let (id, retired) = {
+    ) -> Option<(u32, Vec<u32>, Option<crate::window_basis::WindowBasis>)> {
+        let (id, retired, stored) = {
             let mut inner = self.inner.lock().unwrap();
             if session.is_some_and(crate::session::is_session_ended) {
                 return None;
@@ -445,6 +456,9 @@ impl<S: SnapshotPayload> SnapshotStore<S> {
                 state.applied = ticket;
                 basis
             } else {
+                if let Some(state) = inner.tickets.get_mut(&(pid, window_id)) {
+                    state.applied = state.next;
+                }
                 None
             };
             let lane = inner.entry(pid).or_default();
@@ -471,6 +485,10 @@ impl<S: SnapshotPayload> SnapshotStore<S> {
                 retired.push(lane.remove(0));
             }
             let id = crate::element_token::mint_snapshot_id();
+            let stored = basis.map(|mut b| {
+                b.snapshot_id = crate::window_basis::format_basis_id(id, 0);
+                b
+            });
             lane.push(Snapshot {
                 id,
                 window_id,
@@ -480,18 +498,20 @@ impl<S: SnapshotPayload> SnapshotStore<S> {
                 zoom: None,
                 semantic,
                 payload,
-                basis: basis.map(|mut b| {
-                    b.snapshot_id = crate::window_basis::format_basis_id(id, 0);
-                    b
-                }),
+                basis: stored.clone(),
                 frame_generation: 0,
                 basis_exhausted: false,
             });
-            (id, retired)
+            for snapshot in &retired {
+                if snapshot.window_id != window_id {
+                    inner.tickets.remove(&(pid, snapshot.window_id));
+                }
+            }
+            (id, retired, stored)
         };
         let invalidated = retired.iter().map(|snapshot| snapshot.id).collect();
         drop(retired);
-        Some((id, invalidated))
+        Some((id, invalidated, stored))
     }
 
     /// Resolve the screenshot transform from the same authoritative latest
@@ -641,12 +661,21 @@ impl<S: SnapshotPayload> SnapshotStore<S> {
         let retired = {
             let mut inner = self.inner.lock().unwrap();
             let mut retired = Vec::new();
-            for lane in inner.values_mut() {
+            let mut retired_keys = Vec::new();
+            for (&pid, lane) in inner.snapshots.iter_mut() {
                 let (owned, kept) = std::mem::take(lane)
                     .into_iter()
                     .partition(|snapshot| snapshot.screenshot_owner.as_deref() == Some(session));
                 *lane = kept;
+                retired_keys.extend(
+                    owned
+                        .iter()
+                        .map(|snapshot: &Snapshot<S>| (pid, snapshot.window_id)),
+                );
                 retired.extend::<Vec<_>>(owned);
+            }
+            for key in retired_keys {
+                inner.tickets.remove(&key);
             }
             inner.retain(|_, lane| !lane.is_empty());
             retired
@@ -749,6 +778,7 @@ impl<S: SnapshotPayload> SnapshotStore<S> {
     pub fn remove(&self, pid: i32, window_id: u64) -> Option<u32> {
         let retired = {
             let mut inner = self.inner.lock().unwrap();
+            inner.tickets.remove(&(pid, window_id));
             inner.get_mut(&pid).and_then(|lane| {
                 let position = lane.iter().position(|entry| entry.window_id == window_id)?;
                 Some(lane.remove(position))
@@ -758,7 +788,11 @@ impl<S: SnapshotPayload> SnapshotStore<S> {
     }
 
     pub fn clear(&self) -> usize {
-        let retired = std::mem::take(&mut self.inner.lock().unwrap().snapshots);
+        let retired = {
+            let mut inner = self.inner.lock().unwrap();
+            inner.tickets.clear();
+            std::mem::take(&mut inner.snapshots)
+        };
         let count = retired.len();
         drop(retired);
         count
