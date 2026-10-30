@@ -635,3 +635,36 @@ async fn an_unscoped_bind_under_a_manifest_redacts_tabs_outside_the_manifest() {
         "https://fixture.test/"
     );
 }
+
+#[tokio::test]
+async fn an_explicit_null_scope_is_malformed_and_reaches_no_browser() {
+    let f = fixture().await;
+    let (target, tab) = bind(&f).await;
+    let snap = snapshot(&f, &target, &tab).await;
+    let button = ref_of(&snap, "main", "main-btn");
+    let calls = f.state.lock().unwrap().calls.len();
+
+    let bound = GetBrowserStateTool::new(f.engine.clone())
+        .invoke(json!({
+            "pid": 1, "window_id": 7, "session": SESSION,
+            "origin_scope": null,
+        }))
+        .await;
+    assert_eq!(bound.is_error, Some(true), "{:?}", bound.structured_content);
+    assert_eq!(
+        bound.structured_content.as_ref().unwrap()["code"],
+        "invalid_arguments"
+    );
+    let clicked = click(&f, &target, &tab, &button, json!({"origin_scope": null})).await;
+    assert_eq!(
+        clicked.is_error,
+        Some(true),
+        "{:?}",
+        clicked.structured_content
+    );
+    assert_eq!(
+        clicked.structured_content.as_ref().unwrap()["code"],
+        "invalid_arguments"
+    );
+    assert_eq!(f.state.lock().unwrap().calls.len(), calls, "no CDP call");
+}

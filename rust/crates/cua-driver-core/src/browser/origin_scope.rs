@@ -38,10 +38,12 @@ pub(crate) struct OriginScope {
 
 impl OriginScope {
     /// Parse the optional `origin_scope` argument. Entries use the capability
-    /// manifest's exact canonical origin form; repeats collapse.
+    /// manifest's exact canonical origin form; repeats collapse. Only an
+    /// absent key means no scope: a present `null` is malformed, so it can
+    /// never stand in for an omitted scope.
     pub(crate) fn from_args(args: &Value) -> Result<Option<Self>, String> {
         let raw = match args.get("origin_scope") {
-            None | Some(Value::Null) => return Ok(None),
+            None => return Ok(None),
             Some(Value::Array(raw)) => raw,
             Some(_) => return Err("origin_scope must be an array of origins".to_owned()),
         };
@@ -208,6 +210,7 @@ mod tests {
             json!(["ftp://app.example"]),
             json!([7]),
             json!(too_many),
+            json!(null),
         ] {
             assert!(
                 OriginScope::from_args(&json!({ "origin_scope": bad })).is_err(),
@@ -238,5 +241,9 @@ mod tests {
         );
         assert!(pre_admission_refusal("click", &json!({"origin_scope": 5})).is_none());
         assert!(pre_admission_refusal("browser_click", &json!({"origin_scope": []})).is_some());
+        assert!(
+            pre_admission_refusal("get_browser_state", &json!({"origin_scope": null})).is_some(),
+            "a present null is malformed, not an omitted scope"
+        );
     }
 }
