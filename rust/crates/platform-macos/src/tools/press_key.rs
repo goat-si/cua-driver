@@ -562,6 +562,12 @@ impl Tool for PressKeyTool {
                 Ok(input) => input,
                 Err(result) => return result,
             };
+            if let Some(refusal) = cua_driver_core::browser::protection::frontmost_app_refusal(
+                "press_key",
+                crate::apps::frontmost_pid().map(i64::from),
+            ) {
+                return refusal;
+            }
             let (key, modifiers) = match crate::input::keyboard::resolve_key_press(
                 &input.key,
                 &input.modifiers.unwrap_or_default(),

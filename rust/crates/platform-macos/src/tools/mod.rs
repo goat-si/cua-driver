@@ -1559,6 +1559,9 @@ pub fn register_all(
     host_bundle_id: Option<String>,
 ) {
     let registry = &mut latency::Registry::new(registry);
+    // Desktop-scope pointer tools check where every point lands
+    // (desktop_pointer_guard) and desktop-scope keys check the frontmost app.
+    cua_driver_core::browser::protection::declare_desktop_point_guard();
     let state = Arc::new(ToolState::new_with_capture_service(
         registry.capture_service(),
         cursor_overlay_available,

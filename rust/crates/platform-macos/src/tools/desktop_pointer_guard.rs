@@ -151,6 +151,18 @@ pub(crate) async fn check(
     args: &Value,
     points: Vec<(f64, f64)>,
 ) -> Option<ToolResult> {
+    // A browser holding an origin-scoped attachment is reachable only through
+    // the browser tools, in any delivery mode.
+    let windows = tokio::task::spawn_blocking(crate::windows::visible_windows)
+        .await
+        .unwrap_or_default();
+    if let Some(refusal) =
+        cua_driver_core::browser::protection::desktop_point_refusal(tool, &points, |x, y| {
+            owner_at(&windows, x, y)
+        })
+    {
+        return Some(refusal);
+    }
     let delivery = DeliveryMode::from_args(args);
     if delivery.is_foreground() {
         return None;
@@ -165,6 +177,31 @@ pub(crate) async fn check(
     .await
     .ok()
     .flatten()
+}
+
+/// The process owning the topmost ordinary window at `(x, y)`, from one
+/// window enumeration. An empty enumeration means the list was unavailable.
+fn owner_at(
+    windows: &[crate::windows::WindowInfo],
+    x: f64,
+    y: f64,
+) -> cua_driver_core::browser::protection::PointOwner {
+    use cua_driver_core::browser::protection::PointOwner;
+    if windows.is_empty() {
+        return PointOwner::Unavailable;
+    }
+    let own = std::process::id() as i32;
+    windows
+        .iter()
+        .filter(|w| w.layer == 0 && w.is_on_screen && w.pid != own)
+        .filter(|w| {
+            let b = &w.bounds;
+            x >= b.x && x < b.x + b.width && y >= b.y && y < b.y + b.height
+        })
+        .max_by_key(|w| w.z_index)
+        .map_or(PointOwner::Nothing, |w| {
+            PointOwner::Process(i64::from(w.pid))
+        })
 }
 
 #[cfg(test)]
