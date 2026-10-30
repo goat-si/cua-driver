@@ -239,25 +239,18 @@ impl Tool for SetValueTool {
         .await
         .unwrap_or(false);
         if restore_needed {
-            let post_guard = element_guard.clone();
-            let result = minimized_set_value(
+            // Return would go to a window minimized again right after the
+            // write; refuse before anything is written.
+            if autosubmit {
+                return super::set_value_autosubmit::minimized_refusal(window_id);
+            }
+            return minimized_set_value(
                 _mutation_lease,
                 element_guard,
                 element_index,
                 pid,
                 window_id,
                 value,
-            )
-            .await;
-            return super::set_value_autosubmit::finish(
-                autosubmit,
-                pid,
-                result,
-                |_, key| async move {
-                    let lease = super::acquire_background_mutation(pid).await;
-                    super::set_value_autosubmit::post_return(lease, window_id, post_guard, key)
-                        .await
-                },
             )
             .await;
         }
@@ -338,6 +331,9 @@ impl Tool for SetValueTool {
 
         let changes = snapshot.detect_async().await;
 
+        // Read before the result is built: on web content an unchanged
+        // read-back is reported as unverifiable, not as not applied.
+        let write_not_applied = matches!(&result, Ok(Ok(outcome)) if outcome.not_applied);
         let result = set_value_tool_result(
             result.map_err(|error| error.to_string()),
             ax_echo_surface,
@@ -345,10 +341,21 @@ impl Tool for SetValueTool {
             pid,
             element_index,
         );
-        super::set_value_autosubmit::finish(autosubmit, pid, result, |_, key| async move {
-            super::set_value_autosubmit::post_return(_mutation_lease, window_id, post_guard, key)
+        super::set_value_autosubmit::finish(
+            autosubmit,
+            pid,
+            result,
+            write_not_applied,
+            |_, key| async move {
+                super::set_value_autosubmit::post_return(
+                    _mutation_lease,
+                    window_id,
+                    post_guard,
+                    key,
+                )
                 .await
-        })
+            },
+        )
         .await
     }
 }
@@ -2176,6 +2183,43 @@ mod tests {
         assert_eq!(outcome.verified, Some(false));
         assert_eq!(outcome.changed, None);
         assert!(outcome.detail.contains("not trusted for web content"));
+    }
+
+    /// On web content an unchanged read-back is reported as unverifiable, so
+    /// autosubmit must use the outcome itself: Return would submit the old text.
+    #[tokio::test]
+    async fn autosubmit_skips_return_after_a_web_write_that_did_not_apply() {
+        let write_not_applied = true;
+        let result = super::set_value_tool_result(
+            Ok(Ok(SetValueOutcome {
+                detail: "✅ Set value.".to_owned(),
+                verified: Some(false),
+                changed: Some(false),
+                not_applied: write_not_applied,
+                document_edited: None,
+            })),
+            true,
+            String::new(),
+            42,
+            3,
+        );
+        assert_eq!(
+            result.structured_content.as_ref().unwrap()["effect"],
+            "unverifiable"
+        );
+        let result = super::super::set_value_autosubmit::finish(
+            true,
+            42,
+            result,
+            write_not_applied,
+            |_, _| async { panic!("Return after a write that did not apply") },
+        )
+        .await;
+        let note = result.structured_content.unwrap()["note"].clone();
+        assert!(
+            note.as_str().unwrap().contains("Return was not posted"),
+            "{note}"
+        );
     }
 
     #[test]

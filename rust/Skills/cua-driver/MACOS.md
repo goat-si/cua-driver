@@ -856,11 +856,15 @@ Return delivery and the value's effect are reported separately: the
 structured `note` says whether Return was posted, refused, or uncertain;
 posting it does not verify that the search ran. If the target is not
 identifiable as a search field, the call refuses before writing anything,
-avoiding an unintended submission on another control. When the value write
-itself reports `suspected_noop` or `refused`, Return is not posted, so the
-field's previous text is never submitted. A minimized window
-may be restored for the value write and then fail the key gate after it is
-minimized again; in that case the note reports that Return was not posted.
+avoiding an unintended submission on another control. Return is posted only
+after a write whose effect is `confirmed` or `unverifiable` and whose
+read-back did not still show the old text (on web content that case reads
+`unverifiable`, and Return is still withheld), so the field's previous text
+is never submitted. A field in a minimized window is refused with
+`minimized_or_hidden_window` before anything is written: the write minimizes the
+window again, and Return needs it visible. Once the write has finished,
+cancelling the call does not stop the Return post; it still passes every
+check above, and only the result is lost.
 
 ### A value write the app does not apply (LibreOffice)
 

@@ -7,6 +7,7 @@ pub(super) async fn finish<F, Fut>(
     enabled: bool,
     pid: i32,
     mut result: ToolResult,
+    write_not_applied: bool,
     post: F,
 ) -> ToolResult
 where
@@ -23,9 +24,13 @@ where
         .and_then(Value::as_str)
         .map(str::to_owned);
     // Submitting a write that did not take effect would run the search for
-    // the field's old text.
+    // the field's old text. On web content an unchanged read-back is still
+    // reported as unverifiable, so the outcome's own flag decides too.
     let note = match effect.as_deref() {
-        Some(effect @ ("suspected_noop" | "refused")) => format!(
+        _ if write_not_applied => "Return was not posted: the read-back still showed the \
+             previous text, so submitting would search for it."
+            .to_owned(),
+        Some(effect) if effect != "confirmed" && effect != "unverifiable" => format!(
             "Return was not posted: the value write reported effect {effect}, so submitting \
              would search for the field's previous text."
         ),
@@ -102,8 +107,10 @@ async fn post_return_inner(
         "set_value.autosubmit",
         || async move {
             crate::goat::action_latency::spawn_action_blocking(move || {
-                let _scope = scope;
                 let _lease = lease;
+                // Declared after the lease so it drops first: hand-back
+                // starts while this app's lease is still held, as in press_key.
+                let _scope = scope;
                 super::press_key::verify_raw_key_target(
                     pid,
                     Some(window_id),
@@ -145,6 +152,17 @@ pub(super) fn search_field(role: Option<&str>, subrole: Option<&str>) -> bool {
     role == Some("AXSearchField") || subrole == Some("AXSearchField")
 }
 
+pub(super) fn minimized_refusal(window_id: u32) -> ToolResult {
+    super::pre_dispatch_refusal(
+        cua_driver_core::background_input::refusal_codes::MINIMIZED_OR_HIDDEN,
+        format!(
+            "window {window_id} is minimized: set_value autosubmit needs the window to stay \
+             visible for Return, and the value write minimizes it again. No value or key was \
+             sent; restore the window first."
+        ),
+    )
+}
+
 pub(super) fn non_search_refusal() -> ToolResult {
     super::pre_dispatch_refusal(
         "autosubmit_requires_search_field",
@@ -183,7 +201,7 @@ mod tests {
         let events = std::cell::RefCell::new(vec!["write".to_owned()]);
         let posted_events = &events;
         let result = ToolResult::text("set").with_structured(json!({"effect":"confirmed"}));
-        let result = finish(true, 42, result, |pid, key| async move {
+        let result = finish(true, 42, result, false, |pid, key| async move {
             posted_events.borrow_mut().push(format!("{key}:{pid}"));
             Ok(true)
         })
@@ -198,10 +216,13 @@ mod tests {
     #[tokio::test]
     async fn autosubmit_default_never_posts_and_refusal_preserves_value_effect() {
         let result = ToolResult::text("set").with_structured(json!({"effect":"confirmed"}));
-        let result = finish(false, 42, result, |_, _| async { panic!("unexpected key") }).await;
+        let result = finish(false, 42, result, false, |_, _| async {
+            panic!("unexpected key")
+        })
+        .await;
         assert_eq!(result.structured_content.unwrap()["effect"], "confirmed");
         let result = ToolResult::text("set").with_structured(json!({"effect":"unverifiable"}));
-        let result = finish(true, 42, result, |_, _| async {
+        let result = finish(true, 42, result, false, |_, _| async {
             Err("user_interacting".into())
         })
         .await;
@@ -214,9 +235,9 @@ mod tests {
     /// would run the search for the field's old text.
     #[tokio::test]
     async fn autosubmit_skips_return_when_the_value_did_not_apply() {
-        for effect in ["suspected_noop", "refused"] {
+        for effect in ["not_applied", "refused"] {
             let result = ToolResult::text("set").with_structured(json!({ "effect": effect }));
-            let result = finish(true, 42, result, |_, _| async {
+            let result = finish(true, 42, result, false, |_, _| async {
                 panic!("Return after {effect}")
             })
             .await;
