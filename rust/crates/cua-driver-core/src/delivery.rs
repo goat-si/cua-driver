@@ -348,8 +348,64 @@ pub fn foreground_user_active_result(idle_ms: u64, threshold_ms: u64, fields: Va
     .with_structured(Value::Object(structured))
 }
 
+/// The code of the refusal returned when the person is working in the app an
+/// agent action targets.
+pub const USER_INTERACTING_CODE: &str = "user_interacting";
+
+/// How long after the person's last physical input an action on the app they
+/// are working in is refused (`CUA_DRIVER_USER_TAKEOVER_IDLE_MS`, default
+/// 750 ms; 0 turns the refusal off).
+pub fn user_takeover_threshold_ms() -> u64 {
+    std::env::var("CUA_DRIVER_USER_TAKEOVER_IDLE_MS")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .unwrap_or(750)
+}
+
+/// The refusal for an action sent while the person is using the target app:
+/// nothing was sent, and the caller is told how long to wait.
+pub fn user_interacting_result(idle_ms: u64, threshold_ms: u64, fields: Value) -> ToolResult {
+    let mut structured = match fields {
+        Value::Object(fields) => fields,
+        _ => serde_json::Map::new(),
+    };
+    let retry_after_ms = threshold_ms.saturating_sub(idle_ms).max(1);
+    structured.insert("code".to_owned(), json!(USER_INTERACTING_CODE));
+    structured.insert("effect".to_owned(), json!("refused"));
+    structured.insert("dispatched".to_owned(), json!(false));
+    structured.insert("idle_ms".to_owned(), json!(idle_ms));
+    structured.insert("retry_after_ms".to_owned(), json!(retry_after_ms));
+    ToolResult::error(format!(
+        "The user is interacting with this app (physical input {idle_ms} ms ago); nothing was \
+         sent. Retry in {retry_after_ms} ms, or observe the window before more actions if the \
+         user may have changed it."
+    ))
+    .with_structured(Value::Object(structured))
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_user_interacting_refusal_says_nothing_was_sent_and_when_to_retry() {
+        let result = super::user_interacting_result(
+            200,
+            750,
+            serde_json::json!({"pid": 42, "window_id": 7}),
+        );
+        assert_eq!(result.is_error, Some(true));
+        let data = result.structured_content.expect("structured");
+        assert_eq!(data["code"], "user_interacting");
+        assert_eq!(data["effect"], "refused");
+        assert_eq!(data["dispatched"], false);
+        assert_eq!(data["retry_after_ms"], 550);
+        assert_eq!(data["pid"], 42);
+        // Never zero: a retry is always a moment later.
+        let data = super::user_interacting_result(749, 750, serde_json::json!({}))
+            .structured_content
+            .unwrap();
+        assert_eq!(data["retry_after_ms"], 1);
+    }
+
     #[test]
     fn brief_foreground_is_off_unless_explicitly_enabled() {
         for off in [

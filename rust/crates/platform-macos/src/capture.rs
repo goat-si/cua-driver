@@ -234,22 +234,25 @@ where
     N: FnOnce(u32) -> anyhow::Result<CapturedImage>,
     F: FnOnce(u32) -> anyhow::Result<CapturedImage>,
 {
-    match native(window_id) {
-        Ok(bytes) if !bytes.is_empty() => Ok(bytes),
-        Ok(_) => match fallback(window_id) {
-            Ok(bytes) => Ok(bytes),
-            Err(fallback_err) => Err(anyhow::anyhow!(
-                "window {window_id} capture failed: native produced empty bytes; \
-                 shell fallback: {fallback_err:#}"
+    // A blank native frame is a failure like an empty one: the fallback answers.
+    let native_note = match native(window_id) {
+        Ok(image) => match capture_problem(&image) {
+            None => return Ok(image),
+            Some(problem) => format!("native produced {problem}"),
+        },
+        Err(native_err) => format!("native: {native_err:#}"),
+    };
+    match fallback(window_id) {
+        Ok(image) => match capture_problem(&image) {
+            None => Ok(image),
+            Some(problem) => Err(anyhow::anyhow!(
+                "window {window_id} capture failed: {native_note}; shell fallback produced \
+                 {problem}"
             )),
         },
-        Err(native_err) => match fallback(window_id) {
-            Ok(bytes) => Ok(bytes),
-            Err(fallback_err) => Err(anyhow::anyhow!(
-                "window {window_id} capture failed: native: {native_err:#}; \
-                 shell fallback: {fallback_err:#}"
-            )),
-        },
+        Err(fallback_err) => Err(anyhow::anyhow!(
+            "window {window_id} capture failed: {native_note}; shell fallback: {fallback_err:#}"
+        )),
     }
 }
 
@@ -913,9 +916,11 @@ pub fn screenshot_window_image(window_id: u32) -> anyhow::Result<CapturedImage> 
     // next one gets only what is left instead of a fresh timeout of its own.
     let deadline = Instant::now() + WINDOW_CAPTURE_NATIVE_TIMEOUT;
     let remaining = move || deadline.saturating_duration_since(Instant::now());
-    capture_window_with_space_route_within(
+    capture_window_routed(
         window_id,
         off_space,
+        skylight_first_on_space(),
+        || current_window_capture_identity(window_id),
         |id| {
             capture_window_with_backends(
                 id,
@@ -926,6 +931,55 @@ pub fn screenshot_window_image(window_id: u32) -> anyhow::Result<CapturedImage> 
         |id| screenshot_window_bytes_skylight(id, remaining()),
         remaining,
     )
+}
+
+/// Whether a window on the current Space is captured with SkyLight first. It
+/// is about twice as fast as ScreenCaptureKit (16.7 ms against 33 ms median on
+/// a 760x584 window, the same pixels) and falls back to the public chain when
+/// it fails or returns a blank image. `CUA_DRIVER_WINDOW_CAPTURE=public` keeps
+/// the public chain first.
+fn skylight_first_on_space() -> bool {
+    std::env::var("CUA_DRIVER_WINDOW_CAPTURE").map_or(true, |value| value != "public")
+}
+
+/// What is wrong with a capture that nothing should accept: it has no data, or
+/// every pixel is one value (a backend that returned a blank frame is worse
+/// than one that failed). A PNG is decoded to tell; bytes that do not decode
+/// are left to the frame validation that follows every capture.
+fn capture_problem(image: &CapturedImage) -> Option<&'static str> {
+    if image.is_empty() {
+        return Some("empty bytes");
+    }
+    capture_is_blank(image).then_some("a blank frame")
+}
+
+/// Every pixel equal to the first, or every pixel fully transparent.
+fn capture_is_blank(image: &CapturedImage) -> bool {
+    fn uniform(rgba: &[u8]) -> bool {
+        let mut pixels = rgba.chunks_exact(4);
+        pixels.next().is_some_and(|first| {
+            (first[3] == 0 && rgba.chunks_exact(4).all(|p| p[3] == 0))
+                || pixels.all(|pixel| pixel == first)
+        })
+    }
+    match image {
+        CapturedImage::Rgba(frame) => uniform(&frame.rgba),
+        CapturedImage::Png(bytes) => {
+            image::load_from_memory_with_format(bytes, image::ImageFormat::Png)
+                .map(|decoded| uniform(decoded.to_rgba8().as_raw()))
+                .unwrap_or(false)
+        }
+    }
+}
+
+/// Prefix of the error returned when every backend produced a blank frame or
+/// a frame of a window that changed while it was captured, so a caller can
+/// tell it from a backend that was unavailable.
+pub const CAPTURE_REJECTED_MARKER: &str = "capture_rejected";
+
+/// Whether `error` is a [`CAPTURE_REJECTED_MARKER`] failure.
+pub fn capture_was_rejected(error: &str) -> bool {
+    error.contains(CAPTURE_REJECTED_MARKER)
 }
 
 /// [`capture_window_with_space_route_within`] with an unlimited budget.
@@ -949,6 +1003,7 @@ where
 /// SkyLight capture goes first and the public chain is the fallback. On the
 /// current Space the public chain goes first and SkyLight is the last resort.
 /// When everything fails the error keeps every backend's context.
+#[cfg(test)]
 fn capture_window_with_space_route_within<P, S, R>(
     window_id: u32,
     off_space: bool,
@@ -961,6 +1016,34 @@ where
     S: FnOnce(u32) -> anyhow::Result<CapturedImage>,
     R: Fn() -> Duration,
 {
+    capture_window_routed(
+        window_id,
+        off_space,
+        false,
+        || Ok(WindowCaptureIdentity::new(10, 0, 1.0, 2.0, 800.0, 600.0)),
+        public,
+        skylight,
+        remaining,
+    )
+}
+
+/// The routed capture. On the current Space with `skylight_first`, SkyLight is
+/// tried first and its answer is used unless it failed or is blank.
+fn capture_window_routed<P, S, R, I>(
+    window_id: u32,
+    off_space: bool,
+    skylight_first: bool,
+    identity: I,
+    public: P,
+    skylight: S,
+    remaining: R,
+) -> anyhow::Result<CapturedImage>
+where
+    P: FnOnce(u32) -> anyhow::Result<CapturedImage>,
+    S: FnOnce(u32) -> anyhow::Result<CapturedImage>,
+    R: Fn() -> Duration,
+    I: Fn() -> anyhow::Result<WindowCaptureIdentity>,
+{
     // A second backend needs at least this much time to be worth starting.
     const MIN_BACKEND_BUDGET: Duration = Duration::from_millis(100);
     let spent = |next: &str| {
@@ -969,10 +1052,47 @@ where
             WINDOW_CAPTURE_NATIVE_TIMEOUT.as_millis()
         )
     };
+    // Every capture, whatever backend made it, must be of the window the
+    // caller named (its owner, layer and bounds did not change while it was
+    // captured) and must not be empty or blank.
+    fn accepted<I, F>(
+        window_id: u32,
+        label: &str,
+        identity: &I,
+        capture: F,
+    ) -> anyhow::Result<CapturedImage>
+    where
+        I: Fn() -> anyhow::Result<WindowCaptureIdentity>,
+        F: FnOnce(u32) -> anyhow::Result<CapturedImage>,
+    {
+        let before = identity()?;
+        let image = capture(window_id)?;
+        let after = identity()?;
+        if before != after {
+            anyhow::bail!(
+                "{CAPTURE_REJECTED_MARKER}: window {window_id} changed identity (owner, layer or                  bounds) while {label} captured it"
+            );
+        }
+        match capture_problem(&image) {
+            None => Ok(image),
+            Some(problem) => anyhow::bail!(
+                "{CAPTURE_REJECTED_MARKER}: {label} capture of window {window_id} was {problem}"
+            ),
+        }
+    }
+    let mut skylight = Some(skylight);
+    let mut public = Some(public);
+    let mut skylight_capture = || {
+        let capture = skylight.take().expect("SkyLight is asked once");
+        accepted(window_id, "SkyLight", &identity, capture)
+    };
+    let mut public_capture = || {
+        let capture = public.take().expect("the public chain is asked once");
+        accepted(window_id, "the public chain", &identity, capture)
+    };
     if off_space {
-        let skylight_err = match skylight(window_id) {
-            Ok(bytes) if !bytes.is_empty() => return Ok(bytes),
-            Ok(_) => anyhow::anyhow!("SkyLight capture produced empty bytes"),
+        let skylight_err = match skylight_capture() {
+            Ok(image) => return Ok(image),
             Err(error) => error,
         };
         if remaining() < MIN_BACKEND_BUDGET {
@@ -981,27 +1101,30 @@ where
                 spent("public")
             ));
         }
-        return public(window_id).map_err(|public_err| {
+        return public_capture().map_err(|public_err| {
             anyhow::anyhow!(
                 "window {window_id} is on another Space; SkyLight capture: {skylight_err:#}; \
                  {public_err:#}"
             )
         });
     }
-    match public(window_id) {
-        Ok(bytes) => Ok(bytes),
+    if skylight_first {
+        let skylight_err = match skylight_capture() {
+            Ok(image) => return Ok(image),
+            Err(error) => error,
+        };
+        // Failed, empty, blank or of another window: the public chain answers,
+        // and SkyLight is not asked again.
+        return public_capture()
+            .map_err(|public_err| anyhow::anyhow!("{skylight_err:#}; {public_err:#}"));
+    }
+    match public_capture() {
+        Ok(image) => Ok(image),
         Err(public_err) if remaining() < MIN_BACKEND_BUDGET => {
             Err(anyhow::anyhow!("{public_err:#}; {}", spent("SkyLight")))
         }
-        Err(public_err) => match skylight(window_id) {
-            Ok(bytes) if !bytes.is_empty() => Ok(bytes),
-            Ok(_) => Err(anyhow::anyhow!(
-                "{public_err:#}; SkyLight capture produced empty bytes"
-            )),
-            Err(skylight_err) => Err(anyhow::anyhow!(
-                "{public_err:#}; SkyLight capture: {skylight_err:#}"
-            )),
-        },
+        Err(public_err) => skylight_capture()
+            .map_err(|skylight_err| anyhow::anyhow!("{public_err:#}; {skylight_err:#}")),
     }
 }
 
@@ -1741,8 +1864,12 @@ mod tests {
 
     #[test]
     fn native_window_capture_short_circuits_shell_fallback() {
-        let png = cua_driver_core::image_utils::encode_rgba_to_png(&[0, 0, 0, 255], 1, 1)
-            .expect("encode 1x1 PNG");
+        let png = cua_driver_core::image_utils::encode_rgba_to_png(
+            &[0, 0, 0, 255, 12, 34, 56, 255],
+            2,
+            1,
+        )
+        .expect("encode 2x1 PNG");
         assert!(!png.is_empty(), "PNG bytes must be non-empty");
 
         let native_calls = Rc::new(Cell::new(0u32));
@@ -2049,5 +2176,311 @@ mod tests {
         // A timeout observed after the worker already returned changes nothing.
         GATE.abandon(&slot);
         assert_eq!(GATE.counts(), (0, 0));
+    }
+
+    fn frame(rgba: Vec<u8>) -> CapturedImage {
+        CapturedImage::Rgba(RgbaFrame {
+            width: (rgba.len() / 4) as u32,
+            height: 1,
+            rgba,
+        })
+    }
+
+    #[test]
+    fn a_frame_of_one_value_is_blank_and_a_frame_with_content_is_not() {
+        assert!(capture_is_blank(&frame([10, 20, 30, 255].repeat(8))));
+        assert!(capture_is_blank(&frame([0, 0, 0, 0].repeat(8))));
+        let mut content = [10, 20, 30, 255].repeat(8);
+        content[4 * 5] = 11;
+        assert!(!capture_is_blank(&frame(content)));
+        assert!(!capture_is_blank(&CapturedImage::Png(vec![1, 2, 3])));
+    }
+
+    /// On the current Space SkyLight answers first when it has an image.
+    #[test]
+    fn skylight_answers_first_on_the_current_space_and_the_public_chain_is_not_asked() {
+        let content = frame(vec![1, 2, 3, 255, 9, 9, 9, 255]);
+        let got = capture_window_routed(
+            7,
+            false,
+            true,
+            || Ok(test_identity()),
+            |_| panic!("the public chain must not run"),
+            |_| Ok(content.clone()),
+            || Duration::MAX,
+        )
+        .expect("skylight answers");
+        assert_eq!(got, content);
+    }
+
+    /// A blank or failed SkyLight answer falls through to the public chain.
+    #[test]
+    fn a_blank_or_failed_skylight_capture_falls_back_to_the_public_chain() {
+        let public_image = frame(vec![5, 6, 7, 255, 1, 1, 1, 255]);
+        let blank = frame([0, 0, 0, 255].repeat(4));
+        for first in [Ok(blank), Err(anyhow::anyhow!("no image"))] {
+            let got = capture_window_routed(
+                7,
+                false,
+                true,
+                || Ok(test_identity()),
+                |_| Ok(public_image.clone()),
+                |_| first,
+                || Duration::MAX,
+            )
+            .expect("the public chain answers");
+            assert_eq!(got, public_image);
+        }
+        // Both fail: the error names SkyLight and the public backend.
+        let error = capture_window_routed(
+            7,
+            false,
+            true,
+            || Ok(test_identity()),
+            |_| Err(anyhow::anyhow!("sck down")),
+            |_| Err(anyhow::anyhow!("no image")),
+            || Duration::MAX,
+        )
+        .expect_err("nothing captured");
+        let text = format!("{error:#}");
+        assert!(
+            text.contains("no image") && text.contains("sck down"),
+            "{text}"
+        );
+    }
+
+    fn test_identity() -> WindowCaptureIdentity {
+        WindowCaptureIdentity::new(10, 0, 1.0, 2.0, 800.0, 600.0)
+    }
+
+    fn blank_frame() -> CapturedImage {
+        frame([0, 0, 0, 255].repeat(4))
+    }
+
+    fn content_frame() -> CapturedImage {
+        frame(vec![1, 2, 3, 255, 9, 9, 9, 255])
+    }
+
+    fn png_of(rgba: &[u8], width: u32, height: u32) -> CapturedImage {
+        let mut bytes = Vec::new();
+        image::write_buffer_with_format(
+            &mut std::io::Cursor::new(&mut bytes),
+            rgba,
+            width,
+            height,
+            image::ExtendedColorType::Rgba8,
+            image::ImageFormat::Png,
+        )
+        .expect("encode png");
+        CapturedImage::Png(bytes)
+    }
+
+    /// A black screencapture PNG is a failed capture, not a success: the
+    /// public chain used to accept any non-empty PNG.
+    #[test]
+    fn a_blank_png_from_every_public_backend_is_rejected_and_a_real_one_is_not() {
+        let blank = png_of(&[0, 0, 0, 255].repeat(6), 3, 2);
+        let mut varied = [0, 0, 0, 255].repeat(6);
+        varied[8] = 200;
+        let real = png_of(&varied, 3, 2);
+        assert!(capture_is_blank(&blank));
+        assert!(!capture_is_blank(&real));
+        // Native fails, the shell fallback hands back a black PNG: typed failure.
+        let error =
+            capture_window_with_backends(42, |_| anyhow::bail!("sck down"), |_| Ok(blank.clone()))
+                .expect_err("a blank PNG is no capture");
+        let text = format!("{error:#}");
+        assert!(
+            text.contains("blank frame") && text.contains("sck down"),
+            "{text}"
+        );
+        // A blank native PNG falls through to the shell fallback's real one.
+        let got = capture_window_with_backends(42, |_| Ok(blank.clone()), |_| Ok(real.clone()))
+            .expect("the fallback has content");
+        assert_eq!(got, real);
+    }
+
+    /// On the current Space SkyLight fails and the public chain returns black:
+    /// the routed capture fails with the typed marker.
+    #[test]
+    fn a_blank_public_fallback_after_a_failed_skylight_is_rejected() {
+        let error = capture_window_routed(
+            7,
+            false,
+            true,
+            || Ok(test_identity()),
+            |_| Ok(blank_frame()),
+            |_| Err(anyhow::anyhow!("skylight down")),
+            || Duration::MAX,
+        )
+        .expect_err("black from every backend");
+        let text = format!("{error:#}");
+        assert!(capture_was_rejected(&text), "{text}");
+        assert!(
+            text.contains("skylight down") && text.contains("blank frame"),
+            "{text}"
+        );
+    }
+
+    /// Off the current Space a blank SkyLight frame is not returned: the public
+    /// chain is tried, and when that fails too the failure is typed.
+    #[test]
+    fn a_blank_off_space_skylight_frame_is_not_returned() {
+        let got = capture_window_routed(
+            7,
+            true,
+            false,
+            || Ok(test_identity()),
+            |_| Ok(content_frame()),
+            |_| Ok(blank_frame()),
+            || Duration::MAX,
+        )
+        .expect("the public chain has content");
+        assert_eq!(got, content_frame());
+        let error = capture_window_routed(
+            7,
+            true,
+            false,
+            || Ok(test_identity()),
+            |_| Err(anyhow::anyhow!("sck empty")),
+            |_| Ok(blank_frame()),
+            || Duration::MAX,
+        )
+        .expect_err("no usable frame");
+        let text = format!("{error:#}");
+        assert!(capture_was_rejected(&text), "{text}");
+    }
+
+    /// A SkyLight frame taken while the window changed owner, layer or bounds
+    /// is not accepted; the public chain answers instead.
+    #[test]
+    fn a_skylight_frame_of_a_window_that_changed_identity_is_rejected() {
+        use std::cell::Cell;
+        let reads = Cell::new(0u32);
+        let identity = || {
+            reads.set(reads.get() + 1);
+            // Reads 1 and 2 bracket SkyLight (they differ); 3 and 4 bracket the
+            // public chain (they agree).
+            Ok(match reads.get() {
+                1 => test_identity(),
+                2 => WindowCaptureIdentity::new(10, 0, 1.0, 2.0, 640.0, 480.0),
+                _ => test_identity(),
+            })
+        };
+        let got = capture_window_routed(
+            7,
+            false,
+            true,
+            identity,
+            |_| Ok(content_frame()),
+            |_| Ok(frame(vec![7, 7, 7, 255, 8, 8, 8, 255])),
+            || Duration::MAX,
+        )
+        .expect("the public chain answers");
+        assert_eq!(got, content_frame());
+        // When the identity never settles, no backend's frame is returned.
+        let flip = Cell::new(0u32);
+        let unstable = || {
+            flip.set(flip.get() + 1);
+            Ok(WindowCaptureIdentity::new(
+                10,
+                0,
+                f64::from(flip.get()),
+                2.0,
+                8.0,
+                6.0,
+            ))
+        };
+        let error = capture_window_routed(
+            7,
+            false,
+            true,
+            unstable,
+            |_| Ok(content_frame()),
+            |_| Ok(content_frame()),
+            || Duration::MAX,
+        )
+        .expect_err("identity changes every read");
+        let text = format!("{error:#}");
+        assert!(
+            capture_was_rejected(&text) && text.contains("changed identity"),
+            "{text}"
+        );
+    }
+
+    /// Capture time of one window per backend, on a window of your own (the
+    /// fixture app). Run:
+    /// BENCH_WINDOW_ID=<id> cargo test -p platform-macos --release --lib bench_window_capture_backends -- --ignored --nocapture
+    #[test]
+    #[ignore = "timing benchmark over a live window capture"]
+    fn bench_window_capture_backends() {
+        let Some(window_id) = std::env::var("BENCH_WINDOW_ID")
+            .ok()
+            .and_then(|id| id.parse::<u32>().ok())
+        else {
+            println!("BENCH_WINDOW_ID is not set: NOT MEASURED");
+            return;
+        };
+        fn median_ms(label: &str, mut f: impl FnMut() -> anyhow::Result<(u32, u32)>) {
+            let mut dims = (0, 0);
+            let mut samples = Vec::new();
+            for i in 0..13 {
+                let start = Instant::now();
+                match f() {
+                    Ok(d) => dims = d,
+                    Err(error) => {
+                        println!("{label}: failed: {error:#}");
+                        return;
+                    }
+                }
+                if i >= 3 {
+                    samples.push(start.elapsed().as_secs_f64() * 1000.0);
+                }
+            }
+            samples.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            println!(
+                "{label}: median {:.1} ms, min {:.1}, max {:.1}, {}x{}",
+                samples[samples.len() / 2],
+                samples[0],
+                samples[samples.len() - 1],
+                dims.0,
+                dims.1
+            );
+        }
+        let budget = Duration::from_secs(3);
+        // Do the two in-process backends agree on the pixels?
+        if let (Ok(CapturedImage::Rgba(a)), Ok(CapturedImage::Rgba(b))) = (
+            screenshot_window_bytes_sck(window_id, budget),
+            screenshot_window_bytes_skylight(window_id, budget),
+        ) {
+            if (a.width, a.height) == (b.width, b.height) {
+                let differing = a
+                    .rgba
+                    .chunks_exact(4)
+                    .zip(b.rgba.chunks_exact(4))
+                    .filter(|(x, y)| x.iter().zip(y.iter()).any(|(p, q)| p.abs_diff(*q) > 8))
+                    .count();
+                println!(
+                    "pixels differing by more than 8 in a channel: {differing} of {} ({:.3} %)",
+                    a.rgba.len() / 4,
+                    differing as f64 * 100.0 / (a.rgba.len() / 4) as f64
+                );
+            } else {
+                println!(
+                    "backends returned different sizes: {}x{} vs {}x{}",
+                    a.width, a.height, b.width, b.height
+                );
+            }
+        }
+        median_ms("ScreenCaptureKit window capture", || {
+            screenshot_window_bytes_sck(window_id, budget)?.dimensions()
+        });
+        median_ms("SkyLight SLSHWCaptureWindowList window capture", || {
+            screenshot_window_bytes_skylight(window_id, budget)?.dimensions()
+        });
+        median_ms("screencapture CLI (PNG file)", || {
+            let png = screenshot_window_bytes_shell(window_id)?;
+            crate::capture::png_dimensions(&png)
+        });
     }
 }

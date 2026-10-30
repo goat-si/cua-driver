@@ -278,6 +278,12 @@ impl Tool for HotkeyTool {
         // background combo (matches click/type_text).
         let delivery_mode = super::DeliveryMode::parse(args.opt_str("delivery_mode").as_deref());
         let fg = delivery_mode.is_foreground();
+        // The person is working in this app: nothing is sent.
+        if !fg {
+            if let Err(refusal) = super::gate_user_takeover(pid, window_id) {
+                return refusal;
+            }
+        }
         let px = args.get("x").and_then(|value| value.as_f64());
         let py = args.get("y").and_then(|value| value.as_f64());
         if px.is_some() && py.is_some() && element_index.is_some() {

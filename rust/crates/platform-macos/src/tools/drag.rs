@@ -278,6 +278,12 @@ impl DragTool {
             return window_id_required(fg);
         };
         let window_id = Some(wid);
+        // The person is working in this app: nothing is sent.
+        if !fg {
+            if let Err(refusal) = super::gate_user_takeover(pid, window_id) {
+                return refusal;
+            }
+        }
         let duration_ms = args.u64_or("duration_ms", 500).min(10_000);
         let steps = (args.u64_or("steps", 20) as usize).clamp(1, 200);
         let from_zoom = args.bool_or("from_zoom", false);

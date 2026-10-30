@@ -170,6 +170,18 @@ impl CapturedImage {
     /// resizing the raw pixels gives the same image as resizing the decoded
     /// PNG, and both encode through the same encoder.
     pub fn encode(self, max_dim: u32, encoding: ScreenshotEncoding) -> Result<(Vec<u8>, u32, u32)> {
+        self.encode_with(max_dim, encoding, image::imageops::FilterType::Lanczos3)
+    }
+
+    /// [`encode`] with the downscale filter given. The model-sized screenshot
+    /// uses a faster filter: the downscale is exact 2x on a Retina window, where
+    /// Triangle averages the same four pixels Lanczos would weigh.
+    pub fn encode_with(
+        self,
+        max_dim: u32,
+        encoding: ScreenshotEncoding,
+        filter: image::imageops::FilterType,
+    ) -> Result<(Vec<u8>, u32, u32)> {
         let RgbaFrame {
             width: w,
             height: h,
@@ -194,7 +206,7 @@ impl CapturedImage {
         let mut img = DynamicImage::ImageRgba8(buffer);
         if needs_resize(w, h, max_dim) {
             let (new_w, new_h) = resized_dimensions(w, h, max_dim);
-            img = img.resize(new_w, new_h, image::imageops::FilterType::Lanczos3);
+            img = img.resize(new_w, new_h, filter);
         }
         let (out_w, out_h) = (img.width(), img.height());
         let mut out = Vec::new();
@@ -224,6 +236,28 @@ fn resized_dimensions(w: u32, h: u32, max_dim: u32) -> (u32, u32) {
         (w as f64 * scale).round() as u32,
         (h as f64 * scale).round() as u32,
     )
+}
+
+/// The long edge, in pixels, of a screenshot sized for a model: the capture at
+/// point resolution (its pixels divided by the window's backing scale), the
+/// long side capped at 2048 and the short side at 768, never upscaled. The
+/// result is a cap for [`CapturedImage::encode`], which scales the capture down
+/// to it with the aspect ratio kept.
+pub fn model_fit_long_edge(width_px: u32, height_px: u32, scale: f64) -> u32 {
+    const LONG_CAP: f64 = 2048.0;
+    const SHORT_CAP: f64 = 768.0;
+    let scale = if scale.is_finite() && scale >= 1.0 {
+        scale
+    } else {
+        1.0
+    };
+    let (width, height) = (f64::from(width_px) / scale, f64::from(height_px) / scale);
+    let (long, short) = (width.max(height), width.min(height));
+    if long < 1.0 || short < 1.0 {
+        return width_px.max(height_px);
+    }
+    let factor = (LONG_CAP / long).min(SHORT_CAP / short).min(1.0);
+    (long * factor).round().max(1.0) as u32
 }
 
 // ── Downscale ─────────────────────────────────────────────────────────────
@@ -712,6 +746,44 @@ mod tests {
         let mut decoded = vec![0u8; decoder.total_bytes() as usize];
         decoder.read_image(&mut decoded).unwrap();
         assert_eq!(decoded, vec![30u8, 20, 10, 40]); // RGBA: R=30, G=20, B=10, A=40
+    }
+
+    #[test]
+    fn a_model_sized_screenshot_is_point_resolution_capped_at_2048_by_768_and_never_upscaled() {
+        // A 1400x900 pt window at 2x: 2800x1800 pixels -> 1400x900 pt, the
+        // short side caps it at 768, so the long edge is 1195.
+        assert_eq!(model_fit_long_edge(2800, 1800, 2.0), 1195);
+        // The same window at 1x gives the same size.
+        assert_eq!(model_fit_long_edge(1400, 900, 1.0), 1195);
+        // A wide window: the 2048 long cap binds first.
+        assert_eq!(model_fit_long_edge(5000, 1000, 1.0), 2048);
+        // A small window at 2x is downscaled to points, never enlarged.
+        assert_eq!(model_fit_long_edge(600, 400, 2.0), 300);
+        assert_eq!(model_fit_long_edge(300, 200, 1.0), 300);
+        // An unknown or nonsense scale counts as 1.
+        assert_eq!(model_fit_long_edge(300, 200, 0.0), 300);
+        assert_eq!(model_fit_long_edge(300, 200, f64::NAN), 300);
+        // An empty capture is left alone.
+        assert_eq!(model_fit_long_edge(0, 0, 2.0), 0);
+    }
+
+    /// The encoded model-sized image has the dimensions the cap promises.
+    #[test]
+    fn the_model_fit_cap_gives_the_promised_dimensions() {
+        let frame = CapturedImage::Rgba(RgbaFrame {
+            width: 2800,
+            height: 1800,
+            rgba: vec![200; 2800 * 1800 * 4],
+        });
+        let cap = model_fit_long_edge(2800, 1800, 2.0);
+        let (_, w, h) = frame
+            .encode_with(
+                cap,
+                ScreenshotEncoding::Jpeg { quality: 80 },
+                image::imageops::FilterType::Triangle,
+            )
+            .unwrap();
+        assert_eq!((w, h), (1195, 768));
     }
 
     /// Where a screenshot's encode time goes, on a synthetic window-shaped

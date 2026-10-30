@@ -647,6 +647,12 @@ impl Tool for PressKeyTool {
         // explicit NSMenu-activation rung. Matches click/type_text/hotkey.
         let delivery_mode = super::DeliveryMode::parse(args.opt_str("delivery_mode").as_deref());
         let fg = delivery_mode.is_foreground();
+        // The person is working in this app: nothing is sent.
+        if !fg {
+            if let Err(refusal) = super::gate_user_takeover(pid, window_id) {
+                return refusal;
+            }
+        }
 
         // Argument-shape errors are reported before any gating or retained
         // lookups: a malformed call must fail the same way regardless of
