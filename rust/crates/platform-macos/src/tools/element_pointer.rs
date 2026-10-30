@@ -279,9 +279,18 @@ pub(super) fn performed_result(
     idx: usize,
     window_id: u32,
     count: usize,
+    foreground: bool,
     performed: &Performed,
     suffix: &str,
 ) -> ToolResult {
+    use cua_driver_core::action_record::{
+        ActionEffect, ActionExecutionRecord, ActionTransport, ActualDelivery, RequestedDelivery,
+    };
+    let (requested, actual) = if foreground {
+        (RequestedDelivery::Foreground, ActualDelivery::Foreground)
+    } else {
+        (RequestedDelivery::Background, ActualDelivery::Background)
+    };
     match performed {
         Performed::AxOpen(message) => ToolResult::text(format!(
             "{message} count {count} was sent as AXOpen; no mouse clicks were posted. Nothing \
@@ -295,7 +304,17 @@ pub(super) fn performed_result(
             "performed": "ax_open",
             "clicks_posted": 0,
             "primer_clicks": 0,
-        })),
+        }))
+        .with_action_record(
+            ActionExecutionRecord::builder(
+                ActionEffect::Unverifiable,
+                ActionTransport::MacosAxAction,
+                requested,
+            )
+            .actual_delivery(actual)
+            .build()
+            .expect("AXOpen record is valid"),
+        ),
         Performed::Clicks(clicks) => {
             let (x, y) = clicks.point.screen;
             let primer = if clicks.primer {
@@ -319,6 +338,18 @@ pub(super) fn performed_result(
                 "primer_clicks": u8::from(clicks.primer),
                 "screen_point": { "x": x, "y": y },
             }))
+            // The public wire reads the target clicks from delivered_count.
+            .with_action_record(
+                ActionExecutionRecord::builder(
+                    ActionEffect::Unverifiable,
+                    ActionTransport::MacosCgEventPid,
+                    requested,
+                )
+                .actual_delivery(actual)
+                .delivered_count(count as u32)
+                .build()
+                .expect("pointer click record is valid"),
+            )
         }
     }
 }
@@ -422,7 +453,14 @@ pub(super) async fn click_element(state: &ToolState, request: ElementClick) -> T
                     cursor_overlay::OverlayCommand::ClickPulse { x, y },
                 );
             }
-            performed_result(idx, window_id, count, &performed, &changes.result_suffix())
+            performed_result(
+                idx,
+                window_id,
+                count,
+                foreground,
+                &performed,
+                &changes.result_suffix(),
+            )
         }
         Ok((Err(error), _held)) => error_result(count, error),
         Err(error) => ToolResult::error(format!(

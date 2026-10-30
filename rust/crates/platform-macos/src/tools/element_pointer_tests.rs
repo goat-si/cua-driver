@@ -10,6 +10,11 @@ const RECT: [f64; 4] = [100.0, 100.0, 50.0, 20.0];
 const BOUNDS: [f64; 4] = [0.0, 0.0, 800.0, 600.0];
 const CENTER: (f64, f64) = (125.0, 110.0);
 
+/// One post: where, how many clicks, foreground, and the events handed over.
+type Post = (ElementPoint, usize, bool, Vec<CapturedEvent>);
+/// A refusal code and the fake change that should produce it.
+type Case = (&'static str, Box<dyn Fn(&mut Fake)>);
+
 /// A target with a window at the origin and the element fully inside it.
 struct Fake {
     pid: i32,
@@ -24,7 +29,7 @@ struct Fake {
     activates: bool,
     rect_reads: AtomicUsize,
     calls: Mutex<Vec<&'static str>>,
-    posts: Mutex<Vec<(ElementPoint, usize, bool, Vec<CapturedEvent>)>>,
+    posts: Mutex<Vec<Post>>,
     /// Signals that post started, then waits for a release.
     block: Mutex<Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>>,
 }
@@ -56,7 +61,7 @@ impl Fake {
         self.calls.lock().unwrap().clone()
     }
 
-    fn posts(&self) -> Vec<(ElementPoint, usize, bool, Vec<CapturedEvent>)> {
+    fn posts(&self) -> Vec<Post> {
         self.posts.lock().unwrap().clone()
     }
 }
@@ -216,7 +221,7 @@ fn a_double_click_on_an_element_listing_axopen_sends_axopen_and_no_clicks() {
     let performed = run_blocking(&fake, 3, 2, true, false).unwrap();
     assert!(matches!(performed, Performed::AxOpen(_)));
     assert_eq!(fake.calls(), ["ax_open"]);
-    let result = performed_result(3, WINDOW, 2, &performed, "");
+    let result = performed_result(3, WINDOW, 2, false, &performed, "");
     let structured = result.structured_content.unwrap();
     assert_eq!(structured["performed"], "ax_open");
     assert_eq!(structured["clicks_posted"], 0);
@@ -243,7 +248,7 @@ fn an_axopen_that_may_have_opened_is_not_followed_by_clicks() {
 
 #[test]
 fn a_point_that_is_not_proven_on_the_element_sends_nothing() {
-    let cases: Vec<(&str, Box<dyn Fn(&mut Fake)>)> = vec![
+    let cases: Vec<Case> = vec![
         ("pointer_not_permitted", Box::new(|f| f.permitted = false)),
         ("element_point_unresolved", Box::new(|f| f.rect = None)),
         (
@@ -296,7 +301,9 @@ fn a_coordinate_click_reports_target_clicks_and_the_primer_separately() {
     };
     for (primer, primer_clicks) in [(true, 1), (false, 0)] {
         let performed = Performed::Clicks(PointerClicks { point, primer });
-        let result = performed_result(3, WINDOW, 2, &performed, "");
+        let result = performed_result(3, WINDOW, 2, !primer, &performed, "");
+        let record = result.action_record.clone().expect("action record");
+        assert_eq!(record.delivered_count, Some(2));
         let structured = result.structured_content.unwrap();
         assert_eq!(structured["performed"], "coordinate_clicks");
         assert_eq!(structured["count"], 2);

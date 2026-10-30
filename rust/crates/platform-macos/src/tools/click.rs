@@ -965,7 +965,12 @@ fn def() -> &'static ToolDef {
                     "enum": ["left", "right", "middle"],
                     "description": "Mouse button. Default left."
                 },
-                "count":         { "type": "integer", "description": "Click count (pixel path only). Default 1." },
+                "count":         {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 3,
+                    "description": "Left clicks in one gesture, 1-3. Default 1. With element_token, count 2 sends AXOpen when the element lists it (no mouse clicks; works wherever AX actions work); otherwise, and for count 3, it hands that many left clicks (clickCount 1..N) to the element's center, only after checking that point is on the element in its window (the window must be on screen; refused with nothing sent otherwise). Needs action press, the left button and no modifier. Nothing reads back what the clicks opened."
+                },
                 "modifier": {
                     "type": "array",
                     "items": { "type": "string" },
@@ -1051,6 +1056,12 @@ fn with_screenshot_point(
 impl ClickTool {
     async fn invoke_in(&self, args: Value, space: super::window_points::PointSpace) -> ToolResult {
         use cua_driver_core::tool_args::ArgsExt;
+
+        // Every route reads one validated count; nothing is sent for a bad one.
+        let count = match super::element_pointer::click_count(&args) {
+            Ok(count) => count,
+            Err(refusal) => return refusal,
+        };
 
         // ── Window-less screen-absolute branch (scope="desktop") ──────
         // x,y given with NO pid and NO window_id → the coordinates are TRUE
@@ -1241,7 +1252,13 @@ impl ClickTool {
         } else {
             button_str
         };
-        let count = args.u64_or("count", 1) as usize;
+        // The window-addressed right and middle primitives post one pair.
+        if count > 1 && button_str != "left" {
+            return super::invalid_arguments(format!(
+                "click: count {count} needs the left button; right and middle clicks send one \
+                 click. Nothing was sent."
+            ));
+        }
         let from_zoom = args.bool_or("from_zoom", false);
         let debug_image_out = args.opt_str("debug_image_out");
         let modifiers: Vec<String> = args.str_array("modifier");
@@ -1268,6 +1285,30 @@ impl ClickTool {
         if let (Some(idx), Some(wid), Some(element_guard)) =
             (element_index, window_id, element_guard)
         {
+            // A double or triple click is one gesture: AXOpen or checked
+            // pointer clicks, never a press or selection read back as the
+            // effect.
+            if count > 1 {
+                if action != "press" || !modifiers.is_empty() {
+                    return super::invalid_arguments(format!(
+                        "click: count {count} on an element needs action press and no \
+                         modifier. Nothing was sent."
+                    ));
+                }
+                return super::element_pointer::click_element(
+                    &self.state,
+                    super::element_pointer::ElementClick {
+                        pid,
+                        window_id: wid,
+                        idx,
+                        element: element_guard,
+                        count,
+                        foreground: delivery_mode.is_foreground(),
+                        cursor_key,
+                    },
+                )
+                .await;
+            }
             let element_ptr = element_guard.as_ptr();
 
             // ── Exact-target background gate (macOS background input v1) ──
@@ -2251,7 +2292,11 @@ impl ClickTool {
                         // evidence and is not probed.
                         let mut probe = window_id
                             .filter(|_| {
-                                route != PixelClickRoute::ForegroundHid && button_kind == "left"
+                                // A multi-click's selection read-back would
+                                // prove only its first click.
+                                route != PixelClickRoute::ForegroundHid
+                                    && button_kind == "left"
+                                    && count == 1
                             })
                             .map(|wid| unsafe { ClickProbe::at_point(pid, wid, screen_x, screen_y) });
                         // The element under the point, read before the post.
@@ -2379,6 +2424,7 @@ impl ClickTool {
                 ("right", _) => "right-click",
                 ("middle", _) => "middle-click",
                 (_, 2) => "double-click",
+                (_, 3) => "triple-click",
                 _ => "click",
             };
             match result {
