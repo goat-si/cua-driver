@@ -1097,12 +1097,19 @@ impl ForegroundClick {
             {
                 // No input was sent, but the activation done in preparation
                 // could not be undone: report it next to that side effect.
-                errors.push(json!({"error": format!(
-                    "foreground_restore_failed: previous foreground HWND {:?} was not restored \
-                     (actual foreground HWND {:?})",
-                    self.prev_fg.0,
-                    GetForegroundWindow().0
-                )}));
+                errors.push(json!({
+                    "error": format!(
+                        "foreground_restore_failed: previous foreground HWND {:?} was not \
+                         restored (actual foreground HWND {:?})",
+                        self.prev_fg.0,
+                        GetForegroundWindow().0
+                    ),
+                    "warning": format!(
+                        "foreground could not be restored: target window left in front \
+                         (prior hwnd {:?})",
+                        self.prev_fg.0
+                    ),
+                }));
             }
             self.noactivate.take();
             if sent > 0 && self.mode != ClickMode::NonActivating {

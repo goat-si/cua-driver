@@ -387,3 +387,26 @@ fn basis_refusal_reports_no_prepared_side_effects() {
     assert_eq!(value["nothing_sent"], true);
     assert_eq!(value["prepared_side_effects"], serde_json::json!([]));
 }
+
+#[test]
+fn cleanup_warnings_surface_at_the_top_level() {
+    let mut o = DispatchOutcome {
+        events_planned: 3,
+        events_sent: 0,
+        prepared_side_effects: vec!["activation".into()],
+        effect: DispatchEffect::Refused,
+        cleanup_results: vec![serde_json::json!({
+            "error": "foreground_restore_failed: previous foreground HWND 0x1 was not restored",
+            "warning": "foreground could not be restored: target window left in front (prior hwnd 0x1)"
+        })],
+    };
+    let json = o.to_json();
+    assert_eq!(json["effect"], "refused");
+    assert_eq!(json["nothing_sent"], true);
+    assert_eq!(
+        json["warning"],
+        "foreground could not be restored: target window left in front (prior hwnd 0x1)"
+    );
+    o.cleanup_results = vec![serde_json::json!({"release_button": true})];
+    assert!(o.to_json().get("warning").is_none());
+}
