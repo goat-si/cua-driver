@@ -62,8 +62,21 @@ pub enum BrowserRefusalCode {
     /// browser action.
     BrowserActionUnavailable,
     /// The live top-level document left the origin set approved in the
-    /// capability manifest. Further browser input is paused.
+    /// capability manifest or in the call's `origin_scope`. Further browser
+    /// input is paused.
     BrowserOriginOutsideScope,
+    /// The tab belongs to an attachment of the person's existing browser
+    /// profile and the call did not pass `origin_scope`. Nothing was sent.
+    BrowserOriginScopeRequired,
+    /// A `run_steps` step or `run_script` action targeted a page in the
+    /// person's existing browser profile. Only direct calls reach those
+    /// pages. Nothing was sent.
+    BrowserBatchRefused,
+    /// A desktop tool targeted a browser process that holds an
+    /// origin-scoped browser attachment, or desktop-scope input would land
+    /// on one of its windows. Only the browser tools reach it. Nothing was
+    /// sent.
+    BrowserProcessProtected,
     /// The request cannot be completed without bringing the browser in
     /// front of the user's work, and the caller did not pass
     /// `delivery_mode:"foreground"`. Uses the driver-wide wire code shared by
@@ -91,6 +104,9 @@ impl BrowserRefusalCode {
             Self::BrowserInputIncomplete => "browser_input_incomplete",
             Self::BrowserActionUnavailable => "browser_action_unavailable",
             Self::BrowserOriginOutsideScope => "browser_origin_outside_scope",
+            Self::BrowserOriginScopeRequired => "browser_origin_scope_required",
+            Self::BrowserBatchRefused => "browser_batch_refused",
+            Self::BrowserProcessProtected => "browser_process_protected",
             Self::BackgroundUnavailable => "background_unavailable",
         }
     }
@@ -119,7 +135,38 @@ impl BrowserRefusal {
         self.detail = Some(detail);
         self
     }
+
+    /// Carry this refusal through a protected-resource scope error, whose
+    /// type is a plain string, so the dispatcher can return it unchanged
+    /// instead of a generic scope failure. See [`Self::from_scope_error`].
+    pub(crate) fn into_scope_error(self) -> String {
+        format!(
+            "{SCOPE_ERROR_PREFIX}{}",
+            serde_json::to_string(&self).unwrap_or_default()
+        )
+    }
+
+    /// The refusal a browser tool encoded with [`Self::into_scope_error`].
+    pub(crate) fn from_scope_error(message: &str) -> Option<ToolResult> {
+        let encoded = message.strip_prefix(SCOPE_ERROR_PREFIX)?;
+        let value: Value = serde_json::from_str(encoded).ok()?;
+        let text = format!(
+            "refused ({}): {}",
+            value.get("code")?.as_str()?,
+            value.get("message")?.as_str()?
+        );
+        // An error result, like every other dispatcher refusal, so a batch
+        // stops at it.
+        Some(ToolResult::error(text).with_structured(serde_json::json!({
+            "status": "refused",
+            "refusal": value,
+        })))
+    }
 }
+
+/// Private marker for a refusal encoded in a scope error string. The NUL
+/// byte keeps it out of every message a tool writes by hand.
+const SCOPE_ERROR_PREFIX: &str = "\u{0}browser_refusal:";
 
 /// Raw OS error number for "too many open files in this process"
 /// (EMFILE). Unix only: Windows raw OS errors are Win32 codes.
@@ -311,6 +358,18 @@ mod tests {
             (
                 BrowserRefusalCode::BrowserOriginOutsideScope,
                 "browser_origin_outside_scope",
+            ),
+            (
+                BrowserRefusalCode::BrowserOriginScopeRequired,
+                "browser_origin_scope_required",
+            ),
+            (
+                BrowserRefusalCode::BrowserBatchRefused,
+                "browser_batch_refused",
+            ),
+            (
+                BrowserRefusalCode::BrowserProcessProtected,
+                "browser_process_protected",
             ),
             (
                 BrowserRefusalCode::BackgroundUnavailable,

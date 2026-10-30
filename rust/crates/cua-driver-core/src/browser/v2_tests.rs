@@ -37,6 +37,9 @@ use super::types::{
     NativeOwnershipProof, NativeWindowInfo, OwnedEndpoint, ProcessFingerprint, Rect,
 };
 
+#[path = "origin_scope_tests.rs"]
+mod origin_scope_tests;
+
 // ── Scripted Chromium fixture ────────────────────────────────────────────────
 
 /// Mutable knobs + a call log, shared between the mock handler and the
@@ -82,6 +85,16 @@ pub(super) struct FixtureState {
     dom_click_generation: u64,
     dom_click_focused: bool,
     dom_click_reads_before_failure: Option<usize>,
+    /// Where a `Page.navigate` commits (requested URL when `None`). Only
+    /// used when `navigate_commits` is set, so other tests keep a static page.
+    navigate_lands_on: Option<String>,
+    navigate_commits: bool,
+    /// Frame-tree reads that still show the old document after
+    /// `Page.navigate` answered (a commit reported just after the reply).
+    navigate_commit_after_reads: usize,
+    pending_commit: Option<(String, usize)>,
+    /// The page navigates here while `DOM.getDocument` is being read.
+    dom_read_navigates_to: Option<String>,
     /// Every incoming CDP call: (sessionId, method, params).
     calls: Vec<(Option<String>, String, Value)>,
 }
@@ -121,6 +134,11 @@ impl Default for FixtureState {
             dom_click_generation: 0,
             dom_click_focused: false,
             dom_click_reads_before_failure: None,
+            navigate_lands_on: None,
+            navigate_commits: false,
+            navigate_commit_after_reads: 0,
+            pending_commit: None,
+            dom_read_navigates_to: None,
             calls: Vec::new(),
         }
     }
@@ -501,23 +519,33 @@ fn fixture_handler(state: SharedState) -> MockHandler {
                 st.tab_sessions += 1;
                 MockReply::ok(json!({ "sessionId": format!("tab-sess-{}", st.tab_sessions) }))
             }
-            "Page.getFrameTree" if is_tab => MockReply::ok(json!({
-                "frameTree": {
-                    "frame": {
-                        "id": "F_MAIN",
-                        "loaderId": st.main_loader.clone(),
-                        "url": st.main_url.clone(),
-                    },
-                    "childFrames": [{
-                        "frame": {
-                            "id": "F_IFRAME",
-                            "parentId": "F_MAIN",
-                            "loaderId": st.iframe_loader.clone(),
-                            "url": "https://fixture.test/inner",
-                        }
-                    }]
+            "Page.getFrameTree" if is_tab => {
+                if let Some((url, reads)) = st.pending_commit.take() {
+                    if reads == 0 {
+                        st.main_url = url;
+                        st.main_loader = "L_MAIN_NAVIGATED".into();
+                    } else {
+                        st.pending_commit = Some((url, reads - 1));
+                    }
                 }
-            })),
+                MockReply::ok(json!({
+                    "frameTree": {
+                        "frame": {
+                            "id": "F_MAIN",
+                            "loaderId": st.main_loader.clone(),
+                            "url": st.main_url.clone(),
+                        },
+                        "childFrames": [{
+                            "frame": {
+                                "id": "F_IFRAME",
+                                "parentId": "F_MAIN",
+                                "loaderId": st.iframe_loader.clone(),
+                                "url": "https://fixture.test/inner",
+                            }
+                        }]
+                    }
+                }))
+            }
             "Page.getFrameTree" if is_oopif => MockReply::ok(json!({
                 "frameTree": {
                     "frame": {
@@ -528,6 +556,10 @@ fn fixture_handler(state: SharedState) -> MockHandler {
                 }
             })),
             "DOM.getDocument" if is_tab => {
+                if let Some(url) = st.dom_read_navigates_to.take() {
+                    st.main_url = url;
+                    st.main_loader = "L_MAIN_DURING_READ".into();
+                }
                 let depth = call.params["depth"].as_i64().unwrap_or(-1);
                 if st.semantic_full_dom_times_out && (depth == -1 || depth > 8) {
                     MockReply::err(-32000, "CDP DOM.getDocument timed out after 20s")
@@ -610,10 +642,18 @@ fn fixture_handler(state: SharedState) -> MockHandler {
             "Page.captureScreenshot" if is_tab => {
                 MockReply::ok(json!({"data": st.screenshot_data.clone()}))
             }
-            "Page.navigate" if is_tab => MockReply::ok(json!({
-                "frameId": "F_MAIN",
-                "loaderId": "L_MAIN_NAVIGATED",
-            })),
+            "Page.navigate" if is_tab => {
+                if st.navigate_commits {
+                    let lands_on = st.navigate_lands_on.clone().unwrap_or_else(|| {
+                        call.params["url"].as_str().unwrap_or_default().to_owned()
+                    });
+                    st.pending_commit = Some((lands_on, st.navigate_commit_after_reads));
+                }
+                MockReply::ok(json!({
+                    "frameId": "F_MAIN",
+                    "loaderId": "L_MAIN_NAVIGATED",
+                }))
+            }
             "Target.setAutoAttach" if is_tab => {
                 if call.params["autoAttach"].as_bool() == Some(false) {
                     return MockReply::ok(json!({}));
@@ -1297,7 +1337,7 @@ async fn approved_existing_profile_attach_claims_then_binds_one_generation() {
     let (f, provider) = protected_existing_profile_fixture().await;
     let prepare = BrowserPrepareTool::new(f.engine.clone())
         .invoke(json!({
-            "pid": 1,
+            "origin_scope": ["https://fixture.test"],            "pid": 1,
             "window_id": 7,
             "session": SESSION,
             "_transport_session_id": "transport-v2-attach",
@@ -1315,7 +1355,7 @@ async fn approved_existing_profile_attach_claims_then_binds_one_generation() {
 
     let state = GetBrowserStateTool::new(f.engine.clone())
         .invoke(json!({
-            "pid": 1,
+            "origin_scope": ["https://fixture.test"],            "pid": 1,
             "window_id": 7,
             "session": SESSION,
             "_transport_session_id": "transport-v2-attach"
@@ -1331,7 +1371,7 @@ async fn approved_existing_profile_tools_stay_within_the_reviewed_cdp_surface() 
     let (f, _) = protected_existing_profile_fixture().await;
     let prepare = BrowserPrepareTool::new(f.engine.clone())
         .invoke(json!({
-            "pid": 1,
+            "origin_scope": ["https://fixture.test"],            "pid": 1,
             "window_id": 7,
             "session": SESSION,
             "_transport_session_id": TRANSPORT,
@@ -1347,7 +1387,7 @@ async fn approved_existing_profile_tools_stay_within_the_reviewed_cdp_surface() 
 
     let state = GetBrowserStateTool::new(f.engine.clone())
         .invoke(json!({
-            "pid": 1,
+            "origin_scope": ["https://fixture.test"],            "pid": 1,
             "window_id": 7,
             "session": SESSION,
             "_transport_session_id": TRANSPORT
@@ -1358,12 +1398,12 @@ async fn approved_existing_profile_tools_stay_within_the_reviewed_cdp_surface() 
     let target = bound["target_id"].as_str().unwrap().to_owned();
     let tab = bound["tabs"][0]["tab_id"].as_str().unwrap().to_owned();
 
-    let snap = snapshot(&f, &target, &tab).await;
+    let snap = snapshot_scoped(&f, &target, &tab).await;
     let button = ref_of(&snap, "main", "main-btn");
     let input = ref_of(&snap, "main", "Shadow Input");
     let clicked = BrowserClickTool::new(f.engine.clone())
         .invoke(json!({
-            "target_id": target,
+            "origin_scope": ["https://fixture.test"],            "target_id": target,
             "tab_id": tab,
             "ref": button,
             "input_route": "dom_event",
@@ -1380,7 +1420,7 @@ async fn approved_existing_profile_tools_stay_within_the_reviewed_cdp_surface() 
     );
     let typed = BrowserTypeTool::new(f.engine.clone())
         .invoke(json!({
-            "target_id": target,
+            "origin_scope": ["https://fixture.test"],            "target_id": target,
             "tab_id": tab,
             "ref": input,
             "text": "policy-check",
@@ -1388,9 +1428,11 @@ async fn approved_existing_profile_tools_stay_within_the_reviewed_cdp_surface() 
         }))
         .await;
     assert_eq!(structured(&typed)["status"], "ok", "{}", structured(&typed));
+    // The page commits the navigation, as Chromium does.
+    f.state.lock().unwrap().navigate_commits = true;
     let navigated = BrowserNavigateTool::new(f.engine.clone())
         .invoke(json!({
-            "target_id": target,
+            "origin_scope": ["https://fixture.test"],            "target_id": target,
             "tab_id": tab,
             "url": "https://fixture.test/policy-check",
             "session": SESSION
@@ -1436,7 +1478,7 @@ async fn existing_profile_sessions_share_one_browser_connection_across_session_e
         async move {
             let prepared = BrowserPrepareTool::new(engine)
                 .invoke(json!({
-                    "pid": 1,
+                    "origin_scope": ["https://fixture.test"],                    "pid": 1,
                     "window_id": 7,
                     "session": session,
                     "_transport_session_id": transport,
@@ -1451,7 +1493,7 @@ async fn existing_profile_sessions_share_one_browser_connection_across_session_e
         async move {
             let state = GetBrowserStateTool::new(engine)
                 .invoke(json!({
-                    "pid": 1,
+                    "origin_scope": ["https://fixture.test"],                    "pid": 1,
                     "window_id": 7,
                     "session": session,
                     "_transport_session_id": transport
@@ -1504,7 +1546,7 @@ async fn protected_provider_accepts_exact_attach_and_session_end_revokes_the_gra
     let (f, provider) = protected_existing_profile_fixture().await;
     let prepare = BrowserPrepareTool::new(f.engine.clone())
         .invoke(json!({
-            "pid": 1,
+            "origin_scope": ["https://fixture.test"],            "pid": 1,
             "window_id": 7,
             "session": PROTECTED_SESSION,
             "_transport_session_id": PROTECTED_TRANSPORT,
@@ -1524,7 +1566,7 @@ async fn protected_provider_accepts_exact_attach_and_session_end_revokes_the_gra
 
     let state = GetBrowserStateTool::new(f.engine.clone())
         .invoke(json!({
-            "pid": 1,
+            "origin_scope": ["https://fixture.test"],            "pid": 1,
             "window_id": 7,
             "session": PROTECTED_SESSION,
             "_transport_session_id": PROTECTED_TRANSPORT
@@ -1538,7 +1580,7 @@ async fn approved_existing_profile_setup_reports_exact_side_effects() {
     let (f, setup_invoked) = existing_profile_setup_fixture().await;
     let prepare = BrowserPrepareTool::new(f.engine.clone())
         .invoke(json!({
-            "pid": 1,
+            "origin_scope": ["https://fixture.test"],            "pid": 1,
             "window_id": 7,
             "session": SESSION,
             "strategy": { "kind": "existing_profile" }
@@ -1558,7 +1600,7 @@ async fn approved_existing_profile_setup_reports_exact_side_effects() {
 
     let state = GetBrowserStateTool::new(f.engine.clone())
         .invoke(json!({
-            "pid": 1,
+            "origin_scope": ["https://fixture.test"],            "pid": 1,
             "window_id": 7,
             "session": SESSION
         }))
@@ -1811,6 +1853,18 @@ async fn cancelled_prepare_aborts_the_exact_pending_setup() {
     .await
     .expect("dropping prepare must schedule exact pending-setup rollback");
     stalled_server.abort();
+}
+
+async fn snapshot_scoped(f: &Fixture, target_id: &str, tab_id: &str) -> Value {
+    let result = GetBrowserStateTool::new(f.engine.clone())
+        .invoke(json!({
+            "target_id": target_id,
+            "tab_id": tab_id,
+            "session": SESSION,
+            "origin_scope": ["https://fixture.test"],
+        }))
+        .await;
+    structured(&result).clone()
 }
 
 async fn snapshot(f: &Fixture, target_id: &str, tab_id: &str) -> Value {

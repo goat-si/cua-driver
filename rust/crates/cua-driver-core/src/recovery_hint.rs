@@ -748,6 +748,24 @@ static RULES: &[Rule] = &[
             )
         },
     },
+    Rule {
+        codes: &["browser_origin_scope_required"],
+        build: |_| {
+            RecoveryHint::new(
+                "This tab is in the user's own browser profile. Retry the same call with origin_scope \
+                 listing only the site origins you need, for example [\"https://app.example\"].",
+            )
+        },
+    },
+    Rule {
+        codes: &["browser_batch_refused"],
+        build: |_| {
+            RecoveryHint::new(
+                "Pages in the user's own browser profile take direct calls only. Make this browser \
+                 call on its own, outside run_steps or run_script, with origin_scope.",
+            )
+        },
+    },
 ];
 
 /// Every refusal code that has a hint.

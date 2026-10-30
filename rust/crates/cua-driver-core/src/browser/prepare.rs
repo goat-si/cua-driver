@@ -788,6 +788,23 @@ fn spawned_runtime_pid(ownership: &EndpointOwnershipProof) -> i64 {
 }
 
 impl BrowserEngine {
+    /// Whether this engine attaches browser process `pid`: an
+    /// existing-profile grant or a driver-owned isolated browser.
+    pub(crate) fn holds_browser_attachment(&self, pid: i64) -> bool {
+        self.existing_profile_grants.holds_pid(pid)
+            || self
+                .managed_browsers
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|browser| browser.owned_pid == pid)
+    }
+
+    pub(crate) fn holds_any_browser_attachment(&self) -> bool {
+        !self.existing_profile_grants.is_empty()
+            || !self.managed_browsers.lock().unwrap().is_empty()
+    }
+
     pub(crate) fn is_driver_owned_pid_for_session(&self, session: &str, pid: i64) -> bool {
         self.managed_browsers.lock().unwrap().iter().any(|browser| {
             browser.owned_pid == pid && browser.owner_sessions.iter().any(|owner| owner == session)

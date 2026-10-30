@@ -1605,6 +1605,30 @@ fn foreground_drag_events(
     to_y: f64,
     steps: usize,
 ) -> Vec<ForegroundDragEvent> {
+    foreground_drag_event_plan(from_x, from_y, to_x, to_y, steps)
+}
+
+/// Every screen point a desktop drag of `steps` delivers an event at.
+pub(crate) fn foreground_drag_points(
+    from_x: f64,
+    from_y: f64,
+    to_x: f64,
+    to_y: f64,
+    steps: usize,
+) -> Vec<(f64, f64)> {
+    foreground_drag_event_plan(from_x, from_y, to_x, to_y, steps)
+        .into_iter()
+        .map(|event| (event.point.x, event.point.y))
+        .collect()
+}
+
+fn foreground_drag_event_plan(
+    from_x: f64,
+    from_y: f64,
+    to_x: f64,
+    to_y: f64,
+    steps: usize,
+) -> Vec<ForegroundDragEvent> {
     let steps = steps.max(1);
     let mut events = Vec::with_capacity(steps + 3);
     let from = CGPoint::new(from_x, from_y);
@@ -2405,6 +2429,13 @@ mod tests {
 
     #[test]
     fn foreground_drag_plan_is_one_coherent_gesture() {
+        // The protection hit test sees every delivered point, not only the
+        // ends: a protected window between them is found.
+        let points = foreground_drag_points(0.0, 0.0, 400.0, 0.0, 4);
+        assert!(points.contains(&(200.0, 0.0)), "{points:?}");
+        assert_eq!(points.first(), Some(&(0.0, 0.0)));
+        assert_eq!(points.last(), Some(&(400.0, 0.0)));
+
         let events = foreground_drag_events(10.0, 20.0, 40.0, 80.0, 3);
         let kinds: Vec<_> = events.iter().map(|event| event.kind).collect();
         assert_eq!(
