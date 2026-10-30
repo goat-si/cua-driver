@@ -617,8 +617,14 @@ fn walk_tree_with_web_content(
         // under the same budget, so its items get element tokens. A menu
         // window that could not be examined in time (or past the cap) makes
         // the walk partial, never silently complete.
+        // A WindowServer list that could not be read leaves open menus
+        // unknown: partial.
         let menu_frames = match window_id {
-            Some(_) if !nodes.is_empty() => super::context_menus::open_menu_window_frames(pid),
+            Some(_) if !nodes.is_empty() => super::context_menus::open_menu_window_frames(pid)
+                .unwrap_or_else(|| {
+                    budget.stop_for_timeout();
+                    Vec::new()
+                }),
             _ => Vec::new(),
         };
         let discovery = (!menu_frames.is_empty())
@@ -647,17 +653,25 @@ fn walk_tree_with_web_content(
                 let Some((menu, menu_frame, owner)) =
                     super::context_menus::menu_in_window(pid, frame, deadline)
                 else {
-                    // Out of time is unknown; a hit that is not a menu is not.
-                    incomplete |= Instant::now() >= deadline;
+                    // Nothing readable reached a menu in this menu window.
+                    incomplete = true;
                     continue;
                 };
-                incomplete |=
-                    (menu_frame.is_none() || owner.is_none()) && Instant::now() >= deadline;
                 // Released with the other top-level elements after the walk.
                 top_level.push(menu);
-                if !super::context_menus::publish_menu(menu_frame, frame, owner, wid, &walked_menus)
-                {
-                    continue;
+                match super::context_menus::decide_menu(
+                    menu_frame,
+                    frame,
+                    owner,
+                    wid,
+                    &walked_menus,
+                ) {
+                    super::context_menus::MenuDecision::Publish => {}
+                    super::context_menus::MenuDecision::Skip => continue,
+                    super::context_menus::MenuDecision::Unknown => {
+                        incomplete = true;
+                        continue;
+                    }
                 }
                 walked_menus.extend(menu_frame);
                 walk_element(

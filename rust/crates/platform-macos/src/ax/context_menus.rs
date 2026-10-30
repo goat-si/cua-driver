@@ -36,9 +36,15 @@ pub(crate) fn discovery_deadline(
     (window >= Duration::from_millis(10)).then(|| now + window)
 }
 
-/// The frames of `pid`'s on-screen menu windows, as `[x, y, w, h]`.
-pub(crate) fn open_menu_window_frames(pid: i32) -> Vec<[f64; 4]> {
-    crate::windows::pid_on_screen_windows_any_layer(pid)
+/// The frames of `pid`'s on-screen menu windows, as `[x, y, w, h]`, or
+/// `None` when WindowServer's list could not be read completely.
+pub(crate) fn open_menu_window_frames(pid: i32) -> Option<Vec<[f64; 4]>> {
+    let enumeration = crate::windows::pid_on_screen_windows_any_layer_enumeration(pid);
+    if !enumeration.complete {
+        return None;
+    }
+    let frames = enumeration
+        .windows
         .into_iter()
         .filter(|window| window.layer == MENU_WINDOW_LAYER)
         .map(|window| {
@@ -49,34 +55,87 @@ pub(crate) fn open_menu_window_frames(pid: i32) -> Vec<[f64; 4]> {
                 window.bounds.height,
             ]
         })
-        .collect()
+        .collect();
+    Some(frames)
 }
 
-/// An `AXMenu` frame and a menu window frame describe the same surface.
-pub(crate) fn frames_match(menu: [f64; 4], window: [f64; 4]) -> bool {
-    menu.iter()
-        .zip(window.iter())
+/// Two frames are the same rectangle (within the tolerance).
+pub(crate) fn same_frame(a: [f64; 4], b: [f64; 4]) -> bool {
+    a.iter()
+        .zip(b.iter())
         .all(|(a, b)| a.is_finite() && b.is_finite() && (a - b).abs() <= FRAME_TOLERANCE)
 }
 
-/// Whether a menu found for one menu window is published under the walked
-/// window: its frame matches that menu window, its AX ancestry ends at the
-/// walked window, and no `AXMenu` with the same frame was already walked.
-pub(crate) fn publish_menu(
+/// The widest margin a menu window keeps around its menu. Finder's
+/// context-menu window is the `AXMenu` frame grown by 75 pt on every side
+/// (room for the shadow).
+const MAX_MENU_WINDOW_MARGIN: f64 = 100.0;
+
+/// An `AXMenu` frame is the menu shown in a menu window: the window is the
+/// menu's frame grown by one even margin (zero or more) on all four sides.
+pub(crate) fn menu_fits_window(menu: [f64; 4], window: [f64; 4]) -> bool {
+    if !menu.iter().chain(window.iter()).all(|v| v.is_finite()) {
+        return false;
+    }
+    let [mx, my, mw, mh] = menu;
+    let [wx, wy, ww, wh] = window;
+    let margins = [
+        mx - wx,
+        my - wy,
+        (wx + ww) - (mx + mw),
+        (wy + wh) - (my + mh),
+    ];
+    let low = margins.iter().copied().fold(f64::INFINITY, f64::min);
+    let high = margins.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    low >= -FRAME_TOLERANCE && high <= MAX_MENU_WINDOW_MARGIN && high - low <= FRAME_TOLERANCE
+}
+
+/// Where a menu's `AXParent` chain ends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MenuOwner {
+    /// The first window or sheet reached, by CGWindowID.
+    Window(u32),
+    /// The application itself: a menu-bar menu, no window's.
+    Application,
+}
+
+/// What discovery decided about one menu window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MenuDecision {
+    /// Publish it under the walked window.
+    Publish,
+    /// Proven not to belong in this walk (another window's or the menu
+    /// bar's menu, or already walked).
+    Skip,
+    /// Something could not be read: the walk cannot claim to be complete.
+    Unknown,
+}
+
+/// Decide one menu window from what was read for it: the `AXMenu` frame
+/// must match the menu window, and its AX ancestry must end at the walked
+/// window; an unreadable frame or ancestry is unknown, never "not ours".
+pub(crate) fn decide_menu(
     menu_frame: Option<[f64; 4]>,
     window_frame: [f64; 4],
-    owner_window: Option<u32>,
+    owner: Option<MenuOwner>,
     walked_window: u32,
     walked_menu_frames: &[[f64; 4]],
-) -> bool {
-    let Some(menu_frame) = menu_frame else {
-        return false;
+) -> MenuDecision {
+    let (Some(menu_frame), Some(owner)) = (menu_frame, owner) else {
+        return MenuDecision::Unknown;
     };
-    frames_match(menu_frame, window_frame)
-        && owner_window == Some(walked_window)
-        && !walked_menu_frames
+    if !menu_fits_window(menu_frame, window_frame) {
+        // The centre hit reached a different menu (a submenu over it).
+        return MenuDecision::Unknown;
+    }
+    if owner != MenuOwner::Window(walked_window)
+        || walked_menu_frames
             .iter()
-            .any(|walked| frames_match(*walked, menu_frame))
+            .any(|walked| same_frame(*walked, menu_frame))
+    {
+        return MenuDecision::Skip;
+    }
+    MenuDecision::Publish
 }
 
 /// The `AXMenu` shown in the menu window with `frame`, retained, with its
@@ -90,7 +149,7 @@ pub(crate) unsafe fn menu_in_window(
     pid: i32,
     frame: [f64; 4],
     deadline: Instant,
-) -> Option<(AXUIElementRef, Option<[f64; 4]>, Option<u32>)> {
+) -> Option<(AXUIElementRef, Option<[f64; 4]>, Option<MenuOwner>)> {
     let left = deadline.checked_duration_since(Instant::now())?;
     let [x, y, w, h] = frame;
     let hit = element_at_screen_position_bounded(
@@ -168,10 +227,14 @@ unsafe fn ascend_to_role(
     None
 }
 
-/// The CGWindowID of the first `AXWindow` or `AXSheet` reached through
-/// `AXParent` from `element` (the `AXWindow` attribute is not trusted for
-/// a menu).
-unsafe fn owning_window_by_parents(element: AXUIElementRef, deadline: Instant) -> Option<u32> {
+/// Where `element`'s `AXParent` chain ends: the first `AXWindow` or
+/// `AXSheet` (by CGWindowID), or the application. `None` when a read
+/// failed or ran out of time (the `AXWindow` attribute is not trusted for a
+/// menu).
+unsafe fn owning_window_by_parents(
+    element: AXUIElementRef,
+    deadline: Instant,
+) -> Option<MenuOwner> {
     if !bound(element, deadline) {
         return None;
     }
@@ -188,9 +251,13 @@ unsafe fn owning_window_by_parents(element: AXUIElementRef, deadline: Instant) -
                 }
                 let id = ax_get_window_id(current);
                 CFRelease(current as CFTypeRef);
-                return id;
+                return id.map(MenuOwner::Window);
             }
-            Some("AXApplication") | None => break,
+            Some("AXApplication") => {
+                CFRelease(current as CFTypeRef);
+                return Some(MenuOwner::Application);
+            }
+            None => break,
             _ => {}
         }
         if !bound(current, deadline) {
@@ -222,7 +289,7 @@ pub(crate) unsafe fn element_in_context_menu_of(element: AXUIElementRef, window_
     };
     let owner = owning_window_by_parents(menu, deadline);
     CFRelease(menu as CFTypeRef);
-    owner == Some(window_id)
+    owner == Some(MenuOwner::Window(window_id))
 }
 
 #[cfg(test)]
@@ -232,35 +299,75 @@ mod tests {
     const WINDOW: [f64; 4] = [2002.0, 198.0, 391.0, 552.0];
 
     #[test]
-    fn a_menu_is_published_only_with_a_matching_frame_and_window_ancestry() {
-        assert!(publish_menu(
-            Some([2003.0, 199.0, 390.0, 551.0]),
-            WINDOW,
-            Some(7),
-            7,
-            &[]
-        ));
-        // Another window's menu, or ancestry that could not be read.
-        assert!(!publish_menu(Some(WINDOW), WINDOW, Some(8), 7, &[]));
-        assert!(!publish_menu(Some(WINDOW), WINDOW, None, 7, &[]));
-        // The hit landed on a different menu (a submenu, an occluding one).
-        assert!(!publish_menu(
-            Some([2002.0, 198.0, 391.0, 300.0]),
-            WINDOW,
-            Some(7),
-            7,
-            &[]
-        ));
-        assert!(!publish_menu(None, WINDOW, Some(7), 7, &[]));
-        // Already in the walked tree.
-        assert!(!publish_menu(Some(WINDOW), WINDOW, Some(7), 7, &[WINDOW]));
+    fn a_menu_is_published_only_when_proven_and_unknown_is_never_skipped() {
+        use MenuDecision::{Publish, Skip, Unknown};
+        let ours = Some(MenuOwner::Window(7));
+        assert_eq!(
+            decide_menu(Some([2003.0, 199.0, 390.0, 551.0]), WINDOW, ours, 7, &[]),
+            Publish
+        );
+        // Proven not ours: another window's or the menu bar's, or walked.
+        assert_eq!(
+            decide_menu(Some(WINDOW), WINDOW, Some(MenuOwner::Window(8)), 7, &[]),
+            Skip
+        );
+        assert_eq!(
+            decide_menu(Some(WINDOW), WINDOW, Some(MenuOwner::Application), 7, &[]),
+            Skip
+        );
+        assert_eq!(decide_menu(Some(WINDOW), WINDOW, ours, 7, &[WINDOW]), Skip);
+        // Unreadable frame or ancestry, or the hit reached another menu.
+        assert_eq!(decide_menu(Some(WINDOW), WINDOW, None, 7, &[]), Unknown);
+        assert_eq!(decide_menu(None, WINDOW, ours, 7, &[]), Unknown);
+        assert_eq!(
+            decide_menu(Some([2002.0, 198.0, 391.0, 300.0]), WINDOW, ours, 7, &[]),
+            Unknown
+        );
+        // Finder: the menu window keeps a 75 pt margin around the menu, and
+        // the window walk already listed that menu.
+        let finder_window = [2006.0, 198.0, 391.0, 552.0];
+        let finder_menu = [2081.0, 273.0, 241.0, 402.0];
+        assert_eq!(
+            decide_menu(
+                Some(finder_menu),
+                finder_window,
+                Some(MenuOwner::Window(9)),
+                9,
+                &[]
+            ),
+            Publish
+        );
+        assert_eq!(
+            decide_menu(
+                Some(finder_menu),
+                finder_window,
+                Some(MenuOwner::Window(9)),
+                9,
+                &[finder_menu]
+            ),
+            Skip
+        );
     }
 
     #[test]
     fn frames_must_be_finite_and_close() {
-        assert!(frames_match(WINDOW, [2006.0, 194.0, 391.0, 552.0]));
-        assert!(!frames_match(WINDOW, [2006.5, 198.0, 391.0, 552.0]));
-        assert!(!frames_match([f64::NAN, 198.0, 391.0, 552.0], WINDOW));
+        assert!(same_frame(WINDOW, [2006.0, 194.0, 391.0, 552.0]));
+        assert!(!same_frame(WINDOW, [2006.5, 198.0, 391.0, 552.0]));
+        assert!(!same_frame([f64::NAN, 198.0, 391.0, 552.0], WINDOW));
+        // A menu inside its window by one even margin, or the same frame.
+        assert!(menu_fits_window(
+            [2081.0, 273.0, 241.0, 402.0],
+            [2006.0, 198.0, 391.0, 552.0]
+        ));
+        assert!(menu_fits_window(WINDOW, WINDOW));
+        // Uneven margins: another menu (a submenu) in the same area.
+        assert!(!menu_fits_window(
+            [2081.0, 273.0, 241.0, 200.0],
+            [2006.0, 198.0, 391.0, 552.0]
+        ));
+        // Outside the window, or a margin wider than any menu window keeps.
+        assert!(!menu_fits_window([1900.0, 198.0, 391.0, 552.0], WINDOW));
+        assert!(!menu_fits_window([2202.0, 398.0, 0.0, 152.0], WINDOW));
     }
 
     #[test]

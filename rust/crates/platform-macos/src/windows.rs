@@ -134,13 +134,18 @@ pub(crate) fn pid_windows_with_space_snapshot(pid: i32, on_screen_only: bool) ->
 /// Cheap enough to poll during a gesture (the drag tool watches for a
 /// drag-image window at the dragging level).
 pub(crate) fn pid_on_screen_windows_any_layer(pid: i32) -> Vec<WindowInfo> {
+    pid_on_screen_windows_any_layer_enumeration(pid).windows
+}
+
+/// [`pid_on_screen_windows_any_layer`] with its completeness: an empty list
+/// from a failed WindowServer read is not "no windows".
+pub(crate) fn pid_on_screen_windows_any_layer_enumeration(pid: i32) -> WindowEnumeration {
     enumerate_windows(
         kCGWindowListOptionOnScreenOnly | kCGWindowListExcludeDesktopElements,
         LayerFilter::AnyLayer,
         Some(pid),
         false,
     )
-    .windows
 }
 
 /// On-screen windows of every app on every layer, front to back, without the

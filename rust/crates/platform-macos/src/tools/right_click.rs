@@ -1302,7 +1302,7 @@ fn spatial_evidence_is_one_menu(
     match evidence {
         MenuEvidence::Window => true,
         MenuEvidence::Accessibility => {
-            ax_frame.is_some_and(|ax| crate::ax::context_menus::frames_match(ax, window_frame))
+            ax_frame.is_some_and(|ax| crate::ax::context_menus::menu_fits_window(ax, window_frame))
         }
         MenuEvidence::None => false,
     }
