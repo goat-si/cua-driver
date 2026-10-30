@@ -4,7 +4,7 @@
 //! (via ChildWindowFromPointEx), so the message never reaches the top-level
 //! chrome that would call SetForegroundWindow in response to WM_LBUTTONDOWN.
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::{bail, Result};
 use std::thread::sleep;
 use std::time::Duration;
 use windows::core::{Error, Owned};
@@ -844,13 +844,15 @@ fn send_click_guarded_impl(
         noactivate: None,
         foreground_target: None,
         error: None,
+        batch_remaining: 0,
+        batch_failed: false,
     };
     let planned = sink.downs.len() + sink.count * 3;
     let mut result = run_guarded(&mut sink, planned, guard);
     if let GuardedResult::Sent { outcome } = &mut result {
         if outcome.effect == DispatchEffect::Unverifiable {
             let errors = sink.finish(planned);
-            if !errors.is_empty() {
+            if errors.iter().any(|entry| entry.get("error").is_some()) {
                 outcome.effect = DispatchEffect::Uncertain;
                 outcome.cleanup_results = errors;
             }
@@ -877,6 +879,8 @@ struct ForegroundClick {
     noactivate: Option<crate::input::NoActivateGuard>,
     foreground_target: Option<crate::win32::windows::ForegroundTarget>,
     error: Option<String>,
+    batch_remaining: usize,
+    batch_failed: bool,
 }
 impl InputSink for ForegroundClick {
     fn prepare(&mut self) -> Vec<&'static str> {
@@ -932,25 +936,31 @@ impl InputSink for ForegroundClick {
         if let Some(error) = self.error.take() {
             return Err(error);
         }
-        let n = self.downs.len();
-        if index == n && n > 0 {
-            sleep(Duration::from_millis(5));
+        if self.batch_remaining > 0 {
+            self.batch_remaining -= 1;
+            return Ok(());
         }
-        if index > n && (index - n) % 3 == 0 {
-            sleep(Duration::from_millis(80));
-        }
-        let input = if index < n {
-            self.downs[index]
-        } else {
-            match (index - n) % 3 {
-                0 => self.move_input,
-                1 => self.down_input,
-                _ => self.up_input,
-            }
-        };
-        if crate::input::delivery::send_input(&[input]) != 1 {
+        if self.batch_failed {
             return Err("SendInput inserted fewer modifier or mouse events than expected for the foreground click".into());
         }
+        let n = self.downs.len();
+        let events = if index < n {
+            self.downs.clone()
+        } else {
+            if index == n && n > 0 {
+                sleep(Duration::from_millis(5));
+            }
+            if index > n {
+                sleep(Duration::from_millis(80));
+            }
+            vec![self.move_input, self.down_input, self.up_input]
+        };
+        let sent = crate::input::delivery::send_input(&events) as usize;
+        self.batch_failed = sent < events.len();
+        if sent == 0 {
+            return Err("SendInput inserted fewer modifier or mouse events than expected for the foreground click".into());
+        }
+        self.batch_remaining = sent - 1;
         Ok(())
     }
     fn cleanup(&mut self, sent: usize) -> Vec<Value> {
@@ -962,14 +972,20 @@ impl ForegroundClick {
         let mut errors = vec![];
         let mods = sent.min(self.downs.len());
         let mouse_sent = sent.saturating_sub(self.downs.len());
-        if mouse_sent % 3 == 2 && crate::input::delivery::send_input(&[self.up_input]) != 1 {
-            errors.push(json!({"error":"failed to release mouse button"}));
+        if mouse_sent % 3 == 2 {
+            if crate::input::delivery::send_input(&[self.up_input]) != 1 {
+                errors.push(json!({"error":"failed to release mouse button"}));
+            } else {
+                errors.push(json!({"release_button": true}));
+            }
         }
         if mods > 0 {
             let ups = &self.ups[self.ups.len() - mods..];
             if crate::input::delivery::send_input(ups) as usize != ups.len() {
                 let _ = crate::input::delivery::send_input(ups);
                 errors.push(json!({"error":"failed to release modifiers"}));
+            } else {
+                errors.push(json!({"release_modifiers": mods}));
             }
         }
         unsafe {
