@@ -296,6 +296,44 @@ pub(crate) async fn browser_protected_resource_scope(
     args: &Value,
     tool_name: &str,
 ) -> Result<Option<Value>, String> {
+    browser_tab_resource_scope(engine, args, tool_name).await
+}
+
+/// The protected resource of a bind (`pid` + `window_id`): a browser
+/// window, which the capability manifest admits through its
+/// `existing_profiles` or a desktop window grant. A browser attached with the
+/// person's existing profile is bound only with an `origin_scope`.
+fn browser_bind_resource_scope(
+    engine: &BrowserEngine,
+    args: &Value,
+) -> Result<Option<Value>, String> {
+    let (Some(pid), Some(window_id)) = (
+        args.get("pid").and_then(Value::as_i64),
+        args.get("window_id").and_then(Value::as_u64),
+    ) else {
+        return Ok(None);
+    };
+    let scope = super::origin_scope::OriginScope::from_args(args)?;
+    if scope.is_none() && engine.existing_profile_grants.holds_pid(pid) {
+        return Err(super::origin_scope::require_scope(
+            super::types::EndpointAccessClass::ExistingProfileApproved,
+            None,
+        )
+        .expect_err("an unscoped existing-profile call is refused")
+        .into_scope_error());
+    }
+    Ok(Some(json!({
+        "kind": "browser_window",
+        "pid": pid,
+        "window_id": window_id,
+    })))
+}
+
+async fn browser_tab_resource_scope(
+    engine: &BrowserEngine,
+    args: &Value,
+    tool_name: &str,
+) -> Result<Option<Value>, String> {
     let session = args
         .get("session")
         .and_then(Value::as_str)
@@ -713,6 +751,8 @@ impl Tool for GetBrowserStateTool {
             && args.get("target_id").and_then(Value::as_str).is_some()
         {
             browser_protected_resource_scope(&self.engine, args, "get_browser_state").await
+        } else if adapter_id == "private_observation" {
+            browser_bind_resource_scope(&self.engine, args)
         } else {
             Ok(None)
         }
@@ -809,7 +849,19 @@ impl Tool for GetBrowserStateTool {
                 // With an origin scope, a tab whose address (read fresh from
                 // the browser by this bind) is outside the scope is listed by
                 // id and selection only: never its origin, address or title.
-                let in_scope = |url: &str| scope.as_ref().is_none_or(|scope| scope.allows_url(url));
+                // Under a capability manifest the tab must also be in the
+                // manifest's origins, whatever the caller's scope lists.
+                let manifest_context = crate::tool::current_dispatch_authorization_context()
+                    .filter(|context| context.capability_manifest().is_some());
+                let in_scope = |url: &str| {
+                    scope.as_ref().is_none_or(|scope| {
+                        scope.allows_url(url)
+                            && manifest_context
+                                .as_deref()
+                                .and_then(|context| context.capability_manifest())
+                                .is_none_or(|manifest| manifest.authorize_browser_url(url).is_ok())
+                    })
+                };
                 let tabs: Vec<Value> = record
                     .tabs
                     .values()

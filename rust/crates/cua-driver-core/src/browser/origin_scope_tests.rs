@@ -535,3 +535,72 @@ async fn the_dispatcher_returns_scope_refusals_before_manifest_admission() {
     );
     assert!(recorded_calls(&f, "Page.navigate").is_empty());
 }
+
+#[tokio::test]
+async fn bind_redacts_tabs_outside_the_manifest_even_when_the_scope_lists_them() {
+    let f = fixture().await;
+    let tool = GetBrowserStateTool::new(f.engine.clone());
+    let result = crate::tool::with_test_dispatch_context(
+        manifest_context(&["https://other.example"], ""),
+        tool.invoke(json!({
+            "pid": 1, "window_id": 7, "session": SESSION,
+            "origin_scope": [SCOPE_FIXTURE, "https://other.example"],
+        })),
+    )
+    .await;
+    let s = structured(&result);
+    assert_eq!(s["status"], "ok", "{s}");
+    let tab = s["tabs"][0].as_object().unwrap();
+    assert!(
+        tab.get("url").is_none() && tab.get("title").is_none(),
+        "{s}"
+    );
+    assert!(s["native_title"].is_null());
+}
+
+#[tokio::test]
+async fn an_existing_profile_bind_is_admitted_as_a_browser_window_only_with_a_scope() {
+    const TRANSPORT: &str = "transport-bind-admission";
+    let (f, _) = protected_existing_profile_fixture().await;
+    attach_existing_profile(&f, TRANSPORT).await;
+    let tool = GetBrowserStateTool::new(f.engine.clone());
+    let unscoped = tool
+        .protected_resource_scope(
+            "private_observation",
+            &json!({"pid": 1, "window_id": 7, "session": SESSION}),
+        )
+        .await
+        .unwrap_err();
+    let refusal = super::super::refusal::BrowserRefusal::from_scope_error(&unscoped)
+        .expect("a typed refusal");
+    assert_eq!(code(&refusal), "browser_origin_scope_required");
+    let scoped = tool
+        .protected_resource_scope(
+            "private_observation",
+            &json!({"pid": 1, "window_id": 7, "session": SESSION, "origin_scope": [SCOPE_FIXTURE]}),
+        )
+        .await
+        .unwrap()
+        .expect("a bind resource");
+    assert_eq!(
+        scoped,
+        json!({"kind": "browser_window", "pid": 1, "window_id": 7})
+    );
+    // The manifest admits that resource through existing_profiles alone.
+    let listed = manifest_context(
+        &[SCOPE_FIXTURE],
+        "    existing_profiles:\n      - {pid: 1, window_id: 7}\n",
+    );
+    listed
+        .capability_manifest()
+        .unwrap()
+        .authorize_protected_resource("private_observation", &scoped)
+        .unwrap();
+    let unlisted = manifest_context(&[SCOPE_FIXTURE], "");
+    assert!(unlisted
+        .capability_manifest()
+        .unwrap()
+        .authorize_protected_resource("private_observation", &scoped)
+        .is_err());
+    crate::session::fire_session_end(TRANSPORT);
+}

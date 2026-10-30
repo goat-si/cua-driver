@@ -57,6 +57,9 @@ struct ReloadState {
     file_sha256: String,
     applied: AppliedManifest,
     last_error: Option<String>,
+    /// `last_error` came from reading the file (it may succeed next time),
+    /// not from an invalid version.
+    error_is_transient: bool,
     parses: u64,
 }
 
@@ -99,6 +102,7 @@ impl ConfiguredManifest {
                     manifest: Arc::new(manifest),
                 },
                 last_error: None,
+                error_is_transient: false,
                 parses: 1,
             }),
             path,
@@ -125,10 +129,17 @@ impl ConfiguredManifest {
                     "failed to read capability manifest {}: {error}",
                     self.path.display()
                 ));
+                state.error_is_transient = true;
                 return;
             }
         };
         if state.identity.as_ref() == Some(&before) {
+            // The file is readable again and unchanged: a read failure no
+            // longer applies, while an invalid version's error still does.
+            if state.error_is_transient {
+                state.last_error = None;
+                state.error_is_transient = false;
+            }
             return;
         }
         let bytes = match std::fs::read(&self.path) {
@@ -138,6 +149,7 @@ impl ConfiguredManifest {
                     "failed to read capability manifest {}: {error}",
                     self.path.display()
                 ));
+                state.error_is_transient = true;
                 return;
             }
         };
@@ -151,6 +163,7 @@ impl ConfiguredManifest {
         if file_sha256 == state.file_sha256 {
             state.identity = Some(before);
             state.last_error = None;
+            state.error_is_transient = false;
             return;
         }
         // An invalid version is not retried until the file changes again.
@@ -160,6 +173,7 @@ impl ConfiguredManifest {
             Ok(manifest) => manifest,
             Err(error) => {
                 state.last_error = Some(error);
+                state.error_is_transient = false;
                 return;
             }
         };
@@ -167,6 +181,7 @@ impl ConfiguredManifest {
         if let Some(mode) = self.mode {
             if let Err(error) = manifest.validate_for_mode(mode) {
                 state.last_error = Some(error);
+                state.error_is_transient = false;
                 return;
             }
         }
@@ -176,6 +191,7 @@ impl ConfiguredManifest {
         };
         state.file_sha256 = file_sha256;
         state.last_error = None;
+        state.error_is_transient = false;
     }
 
     /// Content-free reload status for health and configuration output.
@@ -298,6 +314,26 @@ mod tests {
         let applied = store.current();
         assert_eq!(applied.generation, 1);
         assert_eq!(store.parses(), 1);
+    }
+
+    #[test]
+    fn a_read_failure_is_reported_only_while_it_lasts() {
+        let (dir, path, store) = store(NARROW);
+        let aside = dir.path().join("aside.yaml");
+        std::fs::rename(&path, &aside).unwrap();
+        store.current();
+        assert!(store.status_json()["last_error"].is_string());
+        // The same file is back (same identity): the failure no longer applies.
+        std::fs::rename(&aside, &path).unwrap();
+        assert!(store.status_json()["last_error"].is_null());
+        // An invalid version's error stays while that version stays.
+        replace(
+            &path,
+            "version: 3\nallow:\n  tools: [not_a_reviewed_tool]\n",
+        );
+        store.current();
+        store.current();
+        assert!(store.status_json()["last_error"].is_string());
     }
 
     #[test]

@@ -288,6 +288,26 @@ impl SessionManifest {
                 "browser_target" | "authenticated_browser_tab" => {
                     self.authorize_resource_origin(resource)
                 }
+                // A get_browser_state bind of one browser window: listed as an
+                // existing profile, or granted as a desktop window.
+                "browser_window" => {
+                    let listed = resource
+                        .get("pid")
+                        .and_then(serde_json::Value::as_i64)
+                        .zip(
+                            resource
+                                .get("window_id")
+                                .and_then(serde_json::Value::as_u64),
+                        )
+                        .is_some_and(|(pid, window_id)| {
+                            self.allows_existing_profile_window(pid, window_id)
+                        });
+                    if listed {
+                        Ok(())
+                    } else {
+                        self.authorize_desktop_window(resource)
+                    }
+                }
                 // `escalate_session` always expands a browser-scoped session
                 // to desktop scope; it has no caller-selectable capture_scope
                 // argument. Require the immutable manifest's display grant

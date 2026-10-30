@@ -151,16 +151,7 @@ pub(crate) async fn check(
     args: &Value,
     points: Vec<(f64, f64)>,
 ) -> Option<ToolResult> {
-    // A browser holding an origin-scoped attachment is reachable only through
-    // the browser tools, in any delivery mode.
-    let windows = tokio::task::spawn_blocking(crate::windows::visible_windows)
-        .await
-        .unwrap_or_default();
-    if let Some(refusal) =
-        cua_driver_core::browser::protection::desktop_point_refusal(tool, &points, |x, y| {
-            owner_at(&windows, x, y)
-        })
-    {
+    if let Some(refusal) = protected_refusal(tool, &points).await {
         return Some(refusal);
     }
     let delivery = DeliveryMode::from_args(args);
@@ -177,6 +168,19 @@ pub(crate) async fn check(
     .await
     .ok()
     .flatten()
+}
+
+/// A browser holding an origin-scoped attachment is reachable only through
+/// the browser tools, in any delivery mode: the refusal when any of
+/// `points` (every point an event is delivered at) lands on one of its
+/// windows.
+pub(crate) async fn protected_refusal(tool: &str, points: &[(f64, f64)]) -> Option<ToolResult> {
+    let windows = tokio::task::spawn_blocking(crate::windows::visible_windows)
+        .await
+        .unwrap_or_default();
+    cua_driver_core::browser::protection::desktop_point_refusal(tool, points, |x, y| {
+        owner_at(&windows, x, y)
+    })
 }
 
 /// The process owning the topmost ordinary window at `(x, y)`, from one
