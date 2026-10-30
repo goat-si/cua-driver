@@ -235,3 +235,27 @@ fn key_belief_trace_reports_miss_and_ineligible() {
         .finish("ok")
         .contains("key_belief=ineligible scope=entered"));
 }
+
+#[test]
+fn key_trace_exposes_each_breakdown_field() {
+    let trace = Trace::new("press_key");
+    let line = trace.finish("ok");
+    for field in [
+        "entry_us",
+        "prime_us",
+        "final_sample_us",
+        "post_us",
+        "hand_back_us",
+        "lease_us",
+        "gate_again_us",
+        "guard_untargeted_us",
+        "conflict_us",
+        "key_hold_us",
+    ] {
+        assert!(
+            line.split_whitespace()
+                .any(|part| part == format!("{field}=0")),
+            "missing key timing field {field}: {line}"
+        );
+    }
+}

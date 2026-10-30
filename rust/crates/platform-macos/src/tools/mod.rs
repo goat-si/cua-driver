@@ -770,6 +770,8 @@ pub(crate) async fn acquire_key_scope_with_eligibility(
     // The latency trace's key_belief/scope fields are recorded inside the
     // scope entry, so the blocking prime must carry the trace with it.
     match crate::goat::action_latency::spawn_blocking(move || {
+        let _span =
+            crate::goat::action_latency::span(crate::goat::action_latency::Stage::KeyScopePrime);
         if eligible && crate::input::skylight::is_focus_without_raise_available() {
             crate::input::skylight::enter_untargeted_key_scope(pid, wid)
                 .map(Some)
