@@ -159,6 +159,7 @@ pub struct WindowKeyScope {
     order_before: Vec<u32>,
     primed: KeyPrime,
     from_belief: bool,
+    pending_belief: Option<(Ticket, KeyFocus, std::time::Instant)>,
     /// What entering did inside the app, whatever confirmed key at the end.
     entry: KeyEntry,
     /// The hand-back already ran through `finish`.
@@ -289,6 +290,7 @@ trait KeyEnv {
     fn belief_match(&self, pid: pid_t, wid: u32) -> BeliefMatch;
     fn belief_ticket(&self, pid: pid_t) -> Option<Ticket>;
     fn belief_now(&self) -> std::time::Instant;
+    fn prepare_belief(&self, ticket: Ticket, wid: u32, focus: KeyFocus) -> bool;
     fn publish_belief(
         &self,
         ticket: Ticket,
@@ -367,6 +369,17 @@ impl KeyEnv for LiveKeyEnv {
     fn belief_now(&self) -> std::time::Instant {
         std::time::Instant::now()
     }
+    fn prepare_belief(&self, ticket: Ticket, wid: u32, focus: KeyFocus) -> bool {
+        let prepared = std::cell::Cell::new(false);
+        publish_belief_with(
+            wid,
+            focus,
+            || crate::ax::enablement::process_start_stamp(ticket.pid) == Some(ticket.stamp),
+            || super::key_belief_ax::is_proven_standard_window(ticket, wid),
+            || prepared.set(true),
+        );
+        prepared.get()
+    }
     fn publish_belief(
         &self,
         ticket: Ticket,
@@ -374,15 +387,10 @@ impl KeyEnv for LiveKeyEnv {
         focus: KeyFocus,
         confirmed_at: std::time::Instant,
     ) {
-        publish_belief_with(
-            wid,
-            focus,
-            || crate::ax::enablement::process_start_stamp(ticket.pid) == Some(ticket.stamp),
-            || super::key_belief_ax::is_proven_standard_window(ticket, wid, focus.window),
-            || {
-                let _ = BELIEFS.publish(ticket, wid, false, confirmed_at, focus_generation());
-            },
-        );
+        let _ = focus;
+        if crate::ax::enablement::process_start_stamp(ticket.pid) == Some(ticket.stamp) {
+            let _ = BELIEFS.publish(ticket, wid, false, confirmed_at, focus_generation());
+        }
     }
 }
 
@@ -455,6 +463,35 @@ fn run_hand_back_with(
 }
 
 impl WindowKeyScope {
+    fn complete_belief_with(
+        &mut self,
+        env: &dyn KeyEnv,
+        sample: Option<u32>,
+        conflict: crate::ax::exact_target::WindowFocusConflict,
+    ) {
+        if let Some((ticket, focus, confirmed_at)) = self.pending_belief.take() {
+            if sample == Some(self.target)
+                && matches!(
+                    conflict,
+                    crate::ax::exact_target::WindowFocusConflict::Clear
+                )
+            {
+                env.publish_belief(ticket, self.target, focus, confirmed_at);
+            }
+        }
+    }
+
+    pub(crate) fn has_pending_belief(&self) -> bool {
+        self.pending_belief.is_some()
+    }
+
+    pub(crate) fn complete_belief(
+        &mut self,
+        sample: Option<u32>,
+        conflict: crate::ax::exact_target::WindowFocusConflict,
+    ) {
+        self.complete_belief_with(&LiveKeyEnv, sample, conflict);
+    }
     /// How key was confirmed on entry.
     pub fn primed(&self) -> KeyPrime {
         self.primed
@@ -497,7 +534,7 @@ impl WindowKeyScope {
 
 /// Hand key back to `previous` on its own thread. The records' pauses and
 /// the confirmation read are not part of the action, so nothing waits for
-/// them; the next scope's entry does ([`await_key_restores`]). A hand-back
+/// them; the next scope for this pid waits for it. A hand-back
 /// that does not complete is logged, never turned into a refusal.
 fn spawn_hand_back(
     ops: ScopeOps,
@@ -508,7 +545,11 @@ fn spawn_hand_back(
     live: Option<LiveKeyScope>,
 ) -> HandBack {
     note_focus_change();
-    *KEY_RESTORES.0.lock().unwrap_or_else(|e| e.into_inner()) += 1;
+    KEY_RESTORES
+        .0
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push(pid);
     let restore = move || {
         let outcome = (ops.hand_back)(pid, target, primed, previous);
         if outcome != HandBack::Restored {
@@ -516,7 +557,7 @@ fn spawn_hand_back(
         }
         note_focus_change();
         drop(live);
-        key_restore_done();
+        key_restore_done(pid);
     };
     match std::thread::Builder::new()
         .name("cua-key-restore".into())
@@ -526,7 +567,7 @@ fn spawn_hand_back(
         Err(error) => {
             tracing::warn!("key restore thread failed to start: {error}");
             note_focus_change();
-            key_restore_done();
+            key_restore_done(pid);
             HandBack::NotConfirmed
         }
     }
@@ -592,33 +633,64 @@ impl Drop for LiveKeyScope {
     }
 }
 
-/// Hand-backs of [`WindowKeyScope`]s still running. Entering a new scope
-/// waits for none to be left, so it never reads or moves key focus
-/// mid-restore.
-static KEY_RESTORES: (std::sync::Mutex<usize>, std::sync::Condvar) =
-    (std::sync::Mutex::new(0), std::sync::Condvar::new());
+/// Hand-backs of [`WindowKeyScope`]s still running, tracked by target pid.
+/// Scope entry waits for hand-backs in the same app.
+static KEY_RESTORES: (std::sync::Mutex<Vec<pid_t>>, std::sync::Condvar) =
+    (std::sync::Mutex::new(Vec::new()), std::sync::Condvar::new());
 
-fn key_restore_done() {
+fn key_restore_done(pid: pid_t) {
     let mut pending = KEY_RESTORES.0.lock().unwrap_or_else(|e| e.into_inner());
-    *pending = pending.saturating_sub(1);
+    if let Some(index) = pending.iter().position(|p| *p == pid) {
+        pending.swap_remove(index);
+    }
     KEY_RESTORES.1.notify_all();
 }
 
 /// Whether a key scope is live or its hand-back is running now. Never waits.
 fn key_restores_pending() -> bool {
     LIVE_KEY_SCOPES.load(std::sync::atomic::Ordering::Acquire) > 0
-        || *KEY_RESTORES.0.lock().unwrap_or_else(|e| e.into_inner()) > 0
+        || !KEY_RESTORES
+            .0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_empty()
 }
 
 /// Wait (at most 2 s) until no key hand-back is running. `false` when one
 /// is still running: the caller must not move focus or send input then.
 pub fn await_key_restores() -> bool {
+    await_key_restores_for_pid(None, std::time::Duration::from_secs(2))
+}
+
+fn await_key_restores_for_pid(pid: Option<pid_t>, timeout: std::time::Duration) -> bool {
     let pending = KEY_RESTORES.0.lock().unwrap_or_else(|e| e.into_inner());
+    let relevant = |pending: &Vec<pid_t>| match pid {
+        Some(pid) => pending.contains(&pid),
+        None => !pending.is_empty(),
+    };
     let (pending, _) = KEY_RESTORES
         .1
-        .wait_timeout_while(pending, std::time::Duration::from_secs(2), |n| *n > 0)
+        .wait_timeout_while(pending, timeout, |pending| relevant(pending))
         .unwrap_or_else(|e| e.into_inner());
-    *pending == 0
+    !relevant(&pending)
+}
+
+#[cfg(test)]
+#[test]
+fn unrelated_hand_back_does_not_block_key_entry() {
+    let _serial = key_scope_tests_serial();
+    {
+        let mut pending = KEY_RESTORES.0.lock().unwrap_or_else(|e| e.into_inner());
+        pending.push(-88_001);
+    }
+    let same_app_blocked = !await_key_restores_for_pid(Some(-88_001), std::time::Duration::ZERO);
+    let can_enter = await_key_restores_for_pid(Some(-88_002), std::time::Duration::ZERO);
+    key_restore_done(-88_001);
+    assert!(same_app_blocked, "same app hand-back must block entry");
+    assert!(
+        can_enter,
+        "a different app's hand-back must not block this app"
+    );
 }
 
 /// Advanced by every focus record, focused-window write or foreground turn
@@ -1173,9 +1245,9 @@ fn enter_scope_with(
     target_wid: u32,
     eligibility: FastPathEligibility,
 ) -> Result<WindowKeyScope, ScopeEntryError> {
-    // Wait for the previous scope's hand-back to finish; refuse (nothing
-    // sent) when it does not.
-    if !await_key_restores() {
+    // A hand-back in this app can move its key window. Wait for it;
+    // refuse (nothing sent) if it does not finish.
+    if !await_key_restores_for_pid(Some(pid), std::time::Duration::from_secs(2)) {
         return Err(untouched(format!(
             "window {target_wid}: the previous key hand-back in this app did not finish within \
              2 s, so no keys were sent"
@@ -1204,6 +1276,7 @@ fn enter_scope_with(
                 order_before: Vec::new(),
                 primed: KeyPrime::AlreadyKey,
                 from_belief: true,
+                pending_belief: None,
                 entry: initial_entry,
                 done: false,
                 ops,
@@ -1316,11 +1389,13 @@ fn enter_scope_with(
             });
         }
     };
-    if matches!(eligibility, FastPathEligibility::Eligible) && primed == KeyPrime::AlreadyKey {
-        if let Some(ticket) = ticket {
-            env.publish_belief(ticket, target_wid, before, confirmed_at);
-        }
-    }
+    let pending_belief = ticket
+        .filter(|ticket| {
+            matches!(eligibility, FastPathEligibility::Eligible)
+                && primed == KeyPrime::AlreadyKey
+                && env.prepare_belief(*ticket, target_wid, before)
+        })
+        .map(|ticket| (ticket, before, confirmed_at));
     Ok(WindowKeyScope {
         pid,
         target: target_wid,
@@ -1329,6 +1404,7 @@ fn enter_scope_with(
         live: (primed != KeyPrime::AlreadyKey).then(LiveKeyScope::new),
         primed,
         from_belief: false,
+        pending_belief,
         entry: entry.get(),
         done: false,
         ops,
@@ -3701,6 +3777,7 @@ mod wp2_scope_tests {
             order_before: vec![2, 1],
             primed: KeyPrime::KeyRecords,
             from_belief: false,
+            pending_belief: None,
             entry: KeyEntry::default(),
             done: false,
             ops: ScopeOps {
