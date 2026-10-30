@@ -82,7 +82,7 @@ fn generations_sessions_and_tickets() {
     let s = SnapshotStore::new();
     let a = s.begin_capture(42, 7);
     let z = s.begin_capture(42, 7);
-    let (id, _) = s
+    let (id, _, _) = s
         .publish_basis_for_session(42, 7, Payload, Some("a"), Some(1.0), Some(basis()), z)
         .unwrap();
     let key = format_basis_id(id, 0);
@@ -99,7 +99,14 @@ fn generations_sessions_and_tickets() {
     let t = s.begin_capture(42, 7);
     assert_eq!(
         s.refresh_basis_for_session(42, 7, Some("a"), 1.0, None, Some(basis()), t),
-        Some(id)
+        Some((
+            id,
+            Some({
+                let mut b = basis();
+                b.snapshot_id = key.clone();
+                b
+            })
+        ))
     );
     assert!(s.basis_for(42, 7, &key, Some("a")).is_ok());
     let mut changed = basis();
@@ -194,6 +201,66 @@ fn effect_json_accounts_for_zero_and_post_send_failures() {
 }
 
 #[test]
+fn refused_outcome_rejects_sent_events_and_keeps_preparation_separate() {
+    let mut o = DispatchOutcome {
+        events_planned: 1,
+        events_sent: 1,
+        prepared_side_effects: vec!["prepared".into()],
+        effect: DispatchEffect::Refused,
+        cleanup_results: vec![],
+    };
+    assert!(o.validate().is_err());
+    let contradictory = o.to_json();
+    assert_eq!(contradictory["effect"], "uncertain");
+    assert!(contradictory.get("nothing_sent").is_none());
+    o.events_sent = 0;
+    let json = o.to_json();
+    assert_eq!(json["nothing_sent"], true);
+    assert_eq!(json["prepared_side_effects"][0], "prepared");
+    o.effect = DispatchEffect::Partial;
+    assert_ne!(
+        o.to_json().get("nothing_sent").and_then(|v| v.as_bool()),
+        Some(true)
+    );
+}
+
+#[test]
+fn geometry_rejects_bad_scales_window_bounds_and_overflow() {
+    let mut b = basis();
+    b.scale_x = 0.25;
+    assert_eq!(
+        b.to_screen(60.0, 0.0).unwrap_err().code,
+        "point_outside_window"
+    );
+    b.scale_x = 0.5;
+    b.x = i64::MAX;
+    assert_eq!(b.to_screen(1.0, 0.0).unwrap_err().code, "invalid");
+    for scale in [0.0, -1.0, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+        b.scale_x = scale;
+        assert_eq!(b.to_screen(0.0, 0.0).unwrap_err().code, "invalid");
+        b.scale_x = 1.0;
+        b.scale_y = scale;
+        assert_eq!(b.to_screen(0.0, 0.0).unwrap_err().code, "invalid");
+    }
+}
+
+#[test]
+fn checked_mapping_rejects_stale_frame_before_mapping() {
+    let b = basis();
+    assert_eq!(b.check_and_map(&live(), 3.9, 4.9), Ok((-93, 26)));
+    let mut moved = live();
+    moved.x += 1;
+    assert_eq!(
+        b.check_and_map(&moved, f64::NAN, 0.0).unwrap_err().reason,
+        "window_moved"
+    );
+    assert_eq!(
+        b.check_and_map(&live(), 100.0, 0.0).unwrap_err().code,
+        "point_outside_window"
+    );
+}
+
+#[test]
 fn plain_publish_supersedes_an_older_capture() {
     let s = SnapshotStore::new();
     let old = s.begin_capture(42, 7);
@@ -209,7 +276,8 @@ fn plain_publish_supersedes_an_older_capture() {
         .publish_capture_basis_for_session(42, 7, Payload, Some("a"), Some(1.0), Some(basis()), old)
         .is_none());
     assert_eq!(
-        s.refresh_basis_for_session(42, 7, Some("a"), 1.0, None, Some(basis()), old),
+        s.refresh_basis_for_session(42, 7, Some("a"), 1.0, None, Some(basis()), old)
+            .map(|(id, _)| id),
         None
     );
     assert_eq!(s.window_for_snapshot(42, id), Some(7));
@@ -220,7 +288,8 @@ fn plain_publish_supersedes_an_older_capture() {
     // A capture that begins after the publication still lands.
     let new = s.begin_capture(42, 7);
     assert_eq!(
-        s.refresh_basis_for_session(42, 7, Some("a"), 1.0, None, Some(basis()), new),
+        s.refresh_basis_for_session(42, 7, Some("a"), 1.0, None, Some(basis()), new)
+            .map(|(id, _)| id),
         Some(id)
     );
     assert!(s
@@ -249,7 +318,7 @@ fn plain_capture_publish_and_screenshot_refresh_supersede_older_captures() {
     assert_eq!(s.window_for_snapshot(42, id), Some(7));
 
     let t = s.begin_capture(42, 7);
-    let (id, _) = s
+    let (id, _, _) = s
         .publish_basis_for_session(42, 7, Payload, Some("a"), Some(1.0), Some(basis()), t)
         .unwrap();
     let old = s.begin_capture(42, 7);
@@ -260,7 +329,8 @@ fn plain_capture_publish_and_screenshot_refresh_supersede_older_captures() {
     // The screenshot-only read is newer than the in-flight capture, so the
     // capture's frame must not replace it.
     assert_eq!(
-        s.refresh_basis_for_session(42, 7, Some("a"), 1.0, None, Some(basis()), old),
+        s.refresh_basis_for_session(42, 7, Some("a"), 1.0, None, Some(basis()), old)
+            .map(|(id, _)| id),
         None
     );
     assert_eq!(
@@ -274,13 +344,14 @@ fn old_ticket_refresh_after_a_newer_publication_changes_nothing() {
     let s = SnapshotStore::new();
     let old = s.begin_capture(42, 7);
     let newer = s.begin_capture(42, 7);
-    let (id, _) = s
+    let (id, _, _) = s
         .publish_basis_for_session(42, 7, Payload, Some("a"), Some(1.0), Some(basis()), newer)
         .unwrap();
     let mut older = basis();
     older.x += 50;
     assert_eq!(
-        s.refresh_basis_for_session(42, 7, Some("a"), 1.0, None, Some(older), old),
+        s.refresh_basis_for_session(42, 7, Some("a"), 1.0, None, Some(older), old)
+            .map(|(id, _)| id),
         None
     );
     assert_eq!(
@@ -297,11 +368,13 @@ fn old_ticket_refresh_after_a_newer_publication_changes_nothing() {
         .unwrap();
     let new = s.begin_capture(42, 7);
     assert_eq!(
-        s.refresh_basis_for_session(42, 7, Some("a"), 1.0, None, Some(basis()), old),
+        s.refresh_basis_for_session(42, 7, Some("a"), 1.0, None, Some(basis()), old)
+            .map(|(id, _)| id),
         None
     );
     assert_eq!(
-        s.refresh_basis_for_session(42, 7, Some("a"), 1.0, None, Some(basis()), new),
+        s.refresh_basis_for_session(42, 7, Some("a"), 1.0, None, Some(basis()), new)
+            .map(|(id, _)| id),
         Some(id)
     );
 }

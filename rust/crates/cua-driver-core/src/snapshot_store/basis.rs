@@ -89,7 +89,7 @@ impl<S: SnapshotPayload> SnapshotStore<S> {
         screenshot_scale: Option<f64>,
         basis: Option<WindowBasis>,
         ticket: u64,
-    ) -> Option<(u32, Vec<u32>)> {
+    ) -> Option<(u32, Vec<u32>, Option<WindowBasis>)> {
         self.publish_snapshot(
             pid,
             window_id,
@@ -111,7 +111,7 @@ impl<S: SnapshotPayload> SnapshotStore<S> {
         screenshot_scale: Option<f64>,
         basis: Option<WindowBasis>,
         ticket: u64,
-    ) -> Option<(u32, Vec<u32>)> {
+    ) -> Option<(u32, Vec<u32>, Option<WindowBasis>)> {
         self.publish_snapshot(
             pid,
             window_id,
@@ -133,7 +133,7 @@ impl<S: SnapshotPayload> SnapshotStore<S> {
         window_size: Option<(f64, f64)>,
         basis: Option<WindowBasis>,
         ticket: u64,
-    ) -> Option<u32> {
+    ) -> Option<(u32, Option<WindowBasis>)> {
         let mut inner = self.inner.lock().unwrap();
         if session.is_some_and(crate::session::is_session_ended)
             || basis
@@ -159,8 +159,9 @@ impl<S: SnapshotPayload> SnapshotStore<S> {
         snapshot.zoom = None;
         snapshot.ticket_floor = ticket;
         let id = snapshot.id;
+        let stored = snapshot.basis.clone();
         inner.apply_ticket(pid, window_id, ticket);
-        Some(id)
+        Some((id, stored))
     }
 
     pub fn basis_for(
@@ -203,7 +204,7 @@ impl<S: SnapshotPayload> SnapshotStore<S> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    struct Payload;
+    pub(super) struct Payload;
     impl SnapshotPayload for Payload {
         type Element = ();
         fn len(&self) -> usize {
@@ -213,7 +214,7 @@ mod tests {
             None
         }
     }
-    fn frame() -> WindowBasis {
+    pub(super) fn frame() -> WindowBasis {
         WindowBasis {
             window_id: 2,
             pid: 1,
@@ -229,6 +230,42 @@ mod tests {
             display_scale: None,
             captured_at_ms: 0,
         }
+    }
+    #[test]
+    fn publication_returns_the_stored_frame_and_rejects_stale_tickets() {
+        let store = SnapshotStore::new();
+        let stale = store.begin_capture(1, 2);
+        let ticket = store.begin_capture(1, 2);
+        let (id, _, stored) = store
+            .publish_basis_for_session(1, 2, Payload, None, Some(1.0), Some(frame()), ticket)
+            .unwrap();
+        assert_eq!(stored.unwrap().snapshot_id, format_basis_id(id, 0));
+        assert!(store
+            .refresh_basis_for_session(1, 2, None, 1.0, None, None, stale)
+            .is_none());
+        let ticket = store.begin_capture(1, 2);
+        let (_, stored) = store
+            .refresh_basis_for_session(1, 2, None, 1.0, None, Some(frame()), ticket)
+            .unwrap();
+        assert_eq!(stored.unwrap().snapshot_id, format_basis_id(id, 0));
+        let ticket = store.begin_capture(1, 3);
+        let (_, _, stored) = store
+            .publish_capture_basis_for_session(1, 3, Payload, None, None, None, ticket)
+            .unwrap();
+        assert!(stored.is_none());
+        let ticket = store.begin_capture(1, 2);
+        let (id, _, stored) = store
+            .publish_capture_basis_for_session(
+                1,
+                2,
+                Payload,
+                None,
+                Some(1.0),
+                Some(frame()),
+                ticket,
+            )
+            .unwrap();
+        assert_eq!(stored.unwrap().snapshot_id, format_basis_id(id, 0));
     }
     #[test]
     fn generation_overflow_permanently_clears_basis() {
@@ -272,7 +309,7 @@ mod tests {
         assert!(store
             .publish_basis_for_session(1, 2, Payload, None, Some(1.0), Some(frame()), abandoned)
             .is_none());
-        let (id, _) = store
+        let (id, _, _) = store
             .publish_basis_for_session(1, 2, Payload, None, Some(1.0), Some(frame()), fresh)
             .unwrap();
 
@@ -295,5 +332,204 @@ mod tests {
             .publish_basis_for_session(1, 2, Payload, None, Some(1.0), Some(frame()), t)
             .is_none());
         assert!(store.inner.lock().unwrap().tickets.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod review_regressions {
+    use super::tests::{frame, Payload};
+    use super::*;
+
+    #[test]
+    fn legacy_publications_fence_older_captures() {
+        for kind in 0..4 {
+            let store = SnapshotStore::new();
+            store
+                .publish_for_session(1, 2, Payload, None, Some(1.0))
+                .unwrap();
+            let old = store.begin_capture(1, 2);
+            let id = match kind {
+                0 => {
+                    store
+                        .publish_for_session(1, 2, Payload, None, Some(2.0))
+                        .unwrap()
+                        .0
+                }
+                1 => {
+                    store
+                        .publish_sized_for_session(
+                            1,
+                            2,
+                            Payload,
+                            None,
+                            Some(2.0),
+                            Some((10.0, 10.0)),
+                        )
+                        .unwrap()
+                        .0
+                }
+                2 => {
+                    store
+                        .publish_capture_for_session(1, 2, Payload, None, Some(2.0))
+                        .unwrap()
+                        .0
+                }
+                _ => store
+                    .refresh_screenshot_for_session(1, 2, None, 2.0, None)
+                    .unwrap(),
+            };
+            assert!(
+                store
+                    .publish_basis_for_session(1, 2, Payload, None, Some(3.0), Some(frame()), old)
+                    .is_none(),
+                "kind {kind}"
+            );
+            assert!(
+                store
+                    .refresh_basis_for_session(1, 2, None, 3.0, None, Some(frame()), old)
+                    .is_none(),
+                "kind {kind}"
+            );
+            assert_eq!(
+                store
+                    .screenshot_context(1, Some(2), None)
+                    .unwrap()
+                    .snapshot_id,
+                id
+            );
+            assert_eq!(
+                store.screenshot_context(1, Some(2), None).unwrap().scale,
+                2.0
+            );
+        }
+    }
+
+    #[test]
+    fn retired_tickets_cannot_reappear_after_new_capture() {
+        for kind in 0..3 {
+            let store = SnapshotStore::new();
+            store
+                .publish_for_session(1, 2, Payload, Some("review-session"), Some(1.0))
+                .unwrap();
+            let old = store.begin_capture(1, 2);
+            match kind {
+                0 => {
+                    store.remove(1, 2);
+                }
+                1 => {
+                    store.clear();
+                }
+                _ => {
+                    store.retire_session_screenshots("review-session");
+                }
+            }
+            assert!(!store.inner.lock().unwrap().tickets.contains_key(&(1, 2)));
+            let fresh = store.begin_capture(1, 2);
+            assert_ne!(old, fresh);
+            assert!(store
+                .publish_basis_for_session(1, 2, Payload, None, Some(1.0), Some(frame()), old)
+                .is_none());
+            assert!(store
+                .publish_basis_for_session(1, 2, Payload, None, Some(1.0), Some(frame()), fresh)
+                .is_some());
+        }
+    }
+}
+
+#[cfg(test)]
+mod boundary_tests {
+    use super::tests::{frame, Payload};
+    use super::*;
+
+    #[test]
+    fn invalid_and_out_of_order_tickets_and_wrong_basis_are_rejected() {
+        let store = SnapshotStore::new();
+        let first = store.begin_capture(1, 2);
+        let second = store.begin_capture(1, 2);
+        for ticket in [0, second + 1] {
+            assert!(store
+                .publish_basis_for_session(1, 2, Payload, None, Some(1.0), Some(frame()), ticket)
+                .is_none());
+        }
+        for wrong_pid in [true, false] {
+            let mut wrong = frame();
+            if wrong_pid {
+                wrong.pid = 3;
+            } else {
+                wrong.window_id = 3;
+            }
+            assert!(store
+                .publish_basis_for_session(
+                    1,
+                    2,
+                    Payload,
+                    None,
+                    Some(1.0),
+                    Some(wrong.clone()),
+                    first
+                )
+                .is_none());
+            assert!(store
+                .publish_capture_basis_for_session(
+                    1,
+                    2,
+                    Payload,
+                    None,
+                    Some(1.0),
+                    Some(wrong),
+                    first
+                )
+                .is_none());
+        }
+        let (id, _, _) = store
+            .publish_basis_for_session(1, 2, Payload, None, Some(1.0), Some(frame()), first)
+            .unwrap();
+        for ticket in [0, second + 1] {
+            assert!(store
+                .refresh_basis_for_session(1, 2, None, 2.0, None, Some(frame()), ticket)
+                .is_none());
+        }
+        for wrong_pid in [true, false] {
+            let mut wrong = frame();
+            if wrong_pid {
+                wrong.pid = 3;
+            } else {
+                wrong.window_id = 3;
+            }
+            assert!(store
+                .refresh_basis_for_session(1, 2, None, 2.0, None, Some(wrong), second)
+                .is_none());
+        }
+        let third = store.begin_capture(1, 2);
+        assert!(store
+            .refresh_basis_for_session(1, 2, None, 3.0, None, Some(frame()), third)
+            .is_some());
+        assert!(store
+            .refresh_basis_for_session(1, 2, None, 2.0, None, Some(frame()), second)
+            .is_none());
+        let current = store.screenshot_context(1, Some(2), None).unwrap();
+        assert_eq!((current.snapshot_id, current.scale), (id, 3.0));
+    }
+
+    #[test]
+    fn evicted_window_loses_its_ticket_state() {
+        let store = SnapshotStore::new();
+        store
+            .publish_for_session(1, 2, Payload, None, Some(1.0))
+            .unwrap();
+        let old = store.begin_capture(1, 2);
+        for window in 3..3 + crate::element_token::LRU_CAP_PER_PID as u64 {
+            store
+                .publish_for_session(1, window, Payload, None, Some(1.0))
+                .unwrap();
+        }
+        assert!(!store.inner.lock().unwrap().tickets.contains_key(&(1, 2)));
+        let fresh = store.begin_capture(1, 2);
+        assert!(store
+            .publish_basis_for_session(1, 2, Payload, None, Some(1.0), Some(frame()), old)
+            .is_none());
+        assert!(store
+            .publish_basis_for_session(1, 2, Payload, None, Some(1.0), Some(frame()), fresh)
+            .is_some());
     }
 }
