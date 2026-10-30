@@ -1578,14 +1578,24 @@ async fn run_step(
                 Ok(resolved) => {
                     let object = args.as_object_mut().expect("object");
                     object.insert("pid".into(), json!(resolved.pid));
-                    if accepts(registry, tool, "window_id") {
-                        object
-                            .entry("window_id")
-                            .or_insert_with(|| json!(resolved.window_id));
+                    let basis_routes_window =
+                        matches!(tool, "click" | "double_click" | "right_click")
+                            && accepts(registry, tool, "snapshot_id")
+                            && object.get("snapshot_id").is_some_and(Value::is_string)
+                            && window_spec.window_id.is_none()
+                            && window_spec.title.is_none();
+                    if basis_routes_window {
+                        report["target"] = json!({ "pid": resolved.pid });
+                    } else {
+                        if accepts(registry, tool, "window_id") {
+                            object
+                                .entry("window_id")
+                                .or_insert_with(|| json!(resolved.window_id));
+                        }
+                        report["target"] = json!({ "window": resolved.to_json() });
+                        gate.confirm_window(resolved.clone());
+                        *last_window = Some(resolved);
                     }
-                    report["target"] = json!({ "window": resolved.to_json() });
-                    gate.confirm_window(resolved.clone());
-                    *last_window = Some(resolved);
                 }
                 Err(miss) => {
                     return failure(index, label, Phase::Find, miss.code, miss.message, report)

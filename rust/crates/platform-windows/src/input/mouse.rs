@@ -901,6 +901,9 @@ fn send_click_guarded_impl(
     let planned = 1 + sink.downs.len() + sink.count * 3;
     let mut result = run_guarded(&mut sink, planned, guard);
     if let GuardedResult::Sent { outcome } = &mut result {
+        crate::input::guarded_dispatch::discount_unmoved_pointer(outcome, sink.cursor_moved);
+    }
+    if let GuardedResult::Sent { outcome } = &mut result {
         if outcome.effect == DispatchEffect::Unverifiable {
             let errors = sink.finish(planned);
             if errors.iter().any(|entry| entry.get("error").is_some()) {
@@ -1016,7 +1019,7 @@ impl InputSink for ForegroundClick {
             return Ok(());
         }
         if self.batch_failed {
-            return Err("SendInput inserted fewer modifier or mouse events than expected for the foreground click".into());
+            return Err("SendInput inserted fewer modifier or mouse events than expected for the foreground click.".into());
         }
         let n = self.downs.len();
         let events = if index < n {
@@ -1035,7 +1038,7 @@ impl InputSink for ForegroundClick {
         let sent = unsafe { crate::input::delivery::send_input(&events) } as usize;
         self.batch_failed = sent < events.len();
         if sent == 0 {
-            return Err("SendInput inserted fewer modifier or mouse events than expected for the foreground click".into());
+            return Err("SendInput inserted fewer modifier or mouse events than expected for the foreground click.".into());
         }
         self.batch_remaining = sent - 1;
         Ok(())
@@ -1051,6 +1054,9 @@ impl ForegroundClick {
         let input_sent = sent.saturating_sub(1);
         let mods = input_sent.min(self.downs.len());
         let mouse_sent = input_sent.saturating_sub(self.downs.len());
+        // The pointer may have moved through event 0 or through the absolute
+        // move record of any mouse batch that was inserted.
+        let pointer_moved = self.cursor_moved || mouse_sent > 0;
         if mouse_sent % 3 == 2 {
             // SAFETY: one initialised INPUT record.
             if unsafe { crate::input::delivery::send_input(&[self.up_input]) } != 1 {
@@ -1105,11 +1111,11 @@ impl ForegroundClick {
                         SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE,
                     );
                 }
-                if self.prev_cursor_valid && self.cursor_moved {
+                if self.prev_cursor_valid && pointer_moved {
                     let _ = SetCursorPos(self.prev_cursor.x, self.prev_cursor.y);
                 }
             } else if self.prev_cursor_valid
-                && self.cursor_moved
+                && pointer_moved
                 && (self.mode == ClickMode::Window || input_sent == 0)
             {
                 let mut current = POINT::default();

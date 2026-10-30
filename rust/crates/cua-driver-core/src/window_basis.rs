@@ -136,7 +136,7 @@ pub fn basis_refusal(
     basis: Option<&WindowBasis>,
     live: Option<&LiveFrame>,
 ) -> ToolResult {
-    ToolResult::error(format!("{code}: {reason}")).with_structured(json!({"code":code,"reason":reason,"effect":"refused","nothing_sent":true,"window_basis":basis.map(WindowBasis::to_json),"live_frame":live.map(LiveFrame::to_json)}))
+    ToolResult::error(format!("{code}: {reason}")).with_structured(json!({"code":code,"reason":reason,"effect":"refused","nothing_sent":true,"prepared_side_effects":[],"window_basis":basis.map(WindowBasis::to_json),"live_frame":live.map(LiveFrame::to_json)}))
 }
 pub fn format_basis_id(snapshot_id: u32, generation: u32) -> String {
     let id = format_snapshot_id(snapshot_id);

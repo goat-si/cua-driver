@@ -48,6 +48,7 @@ mod keycodes;
 // pass that lives in this commit).
 pub mod lparam;
 
+mod basis_click;
 mod basis_decision;
 #[cfg(test)]
 mod basis_decision_tests;
