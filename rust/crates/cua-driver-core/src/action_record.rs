@@ -494,7 +494,7 @@ impl ActionExecutionRecord {
             .get("path")
             .or_else(|| structured.get("route"))
             .and_then(serde_json::Value::as_str);
-        let transport = transport_from_legacy(tool_name, args, raw_path)?;
+        let transport = transport_from_legacy(tool_name, args, structured, raw_path)?;
         let effect = legacy_effect(structured);
         let actual_delivery =
             actual_delivery_from_legacy(tool_name, args, structured, raw_path, transport, effect);
@@ -504,6 +504,11 @@ impl ActionExecutionRecord {
         record.delivered_count = structured
             .get("delivered_chars")
             .or_else(|| structured.pointer("/refusal/detail/delivered_chars"))
+            .or_else(|| {
+                (raw_path == Some("pixel_basis"))
+                    .then(|| structured.get("events_sent"))
+                    .flatten()
+            })
             .and_then(serde_json::Value::as_u64)
             .and_then(|count| u32::try_from(count).ok());
 
@@ -761,10 +766,20 @@ fn legacy_has_publishable_readback(tool_name: &str, structured: &serde_json::Val
 fn transport_from_legacy(
     tool_name: &str,
     args: &serde_json::Value,
+    structured: &serde_json::Value,
     raw_path: Option<&str>,
 ) -> Option<ActionTransport> {
     let path = raw_path.unwrap_or("");
     let transport = match path {
+        "pixel_basis" if cfg!(target_os = "windows") => match structured
+            .get("delivery_mode")
+            .and_then(serde_json::Value::as_str)
+        {
+            Some("foreground") => ActionTransport::WindowsSendInput,
+            Some("background") => ActionTransport::WindowsPostMessage,
+            _ => return None,
+        },
+        "pixel_basis" => return None,
         "ax" | "ax_fg" => {
             if cfg!(target_os = "macos") {
                 if matches!(tool_name, "type_text" | "type_text_chars" | "set_value") {

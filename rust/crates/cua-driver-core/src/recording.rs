@@ -1406,7 +1406,9 @@ fn write_turn_with_after(
         "t_ms_from_session_start": now.saturating_sub(session_start_ms),
         "t_start_ms_from_session_start": start_ms.saturating_sub(session_start_ms),
     });
-    if let Some((cx, cy)) = click_point {
+    if let Some((cx, cy)) =
+        click_point.filter(|_| !(refused_before_dispatch && args.get("snapshot_id").is_some()))
+    {
         payload["click_point"] = serde_json::json!({"x": cx, "y": cy});
     }
     if click_source.is_some() || supplemental.failure.is_some() {
