@@ -243,6 +243,7 @@ fn hand_back_label(hand_back: HandBack) -> &'static str {
     match hand_back {
         HandBack::NotMoved => "not_moved",
         HandBack::Restored => "restored",
+        HandBack::Deferred => "deferred",
         HandBack::NoTarget => "no_target",
         HandBack::NotConfirmed => "not_confirmed",
     }
