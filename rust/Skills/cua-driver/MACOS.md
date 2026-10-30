@@ -99,7 +99,18 @@ for a background app it refuses with `background_unavailable`, effect
 One exception: a disabled Save (the ⌘S item) of a document window is saved
 through the app's scripting interface instead, still in the background, and the
 result says so; TextEdit disables Save whenever it is behind the user's window.
-A Save is verified on disk. A background `hotkey` whose combo is a menu item's
+For a window-only native `press_key` chord routed through a menu item, including
+when the app is frontmost, the item can read disabled even when the command is
+usable. For commands other than Save, the driver first tries `AXPress` after
+confirming the exact focused and main window. A successful
+press is reported as unverified; an ambiguous AX error may mean the command
+ran, so inspect the window before retrying. If a proven no-dispatch error is
+followed by a disabled read and the chord is sent as keys, the result says
+`effect: "suspected_noop"`: those keys may have done nothing. Validation keys
+and the requested chord are reported separately.
+Save uses the existing menu route, which checks the document on disk after an
+AX press when its path is known. Validation can instead refuse a disabled Save.
+A background `hotkey` whose combo is a menu item's
 key equivalent (⌘S, ⌘W, ⌘C, ...) in a native app takes the same route, because
 background key events never reach an app's menus; no keys are sent. macOS asks
 the user once to allow Cua Driver to control the app (Automation) the first
@@ -994,7 +1005,7 @@ above (`invoke_menu` with a path such as `["Go", "Downloads"]`).
 
 ### LibreOffice, Numbers and other editors in the background
 
-With `window_id`, `type_text`, `press_key` and `hotkey` post keys to that exact window: the driver makes it the app's key window through in-app key-window records (no raise, no activation, real pointer untouched), confirms that the app's focused window and focused element are in that window, posts, and hands key back. This also covers another window or dialog of the app holding focus, and a LibreOffice that was never activated. Which app is frontmost does not change this: keys and chords, Command chords such as cmd+z, cmd+w and cmd+q included, reach a target app that is already frontmost (an app the agent just opened too). The window is already key then and nothing is posted to move focus; when another window of the app is key, the same records move key to the exact window and hand it back afterwards. When the switch cannot be confirmed the call is refused with `window_not_key` and no key is sent. A second window of the same app (Find & Replace, another document) is no longer `same_pid_keyboard_ambiguity`. A command key whose menu route is refused (item disabled while the app is in the background) falls through to key events in that window. Recipe: pass `window_id` on every call; go to the cell with Name Box navigation (`type_text` `A1\n`), type with `\n` and `\t`, read the cell back; run commands (Paste Special, Format, Save) with `invoke_menu({pid, window_id, path})` rather than clicking the menu bar. A `background_unavailable` refusal here means use `get_window_state` and act by element, not stop.
+With `window_id`, `type_text`, `press_key` and `hotkey` target that exact window: the driver makes it the app's key window through in-app key-window records (no raise, no activation, real pointer untouched), confirms focus, and hands key back. This also covers another window or dialog of the app holding focus, and a LibreOffice that was never activated. An already-key window needs no focus move; when another window of the app is key, the records move key to the exact window and hand it back afterwards. When the switch cannot be confirmed the call is refused with `window_not_key`. For a window-only native Command chord with a matching menu item, `press_key` uses the menu route even when the app is frontmost; a disabled-item key fallback reports `suspected_noop`. Recipe: pass `window_id` on every call; go to the cell with Name Box navigation (`type_text` `A1\n`), type with `\n` and `\t`, read the cell back; run commands (Paste Special, Format, Save) with `invoke_menu({pid, window_id, path})` rather than clicking the menu bar. A `background_unavailable` refusal here means use `get_window_state` and act by element, not stop.
 
 ### Preview: export before resizing
 

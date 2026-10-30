@@ -773,14 +773,14 @@ impl Tool for PressKeyTool {
             );
         }
 
-        // ── Menu key equivalents in a background app ──
+        // ── Menu key equivalents in a native app ──
         // Background key events reach a window's views but never its app's
         // menu key equivalents: a background cmd+a to TextEdit was reported
         // "Pressed" and selected nothing. After the exact-target gate, the key
         // scope and the focus-conflict check above, and under the same
         // per-PID lease, a Command combo that is a menu item's key equivalent
         // runs that item through accessibility, or is refused with no keys
-        // sent, as hotkey does. Browsers, Electron, a frontmost app and the
+        // sent, as hotkey does. Browsers, Electron and the
         // px form keep the key route.
         if !fg && px.is_none() && pre_focus_ptr.is_none() {
             if let (Some(wid), Some(lease), Some(combo)) = (
@@ -793,7 +793,7 @@ impl Tool for PressKeyTool {
                     let native = !super::type_text::is_browser_pid(pid)
                         && !crate::browser::electron_js::ElectronJs::is_electron(pid);
                     let in_front = app_is_frontmost(pid, wid);
-                    if native && !in_front {
+                    if super::chord_disabled::lookup_native_menu(native, in_front) {
                         super::menu_equivalent::find(pid, &lookup)
                     } else {
                         None
@@ -1662,9 +1662,9 @@ fn keys_posted_step(
     match post {
         crate::input::keyboard::ChordPost::Posted => ChordStep::KeysPosted {
             text: format!(
-                "{path} reads disabled for window {wid} from the background, so with the window \
-                 held as the app's key window (the app was not activated) the chord was sent to \
-                 it as keys. Its effect is not read back: check the window.{notes}"
+                "{path} reads disabled for window {wid}, so with the window \
+                 held as the app's key window the chord was sent to it as keys. This is \
+                 likely a no-op; check the window.{notes}"
             ),
             validation,
         },
@@ -1754,7 +1754,7 @@ fn keys_step(
         Err(KeysHeld::GateRefused(reason)) => ChordStep::Refused {
             code: "background_unavailable",
             text: format!(
-                "press_key: {reason} The requested chord was not sent and no menu action was \
+                "press_key: {path}: {reason} The requested chord was not sent and no menu action was \
                  sent.{notes}"
             ),
             validation,
@@ -1762,7 +1762,7 @@ fn keys_step(
         Err(KeysHeld::NoLongerTargeted) => ChordStep::Refused {
             code: "window_not_key",
             text: format!(
-                "press_key: before the keys, the window stopped being the app's focused and \
+                "press_key: {path}: before the keys, the window stopped being the app's focused and \
                  main window. The requested chord was not sent and no menu action was sent.{notes}"
             ),
             validation,
@@ -1885,12 +1885,41 @@ fn chord_in_scope(pid: i32, wid: u32, combo: super::menu_equivalent::Combo) -> C
         );
     };
     let element = item.as_ptr() as AXUIElementRef;
-    if menu_item_is_save(element) {
+    let initial_enabled = unsafe { copy_bool_attr(element, "AXEnabled") };
+    // Recheck the binding immediately before attempting the action. An
+    // enablement read alone does not establish whether AXPress will work.
+    if !menu_bound_to(pid, wid) {
+        return chord_refusal(
+            "window_not_key",
+            "before the press, the window stopped being the app's focused and main window.",
+            scope,
+            ValidationPost::default(),
+        );
+    }
+    let Some(err) = super::chord_disabled::press_before_save(menu_item_is_save(element), || {
+        super::chord_disabled::try_press(initial_enabled, || unsafe {
+            crate::ax::bindings::perform_action(element, "AXPress")
+        })
+    }) else {
         return ChordStep::Save {
             scope,
             path: found.path,
         };
+    };
+    if err == crate::ax::bindings::kAXErrorSuccess
+        || !super::click::perform_error_proves_nothing_was_sent(err)
+    {
+        return chord_press_outcome(
+            scope,
+            found.path.join(" > "),
+            wid,
+            "AXPress",
+            err,
+            ValidationPost::default(),
+            None,
+        );
     }
+    let initial_error = Some(err);
     let enabled = || unsafe { copy_bool_attr(element, "AXEnabled") } == Some(true);
     let mut validation = ValidationPost::default();
     if !enabled() {
@@ -1906,14 +1935,20 @@ fn chord_in_scope(pid: i32, wid: u32, combo: super::menu_equivalent::Combo) -> C
                     return ChordStep::NeedsKeys {
                         scope,
                         validation,
-                        path: found.path.join(" > "),
+                        path: match initial_error {
+                            Some(err) => format!(
+                                "{} (AXPress returned AX error {err}; no menu action was sent)",
+                                found.path.join(" > ")
+                            ),
+                            None => found.path.join(" > "),
+                        },
                     }
                 }
                 NotEnabledRoute::Unreadable => {
                     return chord_refusal(
                         "background_unavailable",
                         &format!(
-                            "{}'s enablement could not be read for this window.",
+                            "{}'s enablement could not be read for this window. AXPress returned AX error {err} and sent no menu action.",
                             found.path.join(" > ")
                         ),
                         scope,
@@ -1931,7 +1966,7 @@ fn chord_in_scope(pid: i32, wid: u32, combo: super::menu_equivalent::Combo) -> C
     else {
         return chord_refusal(
             "background_unavailable",
-            "the menu item has no press action.",
+            &format!("the menu item has no press action after AXPress returned AX error {err}; that attempt sent no menu action."),
             scope,
             validation,
         );
@@ -1946,10 +1981,34 @@ fn chord_in_scope(pid: i32, wid: u32, combo: super::menu_equivalent::Combo) -> C
         );
     }
     let err = unsafe { crate::ax::bindings::perform_action(element, action) };
+    chord_press_outcome(
+        scope,
+        found.path.join(" > "),
+        wid,
+        action,
+        err,
+        validation,
+        initial_error,
+    )
+}
+
+fn chord_press_outcome(
+    scope: crate::input::skylight::WindowKeyScope,
+    path: String,
+    wid: u32,
+    action: &str,
+    err: crate::ax::bindings::AXError,
+    validation: crate::input::skylight::ValidationPost,
+    initial_error: Option<crate::ax::bindings::AXError>,
+) -> ChordStep {
     let entry = scope.entry();
     let hand_back = scope.finish();
-    let path = found.path.join(" > ");
     let mut notes = vec![
+        initial_error
+            .map(|err| {
+                format!("An earlier AXPress returned AX error {err}; no menu action was sent.")
+            })
+            .unwrap_or_default(),
         validation.disclosure(),
         crate::input::skylight::scope_disclosure(entry, Some(hand_back)),
     ];
@@ -1962,9 +2021,8 @@ fn chord_in_scope(pid: i32, wid: u32, combo: super::menu_equivalent::Combo) -> C
     if err == crate::ax::bindings::kAXErrorSuccess {
         ChordStep::Pressed {
             text: format!(
-                "Pressed {path} through accessibility for window {wid}, with the app in the \
-                 background (not activated); the requested chord was not sent as keys. Its \
-                 effect is not read back: check the window.{notes}"
+                "Pressed {path} through accessibility for window {wid}; the requested chord was \
+                 not sent as keys. Its effect is not read back: check the window.{notes}"
             ),
             may_have_run: false,
             validation,
@@ -2054,19 +2112,19 @@ fn chord_result(step: ChordStep) -> ToolResult {
             .with_structured(serde_json::json!({
                 "path": "keys_under_scope",
                 "verified": false,
-                "effect": "unverifiable",
+                "effect": "suspected_noop",
                 "keys_sent": true,
                 "validation_keys_sent": validation.key_attempts > 0,
             }))
             .with_action_record(
                 ActionExecutionRecord::builder(
-                    ActionEffect::Unverifiable,
+                    ActionEffect::SuspectedNoop,
                     ActionTransport::MacosCgEventPid,
                     RequestedDelivery::Background,
                 )
                 .actual_delivery(ActualDelivery::Background)
                 .build()
-                .expect("an unverifiable key record is valid"),
+                .expect("a suspected no-op key record is valid"),
             ),
     }
 }
@@ -2209,7 +2267,7 @@ mod tests {
     }
 
     #[test]
-    fn a_chord_sent_as_keys_is_unverifiable_and_says_keys_were_sent() {
+    fn a_disabled_chord_sent_as_keys_is_a_suspected_noop() {
         let validation = crate::input::skylight::ValidationPost {
             records: 2,
             keys: 2,
@@ -2227,11 +2285,17 @@ mod tests {
         let result = chord_result(step);
         assert_ne!(result.is_error, Some(true));
         let structured = result.structured_content.clone().expect("structured");
-        assert_eq!(structured["effect"], "unverifiable");
+        assert_eq!(structured["effect"], "suspected_noop");
         assert_eq!(structured["keys_sent"], true);
+        let message = result
+            .content
+            .iter()
+            .map(|v| format!("{v:?}"))
+            .collect::<String>();
+        assert!(message.contains("likely a no-op"), "{message}");
         assert_eq!(structured["path"], "keys_under_scope");
         let record = result.action_record.expect("record");
-        assert!(matches!(record.effect, ActionEffect::Unverifiable));
+        assert!(matches!(record.effect, ActionEffect::SuspectedNoop));
     }
 
     /// The chord fallback posts only when the keyboard gate passed and the
