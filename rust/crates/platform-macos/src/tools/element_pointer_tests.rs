@@ -606,6 +606,48 @@ async fn an_unconfirmed_background_activation_is_reported_as_uncertain() {
     assert!(!text.contains("had already been made active"), "{text}");
 }
 
+#[test]
+fn only_a_pending_key_hand_back_is_a_clean_prologue_refusal() {
+    let code = |result: ToolResult| {
+        let structured = result.structured_content.unwrap();
+        (
+            structured["code"].as_str().unwrap().to_owned(),
+            structured["effect"].as_str().unwrap().to_owned(),
+            structured.get("activation").cloned(),
+        )
+    };
+    // No attempt: a clean refusal.
+    let refused = prologue_outcome(1, WINDOW, Ok(None), || panic!("not read")).unwrap_err();
+    assert_eq!(
+        code(refused),
+        ("key_restore_pending".into(), "refused".into(), None)
+    );
+    // An attempt that did not activate, with the sticky invalid-connection
+    // flag set by an earlier call: unverifiable, never "nothing sent".
+    let stale = prologue_outcome(1, WINDOW, Ok(Some(false)), || true).unwrap_err();
+    assert_eq!(
+        code(stale),
+        (
+            "windowserver_connection_invalid".into(),
+            "unverifiable".into(),
+            Some(json!("background_uncertain"))
+        )
+    );
+    // The activation task failed after it may have attempted the record.
+    let failed = prologue_outcome(1, WINDOW, Err("panicked".into()), || false).unwrap_err();
+    assert_eq!(
+        code(failed),
+        (
+            "background_unavailable".into(),
+            "unverifiable".into(),
+            Some(json!("background_uncertain"))
+        )
+    );
+    // Otherwise the gesture goes on, certain or uncertain.
+    assert!(prologue_outcome(1, WINDOW, Ok(Some(true)), || true).unwrap());
+    assert!(!prologue_outcome(1, WINDOW, Ok(Some(false)), || false).unwrap());
+}
+
 #[tokio::test]
 async fn a_refused_pointer_prologue_sends_nothing() {
     let pid = 1_000_107;

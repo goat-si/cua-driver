@@ -126,6 +126,55 @@ pub(super) trait ElementTarget: Send + Sync {
     async fn restore_after_pointer(&self, prior_front: Option<i32>, prologue: PointerPrologue);
 }
 
+/// Whether the background prologue may go on, from its activation attempt:
+/// Ok(None) when a pending key hand-back stopped it before any attempt,
+/// Ok(Some(activated)) after an attempt, Err when its task failed.
+///
+/// Only the hand-back case proves nothing was sent; it is the one clean
+/// refusal. An attempt that did not activate is uncertain, since part of the
+/// focus record may have reached the window server: with the WindowServer
+/// connection marked invalid (a process-wide flag that a previous call may
+/// have set) the call stops as unverifiable, otherwise it goes on as an
+/// uncertain activation. A failed task stops as unverifiable too.
+pub(super) fn prologue_outcome(
+    pid: i32,
+    window_id: u32,
+    attempt: Result<Option<bool>, String>,
+    connection_invalid: impl FnOnce() -> bool,
+) -> Result<bool, ToolResult> {
+    let uncertain = |code: &str, reason: String| {
+        ToolResult::error(format!(
+            "click: {reason}. No click was sent.{} Read the window again before retrying.",
+            Activation::BackgroundUncertain.note()
+        ))
+        .with_structured(json!({
+            "code": code,
+            "effect": "unverifiable",
+            "clicks_posted": 0,
+            "activation": Activation::BackgroundUncertain.label(),
+            "pid": pid,
+            "window_id": window_id,
+        }))
+    };
+    match attempt {
+        Ok(None) => Err(super::key_restore_pending_refusal(
+            "click",
+            Some(pid),
+            Some(window_id),
+        )),
+        Ok(Some(true)) => Ok(true),
+        Ok(Some(false)) if connection_invalid() => Err(uncertain(
+            "windowserver_connection_invalid",
+            "The WindowServer connection is marked invalid, so the clicks were not sent".to_owned(),
+        )),
+        Ok(Some(false)) => Ok(false),
+        Err(error) => Err(uncertain(
+            "background_unavailable",
+            format!("The background activation task failed ({error})"),
+        )),
+    }
+}
+
 /// What the background prologue armed; held until focus is restored.
 pub(super) struct PointerPrologue {
     pub(super) activated: bool,
@@ -688,7 +737,13 @@ pub(super) async fn click_element(state: &ToolState, request: ElementClick) -> T
             }
             match action_target.background_pointer_prologue(prior_front).await {
                 Ok(prologue) => Some(prologue),
-                Err(refusal) => return Err(refusal),
+                Err(mut refusal) => {
+                    if let Some(structured) = refusal.structured_content.as_mut() {
+                        structured["count"] = json!(count);
+                        structured["clicks_posted"] = json!(0);
+                    }
+                    return Err(refusal);
+                }
             }
         } else {
             None
@@ -929,32 +984,20 @@ impl ElementTarget for LiveTarget {
             .flatten(),
             _ => None,
         };
-        match latency::spawn_action_blocking(move || {
+        let attempt = latency::spawn_action_blocking(move || {
             crate::input::skylight::await_key_restores()
                 .then(|| crate::input::mouse::prepare_background_pixel_click(pid, wid))
         })
         .await
-        {
-            Ok(None) => Err(super::key_restore_pending_refusal(
-                "click",
-                Some(pid),
-                Some(wid),
-            )),
-            Ok(Some(activated)) => {
-                if !activated && crate::input::skylight::windowserver_connection_invalid() {
-                    return Err(super::windowserver_connection_refusal(pid, Some(wid)));
-                }
-                Ok(PointerPrologue {
-                    activated,
-                    prior_key_wid,
-                    key_focus,
-                })
-            }
-            Err(error) => Err(super::pre_dispatch_refusal(
-                "background_unavailable",
-                format!("Background click activation task failed ({error}); nothing was sent."),
-            )),
-        }
+        .map_err(|error| error.to_string());
+        let activated = prologue_outcome(pid, wid, attempt, || {
+            crate::input::skylight::windowserver_connection_invalid()
+        })?;
+        Ok(PointerPrologue {
+            activated,
+            prior_key_wid,
+            key_focus,
+        })
     }
 
     async fn restore_after_pointer(&self, prior_front: Option<i32>, prologue: PointerPrologue) {
