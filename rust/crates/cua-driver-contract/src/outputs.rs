@@ -697,10 +697,14 @@ pub enum ActionFocusRestorationReason {
 #[serde(deny_unknown_fields)]
 pub struct ActionFocusRestoration {
     pub status: ActionFocusRestorationStatus,
+    /// Present only with `status: abandoned`. Advertised as a plain string
+    /// enum (no null member): the field is omitted when absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "ActionFocusRestorationReason")]
     pub reason: Option<ActionFocusRestorationReason>,
     /// The producer reports null when the previous process was unknown.
     #[serde(deserialize_with = "deserialize_prior_pid")]
+    #[schemars(required)]
     pub prior_pid: Option<i32>,
 }
 

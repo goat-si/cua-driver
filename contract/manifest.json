@@ -238,10 +238,7 @@
             "properties": {
               "prior_pid": {
                 "format": "int32",
-                "type": [
-                  "integer",
-                  "null"
-                ]
+                "type": "integer"
               },
               "reason": {
                 "enum": [
@@ -249,13 +246,9 @@
                   "third_app",
                   "timeout",
                   "panic",
-                  "unconfirmed",
-                  null
+                  "unconfirmed"
                 ],
-                "type": [
-                  "string",
-                  "null"
-                ]
+                "type": "string"
               },
               "status": {
                 "enum": [
@@ -266,7 +259,8 @@
               }
             },
             "required": [
-              "status"
+              "status",
+              "prior_pid"
             ],
             "type": [
               "object",
@@ -848,10 +842,7 @@
             "properties": {
               "prior_pid": {
                 "format": "int32",
-                "type": [
-                  "integer",
-                  "null"
-                ]
+                "type": "integer"
               },
               "reason": {
                 "enum": [
@@ -859,13 +850,9 @@
                   "third_app",
                   "timeout",
                   "panic",
-                  "unconfirmed",
-                  null
+                  "unconfirmed"
                 ],
-                "type": [
-                  "string",
-                  "null"
-                ]
+                "type": "string"
               },
               "status": {
                 "enum": [
@@ -876,7 +863,8 @@
               }
             },
             "required": [
-              "status"
+              "status",
+              "prior_pid"
             ],
             "type": [
               "object",
@@ -2583,10 +2571,7 @@
             "properties": {
               "prior_pid": {
                 "format": "int32",
-                "type": [
-                  "integer",
-                  "null"
-                ]
+                "type": "integer"
               },
               "reason": {
                 "enum": [
@@ -2594,13 +2579,9 @@
                   "third_app",
                   "timeout",
                   "panic",
-                  "unconfirmed",
-                  null
+                  "unconfirmed"
                 ],
-                "type": [
-                  "string",
-                  "null"
-                ]
+                "type": "string"
               },
               "status": {
                 "enum": [
@@ -2611,7 +2592,8 @@
               }
             },
             "required": [
-              "status"
+              "status",
+              "prior_pid"
             ],
             "type": [
               "object",
@@ -2983,10 +2965,7 @@
             "properties": {
               "prior_pid": {
                 "format": "int32",
-                "type": [
-                  "integer",
-                  "null"
-                ]
+                "type": "integer"
               },
               "reason": {
                 "enum": [
@@ -2994,13 +2973,9 @@
                   "third_app",
                   "timeout",
                   "panic",
-                  "unconfirmed",
-                  null
+                  "unconfirmed"
                 ],
-                "type": [
-                  "string",
-                  "null"
-                ]
+                "type": "string"
               },
               "status": {
                 "enum": [
@@ -3011,7 +2986,8 @@
               }
             },
             "required": [
-              "status"
+              "status",
+              "prior_pid"
             ],
             "type": [
               "object",
@@ -3794,10 +3770,7 @@
             "properties": {
               "prior_pid": {
                 "format": "int32",
-                "type": [
-                  "integer",
-                  "null"
-                ]
+                "type": "integer"
               },
               "reason": {
                 "enum": [
@@ -3805,13 +3778,9 @@
                   "third_app",
                   "timeout",
                   "panic",
-                  "unconfirmed",
-                  null
+                  "unconfirmed"
                 ],
-                "type": [
-                  "string",
-                  "null"
-                ]
+                "type": "string"
               },
               "status": {
                 "enum": [
@@ -3822,7 +3791,8 @@
               }
             },
             "required": [
-              "status"
+              "status",
+              "prior_pid"
             ],
             "type": [
               "object",
@@ -4706,10 +4676,7 @@
             "properties": {
               "prior_pid": {
                 "format": "int32",
-                "type": [
-                  "integer",
-                  "null"
-                ]
+                "type": "integer"
               },
               "reason": {
                 "enum": [
@@ -4717,13 +4684,9 @@
                   "third_app",
                   "timeout",
                   "panic",
-                  "unconfirmed",
-                  null
+                  "unconfirmed"
                 ],
-                "type": [
-                  "string",
-                  "null"
-                ]
+                "type": "string"
               },
               "status": {
                 "enum": [
@@ -4734,7 +4697,8 @@
               }
             },
             "required": [
-              "status"
+              "status",
+              "prior_pid"
             ],
             "type": [
               "object",
@@ -5150,10 +5114,7 @@
             "properties": {
               "prior_pid": {
                 "format": "int32",
-                "type": [
-                  "integer",
-                  "null"
-                ]
+                "type": "integer"
               },
               "reason": {
                 "enum": [
@@ -5161,13 +5122,9 @@
                   "third_app",
                   "timeout",
                   "panic",
-                  "unconfirmed",
-                  null
+                  "unconfirmed"
                 ],
-                "type": [
-                  "string",
-                  "null"
-                ]
+                "type": "string"
               },
               "status": {
                 "enum": [
@@ -5178,7 +5135,8 @@
               }
             },
             "required": [
-              "status"
+              "status",
+              "prior_pid"
             ],
             "type": [
               "object",
@@ -5967,10 +5925,7 @@
             "properties": {
               "prior_pid": {
                 "format": "int32",
-                "type": [
-                  "integer",
-                  "null"
-                ]
+                "type": "integer"
               },
               "reason": {
                 "enum": [
@@ -5978,13 +5933,9 @@
                   "third_app",
                   "timeout",
                   "panic",
-                  "unconfirmed",
-                  null
+                  "unconfirmed"
                 ],
-                "type": [
-                  "string",
-                  "null"
-                ]
+                "type": "string"
               },
               "status": {
                 "enum": [
@@ -5995,7 +5946,8 @@
               }
             },
             "required": [
-              "status"
+              "status",
+              "prior_pid"
             ],
             "type": [
               "object",
@@ -6782,10 +6734,7 @@
             "properties": {
               "prior_pid": {
                 "format": "int32",
-                "type": [
-                  "integer",
-                  "null"
-                ]
+                "type": "integer"
               },
               "reason": {
                 "enum": [
@@ -6793,13 +6742,9 @@
                   "third_app",
                   "timeout",
                   "panic",
-                  "unconfirmed",
-                  null
+                  "unconfirmed"
                 ],
-                "type": [
-                  "string",
-                  "null"
-                ]
+                "type": "string"
               },
               "status": {
                 "enum": [
@@ -6810,7 +6755,8 @@
               }
             },
             "required": [
-              "status"
+              "status",
+              "prior_pid"
             ],
             "type": [
               "object",
