@@ -1406,9 +1406,7 @@ fn write_turn_with_after(
         "t_ms_from_session_start": now.saturating_sub(session_start_ms),
         "t_start_ms_from_session_start": start_ms.saturating_sub(session_start_ms),
     });
-    if let Some((cx, cy)) =
-        click_point.filter(|_| !(refused_before_dispatch && args.get("snapshot_id").is_some()))
-    {
+    if let Some((cx, cy)) = click_point {
         payload["click_point"] = serde_json::json!({"x": cx, "y": cy});
     }
     if click_source.is_some() || supplemental.failure.is_some() {
@@ -1806,7 +1804,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn basis_refusal_does_not_publish_supplemental_click_point() {
+    async fn basis_refusal_keeps_diagnostic_point_without_crosshair() {
+        setup_test_marker();
         use crate::action_record::{
             ActionEffect, ActionExecutionRecord, ActionTransport, RequestedDelivery,
         };
@@ -1829,12 +1828,15 @@ mod tests {
         let action: Value =
             serde_json::from_slice(&std::fs::read(root.path().join("action.json")).unwrap())
                 .unwrap();
-        assert!(action.get("click_point").is_none());
+        // The resolved point stays as diagnostic context; only the crosshair
+        // image, which would imply a delivered click, is suppressed.
+        assert_eq!(action["click_point"], serde_json::json!({"x":1.0,"y":0.5}));
         assert!(!root.path().join("click.png").exists());
     }
 
     #[tokio::test]
     async fn basis_sent_keeps_supplemental_click_point() {
+        setup_test_marker();
         use crate::action_record::{
             ActionEffect, ActionExecutionRecord, ActionTransport, ActualDelivery, RequestedDelivery,
         };
@@ -1859,6 +1861,7 @@ mod tests {
             serde_json::from_slice(&std::fs::read(root.path().join("action.json")).unwrap())
                 .unwrap();
         assert_eq!(action["click_point"], serde_json::json!({"x":1.0,"y":0.5}));
+        assert!(root.path().join("click.png").exists());
     }
 
     #[tokio::test]
