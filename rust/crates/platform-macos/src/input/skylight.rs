@@ -276,11 +276,20 @@ trait KeyEnv {
         target: u32,
         style: RecordStyle,
     ) -> Option<RecordPosts>;
-    fn await_focus(&self, pid: pid_t, target: u32, budget: std::time::Duration);
+    /// Wait at most `total` for the app's focus to settle on `target`.
+    fn await_focus(&self, pid: pid_t, target: u32, total: std::time::Duration);
+    /// This app did not show the window as key after the short record form,
+    /// so entering and handing back use the full sequence at once.
+    fn needs_full_records(&self, pid: pid_t) -> bool;
+    fn note_needs_full_records(&self, pid: pid_t);
     fn set_focused_window(&self, pid: pid_t, wid: u32) -> bool;
 }
 
 struct LiveKeyEnv;
+
+/// Apps that did not show a window as key after the short record form. A
+/// reused pid only costs it the short attempt's saving, never correctness.
+static NEEDS_FULL_RECORDS: std::sync::Mutex<Vec<pid_t>> = std::sync::Mutex::new(Vec::new());
 
 impl KeyEnv for LiveKeyEnv {
     fn key_focus(&self, pid: pid_t) -> KeyFocus {
@@ -298,8 +307,23 @@ impl KeyEnv for LiveKeyEnv {
     ) -> Option<RecordPosts> {
         post_key_records(pid, current, target, style)
     }
-    fn await_focus(&self, pid: pid_t, target: u32, budget: std::time::Duration) {
-        await_key_focus(pid, target, budget);
+    fn await_focus(&self, pid: pid_t, target: u32, total: std::time::Duration) {
+        await_key_focus_within(pid, target, total);
+    }
+    fn needs_full_records(&self, pid: pid_t) -> bool {
+        NEEDS_FULL_RECORDS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(&pid)
+    }
+    fn note_needs_full_records(&self, pid: pid_t) {
+        let mut apps = NEEDS_FULL_RECORDS.lock().unwrap_or_else(|e| e.into_inner());
+        if !apps.contains(&pid) {
+            if apps.len() >= 256 {
+                apps.remove(0);
+            }
+            apps.push(pid);
+        }
     }
     fn set_focused_window(&self, pid: pid_t, wid: u32) -> bool {
         set_app_focused_window(pid, wid)
@@ -320,7 +344,11 @@ fn run_hand_back_with(
     previous: u32,
 ) -> HandBack {
     let confirmed = || {
-        env.await_focus(pid, previous, std::time::Duration::from_millis(200));
+        env.await_focus(
+            pid,
+            previous,
+            KEY_RECORD_SETTLE + std::time::Duration::from_millis(200),
+        );
         env.key_focus(pid).routes_to(previous)
     };
     match primed {
@@ -328,11 +356,13 @@ fn run_hand_back_with(
         KeyPrime::KeyRecords => {
             // The short form first, like entering; the full sequence when the
             // app does not show the previous window as key after it.
-            let fast = env.post_records(pid, Some(target), previous, RecordStyle::Fast);
-            if fast.is_some_and(RecordPosts::complete) {
-                env.await_focus(pid, previous, std::time::Duration::ZERO);
-                if env.key_focus(pid).routes_to(previous) {
-                    return HandBack::Restored;
+            if !env.needs_full_records(pid) {
+                let fast = env.post_records(pid, Some(target), previous, RecordStyle::Fast);
+                if fast.is_some_and(RecordPosts::complete) {
+                    env.await_focus(pid, previous, FAST_CONFIRM);
+                    if env.key_focus(pid).routes_to(previous) {
+                        return HandBack::Restored;
+                    }
                 }
             }
             hand_back_outcome(
@@ -801,15 +831,33 @@ pub fn post_window_key_records(pid: pid_t, current: Option<u32>, target: u32) ->
 /// Which key-window records a move of key focus posts.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum RecordStyle {
-    /// Focus and make-key records only: no defocus of the current key window
-    /// and no pause between records. The caller confirms by polling the
-    /// app's focus and falls back to [`RecordStyle::Full`] when it does not
-    /// show the window as key.
+    /// Defocus, focus and the make-key pair with a short pause after the
+    /// first two ([`FAST_RECORD_PAUSE`]). Measured on a two-window AppKit
+    /// app: every switch took it with pauses of 5 ms and up, while leaving
+    /// the defocus record out failed from the second switch on. The caller
+    /// confirms by polling the app's focus ([`FAST_CONFIRM`]) and falls back to
+    /// [`RecordStyle::Full`] when it does not show the window as key.
     Fast,
-    /// Defocus, focus and the make-key pair, with [`KEY_RECORD_SETTLE`] after
-    /// the first two (an app can drop the focus record while it is still
-    /// handling the defocus).
+    /// The same records with [`KEY_RECORD_SETTLE`] after the first two (an app
+    /// can drop the focus record while it is still handling the defocus:
+    /// about half the switches failed on LibreOffice 26.8 without it).
     Full,
+}
+
+/// Pause between the first records of the short form.
+const FAST_RECORD_PAUSE: std::time::Duration = std::time::Duration::from_millis(10);
+
+/// How long the short form is given to show the window as key before the
+/// full sequence runs.
+const FAST_CONFIRM: std::time::Duration = std::time::Duration::from_millis(80);
+
+impl RecordStyle {
+    fn pause(self) -> std::time::Duration {
+        match self {
+            RecordStyle::Fast => FAST_RECORD_PAUSE,
+            RecordStyle::Full => KEY_RECORD_SETTLE,
+        }
+    }
 }
 
 /// The posts of one key-record sequence.
@@ -833,20 +881,18 @@ impl RecordPosts {
 fn post_record_sequence(
     current: Option<u32>,
     target: u32,
-    style: RecordStyle,
     mut send: impl FnMut(&[u8; 0xF8]) -> bool,
     mut settle: impl FnMut(),
 ) -> RecordPosts {
-    let full = style == RecordStyle::Full;
     let mut records: Vec<([u8; 0xF8], bool)> = Vec::with_capacity(4);
-    if let Some(current) = current.filter(|_| full) {
+    if let Some(current) = current {
         let mut defocus = focus_record(current);
         defocus[0x8A] = 0x02;
         records.push((defocus, true));
     }
     let mut focus = focus_record(target);
     focus[0x8A] = 0x01;
-    records.push((focus, full));
+    records.push((focus, true));
     for event_kind in [0x01, 0x02] {
         records.push((make_key_window_record(target, event_kind), false));
     }
@@ -881,9 +927,8 @@ fn post_key_records(
     Some(post_record_sequence(
         current,
         target,
-        style,
         |record| note_post_status(unsafe { post(psn.as_ptr() as *const c_void, record.as_ptr()) }),
-        || std::thread::sleep(KEY_RECORD_SETTLE),
+        || std::thread::sleep(style.pause()),
     ))
 }
 
@@ -904,7 +949,13 @@ pub(crate) fn hand_key_back(pid: pid_t, current: Option<u32>, target: u32) -> bo
 /// Polled from the start: a read that still shows the old focus keeps the
 /// wait going, so no fixed settle is needed before the first read.
 fn await_key_focus(pid: pid_t, target: u32, budget: std::time::Duration) {
-    let deadline = std::time::Instant::now() + KEY_RECORD_SETTLE + budget;
+    await_key_focus_within(pid, target, KEY_RECORD_SETTLE + budget);
+}
+
+/// [`await_key_focus`] with the whole wait given: at most `total`, polled in
+/// 4 ms steps, returning as soon as the app's focus has settled on `target`.
+fn await_key_focus_within(pid: pid_t, target: u32, total: std::time::Duration) {
+    let deadline = std::time::Instant::now() + total;
     while !key_focus_of_pid(pid).settled_on(target) && std::time::Instant::now() < deadline {
         std::thread::sleep(std::time::Duration::from_millis(4));
     }
@@ -1002,22 +1053,36 @@ fn enter_scope_with(
         entry.set(noted);
         posts.is_some_and(RecordPosts::complete)
     };
+    let fast_tried = std::cell::Cell::new(false);
     let primed = match prime_exact_window_key(
         target_wid,
         || first_read.take().unwrap_or_else(|| env.key_focus(pid)),
         || {
+            if env.needs_full_records(pid) {
+                return false;
+            }
+            fast_tried.set(true);
             let ok = post_noted(RecordStyle::Fast);
             if ok {
-                // At most KEY_RECORD_SETTLE (120 ms), polled in 4 ms steps,
-                // for the app to show the window as key.
-                env.await_focus(pid, target_wid, std::time::Duration::ZERO);
+                // The app is given FAST_CONFIRM, polled in 4 ms steps, to show
+                // the window as key.
+                env.await_focus(pid, target_wid, FAST_CONFIRM);
             }
             ok
         },
         || {
+            if fast_tried.get() {
+                // The short form did not do it for this app: its next entry
+                // and hand-back go straight to the full sequence.
+                env.note_needs_full_records(pid);
+            }
             let ok = post_noted(RecordStyle::Full);
             if ok {
-                env.await_focus(pid, target_wid, std::time::Duration::from_millis(400));
+                env.await_focus(
+                    pid,
+                    target_wid,
+                    KEY_RECORD_SETTLE + std::time::Duration::from_millis(400),
+                );
             }
             ok
         },
@@ -1027,7 +1092,11 @@ fn enter_scope_with(
             entry.set(noted);
             let ok = env.set_focused_window(pid, target_wid);
             if ok {
-                env.await_focus(pid, target_wid, std::time::Duration::from_millis(200));
+                env.await_focus(
+                    pid,
+                    target_wid,
+                    KEY_RECORD_SETTLE + std::time::Duration::from_millis(200),
+                );
             }
             ok
         },
@@ -3191,7 +3260,6 @@ mod wp2_scope_tests {
         let posts = post_record_sequence(
             Some(7),
             8,
-            RecordStyle::Full,
             |_| {
                 sent += 1;
                 true
@@ -3209,29 +3277,35 @@ mod wp2_scope_tests {
         );
         assert!(posts.complete());
         // No previous key window: no defocus record.
-        let posts = post_record_sequence(None, 8, RecordStyle::Full, |_| true, || {});
+        let posts = post_record_sequence(None, 8, |_| true, || {});
         assert_eq!(posts.posted, 3);
     }
 
-    /// The fast form: focus and the make-key pair, no defocus of the current
-    /// key window and no pause.
+    /// Both forms post the same records; they differ in the pause between
+    /// them, and the short pause is what the short form saves. The defocus
+    /// record must stay: without it an AppKit app took the switch once and
+    /// ignored it from then on.
     #[test]
-    fn the_fast_record_sequence_posts_three_records_and_never_pauses() {
-        let mut sent = Vec::new();
-        let posts = post_record_sequence(
+    fn the_short_form_differs_from_the_full_one_only_in_its_pause() {
+        let mut order = Vec::new();
+        let _ = post_record_sequence(
             Some(7),
             8,
-            RecordStyle::Fast,
             |record| {
-                sent.push(record[0x8A]);
+                order.push(record[0x8A]);
                 true
             },
-            || panic!("the fast form does not pause"),
+            || {},
         );
-        assert_eq!(posts.posted, 3);
-        assert!(posts.complete());
-        assert_ne!(sent[0], 0x02, "no defocus record first");
-        assert_eq!(sent[0], 0x01, "the focus record leads");
+        assert_eq!(order[0], 0x02, "the defocus record leads");
+        assert_eq!(order[1], 0x01, "then the focus record");
+        assert!(RecordStyle::Fast.pause() < RecordStyle::Full.pause());
+        assert!(
+            RecordStyle::Fast.pause() >= std::time::Duration::from_millis(5),
+            "pauses of 5 ms and up were measured to work, none was not"
+        );
+        assert_eq!(RecordStyle::Full.pause(), KEY_RECORD_SETTLE);
+        assert!(FAST_CONFIRM < KEY_RECORD_SETTLE);
     }
 
     #[test]
@@ -3240,7 +3314,6 @@ mod wp2_scope_tests {
         let posts = post_record_sequence(
             Some(7),
             8,
-            RecordStyle::Full,
             |_| {
                 n += 1;
                 n != 2
@@ -3580,6 +3653,8 @@ mod frontmost_scope_tests {
     struct FakeEnv {
         /// The app takes the short record form.
         obeys_fast: bool,
+        /// Apps remembered as needing the full sequence.
+        needs_full: RefCell<Vec<pid_t>>,
         /// The app takes the full record sequence.
         obeys_records: bool,
         obeys_ax: bool,
@@ -3590,6 +3665,7 @@ mod frontmost_scope_tests {
         fn new(key_window: u32) -> Self {
             Self {
                 obeys_fast: true,
+                needs_full: RefCell::new(Vec::new()),
                 obeys_records: true,
                 obeys_ax: true,
                 state: RefCell::new(State {
@@ -3631,11 +3707,17 @@ mod frontmost_scope_tests {
                 state.element_window = Some(target);
             }
             Some(RecordPosts {
-                posted: if style == RecordStyle::Fast { 3 } else { 4 },
+                posted: 4,
                 failed: 0,
             })
         }
         fn await_focus(&self, _: pid_t, _: u32, _: std::time::Duration) {}
+        fn needs_full_records(&self, pid: pid_t) -> bool {
+            self.needs_full.borrow().contains(&pid)
+        }
+        fn note_needs_full_records(&self, pid: pid_t) {
+            self.needs_full.borrow_mut().push(pid);
+        }
         fn set_focused_window(&self, _: pid_t, wid: u32) -> bool {
             let mut state = self.state.borrow_mut();
             state.ax_writes.push(wid);
@@ -3670,7 +3752,7 @@ mod frontmost_scope_tests {
             vec![(Some(1), 2, RecordStyle::Fast)],
             "the short form alone makes the window key"
         );
-        assert_eq!(scope.entry().records_posted, 3);
+        assert_eq!(scope.entry().records_posted, 4);
         scope.done = true;
     }
 
@@ -3690,8 +3772,48 @@ mod frontmost_scope_tests {
                 (Some(1), 2, RecordStyle::Full)
             ]
         );
-        assert_eq!(scope.entry().records_posted, 7);
+        assert_eq!(scope.entry().records_posted, 8);
         scope.done = true;
+    }
+
+    /// An app that needed the full sequence once is not asked for the short
+    /// form again: its next entry and its hand-back go straight to the full
+    /// one, so a slow app pays the short attempt only once.
+    #[test]
+    fn an_app_that_needed_the_full_sequence_skips_the_short_form_next_time() {
+        let _serial = key_scope_tests_serial();
+        let mut env = FakeEnv::new(1);
+        env.obeys_fast = false;
+        let mut first = enter(&env).expect("the full sequence confirms");
+        first.done = true;
+        env.state.borrow_mut().window = Some(1);
+        env.state.borrow_mut().element_window = Some(1);
+        env.state.borrow_mut().posts.clear();
+        let mut second = enter(&env).expect("the full sequence confirms");
+        assert_eq!(
+            env.state.borrow().posts,
+            vec![(Some(1), 2, RecordStyle::Full)],
+            "no short attempt for an app that did not take it"
+        );
+        second.done = true;
+        // The hand-back skips it too.
+        env.state.borrow_mut().posts.clear();
+        let outcome = run_hand_back_with(&env, -78_001, 2, KeyPrime::KeyRecords, 1);
+        assert_eq!(outcome, HandBack::Restored);
+        assert_eq!(
+            env.state.borrow().posts,
+            vec![(Some(2), 1, RecordStyle::Full)]
+        );
+    }
+
+    /// An app that took the short form is never remembered as slow.
+    #[test]
+    fn an_app_that_took_the_short_form_is_not_marked_slow() {
+        let _serial = key_scope_tests_serial();
+        let env = FakeEnv::new(1);
+        let mut scope = enter(&env).expect("the short form confirms");
+        scope.done = true;
+        assert!(!env.needs_full_records(-78_001));
     }
 
     #[test]
