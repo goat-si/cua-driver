@@ -59,9 +59,11 @@ pub(crate) fn basis_unavailable_reason(
     }
     Some(match capture {
         Some(Err(reason)) => reason,
-        // A newer capture of the same window was published first, so this
-        // frame was dropped; the screenshot in this response has no basis.
-        Some(Ok(_)) if !published => "superseded_by_newer_capture",
+        // The store did not keep this frame: a newer capture or plain
+        // publication of the window, its removal, LRU eviction or the end of
+        // the session made the capture's ticket obsolete before it landed.
+        // The screenshot in this response has no basis to click against.
+        Some(Ok(_)) if !published => "capture_not_stored",
         // Published, but the store retired the window's basis identity.
         Some(Ok(_)) => "basis_retired",
         None => "no_proven_origin",
@@ -169,7 +171,7 @@ mod tests {
         assert_eq!(basis_unavailable_reason(Some(&proven), true, true), None);
         assert_eq!(
             basis_unavailable_reason(Some(&proven), false, false),
-            Some("superseded_by_newer_capture")
+            Some("capture_not_stored")
         );
         assert_eq!(
             basis_unavailable_reason(Some(&proven), true, false),
