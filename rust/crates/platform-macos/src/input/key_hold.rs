@@ -121,13 +121,19 @@ pub(crate) fn deliver(
             KeyRoute::BareGlobal => {
                 let event = keyboard::create_bare_keyboard_event(code, down)?;
                 event.set_flags(flags);
-                event.post(CGEventTapLocation::HID);
+                post_hid(|| event.post(CGEventTapLocation::HID));
                 Ok(())
             }
         },
         || control.is_cancelled(),
         |hold| control.wait(hold),
     )
+}
+
+/// A key posted to the HID queue. Recorded so a pending focus restoration
+/// does not read the driver's own key as the person's input.
+fn post_hid(send: impl FnOnce()) {
+    crate::input::hid_history::post(send);
 }
 
 #[cfg(test)]
@@ -228,6 +234,20 @@ fn deliver_with_pacing(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A bare-global key reaches the HID queue: it must be in the HID history,
+    /// or a pending pixel focus restoration abandons with reason user_input.
+    #[test]
+    fn bare_global_hid_post_is_recorded_as_the_drivers_own() {
+        let since = std::time::Instant::now();
+        let mut sent = false;
+        post_hid(|| sent = true);
+        assert!(sent);
+        assert!(
+            crate::input::hid_history::recorded_since(since) >= 1,
+            "bare-global HID post missing from the HID history"
+        );
+    }
 
     #[test]
     fn global_chord_paces_each_modifier_transition() {
