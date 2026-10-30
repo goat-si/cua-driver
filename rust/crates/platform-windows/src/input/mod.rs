@@ -10,6 +10,7 @@
 //! if screen coords are given). We pack with MAKELPARAM(x,y).
 
 pub mod delivery;
+pub mod guarded_dispatch;
 pub mod inject;
 pub mod keyboard;
 pub mod mouse;
