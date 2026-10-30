@@ -1628,13 +1628,7 @@ impl ClickTool {
                         None => result,
                     }
                 }
-                Ok(Err(e)) => {
-                    if let Some(code) = crate::input::ax_actions::element_action_refusal_code(&e) {
-                        super::pre_dispatch_refusal(code, format!("AX action failed: {e}"))
-                    } else {
-                        ToolResult::error(format!("AX action failed: {e}"))
-                    }
-                }
+                Ok(Err(e)) => element_click_failure(&e),
                 Err(e) => click_task_failure(format!(
                     "The accessibility click task failed ({e}); the action may have run. Read \
                      fresh state before clicking again."
@@ -2593,9 +2587,28 @@ fn unconfirmed_selection_click(
     )
 }
 
+/// The result of an element click whose AX task returned `error`. A typed
+/// refusal is raised before the click sends its action or any selection
+/// write (an unsupported or ambiguous action, a background-only action, a
+/// background target that reads AXEnabled=false) and reaches the caller as a
+/// coded refusal with `dispatched: false`. Any other error stays a plain error
+/// that claims nothing about delivery: some follow an AX write or a posted
+/// pointer event (the selection fallback, a text input's focus), so the
+/// caller reads the window before acting again. An AX action that was sent
+/// and came back with an error does not arrive here: it is an unverifiable
+/// click (`unresolved_perform_error`) unless a read-back confirms it.
+fn element_click_failure(error: &anyhow::Error) -> ToolResult {
+    match crate::input::ax_actions::element_action_refusal_code(error) {
+        Some(code) => super::pre_dispatch_refusal(code, format!("AX action refused: {error}")),
+        None => ToolResult::error(format!("AX action failed: {error}")),
+    }
+}
+
 /// The outcome of an AX action whose perform call returned `err` after it
 /// was sent, when no read-back resolved what happened. An error that proves
-/// nothing was sent stays a failure the caller may retry. Any other error is
+/// the action never reached the app stays a plain failure, never a refusal:
+/// the click's selection fallback may have written AXSelected before or
+/// after the action, so the caller reads the window first. Any other error is
 /// an unconfirmed action (`effect: "unverifiable"`, not an error result), so
 /// the caller reads the window before repeating it instead of sending a
 /// second click (cua-driver#21).
@@ -2802,7 +2815,7 @@ fn perform_ax_click(
     // enable menu items that were disabled in the cached snapshot, while a
     // background transition can disable them after that snapshot. macOS may
     // otherwise return success for a disabled action that did nothing.
-    crate::input::ax_actions::ensure_ax_action_enabled(element_ptr, ax_action)?;
+    crate::input::ax_actions::ensure_ax_action_enabled(element_ptr, ax_action, foreground)?;
 
     // Capture advertised actions BEFORE dispatching so we can detect silent no-ops
     // (AX returns success even when the element doesn't advertise the action).
@@ -3813,6 +3826,7 @@ mod tests {
         let args = serde_json::json!({ "pid": 42, "window_id": 7, "element_token": "s1:3" });
         let codes = [
             crate::ax::bindings::kAXErrorCannotComplete,
+            crate::ax::bindings::kAXErrorFailure,
             crate::ax::bindings::kAXErrorNotImplemented,
             -25299, // a code this driver does not know
         ];
@@ -3853,6 +3867,79 @@ mod tests {
                     "{case}: the caller must read before resending: {hint}"
                 );
             }
+        }
+    }
+
+    /// What a strict MCP client receives for `result`: the tool result after
+    /// the `tools/call` boundary normalizes it.
+    fn click_wire(result: ToolResult) -> serde_json::Value {
+        cua_driver_core::mcp_result::conforming_tool_result(
+            "click",
+            serde_json::to_value(result).expect("a tool result serializes"),
+        )
+    }
+
+    /// Calendar's toolbar view switcher reads AXEnabled=false while its window
+    /// is in the background. A background click refuses before anything is
+    /// sent, and the caller must see that: an uncoded error reached the wire
+    /// as `tool_invocation_failed`, which reads as a write that may have
+    /// landed and blocks the caller's next input.
+    #[test]
+    fn a_background_click_on_a_disabled_target_is_a_coded_refusal_on_the_wire() {
+        let error = crate::input::ax_actions::disabled_action_refusal("AXPress", false);
+        let result = element_click_failure(&error);
+        assert_eq!(result.is_error, Some(true));
+        let wire = click_wire(result);
+        assert_eq!(wire["isError"], true, "{wire}");
+        let structured = &wire["structuredContent"];
+        assert_eq!(structured["code"], "background_unavailable", "{wire}");
+        assert_eq!(structured["effect"], "refused", "{wire}");
+        assert_eq!(structured["dispatched"], false, "{wire}");
+        let text = wire["content"][0]["text"].as_str().expect("text");
+        assert!(text.contains("AXEnabled=false"), "{text}");
+        assert!(text.contains("AXPress was not sent"), "{text}");
+        assert!(text.contains("delivery_mode:\"foreground\""), "{text}");
+    }
+
+    /// An AX error that proves the action itself never reached the app stays
+    /// a plain failure, never a refusal: the click can have written
+    /// AXSelected on an ancestor before or after the action (the selection
+    /// fallback), so it does not prove that nothing changed. The same holds
+    /// for a disabled target in the foreground (the window may already have
+    /// been activated and raised) and for an uncoded error from the click's
+    /// other steps. This guards against widening the refusal above.
+    #[test]
+    fn an_ax_error_that_proves_nothing_was_sent_stays_a_plain_failure() {
+        use crate::ax::bindings::{
+            kAXErrorAPIDisabled, kAXErrorIllegalArgument, kAXErrorInvalidUIElement,
+        };
+        let mut errors: Vec<anyhow::Error> = [
+            kAXErrorIllegalArgument,
+            kAXErrorInvalidUIElement,
+            kAXErrorAPIDisabled,
+        ]
+        .into_iter()
+        .map(|code| {
+            unresolved_perform_error("AXPress", code, (3, "AXRadioButton", "Day"))
+                .expect_err("an error that proves nothing reached the app stays a failure")
+        })
+        .collect();
+        errors.push(anyhow::anyhow!(
+            "selection target stopped exposing AXSelected before delivery"
+        ));
+        errors.push(crate::input::ax_actions::disabled_action_refusal(
+            "AXPress", true,
+        ));
+        for error in errors {
+            let result = element_click_failure(&error);
+            assert_eq!(result.is_error, Some(true), "{error}");
+            assert!(result.structured_content.is_none(), "{error}");
+            let wire = click_wire(result);
+            assert_eq!(wire["structuredContent"]["code"], "tool_invocation_failed");
+            assert!(
+                wire["structuredContent"].get("dispatched").is_none(),
+                "{wire}"
+            );
         }
     }
 

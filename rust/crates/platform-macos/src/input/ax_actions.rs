@@ -188,14 +188,37 @@ pub fn capture_nearest_container_selection(element_ptr: usize) -> Option<Selecti
     None
 }
 
-fn ensure_ax_enabled(enabled: Option<bool>, action: &str) -> anyhow::Result<()> {
+/// The error for a target that reads AXEnabled=false; the action is not sent.
+/// In the background the check runs before key priming, any selection write
+/// and the action, so the click has changed nothing and the error is a coded
+/// refusal: an uncoded error reads as a write that may have landed. Apps
+/// often disable controls of a window that is not key (Calendar's toolbar
+/// view switcher), so the code names the foreground retry. In the foreground
+/// the click may already have activated and raised the window, so the error
+/// stays uncoded and claims nothing beyond the unsent action.
+fn ensure_ax_enabled(enabled: Option<bool>, action: &str, foreground: bool) -> anyhow::Result<()> {
     if enabled == Some(false) {
-        anyhow::bail!(
-            "refusing {action}: the target reports AXEnabled=false. \
-             Retry this action with delivery_mode:\"foreground\" or call bring_to_front first"
-        );
+        return Err(disabled_action_refusal(action, foreground));
     }
     Ok(())
+}
+
+/// The error [`ensure_ax_action_enabled`] returns for a disabled target.
+pub(crate) fn disabled_action_refusal(action: &str, foreground: bool) -> anyhow::Error {
+    if foreground {
+        anyhow::anyhow!(
+            "refusing {action}: the target reports AXEnabled=false, so {action} was not sent. \
+             Read the window again and act on it once it reads enabled"
+        )
+    } else {
+        element_action_refusal(
+            "background_unavailable",
+            format!(
+                "refusing {action}: the target reports AXEnabled=false, so {action} was not sent. \
+                 Retry this action with delivery_mode:\"foreground\" or call bring_to_front first"
+            ),
+        )
+    }
 }
 
 /// Refuse AX actions that macOS reports as disabled.
@@ -203,15 +226,19 @@ fn ensure_ax_enabled(enabled: Option<bool>, action: &str) -> anyhow::Result<()> 
 /// This must be checked immediately before dispatch rather than trusting the
 /// cached snapshot value: foreground delivery can make a menu item live after
 /// it was resolved, while backgrounding can disable it in the other direction.
-pub fn ensure_ax_action_enabled(element_ptr: usize, action: &str) -> anyhow::Result<()> {
+pub fn ensure_ax_action_enabled(
+    element_ptr: usize,
+    action: &str,
+    foreground: bool,
+) -> anyhow::Result<()> {
     let enabled = unsafe { copy_bool_attr(element_ptr as AXUIElementRef, "AXEnabled") };
-    ensure_ax_enabled(enabled, action)
+    ensure_ax_enabled(enabled, action, foreground)
 }
 
 /// Perform an AX action on a cached element.
 pub fn perform_ax_action(element_ptr: usize, action: &str) -> anyhow::Result<()> {
     let ax_action = map_action(action)?;
-    ensure_ax_action_enabled(element_ptr, ax_action)?;
+    ensure_ax_action_enabled(element_ptr, ax_action, false)?;
     let err = unsafe { perform_action(element_ptr as AXUIElementRef, ax_action) };
 
     if err == kAXErrorSuccess {
@@ -807,17 +834,31 @@ mod tests {
 
     #[test]
     fn disabled_elements_are_refused_before_dispatch() {
-        let error = ensure_ax_enabled(Some(false), "AXPick").unwrap_err();
-        let message = error.to_string();
+        let background = ensure_ax_enabled(Some(false), "AXPick", false).unwrap_err();
+        let message = background.to_string();
         assert!(message.contains("AXEnabled=false"));
+        assert!(message.contains("AXPick was not sent"), "{message}");
         assert!(message.contains("delivery_mode:\"foreground\""));
         assert!(message.contains("bring_to_front"));
+        assert_eq!(
+            element_action_refusal_code(&background),
+            Some("background_unavailable")
+        );
+
+        let foreground = ensure_ax_enabled(Some(false), "AXPress", true).unwrap_err();
+        let message = foreground.to_string();
+        assert!(message.contains("AXEnabled=false"));
+        assert!(message.contains("AXPress was not sent"), "{message}");
+        assert!(!message.contains("delivery_mode"), "{message}");
+        assert_eq!(element_action_refusal_code(&foreground), None);
     }
 
     #[test]
     fn enabled_or_unreported_state_is_allowed() {
-        assert!(ensure_ax_enabled(Some(true), "AXPress").is_ok());
-        assert!(ensure_ax_enabled(None, "AXPress").is_ok());
+        for foreground in [false, true] {
+            assert!(ensure_ax_enabled(Some(true), "AXPress", foreground).is_ok());
+            assert!(ensure_ax_enabled(None, "AXPress", foreground).is_ok());
+        }
     }
 
     #[test]
