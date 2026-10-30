@@ -9019,6 +9019,7 @@ impl Tool for GetConfigTool {
             "version":             env!("CARGO_PKG_VERSION"),
             "source_sha":          option_env!("CUA_DRIVER_SOURCE_SHA"),
             "platform":            "windows",
+            "capability_manifest": cua_driver_core::session_manifest::applied_capability_manifest_json(),
             "capture_mode":        cfg.capture_mode,
             "max_image_dimension": cfg.max_image_dimension,
             "agent_cursor":        { "enabled": cursor_enabled },

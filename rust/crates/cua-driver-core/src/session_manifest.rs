@@ -1,8 +1,10 @@
-//! Immutable capability manifest loaded at trusted daemon startup.
+//! Immutable capability manifest loaded from a trusted, host-owned file.
 //!
 //! The agent may propose this file, but selecting and approving it is a
 //! launcher responsibility. The manifest only narrows the built-in,
 //! managed, and user policy layers; it cannot introduce unreviewed tools.
+//! A configured manifest file is re-read when its identity changes (see
+//! [`ConfiguredManifest`]); each applied version stays immutable.
 
 use std::collections::HashSet;
 use std::path::{Component, Path, PathBuf};
@@ -27,6 +29,10 @@ pub const SESSION_POLICY_APPROVED_ENV: &str = "CUA_DRIVER_SESSION_POLICY_APPROVE
 pub const CAPABILITY_MANIFEST_FILE_ENV: &str = "CUA_DRIVER_CAPABILITY_MANIFEST_FILE";
 pub const CAPABILITY_MANIFEST_APPROVED_ENV: &str = "CUA_DRIVER_CAPABILITY_MANIFEST_APPROVED";
 
+#[path = "session_manifest_reload.rs"]
+mod reload;
+pub use reload::{AppliedManifest, ConfiguredManifest};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ManifestDecision {
     Allow,
@@ -39,6 +45,8 @@ pub enum ManifestDecision {
 pub struct SessionManifest {
     version: u32,
     sha256: String,
+    loaded_unix_ms: u128,
+    expires_after: Option<Duration>,
     expires_unix_ms: Option<u128>,
     idle_timeout: Option<Duration>,
     allow: HashSet<String>,
@@ -196,6 +204,46 @@ impl SessionManifest {
         }
     }
 
+    /// Whether an existing-profile attachment of this exact browser window
+    /// may exist under this manifest: either the `existing_profile` profile
+    /// kind is granted or the window is listed in `existing_profiles`.
+    pub fn allows_existing_profile_window(&self, pid: i64, window_id: u64) -> bool {
+        self.existing_profile_kind || self.existing_profiles.contains(&(pid, window_id))
+    }
+
+    /// Whether `pid` is a browser listed in `existing_profiles`.
+    pub fn lists_existing_profile_pid(&self, pid: i64) -> bool {
+        self.existing_profiles
+            .iter()
+            .any(|(profile_pid, _)| *profile_pid == pid)
+    }
+
+    pub fn lists_any_existing_profile(&self) -> bool {
+        !self.existing_profiles.is_empty()
+    }
+
+    /// Carry the lease of the manifest this one replaces. A reload is a new
+    /// version of the same approval, so it shares the idle lease (idle expiry
+    /// stays terminal) and can never move the absolute expiry later than the
+    /// earlier of the previous expiry and the original approval time plus
+    /// this version's `expires_after`.
+    pub(crate) fn inherit_lease(&mut self, previous: &SessionManifest) {
+        // Mark an elapsed idle lease terminal before this version (which may
+        // drop or lengthen idle_timeout) takes over the shared state.
+        let _ = previous.check_lifetime();
+        self.loaded_unix_ms = previous.loaded_unix_ms;
+        let anchored = self
+            .expires_after
+            .map(|duration| self.loaded_unix_ms + duration.as_millis());
+        self.expires_unix_ms = match (previous.expires_unix_ms, anchored) {
+            (Some(previous), Some(anchored)) => Some(previous.min(anchored)),
+            (Some(previous), None) => Some(previous),
+            (None, anchored) => anchored,
+        };
+        self.last_authorized_dispatch = previous.last_authorized_dispatch.clone();
+        self.idle_expired = previous.idle_expired.clone();
+    }
+
     /// Match the implementation-attested resource of an active adapter
     /// against the immutable capability manifest. A tool allow-list entry alone
     /// never widens the resources approved at launch.
@@ -339,8 +387,9 @@ impl SessionManifest {
             .get("window_id")
             .and_then(serde_json::Value::as_u64)
             .ok_or_else(|| "window resource did not attest a window_id".to_owned())?;
+        // An existing-profile browser is reachable only through the browser
+        // tools; listing it never grants desktop access to its windows.
         if self.desktop_windows.contains(&(pid, window_id))
-            || self.existing_profiles.contains(&(pid, window_id))
             || self.resource_matches_application(resource, true)
         {
             Ok(())
@@ -357,10 +406,6 @@ impl SessionManifest {
             .and_then(serde_json::Value::as_i64)
             .ok_or_else(|| "application resource did not attest a pid".to_owned())?;
         if self.desktop_applications.contains(&pid)
-            || self
-                .existing_profiles
-                .iter()
-                .any(|(profile_pid, _)| *profile_pid == pid)
             || self.resource_matches_application(resource, false)
         {
             Ok(())
@@ -510,12 +555,14 @@ impl SessionManifest {
         if self.is_expired() {
             return Err("capability manifest expired".to_owned());
         }
-        let Some(idle_timeout) = self.idle_timeout else {
-            return Ok(());
-        };
+        // Idle expiry is terminal even when a later manifest version no
+        // longer declares an idle timeout.
         if self.is_idle_expired() {
             return Err("capability manifest idle timeout exceeded".to_owned());
         }
+        let Some(idle_timeout) = self.idle_timeout else {
+            return Ok(());
+        };
         let last = self.last_authorized_dispatch.lock().unwrap();
         if Instant::now().duration_since(*last) > idle_timeout {
             self.idle_expired.store(true, Ordering::Release);
@@ -729,17 +776,46 @@ struct RawToolSet {
     tools: Vec<String>,
 }
 
-static CONFIGURED_MANIFEST: OnceLock<Result<Option<SessionManifest>, String>> = OnceLock::new();
+static CONFIGURED_MANIFEST: OnceLock<Result<Option<Arc<ConfiguredManifest>>, String>> =
+    OnceLock::new();
 
-pub fn configured_session_manifest() -> Result<Option<&'static SessionManifest>, String> {
-    match CONFIGURED_MANIFEST.get_or_init(load_configured_manifest) {
-        Ok(manifest) => Ok(manifest.as_ref()),
-        Err(error) => Err(error.clone()),
-    }
+/// The process's configured manifest file, loaded at first use. The file is
+/// re-checked on every [`ConfiguredManifest::current`] call.
+pub fn configured_manifest_store() -> Result<Option<Arc<ConfiguredManifest>>, String> {
+    CONFIGURED_MANIFEST
+        .get_or_init(load_configured_manifest)
+        .clone()
 }
 
-pub fn configured_capability_manifest() -> Result<Option<&'static SessionManifest>, String> {
+/// The currently applied configured manifest, after re-checking its file.
+pub fn configured_session_manifest() -> Result<Option<Arc<SessionManifest>>, String> {
+    Ok(configured_manifest_store()?.map(|store| store.current().manifest))
+}
+
+pub fn configured_capability_manifest() -> Result<Option<Arc<SessionManifest>>, String> {
     configured_session_manifest()
+}
+
+/// The capability manifest the current call is authorized against, for
+/// `get_config`: `sha256` is the manifest identity, `file_sha256` the
+/// SHA-256 of the configured file's applied bytes (when that file is this
+/// manifest's source), and `reload_error` why the latest replacement of
+/// that file was not applied. All null without a manifest.
+pub fn applied_capability_manifest_json() -> serde_json::Value {
+    let sha256 = crate::tool::current_dispatch_authorization_context()
+        .and_then(|context| context.capability_manifest_sha256().map(str::to_owned));
+    let reload = configured_manifest_store()
+        .ok()
+        .flatten()
+        .map(|store| store.status_json())
+        .filter(|status| {
+            sha256.is_some() && status["applied_sha256"].as_str() == sha256.as_deref()
+        });
+    serde_json::json!({
+        "sha256": sha256,
+        "file_sha256": reload.as_ref().map(|status| status["applied_file_sha256"].clone()),
+        "reload_error": reload.as_ref().map(|status| status["last_error"].clone()),
+    })
 }
 
 pub fn capability_manifest_configured() -> bool {
@@ -763,7 +839,7 @@ pub fn capability_manifest_approved() -> bool {
     })
 }
 
-fn load_configured_manifest() -> Result<Option<SessionManifest>, String> {
+fn load_configured_manifest() -> Result<Option<Arc<ConfiguredManifest>>, String> {
     let capability_path = std::env::var_os(CAPABILITY_MANIFEST_FILE_ENV);
     let legacy_path = std::env::var_os(SESSION_POLICY_FILE_ENV);
     if capability_path.is_some() && legacy_path.is_some() && capability_path != legacy_path {
@@ -774,7 +850,8 @@ fn load_configured_manifest() -> Result<Option<SessionManifest>, String> {
     let Some(path) = capability_path.or(legacy_path) else {
         return Ok(None);
     };
-    load_manifest(Path::new(&path)).map(Some)
+    let mode = crate::authorization::configured_permission_mode().ok();
+    ConfiguredManifest::load(PathBuf::from(path), mode).map(|store| Some(Arc::new(store)))
 }
 
 /// Load and validate an immutable capability manifest for a trusted
@@ -786,11 +863,17 @@ pub fn load_manifest(path: &Path) -> Result<SessionManifest, String> {
             path.display()
         )
     })?;
+    parse_manifest_bytes(path, &bytes)
+}
+
+/// Validate manifest bytes read from `path` (used for messages and for
+/// resolving relative resources).
+fn parse_manifest_bytes(path: &Path, bytes: &[u8]) -> Result<SessionManifest, String> {
     if bytes.is_empty() {
         return Err(format!("capability manifest {} is empty", path.display()));
     }
     #[cfg(feature = "yaml")]
-    let raw: RawManifest = serde_yaml_ng::from_slice(&bytes).map_err(|error| {
+    let raw: RawManifest = serde_yaml_ng::from_slice(bytes).map_err(|error| {
         format!(
             "failed to parse capability manifest {}: {error}",
             path.display()
@@ -1019,28 +1102,11 @@ pub fn load_manifest(path: &Path) -> Result<SessionManifest, String> {
             }
         }
         if !browser_origins.is_empty() {
-            const ORIGIN_BYPASS_TOOLS: &[&str] = &[
-                "page",
-                "click",
-                "double_click",
-                "right_click",
-                "drag",
-                "scroll",
-                "type_text",
-                "press_key",
-                "hotkey",
-                "set_value",
-                "run_steps",
-                "run_script",
-                "mouse_button_down",
-                "mouse_button_up",
-                "mouse_drag",
-                "parallel_mouse_drag",
-                "get_accessibility_tree",
-                "get_window_state",
-                "verify_state",
-                "get_desktop_state",
-            ];
+            // These read or act on whole pages or the whole desktop with no
+            // process to check. Desktop tools aimed at a process stay allowed:
+            // a browser process holding an origin-scoped attachment is refused
+            // by the dispatcher (browser_process_protected).
+            const ORIGIN_BYPASS_TOOLS: &[&str] = &["page", "get_desktop_state"];
             if let Some(tool) = ORIGIN_BYPASS_TOOLS
                 .iter()
                 .find(|tool| allow.contains(**tool))
@@ -1058,11 +1124,14 @@ pub fn load_manifest(path: &Path) -> Result<SessionManifest, String> {
             "cua-driver-session-policy"
         };
         digest.update(format!("{digest_domain}-v{version}\0").as_bytes());
-        digest.update(&bytes);
+        digest.update(bytes);
+        let loaded_unix_ms = now_unix_ms();
         Ok(SessionManifest {
             version,
             sha256: format!("{:x}", digest.finalize()),
-            expires_unix_ms: expires_after.map(|duration| now_unix_ms() + duration.as_millis()),
+            loaded_unix_ms,
+            expires_after,
+            expires_unix_ms: expires_after.map(|duration| loaded_unix_ms + duration.as_millis()),
             idle_timeout,
             allow,
             deny,
@@ -1457,7 +1526,7 @@ fn canonical_manifest_path(path: &Path) -> Result<String, String> {
     Ok(canonical.to_string_lossy().into_owned())
 }
 
-fn canonical_origin(raw: &str) -> Result<String, String> {
+pub(crate) fn canonical_origin(raw: &str) -> Result<String, String> {
     let value = raw.trim();
     if value == "about:blank" {
         return Ok(value.to_owned());
@@ -1781,18 +1850,20 @@ allow:
         manifest
             .authorize_browser_url("https://app.example.com/work?q=1")
             .unwrap();
-        manifest
+        // An existing-profile browser is reachable only through the browser
+        // tools: listing it grants no desktop access to its windows.
+        assert!(manifest
             .authorize_protected_resource(
                 "private_observation",
                 &serde_json::json!({"kind": "window", "pid": 42, "window_id": 7}),
             )
-            .unwrap();
-        manifest
+            .is_err());
+        assert!(manifest
             .authorize_protected_resource(
                 "desktop_input",
                 &serde_json::json!({"kind": "application_input", "pid": 42}),
             )
-            .unwrap();
+            .is_err());
         assert!(manifest
             .authorize_browser_url("https://evil.example/redirect")
             .is_err());
@@ -2139,7 +2210,7 @@ allow:
         assert!(loaded.is_idle_expired());
         assert!(loaded.commit_authorized_dispatch().is_err());
 
-        for bypass_tool in ["page", "verify_state"] {
+        for bypass_tool in ["page", "get_desktop_state"] {
             let policy = format!(
                 r#"
 version: 1

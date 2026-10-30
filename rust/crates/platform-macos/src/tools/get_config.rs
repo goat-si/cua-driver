@@ -88,6 +88,7 @@ impl Tool for GetConfigTool {
             },
             "experimental_pip": pip_enabled,
             "experimental_pip_geometry": pip_geometry,
+            "capability_manifest": cua_driver_core::session_manifest::applied_capability_manifest_json(),
         }))
     }
 }
