@@ -1225,6 +1225,9 @@ pub struct ToolRegistry {
     approval_broker: Arc<crate::consent::ApprovalBroker>,
     protected_resource_grants: Arc<crate::consent::ProtectedResourceGrants>,
     protected_resource_ownership: Arc<crate::consent::ProtectedResourceOwnershipStore>,
+    /// The bundle id and launch path of each running app instance, so a call
+    /// under a capability manifest does not list every app again.
+    application_identities: Arc<crate::application_identity::ApplicationIdentityCache>,
 }
 
 impl ToolRegistry {
@@ -1247,8 +1250,14 @@ impl ToolRegistry {
         let weak_grants = Arc::downgrade(&protected_resource_grants);
         let weak_ownership = Arc::downgrade(&protected_resource_ownership);
         let weak_captures = Arc::downgrade(&capture_service);
+        let application_identities =
+            Arc::new(crate::application_identity::ApplicationIdentityCache::default());
+        let weak_identities = Arc::downgrade(&application_identities);
         let session_end_hook =
             crate::session::register_scoped_session_end_hook(move |session_id| {
+                if let Some(identities) = weak_identities.upgrade() {
+                    identities.clear();
+                }
                 crate::agent_cursor::forget_input_origin(session_id);
                 if let Some(ownership) = weak_ownership.upgrade() {
                     ownership.remove_session(session_id);
@@ -1295,6 +1304,7 @@ impl ToolRegistry {
             approval_broker,
             protected_resource_grants,
             protected_resource_ownership,
+            application_identities,
         }
     }
 
@@ -1350,8 +1360,26 @@ impl ToolRegistry {
     }
 
     async fn enrich_application_resource(&self, resource: &mut Value, pid: i64) {
-        if let Some(fingerprint) = self.attest_process_fingerprint(pid).await {
+        let fingerprint = self.attest_process_fingerprint(pid).await;
+        if let Some(fingerprint) = &fingerprint {
             resource["fingerprint"] = serde_json::to_value(fingerprint).unwrap_or(Value::Null);
+        }
+        // The bundle id and launch path of this process instance: served from
+        // the cache while the live fingerprint proves it is the same instance,
+        // read from the app list otherwise.
+        if let Some(cached) = fingerprint
+            .as_ref()
+            .and_then(|fingerprint| self.application_identities.lookup(pid, fingerprint))
+        {
+            for (key, value) in [
+                ("bundle_id", cached.bundle_id),
+                ("launch_path", cached.launch_path),
+            ] {
+                if let Some(value) = value {
+                    resource[key] = value;
+                }
+            }
+            return;
         }
         let Some(tool) = self.tools.get("list_apps") else {
             return;
@@ -1373,6 +1401,17 @@ impl ToolRegistry {
             if let Some(value) = app.get(key).filter(|value| !value.is_null()) {
                 resource[key] = value.clone();
             }
+        }
+        if let Some(fingerprint) = &fingerprint {
+            let read = |key: &str| app.get(key).filter(|value| !value.is_null()).cloned();
+            self.application_identities.store(
+                pid,
+                fingerprint,
+                crate::application_identity::ApplicationIdentity {
+                    bundle_id: read("bundle_id"),
+                    launch_path: read("launch_path"),
+                },
+            );
         }
     }
 
@@ -5111,6 +5150,227 @@ resources:
                 );
             }
         }
+    }
+
+    /// Stands in for the platform's process attestation: the instance
+    /// identity of pid 42, with a start time a test can change (a reused pid).
+    struct ProcessProbe {
+        start_time: Arc<std::sync::atomic::AtomicU64>,
+        alive: Arc<std::sync::atomic::AtomicBool>,
+        def: super::ToolDef,
+    }
+
+    #[async_trait::async_trait]
+    impl super::Tool for ProcessProbe {
+        fn def(&self) -> &super::ToolDef {
+            &self.def
+        }
+
+        async fn protected_resource_scope(
+            &self,
+            _adapter_id: &str,
+            _args: &serde_json::Value,
+        ) -> Result<Option<serde_json::Value>, String> {
+            if !self.alive.load(Ordering::SeqCst) {
+                return Err("process 42 is not running".to_owned());
+            }
+            Ok(Some(serde_json::json!({
+                "kind": "process_instance",
+                "fingerprint": {
+                    "pid": 42,
+                    "start_time": self.start_time.load(Ordering::SeqCst),
+                    "executable": "/Applications/Example.app/Contents/MacOS/Example",
+                },
+            })))
+        }
+
+        async fn invoke(&self, _args: serde_json::Value) -> crate::protocol::ToolResult {
+            crate::protocol::ToolResult::text("not used")
+        }
+    }
+
+    /// Stands in for `list_apps`: the bundle id of pid 42 (a test can change it, as
+    /// another app running under a reused pid) and a count of its lookups.
+    struct AppListProbe {
+        lookups: Arc<AtomicUsize>,
+        bundle_id: Arc<Mutex<String>>,
+        def: super::ToolDef,
+    }
+
+    #[async_trait::async_trait]
+    impl super::Tool for AppListProbe {
+        fn def(&self) -> &super::ToolDef {
+            &self.def
+        }
+
+        async fn invoke(&self, _args: serde_json::Value) -> crate::protocol::ToolResult {
+            self.lookups.fetch_add(1, Ordering::SeqCst);
+            let bundle_id = self.bundle_id.lock().unwrap().clone();
+            crate::protocol::ToolResult::text("apps").with_structured(serde_json::json!({
+                "apps": [{
+                    "pid": 42,
+                    "bundle_id": bundle_id,
+                    "launch_path": "/Applications/Example.app",
+                }],
+            }))
+        }
+    }
+
+    struct AppIdentityFixture {
+        registry: Arc<super::ToolRegistry>,
+        clicks: Arc<AtomicUsize>,
+        lookups: Arc<AtomicUsize>,
+        bundle_id: Arc<Mutex<String>>,
+        start_time: Arc<std::sync::atomic::AtomicU64>,
+        alive: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    fn tool_def(name: &str) -> super::ToolDef {
+        super::ToolDef {
+            name: name.into(),
+            description: "test tool".into(),
+            input_schema: serde_json::json!({"type": "object"}),
+            read_only: false,
+            destructive: false,
+            idempotent: false,
+            open_world: false,
+        }
+    }
+
+    fn app_identity_fixture() -> AppIdentityFixture {
+        let clicks = Arc::new(AtomicUsize::new(0));
+        let lookups = Arc::new(AtomicUsize::new(0));
+        let bundle_id = Arc::new(Mutex::new("com.example.app".to_owned()));
+        let start_time = Arc::new(std::sync::atomic::AtomicU64::new(1_000));
+        let alive = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let mut registry = super::ToolRegistry::new();
+        registry.register(Box::new(ObservationProbe {
+            hits: clicks.clone(),
+            def: tool_def("click"),
+        }));
+        registry.register(Box::new(ProcessProbe {
+            start_time: start_time.clone(),
+            alive: alive.clone(),
+            def: tool_def("kill_app"),
+        }));
+        registry.register(Box::new(AppListProbe {
+            lookups: lookups.clone(),
+            bundle_id: bundle_id.clone(),
+            def: tool_def("list_apps"),
+        }));
+        AppIdentityFixture {
+            registry: Arc::new(registry),
+            clicks,
+            lookups,
+            bundle_id,
+            start_time,
+            alive,
+        }
+    }
+
+    const APP_MANIFEST: &str = r#"
+version: 2
+mode: bounded
+expires_after: 8h
+idle_timeout: 30m
+resources:
+  apps:
+    - bundle_id: com.example.app
+      windows: all
+allow:
+  tools: [click]
+"#;
+
+    async fn click_once(
+        fixture: &AppIdentityFixture,
+        context: &Arc<crate::session_authorization::EffectiveAuthorizationContext>,
+    ) -> bool {
+        let result = fixture
+            .registry
+            .invoke_with_context(
+                "click",
+                serde_json::json!({
+                    "pid": 42, "window_id": 7, "x": 10, "y": 20,
+                    "delivery_mode": "background",
+                }),
+                context.clone(),
+            )
+            .await;
+        result.is_error != Some(true)
+    }
+
+    /// With a capability manifest every call used to ask the platform for the
+    /// whole app list to learn pid 42's bundle id. The answer for a process
+    /// instance does not change, so the second call must not repeat it.
+    #[tokio::test]
+    async fn a_second_call_does_not_look_the_application_up_again() {
+        let fixture = app_identity_fixture();
+        let context = manifest_context(PermissionMode::Bounded, APP_MANIFEST);
+        for _ in 0..3 {
+            assert!(click_once(&fixture, &context).await, "an approved app");
+        }
+        assert_eq!(fixture.clicks.load(Ordering::SeqCst), 3);
+        assert_eq!(
+            fixture.lookups.load(Ordering::SeqCst),
+            1,
+            "one app-list lookup for three calls on the same process"
+        );
+    }
+
+    /// The decision is the same with or without the cache: an app the
+    /// manifest does not grant is refused on every call.
+    #[tokio::test]
+    async fn the_cached_identity_keeps_refusing_an_app_the_manifest_does_not_grant() {
+        let fixture = app_identity_fixture();
+        *fixture.bundle_id.lock().unwrap() = "com.example.other".to_owned();
+        let context = manifest_context(PermissionMode::Bounded, APP_MANIFEST);
+        for _ in 0..3 {
+            assert!(!click_once(&fixture, &context).await, "an unapproved app");
+        }
+        assert_eq!(
+            fixture.clicks.load(Ordering::SeqCst),
+            0,
+            "a refused call never enters the adapter"
+        );
+        assert_eq!(fixture.lookups.load(Ordering::SeqCst), 1);
+    }
+
+    /// A pid reused by another process (a new start time) is looked up again:
+    /// the cached bundle id belongs to the earlier instance and must never
+    /// approve the new one.
+    #[tokio::test]
+    async fn a_reused_pid_is_looked_up_again_and_decided_afresh() {
+        let fixture = app_identity_fixture();
+        let context = manifest_context(PermissionMode::Bounded, APP_MANIFEST);
+        assert!(click_once(&fixture, &context).await);
+        assert!(click_once(&fixture, &context).await);
+        assert_eq!(fixture.lookups.load(Ordering::SeqCst), 1);
+        // The app quit and an app that is not granted took pid 42.
+        fixture.start_time.store(2_000, Ordering::SeqCst);
+        *fixture.bundle_id.lock().unwrap() = "com.example.other".to_owned();
+        assert!(
+            !click_once(&fixture, &context).await,
+            "the earlier instance's grant must not carry over"
+        );
+        assert_eq!(fixture.lookups.load(Ordering::SeqCst), 2);
+        assert_eq!(fixture.clicks.load(Ordering::SeqCst), 2);
+    }
+
+    /// A process that cannot be attested is not cached: nothing proves the
+    /// next call is the same instance.
+    #[tokio::test]
+    async fn a_process_that_cannot_be_attested_is_never_served_from_the_cache() {
+        let fixture = app_identity_fixture();
+        let context = manifest_context(PermissionMode::Bounded, APP_MANIFEST);
+        assert!(click_once(&fixture, &context).await);
+        fixture.alive.store(false, Ordering::SeqCst);
+        let _ = click_once(&fixture, &context).await;
+        let _ = click_once(&fixture, &context).await;
+        assert_eq!(
+            fixture.lookups.load(Ordering::SeqCst),
+            3,
+            "an unattested process is looked up on every call"
+        );
     }
 
     #[tokio::test]
