@@ -190,10 +190,15 @@ struct PostedClick<'a> {
     noact: Option<crate::input::NoActivateGuard>,
     suspended: Option<SuspendedThread>,
     error: Option<String>,
+    /// Post to `target` at `client` as given instead of resolving the
+    /// deepest child of `root` at `screen`.
+    exact: bool,
 }
 impl InputSink for PostedClick<'_> {
     fn prepare(&mut self) -> Vec<&'static str> {
-        (self.target, self.client) = deepest_child(self.root, self.screen);
+        if !self.exact {
+            (self.target, self.client) = deepest_child(self.root, self.screen);
+        }
         if let Some(error) = crate::input::post_message_blocked_by_uipi(self.target.0 as u64) {
             self.error = Some(error);
             return vec![];
@@ -314,7 +319,7 @@ pub fn post_click_guarded(
     button: &str,
     guard: impl FnOnce() -> std::result::Result<(), BasisRefusal>,
 ) -> GuardedResult {
-    let mut sink = PostedClick {
+    let sink = PostedClick {
         root: HWND(root as *mut _),
         screen: POINT { x: sx, y: sy },
         button,
@@ -330,7 +335,41 @@ pub fn post_click_guarded(
         noact: None,
         suspended: None,
         error: None,
+        exact: false,
     };
+    post_click_with(sink, count, guard)
+}
+
+/// Post click messages to `hwnd` at its own client coordinates, without
+/// resolving a child window.
+#[cfg(test)]
+fn post_click_on(hwnd: HWND, x: i32, y: i32, count: usize, button: &str) -> Result<()> {
+    let sink = PostedClick {
+        root: hwnd,
+        screen: POINT::default(),
+        button,
+        target: hwnd,
+        client: POINT { x, y },
+        prev_fg: HWND::default(),
+        target_root: HWND::default(),
+        down: 0,
+        double: 0,
+        up: 0,
+        flag: 0,
+        wants_double: false,
+        noact: None,
+        suspended: None,
+        error: None,
+        exact: true,
+    };
+    legacy_guarded_result(post_click_with(sink, count, || Ok(())))
+}
+
+fn post_click_with(
+    mut sink: PostedClick<'_>,
+    count: usize,
+    guard: impl FnOnce() -> std::result::Result<(), BasisRefusal>,
+) -> GuardedResult {
     let mut result = run_guarded(&mut sink, count.saturating_mul(3), guard);
     if let GuardedResult::Sent { outcome } = &mut result {
         if outcome.effect == DispatchEffect::Unverifiable {
