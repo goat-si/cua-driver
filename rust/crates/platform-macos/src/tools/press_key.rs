@@ -1593,12 +1593,17 @@ fn menu_item_is_save(item: AXUIElementRef) -> bool {
     }
 }
 
+pub(crate) const DISABLED_PRESS_WARNING: &str =
+    "menu item read disabled before the press; effect unverified";
+pub(crate) const DISABLED_KEYS_WARNING: &str = "menu item read disabled; keys sent; likely no-op";
+
 /// What the chord route did, decided on its blocking thread.
 enum ChordStep {
     /// The item was pressed (or may have been).
     Pressed {
         text: String,
         may_have_run: bool,
+        disabled: bool,
         validation: crate::input::skylight::ValidationPost,
     },
     /// Nothing from the menu was sent.
@@ -2249,6 +2254,7 @@ fn chord_press_step(
     scope_note: String,
 ) -> ChordStep {
     let (initial_error, disabled_note) = details;
+    let disabled = disabled_note.is_some();
     let mut notes = vec![
         initial_error
             .map(|err| {
@@ -2271,6 +2277,7 @@ fn chord_press_step(
                 "Sent {action} to {path} for window {wid}; the requested chord was not sent as keys. Its effect is unverified.{notes}"
             ),
             may_have_run: false,
+            disabled,
             validation,
         }
     } else if err == crate::ax::bindings::kAXErrorSuccess {
@@ -2280,6 +2287,7 @@ fn chord_press_step(
                  not sent as keys. Its effect is not read back: check the window.{notes}"
             ),
             may_have_run: false,
+            disabled,
             validation,
         }
     } else if super::click::perform_error_proves_nothing_was_sent(err) {
@@ -2291,6 +2299,7 @@ fn chord_press_step(
                  the menu action may have run. Read the window before repeating it.{notes}"
             ),
             may_have_run: true,
+            disabled,
             validation,
         }
     }
@@ -2314,11 +2323,17 @@ fn chord_refusal_after_hand_back(
 
 /// The tool result for a chord step other than Save.
 fn chord_result(step: ChordStep) -> ToolResult {
-    match step {
+    let warning = match &step {
+        ChordStep::Pressed { disabled: true, .. } => Some(DISABLED_PRESS_WARNING),
+        ChordStep::KeysPosted { .. } => Some(DISABLED_KEYS_WARNING),
+        _ => None,
+    };
+    let mut result = match step {
         ChordStep::Pressed {
             text,
             may_have_run,
             validation,
+            ..
         } => ToolResult::text(text)
             .with_structured(serde_json::json!({
                 "path": "menu_ax",
@@ -2381,6 +2396,20 @@ fn chord_result(step: ChordStep) -> ToolResult {
                 .build()
                 .expect("a suspected no-op key record is valid"),
             ),
+    };
+    if let Some(warning) = warning {
+        append_warning(&mut result, warning);
+    }
+    result
+}
+
+fn append_warning(result: &mut ToolResult, warning: &str) {
+    if let Some(serde_json::Value::Object(fields)) = result.structured_content.as_mut() {
+        let combined = match fields.get("warning").and_then(serde_json::Value::as_str) {
+            Some(previous) if !previous.is_empty() => format!("{previous}; {warning}"),
+            _ => warning.to_owned(),
+        };
+        fields.insert("warning".into(), serde_json::Value::String(combined));
     }
 }
 
@@ -2547,7 +2576,7 @@ pub(super) mod tests {
         }
     }
 
-    pub(crate) fn frontmost_disabled_decision() -> bool {
+    pub(crate) fn frontmost_disabled_result() -> ToolResult {
         let mut env = FakeChord {
             save: false,
             initial: Some(false),
@@ -2562,12 +2591,60 @@ pub(super) mod tests {
             reads: 0,
             disabled_presses: 0,
         };
-        matches!(
-            super::decide_chord(&mut env),
-            super::ChordDecision::Pressed { .. }
-        ) && env.presses == 1
-            && env.disabled_presses == 1
-            && env.validations == 0
+        let decision = super::decide_chord(&mut env);
+        assert_eq!(
+            (env.presses, env.disabled_presses, env.validations),
+            (1, 1, 0)
+        );
+        let super::ChordDecision::Pressed { err, initial_error } = decision else {
+            panic!("expected press");
+        };
+        super::chord_result(super::chord_press_step(
+            "Edit > Undo".into(),
+            42,
+            "AXPress",
+            err,
+            crate::input::skylight::ValidationPost::default(),
+            (initial_error, Some("disabled observation".into())),
+            String::new(),
+        ))
+    }
+
+    #[test]
+    fn warning_preserves_existing_warning() {
+        let mut result =
+            ToolResult::text("sent").with_structured(serde_json::json!({"warning": "earlier"}));
+        super::append_warning(&mut result, super::DISABLED_PRESS_WARNING);
+        assert_eq!(
+            result.structured_content.unwrap()["warning"],
+            "earlier; menu item read disabled before the press; effect unverified"
+        );
+    }
+
+    #[test]
+    fn disabled_ax_actions_warn_only_when_sent_or_uncertain() {
+        for action in ["AXPress", "AXPick"] {
+            for (error, warned) in [
+                (crate::ax::bindings::kAXErrorSuccess, true),
+                (crate::ax::bindings::kAXErrorCannotComplete, true),
+                (crate::ax::bindings::kAXErrorInvalidUIElement, false),
+            ] {
+                let step = super::chord_press_step(
+                    "Edit > Item".into(),
+                    42,
+                    action,
+                    error,
+                    crate::input::skylight::ValidationPost::default(),
+                    (None, Some("disabled observation".into())),
+                    String::new(),
+                );
+                let fields = super::chord_result(step).structured_content.unwrap();
+                assert_eq!(
+                    fields.get("warning").and_then(serde_json::Value::as_str),
+                    warned.then_some(super::DISABLED_PRESS_WARNING)
+                );
+            }
+        }
     }
 
     #[test]
@@ -2673,9 +2750,11 @@ pub(super) mod tests {
             }
             _ => panic!("expected unverified press"),
         }
+        let fields = super::chord_result(step).structured_content.unwrap();
+        assert_eq!(fields["effect"], "unverifiable");
         assert_eq!(
-            super::chord_result(step).structured_content.unwrap()["effect"],
-            "unverifiable"
+            fields["warning"],
+            "menu item read disabled before the press; effect unverified"
         );
     }
 
@@ -2760,7 +2839,12 @@ pub(super) mod tests {
         assert_eq!((env.presses, env.validations, env.bound_reads), (1, 0, 2));
     }
 
-    fn assert_chord_projection(decision: &super::ChordDecision, bound: bool, label: &str) {
+    fn assert_chord_projection(
+        decision: &super::ChordDecision,
+        bound: bool,
+        disabled: bool,
+        label: &str,
+    ) {
         use super::{ChordDecision, ChordStep};
         let validation = crate::input::skylight::ValidationPost::default();
         let keys = std::cell::Cell::new(0);
@@ -2772,7 +2856,10 @@ pub(super) mod tests {
                 "AXPress",
                 err,
                 validation,
-                (initial_error, None),
+                (
+                    initial_error,
+                    disabled.then(|| "disabled observation".to_owned()),
+                ),
                 String::new(),
             ),
             ChordDecision::Keys(_) => {
@@ -2821,6 +2908,16 @@ pub(super) mod tests {
             }
             ChordDecision::Save => unreachable!(),
         };
+        let warning = match (effect, disabled) {
+            ("unverifiable", true) => Some(super::DISABLED_PRESS_WARNING),
+            ("suspected_noop", _) => Some(super::DISABLED_KEYS_WARNING),
+            _ => None,
+        };
+        assert_eq!(
+            fields.get("warning").and_then(serde_json::Value::as_str),
+            warning,
+            "{label}"
+        );
         assert_eq!(fields["effect"], effect, "{label}");
         assert_eq!(
             fields.get("code").and_then(serde_json::Value::as_str),
@@ -3009,7 +3106,12 @@ pub(super) mod tests {
             let decision = super::decide_chord(&mut env);
             assert_eq!(decision, expected);
             assert_eq!((env.presses, env.validations), (presses, validations));
-            assert_chord_projection(&decision, bound, "explicit case");
+            assert_chord_projection(
+                &decision,
+                bound,
+                env.disabled_presses > 0 && env.presses == 1,
+                "explicit case",
+            );
         }
     }
     use super::*;
@@ -3066,6 +3168,10 @@ pub(super) mod tests {
         assert_ne!(result.is_error, Some(true));
         let structured = result.structured_content.clone().expect("structured");
         assert_eq!(structured["effect"], "suspected_noop");
+        assert_eq!(
+            structured["warning"],
+            "menu item read disabled; keys sent; likely no-op"
+        );
         assert_eq!(structured["keys_sent"], true);
         let message = result
             .content
@@ -3165,6 +3271,7 @@ pub(super) mod tests {
         let structured = maybe.structured_content.expect("structured");
         assert_eq!(structured["chord_delivery"], "possible");
         assert_eq!(structured["effect"], "unverifiable");
+        assert!(structured.get("warning").is_none());
         assert!(structured.get("chord_sent").is_none());
     }
 
@@ -3630,6 +3737,7 @@ mod menu_chord_tests {
             text: "Pressed Format > Font > Bold".into(),
             validation: crate::input::skylight::ValidationPost::default(),
             may_have_run: false,
+            disabled: false,
         });
         assert_ne!(pressed.is_error, Some(true));
         let structured = pressed.structured_content.as_ref().expect("structured");
@@ -3640,6 +3748,7 @@ mod menu_chord_tests {
             text: "Sent AXPress".into(),
             validation: crate::input::skylight::ValidationPost::default(),
             may_have_run: true,
+            disabled: false,
         });
         let structured = maybe.structured_content.as_ref().expect("structured");
         assert_eq!(structured["code"], "ax_action_unverified");
