@@ -512,7 +512,7 @@ impl Tool for ExactPidWindowTargetGuard {
         if crate::basis_decision::select_click_basis(&self.inner.def().name, &args)
             == crate::basis_decision::BasisSelection::Invalid
         {
-            return invalid_basis_arguments();
+            return crate::basis_click::invalid_basis_arguments();
         }
 
         if crate::basis_decision::select_click_basis(&self.inner.def().name, &args)
@@ -3422,21 +3422,6 @@ fn background_element_click_result(
         .with_action_record(record)
 }
 
-fn invalid_basis_arguments() -> ToolResult {
-    basis_argument_error(
-        "snapshot_id requires x and y and cannot be combined with element_token, capture_id, \
-         from_zoom, or desktop scope.",
-    )
-}
-
-/// A basis-path argument refusal: nothing was sent, and the message names
-/// the argument that was actually wrong.
-fn basis_argument_error(message: impl Into<String>) -> ToolResult {
-    ToolResult::error(message.into()).with_structured(
-        json!({"code":"invalid_arguments", "effect":"refused", "nothing_sent":true}),
-    )
-}
-
 async fn basis_click(state: &ToolState, tool: &str, args: &Value) -> Option<ToolResult> {
     use crate::basis_click::{self, Transport};
     use crate::basis_decision::{select_click_basis, BasisSelection};
@@ -3444,25 +3429,19 @@ async fn basis_click(state: &ToolState, tool: &str, args: &Value) -> Option<Tool
     use cua_driver_core::window_basis::{basis_refusal, BasisRefusal, DispatchEffect};
     match select_click_basis(tool, args) {
         BasisSelection::Legacy => return None,
-        BasisSelection::Invalid => return Some(invalid_basis_arguments()),
+        BasisSelection::Invalid => return Some(basis_click::invalid_basis_arguments()),
         BasisSelection::Basis => {}
     }
+    let basis_click::ClickArguments {
+        pid,
+        snapshot_id,
+        count,
+        button,
+    } = match basis_click::validate_arguments(tool, args) {
+        Ok(arguments) => arguments,
+        Err(result) => return Some(result),
+    };
     let refuse = || basis_refusal("stale_basis", "unknown_snapshot", None, None);
-    let Some(pid) = args
-        .get("pid")
-        .and_then(Value::as_i64)
-        .and_then(|p| i32::try_from(p).ok())
-    else {
-        return Some(basis_argument_error(
-            "snapshot_id needs the pid of the window it was read from: pass pid from \
-             get_window_state.",
-        ));
-    };
-    let Some(snapshot_id) = args.get("snapshot_id").and_then(Value::as_str) else {
-        return Some(basis_argument_error(
-            "snapshot_id must be the window_basis.snapshot_id string from get_window_state.",
-        ));
-    };
     let hwnd = args.get("window_id").and_then(Value::as_u64).or_else(|| {
         let (id, _) = cua_driver_core::window_basis::parse_basis_id(snapshot_id)?;
         state.snapshots.window_for_snapshot(pid, id)
@@ -3524,25 +3503,6 @@ async fn basis_click(state: &ToolState, tool: &str, args: &Value) -> Option<Tool
             ),
         ));
     }
-    let (count, button) = match tool {
-        "double_click" => (2, "left"),
-        "right_click" => (1, "right"),
-        _ => {
-            let count = args.get("count").and_then(Value::as_u64).unwrap_or(1);
-            if !(1..=3).contains(&count) {
-                return Some(basis_argument_error(
-                    "click: count must be 1 (single), 2 (double) or 3 (triple).",
-                ));
-            }
-            let button = args.get("button").and_then(Value::as_str).unwrap_or("left");
-            if !matches!(button, "left" | "right" | "middle") {
-                return Some(basis_argument_error(format!(
-                    "click: unknown button \"{button}\" — expected one of left, right, middle."
-                )));
-            }
-            (count as usize, button)
-        }
-    };
     let button = button.to_owned();
     crate::recording_hooks::capture_dispatch_click_target(hwnd, pid as u32, sx32, sy32);
     let cursor_key = resolve_cursor_key(args);

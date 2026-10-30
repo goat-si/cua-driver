@@ -2,6 +2,78 @@ use crate::input::guarded_dispatch::GuardedResult;
 use cua_driver_core::window_basis::{BasisRefusal, DispatchEffect, LiveFrame, WindowBasis};
 use serde_json::{json, Value};
 
+#[derive(Debug)]
+pub(crate) struct ClickArguments<'a> {
+    pub pid: i32,
+    pub snapshot_id: &'a str,
+    pub count: usize,
+    pub button: &'a str,
+}
+
+pub(crate) fn basis_argument_error(
+    message: impl Into<String>,
+) -> cua_driver_core::protocol::ToolResult {
+    cua_driver_core::protocol::ToolResult::error(message.into()).with_structured(
+        json!({"code":"invalid_arguments", "effect":"refused", "nothing_sent":true}),
+    )
+}
+
+pub(crate) fn invalid_basis_arguments() -> cua_driver_core::protocol::ToolResult {
+    basis_argument_error(
+        "snapshot_id requires x and y and cannot be combined with element_token, capture_id, \
+         from_zoom, or desktop scope.",
+    )
+}
+
+pub(crate) fn validate_arguments<'a>(
+    tool: &str,
+    args: &'a Value,
+) -> Result<ClickArguments<'a>, cua_driver_core::protocol::ToolResult> {
+    let pid = args
+        .get("pid")
+        .and_then(Value::as_i64)
+        .and_then(|p| i32::try_from(p).ok())
+        .ok_or_else(|| {
+            basis_argument_error(
+                "snapshot_id needs the pid of the window it was read from: pass pid from \
+             get_window_state.",
+            )
+        })?;
+    let snapshot_id = args
+        .get("snapshot_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            basis_argument_error(
+                "snapshot_id must be the window_basis.snapshot_id string from get_window_state.",
+            )
+        })?;
+    let (count, button) = match tool {
+        "double_click" => (2, "left"),
+        "right_click" => (1, "right"),
+        _ => {
+            let count = args.get("count").and_then(Value::as_u64).unwrap_or(1);
+            if !(1..=3).contains(&count) {
+                return Err(basis_argument_error(
+                    "click: count must be 1 (single), 2 (double) or 3 (triple).",
+                ));
+            }
+            let button = args.get("button").and_then(Value::as_str).unwrap_or("left");
+            if !matches!(button, "left" | "right" | "middle") {
+                return Err(basis_argument_error(format!(
+                    "click: unknown button \"{button}\" — expected one of left, right, middle."
+                )));
+            }
+            (count as usize, button)
+        }
+    };
+    Ok(ClickArguments {
+        pid,
+        snapshot_id,
+        count,
+        button,
+    })
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Transport {
     Foreground,
