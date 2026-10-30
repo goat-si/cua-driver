@@ -614,24 +614,45 @@ fn walk_tree_with_web_content(
 
         // An open context menu of the walked window hangs off a view that
         // does not list it as a child: publish it after the window, each
-        // under the same budget, so its items get element tokens.
-        let discovery = super::context_menus::discovery_deadline(
-            Instant::now(),
-            budget.outcome().truncated(),
-            budget.remaining(),
-        );
-        if let (Some(wid), Some(deadline)) = (window_id.filter(|_| !nodes.is_empty()), discovery) {
+        // under the same budget, so its items get element tokens. A menu
+        // window that could not be examined in time (or past the cap) makes
+        // the walk partial, never silently complete.
+        let menu_frames = match window_id {
+            Some(_) if !nodes.is_empty() => super::context_menus::open_menu_window_frames(pid),
+            _ => Vec::new(),
+        };
+        let discovery = (!menu_frames.is_empty())
+            .then(|| {
+                super::context_menus::discovery_deadline(
+                    Instant::now(),
+                    budget.outcome().truncated(),
+                    budget.remaining(),
+                )
+            })
+            .flatten();
+        if !menu_frames.is_empty() && discovery.is_none() {
+            budget.stop_for_timeout();
+        }
+        if let (Some(wid), Some(deadline)) = (window_id, discovery) {
+            let mut incomplete = menu_frames.len() > super::context_menus::MAX_MENU_WINDOWS;
             let mut walked_menus: Vec<[f64; 4]> = nodes
                 .iter()
                 .filter(|node| node.role == "AXMenu")
                 .filter_map(|node| node.frame)
                 .collect();
-            for frame in super::context_menus::open_menu_window_frames(pid) {
+            for &frame in menu_frames
+                .iter()
+                .take(super::context_menus::MAX_MENU_WINDOWS)
+            {
                 let Some((menu, menu_frame, owner)) =
                     super::context_menus::menu_in_window(pid, frame, deadline)
                 else {
+                    // Out of time is unknown; a hit that is not a menu is not.
+                    incomplete |= Instant::now() >= deadline;
                     continue;
                 };
+                incomplete |=
+                    (menu_frame.is_none() || owner.is_none()) && Instant::now() >= deadline;
                 // Released with the other top-level elements after the walk.
                 top_level.push(menu);
                 if !super::context_menus::publish_menu(menu_frame, frame, owner, wid, &walked_menus)
@@ -653,6 +674,9 @@ fn walk_tree_with_web_content(
                     include_web_content,
                     &mut deferred,
                 );
+            }
+            if incomplete {
+                budget.stop_for_timeout();
             }
         }
 

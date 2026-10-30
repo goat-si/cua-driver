@@ -20,7 +20,7 @@ const FRAME_TOLERANCE: f64 = 4.0;
 /// The most time menu discovery spends after a window walk, and the most
 /// menu windows it looks at (an open submenu chain is a few).
 const MAX_DISCOVERY: Duration = Duration::from_millis(250);
-const MAX_MENU_WINDOWS: usize = 4;
+pub(crate) const MAX_MENU_WINDOWS: usize = 4;
 
 /// The deadline for menu discovery after a walk, or `None` to skip it: the
 /// walk was cut short, or its time budget has (almost) run out.
@@ -41,7 +41,6 @@ pub(crate) fn open_menu_window_frames(pid: i32) -> Vec<[f64; 4]> {
     crate::windows::pid_on_screen_windows_any_layer(pid)
         .into_iter()
         .filter(|window| window.layer == MENU_WINDOW_LAYER)
-        .take(MAX_MENU_WINDOWS)
         .map(|window| {
             [
                 window.bounds.x,
@@ -101,13 +100,32 @@ pub(crate) unsafe fn menu_in_window(
         left.as_secs_f32().min(0.25),
     )?;
     let menu = ascend_to_role(hit, "AXMenu", deadline)?;
-    if !bound(menu, deadline) {
-        CFRelease(menu as CFTypeRef);
-        return None;
-    }
-    let menu_frame = element_screen_rect(menu);
+    let menu_frame = bounded_pair(
+        || bound(menu, deadline),
+        || copy_position_attr(menu),
+        || copy_size_attr(menu),
+    )
+    .and_then(|(position, size)| rect_from_parts(Some(position), Some(size)));
     let owner = owning_window_by_parents(menu, deadline);
     Some((menu, menu_frame, owner))
+}
+
+/// Two reads, each started only when `prepare` (which re-arms the remaining
+/// timeout) says time is left: a slow first read cannot let the second run
+/// on the original timeout.
+fn bounded_pair<A, B>(
+    mut prepare: impl FnMut() -> bool,
+    first: impl FnOnce() -> Option<A>,
+    second: impl FnOnce() -> Option<B>,
+) -> Option<(A, B)> {
+    if !prepare() {
+        return None;
+    }
+    let a = first()?;
+    if !prepare() {
+        return None;
+    }
+    Some((a, second()?))
 }
 
 /// Cap the next AX read on `element` at the time left before `deadline`
@@ -243,6 +261,31 @@ mod tests {
         assert!(frames_match(WINDOW, [2006.0, 194.0, 391.0, 552.0]));
         assert!(!frames_match(WINDOW, [2006.5, 198.0, 391.0, 552.0]));
         assert!(!frames_match([f64::NAN, 198.0, 391.0, 552.0], WINDOW));
+    }
+
+    #[test]
+    fn a_slow_first_frame_read_stops_the_second() {
+        use std::cell::Cell;
+        let start = Instant::now();
+        let deadline = start + Duration::from_millis(20);
+        let now = Cell::new(start);
+        let second_ran = Cell::new(false);
+        let frame = bounded_pair(
+            || now.get() < deadline,
+            || {
+                // The position read takes past the deadline.
+                now.set(start + Duration::from_millis(25));
+                Some((1.0, 2.0))
+            },
+            || {
+                second_ran.set(true);
+                Some((3.0, 4.0))
+            },
+        );
+        assert_eq!(frame, None);
+        assert!(!second_ran.get());
+        // In time: both reads.
+        assert_eq!(bounded_pair(|| true, || Some(1), || Some(2)), Some((1, 2)));
     }
 
     #[test]
