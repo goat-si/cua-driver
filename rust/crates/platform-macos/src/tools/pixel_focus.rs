@@ -142,7 +142,16 @@ pub(super) async fn restore_user_focus_with(
     expected_front: Option<i32>,
 ) -> bool {
     if prior_front == Some(pid) {
-        return false;
+        let key_matches = ops.key_focus() == Some(pid)
+            && prior_key_wid.is_none_or(|wid| ops.key_window(pid) == Some(wid));
+        if ops.front() == Some(pid) && !key_matches && ops.allowed(Some(pid)) {
+            if let Some(wid) = window_id {
+                ops.focus(pid, prior_key_wid, pid, wid).await;
+            }
+        }
+        return ops.front() == Some(pid)
+            && ops.key_focus() == Some(pid)
+            && prior_key_wid.is_none_or(|wid| ops.key_window(pid) == Some(wid));
     }
     let reactivated = if let Some(previous_pid) = background_pixel_restore_pid(
         PixelActivationPolicy::AllowTargetWithoutRaise,

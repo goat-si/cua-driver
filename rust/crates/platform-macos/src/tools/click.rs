@@ -2499,16 +2499,31 @@ impl ClickTool {
             };
 
             if activation_policy == PixelActivationPolicy::AllowTargetWithoutRaise
+                && prior_front == Some(pid)
+            {
+                let epoch = super::pixel_restore::current_epoch().expect("input admission");
+                super::pixel_restore::global().update_existing_target(
+                    pid,
+                    window_id,
+                    target_stamp,
+                    epoch,
+                );
+            }
+            if activation_policy == PixelActivationPolicy::AllowTargetWithoutRaise
                 && prior_front != Some(pid)
             {
                 let epoch = super::pixel_restore::current_epoch().expect("input admission");
                 super::pixel_restore::spawn_restore(
-                    pid,
-                    epoch,
-                    expected_front,
-                    restore_baseline,
-                    window_id,
-                    target_stamp,
+                    super::pixel_restore::global(),
+                    super::pixel_restore::SpawnRestore {
+                        pid,
+                        epoch,
+                        expected_front,
+                        baseline: restore_baseline,
+                        window_id,
+                        target_stamp,
+                    },
+                    Arc::new(super::pixel_restore::SystemRestoreProbe),
                     move |target_pid, target_window| async move {
                         super::pixel_focus::restore_user_focus_after_background_pixel_now(
                             target_pid,

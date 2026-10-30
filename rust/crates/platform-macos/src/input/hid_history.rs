@@ -55,6 +55,9 @@ fn quiet_samples(
         }
         let elapsed =
             u64::try_from(post.at.duration_since(previous_at).as_millis()).unwrap_or(u64::MAX);
+        // Idle samples and elapsed time are rounded to milliseconds. The 2 ms
+        // tolerance avoids a rounding-only reset; input within that margin may
+        // be indistinguishable from a driver post.
         if post.idle_before?.saturating_add(2) < previous_idle.saturating_add(elapsed) {
             return Some(false);
         }

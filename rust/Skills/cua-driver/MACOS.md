@@ -21,12 +21,19 @@ steps.
 For a background left pixel click addressed by pid and window ID, the driver
 posts one down/up pair per requested click, with increasing click state and a
 short gap between pairs. Delivery remains unverifiable unless read-back
-confirms an effect. Focus restoration runs separately and waits for admitted
-actions to finish and a 50 ms quiet interval. It retains the original app
+confirms an effect. Focus restoration runs separately and waits for tracked
+actions to finish and a 50 ms quiet interval. Browser tools and
+`get_browser_state` are tracked because they can reconnect or launch a
+browser; `page` setup (`enable_javascript_apple_events`) is tracked because
+it can relaunch one. Other admitted `page` actions do not hold the wait open.
+Restoration retains the original app
 across later actions, and is abandoned on physical user input, a frontmost
 app other than the original or target, or a two-second timeout. A target
 activation alone does not abandon it. The next input or observation result
-for the target pid reports the restoration outcome once. An admission that
+for the last target pid in a click chain reports the outcome once. A panic
+is reported as `status:"abandoned", reason:"panic"`; a click that joins a
+hand-back already attempted without confirmation reports `reason:"unconfirmed"`.
+If the target process start stamp cannot be read, no outcome note is delivered. An admission that
 cannot acquire the restoration commit lock within two seconds returns
 `pixel_restore_pending` without sending input.
 

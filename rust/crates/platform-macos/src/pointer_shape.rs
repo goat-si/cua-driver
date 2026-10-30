@@ -268,7 +268,7 @@ impl PointerShapeBackend for MacPointerShapes {
         ) else {
             return false;
         };
-        event.post(CGEventTapLocation::HID);
+        crate::input::hid_history::post(|| event.post(CGEventTapLocation::HID));
         unsafe { CGAssociateMouseAndMouseCursorPosition(true) };
         true
     }

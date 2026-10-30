@@ -275,35 +275,101 @@ async fn original_front_is_restored_after_intervening_action_and_second_click() 
     assert_eq!(restores.load(Ordering::SeqCst), 1);
 }
 
+struct FakeDesktop {
+    front: AtomicUsize,
+    key: AtomicUsize,
+    window: AtomicUsize,
+    posts: AtomicUsize,
+}
+impl RestoreProbe for FakeDesktop {
+    fn front(&self) -> Option<i32> {
+        Some(self.front.load(Ordering::SeqCst) as i32)
+    }
+    fn check(
+        &self,
+        _: RestoreBaseline,
+        expected: Option<i32>,
+        target: i32,
+        front: Option<i32>,
+    ) -> RestoreCheck {
+        if expected == Some(4) {
+            return RestoreCheck::Retry;
+        }
+        if front == expected || front == Some(target) {
+            RestoreCheck::Valid
+        } else {
+            RestoreCheck::Abandon("third_app")
+        }
+    }
+}
+#[async_trait::async_trait]
+impl super::super::pixel_focus::PixelRestoreOps for FakeDesktop {
+    fn front(&self) -> Option<i32> {
+        RestoreProbe::front(self)
+    }
+    fn key_focus(&self) -> Option<i32> {
+        Some(self.key.load(Ordering::SeqCst) as i32)
+    }
+    fn key_window(&self, _: i32) -> Option<u32> {
+        Some(self.window.load(Ordering::SeqCst) as u32)
+    }
+    fn allowed(&self, _: Option<i32>) -> bool {
+        true
+    }
+    async fn activate(&self, pid: i32) {
+        self.front.store(pid as usize, Ordering::SeqCst);
+    }
+    async fn focus(&self, prior: i32, wid: Option<u32>, _: i32, _: u32) {
+        self.key.store(prior as usize, Ordering::SeqCst);
+        if let Some(wid) = wid {
+            self.window.store(wid as usize, Ordering::SeqCst);
+        }
+        self.posts.fetch_add(1, Ordering::SeqCst);
+    }
+}
+fn fake_baseline() -> RestoreBaseline {
+    RestoreBaseline {
+        idle: Some(1000),
+        started: std::time::Instant::now(),
+    }
+}
+
 #[tokio::test(start_paused = true)]
 async fn cross_pid_click_chain_restores_original_app_once() {
     for reverse in [false, true] {
         let fence: &'static Fence = Box::leak(Box::new(test_fence()));
         let (a_epoch, a_guard) = fence.admit_action(true).await;
         let (c_epoch, c_guard) = fence.admit_action(true).await;
-        let front = Arc::new(AtomicUsize::new(3));
-        let count = Arc::new(AtomicUsize::new(0));
-        let register = |target: i32, epoch: u64, prior: usize| {
-            let sample = front.clone();
-            let destination = front.clone();
-            let count = count.clone();
-            spawn_restore_with(
+        let desktop = Arc::new(FakeDesktop {
+            front: 3.into(),
+            key: 3.into(),
+            window: 7.into(),
+            posts: 0.into(),
+        });
+        let register = |target: i32, epoch: u64, prior: i32| {
+            let ops = desktop.clone();
+            spawn_restore(
                 fence,
-                target,
-                epoch,
-                Some(prior as i32),
-                move || {
-                    let current = sample.load(Ordering::SeqCst) as i32;
-                    if fence.chain_target(target, epoch, Some(current)).0 == current {
-                        RestoreCheck::Valid
-                    } else {
-                        RestoreCheck::Abandon("third_app")
-                    }
+                SpawnRestore {
+                    pid: target,
+                    epoch,
+                    expected_front: Some(prior),
+                    baseline: fake_baseline(),
+                    window_id: Some(9),
+                    target_stamp: fake_identity(target),
                 },
-                move || async move {
-                    destination.store(prior, Ordering::SeqCst);
-                    count.fetch_add(1, Ordering::SeqCst);
-                    true
+                desktop.clone(),
+                move |pid, wid| async move {
+                    super::super::pixel_focus::restore_user_focus_with(
+                        ops.as_ref(),
+                        pid,
+                        Some(prior),
+                        Some(7),
+                        wid,
+                        true,
+                        Some(prior),
+                    )
+                    .await
                 },
             );
         };
@@ -320,11 +386,11 @@ async fn cross_pid_click_chain_restores_original_app_once() {
         tokio::time::advance(std::time::Duration::from_millis(50)).await;
         tokio::task::yield_now().await;
         assert_eq!(
-            front.load(Ordering::SeqCst),
+            desktop.front.load(Ordering::SeqCst),
             1,
             "original front, reverse={reverse}"
         );
-        assert_eq!(count.load(Ordering::SeqCst), 1);
+        assert_eq!(desktop.posts.load(Ordering::SeqCst), 1);
         assert_eq!(
             fence.take_outcome(3).unwrap(),
             serde_json::json!({"status":"restored", "prior_pid":1})
@@ -332,6 +398,208 @@ async fn cross_pid_click_chain_restores_original_app_once() {
         assert!(fence.take_outcome(3).is_none());
         assert!(fence.take_outcome(2).is_none());
     }
+}
+
+#[tokio::test(start_paused = true)]
+async fn chain_targeting_original_app_reports_restored() {
+    let fence: &'static Fence = Box::leak(Box::new(test_fence()));
+    let (a, a_guard) = fence.admit_action(true).await;
+    let (b, b_guard) = fence.admit_action(true).await;
+    let desktop = Arc::new(FakeDesktop {
+        front: 1.into(),
+        key: 1.into(),
+        window: 7.into(),
+        posts: 0.into(),
+    });
+    let ops = desktop.clone();
+    spawn_restore(
+        fence,
+        SpawnRestore {
+            pid: 2,
+            epoch: a,
+            expected_front: Some(1),
+            baseline: fake_baseline(),
+            window_id: Some(9),
+            target_stamp: fake_identity(2),
+        },
+        desktop.clone(),
+        move |pid, wid| async move {
+            super::super::pixel_focus::restore_user_focus_with(
+                ops.as_ref(),
+                pid,
+                Some(1),
+                Some(7),
+                wid,
+                true,
+                Some(1),
+            )
+            .await
+        },
+    );
+    spawn_restore(
+        fence,
+        SpawnRestore {
+            pid: 1,
+            epoch: b,
+            expected_front: Some(2),
+            baseline: fake_baseline(),
+            window_id: Some(7),
+            target_stamp: fake_identity(1),
+        },
+        desktop.clone(),
+        |_, _| async { panic!("chained duplicate") },
+    );
+    drop(a_guard);
+    drop(b_guard);
+    tokio::task::yield_now().await;
+    tokio::time::advance(std::time::Duration::from_millis(50)).await;
+    tokio::task::yield_now().await;
+    assert_eq!(desktop.posts.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        fence.take_outcome(1).unwrap(),
+        serde_json::json!({"status":"restored", "prior_pid":1})
+    );
+}
+
+#[tokio::test]
+async fn original_app_target_restores_its_previous_key_window() {
+    let ops = FakeDesktop {
+        front: 1.into(),
+        key: 1.into(),
+        window: 20.into(),
+        posts: 0.into(),
+    };
+    let restored = super::super::pixel_focus::restore_user_focus_with(
+        &ops,
+        1,
+        Some(1),
+        Some(7),
+        Some(20),
+        true,
+        Some(1),
+    )
+    .await;
+    assert!(restored);
+    assert_eq!(ops.window.load(Ordering::SeqCst), 7);
+    assert_eq!(ops.posts.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn real_spawn_retries_when_another_pending_target_is_frontmost() {
+    let fence: &'static Fence = Box::leak(Box::new(test_fence()));
+    let (a, a_guard) = fence.admit_action(true).await;
+    let (b, b_guard) = fence.admit_action(true).await;
+    let desktop = Arc::new(FakeDesktop {
+        front: 3.into(),
+        key: 3.into(),
+        window: 7.into(),
+        posts: 0.into(),
+    });
+    let ops = desktop.clone();
+    spawn_restore(
+        fence,
+        SpawnRestore {
+            pid: 2,
+            epoch: a,
+            expected_front: Some(1),
+            baseline: fake_baseline(),
+            window_id: Some(9),
+            target_stamp: fake_identity(2),
+        },
+        desktop.clone(),
+        move |pid, wid| async move {
+            super::super::pixel_focus::restore_user_focus_with(
+                ops.as_ref(),
+                pid,
+                Some(1),
+                Some(7),
+                wid,
+                true,
+                Some(1),
+            )
+            .await
+        },
+    );
+    spawn_restore(
+        fence,
+        SpawnRestore {
+            pid: 3,
+            epoch: b,
+            expected_front: Some(4),
+            baseline: fake_baseline(),
+            window_id: Some(10),
+            target_stamp: fake_identity(3),
+        },
+        desktop.clone(),
+        |_, _| async { panic!("other pending restore ran") },
+    );
+    drop(a_guard);
+    drop(b_guard);
+    tokio::task::yield_now().await;
+    tokio::time::advance(std::time::Duration::from_millis(50)).await;
+    tokio::task::yield_now().await;
+    assert_eq!(desktop.posts.load(Ordering::SeqCst), 0);
+    assert!(
+        fence.obligations.lock().unwrap().contains_key(&2),
+        "pending target must not abandon original"
+    );
+    assert!(fence.take_outcome(2).is_none());
+    desktop.front.store(2, Ordering::SeqCst);
+    tokio::time::advance(std::time::Duration::from_millis(50)).await;
+    tokio::task::yield_now().await;
+    assert_eq!(desktop.front.load(Ordering::SeqCst), 1);
+    assert_eq!(desktop.posts.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn chain_target_uses_latest_window_for_repeated_pid() {
+    let fence: &'static Fence = Box::leak(Box::new(test_fence()));
+    let (a, a_guard) = fence.admit_action(true).await;
+    let (b, b_guard) = fence.admit_action(true).await;
+    let (c, c_guard) = fence.admit_action(true).await;
+    for (pid, epoch, prior, wid) in [(2, a, 1, 10), (3, b, 2, 30), (2, c, 3, 20)] {
+        spawn_restore_with_window(
+            fence,
+            RestoreTarget {
+                pid,
+                window_id: Some(wid),
+                stamp: fake_identity(pid),
+            },
+            epoch,
+            Some(prior),
+            || RestoreCheck::Valid,
+            || async { true },
+        );
+    }
+    assert_eq!(fence.chain_target(2, a, Some(2)), (2, Some(20)));
+    drop(a_guard);
+    drop(b_guard);
+    drop(c_guard);
+}
+
+#[tokio::test(start_paused = true)]
+async fn same_pid_click_updates_window_without_new_obligation() {
+    let fence: &'static Fence = Box::leak(Box::new(test_fence()));
+    let (a, first) = fence.admit_action(true).await;
+    spawn_restore_with_window(
+        fence,
+        RestoreTarget {
+            pid: 2,
+            window_id: Some(10),
+            stamp: fake_identity(2),
+        },
+        a,
+        Some(1),
+        || RestoreCheck::Valid,
+        || async { true },
+    );
+    let (b, second) = fence.admit_action(true).await;
+    fence.update_existing_target(2, Some(20), fake_identity(2), b);
+    fence.update_existing_target(2, Some(99), fake_identity(2), a);
+    assert_eq!(fence.chain_target(2, a, Some(2)), (2, Some(20)));
+    assert_eq!(fence.obligations.lock().unwrap().len(), 1);
+    drop(first);
+    drop(second);
 }
 
 #[tokio::test(start_paused = true)]
@@ -428,6 +696,63 @@ async fn debounce_reports_user_input_and_third_app_without_restoring() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn chained_click_after_unconfirmed_restore_reports_outcome() {
+    let fence: &'static Fence = Box::leak(Box::new(test_fence()));
+    let (a, action) = fence.admit_action(true).await;
+    spawn_restore_with(
+        fence,
+        2,
+        a,
+        Some(1),
+        || RestoreCheck::Valid,
+        || async { false },
+    );
+    drop(action);
+    tokio::task::yield_now().await;
+    tokio::time::advance(std::time::Duration::from_millis(50)).await;
+    tokio::task::yield_now().await;
+    let (b, action_b) = fence.admit_action(true).await;
+    spawn_restore_with(
+        fence,
+        3,
+        b,
+        Some(2),
+        || RestoreCheck::Valid,
+        || async { panic!("unconfirmed chain ran") },
+    );
+    drop(action_b);
+    assert_eq!(
+        fence.take_outcome(3).unwrap(),
+        serde_json::json!({"status":"abandoned", "reason":"unconfirmed", "prior_pid":1})
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn same_pid_click_after_unconfirmed_restore_reports_outcome() {
+    let fence: &'static Fence = Box::leak(Box::new(test_fence()));
+    let (a, action) = fence.admit_action(true).await;
+    spawn_restore_with(
+        fence,
+        2,
+        a,
+        Some(1),
+        || RestoreCheck::Valid,
+        || async { false },
+    );
+    drop(action);
+    tokio::task::yield_now().await;
+    tokio::time::advance(std::time::Duration::from_millis(50)).await;
+    tokio::task::yield_now().await;
+    let (b, action_b) = fence.admit_action(true).await;
+    fence.update_existing_target(2, Some(20), fake_identity(2), b);
+    drop(action_b);
+    assert_eq!(
+        fence.take_outcome(2).unwrap(),
+        serde_json::json!({"status":"abandoned", "reason":"unconfirmed", "prior_pid":1})
+    );
+}
+
+#[tokio::test(start_paused = true)]
 async fn unconfirmed_restore_keeps_obligation_until_timeout() {
     let fence = Box::leak(Box::new(test_fence()));
     let (epoch, admission) = fence.admit_action(true).await;
@@ -513,8 +838,54 @@ async fn unreadable_front_or_idle_defers_until_timeout() {
     assert_eq!(fence.take_outcome(2).unwrap()["reason"], "timeout");
 }
 
+#[tokio::test]
+async fn focus_capable_browser_and_page_actions_are_tracked() {
+    struct Probe {
+        def: cua_driver_core::tool::ToolDef,
+        fence: &'static Fence,
+        seen: Arc<AtomicUsize>,
+    }
+    #[async_trait::async_trait]
+    impl cua_driver_core::tool::Tool for Probe {
+        fn def(&self) -> &cua_driver_core::tool::ToolDef {
+            &self.def
+        }
+        async fn invoke(&self, _: serde_json::Value) -> cua_driver_core::protocol::ToolResult {
+            self.seen.store(
+                self.fence.in_flight.load(Ordering::SeqCst),
+                Ordering::SeqCst,
+            );
+            cua_driver_core::protocol::ToolResult::text("ok")
+        }
+    }
+    for (name, action) in [
+        ("page", "enable_javascript_apple_events"),
+        ("browser_navigate", ""),
+        ("browser_click", ""),
+        ("browser_download", ""),
+        ("browser_prepare", ""),
+        ("get_browser_state", ""),
+    ] {
+        let fence: &'static Fence = Box::leak(Box::new(test_fence()));
+        let seen = Arc::new(AtomicUsize::new(0));
+        let mut def = FakeTool::new().0;
+        def.name = name.into();
+        let probe = Probe {
+            def,
+            fence,
+            seen: seen.clone(),
+        };
+        invoke_with_fence(fence, &probe, serde_json::json!({"action":action})).await;
+        assert_eq!(
+            seen.load(Ordering::SeqCst),
+            1,
+            "{name} {action} must be tracked"
+        );
+    }
+}
+
 #[tokio::test(start_paused = true)]
-async fn browser_navigation_does_not_starve_focus_restoration() {
+async fn ordinary_page_action_does_not_starve_focus_restoration() {
     struct BlockingTool {
         def: cua_driver_core::tool::ToolDef,
         ready: Mutex<Option<oneshot::Sender<()>>>,
@@ -550,14 +921,19 @@ async fn browser_navigation_does_not_starve_focus_restoration() {
     let (ready, receiving) = oneshot::channel();
     let (release, released) = oneshot::channel();
     let mut def = FakeTool::new().0;
-    def.name = "browser_navigate".into();
+    def.name = "page".into();
     let tool = BlockingTool {
         def,
         ready: Mutex::new(Some(ready)),
         release: tokio::sync::Mutex::new(Some(released)),
     };
     let action = tokio::spawn(async move {
-        invoke_with_fence(fence, &tool, serde_json::json!({"pid": 99})).await
+        invoke_with_fence(
+            fence,
+            &tool,
+            serde_json::json!({"pid": 99, "action": "click_element"}),
+        )
+        .await
     });
     receiving.await.unwrap();
     tokio::task::yield_now().await;
@@ -568,7 +944,7 @@ async fn browser_navigation_does_not_starve_focus_restoration() {
     action.await.unwrap();
     assert_eq!(
         during_action, 1,
-        "unrelated CDP action delayed focus restoration"
+        "ordinary page action delayed focus restoration"
     );
 }
 

@@ -28,7 +28,8 @@ pub(super) struct Fence {
 struct Obligation {
     epoch: u64,
     prior: Option<i32>,
-    targets: Vec<(i32, Option<u32>, Option<ProcessStamp>)>,
+    targets: Vec<(i32, Option<u32>, Option<ProcessStamp>, u64)>,
+    attempted: bool,
 }
 struct RestoreTarget {
     pid: i32,
@@ -132,9 +133,16 @@ impl Fence {
             .targets
             .iter()
             .copied()
-            .find(|(pid, _, _)| Some(*pid) == front)
-            .or_else(|| chain.targets.last().copied())
-            .map(|(pid, wid, _)| (pid, wid))
+            .filter(|(pid, _, _, _)| Some(*pid) == front)
+            .max_by_key(|(_, _, _, event_epoch)| *event_epoch)
+            .or_else(|| {
+                chain
+                    .targets
+                    .iter()
+                    .copied()
+                    .max_by_key(|(_, _, _, event_epoch)| *event_epoch)
+            })
+            .map(|(pid, wid, _, _)| (pid, wid))
             .unwrap_or((root, None))
     }
     fn outcome_identity(&self, root: i32, epoch: u64) -> (i32, Option<ProcessStamp>) {
@@ -142,8 +150,13 @@ impl Fence {
         obligations
             .get(&root)
             .filter(|chain| chain.epoch == epoch)
-            .and_then(|chain| chain.targets.last())
-            .map_or((root, None), |(pid, _, stamp)| (*pid, *stamp))
+            .and_then(|chain| {
+                chain
+                    .targets
+                    .iter()
+                    .max_by_key(|(_, _, _, event_epoch)| *event_epoch)
+            })
+            .map_or((root, None), |(pid, _, stamp, _)| (*pid, *stamp))
     }
     fn record_chain_outcome(
         &self,
@@ -161,7 +174,28 @@ impl Fence {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .values()
-            .any(|chain| chain.targets.iter().any(|(target, _, _)| *target == pid))
+            .any(|chain| chain.targets.iter().any(|(target, _, _, _)| *target == pid))
+    }
+    pub(super) fn update_existing_target(
+        &self,
+        pid: i32,
+        wid: Option<u32>,
+        stamp: Option<ProcessStamp>,
+        epoch: u64,
+    ) {
+        let mut obligations = self.obligations.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(chain) = obligations.values_mut().find(|chain| {
+            chain.targets.iter().any(|(target, _, prior_stamp, _)| {
+                *target == pid && stamp.is_some() && *prior_stamp == stamp
+            })
+        }) {
+            if chain.attempted {
+                self.record_outcome(pid, stamp, chain.prior, "abandoned", Some("unconfirmed"));
+                return;
+            }
+            chain.targets.push((pid, wid, stamp, epoch));
+            self.notify_epoch_change();
+        }
     }
     fn superseded(&self, pid: i32, epoch: u64) -> bool {
         self.superseded
@@ -221,7 +255,7 @@ impl Drop for Pending<'_> {
     }
 }
 static FENCE: OnceLock<Fence> = OnceLock::new();
-fn global() -> &'static Fence {
+pub(super) fn global() -> &'static Fence {
     FENCE.get_or_init(Fence::default)
 }
 tokio::task_local! { static ACTION_EPOCH: (String, u64); }
@@ -331,34 +365,36 @@ pub(crate) fn wrap(
 }
 
 pub(super) fn requires_admission(name: &str) -> bool {
-    matches!(
-        name,
-        "click"
-            | "double_click"
-            | "right_click"
-            | "drag"
-            | "scroll"
-            | "type_text"
-            | "press_key"
-            | "hotkey"
-            | "set_value"
-            | "select_text"
-            | "invoke_menu"
-            | "menu_bar_extras"
-            | "move_cursor"
-            | "page"
-            | "browser_click"
-            | "browser_type"
-            | "browser_select"
-            | "browser_dialog"
-            | "browser_pointer"
-            | "browser_set_input_files"
-            | "browser_download"
-            | "browser_prepare"
-            | "browser_navigate"
-            | "bring_to_front"
-            | "launch_app"
-    )
+    name.starts_with("browser_")
+        || matches!(
+            name,
+            "click"
+                | "double_click"
+                | "right_click"
+                | "drag"
+                | "scroll"
+                | "type_text"
+                | "press_key"
+                | "hotkey"
+                | "set_value"
+                | "select_text"
+                | "invoke_menu"
+                | "menu_bar_extras"
+                | "move_cursor"
+                | "page"
+                | "get_browser_state"
+                | "browser_click"
+                | "browser_type"
+                | "browser_select"
+                | "browser_dialog"
+                | "browser_pointer"
+                | "browser_set_input_files"
+                | "browser_download"
+                | "browser_prepare"
+                | "browser_navigate"
+                | "bring_to_front"
+                | "launch_app"
+        )
 }
 
 pub(super) async fn invoke(
@@ -374,9 +410,12 @@ async fn invoke_with_fence(
     args: serde_json::Value,
 ) -> cua_driver_core::protocol::ToolResult {
     let name = tool.def().name.clone();
-    // CDP commands do not directly manipulate the native frontmost app.
-    // Preparation may launch a process, so it remains tracked.
-    let tracked = !(name == "page" || (name.starts_with("browser_") && name != "browser_prepare"));
+    // Browser operations can reconnect or launch a process and change the
+    // native frontmost app. Ordinary page calls do not use that reconnect
+    // path; the setup action itself relaunches the browser.
+    let tracked = name != "page"
+        || args.get("action").and_then(serde_json::Value::as_str)
+            == Some("enable_javascript_apple_events");
     let Ok((epoch, _in_flight)) = tokio::time::timeout(
         std::time::Duration::from_secs(2),
         fence.admit_action(tracked),
@@ -455,8 +494,12 @@ impl RestoreBaseline {
         }
     }
 
-    fn abandon_reason(&self, expected: Option<i32>, target: i32) -> RestoreCheck {
-        let front = crate::apps::frontmost_pid();
+    fn abandon_reason(
+        &self,
+        expected: Option<i32>,
+        target: i32,
+        front: Option<i32>,
+    ) -> RestoreCheck {
         let idle = super::physical_input_idle_ms();
         let now = std::time::Instant::now();
         let elapsed =
@@ -492,7 +535,7 @@ impl RestoreBaseline {
         if self.idle.is_none() || idle.is_none() {
             return RestoreCheck::Retry;
         }
-        if !self.valid_sample_with_driver_hid(idle, elapsed, front, expected, target, false) {
+        if !self.valid_sample(idle, elapsed, front, expected, target) {
             return RestoreCheck::Abandon("user_input");
         }
         RestoreCheck::Valid
@@ -509,20 +552,62 @@ impl RestoreBaseline {
     }
 }
 
+pub(super) trait RestoreProbe: Send + Sync {
+    fn front(&self) -> Option<i32>;
+    fn check(
+        &self,
+        baseline: RestoreBaseline,
+        expected: Option<i32>,
+        target: i32,
+        front: Option<i32>,
+    ) -> RestoreCheck;
+}
+
+pub(super) struct SystemRestoreProbe;
+impl RestoreProbe for SystemRestoreProbe {
+    fn front(&self) -> Option<i32> {
+        crate::apps::frontmost_pid()
+    }
+    fn check(
+        &self,
+        baseline: RestoreBaseline,
+        expected: Option<i32>,
+        target: i32,
+        front: Option<i32>,
+    ) -> RestoreCheck {
+        baseline.abandon_reason(expected, target, front)
+    }
+}
+
+pub(super) struct SpawnRestore {
+    pub(super) pid: i32,
+    pub(super) epoch: u64,
+    pub(super) expected_front: Option<i32>,
+    pub(super) baseline: RestoreBaseline,
+    pub(super) window_id: Option<u32>,
+    pub(super) target_stamp: Option<ProcessStamp>,
+}
+
 pub(super) fn spawn_restore<F, Fut>(
-    pid: i32,
-    epoch: u64,
-    expected_front: Option<i32>,
-    baseline: RestoreBaseline,
-    window_id: Option<u32>,
-    target_stamp: Option<ProcessStamp>,
+    fence: &'static Fence,
+    request: SpawnRestore,
+    probe: std::sync::Arc<dyn RestoreProbe>,
     work: F,
 ) where
     F: FnOnce(i32, Option<u32>) -> Fut + Send + 'static,
     Fut: Future<Output = bool> + Send + 'static,
 {
+    let SpawnRestore {
+        pid,
+        epoch,
+        expected_front,
+        baseline,
+        window_id,
+        target_stamp,
+    } = request;
+    let check_probe = probe.clone();
     spawn_restore_with_window(
-        global(),
+        fence,
         RestoreTarget {
             pid,
             window_id,
@@ -531,20 +616,18 @@ pub(super) fn spawn_restore<F, Fut>(
         epoch,
         expected_front,
         move || {
-            let front = crate::apps::frontmost_pid();
-            let (target, _) = global().chain_target(pid, epoch, front);
+            let front = check_probe.front();
+            let (target, _) = fence.chain_target(pid, epoch, front);
             if front.is_some_and(|front| {
-                Some(front) != expected_front
-                    && front != target
-                    && global().is_pending_target(front)
+                Some(front) != expected_front && front != target && fence.is_pending_target(front)
             }) {
                 RestoreCheck::Retry
             } else {
-                baseline.abandon_reason(expected_front, target)
+                check_probe.check(baseline, expected_front, target, front)
             }
         },
         move || {
-            let (target, wid) = global().chain_target(pid, epoch, crate::apps::frontmost_pid());
+            let (target, wid) = fence.chain_target(pid, epoch, probe.front());
             work(target, wid)
         },
     );
@@ -603,10 +686,20 @@ fn spawn_restore_with_window<F, Fut, V>(
                     && root
                         .targets
                         .iter()
-                        .any(|(target, _, _)| *target == previous)
+                        .any(|(target, _, _, _)| *target == previous)
             })
         }) {
-            parent.targets.push((pid, window_id, target_stamp));
+            if parent.attempted {
+                fence.record_outcome(
+                    pid,
+                    target_stamp,
+                    parent.prior,
+                    "abandoned",
+                    Some("unconfirmed"),
+                );
+                return;
+            }
+            parent.targets.push((pid, window_id, target_stamp, epoch));
             fence.notify_epoch_change();
             return;
         }
@@ -617,7 +710,7 @@ fn spawn_restore_with_window<F, Fut, V>(
             return;
         }
         let mut superseded = fence.superseded.lock().unwrap_or_else(|e| e.into_inner());
-        let mut targets = vec![(pid, window_id, target_stamp)];
+        let mut targets = vec![(pid, window_id, target_stamp, epoch)];
         let descendants: Vec<i32> = obligations
             .iter()
             .filter_map(|(root, child)| {
@@ -636,6 +729,7 @@ fn spawn_restore_with_window<F, Fut, V>(
                 epoch,
                 prior,
                 targets,
+                attempted: false,
             },
         );
         superseded.extend(
@@ -702,6 +796,15 @@ fn spawn_restore_with_window<F, Fut, V>(
                     } else if matches!(result, Ok(true)) {
                         fence.record_chain_outcome(pid, epoch, prior, "restored", None);
                     } else {
+                        if let Some(chain) = fence
+                            .obligations
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .get_mut(&pid)
+                            .filter(|chain| chain.epoch == epoch)
+                        {
+                            chain.attempted = true;
+                        }
                         // The hand-back could not be confirmed. Keep the
                         // obligation until a takeover or its original deadline;
                         // never post the focus operation a second time.
