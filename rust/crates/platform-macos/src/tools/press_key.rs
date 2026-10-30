@@ -833,7 +833,7 @@ impl Tool for PressKeyTool {
                 let menu_item = latency::spawn_action_blocking(move || {
                     let native = !super::type_text::is_browser_pid(pid)
                         && !crate::browser::electron_js::ElectronJs::is_electron(pid);
-                    let in_front = apps::frontmost_pid() == Some(pid);
+                    let in_front = app_is_frontmost(pid, wid);
                     if native && !in_front {
                         super::menu_equivalent::find(pid, &lookup)
                     } else {
@@ -1335,17 +1335,7 @@ fn minimized_key_worker(
     let outcome = dispatch_with_ax_oracle(pid, Some(wid), ptr, || {
         with_confirmed_key_focus_or_fallback(
             ptr,
-            // Every focus write, retries included, reads the front app first.
             |target| {
-                if !restore.front_still_ok() {
-                    let earlier = match focus_writes.get() {
-                        0 => "no focus write was sent".to_owned(),
-                        n => format!("{n} earlier focus write(s) may have reached the element"),
-                    };
-                    anyhow::bail!(
-                        "the app came to the front, or which app is in front could not be read; {earlier} and no key was sent"
-                    );
-                }
                 focus_writes.set(focus_writes.get() + 1);
                 crate::input::ax_actions::focus_element(target)
             },
@@ -1359,12 +1349,6 @@ fn minimized_key_worker(
             |_| Ok(false),
             || {
                 verify_raw_key_target(pid, Some(wid), ptr, true)?;
-                // The last read before the post.
-                if !restore.front_still_ok() {
-                    anyhow::bail!(
-                        "the app came to the front, or which app is in front could not be read; no key was sent"
-                    );
-                }
                 crate::input::keyboard::press_key(pid, &key, &m)
             },
         )
@@ -1570,9 +1554,14 @@ where
     tokio::spawn(work).await
 }
 
-/// Another app is frontmost (the person is not using the target app).
-fn front_is_other_app(pid: i32, wid: u32) -> bool {
-    crate::input::skylight::front_process_matches(pid as libc::pid_t, wid) == Some(false)
+/// The target app is frontmost now. WindowServer's answer is used when it
+/// has one: AppKit's frontmost app lags behind it for an app that was just
+/// opened or activated.
+fn app_is_frontmost(pid: i32, wid: u32) -> bool {
+    match crate::input::skylight::front_process_matches(pid as libc::pid_t, wid) {
+        Some(front) => front,
+        None => apps::frontmost_pid() == Some(pid),
+    }
 }
 
 /// The app's focused and main windows are both `wid`: its menu commands
@@ -1732,9 +1721,9 @@ fn keys_posted_step(
 }
 
 /// Post the chord to the held key window: only while it is still the app's
-/// focused and main window and another app is in front, then hand key back.
+/// focused and main window, then hand key back.
 /// Why the chord fallback did not post: the keyboard gate refused, or right
-/// before the post the window or the front app changed.
+/// before the post the window stopped being the app's focused and main window.
 #[derive(Debug, PartialEq, Eq)]
 enum KeysHeld {
     GateRefused(String),
@@ -1775,7 +1764,7 @@ fn keys_under_scope(
     let (outcome, hand_back_note) = run_keys_under_scope(
         scope,
         gate,
-        || menu_bound_to(pid, wid) && front_is_other_app(pid, wid),
+        || menu_bound_to(pid, wid),
         || crate::input::keyboard::press_chord_no_auth(pid, key, &mods),
         |scope| {
             let entry = scope.entry();
@@ -1815,8 +1804,7 @@ fn keys_step(
             code: "window_not_key",
             text: format!(
                 "press_key: before the keys, the window stopped being the app's focused and \
-                 main window, or the app came to the front or which app is in front could not \
-                 be read. The requested chord was not sent and no menu action was sent.{notes}"
+                 main window. The requested chord was not sent and no menu action was sent.{notes}"
             ),
             validation,
         },
@@ -1898,7 +1886,7 @@ fn refusal_text(result: &ToolResult) -> String {
 /// The chord's menu route on one blocking thread: hold the target window as
 /// the app's key window, find and validate the item for that window, and
 /// press it only while the window is still the app's focused and main
-/// window and another app is still in front.
+/// window.
 fn chord_in_scope(pid: i32, wid: u32, combo: super::menu_equivalent::Combo) -> ChordStep {
     use crate::input::skylight::ValidationPost;
     let scope = match crate::input::skylight::enter_exact_window_key_inline(pid as libc::pid_t, wid)
@@ -1947,10 +1935,7 @@ fn chord_in_scope(pid: i32, wid: u32, combo: super::menu_equivalent::Combo) -> C
     let enabled = || unsafe { copy_bool_attr(element, "AXEnabled") } == Some(true);
     let mut validation = ValidationPost::default();
     if !enabled() {
-        validation =
-            crate::input::skylight::prime_menu_validation_guarded(pid as libc::pid_t, wid, || {
-                front_is_other_app(pid, wid)
-            });
+        validation = crate::input::skylight::prime_menu_validation(pid as libc::pid_t, wid);
         let deadline = std::time::Instant::now() + std::time::Duration::from_millis(200);
         while !enabled() && std::time::Instant::now() < deadline {
             std::thread::sleep(std::time::Duration::from_millis(20));
@@ -1992,12 +1977,11 @@ fn chord_in_scope(pid: i32, wid: u32, combo: super::menu_equivalent::Combo) -> C
             validation,
         );
     };
-    // The last checks, immediately before the one dispatch.
-    if !(menu_bound_to(pid, wid) && front_is_other_app(pid, wid)) {
+    // The last check, immediately before the one dispatch.
+    if !menu_bound_to(pid, wid) {
         return chord_refusal(
             "window_not_key",
-            "before the press, the window stopped being the app's focused and main window, or \
-             the app came to the front or which app is in front could not be read.",
+            "before the press, the window stopped being the app's focused and main window.",
             scope,
             validation,
         );
@@ -2140,36 +2124,18 @@ async fn native_menu_chord(
     let pid = lease.pid();
     let outcome = run_detached(async move {
         let lease = lease;
-        let step = match latency::spawn_action_blocking(move || chord_in_scope(pid, wid, combo)).await {
-            Ok(step) => step,
-            Err(error) => {
-                return task_failure(format!(
+        let step =
+            match latency::spawn_action_blocking(move || chord_in_scope(pid, wid, combo)).await {
+                Ok(step) => step,
+                Err(error) => {
+                    return task_failure(format!(
                     "press_key: the menu task failed ({error}); it may have run. Read the window \
                      before repeating it."
                 ))
-            }
-        };
+                }
+            };
         match step {
             ChordStep::Save { scope, path } => {
-                if !front_is_other_app(pid, wid) {
-                    let step = latency::spawn_action_blocking(move || {
-                        chord_refusal(
-                            "window_not_key",
-                            "the app came to the front, or which app is in front could not be read.",
-                            scope,
-                            crate::input::skylight::ValidationPost::default(),
-                        )
-                    })
-                    .await;
-                    return match step {
-                        Ok(step) => chord_result(step),
-                        Err(error) => task_failure(format!(
-                            "press_key: the key hand-back task failed ({error}); no menu action \
-                             was sent, and key focus inside the app may remain on the target \
-                             window."
-                        )),
-                    };
-                }
                 let entry = scope.entry();
                 let result = super::invoke_menu::run_in_background_with_lease(
                     &lease,
@@ -2185,7 +2151,8 @@ async fn native_menu_chord(
                 let mut result = super::hotkey::menu_refusal_without_keys(result);
                 let disclosure = crate::input::skylight::scope_disclosure(entry, Some(hand_back));
                 append_to_summary(&mut result, &disclosure);
-                if let Some(serde_json::Value::Object(fields)) = result.structured_content.as_mut() {
+                if let Some(serde_json::Value::Object(fields)) = result.structured_content.as_mut()
+                {
                     if !disclosure.is_empty() {
                         fields.insert("hand_back_note".into(), serde_json::json!(disclosure));
                     }
@@ -2319,7 +2286,7 @@ mod tests {
             outcome,
             Err(KeysHeld::GateRefused("window 7 is minimized.".into()))
         );
-        // Binding lost, or the person's app is no longer in front (or unknown).
+        // Binding lost.
         let (outcome, posts) = run(Ok(()), false);
         assert_eq!(posts, 0);
         assert_eq!(outcome, Err(KeysHeld::NoLongerTargeted));

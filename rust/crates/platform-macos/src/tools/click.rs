@@ -3095,16 +3095,13 @@ fn perform_ax_click(
             Some((element_ptr, Some(idx))),
             Some(window_id),
         );
-    // A native text input in a background app whose key window is another
-    // of its windows (a second document) takes AXFocused only while its own
-    // window is key: hold that window as the app's key window for the focus
-    // and its checks, then hand key back. The focus stays the window's first
-    // responder for the next type_text, which takes its own key scope.
-    let text_key_scope = text_input_press
-        && !text_in_web_area
-        && !foreground
-        && crate::input::skylight::front_process_matches(pid as libc::pid_t, window_id)
-            == Some(false);
+    // A native text input whose app's key window is another of its windows (a
+    // second document) takes AXFocused only while its own window is key: hold
+    // that window as the app's key window for the focus and its checks, then
+    // hand key back. A window that is already key is held without posting
+    // anything. The focus stays the window's first responder for the next
+    // type_text, which takes its own key scope.
+    let text_key_scope = text_input_press && !text_in_web_area && !foreground;
     if !foreground && !text_key_scope {
         latency::section(latency::Stage::KeyPrime, || {
             prime_key_window_for_background_press(pid, window_id, ax_action)
@@ -3143,16 +3140,6 @@ fn perform_ax_click(
                     foreground,
                 )?;
             } else {
-                // The person may have activated the app since the scope was
-                // entered: read the front app right before the focus write.
-                if text_key_scope
-                    && crate::input::skylight::front_process_matches(pid as libc::pid_t, window_id)
-                        != Some(false)
-                {
-                    anyhow::bail!(
-                        "text input [{idx}]: its app came to the front, or which app is in front could not be read; AXFocused was not written and AXPress was not sent"
-                    );
-                }
                 crate::input::ax_actions::focus_element(element_ptr)?;
             }
             // Focus can land shortly after delivery (a web field's DOM
