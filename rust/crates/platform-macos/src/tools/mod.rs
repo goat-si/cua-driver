@@ -8,6 +8,7 @@ mod click;
 mod clipboard;
 mod double_click;
 mod drag;
+mod element_pointer;
 mod get_window_state;
 mod hotkey;
 mod invoke_menu;

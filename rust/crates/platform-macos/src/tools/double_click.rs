@@ -18,7 +18,7 @@ pub struct DoubleClickTool {
     state: Arc<ToolState>,
 }
 
-fn background_action_for_element(
+pub(super) fn background_action_for_element(
     has_ax_open: bool,
 ) -> cua_driver_core::background_input::BackgroundAction {
     if has_ax_open {
@@ -209,11 +209,11 @@ impl Tool for DoubleClickTool {
 
 /// How an element double-click was delivered.
 #[derive(Debug, PartialEq, Eq)]
-enum ElementDoubleClick {
+pub(super) enum ElementDoubleClick<P = String> {
     /// AXOpen was sent; the message says whether the app reported an error.
     Ax(String),
-    /// A pixel double-click at the element's center.
-    Pixel(String),
+    /// A pixel double-click at the element's center (the caller's report).
+    Pixel(P),
 }
 
 /// A double-click delivered as AXOpen. Nothing reads back what it opened.
@@ -229,13 +229,13 @@ fn ax_double_click_result(message: &str, suffix: &str) -> ToolResult {
 /// never send a pixel double-click after it, which would land in whatever
 /// opened. Only an error that proves nothing was sent falls back to pixels,
 /// and only in the foreground.
-fn double_click_element(
+pub(super) fn double_click_element<P>(
     idx: usize,
     has_ax_open: bool,
     foreground: bool,
     open: impl FnOnce() -> crate::ax::bindings::AXError,
-    pixel: impl FnOnce() -> anyhow::Result<String>,
-) -> anyhow::Result<ElementDoubleClick> {
+    pixel: impl FnOnce() -> anyhow::Result<P>,
+) -> anyhow::Result<ElementDoubleClick<P>> {
     if has_ax_open {
         let err = open();
         if err == kAXErrorSuccess {
@@ -343,7 +343,7 @@ mod tests {
         };
         for err in [kAXErrorCannotComplete, kAXErrorAttributeUnsupported] {
             for foreground in [false, true] {
-                let outcome = double_click_element(
+                let outcome = double_click_element::<String>(
                     3,
                     true,
                     foreground,
@@ -359,7 +359,7 @@ mod tests {
         }
         // An error that proves nothing was sent: background fails, foreground
         // falls back to one pixel double-click.
-        assert!(double_click_element(
+        assert!(double_click_element::<String>(
             3,
             true,
             false,
@@ -368,14 +368,14 @@ mod tests {
         )
         .is_err());
         let pixels = std::cell::Cell::new(0);
-        let outcome = double_click_element(
+        let outcome = double_click_element::<String>(
             3,
             true,
             true,
             || kAXErrorIllegalArgument,
             || {
                 pixels.set(pixels.get() + 1);
-                Ok("pixel".into())
+                Ok(String::from("pixel"))
             },
         )
         .unwrap();

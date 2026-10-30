@@ -1984,7 +1984,7 @@ pub(super) fn click_element_center_for_focus_checked(
     )
 }
 
-unsafe fn element_or_bounded_descendant(
+pub(super) unsafe fn element_or_bounded_descendant(
     mut current: AXUIElementRef,
     target: AXUIElementRef,
 ) -> bool {
