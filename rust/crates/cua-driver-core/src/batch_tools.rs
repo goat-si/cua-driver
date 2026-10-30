@@ -2881,8 +2881,7 @@ mod timeout_tests {
             self.calls.lock().unwrap().push(args);
             self.started.notify_one();
             self.release.notified().await;
-            let result = (self.response)();
-            result
+            (self.response)()
         }
     }
 

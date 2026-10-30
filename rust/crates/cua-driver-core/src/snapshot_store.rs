@@ -1,3 +1,4 @@
+mod basis;
 use crate::element_token::{
     format_snapshot_id, parse_token, refusal, token_for, ResolvedElement, LRU_CAP_PER_PID,
     STALE_TOKEN_ERROR,
@@ -33,6 +34,9 @@ struct Snapshot<S> {
     zoom: Option<ZoomContext>,
     semantic: bool,
     payload: S,
+    basis: Option<crate::window_basis::WindowBasis>,
+    frame_generation: u32,
+    basis_exhausted: bool,
 }
 
 impl<S> Snapshot<S> {
@@ -257,16 +261,40 @@ fn out_of_range_refusal<S: SnapshotPayload>(snapshot: &Snapshot<S>, row: usize) 
     )
 }
 
+#[derive(Default)]
+struct TicketState {
+    next: u64,
+    applied: u64,
+}
+struct StoreState<S> {
+    snapshots: HashMap<i32, Vec<Snapshot<S>>>,
+    tickets: HashMap<(i32, u64), TicketState>,
+}
+impl<S> std::ops::Deref for StoreState<S> {
+    type Target = HashMap<i32, Vec<Snapshot<S>>>;
+    fn deref(&self) -> &Self::Target {
+        &self.snapshots
+    }
+}
+impl<S> std::ops::DerefMut for StoreState<S> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.snapshots
+    }
+}
+
 pub struct SnapshotStore<S: SnapshotPayload> {
     runtime_scope: String,
-    inner: Mutex<HashMap<i32, Vec<Snapshot<S>>>>,
+    inner: Mutex<StoreState<S>>,
 }
 
 impl<S: SnapshotPayload> SnapshotStore<S> {
     pub fn new() -> Self {
         Self {
             runtime_scope: current_runtime_scope(),
-            inner: Mutex::new(HashMap::new()),
+            inner: Mutex::new(StoreState {
+                snapshots: HashMap::new(),
+                tickets: HashMap::new(),
+            }),
         }
     }
 
@@ -297,7 +325,7 @@ impl<S: SnapshotPayload> SnapshotStore<S> {
             payload,
             session,
             (screenshot_scale, None),
-            true,
+            (true, None),
         )
     }
 
@@ -327,7 +355,7 @@ impl<S: SnapshotPayload> SnapshotStore<S> {
             payload,
             session,
             (screenshot_scale, window_size),
-            true,
+            (true, None),
         )
     }
 
@@ -356,6 +384,7 @@ impl<S: SnapshotPayload> SnapshotStore<S> {
             .iter_mut()
             .find(|snapshot| snapshot.window_id == window_id)
             .filter(|snapshot| snapshot.semantic)?;
+        snapshot.advance_basis(None, session);
         snapshot.screenshot_owner = session.map(str::to_owned);
         snapshot.screenshot_scale = Some(screenshot_scale);
         snapshot.screenshot_window_size = window_size;
@@ -379,7 +408,7 @@ impl<S: SnapshotPayload> SnapshotStore<S> {
             payload,
             session,
             (screenshot_scale, None),
-            false,
+            (false, None),
         )
     }
 
@@ -392,13 +421,32 @@ impl<S: SnapshotPayload> SnapshotStore<S> {
         // The new screenshot's scale, if any, and the window size in points
         // at this read.
         (screenshot_scale, window_size): (Option<f64>, Option<(f64, f64)>),
-        semantic: bool,
+        (semantic, basis_ticket): (
+            bool,
+            Option<(u64, Option<crate::window_basis::WindowBasis>)>,
+        ),
     ) -> Option<(u32, Vec<u32>)> {
         let (id, retired) = {
             let mut inner = self.inner.lock().unwrap();
             if session.is_some_and(crate::session::is_session_ended) {
                 return None;
             }
+            let basis = if let Some((ticket, basis)) = basis_ticket {
+                if basis
+                    .as_ref()
+                    .is_some_and(|b| b.pid != pid || b.window_id != window_id)
+                {
+                    return None;
+                }
+                let state = inner.tickets.get_mut(&(pid, window_id))?;
+                if ticket == 0 || ticket > state.next || ticket <= state.applied {
+                    return None;
+                }
+                state.applied = ticket;
+                basis
+            } else {
+                None
+            };
             let lane = inner.entry(pid).or_default();
             let mut retired = Vec::new();
             if let Some(position) = lane.iter().position(|entry| entry.window_id == window_id) {
@@ -432,6 +480,12 @@ impl<S: SnapshotPayload> SnapshotStore<S> {
                 zoom: None,
                 semantic,
                 payload,
+                basis: basis.map(|mut b| {
+                    b.snapshot_id = crate::window_basis::format_basis_id(id, 0);
+                    b
+                }),
+                frame_generation: 0,
+                basis_exhausted: false,
             });
             (id, retired)
         };
@@ -704,7 +758,7 @@ impl<S: SnapshotPayload> SnapshotStore<S> {
     }
 
     pub fn clear(&self) -> usize {
-        let retired = std::mem::take(&mut *self.inner.lock().unwrap());
+        let retired = std::mem::take(&mut self.inner.lock().unwrap().snapshots);
         let count = retired.len();
         drop(retired);
         count
