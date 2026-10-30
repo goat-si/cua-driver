@@ -37,6 +37,12 @@ struct Snapshot<S> {
     basis: Option<crate::window_basis::WindowBasis>,
     frame_generation: u32,
     basis_exhausted: bool,
+    /// Tickets at or below this one can no longer attach a frame here. A
+    /// ticketed publication or refresh sets it to its own ticket, so captures
+    /// that began later still land; a plain publication or screenshot refresh
+    /// sets it to the newest ticket issued, since every capture in flight began
+    /// before it.
+    ticket_floor: u64,
 }
 
 impl<S> Snapshot<S> {
@@ -261,15 +267,19 @@ fn out_of_range_refusal<S: SnapshotPayload>(snapshot: &Snapshot<S>, row: usize) 
     )
 }
 
-#[derive(Default)]
+/// Capture tickets of one window that are still in flight. `issued` is the
+/// newest ticket handed out and `applied` the newest one that published; tickets
+/// in between may still land. The entry is dropped once nothing is in flight.
 struct TicketState {
-    next: u64,
+    issued: u64,
     applied: u64,
 }
 struct StoreState<S> {
     snapshots: HashMap<i32, Vec<Snapshot<S>>>,
     tickets: HashMap<(i32, u64), TicketState>,
-    next_ticket: u64,
+    /// Store-wide ticket counter. It never restarts, even when `tickets`
+    /// entries are dropped, so an old ticket can never match a newer entry.
+    last_ticket: u64,
 }
 impl<S> std::ops::Deref for StoreState<S> {
     type Target = HashMap<i32, Vec<Snapshot<S>>>;
@@ -295,7 +305,7 @@ impl<S: SnapshotPayload> SnapshotStore<S> {
             inner: Mutex::new(StoreState {
                 snapshots: HashMap::new(),
                 tickets: HashMap::new(),
-                next_ticket: 0,
+                last_ticket: 0,
             }),
         }
     }
@@ -383,6 +393,7 @@ impl<S: SnapshotPayload> SnapshotStore<S> {
         if session.is_some_and(crate::session::is_session_ended) {
             return None;
         }
+        let ticket_floor = inner.last_ticket;
         let snapshot = inner
             .get_mut(&pid)?
             .iter_mut()
@@ -393,10 +404,9 @@ impl<S: SnapshotPayload> SnapshotStore<S> {
         snapshot.screenshot_scale = Some(screenshot_scale);
         snapshot.screenshot_window_size = window_size;
         snapshot.zoom = None;
+        snapshot.ticket_floor = ticket_floor;
         let id = snapshot.id;
-        if let Some(state) = inner.tickets.get_mut(&(pid, window_id)) {
-            state.applied = state.next;
-        }
+        inner.supersede_captures(pid, window_id);
         Some(id)
     }
 
@@ -442,24 +452,24 @@ impl<S: SnapshotPayload> SnapshotStore<S> {
             if session.is_some_and(crate::session::is_session_ended) {
                 return None;
             }
-            let basis = if let Some((ticket, basis)) = basis_ticket {
+            let (basis, ticket_floor) = if let Some((ticket, basis)) = basis_ticket {
                 if basis
                     .as_ref()
                     .is_some_and(|b| b.pid != pid || b.window_id != window_id)
                 {
                     return None;
                 }
-                let state = inner.tickets.get_mut(&(pid, window_id))?;
-                if ticket == 0 || ticket > state.next || ticket <= state.applied {
+                if !inner.ticket_current(pid, window_id, ticket) {
                     return None;
                 }
-                state.applied = ticket;
-                basis
+                inner.apply_ticket(pid, window_id, ticket);
+                (basis, ticket)
             } else {
-                if let Some(state) = inner.tickets.get_mut(&(pid, window_id)) {
-                    state.applied = state.next;
-                }
-                None
+                // A plain publication carries no ticket, so every capture
+                // already in flight for the window began before it ended and
+                // must not replace it.
+                inner.supersede_captures(pid, window_id);
+                (None, inner.last_ticket)
             };
             let lane = inner.entry(pid).or_default();
             let mut retired = Vec::new();
@@ -501,6 +511,7 @@ impl<S: SnapshotPayload> SnapshotStore<S> {
                 basis: stored.clone(),
                 frame_generation: 0,
                 basis_exhausted: false,
+                ticket_floor,
             });
             for snapshot in &retired {
                 if snapshot.window_id != window_id {
@@ -778,7 +789,7 @@ impl<S: SnapshotPayload> SnapshotStore<S> {
     pub fn remove(&self, pid: i32, window_id: u64) -> Option<u32> {
         let retired = {
             let mut inner = self.inner.lock().unwrap();
-            inner.tickets.remove(&(pid, window_id));
+            inner.supersede_captures(pid, window_id);
             inner.get_mut(&pid).and_then(|lane| {
                 let position = lane.iter().position(|entry| entry.window_id == window_id)?;
                 Some(lane.remove(position))

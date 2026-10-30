@@ -259,3 +259,122 @@ fn checked_mapping_rejects_stale_frame_before_mapping() {
         "point_outside_window"
     );
 }
+
+#[test]
+fn plain_publish_supersedes_an_older_capture() {
+    let s = SnapshotStore::new();
+    let old = s.begin_capture(42, 7);
+    let (id, _) = s
+        .publish_for_session(42, 7, Payload, Some("a"), None)
+        .unwrap();
+    // The capture began before the tree read: it must neither replace the
+    // newer snapshot (retiring its tokens) nor attach its frame to it.
+    assert!(s
+        .publish_basis_for_session(42, 7, Payload, Some("a"), Some(1.0), Some(basis()), old)
+        .is_none());
+    assert!(s
+        .publish_capture_basis_for_session(42, 7, Payload, Some("a"), Some(1.0), Some(basis()), old)
+        .is_none());
+    assert_eq!(
+        s.refresh_basis_for_session(42, 7, Some("a"), 1.0, None, Some(basis()), old)
+            .map(|(id, _)| id),
+        None
+    );
+    assert_eq!(s.window_for_snapshot(42, id), Some(7));
+    assert_eq!(
+        reason(s.basis_for(42, 7, &format_basis_id(id, 0), Some("a"))),
+        "no_basis"
+    );
+    // A capture that begins after the publication still lands.
+    let new = s.begin_capture(42, 7);
+    assert_eq!(
+        s.refresh_basis_for_session(42, 7, Some("a"), 1.0, None, Some(basis()), new)
+            .map(|(id, _)| id),
+        Some(id)
+    );
+    assert!(s
+        .basis_for(42, 7, &format_basis_id(id, 1), Some("a"))
+        .is_ok());
+}
+
+#[test]
+fn plain_capture_publish_and_screenshot_refresh_supersede_older_captures() {
+    let s = SnapshotStore::new();
+    let first = s.begin_capture(42, 7);
+    let (id, _) = s
+        .publish_capture_for_session(42, 7, Payload, Some("a"), Some(1.0))
+        .unwrap();
+    assert!(s
+        .publish_capture_basis_for_session(
+            42,
+            7,
+            Payload,
+            Some("a"),
+            Some(1.0),
+            Some(basis()),
+            first
+        )
+        .is_none());
+    assert_eq!(s.window_for_snapshot(42, id), Some(7));
+
+    let t = s.begin_capture(42, 7);
+    let (id, _, _) = s
+        .publish_basis_for_session(42, 7, Payload, Some("a"), Some(1.0), Some(basis()), t)
+        .unwrap();
+    let old = s.begin_capture(42, 7);
+    assert_eq!(
+        s.refresh_screenshot_for_session(42, 7, Some("a"), 1.0, None),
+        Some(id)
+    );
+    // The screenshot-only read is newer than the in-flight capture, so the
+    // capture's frame must not replace it.
+    assert_eq!(
+        s.refresh_basis_for_session(42, 7, Some("a"), 1.0, None, Some(basis()), old)
+            .map(|(id, _)| id),
+        None
+    );
+    assert_eq!(
+        reason(s.basis_for(42, 7, &format_basis_id(id, 1), Some("a"))),
+        "no_basis"
+    );
+}
+
+#[test]
+fn old_ticket_refresh_after_a_newer_publication_changes_nothing() {
+    let s = SnapshotStore::new();
+    let old = s.begin_capture(42, 7);
+    let newer = s.begin_capture(42, 7);
+    let (id, _, _) = s
+        .publish_basis_for_session(42, 7, Payload, Some("a"), Some(1.0), Some(basis()), newer)
+        .unwrap();
+    let mut older = basis();
+    older.x += 50;
+    assert_eq!(
+        s.refresh_basis_for_session(42, 7, Some("a"), 1.0, None, Some(older), old)
+            .map(|(id, _)| id),
+        None
+    );
+    assert_eq!(
+        s.basis_for(42, 7, &format_basis_id(id, 0), Some("a"))
+            .unwrap()
+            .x,
+        -100
+    );
+
+    // Same after a plain publication, with a newer capture also in flight.
+    let old = s.begin_capture(42, 7);
+    let (id, _) = s
+        .publish_for_session(42, 7, Payload, Some("a"), Some(1.0))
+        .unwrap();
+    let new = s.begin_capture(42, 7);
+    assert_eq!(
+        s.refresh_basis_for_session(42, 7, Some("a"), 1.0, None, Some(basis()), old)
+            .map(|(id, _)| id),
+        None
+    );
+    assert_eq!(
+        s.refresh_basis_for_session(42, 7, Some("a"), 1.0, None, Some(basis()), new)
+            .map(|(id, _)| id),
+        Some(id)
+    );
+}

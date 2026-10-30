@@ -1,6 +1,34 @@
-use super::{Snapshot, SnapshotPayload, SnapshotStore};
+use super::{Snapshot, SnapshotPayload, SnapshotStore, StoreState, TicketState};
 use crate::protocol::ToolResult;
 use crate::window_basis::{basis_refusal, format_basis_id, parse_basis_id, WindowBasis};
+
+impl<S> StoreState<S> {
+    /// Whether `ticket` was issued for the window and no newer capture or plain
+    /// publication has landed since.
+    pub(super) fn ticket_current(&self, pid: i32, window_id: u64, ticket: u64) -> bool {
+        self.tickets
+            .get(&(pid, window_id))
+            .is_some_and(|state| ticket != 0 && ticket <= state.issued && ticket > state.applied)
+    }
+
+    /// Record `ticket` as landed, dropping the window's entry once no newer
+    /// capture is in flight. Call only after [`Self::ticket_current`].
+    pub(super) fn apply_ticket(&mut self, pid: i32, window_id: u64, ticket: u64) {
+        if let Some(state) = self.tickets.get_mut(&(pid, window_id)) {
+            state.applied = ticket;
+            if state.applied >= state.issued {
+                self.tickets.remove(&(pid, window_id));
+            }
+        }
+    }
+
+    /// Make every capture in flight for the window obsolete. Tickets come from
+    /// a counter that never restarts, so dropping the entry is enough: a later
+    /// [`SnapshotStore::begin_capture`] starts a fresh entry above them.
+    pub(super) fn supersede_captures(&mut self, pid: i32, window_id: u64) {
+        self.tickets.remove(&(pid, window_id));
+    }
+}
 
 impl<S> Snapshot<S> {
     pub(super) fn advance_basis(&mut self, basis: Option<WindowBasis>, session: Option<&str>) {
@@ -28,22 +56,25 @@ impl<S> Snapshot<S> {
 }
 
 impl<S: SnapshotPayload> SnapshotStore<S> {
-    /// Reserve the ordering ticket before starting a capture. Tickets never wrap.
+    /// Reserve the ordering ticket before starting a capture. Tickets never
+    /// wrap: once the store's 64-bit counter is spent this returns 0, a ticket
+    /// every publication and refresh refuses.
     pub fn begin_capture(&self, pid: i32, window_id: u64) -> u64 {
         let mut inner = self.inner.lock().unwrap();
-        let previous = inner.next_ticket;
-        let ticket = previous
-            .checked_add(1)
-            .expect("capture ticket space exhausted");
-        inner.next_ticket = ticket;
-        let state = inner
+        let Some(ticket) = inner.last_ticket.checked_add(1) else {
+            return 0;
+        };
+        inner.last_ticket = ticket;
+        // A new entry starts just below this ticket, so tickets issued before
+        // the window's previous entry was dropped stay obsolete.
+        inner
             .tickets
             .entry((pid, window_id))
-            .or_insert(super::TicketState {
-                next: previous,
-                applied: previous,
-            });
-        state.next = ticket;
+            .or_insert(TicketState {
+                issued: ticket,
+                applied: ticket - 1,
+            })
+            .issued = ticket;
         ticket
     }
 
@@ -111,26 +142,25 @@ impl<S: SnapshotPayload> SnapshotStore<S> {
         {
             return None;
         }
-        let state = inner.tickets.get(&(pid, window_id))?;
-        if ticket == 0 || ticket > state.next || ticket <= state.applied {
+        if !inner.ticket_current(pid, window_id, ticket) {
             return None;
         }
         let snapshot = inner
             .get_mut(&pid)?
             .iter_mut()
-            .find(|s| s.window_id == window_id)?;
+            .find(|s| s.window_id == window_id)
+            // The ticket must postdate the snapshot and its current frame:
+            // an older capture would attach an older frame to newer state.
+            .filter(|s| ticket > s.ticket_floor)?;
         snapshot.advance_basis(basis, session);
         snapshot.screenshot_owner = session.map(str::to_owned);
         snapshot.screenshot_scale = Some(screenshot_scale);
         snapshot.screenshot_window_size = window_size;
         snapshot.zoom = None;
+        snapshot.ticket_floor = ticket;
         let id = snapshot.id;
         let stored = snapshot.basis.clone();
-        inner
-            .tickets
-            .get_mut(&(pid, window_id))
-            .expect("ticket exists")
-            .applied = ticket;
+        inner.apply_ticket(pid, window_id, ticket);
         Some((id, stored))
     }
 
@@ -258,6 +288,50 @@ mod tests {
             .basis_for(1, 2, &format_basis_id(id, u32::MAX), None)
             .unwrap_err();
         assert_eq!(result.structured_content.unwrap()["reason"], "no_basis");
+    }
+    #[test]
+    fn ticket_state_is_pruned_and_never_reused() {
+        let store = SnapshotStore::new();
+        let t = store.begin_capture(1, 2);
+        store
+            .publish_basis_for_session(1, 2, Payload, None, Some(1.0), Some(frame()), t)
+            .unwrap();
+        // Nothing is in flight once the newest ticket lands.
+        assert!(store.inner.lock().unwrap().tickets.is_empty());
+
+        // A capture abandoned before clear() can neither land nor match a
+        // ticket issued afterwards.
+        let abandoned = store.begin_capture(1, 2);
+        assert_eq!(store.clear(), 1);
+        assert!(store.inner.lock().unwrap().tickets.is_empty());
+        let fresh = store.begin_capture(1, 2);
+        assert!(fresh > abandoned);
+        assert!(store
+            .publish_basis_for_session(1, 2, Payload, None, Some(1.0), Some(frame()), abandoned)
+            .is_none());
+        let (id, _, _) = store
+            .publish_basis_for_session(1, 2, Payload, None, Some(1.0), Some(frame()), fresh)
+            .unwrap();
+
+        // remove() drops the window's in-flight captures with its snapshot.
+        let in_flight = store.begin_capture(1, 2);
+        assert_eq!(store.remove(1, 2), Some(id));
+        assert!(store.inner.lock().unwrap().tickets.is_empty());
+        assert!(store
+            .publish_basis_for_session(1, 2, Payload, None, Some(1.0), Some(frame()), in_flight)
+            .is_none());
+    }
+
+    #[test]
+    fn exhausted_ticket_counter_refuses_instead_of_panicking() {
+        let store = SnapshotStore::new();
+        store.inner.lock().unwrap().last_ticket = u64::MAX;
+        let t = store.begin_capture(1, 2);
+        assert_eq!(t, 0);
+        assert!(store
+            .publish_basis_for_session(1, 2, Payload, None, Some(1.0), Some(frame()), t)
+            .is_none());
+        assert!(store.inner.lock().unwrap().tickets.is_empty());
     }
 }
 
