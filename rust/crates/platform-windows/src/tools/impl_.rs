@@ -508,6 +508,12 @@ impl Tool for ExactPidWindowTargetGuard {
     }
 
     async fn invoke(&self, args: Value) -> ToolResult {
+        if crate::basis_decision::select_click_basis(&self.inner.def().name, &args)
+            == crate::basis_decision::BasisSelection::Invalid
+        {
+            return invalid_basis_arguments();
+        }
+
         if args.get("scope").and_then(Value::as_str) != Some("desktop") {
             if let (Some(pid), Some(window_id)) = (
                 args.get("pid").and_then(Value::as_u64),
@@ -539,16 +545,18 @@ impl Tool for ExactPidWindowTargetGuard {
 type PidWindowGuardParts = (
     WindowTargetCandidates,
     cua_driver_core::window_target::TokenPidResolver,
+    cua_driver_core::window_target::SnapshotWindowResolver,
 );
 
 fn pid_window_guarded<T: Tool + 'static>(
     tool: T,
-    (candidates, token_pid_resolver): &PidWindowGuardParts,
+    (candidates, token_pid_resolver, snapshot_resolver): &PidWindowGuardParts,
 ) -> Box<dyn Tool> {
     Box::new(ExactPidWindowTargetGuard {
         inner: Box::new(
             PidOnlyWindowTargetGuard::new(Box::new(tool), candidates.clone())
-                .with_token_pid_resolver(token_pid_resolver.clone()),
+                .with_token_pid_resolver(token_pid_resolver.clone())
+                .with_snapshot_resolver(snapshot_resolver.clone()),
         ),
     })
 }
@@ -3387,6 +3395,155 @@ fn background_element_click_result(
         .with_action_record(record)
 }
 
+fn invalid_basis_arguments() -> ToolResult {
+    ToolResult::error("snapshot_id requires x and y and cannot be combined with element_token, capture_id, from_zoom, or desktop scope.")
+        .with_structured(json!({"code":"invalid_arguments", "effect":"refused", "nothing_sent":true}))
+}
+
+async fn basis_click(state: &ToolState, tool: &str, args: &Value) -> Option<ToolResult> {
+    use crate::basis_click::{self, Transport};
+    use crate::basis_decision::{select_click_basis, BasisSelection};
+    use crate::input::guarded_dispatch::GuardedResult;
+    use cua_driver_core::window_basis::{basis_refusal, BasisRefusal, DispatchEffect};
+    match select_click_basis(tool, args) {
+        BasisSelection::Legacy => return None,
+        BasisSelection::Invalid => return Some(invalid_basis_arguments()),
+        BasisSelection::Basis => {}
+    }
+    let refuse = || basis_refusal("stale_basis", "unknown_snapshot", None, None);
+    let Some(pid) = args
+        .get("pid")
+        .and_then(Value::as_i64)
+        .and_then(|p| i32::try_from(p).ok())
+    else {
+        return Some(invalid_basis_arguments());
+    };
+    let Some(snapshot_id) = args.get("snapshot_id").and_then(Value::as_str) else {
+        return Some(invalid_basis_arguments());
+    };
+    let hwnd = args.get("window_id").and_then(Value::as_u64).or_else(|| {
+        let (id, _) = cua_driver_core::window_basis::parse_basis_id(snapshot_id)?;
+        state.snapshots.window_for_snapshot(pid, id)
+    });
+    let Some(hwnd) = hwnd else {
+        return Some(refuse());
+    };
+    let session = args.get("_session_id").and_then(Value::as_str);
+    let basis = match state.snapshots.basis_for(pid, hwnd, snapshot_id, session) {
+        Ok(basis) => basis,
+        Err(result) => return Some(result),
+    };
+    let frame = match crate::capture::read_live_frame(hwnd) {
+        Ok(frame) => frame,
+        Err(_) => return Some(basis.refusal("stale_basis", "live_frame_unavailable", None)),
+    };
+    let (x, y) = (args["x"].as_f64().unwrap(), args["y"].as_f64().unwrap());
+    let (sx, sy) = match basis_click::early_point(&basis, Ok(frame), x, y) {
+        Ok(point) => point,
+        Err(refusal) => return Some(basis.refusal(refusal.code, refusal.reason, Some(&frame))),
+    };
+    let (Ok(sx32), Ok(sy32)) = (i32::try_from(sx), i32::try_from(sy)) else {
+        return Some(basis.refusal("point_outside_window", "point_outside_window", Some(&frame)));
+    };
+    let modifiers: Vec<String> = args
+        .get("modifier")
+        .and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(Value::as_str)
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default();
+    let unavailable = crate::input::delivery::is_winui3_target_window(hwnd)
+        || crate::input::delivery::would_be_silently_dropped(
+            hwnd,
+            crate::input::delivery::EventKind::MouseClick,
+        );
+    let mode = basis_click::transport(
+        args.get("delivery_mode").and_then(Value::as_str) == Some("foreground"),
+        !modifiers.is_empty(),
+        unavailable,
+    );
+    if mode == Transport::Unavailable {
+        return Some(crate::input::delivery::background_unavailable_error(
+            hwnd,
+            crate::input::delivery::EventKind::MouseClick,
+        ));
+    }
+    let (count, button) = match tool {
+        "double_click" => (2, "left"),
+        "right_click" => (1, "right"),
+        _ => {
+            let count = args.get("count").and_then(Value::as_u64).unwrap_or(1);
+            if !(1..=3).contains(&count) {
+                return Some(invalid_basis_arguments());
+            }
+            let button = args.get("button").and_then(Value::as_str).unwrap_or("left");
+            if !matches!(button, "left" | "right" | "middle") {
+                return Some(invalid_basis_arguments());
+            }
+            (count as usize, button)
+        }
+    };
+    let button = button.to_owned();
+    let cursor_key = resolve_cursor_key(args);
+    pin_overlay_above(&cursor_key, hwnd);
+    overlay_glide_to(&cursor_key, sx as f64, sy as f64).await;
+    crate::overlay::send_command(
+        cursor_key,
+        cursor_overlay::OverlayCommand::ClickPulse {
+            x: sx as f64,
+            y: sy as f64,
+        },
+    );
+    let snapshot_id = snapshot_id.to_owned();
+    let sent = tokio::task::spawn_blocking(move || {
+        let guard = || {
+            let live = crate::capture::read_live_frame(hwnd).map_err(|_| BasisRefusal {
+                code: "stale_basis",
+                reason: "live_frame_unavailable",
+            });
+            basis_click::dispatch_check(&basis, live)
+        };
+        let result = match mode {
+            Transport::Foreground => {
+                let refs: Vec<&str> = modifiers.iter().map(String::as_str).collect();
+                crate::input::send_click_guarded(hwnd, sx32, sy32, count, &button, &refs, guard)
+            }
+            Transport::Background => Ok(crate::input::post_click_guarded(
+                hwnd, sx32, sy32, count, &button, guard,
+            )),
+            Transport::Unavailable => unreachable!(),
+        };
+        (result, snapshot_id)
+    })
+    .await;
+    Some(match sent {
+        Ok((Ok(result), snapshot_id)) => {
+            let error = matches!(&result, GuardedResult::Refused { .. })
+                || match &result {
+                    GuardedResult::Sent { outcome } => {
+                        outcome.effect != DispatchEffect::Unverifiable
+                    }
+                    _ => true,
+                };
+            let value = basis_click::result_json(&result, &snapshot_id, (sx, sy));
+            if error {
+                ToolResult::error("Basis click was refused or delivery could not be completed.")
+                    .with_structured(value)
+            } else {
+                ToolResult::text("Basis click sent.").with_structured(value)
+            }
+        }
+        Ok((Err(error), _)) => ToolResult::error(error.to_string()).with_structured(
+            json!({"code":"dispatch_failed","effect":"refused","nothing_sent":true}),
+        ),
+        Err(error) => ToolResult::error(error.to_string())
+            .with_structured(json!({"code":"uncertain","effect":"uncertain"})),
+    })
+}
+
 pub struct ClickTool {
     state: Arc<ToolState>,
 }
@@ -3452,6 +3609,7 @@ impl Tool for ClickTool {
                     "pid":{"type":"integer","description":"Target process ID for window scope. Optional with element_token (the token carries the pid). Omit with scope=desktop for screen-absolute coordinates from get_desktop_state."},
                     "window_id":{"type":"integer","description":"HWND of the target window. Omit when element_token is supplied (the token carries it)."},
                     "element_token": cua_driver_core::tool_schema::element_token_schema(),
+                "snapshot_id":{"type":"string","description":"Point basis for x,y: window_basis.snapshot_id from get_window_state. Refused with stale_basis, nothing sent, if the window moved, resized or changed scale since that read."},
                     "action":{"type":"string","description":"Accessibility action for an element_token target. \"expand\" opens the element through UIA ExpandCollapsePattern, or clicks the dropdown half of an MSAA split button. Omit for the default invoke."},
                     "capture_id":{"type":"string","minLength":1,"description":"Optional ID from get_window_state or get_desktop_state. When present, x and y are admitted against that exact capture and the ID is consumed before native dispatch."},
                     "x":{"type":"number","description":"X in window-local screenshot pixels — same space as the PNG get_window_state returns. Must be provided together with y."},
@@ -3469,6 +3627,9 @@ impl Tool for ClickTool {
     }
 
     async fn invoke(&self, args: Value) -> ToolResult {
+        if let Some(result) = basis_click(&self.state, "click", &args).await {
+            return result;
+        }
         use crate::input::delivery::{DeliveryMode, EventKind};
         use crate::uia::snapshot::SnapshotKind;
         use cua_driver_core::tool_args::ArgsExt;
@@ -7212,6 +7373,7 @@ impl Tool for DoubleClickTool {
                 "pid":{"type":"integer","description":"Target process ID. Optional with element_token (the token carries the pid)."},
                 "window_id":{"type":"integer","description":"HWND for the target window. Omit when element_token is supplied (the token carries it)."},
                 "element_token": cua_driver_core::tool_schema::element_token_schema(),
+                "snapshot_id":{"type":"string","description":"Point basis for x,y: window_basis.snapshot_id from get_window_state. Refused with stale_basis, nothing sent, if the window moved, resized or changed scale since that read."},
                 "x":{"type":"number","description":"X in window-local screenshot pixels. Must be provided together with y."},
                 "y":{"type":"number","description":"Y in window-local screenshot pixels. Must be provided together with x."},
                 "modifier": cua_driver_core::tool_schema::modifier_schema(),
@@ -7222,6 +7384,9 @@ impl Tool for DoubleClickTool {
         })
     }
     async fn invoke(&self, args: Value) -> ToolResult {
+        if let Some(result) = basis_click(&self.state, "double_click", &args).await {
+            return result;
+        }
         use crate::input::delivery::{DeliveryMode, EventKind};
         // Swift error wording 1:1.
         let raw_pid = match args.get("pid").and_then(|v| v.as_i64()) {
@@ -7579,6 +7744,7 @@ impl Tool for RightClickTool {
                 "pid":{"type":"integer","description":"Target process ID. Optional with element_token (the token carries the pid)."},
                 "window_id":{"type":"integer","description":"HWND for the target window. Omit when element_token is supplied (the token carries it)."},
                 "element_token": cua_driver_core::tool_schema::element_token_schema(),
+                "snapshot_id":{"type":"string","description":"Point basis for x,y: window_basis.snapshot_id from get_window_state. Refused with stale_basis, nothing sent, if the window moved, resized or changed scale since that read."},
                 "x":{"type":"number","description":"X in window-local screenshot pixels. Must be provided together with y."},
                 "y":{"type":"number","description":"Y in window-local screenshot pixels. Must be provided together with x."},
                 "modifier": cua_driver_core::tool_schema::modifier_schema(),
@@ -7589,6 +7755,9 @@ impl Tool for RightClickTool {
         })
     }
     async fn invoke(&self, args: Value) -> ToolResult {
+        if let Some(result) = basis_click(&self.state, "right_click", &args).await {
+            return result;
+        }
         use crate::input::delivery::{DeliveryMode, EventKind};
         // Swift error wording 1:1.
         let raw_pid = match args.get("pid").and_then(|v| v.as_i64()) {
@@ -10653,6 +10822,14 @@ pub fn build_registry_with_provider(
     let pid_window_candidates: PidWindowGuardParts = (
         Arc::new(pid_window_target_candidates),
         token_pid_resolver(state.clone()),
+        {
+            let snapshots = state.snapshots.clone();
+            Arc::new(move |pid, handle| {
+                let pid = i32::try_from(pid).ok()?;
+                let id = cua_driver_core::element_token::parse_snapshot_handle(handle)?;
+                snapshots.window_for_snapshot(pid, id)
+            })
+        },
     );
     r.register(pid_window_guarded(BringToFrontTool, &pid_window_candidates));
     r.register(Box::new(SetWindowFrameTool));
