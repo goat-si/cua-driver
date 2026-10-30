@@ -2613,9 +2613,8 @@ impl ToolRegistry {
                 None
             }
         });
-        if result.is_error != Some(true) && crate::action_record::is_action_tool(resolved_name) {
-            if let Err(error) = publish_action_result(&mut result, resolved_name) {
-                result = ToolResult::error(format!(
+        if let Err(error) = publish_successful_action_result(&mut result, resolved_name) {
+            result = ToolResult::error(format!(
                     "internal action outcome mismatch for {resolved_name}: {error}; the tool may have executed. Verify state before retrying."
                 ))
                 .with_structured(serde_json::json!({
@@ -2624,7 +2623,6 @@ impl ToolRegistry {
                     "tool": resolved_name,
                     "detail": error,
                 }));
-            }
         }
         if result.is_error != Some(true) {
             if let Some(structured) = result.structured_content.clone() {
@@ -3943,6 +3941,38 @@ fn preserve_pointer_fields(
     Ok(())
 }
 
+fn publish_successful_action_result(
+    result: &mut ToolResult,
+    tool_name: &str,
+) -> Result<(), String> {
+    if result.is_error != Some(true) && crate::action_record::is_action_tool(tool_name) {
+        publish_action_result(result, tool_name)?;
+    }
+    Ok(())
+}
+
+fn preserve_action_disclosures(
+    public: &mut cua_driver_contract::ActionResult,
+    producer: &Value,
+) -> Result<(), String> {
+    public.note = optional_string_field(producer, "note")?;
+    public.warning = optional_string_field(producer, "warning")?;
+    public.focus_restoration = match producer.get("focus_restoration") {
+        None => None,
+        Some(value @ Value::Object(object)) => {
+            if object.get("reason").is_some_and(Value::is_null) {
+                return Err("focus_restoration.reason must be a string when present".into());
+            }
+            Some(
+                serde_json::from_value(value.clone())
+                    .map_err(|error| format!("invalid focus_restoration: {error}"))?,
+            )
+        }
+        Some(_) => return Err("focus_restoration must be an object".into()),
+    };
+    Ok(())
+}
+
 fn publish_action_result(result: &mut ToolResult, tool_name: &str) -> Result<(), String> {
     let producer_structured = result.structured_content.clone();
     let action = result
@@ -3961,6 +3991,9 @@ fn publish_action_result(result: &mut ToolResult, tool_name: &str) -> Result<(),
         Content::Text { text, .. } if !text.trim().is_empty() => Some(text.clone()),
         _ => None,
     });
+    if let Some(producer) = producer_structured.as_ref() {
+        preserve_action_disclosures(&mut public, producer)?;
+    }
     if cfg!(target_os = "macos") && matches!(tool_name, "drag" | "right_click") {
         if let Some(producer) = producer_structured.as_ref() {
             preserve_wave400c_readback_fields(&mut public, producer)?;
@@ -6801,6 +6834,62 @@ resources:
         let mut result = pointer_projection_input(producer);
         publish_action_result(&mut result, tool_name)?;
         Ok(result.structured_content.expect("published action result"))
+    }
+
+    #[test]
+    fn action_projection_preserves_focus_note_and_warning() {
+        for &tool in cua_driver_contract::ACTION_RESULT_TOOLS {
+            for focus in [
+                serde_json::json!({"status":"abandoned","reason":"third_app","prior_pid":1}),
+                serde_json::json!({"status":"restored","prior_pid":1}),
+                serde_json::json!({"status":"abandoned","reason":"unconfirmed","prior_pid":null}),
+            ] {
+                let producer = serde_json::json!({
+                    "warning": "warning text", "note": "note text", "focus_restoration": focus
+                });
+                let mut result = pointer_projection_input(producer.clone());
+                publish_action_result(&mut result, tool).unwrap();
+                let published = result.structured_content.unwrap();
+                for key in ["warning", "note", "focus_restoration"] {
+                    assert_eq!(published.get(key), producer.get(key), "{tool}: {key}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn action_projection_rejects_invalid_disclosures() {
+        for focus in [
+            serde_json::json!({"status":"restored","reason":"third_app","prior_pid":1}),
+            serde_json::json!({"status":"unknown","prior_pid":1}),
+            serde_json::json!({"status":"abandoned","reason":"unknown","prior_pid":1}),
+            serde_json::json!({"status":"restored"}),
+            serde_json::json!({"status":"restored","prior_pid":"1"}),
+            serde_json::json!({"status":"restored","prior_pid":1,"extra":true}),
+            serde_json::json!(null),
+        ] {
+            let mut result =
+                pointer_projection_input(serde_json::json!({"focus_restoration":focus}));
+            assert!(
+                publish_action_result(&mut result, "click").is_err(),
+                "{focus}"
+            );
+        }
+        for key in ["note", "warning"] {
+            let mut result = pointer_projection_input(serde_json::json!({key: 7}));
+            assert!(
+                publish_action_result(&mut result, "click").is_err(),
+                "{key}"
+            );
+        }
+    }
+
+    #[test]
+    fn non_action_structured_content_is_untouched_at_publication() {
+        let original = serde_json::json!({"note": 7, "warning": "keep", "focus_restoration": {"custom": true}});
+        let mut result = ToolResult::text("read").with_structured(original.clone());
+        super::publish_successful_action_result(&mut result, "list_apps").unwrap();
+        assert_eq!(result.structured_content, Some(original));
     }
 
     #[test]
