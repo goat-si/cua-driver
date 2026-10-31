@@ -649,13 +649,20 @@ pub fn try_invoke_accelerator_in_window(hwnd: isize, combo: &str) -> anyhow::Res
         "keyboard message delivery",
         move |cancelled| try_invoke_accelerator_in_window_unbounded(hwnd, &combo, &cancelled),
     )
-    .unwrap_or_else(|_| {
-        Err(anyhow::Error::new(AcceleratorStop {
-            verdict: crate::uia_mutation::WriteVerdict::Uncertain(
-                crate::uia_mutation::UncertainKind::Timeout,
-            ),
-            hresult: 0x8013_1505_u32 as i32,
-        }))
+    .unwrap_or_else(|error| match error {
+        // Another UIA operation held the single-flight gate, so this scan
+        // never started and nothing was sent.
+        UiaDeadlineError::Busy => Err(anyhow::anyhow!(
+            "another UI Automation operation is still running; the shortcut was not sent. Retry shortly."
+        )),
+        UiaDeadlineError::Timeout | UiaDeadlineError::Unavailable => {
+            Err(anyhow::Error::new(AcceleratorStop {
+                verdict: crate::uia_mutation::WriteVerdict::Uncertain(
+                    crate::uia_mutation::UncertainKind::Timeout,
+                ),
+                hresult: 0x8013_1505_u32 as i32,
+            }))
+        }
     })
 }
 
