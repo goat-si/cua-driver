@@ -1213,6 +1213,7 @@ impl TrustedInvocationEvidence {
 /// Thread-safe collection of all registered tools.
 pub struct ToolRegistry {
     tools: HashMap<String, Box<dyn Tool>>,
+    desktop_lease: crate::desktop_lease::LeaseManager,
     /// Ordered list of tool names for `tools/list`.
     order: Vec<String>,
     /// Shared recording session — auto-records each non-read-only tool call.
@@ -1300,6 +1301,10 @@ impl ToolRegistry {
             }));
         Self {
             tools: HashMap::new(),
+            #[cfg(not(test))]
+            desktop_lease: crate::desktop_lease::LeaseManager::production(),
+            #[cfg(test)]
+            desktop_lease: crate::desktop_lease::test_support::manager(),
             order: Vec::new(),
             recording,
             history: None,
@@ -2495,6 +2500,30 @@ impl ToolRegistry {
                 Ok(guard) => guard,
                 Err(_) => coordinator.lock().await,
             })
+        } else {
+            None
+        };
+        let _file_lease = if _desktop_action.is_some() {
+            let owner = runtime_session.clone().unwrap_or_else(|| {
+                crate::desktop_lease::runtime_owner(&context.runtime_scope_key())
+            });
+            match self.desktop_lease.acquire(&owner).await {
+                Ok(lease) => Some(lease),
+                Err(error) => {
+                    let (code, message) = match error {
+                        crate::desktop_lease::LeaseFailure::Busy => {
+                            ("desktop_busy", "desktop input is busy".to_owned())
+                        }
+                        crate::desktop_lease::LeaseFailure::Unavailable(reason) => {
+                            ("desktop_lease_unavailable", reason)
+                        }
+                    };
+                    return ToolResult::error(message.clone()).with_structured(serde_json::json!({
+                        "effect": "refused", "code": code, "status": "refused",
+                        "refusal": {"code": code, "message": message}
+                    }));
+                }
+            }
         } else {
             None
         };
@@ -7286,6 +7315,45 @@ resources:
                 ..
             }
         ));
+    }
+
+    #[tokio::test]
+    async fn desktop_busy_after_deadline() {
+        use crate::desktop_lease::{
+            test_support::{TestBackend, TestClock},
+            LeaseManager,
+        };
+        let backend = Arc::new(TestBackend::default());
+        backend.hold();
+        let hits = Arc::new(AtomicUsize::new(0));
+        let mut registry = super::ToolRegistry::new();
+        registry.desktop_lease = LeaseManager::new(backend.clone(), Arc::new(TestClock::default()));
+        registry.register(Box::new(ObservationProbe {
+            hits: hits.clone(),
+            def: super::ToolDef {
+                name: "click".into(),
+                description: "probe".into(),
+                input_schema: serde_json::json!({"type":"object"}),
+                read_only: false,
+                destructive: false,
+                idempotent: false,
+                open_world: false,
+            },
+        }));
+        let result = registry
+            .invoke_with_context(
+                "click",
+                serde_json::json!({
+                    "pid": 42, "window_id": 7, "x": 10, "y": 20,
+                }),
+                unrestricted_context(),
+            )
+            .await;
+        assert_eq!(
+            result.structured_content.unwrap()["refusal"]["code"],
+            "desktop_busy"
+        );
+        assert_eq!(hits.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
