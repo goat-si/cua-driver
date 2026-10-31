@@ -21,6 +21,7 @@ struct Probe {
     calls: Arc<Mutex<Vec<Value>>>,
     pacings: Arc<Mutex<Vec<(String, crate::step_pacing::StepPacing)>>>,
     responses: Arc<Mutex<std::collections::HashMap<String, Value>>>,
+    sequences: Arc<Mutex<std::collections::HashMap<String, std::collections::VecDeque<Value>>>>,
 }
 
 #[async_trait]
@@ -35,7 +36,14 @@ impl Tool for Probe {
             .lock()
             .unwrap()
             .push((self.def.name.clone(), crate::step_pacing::current()));
-        if let Some(response) = self.responses.lock().unwrap().get(&self.def.name) {
+        let response = self
+            .sequences
+            .lock()
+            .unwrap()
+            .get_mut(&self.def.name)
+            .and_then(|values| values.pop_front())
+            .or_else(|| self.responses.lock().unwrap().get(&self.def.name).cloned());
+        if let Some(response) = response {
             return if let Some(error) = response.get("error").and_then(Value::as_str) {
                 ToolResult::error(error.to_owned())
             } else {
@@ -62,6 +70,7 @@ struct Harness {
     calls: std::collections::HashMap<&'static str, Arc<Mutex<Vec<Value>>>>,
     pacings: Arc<Mutex<Vec<(String, crate::step_pacing::StepPacing)>>>,
     responses: Arc<Mutex<std::collections::HashMap<String, Value>>>,
+    sequences: Arc<Mutex<std::collections::HashMap<String, std::collections::VecDeque<Value>>>>,
 }
 
 impl Harness {
@@ -70,6 +79,7 @@ impl Harness {
         let mut calls = std::collections::HashMap::new();
         let pacings: Arc<Mutex<Vec<(String, crate::step_pacing::StepPacing)>>> = Arc::default();
         let responses = Arc::new(Mutex::new(std::collections::HashMap::new()));
+        let sequences = Arc::new(Mutex::new(std::collections::HashMap::new()));
         for name in super::BATCHABLE_TOOLS.iter().copied().chain([
             "get_window_state",
             "zoom",
@@ -125,6 +135,7 @@ impl Harness {
                 calls: log,
                 pacings: pacings.clone(),
                 responses: responses.clone(),
+                sequences: sequences.clone(),
             }));
         }
         registry.register_session_tools();
@@ -135,6 +146,7 @@ impl Harness {
             calls,
             pacings,
             responses,
+            sequences,
         }
     }
 
@@ -143,6 +155,13 @@ impl Harness {
             .lock()
             .unwrap()
             .insert(tool.to_owned(), value);
+    }
+
+    fn respond_sequence(&self, tool: &str, values: Vec<Value>) {
+        self.sequences
+            .lock()
+            .unwrap()
+            .insert(tool.to_owned(), values.into());
     }
 
     fn hits(&self, tool: &str) -> usize {
@@ -198,6 +217,83 @@ fn text(result: &ToolResult) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+fn panel_listing() -> Value {
+    json!({"windows": [{"pid": 42, "window_id": 9, "app_name": "Demo", "title": "Panel", "bounds": {"x": 0, "y": 0, "width": 10, "height": 10}, "is_on_screen": true, "z_index": 1}], "enumeration_complete": true, "authoritative_window_ids": [9]})
+}
+
+fn save_state() -> Value {
+    json!({"pid": 42, "window_id": 9, "snapshot_id": "s00000001", "elements": [{"element_index": 1, "element_token": "s00000001:1", "role": "AXButton", "label": "Save", "depth": 1, "frame": {"x": 0, "y": 0, "w": 10, "h": 10}}], "tree_markdown": "- AXButton \"Save\""})
+}
+
+#[tokio::test]
+async fn a_window_only_in_the_complete_pid_listing_is_not_gone() {
+    let harness = Harness::new();
+    harness.respond(
+        "list_apps",
+        json!({"apps": [{"pid": 42, "name": "Demo", "running": true, "active": false}]}),
+    );
+    harness.respond_sequence(
+        "list_windows",
+        vec![json!({"windows": []}), panel_listing()],
+    );
+    harness.respond("get_window_state", save_state());
+    let result = harness.run(json!({"steps": [{"expect": {"app": "Demo", "window": "Panel", "name": "Save", "gone": true, "timeout_ms": 0}}]})).await.structured_content.unwrap();
+    assert_eq!(result["steps"][0]["code"], "still_present", "{result}");
+    assert_eq!(harness.last("get_window_state")["window_id"], 9);
+    assert_eq!(harness.last("list_windows")["pid"], 42);
+}
+
+#[tokio::test]
+async fn a_window_absent_from_an_incomplete_first_listing_but_present_in_the_complete_one_is_read()
+{
+    let harness = Harness::new();
+    harness.respond_sequence(
+        "list_windows",
+        vec![
+            json!({"windows": [], "enumeration_complete": false}),
+            panel_listing(),
+        ],
+    );
+    harness.respond("get_window_state", save_state());
+    let result = harness.run(json!({"steps": [{"expect": {"pid": 42, "window": "Panel", "name": "Save", "gone": true, "timeout_ms": 0}}]})).await.structured_content.unwrap();
+    assert_eq!(result["steps"][0]["code"], "still_present", "{result}");
+    assert_eq!(harness.last("get_window_state")["window_id"], 9);
+}
+
+#[tokio::test]
+async fn a_hidden_window_still_in_the_authoritative_ids_is_not_gone() {
+    let harness = Harness::new();
+    harness.respond(
+        "list_windows",
+        json!({"windows": [], "enumeration_complete": true, "authoritative_window_ids": [9]}),
+    );
+    let result = harness.run(json!({"steps": [{"expect": {"pid": 42, "window_id": 9, "window": "Panel", "name": "Save", "gone": true, "timeout_ms": 0}}]})).await.structured_content.unwrap();
+    assert_eq!(result["steps"][0]["code"], "gone_unconfirmed", "{result}");
+    assert_eq!(harness.hits("get_window_state"), 0);
+}
+
+#[tokio::test]
+async fn closure_listing_matches_all_resolved_app_pids() {
+    let harness = Harness::new();
+    harness.respond(
+        "list_apps",
+        json!({"apps": [
+            {"pid": 42, "name": "Demo", "running": true, "active": false},
+            {"pid": 43, "name": "Demo", "running": true, "active": false}
+        ]}),
+    );
+    let mut first = panel_listing();
+    first["windows"][0]["title"] = json!("Other");
+    let mut second = panel_listing();
+    second["windows"][0]["pid"] = json!(43);
+    second["windows"][0]["app_name"] = json!("Helper");
+    harness.respond_sequence("list_windows", vec![json!({"windows": []}), first, second]);
+    harness.respond("get_window_state", save_state());
+    let result = harness.run(json!({"steps": [{"expect": {"app": "Demo", "window": "Panel", "name": "Save", "gone": true, "timeout_ms": 0}}]})).await.structured_content.unwrap();
+    assert_eq!(result["steps"][0]["code"], "still_present", "{result}");
+    assert_eq!(harness.last("get_window_state")["pid"], 43);
 }
 
 #[tokio::test]
