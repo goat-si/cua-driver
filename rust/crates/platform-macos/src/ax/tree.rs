@@ -1685,6 +1685,11 @@ mod secure_value_tests {
 
     #[test]
     fn tab_compaction_never_reads_secure_or_unknown_child_values() {
+        assert!(cua_driver_core::snapshot_compaction::is_tab_like_child(
+            "AXTabGroup",
+            "",
+            Some("tab")
+        ));
         let mut secure = Fake::new(Some("AXSecureTextField"));
         let attrs = secure.read(AttrStatus::Known("AXTab".into()));
         assert_eq!(tab_child_value(attrs).0, None);
@@ -1702,6 +1707,17 @@ mod secure_value_tests {
                 .as_deref(),
             Some("ordinary")
         );
+    }
+
+    #[test]
+    fn chrome_button_reuses_the_classification_subrole() {
+        let mut reader = Fake::new(Some("AXCloseButton"));
+        let attrs = reader.read(AttrStatus::Known("AXButton".into()));
+        assert_eq!(
+            window_chrome_button_description("AXButton", "", "", || attrs.subrole.clone()),
+            Some("close button")
+        );
+        assert_eq!(reader.trace, ["batch", "AXValue"]);
     }
 
     #[test]
