@@ -256,7 +256,7 @@ pub unsafe fn ensure_marked_in_held_window(
         collapsed_caret_of(element),
         can_post,
         |key| crate::input::keyboard::press_key(pid, key, &[]),
-        || copy_string_attr(element, "AXValue"),
+        || crate::ax::write_outcome::read_text_value(element),
         || std::thread::sleep(NET_ZERO_POLL_INTERVAL),
     )
 }
@@ -304,7 +304,7 @@ unsafe fn send_net_zero_edit(
     net_zero_edit(
         collapsed_caret_of(element),
         |key| crate::input::keyboard::press_key(pid, key, &[]),
-        || copy_string_attr(element, "AXValue"),
+        || crate::ax::write_outcome::read_text_value(element),
         || std::thread::sleep(NET_ZERO_POLL_INTERVAL),
     )
 }
@@ -476,7 +476,7 @@ unsafe fn element_window_id(element: AXUIElementRef) -> Option<u32> {
 /// # Safety
 /// `element` must be a live `AXUIElementRef`.
 unsafe fn caret_to_end_of(element: AXUIElementRef) {
-    let len = copy_string_attr(element, "AXValue")
+    let len = crate::ax::write_outcome::read_text_value(element)
         .map(|v| v.encode_utf16().count())
         .unwrap_or(0);
     let range = CfRange {

@@ -1212,9 +1212,9 @@ fn typed_progress(before: Option<&str>, after: Option<&str>, text: &str) -> Type
 /// (cheap, and focus is stable across our own keystrokes).
 fn read_axvalue(pid: i32, element_ptr_and_idx: Option<(usize, Option<usize>)>) -> Option<String> {
     if let Some((ptr, _)) = element_ptr_and_idx {
-        unsafe { copy_string_attr(ptr as AXUIElementRef, "AXValue") }
+        unsafe { crate::ax::write_outcome::read_text_value(ptr as AXUIElementRef) }
     } else if let Some(el) = unsafe { focused_element_of_pid(pid) } {
-        let v = unsafe { copy_string_attr(el, "AXValue") };
+        let v = unsafe { crate::ax::write_outcome::read_text_value(el) };
         unsafe {
             CFRelease(el as _);
         }
@@ -1241,7 +1241,7 @@ fn read_axvalue_bound(
     match window_id {
         Some(wid) => unsafe {
             let el = crate::ax::exact_target::focused_element_in_window(pid, wid)?;
-            let v = copy_string_attr(el, "AXValue");
+            let v = crate::ax::write_outcome::read_text_value(el);
             CFRelease(el as _);
             v
         },
@@ -1625,7 +1625,8 @@ fn cgevent_type_verified(
             }
             // A native whole-value write does not depend on the selection. It
             // is safe only while focus and the original value still hold.
-            if unsafe { copy_string_attr(element, "AXValue") }.as_deref() != Some(before)
+            if unsafe { crate::ax::write_outcome::read_text_value(element) }.as_deref()
+                != Some(before)
                 || !element_has_exact_app_focus(pid, wid, ptr)
             {
                 anyhow::bail!(
@@ -1634,7 +1635,7 @@ fn cgevent_type_verified(
             }
             let err = unsafe { set_string_attr(element, "AXValue", text) };
             if err != kAXErrorSuccess {
-                let after = unsafe { copy_string_attr(element, "AXValue") };
+                let after = unsafe { crate::ax::write_outcome::read_text_value(element) };
                 if after.as_deref() != Some(text) {
                     anyhow::bail!("AXUIElementSetAttributeValue(AXValue) failed with error {err}; replacement was not confirmed and no retry was sent")
                 }
@@ -1659,7 +1660,8 @@ fn cgevent_type_verified(
         } else {
             let err = unsafe { set_string_attr(element, "AXSelectedText", text) };
             if err != kAXErrorSuccess
-                && unsafe { copy_string_attr(element, "AXValue") }.as_deref() != Some(text)
+                && unsafe { crate::ax::write_outcome::read_text_value(element) }.as_deref()
+                    != Some(text)
             {
                 anyhow::bail!(
                     "AXUIElementSetAttributeValue(AXSelectedText) failed with error {err}; replacement was not confirmed and no retry was sent"
@@ -1837,7 +1839,7 @@ unsafe fn selected_range(element: AXUIElementRef) -> Option<(usize, usize)> {
 
 fn full_selection_matches(element: AXUIElementRef, before: &str) -> bool {
     unsafe {
-        copy_string_attr(element, "AXValue").as_deref() == Some(before)
+        crate::ax::write_outcome::read_text_value(element).as_deref() == Some(before)
             && copy_string_attr(element, "AXSelectedText").as_deref() == Some(before)
             && selected_range(element) == Some((0, before.encode_utf16().count()))
     }
@@ -1899,16 +1901,30 @@ fn wait_for_full_selection(pid: i32, window_id: u32, element_ptr: usize, before:
 fn await_replacement_delivery(
     text: &str,
     deadline: std::time::Instant,
+    read_value: impl FnMut() -> Option<String>,
+) -> (bool, Option<usize>) {
+    await_replacement_delivery_with(
+        text,
+        read_value,
+        || std::time::Instant::now() >= deadline,
+        || std::thread::sleep(DELIVERY_DRAIN_POLL_INTERVAL),
+    )
+}
+
+fn await_replacement_delivery_with(
+    text: &str,
     mut read_value: impl FnMut() -> Option<String>,
+    mut expired: impl FnMut() -> bool,
+    mut pause: impl FnMut(),
 ) -> (bool, Option<usize>) {
     loop {
         if read_value().as_deref() == Some(text) {
             return (true, Some(text.chars().count()));
         }
-        if std::time::Instant::now() >= deadline {
+        if expired() {
             return (false, None);
         }
-        std::thread::sleep(DELIVERY_DRAIN_POLL_INTERVAL);
+        pause();
     }
 }
 
@@ -2533,7 +2549,7 @@ fn type_text_in_key_window(
         // instead of appending the full payload again. When synthesis would
         // exceed its transport-safe budget, rejected/unchanged AX writes fail
         // safely and unreadable AX state is reported as indeterminate.
-        let after = unsafe { copy_string_attr(element, "AXValue") };
+        let after = unsafe { crate::ax::write_outcome::read_text_value(element) };
         let ax_progress = if err == kAXErrorSuccess {
             Some(typed_progress(before.as_deref(), after.as_deref(), text))
         } else {

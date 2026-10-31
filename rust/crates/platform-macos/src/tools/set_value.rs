@@ -28,7 +28,8 @@ use crate::ax::bindings::{
     kAXErrorSuccess, perform_action, set_number_attr, set_string_attr, AXUIElementRef,
 };
 use crate::ax::write_outcome::{
-    classify_attr_write, query_settable, read_value_typed, AttrWrite, Settable, ValueObs,
+    classify_attr_write, query_settable, read_value_if_allowed, AttrWrite, Settable, ValueObs,
+    ValueRead,
 };
 use crate::focus_guard;
 use crate::window_change_detector::WindowChangeDetector;
@@ -1259,7 +1260,13 @@ struct LiveAxValueOps {
 }
 impl AxValueOps for LiveAxValueOps {
     fn read_typed(&mut self) -> ValueObs {
-        unsafe { read_value_typed(self.element) }
+        match read_value_if_allowed(
+            &mut crate::ax::label_reader::NativeLabelReader,
+            self.element,
+        ) {
+            ValueRead::Allowed(value) => value,
+            ValueRead::Withheld => unreachable!("the preparatory reader always allows reads"),
+        }
     }
     fn query_settable(&mut self) -> Settable {
         unsafe { query_settable(self.element, "AXValue") }
@@ -1696,7 +1703,7 @@ fn describe_option(element: AXUIElementRef) -> PopupOption {
     PopupOption {
         element,
         title: unsafe { copy_string_attr(element, "AXTitle") }.unwrap_or_default(),
-        value: unsafe { copy_string_attr(element, "AXValue") }.unwrap_or_default(),
+        value: unsafe { crate::ax::write_outcome::read_text_value(element) }.unwrap_or_default(),
     }
 }
 
@@ -1803,7 +1810,7 @@ pub(super) fn chromium_select_open_refusal(
     element: AXUIElementRef,
 ) -> cua_driver_core::protocol::ToolResult {
     let title = unsafe { copy_string_attr(element, "AXTitle") }.unwrap_or_default();
-    let current = unsafe { copy_string_attr(element, "AXValue") }.unwrap_or_default();
+    let current = unsafe { crate::ax::write_outcome::read_text_value(element) }.unwrap_or_default();
     let target = match element_index {
         Some(index) => format!("[{index}] AXPopUpButton \"{title}\""),
         None => format!("the AXPopUpButton \"{title}\" at that point"),
@@ -1859,7 +1866,8 @@ fn select_chromium_popup_by_typeahead(
     {
         return None;
     }
-    let selected = || unsafe { copy_string_attr(popup, "AXValue") }.unwrap_or_default();
+    let selected =
+        || unsafe { crate::ax::write_outcome::read_text_value(popup) }.unwrap_or_default();
     let matches = |current: &str| current.trim().to_lowercase() == wanted.to_lowercase();
     if matches(&selected()) {
         return Some(format!(
@@ -2668,6 +2676,7 @@ mod ladder_tests {
         last: ValueObs,
         settable: Settable,
         writes: Vec<&'static str>,
+        payloads: Vec<String>,
         results: VecDeque<i32>,
         steps: VecDeque<i32>,
         pauses: usize,
@@ -2679,6 +2688,7 @@ mod ladder_tests {
                 last: before,
                 settable: Settable::Yes,
                 writes: vec![],
+                payloads: vec![],
                 results: VecDeque::new(),
                 steps: VecDeque::new(),
                 pauses: 0,
@@ -2711,12 +2721,14 @@ mod ladder_tests {
         fn query_settable(&mut self) -> Settable {
             self.settable
         }
-        fn set_number(&mut self, _: f64) -> i32 {
+        fn set_number(&mut self, value: f64) -> i32 {
             self.writes.push("number");
+            self.payloads.push(value.to_string());
             self.results.pop_front().unwrap_or(kAXErrorSuccess)
         }
-        fn set_string(&mut self, _: &str) -> i32 {
+        fn set_string(&mut self, value: &str) -> i32 {
             self.writes.push("string");
+            self.payloads.push(value.to_owned());
             self.results.pop_front().unwrap_or(kAXErrorSuccess)
         }
         fn perform_step(&mut self, _: &str) -> i32 {

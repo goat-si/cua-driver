@@ -550,7 +550,7 @@ impl HoldOps for LiveHoldOps {
 
     fn before(&mut self, element: &Self::Element) -> Option<Before> {
         let ptr = element.as_ptr() as crate::ax::bindings::AXUIElementRef;
-        let value = unsafe { crate::ax::bindings::copy_string_attr(ptr, "AXValue") }?;
+        let value = unsafe { crate::ax::write_outcome::read_text_value(ptr) }?;
         let range = unsafe { crate::ax::tree::read_selected_text_range(ptr) }?;
         Some(Before {
             value,
@@ -597,9 +597,8 @@ impl HoldOps for LiveHoldOps {
 
     fn read_value(&mut self, element: &Self::Element) -> Option<String> {
         unsafe {
-            crate::ax::bindings::copy_string_attr(
-                element.as_ptr() as crate::ax::bindings::AXUIElementRef,
-                "AXValue",
+            crate::ax::write_outcome::read_text_value(
+                element.as_ptr() as crate::ax::bindings::AXUIElementRef
             )
         }
     }
