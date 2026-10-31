@@ -72,6 +72,7 @@ pub fn parent_liveness_stdin_enabled() -> bool {
 
 pub mod action_record;
 pub mod action_target;
+pub mod actionability;
 pub mod agent_cursor;
 mod application_identity;
 pub mod authorization;
