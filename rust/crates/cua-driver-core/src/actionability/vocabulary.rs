@@ -26,15 +26,15 @@ pub enum Affordance {
 pub fn supported_affordances(intent: Intent) -> &'static [Affordance] {
     use Affordance::*;
     match intent {
-        Intent::Click | Intent::DoubleClick | Intent::TripleClick => &[Press, Open],
+        Intent::Click | Intent::DoubleClick | Intent::TripleClick => &[Press],
         Intent::RightClick => &[ShowMenu],
         Intent::SetValue | Intent::Clear => &[SetValue],
         Intent::TypeText => &[TypeText],
         Intent::Focus => &[Focus],
         Intent::Expand => &[Expand],
         Intent::Collapse => &[Collapse],
-        Intent::Select => &[Select, Press, Open],
-        Intent::Toggle | Intent::Check | Intent::Uncheck => &[Toggle, Press, Open],
+        Intent::Select => &[Select, Press],
+        Intent::Toggle | Intent::Check | Intent::Uncheck => &[Toggle, Press],
         Intent::Scroll => &[Scroll],
         Intent::ScrollTo => &[ScrollIntoView],
         Intent::PressKey => &[PressKey],

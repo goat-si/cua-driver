@@ -3,6 +3,9 @@ use std::time::Duration;
 
 pub const SAMPLE_INTERVAL: Duration = Duration::from_millis(17);
 pub fn geometry_matches(a: Rect, b: Rect) -> bool {
+    if !a.valid() || !b.valid() {
+        return false;
+    }
     [
         (a.x, b.x),
         (a.y, b.y),
@@ -23,7 +26,7 @@ impl StabilitySampler {
     pub fn observe(&mut self, clock: &impl Clock, bounds: Evidence<Rect>) -> Evidence<bool> {
         let now = clock.now();
         let bounds = match bounds {
-            Evidence::Known(r) if [r.x, r.y, r.width, r.height].iter().all(|v| v.is_finite()) => r,
+            Evidence::Known(r) if r.valid() => r,
             Evidence::Known(_) => {
                 self.reset();
                 return Evidence::Unknown("invalid geometry".into());
@@ -69,6 +72,7 @@ impl StabilitySampler {
     }
     pub fn revalidate(&self, bounds: Evidence<Rect>) -> Evidence<bool> {
         match bounds {
+            Evidence::Known(r) if !r.valid() => Evidence::Unknown("invalid geometry".into()),
             Evidence::Known(r) => Evidence::Known(
                 self.count >= 3 && self.previous.is_some_and(|p| geometry_matches(p, r)),
             ),

@@ -23,6 +23,7 @@ fn occ() -> Occluder {
 fn facts() -> ElementFacts {
     ElementFacts {
         visible: Evidence::Known(true),
+        offscreen: Evidence::Known(false),
         enabled: Evidence::Known(true),
         editable: Evidence::Known(true),
         stable: Evidence::Known(true),
@@ -49,18 +50,10 @@ fn facts() -> ElementFacts {
     }
 }
 fn headed() -> Policy {
-    Policy {
-        allow_cursor_move: true,
-        allow_focus_steal: true,
-        headed: true,
-    }
+    Policy::headed()
 }
 fn headless() -> Policy {
-    Policy {
-        allow_cursor_move: false,
-        allow_focus_steal: false,
-        headed: false,
-    }
+    Policy::headless()
 }
 fn tuple(r: Requirements) -> (bool, bool, bool, bool, bool) {
     (
@@ -427,10 +420,8 @@ fn policy_is_required_for_cursor_and_physical_fallback() {
             }
         ));
     }
-    let invalid = Policy {
-        headed: true,
-        ..headless()
-    };
+    let invalid = Policy::focus_fallback();
+    f.affordances = Evidence::Known(vec![]);
     assert!(matches!(
         evaluate(Intent::Click, &f, invalid).verdict,
         Verdict::Terminal {
@@ -542,7 +533,7 @@ async fn wait_does_not_inherit_probe_disposition() {
 #[test]
 fn role_and_focus_fallback_are_independent_of_unknown_evidence() {
     let mut f = facts();
-    f.editable = Evidence::Known(false);
+    f.editable = Evidence::Absent;
     f.affordances = Evidence::Known(vec![Affordance::TypeText]);
     assert_eq!(
         evaluate(Intent::TypeText, &f, headless()).verdict,
@@ -562,14 +553,265 @@ fn role_and_focus_fallback_are_independent_of_unknown_evidence() {
             ..
         }
     ));
-    let focus_only = Policy {
-        allow_focus_steal: true,
-        ..headless()
-    };
+    let focus_only = Policy::focus_fallback();
     assert_eq!(
         evaluate(Intent::TypeText, &f, focus_only).verdict,
         Verdict::Pass
     );
     assert_eq!(default_type_budget("가a"), Duration::from_millis(5_060));
     assert_eq!(default_type_budget(""), DEFAULT_BUDGET);
+}
+
+#[test]
+fn review_blocker_boundless_without_onscreen_proof_blocks() {
+    let mut f = facts();
+    f.bounds = Evidence::Absent;
+    f.offscreen = Evidence::Absent;
+    f.nonspatial_visible = false;
+    assert!(matches!(
+        evaluate(Intent::Click, &f, headless()).verdict,
+        Verdict::Transient { .. }
+    ));
+}
+
+#[test]
+fn review_blocker_collapsed_and_invalid_geometry_blocks() {
+    let mut f = facts();
+    for (w, h) in [(0., 0.), (-1., 10.), (10., -1.), (f64::NAN, 10.)] {
+        f.bounds = Evidence::Known(Rect {
+            width: w,
+            height: h,
+            ..rect(0.)
+        });
+        assert!(
+            matches!(
+                evaluate(Intent::Click, &f, headless()).verdict,
+                Verdict::Transient { .. }
+            ),
+            "{w:?} {h:?}"
+        );
+    }
+}
+
+#[test]
+fn review_blocker_focus_fallback_has_no_headless_exemptions() {
+    let mut f = facts();
+    f.stable = Evidence::Known(false);
+    f.receives_events = Evidence::Unknown("no hit".into());
+    f.bounds = Evidence::Absent;
+    f.nonspatial_visible = true;
+    let policy = Policy::focus_fallback();
+    assert!(matches!(
+        evaluate(Intent::Click, &f, policy).verdict,
+        Verdict::Transient { .. }
+    ));
+}
+
+#[test]
+fn review_blocker_headless_nonpointer_boundless_stability() {
+    let mut f = facts();
+    f.bounds = Evidence::Absent;
+    f.nonspatial_visible = true;
+    f.stable = Evidence::Absent;
+    for intent in [
+        Intent::Toggle,
+        Intent::Check,
+        Intent::Uncheck,
+        Intent::Expand,
+        Intent::Collapse,
+        Intent::Scroll,
+    ] {
+        assert_eq!(
+            evaluate(intent, &f, headless()).verdict,
+            Verdict::Pass,
+            "{intent:?}"
+        );
+    }
+}
+
+#[test]
+fn review_blocker_invalid_rectangles_are_unknown_for_stability() {
+    let c = TestClock::default();
+    let mut sampler = StabilitySampler::default();
+    for size in [-1., f64::NAN] {
+        let bad = Rect {
+            width: size,
+            ..rect(0.)
+        };
+        assert!(matches!(
+            sampler.observe(&c, Evidence::Known(bad)),
+            Evidence::Unknown(_)
+        ));
+        assert!(matches!(
+            sampler.revalidate(Evidence::Known(bad)),
+            Evidence::Unknown(_)
+        ));
+    }
+}
+
+#[test]
+fn review_blocker_unknown_editability_inputs_remain_transient() {
+    let mut f = facts();
+    f.editable = Evidence::Absent;
+    f.role = Evidence::Unknown("role".into());
+    f.affordances = Evidence::Known(vec![Affordance::TypeText]);
+    assert!(matches!(
+        evaluate(Intent::TypeText, &f, headless()).verdict,
+        Verdict::Transient { unknown: true, .. }
+    ));
+    f.role = Evidence::Known("button".into());
+    f.affordances = Evidence::Unknown("actions".into());
+    assert!(matches!(
+        evaluate(Intent::TypeText, &f, headless()).verdict,
+        Verdict::Transient { unknown: true, .. }
+    ));
+}
+
+#[test]
+fn review_blocker_unknown_combobox_role_is_transient() {
+    let mut f = facts();
+    f.role = Evidence::Unknown("role".into());
+    f.affordances = Evidence::Known(vec![Affordance::Expand]);
+    assert!(matches!(
+        evaluate(Intent::Select, &f, headless()).verdict,
+        Verdict::Transient { unknown: true, .. }
+    ));
+}
+
+#[test]
+fn review_blocker_known_noneditable_overrides_role_and_capability() {
+    let mut f = facts();
+    f.editable = Evidence::Known(false);
+    assert!(matches!(
+        evaluate(Intent::TypeText, &f, headless()).verdict,
+        Verdict::Terminal { .. }
+    ));
+}
+
+#[test]
+fn review_blocker_open_is_not_press() {
+    let mut f = facts();
+    f.affordances = Evidence::Known(vec![Affordance::Open]);
+    for intent in [Intent::Click, Intent::Select, Intent::Toggle] {
+        assert!(
+            matches!(
+                evaluate(intent, &f, headless()).verdict,
+                Verdict::Terminal { .. }
+            ),
+            "{intent:?}"
+        );
+    }
+    assert!(!supported_affordances(Intent::DoubleClick).contains(&Affordance::Open));
+}
+
+#[test]
+fn review_visibility_evidence_distinguishes_onscreen_windowless_and_unknown() {
+    let mut f = facts();
+    f.bounds = Evidence::Absent;
+    assert_eq!(
+        evaluate(Intent::Click, &f, headless()).verdict,
+        Verdict::Pass
+    );
+    f.offscreen = Evidence::Unknown("offscreen read failed".into());
+    assert!(matches!(
+        evaluate(Intent::Click, &f, headless()).verdict,
+        Verdict::Transient { unknown: true, .. }
+    ));
+    f.offscreen = Evidence::Known(true);
+    assert!(matches!(
+        evaluate(Intent::Click, &f, headless()).verdict,
+        Verdict::Transient { .. }
+    ));
+    f.offscreen = Evidence::Absent;
+    f.bounds = Evidence::Known(Rect {
+        width: 0.,
+        height: 0.,
+        ..rect(0.)
+    });
+    assert_eq!(
+        evaluate(Intent::Click, &f, headless()).verdict,
+        Verdict::Pass
+    );
+    f.offscreen = Evidence::Known(false);
+    assert!(matches!(
+        evaluate(Intent::Click, &f, headless()).verdict,
+        Verdict::Transient { .. }
+    ));
+    f.nonspatial_visible = true;
+    assert!(matches!(
+        evaluate(Intent::Click, &f, headless()).verdict,
+        Verdict::Transient { .. }
+    ));
+}
+
+#[test]
+fn review_unknown_stability_is_not_exempted_for_boundless_target() {
+    let mut f = facts();
+    f.bounds = Evidence::Absent;
+    f.stable = Evidence::Unknown("sample failed".into());
+    assert!(matches!(
+        evaluate(Intent::Toggle, &f, headless()).verdict,
+        Verdict::Transient { unknown: true, .. }
+    ));
+}
+
+#[test]
+fn review_occluder_is_preserved_on_check() {
+    let mut f = facts();
+    f.receives_events = Evidence::Known(collect_hits(rect(0.), |_| Hit::Occluded(occ())));
+    let report = evaluate(Intent::Click, &f, headed());
+    assert_eq!(
+        report
+            .checks
+            .iter()
+            .find(|c| c.name == "receives_events")
+            .unwrap()
+            .occluder,
+        Some(occ())
+    );
+}
+
+#[tokio::test]
+async fn review_unknown_editability_can_resolve_before_deadline() {
+    let c = TestClock::default();
+    let mut calls = 0;
+    let report = auto_wait(&c, Duration::from_millis(150), false, |_| {
+        calls += 1;
+        let ready = calls > 1;
+        async move {
+            let mut f = facts();
+            f.editable = Evidence::Absent;
+            f.affordances = Evidence::Known(vec![Affordance::TypeText]);
+            f.role = if ready {
+                Evidence::Known("textfield".into())
+            } else {
+                Evidence::Unknown("role".into())
+            };
+            evaluate(Intent::TypeText, &f, headless())
+        }
+    })
+    .await;
+    assert_eq!(calls, 2);
+    assert_eq!(report.verdict, Verdict::Pass);
+}
+
+#[test]
+fn review_stability_without_pointer_is_not_measurable_when_bounds_absent() {
+    let mut f = facts();
+    f.bounds = Evidence::Absent;
+    f.stable = Evidence::Known(false);
+    for intent in [
+        Intent::Toggle,
+        Intent::Check,
+        Intent::Uncheck,
+        Intent::Expand,
+        Intent::Collapse,
+        Intent::Scroll,
+    ] {
+        assert_eq!(
+            evaluate(intent, &f, headless()).verdict,
+            Verdict::Pass,
+            "{intent:?}"
+        );
+    }
 }

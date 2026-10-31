@@ -1,4 +1,4 @@
-use super::ElementFacts;
+use super::{ElementFacts, Occluder};
 use serde::Serialize;
 use serde_json::{json, Value};
 
@@ -14,11 +14,12 @@ pub enum CheckStatus {
     Transient { unknown: bool },
     Terminal { code: &'static str },
 }
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Check {
     pub name: &'static str,
     pub status: CheckStatus,
     pub reason: String,
+    pub occluder: Option<Occluder>,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]

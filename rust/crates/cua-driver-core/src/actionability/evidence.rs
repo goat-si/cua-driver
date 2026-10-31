@@ -23,10 +23,22 @@ pub struct Rect {
     pub width: f64,
     pub height: f64,
 }
+impl Rect {
+    pub(crate) fn valid(self) -> bool {
+        self.x.is_finite()
+            && self.y.is_finite()
+            && self.width.is_finite()
+            && self.height.is_finite()
+            && self.width >= 0.0
+            && self.height >= 0.0
+    }
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ElementFacts {
     pub visible: Evidence<bool>,
+    /// Live offscreen state: `Absent` means no owning-window state was supplied.
+    pub offscreen: Evidence<bool>,
     pub enabled: Evidence<bool>,
     pub editable: Evidence<bool>,
     pub stable: Evidence<bool>,
