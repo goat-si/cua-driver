@@ -335,18 +335,22 @@ mod tests {
 
     async fn cancel_dispatch(
         take_hold: bool,
+        owner: &str,
     ) -> (
         Arc<test_support::TestBackend>,
         Arc<GateClock>,
         Option<WorkerHold>,
+        &'static tokio::sync::Mutex<()>,
     ) {
         let backend = Arc::new(test_support::TestBackend::default());
         let clock = Arc::new(GateClock::default());
         let manager = LeaseManager::new(backend.clone(), clock.clone());
-        let mut lease = manager.acquire("cancel-test").await.unwrap();
-        let coordinator = crate::tool::desktop_action_coordinator().lock().await;
+        let mut lease = manager.acquire(owner).await.unwrap();
+        let coordinator: &'static tokio::sync::Mutex<()> =
+            Box::leak(Box::new(tokio::sync::Mutex::new(())));
+        let guard = coordinator.lock().await;
         lease.activate();
-        let mut admission = DispatchAdmission::new(lease, coordinator, clock.clone());
+        let mut admission = DispatchAdmission::new(lease, guard, clock.clone());
         let captured = Mutex::new(None);
         let mut invocation = Box::pin(admission.invoke(async {
             if take_hold {
@@ -358,42 +362,38 @@ mod tests {
         drop(invocation);
         drop(admission);
         let hold = captured.into_inner().unwrap();
-        (backend, clock, hold)
+        (backend, clock, hold, coordinator)
     }
 
     #[tokio::test]
     async fn cancelled_dispatch_keeps_the_lease_until_its_worker_hold_drops() {
-        let (backend, clock, hold) = cancel_dispatch(true).await;
+        let (backend, clock, hold, coordinator) = cancel_dispatch(true, "cancel-worker-hold").await;
         let hold = hold.expect("worker hold installed");
         let second = hold.clone();
         assert!(backend.try_acquire().unwrap().is_none());
-        assert!(crate::tool::desktop_action_coordinator()
-            .try_lock()
-            .is_err());
+        assert!(coordinator.try_lock().is_err());
         drop(hold);
         tokio::task::yield_now().await;
         assert!(backend.try_acquire().unwrap().is_none());
         drop(second);
-        let coordinator = crate::tool::desktop_action_coordinator().lock().await;
+        let guard = coordinator.lock().await;
         assert!(backend.try_acquire().unwrap().is_some());
         assert_eq!(clock.sleeps.load(Ordering::SeqCst), 0);
-        drop(coordinator);
+        drop(guard);
     }
 
     #[tokio::test]
     async fn cancelled_dispatch_without_worker_hold_releases_after_grace() {
-        let (backend, clock, hold) = cancel_dispatch(false).await;
+        let (backend, clock, hold, coordinator) = cancel_dispatch(false, "cancel-no-hold").await;
         assert!(hold.is_none());
         clock.requested.notified().await;
         assert!(backend.try_acquire().unwrap().is_none());
-        assert!(crate::tool::desktop_action_coordinator()
-            .try_lock()
-            .is_err());
+        assert!(coordinator.try_lock().is_err());
         clock.release.notify_one();
-        let coordinator = crate::tool::desktop_action_coordinator().lock().await;
+        let guard = coordinator.lock().await;
         assert!(backend.try_acquire().unwrap().is_some());
         assert_eq!(clock.sleeps.load(Ordering::SeqCst), 1);
-        drop(coordinator);
+        drop(guard);
     }
 
     #[test]
@@ -842,5 +842,10 @@ pub(crate) mod test_support {
             Arc::new(TestBackend::default()),
             Arc::new(TestClock::default()),
         )
+    }
+
+    /// Whether `owner` currently holds a retained lease.
+    pub(crate) fn is_retained(owner: &str) -> bool {
+        owners().lock().unwrap().retained.contains_key(owner)
     }
 }

@@ -1214,6 +1214,7 @@ impl TrustedInvocationEvidence {
 pub struct ToolRegistry {
     tools: HashMap<String, Box<dyn Tool>>,
     desktop_lease: crate::desktop_lease::LeaseManager,
+    desktop_coordinator: &'static tokio::sync::Mutex<()>,
     /// Ordered list of tool names for `tools/list`.
     order: Vec<String>,
     /// Shared recording session — auto-records each non-read-only tool call.
@@ -1305,6 +1306,7 @@ impl ToolRegistry {
             desktop_lease: crate::desktop_lease::LeaseManager::production(),
             #[cfg(test)]
             desktop_lease: crate::desktop_lease::test_support::manager(),
+            desktop_coordinator: desktop_action_coordinator(),
             order: Vec::new(),
             recording,
             history: None,
@@ -2515,7 +2517,7 @@ impl ToolRegistry {
         };
         // File lease waiters must not block the retained owner's coordinator.
         let admission = if let Some(mut lease) = file_lease {
-            let coordinator = desktop_action_coordinator();
+            let coordinator = self.desktop_coordinator;
             let guard = match coordinator.try_lock() {
                 Ok(guard) => guard,
                 Err(_) => coordinator.lock().await,
@@ -7377,9 +7379,9 @@ resources:
             .expect("invoke has a worker hold");
         drop(call);
         assert!(backend.try_acquire().unwrap().is_none());
-        assert!(desktop_action_coordinator().try_lock().is_err());
+        assert!(registry.desktop_coordinator.try_lock().is_err());
         drop(worker);
-        let coordinator = desktop_action_coordinator().lock().await;
+        let coordinator = registry.desktop_coordinator.lock().await;
         assert!(backend.try_acquire().unwrap().is_some());
         drop(coordinator);
     }
@@ -7406,6 +7408,7 @@ resources:
         use crate::desktop_lease::{test_support::TestClock, LeaseManager};
         let mut registry = super::ToolRegistry::new();
         registry.desktop_lease = LeaseManager::new(backend, Arc::new(TestClock::default()));
+        registry.desktop_coordinator = Box::leak(Box::new(tokio::sync::Mutex::new(())));
         registry.register(Box::new(LeaseProbe {
             hits,
             retain,
@@ -7555,7 +7558,7 @@ resources:
     }
 
     #[tokio::test]
-    async fn session_end_releases_a_retained_lease() {
+    async fn releasing_a_retained_lease_admits_another_owner() {
         let backend = Arc::new(crate::desktop_lease::test_support::TestBackend::default());
         let hits = Arc::new(AtomicUsize::new(0));
         let registry = lease_test_registry(backend.clone(), true, hits);
@@ -7566,7 +7569,10 @@ resources:
                 .is_error,
             Some(true)
         );
-        crate::session::end_session(&context.runtime_session_key("lease-ended"));
+        // Session-end hooks are process-wide; ending a session here would
+        // race unrelated parallel tests. session.rs pins that session cleanup
+        // calls release_lease.
+        crate::desktop_lease::release_lease(&context.runtime_session_key("lease-ended"));
         assert_ne!(
             lease_click(&registry, &context, "lease-successor")
                 .await
