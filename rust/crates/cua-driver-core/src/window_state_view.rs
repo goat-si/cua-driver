@@ -270,8 +270,36 @@ pub fn apply(
     content: &mut [Content],
     structured: &mut Value,
 ) {
+    let original_md = structured
+        .get("tree_markdown")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    if let Some(original) = &original_md {
+        let marked = mark_boundaries(original, structured);
+        if marked != *original {
+            structured["tree_markdown"] = json!(marked);
+            rewrite_tree_block(content, original, "", &marked);
+        }
+    }
     if opts.full_output {
         return;
+    }
+    if structured.get("observation_complete").is_none() {
+        structured["observation_complete"] = json!(false);
+        let reasons = structured
+            .get("observation_incomplete_reasons")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let mut reasons = reasons;
+        let not_asserted = json!({"kind":"unknown", "detail":"not_asserted"});
+        if !reasons.contains(&not_asserted) {
+            reasons.push(not_asserted);
+        }
+        structured["observation_incomplete_reasons"] = json!(reasons);
+    }
+    if structured.get("observation_incomplete_reasons").is_none() {
+        structured["observation_incomplete_reasons"] = json!([]);
     }
     trim_metadata(opts, structured);
     let Some(md) = structured
@@ -299,11 +327,11 @@ pub fn apply(
         if since.is_empty() {
             SinceOutcome::Fallback("no_baseline")
         } else {
-            resolve_since(since, snapshot_id.as_deref(), &md, ctx)
+            resolve_since(since, snapshot_id.as_deref(), &md, ctx, structured)
         }
     });
     if let Some(sid) = &snapshot_id {
-        remember(sid, ctx, &md);
+        remember(sid, ctx, &md, structured);
     }
 
     // Header text added to the first line of the tree block.
@@ -411,6 +439,44 @@ pub fn apply(
 
     rewrite_tree_block(content, &md, &header_extra, &body);
     drop_walk_diagnostics(opts, structured);
+}
+
+fn mark_boundaries(md: &str, structured: &Value) -> String {
+    let Some(elements) = structured.get("elements").and_then(Value::as_array) else {
+        return md.to_owned();
+    };
+    let mut markers = std::collections::HashMap::new();
+    for element in elements {
+        let (Some(index), Some(boundary)) = (
+            element.get("element_index").and_then(Value::as_u64),
+            element.get("boundary"),
+        ) else {
+            continue;
+        };
+        let marker = match boundary
+            .get("children_skipped")
+            .and_then(|v| v.get("known"))
+            .and_then(Value::as_u64)
+        {
+            Some(n) => format!("[+{n} more]"),
+            None => "[more: unknown]".to_owned(),
+        };
+        markers.insert(index, marker);
+    }
+    md.split('\n')
+        .map(|line| {
+            let index = line
+                .trim_start()
+                .strip_prefix("- [")
+                .and_then(|s| s.split_once(']'))
+                .and_then(|(n, _)| n.parse::<u64>().ok());
+            match index.and_then(|i| markers.get(&i)) {
+                Some(marker) if !line.ends_with(marker) => format!("{line} {marker}"),
+                _ => line.to_owned(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// Walk diagnostics cost every read context and no caller acts on them:
@@ -580,6 +646,8 @@ struct StoredSnapshot {
     window_id: u64,
     key: ViewKey,
     markdown: String,
+    observation_complete: Value,
+    observation_incomplete_reasons: Value,
     at: Instant,
 }
 
@@ -598,7 +666,7 @@ fn stored_snapshot_key(snapshot_id: &str) -> std::borrow::Cow<'_, str> {
     }
 }
 
-fn remember(snapshot_id: &str, ctx: &ViewContext<'_>, md: &str) {
+fn remember(snapshot_id: &str, ctx: &ViewContext<'_>, md: &str, structured: &Value) {
     let snapshot_id = &*stored_snapshot_key(snapshot_id);
     let mut guard = store().lock().unwrap_or_else(|e| e.into_inner());
     // A screenshot-only read keeps its snapshot id and returns no tree. It
@@ -613,6 +681,14 @@ fn remember(snapshot_id: &str, ctx: &ViewContext<'_>, md: &str) {
         window_id: ctx.window_id,
         key: ctx.key.clone(),
         markdown: md.to_owned(),
+        observation_complete: structured
+            .get("observation_complete")
+            .cloned()
+            .unwrap_or(Value::Null),
+        observation_incomplete_reasons: structured
+            .get("observation_incomplete_reasons")
+            .cloned()
+            .unwrap_or(Value::Null),
         at: Instant::now(),
     });
     let same_window = |s: &StoredSnapshot| s.pid == ctx.pid && s.window_id == ctx.window_id;
@@ -767,7 +843,12 @@ pub(crate) fn remember_for_test(snapshot_id: &str, pid: i64, window_id: u64, mar
         },
         focus_probe: None,
     };
-    remember(snapshot_id, &ctx, markdown);
+    remember(
+        snapshot_id,
+        &ctx,
+        markdown,
+        &json!({"observation_complete": false, "observation_incomplete_reasons": [{"kind":"unknown", "detail":"not_asserted"}]}),
+    );
 }
 
 fn resolve_since(
@@ -775,6 +856,7 @@ fn resolve_since(
     current_id: Option<&str>,
     md: &str,
     ctx: &ViewContext<'_>,
+    structured: &Value,
 ) -> SinceOutcome {
     if current_id.is_none() {
         return SinceOutcome::Fallback("no_snapshot");
@@ -796,11 +878,32 @@ fn resolve_since(
     }
     match diff_markdown(&old.markdown, md) {
         Err(DiffError::TooLarge) => SinceOutcome::Fallback("diff_too_large"),
-        Ok(report) => {
+        Ok(mut report) => {
             if !report.is_empty() && report.render_len() * 100 > md.len() * DIFF_MAX_PERCENT_OF_FULL
             {
                 SinceOutcome::Fallback("too_much_changed")
             } else {
+                let complete = &structured["observation_complete"];
+                let reasons = &structured["observation_incomplete_reasons"];
+                if old.observation_complete != *complete
+                    || old.observation_incomplete_reasons != *reasons
+                {
+                    let before = old
+                        .observation_incomplete_reasons
+                        .as_array()
+                        .cloned()
+                        .unwrap_or_default();
+                    let after = reasons.as_array().cloned().unwrap_or_default();
+                    let added: Vec<_> = after.iter().filter(|r| !before.contains(r)).collect();
+                    let removed: Vec<_> = before.iter().filter(|r| !after.contains(r)).collect();
+                    report.metadata = Some(format!(
+                        "observation_complete: {} → {}; reasons added: {}; removed: {}",
+                        old.observation_complete,
+                        complete,
+                        json!(added),
+                        json!(removed)
+                    ));
+                }
                 SinceOutcome::Diff(report)
             }
         }
@@ -828,6 +931,7 @@ pub struct DiffReport {
     changed: Vec<Row>,
     removed: Vec<Row>,
     reindexed: Vec<(u64, u64, i64)>,
+    metadata: Option<String>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -1034,7 +1138,10 @@ fn diff_ops(old: &[Row], new: &[Row]) -> Result<Vec<Op>, DiffError> {
 
 impl DiffReport {
     pub fn is_empty(&self) -> bool {
-        self.added.is_empty() && self.changed.is_empty() && self.removed.is_empty()
+        self.added.is_empty()
+            && self.changed.is_empty()
+            && self.removed.is_empty()
+            && self.metadata.is_none()
     }
 
     fn render_len(&self) -> usize {
@@ -1064,6 +1171,10 @@ impl DiffReport {
             self.changed.len(),
             self.removed.len()
         );
+        if let Some(metadata) = &self.metadata {
+            out.push_str(metadata);
+            out.push('\n');
+        }
         for row in &self.added {
             out.push_str(&format!("+ {}\n", row.text));
         }
@@ -1260,6 +1371,82 @@ mod tests {
             "element_count": 4
         });
         (content, structured)
+    }
+
+    #[test]
+    fn completeness_only_change_is_a_diff() {
+        let window = 88001;
+        let (mut first_content, mut first) = payload("s0000aa01", OLD);
+        first["observation_complete"] = json!(false);
+        first["observation_incomplete_reasons"] =
+            json!([{"kind":"unknown","detail":"not_asserted"}]);
+        apply(
+            &opts(json!({})),
+            &ctx(window),
+            &mut first_content,
+            &mut first,
+        );
+        let (mut second_content, mut second) = payload("s0000aa02", OLD);
+        second["observation_complete"] = json!(true);
+        second["observation_incomplete_reasons"] = json!([]);
+        apply(
+            &opts(json!({"since":"s0000aa01"})),
+            &ctx(window),
+            &mut second_content,
+            &mut second,
+        );
+        assert_eq!(second["since_status"], "diff");
+        assert!(second["tree_diff"]
+            .as_str()
+            .unwrap()
+            .contains("observation_complete"));
+        assert!(second["tree_diff"].as_str().unwrap().contains("removed:"));
+        let (mut third_content, mut third) = payload("s0000aa03", OLD);
+        third["observation_complete"] = json!(true);
+        third["observation_incomplete_reasons"] = json!([]);
+        apply(
+            &opts(json!({"since":"s0000aa02"})),
+            &ctx(window),
+            &mut third_content,
+            &mut third,
+        );
+        assert_eq!(third["since_status"], "no_change");
+        assert_eq!(third["observation_complete"], true);
+        assert_eq!(third["observation_incomplete_reasons"], json!([]));
+    }
+
+    #[test]
+    fn boundary_markers_and_completeness_survive_diff_and_no_change() {
+        let window = 88002;
+        let (mut content, mut first) = payload("s0000ab01", OLD);
+        first["observation_complete"] = json!(false);
+        first["observation_incomplete_reasons"] = json!([{"kind":"budget","detail":"node_budget"}]);
+        first["elements"][0]["boundary"] = json!({"reasons":[{"kind":"budget","detail":"node_budget"}], "children_skipped":{"known":3}});
+        first["elements"][1]["boundary"] = json!({"reasons":[{"kind":"unknown","detail":"not_asserted"}], "children_skipped":"unknown"});
+        apply(&opts(json!({})), &ctx(window), &mut content, &mut first);
+        assert!(first["tree_markdown"]
+            .as_str()
+            .unwrap()
+            .contains("[+3 more]"));
+        assert!(text_of(&content).contains("[more: unknown]"));
+        let (mut content, mut second) = payload("s0000ab02", OLD);
+        second["observation_complete"] = json!(false);
+        second["observation_incomplete_reasons"] =
+            json!([{"kind":"budget","detail":"node_budget"}]);
+        second["elements"][0]["boundary"] = json!({"reasons":[{"kind":"budget","detail":"node_budget"}], "children_skipped":{"known":3}});
+        second["elements"][1]["boundary"] = json!({"reasons":[{"kind":"unknown","detail":"not_asserted"}], "children_skipped":"unknown"});
+        apply(
+            &opts(json!({"since":"s0000ab01"})),
+            &ctx(window),
+            &mut content,
+            &mut second,
+        );
+        assert_eq!(second["since_status"], "no_change");
+        assert_eq!(second["observation_complete"], false);
+        assert_eq!(
+            second["observation_incomplete_reasons"][0]["detail"],
+            "node_budget"
+        );
     }
 
     fn ctx(window_id: u64) -> ViewContext<'static> {

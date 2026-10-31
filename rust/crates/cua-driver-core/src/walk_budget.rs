@@ -6,6 +6,9 @@
 //! the tool returns the PARTIAL tree it has, and the response says so with the
 //! same structured fields and the same note on every platform.
 
+use cua_driver_contract::{
+    IncompleteReason, IncompleteReasonDetail as Detail, IncompleteReasonKind as Kind,
+};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -58,6 +61,8 @@ pub struct WalkBudget {
     visited: usize,
     pending: usize,
     stop: Option<WalkStop>,
+    exhaustive: bool,
+    incomplete_reasons: Vec<IncompleteReason>,
 }
 
 impl WalkBudget {
@@ -73,6 +78,8 @@ impl WalkBudget {
             visited: 0,
             pending: 0,
             stop: None,
+            exhaustive: false,
+            incomplete_reasons: Vec::new(),
         }
     }
 
@@ -145,10 +152,34 @@ impl WalkBudget {
         self.stop.get_or_insert(WalkStop::AppUnresponsive);
     }
 
+    /// Assert the producer attempted the full requested scope and established trust.
+    pub fn assert_exhaustive(&mut self) {
+        self.exhaustive = true;
+    }
+
+    /// Record omitted requested scope, including a skipped or failed read.
+    pub fn record_skip(&mut self, reason: IncompleteReason) {
+        if !self.incomplete_reasons.contains(&reason) {
+            self.incomplete_reasons.push(reason);
+        }
+    }
+
+    /// Record an untrusted provider or other inability to establish trust.
+    pub fn record_untrusted(&mut self, reason: IncompleteReason) {
+        self.record_skip(reason);
+    }
+
+    /// Record a boundary that omitted part of the requested scope.
+    pub fn record_cut(&mut self, reason: IncompleteReason) {
+        self.record_skip(reason);
+    }
+
     pub fn outcome(&self) -> WalkOutcome {
         WalkOutcome {
             timeout_ms: self.timeout_ms,
             stop: self.stop,
+            exhaustive: self.exhaustive,
+            incomplete_reasons: self.incomplete_reasons.clone(),
             nodes_visited: self.visited,
             nodes_pending: self.pending,
             elapsed_ms: self
@@ -159,13 +190,15 @@ impl WalkBudget {
 }
 
 /// What a finished walk reports.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WalkOutcome {
     pub timeout_ms: u64,
     pub stop: Option<WalkStop>,
     pub nodes_visited: usize,
     pub nodes_pending: usize,
     pub elapsed_ms: u64,
+    exhaustive: bool,
+    incomplete_reasons: Vec<IncompleteReason>,
 }
 
 impl WalkOutcome {
@@ -178,6 +211,8 @@ impl WalkOutcome {
             nodes_visited: 0,
             nodes_pending: 0,
             elapsed_ms: elapsed.as_millis() as u64,
+            exhaustive: false,
+            incomplete_reasons: Vec::new(),
         }
     }
 
@@ -191,6 +226,29 @@ impl WalkOutcome {
 
     /// Write the shared walk fields into a `get_window_state` payload.
     pub fn apply(&self, structured: &mut Value) {
+        let mut reasons = self.incomplete_reasons.clone();
+        if !self.exhaustive {
+            reasons.push(IncompleteReason {
+                kind: Kind::Unknown,
+                detail: Detail::NotAsserted,
+            });
+        }
+        if let Some(stop) = self.stop {
+            let detail = match stop {
+                WalkStop::NodeBudget => Detail::NodeBudget,
+                WalkStop::Timeout | WalkStop::AppLookupTimeout | WalkStop::AppUnresponsive => {
+                    Detail::TimeBudget
+                }
+            };
+            reasons.push(IncompleteReason {
+                kind: Kind::Budget,
+                detail,
+            });
+        }
+        reasons.sort_unstable();
+        reasons.dedup();
+        structured["observation_complete"] = json!(reasons.is_empty());
+        structured["observation_incomplete_reasons"] = json!(reasons);
         structured["truncated"] = json!(self.truncated());
         if let Some(reason) = self.reason() {
             structured["truncation_reason"] = json!(reason);
@@ -388,6 +446,76 @@ impl HungTargetCircuitBreaker {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unasserted_walk_is_explicitly_incomplete() {
+        let budget = WalkBudget::nodes_only(10);
+        let mut output = json!({});
+        budget.outcome().apply(&mut output);
+        assert_eq!(output["observation_complete"], false);
+        assert_eq!(
+            output["observation_incomplete_reasons"][0]["detail"],
+            "not_asserted"
+        );
+    }
+
+    #[test]
+    fn completeness_requires_assertion_and_no_omitted_scope() {
+        let check = |budget: &WalkBudget, complete: bool, detail: Option<&str>| {
+            let mut output = json!({});
+            budget.outcome().apply(&mut output);
+            assert_eq!(output["observation_complete"], complete);
+            if let Some(detail) = detail {
+                assert!(output["observation_incomplete_reasons"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|r| r["detail"] == detail));
+            } else {
+                assert_eq!(output["observation_incomplete_reasons"], json!([]));
+            }
+        };
+        let mut clean = WalkBudget::nodes_only(1);
+        assert!(clean.admit());
+        clean.assert_exhaustive();
+        check(&clean, true, None); // Configured limit is not itself exhaustion.
+        assert!(!clean.admit());
+        check(&clean, false, Some("node_budget"));
+        let mut timeout = WalkBudget::new(0, 1);
+        timeout.assert_exhaustive();
+        assert!(!timeout.admit());
+        check(&timeout, false, Some("time_budget"));
+        for (detail, method) in [
+            (Detail::ChildEnumerationFailed, 0),
+            (Detail::AttributeReadFailed, 1),
+            (Detail::UntrustedProvider, 2),
+        ] {
+            let mut budget = WalkBudget::nodes_only(10);
+            budget.assert_exhaustive();
+            let reason = IncompleteReason {
+                kind: Kind::ProviderFailure,
+                detail,
+            };
+            match method {
+                0 => budget.record_skip(reason),
+                1 => budget.record_cut(reason),
+                _ => budget.record_untrusted(reason),
+            }
+            let mut output = json!({});
+            budget.outcome().apply(&mut output);
+            assert_eq!(output["observation_complete"], false);
+            assert!(output["observation_incomplete_reasons"]
+                .as_array()
+                .unwrap()
+                .contains(&json!(reason)));
+        }
+        let mut early = WalkBudget::nodes_only(10);
+        early.stop_for_app_lookup_timeout();
+        check(&early, false, Some("not_asserted"));
+        let mut output = json!({});
+        WalkOutcome::timed_out(1, Duration::from_millis(2)).apply(&mut output);
+        assert_eq!(output["observation_complete"], false);
+    }
 
     #[test]
     fn remaining_time_is_known_only_for_a_started_time_bounded_walk() {
