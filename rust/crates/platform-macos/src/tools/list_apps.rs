@@ -128,3 +128,27 @@ mod tests {
         assert_eq!(typed.apps[0].last_used, None);
     }
 }
+#[cfg(test)]
+mod inventory_failure_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn a_failed_inventory_task_is_an_error_not_an_empty_list() {
+        let result = inventory_result(|| panic!("injected inventory failure")).await;
+        assert_eq!(result.is_error, Some(true));
+        assert_ne!(
+            result.structured_content,
+            Some(serde_json::json!({"apps": []}))
+        );
+    }
+
+    #[tokio::test]
+    async fn an_empty_inventory_is_successful() {
+        let result = inventory_result(Vec::new).await;
+        assert_ne!(result.is_error, Some(true));
+        assert_eq!(
+            result.structured_content,
+            Some(serde_json::json!({"apps": []}))
+        );
+    }
+}

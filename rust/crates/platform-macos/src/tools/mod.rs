@@ -2334,3 +2334,84 @@ mod user_takeover_tests {
         assert_eq!(user_takeover_idle(Some(true), Some(0), 0), None);
     }
 }
+#[cfg(test)]
+mod coordinate_scale_tests {
+    use super::*;
+    use std::cell::Cell;
+
+    #[tokio::test]
+    async fn unknown_scale_refuses_before_dispatch() {
+        for tool in ["click", "move_cursor", "drag", "scroll"] {
+            let sent = Cell::new(0);
+            let counter = &sent;
+            let result = dispatch_desktop_points(tool, [(4.0, 6.0)], [None], |_| async move {
+                counter.set(counter.get() + 1);
+                ToolResult::text("sent")
+            })
+            .await;
+            assert_eq!(sent.get(), 0, "{tool}");
+            assert_eq!(result.is_error, Some(true), "{tool}");
+            let value = result.structured_content.unwrap();
+            assert_eq!(value["effect"], "refused", "{tool}");
+            assert_eq!(value["dispatched"], false, "{tool}");
+        }
+        for converted in [[None, Some((3.0, 4.0))], [Some((1.0, 2.0)), None]] {
+            let sent = Cell::new(0);
+            let counter = &sent;
+            let result = dispatch_desktop_points(
+                "drag",
+                [(2.0, 4.0), (6.0, 8.0)],
+                converted,
+                |_| async move {
+                    counter.set(counter.get() + 1);
+                    ToolResult::text("sent")
+                },
+            )
+            .await;
+            assert_eq!(sent.get(), 0);
+            let value = result.structured_content.unwrap();
+            assert_eq!(value["effect"], "refused");
+            assert_eq!(value["dispatched"], false);
+        }
+    }
+
+    #[tokio::test]
+    async fn known_scale_dispatches_and_capture_id_keeps_its_bound_point() {
+        for tool in ["click", "move_cursor", "drag", "scroll"] {
+            let sent = Cell::new(0);
+            let counter = &sent;
+            let result = dispatch_desktop_points(
+                tool,
+                [(4.0, 6.0)],
+                [Some((2.0, 3.0))],
+                |points| async move {
+                    assert_eq!(points, [(2.0, 3.0)]);
+                    counter.set(counter.get() + 1);
+                    ToolResult::text("sent")
+                },
+            )
+            .await;
+            assert_eq!(sent.get(), 1, "{tool}");
+            assert_ne!(result.is_error, Some(true), "{tool}");
+        }
+        let point = desktop_click_point(
+            Some("capture"),
+            || panic!("must not query scale"),
+            |id| {
+                assert_eq!(id, "capture");
+                Ok((7.0, 9.0))
+            },
+        )
+        .unwrap();
+        let sent = Cell::new(0);
+        let counter = &sent;
+        let result = dispatch_desktop_points("click", [(1.0, 2.0)], [point], |points| async move {
+            assert_eq!(points, [(7.0, 9.0)]);
+            counter.set(counter.get() + 1);
+            ToolResult::text("sent")
+        })
+        .await;
+        assert_eq!(sent.get(), 1);
+        assert_ne!(result.is_error, Some(true));
+    }
+}

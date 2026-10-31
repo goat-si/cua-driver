@@ -137,3 +137,26 @@ mod tests {
         assert_eq!(backing_scale_from_mode(Some((1920, 0))), Some(1.0));
     }
 }
+#[cfg(test)]
+mod scale_tests {
+    use super::backing_scale_from_mode;
+
+    #[test]
+    fn a_missing_display_mode_is_unknown_scale() {
+        assert_eq!(backing_scale_from_mode(None), None);
+    }
+
+    #[test]
+    fn zero_widths_are_unknown_scale() {
+        assert_eq!(backing_scale_from_mode(Some((0, 3840))), None);
+        assert_eq!(backing_scale_from_mode(Some((1920, 0))), None);
+    }
+
+    #[test]
+    fn valid_modes_keep_the_existing_rounding() {
+        assert_eq!(backing_scale_from_mode(Some((1920, 1920))), Some(1.0));
+        assert_eq!(backing_scale_from_mode(Some((1920, 2880))), Some(1.5));
+        assert_eq!(backing_scale_from_mode(Some((1920, 3840))), Some(2.0));
+        assert_eq!(backing_scale_from_mode(Some((1000, 1499))), Some(1.5));
+    }
+}
