@@ -7,15 +7,19 @@ pub(crate) enum RootVerdict {
     NoAnswer,
 }
 
+pub(crate) fn root_verdict(is_window: bool, responds: bool) -> RootVerdict {
+    match (is_window, responds) {
+        (false, _) => RootVerdict::WindowGone,
+        (true, false) => RootVerdict::NoAnswer,
+        (true, true) => RootVerdict::Ok,
+    }
+}
+
 pub(crate) fn probe_with(is_window: bool, responds: impl FnOnce() -> bool) -> RootVerdict {
     if !is_window {
-        return RootVerdict::WindowGone;
+        return root_verdict(false, false);
     }
-    if responds() {
-        RootVerdict::Ok
-    } else {
-        RootVerdict::NoAnswer
-    }
+    root_verdict(true, responds())
 }
 
 pub(crate) fn warm_up_with(

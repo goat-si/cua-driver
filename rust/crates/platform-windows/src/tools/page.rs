@@ -473,6 +473,8 @@ unsafe fn uia_root_for(hwnd: u64) -> anyhow::Result<(IUIAutomation, IUIAutomatio
     let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
     let automation: IUIAutomation = CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER)
         .map_err(|e| anyhow::anyhow!("UIA init failed: {e}"))?;
+    crate::uia::client::warm_up(&automation)
+        .map_err(|e| anyhow::anyhow!("UIA init failed: {e}"))?;
     let hwnd_win = HWND(hwnd as *mut _);
     let root = automation
         .ElementFromHandle(hwnd_win)
@@ -552,6 +554,7 @@ unsafe fn create_true_condition_or_fallback(
 ) -> Option<windows::Win32::UI::Accessibility::IUIAutomationCondition> {
     let automation: IUIAutomation =
         CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER).ok()?;
+    crate::uia::client::warm_up(&automation).ok()?;
     automation.CreateTrueCondition().ok()
 }
 

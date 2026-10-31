@@ -5,6 +5,10 @@ const E_FAIL: i32 = 0x80004005u32 as i32;
 
 #[test]
 fn uia_root_probe_short_circuits_and_classifies() {
+    assert_eq!(root_verdict(false, true), RootVerdict::WindowGone);
+    assert_eq!(root_verdict(false, false), RootVerdict::WindowGone);
+    assert_eq!(root_verdict(true, false), RootVerdict::NoAnswer);
+    assert_eq!(root_verdict(true, true), RootVerdict::Ok);
     let calls = AtomicUsize::new(0);
     assert_eq!(
         probe_with(false, || {

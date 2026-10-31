@@ -74,13 +74,9 @@ fn try_type_focused_document_append_unbounded(
     state: &AtomicU8,
 ) -> FocusedDocumentTypeOutcome {
     use windows::core::BSTR;
-    use windows::Win32::System::Com::{
-        CoCreateInstance, CoInitializeEx, CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED,
-    };
+    use windows::Win32::System::Com::{CoInitializeEx, COINIT_MULTITHREADED};
     use windows::Win32::System::Threading::GetCurrentThreadId;
-    use windows::Win32::UI::Accessibility::{
-        CUIAutomation, IUIAutomation, IUIAutomationValuePattern,
-    };
+    use windows::Win32::UI::Accessibility::IUIAutomationValuePattern;
 
     let thread_id = unsafe { GetCurrentThreadId() };
     let coinit = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
@@ -110,9 +106,7 @@ fn try_type_focused_document_append_unbounded(
             return not_applicable("target_pid_mismatch");
         }
 
-        let Ok(uia) = (unsafe {
-            CoCreateInstance::<_, IUIAutomation>(&CUIAutomation, None, CLSCTX_INPROC_SERVER)
-        }) else {
+        let Ok(uia) = super::client::new_uia_client() else {
             return not_applicable("uia_create_failed");
         };
         let Ok(focused) = (unsafe { uia.GetFocusedElement() }) else {

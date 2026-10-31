@@ -302,6 +302,8 @@ unsafe fn init_uia() -> Result<IUIAutomation> {
     }
     let automation: IUIAutomation = CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER)
         .map_err(|e| anyhow!("CoCreateInstance(CUIAutomation) failed: {e}"))?;
+    crate::uia::client::warm_up(&automation)
+        .map_err(|e| anyhow!("CoCreateInstance(CUIAutomation) failed: {e}"))?;
     Ok(automation)
 }
 

@@ -5,6 +5,17 @@ use cua_driver_core::action_record::{
 };
 
 #[test]
+fn no_answer_refuses_without_fallback_or_uncertain_effect() {
+    let result = finish_pixel_uia_attempt(PointInvokeOutcome::NotResponding, 7, 3, 4)
+        .expect("precheck must stop the route");
+    assert!(result.is_error.unwrap_or(false));
+    let data = result.structured_content.expect("structured refusal");
+    assert_eq!(data["effect"], "refused");
+    assert_eq!(data["nothing_sent"], true);
+    assert_eq!(data["uia_status"], "not_responding");
+}
+
+#[test]
 fn uia_unavailable_errors_advertise_foreground_escalation() {
     use cua_driver_core::action_record::EscalationKind;
     use cua_driver_core::protocol::Content;
