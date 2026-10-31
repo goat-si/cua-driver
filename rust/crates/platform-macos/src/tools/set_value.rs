@@ -1338,13 +1338,21 @@ fn write_value_ladder(
     value: &str,
     ctx: &LadderContext,
 ) -> LadderOutcome {
-    let _ = ctx.role;
     let mut out = LadderOutcome::new();
     let target = value.trim().parse::<f64>().ok();
+    let text_role = ctx.secure || text_value_role_requires_exact_focus(ctx.role);
+    let numeric_role = matches!(
+        ctx.role,
+        "AXSlider" | "AXIncrementor" | "AXStepper" | "AXScrollBar"
+    );
+    if numeric_role && target.is_none() {
+        out.error = Some(crate::ax::bindings::kAXErrorIllegalArgument);
+        return out;
+    }
     let before = ladder_read(ops, &mut out);
     let settable = ops.query_settable();
     if let (Settable::No, ValueObs::Number(mut current), Some(target), true) =
-        (settable, &before, target, ctx.can_step)
+        (settable, &before, target, ctx.can_step && !text_role)
     {
         out.stepped = true;
         let mut radius = f64::EPSILON;
@@ -1396,7 +1404,13 @@ fn write_value_ladder(
         }
         return out;
     }
-    let first_number = target.is_some() && !matches!(before, ValueObs::Text(_));
+    let first_number = if text_role {
+        false
+    } else if numeric_role {
+        true
+    } else {
+        target.is_some() && !matches!(before, ValueObs::Text(_))
+    };
     let first = if first_number {
         ops.set_number(target.expect("numeric representation"))
     } else {
@@ -1412,7 +1426,7 @@ fn write_value_ladder(
             // Only one alternate representation may be attempted.
             let alternate = if first_number {
                 ops.set_string(value)
-            } else if let Some(number) = target {
+            } else if let Some(number) = target.filter(|_| !text_role) {
                 ops.set_number(number)
             } else {
                 out.error = Some(first);
@@ -1434,7 +1448,8 @@ fn write_value_ladder(
     out.error = (err != kAXErrorSuccess).then_some(err);
     if !ctx.secure {
         let before_s = obs_string(&before);
-        let numeric = !matches!(before, ValueObs::Text(_)) && target.is_some();
+        let numeric = !text_role
+            && (numeric_role || (!matches!(before, ValueObs::Text(_)) && target.is_some()));
         let after = ladder_read(ops, &mut out);
         let after_s = obs_string(&after);
         if !out.verification_withheld {
