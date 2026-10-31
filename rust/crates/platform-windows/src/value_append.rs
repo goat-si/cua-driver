@@ -39,10 +39,13 @@ pub(crate) fn run_value_append<V>(
 }
 
 pub(crate) fn allows_wm_char_fallback(outcome: &AppendOutcome) -> bool {
-    matches!(
-        outcome,
-        AppendOutcome::NoValuePattern | AppendOutcome::WriteFailed { .. }
-    )
+    match outcome {
+        AppendOutcome::NoValuePattern => true,
+        AppendOutcome::WriteFailed { hresult } => crate::uia_mutation::may_fall_through(
+            &crate::uia_mutation::classify_write_hresult(*hresult),
+        ),
+        _ => false,
+    }
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Route {

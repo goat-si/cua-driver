@@ -137,10 +137,7 @@ fn routing_table_observes_calls_and_results() {
         assert_eq!(*write_text.borrow(), written);
         assert_eq!(
             allows_wm_char_fallback(&result),
-            matches!(
-                result,
-                AppendOutcome::NoValuePattern | AppendOutcome::WriteFailed { .. }
-            )
+            matches!(result, AppendOutcome::NoValuePattern)
         );
         let expected_route = if allows_wm_char_fallback(&result) {
             Route::WmChar
@@ -148,6 +145,25 @@ fn routing_table_observes_calls_and_results() {
             Route::Continue(result.clone())
         };
         assert_eq!(route_after_worker(Ok(Some(result))), expected_route);
+    }
+}
+
+#[test]
+fn uia_mutation_write_failure_only_falls_back_when_not_supported() {
+    for (hresult, expected) in [
+        (0x8013_1505_u32 as i32, false),
+        (0x8004_0204_u32 as i32, true),
+    ] {
+        let outcome = AppendOutcome::WriteFailed { hresult };
+        assert_eq!(allows_wm_char_fallback(&outcome), expected);
+        assert_eq!(
+            route_after_worker(Ok(Some(outcome.clone()))),
+            if expected {
+                Route::WmChar
+            } else {
+                Route::Continue(outcome)
+            }
+        );
     }
 }
 
