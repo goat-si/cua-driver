@@ -107,7 +107,7 @@ fn routing_table_observes_calls_and_results() {
             },
             || {
                 events.borrow_mut().push("acquire");
-                pattern.then_some(())
+                Ok(pattern.then_some(()))
             },
             |_| {
                 events.borrow_mut().push("read");
@@ -137,10 +137,7 @@ fn routing_table_observes_calls_and_results() {
         assert_eq!(*write_text.borrow(), written);
         assert_eq!(
             allows_wm_char_fallback(&result),
-            matches!(
-                result,
-                AppendOutcome::NoValuePattern | AppendOutcome::WriteFailed { .. }
-            )
+            matches!(result, AppendOutcome::NoValuePattern)
         );
         let expected_route = if allows_wm_char_fallback(&result) {
             Route::WmChar
@@ -148,6 +145,25 @@ fn routing_table_observes_calls_and_results() {
             Route::Continue(result.clone())
         };
         assert_eq!(route_after_worker(Ok(Some(result))), expected_route);
+    }
+}
+
+#[test]
+fn uia_mutation_write_failure_only_falls_back_when_not_supported() {
+    for (hresult, expected) in [
+        (0x8013_1505_u32 as i32, false),
+        (0x8004_0204_u32 as i32, true),
+    ] {
+        let outcome = AppendOutcome::WriteFailed { hresult };
+        assert_eq!(allows_wm_char_fallback(&outcome), expected);
+        assert_eq!(
+            route_after_worker(Ok(Some(outcome.clone()))),
+            if expected {
+                Route::WmChar
+            } else {
+                Route::Continue(outcome)
+            }
+        );
     }
 }
 
@@ -229,5 +245,30 @@ fn document_requires_each_condition_and_explicit_non_password() {
         assert!(!focused_document_target_ok(
             args.0, args.1, args.2, args.3, args.4, args.5
         ));
+    }
+}
+
+#[test]
+fn failed_value_pattern_acquisition_writes_nothing_and_never_types() {
+    const TIMEOUT: i32 = 0x8013_1505_u32 as i32;
+    for password in [Some(true), Some(false)] {
+        let writes = std::cell::Cell::new(0);
+        let reads = std::cell::Cell::new(0);
+        let result = run_value_append(
+            || password,
+            || Err::<Option<()>, i32>(TIMEOUT),
+            |_| {
+                reads.set(reads.get() + 1);
+                Ok(String::new())
+            },
+            |_, _| {
+                writes.set(writes.get() + 1);
+                Ok(())
+            },
+            "secret",
+        );
+        assert_eq!(result, AppendOutcome::Refused("value_pattern_unreadable"));
+        assert_eq!((reads.get(), writes.get()), (0, 0));
+        assert!(!allows_wm_char_fallback(&result));
     }
 }

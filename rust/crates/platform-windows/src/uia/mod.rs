@@ -9,12 +9,12 @@
 //! (avoids per-property cross-process calls that make Chrome's 5000-node tree
 //!  take >4s when reading each property individually).
 
+use crate::secure_field::{project_node_text, ProjectedNodeText, RawNodeText};
 use cua_driver_core::snapshot_compaction::{
     compact_tab_strip, fold_actionless_text_subtrees, format_omitted_tabs_line,
-    format_uncounted_offscreen_rows_line, is_compaction_summary_line, is_secure_text_field,
-    is_uia_dense_collection, is_uia_offscreen_exempt, plan_uia_collection_children,
-    redact_if_secure, redact_mirrored_secure_name, renumber_indexed_tree, splice_deferred_chunks,
-    CompactableNode, DeferredChunk, FieldSecurityMeta, RenumberableNode, TabChildMeta,
+    format_uncounted_offscreen_rows_line, is_compaction_summary_line, is_uia_dense_collection,
+    is_uia_offscreen_exempt, plan_uia_collection_children, renumber_indexed_tree,
+    splice_deferred_chunks, CompactableNode, DeferredChunk, RenumberableNode, TabChildMeta,
     UiaChildCandidate, UiaChildPlan, TAB_STRIP_COMPACTION_THRESHOLD,
 };
 use cua_driver_core::walk_budget::WalkBudget;
@@ -1431,20 +1431,21 @@ fn emit_cached_node(
     .flatten()
     .collect::<Vec<_>>();
     let description = (!description.is_empty()).then(|| description.join(" "));
-    let security_meta = FieldSecurityMeta {
-        role: &control_type,
-        subrole: None,
-        title: name.as_deref(),
-        description: description.as_deref(),
-        placeholder: None,
-        identifier: automation_id.as_deref(),
-        help: help_text.as_deref(),
-        is_password_flag: read_cached_bool(element, UIA_IsPasswordPropertyId) == Some(true),
-    };
-    let secure = is_secure_text_field(&security_meta);
-    let raw_value = value.clone();
-    let (value, _) = redact_if_secure(&security_meta, value, None);
-    let name = redact_mirrored_secure_name(secure, name, raw_value.as_deref());
+    let ProjectedNodeText {
+        name,
+        value,
+        help: help_text,
+        secure: _secure,
+    } = project_node_text(RawNodeText {
+        control_type: &control_type,
+        name,
+        value,
+        help: help_text,
+        description,
+        automation_id: automation_id.clone(),
+        is_password: read_cached_bool(element, UIA_IsPasswordPropertyId),
+        has_value_pattern: unsafe { element.GetCachedPattern(UIA_ValuePatternId) }.is_ok(),
+    });
     let enabled = read_cached_bool(element, UIA_IsEnabledPropertyId);
     // Missing UIA state must remain unknown on the structured observation
     // surface. Action discovery keeps its historical best-effort assumption.

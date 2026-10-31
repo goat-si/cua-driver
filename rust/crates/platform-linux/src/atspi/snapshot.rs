@@ -178,32 +178,30 @@ mod tests {
 
     #[test]
     fn side_index_ignores_capture_superseded_by_newer_publication() {
-        let (pid, xid) = (424_243_u32, 78);
+        let (pid, xid) = (424_243_i32, 78);
         let cache = Snapshots::new();
-        let older = cache.begin_capture(pid as i32, xid);
-        let newer = cache.begin_capture(pid as i32, xid);
+        let older = cache.begin_capture(pid, xid);
+        let newer = cache.begin_capture(pid, xid);
         let fresh = build_snapshot(&[node(2)], &[(2, 100, 100, 10, 10)]);
         assert!(cache
-            .publish_basis_for_session(pid as i32, xid, fresh, None, None, None, newer)
+            .publish_basis_for_session(pid, xid, fresh, None, None, None, newer)
             .is_some());
         let stale = build_snapshot(&[node(1)], &[(1, 0, 0, 10, 10)]);
         assert!(cache
-            .publish_basis_for_session(pid as i32, xid, stale, None, None, None, older)
+            .publish_basis_for_session(pid, xid, stale, None, None, None, older)
             .is_none());
-        let elements = cache
-            .with_latest(pid as i32, xid, |_, s| s.elements())
-            .unwrap();
+        let elements = cache.with_latest(pid, xid, |_, s| s.elements()).unwrap();
         assert!(hit_test(&elements, 5, 5).is_none());
         assert_eq!(hit_test(&elements, 105, 105).map(|(idx, _)| idx), Some(2));
-        assert_eq!(cache.remove_for_capture(pid as i32, xid, older), None);
+        assert_eq!(cache.remove_for_capture(pid, xid, older), None);
         assert!(cache
-            .with_latest(pid as i32, xid, |_, s| hit_test(&s.elements(), 105, 105))
+            .with_latest(pid, xid, |_, s| hit_test(&s.elements(), 105, 105))
             .flatten()
             .is_some());
-        let ticket = cache.begin_capture(pid as i32, xid);
+        let ticket = cache.begin_capture(pid, xid);
         assert!(cache
             .publish_capture_basis_for_session(
-                pid as i32,
+                pid,
                 xid,
                 AtspiSnapshot::from_nodes(&[]),
                 None,
@@ -213,7 +211,7 @@ mod tests {
             )
             .is_some());
         assert!(cache
-            .with_latest(pid as i32, xid, |_, s| hit_test(&s.elements(), 105, 105))
+            .with_latest(pid, xid, |_, s| hit_test(&s.elements(), 105, 105))
             .flatten()
             .is_none());
     }

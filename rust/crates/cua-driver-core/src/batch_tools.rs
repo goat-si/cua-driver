@@ -192,7 +192,9 @@ impl Tool for RunStepsTool {
                 or be only a check: {role?, name?, text?, gone?, value?, value_contains?, enabled?, selected?, \
                 app?, window?, timeout_ms?}. `text` matches any row, static text included; `gone:true` waits for \
                 it to disappear. Checks poll (wait_for 5 s, expect 2 s, max 10 s); one that does not hold fails \
-                the step with what was found. A failure names the step, its phase (wait_for, find, action, \
+                the step with what was found. Missing field state is unknown. If a window cannot be read, \
+                `gone_unconfirmed` means the window listing does not prove it closed; `lookup_failed` means a window or app listing \
+                failed. A failure names the step, its phase (wait_for, find, action, \
                 expect) and why.\n\
                 \n\
                 Example: \
@@ -3399,6 +3401,31 @@ mod timeout_tests {
         assert!(!gate.is_timed_out());
         assert!(gate.timeout().read_pending);
         assert!(gate.is_timed_out());
+    }
+
+    /// A stale menu-bar token built on a window-basis id still runs as
+    /// invoke_menu (#130).
+    #[test]
+    fn a_basis_handle_menu_token_is_rerouted_to_invoke_menu() {
+        crate::window_state_view::remember_for_test(
+            "s7e570003",
+            42,
+            7,
+            r#"- [27] AXMenuBar
+  - [700] AXMenuBarItem "Sheet"
+    - [701] AXMenu
+      - [771] AXMenuItem "To Next Sheet"
+"#,
+        );
+        let stale = ToolResult::error("element_token is stale")
+            .with_structured(json!({"code":"stale_element_token","effect":"refused"}));
+        let (menu_args, _) = menu_bar_route(
+            &json!({"pid":42,"element_token":"s7e570003.f2:771"}),
+            &stale,
+        )
+        .expect("rerouted");
+        assert_eq!(menu_args["path"], json!(["Sheet", "To Next Sheet"]));
+        assert_eq!(menu_args["window_id"], 7);
     }
 
     #[tokio::test]

@@ -31,6 +31,7 @@ pub mod scroll_area;
 pub mod snapshot;
 pub mod tree;
 pub mod window_scope;
+pub(crate) mod write_outcome;
 
 pub use snapshot::Snapshots;
 pub use tree::{

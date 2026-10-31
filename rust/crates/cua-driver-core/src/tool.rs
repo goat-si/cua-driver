@@ -136,7 +136,7 @@ pub fn with_runtime_scope<T>(scope: String, action: impl FnOnce() -> T) -> T {
     action()
 }
 
-fn desktop_action_coordinator() -> &'static tokio::sync::Mutex<()> {
+pub(crate) fn desktop_action_coordinator() -> &'static tokio::sync::Mutex<()> {
     static COORDINATOR: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
     COORDINATOR.get_or_init(|| tokio::sync::Mutex::new(()))
 }
@@ -1213,6 +1213,8 @@ impl TrustedInvocationEvidence {
 /// Thread-safe collection of all registered tools.
 pub struct ToolRegistry {
     tools: HashMap<String, Box<dyn Tool>>,
+    desktop_lease: crate::desktop_lease::LeaseManager,
+    desktop_coordinator: &'static tokio::sync::Mutex<()>,
     /// Ordered list of tool names for `tools/list`.
     order: Vec<String>,
     /// Shared recording session — auto-records each non-read-only tool call.
@@ -1300,6 +1302,11 @@ impl ToolRegistry {
             }));
         Self {
             tools: HashMap::new(),
+            #[cfg(not(test))]
+            desktop_lease: crate::desktop_lease::LeaseManager::production(),
+            #[cfg(test)]
+            desktop_lease: crate::desktop_lease::test_support::manager(),
+            desktop_coordinator: desktop_action_coordinator(),
             order: Vec::new(),
             recording,
             history: None,
@@ -2480,21 +2487,50 @@ impl ToolRegistry {
                     | "end_session"
             );
         let private_consent_turn = is_existing_profile_prepare(resolved_name, &args);
-        let _desktop_action = if requires_desktop_coordination(
+        let file_lease = if requires_desktop_coordination(
             resolved_name,
             &args,
             tool.has_independent_input_lane(&args),
         ) {
-            let coordinator = desktop_action_coordinator();
-            // Avoid yielding the dispatch task when the process-wide input
-            // lane is uncontended. On Windows, that yield creates a window in
-            // which the foreground target can lose keyboard eligibility
-            // between the fixture's focus proof and SendInput. Contended
-            // runtimes still wait and serialize through the same mutex.
-            Some(match coordinator.try_lock() {
+            let owner = runtime_session.clone().unwrap_or_else(|| {
+                crate::desktop_lease::runtime_owner(&context.runtime_scope_key())
+            });
+            match self.desktop_lease.acquire(&owner).await {
+                Ok(lease) => Some(lease),
+                Err(error) => {
+                    let (code, message) = match error {
+                        crate::desktop_lease::LeaseFailure::Busy => {
+                            ("desktop_busy", "desktop input is busy".to_owned())
+                        }
+                        crate::desktop_lease::LeaseFailure::Unavailable(reason) => {
+                            ("desktop_lease_unavailable", reason)
+                        }
+                    };
+                    // Nothing was dispatched: close the cursor and history
+                    // events this call opened, so neither shows an action.
+                    crate::cursor_events::end_tool(cursor_event);
+                    if let (Some(history), Some(pending)) = (self.history.as_ref(), pending_history)
+                    {
+                        history.finish_action(pending, None, true);
+                    }
+                    return ToolResult::error(message.clone()).with_structured(serde_json::json!({
+                        "effect": "refused", "code": code, "status": "refused",
+                        "refusal": {"code": code, "message": message}
+                    }));
+                }
+            }
+        } else {
+            None
+        };
+        // File lease waiters must not block the retained owner's coordinator.
+        let admission = if let Some(mut lease) = file_lease {
+            let coordinator = self.desktop_coordinator;
+            let guard = match coordinator.try_lock() {
                 Ok(guard) => guard,
                 Err(_) => coordinator.lock().await,
-            })
+            };
+            lease.activate();
+            Some((lease, guard))
         } else {
             None
         };
@@ -2536,11 +2572,22 @@ impl ToolRegistry {
         // back to the uncapped capture before any platform interprets them.
         crate::desktop_capture_scale::map_desktop_args(&mut args);
         crate::tool_activity::note_tool_activity();
-        let mut result = crate::recording::scope_dispatch_click_capture(
+        let dispatch = crate::recording::scope_dispatch_click_capture(
             pending_turn.as_ref(),
             tool.invoke(args.clone()),
-        )
-        .await;
+        );
+        let mut admission = admission.map(|(lease, coordinator)| {
+            crate::desktop_lease::DispatchAdmission::new(
+                lease,
+                coordinator,
+                self.desktop_lease.clock(),
+            )
+        });
+        let mut result = if let Some(admission) = admission.as_mut() {
+            admission.invoke(dispatch).await
+        } else {
+            dispatch.await
+        };
         match resolved_name {
             "get_desktop_state" if result.is_error != Some(true) => {
                 crate::desktop_capture_scale::record_desktop_state(
@@ -2600,7 +2647,7 @@ impl ToolRegistry {
         // capture or result shaping. Keeping the global desktop lock through
         // recording/PiP screenshots would unnecessarily block an unrelated
         // runtime after the input side effect has already completed.
-        drop(_desktop_action);
+        drop(admission);
         restore_public_runtime_result(&mut result, &runtime_prefix);
         // Preserve the producer's private summary for recording/replay before
         // the public ActionResult projection deliberately replaces legacy
@@ -4143,6 +4190,55 @@ mod runtime_isolation_tests {
     struct ReplayProbe {
         hits: Arc<AtomicUsize>,
         def: super::ToolDef,
+    }
+
+    struct EchoInputProbe {
+        def: super::ToolDef,
+        hits: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl super::Tool for EchoInputProbe {
+        fn def(&self) -> &super::ToolDef {
+            &self.def
+        }
+        async fn invoke(&self, args: serde_json::Value) -> crate::protocol::ToolResult {
+            self.hits.fetch_add(1, Ordering::SeqCst);
+            crate::protocol::ToolResult::text(format!("echo: {}", args["text"].as_str().unwrap()))
+        }
+    }
+
+    #[tokio::test]
+    async fn withheld_turn_summary_is_content_free_with_echoing_probe() {
+        let root = tempfile::tempdir().unwrap();
+        let hits = Arc::new(AtomicUsize::new(0));
+        let mut registry = super::ToolRegistry::new();
+        registry.register(Box::new(EchoInputProbe { hits: hits.clone(), def: super::ToolDef {
+            name: "type_text".into(), description: "echo probe".into(),
+            input_schema: serde_json::json!({"type":"object", "properties":{"text":{"type":"string"}}, "required":["text"]}),
+            read_only: false, destructive: false, idempotent: false, open_world: false,
+        }}));
+        registry
+            .recording
+            .start(root.path().to_str().unwrap(), false, None)
+            .unwrap();
+        let _ = registry
+            .invoke_with_context(
+                "type_text",
+                serde_json::json!({"text":"secret"}),
+                unrestricted_context(),
+            )
+            .await;
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        let action = std::fs::read_to_string(root.path().join("turn-00001/action.json")).unwrap();
+        assert!(!action.contains("secret"));
+        assert!(!action.contains("echo"));
+        let parsed: serde_json::Value = serde_json::from_str(&action).unwrap();
+        assert_eq!(parsed["withheld_args"], serde_json::json!(["text"]));
+        assert_eq!(
+            parsed["result_summary"],
+            "type_text: input withheld (6 characters); result summary withheld"
+        );
     }
 
     struct ObservationProbe {
@@ -7288,6 +7384,300 @@ resources:
         ));
     }
 
+    struct LeaseProbe {
+        hits: Arc<AtomicUsize>,
+        retain: bool,
+        def: super::ToolDef,
+    }
+
+    struct CancelledWorkerProbe {
+        def: super::ToolDef,
+        hold: Arc<Mutex<Option<crate::desktop_lease::WorkerHold>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl super::Tool for CancelledWorkerProbe {
+        fn def(&self) -> &super::ToolDef {
+            &self.def
+        }
+        async fn invoke(&self, _: serde_json::Value) -> ToolResult {
+            *self.hold.lock().unwrap() = crate::desktop_lease::worker_hold();
+            std::future::pending().await
+        }
+    }
+
+    #[tokio::test]
+    async fn registry_cancelled_dispatch_keeps_worker_hold() {
+        use crate::desktop_lease::LeaseBackend;
+        let backend = Arc::new(crate::desktop_lease::test_support::TestBackend::default());
+        let hold = Arc::new(Mutex::new(None));
+        let mut registry =
+            lease_test_registry(backend.clone(), false, Arc::new(AtomicUsize::new(0)));
+        registry.register(Box::new(CancelledWorkerProbe {
+            def: super::ToolDef {
+                name: "click".into(),
+                description: "probe".into(),
+                input_schema: serde_json::json!({"type":"object"}),
+                read_only: false,
+                destructive: false,
+                idempotent: false,
+                open_world: false,
+            },
+            hold: hold.clone(),
+        }));
+        let context = unrestricted_context();
+        let mut call = Box::pin(lease_click(&registry, &context, "lease-cancel-worker"));
+        assert!(futures_util::poll!(call.as_mut()).is_pending());
+        let worker = hold
+            .lock()
+            .unwrap()
+            .take()
+            .expect("invoke has a worker hold");
+        drop(call);
+        assert!(backend.try_acquire().unwrap().is_none());
+        assert!(registry.desktop_coordinator.try_lock().is_err());
+        drop(worker);
+        let coordinator = registry.desktop_coordinator.lock().await;
+        assert!(backend.try_acquire().unwrap().is_some());
+        drop(coordinator);
+    }
+
+    #[async_trait::async_trait]
+    impl super::Tool for LeaseProbe {
+        fn def(&self) -> &super::ToolDef {
+            &self.def
+        }
+        async fn invoke(&self, args: serde_json::Value) -> ToolResult {
+            self.hits.fetch_add(1, Ordering::SeqCst);
+            if self.retain {
+                crate::desktop_lease::retain_lease(args["_session_id"].as_str().unwrap()).unwrap();
+            }
+            ToolResult::text("input delivered")
+        }
+    }
+
+    fn lease_test_registry(
+        backend: Arc<crate::desktop_lease::test_support::TestBackend>,
+        retain: bool,
+        hits: Arc<AtomicUsize>,
+    ) -> super::ToolRegistry {
+        use crate::desktop_lease::{test_support::TestClock, LeaseManager};
+        let mut registry = super::ToolRegistry::new();
+        registry.desktop_lease = LeaseManager::new(backend, Arc::new(TestClock::default()));
+        registry.desktop_coordinator = Box::leak(Box::new(tokio::sync::Mutex::new(())));
+        registry.register(Box::new(LeaseProbe {
+            hits,
+            retain,
+            def: super::ToolDef {
+                name: "click".into(),
+                description: "probe".into(),
+                input_schema: serde_json::json!({"type":"object"}),
+                read_only: false,
+                destructive: false,
+                idempotent: false,
+                open_world: false,
+            },
+        }));
+        registry
+    }
+
+    async fn lease_click(
+        registry: &super::ToolRegistry,
+        context: &Arc<crate::session_authorization::EffectiveAuthorizationContext>,
+        session: &str,
+    ) -> ToolResult {
+        registry
+            .invoke_with_context(
+                "click",
+                serde_json::json!({
+                    "pid": 42, "window_id": 7, "x": 10, "y": 20, "session": session,
+                }),
+                context.clone(),
+            )
+            .await
+    }
+
+    #[derive(Default)]
+    struct PausedLeaseClock(AtomicUsize);
+
+    #[async_trait::async_trait]
+    impl crate::desktop_lease::LeaseClock for PausedLeaseClock {
+        fn now(&self) -> Duration {
+            Duration::ZERO
+        }
+        async fn sleep(&self, _: Duration) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            std::future::pending::<()>().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn a_contender_waiting_for_the_file_lease_does_not_block_the_retained_owner() {
+        let backend = Arc::new(crate::desktop_lease::test_support::TestBackend::default());
+        let clock = Arc::new(PausedLeaseClock::default());
+        let hits = Arc::new(AtomicUsize::new(0));
+        let mut registry = lease_test_registry(backend.clone(), true, hits.clone());
+        registry.desktop_lease = crate::desktop_lease::LeaseManager::new(backend, clock.clone());
+        let context = unrestricted_context();
+        let owner = context.runtime_session_key("lease-order-owner");
+        assert_ne!(
+            lease_click(&registry, &context, "lease-order-owner")
+                .await
+                .is_error,
+            Some(true)
+        );
+        let mut contender = Box::pin(lease_click(&registry, &context, "lease-order-contender"));
+        assert!(futures_util::poll!(contender.as_mut()).is_pending());
+        assert_eq!(clock.0.load(Ordering::SeqCst), 1);
+        let mut next = Box::pin(lease_click(&registry, &context, "lease-order-owner"));
+        assert!(futures_util::poll!(next.as_mut()).is_ready());
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+        drop(next);
+        drop(contender);
+        crate::desktop_lease::release_lease(&owner);
+    }
+
+    #[tokio::test]
+    async fn uncontended_admission_does_not_yield() {
+        let backend = Arc::new(crate::desktop_lease::test_support::TestBackend::default());
+        let clock = Arc::new(PausedLeaseClock::default());
+        let mut registry =
+            lease_test_registry(backend.clone(), false, Arc::new(AtomicUsize::new(0)));
+        registry.desktop_lease = crate::desktop_lease::LeaseManager::new(backend, clock.clone());
+        let context = unrestricted_context();
+        let mut call = Box::pin(lease_click(&registry, &context, "lease-no-yield"));
+        assert!(futures_util::poll!(call.as_mut()).is_ready());
+        assert_eq!(clock.0.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn acquires_after_release() {
+        let backend = Arc::new(crate::desktop_lease::test_support::TestBackend::default());
+        backend.hold();
+        backend.release_after.store(3, Ordering::SeqCst);
+        let hits = Arc::new(AtomicUsize::new(0));
+        let registry = lease_test_registry(backend.clone(), false, hits.clone());
+        let result = lease_click(&registry, &unrestricted_context(), "lease-polls").await;
+        assert_ne!(result.is_error, Some(true));
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        assert_eq!(backend.attempts.load(Ordering::SeqCst), 4);
+    }
+
+    #[tokio::test]
+    async fn unavailable_backend_refuses_without_dispatch() {
+        let backend = Arc::new(crate::desktop_lease::test_support::TestBackend::default());
+        backend.unavailable.store(true, Ordering::SeqCst);
+        let hits = Arc::new(AtomicUsize::new(0));
+        let registry = lease_test_registry(backend, false, hits.clone());
+        let result = lease_click(&registry, &unrestricted_context(), "lease-unavailable").await;
+        let body = result.structured_content.unwrap();
+        assert_eq!(body["effect"], "refused");
+        assert_eq!(body["code"], "desktop_lease_unavailable");
+        assert!(body["refusal"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("synthetic failure"));
+        assert_eq!(hits.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn retained_lease_is_reused_by_its_owner_and_blocks_others() {
+        let backend = Arc::new(crate::desktop_lease::test_support::TestBackend::default());
+        let hits = Arc::new(AtomicUsize::new(0));
+        let registry = lease_test_registry(backend.clone(), true, hits.clone());
+        let context = unrestricted_context();
+        let owner = context.runtime_session_key("lease-holder");
+        assert_ne!(
+            lease_click(&registry, &context, "lease-holder")
+                .await
+                .is_error,
+            Some(true)
+        );
+        assert_ne!(
+            lease_click(&registry, &context, "lease-holder")
+                .await
+                .is_error,
+            Some(true)
+        );
+        assert_eq!(backend.attempts.load(Ordering::SeqCst), 1);
+        let other = lease_click(&registry, &context, "lease-other").await;
+        assert_eq!(other.structured_content.unwrap()["code"], "desktop_busy");
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+        crate::desktop_lease::release_lease(&owner);
+        assert_ne!(
+            lease_click(&registry, &context, "lease-other")
+                .await
+                .is_error,
+            Some(true)
+        );
+        crate::desktop_lease::release_lease(&context.runtime_session_key("lease-other"));
+    }
+
+    #[tokio::test]
+    async fn releasing_a_retained_lease_admits_another_owner() {
+        let backend = Arc::new(crate::desktop_lease::test_support::TestBackend::default());
+        let hits = Arc::new(AtomicUsize::new(0));
+        let registry = lease_test_registry(backend.clone(), true, hits);
+        let context = unrestricted_context();
+        assert_ne!(
+            lease_click(&registry, &context, "lease-ended")
+                .await
+                .is_error,
+            Some(true)
+        );
+        // Session-end hooks are process-wide; ending a session here would
+        // race unrelated parallel tests. session.rs pins that session cleanup
+        // calls release_lease.
+        crate::desktop_lease::release_lease(&context.runtime_session_key("lease-ended"));
+        assert_ne!(
+            lease_click(&registry, &context, "lease-successor")
+                .await
+                .is_error,
+            Some(true)
+        );
+        crate::desktop_lease::release_lease(&context.runtime_session_key("lease-successor"));
+    }
+
+    #[tokio::test]
+    async fn desktop_busy_after_deadline() {
+        use crate::desktop_lease::{
+            test_support::{TestBackend, TestClock},
+            LeaseManager,
+        };
+        let backend = Arc::new(TestBackend::default());
+        backend.hold();
+        let hits = Arc::new(AtomicUsize::new(0));
+        let mut registry = super::ToolRegistry::new();
+        registry.desktop_lease = LeaseManager::new(backend.clone(), Arc::new(TestClock::default()));
+        registry.register(Box::new(ObservationProbe {
+            hits: hits.clone(),
+            def: super::ToolDef {
+                name: "click".into(),
+                description: "probe".into(),
+                input_schema: serde_json::json!({"type":"object"}),
+                read_only: false,
+                destructive: false,
+                idempotent: false,
+                open_world: false,
+            },
+        }));
+        let result = registry
+            .invoke_with_context(
+                "click",
+                serde_json::json!({
+                    "pid": 42, "window_id": 7, "x": 10, "y": 20,
+                }),
+                unrestricted_context(),
+            )
+            .await;
+        assert_eq!(
+            result.structured_content.unwrap()["refusal"]["code"],
+            "desktop_busy"
+        );
+        assert_eq!(hits.load(Ordering::SeqCst), 0);
+        assert_eq!(backend.attempts.load(Ordering::SeqCst), 501);
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn physical_desktop_actions_are_admitted_one_at_a_time() {
         let active = Arc::new(AtomicUsize::new(0));
@@ -7640,24 +8030,32 @@ fn is_existing_profile_prepare(tool_name: &str, args: &Value) -> bool {
 fn recording_args_for(tool_name: &str, args: &Value) -> Value {
     let mut redacted = args.clone();
     if let Some(arguments) = redacted.as_object_mut() {
+        arguments.remove("_withheld_args");
+        arguments.remove("_withheld_lengths");
+        let fields: &[&str] = match tool_name {
+            "type_text" | "browser_type" | "page" => &["text"],
+            "set_value" => &["value"],
+            "browser_dialog" => &["prompt_text"],
+            "clipboard_write" => &["text", "image_path", "file_path"],
+            _ => &[],
+        };
+        let mut withheld = Vec::new();
+        let mut lengths = serde_json::Map::new();
+        for &field in fields {
+            if let Some(value) = arguments.remove(field) {
+                withheld.push(field);
+                if let Some(value) = value.as_str() {
+                    lengths.insert(field.to_owned(), serde_json::json!(value.chars().count()));
+                }
+            }
+        }
+        if !withheld.is_empty() {
+            arguments.insert("_withheld_args".into(), serde_json::json!(withheld));
+            arguments.insert("_withheld_lengths".into(), Value::Object(lengths));
+        }
         match tool_name {
             "browser_prepare" => {
                 arguments.remove("_transport_session_id");
-            }
-            "browser_dialog" => {
-                if arguments.contains_key("prompt_text") {
-                    arguments.insert(
-                        "prompt_text".to_owned(),
-                        Value::String("[redacted]".to_owned()),
-                    );
-                }
-            }
-            "clipboard_write" => {
-                for field in ["text", "image_path", "file_path"] {
-                    if arguments.contains_key(field) {
-                        arguments.insert(field.to_owned(), Value::String("[redacted]".to_owned()));
-                    }
-                }
             }
             "browser_set_input_files" => {
                 if let Some(count) = arguments
@@ -7750,6 +8148,25 @@ mod capability_tests {
     use super::*;
 
     #[test]
+    fn recording_args_withhold_typed_text_and_values() {
+        for (tool, field) in [
+            ("type_text", "text"),
+            ("set_value", "value"),
+            ("browser_type", "text"),
+            ("browser_dialog", "prompt_text"),
+            ("clipboard_write", "text"),
+            ("page", "text"),
+        ] {
+            let args = serde_json::json!({field: "séc", "pid": 1});
+            let recorded = recording_args_for(tool, &args);
+            assert!(recorded.get(field).is_none(), "{tool}: {recorded}");
+            assert_eq!(recorded["_withheld_args"], serde_json::json!([field]));
+            assert_eq!(recorded["_withheld_lengths"][field], 3);
+            assert_eq!(recorded["pid"], 1);
+        }
+    }
+
+    #[test]
     fn browser_prepare_recording_redacts_transport_identity() {
         let recorded = recording_args_for(
             "browser_prepare",
@@ -7773,7 +8190,8 @@ mod capability_tests {
             "browser_dialog",
             &serde_json::json!({"action": "accept", "prompt_text": "private reply"}),
         );
-        assert_eq!(dialog["prompt_text"], "[redacted]");
+        assert!(dialog.get("prompt_text").is_none());
+        assert_eq!(dialog["_withheld_args"], serde_json::json!(["prompt_text"]));
 
         let upload = recording_args_for(
             "browser_set_input_files",
@@ -7818,9 +8236,13 @@ mod capability_tests {
                 "session": "public-session",
             }),
         );
-        assert_eq!(recorded["text"], "[redacted]");
-        assert_eq!(recorded["image_path"], "[redacted]");
-        assert_eq!(recorded["file_path"], "[redacted]");
+        assert!(recorded.get("text").is_none());
+        assert!(recorded.get("image_path").is_none());
+        assert!(recorded.get("file_path").is_none());
+        assert_eq!(
+            recorded["_withheld_args"],
+            serde_json::json!(["text", "image_path", "file_path"])
+        );
         assert_eq!(recorded["session"], "public-session");
         let serialized = recorded.to_string();
         for forbidden in [

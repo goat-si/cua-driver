@@ -8,6 +8,7 @@ pub(super) async fn finish<F, Fut>(
     pid: i32,
     mut result: ToolResult,
     write_not_applied: bool,
+    maybe_landed: bool,
     post: F,
 ) -> ToolResult
 where
@@ -27,6 +28,7 @@ where
     // the field's old text. On web content an unchanged read-back is still
     // reported as unverifiable, so the outcome's own flag decides too.
     let note = match effect.as_deref() {
+        _ if maybe_landed => "Return was not posted: the value write may have landed; read the value before deciding what to do next.".to_owned(),
         _ if write_not_applied => "Return was not posted: the read-back still showed the \
              previous text, so submitting would search for it."
             .to_owned(),
@@ -201,7 +203,7 @@ mod tests {
         let events = std::cell::RefCell::new(vec!["write".to_owned()]);
         let posted_events = &events;
         let result = ToolResult::text("set").with_structured(json!({"effect":"confirmed"}));
-        let result = finish(true, 42, result, false, |pid, key| async move {
+        let result = finish(true, 42, result, false, false, |pid, key| async move {
             posted_events.borrow_mut().push(format!("{key}:{pid}"));
             Ok(true)
         })
@@ -216,13 +218,13 @@ mod tests {
     #[tokio::test]
     async fn autosubmit_default_never_posts_and_refusal_preserves_value_effect() {
         let result = ToolResult::text("set").with_structured(json!({"effect":"confirmed"}));
-        let result = finish(false, 42, result, false, |_, _| async {
+        let result = finish(false, 42, result, false, false, |_, _| async {
             panic!("unexpected key")
         })
         .await;
         assert_eq!(result.structured_content.unwrap()["effect"], "confirmed");
         let result = ToolResult::text("set").with_structured(json!({"effect":"unverifiable"}));
-        let result = finish(true, 42, result, false, |_, _| async {
+        let result = finish(true, 42, result, false, false, |_, _| async {
             Err("user_interacting".into())
         })
         .await;
@@ -237,7 +239,7 @@ mod tests {
     async fn autosubmit_skips_return_when_the_value_did_not_apply() {
         for effect in ["not_applied", "refused"] {
             let result = ToolResult::text("set").with_structured(json!({ "effect": effect }));
-            let result = finish(true, 42, result, false, |_, _| async {
+            let result = finish(true, 42, result, false, false, |_, _| async {
                 panic!("Return after {effect}")
             })
             .await;
@@ -248,5 +250,36 @@ mod tests {
                 .unwrap()
                 .contains("Return was not posted"));
         }
+    }
+    #[tokio::test]
+    async fn after_uncertain_autosubmit_posts_no_return() {
+        let result = ToolResult::text("set").with_structured(json!({"effect":"confirmed"}));
+        let result = finish(true, 42, result, false, true, |_, _| async {
+            panic!("Return after uncertain write")
+        })
+        .await;
+        let data = result.structured_content.unwrap();
+        assert_eq!(data["effect"], "confirmed");
+        assert!(data["note"]
+            .as_str()
+            .unwrap()
+            .contains("Return was not posted"));
+    }
+
+    #[tokio::test]
+    async fn applied_path_still_marks_documents_and_autosubmits() {
+        let events = std::cell::RefCell::new(vec!["document"]);
+        let result = ToolResult::text("set")
+            .with_structured(json!({"effect":"confirmed", "document_key_edit_sent":true}));
+        let result = finish(true, 42, result, false, false, |_, _| async {
+            events.borrow_mut().push("return");
+            Ok(true)
+        })
+        .await;
+        assert_eq!(*events.borrow(), ["document", "return"]);
+        assert_eq!(
+            result.structured_content.unwrap()["document_key_edit_sent"],
+            true
+        );
     }
 }

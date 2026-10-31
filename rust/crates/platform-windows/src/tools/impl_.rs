@@ -3368,6 +3368,16 @@ fn finish_pixel_uia_attempt(
 }
 
 enum BackgroundElementClick {
+    Refused {
+        message: String,
+        transport: ActionTransport,
+        failed_calls: Vec<ActionTransport>,
+    },
+    Uncertain {
+        message: String,
+        transport: ActionTransport,
+        failed_calls: Vec<ActionTransport>,
+    },
     Semantic {
         message: String,
         transport: ActionTransport,
@@ -3420,6 +3430,54 @@ fn background_element_click_result(
     ToolResult::text(message)
         .with_structured(json!({ "path": path, "verified": false, "effect": "unverifiable" }))
         .with_action_record(record)
+}
+
+/// Read a UIA pattern, telling "the element has no such pattern" apart from
+/// "the read failed". Only the first may let a caller try another rung.
+fn acquire_uia_pattern<T: windows::core::Interface>(
+    element: &windows::Win32::UI::Accessibility::IUIAutomationElement,
+    pattern_id: windows::Win32::UI::Accessibility::UIA_PATTERN_ID,
+) -> Result<Option<T>, i32> {
+    let classify = |error: windows::core::Error| {
+        let code = error.code().0;
+        if crate::uia_mutation::pattern_absent(code) {
+            Ok(None)
+        } else {
+            Err(code)
+        }
+    };
+    match unsafe { element.GetCurrentPattern(pattern_id) } {
+        Ok(pattern) => match pattern.cast::<T>() {
+            Ok(pattern) => Ok(Some(pattern)),
+            Err(error) => classify(error),
+        },
+        Err(error) => classify(error),
+    }
+}
+
+/// A UIA click rung that nothing was delivered through: the element refused
+/// the write or its pattern could not be read.
+fn refused_element_click_result(
+    message: String,
+    transport: ActionTransport,
+    failed_calls: Vec<ActionTransport>,
+) -> ToolResult {
+    use cua_driver_core::action_record::{
+        ActionAttempt, ActionEffect, ActionExecutionRecord, ActualDelivery, RequestedDelivery,
+    };
+    let mut record = ActionExecutionRecord::new(
+        ActionEffect::Refused,
+        transport,
+        RequestedDelivery::Background,
+    );
+    for attempted in failed_calls {
+        record.attempts.push(ActionAttempt {
+            transport: attempted,
+            delivery: ActualDelivery::Background,
+            detail: Some("UIA provider reported the pattern as not supported".into()),
+        });
+    }
+    ToolResult::error(message).with_action_record(record)
 }
 
 async fn basis_click(state: &ToolState, tool: &str, args: &Value) -> Option<ToolResult> {
@@ -4306,79 +4364,47 @@ impl Tool for ClickTool {
                         let elem: IUIAutomationElement =
                             unsafe { IUIAutomationElement::from_raw(ptr as *mut _) };
 
-                        // Try patterns in order of click-semantics specificity:
-                        //   1. Invoke      - buttons / hyperlinks (canonical)
-                        //   2. Toggle      - checkboxes (no Invoke)
-                        //   3. SelectionItem - radio buttons, listbox items
-                        //   4. ExpandCollapse - combo boxes, tree nodes
-                        // Each call is wrapped in the UWP foreground-steal bypass.
-                        //
-                        // Why this order: PR #1699's WinUI3 control parity tests
-                        // surfaced these pattern-dispatch gaps. Without these
-                        // fallthroughs, cua-driver couldn't drive WinUI3
-                        // CheckBox / RadioButton / ComboBox because PostMessage
-                        // doesn't reach their handlers (CoreInput dispatcher).
-                        let invoke_result = unsafe { elem.GetCurrentPattern(UIA_InvokePatternId) };
-                        if let Ok(pattern) = invoke_result {
-                            if let Ok(inv) = pattern.cast::<IUIAutomationInvokePattern>() {
-                                let outcome = crate::uia::fg_bypass::run_with_uwp_bypass(
-                                    hwnd as isize, || unsafe { inv.Invoke() });
-                                match outcome {
-                                    Ok(()) => {
-                                        std::mem::forget(elem);
-                                        return Ok(BackgroundElementClick::Semantic { message: format!(
-                                            "✅ Performed UIA Invoke on [{idx}] (screen ({cx},{cy}))."
-                                        ), transport: ActionTransport::WindowsUiaInvoke, failed_calls });
+                        use crate::uia_mutation::{click_plan_from_chain, run_rungs, ClickPlan, RungOutcome};
+                        macro_rules! uia_rung {
+                            ($id:expr, $ty:ty, $method:ident) => {
+                                Box::new(|| {
+                                    match acquire_uia_pattern::<$ty>(&elem, $id) {
+                                        Ok(Some(pattern)) => RungOutcome::Called(
+                                            crate::uia::fg_bypass::run_with_uwp_bypass(hwnd as isize, || unsafe { pattern.$method() })
+                                                .map_or_else(|error| error.code().0, |_| 0)),
+                                        Ok(None) => RungOutcome::Absent,
+                                        Err(hresult) => RungOutcome::AcquireFailed(hresult),
                                     }
-                                    Err(e) => tracing::debug!(target: "click",
-                                        "UIA Invoke on [{idx}]: {e}, trying Toggle"),
-                                }
-                                failed_calls.push(ActionTransport::WindowsUiaInvoke);
-                            }
+                                })
+                            };
                         }
-                        let toggle_result = unsafe { elem.GetCurrentPattern(UIA_TogglePatternId) };
-                        if let Ok(pattern) = toggle_result {
-                            if let Ok(tg) = pattern.cast::<IUIAutomationTogglePattern>() {
-                                let outcome = crate::uia::fg_bypass::run_with_uwp_bypass(
-                                    hwnd as isize, || unsafe { tg.Toggle() });
-                                if outcome.is_ok() {
-                                    std::mem::forget(elem);
-                                    return Ok(BackgroundElementClick::Semantic { message: format!(
-                                        "✅ Performed UIA Toggle on [{idx}] (screen ({cx},{cy}))."
-                                    ), transport: ActionTransport::WindowsUiaToggle, failed_calls });
-                                }
-                                failed_calls.push(ActionTransport::WindowsUiaToggle);
-                            }
-                        }
-                        let sel_result = unsafe { elem.GetCurrentPattern(UIA_SelectionItemPatternId) };
-                        if let Ok(pattern) = sel_result {
-                            if let Ok(si) = pattern.cast::<IUIAutomationSelectionItemPattern>() {
-                                let outcome = crate::uia::fg_bypass::run_with_uwp_bypass(
-                                    hwnd as isize, || unsafe { si.Select() });
-                                if outcome.is_ok() {
-                                    std::mem::forget(elem);
-                                    return Ok(BackgroundElementClick::Semantic { message: format!(
-                                        "✅ Performed UIA SelectionItem.Select on [{idx}] (screen ({cx},{cy}))."
-                                    ), transport: ActionTransport::WindowsUiaSelection, failed_calls });
-                                }
-                                failed_calls.push(ActionTransport::WindowsUiaSelection);
-                            }
-                        }
-                        let exp_result = unsafe { elem.GetCurrentPattern(UIA_ExpandCollapsePatternId) };
-                        if let Ok(pattern) = exp_result {
-                            if let Ok(ec) = pattern.cast::<IUIAutomationExpandCollapsePattern>() {
-                                let outcome = crate::uia::fg_bypass::run_with_uwp_bypass(
-                                    hwnd as isize, || unsafe { ec.Expand() });
-                                if outcome.is_ok() {
-                                    std::mem::forget(elem);
-                                    return Ok(BackgroundElementClick::Semantic { message: format!(
-                                        "✅ Performed UIA ExpandCollapse.Expand on [{idx}] (screen ({cx},{cy}))."
-                                    ), transport: ActionTransport::WindowsUiaExpandCollapse, failed_calls });
-                                }
-                                failed_calls.push(ActionTransport::WindowsUiaExpandCollapse);
-                            }
-                        }
+                        let plan = click_plan_from_chain(run_rungs(vec![
+                            uia_rung!(UIA_InvokePatternId, IUIAutomationInvokePattern, Invoke),
+                            uia_rung!(UIA_TogglePatternId, IUIAutomationTogglePattern, Toggle),
+                            uia_rung!(UIA_SelectionItemPatternId, IUIAutomationSelectionItemPattern, Select),
+                            uia_rung!(UIA_ExpandCollapsePatternId, IUIAutomationExpandCollapsePattern, Expand),
+                        ]));
                         std::mem::forget(elem);
+                        let names = ["Invoke", "Toggle", "SelectionItem.Select", "ExpandCollapse.Expand"];
+                        let transports = [ActionTransport::WindowsUiaInvoke, ActionTransport::WindowsUiaToggle,
+                            ActionTransport::WindowsUiaSelection, ActionTransport::WindowsUiaExpandCollapse];
+                        match plan {
+                            ClickPlan::Semantic { rung, failed } => {
+                                return Ok(BackgroundElementClick::Semantic {
+                                    message: format!("✅ Performed UIA {} on [{idx}] (screen ({cx},{cy})).", names[rung]),
+                                    transport: transports[rung], failed_calls: failed.into_iter().map(|i| transports[i]).collect(),
+                                });
+                            }
+                            ClickPlan::Physical { failed } => failed_calls.extend(failed.into_iter().map(|i| transports[i])),
+                            ClickPlan::Refused { rung, kind, hresult, failed } => return Ok(BackgroundElementClick::Refused {
+                                message: format!("UIA {} on [{idx}]: {}", names[rung], crate::uia_mutation::refusal_text(kind, hresult)),
+                                transport: transports[rung], failed_calls: failed.into_iter().map(|i| transports[i]).collect(),
+                            }),
+                            ClickPlan::Uncertain { rung, kind, hresult, failed } => return Ok(BackgroundElementClick::Uncertain {
+                                message: format!("UIA {} on [{idx}] returned 0x{:08X} ({kind:?}); the action may have taken effect. Read the window state before acting again.", names[rung], hresult as u32),
+                                transport: transports[rung], failed_calls: failed.into_iter().map(|i| transports[i]).collect(),
+                            }),
+                        }
                     }
                 }
                 if delivery == DeliveryMode::Background
@@ -4419,6 +4445,16 @@ impl Tool for ClickTool {
                 } => {
                     return background_element_click_result(message, transport, failed_calls);
                 }
+                BackgroundElementClick::Refused {
+                    message,
+                    transport,
+                    failed_calls,
+                } => return refused_element_click_result(message, transport, failed_calls),
+                BackgroundElementClick::Uncertain {
+                    message,
+                    transport,
+                    failed_calls,
+                } => return background_element_click_result(message, transport, failed_calls),
                 BackgroundElementClick::Inject { x, y, failed_calls } => (x, y, failed_calls, true),
                 BackgroundElementClick::Post { x, y, failed_calls } => (x, y, failed_calls, false),
             };
@@ -5288,11 +5324,10 @@ impl Tool for TypeTextTool {
                                     .map(|v| v.as_bool())
                             },
                             || {
-                                unsafe { elem.GetCurrentPattern(UIA_ValuePatternId) }
-                                    .ok()
-                                    .and_then(|pattern| {
-                                        pattern.cast::<IUIAutomationValuePattern>().ok()
-                                    })
+                                acquire_uia_pattern::<IUIAutomationValuePattern>(
+                                    &elem,
+                                    UIA_ValuePatternId,
+                                )
                             },
                             |vp| {
                                 unsafe { vp.CurrentValue() }
@@ -5335,18 +5370,43 @@ impl Tool for TypeTextTool {
                         "secure_state_unknown" => "type_text could not tell whether the field is a password field; wrote nothing",
                         "secure_no_value_pattern" => "type_text could not write the password field because it has no ValuePattern; wrote nothing. Use delivery_mode:\"foreground\".",
                         "value_unreadable" => "type_text could not read the field's current text, so it wrote nothing (appending would have replaced the text). Re-read the window and retry, or use set_value to replace the value.",
+                        "value_pattern_unreadable" => "type_text could not read the field's UIA ValuePattern, so it wrote nothing. Re-read the window and retry.",
                         _ => "type_text refused the write; wrote nothing",
                     };
                     return ToolResult::error(message);
                 }
                 Route::Continue(AppendOutcome::SecureWriteFailed { hresult }) => {
-                    return ToolResult::error(format!("the password field write failed or its effect is unknown; nothing else was sent (HRESULT 0x{:08X})", hresult as u32))
-                        .with_structured(value_write_structured_result(text_len, "unreadable", false));
+                    use crate::uia_mutation::{classify_write_hresult, WriteVerdict};
+                    let message = match classify_write_hresult(hresult) {
+                        WriteVerdict::Refused(_) | WriteVerdict::AffordanceAbsent => format!("the password field refused the write; nothing was written (HRESULT 0x{:08X})", hresult as u32),
+                        _ => format!("the password field write failed or its effect is unknown; nothing else was sent (HRESULT 0x{:08X})", hresult as u32),
+                    };
+                    return ToolResult::error(message).with_structured(
+                        value_write_structured_result(text_len, "unreadable", false),
+                    );
                 }
-                Route::Continue(
-                    AppendOutcome::NoValuePattern | AppendOutcome::WriteFailed { .. },
-                ) => {
-                    unreachable!("fallback outcomes are routed before continuation")
+                Route::Continue(AppendOutcome::WriteFailed { hresult }) => {
+                    use crate::uia_mutation::{
+                        classify_write_hresult, refusal_text, uncertain_text, WriteVerdict,
+                    };
+                    return match classify_write_hresult(hresult) {
+                        WriteVerdict::Refused(kind) => {
+                            ToolResult::error(refusal_text(kind, hresult))
+                        }
+                        WriteVerdict::Uncertain(kind) => {
+                            ToolResult::text(format!(
+                                "{} The UIA write was not retyped.",
+                                uncertain_text(kind, hresult)
+                            ))
+                            .with_structured(
+                                value_write_structured_result(text_len, "unreadable", false),
+                            )
+                        }
+                        _ => unreachable!("only a failed, non-fallback write reaches this branch"),
+                    };
+                }
+                Route::Continue(AppendOutcome::NoValuePattern) => {
+                    unreachable!("absent pattern uses the typing route")
                 }
             };
             if let Some((before, expected)) = set_result {
@@ -6663,47 +6723,71 @@ impl Tool for SetValueTool {
                 }
                 let is_combo = unsafe { elem.CurrentControlType() }
                     .is_ok_and(|control_type| control_type == UIA_ComboBoxControlTypeId);
-                // Try ValuePattern first (text inputs, editable combos, etc).
-                // The SetValue is shielded by the EnableWindow bypass: a
-                // Chromium/Electron (or XAML) SetValue handler self-foregrounds via
-                // SetForegroundWindow, which WS_EX_NOACTIVATE alone does not stop;
-                // disabling the host for the duration does, while the a11y-channel
-                // write still lands. (No-op shield for non-XAML/non-Chromium hosts.)
-                if let Ok(pattern) = unsafe { elem.GetCurrentPattern(UIA_ValuePatternId) } {
-                    if let Ok(vp) = pattern.cast::<IUIAutomationValuePattern>() {
-                        let set =
-                            crate::uia::fg_bypass::run_with_uwp_bypass(hwnd as isize, || unsafe {
-                                vp.SetValue(&BSTR::from(value.as_str()))
-                            });
-                        if set.is_ok() {
-                            return Ok(if is_combo {
-                                SetValueRoute::ComboValuePattern
-                            } else {
-                                SetValueRoute::Pattern("ValuePattern")
-                            });
-                        }
-                    }
-                }
-                // Fall through to RangeValuePattern for Sliders / ProgressBars /
-                // numeric ranges. RangeValue.SetValue takes a double, so coerce
-                // the string. Documented gap-closer (PR #1699 harness exposed).
+                use crate::uia_mutation::{set_value_route, RungOutcome, SetValueDecision};
                 use windows::Win32::UI::Accessibility::{
                     IUIAutomationRangeValuePattern, UIA_RangeValuePatternId,
                 };
-                if let Ok(pattern) = unsafe { elem.GetCurrentPattern(UIA_RangeValuePatternId) } {
-                    if let Ok(rv) = pattern.cast::<IUIAutomationRangeValuePattern>() {
-                        let parsed: f64 = value.parse().map_err(|_| {
-                            anyhow::anyhow!(
+                let value_rung = match acquire_uia_pattern::<IUIAutomationValuePattern>(
+                    &elem,
+                    UIA_ValuePatternId,
+                ) {
+                    Ok(Some(vp)) => RungOutcome::Called(
+                        crate::uia::fg_bypass::run_with_uwp_bypass(hwnd as isize, || unsafe {
+                            vp.SetValue(&BSTR::from(value.as_str()))
+                        })
+                        .map_or_else(|error| error.code().0, |_| 0),
+                    ),
+                    Ok(None) => RungOutcome::Absent,
+                    Err(hresult) => RungOutcome::AcquireFailed(hresult),
+                };
+                let mut parse_error = None;
+                let decision = set_value_route(value_rung, || {
+                    let rv = match acquire_uia_pattern::<IUIAutomationRangeValuePattern>(
+                        &elem,
+                        UIA_RangeValuePatternId,
+                    ) {
+                        Ok(Some(rv)) => rv,
+                        Ok(None) => return RungOutcome::Absent,
+                        Err(hresult) => return RungOutcome::AcquireFailed(hresult),
+                    };
+                    let parsed: f64 = match value.parse() {
+                        Ok(parsed) => parsed,
+                        Err(_) => {
+                            parse_error = Some(anyhow::anyhow!(
                                 "set_value: target element exposes RangeValuePattern (Slider / \
                          ProgressBar / numeric range). `value` must be a parseable f64; \
                          got {value:?}."
-                            )
-                        })?;
+                            ));
+                            return RungOutcome::Absent;
+                        }
+                    };
+                    RungOutcome::Called(
                         crate::uia::fg_bypass::run_with_uwp_bypass(hwnd as isize, || unsafe {
                             rv.SetValue(parsed)
-                        })?;
-                        return Ok(SetValueRoute::Pattern("RangeValuePattern"));
+                        })
+                        .map_or_else(|error| error.code().0, |_| 0),
+                    )
+                });
+                if let Some(error) = parse_error {
+                    return Err(error);
+                }
+                match decision {
+                    SetValueDecision::Delivered { rung: 0 } => {
+                        return Ok(if is_combo {
+                            SetValueRoute::ComboValuePattern
+                        } else {
+                            SetValueRoute::Pattern("ValuePattern")
+                        })
                     }
+                    SetValueDecision::Delivered { rung: 1 } => {
+                        return Ok(SetValueRoute::Pattern("RangeValuePattern"))
+                    }
+                    failure @ (SetValueDecision::Refused { .. }
+                    | SetValueDecision::Uncertain { .. }) => {
+                        return Ok(SetValueRoute::WriteFailure(failure))
+                    }
+                    SetValueDecision::NoAffordance => {}
+                    SetValueDecision::Delivered { .. } => unreachable!("only two value rungs"),
                 }
                 anyhow::bail!(
                     "set_value: element [{idx}] does not implement ValuePattern or \
@@ -6725,6 +6809,9 @@ impl Tool for SetValueTool {
                  did not react, click the combo box and then the option."
             ))
             .with_structured(json!({ "path": "ax", "verified": false, "effect": "unverifiable" })),
+            Ok(Ok(SetValueRoute::WriteFailure(failure))) => {
+                set_value_write_failure_result(failure, &args)
+            }
             Ok(Ok(SetValueRoute::Win32Combo { combo, write })) => {
                 win32_combo_set_value_result(idx, &value, combo, write, &args)
             }
@@ -6736,6 +6823,7 @@ impl Tool for SetValueTool {
 
 /// How `set_value` wrote the value.
 enum SetValueRoute {
+    WriteFailure(crate::uia_mutation::SetValueDecision),
     /// A UIA pattern on a non-combo element (`ValuePattern`, `RangeValuePattern`).
     Pattern(&'static str),
     /// UIA `ValuePattern` on a combo box that has no native Win32 window.
@@ -6745,6 +6833,51 @@ enum SetValueRoute {
         combo: crate::win32::combo::Combo,
         write: crate::win32::combo::ComboWrite,
     },
+}
+
+fn set_value_write_failure_result(
+    decision: crate::uia_mutation::SetValueDecision,
+    args: &Value,
+) -> ToolResult {
+    use crate::uia_mutation::{refusal_text, uncertain_text, SetValueDecision};
+    use cua_driver_core::action_record::{
+        ActionEffect, ActionExecutionRecord, ActionTransport, RequestedDelivery,
+    };
+    let (rung, message, refused) = match decision {
+        SetValueDecision::Refused {
+            rung,
+            kind,
+            hresult,
+        } => (rung, refusal_text(kind, hresult), true),
+        SetValueDecision::Uncertain {
+            rung,
+            kind,
+            hresult,
+        } => (rung, uncertain_text(kind, hresult), false),
+        _ => unreachable!("only write failures are returned here"),
+    };
+    let transport = if rung == 0 {
+        ActionTransport::WindowsUiaValue
+    } else {
+        ActionTransport::WindowsUiaRangeValue
+    };
+    let requested = match args.get("delivery_mode").and_then(Value::as_str) {
+        Some("foreground") => RequestedDelivery::Foreground,
+        _ => RequestedDelivery::Background,
+    };
+    let effect = if refused {
+        ActionEffect::Refused
+    } else {
+        ActionEffect::Unverifiable
+    };
+    let record = ActionExecutionRecord::new(effect, transport, requested);
+    if refused {
+        ToolResult::error(message).with_action_record(record)
+    } else {
+        ToolResult::text(message)
+            .with_structured(json!({ "path": "ax", "verified": false, "effect": "unverifiable" }))
+            .with_action_record(record)
+    }
 }
 
 fn win32_combo_set_value_result(
@@ -10905,7 +11038,7 @@ pub fn build_registry_with_provider(
             let snapshots = state.snapshots.clone();
             Arc::new(move |pid, handle| {
                 let pid = i32::try_from(pid).ok()?;
-                let id = cua_driver_core::element_token::parse_snapshot_handle(handle)?;
+                let id = cua_driver_core::element_token::snapshot_of_handle(handle)?;
                 snapshots.window_for_snapshot(pid, id)
             })
         },

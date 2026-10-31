@@ -503,11 +503,18 @@ impl Tool for Fake {
                         })
                     })
                     .collect();
-                ToolResult::text("windows").with_structured(json!({ "windows": listed }))
+                let mut listing = json!({ "windows": listed, "enumeration_complete": true });
+                if pid.is_some() {
+                    listing["authoritative_window_ids"] = listed
+                        .iter()
+                        .map(|window| window["window_id"].clone())
+                        .collect();
+                }
+                ToolResult::text("windows").with_structured(listing)
             }
             "list_apps" => ToolResult::text("apps").with_structured(json!({"apps": [
-                {"pid": 42, "name": "Notes", "bundle_id": "com.example.notes", "running": true},
-                {"pid": 99, "name": "Mail", "bundle_id": "com.example.mail", "running": true}
+                {"pid": 42, "name": "Notes", "bundle_id": "com.example.notes", "running": true, "active": false},
+                {"pid": 99, "name": "Mail", "bundle_id": "com.example.mail", "running": true, "active": false}
             ]})),
             "get_window_state" => {
                 let pid = args["pid"].as_i64().unwrap_or(0);

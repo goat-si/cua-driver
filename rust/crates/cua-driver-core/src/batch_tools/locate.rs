@@ -456,6 +456,7 @@ impl Miss {
                 | "app_not_found"
                 | "window_not_found"
                 | "still_present"
+                | "gone_unconfirmed"
                 | "unexpected_state"
         )
     }
@@ -697,115 +698,18 @@ impl<'a> Locator<'a> {
             .and_then(Value::as_array)
             .cloned()
             .unwrap_or_default();
-        let mut candidates: Vec<&Value> = windows
-            .iter()
-            .filter(|window| window.get("pid").and_then(Value::as_i64).is_some())
-            .collect();
-        if let Some(app) = &spec.app {
-            let by_name: Vec<&Value> = candidates
-                .iter()
-                .copied()
-                .filter(|window| text_matches(window.get("app_name"), app))
-                .collect();
-            candidates = if by_name.is_empty() {
-                let pids = self.app_pids(app).await;
-                candidates
-                    .into_iter()
-                    .filter(|window| {
-                        window
-                            .get("pid")
-                            .and_then(Value::as_i64)
-                            .is_some_and(|pid| pids.contains(&pid))
-                    })
-                    .collect()
-            } else {
-                by_name
-            };
-            if candidates.is_empty() {
-                let mut apps: Vec<&str> = windows
-                    .iter()
-                    .filter_map(|window| window.get("app_name").and_then(Value::as_str))
-                    .collect();
-                apps.sort_unstable();
-                apps.dedup();
-                return Err(Miss::new(
-                    "app_not_found",
-                    format!(
-                        "no window of app \"{app}\" (apps with windows: {})",
-                        if apps.is_empty() {
-                            "none".to_owned()
-                        } else {
-                            apps.join(", ")
-                        }
-                    ),
-                ));
+        let pids = match &spec.app {
+            Some(app)
+                if !windows.iter().any(|window| {
+                    window.get("pid").and_then(Value::as_i64).is_some()
+                        && text_matches(window.get("app_name"), app)
+                }) =>
+            {
+                self.app_pids(app).await?
             }
-        }
-        if let Some(window_id) = spec.window_id {
-            candidates.retain(|window| {
-                window.get("window_id").and_then(Value::as_u64) == Some(window_id)
-            });
-        }
-        if let Some(title) = &spec.title {
-            let before: Vec<String> = candidates
-                .iter()
-                .filter_map(|window| window.get("title").and_then(Value::as_str))
-                .map(|title| format!("\"{}\"", clip(title, 40)))
-                .collect();
-            candidates.retain(|window| text_matches(window.get("title"), title));
-            if candidates.is_empty() {
-                return Err(Miss::new(
-                    "window_not_found",
-                    format!(
-                        "no window titled like \"{title}\" for {} (titles: {})",
-                        spec.describe(),
-                        if before.is_empty() {
-                            "none".to_owned()
-                        } else {
-                            before.join(", ")
-                        }
-                    ),
-                ));
-            }
-        }
-        if candidates.is_empty() {
-            return Err(Miss::new(
-                "window_not_found",
-                format!("no window for {}", spec.describe()),
-            ));
-        }
-        // On-screen windows first, then the topmost (largest z_index).
-        let mut ranked: Vec<(usize, &Value)> = candidates.into_iter().enumerate().collect();
-        ranked.sort_by_key(|(order, window)| {
-            let on_screen = window.get("is_on_screen").and_then(Value::as_bool) != Some(false);
-            let z = window
-                .get("z_index")
-                .and_then(Value::as_i64)
-                .unwrap_or(i64::MIN);
-            std::cmp::Reverse((on_screen, z, std::cmp::Reverse(*order)))
-        });
-        Ok(ranked
-            .into_iter()
-            .map(|(_, window)| Window {
-                pid: window
-                    .get("pid")
-                    .and_then(Value::as_i64)
-                    .unwrap_or_default(),
-                window_id: window
-                    .get("window_id")
-                    .and_then(Value::as_u64)
-                    .unwrap_or_default(),
-                app: window
-                    .get("app_name")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned),
-                title: window
-                    .get("title")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned),
-                on_screen: window.get("is_on_screen").and_then(Value::as_bool) != Some(false),
-            })
-            .collect())
+            _ => Vec::new(),
+        };
+        filter_windows(&windows, spec, &pids)
     }
 
     /// The windows a lookup searches, best first. An exact pid/window_id is
@@ -828,11 +732,12 @@ impl<'a> Locator<'a> {
     }
 
     /// Pids of running apps whose name or bundle id matches.
-    async fn app_pids(&self, app: &str) -> Vec<i64> {
-        let Ok(listed) = self.call("list_apps", json!({})).await else {
-            return Vec::new();
-        };
-        listed
+    async fn app_pids(&self, app: &str) -> Result<Vec<i64>, Miss> {
+        let listed = self
+            .call("list_apps", json!({}))
+            .await
+            .map_err(|error| Miss::new("lookup_failed", error))?;
+        Ok(listed
             .get("apps")
             .and_then(Value::as_array)
             .map(|apps| {
@@ -848,7 +753,7 @@ impl<'a> Locator<'a> {
                     .filter(|pid| *pid > 0)
                     .collect()
             })
-            .unwrap_or_default()
+            .unwrap_or_default())
     }
 
     /// One fresh accessibility read. It refreshes the window's element
@@ -1005,6 +910,85 @@ impl<'a> Locator<'a> {
         Err(miss)
     }
 
+    /// Classify closure from the same complete listings that supply candidates.
+    ///
+    /// Only a pid-scoped listing can prove a window closed: it must report a
+    /// complete enumeration and a readable authoritative id set. A pid-less
+    /// listing (macOS: layer 0 only, no id set) proves nothing. Without a
+    /// window_id the spec matches by app or title, which a window left out
+    /// of `windows` (an AX-less or helper window) cannot be checked against,
+    /// so any authoritative id missing from `windows` leaves closure unproven.
+    async fn closure_listing(&self, spec: &WindowSpec) -> Result<Closure, Miss> {
+        let mut resolved_app_pids = None;
+        let pids = match (spec.pid, &spec.app) {
+            (Some(pid), _) => vec![pid],
+            (None, Some(app)) => {
+                let pids = self.app_pids(app).await?;
+                if pids.is_empty() {
+                    return Ok(Closure::Closed);
+                }
+                let targets = pids.clone();
+                resolved_app_pids = Some(pids);
+                targets
+            }
+            (None, None) => return Ok(Closure::Incomplete),
+        };
+        let mut windows = Vec::new();
+        let mut hidden = false;
+        for pid in pids {
+            let listed = self
+                .call("list_windows", json!({"pid": pid, "on_screen_only": false}))
+                .await
+                .map_err(|error| Miss::new("lookup_failed", error))?;
+            if listed.get("enumeration_complete").and_then(Value::as_bool) != Some(true) {
+                return Ok(Closure::Incomplete);
+            }
+            let Some(ids) = listed
+                .get("authoritative_window_ids")
+                .and_then(Value::as_array)
+                .and_then(|ids| ids.iter().map(Value::as_u64).collect::<Option<Vec<_>>>())
+            else {
+                return Ok(Closure::Incomplete);
+            };
+            let Some(entries) = listed.get("windows").and_then(Value::as_array) else {
+                return Ok(Closure::Incomplete);
+            };
+            hidden |= match spec.window_id {
+                Some(window_id) => {
+                    ids.contains(&window_id)
+                        && !entries.iter().any(|entry| {
+                            entry.get("window_id").and_then(Value::as_u64) == Some(window_id)
+                        })
+                }
+                None => ids.iter().any(|id| {
+                    !entries
+                        .iter()
+                        .any(|entry| entry.get("window_id").and_then(Value::as_u64) == Some(*id))
+                }),
+            };
+            windows.extend(entries.iter().cloned());
+        }
+        if hidden {
+            return Ok(Closure::HiddenWindow);
+        }
+        let pids = match (&spec.app, resolved_app_pids) {
+            (_, Some(pids)) => pids,
+            (Some(app), None)
+                if !windows.iter().any(|window| {
+                    window.get("pid").and_then(Value::as_i64).is_some()
+                        && text_matches(window.get("app_name"), app)
+                }) =>
+            {
+                self.app_pids(app).await?
+            }
+            _ => Vec::new(),
+        };
+        match filter_windows(&windows, spec, &pids) {
+            Ok(windows) => Ok(Closure::Present(windows)),
+            Err(_) => Ok(Closure::Closed),
+        }
+    }
+
     /// One pass of a check over the windows it names. A presence check
     /// holds when any window satisfies it; `gone` holds when none shows it.
     async fn check_once(
@@ -1013,18 +997,25 @@ impl<'a> Locator<'a> {
         spec: &WindowSpec,
         started: Instant,
     ) -> Result<Checked, Miss> {
-        let windows = match self.search_windows(spec).await {
-            Ok(windows) => windows,
-            Err(miss)
-                if check.gone && matches!(miss.code, "window_not_found" | "app_not_found") =>
-            {
-                return Ok(Checked {
-                    window: None,
-                    observed: Some(format!("{} is closed", spec.describe())),
-                    waited: started.elapsed(),
-                })
-            }
-            Err(miss) => return Err(miss),
+        let windows = if check.gone && spec.exact().is_none() {
+            match self.closure_listing(spec).await? {
+                    Closure::Present(windows) => windows,
+                    Closure::Closed => return Ok(Checked {
+                        window: None,
+                        observed: Some(format!("{} is closed", spec.describe())),
+                        waited: started.elapsed(),
+                    }),
+                    Closure::Incomplete => return Err(Miss::new(
+                        "gone_unconfirmed",
+                        format!("no window for {} is listed, but the window listing is incomplete, so its absence is unproven", spec.describe()),
+                    )),
+                    Closure::HiddenWindow => return Err(Miss::new(
+                        "gone_unconfirmed",
+                        format!("{} is absent from the window list but remains in the authoritative window ids", spec.describe()),
+                    )),
+                }
+        } else {
+            self.search_windows(spec).await?
         };
         let mut best_miss: Option<(usize, Miss)> = None;
         for window in &windows {
@@ -1039,9 +1030,33 @@ impl<'a> Locator<'a> {
                         miss.message,
                     ))
                 }
-                // A window that closed between the lookup and the read has
-                // no elements left.
-                Err(_) if check.gone => continue,
+                Err(miss) if check.gone => {
+                    let listed = self
+                        .call(
+                            "list_windows",
+                            json!({
+                                "pid": window.pid,
+                                "on_screen_only": false,
+                            }),
+                        )
+                        .await
+                        .map_err(|error| Miss::new("lookup_failed", error))?;
+                    // The window list leaves out live helper and AX-less
+                    // windows, so only the complete authoritative id set
+                    // for the pid can prove the window closed.
+                    if window_closed(&listed, window.window_id) {
+                        continue;
+                    }
+                    return Err(Miss::new(
+                        "gone_unconfirmed",
+                        format!(
+                            "{} could not be read and the window listing does not prove it closed: {}",
+                            window.describe(),
+                            miss.message
+                        ),
+                    )
+                    .in_window(window));
+                }
                 Err(miss) => return Err(miss),
             };
             match evaluate(check, &read) {
@@ -1387,14 +1402,23 @@ fn evaluate(check: &Check, read: &Read) -> Result<Option<String>, Miss> {
     if let Some(element) = pool.iter().find(|element| fields_hold(check, element)) {
         return Ok(Some(describe_element(element)));
     }
+    let display = if check.element.nth.is_none() {
+        display_rows(read, &element_spec)
+    } else {
+        Vec::new()
+    };
     if check.element.nth.is_none() {
-        if let Some(row) = display_rows(read, &element_spec)
-            .iter()
-            .find(|row| fields_hold(check, row))
-        {
+        if let Some(row) = display.iter().find(|row| fields_hold(check, row)) {
             return Ok(Some(describe_element(row)));
         }
     }
+    let unknown = pool.iter().copied().chain(display.iter()).any(|element| {
+        ((check.value.is_some() || check.value_contains.is_some())
+            && element.get("value").and_then(Value::as_str).is_none())
+            || (check.enabled.is_some()
+                && element.get("enabled").and_then(Value::as_bool).is_none())
+            || (check.selected.is_some() && selected_state(element).is_none())
+    });
     let shown = pool
         .iter()
         .take(CANDIDATES_SHOWN)
@@ -1404,47 +1428,173 @@ fn evaluate(check: &Check, read: &Read) -> Result<Option<String>, Miss> {
     Err(Miss::new(
         "unexpected_state",
         format!(
-            "{} expected in {}, found {}",
+            "{} expected in {}, found {}{}",
             check.describe(),
             window.describe(),
             if shown.is_empty() {
                 "no addressable match".to_owned()
             } else {
                 shown
+            },
+            if unknown {
+                " (state unknown for a requested field)"
+            } else {
+                ""
             }
         ),
     )
     .in_window(window))
 }
 
+enum Closure {
+    Incomplete,
+    Present(Vec<Window>),
+    HiddenWindow,
+    Closed,
+}
+
+/// Filter and rank window values from any listing using the same selector rules.
+fn filter_windows(windows: &[Value], spec: &WindowSpec, pids: &[i64]) -> Result<Vec<Window>, Miss> {
+    let mut candidates: Vec<&Value> = windows
+        .iter()
+        .filter(|window| window.get("pid").and_then(Value::as_i64).is_some())
+        .collect();
+    if let Some(app) = &spec.app {
+        candidates.retain(|window| {
+            text_matches(window.get("app_name"), app)
+                || window
+                    .get("pid")
+                    .and_then(Value::as_i64)
+                    .is_some_and(|pid| pids.contains(&pid))
+        });
+        if candidates.is_empty() {
+            let mut apps: Vec<&str> = windows
+                .iter()
+                .filter_map(|window| window.get("app_name").and_then(Value::as_str))
+                .collect();
+            apps.sort_unstable();
+            apps.dedup();
+            return Err(Miss::new(
+                "app_not_found",
+                format!(
+                    "no window of app \"{app}\" (apps with windows: {})",
+                    if apps.is_empty() {
+                        "none".to_owned()
+                    } else {
+                        apps.join(", ")
+                    }
+                ),
+            ));
+        }
+    }
+    if let Some(window_id) = spec.window_id {
+        candidates
+            .retain(|window| window.get("window_id").and_then(Value::as_u64) == Some(window_id));
+    }
+    if let Some(title) = &spec.title {
+        let before: Vec<String> = candidates
+            .iter()
+            .filter_map(|window| window.get("title").and_then(Value::as_str))
+            .map(|title| format!("\"{}\"", clip(title, 40)))
+            .collect();
+        candidates.retain(|window| text_matches(window.get("title"), title));
+        if candidates.is_empty() {
+            return Err(Miss::new(
+                "window_not_found",
+                format!(
+                    "no window titled like \"{title}\" for {} (titles: {})",
+                    spec.describe(),
+                    if before.is_empty() {
+                        "none".to_owned()
+                    } else {
+                        before.join(", ")
+                    }
+                ),
+            ));
+        }
+    }
+    if candidates.is_empty() {
+        return Err(Miss::new(
+            "window_not_found",
+            format!("no window for {}", spec.describe()),
+        ));
+    }
+    // On-screen windows first, then the topmost (largest z_index).
+    let mut ranked: Vec<(usize, &Value)> = candidates.into_iter().enumerate().collect();
+    ranked.sort_by_key(|(order, window)| {
+        let on_screen = window.get("is_on_screen").and_then(Value::as_bool) != Some(false);
+        let z = window
+            .get("z_index")
+            .and_then(Value::as_i64)
+            .unwrap_or(i64::MIN);
+        std::cmp::Reverse((on_screen, z, std::cmp::Reverse(*order)))
+    });
+    Ok(ranked
+        .into_iter()
+        .map(|(_, window)| Window {
+            pid: window
+                .get("pid")
+                .and_then(Value::as_i64)
+                .unwrap_or_default(),
+            window_id: window
+                .get("window_id")
+                .and_then(Value::as_u64)
+                .unwrap_or_default(),
+            app: window
+                .get("app_name")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            title: window
+                .get("title")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            on_screen: window.get("is_on_screen").and_then(Value::as_bool) != Some(false),
+        })
+        .collect())
+}
+
+/// Whether a pid-scoped `list_windows` result proves `window_id` closed: the
+/// enumeration is complete and its authoritative id set (every window the
+/// window server reported for the pid, helper windows included) lacks it.
+/// A listing without that evidence proves nothing.
+fn window_closed(listed: &Value, window_id: u64) -> bool {
+    if listed.get("enumeration_complete").and_then(Value::as_bool) != Some(true) {
+        return false;
+    }
+    let Some(ids) = listed
+        .get("authoritative_window_ids")
+        .and_then(Value::as_array)
+    else {
+        return false;
+    };
+    // An entry that is not a window id makes the set unreadable, not a
+    // proof that the window is missing from it.
+    let Some(ids) = ids.iter().map(Value::as_u64).collect::<Option<Vec<u64>>>() else {
+        return false;
+    };
+    !ids.contains(&window_id)
+}
+
 fn fields_hold(check: &Check, element: &Value) -> bool {
-    let value = element
-        .get("value")
-        .and_then(Value::as_str)
-        .unwrap_or_default();
+    let value = element.get("value").and_then(Value::as_str);
     if let Some(expected) = &check.value {
-        if value.trim() != expected.trim() {
+        if !value.is_some_and(|value| value.trim() == expected.trim()) {
             return false;
         }
     }
     if let Some(expected) = &check.value_contains {
-        if !fold(value).contains(&fold(expected)) {
+        if !value.is_some_and(|value| fold(value).contains(&fold(expected))) {
             return false;
         }
     }
     if let Some(expected) = check.enabled {
         // Elements report `enabled` only when the platform knows it.
-        if element
-            .get("enabled")
-            .and_then(Value::as_bool)
-            .unwrap_or(true)
-            != expected
-        {
+        if element.get("enabled").and_then(Value::as_bool) != Some(expected) {
             return false;
         }
     }
     if let Some(expected) = check.selected {
-        if selected_state(element).unwrap_or(false) != expected {
+        if selected_state(element) != Some(expected) {
             return false;
         }
     }
@@ -1835,6 +1985,64 @@ mod tests {
     }
 
     #[test]
+    fn only_a_complete_readable_id_set_proves_a_window_closed() {
+        let closed = |listed: Value| window_closed(&listed, 7);
+        assert!(closed(
+            json!({"enumeration_complete": true, "authoritative_window_ids": [5]})
+        ));
+        assert!(!closed(
+            json!({"enumeration_complete": true, "authoritative_window_ids": [5, 7]})
+        ));
+        assert!(!closed(
+            json!({"enumeration_complete": true, "authoritative_window_ids": ["7"]})
+        ));
+        assert!(!closed(
+            json!({"enumeration_complete": true, "authoritative_window_ids": [5, "x"]})
+        ));
+        assert!(!closed(
+            json!({"enumeration_complete": true, "authoritative_window_ids": [-7]})
+        ));
+        assert!(!closed(
+            json!({"enumeration_complete": false, "authoritative_window_ids": [5]})
+        ));
+        assert!(!closed(json!({"enumeration_complete": true})));
+    }
+
+    #[test]
+    fn unknown_enabled_never_satisfies_enabled_true() {
+        let read = read(vec![element(1, "AXButton", "Save")], "");
+        let check = Check::parse(&json!({"name":"Save", "enabled":true}), 0).unwrap();
+        let miss = evaluate(&check, &read).unwrap_err();
+        assert_eq!(miss.code, "unexpected_state");
+        assert!(miss.message.contains("state unknown"), "{}", miss.message);
+    }
+
+    #[test]
+    fn unknown_selected_never_satisfies_selected_false() {
+        let read = read(vec![element(1, "AXButton", "Save")], "");
+        let check = Check::parse(&json!({"name":"Save", "selected":false}), 0).unwrap();
+        let miss = evaluate(&check, &read).unwrap_err();
+        assert_eq!(miss.code, "unexpected_state");
+        assert!(miss.message.contains("state unknown"), "{}", miss.message);
+    }
+
+    #[test]
+    fn missing_value_never_satisfies_empty_value() {
+        let read = read(vec![element(1, "AXTextField", "Name")], "");
+        for contains in [false, true] {
+            let mut check = Check::parse(&json!({"name":"Name"}), 0).unwrap();
+            if contains {
+                check.value_contains = Some(String::new());
+            } else {
+                check.value = Some(String::new());
+            }
+            let miss = evaluate(&check, &read).unwrap_err();
+            assert_eq!(miss.code, "unexpected_state");
+            assert!(miss.message.contains("state unknown"), "{}", miss.message);
+        }
+    }
+
+    #[test]
     fn exact_name_beats_substring_and_roles_fold_across_platforms() {
         let read = read(
             vec![
@@ -2097,14 +2305,14 @@ mod tests {
         for raw in [
             json!({"role":"AXStaticText","name":"Result","value":"702"}),
             json!({"role":"AXStaticText","name":"Result","value_contains":"70"}),
-            json!({"role":"AXStaticText","name":"Result","enabled":true}),
-            json!({"role":"AXStaticText","name":"Result","selected":false}),
         ] {
             assert!(evaluate(&check(raw.clone()), &read).is_ok(), "{raw}");
         }
         for raw in [
             json!({"role":"AXStaticText","name":"Result","value":"703"}),
+            json!({"role":"AXStaticText","name":"Result","enabled":true}),
             json!({"role":"AXStaticText","name":"Result","enabled":false}),
+            json!({"role":"AXStaticText","name":"Result","selected":false}),
             json!({"role":"AXStaticText","name":"Result","selected":true}),
         ] {
             assert!(evaluate(&check(raw.clone()), &read).is_err(), "{raw}");

@@ -209,8 +209,8 @@ impl Tool for PidOnlyWindowTargetGuard {
             args.get("snapshot_id")
                 .and_then(Value::as_str)
                 .map(|handle| {
-                    crate::window_basis::parse_basis_id(handle)
-                        .map(|(id, _)| crate::element_token::format_snapshot_id(id))
+                    crate::element_token::snapshot_of_handle(handle)
+                        .map(crate::element_token::format_snapshot_id)
                         .unwrap_or_else(|| handle.to_owned())
                 }),
         ) {
