@@ -277,7 +277,8 @@ fn verified_capture(
             Err(e) if prefetch_left_worker_behind => return Err(e),
             Err(e @ PxFrameError::CaptureUnavailable { .. })
                 if matches!(&e, PxFrameError::CaptureUnavailable { reason, .. }
-                    if crate::capture::capture_left_a_worker_behind(reason)) =>
+                    if crate::capture::capture_left_a_worker_behind(reason)
+                    || reason.contains(crate::capture::CAPTURE_GENERATION_MARKER)) =>
             {
                 return Err(e)
             }
@@ -1842,6 +1843,36 @@ fn apply_selection_observation(
 /// the exact matching rows and ancestor chain, so use its indices as the
 /// projection source of truth instead of duplicating query matching over the
 /// structured fields.
+#[cfg(test)]
+mod prefetch_generation_tests {
+    use super::*;
+    use std::cell::Cell;
+
+    #[test]
+    fn prefetch_generation_failure_is_not_recaptured() {
+        let calls = Cell::new(0);
+        let bounds = crate::windows::WindowBounds {
+            x: 0.0,
+            y: 0.0,
+            width: 4.0,
+            height: 4.0,
+        };
+        let error = verified_capture(
+            7,
+            Some(Err(anyhow::anyhow!("capture_generation_changed"))),
+            false,
+            &bounds,
+            || {
+                calls.set(calls.get() + 1);
+                Err(anyhow::anyhow!("recaptured"))
+            },
+        )
+        .expect_err("prefetch generation error is terminal");
+        assert!(format!("{error:?}").contains("capture_generation_changed"));
+        assert_eq!(calls.get(), 0);
+    }
+}
+
 #[cfg(test)]
 mod window_scope_contract_tests {
     use super::*;
