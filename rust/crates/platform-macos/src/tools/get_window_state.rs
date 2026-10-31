@@ -1628,7 +1628,7 @@ fn inherited_row_label(nodes: &[crate::ax::tree::AXNode], row_index: usize) -> O
     None
 }
 
-fn element_entry(
+pub(crate) fn element_entry(
     node: &crate::ax::tree::AXNode,
     snapshot_id: Option<u32>,
     inherited_label: Option<&str>,
