@@ -466,6 +466,129 @@ mod tests {
     }
 
     #[test]
+    fn foreground_err_and_panic_release_button_before_modifiers() {
+        use core_graphics::event::CGEventFlags;
+        use std::{cell::RefCell, rc::Rc};
+        struct Keys(Rc<RefCell<Vec<String>>>);
+        impl super::super::keyboard::ModifierIo for Keys {
+            fn post_key(&mut self, _: u16, down: bool, flags: CGEventFlags) -> anyhow::Result<()> {
+                self.0.borrow_mut().push(format!(
+                    "key:{down}:{}",
+                    flags.contains(CGEventFlags::CGEventFlagShift)
+                ));
+                Ok(())
+            }
+            fn pause(&mut self, _: std::time::Duration) {}
+        }
+        struct Pointer {
+            log: Rc<RefCell<Vec<String>>>,
+            flags: CGEventFlags,
+            panic: bool,
+        }
+        impl GestureIo for Pointer {
+            type Event = Kind;
+            fn prepare(&mut self, _: &Step) {}
+            fn create(&mut self, step: &Step) -> anyhow::Result<Kind> {
+                if !self.panic && step.kind == Kind::Dragged {
+                    return Err(anyhow::anyhow!("injected"));
+                }
+                Ok(step.kind)
+            }
+            fn stamp(&mut self, _: &mut Kind, _: &Step) {}
+            fn post(&mut self, _: &Kind, step: &Step) {
+                if matches!(step.kind, Kind::Down | Kind::Up) {
+                    self.log.borrow_mut().push(format!(
+                        "button:{:?}:{}",
+                        step.kind,
+                        self.flags.contains(CGEventFlags::CGEventFlagShift)
+                    ));
+                }
+            }
+            fn settle(&mut self, _: &Step) {}
+            fn observe(&mut self, step: &Step) {
+                if self.panic && step.kind == Kind::Down {
+                    panic!("injected observer panic");
+                }
+            }
+        }
+        for panic in [false, true] {
+            let log = Rc::new(RefCell::new(Vec::new()));
+            let mut keys = Keys(log.clone());
+            let result = super::super::keyboard::with_modifier_io(&mut keys, &["shift"], |flags| {
+                let mut pointer = Pointer {
+                    log: log.clone(),
+                    flags,
+                    panic,
+                };
+                run_gesture(
+                    &mut pointer,
+                    super::super::mouse::test_foreground_gesture_plan(false),
+                    || true,
+                )
+                .map(|_| ())
+                .map_err(Into::into)
+            });
+            assert!(result.is_err());
+            assert_eq!(
+                *log.borrow(),
+                [
+                    "key:true:true",
+                    "button:Down:true",
+                    "button:Up:true",
+                    "key:false:false"
+                ]
+            );
+        }
+        let log = Rc::new(RefCell::new(Vec::new()));
+        let mut keys = Keys(log.clone());
+        let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _: anyhow::Result<()> =
+                super::super::keyboard::with_modifier_io(&mut keys, &["shift"], |_| {
+                    panic!("outer panic")
+                });
+        }));
+        assert!(unwind.is_err());
+        assert_eq!(*log.borrow(), ["key:true:true", "key:false:false"]);
+    }
+
+    #[test]
+    fn every_creation_failure_after_down_releases_at_the_last_handoff() {
+        for index in 7..=9 {
+            let mut fake = Fake::new(Route::Background);
+            fake.fail_at = Some(index);
+            let failure = run_gesture(&mut fake, background_plan(), || true).unwrap_err();
+            let expected = fake
+                .posted
+                .iter()
+                .rev()
+                .find(|(kind, _)| matches!(kind, Kind::Down | Kind::Dragged))
+                .unwrap()
+                .1;
+            assert_eq!(posted(&fake, Kind::Up), [expected]);
+            assert_eq!(failure.button_receipt, ReleaseReceipt::HandedToTransport);
+        }
+    }
+    #[test]
+    fn release_now_is_idempotent() {
+        let mut fake = Fake::new(Route::Background);
+        let step = *background_plan()
+            .iter()
+            .find(|step| step.kind == Kind::Up)
+            .unwrap();
+        let mut guard = ButtonGuard {
+            release: Kind::Up,
+            step,
+            armed: true,
+        };
+        assert_eq!(
+            guard.release_now(&mut fake),
+            ReleaseReceipt::HandedToTransport
+        );
+        assert_eq!(guard.release_now(&mut fake), ReleaseReceipt::NotArmed);
+        assert_eq!(posted(&fake, Kind::Up).len(), 1);
+    }
+
+    #[test]
     fn operation_order_matches_the_current_background() {
         let actual = ops(
             Route::Background,

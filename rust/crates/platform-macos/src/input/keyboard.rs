@@ -696,45 +696,76 @@ pub fn press_key_global(key: &str, modifiers: &[&str]) -> anyhow::Result<()> {
 /// This is only safe inside an exact-window foreground activation guard. The
 /// caller receives the live modifier flags so every mouse event in the gesture
 /// carries the same state as the physical key transitions.
+pub(super) trait ModifierIo {
+    fn post_key(&mut self, code: u16, down: bool, flags: CGEventFlags) -> anyhow::Result<()>;
+    fn pause(&mut self, duration: std::time::Duration);
+}
+
+struct GlobalModifierIo {
+    source: CGEventSource,
+}
+impl ModifierIo for GlobalModifierIo {
+    fn post_key(&mut self, code: u16, down: bool, flags: CGEventFlags) -> anyhow::Result<()> {
+        post_global_key(
+            &self.source,
+            code,
+            down,
+            flags,
+            core_graphics::event::CGEventTapLocation::HID,
+        )
+    }
+    fn pause(&mut self, duration: std::time::Duration) {
+        std::thread::sleep(duration);
+    }
+}
+
+struct GlobalModifierGuard<'a, I: ModifierIo> {
+    io: &'a mut I,
+    pressed: Vec<(u16, CGEventFlags)>,
+    flags: CGEventFlags,
+}
+impl<I: ModifierIo> Drop for GlobalModifierGuard<'_, I> {
+    fn drop(&mut self) {
+        for &(code, flag) in self.pressed.iter().rev() {
+            self.flags.remove(flag);
+            let _ = self.io.post_key(code, false, self.flags);
+            self.io.pause(key_gap());
+        }
+    }
+}
+
+pub(super) fn with_modifier_io<T, I: ModifierIo>(
+    io: &mut I,
+    modifiers: &[&str],
+    gesture: impl FnOnce(CGEventFlags) -> anyhow::Result<T>,
+) -> anyhow::Result<T> {
+    let mut guard = GlobalModifierGuard {
+        io,
+        pressed: Vec::new(),
+        flags: CGEventFlags::CGEventFlagNull,
+    };
+    for modifier in modifiers {
+        let Some((code, flag)) = modifier_key_code_and_flag(modifier) else {
+            continue;
+        };
+        if guard.pressed.iter().any(|(pressed, _)| *pressed == code) {
+            continue;
+        }
+        guard.flags |= flag;
+        guard.io.post_key(code, true, guard.flags)?;
+        guard.pressed.push((code, flag));
+        guard.io.pause(key_gap());
+    }
+    gesture(guard.flags)
+}
+
 pub(super) fn with_global_modifier_keys<T>(
     modifiers: &[&str],
     gesture: impl FnOnce(CGEventFlags) -> anyhow::Result<T>,
 ) -> anyhow::Result<T> {
-    use core_graphics::event::CGEventTapLocation;
-
     let source = CGEventSource::new(CGEventSourceStateID::HIDSystemState)
         .map_err(|_| anyhow::anyhow!("CGEventSource::new failed"))?;
-    let mut active_flags = CGEventFlags::CGEventFlagNull;
-    let mut pressed = Vec::new();
-
-    for modifier in modifiers {
-        let Some((key_code, flag)) = modifier_key_code_and_flag(modifier) else {
-            continue;
-        };
-        if pressed
-            .iter()
-            .any(|(pressed_code, _)| *pressed_code == key_code)
-        {
-            continue;
-        }
-        active_flags |= flag;
-        if let Err(error) = post_global_key(
-            &source,
-            key_code,
-            true,
-            active_flags,
-            CGEventTapLocation::HID,
-        ) {
-            release_global_modifiers(&source, &pressed, active_flags, CGEventTapLocation::HID);
-            return Err(error);
-        }
-        pressed.push((key_code, flag));
-        key_gap_sleep();
-    }
-
-    let result = gesture(active_flags);
-    release_global_modifiers(&source, &pressed, active_flags, CGEventTapLocation::HID);
-    result
+    with_modifier_io(&mut GlobalModifierIo { source }, modifiers, gesture)
 }
 
 pub(super) fn post_global_key(
