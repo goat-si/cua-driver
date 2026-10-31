@@ -2608,6 +2608,7 @@ fn type_text_in_key_window(
             element,
         );
         if before_withheld || after_read == crate::ax::write_outcome::ValueRead::Withheld {
+            let document = unsafe { crate::document_edit::document_status_without_value(element) };
             let outcome_web_area =
                 classify_target_web_area(pid, Some((element as usize, idx_opt)), window_id);
             if owns {
@@ -2615,7 +2616,8 @@ fn type_text_in_key_window(
             }
             return Ok(TypeTextDelivery::Typed(TypeTextOutcome {
                 detail: format!(
-                    " via AX write into {role} \"{title}\"; the value could not be safely read"
+                    " via AX write into {role} \"{title}\"; the value could not be safely read{}",
+                    document.note()
                 ),
                 path: PATH_AX,
                 verified: false,

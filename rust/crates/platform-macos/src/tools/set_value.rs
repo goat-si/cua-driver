@@ -1521,14 +1521,19 @@ fn finish_ladder_with_mark(
         anyhow::bail!("AXUIElementSetAttributeValue(AXValue) failed with error {err}");
     }
     if out.stepped {
+        let document = if out.verification_withheld {
+            unsafe { crate::document_edit::document_status_without_value(element) }
+        } else {
+            crate::document_edit::DocumentEdited::NotADocument
+        };
         return Ok(SetValueOutcome {
             detail: format!(
-                "✅ Set AXValue on [{element_index}] {role} via AXIncrement/AXDecrement stepping."
+                "✅ Set AXValue on [{element_index}] {role} via AXIncrement/AXDecrement stepping.{}", document.note()
             ),
             verified: out.verified,
             changed: out.changed,
             not_applied: false,
-            document_edited: None,
+            document_edited: document.structured(),
             maybe_landed: out.maybe_landed,
             verification_withheld: out.verification_withheld,
         });
@@ -1539,9 +1544,13 @@ fn finish_ladder_with_mark(
         (Some(false), _) => " Read-back did not confirm the value; verify via screenshot.",
         (None, _) => " Value is not readable through AX; could not confirm.",
     };
-    let document = document_after_ladder(&out, restored_window, mark, || unsafe {
-        window_has_document(element)
-    });
+    let document = document_after_ladder(
+        &out,
+        restored_window,
+        mark,
+        || unsafe { window_has_document(element) },
+        || unsafe { crate::document_edit::document_status_without_value(element) },
+    );
     let warning = if out.maybe_landed {
         " The value may have changed; read it before deciding what to do next."
     } else {
@@ -1566,8 +1575,11 @@ fn document_after_ladder(
     restored_window: bool,
     mark: impl FnOnce() -> crate::document_edit::DocumentEdited,
     has_document: impl FnOnce() -> bool,
+    status_without_value: impl FnOnce() -> crate::document_edit::DocumentEdited,
 ) -> crate::document_edit::DocumentEdited {
-    if !out.maybe_landed && out.changed == Some(true) && !restored_window {
+    if out.verification_withheld {
+        status_without_value()
+    } else if !out.maybe_landed && out.changed == Some(true) && !restored_window {
         mark()
     } else if restored_window && out.changed != Some(false) && has_document() {
         crate::document_edit::DocumentEdited::NotMarked
@@ -3138,6 +3150,7 @@ mod ladder_tests {
             false,
             || panic!("document keys after uncertain write"),
             || panic!("unexpected document query"),
+            || panic!("unexpected document status query"),
         );
         assert_eq!(doc, crate::document_edit::DocumentEdited::NotADocument);
         assert!(out.maybe_landed);
@@ -3151,6 +3164,7 @@ mod ladder_tests {
             false,
             || crate::document_edit::DocumentEdited::Marked,
             || panic!("unexpected document query"),
+            || panic!("unexpected document status query"),
         );
         assert_eq!(doc.structured(), Some(true));
         let value = SetValueOutcome {
