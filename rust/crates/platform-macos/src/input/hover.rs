@@ -23,6 +23,7 @@ use crate::ax::bindings::{
     copy_string_attr, kAXErrorSuccess, perform_action, AXUIElementCopyElementAtPosition,
     AXUIElementCreateApplication, AXUIElementRef, AXUIElementSetMessagingTimeout,
 };
+use crate::ax::label_reader::{LabelReader, NativeLabelReader};
 
 /// How far up from the hit element to look for an element with alternate UI.
 const ANCESTOR_DEPTH: usize = 6;
@@ -149,35 +150,56 @@ unsafe fn restore_default_ui(keep: Option<AXUIElementRef>) {
 }
 
 unsafe fn first_label(element: AXUIElementRef) -> String {
-    for attr in ["AXTitle", "AXDescription", "AXValue"] {
-        if let Some(s) = copy_string_attr(element, attr).filter(|s| !s.trim().is_empty()) {
+    first_label_with(&mut NativeLabelReader, element)
+}
+
+fn first_label_with<R: LabelReader>(reader: &mut R, element: R::Element) -> String {
+    for attr in ["AXTitle", "AXDescription"] {
+        if let Some(s) = reader
+            .string(element, attr)
+            .filter(|s| !s.trim().is_empty())
+        {
             return s;
+        }
+    }
+    if crate::ax::content_attrs::classify_value_read(reader, element) {
+        if let Some(value) = reader
+            .string(element, "AXValue")
+            .filter(|s| !s.trim().is_empty())
+        {
+            return value;
         }
     }
     // Outline rows carry their label on a child (or grandchild) text element.
     let mut label = String::new();
-    for child in copy_children(element) {
+    for child in reader.children(element) {
         if label.is_empty() {
-            label = text_of(child);
+            label = text_of_with(reader, child);
             if label.is_empty() {
-                for grandchild in copy_children(child) {
+                for grandchild in reader.children(child) {
                     if label.is_empty() {
-                        label = text_of(grandchild);
+                        label = text_of_with(reader, grandchild);
                     }
-                    CFRelease(grandchild as CFTypeRef);
+                    reader.release(grandchild);
                 }
             }
         }
-        CFRelease(child as CFTypeRef);
+        reader.release(child);
     }
     label
 }
 
-unsafe fn text_of(element: AXUIElementRef) -> String {
-    copy_string_attr(element, "AXValue")
-        .or_else(|| copy_string_attr(element, "AXTitle"))
-        .filter(|s| !s.trim().is_empty())
-        .unwrap_or_default()
+fn text_of_with<R: LabelReader>(reader: &mut R, element: R::Element) -> String {
+    let value = if crate::ax::content_attrs::classify_value_read(reader, element) {
+        reader
+            .string(element, "AXValue")
+            .or_else(|| reader.string(element, "AXTitle"))
+    } else {
+        reader
+            .string(element, "AXTitle")
+            .or_else(|| reader.string(element, "AXDescription"))
+    };
+    value.filter(|s| !s.trim().is_empty()).unwrap_or_default()
 }
 
 /// Number of elements under `element`, `depth` levels deep (bounded).
@@ -288,5 +310,88 @@ mod tests {
             r#"{"ok":false,"reason":"no_window"}"#
         ));
         assert!(!electron_hover_delivered("undefined"));
+    }
+}
+
+#[cfg(test)]
+mod secure_label_tests {
+    use super::*;
+    use crate::ax::label_reader::fake::FakeReader;
+
+    #[test]
+    fn label_reader_preserves_value_precedence() {
+        let mut reader = FakeReader::default();
+        reader.set(0, "AXRole", "AXStaticText");
+        reader.set(0, "AXValue", "ordinary");
+        assert_eq!(first_label_with(&mut reader, 0), "ordinary");
+        assert_eq!(reader.trace.last().unwrap().1, "AXValue");
+    }
+
+    #[test]
+    fn secure_child_uses_description_without_reading_value() {
+        let mut reader = FakeReader::default();
+        reader.set(1, "AXRole", "AXTextField");
+        reader.set(1, "AXSubrole", "AXSecureTextField");
+        reader.set(1, "AXDescription", "field");
+        reader.set(1, "AXValue", "secret");
+        assert_eq!(text_of_with(&mut reader, 1), "field");
+        assert!(!reader.trace.iter().any(|(_, name)| name == "AXValue"));
+    }
+
+    #[test]
+    fn a_hover_label_never_requests_a_secure_value() {
+        for failed in [None, Some("AXRole"), Some("AXHelp")] {
+            let mut reader = FakeReader::default();
+            reader.set(0, "AXRole", "AXTextField");
+            if let Some(name) = failed {
+                reader.failures.insert((0, name.into()));
+            } else {
+                reader.set(0, "AXSubrole", "AXSecureTextField");
+            }
+            reader.set(0, "AXValue", "secret");
+            first_label_with(&mut reader, 0);
+            assert!(
+                !reader
+                    .trace
+                    .iter()
+                    .any(|(id, name)| *id == 0 && name == "AXValue"),
+                "{:?}",
+                reader.trace
+            );
+        }
+    }
+
+    #[test]
+    fn a_hover_child_text_never_requests_a_secure_value() {
+        for (depth, failed) in [
+            (1, None),
+            (1, Some("AXRole")),
+            (1, Some("AXHelp")),
+            (2, None),
+            (2, Some("AXRole")),
+            (2, Some("AXHelp")),
+        ] {
+            let mut reader = FakeReader::default();
+            reader.children.insert(0, vec![1]);
+            if depth == 2 {
+                reader.children.insert(1, vec![2]);
+            }
+            reader.set(depth, "AXRole", "AXTextField");
+            if let Some(name) = failed {
+                reader.failures.insert((depth, name.into()));
+            } else {
+                reader.set(depth, "AXSubrole", "AXSecureTextField");
+            }
+            reader.set(depth, "AXValue", "secret");
+            first_label_with(&mut reader, 0);
+            assert!(
+                !reader
+                    .trace
+                    .iter()
+                    .any(|(id, name)| *id == depth && name == "AXValue"),
+                "{:?}",
+                reader.trace
+            );
+        }
     }
 }

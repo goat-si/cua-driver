@@ -206,34 +206,202 @@ fn window_title_name(title: &str) -> String {
 ///
 /// `element` must be a valid, live `AXUIElementRef`.
 unsafe fn element_name(element: AXUIElementRef) -> Option<String> {
-    unsafe fn text_inside(element: AXUIElementRef, depth: usize) -> Option<String> {
-        let role = copy_string_attr(element, "AXRole");
+    element_name_with(&mut crate::ax::label_reader::NativeLabelReader, element)
+}
+
+fn element_name_with<R: crate::ax::label_reader::LabelReader>(
+    reader: &mut R,
+    element: R::Element,
+) -> Option<String> {
+    fn text_inside<R: crate::ax::label_reader::LabelReader>(
+        reader: &mut R,
+        element: R::Element,
+        depth: usize,
+    ) -> Option<String> {
+        let role = reader.string(element, "AXRole");
         let label_like = role.as_deref() == Some("AXStaticText")
             || (role.as_deref() == Some("AXTextField")
-                && copy_bool_attr(element, "AXFocused") != Some(true));
+                && reader.boolean(element, "AXFocused") != Some(true));
         if label_like {
-            if let Some(value) =
-                copy_string_attr(element, "AXValue").filter(|v| !v.trim().is_empty())
-            {
-                return Some(value);
+            if crate::ax::content_attrs::classify_value_read(reader, element) {
+                if let Some(value) = reader
+                    .string(element, "AXValue")
+                    .filter(|v| !v.trim().is_empty())
+                {
+                    return Some(value);
+                }
+            } else {
+                for name in ["AXTitle", "AXDescription"] {
+                    if let Some(value) = reader
+                        .string(element, name)
+                        .filter(|v| !v.trim().is_empty())
+                    {
+                        return Some(value);
+                    }
+                }
             }
         }
         if depth == 0 {
             return None;
         }
-        let children = copy_children(element);
+        let children = reader.children(element);
         let found = children
             .iter()
-            .find_map(|&child| text_inside(child, depth - 1));
+            .find_map(|&child| text_inside(reader, child, depth - 1));
         for &child in &children {
-            CFRelease(child as CFTypeRef);
+            reader.release(child);
         }
         found
     }
     ["AXTitle", "AXDescription"]
         .iter()
-        .find_map(|attr| copy_string_attr(element, attr).filter(|text| !text.trim().is_empty()))
-        .or_else(|| text_inside(element, 3))
+        .find_map(|attr| {
+            reader
+                .string(element, attr)
+                .filter(|text| !text.trim().is_empty())
+        })
+        .or_else(|| text_inside(reader, element, 3))
+}
+
+fn popup_option_with<R: crate::ax::label_reader::LabelReader>(
+    reader: &mut R,
+    child: R::Element,
+) -> Option<String> {
+    let t = reader.string(child, "AXTitle").unwrap_or_default();
+    let v = if crate::ax::content_attrs::classify_value_read(reader, child) {
+        reader.string(child, "AXValue").unwrap_or_default()
+    } else {
+        String::new()
+    };
+    if t.is_empty() && v.is_empty() {
+        None
+    } else if v.is_empty() || v == t {
+        Some(format!("\"{t}\""))
+    } else {
+        Some(format!("\"{t}\" (value: {v})"))
+    }
+}
+
+#[cfg(test)]
+mod label_reader_seam_tests {
+    use super::*;
+    use crate::ax::label_reader::fake::FakeReader;
+
+    #[test]
+    fn existing_hit_and_popup_value_precedence_is_preserved() {
+        let mut reader = FakeReader::default();
+        reader.set(0, "AXRole", "AXStaticText");
+        reader.set(0, "AXValue", "ordinary");
+        assert_eq!(
+            element_name_with(&mut reader, 0).as_deref(),
+            Some("ordinary")
+        );
+        assert_eq!(
+            popup_option_with(&mut reader, 0).as_deref(),
+            Some("\"\" (value: ordinary)")
+        );
+        assert!(reader.trace.iter().any(|(_, name)| name == "AXValue"));
+    }
+}
+
+#[cfg(test)]
+mod hit_label_tests {
+    use super::*;
+    use crate::ax::label_reader::fake::FakeReader;
+
+    fn assert_value_not_requested(depth: usize, failed: Option<&str>) {
+        let mut reader = FakeReader::default();
+        let target = depth;
+        if depth > 0 {
+            reader.children.insert(0, vec![1]);
+        }
+        if depth > 1 {
+            reader.children.insert(1, vec![2]);
+        }
+        reader.set(target, "AXRole", "AXTextField");
+        reader.set(target, "AXValue", "secret");
+        if let Some(name) = failed {
+            reader.failures.insert((target, name.into()));
+        } else {
+            reader.set(target, "AXSubrole", "AXSecureTextField");
+        }
+        element_name_with(&mut reader, 0);
+        assert!(
+            !reader
+                .trace
+                .iter()
+                .any(|(id, name)| *id == target && name == "AXValue"),
+            "{:?}",
+            reader.trace
+        );
+    }
+
+    #[test]
+    fn a_click_hit_label_never_requests_a_secure_value() {
+        for failed in [None, Some("AXRole"), Some("AXHelp")] {
+            assert_value_not_requested(0, failed);
+        }
+    }
+    #[test]
+    fn a_click_nested_text_never_requests_a_secure_value() {
+        for depth in [1, 2] {
+            for failed in [None, Some("AXRole"), Some("AXHelp")] {
+                assert_value_not_requested(depth, failed);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod popup_summary_tests {
+    use super::*;
+    use crate::ax::label_reader::fake::FakeReader;
+    #[test]
+    fn popup_option_summary_omits_secure_and_unknown_values() {
+        for failed in [None, Some("AXRole"), Some("AXHelp")] {
+            let mut reader = FakeReader::default();
+            reader.set(0, "AXRole", "AXTextField");
+            reader.set(0, "AXValue", "secret");
+            if let Some(name) = failed {
+                reader.failures.insert((0, name.into()));
+            } else {
+                reader.set(0, "AXSubrole", "AXSecureTextField");
+            }
+            assert_eq!(popup_option_with(&mut reader, 0), None);
+            assert!(!reader.trace.iter().any(|(_, name)| name == "AXValue"));
+        }
+    }
+}
+
+#[cfg(test)]
+mod title_probe_tests {
+    use super::*;
+    use crate::ax::label_reader::fake::FakeReader;
+
+    #[test]
+    fn title_probe_without_a_value_keeps_field_shapes() {
+        let mut reader = FakeReader::default();
+        reader.set(0, "AXRole", "AXTextField");
+        reader.set(0, "AXSubrole", "AXSecureTextField");
+        reader.set(0, "AXValue", "secret");
+        let name = element_name_with(&mut reader, 0);
+        assert_eq!(name, None);
+        assert!(!reader.trace.iter().any(|(_, name)| name == "AXValue"));
+        let hit = pointer_hit_record(Some("AXTextField".into()), name, None);
+        let result = px_ax_press_result("pressed", None, hit);
+        let fields = result.structured_content.unwrap();
+        assert_eq!(fields["effect"], "unverifiable");
+        assert_eq!(fields["verified"], false);
+        assert_eq!(fields["hit"], serde_json::json!({"role":"AXTextField"}));
+        for key in [
+            "write_not_applied",
+            "document_key_edit_sent",
+            "note",
+            "warning",
+        ] {
+            assert!(fields.get(key).is_none(), "{key}");
+        }
+    }
 }
 
 impl Drop for WindowTitleProbe {
@@ -3388,16 +3556,7 @@ fn perform_ax_click(
             let options: Vec<String> = children
                 .iter()
                 .filter_map(|&child| {
-                    let t = unsafe { copy_string_attr(child, "AXTitle") }.unwrap_or_default();
-                    let v = unsafe { copy_string_attr(child, "AXValue") }.unwrap_or_default();
-                    if t.is_empty() && v.is_empty() {
-                        return None;
-                    }
-                    Some(if v.is_empty() || v == t {
-                        format!("\"{t}\"")
-                    } else {
-                        format!("\"{t}\" (value: {v})")
-                    })
+                    popup_option_with(&mut crate::ax::label_reader::NativeLabelReader, child)
                 })
                 .collect();
             for &child in &children {
