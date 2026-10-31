@@ -100,6 +100,7 @@ pub mod cursor_shape;
 pub mod daemon;
 pub mod delivery;
 pub mod desktop_capture_scale;
+pub mod desktop_lease;
 pub mod element_frame;
 pub mod element_query;
 pub mod element_token;

@@ -1373,6 +1373,9 @@ pub fn retry_session_cleanup(session_id: &str) -> SessionCleanupReport {
     let failures = progress.failures.clone();
     if complete {
         all.remove(session_id);
+        // The OS input cleanup hooks must finish before another process can
+        // acquire the desktop lease.
+        crate::desktop_lease::release_lease(session_id);
     }
     SessionCleanupReport {
         complete,
@@ -1740,6 +1743,21 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Barrier};
+
+    #[tokio::test]
+    async fn session_end_releases_a_retained_desktop_lease() {
+        let owner = "__cua_runtime_leasetest:session-end-retained";
+        let mut lease = crate::desktop_lease::test_support::manager()
+            .acquire(owner)
+            .await
+            .unwrap();
+        lease.activate();
+        crate::desktop_lease::retain_lease(owner).unwrap();
+        drop(lease);
+        assert!(crate::desktop_lease::test_support::is_retained(owner));
+        end_session(owner);
+        assert!(!crate::desktop_lease::test_support::is_retained(owner));
+    }
 
     #[derive(Default)]
     struct ProbeObserver {
