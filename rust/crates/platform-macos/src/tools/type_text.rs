@@ -1210,17 +1210,24 @@ fn typed_progress(before: Option<&str>, after: Option<&str>, text: &str) -> Type
 /// Read the focused/target field's `AXValue`, for before/after read-back.
 /// Re-fetches the focused element each call when no explicit element is given
 /// (cheap, and focus is stable across our own keystrokes).
-fn read_axvalue(pid: i32, element_ptr_and_idx: Option<(usize, Option<usize>)>) -> Option<String> {
+fn read_axvalue(
+    pid: i32,
+    element_ptr_and_idx: Option<(usize, Option<usize>)>,
+) -> crate::ax::write_outcome::ValueRead {
+    use crate::ax::write_outcome::{read_value_if_allowed, ValueObs, ValueRead};
     if let Some((ptr, _)) = element_ptr_and_idx {
-        unsafe { crate::ax::write_outcome::read_text_value(ptr as AXUIElementRef) }
+        read_value_if_allowed(
+            &mut crate::ax::label_reader::NativeLabelReader,
+            ptr as AXUIElementRef,
+        )
     } else if let Some(el) = unsafe { focused_element_of_pid(pid) } {
-        let v = unsafe { crate::ax::write_outcome::read_text_value(el) };
+        let v = read_value_if_allowed(&mut crate::ax::label_reader::NativeLabelReader, el);
         unsafe {
             CFRelease(el as _);
         }
         v
     } else {
-        None
+        ValueRead::Allowed(ValueObs::Missing)
     }
 }
 
@@ -1235,13 +1242,24 @@ fn read_axvalue_bound(
     element_ptr_and_idx: Option<(usize, Option<usize>)>,
     window_id: Option<u32>,
 ) -> Option<String> {
+    read_axvalue_bound_classified(pid, element_ptr_and_idx, window_id).text()
+}
+
+fn read_axvalue_bound_classified(
+    pid: i32,
+    element_ptr_and_idx: Option<(usize, Option<usize>)>,
+    window_id: Option<u32>,
+) -> crate::ax::write_outcome::ValueRead {
+    use crate::ax::write_outcome::{read_value_if_allowed, ValueObs, ValueRead};
     if element_ptr_and_idx.is_some() {
         return read_axvalue(pid, element_ptr_and_idx);
     }
     match window_id {
         Some(wid) => unsafe {
-            let el = crate::ax::exact_target::focused_element_in_window(pid, wid)?;
-            let v = crate::ax::write_outcome::read_text_value(el);
+            let Some(el) = crate::ax::exact_target::focused_element_in_window(pid, wid) else {
+                return ValueRead::Allowed(ValueObs::Missing);
+            };
+            let v = read_value_if_allowed(&mut crate::ax::label_reader::NativeLabelReader, el);
             CFRelease(el as _);
             v
         },
@@ -1635,8 +1653,14 @@ fn cgevent_type_verified(
             }
             let err = unsafe { set_string_attr(element, "AXValue", text) };
             if err != kAXErrorSuccess {
-                let after = unsafe { crate::ax::write_outcome::read_text_value(element) };
-                if after.as_deref() != Some(text) {
+                let after = crate::ax::write_outcome::read_value_if_allowed(
+                    &mut crate::ax::label_reader::NativeLabelReader,
+                    element,
+                );
+                if after == crate::ax::write_outcome::ValueRead::Withheld {
+                    return Ok((false, None, true));
+                }
+                if after.text().as_deref() != Some(text) {
                     anyhow::bail!("AXUIElementSetAttributeValue(AXValue) failed with error {err}; replacement was not confirmed and no retry was sent")
                 }
             }
@@ -1659,13 +1683,19 @@ fn cgevent_type_verified(
             }
         } else {
             let err = unsafe { set_string_attr(element, "AXSelectedText", text) };
-            if err != kAXErrorSuccess
-                && unsafe { crate::ax::write_outcome::read_text_value(element) }.as_deref()
-                    != Some(text)
-            {
-                anyhow::bail!(
-                    "AXUIElementSetAttributeValue(AXSelectedText) failed with error {err}; replacement was not confirmed and no retry was sent"
-                )
+            if err != kAXErrorSuccess {
+                let after = crate::ax::write_outcome::read_value_if_allowed(
+                    &mut crate::ax::label_reader::NativeLabelReader,
+                    element,
+                );
+                if after == crate::ax::write_outcome::ValueRead::Withheld {
+                    return Ok((false, None, true));
+                }
+                if after.text().as_deref() != Some(text) {
+                    anyhow::bail!(
+                        "AXUIElementSetAttributeValue(AXSelectedText) failed with error {err}; replacement was not confirmed and no retry was sent"
+                    )
+                }
             }
             if before != text {
                 let _ = unsafe {
@@ -1718,11 +1748,18 @@ fn cgevent_type_verified(
     // visible instead of treating any growth as success. If the deadline
     // expires after observable growth, surface the exact partial count.
     let deadline = std::time::Instant::now() + DELIVERY_DRAIN_TIMEOUT;
+    let withheld = std::cell::Cell::new(false);
     let (verified, delivered) = await_typed_delivery(
         before,
         text,
         deadline,
-        || read_axvalue_bound(pid, element_ptr_and_idx, window_id),
+        || {
+            let value = read_axvalue_bound_classified(pid, element_ptr_and_idx, window_id);
+            if value == crate::ax::write_outcome::ValueRead::Withheld {
+                withheld.set(true);
+            }
+            value.text()
+        },
         || {
             target_readback_is_untrusted(
                 classify_target_web_area(pid, element_ptr_and_idx, window_id),
@@ -1730,7 +1767,11 @@ fn cgevent_type_verified(
             )
         },
     );
-    Ok((verified, delivered, false))
+    if withheld.get() {
+        Ok((false, None, false))
+    } else {
+        Ok((verified, delivered, false))
+    }
 }
 
 fn element_has_exact_app_focus(pid: i32, window_id: u32, element_ptr: usize) -> bool {
@@ -2245,7 +2286,12 @@ fn type_text_in_key_window(
         .as_ref()
         .map(|guard| (guard.as_ptr(), None))
         .or(element_ptr_and_idx);
-    let before = read_axvalue_bound(pid, element_ptr_and_idx, window_id);
+    let before_read = read_axvalue_bound_classified(pid, element_ptr_and_idx, window_id);
+    let before_withheld = before_read == crate::ax::write_outcome::ValueRead::Withheld;
+    if replace && before_withheld {
+        anyhow::bail!("replace:true requires a readable AXValue before mutation; no replacement payload was sent");
+    }
+    let before = before_read.text();
     let actual_web_classification = classify_target_web_area(pid, element_ptr_and_idx, window_id);
     let actual_web_delivery = actual_web_classification != WebAreaClassification::NonWebContent;
     let chromium_native_field = chromium_native_candidate && !actual_web_delivery;
@@ -2453,8 +2499,12 @@ fn type_text_in_key_window(
             } else {
                 PATH_KEY_EVENTS
             },
-            delivered_chars,
-            verified,
+            delivered_chars: if before_withheld {
+                None
+            } else {
+                delivered_chars
+            },
+            verified: verified && !before_withheld,
             web_area: classify_target_web_area(pid, element_ptr_and_idx, window_id),
         }));
     }
@@ -2489,8 +2539,12 @@ fn type_text_in_key_window(
         return Ok(TypeTextDelivery::Typed(TypeTextOutcome {
             detail: format!(" via CGEvent (terminal emulator, {delay_ms}ms delay)"),
             path: PATH_KEY_EVENTS,
-            verified,
-            delivered_chars,
+            verified: verified && !before_withheld,
+            delivered_chars: if before_withheld {
+                None
+            } else {
+                delivered_chars
+            },
             web_area: classify_target_web_area(pid, element_ptr_and_idx, window_id),
         }));
     }
@@ -2549,7 +2603,27 @@ fn type_text_in_key_window(
         // instead of appending the full payload again. When synthesis would
         // exceed its transport-safe budget, rejected/unchanged AX writes fail
         // safely and unreadable AX state is reported as indeterminate.
-        let after = unsafe { crate::ax::write_outcome::read_text_value(element) };
+        let after_read = crate::ax::write_outcome::read_value_if_allowed(
+            &mut crate::ax::label_reader::NativeLabelReader,
+            element,
+        );
+        if before_withheld || after_read == crate::ax::write_outcome::ValueRead::Withheld {
+            let outcome_web_area =
+                classify_target_web_area(pid, Some((element as usize, idx_opt)), window_id);
+            if owns {
+                unsafe { CFRelease(element as _) };
+            }
+            return Ok(TypeTextDelivery::Typed(TypeTextOutcome {
+                detail: format!(
+                    " via AX write into {role} \"{title}\"; the value could not be safely read"
+                ),
+                path: PATH_AX,
+                verified: false,
+                delivered_chars: None,
+                web_area: outcome_web_area,
+            }));
+        }
+        let after = after_read.text();
         let ax_progress = if err == kAXErrorSuccess {
             Some(typed_progress(before.as_deref(), after.as_deref(), text))
         } else {
@@ -2664,8 +2738,12 @@ fn type_text_in_key_window(
         } else {
             PATH_KEY_EVENTS
         },
-        verified,
-        delivered_chars,
+        verified: verified && !before_withheld,
+        delivered_chars: if before_withheld {
+            None
+        } else {
+            delivered_chars
+        },
         web_area: classify_target_web_area(pid, element_ptr_and_idx, window_id),
     }))
 }
