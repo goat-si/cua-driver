@@ -23,7 +23,9 @@ mod outputs;
 mod session;
 mod verification;
 mod visual;
+mod vocabulary;
 mod windows;
+pub use vocabulary::{Role, State};
 pub use windows::*;
 
 pub(crate) fn schema_settings() -> SchemaSettings {

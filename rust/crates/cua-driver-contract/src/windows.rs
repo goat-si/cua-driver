@@ -3,7 +3,7 @@
 
 //! Portable native application discovery and exact-window observations.
 
-use crate::{ToolInput, ToolOutput};
+use crate::{Role, State, ToolInput, ToolOutput};
 use schemars::{json_schema, JsonSchema, Schema, SchemaGenerator};
 use serde::{Deserialize, Serialize};
 
@@ -322,6 +322,14 @@ fn toggle_state_schema(generator: &mut SchemaGenerator) -> Schema {
     ToggleState::json_schema(generator)
 }
 
+fn role_schema(generator: &mut SchemaGenerator) -> Schema {
+    Role::json_schema(generator)
+}
+
+fn states_schema(generator: &mut SchemaGenerator) -> Schema {
+    Vec::<State>::json_schema(generator)
+}
+
 /// Broad cause of a missing part of the requested observation.
 #[derive(
     Debug,
@@ -416,6 +424,19 @@ pub struct NodeBoundary {
 pub struct WindowElement {
     pub element_index: u64,
     pub role: String,
+    /// Canonical role from successful platform evidence. Omitted if the role read
+    /// failed; Unknown means the read succeeded but the evidence was unrecognized.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(schema_with = "role_schema")]
+    pub role_canonical: Option<Role>,
+    /// Asserted states from the same evidence as enabled, selected, toggle_state,
+    /// and expanded; those fields are authoritative. A missing token never means
+    /// false. Focused is asserted only where it was read. Secure is asserted only
+    /// by existing secure detection; its absence does not establish that an
+    /// element is non-secure.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(schema_with = "states_schema")]
+    pub states: Option<Vec<State>>,
     pub depth: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub boundary: Option<NodeBoundary>,
@@ -569,6 +590,41 @@ impl ToolOutput for WindowStateOutput {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn canonical_vocabulary_roundtrips_and_rejects_invalid_values() {
+        let old = json!({"element_index":1,"role":"AXButton","depth":0});
+        let old_element: WindowElement = serde_json::from_value(old.clone()).unwrap();
+        assert_eq!(serde_json::to_value(old_element).unwrap(), old);
+        let new = json!({"element_index":1,"role":"AXButton","depth":0,
+            "role_canonical":"button","states":["focused","disabled","haspopup"]});
+        let element: WindowElement = serde_json::from_value(new.clone()).unwrap();
+        assert_eq!(serde_json::to_value(element).unwrap(), new);
+        let schema = WindowStateOutput::output_schema();
+        let properties = &schema["properties"]["elements"]["items"]["properties"];
+        assert_eq!(properties["role_canonical"]["type"], "string");
+        assert!(!properties["role_canonical"]["enum"]
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::Value::Null));
+        assert_eq!(properties["states"]["type"], "array");
+        assert_eq!(properties["states"]["items"]["type"], "string");
+        assert!(!properties["states"]["items"]["enum"]
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::Value::Null));
+        for invalid in [
+            json!({"role_canonical":"bogus"}),
+            json!({"states":["bogus"]}),
+        ] {
+            let mut value = old.clone();
+            value
+                .as_object_mut()
+                .unwrap()
+                .extend(invalid.as_object().unwrap().clone());
+            assert!(serde_json::from_value::<WindowElement>(value).is_err());
+        }
+    }
 
     #[test]
     fn window_observation_fields_roundtrip_and_omit_when_absent() {

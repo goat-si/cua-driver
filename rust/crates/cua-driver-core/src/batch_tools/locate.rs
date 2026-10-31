@@ -1142,12 +1142,9 @@ pub(crate) fn matches<'r>(read: &'r Read, spec: &ElementSpec) -> Vec<&'r Value> 
         .iter()
         .filter(|element| element.get("display_only").and_then(Value::as_bool) != Some(true))
         .filter(|element| {
-            spec.role.as_deref().is_none_or(|role| {
-                element
-                    .get("role")
-                    .and_then(Value::as_str)
-                    .is_some_and(|actual| role_matches(role, actual))
-            })
+            spec.role
+                .as_deref()
+                .is_none_or(|role| element_role_matches(role, element))
         })
         .collect();
     let named: Vec<&Value> = match &spec.name {
@@ -1911,7 +1908,27 @@ pub(crate) fn role_family(role: &str) -> String {
 }
 
 fn role_matches(wanted: &str, actual: &str) -> bool {
-    role_family(wanted) == role_family(actual)
+    let wanted = role_family(wanted);
+    let actual = role_family(actual);
+    wanted != "unknown" && wanted == actual
+}
+
+fn element_role_matches(wanted: &str, element: &Value) -> bool {
+    use cua_driver_contract::Role;
+
+    let wanted_canonical = Role::from_token(wanted);
+    if wanted_canonical != Role::Unknown {
+        if let Some(actual) = element.get("role_canonical") {
+            return actual.as_str().is_some_and(|actual| {
+                let actual = Role::from_token(actual);
+                actual != Role::Unknown && actual == wanted_canonical
+            });
+        }
+    }
+    element
+        .get("role")
+        .and_then(Value::as_str)
+        .is_some_and(|actual| role_matches(wanted, actual))
 }
 
 /// One driver call as the run_script journal records it.
@@ -2067,6 +2084,31 @@ mod tests {
         assert_eq!(pick(&read, &field).unwrap().element["element_index"], 3);
         assert_eq!(role_family("Push Button"), "button");
         assert_eq!(role_family("Hyperlink"), "link");
+    }
+
+    #[test]
+    fn canonical_role_precedes_native_and_unknown_never_matches_unknown() {
+        let mut canonical = element(1, "AXButton", "one");
+        canonical["role_canonical"] = json!("text_field");
+        let mut unknown = element(2, "unknown", "two");
+        unknown["role_canonical"] = json!("unknown");
+        let read = read(
+            vec![
+                canonical,
+                element(3, "AXButton", "three"),
+                unknown,
+                element(4, "unknown", "four"),
+            ],
+            "",
+        );
+        let spec = |role: &str| ElementSpec {
+            role: Some(role.into()),
+            ..Default::default()
+        };
+        assert_eq!(matches(&read, &spec(" Text_Field "))[0]["element_index"], 1);
+        assert_eq!(matches(&read, &spec("button"))[0]["element_index"], 3);
+        assert_eq!(matches(&read, &spec("Push Button"))[0]["element_index"], 1);
+        assert!(matches(&read, &spec("unknown")).is_empty());
     }
 
     #[test]

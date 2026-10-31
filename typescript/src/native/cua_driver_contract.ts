@@ -6997,6 +6997,352 @@ const FfiConverterTypeVisualParseError = (() => {
 })();
 
 /**
+ * A platform-neutral role. Unknown means a successful read with unrecognized evidence.
+ */
+export enum Role {
+    Alert,
+    AlertDialog,
+    Application,
+    Article,
+    Banner,
+    Browser,
+    Button,
+    Cell,
+    Checkbox,
+    ColorWell,
+    Column,
+    ComboBox,
+    Complementary,
+    ContentInfo,
+    DateField,
+    Definition,
+    Dialog,
+    Disclosure,
+    DockItem,
+    Document,
+    Drawer,
+    Form,
+    Grid,
+    Group,
+    Handle,
+    Heading,
+    HelpTag,
+    Image,
+    Incrementor,
+    LayoutItem,
+    LevelIndicator,
+    Link,
+    List,
+    ListBox,
+    Log,
+    Main,
+    Marquee,
+    Matte,
+    Math,
+    Menu,
+    MenuButton,
+    MenuItem,
+    Navigation,
+    Note,
+    Option,
+    Outline,
+    Page,
+    Paragraph,
+    Popover,
+    ProgressBar,
+    RadioButton,
+    RadioGroup,
+    Region,
+    RelevanceIndicator,
+    Row,
+    Ruler,
+    RulerMarker,
+    ScrollArea,
+    ScrollBar,
+    Search,
+    Separator,
+    Sheet,
+    Slider,
+    Splitter,
+    StaticText,
+    Status,
+    Switch,
+    Tab,
+    TabList,
+    TabPanel,
+    Table,
+    TextField,
+    Term,
+    TimeField,
+    Timer,
+    Toolbar,
+    Tooltip,
+    TreeItem,
+    WebArea,
+    Window,
+    Unknown
+}
+
+const FfiConverterTypeRole = (() => {
+    const ordinalConverter = FfiConverterInt32;
+    type TypeName = Role;
+    class FFIConverter extends AbstractFfiConverterByteArray<TypeName> {
+        read(from: RustBuffer): TypeName {
+            switch (ordinalConverter.read(from)) {
+                case 1: return Role.Alert;
+                case 2: return Role.AlertDialog;
+                case 3: return Role.Application;
+                case 4: return Role.Article;
+                case 5: return Role.Banner;
+                case 6: return Role.Browser;
+                case 7: return Role.Button;
+                case 8: return Role.Cell;
+                case 9: return Role.Checkbox;
+                case 10: return Role.ColorWell;
+                case 11: return Role.Column;
+                case 12: return Role.ComboBox;
+                case 13: return Role.Complementary;
+                case 14: return Role.ContentInfo;
+                case 15: return Role.DateField;
+                case 16: return Role.Definition;
+                case 17: return Role.Dialog;
+                case 18: return Role.Disclosure;
+                case 19: return Role.DockItem;
+                case 20: return Role.Document;
+                case 21: return Role.Drawer;
+                case 22: return Role.Form;
+                case 23: return Role.Grid;
+                case 24: return Role.Group;
+                case 25: return Role.Handle;
+                case 26: return Role.Heading;
+                case 27: return Role.HelpTag;
+                case 28: return Role.Image;
+                case 29: return Role.Incrementor;
+                case 30: return Role.LayoutItem;
+                case 31: return Role.LevelIndicator;
+                case 32: return Role.Link;
+                case 33: return Role.List;
+                case 34: return Role.ListBox;
+                case 35: return Role.Log;
+                case 36: return Role.Main;
+                case 37: return Role.Marquee;
+                case 38: return Role.Matte;
+                case 39: return Role.Math;
+                case 40: return Role.Menu;
+                case 41: return Role.MenuButton;
+                case 42: return Role.MenuItem;
+                case 43: return Role.Navigation;
+                case 44: return Role.Note;
+                case 45: return Role.Option;
+                case 46: return Role.Outline;
+                case 47: return Role.Page;
+                case 48: return Role.Paragraph;
+                case 49: return Role.Popover;
+                case 50: return Role.ProgressBar;
+                case 51: return Role.RadioButton;
+                case 52: return Role.RadioGroup;
+                case 53: return Role.Region;
+                case 54: return Role.RelevanceIndicator;
+                case 55: return Role.Row;
+                case 56: return Role.Ruler;
+                case 57: return Role.RulerMarker;
+                case 58: return Role.ScrollArea;
+                case 59: return Role.ScrollBar;
+                case 60: return Role.Search;
+                case 61: return Role.Separator;
+                case 62: return Role.Sheet;
+                case 63: return Role.Slider;
+                case 64: return Role.Splitter;
+                case 65: return Role.StaticText;
+                case 66: return Role.Status;
+                case 67: return Role.Switch;
+                case 68: return Role.Tab;
+                case 69: return Role.TabList;
+                case 70: return Role.TabPanel;
+                case 71: return Role.Table;
+                case 72: return Role.TextField;
+                case 73: return Role.Term;
+                case 74: return Role.TimeField;
+                case 75: return Role.Timer;
+                case 76: return Role.Toolbar;
+                case 77: return Role.Tooltip;
+                case 78: return Role.TreeItem;
+                case 79: return Role.WebArea;
+                case 80: return Role.Window;
+                case 81: return Role.Unknown;
+                default: throw new UniffiInternalError.UnexpectedEnumCase();
+            }
+        }
+        write(value: TypeName, into: RustBuffer): void {
+            switch (value) {
+                case Role.Alert: return ordinalConverter.write(1, into);
+                case Role.AlertDialog: return ordinalConverter.write(2, into);
+                case Role.Application: return ordinalConverter.write(3, into);
+                case Role.Article: return ordinalConverter.write(4, into);
+                case Role.Banner: return ordinalConverter.write(5, into);
+                case Role.Browser: return ordinalConverter.write(6, into);
+                case Role.Button: return ordinalConverter.write(7, into);
+                case Role.Cell: return ordinalConverter.write(8, into);
+                case Role.Checkbox: return ordinalConverter.write(9, into);
+                case Role.ColorWell: return ordinalConverter.write(10, into);
+                case Role.Column: return ordinalConverter.write(11, into);
+                case Role.ComboBox: return ordinalConverter.write(12, into);
+                case Role.Complementary: return ordinalConverter.write(13, into);
+                case Role.ContentInfo: return ordinalConverter.write(14, into);
+                case Role.DateField: return ordinalConverter.write(15, into);
+                case Role.Definition: return ordinalConverter.write(16, into);
+                case Role.Dialog: return ordinalConverter.write(17, into);
+                case Role.Disclosure: return ordinalConverter.write(18, into);
+                case Role.DockItem: return ordinalConverter.write(19, into);
+                case Role.Document: return ordinalConverter.write(20, into);
+                case Role.Drawer: return ordinalConverter.write(21, into);
+                case Role.Form: return ordinalConverter.write(22, into);
+                case Role.Grid: return ordinalConverter.write(23, into);
+                case Role.Group: return ordinalConverter.write(24, into);
+                case Role.Handle: return ordinalConverter.write(25, into);
+                case Role.Heading: return ordinalConverter.write(26, into);
+                case Role.HelpTag: return ordinalConverter.write(27, into);
+                case Role.Image: return ordinalConverter.write(28, into);
+                case Role.Incrementor: return ordinalConverter.write(29, into);
+                case Role.LayoutItem: return ordinalConverter.write(30, into);
+                case Role.LevelIndicator: return ordinalConverter.write(31, into);
+                case Role.Link: return ordinalConverter.write(32, into);
+                case Role.List: return ordinalConverter.write(33, into);
+                case Role.ListBox: return ordinalConverter.write(34, into);
+                case Role.Log: return ordinalConverter.write(35, into);
+                case Role.Main: return ordinalConverter.write(36, into);
+                case Role.Marquee: return ordinalConverter.write(37, into);
+                case Role.Matte: return ordinalConverter.write(38, into);
+                case Role.Math: return ordinalConverter.write(39, into);
+                case Role.Menu: return ordinalConverter.write(40, into);
+                case Role.MenuButton: return ordinalConverter.write(41, into);
+                case Role.MenuItem: return ordinalConverter.write(42, into);
+                case Role.Navigation: return ordinalConverter.write(43, into);
+                case Role.Note: return ordinalConverter.write(44, into);
+                case Role.Option: return ordinalConverter.write(45, into);
+                case Role.Outline: return ordinalConverter.write(46, into);
+                case Role.Page: return ordinalConverter.write(47, into);
+                case Role.Paragraph: return ordinalConverter.write(48, into);
+                case Role.Popover: return ordinalConverter.write(49, into);
+                case Role.ProgressBar: return ordinalConverter.write(50, into);
+                case Role.RadioButton: return ordinalConverter.write(51, into);
+                case Role.RadioGroup: return ordinalConverter.write(52, into);
+                case Role.Region: return ordinalConverter.write(53, into);
+                case Role.RelevanceIndicator: return ordinalConverter.write(54, into);
+                case Role.Row: return ordinalConverter.write(55, into);
+                case Role.Ruler: return ordinalConverter.write(56, into);
+                case Role.RulerMarker: return ordinalConverter.write(57, into);
+                case Role.ScrollArea: return ordinalConverter.write(58, into);
+                case Role.ScrollBar: return ordinalConverter.write(59, into);
+                case Role.Search: return ordinalConverter.write(60, into);
+                case Role.Separator: return ordinalConverter.write(61, into);
+                case Role.Sheet: return ordinalConverter.write(62, into);
+                case Role.Slider: return ordinalConverter.write(63, into);
+                case Role.Splitter: return ordinalConverter.write(64, into);
+                case Role.StaticText: return ordinalConverter.write(65, into);
+                case Role.Status: return ordinalConverter.write(66, into);
+                case Role.Switch: return ordinalConverter.write(67, into);
+                case Role.Tab: return ordinalConverter.write(68, into);
+                case Role.TabList: return ordinalConverter.write(69, into);
+                case Role.TabPanel: return ordinalConverter.write(70, into);
+                case Role.Table: return ordinalConverter.write(71, into);
+                case Role.TextField: return ordinalConverter.write(72, into);
+                case Role.Term: return ordinalConverter.write(73, into);
+                case Role.TimeField: return ordinalConverter.write(74, into);
+                case Role.Timer: return ordinalConverter.write(75, into);
+                case Role.Toolbar: return ordinalConverter.write(76, into);
+                case Role.Tooltip: return ordinalConverter.write(77, into);
+                case Role.TreeItem: return ordinalConverter.write(78, into);
+                case Role.WebArea: return ordinalConverter.write(79, into);
+                case Role.Window: return ordinalConverter.write(80, into);
+                case Role.Unknown: return ordinalConverter.write(81, into);
+            }
+        }
+        allocationSize(value: TypeName): number {
+            return ordinalConverter.allocationSize(0);
+        }
+    }
+    return new FFIConverter();
+})();
+
+/**
+ * An asserted accessibility state; absence of a token is not a negative assertion.
+ */
+export enum State {
+    Focused,
+    Disabled,
+    Secure,
+    Expanded,
+    Checked,
+    Selected,
+    Hidden,
+    Busy,
+    Modal,
+    Required,
+    Indeterminate,
+    Pressed,
+    Readonly,
+    Offscreen,
+    Invalid,
+    Multiselectable,
+    Haspopup
+}
+
+const FfiConverterTypeState = (() => {
+    const ordinalConverter = FfiConverterInt32;
+    type TypeName = State;
+    class FFIConverter extends AbstractFfiConverterByteArray<TypeName> {
+        read(from: RustBuffer): TypeName {
+            switch (ordinalConverter.read(from)) {
+                case 1: return State.Focused;
+                case 2: return State.Disabled;
+                case 3: return State.Secure;
+                case 4: return State.Expanded;
+                case 5: return State.Checked;
+                case 6: return State.Selected;
+                case 7: return State.Hidden;
+                case 8: return State.Busy;
+                case 9: return State.Modal;
+                case 10: return State.Required;
+                case 11: return State.Indeterminate;
+                case 12: return State.Pressed;
+                case 13: return State.Readonly;
+                case 14: return State.Offscreen;
+                case 15: return State.Invalid;
+                case 16: return State.Multiselectable;
+                case 17: return State.Haspopup;
+                default: throw new UniffiInternalError.UnexpectedEnumCase();
+            }
+        }
+        write(value: TypeName, into: RustBuffer): void {
+            switch (value) {
+                case State.Focused: return ordinalConverter.write(1, into);
+                case State.Disabled: return ordinalConverter.write(2, into);
+                case State.Secure: return ordinalConverter.write(3, into);
+                case State.Expanded: return ordinalConverter.write(4, into);
+                case State.Checked: return ordinalConverter.write(5, into);
+                case State.Selected: return ordinalConverter.write(6, into);
+                case State.Hidden: return ordinalConverter.write(7, into);
+                case State.Busy: return ordinalConverter.write(8, into);
+                case State.Modal: return ordinalConverter.write(9, into);
+                case State.Required: return ordinalConverter.write(10, into);
+                case State.Indeterminate: return ordinalConverter.write(11, into);
+                case State.Pressed: return ordinalConverter.write(12, into);
+                case State.Readonly: return ordinalConverter.write(13, into);
+                case State.Offscreen: return ordinalConverter.write(14, into);
+                case State.Invalid: return ordinalConverter.write(15, into);
+                case State.Multiselectable: return ordinalConverter.write(16, into);
+                case State.Haspopup: return ordinalConverter.write(17, into);
+            }
+        }
+        allocationSize(value: TypeName): number {
+            return ordinalConverter.allocationSize(0);
+        }
+    }
+    return new FFIConverter();
+})();
+
+/**
  * A Windows TogglePattern state: a check box or toggle button is on, off, or
  * mixed (indeterminate, such as a parent of partly checked items).
  */
@@ -7035,6 +7381,19 @@ const FfiConverterTypeToggleState = (() => {
 export type WindowElement = {
     elementIndex: bigint,
     role: string,
+    /**
+     * Canonical role from successful platform evidence. Omitted if the role read
+     * failed; Unknown means the read succeeded but the evidence was unrecognized.
+     */
+    roleCanonical?: Role,
+    /**
+     * Asserted states from the same evidence as enabled, selected, toggle_state,
+     * and expanded; those fields are authoritative. A missing token never means
+     * false. Focused is asserted only where it was read. Secure is asserted only
+     * by existing secure detection; its absence does not establish that an
+     * element is non-secure.
+     */
+    states?: Array<State>,
     depth: number,
     boundary?: NodeBoundary,
     elementToken?: string,
@@ -7084,6 +7443,8 @@ const FfiConverterTypeWindowElement = (() => {
             return {
                 elementIndex: FfiConverterUInt64.read(from),
                 role: FfiConverterString.read(from),
+                roleCanonical: FfiConverterOptionalTypeRole.read(from),
+                states: FfiConverterOptionalSequenceTypeState.read(from),
                 depth: FfiConverterUInt32.read(from),
                 boundary: FfiConverterOptionalTypeNodeBoundary.read(from),
                 elementToken: FfiConverterOptionalString.read(from),
@@ -7105,6 +7466,8 @@ const FfiConverterTypeWindowElement = (() => {
         write(value: TypeName, into: RustBuffer): void {
             FfiConverterUInt64.write(value.elementIndex, into);
             FfiConverterString.write(value.role, into);
+            FfiConverterOptionalTypeRole.write(value.roleCanonical, into);
+            FfiConverterOptionalSequenceTypeState.write(value.states, into);
             FfiConverterUInt32.write(value.depth, into);
             FfiConverterOptionalTypeNodeBoundary.write(value.boundary, into);
             FfiConverterOptionalString.write(value.elementToken, into);
@@ -7125,6 +7488,8 @@ const FfiConverterTypeWindowElement = (() => {
         allocationSize(value: TypeName): number {
             return FfiConverterUInt64.allocationSize(value.elementIndex) +
              FfiConverterString.allocationSize(value.role) +
+             FfiConverterOptionalTypeRole.allocationSize(value.roleCanonical) +
+             FfiConverterOptionalSequenceTypeState.allocationSize(value.states) +
              FfiConverterUInt32.allocationSize(value.depth) +
              FfiConverterOptionalTypeNodeBoundary.allocationSize(value.boundary) +
              FfiConverterOptionalString.allocationSize(value.elementToken) +
@@ -7513,6 +7878,15 @@ const FfiConverterSequenceTypeStatePredicate = new FfiConverterArray(FfiConverte
 // FfiConverter for Array<PredicateOutcome>
 const FfiConverterSequenceTypePredicateOutcome = new FfiConverterArray(FfiConverterTypePredicateOutcome);
 
+// FfiConverter for Role | undefined
+const FfiConverterOptionalTypeRole = new FfiConverterOptional(FfiConverterTypeRole);
+
+// FfiConverter for Array<State>
+const FfiConverterSequenceTypeState = new FfiConverterArray(FfiConverterTypeState);
+
+// FfiConverter for Array<State> | undefined
+const FfiConverterOptionalSequenceTypeState = new FfiConverterOptional(FfiConverterSequenceTypeState);
+
 // FfiConverter for NodeBoundary | undefined
 const FfiConverterOptionalTypeNodeBoundary = new FfiConverterOptional(FfiConverterTypeNodeBoundary);
 
@@ -7643,6 +8017,7 @@ export default Object.freeze({
     FfiConverterTypePlatform,
     FfiConverterTypePredicateOutcome,
     FfiConverterTypePressKeyInput,
+    FfiConverterTypeRole,
     FfiConverterTypeScrollBy,
     FfiConverterTypeScrollDirection,
     FfiConverterTypeScrollInput,
@@ -7661,6 +8036,7 @@ export default Object.freeze({
     FfiConverterTypeSnapshotImage,
     FfiConverterTypeStartSessionInput,
     FfiConverterTypeStartSessionOutput,
+    FfiConverterTypeState,
     FfiConverterTypeStatePredicate,
     FfiConverterTypeToggleState,
     FfiConverterTypeTypeTextInput,

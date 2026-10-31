@@ -9065,6 +9065,917 @@ class _UniffiFfiConverterTypeVisualParseError(_UniffiConverterRustBuffer):
         _UniffiFfiConverterBoolean.write(value.retryable, buf)
         _UniffiFfiConverterOptionalString.write(value.detail, buf)
 
+
+
+
+
+
+class Role(enum.Enum):
+    """
+    A platform-neutral role. Unknown means a successful read with unrecognized evidence.
+"""
+
+    ALERT = 0
+
+    ALERT_DIALOG = 1
+
+    APPLICATION = 2
+
+    ARTICLE = 3
+
+    BANNER = 4
+
+    BROWSER = 5
+
+    BUTTON = 6
+
+    CELL = 7
+
+    CHECKBOX = 8
+
+    COLOR_WELL = 9
+
+    COLUMN = 10
+
+    COMBO_BOX = 11
+
+    COMPLEMENTARY = 12
+
+    CONTENT_INFO = 13
+
+    DATE_FIELD = 14
+
+    DEFINITION = 15
+
+    DIALOG = 16
+
+    DISCLOSURE = 17
+
+    DOCK_ITEM = 18
+
+    DOCUMENT = 19
+
+    DRAWER = 20
+
+    FORM = 21
+
+    GRID = 22
+
+    GROUP = 23
+
+    HANDLE = 24
+
+    HEADING = 25
+
+    HELP_TAG = 26
+
+    IMAGE = 27
+
+    INCREMENTOR = 28
+
+    LAYOUT_ITEM = 29
+
+    LEVEL_INDICATOR = 30
+
+    LINK = 31
+
+    LIST = 32
+
+    LIST_BOX = 33
+
+    LOG = 34
+
+    MAIN = 35
+
+    MARQUEE = 36
+
+    MATTE = 37
+
+    MATH = 38
+
+    MENU = 39
+
+    MENU_BUTTON = 40
+
+    MENU_ITEM = 41
+
+    NAVIGATION = 42
+
+    NOTE = 43
+
+    OPTION = 44
+
+    OUTLINE = 45
+
+    PAGE = 46
+
+    PARAGRAPH = 47
+
+    POPOVER = 48
+
+    PROGRESS_BAR = 49
+
+    RADIO_BUTTON = 50
+
+    RADIO_GROUP = 51
+
+    REGION = 52
+
+    RELEVANCE_INDICATOR = 53
+
+    ROW = 54
+
+    RULER = 55
+
+    RULER_MARKER = 56
+
+    SCROLL_AREA = 57
+
+    SCROLL_BAR = 58
+
+    SEARCH = 59
+
+    SEPARATOR = 60
+
+    SHEET = 61
+
+    SLIDER = 62
+
+    SPLITTER = 63
+
+    STATIC_TEXT = 64
+
+    STATUS = 65
+
+    SWITCH = 66
+
+    TAB = 67
+
+    TAB_LIST = 68
+
+    TAB_PANEL = 69
+
+    TABLE = 70
+
+    TEXT_FIELD = 71
+
+    TERM = 72
+
+    TIME_FIELD = 73
+
+    TIMER = 74
+
+    TOOLBAR = 75
+
+    TOOLTIP = 76
+
+    TREE_ITEM = 77
+
+    WEB_AREA = 78
+
+    WINDOW = 79
+
+    UNKNOWN = 80
+
+
+
+class _UniffiFfiConverterTypeRole(_UniffiConverterRustBuffer):
+    @staticmethod
+    def read(buf):
+        variant = buf.read_i32()
+        if variant == 1:
+            return Role.ALERT
+        if variant == 2:
+            return Role.ALERT_DIALOG
+        if variant == 3:
+            return Role.APPLICATION
+        if variant == 4:
+            return Role.ARTICLE
+        if variant == 5:
+            return Role.BANNER
+        if variant == 6:
+            return Role.BROWSER
+        if variant == 7:
+            return Role.BUTTON
+        if variant == 8:
+            return Role.CELL
+        if variant == 9:
+            return Role.CHECKBOX
+        if variant == 10:
+            return Role.COLOR_WELL
+        if variant == 11:
+            return Role.COLUMN
+        if variant == 12:
+            return Role.COMBO_BOX
+        if variant == 13:
+            return Role.COMPLEMENTARY
+        if variant == 14:
+            return Role.CONTENT_INFO
+        if variant == 15:
+            return Role.DATE_FIELD
+        if variant == 16:
+            return Role.DEFINITION
+        if variant == 17:
+            return Role.DIALOG
+        if variant == 18:
+            return Role.DISCLOSURE
+        if variant == 19:
+            return Role.DOCK_ITEM
+        if variant == 20:
+            return Role.DOCUMENT
+        if variant == 21:
+            return Role.DRAWER
+        if variant == 22:
+            return Role.FORM
+        if variant == 23:
+            return Role.GRID
+        if variant == 24:
+            return Role.GROUP
+        if variant == 25:
+            return Role.HANDLE
+        if variant == 26:
+            return Role.HEADING
+        if variant == 27:
+            return Role.HELP_TAG
+        if variant == 28:
+            return Role.IMAGE
+        if variant == 29:
+            return Role.INCREMENTOR
+        if variant == 30:
+            return Role.LAYOUT_ITEM
+        if variant == 31:
+            return Role.LEVEL_INDICATOR
+        if variant == 32:
+            return Role.LINK
+        if variant == 33:
+            return Role.LIST
+        if variant == 34:
+            return Role.LIST_BOX
+        if variant == 35:
+            return Role.LOG
+        if variant == 36:
+            return Role.MAIN
+        if variant == 37:
+            return Role.MARQUEE
+        if variant == 38:
+            return Role.MATTE
+        if variant == 39:
+            return Role.MATH
+        if variant == 40:
+            return Role.MENU
+        if variant == 41:
+            return Role.MENU_BUTTON
+        if variant == 42:
+            return Role.MENU_ITEM
+        if variant == 43:
+            return Role.NAVIGATION
+        if variant == 44:
+            return Role.NOTE
+        if variant == 45:
+            return Role.OPTION
+        if variant == 46:
+            return Role.OUTLINE
+        if variant == 47:
+            return Role.PAGE
+        if variant == 48:
+            return Role.PARAGRAPH
+        if variant == 49:
+            return Role.POPOVER
+        if variant == 50:
+            return Role.PROGRESS_BAR
+        if variant == 51:
+            return Role.RADIO_BUTTON
+        if variant == 52:
+            return Role.RADIO_GROUP
+        if variant == 53:
+            return Role.REGION
+        if variant == 54:
+            return Role.RELEVANCE_INDICATOR
+        if variant == 55:
+            return Role.ROW
+        if variant == 56:
+            return Role.RULER
+        if variant == 57:
+            return Role.RULER_MARKER
+        if variant == 58:
+            return Role.SCROLL_AREA
+        if variant == 59:
+            return Role.SCROLL_BAR
+        if variant == 60:
+            return Role.SEARCH
+        if variant == 61:
+            return Role.SEPARATOR
+        if variant == 62:
+            return Role.SHEET
+        if variant == 63:
+            return Role.SLIDER
+        if variant == 64:
+            return Role.SPLITTER
+        if variant == 65:
+            return Role.STATIC_TEXT
+        if variant == 66:
+            return Role.STATUS
+        if variant == 67:
+            return Role.SWITCH
+        if variant == 68:
+            return Role.TAB
+        if variant == 69:
+            return Role.TAB_LIST
+        if variant == 70:
+            return Role.TAB_PANEL
+        if variant == 71:
+            return Role.TABLE
+        if variant == 72:
+            return Role.TEXT_FIELD
+        if variant == 73:
+            return Role.TERM
+        if variant == 74:
+            return Role.TIME_FIELD
+        if variant == 75:
+            return Role.TIMER
+        if variant == 76:
+            return Role.TOOLBAR
+        if variant == 77:
+            return Role.TOOLTIP
+        if variant == 78:
+            return Role.TREE_ITEM
+        if variant == 79:
+            return Role.WEB_AREA
+        if variant == 80:
+            return Role.WINDOW
+        if variant == 81:
+            return Role.UNKNOWN
+        raise InternalError("Raw enum value doesn't match any cases")
+
+    @staticmethod
+    def check_lower(value):
+        if value == Role.ALERT:
+            return
+        if value == Role.ALERT_DIALOG:
+            return
+        if value == Role.APPLICATION:
+            return
+        if value == Role.ARTICLE:
+            return
+        if value == Role.BANNER:
+            return
+        if value == Role.BROWSER:
+            return
+        if value == Role.BUTTON:
+            return
+        if value == Role.CELL:
+            return
+        if value == Role.CHECKBOX:
+            return
+        if value == Role.COLOR_WELL:
+            return
+        if value == Role.COLUMN:
+            return
+        if value == Role.COMBO_BOX:
+            return
+        if value == Role.COMPLEMENTARY:
+            return
+        if value == Role.CONTENT_INFO:
+            return
+        if value == Role.DATE_FIELD:
+            return
+        if value == Role.DEFINITION:
+            return
+        if value == Role.DIALOG:
+            return
+        if value == Role.DISCLOSURE:
+            return
+        if value == Role.DOCK_ITEM:
+            return
+        if value == Role.DOCUMENT:
+            return
+        if value == Role.DRAWER:
+            return
+        if value == Role.FORM:
+            return
+        if value == Role.GRID:
+            return
+        if value == Role.GROUP:
+            return
+        if value == Role.HANDLE:
+            return
+        if value == Role.HEADING:
+            return
+        if value == Role.HELP_TAG:
+            return
+        if value == Role.IMAGE:
+            return
+        if value == Role.INCREMENTOR:
+            return
+        if value == Role.LAYOUT_ITEM:
+            return
+        if value == Role.LEVEL_INDICATOR:
+            return
+        if value == Role.LINK:
+            return
+        if value == Role.LIST:
+            return
+        if value == Role.LIST_BOX:
+            return
+        if value == Role.LOG:
+            return
+        if value == Role.MAIN:
+            return
+        if value == Role.MARQUEE:
+            return
+        if value == Role.MATTE:
+            return
+        if value == Role.MATH:
+            return
+        if value == Role.MENU:
+            return
+        if value == Role.MENU_BUTTON:
+            return
+        if value == Role.MENU_ITEM:
+            return
+        if value == Role.NAVIGATION:
+            return
+        if value == Role.NOTE:
+            return
+        if value == Role.OPTION:
+            return
+        if value == Role.OUTLINE:
+            return
+        if value == Role.PAGE:
+            return
+        if value == Role.PARAGRAPH:
+            return
+        if value == Role.POPOVER:
+            return
+        if value == Role.PROGRESS_BAR:
+            return
+        if value == Role.RADIO_BUTTON:
+            return
+        if value == Role.RADIO_GROUP:
+            return
+        if value == Role.REGION:
+            return
+        if value == Role.RELEVANCE_INDICATOR:
+            return
+        if value == Role.ROW:
+            return
+        if value == Role.RULER:
+            return
+        if value == Role.RULER_MARKER:
+            return
+        if value == Role.SCROLL_AREA:
+            return
+        if value == Role.SCROLL_BAR:
+            return
+        if value == Role.SEARCH:
+            return
+        if value == Role.SEPARATOR:
+            return
+        if value == Role.SHEET:
+            return
+        if value == Role.SLIDER:
+            return
+        if value == Role.SPLITTER:
+            return
+        if value == Role.STATIC_TEXT:
+            return
+        if value == Role.STATUS:
+            return
+        if value == Role.SWITCH:
+            return
+        if value == Role.TAB:
+            return
+        if value == Role.TAB_LIST:
+            return
+        if value == Role.TAB_PANEL:
+            return
+        if value == Role.TABLE:
+            return
+        if value == Role.TEXT_FIELD:
+            return
+        if value == Role.TERM:
+            return
+        if value == Role.TIME_FIELD:
+            return
+        if value == Role.TIMER:
+            return
+        if value == Role.TOOLBAR:
+            return
+        if value == Role.TOOLTIP:
+            return
+        if value == Role.TREE_ITEM:
+            return
+        if value == Role.WEB_AREA:
+            return
+        if value == Role.WINDOW:
+            return
+        if value == Role.UNKNOWN:
+            return
+        raise ValueError(value)
+
+    @staticmethod
+    def write(value, buf):
+        if value == Role.ALERT:
+            buf.write_i32(1)
+        if value == Role.ALERT_DIALOG:
+            buf.write_i32(2)
+        if value == Role.APPLICATION:
+            buf.write_i32(3)
+        if value == Role.ARTICLE:
+            buf.write_i32(4)
+        if value == Role.BANNER:
+            buf.write_i32(5)
+        if value == Role.BROWSER:
+            buf.write_i32(6)
+        if value == Role.BUTTON:
+            buf.write_i32(7)
+        if value == Role.CELL:
+            buf.write_i32(8)
+        if value == Role.CHECKBOX:
+            buf.write_i32(9)
+        if value == Role.COLOR_WELL:
+            buf.write_i32(10)
+        if value == Role.COLUMN:
+            buf.write_i32(11)
+        if value == Role.COMBO_BOX:
+            buf.write_i32(12)
+        if value == Role.COMPLEMENTARY:
+            buf.write_i32(13)
+        if value == Role.CONTENT_INFO:
+            buf.write_i32(14)
+        if value == Role.DATE_FIELD:
+            buf.write_i32(15)
+        if value == Role.DEFINITION:
+            buf.write_i32(16)
+        if value == Role.DIALOG:
+            buf.write_i32(17)
+        if value == Role.DISCLOSURE:
+            buf.write_i32(18)
+        if value == Role.DOCK_ITEM:
+            buf.write_i32(19)
+        if value == Role.DOCUMENT:
+            buf.write_i32(20)
+        if value == Role.DRAWER:
+            buf.write_i32(21)
+        if value == Role.FORM:
+            buf.write_i32(22)
+        if value == Role.GRID:
+            buf.write_i32(23)
+        if value == Role.GROUP:
+            buf.write_i32(24)
+        if value == Role.HANDLE:
+            buf.write_i32(25)
+        if value == Role.HEADING:
+            buf.write_i32(26)
+        if value == Role.HELP_TAG:
+            buf.write_i32(27)
+        if value == Role.IMAGE:
+            buf.write_i32(28)
+        if value == Role.INCREMENTOR:
+            buf.write_i32(29)
+        if value == Role.LAYOUT_ITEM:
+            buf.write_i32(30)
+        if value == Role.LEVEL_INDICATOR:
+            buf.write_i32(31)
+        if value == Role.LINK:
+            buf.write_i32(32)
+        if value == Role.LIST:
+            buf.write_i32(33)
+        if value == Role.LIST_BOX:
+            buf.write_i32(34)
+        if value == Role.LOG:
+            buf.write_i32(35)
+        if value == Role.MAIN:
+            buf.write_i32(36)
+        if value == Role.MARQUEE:
+            buf.write_i32(37)
+        if value == Role.MATTE:
+            buf.write_i32(38)
+        if value == Role.MATH:
+            buf.write_i32(39)
+        if value == Role.MENU:
+            buf.write_i32(40)
+        if value == Role.MENU_BUTTON:
+            buf.write_i32(41)
+        if value == Role.MENU_ITEM:
+            buf.write_i32(42)
+        if value == Role.NAVIGATION:
+            buf.write_i32(43)
+        if value == Role.NOTE:
+            buf.write_i32(44)
+        if value == Role.OPTION:
+            buf.write_i32(45)
+        if value == Role.OUTLINE:
+            buf.write_i32(46)
+        if value == Role.PAGE:
+            buf.write_i32(47)
+        if value == Role.PARAGRAPH:
+            buf.write_i32(48)
+        if value == Role.POPOVER:
+            buf.write_i32(49)
+        if value == Role.PROGRESS_BAR:
+            buf.write_i32(50)
+        if value == Role.RADIO_BUTTON:
+            buf.write_i32(51)
+        if value == Role.RADIO_GROUP:
+            buf.write_i32(52)
+        if value == Role.REGION:
+            buf.write_i32(53)
+        if value == Role.RELEVANCE_INDICATOR:
+            buf.write_i32(54)
+        if value == Role.ROW:
+            buf.write_i32(55)
+        if value == Role.RULER:
+            buf.write_i32(56)
+        if value == Role.RULER_MARKER:
+            buf.write_i32(57)
+        if value == Role.SCROLL_AREA:
+            buf.write_i32(58)
+        if value == Role.SCROLL_BAR:
+            buf.write_i32(59)
+        if value == Role.SEARCH:
+            buf.write_i32(60)
+        if value == Role.SEPARATOR:
+            buf.write_i32(61)
+        if value == Role.SHEET:
+            buf.write_i32(62)
+        if value == Role.SLIDER:
+            buf.write_i32(63)
+        if value == Role.SPLITTER:
+            buf.write_i32(64)
+        if value == Role.STATIC_TEXT:
+            buf.write_i32(65)
+        if value == Role.STATUS:
+            buf.write_i32(66)
+        if value == Role.SWITCH:
+            buf.write_i32(67)
+        if value == Role.TAB:
+            buf.write_i32(68)
+        if value == Role.TAB_LIST:
+            buf.write_i32(69)
+        if value == Role.TAB_PANEL:
+            buf.write_i32(70)
+        if value == Role.TABLE:
+            buf.write_i32(71)
+        if value == Role.TEXT_FIELD:
+            buf.write_i32(72)
+        if value == Role.TERM:
+            buf.write_i32(73)
+        if value == Role.TIME_FIELD:
+            buf.write_i32(74)
+        if value == Role.TIMER:
+            buf.write_i32(75)
+        if value == Role.TOOLBAR:
+            buf.write_i32(76)
+        if value == Role.TOOLTIP:
+            buf.write_i32(77)
+        if value == Role.TREE_ITEM:
+            buf.write_i32(78)
+        if value == Role.WEB_AREA:
+            buf.write_i32(79)
+        if value == Role.WINDOW:
+            buf.write_i32(80)
+        if value == Role.UNKNOWN:
+            buf.write_i32(81)
+
+
+
+class _UniffiFfiConverterOptionalTypeRole(_UniffiConverterRustBuffer):
+    @classmethod
+    def check_lower(cls, value):
+        if value is not None:
+            _UniffiFfiConverterTypeRole.check_lower(value)
+
+    @classmethod
+    def write(cls, value, buf):
+        if value is None:
+            buf.write_u8(0)
+            return
+
+        buf.write_u8(1)
+        _UniffiFfiConverterTypeRole.write(value, buf)
+
+    @classmethod
+    def read(cls, buf):
+        flag = buf.read_u8()
+        if flag == 0:
+            return None
+        elif flag == 1:
+            return _UniffiFfiConverterTypeRole.read(buf)
+        else:
+            raise InternalError("Unexpected flag byte for optional type")
+
+
+
+
+
+
+class State(enum.Enum):
+    """
+    An asserted accessibility state; absence of a token is not a negative assertion.
+"""
+
+    FOCUSED = 0
+
+    DISABLED = 1
+
+    SECURE = 2
+
+    EXPANDED = 3
+
+    CHECKED = 4
+
+    SELECTED = 5
+
+    HIDDEN = 6
+
+    BUSY = 7
+
+    MODAL = 8
+
+    REQUIRED = 9
+
+    INDETERMINATE = 10
+
+    PRESSED = 11
+
+    READONLY = 12
+
+    OFFSCREEN = 13
+
+    INVALID = 14
+
+    MULTISELECTABLE = 15
+
+    HASPOPUP = 16
+
+
+
+class _UniffiFfiConverterTypeState(_UniffiConverterRustBuffer):
+    @staticmethod
+    def read(buf):
+        variant = buf.read_i32()
+        if variant == 1:
+            return State.FOCUSED
+        if variant == 2:
+            return State.DISABLED
+        if variant == 3:
+            return State.SECURE
+        if variant == 4:
+            return State.EXPANDED
+        if variant == 5:
+            return State.CHECKED
+        if variant == 6:
+            return State.SELECTED
+        if variant == 7:
+            return State.HIDDEN
+        if variant == 8:
+            return State.BUSY
+        if variant == 9:
+            return State.MODAL
+        if variant == 10:
+            return State.REQUIRED
+        if variant == 11:
+            return State.INDETERMINATE
+        if variant == 12:
+            return State.PRESSED
+        if variant == 13:
+            return State.READONLY
+        if variant == 14:
+            return State.OFFSCREEN
+        if variant == 15:
+            return State.INVALID
+        if variant == 16:
+            return State.MULTISELECTABLE
+        if variant == 17:
+            return State.HASPOPUP
+        raise InternalError("Raw enum value doesn't match any cases")
+
+    @staticmethod
+    def check_lower(value):
+        if value == State.FOCUSED:
+            return
+        if value == State.DISABLED:
+            return
+        if value == State.SECURE:
+            return
+        if value == State.EXPANDED:
+            return
+        if value == State.CHECKED:
+            return
+        if value == State.SELECTED:
+            return
+        if value == State.HIDDEN:
+            return
+        if value == State.BUSY:
+            return
+        if value == State.MODAL:
+            return
+        if value == State.REQUIRED:
+            return
+        if value == State.INDETERMINATE:
+            return
+        if value == State.PRESSED:
+            return
+        if value == State.READONLY:
+            return
+        if value == State.OFFSCREEN:
+            return
+        if value == State.INVALID:
+            return
+        if value == State.MULTISELECTABLE:
+            return
+        if value == State.HASPOPUP:
+            return
+        raise ValueError(value)
+
+    @staticmethod
+    def write(value, buf):
+        if value == State.FOCUSED:
+            buf.write_i32(1)
+        if value == State.DISABLED:
+            buf.write_i32(2)
+        if value == State.SECURE:
+            buf.write_i32(3)
+        if value == State.EXPANDED:
+            buf.write_i32(4)
+        if value == State.CHECKED:
+            buf.write_i32(5)
+        if value == State.SELECTED:
+            buf.write_i32(6)
+        if value == State.HIDDEN:
+            buf.write_i32(7)
+        if value == State.BUSY:
+            buf.write_i32(8)
+        if value == State.MODAL:
+            buf.write_i32(9)
+        if value == State.REQUIRED:
+            buf.write_i32(10)
+        if value == State.INDETERMINATE:
+            buf.write_i32(11)
+        if value == State.PRESSED:
+            buf.write_i32(12)
+        if value == State.READONLY:
+            buf.write_i32(13)
+        if value == State.OFFSCREEN:
+            buf.write_i32(14)
+        if value == State.INVALID:
+            buf.write_i32(15)
+        if value == State.MULTISELECTABLE:
+            buf.write_i32(16)
+        if value == State.HASPOPUP:
+            buf.write_i32(17)
+
+
+
+class _UniffiFfiConverterSequenceTypeState(_UniffiConverterRustBuffer):
+    @classmethod
+    def check_lower(cls, value):
+        for item in value:
+            _UniffiFfiConverterTypeState.check_lower(item)
+
+    @classmethod
+    def write(cls, value, buf):
+        items = len(value)
+        buf.write_i32(items)
+        for item in value:
+            _UniffiFfiConverterTypeState.write(item, buf)
+
+    @classmethod
+    def read(cls, buf):
+        count = buf.read_i32()
+        if count < 0:
+            raise InternalError("Unexpected negative sequence length")
+
+        return [
+            _UniffiFfiConverterTypeState.read(buf) for i in range(count)
+        ]
+
+class _UniffiFfiConverterOptionalSequenceTypeState(_UniffiConverterRustBuffer):
+    @classmethod
+    def check_lower(cls, value):
+        if value is not None:
+            _UniffiFfiConverterSequenceTypeState.check_lower(value)
+
+    @classmethod
+    def write(cls, value, buf):
+        if value is None:
+            buf.write_u8(0)
+            return
+
+        buf.write_u8(1)
+        _UniffiFfiConverterSequenceTypeState.write(value, buf)
+
+    @classmethod
+    def read(cls, buf):
+        flag = buf.read_u8()
+        if flag == 0:
+            return None
+        elif flag == 1:
+            return _UniffiFfiConverterSequenceTypeState.read(buf)
+        else:
+            raise InternalError("Unexpected flag byte for optional type")
+
 class _UniffiFfiConverterOptionalTypeNodeBoundary(_UniffiConverterRustBuffer):
     @classmethod
     def check_lower(cls, value):
@@ -9194,9 +10105,11 @@ class _UniffiFfiConverterOptionalTypeElementFrame(_UniffiConverterRustBuffer):
 
 @dataclass
 class WindowElement:
-    def __init__(self, *, element_index:int, role:str, depth:int, boundary:typing.Optional[NodeBoundary], element_token:typing.Optional[str], label:typing.Optional[str], value:typing.Optional[str], value_description:typing.Optional[str], enabled:typing.Optional[bool], selected:typing.Optional[bool], toggle_state:typing.Optional[ToggleState], expanded:typing.Optional[bool], in_web_content:typing.Optional[bool], actions:typing.Optional[typing.List[str]], parent_index:typing.Optional[int], frame:typing.Optional[ElementFrame], min:typing.Optional[float], max:typing.Optional[float]):
+    def __init__(self, *, element_index:int, role:str, role_canonical:typing.Optional[Role], states:typing.Optional[typing.List[State]], depth:int, boundary:typing.Optional[NodeBoundary], element_token:typing.Optional[str], label:typing.Optional[str], value:typing.Optional[str], value_description:typing.Optional[str], enabled:typing.Optional[bool], selected:typing.Optional[bool], toggle_state:typing.Optional[ToggleState], expanded:typing.Optional[bool], in_web_content:typing.Optional[bool], actions:typing.Optional[typing.List[str]], parent_index:typing.Optional[int], frame:typing.Optional[ElementFrame], min:typing.Optional[float], max:typing.Optional[float]):
         self.element_index = element_index
         self.role = role
+        self.role_canonical = role_canonical
+        self.states = states
         self.depth = depth
         self.boundary = boundary
         self.element_token = element_token
@@ -9218,11 +10131,15 @@ class WindowElement:
 
 
     def __str__(self):
-        return "WindowElement(element_index={}, role={}, depth={}, boundary={}, element_token={}, label={}, value={}, value_description={}, enabled={}, selected={}, toggle_state={}, expanded={}, in_web_content={}, actions={}, parent_index={}, frame={}, min={}, max={})".format(self.element_index, self.role, self.depth, self.boundary, self.element_token, self.label, self.value, self.value_description, self.enabled, self.selected, self.toggle_state, self.expanded, self.in_web_content, self.actions, self.parent_index, self.frame, self.min, self.max)
+        return "WindowElement(element_index={}, role={}, role_canonical={}, states={}, depth={}, boundary={}, element_token={}, label={}, value={}, value_description={}, enabled={}, selected={}, toggle_state={}, expanded={}, in_web_content={}, actions={}, parent_index={}, frame={}, min={}, max={})".format(self.element_index, self.role, self.role_canonical, self.states, self.depth, self.boundary, self.element_token, self.label, self.value, self.value_description, self.enabled, self.selected, self.toggle_state, self.expanded, self.in_web_content, self.actions, self.parent_index, self.frame, self.min, self.max)
     def __eq__(self, other):
         if self.element_index != other.element_index:
             return False
         if self.role != other.role:
+            return False
+        if self.role_canonical != other.role_canonical:
+            return False
+        if self.states != other.states:
             return False
         if self.depth != other.depth:
             return False
@@ -9264,6 +10181,8 @@ class _UniffiFfiConverterTypeWindowElement(_UniffiConverterRustBuffer):
         return WindowElement(
             element_index=_UniffiFfiConverterUInt64.read(buf),
             role=_UniffiFfiConverterString.read(buf),
+            role_canonical=_UniffiFfiConverterOptionalTypeRole.read(buf),
+            states=_UniffiFfiConverterOptionalSequenceTypeState.read(buf),
             depth=_UniffiFfiConverterUInt32.read(buf),
             boundary=_UniffiFfiConverterOptionalTypeNodeBoundary.read(buf),
             element_token=_UniffiFfiConverterOptionalString.read(buf),
@@ -9286,6 +10205,8 @@ class _UniffiFfiConverterTypeWindowElement(_UniffiConverterRustBuffer):
     def check_lower(value):
         _UniffiFfiConverterUInt64.check_lower(value.element_index)
         _UniffiFfiConverterString.check_lower(value.role)
+        _UniffiFfiConverterOptionalTypeRole.check_lower(value.role_canonical)
+        _UniffiFfiConverterOptionalSequenceTypeState.check_lower(value.states)
         _UniffiFfiConverterUInt32.check_lower(value.depth)
         _UniffiFfiConverterOptionalTypeNodeBoundary.check_lower(value.boundary)
         _UniffiFfiConverterOptionalString.check_lower(value.element_token)
@@ -9307,6 +10228,8 @@ class _UniffiFfiConverterTypeWindowElement(_UniffiConverterRustBuffer):
     def write(value, buf):
         _UniffiFfiConverterUInt64.write(value.element_index, buf)
         _UniffiFfiConverterString.write(value.role, buf)
+        _UniffiFfiConverterOptionalTypeRole.write(value.role_canonical, buf)
+        _UniffiFfiConverterOptionalSequenceTypeState.write(value.states, buf)
         _UniffiFfiConverterUInt32.write(value.depth, buf)
         _UniffiFfiConverterOptionalTypeNodeBoundary.write(value.boundary, buf)
         _UniffiFfiConverterOptionalString.write(value.element_token, buf)
@@ -9753,6 +10676,8 @@ __all__ = [
     "CaptureScope",
     "EffectiveScope",
     "VisualParseErrorCode",
+    "Role",
+    "State",
     "ToggleState",
     "Platform",
     "ActionDelivery",

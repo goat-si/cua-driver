@@ -217,6 +217,35 @@ mod tests {
     const UNSCHEMED_TOOL: &str = "no_such_tool";
 
     #[test]
+    fn canonical_vocabulary_schema_and_mixed_proxy_versions() {
+        let tool = "get_window_state";
+        let new_schema = advertised_tool_output_schema(tool).unwrap();
+        let old_success: Value = serde_json::from_str(include_str!(
+            "../../../../contract/fixtures/get-window-state-post-181-success-schema.json"
+        ))
+        .unwrap();
+        let old_schema = cua_driver_contract::advertised_output_schema(old_success);
+        let old = json!({"pid":7,"window_id":9,"elements":[{"element_index":1,
+            "role":"AXButton","depth":0,"identifier":"mac-id","focused":true}]});
+        let mut new = old.clone();
+        new["elements"][0]["role_canonical"] = json!("button");
+        new["elements"][0]["states"] = json!(["focused", "checked"]);
+        let validator = jsonschema::validator_for(&new_schema).unwrap();
+        assert!(jsonschema::validator_for(&old_schema)
+            .unwrap()
+            .is_valid(&old));
+        assert!(validator.is_valid(&old));
+        assert!(validator.is_valid(&new));
+        new["elements"][0]["role_canonical"] = json!("not_a_role");
+        assert!(!validator.is_valid(&new));
+        new["elements"][0]["role_canonical"] = json!("button");
+        new["elements"][0]["states"] = json!(["not_a_state"]);
+        assert!(!validator.is_valid(&new));
+        assert!(validate_proxy_schema_pair(tool, Some(&new_schema), Some(&old_schema)).is_err());
+        assert!(validate_proxy_schema_pair(tool, Some(&old_schema), Some(&new_schema)).is_err());
+    }
+
+    #[test]
     fn window_schema_accepts_old_and_new_payloads_and_refuses_mixed_versions() {
         let tool = "get_window_state";
         let new_schema = advertised_tool_output_schema(tool).unwrap();
