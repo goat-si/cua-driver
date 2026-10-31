@@ -26,6 +26,9 @@ pub trait InputSink {
     fn prepare(&mut self) -> Vec<&'static str>;
     fn send(&mut self, event_index: usize) -> Result<(), SendFailure>;
     fn cleanup(&mut self, sent: usize) -> Vec<Value>;
+    fn finish(&mut self) -> Vec<Value> {
+        vec![]
+    }
 }
 
 #[derive(Debug)]
@@ -118,6 +121,7 @@ pub fn run_guarded(
         outcome.events_sent += 1;
     }
     outcome.effect = DispatchEffect::Unverifiable;
+    outcome.cleanup_results = sink.finish();
     GuardedResult::Sent { outcome }
 }
 
@@ -193,6 +197,29 @@ mod tests {
         assert_eq!(outcome.effect, DispatchEffect::Unverifiable);
         assert_eq!(outcome.events_sent, 3);
         assert_eq!(outcome.prepared_side_effects, ["cursor"]);
+    }
+    #[test]
+    fn success_reports_finish_results() {
+        struct Sink;
+        impl InputSink for Sink {
+            fn prepare(&mut self) -> Vec<&'static str> {
+                vec![]
+            }
+            fn send(&mut self, _: usize) -> Result<(), SendFailure> {
+                Ok(())
+            }
+            fn cleanup(&mut self, _: usize) -> Vec<Value> {
+                panic!("unexpected cleanup")
+            }
+            fn finish(&mut self) -> Vec<Value> {
+                vec![json!({"release":"modifier"})]
+            }
+        }
+        let GuardedResult::Sent { outcome } = run_guarded(&mut Sink, 1, || Ok(())) else {
+            panic!()
+        };
+        assert_eq!(outcome.cleanup_results, [json!({"release":"modifier"})]);
+        assert_eq!(outcome.effect, DispatchEffect::Unverifiable);
     }
     #[test]
     fn failures_account_for_each_prefix() {
