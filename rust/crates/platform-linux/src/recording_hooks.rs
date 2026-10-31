@@ -104,15 +104,20 @@ pub fn element_window_local_xy(
     let (index, window, _) = resolved.into_parts(None);
     let window_id = window?;
     let element_index = u32::try_from(index?).ok()?;
+    let elements = cache.with_latest(i32::try_from(pid).ok()?, window_id, |_, snapshot| {
+        snapshot.elements()
+    });
     let point = if !capture_point {
         None
     } else if tokio::runtime::Handle::try_current().is_ok() {
-        std::thread::spawn(move || element_window_local_xy_blocking(window_id, pid, element_index))
-            .join()
-            .ok()
-            .flatten()
+        std::thread::spawn(move || {
+            element_window_local_xy_blocking(window_id, pid, element_index, elements.as_deref())
+        })
+        .join()
+        .ok()
+        .flatten()
     } else {
-        element_window_local_xy_blocking(window_id, pid, element_index)
+        element_window_local_xy_blocking(window_id, pid, element_index, elements.as_deref())
     };
     Some((window_id, point))
 }
@@ -122,10 +127,17 @@ fn element_window_local_xy_blocking(
     window_id: u64,
     pid: i64,
     element_index: u32,
+    elements: Option<&std::collections::HashMap<usize, crate::atspi::snapshot::CachedElement>>,
 ) -> Option<(f64, f64)> {
     let pid = u32::try_from(pid).ok()?;
     let (screen_x, screen_y, width, height) =
-        crate::atspi::get_element_bounds_for_window(pid, window_id, element_index as usize).ok()?;
+        crate::atspi::get_element_bounds_for_window_with_elements(
+            pid,
+            window_id,
+            element_index as usize,
+            elements,
+        )
+        .ok()?;
     let window = resolve_window_for_recording(pid, Some(window_id))?;
     if crate::wayland::is_wayland() && crate::wayland::hyprland::is_session() {
         let (display_width, display_height, _) = crate::wayland::hyprland::screen_size().ok()?;
