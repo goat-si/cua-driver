@@ -711,34 +711,19 @@ fn count_competing_keyboard_destinations(
 
 struct SheetParentOnce<F> {
     lookup: F,
+    sample: Option<Option<u32>>,
 }
 
 impl<F: FnMut() -> Option<u32>> SheetParentOnce<F> {
     fn new(lookup: F) -> Self {
-        Self { lookup }
+        Self {
+            lookup,
+            sample: None,
+        }
     }
 
     fn get(&mut self) -> Option<u32> {
-        (self.lookup)()
-    }
-}
-
-#[cfg(test)]
-mod sheet_parent_lookup_baseline_tests {
-    use super::SheetParentOnce;
-    use std::cell::Cell;
-
-    #[test]
-    fn each_get_performs_a_lookup_and_construction_does_not() {
-        let calls = Cell::new(0);
-        let mut parent = SheetParentOnce::new(|| {
-            calls.set(calls.get() + 1);
-            Some(calls.get())
-        });
-        assert_eq!(calls.get(), 0);
-        assert_eq!(parent.get(), Some(1));
-        assert_eq!(parent.get(), Some(2));
-        assert_eq!(calls.get(), 2);
+        *self.sample.get_or_insert_with(&mut self.lookup)
     }
 }
 
