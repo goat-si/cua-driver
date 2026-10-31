@@ -2092,6 +2092,11 @@ impl ToolRegistry {
         } else {
             None
         };
+        if has_adapter("process_control") {
+            if let Err(refusal) = check_terminable_process(current_process_fingerprint.as_ref()) {
+                return refusal;
+            }
+        }
         let process_ownership_key =
             process_ownership_key(runtime_session.as_deref(), &runtime_prefix);
         let runtime_proves_driver_owned =
@@ -2111,11 +2116,9 @@ impl ToolRegistry {
                 "standard mode may terminate only a process proven to have been launched by this Cua runtime",
             );
         }
-        if runtime_proves_driver_owned {
-            if let Some(fingerprint) = current_process_fingerprint.as_ref() {
-                args["_protected_process_fingerprint"] =
-                    serde_json::to_value(fingerprint).unwrap_or(Value::Null);
-            }
+        if let Some(fingerprint) = current_process_fingerprint.as_ref() {
+            args["_protected_process_fingerprint"] =
+                serde_json::to_value(fingerprint).unwrap_or(Value::Null);
         }
 
         // Raw/legacy page mutations have no exact browser binding. They are
@@ -2381,6 +2384,29 @@ impl ToolRegistry {
                 Ok(scope) => scope,
                 Err(refusal) => return refusal,
             };
+            // Unrestricted calls without a manifest deliberately have no
+            // attested scope; they retain the fingerprint checked above.
+            if !(context.mode() == crate::authorization::PermissionMode::Unrestricted
+                && context.capability_manifest().is_none())
+            {
+                let approved_fingerprint = serde_json::from_value::<
+                    crate::browser::ProcessFingerprint,
+                >(approved_scope["fingerprint"].clone())
+                .ok();
+                if let Err(refusal) = check_terminable_process(approved_fingerprint.as_ref()) {
+                    return refusal;
+                }
+                if !current_process_fingerprint
+                    .as_ref()
+                    .zip(approved_fingerprint.as_ref())
+                    .is_some_and(|(checked, approved)| checked.matches(approved))
+                {
+                    return protected_refusal(
+                        "protected_resource_scope_stale",
+                        "the process instance changed during authorization",
+                    );
+                }
+            }
             if let Err(refusal) = self
                 .validate_attested_resource(
                     tool.as_ref(),
@@ -6232,6 +6258,259 @@ allow:
         assert_eq!(provider.requests.load(Ordering::SeqCst), 0);
     }
 
+    struct KillFingerprintProbe {
+        fingerprint: Option<crate::browser::ProcessFingerprint>,
+        seen: Arc<Mutex<Vec<serde_json::Value>>>,
+        def: super::ToolDef,
+    }
+
+    #[async_trait::async_trait]
+    impl super::Tool for KillFingerprintProbe {
+        fn def(&self) -> &super::ToolDef {
+            &self.def
+        }
+        async fn protected_resource_scope(
+            &self,
+            _: &str,
+            _: &serde_json::Value,
+        ) -> Result<Option<serde_json::Value>, String> {
+            Ok(self.fingerprint.as_ref().map(|fingerprint| serde_json::json!({"kind": "process_instance", "fingerprint": fingerprint})))
+        }
+        async fn validate_protected_resource_scope(
+            &self,
+            _: &str,
+            _: &serde_json::Value,
+            _: &serde_json::Value,
+        ) -> Result<(), String> {
+            Ok(())
+        }
+        async fn invoke(&self, args: serde_json::Value) -> ToolResult {
+            self.seen.lock().unwrap().push(args);
+            ToolResult::text("killed")
+        }
+    }
+
+    fn kill_probe(
+        executable: Option<&str>,
+        available: bool,
+    ) -> (super::ToolRegistry, Arc<Mutex<Vec<serde_json::Value>>>) {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let mut registry = super::ToolRegistry::new();
+        registry.register(Box::new(KillFingerprintProbe {
+            fingerprint: available.then(|| crate::browser::ProcessFingerprint {
+                pid: 424242,
+                start_time: Some(7),
+                executable: executable.map(str::to_owned),
+            }),
+            seen: seen.clone(),
+            def: tool_def("kill_app"),
+        }));
+        (registry, seen)
+    }
+
+    fn refusal_code(result: &ToolResult) -> Option<&str> {
+        result
+            .structured_content
+            .as_ref()?
+            .pointer("/refusal/code")?
+            .as_str()
+    }
+
+    fn host_protected_path() -> &'static str {
+        if cfg!(target_os = "macos") {
+            "/System/Library/CoreServices/Finder.app/Contents/MacOS/Finder"
+        } else if cfg!(target_os = "windows") {
+            r"C:\Windows\explorer.exe"
+        } else {
+            "/usr/bin/gnome-shell"
+        }
+    }
+
+    #[tokio::test]
+    async fn protected_executables_are_refused_in_every_mode() {
+        let manifest = "version: 3\nexpires_after: 1h\nidle_timeout: 30m\nallow:\n  tools: [kill_app]\nresources:\n  processes:\n    terminate: [424242]\n";
+        for mode in [
+            PermissionMode::Standard,
+            PermissionMode::Bounded,
+            PermissionMode::Unrestricted,
+        ] {
+            let (registry, seen) = kill_probe(Some(host_protected_path()), true);
+            let context = manifest_context(mode, manifest);
+            let result = registry
+                .invoke_with_context("kill_app", serde_json::json!({"pid": 424242}), context)
+                .await;
+            assert_eq!(
+                refusal_code(&result),
+                Some("protected_process"),
+                "{mode:?}: {result:?}"
+            );
+            assert!(seen.lock().unwrap().is_empty(), "{mode:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn lookalike_names_stay_killable() {
+        let (registry, seen) = kill_probe(Some("/tmp/MyFinder"), true);
+        let result = registry
+            .invoke_with_context(
+                "kill_app",
+                serde_json::json!({"pid": 424242}),
+                unrestricted_context(),
+            )
+            .await;
+        assert_ne!(result.is_error, Some(true), "{result:?}");
+        assert_eq!(seen.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn unknown_executable_is_refused() {
+        for available in [true, false] {
+            let (registry, seen) = kill_probe(None, available);
+            let result = registry
+                .invoke_with_context(
+                    "kill_app",
+                    serde_json::json!({"pid": 424242}),
+                    unrestricted_context(),
+                )
+                .await;
+            assert_eq!(refusal_code(&result), Some("protected_process_unverified"));
+            assert!(seen.lock().unwrap().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn fingerprint_is_forwarded_for_foreign_kills() {
+        let (registry, seen) = kill_probe(Some("/tmp/ordinary"), true);
+        let result = registry
+            .invoke_with_context(
+                "kill_app",
+                serde_json::json!({"pid": 424242}),
+                unrestricted_context(),
+            )
+            .await;
+        assert_ne!(result.is_error, Some(true), "{result:?}");
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(
+            seen[0]["_protected_process_fingerprint"],
+            serde_json::json!({"pid": 424242, "start_time": 7, "executable": "/tmp/ordinary"})
+        );
+    }
+
+    struct ReusedPidProbe {
+        calls: AtomicUsize,
+        hits: Arc<AtomicUsize>,
+        replacement: serde_json::Value,
+        def: super::ToolDef,
+    }
+
+    #[async_trait::async_trait]
+    impl super::Tool for ReusedPidProbe {
+        fn def(&self) -> &super::ToolDef {
+            &self.def
+        }
+        async fn protected_resource_scope(
+            &self,
+            _: &str,
+            _: &serde_json::Value,
+        ) -> Result<Option<serde_json::Value>, String> {
+            let first = self.calls.fetch_add(1, Ordering::SeqCst) == 0;
+            let fingerprint = if first {
+                serde_json::json!({"pid": 424242, "start_time": 7, "executable": "/tmp/ordinary"})
+            } else {
+                self.replacement.clone()
+            };
+            Ok(Some(
+                serde_json::json!({"kind": "process_instance", "fingerprint": fingerprint}),
+            ))
+        }
+        async fn validate_protected_resource_scope(
+            &self,
+            _: &str,
+            _: &serde_json::Value,
+            _: &serde_json::Value,
+        ) -> Result<(), String> {
+            Ok(())
+        }
+        async fn invoke(&self, _: serde_json::Value) -> ToolResult {
+            self.hits.fetch_add(1, Ordering::SeqCst);
+            ToolResult::text("killed")
+        }
+    }
+
+    #[tokio::test]
+    async fn reused_pid_cannot_replace_checked_executable_before_authorization() {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let mut registry = super::ToolRegistry::new();
+        registry.register(Box::new(ReusedPidProbe {
+            calls: AtomicUsize::new(0),
+            hits: hits.clone(),
+            replacement: serde_json::json!({"pid": 424242, "start_time": 8, "executable": host_protected_path()}),
+            def: tool_def("kill_app"),
+        }));
+        let context = bounded_context("version: 3\nexpires_after: 1h\nidle_timeout: 30m\nallow:\n  tools: [kill_app]\nresources:\n  processes:\n    terminate: [424242]\n");
+        let result = registry
+            .invoke_with_context("kill_app", serde_json::json!({"pid": 424242}), context)
+            .await;
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            0,
+            "protected replacement dispatched: {result:?}"
+        );
+        assert_eq!(refusal_code(&result), Some("protected_process"));
+    }
+
+    #[tokio::test]
+    async fn changed_or_unverified_approved_fingerprint_is_refused() {
+        let manifest = "version: 3\nexpires_after: 1h\nidle_timeout: 30m\nallow:\n  tools: [kill_app]\nresources:\n  processes:\n    terminate: [424242]\n";
+        for (replacement, expected) in [
+            (
+                serde_json::json!({"pid": 424242, "start_time": 8, "executable": "/tmp/other"}),
+                "protected_resource_scope_stale",
+            ),
+            (
+                serde_json::json!({"pid": 424242, "start_time": 7, "executable": null}),
+                "protected_process_unverified",
+            ),
+            (
+                serde_json::json!({"pid": 424242, "start_time": 7, "executable": ""}),
+                "protected_process_unverified",
+            ),
+            (
+                serde_json::json!({"pid": 424242, "start_time": 8, "executable": host_protected_path()}),
+                "protected_process",
+            ),
+        ] {
+            for mode in [PermissionMode::Bounded, PermissionMode::Unrestricted] {
+                let hits = Arc::new(AtomicUsize::new(0));
+                let mut registry = super::ToolRegistry::new();
+                registry.register(Box::new(ReusedPidProbe {
+                    calls: AtomicUsize::new(0),
+                    hits: hits.clone(),
+                    replacement: replacement.clone(),
+                    def: tool_def("kill_app"),
+                }));
+                let result = registry
+                    .invoke_with_context(
+                        "kill_app",
+                        serde_json::json!({"pid": 424242}),
+                        manifest_context(mode, manifest),
+                    )
+                    .await;
+                assert_eq!(
+                    refusal_code(&result),
+                    Some(expected),
+                    "{mode:?}: {result:?}"
+                );
+                assert_eq!(hits.load(Ordering::SeqCst), 0);
+            }
+        }
+        assert_eq!(
+            refusal_code(&super::check_terminable_process(None).unwrap_err()),
+            Some("protected_process_unverified")
+        );
+    }
+
     #[tokio::test]
     async fn standard_foreign_process_termination_denies_without_prompting() {
         let hits = Arc::new(AtomicUsize::new(0));
@@ -8006,6 +8285,28 @@ fn ended_session_refusal_message(public_label: Option<&str>) -> String {
         ),
         None => "this transport's unnamed session has ended; call start_session without a session label to start a new one".to_owned(),
     }
+}
+
+fn check_terminable_process(
+    fingerprint: Option<&crate::browser::ProcessFingerprint>,
+) -> Result<(), ToolResult> {
+    let executable = fingerprint.and_then(|fingerprint| fingerprint.executable.as_deref());
+    let Some((executable, os)) = executable
+        .filter(|executable| !executable.is_empty())
+        .zip(crate::protected_process::build_target_os())
+    else {
+        return Err(protected_refusal(
+            "protected_process_unverified",
+            "cannot verify the executable of the process to be terminated",
+        ));
+    };
+    if crate::protected_process::is_protected_executable(executable, os) {
+        return Err(protected_refusal(
+            "protected_process",
+            &format!("terminating {executable} would break the desktop session"),
+        ));
+    }
+    Ok(())
 }
 
 fn protected_refusal(code: &str, message: &str) -> ToolResult {
