@@ -50,8 +50,6 @@ pub mod lparam;
 
 mod basis_click;
 mod basis_decision;
-#[cfg(test)]
-mod basis_decision_tests;
 
 #[cfg(any(target_os = "windows", test))]
 mod basis_capture;

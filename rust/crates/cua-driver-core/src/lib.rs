@@ -13,6 +13,7 @@
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 pub mod goat_process_group;
 pub mod guide;
+pub mod guarded_dispatch;
 pub mod mcp_skills;
 pub mod mcp_wire;
 
@@ -75,6 +76,10 @@ pub mod agent_cursor;
 mod application_identity;
 pub mod authorization;
 pub mod background_input;
+pub mod basis_click;
+pub mod basis_decision;
+#[cfg(test)]
+mod basis_decision_tests;
 pub mod batch_nudge;
 pub mod batch_scope;
 pub mod batch_tools;
