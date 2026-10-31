@@ -10,13 +10,15 @@ pub(crate) enum AppendOutcome {
 
 pub(crate) fn run_value_append<V>(
     read_is_password: impl FnOnce() -> Option<bool>,
-    acquire_value_pattern: impl FnOnce() -> Option<V>,
+    acquire_value_pattern: impl FnOnce() -> Result<Option<V>, i32>,
     read_value: impl FnOnce(&V) -> Result<String, i32>,
     set_value: impl FnOnce(&V, &str) -> Result<(), i32>,
     text: &str,
 ) -> AppendOutcome {
     let password = read_is_password();
-    let pattern = acquire_value_pattern();
+    let Ok(pattern) = acquire_value_pattern() else {
+        return AppendOutcome::Refused("value_pattern_unreadable");
+    };
     match (password, pattern) {
         (None, _) => AppendOutcome::Refused("secure_state_unknown"),
         (Some(true), None) => AppendOutcome::Refused("secure_no_value_pattern"),
@@ -39,10 +41,13 @@ pub(crate) fn run_value_append<V>(
 }
 
 pub(crate) fn allows_wm_char_fallback(outcome: &AppendOutcome) -> bool {
-    matches!(
-        outcome,
-        AppendOutcome::NoValuePattern | AppendOutcome::WriteFailed { .. }
-    )
+    match outcome {
+        AppendOutcome::NoValuePattern => true,
+        AppendOutcome::WriteFailed { hresult } => crate::uia_mutation::may_fall_through(
+            &crate::uia_mutation::classify_write_hresult(*hresult),
+        ),
+        _ => false,
+    }
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Route {
