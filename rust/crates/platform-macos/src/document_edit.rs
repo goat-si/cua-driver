@@ -614,6 +614,13 @@ mod secure_read_tests {
         );
         assert_eq!(status_without_value(None), DocumentEdited::NotMarked);
     }
+
+    #[test]
+    fn document_key_edit_sent_mapping_is_unchanged() {
+        assert_eq!(DocumentEdited::Marked.structured(), Some(true));
+        assert_eq!(DocumentEdited::NotMarked.structured(), Some(false));
+        assert_eq!(DocumentEdited::NotADocument.structured(), None);
+    }
 }
 
 #[cfg(test)]

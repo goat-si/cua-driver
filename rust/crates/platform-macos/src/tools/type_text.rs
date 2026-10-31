@@ -666,114 +666,130 @@ impl Tool for TypeTextTool {
                     "retry_from_character": delivered_chars,
                 }))
             }
-            Ok(Ok(outcome)) => {
-                let TypeTextOutcome {
-                    detail,
-                    path,
-                    verified,
-                    delivered_chars,
-                    web_area,
-                } = outcome;
-                // SURFACE-AWARE VERIFICATION. On any web-content surface —
-                // Chromium/WebKit/Electron — AXValue is not independent renderer
-                // evidence. It can report a changed value after either an AX write
-                // or synthesized keystrokes while the renderer/DOM still observes
-                // no edit (the Slack-search AND Chrome-on-X false-confirms). Detect
-                // this at the ELEMENT level (an `AXWebArea` ancestor) so it covers
-                // every browser + Electron uniformly, yet a browser's OWN native
-                // chrome (address bar, toolbar) stays trusted. Probe ONLY when a
-                // path with AXValue-only verification would otherwise confirm, so
-                // native types and already-unverified deliveries pay nothing.
-                let web_area =
-                    (verified && path_has_untrusted_web_readback(path)).then_some(web_area);
-                let electron = crate::browser::electron_js::ElectronJs::is_electron(pid);
-                let target_is_web_content = web_area.is_some_and(|classification| {
-                    target_readback_is_untrusted(classification, electron)
-                });
-                let verification = surface_verification(path, verified, target_is_web_content);
-                let verified = verification.verified;
-                let untrusted_web_readback = verification.untrusted_web_readback;
-                let electron_web_content = untrusted_web_readback
-                    && crate::browser::electron_js::ElectronJs::is_electron(pid);
+            Ok(Ok(outcome)) => type_text_outcome_result(
+                outcome,
+                char_count,
+                used_pixel_focus,
+                crate::browser::electron_js::ElectronJs::is_electron(pid),
+                &changes.result_suffix(),
+            ),
+            Ok(Err(e)) => text_delivery_failure("type_text failed", &e),
+            Err(e) => ToolResult::error(format!("Task error: {e}")),
+        };
+        // Any refusal after a delivered focus action carries its receipt.
+        super::not_editable::account_focus_receipt(result, px_receipt)
+    }
+}
 
-                // `verified:false` means the driver could not confirm the text
-                // landed (Electron AX echo, unreadable AXValue on Catalyst, or a
-                // CGEvent rung the app may have dropped). Don't dress that as a
-                // confirmed insert — tell the agent to look, and point at the
-                // right next rung.
-                let (mark, note) = if verified {
-                    ("✅ Inserted", String::new())
-                } else if untrusted_web_readback {
-                    let web = web_area == Some(WebAreaClassification::WebContent);
-                    let next_step = if electron_web_content && used_pixel_focus {
-                        "The pixel-focus rung already ran, so do not repeat it; verify the \
+fn type_text_outcome_result(
+    outcome: TypeTextOutcome,
+    char_count: usize,
+    used_pixel_focus: bool,
+    electron: bool,
+    suffix: &str,
+) -> ToolResult {
+    let TypeTextOutcome {
+        detail,
+        path,
+        verified,
+        delivered_chars,
+        web_area,
+    } = outcome;
+    // SURFACE-AWARE VERIFICATION. On any web-content surface —
+    // Chromium/WebKit/Electron — AXValue is not independent renderer
+    // evidence. It can report a changed value after either an AX write
+    // or synthesized keystrokes while the renderer/DOM still observes
+    // no edit (the Slack-search AND Chrome-on-X false-confirms). Detect
+    // this at the ELEMENT level (an `AXWebArea` ancestor) so it covers
+    // every browser + Electron uniformly, yet a browser's OWN native
+    // chrome (address bar, toolbar) stays trusted. Probe ONLY when a
+    // path with AXValue-only verification would otherwise confirm, so
+    // native types and already-unverified deliveries pay nothing.
+    let web_area = (verified && path_has_untrusted_web_readback(path)).then_some(web_area);
+    let target_is_web_content = web_area
+        .is_some_and(|classification| target_readback_is_untrusted(classification, electron));
+    let verification = surface_verification(path, verified, target_is_web_content);
+    let verified = verification.verified;
+    let untrusted_web_readback = verification.untrusted_web_readback;
+    let electron_web_content = untrusted_web_readback && electron;
+
+    // `verified:false` means the driver could not confirm the text
+    // landed (Electron AX echo, unreadable AXValue on Catalyst, or a
+    // CGEvent rung the app may have dropped). Don't dress that as a
+    // confirmed insert — tell the agent to look, and point at the
+    // right next rung.
+    let (mark, note) = if verified {
+        ("✅ Inserted", String::new())
+    } else if untrusted_web_readback {
+        let web = web_area == Some(WebAreaClassification::WebContent);
+        let next_step = if electron_web_content && used_pixel_focus {
+            "The pixel-focus rung already ran, so do not repeat it; verify the \
                          result via the screenshot."
-                    } else if web {
-                        "For a browser tab use the `page` tool (it drives the DOM); for an \
+        } else if web {
+            "For a browser tab use the `page` tool (it drives the DOM); for an \
                          embedded web view, re-type with the px form (x,y)."
-                    } else {
-                        "Read the window to check the text before sending it again."
-                    };
-                    let surface = if web {
-                        "web-content surface (Chromium / WebKit / Electron): AXValue \
+        } else {
+            "Read the window to check the text before sending it again."
+        };
+        let surface = if web {
+            "web-content surface (Chromium / WebKit / Electron): AXValue \
                          read-back is not independent proof that the renderer/DOM observed \
                          the input."
-                    } else {
-                        "the window's focused element could not be read, so the AXValue \
+        } else {
+            "the window's focused element could not be read, so the AXValue \
                          read-back cannot be tied to the target window."
-                    };
-                    ("📨 Sent (unverified)", format!(" — {surface} {next_step}"))
-                } else if path == PATH_KEY_EVENTS_FG {
-                    (
-                        "📨 Sent (unverified)",
-                        " — driver could not confirm; verify via screenshot.".to_string(),
-                    )
-                } else {
-                    (
-                        "📨 Sent (unverified)",
-                        " — driver could not confirm the text landed; verify via screenshot, \
+        };
+        ("📨 Sent (unverified)", format!(" — {surface} {next_step}"))
+    } else if path == PATH_KEY_EVENTS_FG {
+        (
+            "📨 Sent (unverified)",
+            " — driver could not confirm; verify via screenshot.".to_string(),
+        )
+    } else {
+        (
+            "📨 Sent (unverified)",
+            " — driver could not confirm the text landed; verify via screenshot, \
                       and re-call with delivery_mode:\"foreground\" if it didn't."
-                            .to_string(),
-                    )
-                };
-                ToolResult::text(format!(
-                    "{mark} {char_count} char(s){detail}.{note}{}",
-                    changes.result_suffix()
-                ))
-                .with_structured({
-                    // `effect` mirrors `verified`'s read-back tri-state: a TRUSTED
-                    // positive read-back is "confirmed"; an unreadable/unchanged
-                    // AXValue, a dropped CGEvent rung, or an Electron AX echo we
-                    // refuse to trust is "unverifiable".
-                    let mut s = serde_json::json!({
-                        "path": path,
-                        "characters": char_count,
-                        "requested_chars": char_count,
-                        "verified": verified,
-                        "effect": if verified { "confirmed" } else { "unverifiable" },
-                    });
-                    if let Some(delivered_chars) = delivered_chars {
-                        s["delivered_chars"] = serde_json::json!(delivered_chars);
-                    }
-                    if untrusted_web_readback {
-                        // Web-content AXValue read-back. A real browser TAB → the
-                        // `page` tool (drives the DOM via CDP) is the reliable rung;
-                        // an embedded web view (Electron, no CDP) → the element px
-                        // action. It's a renderer/DOM-focus problem, never a
-                        // foreground one.
-                        let escalation =
-                            match web_readback_next_rung(electron_web_content, used_pixel_focus) {
-                                Some("px") => Some((
-                                    "px",
-                                    "Electron web view — AXValue read-back cannot prove \
+                .to_string(),
+        )
+    };
+    ToolResult::text(format!(
+        "{mark} {char_count} char(s){detail}.{note}{}",
+        suffix
+    ))
+    .with_structured({
+        // `effect` mirrors `verified`'s read-back tri-state: a TRUSTED
+        // positive read-back is "confirmed"; an unreadable/unchanged
+        // AXValue, a dropped CGEvent rung, or an Electron AX echo we
+        // refuse to trust is "unverifiable".
+        let mut s = serde_json::json!({
+            "path": path,
+            "characters": char_count,
+            "requested_chars": char_count,
+            "verified": verified,
+            "effect": if verified { "confirmed" } else { "unverifiable" },
+        });
+        if let Some(delivered_chars) = delivered_chars {
+            s["delivered_chars"] = serde_json::json!(delivered_chars);
+        }
+        if untrusted_web_readback {
+            // Web-content AXValue read-back. A real browser TAB → the
+            // `page` tool (drives the DOM via CDP) is the reliable rung;
+            // an embedded web view (Electron, no CDP) → the element px
+            // action. It's a renderer/DOM-focus problem, never a
+            // foreground one.
+            let escalation = match web_readback_next_rung(electron_web_content, used_pixel_focus) {
+                Some("px") => Some((
+                    "px",
+                    "Electron web view — AXValue read-back cannot prove \
                                  that the renderer observed the input. Confirm via the \
                                  screenshot; if it didn't land, re-type with the \
                                  element px action (x,y to pixel-focus the field, then \
                                  type).",
-                                )),
-                                Some("page") => Some((
-                                    "page",
-                                    "Browser web content — AXValue read-back cannot prove \
+                )),
+                Some("page") => Some((
+                    "page",
+                    "Browser web content — AXValue read-back cannot prove \
                                  that the DOM observed the input (and AX type_text on a \
                                  contenteditable is racy). Drive the tab's DOM with the \
                                  `page` tool: execute_javascript + el.value/innerText for a \
@@ -783,32 +799,25 @@ impl Tool for TypeTextTool {
                                  first (one CDP call, cheap), then type_keystrokes if that \
                                  also gets discarded (real per-character keyboard events, \
                                  slower but most durable). Or confirm via the screenshot.",
-                                )),
-                                _ => None,
-                            };
-                        if let Some((recommended, reason)) = escalation {
-                            s["escalation"] = serde_json::json!({
-                                "recommended": recommended,
-                                "reason": reason,
-                            });
-                        }
-                    } else if !verified && path != PATH_KEY_EVENTS_FG {
-                        s["escalation"] = serde_json::json!({
-                            "recommended": "foreground",
-                            "reason": "background insert could not be confirmed — \
-                                       re-call with delivery_mode:\"foreground\" if a \
-                                       screenshot shows the text didn't land."
-                        });
-                    }
-                    s
-                })
+                )),
+                _ => None,
+            };
+            if let Some((recommended, reason)) = escalation {
+                s["escalation"] = serde_json::json!({
+                    "recommended": recommended,
+                    "reason": reason,
+                });
             }
-            Ok(Err(e)) => text_delivery_failure("type_text failed", &e),
-            Err(e) => ToolResult::error(format!("Task error: {e}")),
-        };
-        // Any refusal after a delivered focus action carries its receipt.
-        super::not_editable::account_focus_receipt(result, px_receipt)
-    }
+        } else if !verified && path != PATH_KEY_EVENTS_FG {
+            s["escalation"] = serde_json::json!({
+                "recommended": "foreground",
+                "reason": "background insert could not be confirmed — \
+                           re-call with delivery_mode:\"foreground\" if a \
+                           screenshot shows the text didn't land."
+            });
+        }
+        s
+    })
 }
 
 /// The error result for a failed text delivery. A paste that failed after its
@@ -1141,6 +1150,56 @@ struct TypeTextOutcome {
     /// Surface classification of the retained receiver, captured for the
     /// outer result projection so a later focus move cannot change trust.
     web_area: WebAreaClassification,
+}
+
+fn withheld_ax_insert_outcome(
+    role: &str,
+    title: &str,
+    document: crate::document_edit::DocumentEdited,
+    web_area: WebAreaClassification,
+) -> TypeTextOutcome {
+    TypeTextOutcome {
+        detail: format!(
+            " via AX write into {role} \"{title}\"; the value could not be safely read{}",
+            document.note()
+        ),
+        path: PATH_AX,
+        verified: false,
+        delivered_chars: None,
+        web_area,
+    }
+}
+
+fn replacement_readable(
+    replace: bool,
+    before: &crate::ax::write_outcome::ValueRead,
+) -> anyhow::Result<()> {
+    if replace && *before == crate::ax::write_outcome::ValueRead::Withheld {
+        anyhow::bail!("replace:true requires a readable AXValue before mutation; no replacement payload was sent");
+    }
+    Ok(())
+}
+
+enum InsertRead {
+    Withheld,
+    Readable { error: i32, value: Option<String> },
+}
+
+fn send_ax_insert_and_read(
+    before_withheld: bool,
+    send: impl FnOnce() -> i32,
+    read: impl FnOnce() -> crate::ax::write_outcome::ValueRead,
+) -> InsertRead {
+    let error = send();
+    let value = read();
+    if before_withheld || value == crate::ax::write_outcome::ValueRead::Withheld {
+        InsertRead::Withheld
+    } else {
+        InsertRead::Readable {
+            error,
+            value: value.text(),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2288,9 +2347,7 @@ fn type_text_in_key_window(
         .or(element_ptr_and_idx);
     let before_read = read_axvalue_bound_classified(pid, element_ptr_and_idx, window_id);
     let before_withheld = before_read == crate::ax::write_outcome::ValueRead::Withheld;
-    if replace && before_withheld {
-        anyhow::bail!("replace:true requires a readable AXValue before mutation; no replacement payload was sent");
-    }
+    replacement_readable(replace, &before_read)?;
     let before = before_read.text();
     let actual_web_classification = classify_target_web_area(pid, element_ptr_and_idx, window_id);
     let actual_web_delivery = actual_web_classification != WebAreaClassification::NonWebContent;
@@ -2597,35 +2654,39 @@ fn type_text_in_key_window(
     } else if let Some((element, owns, idx_opt)) = ax_target {
         let role = unsafe { copy_string_attr(element, "AXRole") }.unwrap_or_default();
         let title = unsafe { copy_string_attr(element, "AXTitle") }.unwrap_or_default();
-        let err = unsafe { set_string_attr(element, "AXSelectedText", text) };
+        let insertion = send_ax_insert_and_read(
+            before_withheld,
+            || unsafe { set_string_attr(element, "AXSelectedText", text) },
+            || {
+                crate::ax::write_outcome::read_value_if_allowed(
+                    &mut crate::ax::label_reader::NativeLabelReader,
+                    element,
+                )
+            },
+        );
         // Classify the atomic write before considering synthesis. Complete AX
         // delivery returns immediately. Partial delivery is surfaced as such
         // instead of appending the full payload again. When synthesis would
         // exceed its transport-safe budget, rejected/unchanged AX writes fail
         // safely and unreadable AX state is reported as indeterminate.
-        let after_read = crate::ax::write_outcome::read_value_if_allowed(
-            &mut crate::ax::label_reader::NativeLabelReader,
-            element,
-        );
-        if before_withheld || after_read == crate::ax::write_outcome::ValueRead::Withheld {
-            let document = unsafe { crate::document_edit::document_status_without_value(element) };
-            let outcome_web_area =
-                classify_target_web_area(pid, Some((element as usize, idx_opt)), window_id);
-            if owns {
-                unsafe { CFRelease(element as _) };
+        let (err, after) = match insertion {
+            InsertRead::Withheld => {
+                let document =
+                    unsafe { crate::document_edit::document_status_without_value(element) };
+                let outcome_web_area =
+                    classify_target_web_area(pid, Some((element as usize, idx_opt)), window_id);
+                if owns {
+                    unsafe { CFRelease(element as _) };
+                }
+                return Ok(TypeTextDelivery::Typed(withheld_ax_insert_outcome(
+                    &role,
+                    &title,
+                    document,
+                    outcome_web_area,
+                )));
             }
-            return Ok(TypeTextDelivery::Typed(TypeTextOutcome {
-                detail: format!(
-                    " via AX write into {role} \"{title}\"; the value could not be safely read{}",
-                    document.note()
-                ),
-                path: PATH_AX,
-                verified: false,
-                delivered_chars: None,
-                web_area: outcome_web_area,
-            }));
-        }
-        let after = after_read.text();
+            InsertRead::Readable { error, value } => (error, value),
+        };
         let ax_progress = if err == kAXErrorSuccess {
             Some(typed_progress(before.as_deref(), after.as_deref(), text))
         } else {
@@ -3462,8 +3523,9 @@ mod tests {
 
 #[cfg(test)]
 mod secure_read_tests {
+    use super::*;
     use crate::ax::label_reader::fake::FakeReader;
-    use crate::ax::write_outcome::read_text_value_with;
+    use crate::ax::write_outcome::{read_text_value_with, ValueRead};
 
     #[test]
     fn type_text_replace_requests_no_value_before_classification() {
@@ -3472,6 +3534,50 @@ mod secure_read_tests {
         reader.set(0, "AXValue", "secret");
         let _before = read_text_value_with(&mut reader, 0);
         assert!(!reader.trace.iter().any(|(_, name)| name == "AXValue"));
+    }
+
+    #[test]
+    fn type_text_preflight_withheld_reports_nothing_sent() {
+        let result = replacement_readable(true, &ValueRead::Withheld);
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("no replacement payload was sent"));
+        assert!(replacement_readable(false, &ValueRead::Withheld).is_ok());
+    }
+
+    #[test]
+    fn type_text_withheld_in_a_document_keeps_the_save_warning() {
+        let outcome = withheld_ax_insert_outcome(
+            "AXTextArea",
+            "",
+            crate::document_edit::DocumentEdited::NotMarked,
+            WebAreaClassification::NonWebContent,
+        );
+        assert!(outcome.detail.contains("may keep the old content"));
+        assert!(!outcome.verified);
+        assert_eq!(outcome.delivered_chars, None);
+        assert_eq!(outcome.path, PATH_AX);
+        let result = type_text_outcome_result(outcome, 3, false, false, "");
+        assert!(result.content.iter().any(|content| matches!(content, cua_driver_core::protocol::Content::Text { text, .. } if text.contains("may keep the old content"))));
+        let structured = result.structured_content.unwrap();
+        assert_eq!(structured["effect"], "unverifiable");
+        assert_eq!(structured["verified"], false);
+    }
+
+    #[test]
+    fn withheld_verification_sends_no_duplicate_insert_or_document_keys() {
+        let sent = std::cell::RefCell::new(Vec::new());
+        let result = send_ax_insert_and_read(
+            false,
+            || {
+                sent.borrow_mut().push("insert");
+                0
+            },
+            || ValueRead::Withheld,
+        );
+        assert!(matches!(result, InsertRead::Withheld));
+        assert_eq!(*sent.borrow(), ["insert"]);
     }
 }
 
