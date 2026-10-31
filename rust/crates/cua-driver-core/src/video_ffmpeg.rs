@@ -51,6 +51,9 @@ impl FfmpegVideoBackend {
             ),
         };
 
+        #[cfg(unix)]
+        precreate_output(&output_path)?;
+        #[cfg(not(unix))]
         if let Some(parent) = output_path.parent() {
             std::fs::create_dir_all(parent).map_err(|e| {
                 anyhow::anyhow!(
@@ -132,6 +135,38 @@ impl FfmpegVideoBackend {
             started_at: Instant::now(),
             stderr_thread,
         })
+    }
+}
+
+#[cfg(unix)]
+fn precreate_output(path: &Path) -> anyhow::Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("missing video parent"))?;
+    let name = path
+        .file_name()
+        .ok_or_else(|| anyhow::anyhow!("missing video filename"))?;
+    crate::private_artifact::PrivateDir::open(parent)?.create(name, &[])?;
+    Ok(())
+}
+
+#[cfg(all(test, unix))]
+mod private_output_tests {
+    use std::os::unix::fs::{symlink, MetadataExt};
+
+    #[test]
+    fn ffmpeg_output_is_precreated_owner_only_and_rejects_links() {
+        let root = tempfile::tempdir().unwrap();
+        let root = root.path().canonicalize().unwrap();
+        let path = root.join("recording.mp4");
+        super::precreate_output(&path).unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().mode() & 0o777, 0o600);
+        std::fs::remove_file(&path).unwrap();
+        let target = root.join("target");
+        std::fs::write(&target, b"untouched").unwrap();
+        symlink(&target, &path).unwrap();
+        assert!(super::precreate_output(&path).is_err());
+        assert_eq!(std::fs::read(&target).unwrap(), b"untouched");
     }
 }
 
