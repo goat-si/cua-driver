@@ -1,4 +1,3 @@
-#[cfg(test)]
 use super::batch_attrs::BatchSlots;
 use super::batch_attrs::{batch_failure_action, BatchFailureAction, BatchRead};
 use super::bindings::*;
@@ -401,12 +400,7 @@ impl ContentReader for NativeReader<'_> {
     fn batch(&mut self) -> Result<[AttrStatus; 6], super::batch_attrs::BatchFailure> {
         match unsafe { copy_attrs_batch(self.element, &CONTENT_ATTRIBUTES) } {
             BatchRead::Fallback(failure) => Err(failure),
-            BatchRead::Slots(slots) => Ok(std::array::from_fn(|index| match slots.raw(index) {
-                None => AttrStatus::Absent,
-                Some(raw) => unsafe { string_from_cf(raw) }
-                    .map(AttrStatus::Known)
-                    .unwrap_or(AttrStatus::Failed),
-            })),
+            BatchRead::Slots(slots) => Ok(std::array::from_fn(|index| string_slot(&slots, index))),
         }
     }
 
@@ -420,6 +414,15 @@ impl ContentReader for NativeReader<'_> {
 
     fn expired(&self) -> bool {
         self.budget.expired()
+    }
+}
+
+fn string_slot(slots: &BatchSlots, index: usize) -> AttrStatus {
+    match slots.raw(index) {
+        None => AttrStatus::Absent,
+        Some(raw) => unsafe { string_from_cf(raw) }
+            .map(AttrStatus::Known)
+            .unwrap_or(AttrStatus::Failed),
     }
 }
 
@@ -608,6 +611,30 @@ mod tests {
     }
 
     #[test]
+    fn a_wrong_type_in_a_batch_is_failed_evidence() {
+        let array = CFArray::from_CFTypes(&[CFNumber::from(42).as_CFType()]);
+        let raw = array.as_CFTypeRef();
+        let batch = unsafe {
+            CFRetain(raw);
+            super::super::batch_attrs::finish_batch(kAXErrorSuccess, raw, 1)
+        };
+        let BatchRead::Slots(slots) = batch else {
+            panic!("valid batch envelope")
+        };
+        assert_eq!(string_slot(&slots, 0), AttrStatus::Failed);
+        let mut reader = FakeReader::new();
+        reader.attrs[2] = string_slot(&slots, 0);
+        let result = read_with(
+            AttrStatus::Known("AXTextField".into()),
+            &mut reader,
+            &mut false,
+        )
+        .unwrap();
+        assert!(result.value_unknown);
+        assert!(!reader.trace.iter().any(|name| name == "AXValue"));
+    }
+
+    #[test]
     fn absent_hints_still_allow_ordinary_values() {
         let mut reader = FakeReader::new();
         let result = read_with(
@@ -735,9 +762,19 @@ mod tests {
 
     #[test]
     fn happy_path_requests_value_after_one_classification_batch_for_each_role() {
-        for role in ["AXButton", "AXButton", "AXTextField", "AXStaticText"] {
+        for (role, subrole) in [
+            ("AXButton", None),
+            ("AXButton", Some("AXCloseButton")),
+            ("AXTextField", None),
+            ("AXStaticText", None),
+        ] {
             let mut reader = FakeReader::new();
-            read_with(AttrStatus::Known(role.into()), &mut reader, &mut false).unwrap();
+            if let Some(subrole) = subrole {
+                reader.attrs[5] = AttrStatus::Known(subrole.into());
+            }
+            let result =
+                read_with(AttrStatus::Known(role.into()), &mut reader, &mut false).unwrap();
+            assert_eq!(result.subrole.as_deref(), subrole);
             assert_eq!(
                 reader.trace,
                 [
