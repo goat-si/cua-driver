@@ -950,20 +950,26 @@ impl<'a> Locator<'a> {
             else {
                 return Ok(Closure::Incomplete);
             };
-            let entries = listed
-                .get("windows")
-                .and_then(Value::as_array)
-                .cloned()
-                .unwrap_or_default();
+            let Some(entries) = listed.get("windows").and_then(Value::as_array) else {
+                return Ok(Closure::Incomplete);
+            };
             hidden |= match spec.window_id {
-                Some(window_id) => ids.contains(&window_id),
+                Some(window_id) => {
+                    ids.contains(&window_id)
+                        && !entries.iter().any(|entry| {
+                            entry.get("window_id").and_then(Value::as_u64) == Some(window_id)
+                        })
+                }
                 None => ids.iter().any(|id| {
                     !entries
                         .iter()
                         .any(|entry| entry.get("window_id").and_then(Value::as_u64) == Some(*id))
                 }),
             };
-            windows.extend(entries);
+            windows.extend(entries.iter().cloned());
+        }
+        if hidden {
+            return Ok(Closure::HiddenWindow);
         }
         let pids = match (&spec.app, resolved_app_pids) {
             (_, Some(pids)) => pids,
@@ -979,7 +985,6 @@ impl<'a> Locator<'a> {
         };
         match filter_windows(&windows, spec, &pids) {
             Ok(windows) => Ok(Closure::Present(windows)),
-            Err(_) if hidden => Ok(Closure::HiddenWindow),
             Err(_) => Ok(Closure::Closed),
         }
     }
@@ -992,12 +997,8 @@ impl<'a> Locator<'a> {
         spec: &WindowSpec,
         started: Instant,
     ) -> Result<Checked, Miss> {
-        let windows = match self.search_windows(spec).await {
-            Ok(windows) => windows,
-            Err(miss)
-                if check.gone && matches!(miss.code, "window_not_found" | "app_not_found") =>
-            {
-                match self.closure_listing(spec).await? {
+        let windows = if check.gone && spec.exact().is_none() {
+            match self.closure_listing(spec).await? {
                     Closure::Present(windows) => windows,
                     Closure::Closed => return Ok(Checked {
                         window: None,
@@ -1013,8 +1014,8 @@ impl<'a> Locator<'a> {
                         format!("{} is absent from the window list but remains in the authoritative window ids", spec.describe()),
                     )),
                 }
-            }
-            Err(miss) => return Err(miss),
+        } else {
+            self.search_windows(spec).await?
         };
         let mut best_miss: Option<(usize, Miss)> = None;
         for window in &windows {

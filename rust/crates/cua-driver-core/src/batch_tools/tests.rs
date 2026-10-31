@@ -21,7 +21,7 @@ struct Probe {
     calls: Arc<Mutex<Vec<Value>>>,
     pacings: Arc<Mutex<Vec<(String, crate::step_pacing::StepPacing)>>>,
     responses: Arc<Mutex<std::collections::HashMap<String, Value>>>,
-    sequences: Arc<Mutex<std::collections::HashMap<String, std::collections::VecDeque<Value>>>>,
+    conditional: Arc<Mutex<Vec<(String, Value, Value)>>>,
 }
 
 #[async_trait]
@@ -37,11 +37,19 @@ impl Tool for Probe {
             .unwrap()
             .push((self.def.name.clone(), crate::step_pacing::current()));
         let response = self
-            .sequences
+            .conditional
             .lock()
             .unwrap()
-            .get_mut(&self.def.name)
-            .and_then(|values| values.pop_front())
+            .iter()
+            .find(|(name, expected, _)| {
+                name == &self.def.name
+                    && expected.as_object().is_some_and(|fields| {
+                        fields
+                            .iter()
+                            .all(|(key, value)| args.get(key) == Some(value))
+                    })
+            })
+            .map(|(_, _, value)| value.clone())
             .or_else(|| self.responses.lock().unwrap().get(&self.def.name).cloned());
         if let Some(response) = response {
             return if let Some(error) = response.get("error").and_then(Value::as_str) {
@@ -70,7 +78,7 @@ struct Harness {
     calls: std::collections::HashMap<&'static str, Arc<Mutex<Vec<Value>>>>,
     pacings: Arc<Mutex<Vec<(String, crate::step_pacing::StepPacing)>>>,
     responses: Arc<Mutex<std::collections::HashMap<String, Value>>>,
-    sequences: Arc<Mutex<std::collections::HashMap<String, std::collections::VecDeque<Value>>>>,
+    conditional: Arc<Mutex<Vec<(String, Value, Value)>>>,
 }
 
 impl Harness {
@@ -79,7 +87,7 @@ impl Harness {
         let mut calls = std::collections::HashMap::new();
         let pacings: Arc<Mutex<Vec<(String, crate::step_pacing::StepPacing)>>> = Arc::default();
         let responses = Arc::new(Mutex::new(std::collections::HashMap::new()));
-        let sequences = Arc::new(Mutex::new(std::collections::HashMap::new()));
+        let conditional = Arc::new(Mutex::new(Vec::new()));
         for name in super::BATCHABLE_TOOLS.iter().copied().chain([
             "get_window_state",
             "zoom",
@@ -135,7 +143,7 @@ impl Harness {
                 calls: log,
                 pacings: pacings.clone(),
                 responses: responses.clone(),
-                sequences: sequences.clone(),
+                conditional: conditional.clone(),
             }));
         }
         registry.register_session_tools();
@@ -146,7 +154,7 @@ impl Harness {
             calls,
             pacings,
             responses,
-            sequences,
+            conditional,
         }
     }
 
@@ -157,11 +165,11 @@ impl Harness {
             .insert(tool.to_owned(), value);
     }
 
-    fn respond_sequence(&self, tool: &str, values: Vec<Value>) {
-        self.sequences
+    fn respond_when(&self, tool: &str, args: Value, value: Value) {
+        self.conditional
             .lock()
             .unwrap()
-            .insert(tool.to_owned(), values.into());
+            .push((tool.to_owned(), args, value));
     }
 
     fn hits(&self, tool: &str) -> usize {
@@ -227,6 +235,59 @@ fn save_state() -> Value {
     json!({"pid": 42, "window_id": 9, "snapshot_id": "s00000001", "elements": [{"element_index": 1, "element_token": "s00000001:1", "role": "AXButton", "label": "Save", "depth": 1, "frame": {"x": 0, "y": 0, "w": 10, "h": 10}}], "tree_markdown": "- AXButton \"Save\""})
 }
 
+fn test_window(id: u64, on_screen: bool) -> Value {
+    json!({"pid": 42, "window_id": id, "app_name": "Demo", "title": "Main", "bounds": {"x": 0, "y": 0, "width": 10, "height": 10}, "is_on_screen": on_screen, "z_index": 1})
+}
+
+fn empty_state() -> Value {
+    let mut state = save_state();
+    state["elements"] = json!([]);
+    state["tree_markdown"] = json!("");
+    state
+}
+
+#[tokio::test]
+async fn a_partial_global_listing_never_proves_gone_across_an_app() {
+    let harness = Harness::new();
+    harness.respond(
+        "list_apps",
+        json!({"apps": [{"pid": 42, "name": "Demo", "running": true, "active": false}]}),
+    );
+    harness.respond(
+        "list_windows",
+        json!({"windows": [test_window(7, true)], "enumeration_complete": false}),
+    );
+    harness.respond_when(
+        "list_windows",
+        json!({"pid": 42}),
+        json!({"windows": [test_window(7, true)], "enumeration_complete": false}),
+    );
+    harness.respond("get_window_state", empty_state());
+    let result = harness.run(json!({"steps": [{"expect": {"app": "Demo", "name": "Save", "gone": true, "timeout_ms": 0}}]})).await.structured_content.unwrap();
+    assert_eq!(result["steps"][0]["code"], "gone_unconfirmed", "{result}");
+}
+
+#[tokio::test]
+async fn a_hidden_authoritative_window_keeps_gone_unproven_even_with_known_candidates() {
+    let harness = Harness::new();
+    harness.respond("list_windows", json!({"windows": [test_window(7, true)], "enumeration_complete": true, "authoritative_window_ids": [7, 9]}));
+    harness.respond("get_window_state", empty_state());
+    let result = harness.run(json!({"steps": [{"expect": {"pid": 42, "name": "Save", "gone": true, "timeout_ms": 0}}]})).await.structured_content.unwrap();
+    assert_eq!(result["steps"][0]["code"], "gone_unconfirmed", "{result}");
+}
+
+#[tokio::test]
+async fn gone_reads_every_matching_window_not_only_the_first_four_or_on_screen() {
+    let harness = Harness::new();
+    let windows: Vec<Value> = (1..=5).map(|id| test_window(id, id != 5)).collect();
+    harness.respond("list_windows", json!({"windows": windows, "enumeration_complete": true, "authoritative_window_ids": [1, 2, 3, 4, 5]}));
+    harness.respond("get_window_state", empty_state());
+    harness.respond_when("get_window_state", json!({"window_id": 5}), save_state());
+    let result = harness.run(json!({"steps": [{"expect": {"pid": 42, "name": "Save", "gone": true, "timeout_ms": 0}}]})).await.structured_content.unwrap();
+    assert_eq!(result["steps"][0]["code"], "still_present", "{result}");
+    assert_eq!(harness.hits("get_window_state"), 5);
+}
+
 #[tokio::test]
 async fn a_window_only_in_the_complete_pid_listing_is_not_gone() {
     let harness = Harness::new();
@@ -234,10 +295,7 @@ async fn a_window_only_in_the_complete_pid_listing_is_not_gone() {
         "list_apps",
         json!({"apps": [{"pid": 42, "name": "Demo", "running": true, "active": false}]}),
     );
-    harness.respond_sequence(
-        "list_windows",
-        vec![json!({"windows": []}), panel_listing()],
-    );
+    harness.respond_when("list_windows", json!({"pid": 42}), panel_listing());
     harness.respond("get_window_state", save_state());
     let result = harness.run(json!({"steps": [{"expect": {"app": "Demo", "window": "Panel", "name": "Save", "gone": true, "timeout_ms": 0}}]})).await.structured_content.unwrap();
     assert_eq!(result["steps"][0]["code"], "still_present", "{result}");
@@ -246,16 +304,9 @@ async fn a_window_only_in_the_complete_pid_listing_is_not_gone() {
 }
 
 #[tokio::test]
-async fn a_window_absent_from_an_incomplete_first_listing_but_present_in_the_complete_one_is_read()
-{
+async fn a_window_in_the_complete_pid_listing_is_read() {
     let harness = Harness::new();
-    harness.respond_sequence(
-        "list_windows",
-        vec![
-            json!({"windows": [], "enumeration_complete": false}),
-            panel_listing(),
-        ],
-    );
+    harness.respond("list_windows", panel_listing());
     harness.respond("get_window_state", save_state());
     let result = harness.run(json!({"steps": [{"expect": {"pid": 42, "window": "Panel", "name": "Save", "gone": true, "timeout_ms": 0}}]})).await.structured_content.unwrap();
     assert_eq!(result["steps"][0]["code"], "still_present", "{result}");
@@ -289,7 +340,8 @@ async fn closure_listing_matches_all_resolved_app_pids() {
     let mut second = panel_listing();
     second["windows"][0]["pid"] = json!(43);
     second["windows"][0]["app_name"] = json!("Helper");
-    harness.respond_sequence("list_windows", vec![json!({"windows": []}), first, second]);
+    harness.respond_when("list_windows", json!({"pid": 42}), first);
+    harness.respond_when("list_windows", json!({"pid": 43}), second);
     harness.respond("get_window_state", save_state());
     let result = harness.run(json!({"steps": [{"expect": {"app": "Demo", "window": "Panel", "name": "Save", "gone": true, "timeout_ms": 0}}]})).await.structured_content.unwrap();
     assert_eq!(result["steps"][0]["code"], "still_present", "{result}");
@@ -479,7 +531,7 @@ async fn list_apps_error_never_proves_gone() {
         .as_str()
         .unwrap()
         .contains("app enumeration failed"));
-    assert_eq!(harness.hits("list_windows"), 1);
+    assert_eq!(harness.hits("list_windows"), 0);
     assert_eq!(harness.hits("list_apps"), 1);
     assert_eq!(harness.hits("get_window_state"), 0);
 }
