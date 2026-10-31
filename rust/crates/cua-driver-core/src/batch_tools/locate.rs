@@ -1007,6 +1007,37 @@ impl<'a> Locator<'a> {
         Err(miss)
     }
 
+    /// Whether a fresh, unfiltered window listing reports a complete
+    /// enumeration for every process `spec` names. An app that
+    /// `list_apps` does not report running has no windows at all.
+    async fn listing_is_complete(&self, spec: &WindowSpec) -> Result<bool, Miss> {
+        let pids = match (spec.pid, &spec.app) {
+            (Some(pid), _) => vec![Some(pid)],
+            (None, Some(app)) => {
+                let pids = self.app_pids(app).await?;
+                if pids.is_empty() {
+                    return Ok(true);
+                }
+                pids.into_iter().map(Some).collect()
+            }
+            (None, None) => vec![None],
+        };
+        for pid in pids {
+            let mut args = json!({"on_screen_only": false});
+            if let Some(pid) = pid {
+                args["pid"] = json!(pid);
+            }
+            let listed = self
+                .call("list_windows", args)
+                .await
+                .map_err(|error| Miss::new("lookup_failed", error))?;
+            if listed.get("enumeration_complete").and_then(Value::as_bool) != Some(true) {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
     /// One pass of a check over the windows it names. A presence check
     /// holds when any window satisfies it; `gone` holds when none shows it.
     async fn check_once(
@@ -1020,11 +1051,23 @@ impl<'a> Locator<'a> {
             Err(miss)
                 if check.gone && matches!(miss.code, "window_not_found" | "app_not_found") =>
             {
-                return Ok(Checked {
-                    window: None,
-                    observed: Some(format!("{} is closed", spec.describe())),
-                    waited: started.elapsed(),
-                })
+                // The listing drops windows it cannot enumerate, so a window
+                // missing from it is closed only when the listing says it
+                // saw every window of the processes the spec names.
+                if self.listing_is_complete(spec).await? {
+                    return Ok(Checked {
+                        window: None,
+                        observed: Some(format!("{} is closed", spec.describe())),
+                        waited: started.elapsed(),
+                    });
+                }
+                return Err(Miss::new(
+                    "gone_unconfirmed",
+                    format!(
+                        "no window for {} is listed, but the window listing is incomplete, so its absence is unproven",
+                        spec.describe()
+                    ),
+                ));
             }
             Err(miss) => return Err(miss),
         };
@@ -1465,10 +1508,18 @@ fn window_closed(listed: &Value, window_id: u64) -> bool {
     if listed.get("enumeration_complete").and_then(Value::as_bool) != Some(true) {
         return false;
     }
-    listed
+    let Some(ids) = listed
         .get("authoritative_window_ids")
         .and_then(Value::as_array)
-        .is_some_and(|ids| !ids.iter().any(|id| id.as_u64() == Some(window_id)))
+    else {
+        return false;
+    };
+    // An entry that is not a window id makes the set unreadable, not a
+    // proof that the window is missing from it.
+    let Some(ids) = ids.iter().map(Value::as_u64).collect::<Option<Vec<u64>>>() else {
+        return false;
+    };
+    !ids.contains(&window_id)
 }
 
 fn fields_hold(check: &Check, element: &Value) -> bool {
@@ -1878,6 +1929,30 @@ mod tests {
             "label": label,
             "frame": {"x": 0, "y": 0, "w": 10, "h": 10},
         })
+    }
+
+    #[test]
+    fn only_a_complete_readable_id_set_proves_a_window_closed() {
+        let closed = |listed: Value| window_closed(&listed, 7);
+        assert!(closed(
+            json!({"enumeration_complete": true, "authoritative_window_ids": [5]})
+        ));
+        assert!(!closed(
+            json!({"enumeration_complete": true, "authoritative_window_ids": [5, 7]})
+        ));
+        assert!(!closed(
+            json!({"enumeration_complete": true, "authoritative_window_ids": ["7"]})
+        ));
+        assert!(!closed(
+            json!({"enumeration_complete": true, "authoritative_window_ids": [5, "x"]})
+        ));
+        assert!(!closed(
+            json!({"enumeration_complete": true, "authoritative_window_ids": [-7]})
+        ));
+        assert!(!closed(
+            json!({"enumeration_complete": false, "authoritative_window_ids": [5]})
+        ));
+        assert!(!closed(json!({"enumeration_complete": true})));
     }
 
     #[test]

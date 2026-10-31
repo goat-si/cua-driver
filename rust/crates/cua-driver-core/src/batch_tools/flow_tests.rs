@@ -95,7 +95,8 @@ impl Tool for Fake {
                         "bounds": {"x": 500.0, "y": 0.0, "width": 200.0, "height": 100.0}
                     }));
                 }
-                ToolResult::text("windows").with_structured(json!({ "windows": windows }))
+                ToolResult::text("windows")
+                    .with_structured(json!({ "windows": windows, "enumeration_complete": true }))
             }
             "list_apps" => ToolResult::text("apps").with_structured(json!({
                 "apps": [{"pid": 42, "name": "Demo", "bundle_id": "com.example.demo", "running": true, "active": false}]

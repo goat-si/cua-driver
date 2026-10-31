@@ -275,6 +275,42 @@ async fn a_listing_without_closure_evidence_never_proves_gone() {
 }
 
 #[tokio::test]
+async fn a_window_missing_from_the_list_is_gone_only_when_the_listing_is_complete() {
+    for (listing, closed) in [
+        (json!({"windows": []}), false),
+        (json!({"windows": [], "enumeration_complete": false}), false),
+        (json!({"windows": [], "enumeration_complete": true}), true),
+    ] {
+        let harness = Harness::new();
+        harness.respond("list_windows", listing.clone());
+        let result = harness
+            .run(json!({"steps": [{"expect": {"pid": 42, "name": "Save", "gone": true, "timeout_ms": 0}}]}))
+            .await;
+        if closed {
+            assert_ne!(result.is_error, Some(true), "{listing} {}", text(&result));
+        } else {
+            let result = result.structured_content.unwrap();
+            assert_eq!(
+                result["steps"][0]["code"], "gone_unconfirmed",
+                "{listing} {result}"
+            );
+        }
+        assert_eq!(harness.hits("get_window_state"), 0, "{listing}");
+    }
+}
+
+#[tokio::test]
+async fn an_app_that_is_not_running_is_gone() {
+    let harness = Harness::new();
+    harness.respond("list_windows", json!({"windows": []}));
+    harness.respond("list_apps", json!({"apps": []}));
+    let result = harness
+        .run(json!({"steps": [{"expect": {"app": "Demo", "name": "Save", "gone": true, "timeout_ms": 0}}]}))
+        .await;
+    assert_ne!(result.is_error, Some(true), "{}", text(&result));
+}
+
+#[tokio::test]
 async fn a_listing_without_a_window_list_never_proves_gone() {
     let harness = Harness::new();
     harness.respond("get_window_state", json!({"error": "window closed"}));
