@@ -1851,15 +1851,23 @@ pub(super) fn chromium_select_open_refusal(
     element: AXUIElementRef,
 ) -> cua_driver_core::protocol::ToolResult {
     let title = unsafe { copy_string_attr(element, "AXTitle") }.unwrap_or_default();
-    let current = unsafe { crate::ax::write_outcome::read_text_value(element) }.unwrap_or_default();
+    let current_read =
+        read_value_if_allowed(&mut crate::ax::label_reader::NativeLabelReader, element);
+    let withheld = current_read == ValueRead::Withheld;
+    let current = current_read.text().unwrap_or_default();
+    let current_detail = if withheld {
+        String::new()
+    } else {
+        format!(" Its current value is \"{current}\".")
+    };
     let target = match element_index {
         Some(index) => format!("[{index}] AXPopUpButton \"{title}\""),
         None => format!("the AXPopUpButton \"{title}\" at that point"),
     };
     cua_driver_core::protocol::ToolResult::error(format!(
         "Not opened: {target} is a web dropdown (<select>). In the background, opening its \
-         menu brings the browser window above the user's window, so nothing was sent. Its \
-         current value is \"{current}\". Choose an option in one call with \
+         menu brings the browser window above the user's window, so nothing was sent.{current_detail} \
+         Choose an option in one call with \
          set_value(element_token, \"<option text>\"): it types the option's text into the \
          closed control and the menu never opens. Open the menu with \
          delivery_mode:\"foreground\" only if the user agreed to the browser coming forward."
@@ -1894,7 +1902,10 @@ fn wait_typeahead_confirmation(
     mut pause: impl FnMut(),
 ) -> TypeaheadConfirmation {
     loop {
-        let current = read().text().unwrap_or_default();
+        let current = match read() {
+            ValueRead::Withheld => return TypeaheadConfirmation::SentUnverified,
+            value => value.text().unwrap_or_default(),
+        };
         if current.trim().to_lowercase() == wanted.to_lowercase() {
             return TypeaheadConfirmation::Selected(current);
         }
@@ -1914,8 +1925,13 @@ fn wait_typeahead_confirmation(
 /// `<select>` takes the page's own type-ahead instead: typing an option's
 /// label selects it and fires `input` and `change`, and the menu never opens.
 ///
-/// Returns `None` when this route does not apply or did not land on `value`;
-/// the caller then falls back to opening the menu.
+/// Distinguishes a route that did not select from a sent, unverified one.
+enum TypeaheadResult {
+    NotAttempted,
+    Selected(String),
+    SentUnverified,
+}
+
 fn select_chromium_popup_by_typeahead(
     popup: AXUIElementRef,
     element_index: usize,
@@ -1923,20 +1939,20 @@ fn select_chromium_popup_by_typeahead(
     window_id: u32,
     value: &str,
     element_title: &str,
-) -> Option<String> {
+) -> TypeaheadResult {
     let wanted = value.trim();
     if wanted.is_empty()
         || crate::apps::frontmost_pid() == Some(pid)
         || popup_menu_is_open(popup)
         || !is_chromium_popup_owner(pid)
     {
-        return None;
+        return TypeaheadResult::NotAttempted;
     }
     let selected =
         || unsafe { crate::ax::write_outcome::read_text_value(popup) }.unwrap_or_default();
     let matches = |current: &str| current.trim().to_lowercase() == wanted.to_lowercase();
     if matches(&selected()) {
-        return Some(format!(
+        return TypeaheadResult::Selected(format!(
             "✅ '{wanted}' is already selected in AXPopUpButton [{element_index}] \
              \"{element_title}\"; nothing was changed."
         ));
@@ -1945,12 +1961,16 @@ fn select_chromium_popup_by_typeahead(
     unsafe { crate::ax::bindings::set_bool_attr_true(popup, "AXFocused") };
     std::thread::sleep(POPUP_POLL_INTERVAL);
     if unsafe { copy_bool_attr(popup, "AXFocused") } != Some(true) {
-        return None;
+        return TypeaheadResult::NotAttempted;
     }
     // Keys go to the window's focused element, so the window must be the
     // app's key window (in-app records only; the app is not activated).
-    let _scope = super::key_scope(pid, Some(window_id)).ok()?;
-    crate::input::keyboard::type_text(pid, wanted).ok()?;
+    let Ok(_scope) = super::key_scope(pid, Some(window_id)) else {
+        return TypeaheadResult::NotAttempted;
+    };
+    if crate::input::keyboard::type_text(pid, wanted).is_err() {
+        return TypeaheadResult::NotAttempted;
+    }
     let deadline = std::time::Instant::now() + TYPEAHEAD_SETTLE;
     let confirmation = wait_typeahead_confirmation(
         wanted,
@@ -1959,19 +1979,20 @@ fn select_chromium_popup_by_typeahead(
         || std::thread::sleep(POPUP_POLL_INTERVAL),
     );
     match confirmation {
-        TypeaheadConfirmation::Selected(current) => Some(format!(
+        TypeaheadConfirmation::Selected(current) => TypeaheadResult::Selected(format!(
             "✅ Selected '{current}' in AXPopUpButton [{element_index}] \
                  \"{element_title}\" by typing its label into the focused control \
                  (the menu was not opened, so the window order did not change)."
         )),
-        TypeaheadConfirmation::NotSelected | TypeaheadConfirmation::SentUnverified => {
+        TypeaheadConfirmation::NotSelected => {
             tracing::debug!(
                 pid,
                 wanted,
                 "type-ahead did not select the option; opening the menu"
             );
-            None
+            TypeaheadResult::NotAttempted
         }
+        TypeaheadConfirmation::SentUnverified => TypeaheadResult::SentUnverified,
     }
 }
 
@@ -1993,6 +2014,22 @@ mod popup_secure_tests {
         );
         assert_eq!(reads, 1);
         assert_eq!(confirmation, TypeaheadConfirmation::SentUnverified);
+        let result = popup_route(TypeaheadResult::SentUnverified, || {
+            panic!("menu, JavaScript or option press after type-ahead")
+        })
+        .unwrap();
+        assert!(result.contains("verify before repeating"));
+    }
+}
+
+fn popup_route(
+    result: TypeaheadResult,
+    fallback: impl FnOnce() -> anyhow::Result<String>,
+) -> anyhow::Result<String> {
+    match result {
+        TypeaheadResult::NotAttempted => fallback(),
+        TypeaheadResult::Selected(detail) => Ok(detail),
+        TypeaheadResult::SentUnverified => Ok("📨 Type-ahead was sent, but the selected value could not be safely read; verify before repeating.".to_owned()),
     }
 }
 
@@ -2004,16 +2041,26 @@ fn select_popup_option(
     value: &str,
     element_title: &str,
 ) -> anyhow::Result<String> {
-    if let Some(detail) = select_chromium_popup_by_typeahead(
+    let result = select_chromium_popup_by_typeahead(
         element,
         element_index,
         pid,
         window_id,
         value,
         element_title,
-    ) {
-        return Ok(detail);
-    }
+    );
+    popup_route(result, || {
+        select_popup_option_after_typeahead(element, element_index, pid, value, element_title)
+    })
+}
+
+fn select_popup_option_after_typeahead(
+    element: AXUIElementRef,
+    element_index: usize,
+    pid: i32,
+    value: &str,
+    element_title: &str,
+) -> anyhow::Result<String> {
     let mut options = popup_options(element);
     let mut opened_menu = false;
     let mut press_thread = None;
