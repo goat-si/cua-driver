@@ -31,6 +31,8 @@ use crate::focus_guard;
 use crate::window_change_detector::WindowChangeDetector;
 use core_foundation::base::CFRelease;
 
+mod minimized_restore;
+
 use super::ToolState;
 
 pub struct SetValueTool {
@@ -424,7 +426,7 @@ async fn minimized_set_value(
     window_id: u32,
     value: String,
 ) -> ToolResult {
-    use super::type_text::{AxMinimizeOps, MinimizedRestore, RestoreReport};
+    use minimized_restore::{AxMinimizeOps, MinimizedRestore, RestoreReport};
     let task = tokio::spawn(async move {
         let _lease = lease;
         let Some(ops) = latency::spawn_action_blocking(move || AxMinimizeOps::of(pid, window_id))
@@ -640,6 +642,18 @@ async fn minimized_set_value(
                 ))
             }
         };
+        if let Some(changed) = result
+            .as_ref()
+            .err()
+            .and_then(|error| error.downcast_ref::<RestoredRoleChanged>())
+        {
+            let refusal = super::not_editable::not_editable_result(
+                format!("{changed}; AXValue was not written."),
+                super::not_editable::FocusDispatch::Indeterminate,
+            );
+            let report = finish(restore).await;
+            return attach_restore_cleanup(refusal, report, &disclosure);
+        }
         let report = finish(restore).await;
         let suffix = [disclosure.clone(), report.describe()]
             .into_iter()
@@ -671,7 +685,7 @@ fn restore_task_failure(message: String) -> ToolResult {
 /// text (once) and as structured `restore_cleanup`.
 fn attach_restore_cleanup(
     mut result: ToolResult,
-    report: super::type_text::RestoreReport,
+    report: minimized_restore::RestoreReport,
     disclosure: &str,
 ) -> ToolResult {
     let note = [disclosure.to_owned(), report.describe()]
@@ -1007,8 +1021,9 @@ fn set_value_blocking(
 }
 
 /// `restored_window`: the window was restored from the Dock for this write.
-/// Its key scope then hands key back on this thread before returning (the
-/// caller re-minimizes next).
+/// The caller holds the key scope and the temporary restore; the restore
+/// waits for the scope's hand-back before minimizing the window again, and
+/// only a text field is written on this route.
 fn set_value_blocking_with(
     element_ptr: usize,
     element_index: usize,
@@ -1020,6 +1035,14 @@ fn set_value_blocking_with(
     let element = element_ptr as AXUIElementRef;
 
     let role = unsafe { copy_string_attr(element, "AXRole") }.unwrap_or_default();
+
+    // The restored-window route was chosen for a text field. Any other role
+    // now (the popup branch below can post typeahead and dismiss keys) is
+    // refused before anything is written: a key may not reach a window that
+    // is minimized again after it (goat-si/cua-driver#125).
+    if let Some(changed) = restored_role_refusal(restored_window, &role) {
+        return Err(changed.into());
+    }
 
     if role == "AXPopUpButton" {
         let element_title = unsafe { copy_string_attr(element, "AXTitle") }.unwrap_or_default();
@@ -1188,6 +1211,30 @@ fn set_value_blocking_with(
             anyhow::bail!("AXUIElementSetAttributeValue(AXValue) failed with error {err}")
         }
     }
+}
+
+/// The element of a restored-window write no longer reads as a text field.
+#[derive(Debug)]
+struct RestoredRoleChanged {
+    role: String,
+}
+
+impl std::fmt::Display for RestoredRoleChanged {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "the element in the restored window now reads as {:?}, not a text field",
+            self.role
+        )
+    }
+}
+
+impl std::error::Error for RestoredRoleChanged {}
+
+fn restored_role_refusal(restored_window: bool, role: &str) -> Option<RestoredRoleChanged> {
+    (restored_window && !text_value_role_requires_exact_focus(role)).then(|| RestoredRoleChanged {
+        role: role.to_owned(),
+    })
 }
 
 fn text_value_role_requires_exact_focus(role: &str) -> bool {
@@ -2289,8 +2336,8 @@ mod tests {
 
 #[cfg(test)]
 mod restore_cleanup_tests {
-    use super::super::type_text::RestoreReport;
     use super::attach_restore_cleanup;
+    use super::minimized_restore::RestoreReport;
     use cua_driver_core::protocol::ToolResult;
 
     #[test]
@@ -2340,5 +2387,31 @@ mod restore_cleanup_tests {
             "",
         );
         assert_eq!(once.content.len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod restored_role_tests {
+    use super::restored_role_refusal;
+
+    /// A restored-window write reaches only a text field: the popup branch
+    /// can post keys, which may not precede the re-minimize (#125).
+    #[test]
+    fn a_restored_window_write_is_refused_unless_the_role_is_a_text_field() {
+        for role in ["AXPopUpButton", "AXCheckBox", "AXSlider", ""] {
+            let refusal = restored_role_refusal(true, role).expect("refused");
+            assert!(refusal.to_string().contains("not a text field"), "{role}");
+        }
+        for role in [
+            "AXTextField",
+            "AXTextArea",
+            "AXSearchField",
+            "AXSecureTextField",
+            "AXComboBox",
+        ] {
+            assert!(restored_role_refusal(true, role).is_none(), "{role}");
+        }
+        // A visible window keeps every role's own route.
+        assert!(restored_role_refusal(false, "AXPopUpButton").is_none());
     }
 }
