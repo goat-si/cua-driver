@@ -24,7 +24,9 @@ use windows::core::{Interface, VARIANT};
 use windows::Win32::Foundation::HWND;
 use windows::Win32::UI::Accessibility::{AccessibleObjectFromWindow, IAccessible};
 
+use crate::secure_field::msaa_name_withheld;
 use crate::uia::{UiaNode, UiaTreeResult};
+use cua_driver_core::snapshot_compaction::redact_mirrored_secure_name;
 use cua_driver_core::walk_budget::WalkBudget;
 
 const OBJID_CLIENT: u32 = 0xFFFFFFFC;
@@ -138,6 +140,13 @@ unsafe fn walk(
         .ok()
         .map(|b| b.to_string())
         .filter(|s| !s.trim().is_empty());
+    let state = acc
+        .get_accState(&self_var)
+        .ok()
+        .and_then(|v| variant_to_i32(&v))
+        .map(|state| state as u32);
+    let name =
+        redact_mirrored_secure_name(msaa_name_withheld(role_int.unwrap_or(0), state), name, None);
     let default_action: Option<String> = acc
         .get_accDefaultAction(&self_var)
         .ok()
