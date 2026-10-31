@@ -299,7 +299,13 @@ pub struct SnapshotStore<S: SnapshotPayload> {
     /// Shared with the [`CaptureTicket`]s this store issues, so a ticket can
     /// retire itself when it is dropped.
     inner: Arc<Mutex<StoreState<S>>>,
+    /// Tickets dropped while `inner` was locked (a visitor of this store, or
+    /// another thread), retired by the next ticket operation.
+    retired: RetiredTickets,
 }
+
+/// (pid, window, ticket) of dropped tickets waiting for the store lock.
+pub(super) type RetiredTickets = Arc<Mutex<Vec<(i32, u64, u64)>>>;
 
 impl<S: SnapshotPayload> SnapshotStore<S> {
     pub fn new() -> Self {
@@ -310,6 +316,7 @@ impl<S: SnapshotPayload> SnapshotStore<S> {
                 tickets: HashMap::new(),
                 last_ticket: 0,
             })),
+            retired: RetiredTickets::default(),
         }
     }
 
@@ -451,7 +458,7 @@ impl<S: SnapshotPayload> SnapshotStore<S> {
         ),
     ) -> Option<(u32, Vec<u32>, Option<crate::window_basis::WindowBasis>)> {
         let (id, retired, stored) = {
-            let mut inner = self.inner.lock().unwrap();
+            let mut inner = self.lock_for_tickets();
             if session.is_some_and(crate::session::is_session_ended) {
                 // No publication can use this capture's ticket any more.
                 if let Some((ticket, _)) = &basis_ticket {
@@ -834,7 +841,7 @@ impl<S: SnapshotPayload> SnapshotStore<S> {
         }
         let ticket = ticket.ticket();
         let retired = {
-            let mut inner = self.inner.lock().unwrap();
+            let mut inner = self.lock_for_tickets();
             if !inner.ticket_current(pid, window_id, ticket) {
                 return None;
             }

@@ -1,4 +1,4 @@
-use super::{Snapshot, SnapshotPayload, SnapshotStore, StoreState, TicketState};
+use super::{RetiredTickets, Snapshot, SnapshotPayload, SnapshotStore, StoreState, TicketState};
 use crate::protocol::ToolResult;
 use crate::window_basis::{basis_refusal, format_basis_id, parse_basis_id, WindowBasis};
 use std::sync::{Arc, Mutex};
@@ -11,6 +11,7 @@ use std::sync::{Arc, Mutex};
 /// capture cannot keep its window's entry (goat-si/cua-driver#133).
 pub struct CaptureTicket<S> {
     state: Arc<Mutex<StoreState<S>>>,
+    retired: RetiredTickets,
     pid: i32,
     window_id: u64,
     ticket: u64,
@@ -26,10 +27,21 @@ impl<S> CaptureTicket<S> {
 
 impl<S> Drop for CaptureTicket<S> {
     fn drop(&mut self) {
-        self.state
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .retire_ticket(self.pid, self.window_id, self.ticket);
+        let (pid, window_id, ticket) = (self.pid, self.window_id, self.ticket);
+        match self.state.try_lock() {
+            Ok(mut inner) => inner.retire_ticket(pid, window_id, ticket),
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => {
+                poisoned.into_inner().retire_ticket(pid, window_id, ticket)
+            }
+            // The store is locked, possibly by this thread (a ticket dropped
+            // inside a `with_latest` visitor): never wait for it. The next
+            // ticket operation retires it.
+            Err(std::sync::TryLockError::WouldBlock) => self
+                .retired
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push((pid, window_id, ticket)),
+        }
     }
 }
 
@@ -100,6 +112,17 @@ impl<S> Snapshot<S> {
 }
 
 impl<S: SnapshotPayload> SnapshotStore<S> {
+    /// Lock the store for a ticket operation, first retiring the tickets that
+    /// were dropped while it was locked. Lock order: `inner`, then `retired`.
+    pub(super) fn lock_for_tickets(&self) -> std::sync::MutexGuard<'_, StoreState<S>> {
+        let mut inner = self.inner.lock().unwrap();
+        let retired = std::mem::take(&mut *self.retired.lock().unwrap_or_else(|e| e.into_inner()));
+        for (pid, window_id, ticket) in retired {
+            inner.retire_ticket(pid, window_id, ticket);
+        }
+        inner
+    }
+
     /// Whether `ticket` was issued by this store for this window.
     pub(super) fn owns(&self, ticket: &CaptureTicket<S>, pid: i32, window_id: u64) -> bool {
         Arc::ptr_eq(&self.inner, &ticket.state)
@@ -115,6 +138,7 @@ impl<S: SnapshotPayload> SnapshotStore<S> {
         let ticket = self.reserve_ticket(pid, window_id);
         CaptureTicket {
             state: self.inner.clone(),
+            retired: self.retired.clone(),
             pid,
             window_id,
             ticket,
@@ -126,6 +150,7 @@ impl<S: SnapshotPayload> SnapshotStore<S> {
     pub(super) fn forge_ticket(&self, pid: i32, window_id: u64, ticket: u64) -> CaptureTicket<S> {
         CaptureTicket {
             state: self.inner.clone(),
+            retired: self.retired.clone(),
             pid,
             window_id,
             ticket,
@@ -133,7 +158,7 @@ impl<S: SnapshotPayload> SnapshotStore<S> {
     }
 
     fn reserve_ticket(&self, pid: i32, window_id: u64) -> u64 {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.lock_for_tickets();
         let Some(ticket) = inner.last_ticket.checked_add(1) else {
             return 0;
         };
@@ -217,7 +242,7 @@ impl<S: SnapshotPayload> SnapshotStore<S> {
             return None;
         }
         let ticket = ticket.ticket();
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.lock_for_tickets();
         if session.is_some_and(crate::session::is_session_ended) {
             // No publication can use this capture's ticket any more.
             inner.retire_ticket(pid, window_id, ticket);
@@ -818,16 +843,28 @@ mod capture_ticket_tests {
     }
 
     /// A ticket from another store with the same number, or for another
-    /// window of the same process, is refused by every ticketed call and
-    /// changes nothing.
+    /// window of the same process whose number falls in this window's
+    /// in-flight range, is refused by every ticketed call and changes
+    /// nothing. Each call here would succeed without its ownership check.
     #[test]
     fn a_ticket_is_refused_by_another_store_and_another_window() {
         let store = SnapshotStore::new();
         let other_store = SnapshotStore::new();
+        let id = store.publish(1, 2, Payload);
+        let _older = store.begin_capture(1, 2);
+        let other_window = store.begin_capture(1, 3);
         let own = store.begin_capture(1, 2);
         let foreign = other_store.begin_capture(1, 2);
-        assert_eq!(own.ticket(), foreign.ticket());
-        let other_window = store.begin_capture(1, 3);
+        assert!(store
+            .inner
+            .lock()
+            .unwrap()
+            .ticket_current(1, 2, foreign.ticket()));
+        assert!(store
+            .inner
+            .lock()
+            .unwrap()
+            .ticket_current(1, 2, other_window.ticket()));
         for wrong in [&foreign, &other_window] {
             assert!(store
                 .publish_basis_for_session(1, 2, Payload, None, Some(1.0), Some(frame()), wrong)
@@ -848,13 +885,40 @@ mod capture_ticket_tests {
                 .is_none());
             assert_eq!(store.remove_for_capture(1, 2, wrong), None);
         }
+        assert_eq!(
+            store.window_for_snapshot(1, id),
+            Some(2),
+            "snapshot untouched"
+        );
         assert_eq!(entries(&store), 2);
         assert_eq!(entries(&other_store), 1);
         assert!(store
-            .publish_basis_for_session(1, 2, Payload, None, Some(1.0), Some(frame()), &own)
+            .refresh_basis_for_session(1, 2, None, 1.0, None, Some(frame()), &own)
             .is_some());
         assert!(other_store
             .publish_basis_for_session(1, 2, Payload, None, Some(1.0), Some(frame()), &foreign)
             .is_some());
+    }
+
+    /// A ticket dropped inside a visitor of its own store (which runs with
+    /// the store locked) does not deadlock; the next ticket operation
+    /// retires it.
+    #[test]
+    fn a_ticket_dropped_while_its_store_is_locked_is_retired_later() {
+        let store = std::sync::Arc::new(SnapshotStore::new());
+        store.publish(1, 2, Payload);
+        let ticket = store.begin_capture(1, 2);
+        let (done, finished) = std::sync::mpsc::channel();
+        let visiting = store.clone();
+        std::thread::spawn(move || {
+            visiting.with_latest(1, 2, move |_, _| drop(ticket));
+            done.send(()).unwrap();
+        });
+        finished
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("dropping a ticket inside a visitor deadlocked");
+        assert_eq!(entries(&store), 1, "retired by the next ticket operation");
+        drop(store.begin_capture(1, 9));
+        assert_eq!(entries(&store), 0);
     }
 }
