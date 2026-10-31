@@ -82,6 +82,68 @@ pub(super) enum Hit {
     Nothing,
 }
 
+/// Most ancestors walked to find the target's own cell.
+const CELL_ANCESTOR_HOPS: usize = 8;
+
+/// Classifies a hit-test answer for the target. `target_ancestors` walks up
+/// from the target's parent, giving each ancestor's role and whether it is the
+/// hit element. Besides the target and its descendants, the target's nearest
+/// AXCell counts: list apps such as KakaoTalk answer the hit test with the
+/// cell for every point of a row, and a click there lands on the target's row.
+pub(super) fn hit_outcome(
+    in_window: bool,
+    target_or_descendant: bool,
+    hit_role: Option<String>,
+    target_ancestors: impl IntoIterator<Item = (Option<String>, bool)>,
+) -> Hit {
+    if in_window && target_or_descendant {
+        return Hit::Target;
+    }
+    if in_window && hit_role.as_deref() == Some("AXCell") {
+        for (role, is_hit) in target_ancestors.into_iter().take(CELL_ANCESTOR_HOPS) {
+            match role.as_deref() {
+                Some("AXCell") if is_hit => return Hit::Target,
+                Some("AXCell" | "AXWindow" | "AXApplication") => break,
+                _ => {}
+            }
+        }
+    }
+    Hit::Elsewhere(hit_role.unwrap_or_else(|| "an unnamed element".to_owned()))
+}
+
+/// The target's ancestors from its parent up, each with its role and whether
+/// it is `hit`. Owns every parent it copies.
+struct AncestorWalk {
+    current: AXUIElementRef,
+    owns_current: bool,
+    hit: AXUIElementRef,
+}
+
+impl Iterator for AncestorWalk {
+    type Item = (Option<String>, bool);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        use core_foundation::base::{CFEqual, CFRelease, CFTypeRef};
+        let parent = unsafe { crate::ax::bindings::copy_element_attr(self.current, "AXParent") }?;
+        if self.owns_current {
+            unsafe { CFRelease(self.current as CFTypeRef) };
+        }
+        self.current = parent;
+        self.owns_current = true;
+        let role = unsafe { crate::ax::bindings::copy_string_attr(parent, "AXRole") };
+        let is_hit = unsafe { CFEqual(parent as CFTypeRef, self.hit as CFTypeRef) } != 0;
+        Some((role, is_hit))
+    }
+}
+
+impl Drop for AncestorWalk {
+    fn drop(&mut self) {
+        if self.owns_current {
+            unsafe { core_foundation::base::CFRelease(self.current as _) };
+        }
+    }
+}
+
 /// The element a multi-click addresses and every effect it can have. The
 /// live target talks to the app; tests substitute one per pid.
 #[async_trait]
@@ -929,15 +991,21 @@ impl ElementTarget for LiveTarget {
         }) else {
             return Hit::Nothing;
         };
-        let on_target =
-            super::type_text::element_in_requested_window(self.pid, self.window_id, hit as usize)
-                && unsafe { super::type_text::element_or_bounded_descendant(hit, self.element()) };
-        let outcome = if on_target {
-            Hit::Target
+        let in_window =
+            super::type_text::element_in_requested_window(self.pid, self.window_id, hit as usize);
+        let target_or_descendant = in_window
+            && unsafe { super::type_text::element_or_bounded_descendant(hit, self.element()) };
+        let hit_role = if target_or_descendant {
+            None
         } else {
-            let role = unsafe { crate::ax::bindings::copy_string_attr(hit, "AXRole") };
-            Hit::Elsewhere(role.unwrap_or_else(|| "an unnamed element".to_owned()))
+            unsafe { crate::ax::bindings::copy_string_attr(hit, "AXRole") }
         };
+        let ancestors = AncestorWalk {
+            current: self.element(),
+            owns_current: false,
+            hit,
+        };
+        let outcome = hit_outcome(in_window, target_or_descendant, hit_role, ancestors);
         unsafe { core_foundation::base::CFRelease(hit as _) };
         outcome
     }
