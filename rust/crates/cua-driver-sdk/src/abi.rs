@@ -34,6 +34,14 @@ pub const CUA_DRIVER_ABI_MAJOR: u16 = 1;
 pub const CUA_DRIVER_ABI_MINOR: u16 = 1;
 pub const CUA_DRIVER_ABI_PATCH: u16 = 0;
 
+fn finalized_core_result(
+    name: &str,
+    result: &cua_driver_core::protocol::ToolResult,
+) -> Result<Value, serde_json::Error> {
+    serde_json::to_value(result)
+        .map(|value| cua_driver_core::mcp_result::finalize_error_disposition(name, value))
+}
+
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 /// Version of the implementation-neutral Cua Driver ABI.
@@ -771,6 +779,9 @@ pub unsafe extern "C" fn cua_driver_invoke_v1(
                         "the Cua Driver SDK has been shut down",
                     )
                 })?;
+                let result = finalized_core_result(&name, &result).map_err(|error| {
+                    AbiFailure::new(CuaDriverStatus::Internal, error.to_string())
+                })?;
                 serde_json::to_string(&result)
                     .map_err(|error| AbiFailure::new(CuaDriverStatus::Internal, error.to_string()))
             },
@@ -934,6 +945,9 @@ pub unsafe extern "C" fn cua_driver_session_invoke_v1(
                         CuaDriverStatus::Shutdown,
                         "the owning Cua Driver runtime has been shut down",
                     )
+                })?;
+                let result = finalized_core_result(&name, &result).map_err(|error| {
+                    AbiFailure::new(CuaDriverStatus::Internal, error.to_string())
                 })?;
                 serde_json::to_string(&result)
                     .map_err(|error| AbiFailure::new(CuaDriverStatus::Internal, error.to_string()))
@@ -1454,7 +1468,7 @@ impl NativeAbiDriver {
             .invoke_from_trusted_adapter(name, arguments)
             .await
             .ok_or(DriverError::Shutdown)?;
-        serde_json::to_value(result).map_err(|error| DriverError::Protocol {
+        finalized_core_result(name, &result).map_err(|error| DriverError::Protocol {
             reason: format!("serialize {name} trusted-adapter result: {error}"),
         })
     }
@@ -1619,6 +1633,22 @@ fn map_runtime_create_error(error: RuntimeCreateError) -> DriverError {
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[test]
+    fn c_abi_disposition_finalizes_unknown_errors_and_preserves_success() {
+        let error = cua_driver_core::protocol::ToolResult::error("error");
+        let value = finalized_core_result("click", &error).unwrap();
+        assert_eq!(
+            value["structuredContent"]["disposition"],
+            serde_json::json!({"delivery":"unknown", "retry":"unknown"})
+        );
+        let success = cua_driver_core::protocol::ToolResult::text("ok")
+            .with_structured(serde_json::json!({"x":1}));
+        assert_eq!(
+            finalized_core_result("click", &success).unwrap(),
+            serde_json::to_value(success).unwrap()
+        );
+    }
 
     #[test]
     fn abi_layout_and_status_values_are_stable() {

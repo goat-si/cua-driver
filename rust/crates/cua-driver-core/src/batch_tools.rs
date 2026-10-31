@@ -8,6 +8,7 @@
 //! and a batch cannot reach any tool or argument that a single call could
 //! not. The batch itself is only a thin ordered loop plus up-front validation.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -176,7 +177,8 @@ impl Tool for RunStepsTool {
                 focus after a failure is read even without `observe`). A step refused because its app ignores \
                 background input says how to re-send it; `foreground_fallback:true` retries it once in the \
                 foreground. Steps may omit `session` or repeat the batch's. At most 64 steps and 60 s per \
-                batch.\n\
+                batch. retry: safe means a retry cannot duplicate input into an application; it is not permission \
+                to retry and says nothing about file or other side effects.\n\
                 \n\
                 Target by name (no earlier read needed): args may carry `role` (button, textfield, link, \
                 checkbox, menuitem, ...; AX/UIA/AT-SPI names also work), `name` (the label; exact match beats \
@@ -279,6 +281,7 @@ impl Tool for RunStepsTool {
                 return ToolResult::error(
                     "run_steps is not available: registry not initialised yet.",
                 )
+                .with_disposition(cua_driver_contract::ErrorDisposition::NOT_DELIVERED)
             }
         };
         let dispatch_context = match crate::tool::capture_dispatch_context() {
@@ -289,7 +292,8 @@ impl Tool for RunStepsTool {
                         "ok": false,
                         "code": "dispatch_context_unavailable",
                         "executed": 0,
-                    }));
+                    }))
+                    .with_disposition(cua_driver_contract::ErrorDisposition::NOT_DELIVERED);
             }
         };
         let plan = match Plan::parse(&registry, &args) {
@@ -316,7 +320,11 @@ impl Tool for RunStepsTool {
                             if let Some(scope) = &plan.scope {
                                 structured["app_scope"] = scope.to_json();
                             }
-                            return ToolResult::error(message).with_structured(structured);
+                            return ToolResult::error(message)
+                                .with_structured(structured)
+                                .with_disposition(
+                                    cua_driver_contract::ErrorDisposition::NOT_DELIVERED,
+                                );
                         }
                     }
                 }
@@ -416,6 +424,7 @@ impl PlanError {
             "failed_step": self.step,
             "detail": self.message,
         }))
+        .with_disposition(cua_driver_contract::ErrorDisposition::NOT_DELIVERED)
     }
 }
 
@@ -468,18 +477,25 @@ struct GateData {
     window: Option<Window>,
     read_pending: bool,
     scope_refusal: Option<&'static str>,
+    action_dispatched: Arc<AtomicBool>,
 }
 
 #[derive(Clone)]
 struct StepGate(Arc<Mutex<GateData>>);
 
 impl StepGate {
+    #[cfg(test)]
     fn new() -> Self {
+        Self::with_action_tracker(Arc::new(AtomicBool::new(false)))
+    }
+
+    fn with_action_tracker(action_dispatched: Arc<AtomicBool>) -> Self {
         Self(Arc::new(Mutex::new(GateData {
             state: GateState::Open,
             window: None,
             read_pending: false,
             scope_refusal: None,
+            action_dispatched,
         })))
     }
 
@@ -493,6 +509,7 @@ impl StepGate {
             return false;
         }
         data.state = GateState::Dispatching;
+        data.action_dispatched.store(true, Ordering::SeqCst);
         true
     }
 
@@ -881,6 +898,7 @@ impl Plan {
         let total = self.steps.len();
         let started = Instant::now();
         let active_gate = Arc::new(Mutex::new(None::<StepGate>));
+        let action_dispatched = Arc::new(AtomicBool::new(false));
         let read_admission = {
             let active_gate = active_gate.clone();
             Arc::new(move || {
@@ -1000,6 +1018,7 @@ impl Plan {
                         registry.clone(),
                         locator.clone(),
                         active_gate.clone(),
+                        action_dispatched.clone(),
                         dispatch_context.clone(),
                         self.scope.clone(),
                         pacing,
@@ -1317,6 +1336,13 @@ impl Plan {
             content,
             is_error: failed.then_some(true),
             structured_content: Some(structured),
+            disposition: failed.then(|| {
+                if action_dispatched.load(Ordering::SeqCst) {
+                    cua_driver_contract::ErrorDisposition::DELIVERED
+                } else {
+                    cua_driver_contract::ErrorDisposition::NOT_DELIVERED
+                }
+            }),
             ..Default::default()
         }
     }
@@ -1399,6 +1425,7 @@ async fn execute_step(
     registry: Arc<ToolRegistry>,
     locator: Arc<Locator<'static>>,
     active_gate: Arc<Mutex<Option<StepGate>>>,
+    action_dispatched: Arc<AtomicBool>,
     dispatch_context: Option<crate::tool::CapturedDispatchContext>,
     scope: Option<Arc<crate::batch_scope::BatchScope>>,
     pacing: crate::step_pacing::StepPacing,
@@ -1412,7 +1439,7 @@ async fn execute_step(
     timeout_code: &'static str,
 ) -> StepExecution {
     let label = step.label();
-    let gate = StepGate::new();
+    let gate = StepGate::with_action_tracker(action_dispatched);
     *active_gate
         .lock()
         .unwrap_or_else(|error| error.into_inner()) = Some(gate.clone());
@@ -2882,6 +2909,47 @@ mod timeout_tests {
             response: Arc::new(response),
         }));
         calls
+    }
+
+    #[tokio::test]
+    async fn aggregate_disposition_dominates_leaf_refusal_code() {
+        let mut registry = ToolRegistry::new();
+        register_probe(&mut registry, "click", || ToolResult::text("clicked"));
+        register_probe(&mut registry, "type_text", || {
+            ToolResult::error("denied")
+                .with_structured(json!({"code":"permission_denied", "effect":"refused"}))
+        });
+        let registry = Arc::new(registry);
+        let plan = Plan::parse(
+            &registry,
+            &json!({"steps":[
+                {"tool":"click", "args":{"pid":425020,"window_id":7}},
+                {"tool":"type_text", "args":{"pid":425020,"window_id":7}}
+            ]}),
+        )
+        .unwrap_or_else(|error| panic!("invalid plan: {}", error.message));
+        let result = plan.run(registry, None).await;
+        assert_eq!(result.is_error, Some(true));
+        assert_eq!(
+            result.structured_content.as_ref().unwrap()["code"],
+            "permission_denied"
+        );
+        assert_eq!(
+            result.disposition,
+            Some(cua_driver_contract::ErrorDisposition::DELIVERED)
+        );
+    }
+
+    #[tokio::test]
+    async fn rejected_batch_has_no_dispatched_action() {
+        let registry = ToolRegistry::new();
+        let error = Plan::parse(&registry, &json!({"steps":[]}))
+            .err()
+            .expect("empty batch rejected");
+        assert_eq!(
+            error.into_result().disposition,
+            Some(cua_driver_contract::ErrorDisposition::NOT_DELIVERED)
+        );
     }
 
     struct WindowReadTool {
