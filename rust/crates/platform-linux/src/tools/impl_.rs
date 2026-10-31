@@ -9601,14 +9601,11 @@ impl Tool for SetValueTool {
         // 1. Focus-free accessibility write on the exact snapshot object.
         let target = token.clone();
         let ax = spawn_blocking_bounded("set_value", foreground_budget(0), move || {
-            crate::atspi::set_value_token_reporting_retarget(pid, &target, &value_for_task)
+            crate::atspi::set_value_token(pid, &target, &value_for_task)
         })
         .await;
         let ax_error = match ax {
-            Ok(Ok(retargeted)) => {
-                // A write that re-resolved the index may have reached another
-                // element; its secrecy is unknown, so it counts as secret.
-                let secret = secret || retargeted;
+            Ok(Ok(())) => {
                 let target = token.clone();
                 let readback =
                     tokio::task::spawn_blocking(move || crate::atspi::read_value_token(&target))

@@ -560,7 +560,7 @@ async fn accessible_via_bus<'a>(
         .map_err(|e| anyhow!("bad a11y path: {e}"))?
         .build()
         .await
-        .map_err(|e| anyhow!("AccessibleProxy build failed: {e}"))
+        .context("AccessibleProxy build failed")
 }
 
 async fn accessible_for<'a>(
@@ -3797,6 +3797,31 @@ impl std::fmt::Display for CachedElementGone {
 }
 impl std::error::Error for CachedElementGone {}
 
+fn cached_access_error(error: anyhow::Error) -> anyhow::Error {
+    let gone = error.chain().any(|cause| {
+        let Some(error) = cause.downcast_ref::<zbus::Error>() else {
+            return false;
+        };
+        match error {
+            zbus::Error::MethodError(name, _, _) => {
+                crate::token_action_policy::proves_gone(Some(name.as_str()))
+            }
+            zbus::Error::FDO(error) => matches!(
+                error.as_ref(),
+                zbus::fdo::Error::UnknownObject(_)
+                    | zbus::fdo::Error::NameHasNoOwner(_)
+                    | zbus::fdo::Error::ServiceUnknown(_)
+            ),
+            _ => false,
+        }
+    });
+    if gone {
+        CachedElementGone(format!("cached element is gone: {error:#}")).into()
+    } else {
+        error
+    }
+}
+
 /// Open a cached accessible and prove it is still alive (one role read).
 async fn live_accessible<'a>(
     conn: &'a AccessibilityConnection,
@@ -3804,16 +3829,12 @@ async fn live_accessible<'a>(
 ) -> Result<(AccessibleProxy<'a>, String)> {
     let acc = match call(accessible_for(conn, &raw_ref(object_ref))).await {
         Some(Ok(acc)) => acc,
-        Some(Err(error)) => {
-            return Err(CachedElementGone(format!("cached element unreachable: {error}")).into())
-        }
+        Some(Err(error)) => return Err(cached_access_error(error)),
         None => return Err(anyhow!("cached element did not answer in time")),
     };
     let role = match call(acc.get_role_name()).await {
         Some(Ok(role)) => role,
-        Some(Err(error)) => {
-            return Err(CachedElementGone(format!("cached element is gone: {error}")).into())
-        }
+        Some(Err(error)) => return Err(cached_access_error(error.into())),
         None => return Err(anyhow!("cached element did not answer in time")),
     };
     Ok((acc, role))
@@ -3821,7 +3842,7 @@ async fn live_accessible<'a>(
 
 /// [`perform_action`] on a snapshot-cached element identity. Same contract:
 /// `Ok((action_name, suspected_noop))`. Errors when the object no longer
-/// exists so the caller can fall back to resolving the index afresh.
+/// exists so the caller can refuse a stale token.
 pub fn perform_action_ref(object_ref: &ObjectRef) -> Result<(String, bool, bool)> {
     bounded_for(
         REF_ACTION_BUDGET,
