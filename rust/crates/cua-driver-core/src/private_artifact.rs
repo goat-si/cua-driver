@@ -3,6 +3,7 @@
 
 #[cfg(unix)]
 mod platform {
+    use std::collections::VecDeque;
     use std::ffi::{CStr, CString, OsStr};
     use std::fs::File;
     use std::io::{self, Write};
@@ -83,6 +84,43 @@ mod platform {
         Ok(unsafe { File::from_raw_fd(result) })
     }
 
+    fn resolve_ancestors(path: &Path) -> io::Result<PathBuf> {
+        let mut pending: VecDeque<_> = path
+            .components()
+            .map(|c| c.as_os_str().to_owned())
+            .collect();
+        let mut resolved = PathBuf::from("/");
+        let mut links = 0;
+        while let Some(part) = pending.pop_front() {
+            if part == "/" || part == "." {
+                continue;
+            }
+            if part == ".." {
+                resolved.pop();
+                continue;
+            }
+            resolved.push(&part);
+            let metadata = std::fs::symlink_metadata(&resolved)?;
+            if metadata.file_type().is_symlink() {
+                links += 1;
+                if links > 40
+                    || (metadata.uid() != 0 && metadata.uid() != unsafe { libc::geteuid() })
+                {
+                    return Err(fail("unsafe recording symlink"));
+                }
+                let target = std::fs::read_link(&resolved)?;
+                resolved.pop();
+                if target.is_absolute() {
+                    resolved = PathBuf::from("/");
+                }
+                for component in target.components().rev() {
+                    pending.push_front(component.as_os_str().to_owned());
+                }
+            }
+        }
+        Ok(resolved)
+    }
+
     impl PrivateDir {
         pub(crate) fn open(path: &Path) -> io::Result<Self> {
             Self::open_inner(path, true)
@@ -94,35 +132,22 @@ mod platform {
             } else {
                 std::env::current_dir()?.join(path)
             };
-            let mut prefix = PathBuf::from("/");
-            let original_components = absolute
+            if absolute
                 .components()
-                .filter_map(|c| match c {
-                    Component::RootDir | Component::CurDir => None,
-                    Component::Normal(n) => Some(Ok(n)),
-                    _ => Some(Err(fail("unsafe path component"))),
-                })
-                .collect::<io::Result<Vec<_>>>()?;
-            for (index, component) in original_components.iter().enumerate() {
-                prefix.push(component);
-                match std::fs::symlink_metadata(&prefix) {
-                    Ok(metadata) if metadata.file_type().is_symlink() => {
-                        if index + 1 == original_components.len()
-                            || (metadata.uid() != 0 && metadata.uid() != unsafe { libc::geteuid() })
-                        {
-                            return Err(fail("unsafe recording symlink"));
-                        }
-                    }
-                    Ok(_) => {}
-                    Err(e)
-                        if e.kind() == io::ErrorKind::NotFound
-                            && index + 1 == original_components.len()
-                            && create => {}
-                    Err(e) => return Err(e),
+                .any(|c| matches!(c, Component::ParentDir))
+            {
+                return Err(fail("unsafe path component"));
+            }
+            match std::fs::symlink_metadata(&absolute) {
+                Ok(metadata) if metadata.file_type().is_symlink() => {
+                    return Err(fail("unsafe recording symlink"))
                 }
+                Ok(_) => {}
+                Err(e) if e.kind() == io::ErrorKind::NotFound && create => {}
+                Err(e) => return Err(e),
             }
             let absolute = match (absolute.parent(), absolute.file_name()) {
-                (Some(parent), Some(name)) => parent.canonicalize()?.join(name),
+                (Some(parent), Some(name)) => resolve_ancestors(parent)?.join(name),
                 _ => absolute,
             };
             let components = absolute
@@ -274,13 +299,165 @@ mod platform {
     }
 }
 
+#[cfg(windows)]
+mod windows_platform {
+    use std::ffi::OsStr;
+    use std::fs::{File, OpenOptions};
+    use std::io::{self, Write};
+    use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+    use std::path::{Component, Path, PathBuf};
+    use windows::core::PCWSTR;
+    use windows::Win32::Storage::FileSystem::{MoveFileExW, MOVEFILE_REPLACE_EXISTING};
+
+    const OPEN_REPARSE: u32 = 0x0020_0000;
+    const BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    const REPARSE_ATTRIBUTE: u32 = 0x400;
+
+    pub(crate) struct PrivateDir {
+        path: PathBuf,
+        _handle: File,
+    }
+
+    fn open_checked(path: &Path) -> io::Result<File> {
+        let file = OpenOptions::new()
+            .read(true)
+            .custom_flags(OPEN_REPARSE | BACKUP_SEMANTICS)
+            .open(path)?;
+        let meta = file.metadata()?;
+        if meta.file_attributes() & REPARSE_ATTRIBUTE != 0 || !meta.is_dir() {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "unsafe recording directory",
+            ));
+        }
+        Ok(file)
+    }
+
+    fn component(name: &OsStr) -> io::Result<()> {
+        let mut parts = Path::new(name).components();
+        if !matches!(parts.next(), Some(Component::Normal(_))) || parts.next().is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid artifact name",
+            ));
+        }
+        Ok(())
+    }
+
+    impl PrivateDir {
+        pub(crate) fn open(path: &Path) -> io::Result<Self> {
+            Self::open_inner(path, true)
+        }
+
+        fn open_inner(path: &Path, create: bool) -> io::Result<Self> {
+            let path = if path.is_absolute() {
+                path.to_path_buf()
+            } else {
+                std::env::current_dir()?.join(path)
+            };
+            let mut current = PathBuf::new();
+            let parts: Vec<_> = path.components().collect();
+            for (index, part) in parts.iter().enumerate() {
+                if matches!(part, Component::ParentDir) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "unsafe path component",
+                    ));
+                }
+                current.push(part.as_os_str());
+                if matches!(part, Component::Prefix(_)) {
+                    continue;
+                }
+                if create && index + 1 == parts.len() && !current.exists() {
+                    std::fs::create_dir(&current)?;
+                }
+                open_checked(&current)?;
+            }
+            let handle = open_checked(&path)?;
+            Ok(Self {
+                path,
+                _handle: handle,
+            })
+        }
+
+        pub(crate) fn subdir(&self, name: &OsStr) -> io::Result<Self> {
+            component(name)?;
+            let path = self.path.join(name);
+            match std::fs::create_dir(&path) {
+                Ok(()) => {}
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
+                Err(e) => return Err(e),
+            }
+            let handle = open_checked(&path)?;
+            Ok(Self {
+                path,
+                _handle: handle,
+            })
+        }
+
+        pub(crate) fn create(&self, name: &OsStr, bytes: &[u8]) -> io::Result<File> {
+            component(name)?;
+            let target = self.path.join(name);
+            match std::fs::symlink_metadata(&target) {
+                Ok(meta) if meta.file_attributes() & REPARSE_ATTRIBUTE == 0 && meta.is_file() => {}
+                Ok(_) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "unsafe recording artifact",
+                    ))
+                }
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e),
+            }
+            let mut random = [0u8; 16];
+            getrandom::fill(&mut random).map_err(io::Error::other)?;
+            let tmp = self
+                .path
+                .join(format!(".cua-{:032x}.tmp", u128::from_ne_bytes(random)));
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .custom_flags(OPEN_REPARSE)
+                .open(&tmp)?;
+            let result: io::Result<()> = (|| {
+                file.write_all(bytes)?;
+                let a: Vec<u16> = tmp.as_os_str().encode_wide().chain(Some(0)).collect();
+                let b: Vec<u16> = target.as_os_str().encode_wide().chain(Some(0)).collect();
+                unsafe {
+                    MoveFileExW(
+                        PCWSTR(a.as_ptr()),
+                        PCWSTR(b.as_ptr()),
+                        MOVEFILE_REPLACE_EXISTING,
+                    )
+                }
+                .map_err(io::Error::other)?;
+                Ok(())
+            })();
+            if result.is_err() {
+                let _ = std::fs::remove_file(&tmp);
+            }
+            result?;
+            Ok(file)
+        }
+
+        pub(crate) fn verify(&self) -> io::Result<()> {
+            Self::open_inner(&self.path, false).map(|_| ())
+        }
+    }
+}
+
+#[cfg(windows)]
+pub(crate) use windows_platform::PrivateDir;
+
 #[cfg(unix)]
 pub(crate) use platform::PrivateDir;
 
 #[cfg(all(test, unix))]
 mod tests {
     use super::PrivateDir;
-    use std::os::unix::fs::{symlink, PermissionsExt};
+    use std::ffi::OsStr;
+    use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
 
     #[test]
     fn owned_symlink_ancestor_is_allowed_but_destination_link_is_not() {
@@ -292,5 +469,55 @@ mod tests {
         symlink(&real, &link).unwrap();
         assert!(PrivateDir::open(&link).is_err());
         PrivateDir::open(&link.join("recording")).unwrap();
+        let indirect = root.path().join("indirect");
+        symlink("link", &indirect).unwrap();
+        PrivateDir::open(&indirect.join("second-recording")).unwrap();
+    }
+
+    #[test]
+    fn group_writable_ancestor_is_refused() {
+        let root = tempfile::tempdir().unwrap();
+        let ancestor = root.path().join("ancestor");
+        std::fs::create_dir(&ancestor).unwrap();
+        std::fs::set_permissions(&ancestor, std::fs::Permissions::from_mode(0o770)).unwrap();
+        assert!(PrivateDir::open(&ancestor.join("output")).is_err());
+        assert!(!ancestor.join("output").exists());
+    }
+
+    #[test]
+    fn held_dirs_refuse_links_and_write_privately_without_path_reopen() {
+        let root = tempfile::tempdir().unwrap();
+        let output = root.path().join("output");
+        let dir = PrivateDir::open(&output).unwrap();
+        let target = root.path().join("target");
+        std::fs::write(&target, b"unchanged").unwrap();
+        symlink(root.path(), output.join("turn-link")).unwrap();
+        assert!(dir.subdir(OsStr::new("turn-link")).is_err());
+        let turn = dir.subdir(OsStr::new("turn-00001")).unwrap();
+        assert_eq!(
+            std::fs::metadata(output.join("turn-00001")).unwrap().mode() & 0o777,
+            0o700
+        );
+        symlink(&target, output.join("turn-00001/before.png")).unwrap();
+        assert!(turn.create(OsStr::new("before.png"), b"secret").is_err());
+        assert_eq!(std::fs::read(&target).unwrap(), b"unchanged");
+        let moved = root.path().join("moved");
+        std::fs::rename(&output, &moved).unwrap();
+        turn.create(OsStr::new("action.json"), b"{} ").unwrap();
+        assert_eq!(
+            std::fs::metadata(moved.join("turn-00001/action.json"))
+                .unwrap()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        assert!(dir.verify().is_err());
+        assert!(!std::fs::read_dir(moved.join("turn-00001"))
+            .unwrap()
+            .any(|e| e
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".cua-")));
     }
 }

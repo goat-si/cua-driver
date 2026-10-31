@@ -123,7 +123,7 @@ pub mod pip_hook;
 pub mod pointer_shape;
 pub mod policy;
 pub mod post_action_wait;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 mod private_artifact;
 pub mod protocol;
 pub mod recording;
