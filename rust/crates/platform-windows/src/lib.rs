@@ -78,6 +78,9 @@ pub fn install_pointer_shape_backend() -> bool {
 #[cfg(any(target_os = "windows", test))]
 mod process_selection;
 
+#[cfg(any(target_os = "windows", test))]
+mod value_append;
+
 #[cfg(target_os = "windows")]
 pub mod win32;
 
