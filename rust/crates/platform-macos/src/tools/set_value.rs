@@ -1334,16 +1334,12 @@ fn finish_ladder(
         (Some(false), _) => " Read-back did not confirm the value; verify via screenshot.",
         (None, _) => " Value is not readable through AX; could not confirm.",
     };
-    let document = if !out.maybe_landed && out.changed == Some(true) && !restored_window {
-        unsafe { crate::document_edit::ensure_marked_after_ax_write(pid, element, true) }
-    } else if restored_window
-        && out.changed != Some(false)
-        && unsafe { window_has_document(element) }
-    {
-        crate::document_edit::DocumentEdited::NotMarked
-    } else {
-        crate::document_edit::DocumentEdited::NotADocument
-    };
+    let document = document_after_ladder(
+        &out,
+        restored_window,
+        || unsafe { crate::document_edit::ensure_marked_after_ax_write(pid, element, true) },
+        || unsafe { window_has_document(element) },
+    );
     let warning = if out.maybe_landed {
         " The value may have changed; read it before deciding what to do next."
     } else {
@@ -1360,6 +1356,21 @@ fn finish_ladder(
         document_edited: document.structured(),
         maybe_landed: out.maybe_landed,
     })
+}
+
+fn document_after_ladder(
+    out: &LadderOutcome,
+    restored_window: bool,
+    mark: impl FnOnce() -> crate::document_edit::DocumentEdited,
+    has_document: impl FnOnce() -> bool,
+) -> crate::document_edit::DocumentEdited {
+    if !out.maybe_landed && out.changed == Some(true) && !restored_window {
+        mark()
+    } else if restored_window && out.changed != Some(false) && has_document() {
+        crate::document_edit::DocumentEdited::NotMarked
+    } else {
+        crate::document_edit::DocumentEdited::NotADocument
+    }
 }
 
 fn text_value_role_requires_exact_focus(role: &str) -> bool {
@@ -2731,5 +2742,62 @@ mod ladder_tests {
         assert!(result
             .detail
             .contains("via AXIncrement/AXDecrement stepping."));
+    }
+    #[test]
+    fn after_uncertain_no_document_keys_are_sent() {
+        let mut f = Fake::new(text("old"))
+            .read(text("new"))
+            .result(kAXErrorCannotComplete);
+        let out = run(&mut f, "new", false, false);
+        let doc = document_after_ladder(
+            &out,
+            false,
+            || panic!("document keys after uncertain write"),
+            || panic!("unexpected document query"),
+        );
+        assert_eq!(doc, crate::document_edit::DocumentEdited::NotADocument);
+        assert!(out.maybe_landed);
+    }
+    #[test]
+    fn applied_path_still_marks_documents_and_preserves_result_fields() {
+        let mut f = Fake::new(text("old")).read(text("new"));
+        let out = run(&mut f, "new", false, false);
+        let doc = document_after_ladder(
+            &out,
+            false,
+            || crate::document_edit::DocumentEdited::Marked,
+            || panic!("unexpected document query"),
+        );
+        assert_eq!(doc.structured(), Some(true));
+        let value = SetValueOutcome {
+            detail: "set".into(),
+            verified: out.verified,
+            changed: out.changed,
+            not_applied: out.not_applied,
+            document_edited: doc.structured(),
+            maybe_landed: out.maybe_landed,
+        };
+        let result = set_value_tool_result(Ok(Ok(value)), false, String::new(), 0, 1);
+        let data = result.structured_content.unwrap();
+        assert_eq!(data["effect"], "confirmed");
+        assert_eq!(data["verified"], true);
+        assert_eq!(data["document_key_edit_sent"], true);
+        let refused = not_applied_result(1, false);
+        let data = refused.structured_content.unwrap();
+        assert_eq!(data["code"], "write_not_applied");
+        assert_eq!(data["effect"], "not_applied");
+        assert_eq!(data["verified"], false);
+    }
+    #[test]
+    fn uncertain_value_result_remains_unverifiable_and_warns() {
+        let mut f = Fake::new(num(0.)).result(kAXErrorCannotComplete);
+        let out = run(&mut f, "5", false, false);
+        let value = finish_ladder(out, std::ptr::null_mut(), 0, 1, "AXSlider", false).unwrap();
+        assert!(value.detail.contains("may have changed"));
+        let result = set_value_tool_result(Ok(Ok(value)), false, String::new(), 0, 1);
+        let data = result.structured_content.unwrap();
+        assert_eq!(data["effect"], "unverifiable");
+        assert_eq!(data["verified"], false);
+        assert!(data.get("document_key_edit_sent").is_none());
     }
 }

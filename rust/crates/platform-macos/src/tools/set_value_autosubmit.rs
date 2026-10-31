@@ -251,4 +251,35 @@ mod tests {
                 .contains("Return was not posted"));
         }
     }
+    #[tokio::test]
+    async fn after_uncertain_autosubmit_posts_no_return() {
+        let result = ToolResult::text("set").with_structured(json!({"effect":"confirmed"}));
+        let result = finish(true, 42, result, false, true, |_, _| async {
+            panic!("Return after uncertain write")
+        })
+        .await;
+        let data = result.structured_content.unwrap();
+        assert_eq!(data["effect"], "confirmed");
+        assert!(data["note"]
+            .as_str()
+            .unwrap()
+            .contains("Return was not posted"));
+    }
+
+    #[tokio::test]
+    async fn applied_path_still_marks_documents_and_autosubmits() {
+        let events = std::cell::RefCell::new(vec!["document"]);
+        let result = ToolResult::text("set")
+            .with_structured(json!({"effect":"confirmed", "document_key_edit_sent":true}));
+        let result = finish(true, 42, result, false, false, |_, _| async {
+            events.borrow_mut().push("return");
+            Ok(true)
+        })
+        .await;
+        assert_eq!(*events.borrow(), ["document", "return"]);
+        assert_eq!(
+            result.structured_content.unwrap()["document_key_edit_sent"],
+            true
+        );
+    }
 }
