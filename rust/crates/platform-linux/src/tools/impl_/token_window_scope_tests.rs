@@ -2,7 +2,7 @@ use super::{
     element_click_placement, prove_token_element, stale_observed_element, token_element_for,
 };
 use crate::atspi::native::{window_element_membership, ObjectRef};
-use crate::atspi::snapshot::{cached_element, forget_window, update_snapshot, CachedElement};
+use crate::atspi::snapshot::{build_snapshot, CachedElement};
 use crate::atspi::{AtspiIdentity, AtspiNode, Snapshots, TokenElement, WindowProof};
 use cua_driver_core::element_token::{token_for, ResolvedElement};
 use cua_driver_core::protocol::ToolResult;
@@ -112,15 +112,13 @@ async fn a_target_without_an_element_token_needs_no_membership_walk() {
 
 #[test]
 fn a_proven_token_dispatches_to_its_own_element_while_another_window_is_retained() {
-    // Both windows' snapshots are retained: in the runtime store and in the
-    // (pid, window) side index.
+    // Both windows' snapshots are retained in the runtime store.
     let snapshots = Snapshots::new();
     let tokens =
         [(WINDOW_A, "/window_a/text"), (WINDOW_B, "/window_b/text")].map(|(window, path)| {
-            let payload = update_snapshot(PID, window, &[text_field(path)], &[]);
+            let payload = build_snapshot(&[text_field(path)], &[]);
             (snapshots.publish(PID as i32, window, payload), window, path)
         });
-    let mut pid_only = Vec::new();
     for (snapshot, window, path) in tokens {
         let args = serde_json::json!({ "element_token": token_for(snapshot, INDEX) });
         let Ok(ResolvedElement::Element {
@@ -140,13 +138,12 @@ fn a_proven_token_dispatches_to_its_own_element_while_another_window_is_retained
         // Text, focus, value and scroll dispatch address this object.
         assert_eq!(token.object().expect("addressable").path, path);
         assert!(!token.may_reresolve, "a proven token never re-resolves");
-        pid_only.push(cached_element(PID, None, INDEX).and_then(|element| element.object_ref));
+        let cached = snapshots
+            .with_latest(PID as i32, window, |_, snapshot| snapshot.elements())
+            .and_then(|elements| elements.get(&INDEX).cloned())
+            .expect("window snapshot retains its element");
+        assert_eq!(cached.object_ref.expect("addressable").path, path);
     }
-    // The PID-only lookup the earlier dispatch used gives both tokens the same
-    // window's element, so it acted on the wrong window for one of them.
-    assert_eq!(pid_only[0], pid_only[1]);
-    forget_window(PID, WINDOW_A);
-    forget_window(PID, WINDOW_B);
 }
 
 #[test]

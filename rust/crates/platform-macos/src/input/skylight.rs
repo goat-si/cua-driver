@@ -662,7 +662,7 @@ pub fn await_key_restores() -> bool {
     await_key_restores_for_pid(None, std::time::Duration::from_secs(2))
 }
 
-fn await_key_restores_for_pid(pid: Option<pid_t>, timeout: std::time::Duration) -> bool {
+pub(crate) fn await_key_restores_for_pid(pid: Option<pid_t>, timeout: std::time::Duration) -> bool {
     let pending = KEY_RESTORES.0.lock().unwrap_or_else(|e| e.into_inner());
     let relevant = |pending: &Vec<pid_t>| match pid {
         Some(pid) => pending.contains(&pid),
@@ -3809,6 +3809,33 @@ mod wp2_scope_tests {
         // The next scope's entry waits for it, so two never interleave.
         assert!(await_key_restores());
         assert!(SLOW_BACK_DONE.load(Ordering::SeqCst));
+    }
+
+    /// The wait a temporary restore makes before minimizing the window again
+    /// (set_value's restore) covers a hand-back that a finished or dropped
+    /// scope of the same app started: it is registered before `finish` or
+    /// `drop` returns, so the wait cannot miss it (#125).
+    #[test]
+    fn the_apps_hand_back_wait_returns_only_after_a_started_hand_back_finished() {
+        let _serial = super::key_scope_tests_serial();
+        for finish in [true, false] {
+            SLOW_BACK_DONE.store(false, Ordering::SeqCst);
+            let scope = scope_with(slow_hand_back);
+            if finish {
+                assert_eq!(scope.finish(), HandBack::Deferred);
+            } else {
+                drop(scope);
+            }
+            assert!(
+                !await_key_restores_for_pid(Some(-77_001), std::time::Duration::ZERO),
+                "the hand-back is registered when the scope ends"
+            );
+            assert!(await_key_restores_for_pid(
+                Some(-77_001),
+                std::time::Duration::from_secs(2)
+            ));
+            assert!(SLOW_BACK_DONE.load(Ordering::SeqCst));
+        }
     }
 
     /// Dropping a scope returns just as fast.

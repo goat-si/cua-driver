@@ -285,12 +285,6 @@ pub fn walk_tree_bounded_within(
 /// `unverifiable` with an explicit note, never as a plain confirmed/dispatched
 /// success.
 pub fn perform_action(pid: u32, idx: usize) -> Result<(String, bool, bool)> {
-    if let Some(observed) = cache::cached_element(pid, None, idx) {
-        return TokenElement::new(idx, observed, WindowProof::NotRequired)
-            .act(native::perform_action_ref, |idx| {
-                native::perform_action(pid, idx)
-            });
-    }
     native::perform_action(pid, idx)
 }
 
@@ -336,12 +330,6 @@ pub fn element_showing_observed(element: &cache::CachedElement) -> Result<bool> 
 
 /// Give an indexed AT-SPI element keyboard focus without activating its window.
 pub fn focus_element(pid: u32, idx: usize) -> Result<bool> {
-    if let Some(observed) = cache::cached_element(pid, None, idx) {
-        return focus_token(
-            pid,
-            &TokenElement::new(idx, observed, WindowProof::NotRequired),
-        );
-    }
     native::focus_element(pid, idx)
 }
 
@@ -378,11 +366,9 @@ pub fn perform_action_at_point(pid: u32, win_x: i32, win_y: i32) -> Result<Optio
 pub use native::is_focus_taking_role;
 pub use native::AtPointHit;
 
-/// [`perform_action_at_point`] for a known window, in three rungs that never
-/// re-walk the tree first:
-/// 1. the frames cached by the last `get_window_state` snapshot of (pid, xid);
-/// 2. the toolkit's own `Component.GetAccessibleAtPoint` descent (O(depth));
-/// 3. the historical bounded full-walk hit-test (last resort, short budget).
+/// [`perform_action_at_point`] for a known window. Without a runtime snapshot,
+/// use the toolkit's own `Component.GetAccessibleAtPoint` descent followed by
+/// the historical bounded full-walk hit-test.
 ///
 /// `skip_focus_roles`: the caller has a real pointer route to fall back to, so
 /// an entry / spin button / table cell under the point (whose `doAction` does
@@ -394,6 +380,18 @@ pub fn perform_action_at_point_in(
     win_x: i32,
     win_y: i32,
     skip_focus_roles: bool,
+) -> Result<Option<AtPointHit>> {
+    perform_action_at_point_in_with_elements(pid, xid, win_x, win_y, skip_focus_roles, None)
+}
+
+/// With a runtime snapshot, first try its cached frames for this window.
+pub(crate) fn perform_action_at_point_in_with_elements(
+    pid: u32,
+    xid: u64,
+    win_x: i32,
+    win_y: i32,
+    skip_focus_roles: bool,
+    elements: Option<&std::collections::HashMap<usize, cache::CachedElement>>,
 ) -> Result<Option<AtPointHit>> {
     if xid != 0 {
         if let Some((ox, oy)) = native::x11_window_origin(xid) {
@@ -413,7 +411,9 @@ pub fn perform_action_at_point_in(
                     return Ok(None);
                 }
             }
-            if let Some((idx, element)) = cache::hit_test(pid, xid, win_x + ox, win_y + oy) {
+            if let Some((idx, element)) =
+                elements.and_then(|e| cache::hit_test(e, win_x + ox, win_y + oy))
+            {
                 if skip_focus_roles && is_focus_taking_role(&element.role) {
                     return Ok(None);
                 }
@@ -525,9 +525,6 @@ pub fn focused_control(pid: u32) -> Option<(String, String)> {
 }
 
 pub fn get_element_bounds(pid: u32, idx: usize) -> Result<(i32, i32, u32, u32)> {
-    if let Some(bounds) = cached_bounds(pid, None, idx) {
-        return Ok(bounds);
-    }
     native::get_element_bounds(pid, idx)
 }
 
@@ -536,32 +533,28 @@ pub fn get_element_bounds_for_window(
     xid: u64,
     idx: usize,
 ) -> Result<(i32, i32, u32, u32)> {
-    if let Some(bounds) = cached_bounds(pid, Some(xid), idx) {
-        return Ok(bounds);
-    }
-    native::get_element_bounds_for_window(pid, xid, idx)
+    get_element_bounds_for_window_with_elements(pid, xid, idx, None)
 }
 
-/// Bounds for element `idx` from the last snapshot of (pid, xid): the frame
-/// the snapshot recorded, or — when the snapshot ran out of bounds budget —
-/// one `GetExtents` on the cached object identity. `None` only when the
-/// snapshot never saw the element (or the object is gone), in which case the
-/// caller re-walks.
-fn cached_bounds(pid: u32, xid: Option<u64>, idx: usize) -> Option<(i32, i32, u32, u32)> {
-    let element = cache::cached_element(pid, xid, idx)?;
-    if let Some(bounds) = element.bounds {
-        return Some(bounds);
-    }
-    let object_ref = element.object_ref.as_ref()?;
-    match native::element_bounds_ref(object_ref, pid, xid.unwrap_or(0), element.in_web_content) {
-        Ok(bounds) => Some(bounds),
-        Err(error) => {
-            tracing::debug!(
-                "cached element {idx} (pid {pid}) bounds lookup failed, re-resolving: {error:#}"
-            );
-            None
+pub(crate) fn get_element_bounds_for_window_with_elements(
+    pid: u32,
+    xid: u64,
+    idx: usize,
+    elements: Option<&std::collections::HashMap<usize, cache::CachedElement>>,
+) -> Result<(i32, i32, u32, u32)> {
+    if let Some(element) = elements.and_then(|elements| elements.get(&idx)) {
+        if let Some(bounds) = element.bounds {
+            return Ok(bounds);
+        }
+        if let Some(object_ref) = &element.object_ref {
+            if let Ok(bounds) =
+                native::element_bounds_ref(object_ref, pid, xid, element.in_web_content)
+            {
+                return Ok(bounds);
+            }
         }
     }
+    native::get_element_bounds_for_window(pid, xid, idx)
 }
 
 pub use native::{is_window_membership_unproven, WindowElement, WindowProof};
@@ -1044,6 +1037,17 @@ mod token_dispatch_tests {
     }
 
     #[test]
+    fn recording_bounds_use_supplied_window_elements() {
+        let mut observed = token(WindowProof::Proven).observed;
+        observed.bounds = Some((10, 20, 30, 40));
+        let elements = std::collections::HashMap::from([(3, observed)]);
+        assert_eq!(
+            get_element_bounds_for_window_with_elements(42, 7, 3, Some(&elements)).unwrap(),
+            (10, 20, 30, 40)
+        );
+    }
+
+    #[test]
     fn a_proven_token_never_re_resolves_its_index() {
         let error = token(WindowProof::Proven)
             .act(gone, |_| {
@@ -1057,7 +1061,6 @@ mod token_dispatch_tests {
     fn a_walked_action_addresses_the_node_it_walked_not_another_window_at_its_index() {
         // Window A's snapshot is retained with an element at the same index
         // as the consent control a walk of window B found.
-        let pid = 515_252;
         let node = |path: &str| AtspiNode {
             element_index: Some(3),
             role: "push button".into(),
@@ -1085,19 +1088,16 @@ mod token_dispatch_tests {
                 path: path.into(),
             }),
         };
-        cache::update_snapshot(pid, 1, &[node("/window_a/button")], &[]);
+        let snapshots = Snapshots::new();
+        snapshots.publish(
+            515_252,
+            1,
+            cache::build_snapshot(&[node("/window_a/button")], &[]),
+        );
         let walked = node("/window_b/button");
         let (identity, object) = walked_object(&walked).expect("walked node is addressable");
         assert_eq!(identity.path, "/window_b/button");
         assert_eq!(object.path, "/window_b/button");
-        // The PID-only lookup the earlier dispatch used names window A's node.
-        let pid_only = cache::cached_element(pid, None, 3).and_then(|element| element.object_ref);
-        assert_eq!(
-            pid_only.map(|object| object.path).as_deref(),
-            Some("/window_a/button")
-        );
-        cache::forget_window(pid, 1);
-
         let mut unproven = node("/window_b/button");
         unproven.identity = None;
         assert!(walked_object(&unproven).is_err());

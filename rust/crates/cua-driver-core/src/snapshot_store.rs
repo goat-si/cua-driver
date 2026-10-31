@@ -706,6 +706,22 @@ impl<S: SnapshotPayload> SnapshotStore<S> {
             .map(|entry| entry.window_id)
     }
 
+    /// Visit the latest published snapshot for a window, if one exists.
+    ///
+    /// The visitor runs while the store is locked and must not call back into
+    /// this store. The id and payload belong to the same publication; retired
+    /// and superseded snapshots are never visited.
+    pub fn with_latest<R>(
+        &self,
+        pid: i32,
+        window_id: u64,
+        f: impl FnOnce(u32, &S) -> R,
+    ) -> Option<R> {
+        let inner = self.inner.lock().unwrap();
+        let snapshot = inner.get(&pid)?.iter().find(|s| s.window_id == window_id)?;
+        Some(f(snapshot.id, &snapshot.payload))
+    }
+
     /// Whether this runtime has already published any snapshot for the window.
     pub fn contains_window(&self, pid: i32, window_id: u64) -> bool {
         self.inner
@@ -900,6 +916,57 @@ mod tests {
     use crate::element_token::token_for;
     use crate::snapshot_test_support::Payload;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn with_latest_visits_only_current_window_and_payload() {
+        let cache = SnapshotStore::new();
+        let old = cache.publish(42, 7, Payload(vec![1]));
+        cache.publish(42, 8, Payload(vec![8]));
+        let current = cache.publish(42, 7, Payload(vec![2]));
+        assert_ne!(old, current);
+        assert_eq!(
+            cache.with_latest(42, 7, |id, p| (id, p.0[0])),
+            Some((current, 2))
+        );
+        assert_eq!(cache.with_latest(42, 8, |id, p| (id, p.0[0])).unwrap().1, 8);
+    }
+
+    #[test]
+    fn with_latest_never_visits_a_late_older_capture() {
+        let cache = SnapshotStore::new();
+        let old = cache.begin_capture(42, 7);
+        let new = cache.begin_capture(42, 7);
+        let (id, _, _) = cache
+            .publish_basis_for_session(42, 7, Payload(vec![2]), None, None, None, new)
+            .unwrap();
+        assert!(cache
+            .publish_basis_for_session(42, 7, Payload(vec![1]), None, None, None, old)
+            .is_none());
+        assert_eq!(
+            cache.with_latest(42, 7, |seen, p| (seen, p.0[0])),
+            Some((id, 2))
+        );
+        assert_eq!(cache.remove_for_capture(42, 7, old), None);
+        assert_eq!(cache.with_latest(42, 7, |seen, _| seen), Some(id));
+    }
+
+    #[test]
+    fn with_latest_does_not_visit_retired_or_missing_snapshots() {
+        let cache = SnapshotStore::new();
+        let mut calls = 0;
+        assert_eq!(cache.with_latest(42, 7, |_, _| calls += 1), None);
+        cache.publish(42, 7, Payload(vec![1]));
+        cache.remove(42, 7);
+        assert_eq!(cache.with_latest(42, 7, |_, _| calls += 1), None);
+        cache.publish(42, 7, Payload(vec![1]));
+        for window in 8..8 + LRU_CAP_PER_PID as u64 {
+            cache.publish(42, window, Payload(vec![2]));
+        }
+        assert_eq!(cache.with_latest(42, 7, |_, _| calls += 1), None);
+        cache.clear();
+        assert_eq!(cache.with_latest(42, 8, |_, _| calls += 1), None);
+        assert_eq!(calls, 0);
+    }
 
     #[test]
     fn pid_for_token_finds_the_owning_process() {
