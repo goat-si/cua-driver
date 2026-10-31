@@ -1,13 +1,11 @@
 //! AT-SPI element cache for Linux.
 //!
 //! [`AtspiSnapshot`] is the [`SnapshotPayload`] published into the runtime
-//!    snapshot store (`cua_driver_core::snapshot_store`). An `element_token`
-//!    resolves through it to a [`CachedElement`]: the
-//!    element's proven AT-SPI identity ([`AtspiIdentity`]) plus what a later
-//!    per-index action needs to act WITHOUT re-walking the application (its
-//!    D-Bus address ([`native::ObjectRef`]), role, and the screen frame the
-//!    snapshot reported). Re-walking large trees (LibreOffice, GIMP, Nautilus)
-//!    was the multi-second stall behind every element-index click.
+//! snapshot store (`cua_driver_core::snapshot_store`). An `element_token`
+//! resolves through it to a [`CachedElement`]: the element's proven AT-SPI
+//! identity ([`AtspiIdentity`]) plus its D-Bus address ([`native::ObjectRef`]),
+//! role, and screen frame. Re-walking large trees was the multi-second stall
+//! behind every element-index click.
 //!
 //! Membership follows the runtime cache rule: only nodes with an
 //! `element_index` AND a proven identity are addressable. An unproven
@@ -19,6 +17,13 @@ use super::{AtspiIdentity, AtspiNode};
 use cua_driver_core::snapshot_store::{SnapshotPayload, SnapshotStore};
 use std::collections::HashMap;
 use std::sync::Arc;
+
+/// Identifies a process and window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct CacheKey {
+    pub pid: u32,
+    pub xid: u64,
+}
 
 /// One indexed element as the last `get_window_state` snapshot saw it.
 #[derive(Debug, Clone)]

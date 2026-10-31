@@ -1037,6 +1037,17 @@ mod token_dispatch_tests {
     }
 
     #[test]
+    fn recording_bounds_use_supplied_window_elements() {
+        let mut observed = token(WindowProof::Proven).observed;
+        observed.bounds = Some((10, 20, 30, 40));
+        let elements = std::collections::HashMap::from([(3, observed)]);
+        assert_eq!(
+            get_element_bounds_for_window_with_elements(42, 7, 3, Some(&elements)).unwrap(),
+            (10, 20, 30, 40)
+        );
+    }
+
+    #[test]
     fn a_proven_token_never_re_resolves_its_index() {
         let error = token(WindowProof::Proven)
             .act(gone, |_| {
