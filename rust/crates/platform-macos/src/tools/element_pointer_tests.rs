@@ -64,6 +64,12 @@ fn a_cell_that_is_not_the_targets_nearest_cell_stays_elsewhere() {
         hit_outcome(true, false, Some("AXCell".into()), past_window),
         elsewhere()
     );
+    // An ancestor whose role cannot be read may be the nearest cell.
+    let unreadable = vec![(None, false), (Some("AXCell".to_owned()), true)];
+    assert_eq!(
+        hit_outcome(true, false, Some("AXCell".into()), unreadable),
+        elsewhere()
+    );
 }
 /// A refusal code and the fake change that should produce it.
 type Case = (&'static str, Box<dyn Fn(&mut Fake)>);

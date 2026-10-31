@@ -103,7 +103,8 @@ pub(super) fn hit_outcome(
         for (role, is_hit) in target_ancestors.into_iter().take(CELL_ANCESTOR_HOPS) {
             match role.as_deref() {
                 Some("AXCell") if is_hit => return Hit::Target,
-                Some("AXCell" | "AXWindow" | "AXApplication") => break,
+                // An unreadable role may hide the nearest cell, so stop there too.
+                None | Some("AXCell" | "AXWindow" | "AXApplication") => break,
                 _ => {}
             }
         }
