@@ -997,6 +997,43 @@ async fn no_dispatch_context_skips_preflight() {
     assert!(result.get("preflight").is_none(), "{result}");
 }
 
+#[tokio::test]
+async fn preflight_uses_the_parsed_action_after_rewrites() {
+    for (step, expected) in [
+        (
+            json!({"press": {"pid": 42, "element_token": "s00000001:1"}}),
+            "click",
+        ),
+        (json!({"hotkey": {"pid": 42, "keys": ["Tab"]}}), "press_key"),
+        (
+            json!({"press_key": {"pid": 42, "key": "asterisk"}}),
+            "type_text",
+        ),
+    ] {
+        let harness = Harness::new();
+        let manifest = "version: 1\nmode: bounded\nexpires_after: 1h\nidle_timeout: 30m\nallow:\n  tools: [run_steps]\n";
+        let result = harness
+            .registry
+            .invoke_with_context(
+                super::RUN_STEPS_TOOL,
+                json!({"steps": [step]}),
+                context(Some(manifest)),
+            )
+            .await
+            .structured_content
+            .unwrap();
+        assert_eq!(
+            result["preflight"],
+            json!({"step": 0, "tool": expected}),
+            "{result}"
+        );
+        assert!(harness
+            .calls
+            .values()
+            .all(|calls| calls.lock().unwrap().is_empty()));
+    }
+}
+
 #[test]
 fn suspended_scope_refuses() {
     let ctx = context(None);
