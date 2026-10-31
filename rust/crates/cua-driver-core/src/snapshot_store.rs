@@ -812,22 +812,24 @@ impl<S: SnapshotPayload> SnapshotStore<S> {
                 "element_token conflicts with window_id".into(),
             ));
         }
-        if element_index >= snapshot.payload.len() {
-            return Err(out_of_range_refusal(snapshot, element_index));
-        }
+        // Membership comes from the payload itself: some platforms key rows
+        // by sparse member indices, so len() is not an index bound. Retaining
+        // first keeps out-of-range ahead of the ownership refusal; a foreign
+        // caller's retained element is dropped (released) before refusing.
+        let element = snapshot
+            .payload
+            .retain(element_index)
+            .ok_or_else(|| out_of_range_refusal(snapshot, element_index))?;
         // Both absent is compatible with sessionless embedders; registry
         // dispatch installs a namespaced session for session-requiring tools.
         let session = args.get("_session_id").and_then(serde_json::Value::as_str);
         if snapshot.publisher.as_deref() != session {
+            drop(element);
             return Err(refusal(
                 "stale_element_token",
                 "snapshot belongs to another session; call get_window_state in this session".into(),
             ));
         }
-        let element = snapshot
-            .payload
-            .retain(element_index)
-            .ok_or_else(|| out_of_range_refusal(snapshot, element_index))?;
         Ok(ResolvedElement::Element {
             window_id: snapshot.window_id,
             element_index,
@@ -1020,6 +1022,55 @@ mod tests {
         assert_eq!(cache.pid_for_token(&serde_json::json!({})), None);
         let unknown = serde_json::json!({ "element_token": token_for(id + 1000, 0) });
         assert_eq!(cache.pid_for_token(&unknown), None);
+    }
+
+    /// A payload whose element indices are sparse members (as on Linux),
+    /// not dense offsets below len().
+    struct SparsePayload(std::collections::BTreeMap<usize, usize>);
+
+    impl SnapshotPayload for SparsePayload {
+        type Element = usize;
+        fn len(&self) -> usize {
+            self.0.len()
+        }
+        fn retain(&self, index: usize) -> Option<usize> {
+            self.0.get(&index).copied()
+        }
+    }
+
+    #[test]
+    fn sparse_member_index_resolves_and_still_checks_ownership() {
+        let cache = SnapshotStore::new();
+        let id = cache
+            .publish_for_session(
+                42,
+                7,
+                SparsePayload([(7, 70)].into_iter().collect()),
+                Some("runtime:a"),
+                None,
+            )
+            .unwrap()
+            .0;
+        let owner =
+            serde_json::json!({"element_token": token_for(id, 7), "_session_id": "runtime:a"});
+        assert!(matches!(
+            cache.resolve(42, &owner),
+            Ok(ResolvedElement::Element { element: 70, .. })
+        ));
+        let foreign =
+            serde_json::json!({"element_token": token_for(id, 7), "_session_id": "runtime:b"});
+        let err = cache.resolve(42, &foreign).unwrap_err();
+        assert_eq!(
+            err.structured_content.unwrap()["refusal"]["code"],
+            "stale_element_token"
+        );
+        let missing =
+            serde_json::json!({"element_token": token_for(id, 1), "_session_id": "runtime:b"});
+        let err = cache.resolve(42, &missing).unwrap_err();
+        assert_eq!(
+            err.structured_content.unwrap()["refusal"]["code"],
+            "invalid_element_token"
+        );
     }
 
     #[test]
