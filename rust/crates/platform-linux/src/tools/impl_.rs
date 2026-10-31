@@ -155,7 +155,7 @@ fn snapshot_window_resolver(
 ) -> cua_driver_core::window_target::SnapshotWindowResolver {
     Arc::new(move |pid, handle| {
         let pid = i32::try_from(pid).ok()?;
-        let id = cua_driver_core::element_token::parse_snapshot_handle(handle)?;
+        let id = cua_driver_core::element_token::snapshot_of_handle(handle)?;
         state.snapshots.window_for_snapshot(pid, id)
     })
 }

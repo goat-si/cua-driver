@@ -980,6 +980,27 @@ mod tests {
         assert_eq!(cache.pid_for_token(&unknown), None);
     }
 
+    /// A token built on a window-basis id addresses the same snapshot (#130).
+    #[test]
+    fn pid_for_token_accepts_a_window_basis_handle() {
+        let cache = SnapshotStore::new();
+        let id = cache.publish(42, 7, Payload(vec![10, 20]));
+        let handle = crate::window_basis::format_basis_id(id, 3);
+        let args = serde_json::json!({ "element_token": format!("{handle}:1") });
+        assert_eq!(cache.pid_for_token(&args), Some(42));
+        let resolved = cache.resolve(42, &args).unwrap();
+        assert!(matches!(
+            resolved,
+            ResolvedElement::Element {
+                window_id: 7,
+                element_index: 1,
+                ..
+            }
+        ));
+        let malformed = serde_json::json!({ "element_token": format!("{}.f0:1", token_for(id, 1).split(':').next().unwrap()) });
+        assert_eq!(cache.pid_for_token(&malformed), None);
+    }
+
     #[test]
     fn publish_then_resolve_returns_projection() {
         let cache = SnapshotStore::new();
