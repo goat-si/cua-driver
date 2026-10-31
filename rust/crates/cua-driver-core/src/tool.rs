@@ -2506,6 +2506,13 @@ impl ToolRegistry {
                             ("desktop_lease_unavailable", reason)
                         }
                     };
+                    // Nothing was dispatched: close the cursor and history
+                    // events this call opened, so neither shows an action.
+                    crate::cursor_events::end_tool(cursor_event);
+                    if let (Some(history), Some(pending)) = (self.history.as_ref(), pending_history)
+                    {
+                        history.finish_action(pending, None, true);
+                    }
                     return ToolResult::error(message.clone()).with_structured(serde_json::json!({
                         "effect": "refused", "code": code, "status": "refused",
                         "refusal": {"code": code, "message": message}
