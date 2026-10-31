@@ -3255,6 +3255,28 @@ mod lean_row_tests {
 mod selectable_row_tests {
     use super::*;
     #[test]
+    fn a_flat_selectable_row_without_actions_is_eligible() {
+        use crate::ax::write_outcome::Settable;
+        assert!(selectable_row_eligible("AXRow", Some("AXOutline"), true, false, || Settable::Yes));
+    }
+
+    #[test]
+    fn a_finder_sidebar_shape_gets_its_owned_label() {
+        let row = LabelPath::Open(42);
+        let cell = next_label_path(row, Some("AXRow"), Some("AXCell"));
+        let text = next_label_path(cell, Some("AXCell"), Some("AXStaticText"));
+        assert_eq!(text, LabelPath::Open(42));
+        assert_eq!(row_label_candidate(text, "AXStaticText", [Some("Applications"), None, None]), Some("Applications"));
+    }
+
+    #[test]
+    fn foreign_items_and_unreadable_roles_block_the_label_path() {
+        for role in [Some("AXRow"), Some("AXListItem"), Some("AXImage"), Some("AXCell"), None, Some("AXUnknown")] {
+            assert_eq!(next_label_path(LabelPath::Open(42), Some("AXGroup"), role), LabelPath::Blocked);
+        }
+    }
+
+    #[test]
     fn baseline_rows_are_not_newly_eligible_or_labelled() {
         assert!(!selectable_row_eligible(
             "AXButton",

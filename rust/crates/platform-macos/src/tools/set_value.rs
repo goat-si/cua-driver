@@ -2985,6 +2985,25 @@ mod restored_role_tests {
 mod selectable_row_tests {
     use super::*;
     #[tokio::test]
+    async fn set_value_refuses_a_selectable_row_before_any_write() {
+        use crate::ax::write_outcome::Settable;
+        let calls = std::cell::Cell::new(0);
+        let document: Box<dyn FnOnce()> = Box::new(|| calls.set(calls.get() + 1));
+        let result = dispatch_set_value(
+            true, 0, || (Some("AXRow".into()), Settable::No),
+            |document: Box<dyn FnOnce()>| async {
+                calls.set(calls.get() + 1);
+                document();
+                (ToolResult::text("ok"), false, false)
+            },
+            document,
+            |_, _| async { calls.set(calls.get() + 1); Ok(true) },
+        ).await;
+        assert_eq!(calls.get(), 0);
+        assert_eq!(result.is_error, Some(true));
+    }
+
+    #[tokio::test]
     async fn baseline_dispatch_calls_write_document_and_return() {
         let calls = std::cell::RefCell::new(Vec::new());
         let document: Box<dyn FnOnce()> = Box::new(|| calls.borrow_mut().push("document"));

@@ -927,6 +927,13 @@ mod climb_limit_tests {
     use super::climb_limit;
 
     #[test]
+    fn an_item_target_never_climbs() {
+        for role in [None, Some("AXRow"), Some("AXCell"), Some("AXListItem"), Some("AXImage")] {
+            assert_eq!(climb_limit(role), 1, "{role:?}");
+        }
+    }
+
+    #[test]
     fn baseline_label_children_use_eight_steps() {
         for role in [Some("AXStaticText"), Some("AXTextField")] {
             assert_eq!(climb_limit(role), 8);
