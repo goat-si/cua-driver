@@ -4155,8 +4155,8 @@ impl Tool for ClickTool {
             // transient or scroll-adjusted.
             if action_req.as_deref() == Some("expand") {
                 use crate::uia_mutation::{
-                    classify_write_hresult, refusal_text, uncertain_text, RefusalKind, RungOutcome,
-                    WriteVerdict,
+                    classify_write_hresult, expand_route, refusal_text, uncertain_text,
+                    MutationRoute, RefusalKind, RungOutcome, WriteVerdict,
                 };
                 let expand =
                     tokio::task::spawn_blocking({
@@ -4211,15 +4211,27 @@ impl Tool for ClickTool {
                     )
                 };
                 return match expand {
-                    Ok(Ok(RungOutcome::Called(0))) => ToolResult::text(format!("✅ Expanded UIA element [{idx}] via ExpandCollapsePattern."))
-                        .with_structured(json!({ "path": "uia_expand_collapse", "verified": false, "effect": "unverifiable" })),
-                    Ok(Ok(RungOutcome::Absent)) => ToolResult::error("ExpandCollapsePattern unavailable"),
-                    Ok(Ok(RungOutcome::AcquireFailed(hr))) => mutation_refusal(refusal_text(RefusalKind::PatternUnreadable, hr), ActionTransport::WindowsUiaExpandCollapse, requested),
-                    Ok(Ok(RungOutcome::Called(hr))) => match classify_write_hresult(hr) {
-                        WriteVerdict::Refused(kind) => mutation_refusal(refusal_text(kind, hr), ActionTransport::WindowsUiaExpandCollapse, requested),
-                        WriteVerdict::Uncertain(kind) => uncertain(format!("ExpandCollapse.Expand on [{idx}]: {}", uncertain_text(kind, hr))),
-                        WriteVerdict::AffordanceAbsent => ToolResult::error("ExpandCollapsePattern unavailable"),
-                        WriteVerdict::Delivered => unreachable!(),
+                    Ok(Ok(outcome)) => match expand_route(outcome) {
+                        MutationRoute::Done => ToolResult::text(format!("✅ Expanded UIA element [{idx}] via ExpandCollapsePattern."))
+                            .with_structured(json!({ "path": "uia_expand_collapse", "verified": false, "effect": "unverifiable" })),
+                        MutationRoute::FallThrough => ToolResult::error("ExpandCollapsePattern unavailable"),
+                        MutationRoute::Refused => {
+                            let (kind, hr) = match outcome {
+                                RungOutcome::AcquireFailed(hr) => (RefusalKind::PatternUnreadable, hr),
+                                RungOutcome::Called(hr) => match classify_write_hresult(hr) {
+                                    WriteVerdict::Refused(kind) => (kind, hr),
+                                    _ => unreachable!("refused expand route requires a refusal"),
+                                },
+                                RungOutcome::Absent => unreachable!("absent expand route is not refused"),
+                            };
+                            mutation_refusal(refusal_text(kind, hr), ActionTransport::WindowsUiaExpandCollapse, requested)
+                        },
+                        MutationRoute::Uncertain => {
+                            let RungOutcome::Called(hr) = outcome else { unreachable!("uncertain expand route requires a write") };
+                            let WriteVerdict::Uncertain(kind) = classify_write_hresult(hr) else { unreachable!("uncertain expand route requires an uncertain HRESULT") };
+                            uncertain(format!("ExpandCollapse.Expand on [{idx}]: {}", uncertain_text(kind, hr)))
+                        },
+                        MutationRoute::Partial => unreachable!("expand makes only one write"),
                     },
                     Ok(Err(error)) => ToolResult::error(error),
                     Err(error) => uncertain(format!("Expand worker failed: {error}; it may have expanded. Read the state before acting again.")),
