@@ -3412,7 +3412,7 @@ pub fn send_button_down(xid: u64, x: i32, y: i32, button: u8) -> Result<()> {
         state: KeyButMask::from(0u16),
         same_screen: true,
     };
-    conn.send_event(false, target.window, EventMask::BUTTON_PRESS, &press)?
+    conn.send_event(false, target.window, EventMask::BUTTON_PRESS, press)?
         .check()?;
     settle_synthetic_events(&conn);
     Ok(())
@@ -3464,7 +3464,7 @@ pub fn send_button_up(xid: u64, x: i32, y: i32, button: u8) -> Result<()> {
         state: button_state_mask(button),
         same_screen: true,
     };
-    conn.send_event(false, target.window, EventMask::BUTTON_RELEASE, &release)?
+    conn.send_event(false, target.window, EventMask::BUTTON_RELEASE, release)?
         .check()?;
     settle_synthetic_events(&conn);
     Ok(())
@@ -3930,6 +3930,7 @@ pub fn send_scroll_xtest_desktop(x: i32, y: i32, direction: &str, amount: usize)
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn send_drag_xtest_desktop_with_modifiers(
     from_x: i32,
     from_y: i32,
@@ -4256,7 +4257,7 @@ mod own_dialog_tests {
     use super::*;
     use std::io::{BufRead, BufReader};
     use std::process::{Command, Stdio};
-    use x11rb::protocol::{xproto::*, Event};
+    use x11rb::protocol::Event;
     use x11rb::wrapper::ConnectionExt as _;
 
     struct Server(std::process::Child);

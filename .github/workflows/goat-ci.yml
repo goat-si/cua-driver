@@ -498,6 +498,46 @@ jobs:
             rust/target
           key: ${{ steps.rust-cache.outputs.cache-primary-key }}
 
+  # platform-linux and cua-driver-core are linted here; platform-macos above. Same triggers as the
+  # macOS job, so a pull request cannot add a Linux-only warning (goat-si/cua-driver#131).
+  clippy-linux:
+    name: Clippy Linux
+    needs: version
+    if: needs.version.outputs.builds == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: dtolnay/rust-toolchain@4716b85f2fac3e324e64fa2810f6b5c3905760a5 # 1.97.1
+        with:
+          components: clippy
+      - name: Restore the Rust build cache
+        id: rust-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            rust/target
+          key: goat-clippy-linux-${{ hashFiles('rust/Cargo.lock', 'rust/**/Cargo.toml', 'vendor/**/Cargo.toml') }}
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            clang pkg-config libdbus-1-dev libpipewire-0.3-dev libspa-0.2-dev \
+            libei-dev libxkbcommon-dev libx11-dev libxi-dev libxtst-dev libxext-dev
+      - name: Clippy, warnings denied
+        working-directory: rust
+        run: cargo clippy --locked -p platform-linux -p cua-driver-core --all-targets -- -D warnings
+      - name: Save the Rust build cache
+        if: github.event_name != 'pull_request' && steps.rust-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            rust/target
+          key: ${{ steps.rust-cache.outputs.cache-primary-key }}
+
   # The slow lanes below run on release tags, dispatches and the daily schedule only, so a PR never
   # ran the tools/list schema contract or the platform unit suites: goat.4's toggle_state enum, which
   # held a null, failed only in its tag run. These PR jobs run those parts and restore (never save)
@@ -536,6 +576,11 @@ jobs:
       - name: platform-linux unit tests
         working-directory: rust
         run: cargo test --locked -p platform-linux --lib
+      # Core's unit tests (snapshot store, window basis, batch, sessions) otherwise run only in the
+      # slow lanes (goat-si/cua-driver#131).
+      - name: cua-driver-core unit tests
+        working-directory: rust
+        run: cargo test --locked -p cua-driver-core --lib
       - name: Protocol schema contract
         working-directory: rust
         env:
