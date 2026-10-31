@@ -232,6 +232,48 @@ mod tests {
         }
     }
     #[test]
+    fn capture_removal_preserves_order_and_retires_old_snapshot() {
+        let store = SnapshotStore::new();
+        let (old_id, _) = store
+            .publish_for_session(1, 2, Payload, None, Some(1.0))
+            .unwrap();
+        let older = store.begin_capture(1, 2);
+        let own = store.begin_capture(1, 2);
+        let newer = store.begin_capture(1, 2);
+        assert_eq!(store.remove_for_capture(1, 2, own), Some(old_id));
+        assert!(store.screenshot_context(1, Some(2), None).is_err());
+        assert!(store
+            .publish_capture_basis_for_session(1, 2, Payload, None, Some(1.0), Some(frame()), older)
+            .is_none());
+        let (id, _, basis) = store
+            .publish_capture_basis_for_session(1, 2, Payload, None, Some(2.0), Some(frame()), own)
+            .unwrap();
+        let basis = basis.unwrap();
+        assert_ne!(id, old_id);
+        assert_eq!(
+            store
+                .basis_for(1, 2, &basis.snapshot_id, None)
+                .unwrap()
+                .snapshot_id,
+            basis.snapshot_id
+        );
+        assert_eq!(
+            store.screenshot_context(1, Some(2), None).unwrap().scale,
+            2.0
+        );
+        assert!(store
+            .refresh_basis_for_session(1, 2, None, 3.0, None, Some(frame()), newer)
+            .is_some());
+        assert_eq!(store.remove_for_capture(1, 2, own), None);
+        assert_eq!(
+            store.screenshot_context(1, Some(2), None).unwrap().scale,
+            3.0
+        );
+        assert!(store
+            .publish_capture_basis_for_session(1, 2, Payload, None, Some(1.0), Some(frame()), own)
+            .is_none());
+    }
+    #[test]
     fn publication_returns_the_stored_frame_and_rejects_stale_tickets() {
         let store = SnapshotStore::new();
         let stale = store.begin_capture(1, 2);

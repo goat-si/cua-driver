@@ -1600,7 +1600,12 @@ impl Tool for GetWindowStateTool {
                     // the window's scope (`snapshot_binds_window`).
                     let target_scoped = binds_window;
                     if !observation_only && !target_scoped {
-                        invalidated.extend(state.snapshots.remove(pid as i32, xid));
+                        invalidated.extend(crate::basis_eligibility::discard_untrusted_snapshot(
+                            &state.snapshots,
+                            pid as i32,
+                            xid,
+                            ticket,
+                        ));
                         crate::atspi::snapshot::forget_window(pid, xid);
                     }
                     let (snapshot_id, replaced) = (!observation_only && target_scoped)
