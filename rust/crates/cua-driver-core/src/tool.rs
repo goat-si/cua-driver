@@ -7332,6 +7332,58 @@ resources:
         def: super::ToolDef,
     }
 
+    struct CancelledWorkerProbe {
+        def: super::ToolDef,
+        hold: Arc<Mutex<Option<crate::desktop_lease::WorkerHold>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl super::Tool for CancelledWorkerProbe {
+        fn def(&self) -> &super::ToolDef {
+            &self.def
+        }
+        async fn invoke(&self, _: serde_json::Value) -> ToolResult {
+            *self.hold.lock().unwrap() = crate::desktop_lease::worker_hold();
+            std::future::pending().await
+        }
+    }
+
+    #[tokio::test]
+    async fn registry_cancelled_dispatch_keeps_worker_hold() {
+        use crate::desktop_lease::LeaseBackend;
+        let backend = Arc::new(crate::desktop_lease::test_support::TestBackend::default());
+        let hold = Arc::new(Mutex::new(None));
+        let mut registry =
+            lease_test_registry(backend.clone(), false, Arc::new(AtomicUsize::new(0)));
+        registry.register(Box::new(CancelledWorkerProbe {
+            def: super::ToolDef {
+                name: "click".into(),
+                description: "probe".into(),
+                input_schema: serde_json::json!({"type":"object"}),
+                read_only: false,
+                destructive: false,
+                idempotent: false,
+                open_world: false,
+            },
+            hold: hold.clone(),
+        }));
+        let context = unrestricted_context();
+        let mut call = Box::pin(lease_click(&registry, &context, "lease-cancel-worker"));
+        assert!(futures_util::poll!(call.as_mut()).is_pending());
+        let worker = hold
+            .lock()
+            .unwrap()
+            .take()
+            .expect("invoke has a worker hold");
+        drop(call);
+        assert!(backend.try_acquire().unwrap().is_none());
+        assert!(desktop_action_coordinator().try_lock().is_err());
+        drop(worker);
+        let coordinator = desktop_action_coordinator().lock().await;
+        assert!(backend.try_acquire().unwrap().is_some());
+        drop(coordinator);
+    }
+
     #[async_trait::async_trait]
     impl super::Tool for LeaseProbe {
         fn def(&self) -> &super::ToolDef {
