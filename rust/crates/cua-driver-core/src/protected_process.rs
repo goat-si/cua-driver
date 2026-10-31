@@ -27,6 +27,7 @@ const MACOS: &[&str] = &[
     "/System/Library/CoreServices/ControlCenter.app/Contents/MacOS/ControlCenter",
     "/System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer",
     "/System/Library/CoreServices/WindowManager.app/Contents/MacOS/WindowManager",
+    "/sbin/launchd",
 ];
 const WINDOWS: &[&str] = &[
     "explorer.exe",
@@ -40,6 +41,7 @@ const WINDOWS: &[&str] = &[
     "sihost.exe",
     "fontdrvhost.exe",
     "logonui.exe",
+    "lsaiso.exe",
 ];
 const LINUX: &[&str] = &[
     "gnome-shell",
@@ -153,5 +155,38 @@ mod tests {
     fn i3_and_xfwm4_are_protected() {
         assert!(is_protected_executable("/usr/bin/i3", TargetOs::Linux));
         assert!(is_protected_executable("/usr/bin/xfwm4", TargetOs::Linux));
+    }
+
+    /// The session-critical sets the agent-desktop reference protects
+    /// (crates/macos/src/system/app/app_ops.rs and
+    /// crates/windows/src/system/app_ops.rs at 893a4140), listed literally so
+    /// a table omission cannot hide behind iterating the table itself.
+    #[test]
+    fn every_reference_session_critical_process_is_protected() {
+        for path in [
+            "/System/Library/CoreServices/loginwindow.app/Contents/MacOS/loginwindow",
+            "/System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer",
+            "/System/Library/CoreServices/Dock.app/Contents/MacOS/Dock",
+            "/sbin/launchd",
+            "/System/Library/CoreServices/Finder.app/Contents/MacOS/Finder",
+        ] {
+            assert!(is_protected_executable(path, TargetOs::Macos), "{path}");
+        }
+        for name in [
+            "csrss.exe",
+            "wininit.exe",
+            "winlogon.exe",
+            "services.exe",
+            "lsass.exe",
+            "smss.exe",
+            "lsaiso.exe",
+            "dwm.exe",
+            "explorer.exe",
+        ] {
+            assert!(
+                is_protected_executable(&format!(r"C:\Windows\System32\{name}"), TargetOs::Windows),
+                "{name}"
+            );
+        }
     }
 }
