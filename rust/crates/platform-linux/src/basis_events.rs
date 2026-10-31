@@ -102,6 +102,114 @@ mod tests {
     use super::*;
 
     #[test]
+    fn every_failure_index_cleans_possible_resources() {
+        use cua_driver_core::guarded_dispatch::{run_guarded, Emitted, GuardedResult, SendFailure};
+        use cua_driver_core::window_basis::DispatchEffect;
+        use std::collections::HashSet;
+        #[derive(Clone, Copy)]
+        enum Failure {
+            NotEmitted,
+            UnknownBefore,
+            UnknownAfter,
+        }
+        struct Fake {
+            held: HashSet<(bool, u8)>,
+            index: usize,
+            fail: usize,
+            failure: Failure,
+        }
+        impl Requests for Fake {
+            fn submit(&mut self, event: Event) -> Result<(), SendFailure> {
+                let fail = self.index == self.fail;
+                self.index += 1;
+                if !fail || matches!(self.failure, Failure::UnknownAfter) {
+                    match event {
+                        Event::KeyPress(k) => {
+                            self.held.insert((true, k));
+                        }
+                        Event::KeyRelease(k) => {
+                            self.held.remove(&(true, k));
+                        }
+                        Event::ButtonPress(b) => {
+                            self.held.insert((false, b));
+                        }
+                        Event::ButtonRelease(b) => {
+                            self.held.remove(&(false, b));
+                        }
+                        Event::Motion => {}
+                    }
+                }
+                if fail {
+                    Err(SendFailure {
+                        error: "injected".into(),
+                        emitted: if matches!(self.failure, Failure::NotEmitted) {
+                            Emitted::NotEmitted
+                        } else {
+                            Emitted::Unknown
+                        },
+                    })
+                } else {
+                    Ok(())
+                }
+            }
+        }
+        for foreground in [false, true] {
+            for modifiers in [&[][..], &[37, 50][..]] {
+                if !foreground && !modifiers.is_empty() {
+                    continue;
+                }
+                for button in [1, 3] {
+                    for count in [1, 2] {
+                        let events = plan(foreground, modifiers, button, count);
+                        for index in 0..events.len() {
+                            for failure in [
+                                Failure::NotEmitted,
+                                Failure::UnknownBefore,
+                                Failure::UnknownAfter,
+                            ] {
+                                let mut sink = Sink {
+                                    requests: Fake {
+                                        held: HashSet::new(),
+                                        index: 0,
+                                        fail: index,
+                                        failure,
+                                    },
+                                    events: events.clone(),
+                                    resources: Default::default(),
+                                };
+                                let GuardedResult::Sent { outcome } =
+                                    run_guarded(&mut sink, events.len(), || Ok(()))
+                                else {
+                                    panic!()
+                                };
+                                assert_eq!(outcome.events_sent, index as u32);
+                                assert_eq!(
+                                    outcome.effect,
+                                    if matches!(failure, Failure::NotEmitted) {
+                                        if index == 0 {
+                                            DispatchEffect::Refused
+                                        } else {
+                                            DispatchEffect::Partial
+                                        }
+                                    } else {
+                                        DispatchEffect::Uncertain
+                                    }
+                                );
+                                assert!(sink.requests.held.is_empty(), "event {index} {events:?}");
+                                assert!(sink.resources.needing_cleanup().is_empty());
+                                assert_eq!(
+                                    outcome.cleanup_results.last().unwrap()["error"],
+                                    "injected"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn lost_press_reply_still_releases_button() {
         use cua_driver_core::guarded_dispatch::{run_guarded, Emitted, GuardedResult, SendFailure};
         use cua_driver_core::window_basis::DispatchEffect;
