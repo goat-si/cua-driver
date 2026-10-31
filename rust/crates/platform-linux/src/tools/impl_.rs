@@ -6535,6 +6535,9 @@ impl ClickTool {
                         if let Some(stale) = stale_observed_element("click", idx, &error) {
                             return stale;
                         }
+                        if crate::input::foreground::error_code(&error).is_some() {
+                            return input_error_result(error);
+                        }
                         click_action_failure_result(idx, pid, &reason, &error)
                     }
                     Err(error) => click_action_failure_result(
@@ -7942,8 +7945,13 @@ impl Tool for TypeTextTool {
             if xid_opt.is_none() {
                 return foreground_hyprland_refusal("an exact window_id is required");
             }
-            // An explicit token must establish its editable route before any key fallback.
-            if let Some(element) = token.clone() {
+            // Native editables retain their verifiable, addressed AT-SPI route; an
+            // explicit token must establish it before any key fallback. Chromium/WebKit
+            // stay on key events: their bridges can echo a write the renderer never sees.
+            if let Some(element) = token
+                .clone()
+                .filter(|_| !is_chromium_embedder(pid) && !is_webkitgtk_embedder(pid))
+            {
                 let text_ax = text.clone();
                 let target = element.clone();
                 let result = tokio::task::spawn_blocking(move || {
@@ -8051,8 +8059,15 @@ impl Tool for TypeTextTool {
         .await;
 
         let text_len = text.chars().count();
-        // A token-bound inject route must be proven absent before key fallback.
-        if let Some(element) = token.clone().filter(|_| crate::wayland::is_inject_mode()) {
+        // Native toolkit editables have a stronger focus-free route than raw
+        // compositor keyboard injection; a token-bound route must be proven absent
+        // before key fallback. Keep Chromium/WebKit on real key events because their
+        // accessibility bridges may echo a write that never reaches renderer state.
+        if let Some(element) = token.clone().filter(|_| {
+            crate::wayland::is_inject_mode()
+                && !is_chromium_embedder(pid)
+                && !is_webkitgtk_embedder(pid)
+        }) {
             let text_at = text.clone();
             let target = element.clone();
             match tokio::task::spawn_blocking(move || {
@@ -8137,6 +8152,44 @@ impl Tool for TypeTextTool {
         if resolved_elem_idx.is_some() {
             if let Some(refusal) = unavailable_webkit_keyboard_background(pid, delivery) {
                 return refusal;
+            }
+        }
+
+        // Renderer EditableText writes can update the accessible value without
+        // emitting the DOM input event. For an explicit foreground request on
+        // native Wayland, focus the named field and send real keyboard input so
+        // Chromium/WebKit observe the same event sequence as a user.
+        if delivery.is_foreground()
+            && crate::wayland::wayland_input_enabled()
+            && (is_chromium_embedder(pid) || is_webkitgtk_embedder(pid))
+        {
+            if let Some(element) = token.clone() {
+                let idx = element.index;
+                let text_w = text.clone();
+                let result = tokio::task::spawn_blocking(move || {
+                    crate::wayland::with_target_foreground(pid, xid, || {
+                        if !crate::atspi::focus_token(pid, &element)? {
+                            anyhow::bail!(
+                                "AT-SPI Component.GrabFocus returned false for element {idx}"
+                            );
+                        }
+                        crate::wayland::type_text_focused(&text_w)
+                    })
+                })
+                .await;
+                return match result {
+                    Ok(Ok(())) => ToolResult::text(format!(
+                        "Typed {text_len} character(s) (via Wayland virtual-keyboard)."
+                    ))
+                    .with_structured(type_text_structured(
+                        "key_events",
+                        text_len,
+                        false,
+                    )),
+                    Ok(Err(error)) => stale_observed_element("type_text", idx, &error)
+                        .unwrap_or_else(|| ToolResult::error(error.to_string())),
+                    Err(error) => ToolResult::error(format!("Task error: {error}")),
+                };
             }
         }
 
