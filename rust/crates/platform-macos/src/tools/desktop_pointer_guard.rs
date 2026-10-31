@@ -151,14 +151,8 @@ pub(crate) async fn check(
     args: &Value,
     points: Vec<(f64, f64)>,
 ) -> Option<ToolResult> {
-    if let Some(refusal) = protected_refusal(tool, &points).await {
-        return Some(refusal);
-    }
-    let delivery = DeliveryMode::from_args(args);
-    if delivery.is_foreground() {
-        return None;
-    }
-    tokio::task::spawn_blocking(move || {
+    let protection = protected_refusal(tool, &points).await;
+    check_with(tool, args, points, protection, |points, delivery| {
         let frontmost = crate::apps::frontmost_pid();
         points.into_iter().find_map(|point| {
             let under = window_under_point(point.0, point.1);
@@ -166,8 +160,29 @@ pub(crate) async fn check(
         })
     })
     .await
-    .ok()
-    .flatten()
+}
+
+async fn check_with<F>(
+    _tool: &str,
+    args: &Value,
+    points: Vec<(f64, f64)>,
+    protection: Option<ToolResult>,
+    user_window_check: F,
+) -> Option<ToolResult>
+where
+    F: FnOnce(Vec<(f64, f64)>, DeliveryMode) -> Option<ToolResult> + Send + 'static,
+{
+    if let Some(refusal) = protection {
+        return Some(refusal);
+    }
+    let delivery = DeliveryMode::from_args(args);
+    if delivery.is_foreground() {
+        return None;
+    }
+    tokio::task::spawn_blocking(move || user_window_check(points, delivery))
+        .await
+        .ok()
+        .flatten()
 }
 
 /// A browser holding an origin-scoped attachment is reachable only through
@@ -175,7 +190,18 @@ pub(crate) async fn check(
 /// `points` (every point an event is delivered at) lands on one of its
 /// windows.
 pub(crate) async fn protected_refusal(tool: &str, points: &[(f64, f64)]) -> Option<ToolResult> {
-    let windows = tokio::task::spawn_blocking(crate::windows::visible_windows)
+    protected_refusal_with(tool, points, crate::windows::visible_windows).await
+}
+
+async fn protected_refusal_with<F>(
+    tool: &str,
+    points: &[(f64, f64)],
+    inventory: F,
+) -> Option<ToolResult>
+where
+    F: FnOnce() -> Vec<crate::windows::WindowInfo> + Send + 'static,
+{
+    let windows = tokio::task::spawn_blocking(inventory)
         .await
         .unwrap_or_default();
     cua_driver_core::browser::protection::desktop_point_refusal(tool, points, |x, y| {
