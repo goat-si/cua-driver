@@ -20,6 +20,7 @@ struct Probe {
     def: ToolDef,
     calls: Arc<Mutex<Vec<Value>>>,
     pacings: Arc<Mutex<Vec<(String, crate::step_pacing::StepPacing)>>>,
+    events: Arc<Mutex<Vec<super::PaceEvent>>>,
 }
 
 #[async_trait]
@@ -29,6 +30,9 @@ impl Tool for Probe {
     }
 
     async fn invoke(&self, args: Value) -> ToolResult {
+        self.events.lock().unwrap().push(super::PaceEvent::Step {
+            tool: self.def.name.clone(),
+        });
         self.calls.lock().unwrap().push(args.clone());
         self.pacings
             .lock()
@@ -53,6 +57,7 @@ struct Harness {
     registry: Arc<ToolRegistry>,
     calls: std::collections::HashMap<&'static str, Arc<Mutex<Vec<Value>>>>,
     pacings: Arc<Mutex<Vec<(String, crate::step_pacing::StepPacing)>>>,
+    events: Arc<Mutex<Vec<super::PaceEvent>>>,
 }
 
 impl Harness {
@@ -60,6 +65,7 @@ impl Harness {
         let mut registry = ToolRegistry::new();
         let mut calls = std::collections::HashMap::new();
         let pacings: Arc<Mutex<Vec<(String, crate::step_pacing::StepPacing)>>> = Arc::default();
+        let events: Arc<Mutex<Vec<super::PaceEvent>>> = Arc::default();
         for name in super::BATCHABLE_TOOLS.iter().copied().chain([
             "get_window_state",
             "zoom",
@@ -111,6 +117,7 @@ impl Harness {
                 },
                 calls: log,
                 pacings: pacings.clone(),
+                events: events.clone(),
             }));
         }
         registry.register_session_tools();
@@ -120,6 +127,7 @@ impl Harness {
             registry,
             calls,
             pacings,
+            events,
         }
     }
 
@@ -391,16 +399,59 @@ async fn observation_inherits_the_window_and_stays_bounded() {
 #[tokio::test]
 async fn pauses_between_steps_but_not_after_the_last() {
     let harness = Harness::new();
-    let started = std::time::Instant::now();
-    harness
-        .run(json!({"delay_ms": 120, "steps": [
+    let mut plan = super::Plan::parse(
+        &harness.registry,
+        &json!({"delay_ms": 120, "steps": [
             {"tool": "click", "args": {"pid": 42}},
             {"tool": "click", "args": {"pid": 42}},
-        ]}))
-        .await;
-    let elapsed = started.elapsed();
-    assert!(elapsed >= Duration::from_millis(120), "{elapsed:?}");
-    assert!(elapsed < Duration::from_millis(240), "{elapsed:?}");
+        ]}),
+    )
+    .unwrap_or_else(|error| panic!("invalid plan: {}", error.message));
+    plan.pause = super::StepPause::Recorded(harness.events.clone());
+    let result = plan.run(harness.registry.clone(), None).await;
+    assert_ne!(result.is_error, Some(true), "{}", text(&result));
+    assert_eq!(
+        *harness.events.lock().unwrap(),
+        vec![
+            super::PaceEvent::Step {
+                tool: "click".into()
+            },
+            super::PaceEvent::Pause {
+                before_step: 1,
+                delay: Duration::from_millis(120)
+            },
+            super::PaceEvent::Step {
+                tool: "click".into()
+            },
+        ]
+    );
+}
+
+#[tokio::test]
+async fn zero_delay_does_not_pause_between_steps() {
+    let harness = Harness::new();
+    let mut plan = super::Plan::parse(
+        &harness.registry,
+        &json!({"delay_ms": 0, "steps": [
+            {"tool": "click", "args": {"pid": 42}},
+            {"tool": "click", "args": {"pid": 42}},
+        ]}),
+    )
+    .unwrap_or_else(|error| panic!("invalid plan: {}", error.message));
+    plan.pause = super::StepPause::Recorded(harness.events.clone());
+    let result = plan.run(harness.registry.clone(), None).await;
+    assert_ne!(result.is_error, Some(true), "{}", text(&result));
+    assert_eq!(
+        *harness.events.lock().unwrap(),
+        vec![
+            super::PaceEvent::Step {
+                tool: "click".into()
+            },
+            super::PaceEvent::Step {
+                tool: "click".into()
+            },
+        ]
+    );
 }
 
 #[tokio::test]
