@@ -496,6 +496,8 @@ struct RecordingInner {
     /// than a monotonic counter, and it doubles as the config-override key.
     owner: Option<String>,
     output_dir: Option<PathBuf>,
+    #[cfg(unix)]
+    private_dir: Option<crate::private_artifact::PrivateDir>,
     /// Per-turn application-state budget, or `None` when the caller disabled
     /// state capture with `include_accessibility_tree: false`.
     state_budget: Option<StateCaptureBudget>,
@@ -553,6 +555,8 @@ impl RecordingSession {
                 generation: 0,
                 owner: None,
                 output_dir: None,
+                #[cfg(unix)]
+                private_dir: None,
                 state_budget: Some(StateCaptureBudget::default()),
                 next_turn: 1,
                 session_start_ms: 0,
@@ -644,6 +648,10 @@ impl RecordingSession {
         }
 
         let dir = expand_tilde(output_dir);
+        #[cfg(unix)]
+        let private_dir = crate::private_artifact::PrivateDir::open(&dir)
+            .map_err(|e| anyhow::anyhow!("unsafe_recording_destination: {e}"))?;
+        #[cfg(not(unix))]
         std::fs::create_dir_all(&dir)?;
 
         // Single monotonic anchor shared by video, cursor sampler, and
@@ -707,6 +715,10 @@ impl RecordingSession {
         inner.generation = inner.generation.wrapping_add(1);
         inner.enabled = true;
         inner.output_dir = Some(dir);
+        #[cfg(unix)]
+        {
+            inner.private_dir = Some(private_dir);
+        }
         inner.state_budget = state_budget;
         inner.next_turn = 1;
         inner.session_start_ms = started_at_ms;
@@ -1611,6 +1623,31 @@ fn validate_video_metadata(meta: VideoMetadata) -> anyhow::Result<VideoMetadata>
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    #[test]
+    fn unsafe_recording_destination_rejects_symlink_and_writable_directory() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        let root = tempfile::tempdir().unwrap();
+        let root = root.path().canonicalize().unwrap();
+        let real = root.join("real");
+        std::fs::create_dir(&real).unwrap();
+        let link = root.join("link");
+        symlink(&real, &link).unwrap();
+        let session = super::RecordingSession::new();
+        let error = session
+            .start(link.to_str().unwrap(), false, None)
+            .unwrap_err();
+        assert!(error.to_string().contains("unsafe_recording_destination"));
+        assert_eq!(std::fs::read_dir(&real).unwrap().count(), 0);
+
+        std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o770)).unwrap();
+        let error = session
+            .start(real.to_str().unwrap(), false, None)
+            .unwrap_err();
+        assert!(error.to_string().contains("unsafe_recording_destination"));
+        assert_eq!(std::fs::read_dir(&real).unwrap().count(), 0);
+    }
     use super::*;
 
     #[test]

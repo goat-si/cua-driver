@@ -96,6 +96,8 @@ pub mod consent;
 pub mod cursor_events;
 pub mod cursor_hook;
 pub mod cursor_sampler;
+#[cfg(unix)]
+mod private_artifact;
 pub mod cursor_shape;
 pub mod daemon;
 pub mod delivery;
