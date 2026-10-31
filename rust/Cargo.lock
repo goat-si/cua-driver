@@ -3561,7 +3561,6 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
- "unicode-general-category",
  "url",
  "uuid",
  "wayland-backend",

@@ -117,11 +117,41 @@ pub(crate) struct KeyStroke {
     pub code: u32,
     pub shift: Option<u32>,
 }
+/// Coarse class of a refused character: enough to diagnose a layout gap,
+/// never the character itself.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CharClass {
+    Letter,
+    Digit,
+    Whitespace,
+    Control,
+    Punctuation,
+    Other,
+}
+
+impl CharClass {
+    pub(crate) fn of(ch: char) -> Self {
+        if ch.is_alphabetic() {
+            Self::Letter
+        } else if ch.is_numeric() {
+            Self::Digit
+        } else if ch.is_whitespace() {
+            Self::Whitespace
+        } else if ch.is_control() {
+            Self::Control
+        } else if ch.is_ascii_punctuation() {
+            Self::Punctuation
+        } else {
+            Self::Other
+        }
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
-#[error("keycode typing refused {count} character(s); categories: {categories:?}")]
+#[error("keycode typing refused {count} character(s); classes: {categories:?}")]
 pub(crate) struct KeyRefusal {
     pub count: usize,
-    pub categories: Vec<unicode_general_category::GeneralCategory>,
+    pub categories: Vec<CharClass>,
 }
 pub(crate) fn plan_keycodes(
     text: &str,
@@ -143,7 +173,7 @@ pub(crate) fn plan_keycodes(
                     shift: if needs_shift { shift_code } else { None },
                 })
             }
-            _ => categories.push(unicode_general_category::get_general_category(ch)),
+            _ => categories.push(CharClass::of(ch)),
         }
     }
     if categories.is_empty() {
