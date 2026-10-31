@@ -195,10 +195,6 @@ impl ScrollTool {
         // background CGEvents). Only the pixel-wheel path honors it; the
         // keystroke path is background-by-design and untouched.
         let delivery_mode = super::DeliveryMode::parse(args.opt_str("delivery_mode").as_deref());
-        // Electron/Chromium drop background wheel events and keystrokes; a
-        // background scroll there goes through accessibility instead (below).
-        let electron_background =
-            !delivery_mode.is_foreground() && crate::browser::ElectronJs::is_electron(pid);
         let direction = match args.require_str("direction") {
             Ok(v) => v,
             Err(e) => return e,
@@ -215,6 +211,24 @@ impl ScrollTool {
             Ok(window_id) => window_id,
             Err(error) => return error,
         };
+        let x_arg = args
+            .opt_f64("x")
+            .or_else(|| args.opt_i64("x").map(|v| v as f64));
+        let y_arg = args
+            .opt_f64("y")
+            .or_else(|| args.opt_i64("y").map(|v| v as f64));
+        // Argument shape before any live read: window-local x,y with no
+        // element and no window cannot be anchored (the targeted wheel path
+        // below refuses the same case; an element target wins over x,y).
+        if pre_focus_guard.is_none() && window_id.is_none() && x_arg.is_some() && y_arg.is_some() {
+            return super::invalid_arguments(
+                "window_id is required when scrolling by window-local x,y pixels.".to_string(),
+            );
+        }
+        // Electron/Chromium drop background wheel events and keystrokes; a
+        // background scroll there goes through accessibility instead (below).
+        let electron_background =
+            !delivery_mode.is_foreground() && crate::browser::ElectronJs::is_electron(pid);
         // The person is working in this app: nothing is sent.
         if !delivery_mode.is_foreground() {
             if let Err(refusal) = super::gate_user_takeover(pid, window_id) {
@@ -324,13 +338,6 @@ impl ScrollTool {
         // cursor. This is the ONLY way to scroll a nested overflow:auto region
         // that never takes keyboard focus (the keystroke path below no-ops on
         // it). No user-facing flag: presence of a target IS the switch.
-        let x_arg = args
-            .opt_f64("x")
-            .or_else(|| args.opt_i64("x").map(|v| v as f64));
-        let y_arg = args
-            .opt_f64("y")
-            .or_else(|| args.opt_i64("y").map(|v| v as f64));
-
         // Per-notch step + direction→delta mapping (sign convention lives
         // here; the mouse primitive stays sign-agnostic). macOS: +y reveals
         // content ABOVE, -y reveals BELOW; +x reveals LEFT, -x reveals RIGHT.
