@@ -756,7 +756,13 @@ impl Tool for PressKeyTool {
         }
 
         let mut _mutation_lease = if !fg && window_id.is_some() {
-            Some(super::acquire_background_mutation(pid).await)
+            Some(
+                latency::timed(
+                    latency::Stage::KeyLease,
+                    super::acquire_background_mutation(pid),
+                )
+                .await,
+            )
         } else {
             None
         };
@@ -974,6 +980,16 @@ impl Tool for PressKeyTool {
             }
         }
 
+        // Exact-window key gate reads (all are currently retained):
+        // WindowServer owner | kept | stale/foreign-window refusal.
+        // Session lock | kept | lock-screen refusal.
+        // AXWindows and sheet ancestry | kept | target existence and sheets.
+        // AXMinimized and AXHidden | kept | visibility refusal.
+        // Addressed element ancestry | kept | element-target refusal.
+        // AXFocusedWindow and competing WindowServer rows | kept | generic-key
+        // ambiguity; exact-window keys do not use the competing count.
+        // The final focused-window sample and conflict check are separate and
+        // still run immediately before key delivery.
         if !fg {
             if let (Some(wid), Some(lease)) = (window_id, _mutation_lease.as_ref()) {
                 if pre_focus_ptr.is_some_and(|ptr| {
@@ -995,9 +1011,11 @@ impl Tool for PressKeyTool {
                     .filter(|ptr| super::type_text::element_in_requested_window(pid, wid, *ptr))
                     .map(|ptr| super::type_text::gate_window_id_for_element(ptr, wid))
                     .unwrap_or(wid);
-                if let Err(refusal) = lease
-                    .gate_again(gate_window_id, pre_focus_ptr, action)
-                    .await
+                if let Err(refusal) = latency::timed(
+                    latency::Stage::KeyGateAgain,
+                    lease.gate_again(gate_window_id, pre_focus_ptr, action),
+                )
+                .await
                 {
                     return refusal;
                 }
@@ -1006,11 +1024,14 @@ impl Tool for PressKeyTool {
 
         // The addressed window must be the app's confirmed key window before
         // any key (or focus click) goes out; otherwise refuse (window_not_key).
-        let _key_scope = match super::acquire_key_scope_with_eligibility(
-            pid,
-            window_id,
-            fg,
-            pre_focus_ptr.is_none() && px.is_none() && py.is_none(),
+        let _key_scope = match latency::timed(
+            latency::Stage::KeyEntry,
+            super::acquire_key_scope_with_eligibility(
+                pid,
+                window_id,
+                fg,
+                pre_focus_ptr.is_none() && px.is_none() && py.is_none(),
+            ),
         )
         .await
         {
@@ -1022,7 +1043,12 @@ impl Tool for PressKeyTool {
         // CELL rule for untargeted printable keys: a non-editing cell (or an
         // unreadable focused element) refuses the call before any key.
         if printable && pre_focus_guard.is_none() && px.is_none() {
-            if let Some(refusal) = super::not_editable::guard_untargeted(pid, window_id).await {
+            if let Some(refusal) = latency::timed(
+                latency::Stage::KeyGuardUntargeted,
+                super::not_editable::guard_untargeted(pid, window_id),
+            )
+            .await
+            {
                 return refusal;
             }
         }
@@ -1075,6 +1101,7 @@ impl Tool for PressKeyTool {
         // a named session's cursor on the element, or its remembered position,
         // or the window centre, so a keyboard-first session stays visible.
         if !px_focus {
+            let _cursor_span = latency::span(latency::Stage::CursorWork);
             let element_center = match pre_focus_guard.clone() {
                 Some(guard) => latency::spawn_action_blocking(move || unsafe {
                     crate::ax::bindings::element_screen_center(
@@ -1103,8 +1130,10 @@ impl Tool for PressKeyTool {
         // The AX focus_element() pre-write also runs inside the closure
         // so any reflex activations it triggers are caught by both the
         // wildcard snapshot suppressor and the targeted FocusGuard lease.
-        let prior_front = apps::frontmost_pid();
-        let snapshot = WindowChangeDetector::snapshot(prior_front);
+        let (prior_front, snapshot) = latency::section(latency::Stage::WindowSetup, || {
+            let prior_front = apps::frontmost_pid();
+            (prior_front, WindowChangeDetector::snapshot(prior_front))
+        });
         // Return/Escape to a sheet: its window closing is the key's
         // read-back. The baseline is read before the post.
         let sheet_watch = match window_id {
@@ -1214,16 +1243,20 @@ impl Tool for PressKeyTool {
                             || {
                             if let (Some(wid), None) = (window_id, pre_focus_ptr) {
                                 let cached = key_scope.as_ref().is_some_and(|scope| scope.used_belief());
-                                let sample = super::key_delivery_guard::final_window_sample(pid, wid, key_scope)?;
-                                verify_final_key_sample_with(pid, wid, focused_key_route, cached, sample, |sample| match sample {
+                                let sample = latency::section(latency::Stage::KeyFinalSample, || super::key_delivery_guard::final_window_sample(pid, wid, key_scope))?;
+                                let mut final_conflict = None;
+                                latency::section(latency::Stage::KeyConflict, || verify_final_key_sample_with(pid, wid, focused_key_route, cached, sample, |sample| { let conflict = match sample {
                                     Some(window) => crate::ax::exact_target::check_window_focus_conflict_with_sample(pid, wid, None, window),
                                     None => crate::ax::exact_target::check_window_focus_conflict(pid, wid, None),
-                                })?;
+                                }; final_conflict = Some(conflict); conflict }))?;
+                                if let (Some(scope), Some(conflict)) = (key_scope.as_mut(), final_conflict) {
+                                    scope.complete_belief(sample, conflict);
+                                }
                             } else {
                                 verify_raw_key_target(pid, window_id, pre_focus_ptr, focused_key_route)?;
                             }
                             late_cell_refusal(pid, window_id, printable, pre_focus_ptr.is_some())?;
-                            let posted = crate::input::key_hold::deliver(crate::input::key_hold::KeyRoute::Pid(pid), &key, &m, duration, &control);
+                            let posted = latency::section(latency::Stage::KeyPost, || latency::section(latency::Stage::KeyHold, || crate::input::key_hold::deliver(crate::input::key_hold::KeyRoute::Pid(pid), &key, &m, duration, &control)));
                             if posted.is_ok() {
                                 *posted_in.lock().unwrap_or_else(|e| e.into_inner()) =
                                     Some(std::time::Instant::now());
@@ -1251,6 +1284,7 @@ impl Tool for PressKeyTool {
         };
         let changes = super::finish_window_observation(snapshot).await;
 
+        let _result_span = latency::span(latency::Stage::ResultBuild);
         let delivery_outcome = match result {
             Ok(result) => map_delivery_outcome(result),
             Err(error) => {

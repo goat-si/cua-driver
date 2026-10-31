@@ -227,6 +227,12 @@ impl KeyEnv for FakeEnv {
     fn belief_now(&self) -> std::time::Instant {
         self.now.get()
     }
+    fn prepare_belief(&self, ticket: Ticket, wid: u32, focus: KeyFocus) -> bool {
+        self.standard_window.get()
+            && self.incarnation.get() == Some(ticket.stamp)
+            && focus.window == Some(wid)
+            && focus.element_window == Some(wid)
+    }
     fn publish_belief(
         &self,
         ticket: Ticket,
@@ -274,14 +280,82 @@ fn enter(env: &FakeEnv) -> Result<WindowKeyScope, ScopeEntryError> {
     enter_scope_with(env, ops(), -78_001, 2, FastPathEligibility::Ineligible)
 }
 
+#[test]
+fn other_process_hand_back_does_not_block_entry() {
+    let _serial = key_scope_tests_serial();
+    KEY_RESTORES.0.lock().unwrap().push(-78_002);
+    let env = FakeEnv::new(2);
+    let entered = enter(&env);
+    key_restore_done(-78_002);
+    assert!(
+        entered.is_ok(),
+        "an unrelated hand-back must not block entry"
+    );
+}
+
 // The baseline has one entry path; the eligible path must be selected
 // explicitly once window-only key entry is added.
 fn enter_eligible(env: &FakeEnv) -> Result<WindowKeyScope, ScopeEntryError> {
-    enter_scope_with(env, ops(), -78_001, 2, FastPathEligibility::Eligible)
+    let mut scope = enter_scope_with(env, ops(), -78_001, 2, FastPathEligibility::Eligible)?;
+    scope.complete_belief_with(
+        env,
+        Some(2),
+        crate::ax::exact_target::WindowFocusConflict::Clear,
+    );
+    Ok(scope)
 }
 
 fn enter_other_eligible(env: &FakeEnv, target: u32) -> Result<WindowKeyScope, ScopeEntryError> {
-    enter_scope_with(env, ops(), -78_001, target, FastPathEligibility::Eligible)
+    let mut scope = enter_scope_with(env, ops(), -78_001, target, FastPathEligibility::Eligible)?;
+    scope.complete_belief_with(
+        env,
+        Some(target),
+        crate::ax::exact_target::WindowFocusConflict::Clear,
+    );
+    Ok(scope)
+}
+
+#[test]
+fn already_key_belief_waits_for_final_conflict_result() {
+    let _serial = key_scope_tests_serial();
+    let env = FakeEnv::new(2);
+    let mut scope =
+        enter_scope_with(&env, ops(), -78_001, 2, FastPathEligibility::Eligible).unwrap();
+    assert_eq!(env.state.borrow().key_focus_reads, 1);
+    assert_eq!(
+        env.state.borrow().publications,
+        0,
+        "entry must defer belief until the final conflict check"
+    );
+    let sample = env.key_focus(-78_001).window;
+    scope.complete_belief_with(
+        &env,
+        sample,
+        crate::ax::exact_target::WindowFocusConflict::Clear,
+    );
+    assert_eq!(env.state.borrow().key_focus_reads, 2);
+    assert_eq!(env.state.borrow().publications, 1);
+    assert_eq!(scope.finish(), HandBack::NotMoved);
+}
+
+#[test]
+fn final_conflict_rejects_pending_belief_without_another_window_sample() {
+    let _serial = key_scope_tests_serial();
+    let env = FakeEnv::new(2);
+    let mut scope =
+        enter_scope_with(&env, ops(), -78_001, 2, FastPathEligibility::Eligible).unwrap();
+    let sample = env.key_focus(-78_001).window;
+    scope.complete_belief_with(
+        &env,
+        sample,
+        crate::ax::exact_target::WindowFocusConflict::SiblingWindowFocused {
+            target_window_id: 2,
+            sibling_window_id: 1,
+        },
+    );
+    assert_eq!(env.state.borrow().key_focus_reads, 2);
+    assert_eq!(env.state.borrow().publications, 0);
+    assert_eq!(scope.finish(), HandBack::NotMoved);
 }
 
 #[test]

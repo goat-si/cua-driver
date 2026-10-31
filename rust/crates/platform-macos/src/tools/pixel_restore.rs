@@ -349,9 +349,12 @@ async fn invoke_with_fence(
             Some("enable_javascript_apple_events" | "insert_text" | "type_keystrokes")
         )
         || (page_action == Some("execute_javascript") && targeted);
-    let Ok((epoch, _in_flight)) = tokio::time::timeout(
-        std::time::Duration::from_secs(2),
-        fence.admit_action(tracked),
+    let Ok((epoch, _in_flight)) = crate::goat::action_latency::timed(
+        crate::goat::action_latency::Stage::PixelAdmission,
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            fence.admit_action(tracked),
+        ),
     )
     .await
     else {

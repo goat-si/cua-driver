@@ -659,11 +659,17 @@ impl Tool for HotkeyTool {
                         if let Some(wid) = window_id {
                             let cached = key_scope.as_ref().is_some_and(|scope| scope.used_belief());
                             let sample = super::key_delivery_guard::final_window_sample(pid, wid, key_scope)?;
+                            let pending = key_scope.as_ref().is_some_and(|scope| scope.has_pending_belief());
                             if super::press_key::should_check_belief_conflict(cached) {
                                 super::press_key::verify_final_key_sample_with(pid, wid, false, cached, sample, |sample| match sample {
                                     Some(window) => crate::ax::exact_target::check_window_focus_conflict_with_sample(pid, wid, None, window),
                                     None => crate::ax::exact_target::check_window_focus_conflict(pid, wid, None),
                                 })?;
+                            } else if pending {
+                                let conflict = crate::ax::exact_target::check_window_focus_conflict_with_sample(pid, wid, None, sample);
+                                if let Some(scope) = key_scope.as_mut() {
+                                    scope.complete_belief(sample, conflict);
+                                }
                             }
                         }
                     }

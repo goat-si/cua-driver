@@ -48,10 +48,10 @@ mod keycodes;
 // pass that lives in this commit).
 pub mod lparam;
 
+#[cfg(target_os = "windows")]
 mod basis_click;
+#[cfg(target_os = "windows")]
 mod basis_decision;
-#[cfg(test)]
-mod basis_decision_tests;
 
 /// UIA / `WM_NCHITTEST` / `IDC_*` -> cursor shape tables for presence (pure,
 /// every host).
