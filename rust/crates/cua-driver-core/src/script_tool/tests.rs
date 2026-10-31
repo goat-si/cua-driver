@@ -141,6 +141,70 @@ fn structured(result: &ToolResult) -> Value {
     result.structured_content.clone().unwrap_or(Value::Null)
 }
 
+struct HangingAction {
+    def: ToolDef,
+    started: Arc<tokio::sync::Notify>,
+}
+
+#[async_trait]
+impl Tool for HangingAction {
+    fn def(&self) -> &ToolDef {
+        &self.def
+    }
+    async fn invoke(&self, _: Value) -> ToolResult {
+        self.started.notify_one();
+        std::future::pending().await
+    }
+}
+
+#[tokio::test]
+async fn script_timeout_after_attempt_is_not_safe() {
+    let started = Arc::new(tokio::sync::Notify::new());
+    let mut registry = ToolRegistry::new();
+    registry.register(Box::new(HangingAction {
+        def: ToolDef { name:"type_text".into(), description:"fixture".into(),
+            input_schema:json!({"type":"object", "properties":{"pid":{"type":"integer"}, "window_id":{"type":"integer"}, "text":{"type":"string"}}}),
+            read_only:false, destructive:false, idempotent:false, open_world:false },
+        started: started.clone(),
+    }));
+    registry.register_session_tools();
+    registry.register_script_tool();
+    let registry = Arc::new(registry);
+    registry.init_self_weak();
+    let run_registry = registry.clone();
+    let call =
+        tokio::spawn(async move {
+            run_registry.invoke(super::RUN_SCRIPT_TOOL, json!({
+            "script":"await cua.call('type_text', {pid: 425090, window_id: 7, text: 'x'});",
+            "timeout_ms": 1000
+        })).await
+        });
+    tokio::time::timeout(Duration::from_secs(5), started.notified())
+        .await
+        .expect("action was attempted");
+    let result = call.await.expect("script task");
+    assert_eq!(result.is_error, Some(true));
+    assert_eq!(
+        result.disposition,
+        Some(cua_driver_contract::ErrorDisposition::UNCERTAIN)
+    );
+    assert_eq!(
+        serde_json::to_value(&result).unwrap()["structuredContent"]["disposition"],
+        json!({"delivery":"delivery_uncertain", "retry":"unknown"})
+    );
+}
+
+#[tokio::test]
+async fn complete_script_with_no_action_is_not_delivered() {
+    let harness = Harness::new();
+    let result = harness.run("throw new Error('before any call');").await;
+    assert_eq!(result.is_error, Some(true));
+    assert_eq!(
+        result.disposition,
+        Some(cua_driver_contract::ErrorDisposition::NOT_DELIVERED)
+    );
+}
+
 #[tokio::test]
 async fn a_script_acts_by_name_and_returns_value_console_and_call_log() {
     let harness = Harness::new();

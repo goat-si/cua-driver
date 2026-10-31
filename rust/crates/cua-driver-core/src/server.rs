@@ -935,9 +935,12 @@ async fn dispatch_request(
                 if !provider.is_known_tool(&call.name) {
                     return Response::ok(
                         id,
-                        tool_error_result(
-                            format!("Unknown tool: {}", call.name),
-                            serde_json::json!({"code": "unknown_tool"}),
+                        conforming_tool_result(
+                            &call.name,
+                            tool_error_result(
+                                format!("Unknown tool: {}", call.name),
+                                serde_json::json!({"code": "unknown_tool"}),
+                            ),
                         ),
                     );
                 }

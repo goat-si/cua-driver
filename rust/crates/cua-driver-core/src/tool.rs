@@ -1856,7 +1856,7 @@ impl ToolRegistry {
                     .check(tool, &view, scoped_tool.def().read_only, self)
                     .await
                 {
-                    return refusal.into_result();
+                    return registry_disposition(refusal.into_result(), true, false);
                 }
             }
         }
@@ -1873,19 +1873,46 @@ impl ToolRegistry {
                 )
                 .await
             }
-            Err((message, structured)) => ToolResult::error(message).with_structured(structured),
+            Err((message, structured)) => registry_disposition(
+                ToolResult::error(message).with_structured(structured),
+                true,
+                false,
+            ),
         };
         crate::recovery_hint::annotate(tool, &seed, &mut result);
         crate::batch_nudge::annotate(tool, session.as_deref(), in_batch, &mut result);
-        result
+        let read_only = self
+            .tools
+            .get(tool)
+            .is_some_and(|tool| tool.def().read_only);
+        registry_disposition(result, false, read_only)
     }
 
     async fn invoke_authorized_unannotated(
         &self,
         name: &str,
+        args: Value,
+        context: &crate::session_authorization::EffectiveAuthorizationContext,
+        evidence: &TrustedInvocationEvidence,
+    ) -> ToolResult {
+        let mut dispatched = false;
+        let result = self
+            .invoke_authorized_dispatch(name, args, context, evidence, &mut dispatched)
+            .await;
+        if dispatched {
+            result
+        } else {
+            registry_disposition(result, true, false)
+        }
+    }
+
+    async fn invoke_authorized_dispatch(
+        &self,
+        name: &str,
         mut args: Value,
         context: &crate::session_authorization::EffectiveAuthorizationContext,
         evidence: &TrustedInvocationEvidence,
+        dispatched: &mut bool,
     ) -> ToolResult {
         // This function is the canonical native dispatch boundary. Keep
         // transport-side stripping as defense in depth, but never trust a
@@ -2572,6 +2599,7 @@ impl ToolRegistry {
         // back to the uncapped capture before any platform interprets them.
         crate::desktop_capture_scale::map_desktop_args(&mut args);
         crate::tool_activity::note_tool_activity();
+        *dispatched = true;
         let dispatch = crate::recording::scope_dispatch_click_capture(
             pending_turn.as_ref(),
             tool.invoke(args.clone()),
@@ -2588,6 +2616,11 @@ impl ToolRegistry {
         } else {
             dispatch.await
         };
+        if result.is_error == Some(true) {
+            if let Some(Value::Object(structured)) = result.structured_content.as_mut() {
+                structured.remove("disposition");
+            }
+        }
         match resolved_name {
             "get_desktop_state" if result.is_error != Some(true) => {
                 crate::desktop_capture_scale::record_desktop_state(
@@ -4190,6 +4223,107 @@ mod runtime_isolation_tests {
     struct ReplayProbe {
         hits: Arc<AtomicUsize>,
         def: super::ToolDef,
+    }
+
+    struct DispositionProbe {
+        def: super::ToolDef,
+        hits: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl super::Tool for DispositionProbe {
+        fn def(&self) -> &super::ToolDef {
+            &self.def
+        }
+        async fn invoke(&self, _: serde_json::Value) -> ToolResult {
+            self.hits.fetch_add(1, Ordering::SeqCst);
+            ToolResult::error("fixture error").with_structured(serde_json::json!({
+                "code":"fixture_error", "disposition":{"delivery":"not_delivered", "retry":"safe"}
+            }))
+        }
+    }
+
+    fn disposition_probe(
+        name: &str,
+        read_only: bool,
+        hits: Arc<AtomicUsize>,
+    ) -> Box<dyn super::Tool> {
+        Box::new(DispositionProbe {
+            hits,
+            def: super::ToolDef {
+                name: name.into(),
+                description: "test".into(),
+                input_schema: serde_json::json!({"type":"object"}),
+                read_only,
+                destructive: false,
+                idempotent: false,
+                open_world: false,
+            },
+        })
+    }
+
+    #[tokio::test]
+    async fn tool_emitted_disposition_is_stripped() {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let mut registry = super::ToolRegistry::new();
+        registry.register(disposition_probe("clipboard_write", false, hits.clone()));
+        let result = registry
+            .invoke_with_context(
+                "clipboard_write",
+                serde_json::json!({"text":"x"}),
+                unrestricted_context(),
+            )
+            .await;
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        let wire = crate::mcp_result::conforming_tool_result(
+            "clipboard_write",
+            serde_json::to_value(result).unwrap(),
+        );
+        assert_eq!(
+            wire["structuredContent"]["disposition"],
+            serde_json::json!({"delivery":"unknown", "retry":"unknown"})
+        );
+    }
+
+    #[tokio::test]
+    async fn read_only_tool_error_is_not_delivered_safe() {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let mut registry = super::ToolRegistry::new();
+        registry.register(disposition_probe("list_apps", true, hits.clone()));
+        let result = registry
+            .invoke_with_context("list_apps", serde_json::json!({}), unrestricted_context())
+            .await;
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        let wire = crate::mcp_result::conforming_tool_result(
+            "list_apps",
+            serde_json::to_value(result).unwrap(),
+        );
+        assert_eq!(
+            wire["structuredContent"]["disposition"],
+            serde_json::json!({"delivery":"not_delivered", "retry":"safe"})
+        );
+    }
+
+    #[tokio::test]
+    async fn chokepoint_permission_denied_is_not_delivered_safe() {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let mut registry = super::ToolRegistry::new();
+        registry.register(disposition_probe("clipboard_write", false, hits.clone()));
+        let context = bounded_context(
+            "version: 3\nexpires_after: 1h\nidle_timeout: 30m\nallow:\n  tools: [list_apps]\n",
+        );
+        let result = registry
+            .invoke_with_context("clipboard_write", serde_json::json!({"text":"x"}), context)
+            .await;
+        assert_eq!(hits.load(Ordering::SeqCst), 0);
+        let wire = crate::mcp_result::conforming_tool_result(
+            "clipboard_write",
+            serde_json::to_value(result).unwrap(),
+        );
+        assert_eq!(
+            wire["structuredContent"]["disposition"],
+            serde_json::json!({"delivery":"not_delivered", "retry":"safe"})
+        );
     }
 
     struct EchoInputProbe {
@@ -7923,13 +8057,34 @@ fn batch_scope_view(def: &ToolDef, args: &Value) -> Value {
 }
 
 fn permission_denied_result(message: String) -> ToolResult {
-    ToolResult::error(message.clone()).with_structured(serde_json::json!({
-        "status": "refused",
-        "refusal": {
-            "code": "permission_denied",
-            "message": message,
-        }
-    }))
+    registry_disposition(
+        ToolResult::error(message.clone()).with_structured(serde_json::json!({
+            "status": "refused",
+            "refusal": {
+                "code": "permission_denied",
+                "message": message,
+            }
+        })),
+        true,
+        false,
+    )
+}
+
+fn registry_disposition(
+    mut result: ToolResult,
+    before_dispatch: bool,
+    read_only: bool,
+) -> ToolResult {
+    if result.is_error != Some(true) {
+        return result;
+    }
+    if before_dispatch || read_only {
+        result.disposition = Some(cua_driver_contract::ErrorDisposition::NOT_DELIVERED);
+    }
+    if let Some(Value::Object(object)) = result.structured_content.as_mut() {
+        object.remove("disposition");
+    }
+    result
 }
 
 fn protected_consent_refusal(error: crate::consent::ConsentError) -> ToolResult {

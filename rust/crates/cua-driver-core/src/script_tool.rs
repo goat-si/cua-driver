@@ -192,7 +192,9 @@ impl Tool for RunScriptTool {
                 \n\
                 Limits: `timeout_ms` (default 30000, max 120000), `max_calls` (default 100, max 500), 32 MiB \
                 heap. Returns the value, console output and a per-call log (tool, pid/window_id, effect, code); \
-                an error names the script line, the call and the reason.\n\
+                an error names the script line, the call and the reason. retry: safe means a retry cannot \
+                duplicate input into an application; it is not permission to retry and says nothing about file \
+                or other side effects.\n\
                 \n\
                 Example:\n\
                 const app = await cua.getApp(\"Calculator\");\n\
@@ -246,6 +248,7 @@ impl Tool for RunScriptTool {
                 return ToolResult::error(
                     "run_script is not available: registry not initialised yet.",
                 )
+                .with_disposition(cua_driver_contract::ErrorDisposition::NOT_DELIVERED)
             }
         };
         let request = match Request::parse(&args) {
@@ -255,6 +258,7 @@ impl Tool for RunScriptTool {
                     .with_structured(
                         json!({"ok": false, "code": "invalid_script", "detail": message}),
                     )
+                    .with_disposition(cua_driver_contract::ErrorDisposition::NOT_DELIVERED)
             }
         };
         let scope = request.scope.clone();
@@ -399,13 +403,15 @@ async fn run(registry: &ToolRegistry, request: Request) -> ToolResult {
             let _ = done_tx.send(outcome);
         });
     if let Err(error) = spawned {
-        return ToolResult::error(format!("run_script could not start its engine: {error}"));
+        return ToolResult::error(format!("run_script could not start its engine: {error}"))
+            .with_disposition(cua_driver_contract::ErrorDisposition::NOT_DELIVERED);
     }
 
     let mut api = Api::new(registry, request.session.clone(), deadline);
     api.checkpoint = request.checkpoint;
     let mut log: Vec<CallRecord> = Vec::new();
     let mut scope_stop: Option<ScopeStop> = None;
+    let mut interrupted_call = false;
     let hard_stop = deadline + SHUTDOWN_GRACE;
     let outcome = loop {
         tokio::select! {
@@ -424,7 +430,10 @@ async fn run(registry: &ToolRegistry, request: Request) -> ToolResult {
                 } else {
                     match tokio::time::timeout_at(deadline.into(), api.dispatch(&call.op, call.args)).await {
                         Ok(result) => result,
-                        Err(_) => Err(HostError::new("the script's wall-time limit was reached", "timeout")),
+                        Err(_) => {
+                            interrupted_call = true;
+                            Err(HostError::new("the script's wall-time limit was reached", "timeout"))
+                        },
                     }
                 };
                 let mut facts = api.last.take().unwrap_or_default();
@@ -531,7 +540,20 @@ async fn run(registry: &ToolRegistry, request: Request) -> ToolResult {
         }
         (outcome, _) => outcome,
     };
-    render(
+    let complete = !interrupted_call
+        && outcome.as_ref().is_some_and(|outcome| {
+            outcome.result.as_ref().err().is_none_or(|failure| {
+                matches!(failure.kind, FailureKind::Exception | FailureKind::Syntax)
+            })
+        });
+    let disposition = if api.action_history.iter().any(|completed| *completed) {
+        cua_driver_contract::ErrorDisposition::DELIVERED
+    } else if !complete || !api.action_history.is_empty() {
+        cua_driver_contract::ErrorDisposition::UNCERTAIN
+    } else {
+        cua_driver_contract::ErrorDisposition::NOT_DELIVERED
+    };
+    let mut result = render(
         outcome,
         log,
         api.images,
@@ -539,7 +561,11 @@ async fn run(registry: &ToolRegistry, request: Request) -> ToolResult {
         request.max_calls,
         request.scope.as_deref(),
         request.checkpoint,
-    )
+    );
+    if result.is_error == Some(true) {
+        result.disposition = Some(disposition);
+    }
+    result
 }
 
 /// Executes the script's operations through the registry.
@@ -553,6 +579,8 @@ struct Api<'a> {
     last: Option<CallFacts>,
     /// `verify: "checkpoint"`: actions skip their post-action report wait.
     checkpoint: bool,
+    /// One entry per attempted non-read-only call, inserted before awaiting it.
+    action_history: Vec<bool>,
 }
 
 impl<'a> Api<'a> {
@@ -565,6 +593,7 @@ impl<'a> Api<'a> {
             images: Vec::new(),
             last: None,
             checkpoint: false,
+            action_history: Vec::new(),
         }
     }
 
@@ -658,9 +687,19 @@ impl<'a> Api<'a> {
         } else {
             crate::step_pacing::StepPacing::Single
         };
+        let action = self.registry.get_def(tool).is_none_or(|def| !def.read_only);
+        if action {
+            self.action_history.push(false);
+        }
         let result =
             crate::step_pacing::scope(pacing, self.registry.invoke(tool, Value::Object(args)))
                 .await;
+        if action {
+            *self
+                .action_history
+                .last_mut()
+                .expect("action attempt recorded") = true;
+        }
         let structured_str = |key: &str| {
             result
                 .structured_content

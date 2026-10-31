@@ -196,7 +196,7 @@ impl Tool for GetDesktopStateTool {
             content,
             is_error: None,
             structured_content: Some(structured),
-            action_record: None,
+            ..Default::default()
         }
     }
 }

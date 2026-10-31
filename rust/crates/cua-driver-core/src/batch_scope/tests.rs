@@ -1036,6 +1036,18 @@ async fn a_refused_precondition_never_lets_the_same_step_act() {
     assert_eq!(out["steps"][0]["code"], OUTSIDE_SCOPE, "{out}");
     assert_eq!(out["steps"][0]["effect"], "refused");
     assert!(harness.sent("click").is_empty(), "the action was not sent");
+    assert_eq!(
+        result.disposition,
+        Some(cua_driver_contract::ErrorDisposition::NOT_DELIVERED)
+    );
+    let wire = crate::mcp_result::conforming_tool_result(
+        "run_steps",
+        serde_json::to_value(&result).unwrap(),
+    );
+    assert_eq!(
+        wire["structuredContent"]["disposition"],
+        json!({"delivery":"not_delivered", "retry":"safe"})
+    );
 }
 
 #[tokio::test]
@@ -1056,6 +1068,10 @@ async fn a_refused_final_read_fails_the_batch() {
     assert_eq!(out["code"], OUTSIDE_SCOPE);
     assert_eq!(out["observation"]["code"], OUTSIDE_SCOPE, "{out}");
     assert_eq!(out["observation"]["effect"], "refused");
+    assert_eq!(
+        result.disposition,
+        Some(cua_driver_contract::ErrorDisposition::DELIVERED)
+    );
     assert_eq!(
         out["steps"][0]["effect"], "unverifiable",
         "the step itself ran"
