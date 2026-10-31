@@ -86,6 +86,7 @@ pub mod batch_scope;
 pub mod batch_tools;
 pub mod browser;
 pub mod build_info;
+pub mod desktop_lease;
 pub mod capture_mode;
 pub(crate) mod capture_registry;
 pub mod capture_runtime;
