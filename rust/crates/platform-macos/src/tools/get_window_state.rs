@@ -277,7 +277,8 @@ fn verified_capture(
             Err(e) if prefetch_left_worker_behind => return Err(e),
             Err(e @ PxFrameError::CaptureUnavailable { .. })
                 if matches!(&e, PxFrameError::CaptureUnavailable { reason, .. }
-                    if crate::capture::capture_left_a_worker_behind(reason)) =>
+                    if crate::capture::capture_left_a_worker_behind(reason)
+                    || reason.contains(crate::capture::CAPTURE_GENERATION_MARKER)) =>
             {
                 return Err(e)
             }
