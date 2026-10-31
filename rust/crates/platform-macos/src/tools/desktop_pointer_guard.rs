@@ -360,3 +360,35 @@ mod tests {
         .is_some());
     }
 }
+
+#[cfg(test)]
+mod task_failure_tests {
+    use super::*;
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+
+    #[tokio::test]
+    async fn a_failed_user_window_check_refuses() {
+        let dispatched = Arc::new(AtomicUsize::new(0));
+        let refusal = check_with("click", &json!({}), vec![(1.0, 2.0)], None, |_, _| {
+            panic!("fake user-window check failed")
+        })
+        .await;
+        if refusal.is_none() {
+            dispatched.fetch_add(1, Ordering::SeqCst);
+        }
+        assert_eq!(
+            dispatched.load(Ordering::SeqCst),
+            0,
+            "no input should be dispatched"
+        );
+        let result = refusal.expect("a failed check must refuse");
+        assert_eq!(result.is_error, Some(true));
+        let structured = result.structured_content.expect("refusal details");
+        assert_eq!(structured["effect"], "refused");
+        assert_eq!(structured["dispatched"], false);
+        assert!(format!("{:?}", result.content).contains("could not complete"));
+    }
+}
