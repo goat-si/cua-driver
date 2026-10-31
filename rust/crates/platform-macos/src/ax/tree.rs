@@ -28,8 +28,8 @@ use core_foundation::{
 };
 use cua_driver_core::snapshot_compaction::{
     compact_tab_strip, fold_actionless_text_subtrees, format_omitted_tabs_line,
-    is_secure_text_field, redact_if_secure, should_probe_secure_text_role, CompactableNode,
-    FieldSecurityMeta, TabChildMeta, TabStripCompaction, TAB_STRIP_COMPACTION_THRESHOLD,
+    is_secure_text_field, redact_if_secure, CompactableNode, FieldSecurityMeta, TabChildMeta,
+    TabStripCompaction, TAB_STRIP_COMPACTION_THRESHOLD,
 };
 use cua_driver_core::walk_budget::{WalkBudget, WalkOutcome};
 use std::time::Instant;
@@ -1023,7 +1023,23 @@ unsafe fn walk_element(
     // A scroll area that can scroll is a row of its own: it is what scroll
     // targets, and its bar position tells an agent, and a diff read, whether
     // a scroll moved anything. One that cannot scroll is layout only.
+    let mut scroll_attrs = None;
     if role == "AXScrollArea" && !in_web_content {
+        let Some(attrs) = read_content_attrs(element, &role, budget, batching_disabled) else {
+            push_timed_out_row(
+                role,
+                element,
+                depth,
+                parent_index,
+                in_web_content,
+                nodes,
+                lines,
+            );
+            return;
+        };
+        if attrs.read_failed {
+            note_skipped();
+        }
         let vertical = super::scroll_area::bar_position(element, "down");
         let horizontal = super::scroll_area::bar_position(element, "right");
         if let Some(label) = super::scroll_area::position_label(vertical, horizontal) {
@@ -1033,20 +1049,10 @@ unsafe fn walk_element(
             // An exhaustive walk keeps the area's own labels, read with their
             // failures, so a selector naming it is answered; the bar
             // position stays the row's value.
+            let secure = attrs.secure;
+            let value_unknown = attrs.value_unknown;
             let ((title, description, own_value, identifier), exhaustive) = if exhaustive_nodes() {
-                match read_content_attrs(element, budget, batching_disabled) {
-                    Some(attrs) => {
-                        let (labels, complete) = scroll_area_labels(attrs);
-                        if !complete {
-                            note_skipped();
-                        }
-                        (labels, true)
-                    }
-                    None => {
-                        note_skipped();
-                        ((None, None, None, None), true)
-                    }
-                }
+                (scroll_area_labels(attrs).0, true)
             } else {
                 (
                     (
@@ -1065,7 +1071,15 @@ unsafe fn walk_element(
                 // A verify read keeps the area's own label order (its value,
                 // then its identifier); the bar position is in value_state,
                 // which is what the row's structured `value` reports.
-                value: if exhaustive { own_value } else { Some(label) },
+                value: if secure {
+                    Some("[redacted]".into())
+                } else if value_unknown {
+                    None
+                } else if exhaustive {
+                    own_value
+                } else {
+                    Some(label)
+                },
                 description,
                 identifier,
                 help: None,
@@ -1074,7 +1088,13 @@ unsafe fn walk_element(
                 depth,
                 parent_element_index: parent_index,
                 frame: element_screen_rect(element),
-                value_state: vertical.or(horizontal).map(|v| format!("{v:.3}")),
+                value_state: if secure {
+                    Some("[redacted]".into())
+                } else if value_unknown {
+                    None
+                } else {
+                    vertical.or(horizontal).map(|v| format!("{v:.3}"))
+                },
                 value_description: None,
                 min_value: Some(0.0),
                 max_value: Some(1.0),
@@ -1101,6 +1121,7 @@ unsafe fn walk_element(
             );
             return;
         }
+        scroll_attrs = Some(attrs);
     }
 
     // Skip pure layout containers that have no interesting content.
@@ -1108,7 +1129,11 @@ unsafe fn walk_element(
         // An exhaustive walk keeps the container as a display-only row, so a
         // selector naming it is answered rather than assumed absent.
         if exhaustive_nodes() {
-            let node = match read_content_attrs(element, budget, batching_disabled) {
+            let attrs = match scroll_attrs.take() {
+                Some(attrs) => Some(attrs),
+                None => read_content_attrs(element, &role, budget, batching_disabled),
+            };
+            let node = match attrs {
                 Some(attrs) => {
                     if attrs.read_failed {
                         note_skipped();
@@ -1159,12 +1184,15 @@ unsafe fn walk_element(
         title,
         copied_value,
         value,
-        placeholder,
+        placeholder: _,
         description,
         identifier,
         help,
+        subrole,
         read_failed,
-    }) = read_content_attrs(element, budget, batching_disabled)
+        secure,
+        value_unknown,
+    }) = read_content_attrs(element, &role, budget, batching_disabled)
     else {
         // Only the role is known: a selector on its label cannot be answered.
         note_skipped();
@@ -1178,20 +1206,12 @@ unsafe fn walk_element(
         note_skipped();
     }
     let actions = copy_action_names(element);
-    let (subrole, placeholder) = if should_probe_secure_text_role(&role, None) {
-        let subrole = copy_string_attr(element, "AXSubrole");
-        let placeholder = placeholder.or_else(|| copy_string_attr(element, "AXPlaceholderValue"));
-        (subrole, placeholder)
-    } else {
-        (None, placeholder)
-    };
-
     let visible_title = title.as_deref().unwrap_or("").trim().to_owned();
     let visible_description = description.as_deref().unwrap_or("").trim().to_owned();
     let visible_value = value.as_deref().unwrap_or("").trim().to_owned();
     let visible_description =
         window_chrome_button_description(&role, &visible_title, &visible_description, || {
-            copy_string_attr(element, "AXSubrole")
+            subrole.clone()
         })
         .map(str::to_owned)
         .unwrap_or(visible_description);
@@ -1310,31 +1330,28 @@ unsafe fn walk_element(
                 .or_else(|| value.clone())
                 .map(|v| v.trim().to_owned())
                 .filter(|v| !v.is_empty()),
-            value_description: control
-                .value_description
-                .map(|v| v.trim().to_owned())
-                .filter(|v| !v.is_empty()),
+            value_description: if secure || value_unknown {
+                None
+            } else {
+                control
+                    .value_description
+                    .map(|v| v.trim().to_owned())
+                    .filter(|v| !v.is_empty())
+            },
             min_value: control.min_value,
             max_value: control.max_value,
             enabled,
             selected: control.selected,
         }
     });
-    let security_meta = FieldSecurityMeta {
-        role: &role,
-        subrole: subrole.as_deref(),
-        title: (!visible_title.is_empty()).then_some(visible_title.as_str()),
-        description: (!visible_description.is_empty()).then_some(visible_description.as_str()),
-        placeholder: placeholder.as_deref(),
-        identifier: identifier.as_deref(),
-        help: help.as_deref(),
-        is_password_flag: false,
+    let (redacted_value, redacted_value_state) = if secure {
+        (Some("[redacted]".to_owned()), Some("[redacted]".to_owned()))
+    } else {
+        (
+            (!visible_value.is_empty()).then(|| visible_value.clone()),
+            control_state.value_state.clone(),
+        )
     };
-    let (redacted_value, redacted_value_state) = redact_if_secure(
-        &security_meta,
-        (!visible_value.is_empty()).then(|| visible_value.clone()),
-        control_state.value_state.clone(),
-    );
     let node = if is_actionable {
         let idx = *counter;
         *counter += 1;
@@ -1476,7 +1493,7 @@ unsafe fn walk_children(
         return;
     };
     let tab_plan = if !in_web_content && children.len() >= TAB_STRIP_COMPACTION_THRESHOLD {
-        plan_macos_tab_strip(element, role, &children)
+        plan_macos_tab_strip(element, role, &children, budget, batching_disabled)
     } else {
         None
     };
@@ -1544,6 +1561,8 @@ unsafe fn plan_macos_tab_strip(
     parent: AXUIElementRef,
     parent_role: &str,
     children: &[AXUIElementRef],
+    budget: &mut WalkBudget,
+    batching_disabled: &mut bool,
 ) -> Option<TabStripCompaction> {
     if !matches!(
         parent_role,
@@ -1572,7 +1591,13 @@ unsafe fn plan_macos_tab_strip(
         if cua_driver_core::snapshot_compaction::is_tab_like_child(parent_role, &r, rd.as_deref()) {
             tab_like_count += 1;
             child_selected.push(copy_bool_attr(child, "AXSelected"));
-            child_values.push(copy_stringish_attr(child, "AXValue").map(|v| v.state_value));
+            let role = if r.is_empty() { "AXUnknown" } else { &r };
+            let attrs = read_content_attrs(child, role, budget, batching_disabled)?;
+            let (value, incomplete) = tab_child_value(attrs);
+            if incomplete {
+                note_skipped();
+            }
+            child_values.push(value);
         } else {
             child_selected.push(None);
             child_values.push(None);
@@ -1600,6 +1625,221 @@ unsafe fn plan_macos_tab_strip(
         parent_role_desc.as_deref(),
         &metas,
     )
+}
+
+fn tab_child_value(attrs: ContentAttrs) -> (Option<String>, bool) {
+    (
+        attrs.copied_value.map(|value| value.state_value),
+        attrs.read_failed,
+    )
+}
+
+#[cfg(test)]
+mod secure_value_tests {
+    use super::*;
+    use crate::ax::batch_attrs::BatchFailure;
+    use crate::ax::content_attrs::{read_with, AttrStatus, ContentReader};
+    use cua_driver_core::protocol::Content;
+    use cua_driver_core::window_state_view::{apply, ViewContext, ViewKey, ViewOptions};
+    use serde_json::json;
+    use std::cell::RefCell;
+
+    struct Fake {
+        attrs: [AttrStatus; 6],
+        trace: Vec<&'static str>,
+    }
+    impl Fake {
+        fn new(subrole: Option<&str>) -> Self {
+            let mut attrs = std::array::from_fn(|_| AttrStatus::Absent);
+            if let Some(subrole) = subrole {
+                attrs[5] = AttrStatus::Known(subrole.into());
+            }
+            Self {
+                attrs,
+                trace: Vec::new(),
+            }
+        }
+        fn read(&mut self, role: AttrStatus) -> ContentAttrs {
+            read_with(role, self, &mut false).unwrap()
+        }
+    }
+    impl ContentReader for Fake {
+        fn batch(&mut self) -> Result<[AttrStatus; 6], BatchFailure> {
+            self.trace.push("batch");
+            Ok(self.attrs.clone())
+        }
+        fn string(&mut self, _: &str) -> AttrStatus {
+            panic!("batch should succeed")
+        }
+        fn value(&mut self) -> Result<Option<StringishAttrValue>, AXError> {
+            self.trace.push("AXValue");
+            Ok(Some(StringishAttrValue {
+                string_value: Some("ordinary".into()),
+                state_value: "ordinary".into(),
+            }))
+        }
+        fn expired(&self) -> bool {
+            false
+        }
+    }
+
+    #[test]
+    fn tab_compaction_never_reads_secure_or_unknown_child_values() {
+        assert!(cua_driver_core::snapshot_compaction::is_tab_like_child(
+            "AXTabGroup",
+            "",
+            Some("tab")
+        ));
+        let mut secure = Fake::new(Some("AXSecureTextField"));
+        let attrs = secure.read(AttrStatus::Known("AXTab".into()));
+        assert_eq!(tab_child_value(attrs).0, None);
+        assert!(!secure.trace.contains(&"AXValue"));
+        let mut unknown = Fake::new(None);
+        let attrs = unknown.read(AttrStatus::Failed);
+        let (value, incomplete) = tab_child_value(attrs);
+        assert_eq!(value, None);
+        assert!(incomplete);
+        assert!(!unknown.trace.contains(&"AXValue"));
+        let mut ordinary = Fake::new(None);
+        assert_eq!(
+            tab_child_value(ordinary.read(AttrStatus::Known("AXTab".into())))
+                .0
+                .as_deref(),
+            Some("ordinary")
+        );
+    }
+
+    #[test]
+    fn chrome_button_reuses_the_classification_subrole() {
+        let mut reader = Fake::new(Some("AXCloseButton"));
+        let attrs = reader.read(AttrStatus::Known("AXButton".into()));
+        assert_eq!(
+            window_chrome_button_description("AXButton", "", "", || attrs.subrole.clone()),
+            Some("close button")
+        );
+        assert_eq!(reader.trace, ["batch", "AXValue"]);
+    }
+
+    #[test]
+    fn scrollbar_position_reads_require_a_known_scrollbar_role() {
+        for role in [None, Some("AXButton"), Some("AXSecureTextField")] {
+            let trace = RefCell::new(Vec::new());
+            let value = super::super::scroll_area::scrollbar_value(
+                || {
+                    trace.borrow_mut().push("AXRole");
+                    role.map(str::to_owned)
+                },
+                || {
+                    trace.borrow_mut().push("AXValue");
+                    Some(0.5)
+                },
+            );
+            assert_eq!(value, None);
+            assert_eq!(*trace.borrow(), ["AXRole"]);
+        }
+        let trace = RefCell::new(Vec::new());
+        let value = super::super::scroll_area::scrollbar_value(
+            || {
+                trace.borrow_mut().push("AXRole");
+                Some("AXScrollBar".into())
+            },
+            || {
+                trace.borrow_mut().push("AXValue");
+                Some(0.5)
+            },
+        );
+        assert_eq!(value, Some(0.5));
+        assert_eq!(*trace.borrow(), ["AXRole", "AXValue"]);
+    }
+
+    fn fake_node(role: AttrStatus, subrole: Option<&str>) -> (AXNode, Vec<&'static str>) {
+        let mut reader = Fake::new(subrole);
+        let attrs = reader.read(role);
+        let mut node = display_node("AXTextField", attrs, std::ptr::null_mut(), 0, None, false);
+        node.element_index = Some(0);
+        node.value_state = node.value.clone();
+        (node, reader.trace)
+    }
+
+    #[test]
+    fn structured_elements_and_since_follow_the_same_rule() {
+        let (secure, trace) = fake_node(
+            AttrStatus::Known("AXTextField".into()),
+            Some("AXSecureTextField"),
+        );
+        assert!(!trace.contains(&"AXValue"));
+        let line = format_node_line(&secure);
+        assert!(line.contains("[redacted]"));
+        assert_eq!(
+            crate::tools::test_element_entry(&secure, None, None)["value"],
+            "[redacted]"
+        );
+        let (unknown, trace) = fake_node(AttrStatus::Failed, None);
+        assert!(!trace.contains(&"AXValue"));
+        assert!(!format_node_line(&unknown).contains("ordinary"));
+        assert!(crate::tools::test_element_entry(&unknown, None, None)
+            .get("value")
+            .is_none());
+        let ctx = ViewContext {
+            pid: 260105,
+            window_id: 260105,
+            key: ViewKey {
+                query: None,
+                max_elements: 250,
+                max_depth: None,
+            },
+            focus_probe: None,
+        };
+        let mut before = json!({"snapshot_id":"s00de1001", "tree_markdown":line});
+        let mut content = vec![Content::text(before["tree_markdown"].as_str().unwrap())];
+        apply(
+            &ViewOptions::from_args(&json!({})).unwrap(),
+            &ctx,
+            &mut content,
+            &mut before,
+        );
+        let mut after =
+            json!({"snapshot_id":"s00de1002", "tree_markdown":format_node_line(&secure)});
+        apply(
+            &ViewOptions::from_args(&json!({"since":"s00de1001"})).unwrap(),
+            &ctx,
+            &mut content,
+            &mut after,
+        );
+        assert_eq!(after["since_status"], "no_change");
+        assert!(!after.to_string().contains("ordinary"));
+    }
+
+    #[test]
+    fn deferred_dense_rows_use_the_same_policy() {
+        let mut rows = vec![DeferredRow {
+            anchor: 0,
+            seq: 0,
+            position: 0,
+            collection: 0,
+            element: unsafe { RetainedElement::retain(0) },
+            depth: 0,
+            parent_index: None,
+            in_web_content: false,
+            visible: true,
+            walked: None,
+        }];
+        let skipped = dense_rows::walk_deferred(&mut rows, false, |_| {
+            let (node, trace) = fake_node(
+                AttrStatus::Known("AXTextField".into()),
+                Some("AXSecureTextField"),
+            );
+            assert!(!trace.contains(&"AXValue"));
+            Chunk {
+                lines: vec![(0, format_node_line(&node))],
+                nodes: vec![node],
+            }
+        });
+        assert!(!skipped);
+        let chunk = rows[0].walked.as_ref().unwrap();
+        assert!(chunk.lines[0].1.contains("[redacted]"));
+        assert_eq!(chunk.nodes[0].value.as_deref(), Some("[redacted]"));
+    }
 }
 
 /// Trimmed text, or `None` when empty.
@@ -2723,7 +2963,10 @@ mod lean_row_tests {
             description: None,
             identifier: Some("editor-scroll".into()),
             help: None,
+            subrole: None,
             read_failed,
+            secure: false,
+            value_unknown: false,
         };
         let ((title, _, _, identifier), complete) =
             super::scroll_area_labels(attrs(Some(" Editor "), None, false));
@@ -2751,7 +2994,10 @@ mod lean_row_tests {
             description: None,
             identifier: None,
             help: None,
+            subrole: None,
             read_failed: false,
+            secure: false,
+            value_unknown: false,
         };
         let node = super::display_node("AXGroup", attrs, std::ptr::null_mut(), 1, None, false);
         assert_eq!(node.value.as_deref(), Some("Saved"));

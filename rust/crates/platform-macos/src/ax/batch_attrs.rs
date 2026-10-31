@@ -73,6 +73,7 @@ impl BatchSlots {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn stringish(&self, index: usize) -> Option<StringishAttrValue> {
         match self.slots[index] {
             Slot::Value(value) => unsafe { stringish_from_cf(value) },

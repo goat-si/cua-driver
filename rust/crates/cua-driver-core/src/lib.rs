@@ -100,6 +100,7 @@ pub mod cursor_shape;
 pub mod daemon;
 pub mod delivery;
 pub mod desktop_capture_scale;
+pub mod desktop_lease;
 pub mod element_frame;
 pub mod element_query;
 pub mod element_token;
@@ -125,6 +126,7 @@ pub mod policy;
 pub mod post_action_wait;
 #[cfg(any(unix, windows))]
 mod private_artifact;
+mod protected_process;
 pub mod protocol;
 pub mod recording;
 pub mod recording_loader;

@@ -136,7 +136,7 @@ pub fn with_runtime_scope<T>(scope: String, action: impl FnOnce() -> T) -> T {
     action()
 }
 
-fn desktop_action_coordinator() -> &'static tokio::sync::Mutex<()> {
+pub(crate) fn desktop_action_coordinator() -> &'static tokio::sync::Mutex<()> {
     static COORDINATOR: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
     COORDINATOR.get_or_init(|| tokio::sync::Mutex::new(()))
 }
@@ -1213,6 +1213,8 @@ impl TrustedInvocationEvidence {
 /// Thread-safe collection of all registered tools.
 pub struct ToolRegistry {
     tools: HashMap<String, Box<dyn Tool>>,
+    desktop_lease: crate::desktop_lease::LeaseManager,
+    desktop_coordinator: &'static tokio::sync::Mutex<()>,
     /// Ordered list of tool names for `tools/list`.
     order: Vec<String>,
     /// Shared recording session — auto-records each non-read-only tool call.
@@ -1300,6 +1302,11 @@ impl ToolRegistry {
             }));
         Self {
             tools: HashMap::new(),
+            #[cfg(not(test))]
+            desktop_lease: crate::desktop_lease::LeaseManager::production(),
+            #[cfg(test)]
+            desktop_lease: crate::desktop_lease::test_support::manager(),
+            desktop_coordinator: desktop_action_coordinator(),
             order: Vec::new(),
             recording,
             history: None,
@@ -2085,6 +2092,11 @@ impl ToolRegistry {
         } else {
             None
         };
+        if has_adapter("process_control") {
+            if let Err(refusal) = check_terminable_process(current_process_fingerprint.as_ref()) {
+                return refusal;
+            }
+        }
         let process_ownership_key =
             process_ownership_key(runtime_session.as_deref(), &runtime_prefix);
         let runtime_proves_driver_owned =
@@ -2104,11 +2116,9 @@ impl ToolRegistry {
                 "standard mode may terminate only a process proven to have been launched by this Cua runtime",
             );
         }
-        if runtime_proves_driver_owned {
-            if let Some(fingerprint) = current_process_fingerprint.as_ref() {
-                args["_protected_process_fingerprint"] =
-                    serde_json::to_value(fingerprint).unwrap_or(Value::Null);
-            }
+        if let Some(fingerprint) = current_process_fingerprint.as_ref() {
+            args["_protected_process_fingerprint"] =
+                serde_json::to_value(fingerprint).unwrap_or(Value::Null);
         }
 
         // Raw/legacy page mutations have no exact browser binding. They are
@@ -2374,6 +2384,29 @@ impl ToolRegistry {
                 Ok(scope) => scope,
                 Err(refusal) => return refusal,
             };
+            // Unrestricted calls without a manifest deliberately have no
+            // attested scope; they retain the fingerprint checked above.
+            if !(context.mode() == crate::authorization::PermissionMode::Unrestricted
+                && context.capability_manifest().is_none())
+            {
+                let approved_fingerprint = serde_json::from_value::<
+                    crate::browser::ProcessFingerprint,
+                >(approved_scope["fingerprint"].clone())
+                .ok();
+                if let Err(refusal) = check_terminable_process(approved_fingerprint.as_ref()) {
+                    return refusal;
+                }
+                if !current_process_fingerprint
+                    .as_ref()
+                    .zip(approved_fingerprint.as_ref())
+                    .is_some_and(|(checked, approved)| checked.matches(approved))
+                {
+                    return protected_refusal(
+                        "protected_resource_scope_stale",
+                        "the process instance changed during authorization",
+                    );
+                }
+            }
             if let Err(refusal) = self
                 .validate_attested_resource(
                     tool.as_ref(),
@@ -2480,21 +2513,50 @@ impl ToolRegistry {
                     | "end_session"
             );
         let private_consent_turn = is_existing_profile_prepare(resolved_name, &args);
-        let _desktop_action = if requires_desktop_coordination(
+        let file_lease = if requires_desktop_coordination(
             resolved_name,
             &args,
             tool.has_independent_input_lane(&args),
         ) {
-            let coordinator = desktop_action_coordinator();
-            // Avoid yielding the dispatch task when the process-wide input
-            // lane is uncontended. On Windows, that yield creates a window in
-            // which the foreground target can lose keyboard eligibility
-            // between the fixture's focus proof and SendInput. Contended
-            // runtimes still wait and serialize through the same mutex.
-            Some(match coordinator.try_lock() {
+            let owner = runtime_session.clone().unwrap_or_else(|| {
+                crate::desktop_lease::runtime_owner(&context.runtime_scope_key())
+            });
+            match self.desktop_lease.acquire(&owner).await {
+                Ok(lease) => Some(lease),
+                Err(error) => {
+                    let (code, message) = match error {
+                        crate::desktop_lease::LeaseFailure::Busy => {
+                            ("desktop_busy", "desktop input is busy".to_owned())
+                        }
+                        crate::desktop_lease::LeaseFailure::Unavailable(reason) => {
+                            ("desktop_lease_unavailable", reason)
+                        }
+                    };
+                    // Nothing was dispatched: close the cursor and history
+                    // events this call opened, so neither shows an action.
+                    crate::cursor_events::end_tool(cursor_event);
+                    if let (Some(history), Some(pending)) = (self.history.as_ref(), pending_history)
+                    {
+                        history.finish_action(pending, None, true);
+                    }
+                    return ToolResult::error(message.clone()).with_structured(serde_json::json!({
+                        "effect": "refused", "code": code, "status": "refused",
+                        "refusal": {"code": code, "message": message}
+                    }));
+                }
+            }
+        } else {
+            None
+        };
+        // File lease waiters must not block the retained owner's coordinator.
+        let admission = if let Some(mut lease) = file_lease {
+            let coordinator = self.desktop_coordinator;
+            let guard = match coordinator.try_lock() {
                 Ok(guard) => guard,
                 Err(_) => coordinator.lock().await,
-            })
+            };
+            lease.activate();
+            Some((lease, guard))
         } else {
             None
         };
@@ -2536,11 +2598,22 @@ impl ToolRegistry {
         // back to the uncapped capture before any platform interprets them.
         crate::desktop_capture_scale::map_desktop_args(&mut args);
         crate::tool_activity::note_tool_activity();
-        let mut result = crate::recording::scope_dispatch_click_capture(
+        let dispatch = crate::recording::scope_dispatch_click_capture(
             pending_turn.as_ref(),
             tool.invoke(args.clone()),
-        )
-        .await;
+        );
+        let mut admission = admission.map(|(lease, coordinator)| {
+            crate::desktop_lease::DispatchAdmission::new(
+                lease,
+                coordinator,
+                self.desktop_lease.clock(),
+            )
+        });
+        let mut result = if let Some(admission) = admission.as_mut() {
+            admission.invoke(dispatch).await
+        } else {
+            dispatch.await
+        };
         match resolved_name {
             "get_desktop_state" if result.is_error != Some(true) => {
                 crate::desktop_capture_scale::record_desktop_state(
@@ -2600,7 +2673,7 @@ impl ToolRegistry {
         // capture or result shaping. Keeping the global desktop lock through
         // recording/PiP screenshots would unnecessarily block an unrelated
         // runtime after the input side effect has already completed.
-        drop(_desktop_action);
+        drop(admission);
         restore_public_runtime_result(&mut result, &runtime_prefix);
         // Preserve the producer's private summary for recording/replay before
         // the public ActionResult projection deliberately replaces legacy
@@ -6185,6 +6258,259 @@ allow:
         assert_eq!(provider.requests.load(Ordering::SeqCst), 0);
     }
 
+    struct KillFingerprintProbe {
+        fingerprint: Option<crate::browser::ProcessFingerprint>,
+        seen: Arc<Mutex<Vec<serde_json::Value>>>,
+        def: super::ToolDef,
+    }
+
+    #[async_trait::async_trait]
+    impl super::Tool for KillFingerprintProbe {
+        fn def(&self) -> &super::ToolDef {
+            &self.def
+        }
+        async fn protected_resource_scope(
+            &self,
+            _: &str,
+            _: &serde_json::Value,
+        ) -> Result<Option<serde_json::Value>, String> {
+            Ok(self.fingerprint.as_ref().map(|fingerprint| serde_json::json!({"kind": "process_instance", "fingerprint": fingerprint})))
+        }
+        async fn validate_protected_resource_scope(
+            &self,
+            _: &str,
+            _: &serde_json::Value,
+            _: &serde_json::Value,
+        ) -> Result<(), String> {
+            Ok(())
+        }
+        async fn invoke(&self, args: serde_json::Value) -> ToolResult {
+            self.seen.lock().unwrap().push(args);
+            ToolResult::text("killed")
+        }
+    }
+
+    fn kill_probe(
+        executable: Option<&str>,
+        available: bool,
+    ) -> (super::ToolRegistry, Arc<Mutex<Vec<serde_json::Value>>>) {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let mut registry = super::ToolRegistry::new();
+        registry.register(Box::new(KillFingerprintProbe {
+            fingerprint: available.then(|| crate::browser::ProcessFingerprint {
+                pid: 424242,
+                start_time: Some(7),
+                executable: executable.map(str::to_owned),
+            }),
+            seen: seen.clone(),
+            def: tool_def("kill_app"),
+        }));
+        (registry, seen)
+    }
+
+    fn refusal_code(result: &ToolResult) -> Option<&str> {
+        result
+            .structured_content
+            .as_ref()?
+            .pointer("/refusal/code")?
+            .as_str()
+    }
+
+    fn host_protected_path() -> &'static str {
+        if cfg!(target_os = "macos") {
+            "/System/Library/CoreServices/Finder.app/Contents/MacOS/Finder"
+        } else if cfg!(target_os = "windows") {
+            r"C:\Windows\explorer.exe"
+        } else {
+            "/usr/bin/gnome-shell"
+        }
+    }
+
+    #[tokio::test]
+    async fn protected_executables_are_refused_in_every_mode() {
+        let manifest = "version: 3\nexpires_after: 1h\nidle_timeout: 30m\nallow:\n  tools: [kill_app]\nresources:\n  processes:\n    terminate: [424242]\n";
+        for mode in [
+            PermissionMode::Standard,
+            PermissionMode::Bounded,
+            PermissionMode::Unrestricted,
+        ] {
+            let (registry, seen) = kill_probe(Some(host_protected_path()), true);
+            let context = manifest_context(mode, manifest);
+            let result = registry
+                .invoke_with_context("kill_app", serde_json::json!({"pid": 424242}), context)
+                .await;
+            assert_eq!(
+                refusal_code(&result),
+                Some("protected_process"),
+                "{mode:?}: {result:?}"
+            );
+            assert!(seen.lock().unwrap().is_empty(), "{mode:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn lookalike_names_stay_killable() {
+        let (registry, seen) = kill_probe(Some("/tmp/MyFinder"), true);
+        let result = registry
+            .invoke_with_context(
+                "kill_app",
+                serde_json::json!({"pid": 424242}),
+                unrestricted_context(),
+            )
+            .await;
+        assert_ne!(result.is_error, Some(true), "{result:?}");
+        assert_eq!(seen.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn unknown_executable_is_refused() {
+        for available in [true, false] {
+            let (registry, seen) = kill_probe(None, available);
+            let result = registry
+                .invoke_with_context(
+                    "kill_app",
+                    serde_json::json!({"pid": 424242}),
+                    unrestricted_context(),
+                )
+                .await;
+            assert_eq!(refusal_code(&result), Some("protected_process_unverified"));
+            assert!(seen.lock().unwrap().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn fingerprint_is_forwarded_for_foreign_kills() {
+        let (registry, seen) = kill_probe(Some("/tmp/ordinary"), true);
+        let result = registry
+            .invoke_with_context(
+                "kill_app",
+                serde_json::json!({"pid": 424242}),
+                unrestricted_context(),
+            )
+            .await;
+        assert_ne!(result.is_error, Some(true), "{result:?}");
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(
+            seen[0]["_protected_process_fingerprint"],
+            serde_json::json!({"pid": 424242, "start_time": 7, "executable": "/tmp/ordinary"})
+        );
+    }
+
+    struct ReusedPidProbe {
+        calls: AtomicUsize,
+        hits: Arc<AtomicUsize>,
+        replacement: serde_json::Value,
+        def: super::ToolDef,
+    }
+
+    #[async_trait::async_trait]
+    impl super::Tool for ReusedPidProbe {
+        fn def(&self) -> &super::ToolDef {
+            &self.def
+        }
+        async fn protected_resource_scope(
+            &self,
+            _: &str,
+            _: &serde_json::Value,
+        ) -> Result<Option<serde_json::Value>, String> {
+            let first = self.calls.fetch_add(1, Ordering::SeqCst) == 0;
+            let fingerprint = if first {
+                serde_json::json!({"pid": 424242, "start_time": 7, "executable": "/tmp/ordinary"})
+            } else {
+                self.replacement.clone()
+            };
+            Ok(Some(
+                serde_json::json!({"kind": "process_instance", "fingerprint": fingerprint}),
+            ))
+        }
+        async fn validate_protected_resource_scope(
+            &self,
+            _: &str,
+            _: &serde_json::Value,
+            _: &serde_json::Value,
+        ) -> Result<(), String> {
+            Ok(())
+        }
+        async fn invoke(&self, _: serde_json::Value) -> ToolResult {
+            self.hits.fetch_add(1, Ordering::SeqCst);
+            ToolResult::text("killed")
+        }
+    }
+
+    #[tokio::test]
+    async fn reused_pid_cannot_replace_checked_executable_before_authorization() {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let mut registry = super::ToolRegistry::new();
+        registry.register(Box::new(ReusedPidProbe {
+            calls: AtomicUsize::new(0),
+            hits: hits.clone(),
+            replacement: serde_json::json!({"pid": 424242, "start_time": 8, "executable": host_protected_path()}),
+            def: tool_def("kill_app"),
+        }));
+        let context = bounded_context("version: 3\nexpires_after: 1h\nidle_timeout: 30m\nallow:\n  tools: [kill_app]\nresources:\n  processes:\n    terminate: [424242]\n");
+        let result = registry
+            .invoke_with_context("kill_app", serde_json::json!({"pid": 424242}), context)
+            .await;
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            0,
+            "protected replacement dispatched: {result:?}"
+        );
+        assert_eq!(refusal_code(&result), Some("protected_process"));
+    }
+
+    #[tokio::test]
+    async fn changed_or_unverified_approved_fingerprint_is_refused() {
+        let manifest = "version: 3\nexpires_after: 1h\nidle_timeout: 30m\nallow:\n  tools: [kill_app]\nresources:\n  processes:\n    terminate: [424242]\n";
+        for (replacement, expected) in [
+            (
+                serde_json::json!({"pid": 424242, "start_time": 8, "executable": "/tmp/other"}),
+                "protected_resource_scope_stale",
+            ),
+            (
+                serde_json::json!({"pid": 424242, "start_time": 7, "executable": null}),
+                "protected_process_unverified",
+            ),
+            (
+                serde_json::json!({"pid": 424242, "start_time": 7, "executable": ""}),
+                "protected_process_unverified",
+            ),
+            (
+                serde_json::json!({"pid": 424242, "start_time": 8, "executable": host_protected_path()}),
+                "protected_process",
+            ),
+        ] {
+            for mode in [PermissionMode::Bounded, PermissionMode::Unrestricted] {
+                let hits = Arc::new(AtomicUsize::new(0));
+                let mut registry = super::ToolRegistry::new();
+                registry.register(Box::new(ReusedPidProbe {
+                    calls: AtomicUsize::new(0),
+                    hits: hits.clone(),
+                    replacement: replacement.clone(),
+                    def: tool_def("kill_app"),
+                }));
+                let result = registry
+                    .invoke_with_context(
+                        "kill_app",
+                        serde_json::json!({"pid": 424242}),
+                        manifest_context(mode, manifest),
+                    )
+                    .await;
+                assert_eq!(
+                    refusal_code(&result),
+                    Some(expected),
+                    "{mode:?}: {result:?}"
+                );
+                assert_eq!(hits.load(Ordering::SeqCst), 0);
+            }
+        }
+        assert_eq!(
+            refusal_code(&super::check_terminable_process(None).unwrap_err()),
+            Some("protected_process_unverified")
+        );
+    }
+
     #[tokio::test]
     async fn standard_foreign_process_termination_denies_without_prompting() {
         let hits = Arc::new(AtomicUsize::new(0));
@@ -7337,6 +7663,300 @@ resources:
         ));
     }
 
+    struct LeaseProbe {
+        hits: Arc<AtomicUsize>,
+        retain: bool,
+        def: super::ToolDef,
+    }
+
+    struct CancelledWorkerProbe {
+        def: super::ToolDef,
+        hold: Arc<Mutex<Option<crate::desktop_lease::WorkerHold>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl super::Tool for CancelledWorkerProbe {
+        fn def(&self) -> &super::ToolDef {
+            &self.def
+        }
+        async fn invoke(&self, _: serde_json::Value) -> ToolResult {
+            *self.hold.lock().unwrap() = crate::desktop_lease::worker_hold();
+            std::future::pending().await
+        }
+    }
+
+    #[tokio::test]
+    async fn registry_cancelled_dispatch_keeps_worker_hold() {
+        use crate::desktop_lease::LeaseBackend;
+        let backend = Arc::new(crate::desktop_lease::test_support::TestBackend::default());
+        let hold = Arc::new(Mutex::new(None));
+        let mut registry =
+            lease_test_registry(backend.clone(), false, Arc::new(AtomicUsize::new(0)));
+        registry.register(Box::new(CancelledWorkerProbe {
+            def: super::ToolDef {
+                name: "click".into(),
+                description: "probe".into(),
+                input_schema: serde_json::json!({"type":"object"}),
+                read_only: false,
+                destructive: false,
+                idempotent: false,
+                open_world: false,
+            },
+            hold: hold.clone(),
+        }));
+        let context = unrestricted_context();
+        let mut call = Box::pin(lease_click(&registry, &context, "lease-cancel-worker"));
+        assert!(futures_util::poll!(call.as_mut()).is_pending());
+        let worker = hold
+            .lock()
+            .unwrap()
+            .take()
+            .expect("invoke has a worker hold");
+        drop(call);
+        assert!(backend.try_acquire().unwrap().is_none());
+        assert!(registry.desktop_coordinator.try_lock().is_err());
+        drop(worker);
+        let coordinator = registry.desktop_coordinator.lock().await;
+        assert!(backend.try_acquire().unwrap().is_some());
+        drop(coordinator);
+    }
+
+    #[async_trait::async_trait]
+    impl super::Tool for LeaseProbe {
+        fn def(&self) -> &super::ToolDef {
+            &self.def
+        }
+        async fn invoke(&self, args: serde_json::Value) -> ToolResult {
+            self.hits.fetch_add(1, Ordering::SeqCst);
+            if self.retain {
+                crate::desktop_lease::retain_lease(args["_session_id"].as_str().unwrap()).unwrap();
+            }
+            ToolResult::text("input delivered")
+        }
+    }
+
+    fn lease_test_registry(
+        backend: Arc<crate::desktop_lease::test_support::TestBackend>,
+        retain: bool,
+        hits: Arc<AtomicUsize>,
+    ) -> super::ToolRegistry {
+        use crate::desktop_lease::{test_support::TestClock, LeaseManager};
+        let mut registry = super::ToolRegistry::new();
+        registry.desktop_lease = LeaseManager::new(backend, Arc::new(TestClock::default()));
+        registry.desktop_coordinator = Box::leak(Box::new(tokio::sync::Mutex::new(())));
+        registry.register(Box::new(LeaseProbe {
+            hits,
+            retain,
+            def: super::ToolDef {
+                name: "click".into(),
+                description: "probe".into(),
+                input_schema: serde_json::json!({"type":"object"}),
+                read_only: false,
+                destructive: false,
+                idempotent: false,
+                open_world: false,
+            },
+        }));
+        registry
+    }
+
+    async fn lease_click(
+        registry: &super::ToolRegistry,
+        context: &Arc<crate::session_authorization::EffectiveAuthorizationContext>,
+        session: &str,
+    ) -> ToolResult {
+        registry
+            .invoke_with_context(
+                "click",
+                serde_json::json!({
+                    "pid": 42, "window_id": 7, "x": 10, "y": 20, "session": session,
+                }),
+                context.clone(),
+            )
+            .await
+    }
+
+    #[derive(Default)]
+    struct PausedLeaseClock(AtomicUsize);
+
+    #[async_trait::async_trait]
+    impl crate::desktop_lease::LeaseClock for PausedLeaseClock {
+        fn now(&self) -> Duration {
+            Duration::ZERO
+        }
+        async fn sleep(&self, _: Duration) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            std::future::pending::<()>().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn a_contender_waiting_for_the_file_lease_does_not_block_the_retained_owner() {
+        let backend = Arc::new(crate::desktop_lease::test_support::TestBackend::default());
+        let clock = Arc::new(PausedLeaseClock::default());
+        let hits = Arc::new(AtomicUsize::new(0));
+        let mut registry = lease_test_registry(backend.clone(), true, hits.clone());
+        registry.desktop_lease = crate::desktop_lease::LeaseManager::new(backend, clock.clone());
+        let context = unrestricted_context();
+        let owner = context.runtime_session_key("lease-order-owner");
+        assert_ne!(
+            lease_click(&registry, &context, "lease-order-owner")
+                .await
+                .is_error,
+            Some(true)
+        );
+        let mut contender = Box::pin(lease_click(&registry, &context, "lease-order-contender"));
+        assert!(futures_util::poll!(contender.as_mut()).is_pending());
+        assert_eq!(clock.0.load(Ordering::SeqCst), 1);
+        let mut next = Box::pin(lease_click(&registry, &context, "lease-order-owner"));
+        assert!(futures_util::poll!(next.as_mut()).is_ready());
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+        drop(next);
+        drop(contender);
+        crate::desktop_lease::release_lease(&owner);
+    }
+
+    #[tokio::test]
+    async fn uncontended_admission_does_not_yield() {
+        let backend = Arc::new(crate::desktop_lease::test_support::TestBackend::default());
+        let clock = Arc::new(PausedLeaseClock::default());
+        let mut registry =
+            lease_test_registry(backend.clone(), false, Arc::new(AtomicUsize::new(0)));
+        registry.desktop_lease = crate::desktop_lease::LeaseManager::new(backend, clock.clone());
+        let context = unrestricted_context();
+        let mut call = Box::pin(lease_click(&registry, &context, "lease-no-yield"));
+        assert!(futures_util::poll!(call.as_mut()).is_ready());
+        assert_eq!(clock.0.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn acquires_after_release() {
+        let backend = Arc::new(crate::desktop_lease::test_support::TestBackend::default());
+        backend.hold();
+        backend.release_after.store(3, Ordering::SeqCst);
+        let hits = Arc::new(AtomicUsize::new(0));
+        let registry = lease_test_registry(backend.clone(), false, hits.clone());
+        let result = lease_click(&registry, &unrestricted_context(), "lease-polls").await;
+        assert_ne!(result.is_error, Some(true));
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        assert_eq!(backend.attempts.load(Ordering::SeqCst), 4);
+    }
+
+    #[tokio::test]
+    async fn unavailable_backend_refuses_without_dispatch() {
+        let backend = Arc::new(crate::desktop_lease::test_support::TestBackend::default());
+        backend.unavailable.store(true, Ordering::SeqCst);
+        let hits = Arc::new(AtomicUsize::new(0));
+        let registry = lease_test_registry(backend, false, hits.clone());
+        let result = lease_click(&registry, &unrestricted_context(), "lease-unavailable").await;
+        let body = result.structured_content.unwrap();
+        assert_eq!(body["effect"], "refused");
+        assert_eq!(body["code"], "desktop_lease_unavailable");
+        assert!(body["refusal"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("synthetic failure"));
+        assert_eq!(hits.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn retained_lease_is_reused_by_its_owner_and_blocks_others() {
+        let backend = Arc::new(crate::desktop_lease::test_support::TestBackend::default());
+        let hits = Arc::new(AtomicUsize::new(0));
+        let registry = lease_test_registry(backend.clone(), true, hits.clone());
+        let context = unrestricted_context();
+        let owner = context.runtime_session_key("lease-holder");
+        assert_ne!(
+            lease_click(&registry, &context, "lease-holder")
+                .await
+                .is_error,
+            Some(true)
+        );
+        assert_ne!(
+            lease_click(&registry, &context, "lease-holder")
+                .await
+                .is_error,
+            Some(true)
+        );
+        assert_eq!(backend.attempts.load(Ordering::SeqCst), 1);
+        let other = lease_click(&registry, &context, "lease-other").await;
+        assert_eq!(other.structured_content.unwrap()["code"], "desktop_busy");
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+        crate::desktop_lease::release_lease(&owner);
+        assert_ne!(
+            lease_click(&registry, &context, "lease-other")
+                .await
+                .is_error,
+            Some(true)
+        );
+        crate::desktop_lease::release_lease(&context.runtime_session_key("lease-other"));
+    }
+
+    #[tokio::test]
+    async fn releasing_a_retained_lease_admits_another_owner() {
+        let backend = Arc::new(crate::desktop_lease::test_support::TestBackend::default());
+        let hits = Arc::new(AtomicUsize::new(0));
+        let registry = lease_test_registry(backend.clone(), true, hits);
+        let context = unrestricted_context();
+        assert_ne!(
+            lease_click(&registry, &context, "lease-ended")
+                .await
+                .is_error,
+            Some(true)
+        );
+        // Session-end hooks are process-wide; ending a session here would
+        // race unrelated parallel tests. session.rs pins that session cleanup
+        // calls release_lease.
+        crate::desktop_lease::release_lease(&context.runtime_session_key("lease-ended"));
+        assert_ne!(
+            lease_click(&registry, &context, "lease-successor")
+                .await
+                .is_error,
+            Some(true)
+        );
+        crate::desktop_lease::release_lease(&context.runtime_session_key("lease-successor"));
+    }
+
+    #[tokio::test]
+    async fn desktop_busy_after_deadline() {
+        use crate::desktop_lease::{
+            test_support::{TestBackend, TestClock},
+            LeaseManager,
+        };
+        let backend = Arc::new(TestBackend::default());
+        backend.hold();
+        let hits = Arc::new(AtomicUsize::new(0));
+        let mut registry = super::ToolRegistry::new();
+        registry.desktop_lease = LeaseManager::new(backend.clone(), Arc::new(TestClock::default()));
+        registry.register(Box::new(ObservationProbe {
+            hits: hits.clone(),
+            def: super::ToolDef {
+                name: "click".into(),
+                description: "probe".into(),
+                input_schema: serde_json::json!({"type":"object"}),
+                read_only: false,
+                destructive: false,
+                idempotent: false,
+                open_world: false,
+            },
+        }));
+        let result = registry
+            .invoke_with_context(
+                "click",
+                serde_json::json!({
+                    "pid": 42, "window_id": 7, "x": 10, "y": 20,
+                }),
+                unrestricted_context(),
+            )
+            .await;
+        assert_eq!(
+            result.structured_content.unwrap()["refusal"]["code"],
+            "desktop_busy"
+        );
+        assert_eq!(hits.load(Ordering::SeqCst), 0);
+        assert_eq!(backend.attempts.load(Ordering::SeqCst), 501);
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn physical_desktop_actions_are_admitted_one_at_a_time() {
         let active = Arc::new(AtomicUsize::new(0));
@@ -7665,6 +8285,28 @@ fn ended_session_refusal_message(public_label: Option<&str>) -> String {
         ),
         None => "this transport's unnamed session has ended; call start_session without a session label to start a new one".to_owned(),
     }
+}
+
+fn check_terminable_process(
+    fingerprint: Option<&crate::browser::ProcessFingerprint>,
+) -> Result<(), ToolResult> {
+    let executable = fingerprint.and_then(|fingerprint| fingerprint.executable.as_deref());
+    let Some((executable, os)) = executable
+        .filter(|executable| !executable.is_empty())
+        .zip(crate::protected_process::build_target_os())
+    else {
+        return Err(protected_refusal(
+            "protected_process_unverified",
+            "cannot verify the executable of the process to be terminated",
+        ));
+    };
+    if crate::protected_process::is_protected_executable(executable, os) {
+        return Err(protected_refusal(
+            "protected_process",
+            &format!("terminating {executable} would break the desktop session"),
+        ));
+    }
+    Ok(())
 }
 
 fn protected_refusal(code: &str, message: &str) -> ToolResult {
