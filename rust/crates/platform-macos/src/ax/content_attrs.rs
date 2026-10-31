@@ -1,9 +1,11 @@
-use super::batch_attrs::{batch_failure_action, BatchFailureAction, BatchRead};
 #[cfg(test)]
 use super::batch_attrs::BatchSlots;
+use super::batch_attrs::{batch_failure_action, BatchFailureAction, BatchRead};
 use super::bindings::*;
+use cua_driver_core::snapshot_compaction::{
+    is_secure_text_field, FieldSecurityMeta, REDACTED_VALUE,
+};
 use cua_driver_core::walk_budget::WalkBudget;
-use cua_driver_core::snapshot_compaction::{is_secure_text_field, FieldSecurityMeta, REDACTED_VALUE};
 
 const CONTENT_ATTRIBUTES: [&str; 6] = [
     "AXTitle",
@@ -23,9 +25,14 @@ pub(crate) enum AttrStatus {
 
 impl AttrStatus {
     fn text(&self) -> Option<&str> {
-        match self { Self::Known(value) => Some(value), _ => None }
+        match self {
+            Self::Known(value) => Some(value),
+            _ => None,
+        }
     }
-    fn complete(&self) -> bool { !matches!(self, Self::Failed) }
+    fn complete(&self) -> bool {
+        !matches!(self, Self::Failed)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -38,9 +45,12 @@ impl SecurityEvidence {
     fn secure(&self) -> bool {
         is_secure_text_field(&FieldSecurityMeta {
             role: self.role.text().unwrap_or("AXUnknown"),
-            title: self.attrs[0].text(), placeholder: self.attrs[1].text(),
-            description: self.attrs[2].text(), identifier: self.attrs[3].text(),
-            help: self.attrs[4].text(), subrole: self.attrs[5].text(),
+            title: self.attrs[0].text(),
+            placeholder: self.attrs[1].text(),
+            description: self.attrs[2].text(),
+            identifier: self.attrs[3].text(),
+            help: self.attrs[4].text(),
+            subrole: self.attrs[5].text(),
             is_password_flag: false,
         })
     }
@@ -52,7 +62,7 @@ pub(crate) fn value_read_allowed(evidence: &SecurityEvidence) -> bool {
         && !evidence.secure()
 }
 
-trait ContentReader {
+pub(super) trait ContentReader {
     fn batch(&mut self) -> Result<[AttrStatus; 6], super::batch_attrs::BatchFailure>;
     fn string(&mut self, name: &str) -> AttrStatus;
     fn value(&mut self) -> Result<Option<StringishAttrValue>, AXError>;
@@ -60,28 +70,37 @@ trait ContentReader {
     fn classified(&mut self) {}
 }
 
-fn read_with<R: ContentReader>(
+pub(super) fn read_with<R: ContentReader>(
     role: AttrStatus,
     reader: &mut R,
     batching_disabled: &mut bool,
 ) -> Option<ContentAttrs> {
-    if reader.expired() { return None; }
+    if reader.expired() {
+        return None;
+    }
     let attrs = if !*batching_disabled {
         match reader.batch() {
             Ok(attrs) => Some(attrs),
             Err(kind) => match batch_failure_action(kind, reader.expired(), false) {
-                BatchFailureAction::DisableAndReplay => { *batching_disabled = true; None },
+                BatchFailureAction::DisableAndReplay => {
+                    *batching_disabled = true;
+                    None
+                }
                 BatchFailureAction::Replay => None,
                 BatchFailureAction::StopForTimeout => return None,
             },
         }
-    } else { None };
+    } else {
+        None
+    };
     let attrs = match attrs {
         Some(attrs) => attrs,
         None => {
             let mut result = Vec::with_capacity(6);
             for name in CONTENT_ATTRIBUTES {
-                if reader.expired() { return None; }
+                if reader.expired() {
+                    return None;
+                }
                 result.push(reader.string(name));
             }
             result.try_into().expect("six content attributes")
@@ -91,9 +110,13 @@ fn read_with<R: ContentReader>(
     let secure = evidence.secure();
     let allowed = value_read_allowed(&evidence);
     reader.classified();
-    if reader.expired() { return None; }
+    if reader.expired() {
+        return None;
+    }
     let read_value = if allowed { Some(reader.value()) } else { None };
-    if reader.expired() { return None; }
+    if reader.expired() {
+        return None;
+    }
     let value_failed = read_value.as_ref().is_some_and(Result::is_err);
     let copied_value = read_value.and_then(Result::ok).flatten();
     let text = |index: usize| evidence.attrs[index].text().map(str::to_owned);
@@ -102,23 +125,40 @@ fn read_with<R: ContentReader>(
         Some(REDACTED_VALUE.to_owned())
     } else if allowed {
         value_with_placeholder(copied_value.as_ref(), || placeholder.clone())
-    } else { None };
+    } else {
+        None
+    };
     let label_status = |index: usize| match &evidence.attrs[index] {
         AttrStatus::Known(s) if !s.trim().is_empty() => LabelSlot::Present,
         AttrStatus::Failed => LabelSlot::Failed,
         _ => LabelSlot::Absent,
     };
-    let value_status = if !secure && (!allowed || value_failed) { LabelSlot::Failed }
-        else if value.as_deref().is_some_and(|v| !v.trim().is_empty()) { LabelSlot::Present }
-        else { LabelSlot::Absent };
-    let read_failed = (!secure && !allowed) || label_hidden(&[
-        label_status(0), label_status(2), value_status, label_status(3),
-    ]);
+    let value_status = if !secure && (!allowed || value_failed) {
+        LabelSlot::Failed
+    } else if value.as_deref().is_some_and(|v| !v.trim().is_empty()) {
+        LabelSlot::Present
+    } else {
+        LabelSlot::Absent
+    };
+    let read_failed = (!secure && !allowed)
+        || label_hidden(&[
+            label_status(0),
+            label_status(2),
+            value_status,
+            label_status(3),
+        ]);
     Some(ContentAttrs {
-        title: text(0), copied_value, value, placeholder,
-        description: text(2), identifier: text(3),
+        title: text(0),
+        copied_value,
+        value,
+        placeholder,
+        description: text(2),
+        identifier: text(3),
         help: text(4).filter(|help| !help.trim().is_empty()),
-        subrole: text(5), read_failed, secure,
+        subrole: text(5),
+        read_failed,
+        secure,
+        value_unknown: !secure && (!allowed || value_failed),
     })
 }
 
@@ -136,6 +176,7 @@ pub(crate) struct ContentAttrs {
     /// (A batched read with such an error falls back to single reads.)
     pub read_failed: bool,
     pub secure: bool,
+    pub value_unknown: bool,
 }
 
 fn value_with_placeholder(
@@ -165,6 +206,7 @@ impl ContentAttrs {
             read_failed: false,
             subrole: None,
             secure: false,
+            value_unknown: false,
         }
     }
 
@@ -219,6 +261,7 @@ impl ContentAttrs {
             read_failed,
             subrole: None,
             secure: false,
+            value_unknown: false,
         }
     }
 }
@@ -333,13 +376,26 @@ pub(crate) unsafe fn read_content_attrs(
     budget: &mut WalkBudget,
     batching_disabled: &mut bool,
 ) -> Option<ContentAttrs> {
-    let role = if role == "AXUnknown" { AttrStatus::Failed } else { AttrStatus::Known(role.to_owned()) };
-    let result = read_with(role, &mut NativeReader { element, budget }, batching_disabled);
-    if result.is_none() { budget.stop_for_timeout(); }
+    let role = if role == "AXUnknown" {
+        AttrStatus::Failed
+    } else {
+        AttrStatus::Known(role.to_owned())
+    };
+    let result = read_with(
+        role,
+        &mut NativeReader { element, budget },
+        batching_disabled,
+    );
+    if result.is_none() {
+        budget.stop_for_timeout();
+    }
     result
 }
 
-struct NativeReader<'a> { element: AXUIElementRef, budget: &'a WalkBudget }
+struct NativeReader<'a> {
+    element: AXUIElementRef,
+    budget: &'a WalkBudget,
+}
 
 impl ContentReader for NativeReader<'_> {
     fn batch(&mut self) -> Result<[AttrStatus; 6], super::batch_attrs::BatchFailure> {
@@ -347,7 +403,9 @@ impl ContentReader for NativeReader<'_> {
             BatchRead::Fallback(failure) => Err(failure),
             BatchRead::Slots(slots) => Ok(std::array::from_fn(|index| match slots.raw(index) {
                 None => AttrStatus::Absent,
-                Some(raw) => unsafe { string_from_cf(raw) }.map(AttrStatus::Known).unwrap_or(AttrStatus::Failed),
+                Some(raw) => unsafe { string_from_cf(raw) }
+                    .map(AttrStatus::Known)
+                    .unwrap_or(AttrStatus::Failed),
             })),
         }
     }
@@ -360,7 +418,9 @@ impl ContentReader for NativeReader<'_> {
         unsafe { single_read(self.element, "AXValue", |value| stringish_from_cf(value)) }
     }
 
-    fn expired(&self) -> bool { self.budget.expired() }
+    fn expired(&self) -> bool {
+        self.budget.expired()
+    }
 }
 
 unsafe fn read_string_status(element: AXUIElementRef, name: &str) -> AttrStatus {
@@ -368,8 +428,14 @@ unsafe fn read_string_status(element: AXUIElementRef, name: &str) -> AttrStatus 
     let attr = CFString::new(name);
     let mut value: core_foundation::base::CFTypeRef = std::ptr::null();
     let error = AXUIElementCopyAttributeValue(element, attr.as_concrete_TypeRef(), &mut value);
-    let decoded = if error == kAXErrorSuccess && !value.is_null() { string_from_cf(value) } else { None };
-    if !value.is_null() { core_foundation::base::CFRelease(value); }
+    let decoded = if error == kAXErrorSuccess && !value.is_null() {
+        string_from_cf(value)
+    } else {
+        None
+    };
+    if !value.is_null() {
+        core_foundation::base::CFRelease(value);
+    }
     if error == kAXErrorSuccess {
         return decoded.map(AttrStatus::Known).unwrap_or(AttrStatus::Failed);
     }
@@ -408,16 +474,34 @@ mod tests {
     };
 
     struct FakeReader {
-        trace: Vec<String>, attrs: [AttrStatus; 6], reject_batch: bool,
-        expire_on_classification: bool, expired: bool,
+        trace: Vec<String>,
+        attrs: [AttrStatus; 6],
+        reject_batch: bool,
+        expire_on_classification: bool,
+        expired: bool,
     }
     impl FakeReader {
-        fn new() -> Self { Self { trace: vec!["AXRole".into()], attrs: std::array::from_fn(|_| AttrStatus::Absent), reject_batch: false, expire_on_classification: false, expired: false } }
+        fn new() -> Self {
+            Self {
+                trace: vec!["AXRole".into()],
+                attrs: std::array::from_fn(|_| AttrStatus::Absent),
+                reject_batch: false,
+                expire_on_classification: false,
+                expired: false,
+            }
+        }
     }
     impl ContentReader for FakeReader {
         fn batch(&mut self) -> Result<[AttrStatus; 6], super::super::batch_attrs::BatchFailure> {
-            self.trace.push(format!("batch:{}", CONTENT_ATTRIBUTES.join(",")));
-            if self.reject_batch { Err(super::super::batch_attrs::BatchFailure::WholeCall(kAXErrorNotImplemented)) } else { Ok(self.attrs.clone()) }
+            self.trace
+                .push(format!("batch:{}", CONTENT_ATTRIBUTES.join(",")));
+            if self.reject_batch {
+                Err(super::super::batch_attrs::BatchFailure::WholeCall(
+                    kAXErrorNotImplemented,
+                ))
+            } else {
+                Ok(self.attrs.clone())
+            }
         }
         fn string(&mut self, name: &str) -> AttrStatus {
             self.trace.push(name.into());
@@ -425,17 +509,38 @@ mod tests {
         }
         fn value(&mut self) -> Result<Option<StringishAttrValue>, AXError> {
             self.trace.push("AXValue".into());
-            Ok(Some(StringishAttrValue { string_value: Some("value".into()), state_value: "value".into() }))
+            Ok(Some(StringishAttrValue {
+                string_value: Some("value".into()),
+                state_value: "value".into(),
+            }))
         }
-        fn expired(&self) -> bool { self.expired }
-        fn classified(&mut self) { self.trace.push("classified".into()); self.expired = self.expire_on_classification; }
+        fn expired(&self) -> bool {
+            self.expired
+        }
+        fn classified(&mut self) {
+            self.trace.push("classified".into());
+            self.expired = self.expire_on_classification;
+        }
     }
 
     #[test]
     fn axvalue_is_never_requested_before_classification() {
         let mut reader = FakeReader::new();
-        read_with(AttrStatus::Known("AXTextField".into()), &mut reader, &mut false).unwrap();
-        assert_eq!(reader.trace, ["AXRole", "batch:AXTitle,AXPlaceholderValue,AXDescription,AXIdentifier,AXHelp,AXSubrole", "classified", "AXValue"]);
+        read_with(
+            AttrStatus::Known("AXTextField".into()),
+            &mut reader,
+            &mut false,
+        )
+        .unwrap();
+        assert_eq!(
+            reader.trace,
+            [
+                "AXRole",
+                "batch:AXTitle,AXPlaceholderValue,AXDescription,AXIdentifier,AXHelp,AXSubrole",
+                "classified",
+                "AXValue"
+            ]
+        );
     }
 
     #[test]
@@ -444,14 +549,23 @@ mod tests {
         let attrs = read_with(AttrStatus::Failed, &mut reader, &mut false).unwrap();
         assert!(attrs.read_failed);
         assert_eq!(attrs.value, None);
-        assert!(!reader.trace.iter().any(|name| name == "AXValue"), "{:?}", reader.trace);
+        assert!(
+            !reader.trace.iter().any(|name| name == "AXValue"),
+            "{:?}",
+            reader.trace
+        );
     }
 
     #[test]
     fn a_secure_subrole_field_shows_redacted_without_reading() {
         let mut reader = FakeReader::new();
         reader.attrs[5] = AttrStatus::Known("AXSecureTextField".into());
-        let result = read_with(AttrStatus::Known("AXTextField".into()), &mut reader, &mut false).unwrap();
+        let result = read_with(
+            AttrStatus::Known("AXTextField".into()),
+            &mut reader,
+            &mut false,
+        )
+        .unwrap();
         assert_eq!(result.value.as_deref(), Some("[redacted]"));
         assert!(result.secure);
         assert!(!reader.trace.iter().any(|s| s == "AXValue"));
@@ -461,7 +575,12 @@ mod tests {
     fn a_password_labelled_field_shows_redacted_without_reading() {
         let mut reader = FakeReader::new();
         reader.attrs[1] = AttrStatus::Known("Password".into());
-        let result = read_with(AttrStatus::Known("AXTextField".into()), &mut reader, &mut false).unwrap();
+        let result = read_with(
+            AttrStatus::Known("AXTextField".into()),
+            &mut reader,
+            &mut false,
+        )
+        .unwrap();
         assert_eq!(result.value.as_deref(), Some("[redacted]"));
         assert!(!reader.trace.iter().any(|s| s == "AXValue"));
     }
@@ -471,7 +590,12 @@ mod tests {
         for i in 0..6 {
             let mut reader = FakeReader::new();
             reader.attrs[i] = AttrStatus::Failed;
-            let result = read_with(AttrStatus::Known("AXTextField".into()), &mut reader, &mut false).unwrap();
+            let result = read_with(
+                AttrStatus::Known("AXTextField".into()),
+                &mut reader,
+                &mut false,
+            )
+            .unwrap();
             assert!(result.read_failed);
             assert_eq!(result.value, None);
             assert!(!reader.trace.iter().any(|s| s == "AXValue"));
@@ -481,7 +605,12 @@ mod tests {
     #[test]
     fn absent_hints_still_allow_ordinary_values() {
         let mut reader = FakeReader::new();
-        let result = read_with(AttrStatus::Known("AXTextField".into()), &mut reader, &mut false).unwrap();
+        let result = read_with(
+            AttrStatus::Known("AXTextField".into()),
+            &mut reader,
+            &mut false,
+        )
+        .unwrap();
         assert_eq!(result.value.as_deref(), Some("value"));
         assert!(!result.read_failed);
     }
@@ -491,31 +620,77 @@ mod tests {
         let mut reader = FakeReader::new();
         reader.reject_batch = true;
         let mut disabled = false;
-        read_with(AttrStatus::Known("AXTextField".into()), &mut reader, &mut disabled).unwrap();
+        read_with(
+            AttrStatus::Known("AXTextField".into()),
+            &mut reader,
+            &mut disabled,
+        )
+        .unwrap();
         assert!(disabled);
-        assert_eq!(&reader.trace[2..], ["AXTitle", "AXPlaceholderValue", "AXDescription", "AXIdentifier", "AXHelp", "AXSubrole", "classified", "AXValue"]);
+        assert_eq!(
+            &reader.trace[2..],
+            [
+                "AXTitle",
+                "AXPlaceholderValue",
+                "AXDescription",
+                "AXIdentifier",
+                "AXHelp",
+                "AXSubrole",
+                "classified",
+                "AXValue"
+            ]
+        );
     }
 
     #[test]
     fn disabled_batching_order_is_value_last() {
         let mut reader = FakeReader::new();
         read_with(AttrStatus::Known("AXButton".into()), &mut reader, &mut true).unwrap();
-        assert_eq!(&reader.trace[1..], ["AXTitle", "AXPlaceholderValue", "AXDescription", "AXIdentifier", "AXHelp", "AXSubrole", "classified", "AXValue"]);
+        assert_eq!(
+            &reader.trace[1..],
+            [
+                "AXTitle",
+                "AXPlaceholderValue",
+                "AXDescription",
+                "AXIdentifier",
+                "AXHelp",
+                "AXSubrole",
+                "classified",
+                "AXValue"
+            ]
+        );
     }
 
     #[test]
     fn deadline_between_phases_reads_no_value() {
         let mut reader = FakeReader::new();
         reader.expire_on_classification = true;
-        assert!(read_with(AttrStatus::Known("AXTextField".into()), &mut reader, &mut false).is_none());
+        assert!(read_with(
+            AttrStatus::Known("AXTextField".into()),
+            &mut reader,
+            &mut false
+        )
+        .is_none());
         assert!(!reader.trace.iter().any(|s| s == "AXValue"));
     }
 
     #[test]
     fn subrole_is_read_once_per_node() {
         let mut reader = FakeReader::new();
-        read_with(AttrStatus::Known("AXButton".into()), &mut reader, &mut false).unwrap();
-        assert_eq!(reader.trace.iter().map(|line| line.matches("AXSubrole").count()).sum::<usize>(), 1);
+        read_with(
+            AttrStatus::Known("AXButton".into()),
+            &mut reader,
+            &mut false,
+        )
+        .unwrap();
+        assert_eq!(
+            reader
+                .trace
+                .iter()
+                .map(|line| line.matches("AXSubrole").count())
+                .sum::<usize>(),
+            1
+        );
     }
 
     #[test]
@@ -523,8 +698,16 @@ mod tests {
         let absent = single_read_outcome::<String>(kAXErrorFailure, None, || Some(false));
         assert_eq!(absent, Ok(None));
         let mut reader = FakeReader::new();
-        reader.attrs[2] = match absent { Ok(None) => AttrStatus::Absent, _ => AttrStatus::Failed };
-        let result = read_with(AttrStatus::Known("AXTextField".into()), &mut reader, &mut false).unwrap();
+        reader.attrs[2] = match absent {
+            Ok(None) => AttrStatus::Absent,
+            _ => AttrStatus::Failed,
+        };
+        let result = read_with(
+            AttrStatus::Known("AXTextField".into()),
+            &mut reader,
+            &mut false,
+        )
+        .unwrap();
         assert_eq!(result.value.as_deref(), Some("value"));
     }
 
@@ -533,7 +716,15 @@ mod tests {
         for role in ["AXButton", "AXButton", "AXTextField", "AXStaticText"] {
             let mut reader = FakeReader::new();
             read_with(AttrStatus::Known(role.into()), &mut reader, &mut false).unwrap();
-            assert_eq!(reader.trace, ["AXRole", "batch:AXTitle,AXPlaceholderValue,AXDescription,AXIdentifier,AXHelp,AXSubrole", "classified", "AXValue"]);
+            assert_eq!(
+                reader.trace,
+                [
+                    "AXRole",
+                    "batch:AXTitle,AXPlaceholderValue,AXDescription,AXIdentifier,AXHelp,AXSubrole",
+                    "classified",
+                    "AXValue"
+                ]
+            );
         }
     }
 

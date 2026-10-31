@@ -85,7 +85,9 @@ pub(super) fn scrollbar_value(
     role: impl FnOnce() -> Option<String>,
     value: impl FnOnce() -> Option<f64>,
 ) -> Option<f64> {
-    (role().as_deref() == Some("AXScrollBar")).then(value).flatten()
+    (role().as_deref() == Some("AXScrollBar"))
+        .then(value)
+        .flatten()
 }
 
 /// How a scroll area shows in a tree row: where each of its bars sits. None

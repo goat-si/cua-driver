@@ -11,6 +11,8 @@ mod drag;
 mod element_pointer;
 mod element_simulate;
 mod get_window_state;
+#[cfg(test)]
+pub(crate) use get_window_state::element_entry as test_element_entry;
 mod hotkey;
 mod invoke_menu;
 mod key_delivery_guard;
