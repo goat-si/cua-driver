@@ -1,4 +1,6 @@
-use platform_linux::basis_eligibility::{capture_eligibility, session_kind, CaptureBackend, SessionKind};
+use platform_linux::basis_eligibility::{
+    capture_eligibility, session_kind, CaptureBackend, SessionKind,
+};
 
 #[test]
 fn only_exact_x11_drawable_capture_is_eligible() {
@@ -39,35 +41,114 @@ use platform_linux::basis_eligibility::{capture_basis, response_fields, CaptureP
 use serde_json::json;
 
 fn frame() -> LiveFrame {
-    LiveFrame { x: 10, y: 20, width: 800, height: 600, display_scale: None }
+    LiveFrame {
+        x: 10,
+        y: 20,
+        width: 800,
+        height: 600,
+        display_scale: None,
+    }
 }
 
 #[test]
 fn capture_decision_fences_provenance_and_uses_final_size() {
     let f = frame();
-    let decide = |session, path, pre, post| capture_basis(7, 42, session, path, pre, post, (800, 600), (200, 150), 123);
-    for session in [session_kind(false, true, false), session_kind(false, false, true), SessionKind::Wayland] {
-        assert_eq!(decide(session, CapturePath::X11Client(Some(f)), Some(f), Some(f)).unwrap_err(), "no_proven_origin");
+    let decide = |session, path, pre, post| {
+        capture_basis(7, 42, session, path, pre, post, (800, 600), (200, 150), 123)
+    };
+    for session in [
+        session_kind(false, true, false),
+        session_kind(false, false, true),
+        SessionKind::Wayland,
+    ] {
+        assert_eq!(
+            decide(session, CapturePath::X11Client(Some(f)), Some(f), Some(f)).unwrap_err(),
+            "no_proven_origin"
+        );
     }
-    for path in [CapturePath::Preview, CapturePath::RootRegion, CapturePath::WaylandDispatch, CapturePath::ImportFallback, CapturePath::X11Client(None)] {
-        assert_eq!(decide(SessionKind::X11, path, Some(f), Some(f)).unwrap_err(), "no_proven_origin");
+    for path in [
+        CapturePath::Preview,
+        CapturePath::RootRegion,
+        CapturePath::WaylandDispatch,
+        CapturePath::ImportFallback,
+        CapturePath::X11Client(None),
+    ] {
+        assert_eq!(
+            decide(SessionKind::X11, path, Some(f), Some(f)).unwrap_err(),
+            "no_proven_origin"
+        );
     }
-    let mut moved = f; moved.x += 1;
-    assert_eq!(decide(SessionKind::X11, CapturePath::X11Client(Some(f)), Some(f), Some(moved)).unwrap_err(), "window_moved_during_capture");
-    assert_eq!(decide(SessionKind::X11, CapturePath::X11Client(Some(moved)), Some(f), Some(f)).unwrap_err(), "window_moved_during_capture");
-    let basis = decide(SessionKind::X11, CapturePath::X11Client(Some(f)), Some(f), Some(f)).unwrap();
-    assert_eq!((basis.scale_x, basis.scale_y, basis.capture_width, basis.capture_height), (0.25, 0.25, 200, 150));
+    let mut moved = f;
+    moved.x += 1;
+    assert_eq!(
+        decide(
+            SessionKind::X11,
+            CapturePath::X11Client(Some(f)),
+            Some(f),
+            Some(moved)
+        )
+        .unwrap_err(),
+        "window_moved_during_capture"
+    );
+    assert_eq!(
+        decide(
+            SessionKind::X11,
+            CapturePath::X11Client(Some(moved)),
+            Some(f),
+            Some(f)
+        )
+        .unwrap_err(),
+        "window_moved_during_capture"
+    );
+    let basis = decide(
+        SessionKind::X11,
+        CapturePath::X11Client(Some(f)),
+        Some(f),
+        Some(f),
+    )
+    .unwrap();
+    assert_eq!(
+        (
+            basis.scale_x,
+            basis.scale_y,
+            basis.capture_width,
+            basis.capture_height
+        ),
+        (0.25, 0.25, 200, 150)
+    );
 }
 
 #[test]
 fn response_emits_only_the_stored_basis() {
     let f = frame();
-    let candidate = capture_basis(7, 42, SessionKind::X11, CapturePath::X11Client(Some(f)), Some(f), Some(f), (800, 600), (200, 150), 123);
+    let candidate = capture_basis(
+        7,
+        42,
+        SessionKind::X11,
+        CapturePath::X11Client(Some(f)),
+        Some(f),
+        Some(f),
+        (800, 600),
+        (200, 150),
+        123,
+    );
     let mut stored = candidate.clone().unwrap();
     stored.snapshot_id = "stored-snapshot".into();
-    assert_eq!(response_fields(None, Some(&candidate), false, true, false), json!({"basis_unavailable_reason":"capture_not_stored"}));
-    assert_eq!(response_fields(None, Some(&candidate), true, true, false), json!({"basis_unavailable_reason":"basis_retired"}));
-    assert_eq!(response_fields(Some(&stored), Some(&candidate), true, true, false), json!({"window_basis":stored.to_json()}));
-    assert_eq!(response_fields(None, Some(&candidate), false, true, true), json!({}));
+    assert_eq!(
+        response_fields(None, Some(&candidate), false, true, false),
+        json!({"basis_unavailable_reason":"capture_not_stored"})
+    );
+    assert_eq!(
+        response_fields(None, Some(&candidate), true, true, false),
+        json!({"basis_unavailable_reason":"basis_retired"})
+    );
+    assert_eq!(
+        response_fields(Some(&stored), Some(&candidate), true, true, false),
+        json!({"window_basis":stored.to_json()})
+    );
+    assert_eq!(
+        response_fields(None, Some(&candidate), false, true, true),
+        json!({})
+    );
     assert_eq!(response_fields(None, None, false, false, false), json!({}));
 }

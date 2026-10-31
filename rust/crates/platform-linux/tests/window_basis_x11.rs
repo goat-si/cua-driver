@@ -7,6 +7,7 @@ use platform_linux::capture::{
 };
 use x11rb::connection::Connection;
 use x11rb::protocol::xproto::*;
+use x11rb::wrapper::ConnectionExt as _;
 
 #[test]
 #[ignore = "requires an isolated X11 display"]
@@ -61,6 +62,78 @@ fn client_capture_basis_tracks_origin_resize_and_downscale() -> Result<()> {
         (refusal.code, refusal.reason),
         ("stale_basis", "window_moved")
     );
+    conn.destroy_window(window)?.check()?;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires an isolated X11 display"]
+async fn tool_response_basis_matches_delivered_screenshot() -> Result<()> {
+    use serde_json::json;
+    let (conn, screen) = x11rb::connect(None)?;
+    let root = conn.setup().roots[screen].root;
+    let window = conn.generate_id()?;
+    conn.create_window(
+        x11rb::COPY_DEPTH_FROM_PARENT,
+        window,
+        root,
+        50,
+        60,
+        200,
+        120,
+        0,
+        WindowClass::INPUT_OUTPUT,
+        0,
+        &CreateWindowAux::new().override_redirect(1),
+    )?
+    .check()?;
+    let pid_atom = conn.intern_atom(false, b"_NET_WM_PID")?.reply()?.atom;
+    conn.change_property32(
+        PropMode::REPLACE,
+        window,
+        pid_atom,
+        AtomEnum::CARDINAL,
+        &[std::process::id()],
+    )?
+    .check()?;
+    conn.map_window(window)?.check()?;
+    let registry = platform_linux::tools::build_registry(false);
+    let response = registry
+        .invoke(
+            "get_window_state",
+            json!({
+                "pid": std::process::id(), "window_id": window,
+                "include_accessibility_tree": false, "max_image_dimension": 100
+            }),
+        )
+        .await;
+    assert_ne!(response.is_error, Some(true), "{response:?}");
+    let structured = response.structured_content.expect("structured response");
+    let basis = &structured["window_basis"];
+    assert_eq!(
+        (
+            basis["x"].as_i64(),
+            basis["y"].as_i64(),
+            basis["width"].as_u64(),
+            basis["height"].as_u64()
+        ),
+        (Some(50), Some(60), Some(200), Some(120))
+    );
+    assert_eq!(basis["capture_width"], structured["screenshot_width"]);
+    assert_eq!(basis["capture_height"], structured["screenshot_height"]);
+    assert_eq!(
+        basis["scale_x"].as_f64().unwrap(),
+        structured["screenshot_width"].as_f64().unwrap() / 200.0
+    );
+    assert_eq!(
+        basis["scale_y"].as_f64().unwrap(),
+        structured["screenshot_height"].as_f64().unwrap() / 120.0
+    );
+    assert_eq!(basis["snapshot_id"], structured["snapshot_id"]);
+    assert!(structured["snapshot_id"]
+        .as_str()
+        .is_some_and(|id| !id.is_empty()));
+    println!("tool response window_basis: {basis}");
     conn.destroy_window(window)?.check()?;
     Ok(())
 }

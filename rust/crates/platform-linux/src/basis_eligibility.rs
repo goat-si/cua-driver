@@ -40,3 +40,62 @@ pub fn capture_eligibility(
         Err("no_proven_origin")
     }
 }
+
+use cua_driver_core::window_basis::{LiveFrame, WindowBasis};
+use serde_json::{json, Value};
+
+#[derive(Clone, Copy, Debug)]
+pub enum CapturePath {
+    Preview,
+    RootRegion,
+    WaylandDispatch,
+    X11Client(Option<LiveFrame>),
+    ImportFallback,
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn capture_basis(
+    window_id: u64,
+    pid: i32,
+    session: SessionKind,
+    path: CapturePath,
+    pre: Option<LiveFrame>,
+    post: Option<LiveFrame>,
+    native: (u32, u32),
+    delivered: (u32, u32),
+    captured_at_ms: u64,
+) -> Result<WindowBasis, &'static str> {
+    let geometry = match (session, path) {
+        (SessionKind::X11, CapturePath::X11Client(geometry)) => geometry,
+        _ => None,
+    };
+    cua_driver_core::basis_capture::build_capture_basis(
+        window_id,
+        pid,
+        pre,
+        post,
+        geometry,
+        native,
+        delivered,
+        captured_at_ms,
+    )
+}
+
+pub fn response_fields(
+    stored: Option<&WindowBasis>,
+    capture: Option<&Result<WindowBasis, &'static str>>,
+    published: bool,
+    screenshot_present: bool,
+    observation_only: bool,
+) -> Value {
+    if let Some(basis) = stored {
+        json!({"window_basis": basis.to_json()})
+    } else if screenshot_present && !observation_only {
+        match cua_driver_core::basis_capture::basis_unavailable_reason(capture, published, false) {
+            Some(reason) => json!({"basis_unavailable_reason": reason}),
+            None => json!({}),
+        }
+    } else {
+        json!({})
+    }
+}

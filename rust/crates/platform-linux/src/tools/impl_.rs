@@ -1419,7 +1419,7 @@ impl Tool for GetWindowStateTool {
                 let eligible = session == crate::basis_eligibility::SessionKind::X11 && !overlays.covers_window;
                 let pre = eligible.then(|| crate::capture::read_live_frame(xid).ok()).flatten();
                 let captured = if let Some((png, width, height)) = preview {
-                    Ok((png, Some((width, height)), None))
+                    Ok((png, Some((width, height)), crate::basis_eligibility::CapturePath::Preview))
                 } else if overlays.covers_window {
                     overlays
                         .window_rect
@@ -1427,18 +1427,26 @@ impl Tool for GetWindowStateTool {
                         .and_then(|(x, y, w, h)| {
                             crate::capture::screenshot_root_region_png(x, y, w, h)
                         })
-                        .or_else(|_| crate::wayland::screenshot_dispatch_with_pid(xid, pid))
-                        .map(|png| (png, None, None))
+                        .map(|png| (png, None, crate::basis_eligibility::CapturePath::RootRegion))
+                        .or_else(|_| crate::wayland::screenshot_dispatch_with_pid(xid, pid)
+                            .map(|png| (png, None, crate::basis_eligibility::CapturePath::WaylandDispatch)))
                 } else if wayland {
-                    crate::wayland::screenshot_dispatch_with_pid(xid, pid).map(|png| (png, None, None))
+                    crate::wayland::screenshot_dispatch_with_pid(xid, pid).map(|png| (png, None, crate::basis_eligibility::CapturePath::WaylandDispatch))
                 } else {
-                    crate::capture::screenshot_window_with_geometry(xid).map(|(png, geometry)| (png, None, geometry))
+                    crate::capture::screenshot_window_with_geometry(xid).map(|(png, geometry)| {
+                        let path = if geometry.is_some() {
+                            crate::basis_eligibility::CapturePath::X11Client(geometry)
+                        } else {
+                            crate::basis_eligibility::CapturePath::ImportFallback
+                        };
+                        (png, None, path)
+                    })
                 };
                 let post = eligible.then(|| crate::capture::read_live_frame(xid).ok()).flatten();
                 let captured_at_ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default().as_millis().min(u128::from(u64::MAX)) as u64;
                 match captured {
-                    Ok((raw, original_size, geometry)) => {
+                    Ok((raw, original_size, path)) => {
                         let (orig_w, orig_h) = match original_size {
                             Some(size) => size,
                             None => crate::capture::png_dimensions_pub(&raw)?,
@@ -1457,8 +1465,8 @@ impl Tool for GetWindowStateTool {
                             None => png,
                         };
                         let (w, h) = crate::capture::png_dimensions_pub(&png)?;
-                        basis_result = Some(cua_driver_core::basis_capture::build_capture_basis(
-                            xid, pid as i32, pre, post, if eligible { geometry } else { None }, (orig_w, orig_h), (w, h), captured_at_ms,
+                        basis_result = Some(crate::basis_eligibility::capture_basis(
+                            xid, pid as i32, session, path, pre, post, (orig_w, orig_h), (w, h), captured_at_ms,
                         ));
                         let original_w = if w < orig_w { Some(orig_w) } else { None };
                         let (b64, file_path) = if let Some(ref path) = screenshot_out_file {
@@ -1831,17 +1839,22 @@ impl Tool for GetWindowStateTool {
                     structured["invalidated_snapshot_ids"] = json!(ids);
                 }
 
-                if let Some(basis) = &stored_basis {
-                    structured["window_basis"] = basis.to_json();
-                } else if shot_opt.is_some() && !observation_only {
-                    if let Some(reason) = cua_driver_core::basis_capture::basis_unavailable_reason(
-                        basis_result.as_ref(),
-                        capture_published,
-                        false,
-                    ) {
-                        structured["basis_unavailable_reason"] = json!(reason);
-                    }
-                }
+                let fields = crate::basis_eligibility::response_fields(
+                    stored_basis.as_ref(),
+                    basis_result.as_ref(),
+                    capture_published,
+                    shot_opt.is_some(),
+                    observation_only,
+                );
+                structured
+                    .as_object_mut()
+                    .expect("structured response is an object")
+                    .extend(
+                        fields
+                            .as_object()
+                            .expect("basis fields are an object")
+                            .clone(),
+                    );
                 if let Some((b64_opt, file_path, w, h, orig_w, capture_id)) = shot_opt {
                     // ax mode + screenshot_out_file writes the PNG to disk and
                     // returns b64=None — never embed the image bytes in that case.
