@@ -3840,6 +3840,24 @@ async fn live_accessible<'a>(
     Ok((acc, role))
 }
 
+/// The operation failed before an input mutation was dispatched.
+#[derive(Debug)]
+pub struct TokenRouteUnavailable(pub String);
+impl std::fmt::Display for TokenRouteUnavailable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+impl std::error::Error for TokenRouteUnavailable {}
+
+fn token_pre_dispatch(error: anyhow::Error) -> anyhow::Error {
+    if error.is::<CachedElementGone>() {
+        error
+    } else {
+        TokenRouteUnavailable(format!("{error:#}")).into()
+    }
+}
+
 /// [`perform_action`] on a snapshot-cached element identity. Same contract:
 /// `Ok((action_name, suspected_noop))`. Errors when the object no longer
 /// exists so the caller can refuse a stale token.
@@ -3847,20 +3865,22 @@ pub fn perform_action_ref(object_ref: &ObjectRef) -> Result<(String, bool, bool)
     bounded_for(
         REF_ACTION_BUDGET,
         async {
-            let conn = shared_connection().await?;
-            let (acc, role) = live_accessible(conn, object_ref).await?;
-            let proxies = acc
-                .proxies()
+            let conn = shared_connection().await.map_err(token_pre_dispatch)?;
+            let (acc, role) = live_accessible(conn, object_ref)
                 .await
-                .map_err(|e| anyhow!("interface proxies unavailable: {e}"))?;
+                .map_err(token_pre_dispatch)?;
+            let proxies = acc.proxies().await.map_err(|e| {
+                TokenRouteUnavailable(format!("interface proxies unavailable: {e}"))
+            })?;
             let ap = proxies
                 .action()
                 .await
-                .map_err(|e| anyhow!("Action unavailable: {e}"))?;
+                .map_err(|e| TokenRouteUnavailable(format!("Action unavailable: {e}")))?;
             let actions = action_names(&ap).await;
             let suspected_noop = actions.is_empty() || is_passive_role(&role);
-            let chosen = activation_index(&role, &actions)
-                .ok_or_else(|| anyhow!("element does not advertise a safe activation action"))?;
+            let chosen = activation_index(&role, &actions).ok_or_else(|| {
+                TokenRouteUnavailable("element does not advertise a safe activation action".into())
+            })?;
             // See `perform_action`'s `unacknowledged`: an unanswered doAction
             // is unknown, not dispatched-implies-success, and must not be
             // folded into `rejected`/`suspected_noop` (which would claim the
@@ -4013,14 +4033,24 @@ pub fn type_into_editable_ref(object_ref: &ObjectRef, text: &str) -> Result<()> 
     bounded_for(
         REF_ACTION_BUDGET,
         async {
-            let conn = shared_connection().await?;
-            let (acc, _) = live_accessible(conn, object_ref).await?;
+            let conn = shared_connection().await.map_err(token_pre_dispatch)?;
+            let (acc, _) = live_accessible(conn, object_ref)
+                .await
+                .map_err(token_pre_dispatch)?;
             let ifaces = match call(acc.get_interfaces()).await {
                 Some(Ok(ifaces)) => ifaces,
-                _ => return Err(anyhow!("cached element interfaces unavailable")),
+                Some(Err(error)) => {
+                    return Err(token_pre_dispatch(cached_access_error(error.into())))
+                }
+                None => {
+                    return Err(TokenRouteUnavailable(
+                        "cached element interfaces unavailable".into(),
+                    )
+                    .into())
+                }
             };
             if !ifaces.contains(Interface::EditableText) {
-                return Err(anyhow!("cached element is not editable"));
+                return Err(anyhow!("{NO_VALUE_ROUTE}: cached element is not editable"));
             }
             if write_into_editable_acc(&acc, ifaces.contains(Interface::Component), text).await? {
                 Ok(())

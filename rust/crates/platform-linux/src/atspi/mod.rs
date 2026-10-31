@@ -1022,13 +1022,12 @@ mod token_dispatch_tests {
         for proof in [WindowProof::Proven, WindowProof::NotRequired] {
             let target = token(proof);
             let calls = std::cell::Cell::new(0);
-            let error = target
-                .act(|object| {
-                    calls.set(calls.get() + 1);
-                    assert_eq!(object.path, "/window_b/text");
-                    Err::<(), _>(anyhow::anyhow!("bounds unavailable"))
-                })
-                .unwrap_err();
+            let error = token_bounds_with(&target, |object| {
+                calls.set(calls.get() + 1);
+                assert_eq!(object.path, "/window_b/text");
+                Err(anyhow::anyhow!("bounds unavailable"))
+            })
+            .unwrap_err();
             assert_eq!(error.to_string(), "bounds unavailable");
             assert_eq!(calls.get(), 1);
         }
