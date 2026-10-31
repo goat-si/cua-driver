@@ -14320,18 +14320,7 @@ impl Tool for TypeTextCharsTool {
         let text_len = text.chars().count();
         let result = tokio::task::spawn_blocking(move || {
             if crate::wayland::wayland_input_enabled() {
-                // Per-char `wtype` loop with the requested delay — mirrors the
-                // X11 XSendEvent per-char path. Sleeping here is fine because
-                // we're inside spawn_blocking.
-                let mut buf = [0u8; 4];
-                for ch in text.chars() {
-                    let s = ch.encode_utf8(&mut buf);
-                    crate::wayland::type_text(xid, s)?;
-                    if delay_ms > 0 {
-                        std::thread::sleep(std::time::Duration::from_millis(delay_ms));
-                    }
-                }
-                return Ok(());
+                return crate::wayland::type_text_chars(xid, &text, delay_ms);
             }
             crate::input::send_type_text_with_delay(xid, &text, delay_ms)
         })
