@@ -37,8 +37,11 @@ impl CursorSampler {
     /// Start sampling. Writes JSON-line records to `output_path` from a
     /// background thread. `session_start` is used as the time anchor —
     /// `t_ms` in each sample is `(now - session_start).as_millis()`.
-    pub fn start(output_path: PathBuf, session_start: Instant) -> std::io::Result<Self> {
-        let file = File::create(&output_path)?;
+    pub(crate) fn start(
+        output_path: PathBuf,
+        file: File,
+        session_start: Instant,
+    ) -> std::io::Result<Self> {
         let stop_flag = Arc::new(AtomicBool::new(false));
         let flag_for_thread = stop_flag.clone();
         let path_for_thread = output_path.clone();

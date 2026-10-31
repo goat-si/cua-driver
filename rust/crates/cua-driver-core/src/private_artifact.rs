@@ -18,6 +18,9 @@ mod platform {
     }
 
     fn name(s: &OsStr) -> io::Result<CString> {
+        if s.as_bytes().is_empty() || s.as_bytes().contains(&b'/') || s == "." || s == ".." {
+            return Err(fail("invalid artifact name"));
+        }
         CString::new(s.as_bytes())
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "NUL in path"))
     }
@@ -81,6 +84,10 @@ mod platform {
 
     impl PrivateDir {
         pub(crate) fn open(path: &Path) -> io::Result<Self> {
+            Self::open_inner(path, true)
+        }
+
+        fn open_inner(path: &Path, create: bool) -> io::Result<Self> {
             let absolute = if path.is_absolute() {
                 path.to_owned()
             } else {
@@ -111,7 +118,7 @@ mod platform {
                 let last = index + 1 == components.len();
                 let stat = match stat_at(file.as_raw_fd(), &component) {
                     Ok(stat) => stat,
-                    Err(e) if e.kind() == io::ErrorKind::NotFound && last => {
+                    Err(e) if e.kind() == io::ErrorKind::NotFound && last && create => {
                         if unsafe { libc::mkdirat(file.as_raw_fd(), component.as_ptr(), 0o700) }
                             != 0
                         {
@@ -226,7 +233,7 @@ mod platform {
         }
 
         pub(crate) fn verify(&self) -> io::Result<()> {
-            let fresh = Self::open(&self.path)?;
+            let fresh = Self::open_inner(&self.path, false)?;
             if (fresh.dev, fresh.ino) != (self.dev, self.ino) {
                 return Err(fail("recording directory changed"));
             }

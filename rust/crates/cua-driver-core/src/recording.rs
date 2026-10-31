@@ -684,7 +684,11 @@ impl RecordingSession {
         // post-hoc analysis, so we run it anyway — the cost is one
         // background thread + a small jsonl file.
         let cursor_path = dir.join("cursor.jsonl");
-        match CursorSampler::start(cursor_path, monotonic_start) {
+        #[cfg(unix)]
+        let cursor_file = private_dir.create(std::ffi::OsStr::new("cursor.jsonl"), &[])?;
+        #[cfg(not(unix))]
+        let cursor_file = std::fs::File::create(&cursor_path)?;
+        match CursorSampler::start(cursor_path, cursor_file, monotonic_start) {
             Ok(s) => {
                 inner.cursor = Some(s);
             }
@@ -786,6 +790,11 @@ impl RecordingSession {
         inner.last_video = video_meta.clone();
         inner.last_cursor_samples = cursor_samples;
         let final_video_error = inner.last_error.clone();
+
+        #[cfg(unix)]
+        if let Some(dir) = inner.private_dir.take() {
+            dir.verify()?;
+        }
 
         // Rewrite session.json with final video metadata + cursor count
         // so the renderer (and any external analysis) sees what actually
@@ -1161,11 +1170,29 @@ fn write_phase_artifacts(
     phase: &str,
     capture: &TurnCapture,
 ) -> anyhow::Result<()> {
+    #[cfg(unix)]
+    let dir = crate::private_artifact::PrivateDir::open(
+        turn_dir
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("missing turn parent"))?,
+    )?
+    .subdir(
+        turn_dir
+            .file_name()
+            .ok_or_else(|| anyhow::anyhow!("missing turn name"))?,
+    )?;
+    #[cfg(not(unix))]
     std::fs::create_dir_all(turn_dir)?;
     if let Some(state) = &capture.state.bytes {
+        #[cfg(unix)]
+        dir.create(std::ffi::OsStr::new(&format!("{phase}_state.json")), state)?;
+        #[cfg(not(unix))]
         std::fs::write(turn_dir.join(format!("{phase}_state.json")), state)?;
     }
     if let Some(screenshot) = &capture.screenshot {
+        #[cfg(unix)]
+        dir.create(std::ffi::OsStr::new(&format!("{phase}.png")), screenshot)?;
+        #[cfg(not(unix))]
         std::fs::write(turn_dir.join(format!("{phase}.png")), screenshot)?;
     }
     Ok(())
@@ -1409,6 +1436,18 @@ fn write_turn_with_after(
             }),
             None => click_point,
         };
+    #[cfg(unix)]
+    crate::private_artifact::PrivateDir::open(
+        turn_dir
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("missing turn parent"))?,
+    )?
+    .subdir(
+        turn_dir
+            .file_name()
+            .ok_or_else(|| anyhow::anyhow!("missing turn name"))?,
+    )?;
+    #[cfg(not(unix))]
     std::fs::create_dir_all(&turn_dir)?;
     let now = now_ms();
     let click_family = matches!(tool_name.as_str(), "click" | "double_click" | "right_click");
@@ -1484,15 +1523,15 @@ fn write_turn_with_after(
     write_json_atomic(&turn_dir.join("action.json"), &payload)?;
     write_phase_artifacts(&turn_dir, "after", &after)?;
     if let Some(source) = click_source {
-        std::fs::write(turn_dir.join("click_source.png"), source)?;
+        write_artifact(&turn_dir.join("click_source.png"), source)?;
     }
 
     // Preserve the original post-action names for existing trajectory readers.
     if let Some(state) = &after.state.bytes {
-        std::fs::write(turn_dir.join("app_state.json"), state)?;
+        write_artifact(&turn_dir.join("app_state.json"), state)?;
     }
     if let Some(screenshot) = &after.screenshot {
-        std::fs::write(turn_dir.join("screenshot.png"), screenshot)?;
+        write_artifact(&turn_dir.join("screenshot.png"), screenshot)?;
     }
 
     // A click marker describes where the action was aimed, so ground it on
@@ -1504,7 +1543,7 @@ fn write_turn_with_after(
             (click_point, marker_source, CLICK_MARKER_FN.get())
         {
             if let Some(click_png) = marker(screenshot, cx, cy) {
-                std::fs::write(turn_dir.join("click.png"), click_png)?;
+                write_artifact(&turn_dir.join("click.png"), &click_png)?;
                 click_captured = true;
             }
         }
@@ -1534,10 +1573,34 @@ fn write_turn_with_after(
 }
 
 fn write_json_atomic(path: &Path, value: &Value) -> anyhow::Result<()> {
-    let tmp = path.with_extension("tmp");
-    std::fs::write(&tmp, serde_json::to_string_pretty(value)?)?;
-    std::fs::rename(&tmp, path)?;
-    Ok(())
+    #[cfg(unix)]
+    return write_artifact(path, &serde_json::to_vec_pretty(value)?);
+    #[cfg(not(unix))]
+    {
+        let tmp = path.with_extension("tmp");
+        std::fs::write(&tmp, serde_json::to_string_pretty(value)?)?;
+        std::fs::rename(&tmp, path)?;
+        Ok(())
+    }
+}
+
+fn write_artifact(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
+    #[cfg(unix)]
+    {
+        let parent = path
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("missing artifact parent"))?;
+        let name = path
+            .file_name()
+            .ok_or_else(|| anyhow::anyhow!("missing artifact name"))?;
+        crate::private_artifact::PrivateDir::open(parent)?.create(name, bytes)?;
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(path, bytes)?;
+        Ok(())
+    }
 }
 
 /// Current wall-clock time as milliseconds since Unix epoch.
@@ -1623,6 +1686,26 @@ fn validate_video_metadata(meta: VideoMetadata) -> anyhow::Result<VideoMetadata>
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    #[test]
+    fn recording_phase_does_not_follow_artifact_symlink() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        let root = tempfile::tempdir().unwrap();
+        let target = root.path().join("target");
+        std::fs::write(&target, b"untouched").unwrap();
+        let turn = root.path().canonicalize().unwrap().join("turn-00001");
+        std::fs::create_dir(&turn).unwrap();
+        std::fs::set_permissions(&turn, std::fs::Permissions::from_mode(0o700)).unwrap();
+        symlink(&target, turn.join("before.png")).unwrap();
+        let capture = super::TurnCapture {
+            screenshot: Some(b"private screenshot".to_vec()),
+            state: super::StateCapture::captured(b"state".to_vec()),
+            screenshot_classification: None,
+        };
+        assert!(super::write_phase_artifacts(&turn, "before", &capture).is_err());
+        assert_eq!(std::fs::read(&target).unwrap(), b"untouched");
+    }
+
     #[cfg(unix)]
     #[test]
     fn unsafe_recording_destination_rejects_symlink_and_writable_directory() {
