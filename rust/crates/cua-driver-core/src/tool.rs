@@ -7620,6 +7620,61 @@ resources:
         }
     }
 
+    struct SessionSnapshotProbe {
+        def: super::ToolDef,
+        cache: Arc<crate::snapshot_store::SnapshotStore<crate::snapshot_test_support::Payload>>,
+    }
+
+    #[async_trait::async_trait]
+    impl super::Tool for SessionSnapshotProbe {
+        fn def(&self) -> &super::ToolDef {
+            &self.def
+        }
+        async fn invoke(&self, args: serde_json::Value) -> ToolResult {
+            match self.cache.resolve(424242, &args) {
+                Ok(_) => ToolResult::text("resolved"),
+                Err(error) => error,
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn registry_dispatch_scopes_snapshot_tokens_to_the_publisher_session() {
+        let context = standard_context();
+        let cache = Arc::new(crate::snapshot_store::SnapshotStore::new());
+        let owner = context.runtime_session_key("snapshot-owner");
+        let id = cache
+            .publish_for_session(
+                424242,
+                44,
+                crate::snapshot_test_support::Payload(vec![0]),
+                Some(&owner),
+                None,
+            )
+            .unwrap()
+            .0;
+        let token = crate::element_token::token_for(id, 0);
+        let mut registry = super::ToolRegistry::new();
+        registry.register(Box::new(SessionSnapshotProbe { cache, def: super::ToolDef {
+            name: "click".into(), description: "snapshot resolution probe".into(),
+            input_schema: serde_json::json!({"type": "object", "properties": {"element_token": {"type": "string"}}}),
+            read_only: false, destructive: false, idempotent: false, open_world: false,
+        }}));
+        let result = registry
+            .invoke_with_context(
+                "click",
+                serde_json::json!({"session": "snapshot-owner", "element_token": token}),
+                context.clone(),
+            )
+            .await;
+        assert_ne!(result.is_error, Some(true), "{result:?}");
+        let result = registry.invoke_with_context("click", serde_json::json!({"session": "snapshot-other", "element_token": token, "_session_id": owner}), context).await;
+        assert_eq!(
+            result.structured_content.unwrap()["refusal"]["code"],
+            "stale_element_token"
+        );
+    }
+
     #[tokio::test]
     async fn element_tokens_resolve_only_in_the_runtime_that_published_them() {
         let pid = 8_675_309;

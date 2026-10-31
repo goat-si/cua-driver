@@ -85,7 +85,18 @@ impl Tool for ProbeTool {
                 self.state.capture_started.notify_one();
                 self.state.finish_capture.notified().await;
             }
-            let snapshot = self.state.cache.publish(PID, WINDOW, prepared);
+            let snapshot = self
+                .state
+                .cache
+                .publish_for_session(
+                    PID,
+                    WINDOW,
+                    prepared,
+                    args.get("_session_id").and_then(Value::as_str),
+                    None,
+                )
+                .expect("live fixture session publishes")
+                .0;
             return ToolResult::text("test capture complete").with_structured(json!({
                 "pid": PID,
                 "window_id": WINDOW,
