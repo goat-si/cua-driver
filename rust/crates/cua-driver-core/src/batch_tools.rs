@@ -320,7 +320,11 @@ impl Tool for RunStepsTool {
                             if let Some(scope) = &plan.scope {
                                 structured["app_scope"] = scope.to_json();
                             }
-                            return ToolResult::error(message).with_structured(structured);
+                            return ToolResult::error(message)
+                                .with_structured(structured)
+                                .with_disposition(
+                                    cua_driver_contract::ErrorDisposition::NOT_DELIVERED,
+                                );
                         }
                     }
                 }
