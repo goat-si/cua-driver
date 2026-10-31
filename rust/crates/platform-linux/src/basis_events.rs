@@ -40,7 +40,7 @@ impl<R: Requests> Sink<R> {
         };
         if let Some(resource) = &resource {
             if press {
-                self.resources.press_submit(resource.clone());
+                self.resources.press_submit(*resource);
             } else {
                 self.resources.release_submit(resource);
             }
