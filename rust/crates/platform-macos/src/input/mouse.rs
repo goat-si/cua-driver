@@ -1388,7 +1388,11 @@ impl<F: FnMut(f64, f64)> super::gesture::GestureIo for MouseGestureIo<F> {
     fn post(&mut self, event: &CGEvent, _step: &super::gesture::Step) {
         match self.route {
             GestureRoute::Background { pid, route, .. } => dispatch_mouse_event(route, pid, event),
-            GestureRoute::Window { pid, .. } => dispatch_mouse_event(PostRoute::Hid, pid, event),
+            GestureRoute::Window { pid, .. } => dispatch_mouse_event(
+                post_route(MousePostMode::HidOnly, skylight_available()),
+                pid,
+                event,
+            ),
             GestureRoute::Desktop => super::hid_history::post(|| {
                 event.post(core_graphics::event::CGEventTapLocation::HID)
             }),
