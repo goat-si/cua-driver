@@ -84,6 +84,9 @@ mod uia_mutation;
 #[cfg(any(target_os = "windows", test))]
 mod value_append;
 
+#[cfg(any(target_os = "windows", test))]
+mod secure_field;
+
 #[cfg(target_os = "windows")]
 pub mod win32;
 
