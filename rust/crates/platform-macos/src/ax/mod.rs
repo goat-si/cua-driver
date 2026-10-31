@@ -18,7 +18,7 @@
 
 mod batch_attrs;
 pub mod bindings;
-mod content_attrs;
+pub(crate) mod content_attrs;
 pub(crate) mod label_reader;
 pub(crate) mod context_menus;
 mod control_attrs;

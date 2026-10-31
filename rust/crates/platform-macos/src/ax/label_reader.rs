@@ -1,5 +1,6 @@
 //! Attribute and child access for label construction.
 use super::bindings::{copy_bool_attr, copy_children, copy_string_attr, AXUIElementRef};
+use super::content_attrs::{AttrStatus, CLASSIFICATION_ATTRIBUTES};
 use core_foundation::base::{CFRelease, CFTypeRef};
 
 pub(crate) trait LabelReader {
@@ -8,6 +9,8 @@ pub(crate) trait LabelReader {
     fn boolean(&mut self, element: Self::Element, name: &str) -> Option<bool>;
     fn children(&mut self, element: Self::Element) -> Vec<Self::Element>;
     fn release(&mut self, element: Self::Element);
+    fn status(&mut self, element: Self::Element, name: &str) -> AttrStatus;
+    fn security_batch(&mut self, element: Self::Element) -> Option<[AttrStatus; 7]>;
 }
 
 pub(crate) struct NativeLabelReader;
@@ -26,11 +29,22 @@ impl LabelReader for NativeLabelReader {
     fn release(&mut self, element: Self::Element) {
         unsafe { CFRelease(element as CFTypeRef) }
     }
+    fn status(&mut self, element: Self::Element, name: &str) -> AttrStatus {
+        unsafe { super::content_attrs::read_string_status(element, name) }
+    }
+    fn security_batch(&mut self, element: Self::Element) -> Option<[AttrStatus; 7]> {
+        match unsafe { super::batch_attrs::copy_attrs_batch(element, &CLASSIFICATION_ATTRIBUTES) } {
+            super::batch_attrs::BatchRead::Slots(slots) => Some(std::array::from_fn(|i| {
+                super::content_attrs::string_slot(&slots, i)
+            })),
+            super::batch_attrs::BatchRead::Fallback(_) => None,
+        }
+    }
 }
 
 #[cfg(test)]
 pub(crate) mod fake {
-    use super::LabelReader;
+    use super::{AttrStatus, LabelReader, CLASSIFICATION_ATTRIBUTES};
     use std::collections::HashMap;
 
     #[derive(Default)]
@@ -39,6 +53,7 @@ pub(crate) mod fake {
         pub children: HashMap<usize, Vec<usize>>,
         pub trace: Vec<(usize, String)>,
         pub failures: std::collections::HashSet<(usize, String)>,
+        pub reject_batch: bool,
     }
 
     impl FakeReader {
@@ -63,5 +78,22 @@ pub(crate) mod fake {
             self.children.get(&element).cloned().unwrap_or_default()
         }
         fn release(&mut self, _element: usize) {}
+        fn status(&mut self, element: usize, name: &str) -> AttrStatus {
+            self.trace.push((element, name.into()));
+            if self.failures.contains(&(element, name.into())) {
+                AttrStatus::Failed
+            } else if let Some(value) = self.strings.get(&(element, name.into())) {
+                AttrStatus::Known(value.clone())
+            } else {
+                AttrStatus::Absent
+            }
+        }
+        fn security_batch(&mut self, element: usize) -> Option<[AttrStatus; 7]> {
+            if self.reject_batch {
+                None
+            } else {
+                Some(CLASSIFICATION_ATTRIBUTES.map(|name| self.status(element, name)))
+            }
+        }
     }
 }

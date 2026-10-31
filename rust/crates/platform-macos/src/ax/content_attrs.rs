@@ -14,6 +14,15 @@ const CONTENT_ATTRIBUTES: [&str; 6] = [
     "AXHelp",
     "AXSubrole",
 ];
+pub(crate) const CLASSIFICATION_ATTRIBUTES: [&str; 7] = [
+    "AXRole",
+    "AXTitle",
+    "AXPlaceholderValue",
+    "AXDescription",
+    "AXIdentifier",
+    "AXHelp",
+    "AXSubrole",
+];
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum AttrStatus {
@@ -59,6 +68,20 @@ pub(crate) fn value_read_allowed(evidence: &SecurityEvidence) -> bool {
     matches!(&evidence.role, AttrStatus::Known(role) if !role.trim().is_empty() && role != "AXUnknown")
         && evidence.attrs.iter().all(AttrStatus::complete)
         && !evidence.secure()
+}
+
+/// Classify only: never read AXValue while gathering security evidence.
+pub(crate) fn classify_value_read<R: super::label_reader::LabelReader>(
+    reader: &mut R,
+    element: R::Element,
+) -> bool {
+    let [role, title, placeholder, description, identifier, help, subrole] = reader
+        .security_batch(element)
+        .unwrap_or_else(|| CLASSIFICATION_ATTRIBUTES.map(|name| reader.status(element, name)));
+    value_read_allowed(&SecurityEvidence {
+        role,
+        attrs: [title, placeholder, description, identifier, help, subrole],
+    })
 }
 
 pub(super) trait ContentReader {
@@ -417,7 +440,7 @@ impl ContentReader for NativeReader<'_> {
     }
 }
 
-fn string_slot(slots: &BatchSlots, index: usize) -> AttrStatus {
+pub(crate) fn string_slot(slots: &BatchSlots, index: usize) -> AttrStatus {
     match slots.raw(index) {
         None => AttrStatus::Absent,
         Some(raw) => unsafe { string_from_cf(raw) }
@@ -426,7 +449,7 @@ fn string_slot(slots: &BatchSlots, index: usize) -> AttrStatus {
     }
 }
 
-unsafe fn read_string_status(element: AXUIElementRef, name: &str) -> AttrStatus {
+pub(crate) unsafe fn read_string_status(element: AXUIElementRef, name: &str) -> AttrStatus {
     use core_foundation::{base::TCFType, string::CFString};
     let attr = CFString::new(name);
     let mut value: core_foundation::base::CFTypeRef = std::ptr::null();
@@ -468,6 +491,23 @@ fn replay_after_failure(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ax::label_reader::fake::FakeReader as LabelFakeReader;
+
+    #[test]
+    fn classification_only_preserves_failed_and_absent_evidence() {
+        for reject_batch in [false, true] {
+            let mut reader = LabelFakeReader {
+                reject_batch,
+                ..Default::default()
+            };
+            reader.set(0, "AXRole", "AXTextField");
+            assert!(classify_value_read(&mut reader, 0));
+            assert!(!reader.trace.iter().any(|(_, name)| name == "AXValue"));
+            reader.failures.insert((0, "AXDescription".into()));
+            assert!(!classify_value_read(&mut reader, 0));
+            assert!(!reader.trace.iter().any(|(_, name)| name == "AXValue"));
+        }
+    }
     use core_foundation::{
         array::CFArray,
         base::{CFRetain, CFType, TCFType},

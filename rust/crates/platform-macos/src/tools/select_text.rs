@@ -122,10 +122,9 @@ unsafe fn optional_string_attr_once(
 /// TextEdit's document text view (its AXDescription fails with
 /// kAXErrorFailure on every read): an AXTextArea whose role, subrole, role
 /// description and other four hints read cleanly with no security marking
-/// may have exactly one hint that fails that way. Such an element's value is
-/// already published unredacted by get_window_state, which reads a failed
-/// hint as absent under the same classifier. A field whose only protection
-/// signal sits in that one failing hint would be admitted.
+/// may have a failing description only when it has the document body shape.
+/// This is a compatibility exception, not a security proof: a custom field
+/// with the same shape and a secret marker only in that description is admitted.
 fn selection_exposure_allowed(attributes: &[OptionalStringAttr; 8]) -> bool {
     if !matches!(attributes[0], OptionalStringAttr::Value(_))
         || !matches!(attributes[1], OptionalStringAttr::Value(_))
@@ -198,7 +197,18 @@ fn selection_exposure_with_shape(
     attributes: &[OptionalStringAttr; 8],
     shape: DocumentShape<'_>,
 ) -> bool {
-    let _ = (shape.parent_role, shape.window_subrole);
+    let failed_hints = attributes[2..7]
+        .iter()
+        .filter(|a| matches!(a, OptionalStringAttr::StableFailure))
+        .count();
+    if failed_hints > 0
+        && (failed_hints != 1
+            || !matches!(attributes[3], OptionalStringAttr::StableFailure)
+            || shape.parent_role != Some("AXScrollArea")
+            || shape.window_subrole != Some("AXStandardWindow"))
+    {
+        return false;
+    }
     selection_exposure_allowed(attributes)
 }
 
@@ -301,11 +311,27 @@ unsafe fn select_text_blocking(
     selection: &str,
 ) -> Result<(String, SelectedTextRange, usize, usize), SelectError> {
     let attributes = selection_attributes_with(|name| optional_string_attr(element, name));
+    let (parent_role, window_subrole) =
+        if matches!(attributes[3], OptionalStringAttr::StableFailure) {
+            let read_related = |name: &str, attr: &str| {
+                copy_element_attr(element, name).and_then(|related| {
+                    let value = copy_string_attr(related, attr);
+                    CFRelease(related as CFTypeRef);
+                    value
+                })
+            };
+            (
+                read_related("AXParent", "AXRole"),
+                read_related("AXWindow", "AXSubrole"),
+            )
+        } else {
+            (None, None)
+        };
     if !selection_exposure_with_shape(
         &attributes,
         DocumentShape {
-            parent_role: None,
-            window_subrole: None,
+            parent_role: parent_role.as_deref(),
+            window_subrole: window_subrole.as_deref(),
         },
     ) {
         return Err(

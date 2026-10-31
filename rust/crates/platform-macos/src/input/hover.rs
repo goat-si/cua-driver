@@ -154,12 +154,20 @@ unsafe fn first_label(element: AXUIElementRef) -> String {
 }
 
 fn first_label_with<R: LabelReader>(reader: &mut R, element: R::Element) -> String {
-    for attr in ["AXTitle", "AXDescription", "AXValue"] {
+    for attr in ["AXTitle", "AXDescription"] {
         if let Some(s) = reader
             .string(element, attr)
             .filter(|s| !s.trim().is_empty())
         {
             return s;
+        }
+    }
+    if crate::ax::content_attrs::classify_value_read(reader, element) {
+        if let Some(value) = reader
+            .string(element, "AXValue")
+            .filter(|s| !s.trim().is_empty())
+        {
+            return value;
         }
     }
     // Outline rows carry their label on a child (or grandchild) text element.
@@ -182,11 +190,16 @@ fn first_label_with<R: LabelReader>(reader: &mut R, element: R::Element) -> Stri
 }
 
 fn text_of_with<R: LabelReader>(reader: &mut R, element: R::Element) -> String {
-    reader
-        .string(element, "AXValue")
-        .or_else(|| reader.string(element, "AXTitle"))
-        .filter(|s| !s.trim().is_empty())
-        .unwrap_or_default()
+    let value = if crate::ax::content_attrs::classify_value_read(reader, element) {
+        reader
+            .string(element, "AXValue")
+            .or_else(|| reader.string(element, "AXTitle"))
+    } else {
+        reader
+            .string(element, "AXTitle")
+            .or_else(|| reader.string(element, "AXDescription"))
+    };
+    value.filter(|s| !s.trim().is_empty()).unwrap_or_default()
 }
 
 /// Number of elements under `element`, `depth` levels deep (bounded).
@@ -308,18 +321,30 @@ mod secure_label_tests {
     #[test]
     fn label_reader_preserves_value_precedence() {
         let mut reader = FakeReader::default();
+        reader.set(0, "AXRole", "AXStaticText");
         reader.set(0, "AXValue", "ordinary");
         assert_eq!(first_label_with(&mut reader, 0), "ordinary");
         assert_eq!(reader.trace.last().unwrap().1, "AXValue");
     }
 
     #[test]
+    fn secure_child_uses_description_without_reading_value() {
+        let mut reader = FakeReader::default();
+        reader.set(1, "AXRole", "AXTextField");
+        reader.set(1, "AXSubrole", "AXSecureTextField");
+        reader.set(1, "AXDescription", "field");
+        reader.set(1, "AXValue", "secret");
+        assert_eq!(text_of_with(&mut reader, 1), "field");
+        assert!(!reader.trace.iter().any(|(_, name)| name == "AXValue"));
+    }
+
+    #[test]
     fn a_hover_label_never_requests_a_secure_value() {
-        for failed in [false, true] {
+        for failed in [None, Some("AXRole"), Some("AXHelp")] {
             let mut reader = FakeReader::default();
             reader.set(0, "AXRole", "AXTextField");
-            if failed {
-                reader.failures.insert((0, "AXRole".into()));
+            if let Some(name) = failed {
+                reader.failures.insert((0, name.into()));
             } else {
                 reader.set(0, "AXSubrole", "AXSecureTextField");
             }
@@ -338,22 +363,32 @@ mod secure_label_tests {
 
     #[test]
     fn a_hover_child_text_never_requests_a_secure_value() {
-        for failed in [false, true] {
+        for (depth, failed) in [
+            (1, None),
+            (1, Some("AXRole")),
+            (1, Some("AXHelp")),
+            (2, None),
+            (2, Some("AXRole")),
+            (2, Some("AXHelp")),
+        ] {
             let mut reader = FakeReader::default();
             reader.children.insert(0, vec![1]);
-            reader.set(1, "AXRole", "AXTextField");
-            if failed {
-                reader.failures.insert((1, "AXHelp".into()));
-            } else {
-                reader.set(1, "AXSubrole", "AXSecureTextField");
+            if depth == 2 {
+                reader.children.insert(1, vec![2]);
             }
-            reader.set(1, "AXValue", "secret");
+            reader.set(depth, "AXRole", "AXTextField");
+            if let Some(name) = failed {
+                reader.failures.insert((depth, name.into()));
+            } else {
+                reader.set(depth, "AXSubrole", "AXSecureTextField");
+            }
+            reader.set(depth, "AXValue", "secret");
             first_label_with(&mut reader, 0);
             assert!(
                 !reader
                     .trace
                     .iter()
-                    .any(|(id, name)| *id == 1 && name == "AXValue"),
+                    .any(|(id, name)| *id == depth && name == "AXValue"),
                 "{:?}",
                 reader.trace
             );
