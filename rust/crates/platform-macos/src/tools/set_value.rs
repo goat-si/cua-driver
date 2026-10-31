@@ -1078,95 +1078,150 @@ fn set_value_blocking_with(
                 )
             }
         }
-        // Default path: write AXValue directly. Numeric controls (AXSlider /
-        // AXStepper) reject a CFString with -25201 and need a CFNumber; text
-        // fields take a CFString. Try numeric first when the value parses as a
-        // number, then fall back to a string write.
-        // Numeric target carried through so we can step toward it if the
-        // direct writes are rejected (SwiftUI AXSlider rejects every AXValue
-        // write with -25200 yet exposes a readable AXValue + increment/decrement
-        // actions).
-        let numeric_target = value.trim().parse::<f64>().ok();
-        // Read the value before writing so an unchanged field can be reported as
-        // idempotent rather than silently indistinguishable from a fresh write.
-        let before = unsafe { copy_string_attr(element, "AXValue") };
-        let err = match numeric_target {
-            Some(n) => {
-                let e = unsafe { set_number_attr(element, "AXValue", n) };
-                if e == kAXErrorSuccess {
-                    e
-                } else {
-                    unsafe { set_string_attr(element, "AXValue", value) }
-                }
+        let mut ops = LiveAxValueOps { element, pid };
+        write_value_ladder(&mut ops, value, element_index, &role, restored_window)
+    }
+}
+
+trait AxValueOps {
+    fn read_string(&mut self) -> Option<String>;
+    fn read_number(&mut self) -> Option<f64>;
+    fn set_number(&mut self, value: f64) -> i32;
+    fn set_string(&mut self, value: &str) -> i32;
+    fn perform_step(&mut self, action: &str) -> i32;
+    fn settle_pause(&mut self);
+    fn secure(&mut self) -> bool;
+    fn mark_document(&mut self) -> crate::document_edit::DocumentEdited;
+    fn window_has_document(&mut self) -> bool;
+}
+
+struct LiveAxValueOps {
+    element: AXUIElementRef,
+    pid: i32,
+}
+impl AxValueOps for LiveAxValueOps {
+    fn read_string(&mut self) -> Option<String> {
+        unsafe { copy_string_attr(self.element, "AXValue") }
+    }
+    fn read_number(&mut self) -> Option<f64> {
+        unsafe { copy_number_attr(self.element, "AXValue") }
+    }
+    fn set_number(&mut self, value: f64) -> i32 {
+        unsafe { set_number_attr(self.element, "AXValue", value) }
+    }
+    fn set_string(&mut self, value: &str) -> i32 {
+        unsafe { set_string_attr(self.element, "AXValue", value) }
+    }
+    fn perform_step(&mut self, action: &str) -> i32 {
+        unsafe { perform_action(self.element, action) }
+    }
+    fn settle_pause(&mut self) {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    fn secure(&mut self) -> bool {
+        unsafe { copy_string_attr(self.element, "AXSubrole") }.as_deref()
+            == Some("AXSecureTextField")
+    }
+    fn mark_document(&mut self) -> crate::document_edit::DocumentEdited {
+        unsafe { crate::document_edit::ensure_marked_after_ax_write(self.pid, self.element, true) }
+    }
+    fn window_has_document(&mut self) -> bool {
+        unsafe { window_has_document(self.element) }
+    }
+}
+
+fn write_value_ladder(
+    ops: &mut impl AxValueOps,
+    value: &str,
+    element_index: usize,
+    role: &str,
+    restored_window: bool,
+) -> anyhow::Result<SetValueOutcome> {
+    // Default path: write AXValue directly. Numeric controls (AXSlider /
+    // AXStepper) reject a CFString with -25201 and need a CFNumber; text
+    // fields take a CFString. Try numeric first when the value parses as a
+    // number, then fall back to a string write.
+    // Numeric target carried through so we can step toward it if the
+    // direct writes are rejected (SwiftUI AXSlider rejects every AXValue
+    // write with -25200 yet exposes a readable AXValue + increment/decrement
+    // actions).
+    let numeric_target = value.trim().parse::<f64>().ok();
+    // Read the value before writing so an unchanged field can be reported as
+    // idempotent rather than silently indistinguishable from a fresh write.
+    let before = ops.read_string();
+    let err = match numeric_target {
+        Some(n) => {
+            let e = ops.set_number(n);
+            if e == kAXErrorSuccess {
+                e
+            } else {
+                ops.set_string(value)
             }
-            None => unsafe { set_string_attr(element, "AXValue", value) },
-        };
-        if err == kAXErrorSuccess {
-            let mut after = unsafe { copy_string_attr(element, "AXValue") };
-            let (mut verified, mut changed) = classify_write(
+        }
+        None => ops.set_string(value),
+    };
+    if err == kAXErrorSuccess {
+        let mut after = ops.read_string();
+        let (mut verified, mut changed) = classify_write(
+            before.as_deref(),
+            after.as_deref(),
+            value,
+            numeric_target.is_some(),
+        );
+        // Some apps apply the write a moment later; give it a short
+        // settle before calling it not applied.
+        let secure = ops.secure();
+        for _ in 0..NOT_APPLIED_REREADS {
+            if secure || !write_not_applied(verified, changed) {
+                break;
+            }
+            ops.settle_pause();
+            after = ops.read_string();
+            (verified, changed) = classify_write(
                 before.as_deref(),
                 after.as_deref(),
                 value,
                 numeric_target.is_some(),
             );
-            // Some apps apply the write a moment later; give it a short
-            // settle before calling it not applied.
-            let secure = unsafe { copy_string_attr(element, "AXSubrole") }.as_deref()
-                == Some("AXSecureTextField");
-            for _ in 0..NOT_APPLIED_REREADS {
-                if secure || !write_not_applied(verified, changed) {
-                    break;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(100));
-                after = unsafe { copy_string_attr(element, "AXValue") };
-                (verified, changed) = classify_write(
-                    before.as_deref(),
-                    after.as_deref(),
-                    value,
-                    numeric_target.is_some(),
-                );
-            }
-            let suffix = match (verified, changed) {
-                (Some(true), Some(false)) => " Value already matched; write was idempotent.",
-                (Some(true), _) => "",
-                (Some(false), _) => " Read-back did not confirm the value; verify via screenshot.",
-                (None, _) => " Value is not readable through AX; could not confirm.",
-            };
-            // An AX write bypasses NSTextView's edit model, so a document is
-            // not marked edited and would never save the new text (DS-07).
-            // A restored window gets no document key edit (space, backspace):
-            // a document there is reported as not marked.
-            let document = if changed == Some(true) && !restored_window {
-                unsafe { crate::document_edit::ensure_marked_after_ax_write(pid, element, true) }
-            } else if restored_window
-                && changed != Some(false)
-                && unsafe { window_has_document(element) }
-            {
-                crate::document_edit::DocumentEdited::NotMarked
-            } else {
-                crate::document_edit::DocumentEdited::NotADocument
-            };
+        }
+        let suffix = match (verified, changed) {
+            (Some(true), Some(false)) => " Value already matched; write was idempotent.",
+            (Some(true), _) => "",
+            (Some(false), _) => " Read-back did not confirm the value; verify via screenshot.",
+            (None, _) => " Value is not readable through AX; could not confirm.",
+        };
+        // An AX write bypasses NSTextView's edit model, so a document is
+        // not marked edited and would never save the new text (DS-07).
+        // A restored window gets no document key edit (space, backspace):
+        // a document there is reported as not marked.
+        let document = if changed == Some(true) && !restored_window {
+            ops.mark_document()
+        } else if restored_window && changed != Some(false) && ops.window_has_document() {
+            crate::document_edit::DocumentEdited::NotMarked
+        } else {
+            crate::document_edit::DocumentEdited::NotADocument
+        };
+        Ok(SetValueOutcome {
+            detail: format!(
+                "✅ Set AXValue on [{element_index}] {role}.{suffix}{}",
+                document.note()
+            ),
+            verified,
+            changed,
+            // A secure text field reads back empty or masked, so its
+            // read-back proves nothing either way.
+            not_applied: !secure && write_not_applied(verified, changed),
+            document_edited: document.structured(),
+        })
+    } else if let Some(target) = numeric_target {
+        // Both direct writes failed for a numeric target — fall back to
+        // stepping the control via AXIncrement / AXDecrement actions.
+        let mut steps_sent = 0u32;
+        if step_to_value(ops, target, &mut steps_sent) {
+            let after = ops.read_string();
+            let (verified, changed) =
+                classify_write(before.as_deref(), after.as_deref(), value, true);
             Ok(SetValueOutcome {
-                detail: format!(
-                    "✅ Set AXValue on [{element_index}] {role}.{suffix}{}",
-                    document.note()
-                ),
-                verified,
-                changed,
-                // A secure text field reads back empty or masked, so its
-                // read-back proves nothing either way.
-                not_applied: !secure && write_not_applied(verified, changed),
-                document_edited: document.structured(),
-            })
-        } else if let Some(target) = numeric_target {
-            // Both direct writes failed for a numeric target — fall back to
-            // stepping the control via AXIncrement / AXDecrement actions.
-            let mut steps_sent = 0u32;
-            if step_to_value(element, target, &mut steps_sent) {
-                let after = unsafe { copy_string_attr(element, "AXValue") };
-                let (verified, changed) =
-                    classify_write(before.as_deref(), after.as_deref(), value, true);
-                Ok(SetValueOutcome {
                     detail: format!(
                         "✅ Set AXValue on [{element_index}] {role} via AXIncrement/AXDecrement stepping."
                     ),
@@ -1175,18 +1230,17 @@ fn set_value_blocking_with(
                     not_applied: false,
                     document_edited: None,
                 })
-            } else if steps_sent > 0 {
-                anyhow::bail!(
-                    "AXUIElementSetAttributeValue(AXValue) failed with error {err}, and stepping \
+        } else if steps_sent > 0 {
+            anyhow::bail!(
+                "AXUIElementSetAttributeValue(AXValue) failed with error {err}, and stepping \
                      stopped after {steps_sent} AXIncrement/AXDecrement action(s) were sent; the \
                      value may have changed. Read it before repeating"
-                )
-            } else {
-                anyhow::bail!("AXUIElementSetAttributeValue(AXValue) failed with error {err}")
-            }
+            )
         } else {
             anyhow::bail!("AXUIElementSetAttributeValue(AXValue) failed with error {err}")
         }
+    } else {
+        anyhow::bail!("AXUIElementSetAttributeValue(AXValue) failed with error {err}")
     }
 }
 
@@ -1286,9 +1340,9 @@ fn classify_write(
 /// Returns `true` once the control's value lands within half of the last
 /// observed step of `target`, `false` if it can't be read or can't be moved.
 /// `sent` counts the step actions performed.
-fn step_to_value(element: AXUIElementRef, target: f64, sent: &mut u32) -> bool {
+fn step_to_value(ops: &mut impl AxValueOps, target: f64, sent: &mut u32) -> bool {
     // Can't target precisely without feedback — bail if AXValue is unreadable.
-    let mut current = match unsafe { copy_number_attr(element, "AXValue") } {
+    let mut current = match ops.read_number() {
         Some(v) => v,
         None => return false,
     };
@@ -1312,9 +1366,9 @@ fn step_to_value(element: AXUIElementRef, target: f64, sent: &mut u32) -> bool {
             "AXDecrement"
         };
         *sent += 1;
-        let _ = unsafe { perform_action(element, action) };
+        let _ = ops.perform_step(action);
 
-        let next = match unsafe { copy_number_attr(element, "AXValue") } {
+        let next = match ops.read_number() {
             Some(v) => v,
             None => return false,
         };
