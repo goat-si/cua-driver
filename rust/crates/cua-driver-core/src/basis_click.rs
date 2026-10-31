@@ -10,9 +10,7 @@ pub struct ClickArguments<'a> {
     pub button: &'a str,
 }
 
-pub fn basis_argument_error(
-    message: impl Into<String>,
-) -> crate::protocol::ToolResult {
+pub fn basis_argument_error(message: impl Into<String>) -> crate::protocol::ToolResult {
     crate::protocol::ToolResult::error(message.into()).with_structured(
         json!({"code":"invalid_arguments", "effect":"refused", "nothing_sent":true}),
     )
@@ -111,9 +109,7 @@ pub fn dispatch_check(
     basis.check(&frame?)
 }
 
-pub fn background_refusal(
-    mut result: crate::protocol::ToolResult,
-) -> crate::protocol::ToolResult {
+pub fn background_refusal(mut result: crate::protocol::ToolResult) -> crate::protocol::ToolResult {
     if let Some(value) = result.structured_content.as_mut() {
         value["effect"] = json!("refused");
         value["nothing_sent"] = json!(true);
@@ -270,7 +266,7 @@ mod tests {
         fn prepare(&mut self) -> Vec<&'static str> {
             vec![]
         }
-        fn send(&mut self, _: usize) -> Result<(), String> {
+        fn send(&mut self, _: usize) -> Result<(), crate::guarded_dispatch::SendFailure> {
             self.0.borrow_mut().push("send");
             Ok(())
         }

@@ -241,37 +241,43 @@ impl InputSink for PostedClick<'_> {
         }
         effects
     }
-    fn send(&mut self, index: usize) -> std::result::Result<(), String> {
-        if let Some(error) = self.error.take() {
-            return Err(error);
-        }
-        let part = index % 3;
-        if index > 0 && part == 0 {
-            if let Some(thread) = self.suspended.take() {
-                thread.resume().map_err(|e| format!("target thread: {e}"))?;
+    fn send(
+        &mut self,
+        index: usize,
+    ) -> std::result::Result<(), crate::input::guarded_dispatch::SendFailure> {
+        (|| -> std::result::Result<(), String> {
+            if let Some(error) = self.error.take() {
+                return Err(error);
             }
-            sleep(Duration::from_millis(80));
-            self.suspended =
-                SuspendedThread::suspend(self.target).map_err(|e| format!("target thread: {e}"))?;
-        }
-        let (message, wparam) = match part {
-            0 => (WM_MOUSEMOVE, WPARAM(0)),
-            1 => (
-                posted_press_message(self.down, self.double, index / 3, self.wants_double),
-                WPARAM(self.flag as usize),
-            ),
-            _ => (self.up, WPARAM(0)),
-        };
-        unsafe {
-            PostMessageW(
-                self.target,
-                message,
-                wparam,
-                make_lparam(self.client.x, self.client.y),
-            )
-        }
-        .map_err(|e| e.to_string())?;
-        Ok(())
+            let part = index % 3;
+            if index > 0 && part == 0 {
+                if let Some(thread) = self.suspended.take() {
+                    thread.resume().map_err(|e| format!("target thread: {e}"))?;
+                }
+                sleep(Duration::from_millis(80));
+                self.suspended = SuspendedThread::suspend(self.target)
+                    .map_err(|e| format!("target thread: {e}"))?;
+            }
+            let (message, wparam) = match part {
+                0 => (WM_MOUSEMOVE, WPARAM(0)),
+                1 => (
+                    posted_press_message(self.down, self.double, index / 3, self.wants_double),
+                    WPARAM(self.flag as usize),
+                ),
+                _ => (self.up, WPARAM(0)),
+            };
+            unsafe {
+                PostMessageW(
+                    self.target,
+                    message,
+                    wparam,
+                    make_lparam(self.client.x, self.client.y),
+                )
+            }
+            .map_err(|e| e.to_string())?;
+            Ok(())
+        })()
+        .map_err(Into::into)
     }
     fn cleanup(&mut self, sent: usize) -> Vec<Value> {
         let mut results = vec![];
@@ -1002,7 +1008,11 @@ impl InputSink for ForegroundClick {
         }
         effects
     }
-    fn send(&mut self, index: usize) -> std::result::Result<(), String> {
+    fn send(
+        &mut self,
+        index: usize,
+    ) -> std::result::Result<(), crate::input::guarded_dispatch::SendFailure> {
+        (|| -> std::result::Result<(), String> {
         if let Some(error) = self.error.take() {
             return Err(error);
         }
@@ -1042,6 +1052,7 @@ impl InputSink for ForegroundClick {
         }
         self.batch_remaining = sent - 1;
         Ok(())
+        })().map_err(Into::into)
     }
     fn cleanup(&mut self, sent: usize) -> Vec<Value> {
         self.finish(sent)

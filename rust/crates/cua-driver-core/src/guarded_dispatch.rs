@@ -1,9 +1,30 @@
 use crate::window_basis::{BasisRefusal, DispatchEffect, DispatchOutcome};
 use serde_json::{json, Value};
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Emitted {
+    NotEmitted,
+    Unknown,
+}
+
+#[derive(Debug)]
+pub struct SendFailure {
+    pub error: String,
+    pub emitted: Emitted,
+}
+
+impl From<String> for SendFailure {
+    fn from(error: String) -> Self {
+        Self {
+            error,
+            emitted: Emitted::NotEmitted,
+        }
+    }
+}
+
 pub trait InputSink {
     fn prepare(&mut self) -> Vec<&'static str>;
-    fn send(&mut self, event_index: usize) -> Result<(), String>;
+    fn send(&mut self, event_index: usize) -> Result<(), SendFailure>;
     fn cleanup(&mut self, sent: usize) -> Vec<Value>;
 }
 
@@ -83,13 +104,15 @@ pub fn run_guarded(
     }
     for i in 0..planned {
         if let Err(error) = sink.send(i) {
-            outcome.effect = if i == 0 {
+            outcome.effect = if error.emitted == Emitted::Unknown {
+                DispatchEffect::Uncertain
+            } else if i == 0 {
                 DispatchEffect::Refused
             } else {
                 DispatchEffect::Partial
             };
             outcome.cleanup_results = sink.cleanup(i);
-            outcome.cleanup_results.push(json!({"error": error}));
+            outcome.cleanup_results.push(json!({"error": error.error}));
             return GuardedResult::Sent { outcome };
         }
         outcome.events_sent += 1;
@@ -111,10 +134,10 @@ mod tests {
             self.log.borrow_mut().push("prepare".into());
             vec!["cursor"]
         }
-        fn send(&mut self, i: usize) -> Result<(), String> {
+        fn send(&mut self, i: usize) -> Result<(), SendFailure> {
             self.log.borrow_mut().push(format!("send {i}"));
             if self.fail == Some(i) {
-                Err("failed".into())
+                Err(SendFailure::from("failed".to_owned()))
             } else {
                 Ok(())
             }
@@ -293,24 +316,47 @@ mod pointer_slot_tests {
 #[cfg(test)]
 mod unknown_tests {
     use super::*;
-    struct UnknownSink { fail: usize, cleaned: Option<usize> }
+    struct UnknownSink {
+        fail: usize,
+        cleaned: Option<usize>,
+    }
     impl InputSink for UnknownSink {
-        fn prepare(&mut self) -> Vec<&'static str> { vec![] }
-        fn send(&mut self, i: usize) -> Result<(), SendFailure> {
-            if i == self.fail { Err(SendFailure { error: "lost reply".into(), emitted: Emitted::Unknown }) } else { Ok(()) }
+        fn prepare(&mut self) -> Vec<&'static str> {
+            vec![]
         }
-        fn cleanup(&mut self, sent: usize) -> Vec<Value> { self.cleaned = Some(sent); vec![json!("cleaned")] }
+        fn send(&mut self, i: usize) -> Result<(), SendFailure> {
+            if i == self.fail {
+                Err(SendFailure {
+                    error: "lost reply".into(),
+                    emitted: Emitted::Unknown,
+                })
+            } else {
+                Ok(())
+            }
+        }
+        fn cleanup(&mut self, sent: usize) -> Vec<Value> {
+            self.cleaned = Some(sent);
+            vec![json!("cleaned")]
+        }
     }
     #[test]
     fn unknown_preserves_confirmed_prefix_and_cleans_up() {
         for i in [0, 2] {
-            let mut sink = UnknownSink { fail: i, cleaned: None };
-            let GuardedResult::Sent { outcome } = run_guarded(&mut sink, 3, || Ok(())) else { panic!() };
+            let mut sink = UnknownSink {
+                fail: i,
+                cleaned: None,
+            };
+            let GuardedResult::Sent { outcome } = run_guarded(&mut sink, 3, || Ok(())) else {
+                panic!()
+            };
             assert_eq!(outcome.effect, DispatchEffect::Uncertain);
             assert_eq!(outcome.events_sent, i as u32);
             assert!(outcome.to_json().get("nothing_sent").is_none());
             assert_eq!(sink.cleaned, Some(i));
-            assert_eq!(outcome.cleanup_results, [json!("cleaned"), json!({"error":"lost reply"})]);
+            assert_eq!(
+                outcome.cleanup_results,
+                [json!("cleaned"), json!({"error":"lost reply"})]
+            );
         }
     }
 }
