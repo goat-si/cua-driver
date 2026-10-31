@@ -35,7 +35,9 @@ pub fn snapshot_of_handle(handle: &str) -> Option<u32> {
 
 pub fn parse_snapshot_handle(handle: &str) -> Option<u32> {
     let hex = handle.strip_prefix('s')?;
-    if hex.len() != 8 {
+    // Exactly eight hex digits: `from_str_radix` alone also takes a sign
+    // (`s+000001`).
+    if hex.len() != 8 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
         return None;
     }
     u32::from_str_radix(hex, 16).ok()
@@ -156,7 +158,10 @@ mod tests {
             "s0000002a.f",
             "s0000002a.fx",
             "s0000002a.f03",
+            "s0000002a.f+3",
             "s2a.f3",
+            "s+000002a.f3",
+            "s+000002a",
         ] {
             assert_eq!(snapshot_of_handle(handle), None, "{handle}");
             assert!(parse_token(&format!("{handle}:12")).is_none(), "{handle}");
