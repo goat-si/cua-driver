@@ -44,6 +44,19 @@ pub fn capture_eligibility(
 use cua_driver_core::window_basis::{LiveFrame, WindowBasis};
 use serde_json::{json, Value};
 
+/// Discard untrusted rows without cancelling the screenshot being captured.
+pub fn discard_untrusted_snapshot<S: cua_driver_core::snapshot_store::SnapshotPayload>(
+    store: &cua_driver_core::snapshot_store::SnapshotStore<S>,
+    pid: i32,
+    window_id: u64,
+    ticket: Option<u64>,
+) -> Option<u32> {
+    match ticket {
+        Some(ticket) => store.remove_for_capture(pid, window_id, ticket),
+        None => store.remove(pid, window_id),
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub enum CapturePath {
     Preview,

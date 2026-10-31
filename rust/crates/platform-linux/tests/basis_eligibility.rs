@@ -40,6 +40,58 @@ use cua_driver_core::window_basis::LiveFrame;
 use platform_linux::basis_eligibility::{capture_basis, response_fields, CapturePath};
 use serde_json::json;
 
+#[test]
+fn untrusted_rows_are_removed_before_capture_only_publication() {
+    use cua_driver_core::snapshot_store::{SnapshotPayload, SnapshotStore};
+    use platform_linux::basis_eligibility::discard_untrusted_snapshot;
+    struct Payload;
+    impl SnapshotPayload for Payload {
+        type Element = ();
+        fn len(&self) -> usize {
+            0
+        }
+        fn retain(&self, _: usize) -> Option<()> {
+            None
+        }
+    }
+    let store = SnapshotStore::new();
+    let old = store
+        .publish_for_session(42, 7, Payload, None, Some(1.0))
+        .unwrap()
+        .0;
+    let ticket = store.begin_capture(42, 7);
+    assert_eq!(
+        discard_untrusted_snapshot(&store, 42, 7, Some(ticket)),
+        Some(old)
+    );
+    let f = frame();
+    let basis = capture_basis(
+        7,
+        42,
+        SessionKind::X11,
+        CapturePath::X11Client(Some(f)),
+        Some(f),
+        Some(f),
+        (800, 600),
+        (200, 150),
+        123,
+    )
+    .unwrap();
+    assert!(store
+        .refresh_basis_for_session(42, 7, None, 0.25, None, Some(basis.clone()), ticket)
+        .is_none());
+    let (_, _, stored) = store
+        .publish_capture_basis_for_session(42, 7, Payload, None, Some(0.25), Some(basis), ticket)
+        .unwrap();
+    let stored = stored.unwrap();
+    assert!(store.basis_for(42, 7, &stored.snapshot_id, None).is_ok());
+    assert_eq!(
+        store.screenshot_context(42, Some(7), None).unwrap().scale,
+        0.25
+    );
+    assert!(discard_untrusted_snapshot(&store, 42, 7, None).is_some());
+}
+
 fn frame() -> LiveFrame {
     LiveFrame {
         x: 10,
