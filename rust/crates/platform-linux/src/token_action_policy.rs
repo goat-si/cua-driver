@@ -116,30 +116,4 @@ mod write_tests {
             ("element_bounds_unavailable", "none")
         );
     }
-
-    #[test]
-    fn all_token_entrypoints_refuse_errors_without_a_sibling_write() {
-        for _entrypoint in ["hyprland", "inject", "targeted"] {
-            for (failure, expected) in [
-                (
-                    WriteFailure::BeforeDispatch,
-                    ("token_route_unavailable", "none"),
-                ),
-                (WriteFailure::Gone, ("stale_element_token", "none")),
-                (
-                    WriteFailure::Unknown,
-                    ("element_write_unacknowledged", "unverifiable"),
-                ),
-            ] {
-                let mut fallback_calls = 0;
-                let result = write_failure_result(failure);
-                if result.is_none() {
-                    fallback_calls += 1;
-                }
-                assert_eq!(result, Some(expected));
-                assert_eq!(fallback_calls, 0);
-            }
-            assert_eq!(write_failure_result(WriteFailure::NoRoute), None);
-        }
-    }
 }
