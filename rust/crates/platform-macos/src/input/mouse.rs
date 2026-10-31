@@ -1534,6 +1534,68 @@ fn foreground_gesture_plan(
 }
 
 #[cfg(test)]
+pub(super) fn test_stamped_release_events(
+    background: bool,
+) -> (CGEvent, CGEvent, super::gesture::Placement) {
+    use super::gesture::GestureIo;
+    let (route, source, plan) = if background {
+        (
+            GestureRoute::Background {
+                pid: 4321,
+                wid: 456,
+                origin: (100.0, 200.0),
+                id: 789,
+                route: PostRoute::PublicPid,
+            },
+            Some(CGEventSource::new(CGEventSourceStateID::HIDSystemState).unwrap()),
+            background_gesture_plan((100.0, 200.0), (110.0, 210.0), 2, 20),
+        )
+    } else {
+        (
+            GestureRoute::Window {
+                pid: 4321,
+                wid: Some(456),
+                id: Some(789),
+            },
+            None,
+            foreground_gesture_plan(
+                foreground_drag_events(100.0, 200.0, 120.0, 240.0, 2),
+                Some((1.0, 2.0)),
+                Some((11.0, 22.0)),
+                20,
+                false,
+            ),
+        )
+    };
+    let mut io = MouseGestureIo {
+        route,
+        source,
+        button: CGMouseButton::Left,
+        down: CGEventType::LeftMouseDown,
+        dragged: CGEventType::LeftMouseDragged,
+        up: CGEventType::LeftMouseUp,
+        button_number: 0,
+        flags: CGEventFlags::CGEventFlagShift,
+        observe: |_, _| {},
+    };
+    let mut up = *plan
+        .iter()
+        .find(|step| step.kind == super::gesture::Kind::Up)
+        .unwrap();
+    let mut emergency = io.create(&up).unwrap();
+    let last = plan
+        .iter()
+        .find(|step| step.kind == super::gesture::Kind::Dragged)
+        .unwrap()
+        .placement;
+    up.placement = last;
+    let mut planned = io.create(&up).unwrap();
+    io.stamp(&mut emergency, &up);
+    io.stamp(&mut planned, &up);
+    (emergency, planned, last)
+}
+
+#[cfg(test)]
 pub(super) fn test_foreground_gesture_plan(desktop: bool) -> Vec<super::gesture::Step> {
     foreground_gesture_plan(
         foreground_drag_events(0.0, 0.0, 10.0, 10.0, 1),

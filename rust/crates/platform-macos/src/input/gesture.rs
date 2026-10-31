@@ -589,6 +589,52 @@ mod tests {
     }
 
     #[test]
+    fn background_release_is_stamped_like_the_planned_up() {
+        use core_graphics::{event::CGEventFlags, geometry::CGPoint};
+        use foreign_types::ForeignType;
+        extern "C" {
+            fn CGEventGetWindowLocation(event: *const std::ffi::c_void) -> CGPoint;
+        }
+        let (emergency, planned, last) = super::super::mouse::test_stamped_release_events(true);
+        for (field, expected) in [(40, 4321), (51, 456), (91, 456), (92, 456), (58, 789)] {
+            assert_eq!(emergency.get_integer_value_field(field), expected);
+            assert_eq!(
+                emergency.get_integer_value_field(field),
+                planned.get_integer_value_field(field)
+            );
+        }
+        assert_eq!(emergency.get_flags(), CGEventFlags::CGEventFlagShift);
+        assert_eq!(emergency.get_flags(), planned.get_flags());
+        assert_eq!(
+            (emergency.location().x, emergency.location().y),
+            last.screen
+        );
+        let local = unsafe { CGEventGetWindowLocation(emergency.as_ptr().cast()) };
+        let planned_local = unsafe { CGEventGetWindowLocation(planned.as_ptr().cast()) };
+        assert_eq!((local.x, local.y), (5.0, 5.0));
+        assert_eq!((local.x, local.y), (planned_local.x, planned_local.y));
+    }
+    #[test]
+    fn window_foreground_release_keeps_endpoint_local_interpolation() {
+        use core_graphics::geometry::CGPoint;
+        use foreign_types::ForeignType;
+        extern "C" {
+            fn CGEventGetWindowLocation(event: *const std::ffi::c_void) -> CGPoint;
+        }
+        let (emergency, planned, last) = super::super::mouse::test_stamped_release_events(false);
+        assert_eq!(last.screen, (110.0, 220.0));
+        assert_eq!(last.window_local, Some((6.0, 12.0)));
+        let local = unsafe { CGEventGetWindowLocation(emergency.as_ptr().cast()) };
+        let planned_local = unsafe { CGEventGetWindowLocation(planned.as_ptr().cast()) };
+        assert_eq!((local.x, local.y), (6.0, 12.0));
+        assert_eq!((local.x, local.y), (planned_local.x, planned_local.y));
+        assert_eq!(
+            (emergency.location().x, emergency.location().y),
+            last.screen
+        );
+    }
+
+    #[test]
     fn operation_order_matches_the_current_background() {
         let actual = ops(
             Route::Background,
