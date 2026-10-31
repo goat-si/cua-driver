@@ -5,8 +5,14 @@ use core_foundation::base::{CFEqual, CFRelease, CFRetain, CFTypeRef};
 
 const MAX_SELECTION_ANCESTORS: usize = 8;
 
-pub(crate) fn climb_limit(_start_role: Option<&str>) -> usize {
-    MAX_SELECTION_ANCESTORS
+pub(crate) fn climb_limit(start_role: Option<&str>) -> usize {
+    if start_role.is_none_or(|role| {
+        role.is_empty() || role == "AXUnknown" || is_selectable_container_role(role)
+    }) {
+        1
+    } else {
+        MAX_SELECTION_ANCESTORS
+    }
 }
 
 fn is_selectable_container_role(role: &str) -> bool {
@@ -34,7 +40,7 @@ pub fn select_nearest_container(element_ptr: usize) -> Option<String> {
 
     let mut start_role = Some(unsafe { copy_string_attr(current, "AXRole") });
     let limit = climb_limit(start_role.as_ref().and_then(|role| role.as_deref()));
-    for _ in 0..limit {
+    for step in 0..limit {
         let role = start_role
             .take()
             .unwrap_or_else(|| unsafe { copy_string_attr(current, "AXRole") })
@@ -53,6 +59,9 @@ pub fn select_nearest_container(element_ptr: usize) -> Option<String> {
             }
         }
 
+        if step + 1 == limit {
+            break;
+        }
         let parent = unsafe { copy_element_attr(current, "AXParent") };
         if owns_current {
             unsafe { CFRelease(current as CFTypeRef) };
@@ -77,7 +86,7 @@ pub fn nearest_container_selection_state(element_ptr: usize) -> Option<(String, 
 
     let mut start_role = Some(unsafe { copy_string_attr(current, "AXRole") });
     let limit = climb_limit(start_role.as_ref().and_then(|role| role.as_deref()));
-    for _ in 0..limit {
+    for step in 0..limit {
         let role = start_role
             .take()
             .unwrap_or_else(|| unsafe { copy_string_attr(current, "AXRole") })
@@ -91,6 +100,9 @@ pub fn nearest_container_selection_state(element_ptr: usize) -> Option<(String, 
             }
         }
 
+        if step + 1 == limit {
+            break;
+        }
         let parent = unsafe { copy_element_attr(current, "AXParent") };
         if owns_current {
             unsafe { CFRelease(current as CFTypeRef) };
@@ -157,7 +169,7 @@ pub fn capture_nearest_container_selection(element_ptr: usize) -> Option<Selecti
 
     let mut start_role = Some(unsafe { copy_string_attr(current, "AXRole") });
     let limit = climb_limit(start_role.as_ref().and_then(|role| role.as_deref()));
-    for _ in 0..limit {
+    for step in 0..limit {
         let role = start_role
             .take()
             .unwrap_or_else(|| unsafe { copy_string_attr(current, "AXRole") })
@@ -193,6 +205,9 @@ pub fn capture_nearest_container_selection(element_ptr: usize) -> Option<Selecti
             });
         }
 
+        if step + 1 == limit {
+            break;
+        }
         let parent = unsafe { copy_element_attr(current, "AXParent") };
         if owns_current {
             unsafe { CFRelease(current as CFTypeRef) };
@@ -928,7 +943,15 @@ mod climb_limit_tests {
 
     #[test]
     fn an_item_target_never_climbs() {
-        for role in [None, Some("AXRow"), Some("AXCell"), Some("AXListItem"), Some("AXImage")] {
+        for role in [
+            None,
+            Some(""),
+            Some("AXUnknown"),
+            Some("AXRow"),
+            Some("AXCell"),
+            Some("AXListItem"),
+            Some("AXImage"),
+        ] {
             assert_eq!(climb_limit(role), 1, "{role:?}");
         }
     }

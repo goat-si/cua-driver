@@ -446,6 +446,7 @@ mod tests {
         parent: Option<usize>,
     ) -> AXNode {
         AXNode {
+            owned_row_label: None,
             element_index: index,
             role: role.into(),
             title: Some(title.into()),

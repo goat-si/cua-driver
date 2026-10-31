@@ -1604,6 +1604,10 @@ fn inherited_row_label(nodes: &[crate::ax::tree::AXNode], row_index: usize) -> O
         return None;
     }
 
+    if let Some(label) = &row.owned_row_label {
+        return label.as_deref();
+    }
+
     for candidate in &nodes[row_index + 1..] {
         if candidate.depth <= row.depth {
             break;
@@ -2359,6 +2363,7 @@ mod tests {
         actions: Vec<String>,
     ) -> AXNode {
         AXNode {
+            owned_row_label: None,
             element_index: idx,
             role: role.into(),
             title: title.map(|s| s.to_string()),
@@ -2984,5 +2989,64 @@ mod tests {
     fn the_schema_advertises_the_model_fit() {
         let props = &def().input_schema["properties"]["screenshot_fit"];
         assert_eq!(props["enum"], serde_json::json!(["native", "model"]));
+    }
+}
+
+#[cfg(test)]
+mod row_label_tests {
+    use super::*;
+    use crate::ax::tree::AXNode;
+
+    fn row(index: usize, owned: Option<Option<&str>>) -> AXNode {
+        let mut node = AXNode::for_test(Some(index), 0);
+        node.role = "AXRow".into();
+        node.owned_row_label = owned.map(|label| label.map(str::to_owned));
+        node
+    }
+
+    fn text(value: &str, depth: usize) -> AXNode {
+        let mut node = AXNode::for_test(None, 0);
+        node.role = "AXStaticText".into();
+        node.value = Some(value.into());
+        node.depth = depth;
+        node
+    }
+
+    #[test]
+    fn new_rows_use_only_the_structurally_owned_label() {
+        let nodes = vec![row(4, Some(Some("Applications"))), text("foreign", 1)];
+        assert_eq!(inherited_row_label(&nodes, 0), Some("Applications"));
+        let nodes = vec![row(4, Some(None)), text("foreign", 1)];
+        assert_eq!(inherited_row_label(&nodes, 0), None);
+    }
+
+    #[test]
+    fn existing_indexed_rows_keep_their_inheritance() {
+        let nodes = vec![row(4, None), text("legacy", 1)];
+        assert_eq!(inherited_row_label(&nodes, 0), Some("legacy"));
+    }
+
+    #[test]
+    fn a_text_node_never_borrows_a_token() {
+        let nodes = vec![row(4, Some(Some("Applications"))), text("Applications", 1)];
+        let entries = build_elements_array_with_token(&nodes, None);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0]["element_index"], 4);
+        assert_eq!(entries[0]["label"], "Applications");
+    }
+
+    #[test]
+    fn a_query_for_the_row_label_keeps_the_row_in_structured_elements() {
+        let nodes = vec![row(4, Some(Some("Applications"))), text("Applications", 1)];
+        let (nodes, markdown) = crate::ax::tree::test_fold_and_filter(nodes, "Applications");
+        let entries = build_elements_array_with_token(&nodes, None);
+        let entries = cua_driver_core::element_query::project_elements_for_query(
+            entries,
+            Some("Applications"),
+            &markdown,
+        );
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0]["element_index"], 4);
+        assert_eq!(entries[0]["label"], "Applications");
     }
 }

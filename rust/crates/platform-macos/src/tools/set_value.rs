@@ -147,6 +147,32 @@ impl Tool for SetValueTool {
             Err(refusal_result) => return refusal_result,
         };
 
+        // Refuse non-writable rows and cells before rename or any other mutation.
+        let editability_guard = element_guard.clone();
+        let refusal = latency::spawn_action_blocking(move || unsafe {
+            let element = editability_guard.as_ptr() as AXUIElementRef;
+            let role = copy_string_attr(element, "AXRole");
+            let settable = if matches!(role.as_deref(), Some("AXRow" | "AXCell")) {
+                crate::ax::write_outcome::query_settable(element, "AXValue")
+            } else {
+                crate::ax::write_outcome::Settable::No
+            };
+            (role, settable)
+        })
+        .await;
+        let (row_role, row_settable) =
+            match refusal {
+                Ok(facts) => facts,
+                Err(_) => return super::not_editable::not_editable_result(
+                    "the target's editability could not be classified; no text or keys were sent."
+                        .into(),
+                    super::not_editable::FocusDispatch::None,
+                ),
+            };
+        if let Some(refusal) = selectable_row_refusal(row_role.as_deref(), row_settable) {
+            return refusal;
+        }
+
         // A file's name as Finder lists it takes an AXValue write and reads it
         // back, but the file is never renamed. Refuse before anything moves.
         // Finder's Get Info Name field does the same.
@@ -325,13 +351,7 @@ impl Tool for SetValueTool {
         dispatch_set_value(
             autosubmit,
             pid,
-            move || unsafe {
-                let element = element_ptr as AXUIElementRef;
-                (
-                    copy_string_attr(element, "AXRole"),
-                    crate::ax::write_outcome::query_settable(element, "AXValue"),
-                )
-            },
+            move || (row_role, row_settable),
             move |document_key| async move {
                 let result = focus_guard::with_focus_suppressed(
                     Some(pid),
@@ -379,10 +399,27 @@ impl Tool for SetValueTool {
     }
 }
 
+fn selectable_row_refusal(
+    role: Option<&str>,
+    settable: crate::ax::write_outcome::Settable,
+) -> Option<ToolResult> {
+    if matches!(role, Some("AXRow" | "AXCell"))
+        && settable != crate::ax::write_outcome::Settable::Yes
+    {
+        Some(super::not_editable::not_editable_result(
+            "the target row or cell does not have a writable AXValue; no text or keys were sent."
+                .into(),
+            super::not_editable::FocusDispatch::None,
+        ))
+    } else {
+        None
+    }
+}
+
 async fn dispatch_set_value<W, WF, D, R, RF>(
     autosubmit: bool,
     pid: i32,
-    _classify: impl FnOnce() -> (Option<String>, crate::ax::write_outcome::Settable),
+    classify: impl FnOnce() -> (Option<String>, crate::ax::write_outcome::Settable),
     write: W,
     document_key: D,
     return_key: R,
@@ -393,6 +430,10 @@ where
     R: FnOnce(i32, &'static str) -> RF,
     RF: std::future::Future<Output = Result<bool, String>>,
 {
+    let (role, settable) = classify();
+    if let Some(refusal) = selectable_row_refusal(role.as_deref(), settable) {
+        return refusal;
+    }
     let (result, write_not_applied, maybe_landed) = write(document_key).await;
     super::set_value_autosubmit::finish(
         autosubmit,
@@ -2990,15 +3031,21 @@ mod selectable_row_tests {
         let calls = std::cell::Cell::new(0);
         let document: Box<dyn FnOnce()> = Box::new(|| calls.set(calls.get() + 1));
         let result = dispatch_set_value(
-            true, 0, || (Some("AXRow".into()), Settable::No),
+            true,
+            0,
+            || (Some("AXRow".into()), Settable::No),
             |document: Box<dyn FnOnce()>| async {
                 calls.set(calls.get() + 1);
                 document();
                 (ToolResult::text("ok"), false, false)
             },
             document,
-            |_, _| async { calls.set(calls.get() + 1); Ok(true) },
-        ).await;
+            |_, _| async {
+                calls.set(calls.get() + 1);
+                Ok(true)
+            },
+        )
+        .await;
         assert_eq!(calls.get(), 0);
         assert_eq!(result.is_error, Some(true));
     }

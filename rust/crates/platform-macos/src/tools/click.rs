@@ -93,7 +93,7 @@ fn nearest_selectable_container_center(element_ptr: usize) -> Option<(f64, f64)>
     let mut start_role = Some(unsafe { copy_string_attr(current, "AXRole") });
     let limit =
         crate::input::ax_actions::climb_limit(start_role.as_ref().and_then(|role| role.as_deref()));
-    for _ in 0..limit {
+    for step in 0..limit {
         let role = start_role
             .take()
             .unwrap_or_else(|| unsafe { copy_string_attr(current, "AXRole") })
@@ -109,6 +109,9 @@ fn nearest_selectable_container_center(element_ptr: usize) -> Option<(f64, f64)>
             return center;
         }
 
+        if step + 1 == limit {
+            break;
+        }
         let parent = unsafe { copy_element_attr(current, "AXParent") };
         if owns_current {
             unsafe { CFRelease(current as CFTypeRef) };
@@ -448,7 +451,7 @@ impl SelectionSnapshot {
         let limit = crate::input::ax_actions::climb_limit(
             start_role.as_ref().and_then(|role| role.as_deref()),
         );
-        for _ in 0..limit {
+        for step in 0..limit {
             let role = start_role
                 .take()
                 .unwrap_or_else(|| copy_string_attr(current.0, "AXRole"))
@@ -458,6 +461,9 @@ impl SelectionSnapshot {
                 if let Some(selected) = copy_bool_attr(current.0, "AXSelected") {
                     items.push((Retained::retain(current.0), selected));
                 }
+            }
+            if step + 1 == limit {
+                break;
             }
             let Some(parent) = copy_element_attr(current.0, "AXParent") else {
                 break;
