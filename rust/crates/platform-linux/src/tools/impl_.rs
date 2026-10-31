@@ -7061,22 +7061,20 @@ impl Tool for ClickTool {
                     }
                 };
                 if let Ok(Ok(((_action, suspected_noop, unacknowledged), guard))) = ax_result {
-                    let mut structured = json!({
-                        "path": "ax",
-                        "verified": false,
-                        "effect": if suspected_noop { "suspected_noop" } else { "unverifiable" },
-                    });
-                    if suspected_noop {
+                    let mut structured = crate::token_action_policy::ax_click_structured(
+                        suspected_noop,
+                        unacknowledged,
+                    );
+                    if suspected_noop && !unacknowledged {
                         structured["escalation"] = non_ax_escalation();
-                    } else if unacknowledged {
-                        structured["note"] = json!(
-                            "no acknowledgement received for the doAction call within the \
-                             AT-SPI timeout; its effect is unknown"
-                        );
                     }
+                    let message = if unacknowledged {
+                        format!("Action may have run on element [{idx}]")
+                    } else {
+                        format!("Clicked element [{idx}] (pid {pid}).")
+                    };
                     return attach_focus_guard(
-                        ToolResult::text(format!("Clicked element [{idx}] (pid {pid})."))
-                            .with_structured(structured),
+                        ToolResult::text(message).with_structured(structured),
                         guard.as_ref(),
                     );
                 }
@@ -7736,7 +7734,149 @@ async fn focus_nested_inject_target(
 
 pub struct TypeTextTool {
     state: Arc<ToolState>,
+    #[cfg(test)]
+    test_hooks: Option<Arc<TypeTextTestHooks>>,
 }
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TypeTextBranch {
+    HyprlandForeground,
+    Inject,
+    Targeted,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy)]
+enum TypeTextTestOutcome {
+    Unavailable,
+    Gone,
+    Unknown,
+    Panic,
+    Ok,
+    NoRoute,
+}
+
+#[cfg(test)]
+struct TypeTextTestHooks {
+    hyprland_foreground: bool,
+    inject_mode: bool,
+    chromium_or_webkit: bool,
+    outcome: TypeTextTestOutcome,
+    fallthroughs: std::sync::Mutex<Vec<TypeTextBranch>>,
+}
+
+#[cfg(test)]
+impl TypeTextTool {
+    fn hyprland_foreground(&self, delivery: crate::input::delivery::DeliveryMode) -> bool {
+        if let Some(hooks) = &self.test_hooks {
+            return hooks.hyprland_foreground;
+        }
+        hyprland_foreground(delivery)
+    }
+
+    fn inject_mode(&self) -> bool {
+        if let Some(hooks) = &self.test_hooks {
+            return hooks.inject_mode;
+        }
+        crate::wayland::is_inject_mode()
+    }
+
+    fn chromium_or_webkit(&self, pid: u32) -> bool {
+        if let Some(hooks) = &self.test_hooks {
+            return hooks.chromium_or_webkit;
+        }
+        is_chromium_embedder(pid) || is_webkitgtk_embedder(pid)
+    }
+
+    async fn type_into_token(
+        &self,
+        pid: u32,
+        target: crate::atspi::TokenElement,
+        text: String,
+    ) -> Result<anyhow::Result<()>, tokio::task::JoinError> {
+        if let Some(hooks) = &self.test_hooks {
+            let outcome = hooks.outcome;
+            return tokio::task::spawn_blocking(move || match outcome {
+                TypeTextTestOutcome::Unavailable => {
+                    Err(crate::atspi::native::TokenRouteUnavailable("test".into()).into())
+                }
+                TypeTextTestOutcome::Gone => {
+                    Err(crate::atspi::native::CachedElementGone("test".into()).into())
+                }
+                TypeTextTestOutcome::Unknown => Err(anyhow::anyhow!("test write error")),
+                TypeTextTestOutcome::Panic => panic!("test task panic"),
+                TypeTextTestOutcome::Ok => Ok(()),
+                TypeTextTestOutcome::NoRoute => Err(anyhow::anyhow!("no_value_route: test")),
+            })
+            .await;
+        }
+        tokio::task::spawn_blocking(move || crate::atspi::type_into_token(pid, &target, &text))
+            .await
+    }
+
+    fn fallthrough(&self, branch: TypeTextBranch) -> Option<ToolResult> {
+        let hooks = self.test_hooks.as_ref()?;
+        hooks.fallthroughs.lock().unwrap().push(branch);
+        Some(
+            ToolResult::text("test fallthrough").with_structured(json!({"test_fallthrough": true})),
+        )
+    }
+}
+#[cfg(test)]
+macro_rules! type_text_hyprland {
+    ($tool:expr, $delivery:expr) => {
+        $tool.hyprland_foreground($delivery)
+    };
+}
+#[cfg(not(test))]
+macro_rules! type_text_hyprland {
+    ($tool:expr, $delivery:expr) => {
+        hyprland_foreground($delivery)
+    };
+}
+#[cfg(test)]
+macro_rules! type_text_inject {
+    ($tool:expr) => {
+        $tool.inject_mode()
+    };
+}
+#[cfg(not(test))]
+macro_rules! type_text_inject {
+    ($tool:expr) => {
+        crate::wayland::is_inject_mode()
+    };
+}
+#[cfg(test)]
+macro_rules! type_text_web {
+    ($tool:expr, $pid:expr) => {
+        $tool.chromium_or_webkit($pid)
+    };
+}
+#[cfg(not(test))]
+macro_rules! type_text_web {
+    ($tool:expr, $pid:expr) => {
+        is_chromium_embedder($pid) || is_webkitgtk_embedder($pid)
+    };
+}
+#[cfg(test)]
+macro_rules! type_text_token {
+    ($tool:expr, $pid:expr, $target:expr, $text:expr) => {
+        $tool.type_into_token($pid, $target, $text).await
+    };
+}
+#[cfg(not(test))]
+macro_rules! type_text_token {
+    ($tool:expr, $pid:expr, $target:expr, $text:expr) => {
+        tokio::task::spawn_blocking(move || crate::atspi::type_into_token($pid, &$target, &$text))
+            .await
+    };
+}
+
+#[cfg(test)]
+#[path = "impl_/type_text_token_routing_tests.rs"]
+mod type_text_token_routing_tests;
+
 static TYPE_DEF: std::sync::OnceLock<ToolDef> = std::sync::OnceLock::new();
 
 #[async_trait]
@@ -7943,23 +8083,17 @@ impl Tool for TypeTextTool {
             );
         }
 
-        if hyprland_foreground(delivery) {
+        if type_text_hyprland!(self, delivery) {
             if xid_opt.is_none() {
                 return foreground_hyprland_refusal("an exact window_id is required");
             }
             // Native editables retain their verifiable, addressed AT-SPI route; an
             // explicit token must establish it before any key fallback. Chromium/WebKit
             // stay on key events: their bridges can echo a write the renderer never sees.
-            if let Some(element) = token
-                .clone()
-                .filter(|_| !is_chromium_embedder(pid) && !is_webkitgtk_embedder(pid))
-            {
+            if let Some(element) = token.clone().filter(|_| !type_text_web!(self, pid)) {
                 let text_ax = text.clone();
                 let target = element.clone();
-                let result = tokio::task::spawn_blocking(move || {
-                    crate::atspi::type_into_token(pid, &target, &text_ax)
-                })
-                .await;
+                let result = type_text_token!(self, pid, target, text_ax);
                 match result {
                     Ok(Ok(())) => {
                         position_named_session_keyboard_cursor(
@@ -7991,6 +8125,10 @@ impl Tool for TypeTextTool {
                         .expect("unknown write outcome must refuse")
                     }
                 }
+            }
+            #[cfg(test)]
+            if let Some(result) = self.fallthrough(TypeTextBranch::HyprlandForeground) {
+                return result;
             }
             match crate::wayland::hyprland_input::text_actions(&text) {
                 Ok(actions) if !actions.is_empty() => {}
@@ -8065,18 +8203,13 @@ impl Tool for TypeTextTool {
         // compositor keyboard injection; a token-bound route must be proven absent
         // before key fallback. Keep Chromium/WebKit on real key events because their
         // accessibility bridges may echo a write that never reaches renderer state.
-        if let Some(element) = token.clone().filter(|_| {
-            crate::wayland::is_inject_mode()
-                && !is_chromium_embedder(pid)
-                && !is_webkitgtk_embedder(pid)
-        }) {
+        if let Some(element) = token
+            .clone()
+            .filter(|_| type_text_inject!(self) && !type_text_web!(self, pid))
+        {
             let text_at = text.clone();
             let target = element.clone();
-            match tokio::task::spawn_blocking(move || {
-                crate::atspi::type_into_token(pid, &target, &text_at)
-            })
-            .await
-            {
+            match type_text_token!(self, pid, target, text_at) {
                 Ok(Ok(())) => {
                     return type_text_ax_result_verified(pid, element, &text, "via targeted AT-SPI")
                         .await
@@ -8098,7 +8231,11 @@ impl Tool for TypeTextTool {
         // The private nested compositor can target the owning Wayland client
         // directly. Establish widget-local focus first, without changing the
         // compositor's focused toplevel, so keys reach the addressed control.
-        if crate::wayland::is_inject_mode() {
+        if type_text_inject!(self) {
+            #[cfg(test)]
+            if let Some(result) = self.fallthrough(TypeTextBranch::Inject) {
+                return result;
+            }
             if let Err(error) =
                 focus_nested_inject_target(pid, xid, token.clone(), px.zip(py)).await
             {
@@ -8201,10 +8338,7 @@ impl Tool for TypeTextTool {
         if let Some(element) = token.clone() {
             let text_at = text.clone();
             let target = element.clone();
-            let targeted = tokio::task::spawn_blocking(move || {
-                crate::atspi::type_into_token(pid, &target, &text_at)
-            })
-            .await;
+            let targeted = type_text_token!(self, pid, target, text_at);
             match targeted {
                 Ok(Ok(())) => {
                     return type_text_ax_result_verified(pid, element, &text, "via targeted AT-SPI")
@@ -8223,6 +8357,11 @@ impl Tool for TypeTextTool {
                     .expect("unknown write outcome must refuse")
                 }
             }
+        }
+
+        #[cfg(test)]
+        if let Some(result) = self.fallthrough(TypeTextBranch::Targeted) {
+            return result;
         }
 
         // Native Wayland: keys go to the *focused* surface (no pid/window
@@ -15035,6 +15174,8 @@ pub fn build_registry_with_provider(
     r.register(pid_window_guarded(
         TypeTextTool {
             state: state.clone(),
+            #[cfg(test)]
+            test_hooks: None,
         },
         &pid_window_candidates,
     ));
