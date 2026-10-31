@@ -709,6 +709,39 @@ fn count_competing_keyboard_destinations(
         .count()
 }
 
+struct SheetParentOnce<F> {
+    lookup: F,
+}
+
+impl<F: FnMut() -> Option<u32>> SheetParentOnce<F> {
+    fn new(lookup: F) -> Self {
+        Self { lookup }
+    }
+
+    fn get(&mut self) -> Option<u32> {
+        (self.lookup)()
+    }
+}
+
+#[cfg(test)]
+mod sheet_parent_lookup_baseline_tests {
+    use super::SheetParentOnce;
+    use std::cell::Cell;
+
+    #[test]
+    fn each_get_performs_a_lookup_and_construction_does_not() {
+        let calls = Cell::new(0);
+        let mut parent = SheetParentOnce::new(|| {
+            calls.set(calls.get() + 1);
+            Some(calls.get())
+        });
+        assert_eq!(calls.get(), 0);
+        assert_eq!(parent.get(), Some(1));
+        assert_eq!(parent.get(), Some(2));
+        assert_eq!(calls.get(), 2);
+    }
+}
+
 /// Gather fresh background-input facts for one `(pid, window_id)` target.
 ///
 /// `element_ptr` is an optional retained `AXUIElementRef` (as `usize`) for an
@@ -748,6 +781,8 @@ pub fn gather_background_facts(
             super::enablement::ensure_chromium_ax_enabled(pid, app);
             let records = ax_window_records(app, pid, window_id);
             let app_hidden = copy_bool_attr(app, "AXHidden");
+            let mut sheet_parent =
+                SheetParentOnce::new(|| sheet_parent_window_id(app, pid, window_id));
             let element = element_ptr.map(|ptr| {
                 let element = ptr as AXUIElementRef;
                 let window = element_window_id(element);
@@ -756,7 +791,7 @@ pub fn gather_background_facts(
                 let in_menu_bar = window.is_none() && element_in_app_menu_bar(app, element);
                 let in_recorded_menu = window.is_none()
                     && element_in_recorded_top_level_menu(app, element, pid, window_id);
-                let requested = match sheet_parent_window_id(app, pid, window_id) {
+                let requested = match sheet_parent.get() {
                     Some(parent) if element_in_requested_sheet(element, window_id) => parent,
                     _ => window_id,
                 };
@@ -777,7 +812,7 @@ pub fn gather_background_facts(
                 CFRelease(window as CFTypeRef);
                 window_id
             });
-            let sheet_parent = sheet_parent_window_id(app, pid, window_id);
+            let sheet_parent = sheet_parent.get();
             CFRelease(app as CFTypeRef);
             (
                 records,
