@@ -1,7 +1,7 @@
 use cua_driver_core::guarded_dispatch::Emitted;
 use x11rb::errors::{ConnectionError, ReplyError};
 
-fn request_error(error: &ConnectionError) -> Emitted {
+pub(crate) fn request_error(error: &ConnectionError) -> Emitted {
     match error {
         ConnectionError::UnsupportedExtension | ConnectionError::MaximumRequestLengthExceeded => {
             Emitted::NotEmitted
@@ -14,7 +14,7 @@ fn request_error(error: &ConnectionError) -> Emitted {
         _ => Emitted::Unknown,
     }
 }
-fn reply_error(error: &ReplyError) -> Emitted {
+pub(crate) fn reply_error(error: &ReplyError) -> Emitted {
     match error {
         ReplyError::X11Error(_) => Emitted::NotEmitted,
         ReplyError::ConnectionError(_) => Emitted::Unknown,

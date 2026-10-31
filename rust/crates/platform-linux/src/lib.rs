@@ -21,10 +21,12 @@
 use cua_driver_core::tool::ToolRegistry;
 
 pub mod basis_eligibility;
-#[cfg(test)]
+#[cfg(any(test, target_os = "linux"))]
 mod basis_events;
-#[cfg(test)]
+#[cfg(any(test, target_os = "linux"))]
 mod basis_x11_errors;
+#[cfg(target_os = "linux")]
+pub mod basis_click_x11;
 pub mod health_report;
 pub mod overlay;
 pub mod overlay_capture;
