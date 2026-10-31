@@ -51,13 +51,23 @@ impl FfmpegVideoBackend {
             ),
         };
 
-        if let Some(parent) = output_path.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| {
-                anyhow::anyhow!(
-                    "failed to create recording output directory {}: {e}",
-                    parent.display()
-                )
-            })?;
+        let metadata = std::fs::symlink_metadata(&output_path)?;
+        if !metadata.file_type().is_file() {
+            anyhow::bail!("video output is not a pre-created regular file");
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            if metadata.uid() != unsafe { libc::geteuid() } || metadata.mode() & 0o077 != 0 {
+                anyhow::bail!("video output is not owner-only");
+            }
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::MetadataExt;
+            if metadata.file_attributes() & 0x400 != 0 {
+                anyhow::bail!("video output is a reparse point");
+            }
         }
 
         let mut cmd = Command::new(&ffmpeg);
@@ -132,6 +142,33 @@ impl FfmpegVideoBackend {
             started_at: Instant::now(),
             stderr_thread,
         })
+    }
+}
+
+#[cfg(any(unix, windows))]
+pub(crate) fn precreate_output(dir: &crate::private_artifact::PrivateDir) -> anyhow::Result<()> {
+    dir.create(std::ffi::OsStr::new("recording.mp4"), &[])?;
+    Ok(())
+}
+
+#[cfg(all(test, unix))]
+mod private_output_tests {
+    use std::os::unix::fs::{symlink, MetadataExt};
+
+    #[test]
+    fn ffmpeg_output_is_precreated_owner_only_and_rejects_links() {
+        let root = tempfile::tempdir().unwrap();
+        let root = root.path().canonicalize().unwrap();
+        let dir = crate::private_artifact::PrivateDir::open(&root).unwrap();
+        let path = root.join("recording.mp4");
+        super::precreate_output(&dir).unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().mode() & 0o777, 0o600);
+        std::fs::remove_file(&path).unwrap();
+        let target = root.join("target");
+        std::fs::write(&target, b"untouched").unwrap();
+        symlink(&target, &path).unwrap();
+        assert!(super::precreate_output(&dir).is_err());
+        assert_eq!(std::fs::read(&target).unwrap(), b"untouched");
     }
 }
 

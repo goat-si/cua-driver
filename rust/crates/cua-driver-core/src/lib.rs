@@ -124,6 +124,8 @@ pub mod pip_hook;
 pub mod pointer_shape;
 pub mod policy;
 pub mod post_action_wait;
+#[cfg(any(unix, windows))]
+mod private_artifact;
 mod protected_process;
 pub mod protocol;
 pub mod recording;

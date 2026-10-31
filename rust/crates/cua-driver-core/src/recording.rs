@@ -435,6 +435,8 @@ pub(crate) async fn scope_dispatch_click_capture<F: std::future::Future>(
 pub struct PendingTurn {
     generation: u64,
     turn_dir: PathBuf,
+    #[cfg(any(unix, windows))]
+    private_dir: crate::private_artifact::PrivateDir,
     tool_name: String,
     args: Value,
     withheld_args: Vec<String>,
@@ -496,6 +498,8 @@ struct RecordingInner {
     /// than a monotonic counter, and it doubles as the config-override key.
     owner: Option<String>,
     output_dir: Option<PathBuf>,
+    #[cfg(any(unix, windows))]
+    private_dir: Option<crate::private_artifact::PrivateDir>,
     /// Per-turn application-state budget, or `None` when the caller disabled
     /// state capture with `include_accessibility_tree: false`.
     state_budget: Option<StateCaptureBudget>,
@@ -553,6 +557,8 @@ impl RecordingSession {
                 generation: 0,
                 owner: None,
                 output_dir: None,
+                #[cfg(any(unix, windows))]
+                private_dir: None,
                 state_budget: Some(StateCaptureBudget::default()),
                 next_turn: 1,
                 session_start_ms: 0,
@@ -642,19 +648,39 @@ impl RecordingSession {
         if let Some(cur) = inner.cursor.take() {
             let _ = cur.stop();
         }
+        inner.enabled = false;
+        inner.owner = None;
+        inner.output_dir = None;
+        inner.generation = inner.generation.wrapping_add(1);
+        inner.session_monotonic_start = None;
+        #[cfg(any(unix, windows))]
+        {
+            inner.private_dir = None;
+        }
 
         let dir = expand_tilde(output_dir);
+        #[cfg(any(unix, windows))]
+        let private_dir = crate::private_artifact::PrivateDir::open(&dir)
+            .map_err(|e| anyhow::anyhow!("unsafe_recording_destination: {e}"))?;
+        #[cfg(not(any(unix, windows)))]
         std::fs::create_dir_all(&dir)?;
 
         // Single monotonic anchor shared by video, cursor sampler, and
         // per-turn `t_ms_from_session_start` math in `finish_turn()` — so all
         // three timelines line up at the millisecond.
         let monotonic_start = Instant::now();
+        let cursor_path = dir.join("cursor.jsonl");
+        #[cfg(any(unix, windows))]
+        let cursor_file = private_dir.create(std::ffi::OsStr::new("cursor.jsonl"), &[])?;
+        #[cfg(not(any(unix, windows)))]
+        let cursor_file = std::fs::File::create(&cursor_path)?;
 
         let mut video_present = false;
         let mut video_error: Option<String> = None;
         if record_video {
             let path = dir.join("recording.mp4");
+            #[cfg(any(unix, windows))]
+            crate::video_ffmpeg::precreate_output(&private_dir)?;
             match video::start_video(&path) {
                 Ok(rec) => {
                     inner.video = Some(rec);
@@ -675,8 +701,7 @@ impl RecordingSession {
         // off (record_video=false), the sampler is still useful for
         // post-hoc analysis, so we run it anyway — the cost is one
         // background thread + a small jsonl file.
-        let cursor_path = dir.join("cursor.jsonl");
-        match CursorSampler::start(cursor_path, monotonic_start) {
+        match CursorSampler::start(cursor_path, cursor_file, monotonic_start) {
             Ok(s) => {
                 inner.cursor = Some(s);
             }
@@ -696,7 +721,27 @@ impl RecordingSession {
             "video": video_session_payload(video_present, video_error.as_deref(), None),
             "cursor": { "present": inner.cursor.is_some(), "sample_count": 0 }
         });
-        let _ = write_json_atomic(&dir.join("session.json"), &session_payload);
+        let session_write = (|| -> anyhow::Result<()> {
+            #[cfg(any(unix, windows))]
+            private_dir.create(
+                std::ffi::OsStr::new("session.json"),
+                &serde_json::to_vec_pretty(&session_payload)?,
+            )?;
+            #[cfg(not(any(unix, windows)))]
+            write_json_atomic(&dir.join("session.json"), &session_payload)?;
+            Ok(())
+        })();
+        if let Err(error) = session_write {
+            if let Some(cursor) = inner.cursor.take() {
+                cursor.stop();
+            }
+            if let Some(video) = inner.video.take() {
+                if let Err(stop_error) = video.stop() {
+                    return Err(error.context(format!("video cleanup failed: {stop_error}")));
+                }
+            }
+            return Err(error);
+        }
 
         // Stamp the owning session on every successful start (reached only on
         // the success path — start() returns early via `?` on `create_dir_all`
@@ -707,6 +752,10 @@ impl RecordingSession {
         inner.generation = inner.generation.wrapping_add(1);
         inner.enabled = true;
         inner.output_dir = Some(dir);
+        #[cfg(any(unix, windows))]
+        {
+            inner.private_dir = Some(private_dir);
+        }
         inner.state_budget = state_budget;
         inner.next_turn = 1;
         inner.session_start_ms = started_at_ms;
@@ -775,10 +824,20 @@ impl RecordingSession {
         inner.last_cursor_samples = cursor_samples;
         let final_video_error = inner.last_error.clone();
 
+        #[cfg(any(unix, windows))]
+        let private_dir = inner
+            .private_dir
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("missing recording directory"))?;
+        #[cfg(any(unix, windows))]
+        private_dir.verify()?;
+
         // Rewrite session.json with final video metadata + cursor count
         // so the renderer (and any external analysis) sees what actually
         // landed.
         if let Some(dir) = dir {
+            #[cfg(any(unix, windows))]
+            let _ = &dir;
             let video_block = if let Some(ref m) = video_meta {
                 video_session_payload(true, None, Some(m))
             } else {
@@ -790,7 +849,13 @@ impl RecordingSession {
                 "video": video_block,
                 "cursor": { "present": cursor_samples > 0, "sample_count": cursor_samples }
             });
-            let _ = write_json_atomic(&dir.join("session.json"), &session_payload);
+            #[cfg(any(unix, windows))]
+            private_dir.create(
+                std::ffi::OsStr::new("session.json"),
+                &serde_json::to_vec_pretty(&session_payload)?,
+            )?;
+            #[cfg(not(any(unix, windows)))]
+            write_json_atomic(&dir.join("session.json"), &session_payload)?;
         }
         if let Some(error) = stop_error {
             anyhow::bail!("video finalization failed: {error}");
@@ -958,7 +1023,26 @@ impl RecordingSession {
         if !inner.enabled || inner.generation != generation {
             return None;
         }
-        if let Err(error) = write_phase_artifacts(&turn_dir, "before", &before) {
+        #[cfg(any(unix, windows))]
+        let private_dir = match inner
+            .private_dir
+            .as_ref()
+            .ok_or_else(|| std::io::Error::other("missing recording directory"))
+            .and_then(|dir| dir.subdir(turn_dir.file_name().expect("turn has a name")))
+        {
+            Ok(dir) => dir,
+            Err(error) => {
+                inner.last_error = Some(error.to_string());
+                return None;
+            }
+        };
+        if let Err(error) = write_phase_artifacts(
+            &turn_dir,
+            #[cfg(any(unix, windows))]
+            &private_dir,
+            "before",
+            &before,
+        ) {
             inner.last_error = Some(error.to_string());
         }
         drop(inner);
@@ -966,6 +1050,8 @@ impl RecordingSession {
         Some(PendingTurn {
             generation,
             turn_dir,
+            #[cfg(any(unix, windows))]
+            private_dir,
             tool_name: tool_name.to_owned(),
             args,
             withheld_args,
@@ -1146,14 +1232,24 @@ fn resolve_click_point(
 
 fn write_phase_artifacts(
     turn_dir: &Path,
+    #[cfg(any(unix, windows))] dir: &crate::private_artifact::PrivateDir,
     phase: &str,
     capture: &TurnCapture,
 ) -> anyhow::Result<()> {
+    #[cfg(any(unix, windows))]
+    let _ = turn_dir;
+    #[cfg(not(any(unix, windows)))]
     std::fs::create_dir_all(turn_dir)?;
     if let Some(state) = &capture.state.bytes {
+        #[cfg(any(unix, windows))]
+        dir.create(std::ffi::OsStr::new(&format!("{phase}_state.json")), state)?;
+        #[cfg(not(any(unix, windows)))]
         std::fs::write(turn_dir.join(format!("{phase}_state.json")), state)?;
     }
     if let Some(screenshot) = &capture.screenshot {
+        #[cfg(any(unix, windows))]
+        dir.create(std::ffi::OsStr::new(&format!("{phase}.png")), screenshot)?;
+        #[cfg(not(any(unix, windows)))]
         std::fs::write(turn_dir.join(format!("{phase}.png")), screenshot)?;
     }
     Ok(())
@@ -1200,6 +1296,7 @@ struct ClickEvidence {
 
 fn write_evidence_manifest(
     turn_dir: &Path,
+    #[cfg(any(unix, windows))] private_dir: &crate::private_artifact::PrivateDir,
     before: &TurnCapture,
     after: &TurnCapture,
     state_expected: bool,
@@ -1247,7 +1344,12 @@ fn write_evidence_manifest(
             manifest["click_source"]["source_image"] = serde_json::json!("click_source.png");
         }
     }
-    write_json_atomic(&turn_dir.join("evidence.json"), &manifest)
+    write_json_atomic(
+        &turn_dir.join("evidence.json"),
+        #[cfg(any(unix, windows))]
+        private_dir,
+        &manifest,
+    )
 }
 
 /// Drop reserved internal keys (any `_`-prefixed key, e.g. the daemon-injected
@@ -1349,6 +1451,8 @@ fn write_turn_with_after(
     let PendingTurn {
         generation: _,
         turn_dir,
+        #[cfg(any(unix, windows))]
+        private_dir,
         tool_name,
         args,
         withheld_args,
@@ -1397,6 +1501,7 @@ fn write_turn_with_after(
             }),
             None => click_point,
         };
+    #[cfg(not(any(unix, windows)))]
     std::fs::create_dir_all(&turn_dir)?;
     let now = now_ms();
     let click_family = matches!(tool_name.as_str(), "click" | "double_click" | "right_click");
@@ -1469,18 +1574,44 @@ fn write_turn_with_after(
         && !refused_before_target_resolution
         && !refused_before_dispatch
         && !semantic_without_point;
-    write_json_atomic(&turn_dir.join("action.json"), &payload)?;
-    write_phase_artifacts(&turn_dir, "after", &after)?;
+    write_json_atomic(
+        &turn_dir.join("action.json"),
+        #[cfg(any(unix, windows))]
+        &private_dir,
+        &payload,
+    )?;
+    write_phase_artifacts(
+        &turn_dir,
+        #[cfg(any(unix, windows))]
+        &private_dir,
+        "after",
+        &after,
+    )?;
     if let Some(source) = click_source {
-        std::fs::write(turn_dir.join("click_source.png"), source)?;
+        write_artifact(
+            &turn_dir.join("click_source.png"),
+            #[cfg(any(unix, windows))]
+            &private_dir,
+            source,
+        )?;
     }
 
     // Preserve the original post-action names for existing trajectory readers.
     if let Some(state) = &after.state.bytes {
-        std::fs::write(turn_dir.join("app_state.json"), state)?;
+        write_artifact(
+            &turn_dir.join("app_state.json"),
+            #[cfg(any(unix, windows))]
+            &private_dir,
+            state,
+        )?;
     }
     if let Some(screenshot) = &after.screenshot {
-        std::fs::write(turn_dir.join("screenshot.png"), screenshot)?;
+        write_artifact(
+            &turn_dir.join("screenshot.png"),
+            #[cfg(any(unix, windows))]
+            &private_dir,
+            screenshot,
+        )?;
     }
 
     // A click marker describes where the action was aimed, so ground it on
@@ -1492,13 +1623,20 @@ fn write_turn_with_after(
             (click_point, marker_source, CLICK_MARKER_FN.get())
         {
             if let Some(click_png) = marker(screenshot, cx, cy) {
-                std::fs::write(turn_dir.join("click.png"), click_png)?;
+                write_artifact(
+                    &turn_dir.join("click.png"),
+                    #[cfg(any(unix, windows))]
+                    &private_dir,
+                    &click_png,
+                )?;
                 click_captured = true;
             }
         }
     }
     write_evidence_manifest(
         &turn_dir,
+        #[cfg(any(unix, windows))]
+        &private_dir,
         &before,
         &after,
         pid.is_some() && capture_visual_state,
@@ -1521,11 +1659,40 @@ fn write_turn_with_after(
     Ok(())
 }
 
-fn write_json_atomic(path: &Path, value: &Value) -> anyhow::Result<()> {
-    let tmp = path.with_extension("tmp");
-    std::fs::write(&tmp, serde_json::to_string_pretty(value)?)?;
-    std::fs::rename(&tmp, path)?;
-    Ok(())
+fn write_json_atomic(
+    path: &Path,
+    #[cfg(any(unix, windows))] private_dir: &crate::private_artifact::PrivateDir,
+    value: &Value,
+) -> anyhow::Result<()> {
+    #[cfg(any(unix, windows))]
+    return write_artifact(path, private_dir, &serde_json::to_vec_pretty(value)?);
+    #[cfg(not(any(unix, windows)))]
+    {
+        let tmp = path.with_extension("tmp");
+        std::fs::write(&tmp, serde_json::to_string_pretty(value)?)?;
+        std::fs::rename(&tmp, path)?;
+        Ok(())
+    }
+}
+
+fn write_artifact(
+    path: &Path,
+    #[cfg(any(unix, windows))] private_dir: &crate::private_artifact::PrivateDir,
+    bytes: &[u8],
+) -> anyhow::Result<()> {
+    #[cfg(any(unix, windows))]
+    {
+        let name = path
+            .file_name()
+            .ok_or_else(|| anyhow::anyhow!("missing artifact name"))?;
+        private_dir.create(name, bytes)?;
+        Ok(())
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        std::fs::write(path, bytes)?;
+        Ok(())
+    }
 }
 
 /// Current wall-clock time as milliseconds since Unix epoch.
@@ -1611,6 +1778,94 @@ fn validate_video_metadata(meta: VideoMetadata) -> anyhow::Result<VideoMetadata>
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    #[test]
+    fn recording_phase_does_not_follow_artifact_symlink() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        let root = tempfile::tempdir().unwrap();
+        let target = root.path().join("target");
+        std::fs::write(&target, b"untouched").unwrap();
+        let turn = root.path().canonicalize().unwrap().join("turn-00001");
+        std::fs::create_dir(&turn).unwrap();
+        std::fs::set_permissions(&turn, std::fs::Permissions::from_mode(0o700)).unwrap();
+        symlink(&target, turn.join("before.png")).unwrap();
+        let capture = super::TurnCapture {
+            screenshot: Some(b"private screenshot".to_vec()),
+            state: super::StateCapture::captured(b"state".to_vec()),
+            screenshot_classification: None,
+        };
+        assert!(super::write_phase_artifacts(
+            &turn,
+            &crate::private_artifact::PrivateDir::open(&turn).unwrap(),
+            "before",
+            &capture
+        )
+        .is_err());
+        assert_eq!(std::fs::read(&target).unwrap(), b"untouched");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unsafe_recording_destination_rejects_symlink_and_writable_directory() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        let root = tempfile::tempdir().unwrap();
+        let root = root.path().canonicalize().unwrap();
+        let real = root.join("real");
+        std::fs::create_dir(&real).unwrap();
+        let link = root.join("link");
+        symlink(&real, &link).unwrap();
+        let session = super::RecordingSession::new();
+        let error = session
+            .start(link.to_str().unwrap(), false, None)
+            .unwrap_err();
+        assert!(error.to_string().contains("unsafe_recording_destination"));
+        assert_eq!(std::fs::read_dir(&real).unwrap().count(), 0);
+
+        std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o770)).unwrap();
+        let error = session
+            .start(real.to_str().unwrap(), false, None)
+            .unwrap_err();
+        assert!(error.to_string().contains("unsafe_recording_destination"));
+        assert_eq!(std::fs::read_dir(&real).unwrap().count(), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_session_write_stops_the_cursor_sampler() {
+        use std::os::unix::fs::symlink;
+        let root = tempfile::tempdir().unwrap();
+        let target = root.path().join("target");
+        std::fs::write(&target, b"unchanged").unwrap();
+        symlink(&target, root.path().join("session.json")).unwrap();
+        let session = RecordingSession::new();
+        assert!(session
+            .start(root.path().to_str().unwrap(), false, None)
+            .is_err());
+        let inner = session.inner.lock().unwrap();
+        assert!(!inner.enabled);
+        assert!(inner.cursor.is_none());
+        assert_eq!(std::fs::read(target).unwrap(), b"unchanged");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_restart_does_not_leave_old_recording_enabled() {
+        use std::os::unix::fs::symlink;
+        let root = tempfile::tempdir().unwrap();
+        let session = RecordingSession::new();
+        session
+            .start(root.path().to_str().unwrap(), false, None)
+            .unwrap();
+        let link = root.path().join("link");
+        symlink(root.path(), &link).unwrap();
+        assert!(session.start(link.to_str().unwrap(), false, None).is_err());
+        let inner = session.inner.lock().unwrap();
+        assert!(!inner.enabled);
+        assert!(inner.output_dir.is_none());
+        assert!(inner.private_dir.is_none());
+        assert!(inner.cursor.is_none());
+    }
     use super::*;
 
     #[test]
@@ -1625,6 +1880,11 @@ mod tests {
                 let mut inner = registry.recording.inner.lock().unwrap();
                 inner.enabled = true;
                 inner.output_dir = Some(output.path().to_owned());
+                #[cfg(any(unix, windows))]
+                {
+                    inner.private_dir =
+                        Some(crate::private_artifact::PrivateDir::open(output.path()).unwrap());
+                }
             }
             let ratio = Arc::downgrade(ratio);
             registry.recording.set_pixel_point_fn(move |_, _, _, x, y| {
@@ -1770,6 +2030,8 @@ mod tests {
             withheld_args: Vec::new(),
             withheld_lengths: Default::default(),
             turn_dir: root.to_path_buf(),
+            #[cfg(any(unix, windows))]
+            private_dir: crate::private_artifact::PrivateDir::open(root).unwrap(),
             tool_name: "click".into(),
             args: serde_json::json!({"pid": 901, "window_id": 902, "element_token": "s00000001:3"}),
             start_ms: 0,
@@ -1791,6 +2053,78 @@ mod tests {
                 capture: Mutex::new(DispatchClickCapture::default()),
             })),
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recording_artifacts_keep_modes_and_loader_layout() {
+        use std::os::unix::fs::MetadataExt;
+        setup_test_marker();
+        let root = tempfile::tempdir().unwrap();
+        let session = RecordingSession::new();
+        session
+            .start(root.path().to_str().unwrap(), false, None)
+            .unwrap();
+        let turn_path = root.path().join("turn-00001");
+        {
+            let inner = session.inner.lock().unwrap();
+            let dir = inner.private_dir.as_ref().unwrap();
+            crate::video_ffmpeg::precreate_output(dir).unwrap();
+            dir.subdir(std::ffi::OsStr::new("turn-00001")).unwrap();
+        }
+        let mut pending = dispatch_pending(&turn_path);
+        pending.click_point = Some((1.0, 1.0));
+        let image = pending.before.screenshot.clone().unwrap();
+        pending
+            .dispatch_click
+            .as_ref()
+            .unwrap()
+            .capture
+            .lock()
+            .unwrap()
+            .image = Some((image.clone(), 1.0, 1.0));
+        write_phase_artifacts(&turn_path, &pending.private_dir, "before", &pending.before).unwrap();
+        let after = TurnCapture {
+            screenshot: Some(image),
+            state: StateCapture::captured(b"after".to_vec()),
+            screenshot_classification: None,
+        };
+        write_turn_with_after(pending, after, "ok", None, false).unwrap();
+        session.stop_owner(None).unwrap();
+        for name in ["session.json", "cursor.jsonl", "recording.mp4"] {
+            assert_eq!(
+                std::fs::metadata(root.path().join(name)).unwrap().mode() & 0o777,
+                0o600,
+                "{name}"
+            );
+        }
+        assert_eq!(std::fs::metadata(&turn_path).unwrap().mode() & 0o777, 0o700);
+        for name in [
+            "before.png",
+            "before_state.json",
+            "after.png",
+            "after_state.json",
+            "action.json",
+            "evidence.json",
+            "click_source.png",
+            "app_state.json",
+            "screenshot.png",
+            "click.png",
+        ] {
+            assert_eq!(
+                std::fs::metadata(turn_path.join(name)).unwrap().mode() & 0o777,
+                0o600,
+                "{name}"
+            );
+        }
+        for dir in [root.path(), turn_path.as_path()] {
+            assert!(!std::fs::read_dir(dir).unwrap().any(|entry| entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".cua-")));
+        }
+        assert!(crate::recording_loader::load(root.path()).is_ok());
     }
 
     #[tokio::test]
@@ -1821,6 +2155,11 @@ mod tests {
             let mut inner = session.inner.lock().unwrap();
             inner.enabled = true;
             inner.output_dir = Some(root.path().to_path_buf());
+            #[cfg(any(unix, windows))]
+            {
+                inner.private_dir =
+                    Some(crate::private_artifact::PrivateDir::open(root.path()).unwrap());
+            }
         }
         let private = session
             .begin_private_turn("click", &pending.args, 0, RecordingCaller::default())
@@ -1900,6 +2239,11 @@ mod tests {
             let mut inner = session.inner.lock().unwrap();
             inner.enabled = true;
             inner.output_dir = Some(root.path().to_path_buf());
+            #[cfg(any(unix, windows))]
+            {
+                inner.private_dir =
+                    Some(crate::private_artifact::PrivateDir::open(root.path()).unwrap());
+            }
         }
         let pending = session
             .begin_turn(
@@ -2004,7 +2348,14 @@ mod tests {
             let pending = dispatch_pending(root.path());
             let original = pending.before.screenshot.clone().unwrap();
             let source = crate::image_utils::encode_rgba_to_png(&[255; 16], 2, 2).unwrap();
-            write_phase_artifacts(root.path(), "before", &pending.before).unwrap();
+            write_phase_artifacts(
+                root.path(),
+                #[cfg(any(unix, windows))]
+                &pending.private_dir,
+                "before",
+                &pending.before,
+            )
+            .unwrap();
             scope_dispatch_click_capture(Some(&pending), async {
                 capture_dispatch_click_target(902, 901, || {
                     point.map(|(x, y)| (source.clone(), x, y))
@@ -2219,6 +2570,8 @@ mod tests {
                 withheld_args: Vec::new(),
                 withheld_lengths: Default::default(),
                 turn_dir: root.path().to_path_buf(),
+                #[cfg(any(unix, windows))]
+                private_dir: crate::private_artifact::PrivateDir::open(root.path()).unwrap(),
                 tool_name: "click".into(),
                 args: serde_json::json!({"pid":1,"element_token": "s00000001:3"}),
                 start_ms: 0,
@@ -2288,6 +2641,9 @@ mod tests {
                         withheld_args: Vec::new(),
                         withheld_lengths: Default::default(),
                         turn_dir: root.path().to_path_buf(),
+                        #[cfg(any(unix, windows))]
+                        private_dir: crate::private_artifact::PrivateDir::open(root.path())
+                            .unwrap(),
                         tool_name: "click".into(),
                         args,
                         start_ms: 0,
@@ -2395,6 +2751,11 @@ mod tests {
             let mut inner = session.inner.lock().expect("recording lock");
             inner.enabled = true;
             inner.output_dir = Some(output_dir.clone());
+            #[cfg(any(unix, windows))]
+            {
+                inner.private_dir =
+                    Some(crate::private_artifact::PrivateDir::open(&output_dir).unwrap());
+            }
             inner.session_start_ms = now_ms();
         }
         let pending = session
@@ -2607,6 +2968,11 @@ mod tests {
             inner.enabled = true;
             inner.generation = 1;
             inner.output_dir = Some(output_dir.clone());
+            #[cfg(any(unix, windows))]
+            {
+                inner.private_dir =
+                    Some(crate::private_artifact::PrivateDir::open(&output_dir).unwrap());
+            }
             inner.session_start_ms = now_ms();
         }
         let pending = session
@@ -2752,6 +3118,8 @@ mod tests {
             withheld_args: Vec::new(),
             withheld_lengths: Default::default(),
             turn_dir: root.to_path_buf(),
+            #[cfg(any(unix, windows))]
+            private_dir: crate::private_artifact::PrivateDir::open(root).unwrap(),
             tool_name: "click".into(),
             args: serde_json::json!({"pid": 1, "window_id": 2, "x": 0, "y": 0}),
             start_ms: 0,
@@ -2813,6 +3181,11 @@ mod tests {
             let mut inner = session.inner.lock().expect("recording lock");
             inner.enabled = true;
             inner.output_dir = Some(output_dir.clone());
+            #[cfg(any(unix, windows))]
+            {
+                inner.private_dir =
+                    Some(crate::private_artifact::PrivateDir::open(&output_dir).unwrap());
+            }
             inner.session_start_ms = now_ms();
         }
         let pending = session
@@ -2871,6 +3244,11 @@ mod tests {
             let mut inner = session.inner.lock().expect("recording lock");
             inner.enabled = true;
             inner.output_dir = Some(output_dir.clone());
+            #[cfg(any(unix, windows))]
+            {
+                inner.private_dir =
+                    Some(crate::private_artifact::PrivateDir::open(&output_dir).unwrap());
+            }
             inner.video = Some(Box::new(FailingVideo));
         }
 
