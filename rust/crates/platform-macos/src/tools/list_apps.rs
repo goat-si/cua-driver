@@ -40,15 +40,22 @@ impl Tool for ListAppsTool {
     }
 
     async fn invoke(&self, _args: Value) -> ToolResult {
-        let apps = tokio::task::spawn_blocking(crate::apps::list_all_apps)
-            .await
-            .unwrap_or_default();
-        let text = crate::apps::format_app_list(&apps);
-        let structured = serde_json::json!({
-            "apps": apps.iter().map(app_record_json).collect::<Vec<_>>()
-        });
-        ToolResult::text(text).with_structured(structured)
+        inventory_result(crate::apps::list_all_apps).await
     }
+}
+
+async fn inventory_result<F>(inventory: F) -> ToolResult
+where
+    F: FnOnce() -> Vec<crate::apps::AppInfo> + Send + 'static,
+{
+    let apps = tokio::task::spawn_blocking(inventory)
+        .await
+        .unwrap_or_default();
+    let text = crate::apps::format_app_list(&apps);
+    let structured = serde_json::json!({
+        "apps": apps.iter().map(app_record_json).collect::<Vec<_>>()
+    });
+    ToolResult::text(text).with_structured(structured)
 }
 
 /// One `list_apps` record. `pid`, `name`, `running` and `active` are always

@@ -1328,6 +1328,35 @@ pub fn desktop_screenshot_point(x: f64, y: f64) -> (f64, f64) {
     (x / ratio, y / ratio)
 }
 
+fn desktop_click_point<C, B>(
+    capture_id: Option<&str>,
+    convert: C,
+    bound: B,
+) -> Result<Option<(f64, f64)>, ToolResult>
+where
+    C: FnOnce() -> Option<(f64, f64)>,
+    B: FnOnce(&str) -> Result<(f64, f64), ToolResult>,
+{
+    match capture_id {
+        Some(id) => bound(id).map(Some),
+        None => Ok(convert()),
+    }
+}
+
+async fn dispatch_desktop_points<const N: usize, F, Fut>(
+    _tool: &str,
+    originals: [(f64, f64); N],
+    converted: [Option<(f64, f64)>; N],
+    dispatch: F,
+) -> ToolResult
+where
+    F: FnOnce([(f64, f64); N]) -> Fut,
+    Fut: std::future::Future<Output = ToolResult>,
+{
+    let points = std::array::from_fn(|i| converted[i].unwrap_or(originals[i]));
+    dispatch(points).await
+}
+
 /// Persist a single key/value pair to `~/.cua-driver/config.json`.
 /// Merges with any existing file contents so other keys are preserved.
 /// Returns `Err` if the directory cannot be created or the file cannot be written.

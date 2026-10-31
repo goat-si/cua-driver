@@ -1320,18 +1320,20 @@ impl ClickTool {
             // x,y arrive in desktop-SCREENSHOT space (what the agent reads off the
             // PNG) and must be divided by the screenshot↔logical ratio, or a
             // center-pixel pick warps to the corner (off by the backing scale).
-            let (sx, sy) = if let Some(ref capture_id) = capture_id {
-                match self
-                    .state
-                    .capture_bindings
-                    .admit_desktop_click(capture_id, &args, sx_shot, sy_shot)
-                {
-                    Ok(point) => point,
-                    Err(refusal) => return refusal,
-                }
-            } else {
-                super::desktop_screenshot_point(sx_shot, sy_shot)
+            let converted = match super::desktop_click_point(
+                capture_id.as_deref(),
+                || Some(super::desktop_screenshot_point(sx_shot, sy_shot)),
+                |id| {
+                    self.state
+                        .capture_bindings
+                        .admit_desktop_click(id, &args, sx_shot, sy_shot)
+                },
+            ) {
+                Ok(point) => point,
+                Err(refusal) => return refusal,
             };
+            return super::dispatch_desktop_points(
+                "click", [(sx_shot, sy_shot)], [converted], |[(sx, sy)]| async move {
             let button = match input.button.unwrap_or(ClickButton::Left) {
                 ClickButton::Left => "left",
                 ClickButton::Right => "right",
@@ -1406,6 +1408,8 @@ impl ClickTool {
                 Ok(Err(e)) => ToolResult::error(format!("desktop-scope click failed: {e}")),
                 Err(e) => ToolResult::error(format!("task error: {e}")),
             };
+                },
+            ).await;
         }
 
         let pid = match super::target_pid(&self.state, &args) {

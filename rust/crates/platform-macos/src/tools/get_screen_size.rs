@@ -81,19 +81,22 @@ pub(crate) fn main_screen_size() -> Option<(i64, i64, f64)> {
 pub(crate) fn get_backing_scale(display_id: u32) -> f64 {
     use core_graphics::display::CGDisplay;
 
-    let Some(mode) = CGDisplay::new(display_id).display_mode() else {
-        return 1.0;
-    };
-    backing_scale_from_widths(mode.width(), mode.pixel_width())
+    let mode = CGDisplay::new(display_id)
+        .display_mode()
+        .map(|mode| (mode.width(), mode.pixel_width()));
+    backing_scale_from_mode(mode).unwrap_or(1.0)
 }
 
-fn backing_scale_from_widths(point_width: u64, pixel_width: u64) -> f64 {
+fn backing_scale_from_mode(mode: Option<(u64, u64)>) -> Option<f64> {
+    let Some((point_width, pixel_width)) = mode else {
+        return Some(1.0);
+    };
     if point_width == 0 || pixel_width == 0 {
-        return 1.0;
+        return Some(1.0);
     }
     let ratio = pixel_width as f64 / point_width as f64;
     // Round to nearest 0.5 to avoid floating point noise.
-    (ratio * 2.0).round() / 2.0
+    Some((ratio * 2.0).round() / 2.0)
 }
 
 #[cfg(test)]
@@ -128,9 +131,9 @@ mod tests {
 
     #[test]
     fn display_mode_widths_preserve_rounding_and_fallbacks() {
-        assert_eq!(backing_scale_from_widths(1920, 3840), 2.0);
-        assert_eq!(backing_scale_from_widths(1920, 2880), 1.5);
-        assert_eq!(backing_scale_from_widths(0, 3840), 1.0);
-        assert_eq!(backing_scale_from_widths(1920, 0), 1.0);
+        assert_eq!(backing_scale_from_mode(Some((1920, 3840))), Some(2.0));
+        assert_eq!(backing_scale_from_mode(Some((1920, 2880))), Some(1.5));
+        assert_eq!(backing_scale_from_mode(Some((0, 3840))), Some(1.0));
+        assert_eq!(backing_scale_from_mode(Some((1920, 0))), Some(1.0));
     }
 }

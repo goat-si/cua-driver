@@ -83,36 +83,48 @@ impl MoveCursorTool {
                 Err(result) => return result,
             };
             let (x, y) = (input.x, input.y);
-            let (x, y) = super::desktop_screenshot_point(x, y);
-            if let Some(refusal) =
-                super::desktop_pointer_guard::check("move_cursor", &args, vec![(x, y)]).await
-            {
-                return refusal;
-            }
-            let result =
-                tokio::task::spawn_blocking(move || crate::input::mouse::move_cursor_desktop(x, y))
+            let converted = Some(super::desktop_screenshot_point(x, y));
+            return super::dispatch_desktop_points(
+                "move_cursor",
+                [(x, y)],
+                [converted],
+                |[(x, y)]| async move {
+                    if let Some(refusal) =
+                        super::desktop_pointer_guard::check("move_cursor", &args, vec![(x, y)])
+                            .await
+                    {
+                        return refusal;
+                    }
+                    let result = tokio::task::spawn_blocking(move || {
+                        crate::input::mouse::move_cursor_desktop(x, y)
+                    })
                     .await;
-            let note = tokio::task::spawn_blocking(move || inactive_app_under_point(x, y))
-                .await
-                .ok()
-                .flatten()
-                .map(|app| inactive_app_note(&app))
-                .unwrap_or_default();
-            return match result {
-                Ok(Ok(())) => ToolResult::text(format!(
-                    "Moved the real desktop pointer to ({x:.1}, {y:.1}).{note}"
-                ))
-                .with_structured(serde_json::json!({
-                    "scope": "desktop",
-                    "x": x,
-                    "y": y,
-                    "effect": "unverifiable"
-                })),
-                Ok(Err(error)) => {
-                    ToolResult::error(format!("desktop pointer move failed: {error}"))
-                }
-                Err(error) => ToolResult::error(format!("desktop pointer task failed: {error}")),
-            };
+                    let note = tokio::task::spawn_blocking(move || inactive_app_under_point(x, y))
+                        .await
+                        .ok()
+                        .flatten()
+                        .map(|app| inactive_app_note(&app))
+                        .unwrap_or_default();
+                    return match result {
+                        Ok(Ok(())) => ToolResult::text(format!(
+                            "Moved the real desktop pointer to ({x:.1}, {y:.1}).{note}"
+                        ))
+                        .with_structured(serde_json::json!({
+                            "scope": "desktop",
+                            "x": x,
+                            "y": y,
+                            "effect": "unverifiable"
+                        })),
+                        Ok(Err(error)) => {
+                            ToolResult::error(format!("desktop pointer move failed: {error}"))
+                        }
+                        Err(error) => {
+                            ToolResult::error(format!("desktop pointer task failed: {error}"))
+                        }
+                    };
+                },
+            )
+            .await;
         }
         if let (Some(pid), Some(wid)) = (args.opt_i64("pid"), args.opt_u64("window_id")) {
             return self

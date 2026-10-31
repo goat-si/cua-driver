@@ -197,82 +197,97 @@ impl DragTool {
                 Err(result) => return result,
             };
             let (from_x, from_y, to_x, to_y) = (input.from_x, input.from_y, input.to_x, input.to_y);
-            let (from_x, from_y) = super::desktop_screenshot_point(from_x, from_y);
-            let (to_x, to_y) = super::desktop_screenshot_point(to_x, to_y);
-            let duration_ms = input.duration_ms.unwrap_or(500).min(10_000);
-            let steps = input.steps.unwrap_or(20).clamp(1, 200) as usize;
-            // Every point the gesture is delivered at, not only its ends.
-            if let Some(refusal) = super::desktop_pointer_guard::protected_refusal(
+            let converted = [
+                Some(super::desktop_screenshot_point(from_x, from_y)),
+                Some(super::desktop_screenshot_point(to_x, to_y)),
+            ];
+            return super::dispatch_desktop_points(
                 "drag",
-                &crate::input::mouse::foreground_drag_points(from_x, from_y, to_x, to_y, steps),
-            )
-            .await
-            {
-                return refusal;
-            }
-            if let Some(refusal) = super::desktop_pointer_guard::check(
-                "drag",
-                &args,
-                vec![(from_x, from_y), (to_x, to_y)],
-            )
-            .await
-            {
-                return refusal;
-            }
-            let modifiers = input.modifier.unwrap_or_default();
-            let button = match input.button.unwrap_or(ClickButton::Left) {
-                ClickButton::Left => DragButton::Left,
-                ClickButton::Right => DragButton::Right,
-                ClickButton::Middle => DragButton::Middle,
-            };
-            let cursor_for_drag = cursor_key.clone();
-            crate::cursor::overlay::send_command(
-                cursor_key.clone(),
-                cursor_overlay::OverlayCommand::SetPressed(true),
-            );
-            let result = latency::spawn_action_blocking(move || {
-                let modifier_refs: Vec<&str> = modifiers.iter().map(String::as_str).collect();
-                crate::input::mouse::drag_at_xy_foreground_observed(
-                    from_x,
-                    from_y,
-                    to_x,
-                    to_y,
-                    duration_ms,
-                    steps,
-                    &modifier_refs,
-                    button,
-                    move |x, y| {
-                        crate::cursor::overlay::send_command(
-                            cursor_for_drag.clone(),
-                            cursor_overlay::track_pointer_command(x, y),
-                        );
-                    },
-                )
-            })
-            .await;
-            crate::cursor::overlay::send_command(
-                cursor_key.clone(),
-                cursor_overlay::OverlayCommand::SetPressed(false),
-            );
-            if matches!(&result, Ok(Ok(()))) {
-                self.state
-                    .cursor_registry
-                    .update_position(&cursor_key, to_x, to_y);
-            }
-            return match result {
-                Ok(Ok(())) => ToolResult::text(format!(
+                [(from_x, from_y), (to_x, to_y)],
+                converted,
+                |[(from_x, from_y), (to_x, to_y)]| async move {
+                    let duration_ms = input.duration_ms.unwrap_or(500).min(10_000);
+                    let steps = input.steps.unwrap_or(20).clamp(1, 200) as usize;
+                    // Every point the gesture is delivered at, not only its ends.
+                    if let Some(refusal) = super::desktop_pointer_guard::protected_refusal(
+                        "drag",
+                        &crate::input::mouse::foreground_drag_points(
+                            from_x, from_y, to_x, to_y, steps,
+                        ),
+                    )
+                    .await
+                    {
+                        return refusal;
+                    }
+                    if let Some(refusal) = super::desktop_pointer_guard::check(
+                        "drag",
+                        &args,
+                        vec![(from_x, from_y), (to_x, to_y)],
+                    )
+                    .await
+                    {
+                        return refusal;
+                    }
+                    let modifiers = input.modifier.unwrap_or_default();
+                    let button = match input.button.unwrap_or(ClickButton::Left) {
+                        ClickButton::Left => DragButton::Left,
+                        ClickButton::Right => DragButton::Right,
+                        ClickButton::Middle => DragButton::Middle,
+                    };
+                    let cursor_for_drag = cursor_key.clone();
+                    crate::cursor::overlay::send_command(
+                        cursor_key.clone(),
+                        cursor_overlay::OverlayCommand::SetPressed(true),
+                    );
+                    let result = latency::spawn_action_blocking(move || {
+                        let modifier_refs: Vec<&str> =
+                            modifiers.iter().map(String::as_str).collect();
+                        crate::input::mouse::drag_at_xy_foreground_observed(
+                            from_x,
+                            from_y,
+                            to_x,
+                            to_y,
+                            duration_ms,
+                            steps,
+                            &modifier_refs,
+                            button,
+                            move |x, y| {
+                                crate::cursor::overlay::send_command(
+                                    cursor_for_drag.clone(),
+                                    cursor_overlay::track_pointer_command(x, y),
+                                );
+                            },
+                        )
+                    })
+                    .await;
+                    crate::cursor::overlay::send_command(
+                        cursor_key.clone(),
+                        cursor_overlay::OverlayCommand::SetPressed(false),
+                    );
+                    if matches!(&result, Ok(Ok(()))) {
+                        self.state
+                            .cursor_registry
+                            .update_position(&cursor_key, to_x, to_y);
+                    }
+                    return match result {
+                        Ok(Ok(())) => ToolResult::text(format!(
                     "Dragged desktop from ({from_x:.1}, {from_y:.1}) to ({to_x:.1}, {to_y:.1})."
                 ))
-                .with_structured(serde_json::json!({
-                    "scope": "desktop",
-                    "path": "hid",
-                    "effect": "unverifiable"
-                })),
-                Ok(Err(error)) => {
-                    ToolResult::error(format_drag_failure("desktop drag failed", &error))
-                }
-                Err(error) => ToolResult::error(format!("desktop drag task failed: {error}")),
-            };
+                        .with_structured(serde_json::json!({
+                            "scope": "desktop",
+                            "path": "hid",
+                            "effect": "unverifiable"
+                        })),
+                        Ok(Err(error)) => {
+                            ToolResult::error(format_drag_failure("desktop drag failed", &error))
+                        }
+                        Err(error) => {
+                            ToolResult::error(format!("desktop drag task failed: {error}"))
+                        }
+                    };
+                },
+            )
+            .await;
         }
         let pid = match args.require_i32("pid") {
             Ok(v) => v,
