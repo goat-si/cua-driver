@@ -476,6 +476,15 @@ unsafe fn uia_root_for(hwnd: u64) -> anyhow::Result<(IUIAutomation, IUIAutomatio
     crate::uia::client::warm_up(&automation)
         .map_err(|e| anyhow::anyhow!("UIA init failed: {e}"))?;
     let hwnd_win = HWND(hwnd as *mut _);
+    match crate::uia::client::probe_root(hwnd_win) {
+        crate::uia_root::RootVerdict::Ok => {}
+        crate::uia_root::RootVerdict::WindowGone => {
+            anyhow::bail!("window 0x{hwnd:x} no longer exists; nothing was read")
+        }
+        crate::uia_root::RootVerdict::NoAnswer => anyhow::bail!(
+            "window 0x{hwnd:x} did not answer a no-op message within 1 s (the app may be hung); nothing was read"
+        ),
+    }
     let root = automation
         .ElementFromHandle(hwnd_win)
         .map_err(|e| anyhow::anyhow!("ElementFromHandle failed: {e}"))?;

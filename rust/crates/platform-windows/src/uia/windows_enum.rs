@@ -417,6 +417,7 @@ pub(crate) enum PointInvokeOutcome {
     Timeout,
     Unavailable,
     NotResponding,
+    WindowGone,
 }
 
 impl PointInvokeOutcome {
@@ -457,7 +458,7 @@ fn try_invoke_in_window_at_point_unbounded(
     };
     match super::client::probe_root(HWND(hwnd as *mut _)) {
         crate::uia_root::RootVerdict::Ok => {}
-        crate::uia_root::RootVerdict::WindowGone => return Unavailable,
+        crate::uia_root::RootVerdict::WindowGone => return PointInvokeOutcome::WindowGone,
         crate::uia_root::RootVerdict::NoAnswer => return PointInvokeOutcome::NotResponding,
     }
     unsafe {

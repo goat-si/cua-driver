@@ -325,6 +325,15 @@ unsafe fn root_for_window(
     if actual_pid as i32 != expected_pid {
         bail!("hwnd 0x{hwnd_raw:x} belongs to pid {actual_pid}, not the expected {expected_pid}");
     }
+    match crate::uia::client::probe_root(hwnd) {
+        crate::uia_root::RootVerdict::Ok => {}
+        crate::uia_root::RootVerdict::WindowGone => {
+            bail!("window 0x{hwnd_raw:x} no longer exists; the bookmark was not invoked")
+        }
+        crate::uia_root::RootVerdict::NoAnswer => bail!(
+            "window 0x{hwnd_raw:x} did not answer a no-op message within 1 s (the app may be hung); the bookmark was not invoked"
+        ),
+    }
     automation
         .ElementFromHandle(hwnd)
         .map_err(|e| anyhow!("ElementFromHandle(0x{hwnd_raw:x}) failed: {e}"))

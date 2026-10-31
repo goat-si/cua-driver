@@ -3357,6 +3357,14 @@ fn finish_pixel_uia_attempt(
                 json!({"uia_status": "not_responding", "path": "ax", "verified": false, "effect": "refused", "nothing_sent": true}),
             ));
         }
+        PointInvokeOutcome::WindowGone => {
+            return Some(cua_driver_core::delivery::background_unavailable_result(
+                "the target window no longer exists; nothing was sent".to_owned(),
+                "background_unavailable",
+                "the target window no longer exists; nothing was sent".to_owned(),
+                json!({"uia_status": "window_gone", "path": "ax", "verified": false, "effect": "refused", "nothing_sent": true}),
+            ));
+        }
     };
     Some(cua_driver_core::delivery::background_unavailable_result(
         format!(
