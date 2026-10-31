@@ -110,6 +110,7 @@ mod tests {
     struct Fake {
         route: Route,
         ops: Vec<String>,
+        fail: Option<Kind>,
     }
     impl GestureIo for Fake {
         type Event = Kind;
@@ -128,6 +129,9 @@ mod tests {
         }
         fn create(&mut self, step: &Step) -> anyhow::Result<Kind> {
             self.ops.push(format!("create:{:?}", step.kind));
+            if self.fail == Some(step.kind) {
+                return Err(anyhow::anyhow!("injected create failure"));
+            }
             Ok(step.kind)
         }
         fn stamp(&mut self, _: &mut Kind, step: &Step) {
@@ -148,7 +152,11 @@ mod tests {
         }
     }
     fn ops(route: Route, plan: Vec<Step>) -> Vec<String> {
-        let mut fake = Fake { route, ops: vec![] };
+        let mut fake = Fake {
+            route,
+            ops: vec![],
+            fail: None,
+        };
         if matches!(route, Route::Desktop) {
             fake.ops
                 .extend(["warp", "associate", "observe:start", "wait40"].map(str::to_owned));
@@ -163,6 +171,24 @@ mod tests {
         }
         fake.ops
     }
+    #[test]
+    fn a_create_failure_after_down_posts_exactly_one_release() {
+        let mut fake = Fake {
+            route: Route::Desktop,
+            ops: vec![],
+            fail: Some(Kind::Dragged),
+        };
+        let plan = super::super::mouse::test_foreground_gesture_plan(true);
+        assert!(run_gesture(&mut fake, plan, || true).is_err());
+        assert_eq!(
+            fake.ops
+                .iter()
+                .filter(|op| op.as_str() == "post:Up")
+                .count(),
+            1
+        );
+    }
+
     #[test]
     fn operation_order_matches_the_current_background() {
         let actual = ops(
