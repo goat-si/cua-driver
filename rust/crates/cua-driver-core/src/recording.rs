@@ -988,9 +988,13 @@ impl RecordingSession {
         use crate::tool_args::ArgsExt;
         let pid = args.opt_i64("pid");
         let element = pid.and_then(|pid| {
+            let mut lookup_args = args.clone();
+            if let (Some(session), Some(object)) = (caller.session, lookup_args.as_object_mut()) {
+                object.insert("_session_id".into(), Value::String(session.to_owned()));
+            }
             ELEMENT_BOUNDS_FN.get()?(
                 pid,
-                &args,
+                &lookup_args,
                 matches!(tool_name, "click" | "double_click" | "right_click"),
             )
         });
@@ -2797,14 +2801,26 @@ mod tests {
         assert_eq!(action["action_truth"]["route"], "synthetic_events");
         assert_eq!(action["action_truth"]["requested_delivery"], "background");
 
-        let snapshot_id = cache.publish(1, 77, crate::snapshot_test_support::Payload(vec![0]));
+        let snapshot_id = cache
+            .publish_for_session(
+                1,
+                77,
+                crate::snapshot_test_support::Payload(vec![0]),
+                Some("recording:owner"),
+                None,
+            )
+            .unwrap()
+            .0;
         let token = crate::element_token::token_for(snapshot_id, 0);
         let pending = session
             .begin_turn(
                 "click",
-                &serde_json::json!({"pid": 1, "element_token": token}),
+                &serde_json::json!({"pid": 1, "element_token": token, "_session_id": "untrusted"}),
                 now_ms(),
-                RecordingCaller::default(),
+                RecordingCaller {
+                    session: Some("recording:owner"),
+                    transport: None,
+                },
             )
             .expect("token-only click should reserve a targeted turn");
         session.finish_turn(pending, "token click");
@@ -2815,6 +2831,7 @@ mod tests {
         .expect("parse token action");
         assert_eq!(token_action["click_point"]["x"], 77.0);
         assert_eq!(token_action["click_point"]["y"], 1.0);
+        assert!(!token_action.to_string().contains("_session_id"));
         assert!(token_turn.join("click.png").exists());
 
         let stale_snapshot = cache.publish(1, 88, crate::snapshot_test_support::Payload(vec![0]));
