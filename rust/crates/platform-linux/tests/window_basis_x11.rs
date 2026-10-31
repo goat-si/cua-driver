@@ -108,6 +108,16 @@ async fn tool_response_basis_matches_delivered_screenshot() -> Result<()> {
         )
         .await;
     assert_ne!(response.is_error, Some(true), "{response:?}");
+    use base64::{engine::general_purpose::STANDARD, Engine as _};
+    let image = response
+        .content
+        .iter()
+        .find_map(|content| match content {
+            cua_driver_core::protocol::Content::Image { data, .. } => Some(data),
+            _ => None,
+        })
+        .expect("image content");
+    let delivered = png_dimensions_pub(&STANDARD.decode(image)?)?;
     let structured = response.structured_content.expect("structured response");
     let basis = &structured["window_basis"];
     assert_eq!(
@@ -118,6 +128,15 @@ async fn tool_response_basis_matches_delivered_screenshot() -> Result<()> {
             basis["height"].as_u64()
         ),
         (Some(50), Some(60), Some(200), Some(120))
+    );
+    assert_eq!(delivered, (100, 60));
+    assert_eq!(
+        basis["capture_width"].as_u64(),
+        Some(u64::from(delivered.0))
+    );
+    assert_eq!(
+        basis["capture_height"].as_u64(),
+        Some(u64::from(delivered.1))
     );
     assert_eq!(basis["capture_width"], structured["screenshot_width"]);
     assert_eq!(basis["capture_height"], structured["screenshot_height"]);
@@ -132,7 +151,8 @@ async fn tool_response_basis_matches_delivered_screenshot() -> Result<()> {
     assert_eq!(basis["snapshot_id"], structured["snapshot_id"]);
     assert!(structured["snapshot_id"]
         .as_str()
-        .is_some_and(|id| !id.is_empty()));
+        .and_then(cua_driver_core::element_token::parse_snapshot_handle)
+        .is_some());
     println!("tool response window_basis: {basis}");
     conn.destroy_window(window)?.check()?;
     Ok(())
