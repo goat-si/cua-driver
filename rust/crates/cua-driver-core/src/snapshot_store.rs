@@ -4,6 +4,7 @@ use crate::element_token::{
     STALE_TOKEN_ERROR,
 };
 use crate::protocol::ToolResult;
+pub use basis::CaptureTicket;
 use std::any::Any;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock, Weak};
@@ -295,18 +296,20 @@ impl<S> std::ops::DerefMut for StoreState<S> {
 
 pub struct SnapshotStore<S: SnapshotPayload> {
     runtime_scope: String,
-    inner: Mutex<StoreState<S>>,
+    /// Shared with the [`CaptureTicket`]s this store issues, so a ticket can
+    /// retire itself when it is dropped.
+    inner: Arc<Mutex<StoreState<S>>>,
 }
 
 impl<S: SnapshotPayload> SnapshotStore<S> {
     pub fn new() -> Self {
         Self {
             runtime_scope: current_runtime_scope(),
-            inner: Mutex::new(StoreState {
+            inner: Arc::new(Mutex::new(StoreState {
                 snapshots: HashMap::new(),
                 tickets: HashMap::new(),
                 last_ticket: 0,
-            }),
+            })),
         }
     }
 
@@ -450,6 +453,10 @@ impl<S: SnapshotPayload> SnapshotStore<S> {
         let (id, retired, stored) = {
             let mut inner = self.inner.lock().unwrap();
             if session.is_some_and(crate::session::is_session_ended) {
+                // No publication can use this capture's ticket any more.
+                if let Some((ticket, _)) = &basis_ticket {
+                    inner.retire_ticket(pid, window_id, *ticket);
+                }
                 return None;
             }
             let (basis, ticket_floor) = if let Some((ticket, basis)) = basis_ticket {
@@ -816,7 +823,16 @@ impl<S: SnapshotPayload> SnapshotStore<S> {
 
     /// Retire the current snapshot while preserving this capture and newer ones.
     /// An obsolete ticket cannot retire state published by a newer operation.
-    pub fn remove_for_capture(&self, pid: i32, window_id: u64, ticket: u64) -> Option<u32> {
+    pub fn remove_for_capture(
+        &self,
+        pid: i32,
+        window_id: u64,
+        ticket: &CaptureTicket<S>,
+    ) -> Option<u32> {
+        if !self.owns(ticket, pid, window_id) {
+            return None;
+        }
+        let ticket = ticket.ticket();
         let retired = {
             let mut inner = self.inner.lock().unwrap();
             if !inner.ticket_current(pid, window_id, ticket) {
@@ -937,16 +953,16 @@ mod tests {
         let old = cache.begin_capture(42, 7);
         let new = cache.begin_capture(42, 7);
         let (id, _, _) = cache
-            .publish_basis_for_session(42, 7, Payload(vec![2]), None, None, None, new)
+            .publish_basis_for_session(42, 7, Payload(vec![2]), None, None, None, &new)
             .unwrap();
         assert!(cache
-            .publish_basis_for_session(42, 7, Payload(vec![1]), None, None, None, old)
+            .publish_basis_for_session(42, 7, Payload(vec![1]), None, None, None, &old)
             .is_none());
         assert_eq!(
             cache.with_latest(42, 7, |seen, p| (seen, p.0[0])),
             Some((id, 2))
         );
-        assert_eq!(cache.remove_for_capture(42, 7, old), None);
+        assert_eq!(cache.remove_for_capture(42, 7, &old), None);
         assert_eq!(cache.with_latest(42, 7, |seen, _| seen), Some(id));
     }
 

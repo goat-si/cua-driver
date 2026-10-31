@@ -1,6 +1,37 @@
 use super::{Snapshot, SnapshotPayload, SnapshotStore, StoreState, TicketState};
 use crate::protocol::ToolResult;
 use crate::window_basis::{basis_refusal, format_basis_id, parse_basis_id, WindowBasis};
+use std::sync::{Arc, Mutex};
+
+/// A capture's ordering ticket, owned by the code doing the capture for as
+/// long as it may still publish. Every ticketed publication, refresh and
+/// retirement borrows it, so it cannot be dropped before the last of them;
+/// dropping it retires the ticket if it never landed (after a failed
+/// capture, an early return, or a cancelled request), so an abandoned
+/// capture cannot keep its window's entry (goat-si/cua-driver#133).
+pub struct CaptureTicket<S> {
+    state: Arc<Mutex<StoreState<S>>>,
+    pid: i32,
+    window_id: u64,
+    ticket: u64,
+}
+
+impl<S> CaptureTicket<S> {
+    /// The ticket number: 0 once the store's counter is spent, which every
+    /// publication refuses.
+    pub fn ticket(&self) -> u64 {
+        self.ticket
+    }
+}
+
+impl<S> Drop for CaptureTicket<S> {
+    fn drop(&mut self) {
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retire_ticket(self.pid, self.window_id, self.ticket);
+    }
+}
 
 impl<S> StoreState<S> {
     /// Whether `ticket` was issued for the window and no newer capture or plain
@@ -19,6 +50,19 @@ impl<S> StoreState<S> {
             if state.applied >= state.issued {
                 self.tickets.remove(&(pid, window_id));
             }
+        }
+    }
+
+    /// Drop the window's entry when `ticket` is the newest one issued and has
+    /// not landed: nothing can land after it. A newer capture keeps the
+    /// entry, and a landed ticket has already left it.
+    pub(super) fn retire_ticket(&mut self, pid: i32, window_id: u64, ticket: u64) {
+        if self
+            .tickets
+            .get(&(pid, window_id))
+            .is_some_and(|state| ticket != 0 && state.issued == ticket && state.applied < ticket)
+        {
+            self.tickets.remove(&(pid, window_id));
         }
     }
 
@@ -56,10 +100,39 @@ impl<S> Snapshot<S> {
 }
 
 impl<S: SnapshotPayload> SnapshotStore<S> {
-    /// Reserve the ordering ticket before starting a capture. Tickets never
-    /// wrap: once the store's 64-bit counter is spent this returns 0, a ticket
-    /// every publication and refresh refuses.
-    pub fn begin_capture(&self, pid: i32, window_id: u64) -> u64 {
+    /// Whether `ticket` was issued by this store for this window.
+    pub(super) fn owns(&self, ticket: &CaptureTicket<S>, pid: i32, window_id: u64) -> bool {
+        Arc::ptr_eq(&self.inner, &ticket.state)
+            && ticket.pid == pid
+            && ticket.window_id == window_id
+    }
+
+    /// Reserve the ordering ticket before starting a capture. Keep it until
+    /// the capture's last publication; dropping it retires a ticket that
+    /// never landed. Tickets never wrap: once the store's 64-bit counter is
+    /// spent the ticket is 0, which every publication and refresh refuses.
+    pub fn begin_capture(&self, pid: i32, window_id: u64) -> CaptureTicket<S> {
+        let ticket = self.reserve_ticket(pid, window_id);
+        CaptureTicket {
+            state: self.inner.clone(),
+            pid,
+            window_id,
+            ticket,
+        }
+    }
+
+    /// A ticket with any number, for tests of tickets no capture was issued.
+    #[cfg(test)]
+    pub(super) fn forge_ticket(&self, pid: i32, window_id: u64, ticket: u64) -> CaptureTicket<S> {
+        CaptureTicket {
+            state: self.inner.clone(),
+            pid,
+            window_id,
+            ticket,
+        }
+    }
+
+    fn reserve_ticket(&self, pid: i32, window_id: u64) -> u64 {
         let mut inner = self.inner.lock().unwrap();
         let Some(ticket) = inner.last_ticket.checked_add(1) else {
             return 0;
@@ -88,15 +161,18 @@ impl<S: SnapshotPayload> SnapshotStore<S> {
         session: Option<&str>,
         screenshot_scale: Option<f64>,
         basis: Option<WindowBasis>,
-        ticket: u64,
+        ticket: &CaptureTicket<S>,
     ) -> Option<(u32, Vec<u32>, Option<WindowBasis>)> {
+        if !self.owns(ticket, pid, window_id) {
+            return None;
+        }
         self.publish_snapshot(
             pid,
             window_id,
             payload,
             session,
             (screenshot_scale, None),
-            (true, Some((ticket, basis))),
+            (true, Some((ticket.ticket(), basis))),
         )
     }
 
@@ -110,15 +186,18 @@ impl<S: SnapshotPayload> SnapshotStore<S> {
         session: Option<&str>,
         screenshot_scale: Option<f64>,
         basis: Option<WindowBasis>,
-        ticket: u64,
+        ticket: &CaptureTicket<S>,
     ) -> Option<(u32, Vec<u32>, Option<WindowBasis>)> {
+        if !self.owns(ticket, pid, window_id) {
+            return None;
+        }
         self.publish_snapshot(
             pid,
             window_id,
             payload,
             session,
             (screenshot_scale, None),
-            (false, Some((ticket, basis))),
+            (false, Some((ticket.ticket(), basis))),
         )
     }
 
@@ -132,13 +211,21 @@ impl<S: SnapshotPayload> SnapshotStore<S> {
         screenshot_scale: f64,
         window_size: Option<(f64, f64)>,
         basis: Option<WindowBasis>,
-        ticket: u64,
+        ticket: &CaptureTicket<S>,
     ) -> Option<(u32, Option<WindowBasis>)> {
+        if !self.owns(ticket, pid, window_id) {
+            return None;
+        }
+        let ticket = ticket.ticket();
         let mut inner = self.inner.lock().unwrap();
-        if session.is_some_and(crate::session::is_session_ended)
-            || basis
-                .as_ref()
-                .is_some_and(|b| b.pid != pid || b.window_id != window_id)
+        if session.is_some_and(crate::session::is_session_ended) {
+            // No publication can use this capture's ticket any more.
+            inner.retire_ticket(pid, window_id, ticket);
+            return None;
+        }
+        if basis
+            .as_ref()
+            .is_some_and(|b| b.pid != pid || b.window_id != window_id)
         {
             return None;
         }
@@ -240,13 +327,21 @@ mod tests {
         let older = store.begin_capture(1, 2);
         let own = store.begin_capture(1, 2);
         let newer = store.begin_capture(1, 2);
-        assert_eq!(store.remove_for_capture(1, 2, own), Some(old_id));
+        assert_eq!(store.remove_for_capture(1, 2, &own), Some(old_id));
         assert!(store.screenshot_context(1, Some(2), None).is_err());
         assert!(store
-            .publish_capture_basis_for_session(1, 2, Payload, None, Some(1.0), Some(frame()), older)
+            .publish_capture_basis_for_session(
+                1,
+                2,
+                Payload,
+                None,
+                Some(1.0),
+                Some(frame()),
+                &older
+            )
             .is_none());
         let (id, _, basis) = store
-            .publish_capture_basis_for_session(1, 2, Payload, None, Some(2.0), Some(frame()), own)
+            .publish_capture_basis_for_session(1, 2, Payload, None, Some(2.0), Some(frame()), &own)
             .unwrap();
         let basis = basis.unwrap();
         assert_ne!(id, old_id);
@@ -262,15 +357,15 @@ mod tests {
             2.0
         );
         assert!(store
-            .refresh_basis_for_session(1, 2, None, 3.0, None, Some(frame()), newer)
+            .refresh_basis_for_session(1, 2, None, 3.0, None, Some(frame()), &newer)
             .is_some());
-        assert_eq!(store.remove_for_capture(1, 2, own), None);
+        assert_eq!(store.remove_for_capture(1, 2, &own), None);
         assert_eq!(
             store.screenshot_context(1, Some(2), None).unwrap().scale,
             3.0
         );
         assert!(store
-            .publish_capture_basis_for_session(1, 2, Payload, None, Some(1.0), Some(frame()), own)
+            .publish_capture_basis_for_session(1, 2, Payload, None, Some(1.0), Some(frame()), &own)
             .is_none());
     }
     #[test]
@@ -279,20 +374,20 @@ mod tests {
         let stale = store.begin_capture(1, 2);
         let ticket = store.begin_capture(1, 2);
         let (id, _, stored) = store
-            .publish_basis_for_session(1, 2, Payload, None, Some(1.0), Some(frame()), ticket)
+            .publish_basis_for_session(1, 2, Payload, None, Some(1.0), Some(frame()), &ticket)
             .unwrap();
         assert_eq!(stored.unwrap().snapshot_id, format_basis_id(id, 0));
         assert!(store
-            .refresh_basis_for_session(1, 2, None, 1.0, None, None, stale)
+            .refresh_basis_for_session(1, 2, None, 1.0, None, None, &stale)
             .is_none());
         let ticket = store.begin_capture(1, 2);
         let (_, stored) = store
-            .refresh_basis_for_session(1, 2, None, 1.0, None, Some(frame()), ticket)
+            .refresh_basis_for_session(1, 2, None, 1.0, None, Some(frame()), &ticket)
             .unwrap();
         assert_eq!(stored.unwrap().snapshot_id, format_basis_id(id, 0));
         let ticket = store.begin_capture(1, 3);
         let (_, _, stored) = store
-            .publish_capture_basis_for_session(1, 3, Payload, None, None, None, ticket)
+            .publish_capture_basis_for_session(1, 3, Payload, None, None, None, &ticket)
             .unwrap();
         assert!(stored.is_none());
         let ticket = store.begin_capture(1, 2);
@@ -304,7 +399,7 @@ mod tests {
                 None,
                 Some(1.0),
                 Some(frame()),
-                ticket,
+                &ticket,
             )
             .unwrap();
         assert_eq!(stored.unwrap().snapshot_id, format_basis_id(id, 0));
@@ -314,17 +409,17 @@ mod tests {
         let store = SnapshotStore::new();
         let t = store.begin_capture(1, 2);
         let id = store
-            .publish_basis_for_session(1, 2, Payload, None, Some(1.0), Some(frame()), t)
+            .publish_basis_for_session(1, 2, Payload, None, Some(1.0), Some(frame()), &t)
             .unwrap()
             .0;
         store.inner.lock().unwrap().get_mut(&1).unwrap()[0].frame_generation = u32::MAX;
         let t = store.begin_capture(1, 2);
         store
-            .refresh_basis_for_session(1, 2, None, 1.0, None, None, t)
+            .refresh_basis_for_session(1, 2, None, 1.0, None, None, &t)
             .unwrap();
         let t = store.begin_capture(1, 2);
         store
-            .refresh_basis_for_session(1, 2, None, 1.0, None, Some(frame()), t)
+            .refresh_basis_for_session(1, 2, None, 1.0, None, Some(frame()), &t)
             .unwrap();
         let result = store
             .basis_for(1, 2, &format_basis_id(id, u32::MAX), None)
@@ -336,7 +431,7 @@ mod tests {
         let store = SnapshotStore::new();
         let t = store.begin_capture(1, 2);
         store
-            .publish_basis_for_session(1, 2, Payload, None, Some(1.0), Some(frame()), t)
+            .publish_basis_for_session(1, 2, Payload, None, Some(1.0), Some(frame()), &t)
             .unwrap();
         // Nothing is in flight once the newest ticket lands.
         assert!(store.inner.lock().unwrap().tickets.is_empty());
@@ -347,12 +442,12 @@ mod tests {
         assert_eq!(store.clear(), 1);
         assert!(store.inner.lock().unwrap().tickets.is_empty());
         let fresh = store.begin_capture(1, 2);
-        assert!(fresh > abandoned);
+        assert!(fresh.ticket() > abandoned.ticket());
         assert!(store
-            .publish_basis_for_session(1, 2, Payload, None, Some(1.0), Some(frame()), abandoned)
+            .publish_basis_for_session(1, 2, Payload, None, Some(1.0), Some(frame()), &abandoned)
             .is_none());
         let (id, _, _) = store
-            .publish_basis_for_session(1, 2, Payload, None, Some(1.0), Some(frame()), fresh)
+            .publish_basis_for_session(1, 2, Payload, None, Some(1.0), Some(frame()), &fresh)
             .unwrap();
 
         // remove() drops the window's in-flight captures with its snapshot.
@@ -360,7 +455,7 @@ mod tests {
         assert_eq!(store.remove(1, 2), Some(id));
         assert!(store.inner.lock().unwrap().tickets.is_empty());
         assert!(store
-            .publish_basis_for_session(1, 2, Payload, None, Some(1.0), Some(frame()), in_flight)
+            .publish_basis_for_session(1, 2, Payload, None, Some(1.0), Some(frame()), &in_flight)
             .is_none());
     }
 
@@ -369,9 +464,9 @@ mod tests {
         let store = SnapshotStore::new();
         store.inner.lock().unwrap().last_ticket = u64::MAX;
         let t = store.begin_capture(1, 2);
-        assert_eq!(t, 0);
+        assert_eq!(t.ticket(), 0);
         assert!(store
-            .publish_basis_for_session(1, 2, Payload, None, Some(1.0), Some(frame()), t)
+            .publish_basis_for_session(1, 2, Payload, None, Some(1.0), Some(frame()), &t)
             .is_none());
         assert!(store.inner.lock().unwrap().tickets.is_empty());
     }
@@ -422,13 +517,13 @@ mod review_regressions {
             };
             assert!(
                 store
-                    .publish_basis_for_session(1, 2, Payload, None, Some(3.0), Some(frame()), old)
+                    .publish_basis_for_session(1, 2, Payload, None, Some(3.0), Some(frame()), &old)
                     .is_none(),
                 "kind {kind}"
             );
             assert!(
                 store
-                    .refresh_basis_for_session(1, 2, None, 3.0, None, Some(frame()), old)
+                    .refresh_basis_for_session(1, 2, None, 3.0, None, Some(frame()), &old)
                     .is_none(),
                 "kind {kind}"
             );
@@ -467,12 +562,12 @@ mod review_regressions {
             }
             assert!(!store.inner.lock().unwrap().tickets.contains_key(&(1, 2)));
             let fresh = store.begin_capture(1, 2);
-            assert_ne!(old, fresh);
+            assert_ne!(old.ticket(), fresh.ticket());
             assert!(store
-                .publish_basis_for_session(1, 2, Payload, None, Some(1.0), Some(frame()), old)
+                .publish_basis_for_session(1, 2, Payload, None, Some(1.0), Some(frame()), &old)
                 .is_none());
             assert!(store
-                .publish_basis_for_session(1, 2, Payload, None, Some(1.0), Some(frame()), fresh)
+                .publish_basis_for_session(1, 2, Payload, None, Some(1.0), Some(frame()), &fresh)
                 .is_some());
         }
     }
@@ -488,9 +583,10 @@ mod boundary_tests {
         let store = SnapshotStore::new();
         let first = store.begin_capture(1, 2);
         let second = store.begin_capture(1, 2);
-        for ticket in [0, second + 1] {
+        for ticket in [0, second.ticket() + 1] {
+            let ticket = store.forge_ticket(1, 2, ticket);
             assert!(store
-                .publish_basis_for_session(1, 2, Payload, None, Some(1.0), Some(frame()), ticket)
+                .publish_basis_for_session(1, 2, Payload, None, Some(1.0), Some(frame()), &ticket)
                 .is_none());
         }
         for wrong_pid in [true, false] {
@@ -508,7 +604,7 @@ mod boundary_tests {
                     None,
                     Some(1.0),
                     Some(wrong.clone()),
-                    first
+                    &first
                 )
                 .is_none());
             assert!(store
@@ -519,16 +615,17 @@ mod boundary_tests {
                     None,
                     Some(1.0),
                     Some(wrong),
-                    first
+                    &first
                 )
                 .is_none());
         }
         let (id, _, _) = store
-            .publish_basis_for_session(1, 2, Payload, None, Some(1.0), Some(frame()), first)
+            .publish_basis_for_session(1, 2, Payload, None, Some(1.0), Some(frame()), &first)
             .unwrap();
-        for ticket in [0, second + 1] {
+        for ticket in [0, second.ticket() + 1] {
+            let ticket = store.forge_ticket(1, 2, ticket);
             assert!(store
-                .refresh_basis_for_session(1, 2, None, 2.0, None, Some(frame()), ticket)
+                .refresh_basis_for_session(1, 2, None, 2.0, None, Some(frame()), &ticket)
                 .is_none());
         }
         for wrong_pid in [true, false] {
@@ -539,15 +636,15 @@ mod boundary_tests {
                 wrong.window_id = 3;
             }
             assert!(store
-                .refresh_basis_for_session(1, 2, None, 2.0, None, Some(wrong), second)
+                .refresh_basis_for_session(1, 2, None, 2.0, None, Some(wrong), &second)
                 .is_none());
         }
         let third = store.begin_capture(1, 2);
         assert!(store
-            .refresh_basis_for_session(1, 2, None, 3.0, None, Some(frame()), third)
+            .refresh_basis_for_session(1, 2, None, 3.0, None, Some(frame()), &third)
             .is_some());
         assert!(store
-            .refresh_basis_for_session(1, 2, None, 2.0, None, Some(frame()), second)
+            .refresh_basis_for_session(1, 2, None, 2.0, None, Some(frame()), &second)
             .is_none());
         let current = store.screenshot_context(1, Some(2), None).unwrap();
         assert_eq!((current.snapshot_id, current.scale), (id, 3.0));
@@ -568,10 +665,196 @@ mod boundary_tests {
         assert!(!store.inner.lock().unwrap().tickets.contains_key(&(1, 2)));
         let fresh = store.begin_capture(1, 2);
         assert!(store
-            .publish_basis_for_session(1, 2, Payload, None, Some(1.0), Some(frame()), old)
+            .publish_basis_for_session(1, 2, Payload, None, Some(1.0), Some(frame()), &old)
             .is_none());
         assert!(store
-            .publish_basis_for_session(1, 2, Payload, None, Some(1.0), Some(frame()), fresh)
+            .publish_basis_for_session(1, 2, Payload, None, Some(1.0), Some(frame()), &fresh)
+            .is_some());
+    }
+}
+
+#[cfg(test)]
+mod capture_ticket_tests {
+    //! An abandoned capture cannot keep its window's ticket entry
+    //! (goat-si/cua-driver#133).
+    use super::tests::{frame, Payload};
+    use super::*;
+
+    fn entries(store: &SnapshotStore<Payload>) -> usize {
+        store.inner.lock().unwrap().tickets.len()
+    }
+
+    #[test]
+    fn a_dropped_unpublished_ticket_leaves_no_entry() {
+        let store = SnapshotStore::new();
+        let ticket = store.begin_capture(1, 2);
+        assert_eq!(entries(&store), 1);
+        drop(ticket);
+        assert_eq!(entries(&store), 0);
+    }
+
+    #[test]
+    fn dropping_a_landed_ticket_does_not_touch_a_newer_capture() {
+        let store = SnapshotStore::new();
+        let landed = store.begin_capture(1, 2);
+        store
+            .publish_basis_for_session(1, 2, Payload, None, Some(1.0), Some(frame()), &landed)
+            .unwrap();
+        let newer = store.begin_capture(1, 2);
+        drop(landed);
+        assert_eq!(entries(&store), 1);
+        assert!(store
+            .publish_basis_for_session(1, 2, Payload, None, Some(1.0), Some(frame()), &newer)
+            .is_some());
+        drop(newer);
+        assert_eq!(entries(&store), 0);
+    }
+
+    /// Linux's screenshot-only read: a refresh that finds no snapshot, then a
+    /// capture-only publication with the same ticket.
+    #[test]
+    fn a_refresh_without_a_snapshot_then_a_capture_only_publication_lands() {
+        let store = SnapshotStore::new();
+        let ticket = store.begin_capture(1, 2);
+        assert!(store
+            .refresh_basis_for_session(1, 2, None, 1.0, None, Some(frame()), &ticket)
+            .is_none());
+        assert_eq!(entries(&store), 1, "a refused refresh keeps the ticket");
+        assert!(store
+            .publish_capture_basis_for_session(
+                1,
+                2,
+                Payload,
+                None,
+                Some(1.0),
+                Some(frame()),
+                &ticket
+            )
+            .is_some());
+        drop(ticket);
+        assert_eq!(entries(&store), 0);
+    }
+
+    #[test]
+    fn remove_for_capture_then_a_publication_with_the_same_ticket_lands() {
+        let store = SnapshotStore::new();
+        let old = store.publish(1, 2, Payload);
+        let ticket = store.begin_capture(1, 2);
+        assert_eq!(store.remove_for_capture(1, 2, &ticket), Some(old));
+        assert!(store
+            .publish_basis_for_session(1, 2, Payload, None, Some(1.0), Some(frame()), &ticket)
+            .is_some());
+        drop(ticket);
+        assert_eq!(entries(&store), 0);
+    }
+
+    #[test]
+    fn an_older_dropped_ticket_keeps_the_newer_capture_publishable() {
+        let store = SnapshotStore::new();
+        let older = store.begin_capture(1, 2);
+        let newer = store.begin_capture(1, 2);
+        drop(older);
+        assert_eq!(entries(&store), 1);
+        assert!(store
+            .publish_basis_for_session(1, 2, Payload, None, Some(1.0), Some(frame()), &newer)
+            .is_some());
+    }
+
+    /// Dropping the newest ticket retires the entry: an older capture still
+    /// in flight then refuses (fail closed).
+    #[test]
+    fn a_dropped_newest_ticket_makes_older_captures_refuse() {
+        let store = SnapshotStore::new();
+        let older = store.begin_capture(1, 2);
+        drop(store.begin_capture(1, 2));
+        assert_eq!(entries(&store), 0);
+        assert!(store
+            .publish_basis_for_session(1, 2, Payload, None, Some(1.0), Some(frame()), &older)
+            .is_none());
+        drop(older);
+        assert_eq!(entries(&store), 0);
+    }
+
+    /// A cancelled request drops the ticket it held.
+    #[tokio::test]
+    async fn a_cancelled_capture_drops_its_ticket() {
+        let store = SnapshotStore::<Payload>::new();
+        let ticket = store.begin_capture(1, 2);
+        let capture = tokio::spawn(async move {
+            let _ticket = ticket;
+            std::future::pending::<()>().await;
+        });
+        tokio::task::yield_now().await;
+        assert_eq!(entries(&store), 1);
+        capture.abort();
+        assert!(capture.await.unwrap_err().is_cancelled());
+        assert_eq!(entries(&store), 0);
+    }
+
+    #[test]
+    fn an_ended_session_retires_the_ticket_on_publication_and_refresh() {
+        let store = SnapshotStore::new();
+        let session = "drv-133-ended-session";
+        crate::session::end_session(session);
+        let ticket = store.begin_capture(1, 2);
+        let _keep = store.begin_capture(1, 3);
+        assert!(store
+            .publish_basis_for_session(
+                1,
+                2,
+                Payload,
+                Some(session),
+                Some(1.0),
+                Some(frame()),
+                &ticket
+            )
+            .is_none());
+        assert_eq!(entries(&store), 1, "window 2 retired, window 3 kept");
+        let ticket = store.begin_capture(1, 2);
+        assert!(store
+            .refresh_basis_for_session(1, 2, Some(session), 1.0, None, Some(frame()), &ticket)
+            .is_none());
+        assert_eq!(entries(&store), 1);
+    }
+
+    /// A ticket from another store with the same number, or for another
+    /// window of the same process, is refused by every ticketed call and
+    /// changes nothing.
+    #[test]
+    fn a_ticket_is_refused_by_another_store_and_another_window() {
+        let store = SnapshotStore::new();
+        let other_store = SnapshotStore::new();
+        let own = store.begin_capture(1, 2);
+        let foreign = other_store.begin_capture(1, 2);
+        assert_eq!(own.ticket(), foreign.ticket());
+        let other_window = store.begin_capture(1, 3);
+        for wrong in [&foreign, &other_window] {
+            assert!(store
+                .publish_basis_for_session(1, 2, Payload, None, Some(1.0), Some(frame()), wrong)
+                .is_none());
+            assert!(store
+                .publish_capture_basis_for_session(
+                    1,
+                    2,
+                    Payload,
+                    None,
+                    Some(1.0),
+                    Some(frame()),
+                    wrong
+                )
+                .is_none());
+            assert!(store
+                .refresh_basis_for_session(1, 2, None, 1.0, None, Some(frame()), wrong)
+                .is_none());
+            assert_eq!(store.remove_for_capture(1, 2, wrong), None);
+        }
+        assert_eq!(entries(&store), 2);
+        assert_eq!(entries(&other_store), 1);
+        assert!(store
+            .publish_basis_for_session(1, 2, Payload, None, Some(1.0), Some(frame()), &own)
+            .is_some());
+        assert!(other_store
+            .publish_basis_for_session(1, 2, Payload, None, Some(1.0), Some(frame()), &foreign)
             .is_some());
     }
 }

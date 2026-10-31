@@ -1528,6 +1528,8 @@ impl Tool for GetWindowStateTool {
         } else {
             None
         };
+        // Held to the end of this call: ticketed publications borrow it, and
+        // dropping it retires a ticket that never landed (#133).
         let ticket =
             (do_shot && !observation_only).then(|| state.snapshots.begin_capture(pid as i32, hwnd));
         let blocking = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
@@ -1648,7 +1650,7 @@ impl Tool for GetWindowStateTool {
 
                     let publication = if observation_only {
                         None
-                    } else if let Some(ticket) = ticket {
+                    } else if let Some(ticket) = ticket.as_ref() {
                         state.snapshots.publish_basis_for_session(
                             pid as i32,
                             hwnd,
@@ -1770,7 +1772,7 @@ impl Tool for GetWindowStateTool {
                 if let (false, false, Some(scale)) =
                     (observation_only, published_snapshot, screenshot_scale)
                 {
-                    let ticket = ticket.expect("screenshot ticket reserved");
+                    let ticket = ticket.as_ref().expect("screenshot ticket reserved");
                     if let Some((id, basis)) = state.snapshots.refresh_basis_for_session(
                         pid as i32,
                         hwnd,
