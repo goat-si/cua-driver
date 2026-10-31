@@ -167,6 +167,18 @@ where
         );
     }
 
+    fn insert_if_absent_at(&mut self, key: K, value: V, now: T) -> bool {
+        if self
+            .map
+            .get(&key)
+            .is_some_and(|entry| now.age_since(entry.inserted_at) < self.ttl)
+        {
+            return false;
+        }
+        self.insert_at(key, value, now);
+        true
+    }
+
     /// Clone a fresh value for `key`. Removes the entry when its age is
     /// greater than or equal to TTL. If `now` is earlier than insertion, age is
     /// treated as zero (still fresh).
@@ -961,13 +973,12 @@ fn same_cached_plan<T>(stored: &std::sync::Arc<T>, plan: &std::sync::Arc<T>) -> 
 }
 
 fn retry_identity_generation<T>(
-    pinned: Option<ProcessGeneration>,
+    window_id: u32,
+    pinned: ProcessGeneration,
     actual: WindowCaptureIdentity,
     retry: impl FnOnce() -> anyhow::Result<T>,
 ) -> anyhow::Result<T> {
-    if let Some(pinned) = pinned {
-        check_generation(pinned, actual, 0)?;
-    }
+    check_generation(pinned, actual, window_id)?;
     retry()
 }
 
@@ -984,12 +995,12 @@ fn retry_after_identity_change(
     actual_identity: WindowCaptureIdentity,
     pinned: ProcessGeneration,
 ) -> anyhow::Result<CapturedImage> {
-    retry_identity_generation(Some(pinned), actual_identity, || {
+    retry_identity_generation(window_id, pinned, actual_identity, || {
         evict_window_capture_plan(window_id, stale_plan);
         let rebuilt = build_window_capture_plan(window_id, actual_identity)?;
         {
             let mut cache = lock_window_plan_cache();
-            cache.insert_at(window_id, std::sync::Arc::clone(&rebuilt), Instant::now());
+            cache.insert_if_absent_at(window_id, std::sync::Arc::clone(&rebuilt), Instant::now());
         }
         match capture_window_from_plan_validated(window_id, &rebuilt) {
             Ok(CaptureIdentityValidation::Matched(bytes)) => Ok(bytes),
@@ -1059,7 +1070,11 @@ fn screenshot_window_bytes_sck_inner(
 
                     {
                         let mut cache = lock_window_plan_cache();
-                        cache.insert_at(window_id, std::sync::Arc::clone(&rebuilt), Instant::now());
+                        cache.insert_if_absent_at(
+                            window_id,
+                            std::sync::Arc::clone(&rebuilt),
+                            Instant::now(),
+                        );
                     }
 
                     match capture_window_from_plan_validated(window_id, &rebuilt) {
@@ -1091,7 +1106,7 @@ fn screenshot_window_bytes_sck_inner(
     let plan = build_window_capture_plan(window_id, identity)?;
     {
         let mut cache = lock_window_plan_cache();
-        cache.insert_at(window_id, std::sync::Arc::clone(&plan), Instant::now());
+        cache.insert_if_absent_at(window_id, std::sync::Arc::clone(&plan), Instant::now());
     }
     match capture_window_from_plan_validated(window_id, &plan) {
         Ok(CaptureIdentityValidation::Matched(bytes)) => Ok(bytes),
@@ -1915,7 +1930,7 @@ mod process_identity_tests {
     #[test]
     fn an_sck_rebuild_for_another_generation_is_refused() {
         let calls = Cell::new(0);
-        let error = retry_identity_generation(Some((10, (1, 0))), identity(11), || {
+        let error = retry_identity_generation(7, (10, (1, 0)), identity(11), || {
             calls.set(calls.get() + 1);
             Ok(image())
         })
@@ -1973,6 +1988,7 @@ mod process_identity_tests {
         cache.insert_at(7, old.clone(), Duration::ZERO);
         cache.insert_at(7, newer.clone(), Duration::ZERO);
         assert!(!cache.remove_if(&7, |stored| same_cached_plan(stored, &old)));
+        assert!(!cache.insert_if_absent_at(7, old, Duration::ZERO));
         assert!(same_cached_plan(
             &cache.get_cloned_at(&7, Duration::ZERO).unwrap(),
             &newer
