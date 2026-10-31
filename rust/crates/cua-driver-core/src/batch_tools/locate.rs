@@ -1052,29 +1052,21 @@ impl<'a> Locator<'a> {
                         )
                         .await
                         .map_err(|error| Miss::new("lookup_failed", error))?;
-                    let still_listed =
-                        listed
-                            .get("windows")
-                            .and_then(Value::as_array)
-                            .is_some_and(|windows| {
-                                windows.iter().any(|candidate| {
-                                    candidate.get("pid").and_then(Value::as_i64) == Some(window.pid)
-                                        && candidate.get("window_id").and_then(Value::as_u64)
-                                            == Some(window.window_id)
-                                })
-                            });
-                    if still_listed {
-                        return Err(Miss::new(
-                            "gone_unconfirmed",
-                            format!(
-                                "{} could not be read, so its absence is unproven: {}",
-                                window.describe(),
-                                miss.message
-                            ),
-                        )
-                        .in_window(window));
+                    // The window list leaves out live helper and AX-less
+                    // windows, so only the complete authoritative id set
+                    // for the pid can prove the window closed.
+                    if window_closed(&listed, window.window_id) {
+                        continue;
                     }
-                    continue;
+                    return Err(Miss::new(
+                        "gone_unconfirmed",
+                        format!(
+                            "{} could not be read and the window listing does not prove it closed: {}",
+                            window.describe(),
+                            miss.message
+                        ),
+                    )
+                    .in_window(window));
                 }
                 Err(miss) => return Err(miss),
             };
@@ -1463,6 +1455,20 @@ fn evaluate(check: &Check, read: &Read) -> Result<Option<String>, Miss> {
         ),
     )
     .in_window(window))
+}
+
+/// Whether a pid-scoped `list_windows` result proves `window_id` closed: the
+/// enumeration is complete and its authoritative id set (every window the
+/// window server reported for the pid, helper windows included) lacks it.
+/// A listing without that evidence proves nothing.
+fn window_closed(listed: &Value, window_id: u64) -> bool {
+    if listed.get("enumeration_complete").and_then(Value::as_bool) != Some(true) {
+        return false;
+    }
+    listed
+        .get("authoritative_window_ids")
+        .and_then(Value::as_array)
+        .is_some_and(|ids| !ids.iter().any(|id| id.as_u64() == Some(window_id)))
 }
 
 fn fields_hold(check: &Check, element: &Value) -> bool {
