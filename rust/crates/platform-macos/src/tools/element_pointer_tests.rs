@@ -12,6 +12,65 @@ const CENTER: (f64, f64) = (125.0, 110.0);
 
 /// One post: where, how many clicks, foreground, and the events handed over.
 type Post = (ElementPoint, usize, bool, Vec<CapturedEvent>);
+
+fn ancestors(chain: &[(&str, bool)]) -> Vec<(Option<String>, bool)> {
+    chain
+        .iter()
+        .map(|(role, is_hit)| (Some((*role).to_owned()), *is_hit))
+        .collect()
+}
+
+#[test]
+fn a_hit_on_the_targets_own_cell_counts_as_the_target() {
+    // KakaoTalk's chat list: the row title is an AXStaticText inside an AXCell
+    // that answers the hit test for the whole row (goat-si/goat#2313).
+    let chain = ancestors(&[("AXGroup", false), ("AXCell", true), ("AXRow", false)]);
+    assert_eq!(
+        hit_outcome(true, false, Some("AXCell".into()), chain),
+        Hit::Target
+    );
+}
+
+#[test]
+fn a_cell_that_is_not_the_targets_nearest_cell_stays_elsewhere() {
+    let elsewhere = || Hit::Elsewhere("AXCell".into());
+    // Another row's cell.
+    let other_row = ancestors(&[("AXCell", false), ("AXRow", false), ("AXTable", false)]);
+    assert_eq!(
+        hit_outcome(true, false, Some("AXCell".into()), other_row),
+        elsewhere()
+    );
+    // An outer cell past the target's own cell.
+    let outer = ancestors(&[("AXCell", false), ("AXTable", false), ("AXCell", true)]);
+    assert_eq!(
+        hit_outcome(true, false, Some("AXCell".into()), outer),
+        elsewhere()
+    );
+    // The target's cell, but in another window.
+    let own = ancestors(&[("AXCell", true)]);
+    assert_eq!(
+        hit_outcome(false, false, Some("AXCell".into()), own),
+        elsewhere()
+    );
+    // A non-cell ancestor that answers the hit test (a whole list or window).
+    let list = ancestors(&[("AXCell", false), ("AXTable", true)]);
+    assert_eq!(
+        hit_outcome(true, false, Some("AXTable".into()), list),
+        Hit::Elsewhere("AXTable".into())
+    );
+    // A walk that passes the window boundary stops there.
+    let past_window = ancestors(&[("AXWindow", false), ("AXCell", true)]);
+    assert_eq!(
+        hit_outcome(true, false, Some("AXCell".into()), past_window),
+        elsewhere()
+    );
+    // An ancestor whose role cannot be read may be the nearest cell.
+    let unreadable = vec![(None, false), (Some("AXCell".to_owned()), true)];
+    assert_eq!(
+        hit_outcome(true, false, Some("AXCell".into()), unreadable),
+        elsewhere()
+    );
+}
 /// A refusal code and the fake change that should produce it.
 type Case = (&'static str, Box<dyn Fn(&mut Fake)>);
 
