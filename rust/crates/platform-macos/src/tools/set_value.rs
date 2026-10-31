@@ -385,7 +385,12 @@ impl Tool for SetValueTool {
                     pid,
                     element_index,
                 );
-                (result, write_not_applied, maybe_landed, verification_withheld)
+                (
+                    result,
+                    write_not_applied,
+                    maybe_landed,
+                    verification_withheld,
+                )
             },
             document_key,
             |_, key| async move {
@@ -437,7 +442,8 @@ where
     if let Some(refusal) = selectable_row_refusal(role.as_deref(), settable) {
         return refusal;
     }
-    let (result, write_not_applied, maybe_landed, verification_withheld) = write(document_key).await;
+    let (result, write_not_applied, maybe_landed, verification_withheld) =
+        write(document_key).await;
     super::set_value_autosubmit::finish(
         autosubmit,
         pid,
@@ -3637,6 +3643,38 @@ mod restored_role_tests {
 #[cfg(test)]
 mod selectable_row_tests {
     use super::*;
+    #[tokio::test]
+    async fn dispatch_withheld_verification_does_not_submit() {
+        let result = dispatch_set_value(
+            true,
+            42,
+            || {
+                (
+                    Some("AXTextField".into()),
+                    crate::ax::write_outcome::Settable::Yes,
+                )
+            },
+            |_: ()| async {
+                (
+                    ToolResult::text("set")
+                        .with_structured(serde_json::json!({"effect":"unverifiable"})),
+                    false,
+                    false,
+                    true,
+                )
+            },
+            (),
+            |_, _| async { panic!("Return after withheld verification") },
+        )
+        .await;
+        let data = result.structured_content.unwrap();
+        assert_eq!(data["effect"], "unverifiable");
+        assert!(data["note"]
+            .as_str()
+            .unwrap()
+            .contains("Return was not posted"));
+    }
+
     #[tokio::test]
     async fn set_value_refuses_a_selectable_row_before_any_write() {
         use crate::ax::write_outcome::Settable;
