@@ -376,6 +376,8 @@ impl Tool for SetValueTool {
                 let changes = snapshot.detect_async().await;
                 let write_not_applied = matches!(&result, Ok(Ok(outcome)) if outcome.not_applied);
                 let maybe_landed = matches!(&result, Ok(Ok(outcome)) if outcome.maybe_landed);
+                let verification_withheld =
+                    matches!(&result, Ok(Ok(outcome)) if outcome.verification_withheld);
                 let result = set_value_tool_result(
                     result.map_err(|error| error.to_string()),
                     ax_echo_surface,
@@ -383,7 +385,7 @@ impl Tool for SetValueTool {
                     pid,
                     element_index,
                 );
-                (result, write_not_applied, maybe_landed)
+                (result, write_not_applied, maybe_landed, verification_withheld)
             },
             document_key,
             |_, key| async move {
@@ -427,7 +429,7 @@ async fn dispatch_set_value<W, WF, D, R, RF>(
 ) -> ToolResult
 where
     W: FnOnce(D) -> WF,
-    WF: std::future::Future<Output = (ToolResult, bool, bool)>,
+    WF: std::future::Future<Output = (ToolResult, bool, bool, bool)>,
     R: FnOnce(i32, &'static str) -> RF,
     RF: std::future::Future<Output = Result<bool, String>>,
 {
@@ -435,13 +437,14 @@ where
     if let Some(refusal) = selectable_row_refusal(role.as_deref(), settable) {
         return refusal;
     }
-    let (result, write_not_applied, maybe_landed) = write(document_key).await;
+    let (result, write_not_applied, maybe_landed, verification_withheld) = write(document_key).await;
     super::set_value_autosubmit::finish(
         autosubmit,
         pid,
         result,
         write_not_applied,
         maybe_landed,
+        verification_withheld,
         return_key,
     )
     .await
@@ -1075,6 +1078,7 @@ struct SetValueOutcome {
     /// document or when the value did not move.
     document_edited: Option<bool>,
     maybe_landed: bool,
+    verification_withheld: bool,
 }
 
 fn apply_surface_trust(outcome: &mut SetValueOutcome, ax_echo_surface: bool) {
@@ -1183,6 +1187,7 @@ fn set_value_blocking_inner(
             not_applied: false,
             document_edited: None,
             maybe_landed: false,
+            verification_withheld: false,
         })
     } else {
         // A restored window's caller already holds an inline key scope for
@@ -1525,6 +1530,7 @@ fn finish_ladder_with_mark(
             not_applied: false,
             document_edited: None,
             maybe_landed: out.maybe_landed,
+            verification_withheld: out.verification_withheld,
         });
     }
     let suffix = match (out.verified, out.changed) {
@@ -1551,6 +1557,7 @@ fn finish_ladder_with_mark(
         not_applied: out.not_applied,
         document_edited: document.structured(),
         maybe_landed: out.maybe_landed,
+        verification_withheld: out.verification_withheld,
     })
 }
 
@@ -2573,6 +2580,7 @@ mod tests {
             not_applied: false,
             document_edited: None,
             maybe_landed: false,
+            verification_withheld: false,
         };
         apply_surface_trust(&mut outcome, true);
         assert_eq!(outcome.verified, Some(false));
@@ -2593,6 +2601,7 @@ mod tests {
                 not_applied: write_not_applied,
                 document_edited: None,
                 maybe_landed: false,
+                verification_withheld: false,
             })),
             true,
             String::new(),
@@ -2608,6 +2617,7 @@ mod tests {
             42,
             result,
             write_not_applied,
+            false,
             false,
             |_, _| async { panic!("Return after a write that did not apply") },
         )
@@ -2634,6 +2644,7 @@ mod tests {
             result,
             true,
             false,
+            false,
             |_, _| async { panic!("Return after a native write that did not apply") },
         )
         .await;
@@ -2649,6 +2660,7 @@ mod tests {
             not_applied: false,
             document_edited: None,
             maybe_landed: false,
+            verification_withheld: false,
         };
         apply_surface_trust(&mut outcome, false);
         assert_eq!(outcome.verified, Some(true));
@@ -2681,6 +2693,7 @@ mod tests {
             not_applied: false,
             document_edited: None,
             maybe_landed: false,
+            verification_withheld: false,
         };
         apply_verification_label(&mut outcome);
         assert_eq!(
@@ -3100,6 +3113,7 @@ mod ladder_tests {
             not_applied: out.not_applied,
             document_edited: doc.structured(),
             maybe_landed: out.maybe_landed,
+            verification_withheld: out.verification_withheld,
         };
         let result = set_value_tool_result(Ok(Ok(value)), false, String::new(), 0, 1);
         let data = result.structured_content.unwrap();
@@ -3222,7 +3236,7 @@ mod selectable_row_tests {
             |document: Box<dyn FnOnce()>| async {
                 calls.set(calls.get() + 1);
                 document();
-                (ToolResult::text("ok"), false, false)
+                (ToolResult::text("ok"), false, false, false)
             },
             document,
             |_, _| async {
@@ -3251,7 +3265,7 @@ mod selectable_row_tests {
             |document: Box<dyn FnOnce()>| async {
                 calls.borrow_mut().push("write");
                 document();
-                (ToolResult::text("ok"), false, false)
+                (ToolResult::text("ok"), false, false, false)
             },
             document,
             |_, _| async {
