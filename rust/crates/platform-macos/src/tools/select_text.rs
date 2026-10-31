@@ -286,16 +286,7 @@ unsafe fn select_text_blocking(
     suffix: Option<&str>,
     selection: &str,
 ) -> Result<(String, SelectedTextRange, usize, usize), SelectError> {
-    let attributes = [
-        optional_string_attr(element, "AXRole"),
-        optional_string_attr(element, "AXSubrole"),
-        optional_string_attr(element, "AXTitle"),
-        optional_string_attr(element, "AXDescription"),
-        optional_string_attr(element, "AXPlaceholderValue"),
-        optional_string_attr(element, "AXIdentifier"),
-        optional_string_attr(element, "AXHelp"),
-        optional_string_attr(element, "AXRoleDescription"),
-    ];
+    let attributes = selection_attributes_with(|name| optional_string_attr(element, name));
     if !selection_exposure_allowed(&attributes) {
         return Err(
             "select_text refuses secure fields, and fields whose security attributes could not be read"
@@ -370,6 +361,22 @@ unsafe fn select_text_blocking(
         ));
     }
     Ok((selected_text, range, occurrence, match_count))
+}
+
+fn selection_attributes_with(
+    mut read: impl FnMut(&str) -> OptionalStringAttr,
+) -> [OptionalStringAttr; 8] {
+    [
+        "AXRole",
+        "AXSubrole",
+        "AXTitle",
+        "AXDescription",
+        "AXPlaceholderValue",
+        "AXIdentifier",
+        "AXHelp",
+        "AXRoleDescription",
+    ]
+    .map(&mut read)
 }
 
 #[async_trait]
@@ -491,6 +498,28 @@ impl Tool for SelectTextTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn selection_reader_requests_the_existing_attribute_order() {
+        let mut trace = Vec::new();
+        let _ = selection_attributes_with(|name| {
+            trace.push(name.to_owned());
+            OptionalStringAttr::Value(None)
+        });
+        assert_eq!(
+            trace,
+            [
+                "AXRole",
+                "AXSubrole",
+                "AXTitle",
+                "AXDescription",
+                "AXPlaceholderValue",
+                "AXIdentifier",
+                "AXHelp",
+                "AXRoleDescription"
+            ]
+        );
+    }
 
     #[test]
     fn occurrences_overlap_on_scalar_boundaries() {
