@@ -825,10 +825,13 @@ fn perform_keycodes<S: EmissionSink>(
     skip: usize,
     make: impl FnOnce() -> anyhow::Result<S>,
 ) -> anyhow::Result<()> {
+    // Admit only what is still untyped: an earlier backend may already have
+    // typed the first skip characters.
+    let remainder: String = text.chars().skip(skip).collect();
     let strokes =
-        crate::libei_route::plan_keycodes(text, keymap, shift).map_err(LibeiRefusal::from)?;
+        crate::libei_route::plan_keycodes(&remainder, keymap, shift).map_err(LibeiRefusal::from)?;
     let mut sink = make()?;
-    for stroke in strokes.into_iter().skip(skip) {
+    for stroke in strokes {
         if let Some(shift) = stroke.shift {
             sink.key(shift, true);
             sink.frame();
@@ -1654,6 +1657,40 @@ mod tests {
                 Emitted::Delay(delay)
             ]
         );
+    }
+
+    #[test]
+    fn keycode_admission_plans_only_the_untyped_remainder() {
+        // An earlier backend typed the first character; the loaded keymap maps
+        // the remainder but not that character, so the remainder is typed.
+        let sink = FakeSink::default();
+        let mut map = crate::libei_route::KeymapChars::new();
+        map.insert('a', (30, false));
+        map.insert('b', (48, false));
+        let none = std::time::Duration::ZERO;
+        perform_keycodes("\u{20ac}ab", Some(&map), None, none, 1, || Ok(sink.clone())).unwrap();
+        assert_eq!(
+            *sink.0.borrow(),
+            vec![
+                Emitted::Key(30, true),
+                Emitted::Frame,
+                Emitted::Key(30, false),
+                Emitted::Frame,
+                Emitted::Key(48, true),
+                Emitted::Frame,
+                Emitted::Key(48, false),
+                Emitted::Frame,
+            ]
+        );
+        // An unmappable character in the remainder still refuses with nothing sent.
+        let refused = FakeSink::default();
+        assert!(
+            perform_keycodes("a\u{20ac}b", Some(&map), None, none, 1, || Ok(
+                refused.clone()
+            ))
+            .is_err()
+        );
+        assert!(refused.0.borrow().is_empty());
     }
 
     #[test]
