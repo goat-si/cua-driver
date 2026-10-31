@@ -356,6 +356,193 @@ const FfiConverterTypeActionEvidence = (() => {
     return new FFIConverter();
 })();
 
+export enum ActionFocusRestorationStatus {
+    Restored,
+    Abandoned
+}
+
+const FfiConverterTypeActionFocusRestorationStatus = (() => {
+    const ordinalConverter = FfiConverterInt32;
+    type TypeName = ActionFocusRestorationStatus;
+    class FFIConverter extends AbstractFfiConverterByteArray<TypeName> {
+        read(from: RustBuffer): TypeName {
+            switch (ordinalConverter.read(from)) {
+                case 1: return ActionFocusRestorationStatus.Restored;
+                case 2: return ActionFocusRestorationStatus.Abandoned;
+                default: throw new UniffiInternalError.UnexpectedEnumCase();
+            }
+        }
+        write(value: TypeName, into: RustBuffer): void {
+            switch (value) {
+                case ActionFocusRestorationStatus.Restored: return ordinalConverter.write(1, into);
+                case ActionFocusRestorationStatus.Abandoned: return ordinalConverter.write(2, into);
+            }
+        }
+        allocationSize(value: TypeName): number {
+            return ordinalConverter.allocationSize(0);
+        }
+    }
+    return new FFIConverter();
+})();
+
+export enum ActionFocusRestorationReason {
+    UserInput,
+    ThirdApp,
+    Timeout,
+    Panic,
+    Unconfirmed
+}
+
+const FfiConverterTypeActionFocusRestorationReason = (() => {
+    const ordinalConverter = FfiConverterInt32;
+    type TypeName = ActionFocusRestorationReason;
+    class FFIConverter extends AbstractFfiConverterByteArray<TypeName> {
+        read(from: RustBuffer): TypeName {
+            switch (ordinalConverter.read(from)) {
+                case 1: return ActionFocusRestorationReason.UserInput;
+                case 2: return ActionFocusRestorationReason.ThirdApp;
+                case 3: return ActionFocusRestorationReason.Timeout;
+                case 4: return ActionFocusRestorationReason.Panic;
+                case 5: return ActionFocusRestorationReason.Unconfirmed;
+                default: throw new UniffiInternalError.UnexpectedEnumCase();
+            }
+        }
+        write(value: TypeName, into: RustBuffer): void {
+            switch (value) {
+                case ActionFocusRestorationReason.UserInput: return ordinalConverter.write(1, into);
+                case ActionFocusRestorationReason.ThirdApp: return ordinalConverter.write(2, into);
+                case ActionFocusRestorationReason.Timeout: return ordinalConverter.write(3, into);
+                case ActionFocusRestorationReason.Panic: return ordinalConverter.write(4, into);
+                case ActionFocusRestorationReason.Unconfirmed: return ordinalConverter.write(5, into);
+            }
+        }
+        allocationSize(value: TypeName): number {
+            return ordinalConverter.allocationSize(0);
+        }
+    }
+    return new FFIConverter();
+})();
+
+export type ActionFocusRestoration = {
+    status: ActionFocusRestorationStatus,
+    /**
+     * Present only with `status: abandoned`. Advertised as a plain string
+     * enum (no null member): the field is omitted when absent.
+     */
+    reason?: ActionFocusRestorationReason,
+    /**
+     * The producer reports null when the previous process was unknown.
+     */
+    priorPid?: number
+}
+
+/**
+ * Generated factory for {@link ActionFocusRestoration} record objects.
+ */
+export const ActionFocusRestoration = (() => {
+    const defaults = () => ({
+    });
+    const create = (() => {
+        return uniffiCreateRecord<ActionFocusRestoration, ReturnType<typeof defaults>>(defaults);
+    })();
+    return Object.freeze({
+        create,
+        new: create,
+        defaults: () => Object.freeze(defaults()) as Partial<ActionFocusRestoration>,
+    });
+})();
+
+const FfiConverterTypeActionFocusRestoration = (() => {
+    type TypeName = ActionFocusRestoration;
+    class FFIConverter extends AbstractFfiConverterByteArray<TypeName> {
+        read(from: RustBuffer): TypeName {
+            return {
+                status: FfiConverterTypeActionFocusRestorationStatus.read(from),
+                reason: FfiConverterOptionalTypeActionFocusRestorationReason.read(from),
+                priorPid: FfiConverterOptionalInt32.read(from)
+            };
+        }
+        write(value: TypeName, into: RustBuffer): void {
+            FfiConverterTypeActionFocusRestorationStatus.write(value.status, into);
+            FfiConverterOptionalTypeActionFocusRestorationReason.write(value.reason, into);
+            FfiConverterOptionalInt32.write(value.priorPid, into);
+        }
+        allocationSize(value: TypeName): number {
+            return FfiConverterTypeActionFocusRestorationStatus.allocationSize(value.status) +
+             FfiConverterOptionalTypeActionFocusRestorationReason.allocationSize(value.reason) +
+             FfiConverterOptionalInt32.allocationSize(value.priorPid);
+
+        }
+    };
+    return new FFIConverter();
+})();
+
+/**
+ * The element a pointer route reported hitting when it dispatched.
+ */
+export type ActionHit = {
+    /**
+     * Element index in the snapshot the route resolved against.
+     */
+    index?: bigint,
+    /**
+     * Accessibility role, in the platform's vocabulary.
+     */
+    role?: string,
+    /**
+     * Accessible name or label.
+     */
+    label?: string,
+    /**
+     * Stable accessibility identifier, when the element has one.
+     */
+    identifier?: string
+}
+
+/**
+ * Generated factory for {@link ActionHit} record objects.
+ */
+export const ActionHit = (() => {
+    const defaults = () => ({
+    });
+    const create = (() => {
+        return uniffiCreateRecord<ActionHit, ReturnType<typeof defaults>>(defaults);
+    })();
+    return Object.freeze({
+        create,
+        new: create,
+        defaults: () => Object.freeze(defaults()) as Partial<ActionHit>,
+    });
+})();
+
+const FfiConverterTypeActionHit = (() => {
+    type TypeName = ActionHit;
+    class FFIConverter extends AbstractFfiConverterByteArray<TypeName> {
+        read(from: RustBuffer): TypeName {
+            return {
+                index: FfiConverterOptionalUInt64.read(from),
+                role: FfiConverterOptionalString.read(from),
+                label: FfiConverterOptionalString.read(from),
+                identifier: FfiConverterOptionalString.read(from)
+            };
+        }
+        write(value: TypeName, into: RustBuffer): void {
+            FfiConverterOptionalUInt64.write(value.index, into);
+            FfiConverterOptionalString.write(value.role, into);
+            FfiConverterOptionalString.write(value.label, into);
+            FfiConverterOptionalString.write(value.identifier, into);
+        }
+        allocationSize(value: TypeName): number {
+            return FfiConverterOptionalUInt64.allocationSize(value.index) +
+             FfiConverterOptionalString.allocationSize(value.role) +
+             FfiConverterOptionalString.allocationSize(value.label) +
+             FfiConverterOptionalString.allocationSize(value.identifier);
+
+        }
+    };
+    return new FFIConverter();
+})();
+
 /**
  * A call an agent can make next: `{tool, arguments}`.
  */
@@ -400,6 +587,60 @@ const FfiConverterTypeActionNextCall = (() => {
         allocationSize(value: TypeName): number {
             return FfiConverterString.allocationSize(value.tool) +
              FfiConverterString.allocationSize(value.arguments);
+
+        }
+    };
+    return new FFIConverter();
+})();
+
+/**
+ * The point a pointer action aimed at, as its producer reports it.
+ */
+export type ActionPoint = {
+    x: number,
+    y: number,
+    /**
+     * The space `x`/`y` are in, such as `window_points`. Absent when the
+     * producer did not say.
+     */
+    coordinateSpace?: string
+}
+
+/**
+ * Generated factory for {@link ActionPoint} record objects.
+ */
+export const ActionPoint = (() => {
+    const defaults = () => ({
+    });
+    const create = (() => {
+        return uniffiCreateRecord<ActionPoint, ReturnType<typeof defaults>>(defaults);
+    })();
+    return Object.freeze({
+        create,
+        new: create,
+        defaults: () => Object.freeze(defaults()) as Partial<ActionPoint>,
+    });
+})();
+
+const FfiConverterTypeActionPoint = (() => {
+    type TypeName = ActionPoint;
+    class FFIConverter extends AbstractFfiConverterByteArray<TypeName> {
+        read(from: RustBuffer): TypeName {
+            return {
+                x: FfiConverterFloat64.read(from),
+                y: FfiConverterFloat64.read(from),
+                coordinateSpace: FfiConverterOptionalString.read(from)
+            };
+        }
+        write(value: TypeName, into: RustBuffer): void {
+            FfiConverterFloat64.write(value.x, into);
+            FfiConverterFloat64.write(value.y, into);
+            FfiConverterOptionalString.write(value.coordinateSpace, into);
+        }
+        allocationSize(value: TypeName): number {
+            return FfiConverterFloat64.allocationSize(value.x) +
+             FfiConverterFloat64.allocationSize(value.y) +
+             FfiConverterOptionalString.allocationSize(value.coordinateSpace);
 
         }
     };
@@ -485,6 +726,53 @@ const FfiConverterTypeActionRoute = (() => {
     return new FFIConverter();
 })();
 
+export type ActionSelectedTextRange = {
+    location: bigint,
+    length: bigint,
+    units: string
+}
+
+/**
+ * Generated factory for {@link ActionSelectedTextRange} record objects.
+ */
+export const ActionSelectedTextRange = (() => {
+    const defaults = () => ({
+    });
+    const create = (() => {
+        return uniffiCreateRecord<ActionSelectedTextRange, ReturnType<typeof defaults>>(defaults);
+    })();
+    return Object.freeze({
+        create,
+        new: create,
+        defaults: () => Object.freeze(defaults()) as Partial<ActionSelectedTextRange>,
+    });
+})();
+
+const FfiConverterTypeActionSelectedTextRange = (() => {
+    type TypeName = ActionSelectedTextRange;
+    class FFIConverter extends AbstractFfiConverterByteArray<TypeName> {
+        read(from: RustBuffer): TypeName {
+            return {
+                location: FfiConverterUInt64.read(from),
+                length: FfiConverterUInt64.read(from),
+                units: FfiConverterString.read(from)
+            };
+        }
+        write(value: TypeName, into: RustBuffer): void {
+            FfiConverterUInt64.write(value.location, into);
+            FfiConverterUInt64.write(value.length, into);
+            FfiConverterString.write(value.units, into);
+        }
+        allocationSize(value: TypeName): number {
+            return FfiConverterUInt64.allocationSize(value.location) +
+             FfiConverterUInt64.allocationSize(value.length) +
+             FfiConverterString.allocationSize(value.units);
+
+        }
+    };
+    return new FFIConverter();
+})();
+
 export type ActionResult = {
     effect: ActionEffect,
     route: ActionRoute,
@@ -498,6 +786,9 @@ export type ActionResult = {
      * text content says.
      */
     summary?: string,
+    note?: string,
+    warning?: string,
+    focusRestoration?: ActionFocusRestoration,
     /**
      * Present only with `effect: refused`.
      */
@@ -514,7 +805,32 @@ export type ActionResult = {
      * The call that moves the task forward, always safe to run as is (a read,
      * or a call that keeps the user's window where it is).
      */
-    nextCall?: ActionNextCall
+    nextCall?: ActionNextCall,
+    /**
+     * Producer confirmation retained for the macOS drag/right-click readbacks.
+     */
+    verified?: boolean,
+    selectionChanged?: boolean,
+    selectedTextRange?: ActionSelectedTextRange,
+    selectedText?: string,
+    menuOpened?: boolean,
+    menuItems?: Array<string>,
+    /**
+     * The point a pointer action (click, double_click, right_click,
+     * move_cursor, scroll, drag) aimed at, in `coordinate_space`, as its
+     * producer reports it; for drag, the end point. It says where the input
+     * was aimed, not that anything changed there: `effect` and `evidence`
+     * carry the outcome. Absent when the producer reported no point (macOS
+     * reports one for window-points calls, which cannot also name an
+     * element_token).
+     */
+    point?: ActionPoint,
+    /**
+     * The element the pointer route reported hitting at dispatch time.
+     * Absent when the route reported none; never inferred from an earlier
+     * snapshot.
+     */
+    hit?: ActionHit
 }
 
 /**
@@ -544,9 +860,20 @@ const FfiConverterTypeActionResult = (() => {
                 evidence: FfiConverterOptionalSequenceTypeActionEvidence.read(from),
                 escalation: FfiConverterOptionalTypeActionEscalation.read(from),
                 summary: FfiConverterOptionalString.read(from),
+                note: FfiConverterOptionalString.read(from),
+                warning: FfiConverterOptionalString.read(from),
+                focusRestoration: FfiConverterOptionalTypeActionFocusRestoration.read(from),
                 error: FfiConverterOptionalTypeActionError.read(from),
                 hint: FfiConverterOptionalString.read(from),
-                nextCall: FfiConverterOptionalTypeActionNextCall.read(from)
+                nextCall: FfiConverterOptionalTypeActionNextCall.read(from),
+                verified: FfiConverterOptionalBoolean.read(from),
+                selectionChanged: FfiConverterOptionalBoolean.read(from),
+                selectedTextRange: FfiConverterOptionalTypeActionSelectedTextRange.read(from),
+                selectedText: FfiConverterOptionalString.read(from),
+                menuOpened: FfiConverterOptionalBoolean.read(from),
+                menuItems: FfiConverterOptionalSequenceString.read(from),
+                point: FfiConverterOptionalTypeActionPoint.read(from),
+                hit: FfiConverterOptionalTypeActionHit.read(from)
             };
         }
         write(value: TypeName, into: RustBuffer): void {
@@ -556,9 +883,20 @@ const FfiConverterTypeActionResult = (() => {
             FfiConverterOptionalSequenceTypeActionEvidence.write(value.evidence, into);
             FfiConverterOptionalTypeActionEscalation.write(value.escalation, into);
             FfiConverterOptionalString.write(value.summary, into);
+            FfiConverterOptionalString.write(value.note, into);
+            FfiConverterOptionalString.write(value.warning, into);
+            FfiConverterOptionalTypeActionFocusRestoration.write(value.focusRestoration, into);
             FfiConverterOptionalTypeActionError.write(value.error, into);
             FfiConverterOptionalString.write(value.hint, into);
             FfiConverterOptionalTypeActionNextCall.write(value.nextCall, into);
+            FfiConverterOptionalBoolean.write(value.verified, into);
+            FfiConverterOptionalBoolean.write(value.selectionChanged, into);
+            FfiConverterOptionalTypeActionSelectedTextRange.write(value.selectedTextRange, into);
+            FfiConverterOptionalString.write(value.selectedText, into);
+            FfiConverterOptionalBoolean.write(value.menuOpened, into);
+            FfiConverterOptionalSequenceString.write(value.menuItems, into);
+            FfiConverterOptionalTypeActionPoint.write(value.point, into);
+            FfiConverterOptionalTypeActionHit.write(value.hit, into);
         }
         allocationSize(value: TypeName): number {
             return FfiConverterTypeActionEffect.allocationSize(value.effect) +
@@ -567,9 +905,20 @@ const FfiConverterTypeActionResult = (() => {
              FfiConverterOptionalSequenceTypeActionEvidence.allocationSize(value.evidence) +
              FfiConverterOptionalTypeActionEscalation.allocationSize(value.escalation) +
              FfiConverterOptionalString.allocationSize(value.summary) +
+             FfiConverterOptionalString.allocationSize(value.note) +
+             FfiConverterOptionalString.allocationSize(value.warning) +
+             FfiConverterOptionalTypeActionFocusRestoration.allocationSize(value.focusRestoration) +
              FfiConverterOptionalTypeActionError.allocationSize(value.error) +
              FfiConverterOptionalString.allocationSize(value.hint) +
-             FfiConverterOptionalTypeActionNextCall.allocationSize(value.nextCall);
+             FfiConverterOptionalTypeActionNextCall.allocationSize(value.nextCall) +
+             FfiConverterOptionalBoolean.allocationSize(value.verified) +
+             FfiConverterOptionalBoolean.allocationSize(value.selectionChanged) +
+             FfiConverterOptionalTypeActionSelectedTextRange.allocationSize(value.selectedTextRange) +
+             FfiConverterOptionalString.allocationSize(value.selectedText) +
+             FfiConverterOptionalBoolean.allocationSize(value.menuOpened) +
+             FfiConverterOptionalSequenceString.allocationSize(value.menuItems) +
+             FfiConverterOptionalTypeActionPoint.allocationSize(value.point) +
+             FfiConverterOptionalTypeActionHit.allocationSize(value.hit);
 
         }
     };
@@ -3142,6 +3491,152 @@ const FfiConverterTypeHotkeyInput = (() => {
 })();
 
 /**
+ * Broad cause of a missing part of the requested observation.
+ */
+export enum IncompleteReasonKind {
+    PolicyOmission,
+    ProviderFailure,
+    Budget,
+    Unknown
+}
+
+const FfiConverterTypeIncompleteReasonKind = (() => {
+    const ordinalConverter = FfiConverterInt32;
+    type TypeName = IncompleteReasonKind;
+    class FFIConverter extends AbstractFfiConverterByteArray<TypeName> {
+        read(from: RustBuffer): TypeName {
+            switch (ordinalConverter.read(from)) {
+                case 1: return IncompleteReasonKind.PolicyOmission;
+                case 2: return IncompleteReasonKind.ProviderFailure;
+                case 3: return IncompleteReasonKind.Budget;
+                case 4: return IncompleteReasonKind.Unknown;
+                default: throw new UniffiInternalError.UnexpectedEnumCase();
+            }
+        }
+        write(value: TypeName, into: RustBuffer): void {
+            switch (value) {
+                case IncompleteReasonKind.PolicyOmission: return ordinalConverter.write(1, into);
+                case IncompleteReasonKind.ProviderFailure: return ordinalConverter.write(2, into);
+                case IncompleteReasonKind.Budget: return ordinalConverter.write(3, into);
+                case IncompleteReasonKind.Unknown: return ordinalConverter.write(4, into);
+            }
+        }
+        allocationSize(value: TypeName): number {
+            return ordinalConverter.allocationSize(0);
+        }
+    }
+    return new FFIConverter();
+})();
+
+export enum IncompleteReasonDetail {
+    CollapsedMenu,
+    Offscreen,
+    InactiveTab,
+    WebContent,
+    HugeContainer,
+    DepthLimit,
+    NodeBudget,
+    TimeBudget,
+    ChildEnumerationFailed,
+    AttributeReadFailed,
+    EnumerationErrorUnclassified,
+    UntrustedProvider,
+    ScopeMismatch,
+    NotAsserted
+}
+
+const FfiConverterTypeIncompleteReasonDetail = (() => {
+    const ordinalConverter = FfiConverterInt32;
+    type TypeName = IncompleteReasonDetail;
+    class FFIConverter extends AbstractFfiConverterByteArray<TypeName> {
+        read(from: RustBuffer): TypeName {
+            switch (ordinalConverter.read(from)) {
+                case 1: return IncompleteReasonDetail.CollapsedMenu;
+                case 2: return IncompleteReasonDetail.Offscreen;
+                case 3: return IncompleteReasonDetail.InactiveTab;
+                case 4: return IncompleteReasonDetail.WebContent;
+                case 5: return IncompleteReasonDetail.HugeContainer;
+                case 6: return IncompleteReasonDetail.DepthLimit;
+                case 7: return IncompleteReasonDetail.NodeBudget;
+                case 8: return IncompleteReasonDetail.TimeBudget;
+                case 9: return IncompleteReasonDetail.ChildEnumerationFailed;
+                case 10: return IncompleteReasonDetail.AttributeReadFailed;
+                case 11: return IncompleteReasonDetail.EnumerationErrorUnclassified;
+                case 12: return IncompleteReasonDetail.UntrustedProvider;
+                case 13: return IncompleteReasonDetail.ScopeMismatch;
+                case 14: return IncompleteReasonDetail.NotAsserted;
+                default: throw new UniffiInternalError.UnexpectedEnumCase();
+            }
+        }
+        write(value: TypeName, into: RustBuffer): void {
+            switch (value) {
+                case IncompleteReasonDetail.CollapsedMenu: return ordinalConverter.write(1, into);
+                case IncompleteReasonDetail.Offscreen: return ordinalConverter.write(2, into);
+                case IncompleteReasonDetail.InactiveTab: return ordinalConverter.write(3, into);
+                case IncompleteReasonDetail.WebContent: return ordinalConverter.write(4, into);
+                case IncompleteReasonDetail.HugeContainer: return ordinalConverter.write(5, into);
+                case IncompleteReasonDetail.DepthLimit: return ordinalConverter.write(6, into);
+                case IncompleteReasonDetail.NodeBudget: return ordinalConverter.write(7, into);
+                case IncompleteReasonDetail.TimeBudget: return ordinalConverter.write(8, into);
+                case IncompleteReasonDetail.ChildEnumerationFailed: return ordinalConverter.write(9, into);
+                case IncompleteReasonDetail.AttributeReadFailed: return ordinalConverter.write(10, into);
+                case IncompleteReasonDetail.EnumerationErrorUnclassified: return ordinalConverter.write(11, into);
+                case IncompleteReasonDetail.UntrustedProvider: return ordinalConverter.write(12, into);
+                case IncompleteReasonDetail.ScopeMismatch: return ordinalConverter.write(13, into);
+                case IncompleteReasonDetail.NotAsserted: return ordinalConverter.write(14, into);
+            }
+        }
+        allocationSize(value: TypeName): number {
+            return ordinalConverter.allocationSize(0);
+        }
+    }
+    return new FFIConverter();
+})();
+
+export type IncompleteReason = {
+    kind: IncompleteReasonKind,
+    detail: IncompleteReasonDetail
+}
+
+/**
+ * Generated factory for {@link IncompleteReason} record objects.
+ */
+export const IncompleteReason = (() => {
+    const defaults = () => ({
+    });
+    const create = (() => {
+        return uniffiCreateRecord<IncompleteReason, ReturnType<typeof defaults>>(defaults);
+    })();
+    return Object.freeze({
+        create,
+        new: create,
+        defaults: () => Object.freeze(defaults()) as Partial<IncompleteReason>,
+    });
+})();
+
+const FfiConverterTypeIncompleteReason = (() => {
+    type TypeName = IncompleteReason;
+    class FFIConverter extends AbstractFfiConverterByteArray<TypeName> {
+        read(from: RustBuffer): TypeName {
+            return {
+                kind: FfiConverterTypeIncompleteReasonKind.read(from),
+                detail: FfiConverterTypeIncompleteReasonDetail.read(from)
+            };
+        }
+        write(value: TypeName, into: RustBuffer): void {
+            FfiConverterTypeIncompleteReasonKind.write(value.kind, into);
+            FfiConverterTypeIncompleteReasonDetail.write(value.detail, into);
+        }
+        allocationSize(value: TypeName): number {
+            return FfiConverterTypeIncompleteReasonKind.allocationSize(value.kind) +
+             FfiConverterTypeIncompleteReasonDetail.allocationSize(value.detail);
+
+        }
+    };
+    return new FFIConverter();
+})();
+
+/**
  * Exact, immediate-child application menu path to resolve and invoke through
  * the operating system's accessibility API. Path labels are matched after
  * trimming surrounding whitespace and otherwise remain case-sensitive. On
@@ -3849,6 +4344,186 @@ const FfiConverterTypeMoveCursorInput = (() => {
              FfiConverterOptionalTypeActionTarget.allocationSize(value.target) +
              FfiConverterOptionalTypeDesktopScope.allocationSize(value.scope) +
              FfiConverterOptionalString.allocationSize(value.session);
+
+        }
+    };
+    return new FFIConverter();
+})();
+
+
+// Enum: CountEvidence
+export enum CountEvidence_Tags {
+    Known = "Known",
+    Unknown = "Unknown"
+}
+/**
+ * Evidence for the number of direct children omitted at this node.
+ */
+export const CountEvidence = (() => {
+
+    type Known__interface = {
+        tag: CountEvidence_Tags.Known;
+        inner:
+Readonly<
+[number
+]>
+    };
+    class Known_ extends UniffiEnum implements Known__interface {
+        /**
+         * @private
+         * This field is private and should not be used, use `tag` instead.
+         */
+        readonly [uniffiTypeNameSymbol] = "CountEvidence";
+        readonly tag = CountEvidence_Tags.Known;
+        readonly inner:
+Readonly<
+[number
+]>;
+        constructor(v0: number) {
+            super("CountEvidence", "Known");
+
+            this.inner = Object.freeze([v0]);
+        }
+        static new(v0: number): Known_ {
+            return new Known_(v0);
+        }
+
+        static instanceOf(obj: any): obj is Known_ {
+            return obj.tag === CountEvidence_Tags.Known;
+        }
+
+    }
+
+    type Unknown__interface = {
+        tag: CountEvidence_Tags.Unknown
+    };
+    class Unknown_ extends UniffiEnum implements Unknown__interface {
+        /**
+         * @private
+         * This field is private and should not be used, use `tag` instead.
+         */
+        readonly [uniffiTypeNameSymbol] = "CountEvidence";
+        readonly tag = CountEvidence_Tags.Unknown;
+        constructor() {
+            super("CountEvidence", "Unknown");
+        }
+
+        static new(): Unknown_ {
+            return new Unknown_();
+        }
+
+        static instanceOf(obj: any): obj is Unknown_ {
+            return obj.tag === CountEvidence_Tags.Unknown;
+        }
+
+    }
+
+    function instanceOf(obj: any): obj is CountEvidence {
+        return obj[uniffiTypeNameSymbol] === "CountEvidence";
+    }
+
+    return Object.freeze({
+        instanceOf,
+  Known: Known_,
+  Unknown: Unknown_
+    });
+
+})();
+/**
+ * Evidence for the number of direct children omitted at this node.
+ */
+export type CountEvidence = InstanceType<
+    typeof CountEvidence['Known' | 'Unknown']
+>;
+
+// FfiConverter for enum CountEvidence
+const FfiConverterTypeCountEvidence = (() => {
+    const ordinalConverter = FfiConverterInt32;
+    type TypeName = CountEvidence;
+    class FFIConverter extends AbstractFfiConverterByteArray<TypeName> {
+        read(from: RustBuffer): TypeName {
+            switch (ordinalConverter.read(from)) {
+                case 1: return new CountEvidence.Known(FfiConverterUInt32.read(from));
+                case 2: return new CountEvidence.Unknown();
+                default: throw new UniffiInternalError.UnexpectedEnumCase();
+            }
+        }
+        write(value: TypeName, into: RustBuffer): void {
+            switch (value.tag) {
+                case CountEvidence_Tags.Known: {
+                    ordinalConverter.write(1, into);
+                    const inner = value.inner;
+                    FfiConverterUInt32.write(inner[0], into);
+                    return;
+                }
+                case CountEvidence_Tags.Unknown: {
+                    ordinalConverter.write(2, into);
+                    return;
+                }
+                default:
+                    // Throwing from here means that CountEvidence_Tags hasn't matched an ordinal.
+                    throw new UniffiInternalError.UnexpectedEnumCase();
+            }
+        }
+        allocationSize(value: TypeName): number {
+            switch (value.tag) {
+                case CountEvidence_Tags.Known: {
+                    const inner = value.inner;
+                    let size = ordinalConverter.allocationSize(1);
+                    size += FfiConverterUInt32.allocationSize(inner[0]);
+                    return size;
+                }
+                case CountEvidence_Tags.Unknown: {
+                    return ordinalConverter.allocationSize(2);
+                }
+                default: throw new UniffiInternalError.UnexpectedEnumCase();
+            }
+        }
+    }
+    return new FFIConverter();
+})();
+
+export type NodeBoundary = {
+    reasons: Array<IncompleteReason>,
+    childrenSkipped: CountEvidence,
+    descendantsOmitted?: boolean
+}
+
+/**
+ * Generated factory for {@link NodeBoundary} record objects.
+ */
+export const NodeBoundary = (() => {
+    const defaults = () => ({
+    });
+    const create = (() => {
+        return uniffiCreateRecord<NodeBoundary, ReturnType<typeof defaults>>(defaults);
+    })();
+    return Object.freeze({
+        create,
+        new: create,
+        defaults: () => Object.freeze(defaults()) as Partial<NodeBoundary>,
+    });
+})();
+
+const FfiConverterTypeNodeBoundary = (() => {
+    type TypeName = NodeBoundary;
+    class FFIConverter extends AbstractFfiConverterByteArray<TypeName> {
+        read(from: RustBuffer): TypeName {
+            return {
+                reasons: FfiConverterSequenceTypeIncompleteReason.read(from),
+                childrenSkipped: FfiConverterTypeCountEvidence.read(from),
+                descendantsOmitted: FfiConverterOptionalBoolean.read(from)
+            };
+        }
+        write(value: TypeName, into: RustBuffer): void {
+            FfiConverterSequenceTypeIncompleteReason.write(value.reasons, into);
+            FfiConverterTypeCountEvidence.write(value.childrenSkipped, into);
+            FfiConverterOptionalBoolean.write(value.descendantsOmitted, into);
+        }
+        allocationSize(value: TypeName): number {
+            return FfiConverterSequenceTypeIncompleteReason.allocationSize(value.reasons) +
+             FfiConverterTypeCountEvidence.allocationSize(value.childrenSkipped) +
+             FfiConverterOptionalBoolean.allocationSize(value.descendantsOmitted);
 
         }
     };
@@ -6361,6 +7036,7 @@ export type WindowElement = {
     elementIndex: bigint,
     role: string,
     depth: number,
+    boundary?: NodeBoundary,
     elementToken?: string,
     label?: string,
     value?: string,
@@ -6368,12 +7044,13 @@ export type WindowElement = {
     enabled?: boolean,
     selected?: boolean,
     /**
-     * TogglePattern state, for elements that have one (Windows).
+     * TogglePattern state (Windows), or the AT-SPI CHECKED/INDETERMINATE state of a
+     * check box, radio button, toggle button or switch (Linux).
      */
     toggleState?: ToggleState,
     /**
-     * ExpandCollapsePattern state; partly expanded counts as expanded. Absent
-     * for elements that cannot expand (Windows).
+     * ExpandCollapsePattern state (Windows; partly expanded counts as expanded), or
+     * AT-SPI EXPANDED/EXPANDABLE (Linux). Absent for elements that cannot expand.
      */
     expanded?: boolean,
     inWebContent?: boolean,
@@ -6408,6 +7085,7 @@ const FfiConverterTypeWindowElement = (() => {
                 elementIndex: FfiConverterUInt64.read(from),
                 role: FfiConverterString.read(from),
                 depth: FfiConverterUInt32.read(from),
+                boundary: FfiConverterOptionalTypeNodeBoundary.read(from),
                 elementToken: FfiConverterOptionalString.read(from),
                 label: FfiConverterOptionalString.read(from),
                 value: FfiConverterOptionalString.read(from),
@@ -6428,6 +7106,7 @@ const FfiConverterTypeWindowElement = (() => {
             FfiConverterUInt64.write(value.elementIndex, into);
             FfiConverterString.write(value.role, into);
             FfiConverterUInt32.write(value.depth, into);
+            FfiConverterOptionalTypeNodeBoundary.write(value.boundary, into);
             FfiConverterOptionalString.write(value.elementToken, into);
             FfiConverterOptionalString.write(value.label, into);
             FfiConverterOptionalString.write(value.value, into);
@@ -6447,6 +7126,7 @@ const FfiConverterTypeWindowElement = (() => {
             return FfiConverterUInt64.allocationSize(value.elementIndex) +
              FfiConverterString.allocationSize(value.role) +
              FfiConverterUInt32.allocationSize(value.depth) +
+             FfiConverterOptionalTypeNodeBoundary.allocationSize(value.boundary) +
              FfiConverterOptionalString.allocationSize(value.elementToken) +
              FfiConverterOptionalString.allocationSize(value.label) +
              FfiConverterOptionalString.allocationSize(value.value) +
@@ -6480,6 +7160,12 @@ export type WindowStateOutput = {
     returnedElementCount?: bigint,
     filteredElementCount?: bigint,
     elementsComplete?: boolean,
+    /**
+     * Producer assertion about the requested scope. Absence is incomplete;
+     * reductions after the walk do not change observation completeness.
+     */
+    observationComplete?: boolean,
+    observationIncompleteReasons?: Array<IncompleteReason>,
     degraded?: boolean,
     degradedReason?: string,
     truncated?: boolean,
@@ -6553,6 +7239,8 @@ const FfiConverterTypeWindowStateOutput = (() => {
                 returnedElementCount: FfiConverterOptionalUInt64.read(from),
                 filteredElementCount: FfiConverterOptionalUInt64.read(from),
                 elementsComplete: FfiConverterOptionalBoolean.read(from),
+                observationComplete: FfiConverterOptionalBoolean.read(from),
+                observationIncompleteReasons: FfiConverterOptionalSequenceTypeIncompleteReason.read(from),
                 degraded: FfiConverterOptionalBoolean.read(from),
                 degradedReason: FfiConverterOptionalString.read(from),
                 truncated: FfiConverterOptionalBoolean.read(from),
@@ -6585,6 +7273,8 @@ const FfiConverterTypeWindowStateOutput = (() => {
             FfiConverterOptionalUInt64.write(value.returnedElementCount, into);
             FfiConverterOptionalUInt64.write(value.filteredElementCount, into);
             FfiConverterOptionalBoolean.write(value.elementsComplete, into);
+            FfiConverterOptionalBoolean.write(value.observationComplete, into);
+            FfiConverterOptionalSequenceTypeIncompleteReason.write(value.observationIncompleteReasons, into);
             FfiConverterOptionalBoolean.write(value.degraded, into);
             FfiConverterOptionalString.write(value.degradedReason, into);
             FfiConverterOptionalBoolean.write(value.truncated, into);
@@ -6616,6 +7306,8 @@ const FfiConverterTypeWindowStateOutput = (() => {
              FfiConverterOptionalUInt64.allocationSize(value.returnedElementCount) +
              FfiConverterOptionalUInt64.allocationSize(value.filteredElementCount) +
              FfiConverterOptionalBoolean.allocationSize(value.elementsComplete) +
+             FfiConverterOptionalBoolean.allocationSize(value.observationComplete) +
+             FfiConverterOptionalSequenceTypeIncompleteReason.allocationSize(value.observationIncompleteReasons) +
              FfiConverterOptionalBoolean.allocationSize(value.degraded) +
              FfiConverterOptionalString.allocationSize(value.degradedReason) +
              FfiConverterOptionalBoolean.allocationSize(value.truncated) +
@@ -6677,6 +7369,15 @@ const FfiConverterOptionalUInt32 = new FfiConverterOptional(FfiConverterUInt32);
 // FfiConverter for string | undefined
 const FfiConverterOptionalString = new FfiConverterOptional(FfiConverterString);
 
+// FfiConverter for ActionFocusRestorationReason | undefined
+const FfiConverterOptionalTypeActionFocusRestorationReason = new FfiConverterOptional(FfiConverterTypeActionFocusRestorationReason);
+
+// FfiConverter for number | undefined
+const FfiConverterOptionalInt32 = new FfiConverterOptional(FfiConverterInt32);
+
+// FfiConverter for bigint | undefined
+const FfiConverterOptionalUInt64 = new FfiConverterOptional(FfiConverterUInt64);
+
 // FfiConverter for ActionDelivery | undefined
 const FfiConverterOptionalTypeActionDelivery = new FfiConverterOptional(FfiConverterTypeActionDelivery);
 
@@ -6689,20 +7390,38 @@ const FfiConverterOptionalSequenceTypeActionEvidence = new FfiConverterOptional(
 // FfiConverter for ActionEscalation | undefined
 const FfiConverterOptionalTypeActionEscalation = new FfiConverterOptional(FfiConverterTypeActionEscalation);
 
+// FfiConverter for ActionFocusRestoration | undefined
+const FfiConverterOptionalTypeActionFocusRestoration = new FfiConverterOptional(FfiConverterTypeActionFocusRestoration);
+
 // FfiConverter for ActionError | undefined
 const FfiConverterOptionalTypeActionError = new FfiConverterOptional(FfiConverterTypeActionError);
 
 // FfiConverter for ActionNextCall | undefined
 const FfiConverterOptionalTypeActionNextCall = new FfiConverterOptional(FfiConverterTypeActionNextCall);
 
+// FfiConverter for boolean | undefined
+const FfiConverterOptionalBoolean = new FfiConverterOptional(FfiConverterBool);
+
+// FfiConverter for ActionSelectedTextRange | undefined
+const FfiConverterOptionalTypeActionSelectedTextRange = new FfiConverterOptional(FfiConverterTypeActionSelectedTextRange);
+
+// FfiConverter for Array<string>
+const FfiConverterSequenceString = new FfiConverterArray(FfiConverterString);
+
+// FfiConverter for Array<string> | undefined
+const FfiConverterOptionalSequenceString = new FfiConverterOptional(FfiConverterSequenceString);
+
+// FfiConverter for ActionPoint | undefined
+const FfiConverterOptionalTypeActionPoint = new FfiConverterOptional(FfiConverterTypeActionPoint);
+
+// FfiConverter for ActionHit | undefined
+const FfiConverterOptionalTypeActionHit = new FfiConverterOptional(FfiConverterTypeActionHit);
+
 // FfiConverter for number | undefined
 const FfiConverterOptionalFloat64 = new FfiConverterOptional(FfiConverterFloat64);
 
 // FfiConverter for ClickButton | undefined
 const FfiConverterOptionalTypeClickButton = new FfiConverterOptional(FfiConverterTypeClickButton);
-
-// FfiConverter for Array<string>
-const FfiConverterSequenceString = new FfiConverterArray(FfiConverterString);
 
 // FfiConverter for CursorEffectSetting | undefined
 const FfiConverterOptionalTypeCursorEffectSetting = new FfiConverterOptional(FfiConverterTypeCursorEffectSetting);
@@ -6725,15 +7444,6 @@ const FfiConverterOptionalTypeActionTarget = new FfiConverterOptional(FfiConvert
 // FfiConverter for DesktopScope | undefined
 const FfiConverterOptionalTypeDesktopScope = new FfiConverterOptional(FfiConverterTypeDesktopScope);
 
-// FfiConverter for bigint | undefined
-const FfiConverterOptionalUInt64 = new FfiConverterOptional(FfiConverterUInt64);
-
-// FfiConverter for Array<string> | undefined
-const FfiConverterOptionalSequenceString = new FfiConverterOptional(FfiConverterSequenceString);
-
-// FfiConverter for boolean | undefined
-const FfiConverterOptionalBoolean = new FfiConverterOptional(FfiConverterBool);
-
 // FfiConverter for CursorPointOutput | undefined
 const FfiConverterOptionalTypeCursorPointOutput = new FfiConverterOptional(FfiConverterTypeCursorPointOutput);
 
@@ -6746,9 +7456,6 @@ const FfiConverterSequenceTypeSessionOutput = new FfiConverterArray(FfiConverter
 // FfiConverter for bigint | undefined
 const FfiConverterOptionalInt64 = new FfiConverterOptional(FfiConverterInt64);
 
-// FfiConverter for number | undefined
-const FfiConverterOptionalInt32 = new FfiConverterOptional(FfiConverterInt32);
-
 // FfiConverter for Array<bigint>
 const FfiConverterSequenceUInt64 = new FfiConverterArray(FfiConverterUInt64);
 
@@ -6757,6 +7464,9 @@ const FfiConverterOptionalSequenceUInt64 = new FfiConverterOptional(FfiConverter
 
 // FfiConverter for Array<WindowInfo>
 const FfiConverterSequenceTypeWindowInfo = new FfiConverterArray(FfiConverterTypeWindowInfo);
+
+// FfiConverter for Array<IncompleteReason>
+const FfiConverterSequenceTypeIncompleteReason = new FfiConverterArray(FfiConverterTypeIncompleteReason);
 
 // FfiConverter for Array<VisualRegionKind>
 const FfiConverterSequenceTypeVisualRegionKind = new FfiConverterArray(FfiConverterTypeVisualRegionKind);
@@ -6803,6 +7513,9 @@ const FfiConverterSequenceTypeStatePredicate = new FfiConverterArray(FfiConverte
 // FfiConverter for Array<PredicateOutcome>
 const FfiConverterSequenceTypePredicateOutcome = new FfiConverterArray(FfiConverterTypePredicateOutcome);
 
+// FfiConverter for NodeBoundary | undefined
+const FfiConverterOptionalTypeNodeBoundary = new FfiConverterOptional(FfiConverterTypeNodeBoundary);
+
 // FfiConverter for ToggleState | undefined
 const FfiConverterOptionalTypeToggleState = new FfiConverterOptional(FfiConverterTypeToggleState);
 
@@ -6814,6 +7527,9 @@ const FfiConverterSequenceTypeWindowElement = new FfiConverterArray(FfiConverter
 
 // FfiConverter for Array<WindowElement> | undefined
 const FfiConverterOptionalSequenceTypeWindowElement = new FfiConverterOptional(FfiConverterSequenceTypeWindowElement);
+
+// FfiConverter for Array<IncompleteReason> | undefined
+const FfiConverterOptionalSequenceTypeIncompleteReason = new FfiConverterOptional(FfiConverterSequenceTypeIncompleteReason);
 
 // FfiConverter for WindowBounds | undefined
 const FfiConverterOptionalTypeWindowBounds = new FfiConverterOptional(FfiConverterTypeWindowBounds);
@@ -6855,9 +7571,15 @@ export default Object.freeze({
     FfiConverterTypeActionEscalationTarget,
     FfiConverterTypeActionEvidence,
     FfiConverterTypeActionEvidenceKind,
+    FfiConverterTypeActionFocusRestoration,
+    FfiConverterTypeActionFocusRestorationReason,
+    FfiConverterTypeActionFocusRestorationStatus,
+    FfiConverterTypeActionHit,
     FfiConverterTypeActionNextCall,
+    FfiConverterTypeActionPoint,
     FfiConverterTypeActionResult,
     FfiConverterTypeActionRoute,
+    FfiConverterTypeActionSelectedTextRange,
     FfiConverterTypeActionTarget,
     FfiConverterTypeAppInfo,
     FfiConverterTypeBoundsExpectation,
@@ -6869,6 +7591,7 @@ export default Object.freeze({
     FfiConverterTypeClipboardReadOutput,
     FfiConverterTypeClipboardWriteInput,
     FfiConverterTypeClipboardWriteOutput,
+    FfiConverterTypeCountEvidence,
     FfiConverterTypeCursorAction,
     FfiConverterTypeCursorEffectSetting,
     FfiConverterTypeCursorMotionEffects,
@@ -6901,6 +7624,9 @@ export default Object.freeze({
     FfiConverterTypeGetSessionStateInput,
     FfiConverterTypeGetWindowStateInput,
     FfiConverterTypeHotkeyInput,
+    FfiConverterTypeIncompleteReason,
+    FfiConverterTypeIncompleteReasonDetail,
+    FfiConverterTypeIncompleteReasonKind,
     FfiConverterTypeInputDeliveryMode,
     FfiConverterTypeInvokeMenuInput,
     FfiConverterTypeListAppsInput,
@@ -6910,6 +7636,7 @@ export default Object.freeze({
     FfiConverterTypeListWindowsInput,
     FfiConverterTypeListWindowsOutput,
     FfiConverterTypeMoveCursorInput,
+    FfiConverterTypeNodeBoundary,
     FfiConverterTypeParseVisualRegionsInput,
     FfiConverterTypeParseVisualRegionsOptions,
     FfiConverterTypeParseVisualRegionsOutput,
