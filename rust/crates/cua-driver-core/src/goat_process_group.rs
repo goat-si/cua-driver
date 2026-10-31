@@ -406,6 +406,10 @@ mod tests {
             .stderr(Stdio::null())
             .process_group(0);
         let pending = PreparedProcessGroup::prepare(&mut command).unwrap();
+        #[expect(
+            clippy::zombie_processes,
+            reason = "the owner-death branch never waits: it is SIGKILLed and the group sentinel ends cat"
+        )]
         let mut child = command.spawn().unwrap();
         let lifetime = pending.finish().unwrap();
         println!("OWNED={}", child.id());
@@ -413,9 +417,14 @@ mod tests {
             drop(lifetime);
             assert!(!child.wait().unwrap().success());
         } else {
-            std::io::Read::read_exact(&mut std::io::stdin(), &mut [0u8]).unwrap();
-            drop(lifetime);
-            assert!(!child.wait().unwrap().success());
+            // Owner-death case: wait to be SIGKILLed. The controller keeps
+            // stdin open and never writes, so in this test the read does not
+            // return and only the group sentinel can end cat. The fixture
+            // must not end the group itself (goat-si/cua-driver#129): should
+            // a byte ever arrive, die without unwinding, as SIGKILL would,
+            // so `lifetime` is not dropped here.
+            let _ = std::io::Read::read_exact(&mut std::io::stdin(), &mut [0u8]);
+            std::process::abort();
         }
     }
 
