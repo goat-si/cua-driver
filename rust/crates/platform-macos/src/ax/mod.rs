@@ -19,13 +19,13 @@
 mod batch_attrs;
 pub mod bindings;
 pub(crate) mod content_attrs;
-pub(crate) mod label_reader;
 pub(crate) mod context_menus;
 mod control_attrs;
 pub mod dense_rows;
 pub mod editable;
 pub mod enablement;
 pub mod exact_target;
+pub(crate) mod label_reader;
 pub mod launch;
 pub mod reveal_scroll;
 pub mod scroll_area;
