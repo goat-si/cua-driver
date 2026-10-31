@@ -1085,8 +1085,8 @@ fn set_value_blocking_with(
                 )
             }
         }
-        let secure = unsafe { copy_string_attr(element, "AXSubrole") }.as_deref()
-            == Some("AXSecureTextField");
+        let subrole = unsafe { copy_string_attr(element, "AXSubrole") };
+        let secure = is_secure_field(&role, subrole.as_deref());
         let actions = unsafe { copy_action_names(element) };
         let ctx = LadderContext {
             secure,
@@ -1363,6 +1363,10 @@ fn document_after_ladder(
     } else {
         crate::document_edit::DocumentEdited::NotADocument
     }
+}
+
+fn is_secure_field(role: &str, subrole: Option<&str>) -> bool {
+    role == "AXSecureTextField" || subrole == Some("AXSecureTextField")
 }
 
 fn text_value_role_requires_exact_focus(role: &str) -> bool {
@@ -2697,6 +2701,9 @@ mod ladder_tests {
     }
     #[test]
     fn masked_secure_value_is_not_judged_and_not_rewritten() {
+        assert!(is_secure_field("AXSecureTextField", None));
+        assert!(is_secure_field("AXTextField", Some("AXSecureTextField")));
+        assert!(!is_secure_field("AXTextField", None));
         let mut f = Fake::new(text("***"));
         let out = run(&mut f, "5", false, true);
         assert_eq!(f.writes, ["string"]);
