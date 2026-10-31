@@ -35,7 +35,7 @@ pub(crate) struct ApplicationIdentity {
 
 #[derive(Default)]
 pub(crate) struct ApplicationIdentityCache {
-    entries: Mutex<HashMap<i64, Entry>>,
+    entries: Mutex<HashMap<String, HashMap<i64, Entry>>>,
 }
 
 impl ApplicationIdentityCache {
@@ -44,12 +44,13 @@ impl ApplicationIdentityCache {
     /// never served from the cache.
     pub(crate) fn lookup(
         &self,
+        runtime_scope: &str,
         pid: i64,
         fingerprint: &ProcessFingerprint,
     ) -> Option<ApplicationIdentity> {
         fingerprint.start_time?;
         let entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
-        let entry = entries.get(&pid)?;
+        let entry = entries.get(runtime_scope)?.get(&pid)?;
         entry
             .fingerprint
             .matches(fingerprint)
@@ -64,6 +65,7 @@ impl ApplicationIdentityCache {
     /// for an instance that cannot be proven.
     pub(crate) fn store(
         &self,
+        runtime_scope: &str,
         pid: i64,
         fingerprint: &ProcessFingerprint,
         identity: ApplicationIdentity,
@@ -74,10 +76,15 @@ impl ApplicationIdentityCache {
             return;
         }
         let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
-        if entries.len() >= MAX_ENTRIES && !entries.contains_key(&pid) {
+        let count: usize = entries.values().map(HashMap::len).sum();
+        if count >= MAX_ENTRIES
+            && !entries
+                .get(runtime_scope)
+                .is_some_and(|scope| scope.contains_key(&pid))
+        {
             entries.clear();
         }
-        entries.insert(
+        entries.entry(runtime_scope.to_owned()).or_default().insert(
             pid,
             Entry {
                 fingerprint: fingerprint.clone(),
@@ -87,12 +94,18 @@ impl ApplicationIdentityCache {
         );
     }
 
-    /// Drop everything (a session ended).
-    pub(crate) fn clear(&self) {
+    /// Forget only the runtime whose namespaced session ended.
+    pub(crate) fn clear_for_session(&self, session_id: &str) {
+        let Some((scope, _)) = session_id
+            .strip_prefix("__cua_runtime_")
+            .and_then(|id| id.split_once(':'))
+        else {
+            return;
+        };
         self.entries
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .clear();
+            .remove(scope);
     }
 }
 
@@ -119,24 +132,27 @@ mod tests {
     fn an_identity_is_served_only_to_the_instance_it_was_read_for() {
         let cache = ApplicationIdentityCache::default();
         let first = fingerprint(42, Some(10));
-        assert_eq!(cache.lookup(42, &first), None);
-        cache.store(42, &first, identity("com.example.app"));
-        assert_eq!(cache.lookup(42, &first), Some(identity("com.example.app")));
+        assert_eq!(cache.lookup("scope", 42, &first), None);
+        cache.store("scope", 42, &first, identity("com.example.app"));
+        assert_eq!(
+            cache.lookup("scope", 42, &first),
+            Some(identity("com.example.app"))
+        );
         // The same pid, another start time: another process.
-        assert_eq!(cache.lookup(42, &fingerprint(42, Some(11))), None);
+        assert_eq!(cache.lookup("scope", 42, &fingerprint(42, Some(11))), None);
         // Another pid is not the cached one.
-        assert_eq!(cache.lookup(43, &fingerprint(43, Some(10))), None);
+        assert_eq!(cache.lookup("scope", 43, &fingerprint(43, Some(10))), None);
     }
 
     #[test]
     fn an_instance_without_a_proven_start_time_is_never_cached_or_served() {
         let cache = ApplicationIdentityCache::default();
         let unproven = fingerprint(42, None);
-        cache.store(42, &unproven, identity("com.example.app"));
-        assert_eq!(cache.lookup(42, &unproven), None);
+        cache.store("scope", 42, &unproven, identity("com.example.app"));
+        assert_eq!(cache.lookup("scope", 42, &unproven), None);
         let proven = fingerprint(42, Some(10));
-        cache.store(42, &proven, identity("com.example.app"));
-        assert_eq!(cache.lookup(42, &unproven), None);
+        cache.store("scope", 42, &proven, identity("com.example.app"));
+        assert_eq!(cache.lookup("scope", 42, &unproven), None);
     }
 
     #[test]
@@ -144,6 +160,7 @@ mod tests {
         let cache = ApplicationIdentityCache::default();
         let proven = fingerprint(42, Some(10));
         cache.store(
+            "scope",
             42,
             &proven,
             ApplicationIdentity {
@@ -151,15 +168,34 @@ mod tests {
                 launch_path: None,
             },
         );
-        assert_eq!(cache.lookup(42, &proven), None);
+        assert_eq!(cache.lookup("scope", 42, &proven), None);
     }
 
     #[test]
     fn clearing_forgets_every_pid() {
         let cache = ApplicationIdentityCache::default();
         let proven = fingerprint(42, Some(10));
-        cache.store(42, &proven, identity("com.example.app"));
-        cache.clear();
-        assert_eq!(cache.lookup(42, &proven), None);
+        cache.store("scope", 42, &proven, identity("com.example.app"));
+        cache.clear_for_session("__cua_runtime_scope:session");
+        assert_eq!(cache.lookup("scope", 42, &proven), None);
+    }
+
+    #[test]
+    fn ending_one_runtime_does_not_clear_another_in_the_same_cache() {
+        let cache = ApplicationIdentityCache::default();
+        let proven = fingerprint(42, Some(10));
+        cache.store("first", 42, &proven, identity("com.example.first"));
+        cache.store("second", 42, &proven, identity("com.example.second"));
+        cache.clear_for_session("unrelated-session");
+        assert_eq!(
+            cache.lookup("first", 42, &proven),
+            Some(identity("com.example.first"))
+        );
+        cache.clear_for_session("__cua_runtime_second:session");
+        assert_eq!(
+            cache.lookup("first", 42, &proven),
+            Some(identity("com.example.first"))
+        );
+        assert_eq!(cache.lookup("second", 42, &proven), None);
     }
 }

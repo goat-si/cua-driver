@@ -1267,7 +1267,7 @@ impl ToolRegistry {
         let session_end_hook =
             crate::session::register_scoped_session_end_hook(move |session_id| {
                 if let Some(identities) = weak_identities.upgrade() {
-                    identities.clear();
+                    identities.clear_for_session(session_id);
                 }
                 crate::agent_cursor::forget_input_origin(session_id);
                 if let Some(ownership) = weak_ownership.upgrade() {
@@ -1375,7 +1375,12 @@ impl ToolRegistry {
         serde_json::from_value(scope.get("fingerprint")?.clone()).ok()
     }
 
-    async fn enrich_application_resource(&self, resource: &mut Value, pid: i64) {
+    async fn enrich_application_resource(
+        &self,
+        resource: &mut Value,
+        pid: i64,
+        runtime_scope: &str,
+    ) {
         let fingerprint = self.attest_process_fingerprint(pid).await;
         if let Some(fingerprint) = &fingerprint {
             resource["fingerprint"] = serde_json::to_value(fingerprint).unwrap_or(Value::Null);
@@ -1383,10 +1388,10 @@ impl ToolRegistry {
         // The bundle id and launch path of this process instance: served from
         // the cache while the live fingerprint proves it is the same instance,
         // read from the app list otherwise.
-        if let Some(cached) = fingerprint
-            .as_ref()
-            .and_then(|fingerprint| self.application_identities.lookup(pid, fingerprint))
-        {
+        if let Some(cached) = fingerprint.as_ref().and_then(|fingerprint| {
+            self.application_identities
+                .lookup(runtime_scope, pid, fingerprint)
+        }) {
             for (key, value) in [
                 ("bundle_id", cached.bundle_id),
                 ("launch_path", cached.launch_path),
@@ -1421,6 +1426,7 @@ impl ToolRegistry {
         if let Some(fingerprint) = &fingerprint {
             let read = |key: &str| app.get(key).filter(|value| !value.is_null()).cloned();
             self.application_identities.store(
+                runtime_scope,
                 pid,
                 fingerprint,
                 crate::application_identity::ApplicationIdentity {
@@ -2933,7 +2939,8 @@ impl ToolRegistry {
         }
         if context.capability_manifest().is_some() {
             if let Some(pid) = resource.get("pid").and_then(Value::as_i64) {
-                self.enrich_application_resource(&mut resource, pid).await;
+                self.enrich_application_resource(&mut resource, pid, &context.runtime_scope_key())
+                    .await;
             }
         }
         let validate_external_panel = tool_name == "get_window_state"
@@ -3050,7 +3057,8 @@ impl ToolRegistry {
         }
         if context.capability_manifest().is_some() {
             if let Some(pid) = resource.get("pid").and_then(Value::as_i64) {
-                self.enrich_application_resource(&mut resource, pid).await;
+                self.enrich_application_resource(&mut resource, pid, &context.runtime_scope_key())
+                    .await;
             }
         }
         self.protected_resource_grants
@@ -5496,6 +5504,42 @@ allow:
             1,
             "one app-list lookup for three calls on the same process"
         );
+    }
+
+    #[tokio::test]
+    async fn ending_another_runtime_session_does_not_clear_this_runtime_identity() {
+        let first = app_identity_fixture();
+        let first_context = manifest_context(PermissionMode::Bounded, APP_MANIFEST);
+        let second = app_identity_fixture();
+        let second_context = manifest_context(PermissionMode::Bounded, APP_MANIFEST);
+
+        assert!(click_once(&first, &first_context).await);
+        let args = serde_json::json!({
+            "pid": 42, "window_id": 7, "x": 10, "y": 20,
+            "delivery_mode": "background", "session": "ending-session",
+        });
+        let result = second
+            .registry
+            .invoke_with_context("click", args.clone(), second_context.clone())
+            .await;
+        assert_ne!(result.is_error, Some(true));
+        assert_eq!(first.lookups.load(Ordering::SeqCst), 1);
+        assert!(crate::session::fire_session_end(
+            &second_context.runtime_session_key("ending-session")
+        ));
+        assert!(click_once(&first, &first_context).await);
+        assert_eq!(first.lookups.load(Ordering::SeqCst), 1);
+
+        let result = first
+            .registry
+            .invoke_with_context("click", args, first_context.clone())
+            .await;
+        assert_ne!(result.is_error, Some(true));
+        assert!(crate::session::fire_session_end(
+            &first_context.runtime_session_key("ending-session")
+        ));
+        assert!(click_once(&first, &first_context).await);
+        assert_eq!(first.lookups.load(Ordering::SeqCst), 2);
     }
 
     /// The decision is the same with or without the cache: an app the
