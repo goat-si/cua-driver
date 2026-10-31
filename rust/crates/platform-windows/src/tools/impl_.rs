@@ -3534,11 +3534,11 @@ async fn basis_click(state: &ToolState, tool: &str, args: &Value) -> Option<Tool
             )),
             Transport::Unavailable => unreachable!(),
         };
-        (result, snapshot_id)
+        (result, snapshot_id, mode)
     })
     .await;
     Some(match sent {
-        Ok((Ok(result), snapshot_id)) => {
+        Ok((Ok(result), snapshot_id, mode)) => {
             let error = matches!(&result, GuardedResult::Refused { .. })
                 || match &result {
                     GuardedResult::Sent { outcome } => {
@@ -3546,7 +3546,7 @@ async fn basis_click(state: &ToolState, tool: &str, args: &Value) -> Option<Tool
                     }
                     _ => true,
                 };
-            let value = basis_click::result_json(&result, &snapshot_id, (sx, sy));
+            let value = basis_click::result_json(&result, &snapshot_id, (sx, sy), mode);
             if error {
                 ToolResult::error("Basis click was refused or delivery could not be completed.")
                     .with_structured(value)
@@ -3554,7 +3554,7 @@ async fn basis_click(state: &ToolState, tool: &str, args: &Value) -> Option<Tool
                 ToolResult::text("Basis click sent.").with_structured(value)
             }
         }
-        Ok((Err(error), _)) => ToolResult::error(error.to_string()).with_structured(
+        Ok((Err(error), _, _)) => ToolResult::error(error.to_string()).with_structured(
             json!({"code":"dispatch_failed","effect":"refused","nothing_sent":true}),
         ),
         Err(error) => ToolResult::error(error.to_string())

@@ -494,7 +494,7 @@ impl ActionExecutionRecord {
             .get("path")
             .or_else(|| structured.get("route"))
             .and_then(serde_json::Value::as_str);
-        let transport = transport_from_legacy(tool_name, args, raw_path)?;
+        let transport = transport_from_legacy(tool_name, args, structured, raw_path)?;
         let effect = legacy_effect(structured);
         let actual_delivery =
             actual_delivery_from_legacy(tool_name, args, structured, raw_path, transport, effect);
@@ -504,6 +504,11 @@ impl ActionExecutionRecord {
         record.delivered_count = structured
             .get("delivered_chars")
             .or_else(|| structured.pointer("/refusal/detail/delivered_chars"))
+            .or_else(|| {
+                (raw_path == Some("pixel_basis"))
+                    .then(|| structured.get("events_sent"))
+                    .flatten()
+            })
             .and_then(serde_json::Value::as_u64)
             .and_then(|count| u32::try_from(count).ok());
 
@@ -761,10 +766,20 @@ fn legacy_has_publishable_readback(tool_name: &str, structured: &serde_json::Val
 fn transport_from_legacy(
     tool_name: &str,
     args: &serde_json::Value,
+    structured: &serde_json::Value,
     raw_path: Option<&str>,
 ) -> Option<ActionTransport> {
     let path = raw_path.unwrap_or("");
     let transport = match path {
+        "pixel_basis" if cfg!(target_os = "windows") => match structured
+            .get("delivery_mode")
+            .and_then(serde_json::Value::as_str)
+        {
+            Some("foreground") => ActionTransport::WindowsSendInput,
+            Some("background") => ActionTransport::WindowsPostMessage,
+            _ => return None,
+        },
+        "pixel_basis" => return None,
         "ax" | "ax_fg" => {
             if cfg!(target_os = "macos") {
                 if matches!(tool_name, "type_text" | "type_text_chars" | "set_value") {
@@ -2061,6 +2076,52 @@ mod tests {
         )
         .expect("an explicit delivered count should normalize");
         assert_eq!(record.delivered_count, Some(2));
+    }
+
+    #[test]
+    #[cfg(target_os = "windows")]
+    fn pixel_basis_results_normalize_using_actual_transport() {
+        for (effect, mode, expected_effect, transport, delivery) in [
+            (
+                "refused",
+                "foreground",
+                ActionEffect::Refused,
+                ActionTransport::WindowsSendInput,
+                None,
+            ),
+            (
+                "unverifiable",
+                "background",
+                ActionEffect::Unverifiable,
+                ActionTransport::WindowsPostMessage,
+                Some(ActualDelivery::Background),
+            ),
+            (
+                "partial",
+                "foreground",
+                ActionEffect::Partial,
+                ActionTransport::WindowsSendInput,
+                Some(ActualDelivery::Foreground),
+            ),
+            (
+                "uncertain",
+                "background",
+                ActionEffect::Unverifiable,
+                ActionTransport::WindowsPostMessage,
+                Some(ActualDelivery::Background),
+            ),
+        ] {
+            let record = ActionExecutionRecord::from_legacy("click", &serde_json::json!({"delivery_mode":"foreground"}), &serde_json::json!({"path":"pixel_basis", "effect":effect, "nothing_sent":effect == "refused", "code":"stale_basis", "events_sent":if effect == "refused" {0} else {2}, "delivery_mode":mode})).unwrap();
+            assert_eq!(record.effect, expected_effect);
+            assert_eq!(record.transport, transport);
+            assert_eq!(record.actual_delivery, delivery);
+        }
+    }
+
+    #[test]
+    #[cfg(not(target_os = "windows"))]
+    fn pixel_basis_is_not_normalized_on_other_platforms() {
+        assert!(ActionExecutionRecord::from_legacy("click", &serde_json::json!({}), &serde_json::json!({"path":"pixel_basis","effect":"refused","delivery_mode":"foreground"})).is_none());
     }
 
     #[test]
