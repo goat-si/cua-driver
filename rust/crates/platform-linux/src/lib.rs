@@ -21,6 +21,8 @@
 use cua_driver_core::tool::ToolRegistry;
 
 pub mod basis_eligibility;
+#[cfg(test)]
+mod basis_events;
 pub mod health_report;
 pub mod overlay;
 pub mod overlay_capture;
