@@ -89,6 +89,34 @@ fn replacement_invalidates_every_old_member_and_admits_new_members() {
 }
 
 #[test]
+fn capture_removal_retires_element_tokens() {
+    let cache = SnapshotStore::new();
+    let old = cache.publish(42, 7, payload(vec![1]));
+    assert_eq!(resolve(&cache, old, 0), Ok((7, 0, 1)));
+    let ticket = cache.begin_capture(42, 7);
+    assert_eq!(cache.remove_for_capture(42, 7, ticket), Some(old));
+    assert_eq!(
+        resolve(&cache, old, 0),
+        Err("stale_element_token".to_owned())
+    );
+    cache
+        .publish_capture_basis_for_session(
+            42,
+            7,
+            payload(Vec::<usize>::new()),
+            None,
+            Some(1.0),
+            None,
+            ticket,
+        )
+        .unwrap();
+    assert_eq!(
+        resolve(&cache, old, 0),
+        Err("stale_element_token".to_owned())
+    );
+}
+
+#[test]
 fn resolving_does_not_change_publication_order_eviction() {
     let cache = SnapshotStore::new();
     let mut ids: Vec<_> = (1..=LRU_CAP_PER_PID as u64)
