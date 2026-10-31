@@ -123,7 +123,7 @@ pub(super) fn read_with<R: ContentReader>(
     let placeholder = text(1);
     let value = if secure {
         Some(REDACTED_VALUE.to_owned())
-    } else if allowed {
+    } else if allowed && !value_failed {
         value_with_placeholder(copied_value.as_ref(), || placeholder.clone())
     } else {
         None
@@ -140,7 +140,7 @@ pub(super) fn read_with<R: ContentReader>(
     } else {
         LabelSlot::Absent
     };
-    let read_failed = (!secure && !allowed)
+    let read_failed = (!secure && (!allowed || value_failed))
         || label_hidden(&[
             label_status(0),
             label_status(2),
@@ -479,6 +479,7 @@ mod tests {
         reject_batch: bool,
         expire_on_classification: bool,
         expired: bool,
+        fail_value: bool,
     }
     impl FakeReader {
         fn new() -> Self {
@@ -488,6 +489,7 @@ mod tests {
                 reject_batch: false,
                 expire_on_classification: false,
                 expired: false,
+                fail_value: false,
             }
         }
     }
@@ -509,6 +511,9 @@ mod tests {
         }
         fn value(&mut self) -> Result<Option<StringishAttrValue>, AXError> {
             self.trace.push("AXValue".into());
+            if self.fail_value {
+                return Err(kAXErrorCannotComplete);
+            }
             Ok(Some(StringishAttrValue {
                 string_value: Some("value".into()),
                 state_value: "value".into(),
@@ -613,6 +618,23 @@ mod tests {
         .unwrap();
         assert_eq!(result.value.as_deref(), Some("value"));
         assert!(!result.read_failed);
+    }
+
+    #[test]
+    fn a_failed_value_read_marks_a_named_node_incomplete() {
+        let mut reader = FakeReader::new();
+        reader.attrs[0] = AttrStatus::Known("Named field".into());
+        reader.attrs[1] = AttrStatus::Known("Placeholder".into());
+        reader.fail_value = true;
+        let attrs = read_with(
+            AttrStatus::Known("AXTextField".into()),
+            &mut reader,
+            &mut false,
+        )
+        .unwrap();
+        assert!(attrs.read_failed);
+        assert!(attrs.value_unknown);
+        assert_eq!(attrs.value, None);
     }
 
     #[test]
