@@ -3432,6 +3432,34 @@ fn background_element_click_result(
         .with_action_record(record)
 }
 
+fn mutation_refusal(
+    message: String,
+    transport: ActionTransport,
+    requested: cua_driver_core::action_record::RequestedDelivery,
+) -> ToolResult {
+    use cua_driver_core::action_record::{ActionEffect, ActionExecutionRecord};
+    ToolResult::error(message).with_action_record(ActionExecutionRecord::new(
+        ActionEffect::Refused,
+        transport,
+        requested,
+    ))
+}
+
+fn mutation_uncertain(
+    message: String,
+    path: &str,
+    transport: ActionTransport,
+    requested: cua_driver_core::action_record::RequestedDelivery,
+    actual: cua_driver_core::action_record::ActualDelivery,
+) -> ToolResult {
+    use cua_driver_core::action_record::{ActionEffect, ActionExecutionRecord};
+    let mut record = ActionExecutionRecord::new(ActionEffect::Unverifiable, transport, requested);
+    record.actual_delivery = Some(actual);
+    ToolResult::text(message)
+        .with_structured(json!({"path":path, "verified":false, "effect":"unverifiable"}))
+        .with_action_record(record)
+}
+
 /// Read a UIA pattern, telling "the element has no such pattern" apart from
 /// "the read failed". Only the first may let a caller try another rung.
 fn acquire_uia_pattern<T: windows::core::Interface>(
@@ -4126,53 +4154,75 @@ impl Tool for ClickTool {
             // WPF/WinUI menus and tree nodes whose visual click target is
             // transient or scroll-adjusted.
             if action_req.as_deref() == Some("expand") {
-                let expand = tokio::task::spawn_blocking({
-                    let admitted = admitted.clone();
-                    move || -> anyhow::Result<()> {
-                        let _admission = &admitted;
-                        use windows::core::Interface;
-                        use windows::Win32::UI::Accessibility::{
-                            IUIAutomationElement, IUIAutomationExpandCollapsePattern,
-                            UIA_ExpandCollapsePatternId,
-                        };
-
-                        let retained = admitted.as_ref().ok_or_else(|| {
-                            anyhow::anyhow!("element [{idx}] is not in the UIA cache")
-                        })?;
-                        if !retained.is_uia() {
-                            anyhow::bail!("element [{idx}] is not a UIA element");
-                        }
-                        let element = std::mem::ManuallyDrop::new(unsafe {
-                            IUIAutomationElement::from_raw(retained.as_ptr() as *mut _)
-                        });
-                        let pattern = unsafe {
-                            element
-                                .GetCurrentPattern(UIA_ExpandCollapsePatternId)
-                                .and_then(|value| {
-                                    value.cast::<IUIAutomationExpandCollapsePattern>()
-                                })
-                        }
-                        .map_err(|error| {
-                            anyhow::anyhow!("ExpandCollapsePattern unavailable: {error}")
-                        })?;
-                        let result =
-                            crate::uia::fg_bypass::run_with_uwp_bypass(hwnd as isize, || unsafe {
-                                pattern.Expand()
+                use crate::uia_mutation::{
+                    classify_write_hresult, refusal_text, uncertain_text, RefusalKind, RungOutcome,
+                    WriteVerdict,
+                };
+                let expand =
+                    tokio::task::spawn_blocking({
+                        let admitted = admitted.clone();
+                        move || -> Result<RungOutcome, String> {
+                            let retained = admitted.as_ref().ok_or_else(|| {
+                                format!("element [{idx}] is not in the UIA cache")
+                            })?;
+                            if !retained.is_uia() {
+                                return Err(format!("element [{idx}] is not a UIA element"));
+                            }
+                            use windows::core::Interface;
+                            use windows::Win32::UI::Accessibility::{
+                                IUIAutomationElement, IUIAutomationExpandCollapsePattern,
+                                UIA_ExpandCollapsePatternId,
+                            };
+                            let element = std::mem::ManuallyDrop::new(unsafe {
+                                IUIAutomationElement::from_raw(retained.as_ptr() as *mut _)
                             });
-                        std::mem::forget(element);
-                        result.map_err(|error| {
-                            anyhow::anyhow!("ExpandCollapse.Expand failed: {error}")
-                        })
-                    }
-                })
-                .await;
+                            let pattern = match acquire_uia_pattern::<
+                                IUIAutomationExpandCollapsePattern,
+                            >(
+                                &element, UIA_ExpandCollapsePatternId
+                            ) {
+                                Ok(Some(pattern)) => pattern,
+                                Ok(None) => return Ok(RungOutcome::Absent),
+                                Err(hr) => return Ok(RungOutcome::AcquireFailed(hr)),
+                            };
+                            let result = crate::uia::fg_bypass::run_with_uwp_bypass(
+                                hwnd as isize,
+                                || unsafe { pattern.Expand() },
+                            );
+                            Ok(RungOutcome::Called(
+                                result.map_or_else(|error| error.code().0, |()| 0),
+                            ))
+                        }
+                    })
+                    .await;
+                use cua_driver_core::action_record::{ActualDelivery, RequestedDelivery};
+                let (requested, actual) = if delivery == DeliveryMode::Foreground {
+                    (RequestedDelivery::Foreground, ActualDelivery::Foreground)
+                } else {
+                    (RequestedDelivery::Background, ActualDelivery::Background)
+                };
+                let uncertain = |message: String| {
+                    mutation_uncertain(
+                        message,
+                        "uia_expand_collapse",
+                        ActionTransport::WindowsUiaExpandCollapse,
+                        requested,
+                        actual,
+                    )
+                };
                 return match expand {
-                    Ok(Ok(())) => ToolResult::text(format!(
-                        "✅ Expanded UIA element [{idx}] via ExpandCollapsePattern."
-                    ))
-                    .with_structured(json!({ "path": "uia_expand_collapse", "verified": false, "effect": "unverifiable" })),
-                    Ok(Err(error)) => ToolResult::error(error.to_string()),
-                    Err(error) => ToolResult::error(format!("Task error: {error}")),
+                    Ok(Ok(RungOutcome::Called(0))) => ToolResult::text(format!("✅ Expanded UIA element [{idx}] via ExpandCollapsePattern."))
+                        .with_structured(json!({ "path": "uia_expand_collapse", "verified": false, "effect": "unverifiable" })),
+                    Ok(Ok(RungOutcome::Absent)) => ToolResult::error("ExpandCollapsePattern unavailable"),
+                    Ok(Ok(RungOutcome::AcquireFailed(hr))) => mutation_refusal(refusal_text(RefusalKind::PatternUnreadable, hr), ActionTransport::WindowsUiaExpandCollapse, requested),
+                    Ok(Ok(RungOutcome::Called(hr))) => match classify_write_hresult(hr) {
+                        WriteVerdict::Refused(kind) => mutation_refusal(refusal_text(kind, hr), ActionTransport::WindowsUiaExpandCollapse, requested),
+                        WriteVerdict::Uncertain(kind) => uncertain(format!("ExpandCollapse.Expand on [{idx}]: {}", uncertain_text(kind, hr))),
+                        WriteVerdict::AffordanceAbsent => ToolResult::error("ExpandCollapsePattern unavailable"),
+                        WriteVerdict::Delivered => unreachable!(),
+                    },
+                    Ok(Err(error)) => ToolResult::error(error),
+                    Err(error) => uncertain(format!("Expand worker failed: {error}; it may have expanded. Read the state before acting again.")),
                 };
             }
 
@@ -6484,8 +6534,18 @@ impl Tool for HotkeyTool {
                      UIA actions, then use an exposed accelerator or `click` the matching \
                      element directly."
                 )),
-                Ok(Err(e)) => ToolResult::error(format!("hotkey (UIA path): {e}")),
-                Err(e) => ToolResult::error(format!("Task error: {e}")),
+                Ok(Err(e)) => {
+                    use crate::uia_mutation::{refusal_text, uncertain_text, WriteVerdict};
+                    match e.downcast_ref::<crate::uia::windows_enum::AcceleratorStop>() {
+                        Some(stop) => match stop.verdict {
+                            WriteVerdict::Refused(kind) => ToolResult::error(refusal_text(kind, stop.hresult)),
+                            WriteVerdict::Uncertain(kind) => ToolResult::text(format!("{} The shortcut may have been delivered.", uncertain_text(kind, stop.hresult))).with_structured(json!({"path":"uia", "verified":false, "effect":"unverifiable"})),
+                            _ => ToolResult::error(format!("hotkey (UIA path): {e}")),
+                        },
+                        None => ToolResult::error(format!("hotkey (UIA path): {e}")),
+                    }
+                },
+                Err(e) => ToolResult::text(format!("Task error: {e}; the shortcut may have been delivered. Read the window state before acting again.")).with_structured(json!({"path":"uia", "verified":false, "effect":"unverifiable"})),
             };
         }
 
@@ -7144,12 +7204,14 @@ impl Tool for ScrollTool {
                 let admitted = admitted.clone();
                 move || {
                     let _admission = &admitted;
-                    let retained = admitted.as_ref().ok_or_else(|| {
-                        anyhow::anyhow!("element [{idx}] is not in the UIA cache")
-                    })?;
-                    if !retained.is_uia() {
-                        anyhow::bail!("element [{idx}] is not a UIA scroll element");
-                    }
+                    let Some(retained) = admitted.as_ref().filter(|element| element.is_uia())
+                    else {
+                        return Ok(crate::uia::scroll::ScrollWrite {
+                            completed: 0,
+                            requested: amount.max(1),
+                            stop: Some(crate::uia_mutation::MutationStop::Absent),
+                        });
+                    };
                     unsafe {
                         crate::uia::scroll::scroll_element(
                             retained.as_ptr(),
@@ -7160,7 +7222,28 @@ impl Tool for ScrollTool {
                 }
             })
             .await;
-            if matches!(uia_result, Ok(Ok(()))) {
+            use crate::uia_mutation::{scroll_route, MutationRoute, MutationStop};
+            use cua_driver_core::action_record::{ActualDelivery, RequestedDelivery};
+            let (requested_delivery, actual_delivery) = if delivery == DeliveryMode::Foreground {
+                (RequestedDelivery::Foreground, ActualDelivery::Foreground)
+            } else {
+                (RequestedDelivery::Background, ActualDelivery::Background)
+            };
+            let uia_result = match uia_result {
+                Ok(Ok(result)) => result,
+                Ok(Err(error)) => return ToolResult::error(error.to_string()),
+                Err(error) => {
+                    match scroll_route(0, Some(MutationStop::WorkerFailed)) {
+                        MutationRoute::Uncertain => return mutation_uncertain(format!("UIA scroll worker failed: {error}; accepted step count is unknown, and the scroll may have landed. Read the window state before acting again."), "uia", ActionTransport::WindowsUiaScroll, requested_delivery, actual_delivery),
+                        _ => unreachable!("worker failure must be uncertain"),
+                    }
+                }
+            };
+            match scroll_route(uia_result.completed, uia_result.stop) {
+                MutationRoute::FallThrough => {},
+                MutationRoute::Refused => return mutation_refusal(format!("UIA scroll was refused ({:?}); nothing was sent. Read the window state before retrying.", uia_result.stop), ActionTransport::WindowsUiaScroll, requested_delivery),
+                MutationRoute::Partial | MutationRoute::Uncertain => return mutation_uncertain(format!("UIA accepted {} of {} scroll steps; a further step may have landed. No other scroll input was sent. Read the window state before acting again.", uia_result.completed, uia_result.requested), "uia", ActionTransport::WindowsUiaScroll, requested_delivery, actual_delivery),
+                MutationRoute::Done => {
                 if delivery == DeliveryMode::Background {
                     // Keep WS_EX_NOACTIVATE armed through any WebView handler
                     // queued by the UIA operation.
@@ -7195,6 +7278,7 @@ impl Tool for ScrollTool {
                     "verified": false,
                     "delivery_mode": "background"
                 }));
+                }
             }
         }
 
@@ -7441,50 +7525,61 @@ async fn chromium_click_short_circuit(
 /// already relies on for single-click. Runs blocking COM, so call inside
 /// `spawn_blocking`. Returns `Some(Ok)` on success, `Some(Err)` if Invoke
 /// failed, `None` if the element isn't cached or has no InvokePattern.
+struct MultiInvoke {
+    delivered: usize,
+    requested: usize,
+    stop: Option<crate::uia_mutation::MutationStop>,
+}
+
 fn winui3_uia_multi_invoke(
     admitted: &Option<crate::uia::snapshot::RetainedElement>,
     hwnd: u64,
     count: usize,
-) -> Option<anyhow::Result<()>> {
-    let guard = admitted.as_ref().filter(|element| element.is_uia())?;
-    let ptr = guard.as_ptr();
+) -> Result<Option<MultiInvoke>, String> {
+    use crate::uia_mutation::MutationStop;
+    let Some(guard) = admitted.as_ref().filter(|element| element.is_uia()) else {
+        return Ok(None);
+    };
     use windows::core::Interface;
     use windows::Win32::UI::Accessibility::{
         IUIAutomationElement, IUIAutomationInvokePattern, UIA_InvokePatternId,
     };
-    // Hold the frame non-activatable so the XAML Invoke handler's
-    // SetFocus()→SetForegroundWindow(self) is refused for the whole burst.
-    let _noact = match crate::input::NoActivateGuard::arm(windows::Win32::Foundation::HWND(
-        hwnd as *mut _,
-    )) {
-        Ok(guard) => guard,
-        Err(error) => return Some(Err(error)),
+    let _noact =
+        crate::input::NoActivateGuard::arm(windows::Win32::Foundation::HWND(hwnd as *mut _))
+            .map_err(|error| error.to_string())?;
+    let elem = std::mem::ManuallyDrop::new(unsafe {
+        IUIAutomationElement::from_raw(guard.as_ptr() as *mut _)
+    });
+    let requested = count.max(2);
+    let mut result = MultiInvoke {
+        delivered: 0,
+        requested,
+        stop: None,
     };
-    let elem: IUIAutomationElement = unsafe { IUIAutomationElement::from_raw(ptr as *mut _) };
-    let outcome: Option<anyhow::Result<()>> = (|| {
-        let pattern = unsafe { elem.GetCurrentPattern(UIA_InvokePatternId) }.ok()?;
-        let inv = pattern.cast::<IUIAutomationInvokePattern>().ok()?;
-        let n = count.max(2);
-        let mut res = Ok(());
-        for i in 0..n {
-            let r = crate::uia::fg_bypass::run_with_uwp_bypass(hwnd as isize, || unsafe {
-                inv.Invoke()
-            });
-            if let Err(e) = r {
-                res = Err(anyhow::anyhow!("UIA Invoke #{i}: {e}"));
-                break;
-            }
-            if i + 1 < n {
-                std::thread::sleep(std::time::Duration::from_millis(40));
-            }
+    let inv = match acquire_uia_pattern::<IUIAutomationInvokePattern>(&elem, UIA_InvokePatternId) {
+        Ok(Some(inv)) => inv,
+        Ok(None) => {
+            result.stop = Some(MutationStop::Absent);
+            return Ok(Some(result));
         }
-        Some(res)
-    })();
-    // The cache owns this element's ref (AddRef'd under the cache lock by
-    // get_element_retained); `from_raw` took ownership without AddRef, so forget
-    // it to avoid double-releasing the cache's ref.
-    std::mem::forget(elem);
-    outcome
+        Err(hr) => {
+            result.stop = Some(MutationStop::AcquireFailed(hr));
+            return Ok(Some(result));
+        }
+    };
+    for i in 0..requested {
+        let call =
+            crate::uia::fg_bypass::run_with_uwp_bypass(hwnd as isize, || unsafe { inv.Invoke() });
+        if let Err(error) = call {
+            result.stop = Some(MutationStop::Write(error.code().0));
+            break;
+        }
+        result.delivered += 1;
+        if i + 1 < requested {
+            std::thread::sleep(std::time::Duration::from_millis(40));
+        }
+    }
+    Ok(Some(result))
 }
 
 /// WinUI3 background gesture resolution, shared by click / double_click /
@@ -7533,14 +7628,21 @@ async fn winui3_background_gesture(
                     winui3_uia_multi_invoke(&admitted, hwnd, count)
                 }
             })
-            .await
-            .ok()
-            .flatten();
-            if let Some(Ok(())) = uia {
-                return Some(ToolResult::text(format!(
-                    "✅ Double-invoked WinUI3 element [{idx}] x{count} via UIA \
-                     (pid {pid}, background, no foreground swap)."
-                )));
+            .await;
+            use crate::uia_mutation::{multi_invoke_route, MutationRoute};
+            match uia {
+                Ok(Ok(Some(result))) => match multi_invoke_route(result.delivered, result.stop) {
+                    MutationRoute::Done => return Some(ToolResult::text(format!(
+                        "✅ Double-invoked WinUI3 element [{idx}] x{count} via UIA \
+                         (pid {pid}, background, no foreground swap)."
+                    ))),
+                    MutationRoute::FallThrough => {},
+                    MutationRoute::Refused => return Some(ToolResult::error(format!("UIA Invoke was refused ({:?}); nothing was sent. Read the window state before retrying.", result.stop))),
+                    MutationRoute::Partial | MutationRoute::Uncertain => return Some(ToolResult::text(format!("Double-click accepted {} of {} UIA invokes; the next may have landed. Read the window state before acting again.", result.delivered, result.requested)).with_structured(json!({"path":"uia", "verified":false, "effect":"unverifiable"}))),
+                },
+                Ok(Ok(None)) => {},
+                Ok(Err(error)) => return Some(ToolResult::error(error)),
+                Err(error) => return Some(ToolResult::text(format!("UIA Invoke worker failed: {error}; the double-click may have landed. Read the window state before acting again.")).with_structured(json!({"path":"uia", "verified":false, "effect":"unverifiable"}))),
             }
         }
     }
@@ -9955,10 +10057,32 @@ fn normalized_menu_path(path: Vec<String>) -> Result<Vec<String>, String> {
 }
 
 fn menu_refusal(message: String) -> ToolResult {
-    ToolResult::error(message.clone()).with_structured(json!({
+    mutation_refusal(
+        message.clone(),
+        ActionTransport::WindowsUiaInvoke,
+        cua_driver_core::action_record::RequestedDelivery::Foreground,
+    )
+    .with_structured(json!({
         "status": "refused",
         "refusal": { "code": "menu_path_unavailable", "message": message }
     }))
+}
+
+fn menu_uncertain(message: String, transport: ActionTransport) -> ToolResult {
+    use cua_driver_core::action_record::{
+        ActionEffect, ActionExecutionRecord, ActualDelivery, RequestedDelivery,
+    };
+    let record = ActionExecutionRecord::builder(
+        ActionEffect::Unverifiable,
+        transport,
+        RequestedDelivery::Foreground,
+    )
+    .actual_delivery(ActualDelivery::Foreground)
+    .build()
+    .expect("menu uncertainty record is valid");
+    ToolResult::text(message)
+        .with_structured(json!({"status":"unverifiable", "effect":"unverifiable"}))
+        .with_action_record(record)
 }
 
 /// Activate a window for a visible native-menu operation. Windows may reject
@@ -10031,7 +10155,12 @@ impl Tool for InvokeMenuTool {
             let prior = unsafe { GetForegroundWindow() };
             let needs_activation = prior != hwnd;
             let used_activation_retry = if needs_activation {
-                activate_window_for_menu(hwnd)?
+                activate_window_for_menu(hwnd).map_err(|message| crate::uia::MenuPathError {
+                    message,
+                    completed_hops: 0,
+                    failure: crate::uia_mutation::MenuFailure::Refused,
+                    transport: ActionTransport::WindowsUiaInvoke,
+                })?
             } else {
                 false
             };
@@ -10070,8 +10199,15 @@ impl Tool for InvokeMenuTool {
                 .build()
                 .expect("invoke_menu record is valid"),
             ),
-            Ok(Err(error)) => menu_refusal(error),
-            Err(error) => menu_refusal(format!("invoke_menu: blocking task failed: {error}")),
+            Ok(Err(error)) => {
+                use crate::uia_mutation::{menu_outcome, MenuResult};
+                match menu_outcome(error.completed_hops, Some(error.failure)) {
+                    MenuResult::Refused => menu_refusal(error.message),
+                    MenuResult::Partial { completed_hops } | MenuResult::Uncertain { completed_hops } => menu_uncertain(format!("{}; {completed_hops} menu hop(s) accepted; the menu's semantic effect is unconfirmed. Read the window state before acting again.", error.message), error.transport),
+                    MenuResult::Done => unreachable!(),
+                }
+            },
+            Err(error) => menu_uncertain(format!("invoke_menu: blocking task failed: {error}; accepted hop count is unknown; the menu's semantic effect is unconfirmed. Read the window state before acting again."), ActionTransport::WindowsUiaInvoke),
         }
     }
 }
@@ -11217,3 +11353,6 @@ mod pid_window_target_tests;
 mod display_only_tests;
 #[cfg(test)]
 mod value_write_readback_tests;
+
+#[cfg(test)]
+mod w2b_action_record_tests;
