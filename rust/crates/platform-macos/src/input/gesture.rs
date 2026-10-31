@@ -91,27 +91,41 @@ impl std::fmt::Display for GestureFailure {
 }
 impl std::error::Error for GestureFailure {}
 
-struct ButtonGuard<E> {
+struct Reserved<E> {
     release: E,
+    step: Step,
+}
+
+type SharedIo<'a, I> = std::rc::Rc<std::cell::RefCell<&'a mut I>>;
+
+struct ButtonGuard<'a, I: GestureIo> {
+    io: SharedIo<'a, I>,
+    release: I::Event,
     step: Step,
     armed: bool,
 }
 
-impl<E> ButtonGuard<E> {
-    fn release_now<I: GestureIo<Event = E>>(&mut self, io: &mut I) -> ReleaseReceipt {
+impl<I: GestureIo> ButtonGuard<'_, I> {
+    fn release_now(&mut self) -> ReleaseReceipt {
         if !self.armed {
             return ReleaseReceipt::NotArmed;
         }
         self.armed = false;
+        let mut io = self.io.borrow_mut();
         io.stamp(&mut self.release, &self.step);
         io.post(&self.release, &self.step);
         ReleaseReceipt::HandedToTransport
     }
 }
+impl<I: GestureIo> Drop for ButtonGuard<'_, I> {
+    fn drop(&mut self) {
+        self.release_now();
+    }
+}
 
 pub(super) struct Prepared<E> {
-    primer: Option<ButtonGuard<E>>,
-    button: ButtonGuard<E>,
+    primer: Option<Reserved<E>>,
+    button: Reserved<E>,
 }
 
 fn empty_failure(error: impl std::fmt::Display) -> GestureFailure {
@@ -127,13 +141,9 @@ pub(super) fn prepare_gesture<I: GestureIo>(
     io: &mut I,
     plan: &[Step],
 ) -> Result<Prepared<I::Event>, GestureFailure> {
-    let build = |io: &mut I, step: Step| -> Result<ButtonGuard<I::Event>, GestureFailure> {
+    let build = |io: &mut I, step: Step| -> Result<Reserved<I::Event>, GestureFailure> {
         let release = io.create(&step).map_err(empty_failure)?;
-        Ok(ButtonGuard {
-            release,
-            step,
-            armed: false,
-        })
+        Ok(Reserved { release, step })
     };
     let primer = plan
         .iter()
@@ -150,40 +160,26 @@ pub(super) fn prepare_gesture<I: GestureIo>(
     Ok(Prepared { primer, button })
 }
 
-struct Running<'a, I: GestureIo> {
-    io: &'a mut I,
-    prepared: Prepared<I::Event>,
-    input_posted: bool,
-}
-
-impl<I: GestureIo> Running<'_, I> {
-    fn release(&mut self) -> (ReleaseReceipt, ReleaseReceipt) {
-        let primer = self
-            .prepared
-            .primer
-            .as_mut()
-            .map_or(ReleaseReceipt::NotArmed, |guard| guard.release_now(self.io));
-        let button = self.prepared.button.release_now(self.io);
-        (primer, button)
-    }
-}
-impl<I: GestureIo> Drop for Running<'_, I> {
-    fn drop(&mut self) {
-        self.release();
-    }
-}
-
 pub(super) fn run_prepared<I: GestureIo>(
     io: &mut I,
     plan: Vec<Step>,
     prepared: Prepared<I::Event>,
     mut keep_going: impl FnMut() -> bool,
 ) -> Result<GestureOutcome, GestureFailure> {
-    let mut running = Running {
-        io,
-        prepared,
-        input_posted: false,
+    let io = std::rc::Rc::new(std::cell::RefCell::new(io));
+    let mut primer = prepared.primer.map(|reserved| ButtonGuard {
+        io: io.clone(),
+        release: reserved.release,
+        step: reserved.step,
+        armed: false,
+    });
+    let mut button = ButtonGuard {
+        io: io.clone(),
+        release: prepared.button.release,
+        step: prepared.button.step,
+        armed: false,
     };
+    let mut input_posted = false;
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
         || -> anyhow::Result<GestureOutcome> {
             let mut stopped = None;
@@ -195,35 +191,35 @@ pub(super) fn run_prepared<I: GestureIo>(
                         _ => {}
                     }
                 }
-                running.io.prepare(&step);
-                let mut event = running.io.create(&step)?;
-                running.io.stamp(&mut event, &step);
-                running.io.post(&event, &step);
-                running.input_posted = true;
+                io.borrow_mut().prepare(&step);
+                let mut event = io.borrow_mut().create(&step)?;
+                io.borrow_mut().stamp(&mut event, &step);
+                io.borrow_mut().post(&event, &step);
+                input_posted = true;
                 match step.kind {
                     Kind::PrimerDown => {
-                        if let Some(guard) = &mut running.prepared.primer {
+                        if let Some(guard) = &mut primer {
                             guard.armed = true;
                             guard.step.placement = step.placement;
                         }
                     }
                     Kind::PrimerUp => {
-                        if let Some(guard) = &mut running.prepared.primer {
+                        if let Some(guard) = &mut primer {
                             guard.armed = false;
                         }
                     }
                     Kind::Down => {
-                        running.prepared.button.armed = true;
-                        running.prepared.button.step.placement = step.placement;
+                        button.armed = true;
+                        button.step.placement = step.placement;
                     }
-                    Kind::Dragged => running.prepared.button.step.placement = step.placement,
-                    Kind::Up => running.prepared.button.armed = false,
+                    Kind::Dragged => button.step.placement = step.placement,
+                    Kind::Up => button.armed = false,
                     Kind::Move => {}
                 }
                 if matches!(step.kind, Kind::Down | Kind::Dragged) {
-                    running.io.observe(&step);
+                    io.borrow_mut().observe(&step);
                 }
-                running.io.settle(&step);
+                io.borrow_mut().settle(&step);
                 if step.kind == Kind::Dragged && stopped.is_none() && !keep_going() {
                     stopped = Some(step.placement);
                 }
@@ -246,10 +242,13 @@ pub(super) fn run_prepared<I: GestureIo>(
                     .unwrap_or_else(|| "gesture panicked".to_owned()),
                 Ok(Ok(_)) => unreachable!(),
             };
-            let (primer_receipt, button_receipt) = running.release();
+            let primer_receipt = primer
+                .as_mut()
+                .map_or(ReleaseReceipt::NotArmed, ButtonGuard::release_now);
+            let button_receipt = button.release_now();
             Err(GestureFailure {
                 error,
-                input_posted: running.input_posted,
+                input_posted,
                 primer_receipt,
                 button_receipt,
             })
@@ -575,16 +574,35 @@ mod tests {
             .iter()
             .find(|step| step.kind == Kind::Up)
             .unwrap();
-        let mut guard = ButtonGuard {
-            release: Kind::Up,
-            step,
-            armed: true,
-        };
-        assert_eq!(
-            guard.release_now(&mut fake),
-            ReleaseReceipt::HandedToTransport
-        );
-        assert_eq!(guard.release_now(&mut fake), ReleaseReceipt::NotArmed);
+        {
+            let io = std::rc::Rc::new(std::cell::RefCell::new(&mut fake));
+            let mut guard = ButtonGuard {
+                io,
+                release: Kind::Up,
+                step,
+                armed: true,
+            };
+            assert_eq!(guard.release_now(), ReleaseReceipt::HandedToTransport);
+            assert_eq!(guard.release_now(), ReleaseReceipt::NotArmed);
+        }
+        assert_eq!(posted(&fake, Kind::Up).len(), 1);
+    }
+    #[test]
+    fn dropping_an_armed_guard_releases_once() {
+        let mut fake = Fake::new(Route::Background);
+        let step = *background_plan()
+            .iter()
+            .find(|step| step.kind == Kind::Up)
+            .unwrap();
+        {
+            let io = std::rc::Rc::new(std::cell::RefCell::new(&mut fake));
+            let _guard = ButtonGuard {
+                io,
+                release: Kind::Up,
+                step,
+                armed: true,
+            };
+        }
         assert_eq!(posted(&fake, Kind::Up).len(), 1);
     }
 
