@@ -1908,15 +1908,19 @@ mod tests {
         assert_eq!(parse_loopback_lsof_ports(input), vec![9222, 9444]);
     }
 
-    /// Lookups served by [`fixture_app_identity`].
-    static FIXTURE_IDENTITY_LOOKUPS: std::sync::atomic::AtomicUsize =
-        std::sync::atomic::AtomicUsize::new(0);
+    /// The pids [`fixture_app_identity`] was asked about. Each case spawns
+    /// its own fixture process, so its pid identifies the case even while
+    /// other cases run in parallel.
+    static FIXTURE_IDENTITY_PIDS: Mutex<Vec<i64>> = Mutex::new(Vec::new());
 
     /// What the live lookup reports for the unbundled /bin/sh endpoint
     /// fixture: no running-app record, process name "sh", no bundle id. A
     /// live lookup would read AppKit and WindowServer state (#151).
-    fn fixture_app_identity(_pid: i64) -> AppIdentity {
-        FIXTURE_IDENTITY_LOOKUPS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    fn fixture_app_identity(pid: i64) -> AppIdentity {
+        FIXTURE_IDENTITY_PIDS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(pid);
         (None, Some("sh".to_owned()), None)
     }
 
@@ -2070,11 +2074,13 @@ mod tests {
             || std::array::from_fn::<_, 3, _>(|index| counts[index].swap(0, Ordering::SeqCst));
         let platform = MacOsBrowserPlatform::new(Arc::new(crate::cursor::CursorRegistry::new()))
             .with_app_identity(fixture_app_identity);
-        let lookups_before = FIXTURE_IDENTITY_LOOKUPS.load(std::sync::atomic::Ordering::SeqCst);
         let endpoint = platform.discover_owned_endpoint(pid).await;
         assert!(
-            FIXTURE_IDENTITY_LOOKUPS.load(std::sync::atomic::Ordering::SeqCst) > lookups_before,
-            "discovery classified the fixture through the injected lookup: {case}"
+            FIXTURE_IDENTITY_PIDS
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains(&pid),
+            "discovery classified this case's fixture through the injected lookup: {case}"
         );
         let expected_counts = match case {
             "absolute" | "conflicting" | "malformed" | "unreadable" => [0, 0, 0],
