@@ -2074,6 +2074,11 @@ mod tests {
             || std::array::from_fn::<_, 3, _>(|index| counts[index].swap(0, Ordering::SeqCst));
         let platform = MacOsBrowserPlatform::new(Arc::new(crate::cursor::CursorRegistry::new()))
             .with_app_identity(fixture_app_identity);
+        // A pid reused from an earlier case must not satisfy the check below.
+        FIXTURE_IDENTITY_PIDS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|seen| *seen != pid);
         let endpoint = platform.discover_owned_endpoint(pid).await;
         assert!(
             FIXTURE_IDENTITY_PIDS
