@@ -21,7 +21,16 @@ pub fn token_for(snapshot_id: u32, element_index: usize) -> String {
 
 pub fn parse_token(token: &str) -> Option<(u32, usize)> {
     let (handle, index) = token.split_once(':')?;
-    Some((parse_snapshot_handle(handle)?, index.parse().ok()?))
+    Some((snapshot_of_handle(handle)?, index.parse().ok()?))
+}
+
+/// The snapshot a handle names: a plain snapshot id (`s0000002a`) or a
+/// window-basis id (`s0000002a.f3`, from `window_basis.snapshot_id`). The
+/// frame generation does not change which snapshot's elements a handle
+/// addresses, so every reader of a snapshot handle accepts both forms;
+/// only pixel-basis input keeps the generation (goat-si/cua-driver#130).
+pub fn snapshot_of_handle(handle: &str) -> Option<u32> {
+    crate::window_basis::parse_basis_id(handle).map(|(id, _)| id)
 }
 
 pub fn parse_snapshot_handle(handle: &str) -> Option<u32> {
@@ -137,6 +146,23 @@ mod tests {
         assert_eq!(token_for(0x0001_0001, 3), "s00010001:3");
         assert_eq!(parse_token("s00010001:3"), Some((0x0001_0001, 3)));
     }
+    #[test]
+    fn a_window_basis_handle_names_its_snapshot() {
+        assert_eq!(snapshot_of_handle("s0000002a"), Some(0x2a));
+        assert_eq!(snapshot_of_handle("s0000002a.f3"), Some(0x2a));
+        assert_eq!(parse_token("s0000002a.f3:12"), Some((0x2a, 12)));
+        for handle in [
+            "s0000002a.f0",
+            "s0000002a.f",
+            "s0000002a.fx",
+            "s0000002a.f03",
+            "s2a.f3",
+        ] {
+            assert_eq!(snapshot_of_handle(handle), None, "{handle}");
+            assert!(parse_token(&format!("{handle}:12")).is_none(), "{handle}");
+        }
+    }
+
     #[test]
     fn parse_rejects_unknown_prefix_or_shape() {
         for token in [

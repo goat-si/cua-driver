@@ -588,7 +588,18 @@ fn store() -> &'static Mutex<VecDeque<StoredSnapshot>> {
     STORE.get_or_init(|| Mutex::new(VecDeque::new()))
 }
 
+/// The key a read is remembered under: a window-basis id names the same
+/// read as its plain snapshot id (goat-si/cua-driver#130). Any other text is
+/// kept as given.
+fn stored_snapshot_key(snapshot_id: &str) -> std::borrow::Cow<'_, str> {
+    match crate::element_token::snapshot_of_handle(snapshot_id) {
+        Some(id) => crate::element_token::format_snapshot_id(id).into(),
+        None => snapshot_id.into(),
+    }
+}
+
 fn remember(snapshot_id: &str, ctx: &ViewContext<'_>, md: &str) {
+    let snapshot_id = &*stored_snapshot_key(snapshot_id);
     let mut guard = store().lock().unwrap_or_else(|e| e.into_inner());
     // A screenshot-only read keeps its snapshot id and returns no tree. It
     // must not erase the rows that snapshot's tokens were read from.
@@ -627,6 +638,7 @@ pub(crate) struct StoredRow {
 /// still remembered. Lets a caller holding a stale element token find the
 /// same element again by what it was.
 pub(crate) fn snapshot_row(snapshot_id: &str, index: u64) -> Option<StoredRow> {
+    let snapshot_id = &*stored_snapshot_key(snapshot_id);
     let snapshot = {
         let mut guard = store().lock().unwrap_or_else(|e| e.into_inner());
         guard.retain(|s| s.at.elapsed() <= STORE_TTL);
@@ -654,6 +666,7 @@ pub(crate) fn snapshot_row(snapshot_id: &str, index: u64) -> Option<StoredRow> {
 /// AXMenuBarItem and AXMenuItem ancestors, then its own. `None` for any
 /// other row.
 pub(crate) fn snapshot_menu_path(snapshot_id: &str, index: u64) -> Option<Vec<String>> {
+    let snapshot_id = &*stored_snapshot_key(snapshot_id);
     let markdown = {
         let guard = store().lock().unwrap_or_else(|e| e.into_inner());
         guard
@@ -766,6 +779,7 @@ fn resolve_since(
     if current_id.is_none() {
         return SinceOutcome::Fallback("no_snapshot");
     }
+    let since = &*stored_snapshot_key(since);
     let found = {
         let mut guard = store().lock().unwrap_or_else(|e| e.into_inner());
         guard.retain(|s| s.at.elapsed() <= STORE_TTL);
@@ -1401,6 +1415,51 @@ mod tests {
         assert!(s.get("tree_markdown").is_none());
         assert_eq!(s["elements"].as_array().unwrap().len(), 2);
         assert!(!text_of(&content).contains("AXButton"));
+    }
+
+    /// `since` and stored-row lookups take a window-basis id for the read
+    /// it names (#130); another window's read still falls back.
+    #[test]
+    fn since_and_row_lookups_accept_a_window_basis_id() {
+        let window = 7005;
+        let (mut c1, mut s1) = payload("s000000c1", OLD);
+        apply(&opts(json!({})), &ctx(window), &mut c1, &mut s1);
+
+        let (mut c2, mut s2) = payload("s000000c2", OLD);
+        apply(
+            &opts(json!({"since": "s000000c1.f2"})),
+            &ctx(window),
+            &mut c2,
+            &mut s2,
+        );
+        assert_eq!(s2["since_status"], "no_change");
+
+        let (mut c3, mut s3) = payload("s000000c3", OLD);
+        apply(
+            &opts(json!({"since": "s000000c2.f1"})),
+            &ctx(window + 1),
+            &mut c3,
+            &mut s3,
+        );
+        assert_ne!(s3["since_status"], "no_change");
+        assert_ne!(s3["since_status"], "diff");
+
+        remember_for_test(
+            "s7e570002",
+            4,
+            5,
+            r#"- [27] AXMenuBar
+  - [700] AXMenuBarItem "File"
+    - [701] AXMenu
+      - [702] AXMenuItem "Save"
+"#,
+        );
+        assert!(snapshot_row("s7e570002.f4", 702).is_some_and(|row| row.line.contains("Save")));
+        assert_eq!(
+            snapshot_menu_path("s7e570002.f4", 702),
+            Some(vec!["File".to_owned(), "Save".to_owned()])
+        );
+        assert!(snapshot_row("s7e570002.f0", 702).is_none());
     }
 
     #[test]
