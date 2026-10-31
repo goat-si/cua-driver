@@ -1232,44 +1232,36 @@ fn write_value_ladder(
         return out;
     }
     let first_number = target.is_some() && !matches!(before, ValueObs::Text(_));
-    let mut number = first_number;
-    let err = loop {
-        let err = if number {
-            ops.set_number(target.expect("numeric representation"))
-        } else {
-            ops.set_string(value)
-        };
-        match classify_attr_write(err) {
-            AttrWrite::Applied => break err,
-            AttrWrite::Uncertain => {
-                out.maybe_landed = true;
-                break err;
-            }
-            AttrWrite::Rejected => {
-                if number {
-                    number = false;
-                } else if first_number || target.is_none() {
-                    out.error = Some(err);
+    let first = if first_number {
+        ops.set_number(target.expect("numeric representation"))
+    } else {
+        ops.set_string(value)
+    };
+    let err = match classify_attr_write(first) {
+        AttrWrite::Applied => first,
+        AttrWrite::Uncertain => {
+            out.maybe_landed = true;
+            first
+        }
+        AttrWrite::Rejected => {
+            // Only one alternate representation may be attempted.
+            let alternate = if first_number {
+                ops.set_string(value)
+            } else if let Some(number) = target {
+                ops.set_number(number)
+            } else {
+                out.error = Some(first);
+                return out;
+            };
+            match classify_attr_write(alternate) {
+                AttrWrite::Applied => alternate,
+                AttrWrite::Rejected => {
+                    out.error = Some(alternate);
                     return out;
-                } else {
-                    number = true;
                 }
-                // Only one alternate representation may be attempted.
-                let alternate = if number {
-                    ops.set_number(target.expect("numeric alternate"))
-                } else {
-                    ops.set_string(value)
-                };
-                match classify_attr_write(alternate) {
-                    AttrWrite::Applied => break alternate,
-                    AttrWrite::Rejected => {
-                        out.error = Some(alternate);
-                        return out;
-                    }
-                    AttrWrite::Uncertain => {
-                        out.maybe_landed = true;
-                        break alternate;
-                    }
+                AttrWrite::Uncertain => {
+                    out.maybe_landed = true;
+                    alternate
                 }
             }
         }
