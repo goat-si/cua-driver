@@ -456,6 +456,7 @@ impl Miss {
                 | "app_not_found"
                 | "window_not_found"
                 | "still_present"
+                | "gone_unconfirmed"
                 | "unexpected_state"
         )
     }
@@ -708,7 +709,7 @@ impl<'a> Locator<'a> {
                 .filter(|window| text_matches(window.get("app_name"), app))
                 .collect();
             candidates = if by_name.is_empty() {
-                let pids = self.app_pids(app).await;
+                let pids = self.app_pids(app).await?;
                 candidates
                     .into_iter()
                     .filter(|window| {
@@ -828,11 +829,12 @@ impl<'a> Locator<'a> {
     }
 
     /// Pids of running apps whose name or bundle id matches.
-    async fn app_pids(&self, app: &str) -> Vec<i64> {
-        let Ok(listed) = self.call("list_apps", json!({})).await else {
-            return Vec::new();
-        };
-        listed
+    async fn app_pids(&self, app: &str) -> Result<Vec<i64>, Miss> {
+        let listed = self
+            .call("list_apps", json!({}))
+            .await
+            .map_err(|error| Miss::new("lookup_failed", error))?;
+        Ok(listed
             .get("apps")
             .and_then(Value::as_array)
             .map(|apps| {
@@ -848,7 +850,7 @@ impl<'a> Locator<'a> {
                     .filter(|pid| *pid > 0)
                     .collect()
             })
-            .unwrap_or_default()
+            .unwrap_or_default())
     }
 
     /// One fresh accessibility read. It refreshes the window's element
@@ -1039,9 +1041,41 @@ impl<'a> Locator<'a> {
                         miss.message,
                     ))
                 }
-                // A window that closed between the lookup and the read has
-                // no elements left.
-                Err(_) if check.gone => continue,
+                Err(miss) if check.gone => {
+                    let listed = self
+                        .call(
+                            "list_windows",
+                            json!({
+                                "pid": window.pid,
+                                "on_screen_only": false,
+                            }),
+                        )
+                        .await
+                        .map_err(|error| Miss::new("lookup_failed", error))?;
+                    let still_listed =
+                        listed
+                            .get("windows")
+                            .and_then(Value::as_array)
+                            .is_some_and(|windows| {
+                                windows.iter().any(|candidate| {
+                                    candidate.get("pid").and_then(Value::as_i64) == Some(window.pid)
+                                        && candidate.get("window_id").and_then(Value::as_u64)
+                                            == Some(window.window_id)
+                                })
+                            });
+                    if still_listed {
+                        return Err(Miss::new(
+                            "gone_unconfirmed",
+                            format!(
+                                "{} could not be read, so its absence is unproven: {}",
+                                window.describe(),
+                                miss.message
+                            ),
+                        )
+                        .in_window(window));
+                    }
+                    continue;
+                }
                 Err(miss) => return Err(miss),
             };
             match evaluate(check, &read) {
@@ -1387,14 +1421,23 @@ fn evaluate(check: &Check, read: &Read) -> Result<Option<String>, Miss> {
     if let Some(element) = pool.iter().find(|element| fields_hold(check, element)) {
         return Ok(Some(describe_element(element)));
     }
+    let display = if check.element.nth.is_none() {
+        display_rows(read, &element_spec)
+    } else {
+        Vec::new()
+    };
     if check.element.nth.is_none() {
-        if let Some(row) = display_rows(read, &element_spec)
-            .iter()
-            .find(|row| fields_hold(check, row))
-        {
+        if let Some(row) = display.iter().find(|row| fields_hold(check, row)) {
             return Ok(Some(describe_element(row)));
         }
     }
+    let unknown = pool.iter().copied().chain(display.iter()).any(|element| {
+        ((check.value.is_some() || check.value_contains.is_some())
+            && element.get("value").and_then(Value::as_str).is_none())
+            || (check.enabled.is_some()
+                && element.get("enabled").and_then(Value::as_bool).is_none())
+            || (check.selected.is_some() && selected_state(element).is_none())
+    });
     let shown = pool
         .iter()
         .take(CANDIDATES_SHOWN)
@@ -1404,13 +1447,18 @@ fn evaluate(check: &Check, read: &Read) -> Result<Option<String>, Miss> {
     Err(Miss::new(
         "unexpected_state",
         format!(
-            "{} expected in {}, found {}",
+            "{} expected in {}, found {}{}",
             check.describe(),
             window.describe(),
             if shown.is_empty() {
                 "no addressable match".to_owned()
             } else {
                 shown
+            },
+            if unknown {
+                " (state unknown for a requested field)"
+            } else {
+                ""
             }
         ),
     )
@@ -1418,33 +1466,25 @@ fn evaluate(check: &Check, read: &Read) -> Result<Option<String>, Miss> {
 }
 
 fn fields_hold(check: &Check, element: &Value) -> bool {
-    let value = element
-        .get("value")
-        .and_then(Value::as_str)
-        .unwrap_or_default();
+    let value = element.get("value").and_then(Value::as_str);
     if let Some(expected) = &check.value {
-        if value.trim() != expected.trim() {
+        if !value.is_some_and(|value| value.trim() == expected.trim()) {
             return false;
         }
     }
     if let Some(expected) = &check.value_contains {
-        if !fold(value).contains(&fold(expected)) {
+        if !value.is_some_and(|value| fold(value).contains(&fold(expected))) {
             return false;
         }
     }
     if let Some(expected) = check.enabled {
         // Elements report `enabled` only when the platform knows it.
-        if element
-            .get("enabled")
-            .and_then(Value::as_bool)
-            .unwrap_or(true)
-            != expected
-        {
+        if element.get("enabled").and_then(Value::as_bool) != Some(expected) {
             return false;
         }
     }
     if let Some(expected) = check.selected {
-        if selected_state(element).unwrap_or(false) != expected {
+        if selected_state(element) != Some(expected) {
             return false;
         }
     }
@@ -1835,6 +1875,40 @@ mod tests {
     }
 
     #[test]
+    fn unknown_enabled_never_satisfies_enabled_true() {
+        let read = read(vec![element(1, "AXButton", "Save")], "");
+        let check = Check::parse(&json!({"name":"Save", "enabled":true}), 0).unwrap();
+        let miss = evaluate(&check, &read).unwrap_err();
+        assert_eq!(miss.code, "unexpected_state");
+        assert!(miss.message.contains("state unknown"), "{}", miss.message);
+    }
+
+    #[test]
+    fn unknown_selected_never_satisfies_selected_false() {
+        let read = read(vec![element(1, "AXButton", "Save")], "");
+        let check = Check::parse(&json!({"name":"Save", "selected":false}), 0).unwrap();
+        let miss = evaluate(&check, &read).unwrap_err();
+        assert_eq!(miss.code, "unexpected_state");
+        assert!(miss.message.contains("state unknown"), "{}", miss.message);
+    }
+
+    #[test]
+    fn missing_value_never_satisfies_empty_value() {
+        let read = read(vec![element(1, "AXTextField", "Name")], "");
+        for contains in [false, true] {
+            let mut check = Check::parse(&json!({"name":"Name"}), 0).unwrap();
+            if contains {
+                check.value_contains = Some(String::new());
+            } else {
+                check.value = Some(String::new());
+            }
+            let miss = evaluate(&check, &read).unwrap_err();
+            assert_eq!(miss.code, "unexpected_state");
+            assert!(miss.message.contains("state unknown"), "{}", miss.message);
+        }
+    }
+
+    #[test]
     fn exact_name_beats_substring_and_roles_fold_across_platforms() {
         let read = read(
             vec![
@@ -2097,14 +2171,14 @@ mod tests {
         for raw in [
             json!({"role":"AXStaticText","name":"Result","value":"702"}),
             json!({"role":"AXStaticText","name":"Result","value_contains":"70"}),
-            json!({"role":"AXStaticText","name":"Result","enabled":true}),
-            json!({"role":"AXStaticText","name":"Result","selected":false}),
         ] {
             assert!(evaluate(&check(raw.clone()), &read).is_ok(), "{raw}");
         }
         for raw in [
             json!({"role":"AXStaticText","name":"Result","value":"703"}),
+            json!({"role":"AXStaticText","name":"Result","enabled":true}),
             json!({"role":"AXStaticText","name":"Result","enabled":false}),
+            json!({"role":"AXStaticText","name":"Result","selected":false}),
             json!({"role":"AXStaticText","name":"Result","selected":true}),
         ] {
             assert!(evaluate(&check(raw.clone()), &read).is_err(), "{raw}");
