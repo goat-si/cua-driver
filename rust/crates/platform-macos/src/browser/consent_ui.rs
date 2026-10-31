@@ -398,6 +398,7 @@ mod tests {
 
     fn node(role: &str, depth: usize, title: Option<&str>, actions: &[&str]) -> AXNode {
         AXNode {
+            owned_row_label: None,
             element_index: (!actions.is_empty()).then_some(0),
             role: role.to_owned(),
             title: title.map(str::to_owned),
