@@ -28,6 +28,12 @@
 //! driver from starting it at all; an embedded driver (`--embedded`) keeps it
 //! off unless the host sets the variable to `0`.
 //!
+//! Window captures require a readable process start stamp. Windows owned by
+//! other users or sandboxed processes may be refused when inspection fails;
+//! the scope of this compatibility limit has not been established. The shell
+//! deadline reserves cleanup time, but a failed kill or blocking wait can
+//! exceed it, so it is not a strict wall-clock bound.
+//!
 //! ## Windows on another Space (CUA-1351)
 //!
 //! ScreenCaptureKit and `screencapture -l` return no content for a window
@@ -62,23 +68,42 @@ use std::time::{Duration, Instant};
 
 /// Bounded TTL map keyed by insertion time. Std-only; used for the warm SCK
 /// window filter/config cache and unit-tested independently of ScreenCaptureKit.
-struct TimedCache<K, V> {
+trait CacheTime: Copy {
+    fn age_since(self, earlier: Self) -> Duration;
+}
+
+impl CacheTime for Instant {
+    fn age_since(self, earlier: Self) -> Duration {
+        self.checked_duration_since(earlier)
+            .unwrap_or(Duration::ZERO)
+    }
+}
+
+#[cfg(test)]
+impl CacheTime for Duration {
+    fn age_since(self, earlier: Self) -> Duration {
+        self.saturating_sub(earlier)
+    }
+}
+
+struct TimedCache<K, V, T = Instant> {
     ttl: Duration,
     capacity: usize,
     next_seq: u64,
-    map: HashMap<K, TimedCacheEntry<V>>,
+    map: HashMap<K, TimedCacheEntry<V, T>>,
 }
 
-struct TimedCacheEntry<V> {
+struct TimedCacheEntry<V, T> {
     value: V,
-    inserted_at: Instant,
+    inserted_at: T,
     /// Monotonic insertion sequence for oldest-first eviction (stable ties).
     seq: u64,
 }
 
-impl<K, V> TimedCache<K, V>
+impl<K, V, T> TimedCache<K, V, T>
 where
     K: Eq + Hash + Clone,
+    T: CacheTime,
 {
     fn new(ttl: Duration, capacity: usize) -> Self {
         Self {
@@ -97,18 +122,15 @@ where
     /// Insert or replace `key`. Capacity 0 stores nothing. At capacity, a new
     /// key evicts the oldest insertion. Replacing an existing key refreshes
     /// its timestamp and insertion order.
-    fn insert_at(&mut self, key: K, value: V, now: Instant) {
+    fn insert_at(&mut self, key: K, value: V, now: T) {
         if self.capacity == 0 {
             return;
         }
 
         // Do not let expired entries occupy capacity merely because their
         // individual keys have not been queried again.
-        self.map.retain(|_, entry| {
-            now.checked_duration_since(entry.inserted_at)
-                .unwrap_or(Duration::ZERO)
-                < self.ttl
-        });
+        self.map
+            .retain(|_, entry| now.age_since(entry.inserted_at) < self.ttl);
 
         if self.map.contains_key(&key) {
             let seq = self.alloc_seq();
@@ -148,15 +170,13 @@ where
     /// Clone a fresh value for `key`. Removes the entry when its age is
     /// greater than or equal to TTL. If `now` is earlier than insertion, age is
     /// treated as zero (still fresh).
-    fn get_cloned_at(&mut self, key: &K, now: Instant) -> Option<V>
+    fn get_cloned_at(&mut self, key: &K, now: T) -> Option<V>
     where
         V: Clone,
     {
         let expired = {
             let entry = self.map.get(key)?;
-            let age = now
-                .checked_duration_since(entry.inserted_at)
-                .unwrap_or(Duration::ZERO);
+            let age = now.age_since(entry.inserted_at);
             age >= self.ttl
         };
 
@@ -1133,9 +1153,7 @@ pub fn screenshot_window_image(window_id: u32) -> anyhow::Result<CapturedImage> 
     let deadline = Instant::now() + WINDOW_CAPTURE_NATIVE_TIMEOUT;
     let remaining = move || deadline.saturating_duration_since(Instant::now());
     capture_window_routed(
-        window_id,
-        off_space,
-        skylight_first_on_space(),
+        (window_id, off_space, skylight_first_on_space()),
         Some(pinned),
         crate::ax::enablement::process_start_stamp,
         || current_window_capture_identity(window_id),
@@ -1235,9 +1253,7 @@ where
     R: Fn() -> Duration,
 {
     capture_window_routed(
-        window_id,
-        off_space,
-        false,
+        (window_id, off_space, false),
         None,
         |_| None,
         || Ok(WindowCaptureIdentity::new(10, 0, 1.0, 2.0, 800.0, 600.0)),
@@ -1250,9 +1266,7 @@ where
 /// The routed capture. On the current Space with `skylight_first`, SkyLight is
 /// tried first and its answer is used unless it failed or is blank.
 fn capture_window_routed<P, S, R, I, G>(
-    window_id: u32,
-    off_space: bool,
-    skylight_first: bool,
+    route: (u32, bool, bool),
     pinned_generation: Option<ProcessGeneration>,
     generation: G,
     identity: I,
@@ -1267,6 +1281,7 @@ where
     I: Fn() -> anyhow::Result<WindowCaptureIdentity>,
     G: Fn(i32) -> Option<crate::ax::enablement::ProcessStartStamp>,
 {
+    let (window_id, off_space, skylight_first) = route;
     // A second backend needs at least this much time to be worth starting.
     const MIN_BACKEND_BUDGET: Duration = Duration::from_millis(100);
     let spent = |next: &str| {
@@ -1838,9 +1853,7 @@ mod process_identity_tests {
         let reads = Cell::new(0);
         let public_calls = Cell::new(0);
         let error = capture_window_routed(
-            7,
-            false,
-            true,
+            (7, false, true),
             Some((10, (1, 0))),
             |_| Some((1, 0)),
             || {
@@ -1863,9 +1876,7 @@ mod process_identity_tests {
     fn a_recycled_pid_with_the_same_frame_discards_the_image() {
         let reads = Cell::new(0);
         let error = capture_window_routed(
-            7,
-            false,
-            true,
+            (7, false, true),
             Some((10, (1, 0))),
             |_| {
                 reads.set(reads.get() + 1);
@@ -1885,9 +1896,7 @@ mod process_identity_tests {
         for missing in [1, 2] {
             let reads = Cell::new(0);
             let error = capture_window_routed(
-                7,
-                false,
-                true,
+                (7, false, true),
                 Some((10, (1, 0))),
                 |_| {
                     reads.set(reads.get() + 1);
@@ -1925,9 +1934,7 @@ mod process_identity_tests {
         };
         let image = CapturedImage::Png(vec![1, 2, 3]);
         let got = capture_window_routed(
-            7,
-            false,
-            true,
+            (7, false, true),
             Some((10, (1, 0))),
             |_| Some((1, 0)),
             identity,
@@ -1942,19 +1949,34 @@ mod process_identity_tests {
 
     #[test]
     fn a_warm_cache_plan_for_another_generation_is_rebuilt_or_refused() {
-        let old = identity(10);
-        let mut replacement = old;
+        let old = std::sync::Arc::new(identity(10));
+        let mut replacement = *old;
         replacement.start_stamp = (2, 0);
-        assert_ne!(old, replacement);
-        assert!(check_generation((10, (2, 0)), old, 7).is_err());
+        let mut cache: TimedCache<u32, _, Duration> = TimedCache::new(Duration::from_secs(2), 1);
+        cache.insert_at(7, old.clone(), Duration::ZERO);
+        let cached = cache.get_cloned_at(&7, Duration::ZERO).unwrap();
+        assert_ne!(*cached, replacement);
+        assert!(check_generation((10, (2, 0)), *cached, 7).is_err());
+        assert!(cache.remove_if(&7, |stored| same_cached_plan(stored, &cached)));
+        cache.insert_at(7, std::sync::Arc::new(replacement), Duration::ZERO);
+        assert_eq!(
+            *cache.get_cloned_at(&7, Duration::ZERO).unwrap(),
+            replacement
+        );
     }
 
     #[test]
     fn concurrent_replacement_keeps_the_newer_cache_entry() {
         let old = std::sync::Arc::new(1);
         let newer = std::sync::Arc::new(2);
-        assert!(!same_cached_plan(&newer, &old));
-        assert!(same_cached_plan(&newer, &newer));
+        let mut cache: TimedCache<u32, _, Duration> = TimedCache::new(Duration::from_secs(2), 1);
+        cache.insert_at(7, old.clone(), Duration::ZERO);
+        cache.insert_at(7, newer.clone(), Duration::ZERO);
+        assert!(!cache.remove_if(&7, |stored| same_cached_plan(stored, &old)));
+        assert!(same_cached_plan(
+            &cache.get_cloned_at(&7, Duration::ZERO).unwrap(),
+            &newer
+        ));
     }
 
     #[test]
@@ -1977,9 +1999,7 @@ mod process_identity_tests {
     #[test]
     fn an_unchanged_process_still_captures() {
         let got = capture_window_routed(
-            7,
-            false,
-            true,
+            (7, false, true),
             Some((10, (1, 0))),
             |_| Some((1, 0)),
             || Ok(identity(10)),
@@ -2024,6 +2044,7 @@ mod shell_deadline_tests {
         missing_image: bool,
         exit_code: i32,
         stderr: Vec<u8>,
+        late_write: bool,
         spawn_advance: Option<std::rc::Rc<std::cell::Cell<Duration>>>,
     }
     impl ShellChildOps for FakeOps {
@@ -2052,6 +2073,10 @@ mod shell_deadline_tests {
         }
         fn kill(&mut self, _: &mut ()) -> std::io::Result<()> {
             self.events.push("kill");
+            if self.late_write {
+                std::fs::write(self.path.as_ref().unwrap(), [9, 9, 9])?;
+                self.events.push("late_output");
+            }
             if self.kill_error {
                 Err(std::io::Error::other("kill failed"))
             } else {
@@ -2130,13 +2155,21 @@ mod shell_deadline_tests {
     }
     #[test]
     fn late_output_after_timeout_is_ignored() {
-        let mut ops = FakeOps::default();
+        let mut ops = FakeOps {
+            missing_image: true,
+            late_write: true,
+            ..Default::default()
+        };
         assert!(run(
             &mut ops,
             Duration::from_millis(300),
             &std::cell::Cell::new(Duration::ZERO)
         )
         .is_err());
+        assert_eq!(
+            ops.events,
+            ["spawn", "try_wait", "kill", "late_output", "wait"]
+        );
         cleaned(&ops);
     }
     #[test]
@@ -2836,9 +2869,7 @@ mod tests {
     fn skylight_answers_first_on_the_current_space_and_the_public_chain_is_not_asked() {
         let content = frame(vec![1, 2, 3, 255, 9, 9, 9, 255]);
         let got = capture_window_routed(
-            7,
-            false,
-            true,
+            (7, false, true),
             None,
             |_| None,
             || Ok(test_identity()),
@@ -2857,9 +2888,7 @@ mod tests {
         let blank = frame([0, 0, 0, 255].repeat(4));
         for first in [Ok(blank), Err(anyhow::anyhow!("no image"))] {
             let got = capture_window_routed(
-                7,
-                false,
-                true,
+                (7, false, true),
                 None,
                 |_| None,
                 || Ok(test_identity()),
@@ -2872,9 +2901,7 @@ mod tests {
         }
         // Both fail: the error names SkyLight and the public backend.
         let error = capture_window_routed(
-            7,
-            false,
-            true,
+            (7, false, true),
             None,
             |_| None,
             || Ok(test_identity()),
@@ -2946,9 +2973,7 @@ mod tests {
     #[test]
     fn a_blank_public_fallback_after_a_failed_skylight_is_rejected() {
         let error = capture_window_routed(
-            7,
-            false,
-            true,
+            (7, false, true),
             None,
             |_| None,
             || Ok(test_identity()),
@@ -2970,9 +2995,7 @@ mod tests {
     #[test]
     fn a_blank_off_space_skylight_frame_is_not_returned() {
         let got = capture_window_routed(
-            7,
-            true,
-            false,
+            (7, true, false),
             None,
             |_| None,
             || Ok(test_identity()),
@@ -2983,9 +3006,7 @@ mod tests {
         .expect("the public chain has content");
         assert_eq!(got, content_frame());
         let error = capture_window_routed(
-            7,
-            true,
-            false,
+            (7, true, false),
             None,
             |_| None,
             || Ok(test_identity()),
@@ -3015,9 +3036,7 @@ mod tests {
             })
         };
         let got = capture_window_routed(
-            7,
-            false,
-            true,
+            (7, false, true),
             None,
             |_| None,
             identity,
@@ -3041,9 +3060,7 @@ mod tests {
             ))
         };
         let error = capture_window_routed(
-            7,
-            false,
-            true,
+            (7, false, true),
             None,
             |_| None,
             unstable,
