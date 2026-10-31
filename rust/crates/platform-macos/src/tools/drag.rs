@@ -38,6 +38,29 @@ use crate::focus_guard;
 use crate::input::mouse::DragButton;
 use crate::window_change_detector::WindowChangeDetector;
 
+fn drag_failure_text(failure: &crate::input::gesture::GestureFailure) -> String {
+    use crate::input::gesture::ReleaseReceipt;
+    let mut text = failure.error.clone();
+    if failure.input_posted {
+        let release = if failure.primer_receipt == ReleaseReceipt::HandedToTransport
+            || failure.button_receipt == ReleaseReceipt::HandedToTransport
+        {
+            "A button release was handed to the transport; release was not confirmed."
+        } else {
+            "There was no button requiring an emergency release."
+        };
+        text.push_str(&format!(" Some input was handed to the transport. {release} Re-read the window before deciding what to do."));
+    }
+    text
+}
+
+fn format_drag_failure(prefix: &str, error: &anyhow::Error) -> String {
+    match error.downcast_ref::<crate::input::gesture::GestureFailure>() {
+        Some(failure) => format!("{prefix}: {}", drag_failure_text(failure)),
+        None => format!("{prefix}: {error}"),
+    }
+}
+
 pub struct DragTool {
     pub state: Arc<ToolState>,
 }
@@ -245,7 +268,9 @@ impl DragTool {
                     "path": "hid",
                     "effect": "unverifiable"
                 })),
-                Ok(Err(error)) => ToolResult::error(format!("desktop drag failed: {error}")),
+                Ok(Err(error)) => {
+                    ToolResult::error(format_drag_failure("desktop drag failed", &error))
+                }
                 Err(error) => ToolResult::error(format!("desktop drag task failed: {error}")),
             };
         }
@@ -734,7 +759,7 @@ impl DragTool {
                     selection,
                 )
             }
-            Ok(Err(e)) => ToolResult::error(format!("drag failed: {e}")),
+            Ok(Err(e)) => ToolResult::error(format_drag_failure("drag failed", &e)),
             Err(e) => ToolResult::error(format!("Task error: {e}")),
         }
     }
@@ -1419,6 +1444,59 @@ fn window_id_required(foreground: bool) -> ToolResult {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn drag_failure_text_window_branch_formats_a_gesture_failure() {
+        use crate::input::gesture::{GestureFailure, ReleaseReceipt};
+        let error = anyhow::Error::new(GestureFailure {
+            error: "injected".into(),
+            input_posted: true,
+            primer_receipt: ReleaseReceipt::NotArmed,
+            button_receipt: ReleaseReceipt::HandedToTransport,
+        });
+        let text = super::format_drag_failure("drag failed", &error);
+        assert!(text.starts_with("drag failed: injected"));
+        assert!(text.contains("handed to the transport"));
+        assert!(text.contains("release was not confirmed"));
+        assert!(text.contains("Re-read the window"));
+    }
+    #[test]
+    fn drag_failure_text_desktop_branch_formats_a_gesture_failure() {
+        use crate::input::gesture::{GestureFailure, ReleaseReceipt};
+        let error = anyhow::Error::new(GestureFailure {
+            error: "injected".into(),
+            input_posted: true,
+            primer_receipt: ReleaseReceipt::NotArmed,
+            button_receipt: ReleaseReceipt::NotArmed,
+        });
+        let text = super::format_drag_failure("desktop drag failed", &error);
+        assert!(text.starts_with("desktop drag failed: injected"));
+        assert!(text.contains("no button requiring an emergency release"));
+        assert!(text.contains("Re-read the window"));
+    }
+    #[test]
+    fn drag_failure_text_an_ordinary_error_keeps_the_old_text() {
+        let error = anyhow::anyhow!("ordinary");
+        assert_eq!(
+            super::format_drag_failure("drag failed", &error),
+            "drag failed: ordinary"
+        );
+        assert_eq!(
+            super::format_drag_failure("desktop drag failed", &error),
+            "desktop drag failed: ordinary"
+        );
+    }
+    #[test]
+    fn drag_failure_text_without_posted_input_has_no_partial_input_warning() {
+        use crate::input::gesture::{GestureFailure, ReleaseReceipt};
+        let failure = GestureFailure {
+            error: "injected".into(),
+            input_posted: false,
+            primer_receipt: ReleaseReceipt::NotArmed,
+            button_receipt: ReleaseReceipt::NotArmed,
+        };
+        assert_eq!(super::drag_failure_text(&failure), "injected");
+    }
+
     use super::*;
 
     #[tokio::test]
