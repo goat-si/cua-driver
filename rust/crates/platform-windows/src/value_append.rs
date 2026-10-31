@@ -55,7 +55,10 @@ pub(crate) fn route_after_worker(result: Result<Option<AppendOutcome>, WorkerFai
     match result {
         Ok(Some(outcome)) if allows_wm_char_fallback(&outcome) => Route::WmChar,
         Ok(Some(outcome)) => Route::Continue(outcome),
-        Ok(None) | Err(_) => Route::Terminal,
+        // None: the admitted element is not a UIA element, so nothing was
+        // written and the typing route is the only one it ever had.
+        Ok(None) => Route::WmChar,
+        Err(_) => Route::Terminal,
     }
 }
 pub(crate) fn read_value_gated(

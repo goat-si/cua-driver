@@ -5315,16 +5315,13 @@ impl Tool for TypeTextTool {
             })
             .await;
             use crate::value_append::{route_after_worker, AppendOutcome, Route, WorkerFailed};
-            let worker_failed = set_result.is_err();
             let set_result = match route_after_worker(set_result.map_err(|_| WorkerFailed)) {
                 Route::WmChar => None,
                 Route::Terminal => {
-                    return ToolResult::error(if worker_failed {
-                        "type_text's UIA write worker failed; the field may or may not have changed; nothing else was sent"
-                    } else {
-                        "type_text could not access the indexed UIA element; nothing was sent"
-                    })
-                        .with_structured(value_write_structured_result(text_len, "unreadable", false));
+                    return ToolResult::error(
+                        "type_text's UIA write worker failed; the field may or may not have changed; nothing else was sent",
+                    )
+                    .with_structured(value_write_structured_result(text_len, "unreadable", false));
                 }
                 Route::Continue(AppendOutcome::Written { before, inserted }) => {
                     Some((before, inserted))

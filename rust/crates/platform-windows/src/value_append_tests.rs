@@ -154,7 +154,14 @@ fn routing_table_observes_calls_and_results() {
 #[test]
 fn worker_failure_is_terminal() {
     assert_eq!(route_after_worker(Err(WorkerFailed)), Route::Terminal);
-    assert_eq!(route_after_worker(Ok(None)), Route::Terminal);
+}
+
+#[test]
+fn non_uia_indexed_element_keeps_the_typing_route() {
+    // The worker returns None only when the admitted element is not a UIA
+    // element (an MSAA row, e.g. VCL/LibreOffice). Nothing was written, and
+    // before this change those elements were typed into with WM_CHAR.
+    assert_eq!(route_after_worker(Ok(None)), Route::WmChar);
 }
 
 #[test]
