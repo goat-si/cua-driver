@@ -1228,6 +1228,7 @@ fn set_value_blocking_inner(
         let actions = unsafe { copy_action_names(element) };
         let ctx = LadderContext {
             secure,
+            role: &role,
             can_step: actions
                 .iter()
                 .any(|a| a == "AXIncrement" || a == "AXDecrement"),
@@ -1285,9 +1286,10 @@ impl AxValueOps for LiveAxValueOps {
     }
 }
 
-struct LadderContext {
+struct LadderContext<'a> {
     secure: bool,
     can_step: bool,
+    role: &'a str,
 }
 #[derive(Debug)]
 struct LadderOutcome {
@@ -1328,6 +1330,7 @@ fn write_value_ladder(
     value: &str,
     ctx: &LadderContext,
 ) -> LadderOutcome {
+    let _ = ctx.role;
     let mut out = LadderOutcome::new();
     let target = value.trim().parse::<f64>().ok();
     let before = ops.read_typed();
@@ -1839,6 +1842,31 @@ pub(super) fn chromium_select_open_refusal(
 /// How long the page may take to apply a type-ahead selection.
 const TYPEAHEAD_SETTLE: std::time::Duration = std::time::Duration::from_millis(800);
 
+#[derive(Debug, PartialEq)]
+enum TypeaheadConfirmation {
+    Selected(String),
+    NotSelected,
+    SentUnverified,
+}
+
+fn wait_typeahead_confirmation(
+    wanted: &str,
+    mut read: impl FnMut() -> ValueRead,
+    mut expired: impl FnMut() -> bool,
+    mut pause: impl FnMut(),
+) -> TypeaheadConfirmation {
+    loop {
+        let current = read().text().unwrap_or_default();
+        if current.trim().to_lowercase() == wanted.to_lowercase() {
+            return TypeaheadConfirmation::Selected(current);
+        }
+        if expired() {
+            return TypeaheadConfirmation::NotSelected;
+        }
+        pause();
+    }
+}
+
 /// Select a background Chromium `<select>` without opening its menu.
 ///
 /// Chromium shows a `<select>` menu as a native popup. Opening it orders the
@@ -1886,25 +1914,47 @@ fn select_chromium_popup_by_typeahead(
     let _scope = super::key_scope(pid, Some(window_id)).ok()?;
     crate::input::keyboard::type_text(pid, wanted).ok()?;
     let deadline = std::time::Instant::now() + TYPEAHEAD_SETTLE;
-    loop {
-        let current = selected();
-        if matches(&current) {
-            return Some(format!(
-                "✅ Selected '{current}' in AXPopUpButton [{element_index}] \
+    let confirmation = wait_typeahead_confirmation(
+        wanted,
+        || read_value_if_allowed(&mut crate::ax::label_reader::NativeLabelReader, popup),
+        || std::time::Instant::now() >= deadline,
+        || std::thread::sleep(POPUP_POLL_INTERVAL),
+    );
+    match confirmation {
+        TypeaheadConfirmation::Selected(current) => Some(format!(
+            "✅ Selected '{current}' in AXPopUpButton [{element_index}] \
                  \"{element_title}\" by typing its label into the focused control \
                  (the menu was not opened, so the window order did not change)."
-            ));
-        }
-        if std::time::Instant::now() >= deadline {
+        )),
+        TypeaheadConfirmation::NotSelected | TypeaheadConfirmation::SentUnverified => {
             tracing::debug!(
                 pid,
                 wanted,
-                current,
                 "type-ahead did not select the option; opening the menu"
             );
-            return None;
+            None
         }
-        std::thread::sleep(POPUP_POLL_INTERVAL);
+    }
+}
+
+#[cfg(test)]
+mod popup_secure_tests {
+    use super::*;
+
+    #[test]
+    fn popup_typeahead_withheld_confirmation_sends_nothing_more() {
+        let mut reads = 0;
+        let confirmation = wait_typeahead_confirmation(
+            "choice",
+            || {
+                reads += 1;
+                ValueRead::Withheld
+            },
+            || true,
+            || panic!("no further wait"),
+        );
+        assert_eq!(reads, 1);
+        assert_eq!(confirmation, TypeaheadConfirmation::SentUnverified);
     }
 }
 
@@ -2740,7 +2790,15 @@ mod ladder_tests {
         }
     }
     fn run(f: &mut Fake, request: &str, can_step: bool, secure: bool) -> LadderOutcome {
-        write_value_ladder(f, request, &LadderContext { secure, can_step })
+        write_value_ladder(
+            f,
+            request,
+            &LadderContext {
+                secure,
+                can_step,
+                role: "AXUnknown",
+            },
+        )
     }
     fn num(n: f64) -> ValueObs {
         ValueObs::Number(n)
@@ -2841,6 +2899,35 @@ mod ladder_tests {
         let out = run(&mut f, "5", false, false);
         assert_eq!(f.writes, ["string", "number"]);
         assert_eq!(out.verified, Some(true));
+    }
+    #[test]
+    fn text_role_payload_stays_the_exact_string() {
+        let mut f = Fake::new(num(0.)).read(num(1234.));
+        write_value_ladder(
+            &mut f,
+            "001234",
+            &LadderContext {
+                secure: false,
+                can_step: false,
+                role: "AXTextField",
+            },
+        );
+        assert_eq!(f.writes, ["string"]);
+        assert_eq!(f.payloads, ["001234"]);
+    }
+    #[test]
+    fn text_role_verification_does_not_accept_a_normalised_number() {
+        let mut f = Fake::new(num(0.)).read(num(1234.));
+        let out = write_value_ladder(
+            &mut f,
+            "001234",
+            &LadderContext {
+                secure: false,
+                can_step: false,
+                role: "AXTextField",
+            },
+        );
+        assert_eq!(out.verified, Some(false));
     }
     #[test]
     fn number_before_with_non_numeric_request_writes_string_once() {
@@ -3005,6 +3092,64 @@ mod ladder_tests {
         assert_eq!(data["effect"], "unverifiable");
         assert_eq!(data["verified"], false);
         assert!(data.get("document_key_edit_sent").is_none());
+    }
+}
+
+#[cfg(test)]
+mod secure_read_tests {
+    use super::*;
+    use crate::ax::label_reader::fake::FakeReader;
+
+    struct FakeLadder {
+        reader: FakeReader,
+    }
+
+    impl AxValueOps for FakeLadder {
+        fn read_typed(&mut self) -> ValueObs {
+            match read_value_if_allowed(&mut self.reader, 0) {
+                ValueRead::Allowed(value) => value,
+                ValueRead::Withheld => ValueObs::Missing,
+            }
+        }
+        fn query_settable(&mut self) -> Settable {
+            Settable::Yes
+        }
+        fn set_number(&mut self, _: f64) -> i32 {
+            kAXErrorSuccess
+        }
+        fn set_string(&mut self, _: &str) -> i32 {
+            kAXErrorSuccess
+        }
+        fn perform_step(&mut self, _: &str) -> i32 {
+            kAXErrorSuccess
+        }
+        fn settle_pause(&mut self) {}
+    }
+
+    #[test]
+    fn set_value_on_a_secure_or_unknown_field_requests_no_value() {
+        for role in [Some("AXSecureTextField"), None] {
+            let mut reader = FakeReader::default();
+            if let Some(role) = role {
+                reader.set(0, "AXRole", role);
+            }
+            reader.set(0, "AXValue", "secret");
+            let mut ops = FakeLadder { reader };
+            let _ = write_value_ladder(
+                &mut ops,
+                "replacement",
+                &LadderContext {
+                    secure: false,
+                    can_step: false,
+                    role: role.unwrap_or("AXUnknown"),
+                },
+            );
+            assert!(
+                !ops.reader.trace.iter().any(|(_, name)| name == "AXValue"),
+                "role={role:?}; trace={:?}",
+                ops.reader.trace
+            );
+        }
     }
 }
 

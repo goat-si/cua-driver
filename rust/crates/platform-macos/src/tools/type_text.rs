@@ -3381,6 +3381,21 @@ mod tests {
 }
 
 #[cfg(test)]
+mod secure_read_tests {
+    use crate::ax::label_reader::fake::FakeReader;
+    use crate::ax::write_outcome::read_text_value_with;
+
+    #[test]
+    fn type_text_replace_requests_no_value_before_classification() {
+        let mut reader = FakeReader::default();
+        reader.set(0, "AXRole", "AXSecureTextField");
+        reader.set(0, "AXValue", "secret");
+        let _before = read_text_value_with(&mut reader, 0);
+        assert!(!reader.trace.iter().any(|(_, name)| name == "AXValue"));
+    }
+}
+
+#[cfg(test)]
 mod minimized_restore_tests {
     use super::*;
 

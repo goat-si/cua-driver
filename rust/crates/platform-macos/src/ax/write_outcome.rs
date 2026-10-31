@@ -73,7 +73,14 @@ pub(crate) fn read_value_if_allowed<R: DirectValueReader>(
 }
 
 pub(crate) unsafe fn read_text_value(element: AXUIElementRef) -> Option<String> {
-    read_value_if_allowed(&mut super::label_reader::NativeLabelReader, element).text()
+    read_text_value_with(&mut super::label_reader::NativeLabelReader, element)
+}
+
+pub(crate) fn read_text_value_with<R: DirectValueReader>(
+    reader: &mut R,
+    element: R::Element,
+) -> Option<String> {
+    read_value_if_allowed(reader, element).text()
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Settable {
