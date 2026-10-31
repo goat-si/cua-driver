@@ -178,7 +178,7 @@ mod tests {
 
     #[test]
     fn side_index_ignores_capture_superseded_by_newer_publication() {
-        let (pid, xid) = (424_243, 78);
+        let (pid, xid) = (424_243_u32, 78);
         let cache = Snapshots::new();
         let older = cache.begin_capture(pid as i32, xid);
         let newer = cache.begin_capture(pid as i32, xid);
