@@ -124,6 +124,9 @@ pub mod pip_hook;
 pub mod pointer_shape;
 pub mod policy;
 pub mod post_action_wait;
+#[cfg(any(unix, windows))]
+mod private_artifact;
+mod protected_process;
 pub mod protocol;
 pub mod recording;
 pub mod recording_loader;
@@ -151,6 +154,7 @@ pub mod tool;
 pub mod tool_activity;
 pub mod tool_args;
 pub mod tool_schema;
+pub mod tree_boundary;
 pub mod video;
 pub mod video_ffmpeg;
 pub mod walk_budget;

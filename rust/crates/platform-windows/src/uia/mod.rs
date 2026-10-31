@@ -9,12 +9,12 @@
 //! (avoids per-property cross-process calls that make Chrome's 5000-node tree
 //!  take >4s when reading each property individually).
 
+use crate::secure_field::{project_node_text, ProjectedNodeText, RawNodeText};
 use cua_driver_core::snapshot_compaction::{
     compact_tab_strip, fold_actionless_text_subtrees, format_omitted_tabs_line,
-    format_uncounted_offscreen_rows_line, is_compaction_summary_line, is_secure_text_field,
-    is_uia_dense_collection, is_uia_offscreen_exempt, plan_uia_collection_children,
-    redact_if_secure, redact_mirrored_secure_name, renumber_indexed_tree, splice_deferred_chunks,
-    CompactableNode, DeferredChunk, FieldSecurityMeta, RenumberableNode, TabChildMeta,
+    format_uncounted_offscreen_rows_line, is_compaction_summary_line, is_uia_dense_collection,
+    is_uia_offscreen_exempt, plan_uia_collection_children, renumber_indexed_tree,
+    splice_deferred_chunks, CompactableNode, DeferredChunk, RenumberableNode, TabChildMeta,
     UiaChildCandidate, UiaChildPlan, TAB_STRIP_COMPACTION_THRESHOLD,
 };
 use cua_driver_core::walk_budget::WalkBudget;
@@ -273,67 +273,175 @@ unsafe fn release_walk_nodes(nodes: Vec<UiaNode>) {
     }
 }
 
-unsafe fn invoke_menu_element(element_ptr: usize, final_segment: bool) -> Result<(), String> {
-    let element =
-        std::mem::ManuallyDrop::new(IUIAutomationElement::from_raw(element_ptr as *mut _));
-    if !final_segment {
-        if let Ok(pattern) = element.GetCurrentPattern(UIA_ExpandCollapsePatternId) {
-            if let Ok(expand) = pattern.cast::<IUIAutomationExpandCollapsePattern>() {
-                return expand
-                    .Expand()
-                    .map_err(|error| format!("ExpandCollapse.Expand failed: {error}"));
-            }
-        }
-    }
-    if let Ok(pattern) = element.GetCurrentPattern(UIA_InvokePatternId) {
-        if let Ok(invoke) = pattern.cast::<IUIAutomationInvokePattern>() {
-            return invoke
-                .Invoke()
-                .map_err(|error| format!("InvokePattern.Invoke failed: {error}"));
-        }
-    }
-    if final_segment {
-        if let Ok(pattern) = element.GetCurrentPattern(UIA_SelectionItemPatternId) {
-            if let Ok(selection) = pattern.cast::<IUIAutomationSelectionItemPattern>() {
-                return selection
-                    .Select()
-                    .map_err(|error| format!("SelectionItem.Select failed: {error}"));
-            }
-        }
-    }
-    Err("element exposes no usable native menu pattern".into())
+#[derive(Debug)]
+pub(crate) struct MenuPathError {
+    pub message: String,
+    pub completed_hops: usize,
+    pub failure: crate::uia_mutation::MenuFailure,
+    pub transport: cua_driver_core::action_record::ActionTransport,
 }
 
-/// Resolve and invoke an exact application menu path from fresh UIA state at
-/// every hop. No cached element index survives a menu mutation.
-pub fn invoke_menu_path(hwnd: u64, path: &[String]) -> Result<(), String> {
+unsafe fn menu_pattern<T: Interface>(
+    element: &IUIAutomationElement,
+    id: windows::Win32::UI::Accessibility::UIA_PATTERN_ID,
+) -> Result<Option<T>, i32> {
+    match element
+        .GetCurrentPattern(id)
+        .and_then(|pattern| pattern.cast::<T>())
+    {
+        Ok(pattern) => Ok(Some(pattern)),
+        Err(error) if crate::uia_mutation::pattern_absent(error.code().0) => Ok(None),
+        Err(error) => Err(error.code().0),
+    }
+}
+
+unsafe fn invoke_menu_element(
+    element_ptr: usize,
+    final_segment: bool,
+) -> Result<
+    cua_driver_core::action_record::ActionTransport,
+    (
+        String,
+        crate::uia_mutation::MenuFailure,
+        cua_driver_core::action_record::ActionTransport,
+        bool,
+    ),
+> {
+    use crate::uia_mutation::{classify_write_hresult, MenuFailure, WriteVerdict};
+    use cua_driver_core::action_record::ActionTransport;
+    let element =
+        std::mem::ManuallyDrop::new(IUIAutomationElement::from_raw(element_ptr as *mut _));
+    macro_rules! attempt {
+        ($ty:ty, $id:expr, $method:ident, $transport:expr) => {{
+            let transport = $transport;
+            match menu_pattern::<$ty>(&element, $id) {
+                Err(hr) => {
+                    return Err((
+                        format!("pattern acquisition failed: HRESULT 0x{:08X}", hr as u32),
+                        MenuFailure::Refused,
+                        transport,
+                        false,
+                    ))
+                }
+                Ok(None) => {}
+                Ok(Some(pattern)) => match pattern.$method() {
+                    Ok(()) => return Ok(transport),
+                    Err(error) => {
+                        let hr = error.code().0;
+                        match classify_write_hresult(hr) {
+                            WriteVerdict::AffordanceAbsent => {}
+                            WriteVerdict::Refused(_) => {
+                                return Err((
+                                    format!("{} failed: {error}", stringify!($method)),
+                                    MenuFailure::Refused,
+                                    transport,
+                                    true,
+                                ))
+                            }
+                            _ => {
+                                return Err((
+                                    format!("{} failed: {error}", stringify!($method)),
+                                    MenuFailure::Uncertain,
+                                    transport,
+                                    true,
+                                ))
+                            }
+                        }
+                    }
+                },
+            }
+        }};
+    }
+    if !final_segment {
+        attempt!(
+            IUIAutomationExpandCollapsePattern,
+            UIA_ExpandCollapsePatternId,
+            Expand,
+            ActionTransport::WindowsUiaExpandCollapse
+        );
+    }
+    attempt!(
+        IUIAutomationInvokePattern,
+        UIA_InvokePatternId,
+        Invoke,
+        ActionTransport::WindowsUiaInvoke
+    );
+    if final_segment {
+        attempt!(
+            IUIAutomationSelectionItemPattern,
+            UIA_SelectionItemPatternId,
+            Select,
+            ActionTransport::WindowsUiaSelection
+        );
+    }
+    Err((
+        "element exposes no usable native menu pattern".into(),
+        MenuFailure::Refused,
+        ActionTransport::WindowsUiaInvoke,
+        false,
+    ))
+}
+
+/// Resolve and invoke an exact application menu path from fresh UIA state at every hop.
+pub(crate) fn invoke_menu_path(hwnd: u64, path: &[String]) -> Result<(), MenuPathError> {
+    use crate::uia_mutation::MenuFailure;
+    use cua_driver_core::action_record::ActionTransport;
+    let mut last_transport = ActionTransport::WindowsUiaInvoke;
     for depth in 0..path.len() {
         let result = walk_tree(hwnd, None);
         let matches = exact_menu_path_matches(&result.nodes, &path[..=depth]);
         let target_index = match matches.as_slice() {
             [index] => *index,
-            [] => {
-                unsafe { release_walk_nodes(result.nodes) };
-                return Err(format!("menu path segment {depth} was not found"));
-            }
             _ => {
+                let message = if matches.is_empty() {
+                    format!("menu path segment {depth} was not found")
+                } else {
+                    format!("menu path segment {depth} is ambiguous")
+                };
                 unsafe { release_walk_nodes(result.nodes) };
-                return Err(format!("menu path segment {depth} is ambiguous"));
+                return Err(MenuPathError {
+                    message,
+                    completed_hops: depth,
+                    failure: MenuFailure::Refused,
+                    transport: last_transport,
+                });
             }
         };
         let target = &result.nodes[target_index];
-        let error = if target.enabled == Some(false) {
-            Some(format!("menu path segment {depth} is disabled"))
+        let action = if target.enabled == Some(false) {
+            Err((
+                format!("menu path segment {depth} is disabled"),
+                MenuFailure::Refused,
+                last_transport,
+                false,
+            ))
         } else if target.msaa_role.is_some() {
-            Some(format!(
-                "menu path segment {depth} is exposed only through MSAA, not UI Automation"
+            Err((
+                format!(
+                    "menu path segment {depth} is exposed only through MSAA, not UI Automation"
+                ),
+                MenuFailure::Refused,
+                last_transport,
+                false,
             ))
         } else {
-            unsafe { invoke_menu_element(target.element_ptr, depth + 1 == path.len()) }.err()
+            unsafe { invoke_menu_element(target.element_ptr, depth + 1 == path.len()) }
         };
         unsafe { release_walk_nodes(result.nodes) };
-        if let Some(error) = error {
-            return Err(format!("menu path segment {depth}: {error}"));
+        match action {
+            Ok(transport) => last_transport = transport,
+            Err((message, failure, transport, called)) => {
+                return Err(MenuPathError {
+                    message: format!("menu path segment {depth}: {message}"),
+                    completed_hops: depth,
+                    failure,
+                    transport: if called || depth == 0 {
+                        transport
+                    } else {
+                        last_transport
+                    },
+                })
+            }
         }
         if depth + 1 != path.len() {
             std::thread::sleep(std::time::Duration::from_millis(80));
@@ -1431,20 +1539,21 @@ fn emit_cached_node(
     .flatten()
     .collect::<Vec<_>>();
     let description = (!description.is_empty()).then(|| description.join(" "));
-    let security_meta = FieldSecurityMeta {
-        role: &control_type,
-        subrole: None,
-        title: name.as_deref(),
-        description: description.as_deref(),
-        placeholder: None,
-        identifier: automation_id.as_deref(),
-        help: help_text.as_deref(),
-        is_password_flag: read_cached_bool(element, UIA_IsPasswordPropertyId) == Some(true),
-    };
-    let secure = is_secure_text_field(&security_meta);
-    let raw_value = value.clone();
-    let (value, _) = redact_if_secure(&security_meta, value, None);
-    let name = redact_mirrored_secure_name(secure, name, raw_value.as_deref());
+    let ProjectedNodeText {
+        name,
+        value,
+        help: help_text,
+        secure: _secure,
+    } = project_node_text(RawNodeText {
+        control_type: &control_type,
+        name,
+        value,
+        help: help_text,
+        description,
+        automation_id: automation_id.clone(),
+        is_password: read_cached_bool(element, UIA_IsPasswordPropertyId),
+        has_value_pattern: unsafe { element.GetCachedPattern(UIA_ValuePatternId) }.is_ok(),
+    });
     let enabled = read_cached_bool(element, UIA_IsEnabledPropertyId);
     // Missing UIA state must remain unknown on the structured observation
     // surface. Action discovery keeps its historical best-effort assumption.

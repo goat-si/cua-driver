@@ -137,7 +137,6 @@ fn a_proven_token_dispatches_to_its_own_element_while_another_window_is_retained
             .expect("membership proven");
         // Text, focus, value and scroll dispatch address this object.
         assert_eq!(token.object().expect("addressable").path, path);
-        assert!(!token.may_reresolve, "a proven token never re-resolves");
         let cached = snapshots
             .with_latest(PID as i32, window, |_, snapshot| snapshot.elements())
             .and_then(|elements| elements.get(&INDEX).cloned())
@@ -147,11 +146,11 @@ fn a_proven_token_dispatches_to_its_own_element_while_another_window_is_retained
 }
 
 #[test]
-fn only_an_unproven_session_may_re_resolve_a_token_index() {
-    let proven = TokenElement::new(INDEX, observed("/window_b/text"), WindowProof::Proven);
-    assert!(!proven.may_reresolve);
-    let unproven = TokenElement::new(INDEX, observed("/window_b/text"), WindowProof::NotRequired);
-    assert!(unproven.may_reresolve);
+fn both_window_proofs_keep_the_observed_object() {
+    for proof in [WindowProof::Proven, WindowProof::NotRequired] {
+        let token = TokenElement::new(INDEX, observed("/window_b/text"), proof);
+        assert_eq!(token.object().unwrap().path, "/window_b/text");
+    }
 }
 
 #[test]

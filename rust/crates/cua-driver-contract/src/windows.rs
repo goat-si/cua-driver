@@ -322,11 +322,103 @@ fn toggle_state_schema(generator: &mut SchemaGenerator) -> Schema {
     ToggleState::json_schema(generator)
 }
 
+/// Broad cause of a missing part of the requested observation.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Serialize,
+    Deserialize,
+    JsonSchema,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    uniffi::Enum,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum IncompleteReasonKind {
+    PolicyOmission,
+    ProviderFailure,
+    Budget,
+    Unknown,
+}
+
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Serialize,
+    Deserialize,
+    JsonSchema,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    uniffi::Enum,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum IncompleteReasonDetail {
+    CollapsedMenu,
+    Offscreen,
+    InactiveTab,
+    WebContent,
+    HugeContainer,
+    DepthLimit,
+    NodeBudget,
+    TimeBudget,
+    ChildEnumerationFailed,
+    AttributeReadFailed,
+    EnumerationErrorUnclassified,
+    UntrustedProvider,
+    ScopeMismatch,
+    NotAsserted,
+}
+
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Serialize,
+    Deserialize,
+    JsonSchema,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    uniffi::Record,
+)]
+pub struct IncompleteReason {
+    pub kind: IncompleteReasonKind,
+    pub detail: IncompleteReasonDetail,
+}
+
+/// A boundary and a read-level omission use the same vocabulary.
+pub type BoundaryReason = IncompleteReason;
+
+/// Evidence for the number of direct children omitted at this node.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq, uniffi::Enum)]
+#[serde(rename_all = "snake_case")]
+pub enum CountEvidence {
+    Known(u32),
+    Unknown,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq, uniffi::Record)]
+pub struct NodeBoundary {
+    pub reasons: Vec<IncompleteReason>,
+    pub children_skipped: CountEvidence,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub descendants_omitted: Option<bool>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, uniffi::Record)]
 pub struct WindowElement {
     pub element_index: u64,
     pub role: String,
     pub depth: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub boundary: Option<NodeBoundary>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub element_token: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -392,6 +484,12 @@ pub struct WindowStateOutput {
     pub filtered_element_count: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub elements_complete: Option<bool>,
+    /// Producer assertion about the requested scope. Absence is incomplete;
+    /// reductions after the walk do not change observation completeness.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observation_complete: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observation_incomplete_reasons: Option<Vec<IncompleteReason>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub degraded: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -471,6 +569,24 @@ impl ToolOutput for WindowStateOutput {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn window_observation_fields_roundtrip_and_omit_when_absent() {
+        let old = json!({"pid":7,"window_id":9,"elements":[{"element_index":1,"role":"button","depth":0}]});
+        let output: WindowStateOutput = serde_json::from_value(old.clone()).unwrap();
+        assert_eq!(serde_json::to_value(output).unwrap(), old);
+        let new = json!({"pid":7,"window_id":9,"observation_complete":false,
+            "observation_incomplete_reasons":[{"kind":"budget","detail":"node_budget"}],
+            "elements":[{"element_index":1,"role":"button","depth":0,"boundary":{
+                "reasons":[{"kind":"budget","detail":"node_budget"}],"children_skipped":{"known":4},"descendants_omitted":true}}]});
+        let output: WindowStateOutput = serde_json::from_value(new.clone()).unwrap();
+        assert_eq!(serde_json::to_value(output).unwrap(), new);
+        let schema = WindowStateOutput::output_schema();
+        assert!(schema["properties"]["observation_complete"].is_object());
+        assert!(schema["properties"]["elements"]
+            .to_string()
+            .contains("boundary"));
+    }
 
     #[test]
     fn native_app_success_shapes_allow_unavailable_metadata() {

@@ -77,8 +77,16 @@ pub fn conforming_tool_result(tool: &str, result: Value) -> Value {
 /// Reject contracts this proxy cannot safely normalize errors against. An older
 /// daemon may omit its schema; that does not promise the local success contract.
 pub fn validate_proxy_output_schema(tool: &str, schema: Option<&Value>) -> Result<(), String> {
+    validate_proxy_schema_pair(tool, advertised_tool_output_schema(tool).as_ref(), schema)
+}
+
+fn validate_proxy_schema_pair(
+    tool: &str,
+    local: Option<&Value>,
+    schema: Option<&Value>,
+) -> Result<(), String> {
     if let Some(schema) = schema {
-        if advertised_tool_output_schema(tool).as_ref() != Some(schema) {
+        if local != Some(schema) {
             return Err(format!(
                 "incompatible daemon output schema for {tool}; use matching proxy and daemon versions"
             ));
@@ -492,6 +500,53 @@ mod tests {
         assert_eq!(
             conforming_tool_result("no_such_tool", result.clone()),
             result
+        );
+    }
+
+    #[test]
+    fn window_schema_accepts_old_and_new_payloads_and_refuses_mixed_versions() {
+        let tool = "get_window_state";
+        let new_schema = advertised_tool_output_schema(tool).unwrap();
+        let validator = jsonschema::validator_for(&new_schema).unwrap();
+        let old_success: Value = serde_json::from_str(include_str!(
+            "../../../../contract/fixtures/get-window-state-old-success-schema.json"
+        ))
+        .unwrap();
+        let old_schema = cua_driver_contract::advertised_output_schema(old_success);
+        let old_validator = jsonschema::validator_for(&old_schema).unwrap();
+        let old_element = &old_schema["anyOf"][0]["properties"]["elements"]["items"];
+        let new_element = &new_schema["anyOf"][0]["properties"]["elements"]["items"];
+        assert_eq!(
+            old_element.get("additionalProperties"),
+            new_element.get("additionalProperties")
+        );
+        let old_payload = json!({"pid":7,"window_id":9,"elements":[{"element_index":1,"role":"button","depth":0,"identifier":"mac-id","focused":true}]});
+        let new_payload = json!({"pid":7,"window_id":9,"observation_complete":false,
+            "observation_incomplete_reasons":[{"kind":"budget","detail":"node_budget"}],
+            "elements":[{"element_index":1,"role":"button","depth":0,"identifier":"mac-id","focused":true,"boundary":{
+                "reasons":[{"kind":"budget","detail":"node_budget"}],"children_skipped":{"known":2}}}]});
+        assert!(old_validator.is_valid(&old_payload));
+        assert!(validator.is_valid(&old_payload));
+        assert!(
+            validator.is_valid(&new_payload),
+            "{:?}",
+            validator.validate(&new_payload)
+        );
+        let mut invalid = new_payload.clone();
+        invalid["elements"][0]["boundary"]["reasons"][0]["detail"] = json!("not_a_reason");
+        assert!(!validator.is_valid(&invalid));
+        let message = "incompatible daemon output schema for get_window_state; use matching proxy and daemon versions";
+        assert_eq!(
+            validate_proxy_schema_pair(tool, Some(&new_schema), Some(&old_schema)).unwrap_err(),
+            message
+        );
+        assert_eq!(
+            validate_proxy_schema_pair(tool, Some(&old_schema), Some(&new_schema)).unwrap_err(),
+            message
+        );
+        assert_eq!(
+            validate_proxy_output_schema(tool, Some(&old_schema)).unwrap_err(),
+            message
         );
     }
 

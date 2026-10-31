@@ -2078,6 +2078,87 @@
                     "null"
                   ]
                 },
+                "boundary": {
+                  "properties": {
+                    "children_skipped": {
+                      "oneOf": [
+                        {
+                          "enum": [
+                            "unknown"
+                          ],
+                          "type": "string"
+                        },
+                        {
+                          "additionalProperties": false,
+                          "properties": {
+                            "known": {
+                              "minimum": 0,
+                              "type": "integer"
+                            }
+                          },
+                          "required": [
+                            "known"
+                          ],
+                          "type": "object"
+                        }
+                      ]
+                    },
+                    "descendants_omitted": {
+                      "type": [
+                        "boolean",
+                        "null"
+                      ]
+                    },
+                    "reasons": {
+                      "items": {
+                        "properties": {
+                          "detail": {
+                            "enum": [
+                              "collapsed_menu",
+                              "offscreen",
+                              "inactive_tab",
+                              "web_content",
+                              "huge_container",
+                              "depth_limit",
+                              "node_budget",
+                              "time_budget",
+                              "child_enumeration_failed",
+                              "attribute_read_failed",
+                              "enumeration_error_unclassified",
+                              "untrusted_provider",
+                              "scope_mismatch",
+                              "not_asserted"
+                            ],
+                            "type": "string"
+                          },
+                          "kind": {
+                            "enum": [
+                              "policy_omission",
+                              "provider_failure",
+                              "budget",
+                              "unknown"
+                            ],
+                            "type": "string"
+                          }
+                        },
+                        "required": [
+                          "kind",
+                          "detail"
+                        ],
+                        "type": "object"
+                      },
+                      "type": "array"
+                    }
+                  },
+                  "required": [
+                    "reasons",
+                    "children_skipped"
+                  ],
+                  "type": [
+                    "object",
+                    "null"
+                  ]
+                },
                 "depth": {
                   "minimum": 0,
                   "type": "integer"
@@ -2213,6 +2294,55 @@
             "minimum": 0,
             "type": [
               "integer",
+              "null"
+            ]
+          },
+          "observation_complete": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "observation_incomplete_reasons": {
+            "items": {
+              "properties": {
+                "detail": {
+                  "enum": [
+                    "collapsed_menu",
+                    "offscreen",
+                    "inactive_tab",
+                    "web_content",
+                    "huge_container",
+                    "depth_limit",
+                    "node_budget",
+                    "time_budget",
+                    "child_enumeration_failed",
+                    "attribute_read_failed",
+                    "enumeration_error_unclassified",
+                    "untrusted_provider",
+                    "scope_mismatch",
+                    "not_asserted"
+                  ],
+                  "type": "string"
+                },
+                "kind": {
+                  "enum": [
+                    "policy_omission",
+                    "provider_failure",
+                    "budget",
+                    "unknown"
+                  ],
+                  "type": "string"
+                }
+              },
+              "required": [
+                "kind",
+                "detail"
+              ],
+              "type": "object"
+            },
+            "type": [
+              "array",
               "null"
             ]
           },

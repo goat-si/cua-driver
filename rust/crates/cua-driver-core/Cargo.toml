@@ -60,6 +60,9 @@ jsonschema = { version = "0.46", default-features = false }
 tempfile = "3"
 rquickjs = { version = "0.14", default-features = false, features = ["std"], optional = true }
 
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 

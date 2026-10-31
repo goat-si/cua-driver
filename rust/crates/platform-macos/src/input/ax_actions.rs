@@ -5,8 +5,169 @@ use core_foundation::base::{CFEqual, CFRelease, CFRetain, CFTypeRef};
 
 const MAX_SELECTION_ANCESTORS: usize = 8;
 
+pub(crate) fn climb_limit(start_role: Option<&str>) -> usize {
+    if start_role.is_none_or(|role| {
+        role.is_empty() || role == "AXUnknown" || is_selectable_container_role(role)
+    }) {
+        1
+    } else {
+        MAX_SELECTION_ANCESTORS
+    }
+}
+
 fn is_selectable_container_role(role: &str) -> bool {
     matches!(role, "AXRow" | "AXCell" | "AXListItem" | "AXImage")
+}
+
+pub(crate) trait SelectionOps {
+    type Element: Clone;
+    fn role(&mut self, element: &Self::Element) -> Option<String>;
+    fn parent(&mut self, element: &Self::Element) -> Option<Self::Element>;
+    fn selected(&mut self, element: &Self::Element) -> Option<bool>;
+    fn select(&mut self, element: &Self::Element) -> bool;
+    fn center(&mut self, element: &Self::Element) -> Option<(f64, f64)>;
+}
+
+pub(crate) struct SelectionElement(AXUIElementRef);
+impl SelectionElement {
+    pub(crate) unsafe fn retain(element: AXUIElementRef) -> Self {
+        CFRetain(element as CFTypeRef);
+        Self(element)
+    }
+    pub(crate) fn into_raw(self) -> AXUIElementRef {
+        let ptr = self.0;
+        std::mem::forget(self);
+        ptr
+    }
+}
+impl Clone for SelectionElement {
+    fn clone(&self) -> Self {
+        unsafe { Self::retain(self.0) }
+    }
+}
+impl Drop for SelectionElement {
+    fn drop(&mut self) {
+        unsafe { CFRelease(self.0 as CFTypeRef) }
+    }
+}
+
+pub(crate) struct LiveSelectionOps;
+impl SelectionOps for LiveSelectionOps {
+    type Element = SelectionElement;
+    fn role(&mut self, element: &Self::Element) -> Option<String> {
+        unsafe { copy_string_attr(element.0, "AXRole") }
+    }
+    fn parent(&mut self, element: &Self::Element) -> Option<Self::Element> {
+        unsafe { copy_element_attr(element.0, "AXParent").map(SelectionElement) }
+    }
+    fn selected(&mut self, element: &Self::Element) -> Option<bool> {
+        unsafe { copy_bool_attr(element.0, "AXSelected") }
+    }
+    fn select(&mut self, element: &Self::Element) -> bool {
+        unsafe { set_bool_attr_true(element.0, "AXSelected") == kAXErrorSuccess }
+    }
+    fn center(&mut self, element: &Self::Element) -> Option<(f64, f64)> {
+        unsafe { element_screen_rect(element.0) }
+            .map(|rect| (rect[0] + rect[2] / 2.0, rect[1] + rect[3] / 2.0))
+    }
+}
+
+fn walk_selection<B: SelectionOps, T>(
+    ops: &mut B,
+    start: B::Element,
+    mut visit: impl FnMut(&mut B, &B::Element, Option<&str>) -> std::ops::ControlFlow<T>,
+) -> Option<T> {
+    let mut current = start;
+    let mut role = ops.role(&current);
+    let limit = climb_limit(role.as_deref());
+    for step in 0..limit {
+        if let std::ops::ControlFlow::Break(value) = visit(ops, &current, role.as_deref()) {
+            return Some(value);
+        }
+        if step + 1 == limit {
+            break;
+        }
+        current = ops.parent(&current)?;
+        role = ops.role(&current);
+    }
+    None
+}
+
+fn selectable(role: Option<&str>) -> bool {
+    role.is_some_and(is_selectable_container_role)
+}
+
+pub(crate) fn select_with<B: SelectionOps>(ops: &mut B, start: B::Element) -> Option<String> {
+    walk_selection(ops, start, |ops, item, role| {
+        if selectable(role)
+            && ops.selected(item).is_some()
+            && ops.select(item)
+            && ops.selected(item) == Some(true)
+        {
+            std::ops::ControlFlow::Break(role.unwrap().to_owned())
+        } else {
+            std::ops::ControlFlow::Continue(())
+        }
+    })
+}
+
+pub(crate) fn selection_state_with<B: SelectionOps>(
+    ops: &mut B,
+    start: B::Element,
+) -> Option<(String, bool)> {
+    walk_selection(ops, start, |ops, item, role| {
+        if selectable(role) {
+            if let Some(selected) = ops.selected(item) {
+                return std::ops::ControlFlow::Break((role.unwrap().to_owned(), selected));
+            }
+        }
+        std::ops::ControlFlow::Continue(())
+    })
+}
+
+pub(crate) fn selection_target_with<B: SelectionOps>(
+    ops: &mut B,
+    start: B::Element,
+) -> Option<(String, B::Element)> {
+    walk_selection(ops, start, |ops, item, role| {
+        if selectable(role) && ops.selected(item).is_some() {
+            std::ops::ControlFlow::Break((role.unwrap().to_owned(), item.clone()))
+        } else {
+            std::ops::ControlFlow::Continue(())
+        }
+    })
+}
+
+pub(crate) fn selection_center_with<B: SelectionOps>(
+    ops: &mut B,
+    start: B::Element,
+) -> Option<(f64, f64)> {
+    walk_selection(ops, start, |ops, item, role| {
+        if selectable(role) && ops.selected(item).is_some() {
+            std::ops::ControlFlow::Break(ops.center(item))
+        } else {
+            std::ops::ControlFlow::Continue(())
+        }
+    })
+    .flatten()
+}
+
+pub(crate) fn selection_snapshot_with<B: SelectionOps>(
+    ops: &mut B,
+    start: B::Element,
+) -> (Vec<(B::Element, bool)>, bool) {
+    let mut items = Vec::new();
+    let mut in_item = false;
+    let _: Option<()> = walk_selection(ops, start, |ops, item, role| {
+        if selectable(role) {
+            in_item = true;
+            if let Some(selected) = ops.selected(item) {
+                items.push((item.clone(), selected));
+            }
+        }
+        std::ops::ControlFlow::Continue(())
+    });
+    (items, in_item)
 }
 
 /// Select the nearest list-like element at or above `element_ptr` and confirm
@@ -25,37 +186,8 @@ fn is_selectable_container_role(role: &str) -> bool {
 /// `AXSelected=true` read-back, so an arbitrary failed image/button press cannot
 /// become a claimed success.
 pub fn select_nearest_container(element_ptr: usize) -> Option<String> {
-    let mut current = element_ptr as AXUIElementRef;
-    let mut owns_current = false;
-
-    for _ in 0..MAX_SELECTION_ANCESTORS {
-        let role = unsafe { copy_string_attr(current, "AXRole") }.unwrap_or_default();
-        if is_selectable_container_role(&role)
-            && unsafe { copy_bool_attr(current, "AXSelected") }.is_some()
-        {
-            let err = unsafe { set_bool_attr_true(current, "AXSelected") };
-            if err == kAXErrorSuccess
-                && unsafe { copy_bool_attr(current, "AXSelected") } == Some(true)
-            {
-                if owns_current {
-                    unsafe { CFRelease(current as CFTypeRef) };
-                }
-                return Some(role);
-            }
-        }
-
-        let parent = unsafe { copy_element_attr(current, "AXParent") };
-        if owns_current {
-            unsafe { CFRelease(current as CFTypeRef) };
-        }
-        current = parent?;
-        owns_current = true;
-    }
-
-    if owns_current {
-        unsafe { CFRelease(current as CFTypeRef) };
-    }
-    None
+    let start = unsafe { SelectionElement::retain(element_ptr as AXUIElementRef) };
+    select_with(&mut LiveSelectionOps, start)
 }
 
 /// Read the selection state of the nearest collection-like element without
@@ -63,32 +195,8 @@ pub fn select_nearest_container(element_ptr: usize) -> Option<String> {
 /// exposes `AXSelected` but refuses to set it directly (notably Finder icon
 /// views).
 pub fn nearest_container_selection_state(element_ptr: usize) -> Option<(String, bool)> {
-    let mut current = element_ptr as AXUIElementRef;
-    let mut owns_current = false;
-
-    for _ in 0..MAX_SELECTION_ANCESTORS {
-        let role = unsafe { copy_string_attr(current, "AXRole") }.unwrap_or_default();
-        if is_selectable_container_role(&role) {
-            if let Some(selected) = unsafe { copy_bool_attr(current, "AXSelected") } {
-                if owns_current {
-                    unsafe { CFRelease(current as CFTypeRef) };
-                }
-                return Some((role, selected));
-            }
-        }
-
-        let parent = unsafe { copy_element_attr(current, "AXParent") };
-        if owns_current {
-            unsafe { CFRelease(current as CFTypeRef) };
-        }
-        current = parent?;
-        owns_current = true;
-    }
-
-    if owns_current {
-        unsafe { CFRelease(current as CFTypeRef) };
-    }
-    None
+    let start = unsafe { SelectionElement::retain(element_ptr as AXUIElementRef) };
+    selection_state_with(&mut LiveSelectionOps, start)
 }
 
 /// A retained selection context for proving the settled result of a modified
@@ -138,54 +246,30 @@ impl Drop for SelectionReadback {
 /// Returns `None` when the platform does not expose a readable selection model;
 /// callers must then leave the action unverifiable instead of inventing proof.
 pub fn capture_nearest_container_selection(element_ptr: usize) -> Option<SelectionReadback> {
-    let mut current = element_ptr as AXUIElementRef;
-    let mut owns_current = false;
-
-    for _ in 0..MAX_SELECTION_ANCESTORS {
-        let role = unsafe { copy_string_attr(current, "AXRole") }.unwrap_or_default();
-        if is_selectable_container_role(&role)
-            && unsafe { copy_bool_attr(current, "AXSelected") }.is_some()
-        {
-            if !owns_current {
-                unsafe { CFRetain(current as CFTypeRef) };
+    let start = unsafe { SelectionElement::retain(element_ptr as AXUIElementRef) };
+    let (role, target) = selection_target_with(&mut LiveSelectionOps, start)?;
+    let target = target.into_raw();
+    let parent = unsafe { copy_element_attr(target, "AXParent") };
+    let mut peers = Vec::new();
+    let mut peer_model_observed = false;
+    if let Some(parent) = parent {
+        for child in unsafe { copy_children(parent) } {
+            let is_target = unsafe { CFEqual(child as CFTypeRef, target as CFTypeRef) != 0 };
+            peer_model_observed |= is_target;
+            if !is_target && unsafe { copy_bool_attr(child, "AXSelected") } == Some(true) {
+                peers.push(child);
+            } else {
+                unsafe { CFRelease(child as CFTypeRef) };
             }
-            let target = current;
-            let parent = unsafe { copy_element_attr(target, "AXParent") };
-            let mut peers = Vec::new();
-            let mut peer_model_observed = false;
-            if let Some(parent) = parent {
-                for child in unsafe { copy_children(parent) } {
-                    let is_target =
-                        unsafe { CFEqual(child as CFTypeRef, target as CFTypeRef) != 0 };
-                    peer_model_observed |= is_target;
-                    if !is_target && unsafe { copy_bool_attr(child, "AXSelected") } == Some(true) {
-                        peers.push(child);
-                    } else {
-                        unsafe { CFRelease(child as CFTypeRef) };
-                    }
-                }
-                unsafe { CFRelease(parent as CFTypeRef) };
-            }
-            return Some(SelectionReadback {
-                role,
-                target,
-                peer_model_observed,
-                previously_selected_peers: peers,
-            });
         }
-
-        let parent = unsafe { copy_element_attr(current, "AXParent") };
-        if owns_current {
-            unsafe { CFRelease(current as CFTypeRef) };
-        }
-        current = parent?;
-        owns_current = true;
+        unsafe { CFRelease(parent as CFTypeRef) };
     }
-
-    if owns_current {
-        unsafe { CFRelease(current as CFTypeRef) };
-    }
-    None
+    Some(SelectionReadback {
+        role,
+        target,
+        peer_model_observed,
+        previously_selected_peers: peers,
+    })
 }
 
 /// The error for a target that reads AXEnabled=false; the action is not sent.
@@ -899,6 +983,139 @@ mod tests {
             assert!(!is_web_or_safari_focus_fallback_candidate(
                 non_text, true, true
             ));
+        }
+    }
+}
+
+#[cfg(test)]
+mod climb_limit_tests {
+    use super::*;
+
+    #[derive(Default)]
+    struct FakeSelection {
+        roles: Vec<Option<&'static str>>,
+        selected: Vec<Option<bool>>,
+        reads: Vec<usize>,
+        writes: Vec<usize>,
+        centers: Vec<usize>,
+        parents: Vec<usize>,
+        write_succeeds: bool,
+    }
+    impl SelectionOps for FakeSelection {
+        type Element = usize;
+        fn role(&mut self, n: &usize) -> Option<String> {
+            self.roles[*n].map(str::to_owned)
+        }
+        fn parent(&mut self, n: &usize) -> Option<usize> {
+            self.parents.push(*n);
+            (*n + 1 < self.roles.len()).then_some(*n + 1)
+        }
+        fn selected(&mut self, n: &usize) -> Option<bool> {
+            self.reads.push(*n);
+            self.selected[*n]
+        }
+        fn select(&mut self, n: &usize) -> bool {
+            self.writes.push(*n);
+            self.write_succeeds
+        }
+        fn center(&mut self, n: &usize) -> Option<(f64, f64)> {
+            self.centers.push(*n);
+            Some((*n as f64, 0.0))
+        }
+    }
+    fn fake(role: Option<&'static str>, selected: Option<bool>) -> FakeSelection {
+        FakeSelection {
+            roles: vec![role, Some("AXRow")],
+            selected: vec![selected, Some(true)],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn five_traversals_never_use_an_outer_item_for_an_item_or_unknown_start() {
+        for role in [
+            None,
+            Some("AXUnknown"),
+            Some(""),
+            Some("AXRow"),
+            Some("AXCell"),
+            Some("AXListItem"),
+            Some("AXImage"),
+        ] {
+            // A failed write or unreadable selection cannot fall through to the outer item.
+            let mut ops = fake(role, Some(false));
+            assert_eq!(select_with(&mut ops, 0), None);
+            assert!(ops.parents.is_empty());
+            assert!(ops.writes.iter().all(|n| *n == 0));
+            let mut ops = fake(role, None);
+            assert_eq!(selection_state_with(&mut ops, 0), None);
+            assert!(ops.parents.is_empty());
+            let mut ops = fake(role, None);
+            assert!(selection_target_with(&mut ops, 0).is_none());
+            assert!(ops.parents.is_empty());
+            let mut ops = fake(role, None);
+            assert_eq!(selection_center_with(&mut ops, 0), None);
+            assert!(ops.parents.is_empty());
+            assert!(ops.centers.is_empty());
+            let mut ops = fake(role, Some(false));
+            let (before, _) = selection_snapshot_with(&mut ops, 0);
+            assert!(ops.parents.is_empty());
+            assert!(before.iter().all(|(n, _)| *n == 0));
+            // Only the outer item changes: no captured target transition exists.
+            ops.selected[1] = Some(true);
+            assert!(!before
+                .iter()
+                .any(|(n, selected)| !selected && ops.selected[*n] == Some(true)));
+        }
+    }
+
+    #[test]
+    fn selection_element_owns_each_retain_once() {
+        use core_foundation::base::{CFGetRetainCount, TCFType};
+        use core_foundation::string::CFString;
+        let value = CFString::new("selection-element-test");
+        let ptr = value.as_concrete_TypeRef() as CFTypeRef;
+        let baseline = unsafe { CFGetRetainCount(ptr) };
+        let original = unsafe { SelectionElement::retain(ptr as AXUIElementRef) };
+        let cloned = original.clone();
+        assert_eq!(unsafe { CFGetRetainCount(ptr) }, baseline + 2);
+        drop(original);
+        assert_eq!(unsafe { CFGetRetainCount(ptr) }, baseline + 1);
+        let raw = cloned.into_raw();
+        assert_eq!(unsafe { CFGetRetainCount(ptr) }, baseline + 1);
+        unsafe { CFRelease(raw as CFTypeRef) };
+        assert_eq!(unsafe { CFGetRetainCount(ptr) }, baseline);
+    }
+
+    #[test]
+    fn a_label_child_still_climbs_to_its_row() {
+        let mut ops = fake(Some("AXStaticText"), None);
+        assert_eq!(
+            selection_state_with(&mut ops, 0),
+            Some(("AXRow".into(), true))
+        );
+        assert_eq!(ops.parents, [0]);
+    }
+
+    #[test]
+    fn an_item_target_never_climbs() {
+        for role in [
+            None,
+            Some(""),
+            Some("AXUnknown"),
+            Some("AXRow"),
+            Some("AXCell"),
+            Some("AXListItem"),
+            Some("AXImage"),
+        ] {
+            assert_eq!(climb_limit(role), 1, "{role:?}");
+        }
+    }
+
+    #[test]
+    fn baseline_label_children_use_eight_steps() {
+        for role in [Some("AXStaticText"), Some("AXTextField")] {
+            assert_eq!(climb_limit(role), 8);
         }
     }
 }

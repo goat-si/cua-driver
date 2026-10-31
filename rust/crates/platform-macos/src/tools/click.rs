@@ -87,34 +87,9 @@ fn selection_pixel_target(
 /// selectable NSTextField. A modified click on the child can be consumed as a
 /// text interaction without ever reaching the collection's selection model.
 fn nearest_selectable_container_center(element_ptr: usize) -> Option<(f64, f64)> {
-    let mut current = element_ptr as AXUIElementRef;
-    let mut owns_current = false;
-
-    for _ in 0..8 {
-        let role = unsafe { copy_string_attr(current, "AXRole") }.unwrap_or_default();
-        if matches!(role.as_str(), "AXRow" | "AXCell" | "AXListItem" | "AXImage")
-            && unsafe { copy_bool_attr(current, "AXSelected") }.is_some()
-        {
-            let center = unsafe { element_screen_rect(current) }
-                .map(|rect| (rect[0] + rect[2] / 2.0, rect[1] + rect[3] / 2.0));
-            if owns_current {
-                unsafe { CFRelease(current as CFTypeRef) };
-            }
-            return center;
-        }
-
-        let parent = unsafe { copy_element_attr(current, "AXParent") };
-        if owns_current {
-            unsafe { CFRelease(current as CFTypeRef) };
-        }
-        current = parent?;
-        owns_current = true;
-    }
-
-    if owns_current {
-        unsafe { CFRelease(current as CFTypeRef) };
-    }
-    None
+    use crate::input::ax_actions::{selection_center_with, LiveSelectionOps, SelectionElement};
+    let start = unsafe { SelectionElement::retain(element_ptr as AXUIElementRef) };
+    selection_center_with(&mut LiveSelectionOps, start)
 }
 
 /// A plain click on a row already selected can show no change: nothing is
@@ -416,10 +391,6 @@ impl Drop for Retained {
     }
 }
 
-fn is_selectable_item_role(role: &str) -> bool {
-    matches!(role, "AXRow" | "AXCell" | "AXListItem" | "AXImage")
-}
-
 /// Every selectable item at or above an element (the same roles and depth
 /// the selection fallback walks), each with its AXSelected before the click.
 /// Read back on the SAME retained elements, a selection write that landed on
@@ -435,22 +406,15 @@ impl SelectionSnapshot {
     ///
     /// `element` must be a valid, live `AXUIElementRef`.
     unsafe fn capture(element: AXUIElementRef) -> Self {
-        let mut items = Vec::new();
-        let mut in_item = false;
-        let mut current = Retained::retain(element);
-        for _ in 0..8 {
-            let role = copy_string_attr(current.0, "AXRole").unwrap_or_default();
-            if is_selectable_item_role(&role) {
-                in_item = true;
-                if let Some(selected) = copy_bool_attr(current.0, "AXSelected") {
-                    items.push((Retained::retain(current.0), selected));
-                }
-            }
-            let Some(parent) = copy_element_attr(current.0, "AXParent") else {
-                break;
-            };
-            current = Retained(parent);
-        }
+        use crate::input::ax_actions::{
+            selection_snapshot_with, LiveSelectionOps, SelectionElement,
+        };
+        let start = SelectionElement::retain(element);
+        let (items, in_item) = selection_snapshot_with(&mut LiveSelectionOps, start);
+        let items = items
+            .into_iter()
+            .map(|(item, selected)| (Retained(item.into_raw()), selected))
+            .collect();
         Self { items, in_item }
     }
 

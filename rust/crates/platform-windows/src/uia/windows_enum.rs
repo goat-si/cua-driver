@@ -625,6 +625,22 @@ fn try_invoke_in_window_at_point_unbounded(
 /// their keyboard accelerators are surfaced through UI Automation instead.
 /// This helper keeps that routing narrow by requiring an advertised
 /// AcceleratorKey match before invoking anything.
+#[derive(Debug)]
+pub(crate) struct AcceleratorStop {
+    pub verdict: crate::uia_mutation::WriteVerdict,
+    pub hresult: i32,
+}
+impl std::fmt::Display for AcceleratorStop {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "accelerator UIA write stopped: {:?} (HRESULT 0x{:08X})",
+            self.verdict, self.hresult as u32
+        )
+    }
+}
+impl std::error::Error for AcceleratorStop {}
+
 pub fn try_invoke_accelerator_in_window(hwnd: isize, combo: &str) -> anyhow::Result<(bool, usize)> {
     let combo = combo.to_owned();
     run_uia_with_deadline_cancelable(
@@ -633,11 +649,20 @@ pub fn try_invoke_accelerator_in_window(hwnd: isize, combo: &str) -> anyhow::Res
         "keyboard message delivery",
         move |cancelled| try_invoke_accelerator_in_window_unbounded(hwnd, &combo, &cancelled),
     )
-    .unwrap_or_else(|_| {
-        Err(anyhow::anyhow!(
-            "UIA accelerator scan exceeded {}ms; a UIA provider in the target app is likely unresponsive",
-            SUBTREE_OP_TIMEOUT.as_millis()
-        ))
+    .unwrap_or_else(|error| match error {
+        // Another UIA operation held the single-flight gate, so this scan
+        // never started and nothing was sent.
+        UiaDeadlineError::Busy => Err(anyhow::anyhow!(
+            "another UI Automation operation is still running; the shortcut was not sent. Retry shortly."
+        )),
+        UiaDeadlineError::Timeout | UiaDeadlineError::Unavailable => {
+            Err(anyhow::Error::new(AcceleratorStop {
+                verdict: crate::uia_mutation::WriteVerdict::Uncertain(
+                    crate::uia_mutation::UncertainKind::Timeout,
+                ),
+                hresult: 0x8013_1505_u32 as i32,
+            }))
+        }
     })
 }
 
@@ -723,19 +748,11 @@ fn try_invoke_accelerator_in_window_unbounded(
             // as a TogglePattern button — calling .Invoke on it returns the
             // misleading "operation completed successfully (0x00000000)"
             // error because Invoke isn't supported on the element.
-            match try_invoke_via_patterns(&elem, hwnd, cancelled) {
-                Ok(true) => return Ok((true, count as usize)),
-                Ok(false) => {
-                    matched_failure = Some(format!(
-                        "matched AcceleratorKey `{accelerator}`, but the element exposes \
-                         neither InvokePattern nor TogglePattern"
-                    ));
-                }
-                Err(e) => {
-                    matched_failure = Some(format!(
-                        "matched AcceleratorKey `{accelerator}`, but Invoke / Toggle failed: {e}"
-                    ));
-                }
+            use crate::uia_mutation::{accelerator_scan, AccelOutcome};
+            match accelerator_scan(std::iter::once(try_invoke_via_patterns(&elem, hwnd, cancelled))) {
+                AccelOutcome::Delivered => return Ok((true, count as usize)),
+                AccelOutcome::Absent => matched_failure = Some(format!("matched AcceleratorKey `{accelerator}`, but the element exposes neither InvokePattern nor TogglePattern")),
+                AccelOutcome::Stop(verdict, hresult) => return Err(anyhow::Error::new(AcceleratorStop { verdict, hresult })),
             }
         }
 
@@ -839,40 +856,51 @@ unsafe fn try_invoke_via_patterns(
     elem: &IUIAutomationElement,
     host_hwnd: isize,
     cancelled: &AtomicBool,
-) -> anyhow::Result<bool> {
-    // Invoke first — that's what most accelerator-targeted controls advertise.
-    if let Ok(pattern) = elem.GetCurrentPattern(UIA_InvokePatternId) {
-        if let Ok(inv) = pattern.cast::<IUIAutomationInvokePattern>() {
-            if cancelled.load(Ordering::Acquire) {
-                return Ok(false);
-            }
-            return crate::uia::fg_bypass::run_with_uwp_bypass(host_hwnd, || {
-                if cancelled.load(Ordering::Acquire) {
-                    return Ok(false);
+) -> crate::uia_mutation::AccelOutcome {
+    use crate::uia_mutation::{
+        classify_write_hresult, pattern_absent, AccelOutcome, RefusalKind, WriteVerdict,
+    };
+    macro_rules! attempt {
+        ($ty:ty, $id:expr, $method:ident) => {{
+            let pattern = elem
+                .GetCurrentPattern($id)
+                .and_then(|value| value.cast::<$ty>());
+            match pattern {
+                Err(error) if pattern_absent(error.code().0) => {}
+                Err(error) => {
+                    return AccelOutcome::Stop(
+                        WriteVerdict::Refused(RefusalKind::PatternUnreadable),
+                        error.code().0,
+                    )
                 }
-                inv.Invoke()
-                    .map(|()| true)
-                    .map_err(|e| anyhow::anyhow!("InvokePattern.Invoke: {e}"))
-            });
-        }
-    }
-    // Toggle next — Bold/Italic/Underline-style toolbar buttons sit here.
-    if let Ok(pattern) = elem.GetCurrentPattern(UIA_TogglePatternId) {
-        if let Ok(tog) = pattern.cast::<IUIAutomationTogglePattern>() {
-            if cancelled.load(Ordering::Acquire) {
-                return Ok(false);
-            }
-            return crate::uia::fg_bypass::run_with_uwp_bypass(host_hwnd, || {
-                if cancelled.load(Ordering::Acquire) {
-                    return Ok(false);
+                Ok(pattern) => {
+                    if cancelled.load(Ordering::Acquire) {
+                        return AccelOutcome::Absent;
+                    }
+                    let result = crate::uia::fg_bypass::run_with_uwp_bypass(host_hwnd, || {
+                        if cancelled.load(Ordering::Acquire) {
+                            return None;
+                        }
+                        Some(pattern.$method())
+                    });
+                    match result {
+                        None => return AccelOutcome::Absent,
+                        Some(Ok(())) => return AccelOutcome::Delivered,
+                        Some(Err(error)) => {
+                            let hr = error.code().0;
+                            match classify_write_hresult(hr) {
+                                WriteVerdict::AffordanceAbsent => {}
+                                verdict => return AccelOutcome::Stop(verdict, hr),
+                            }
+                        }
+                    }
                 }
-                tog.Toggle()
-                    .map(|()| true)
-                    .map_err(|e| anyhow::anyhow!("TogglePattern.Toggle: {e}"))
-            });
-        }
+            }
+        }};
     }
-    Ok(false)
+    attempt!(IUIAutomationInvokePattern, UIA_InvokePatternId, Invoke);
+    attempt!(IUIAutomationTogglePattern, UIA_TogglePatternId, Toggle);
+    AccelOutcome::Absent
 }
 
 /// Extract a shortcut hint from a UIA element name like `"Bold (Ctrl+B)"`,

@@ -246,3 +246,110 @@ pub(crate) fn uncertain_text(kind: UncertainKind, hresult: i32) -> String {
 #[cfg(test)]
 #[path = "uia_mutation_tests.rs"]
 mod tests;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MutationStop {
+    Absent,
+    AcquireFailed(i32),
+    Write(i32),
+    WorkerFailed,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MutationRoute {
+    Done,
+    FallThrough,
+    Refused,
+    Partial,
+    Uncertain,
+}
+pub(crate) fn scroll_route(completed: u32, stop: Option<MutationStop>) -> MutationRoute {
+    mutation_route(completed as usize, stop)
+}
+fn mutation_route(completed: usize, stop: Option<MutationStop>) -> MutationRoute {
+    use MutationRoute::*;
+    match stop {
+        None => Done,
+        Some(MutationStop::WorkerFailed) => Uncertain,
+        Some(MutationStop::Write(hr))
+            if matches!(classify_write_hresult(hr), WriteVerdict::Uncertain(_)) =>
+        {
+            Uncertain
+        }
+        Some(_) if completed > 0 => Partial,
+        Some(MutationStop::Absent) => FallThrough,
+        Some(MutationStop::Write(hr))
+            if matches!(classify_write_hresult(hr), WriteVerdict::AffordanceAbsent) =>
+        {
+            FallThrough
+        }
+        Some(_) => Refused,
+    }
+}
+pub(crate) fn multi_invoke_route(delivered: usize, stop: Option<MutationStop>) -> MutationRoute {
+    mutation_route(delivered, stop)
+}
+pub(crate) fn scroll_direction(direction: &str) -> Option<(bool, bool)> {
+    match direction {
+        "up" => Some((false, false)),
+        "down" => Some((false, true)),
+        "left" => Some((true, false)),
+        "right" => Some((true, true)),
+        _ => None,
+    }
+}
+/// Validate the direction before acquiring a COM interface or calling a provider.
+pub(crate) fn scroll_preflight<T>(
+    direction: &str,
+    acquire: impl FnOnce() -> T,
+) -> Option<(bool, bool, T)> {
+    let (horizontal, increment) = scroll_direction(direction)?;
+    Some((horizontal, increment, acquire()))
+}
+
+pub(crate) fn expand_route(outcome: RungOutcome) -> MutationRoute {
+    match outcome {
+        RungOutcome::Absent => MutationRoute::FallThrough,
+        RungOutcome::AcquireFailed(_) => MutationRoute::Refused,
+        RungOutcome::Called(hr) => match classify_write_hresult(hr) {
+            WriteVerdict::Delivered => MutationRoute::Done,
+            WriteVerdict::AffordanceAbsent => MutationRoute::FallThrough,
+            WriteVerdict::Refused(_) => MutationRoute::Refused,
+            WriteVerdict::Uncertain(_) => MutationRoute::Uncertain,
+        },
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AccelOutcome {
+    Delivered,
+    Absent,
+    Stop(WriteVerdict, i32),
+}
+pub(crate) fn accelerator_scan(outcomes: impl Iterator<Item = AccelOutcome>) -> AccelOutcome {
+    for outcome in outcomes {
+        if outcome != AccelOutcome::Absent {
+            return outcome;
+        }
+    }
+    AccelOutcome::Absent
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MenuFailure {
+    Refused,
+    Uncertain,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MenuResult {
+    Done,
+    Refused,
+    Partial { completed_hops: usize },
+    Uncertain { completed_hops: usize },
+}
+pub(crate) fn menu_outcome(completed_hops: usize, failure: Option<MenuFailure>) -> MenuResult {
+    match failure {
+        None => MenuResult::Done,
+        Some(MenuFailure::Uncertain) => MenuResult::Uncertain { completed_hops },
+        Some(MenuFailure::Refused) if completed_hops > 0 => MenuResult::Partial { completed_hops },
+        Some(MenuFailure::Refused) => MenuResult::Refused,
+    }
+}

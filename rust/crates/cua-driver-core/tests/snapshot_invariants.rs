@@ -94,7 +94,7 @@ fn capture_removal_retires_element_tokens() {
     let old = cache.publish(42, 7, payload(vec![1]));
     assert_eq!(resolve(&cache, old, 0), Ok((7, 0, 1)));
     let ticket = cache.begin_capture(42, 7);
-    assert_eq!(cache.remove_for_capture(42, 7, ticket), Some(old));
+    assert_eq!(cache.remove_for_capture(42, 7, &ticket), Some(old));
     assert_eq!(
         resolve(&cache, old, 0),
         Err("stale_element_token".to_owned())
@@ -107,7 +107,7 @@ fn capture_removal_retires_element_tokens() {
             None,
             Some(1.0),
             None,
-            ticket,
+            &ticket,
         )
         .unwrap();
     assert_eq!(

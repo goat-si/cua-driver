@@ -28,6 +28,12 @@
 //! driver from starting it at all; an embedded driver (`--embedded`) keeps it
 //! off unless the host sets the variable to `0`.
 //!
+//! Window captures require a readable process start stamp. Windows owned by
+//! other users or sandboxed processes may be refused when inspection fails;
+//! the scope of this compatibility limit has not been established. The shell
+//! deadline reserves cleanup time, but a failed kill or blocking wait can
+//! exceed it, so it is not a strict wall-clock bound.
+//!
 //! ## Windows on another Space (CUA-1351)
 //!
 //! ScreenCaptureKit and `screencapture -l` return no content for a window
@@ -62,23 +68,42 @@ use std::time::{Duration, Instant};
 
 /// Bounded TTL map keyed by insertion time. Std-only; used for the warm SCK
 /// window filter/config cache and unit-tested independently of ScreenCaptureKit.
-struct TimedCache<K, V> {
+trait CacheTime: Copy {
+    fn age_since(self, earlier: Self) -> Duration;
+}
+
+impl CacheTime for Instant {
+    fn age_since(self, earlier: Self) -> Duration {
+        self.checked_duration_since(earlier)
+            .unwrap_or(Duration::ZERO)
+    }
+}
+
+#[cfg(test)]
+impl CacheTime for Duration {
+    fn age_since(self, earlier: Self) -> Duration {
+        self.saturating_sub(earlier)
+    }
+}
+
+struct TimedCache<K, V, T = Instant> {
     ttl: Duration,
     capacity: usize,
     next_seq: u64,
-    map: HashMap<K, TimedCacheEntry<V>>,
+    map: HashMap<K, TimedCacheEntry<V, T>>,
 }
 
-struct TimedCacheEntry<V> {
+struct TimedCacheEntry<V, T> {
     value: V,
-    inserted_at: Instant,
+    inserted_at: T,
     /// Monotonic insertion sequence for oldest-first eviction (stable ties).
     seq: u64,
 }
 
-impl<K, V> TimedCache<K, V>
+impl<K, V, T> TimedCache<K, V, T>
 where
     K: Eq + Hash + Clone,
+    T: CacheTime,
 {
     fn new(ttl: Duration, capacity: usize) -> Self {
         Self {
@@ -97,18 +122,15 @@ where
     /// Insert or replace `key`. Capacity 0 stores nothing. At capacity, a new
     /// key evicts the oldest insertion. Replacing an existing key refreshes
     /// its timestamp and insertion order.
-    fn insert_at(&mut self, key: K, value: V, now: Instant) {
+    fn insert_at(&mut self, key: K, value: V, now: T) {
         if self.capacity == 0 {
             return;
         }
 
         // Do not let expired entries occupy capacity merely because their
         // individual keys have not been queried again.
-        self.map.retain(|_, entry| {
-            now.checked_duration_since(entry.inserted_at)
-                .unwrap_or(Duration::ZERO)
-                < self.ttl
-        });
+        self.map
+            .retain(|_, entry| now.age_since(entry.inserted_at) < self.ttl);
 
         if self.map.contains_key(&key) {
             let seq = self.alloc_seq();
@@ -145,18 +167,28 @@ where
         );
     }
 
+    fn insert_if_absent_at(&mut self, key: K, value: V, now: T) -> bool {
+        if self
+            .map
+            .get(&key)
+            .is_some_and(|entry| now.age_since(entry.inserted_at) < self.ttl)
+        {
+            return false;
+        }
+        self.insert_at(key, value, now);
+        true
+    }
+
     /// Clone a fresh value for `key`. Removes the entry when its age is
     /// greater than or equal to TTL. If `now` is earlier than insertion, age is
     /// treated as zero (still fresh).
-    fn get_cloned_at(&mut self, key: &K, now: Instant) -> Option<V>
+    fn get_cloned_at(&mut self, key: &K, now: T) -> Option<V>
     where
         V: Clone,
     {
         let expired = {
             let entry = self.map.get(key)?;
-            let age = now
-                .checked_duration_since(entry.inserted_at)
-                .unwrap_or(Duration::ZERO);
+            let age = now.age_since(entry.inserted_at);
             age >= self.ttl
         };
 
@@ -216,6 +248,7 @@ impl SecureCapturePath {
 impl Drop for SecureCapturePath {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.file);
+        let _ = std::fs::remove_file(self.directory.join("stderr"));
         let _ = std::fs::remove_dir(&self.directory);
     }
 }
@@ -240,6 +273,7 @@ where
             None => return Ok(image),
             Some(problem) => format!("native produced {problem}"),
         },
+        Err(native_err) if is_generation_error(&native_err) => return Err(native_err),
         Err(native_err) => format!("native: {native_err:#}"),
     };
     match fallback(window_id) {
@@ -257,35 +291,140 @@ where
 }
 
 /// Shell compatibility path: `screencapture -l <id> -x -o <tmp.png>`.
-fn screenshot_window_bytes_shell(window_id: u32) -> anyhow::Result<Vec<u8>> {
+trait ShellChildOps {
+    type Child;
+    fn spawn(&mut self, command: &mut Command) -> std::io::Result<Self::Child>;
+    fn try_wait(
+        &mut self,
+        child: &mut Self::Child,
+    ) -> std::io::Result<Option<std::process::ExitStatus>>;
+    fn kill(&mut self, child: &mut Self::Child) -> std::io::Result<()>;
+    fn wait(&mut self, child: &mut Self::Child) -> std::io::Result<std::process::ExitStatus>;
+}
+
+struct SystemShellChildOps;
+
+impl ShellChildOps for SystemShellChildOps {
+    type Child = std::process::Child;
+    fn spawn(&mut self, command: &mut Command) -> std::io::Result<Self::Child> {
+        command.spawn()
+    }
+    fn try_wait(
+        &mut self,
+        child: &mut Self::Child,
+    ) -> std::io::Result<Option<std::process::ExitStatus>> {
+        child.try_wait()
+    }
+    fn kill(&mut self, child: &mut Self::Child) -> std::io::Result<()> {
+        child.kill()
+    }
+    fn wait(&mut self, child: &mut Self::Child) -> std::io::Result<std::process::ExitStatus> {
+        child.wait()
+    }
+}
+
+fn screenshot_window_bytes_shell(window_id: u32, budget: Duration) -> anyhow::Result<Vec<u8>> {
+    let start = Instant::now();
+    screenshot_window_bytes_shell_with(
+        window_id,
+        budget,
+        &mut SystemShellChildOps,
+        || start.elapsed(),
+        std::thread::sleep,
+        || screencapture_command(screencapture_disabled()),
+    )
+}
+
+fn screenshot_window_bytes_shell_with<O: ShellChildOps>(
+    window_id: u32,
+    budget: Duration,
+    ops: &mut O,
+    now: impl Fn() -> Duration,
+    pause: impl Fn(Duration),
+    command: impl FnOnce() -> anyhow::Result<Command>,
+) -> anyhow::Result<Vec<u8>> {
+    const SHELL_CLEANUP_RESERVE: Duration = Duration::from_millis(200);
+    const MIN_SHELL_BUDGET: Duration = Duration::from_millis(100);
+    let deadline = budget.saturating_sub(SHELL_CLEANUP_RESERVE);
+    if deadline < MIN_SHELL_BUDGET {
+        anyhow::bail!("screencapture budget exhausted");
+    }
     let capture = SecureCapturePath::new("window.png")?;
     let tmp_path = capture.file.to_string_lossy().into_owned();
 
-    let output = screencapture_command(screencapture_disabled())?
-        .args([
-            "-l",
-            &window_id.to_string(),
-            "-x", // no sound
-            "-o", // no shadow
-            &tmp_path,
-        ])
-        .output()?;
+    let mut command = command()?;
+    let stderr = std::fs::File::create(capture.directory.join("stderr"))?;
+    command
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(stderr);
+    command.args([
+        "-l",
+        &window_id.to_string(),
+        "-x", // no sound
+        "-o", // no shadow
+        &tmp_path,
+    ]);
+    if now() >= deadline {
+        anyhow::bail!("screencapture budget exhausted before spawn");
+    }
+    let mut child = ops.spawn(&mut command)?;
+    let status = loop {
+        if now() >= deadline {
+            let kill = ops.kill(&mut child);
+            let wait = ops.wait(&mut child);
+            if let Err(error) = wait {
+                anyhow::bail!(
+                    "screencapture timed out; failed to reap child: {error}; kill: {kill:?}"
+                );
+            }
+            anyhow::bail!("screencapture timed out; kill: {kill:?}");
+        }
+        match ops.try_wait(&mut child) {
+            Ok(Some(_)) => {
+                break ops
+                    .wait(&mut child)
+                    .map_err(|e| anyhow::anyhow!("failed to reap child: {e}"))?
+            }
+            Ok(None) => pause(Duration::from_millis(10).min(deadline.saturating_sub(now()))),
+            Err(error) => {
+                let kill = ops.kill(&mut child);
+                let wait = ops.wait(&mut child);
+                if let Err(reap) = wait {
+                    anyhow::bail!("screencapture status: {error}; failed to reap child: {reap}; kill: {kill:?}");
+                }
+                return Err(error.into());
+            }
+        }
+    };
 
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+    if !status.success() {
+        use std::io::Read;
+        let mut stderr_bytes = Vec::new();
+        std::fs::File::open(capture.directory.join("stderr"))?
+            .take(4096)
+            .read_to_end(&mut stderr_bytes)?;
+        let stderr = String::from_utf8_lossy(&stderr_bytes).trim().to_owned();
         if stderr.is_empty() {
             anyhow::bail!(
                 "screencapture failed for window {window_id} with status {}",
-                output.status
+                status
             );
         }
         anyhow::bail!(
             "screencapture failed for window {window_id} with status {}: {stderr}",
-            output.status
+            status
         );
     }
 
+    if now() >= deadline {
+        anyhow::bail!("screencapture timed out before output could be read");
+    }
     let bytes = std::fs::read(&capture.file)?;
+
+    if now() >= deadline {
+        anyhow::bail!("screencapture timed out before output could be accepted");
+    }
 
     if bytes.is_empty() {
         anyhow::bail!("screencapture produced empty output for window {window_id}");
@@ -341,6 +480,7 @@ struct WindowCapturePlan {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct WindowCaptureIdentity {
     pid: i32,
+    start_stamp: crate::ax::enablement::ProcessStartStamp,
     layer: i32,
     x: u64,
     y: u64,
@@ -348,10 +488,26 @@ struct WindowCaptureIdentity {
     height: u64,
 }
 
+type ProcessGeneration = (i32, crate::ax::enablement::ProcessStartStamp);
+
 impl WindowCaptureIdentity {
+    #[cfg(test)]
     fn new(pid: i32, layer: i32, x: f64, y: f64, width: f64, height: f64) -> Self {
+        Self::with_stamp(pid, (1, 0), layer, x, y, width, height)
+    }
+
+    fn with_stamp(
+        pid: i32,
+        start_stamp: crate::ax::enablement::ProcessStartStamp,
+        layer: i32,
+        x: f64,
+        y: f64,
+        width: f64,
+        height: f64,
+    ) -> Self {
         Self {
             pid,
+            start_stamp,
             layer,
             x: x.to_bits(),
             y: y.to_bits(),
@@ -364,14 +520,47 @@ impl WindowCaptureIdentity {
 fn current_window_capture_identity(window_id: u32) -> anyhow::Result<WindowCaptureIdentity> {
     let info = crate::windows::window_info_by_id(window_id)
         .ok_or_else(|| anyhow::anyhow!("WindowServer no longer lists window id {window_id}"))?;
-    Ok(WindowCaptureIdentity::new(
+    let stamp = crate::ax::enablement::process_start_stamp(info.pid)
+        .ok_or_else(|| generation_error(window_id))?;
+    Ok(WindowCaptureIdentity::with_stamp(
         info.pid,
+        stamp,
         info.layer,
         info.bounds.x,
         info.bounds.y,
         info.bounds.width,
         info.bounds.height,
     ))
+}
+
+pub(crate) const CAPTURE_GENERATION_MARKER: &str = "capture_generation_changed";
+
+fn generation_error(window_id: u32) -> anyhow::Error {
+    anyhow::anyhow!("{CAPTURE_GENERATION_MARKER}: window {window_id} process generation changed or is unreadable")
+}
+
+fn is_generation_error(error: &anyhow::Error) -> bool {
+    format!("{error:#}").contains(CAPTURE_GENERATION_MARKER)
+}
+
+fn check_generation(
+    pinned: ProcessGeneration,
+    identity: WindowCaptureIdentity,
+    window_id: u32,
+) -> anyhow::Result<()> {
+    if (identity.pid, identity.start_stamp) != pinned {
+        return Err(generation_error(window_id));
+    }
+    Ok(())
+}
+
+fn owner_generation(
+    window_id: u32,
+    pid: i32,
+    lookup: impl FnOnce(i32) -> Option<crate::ax::enablement::ProcessStartStamp>,
+) -> anyhow::Result<ProcessGeneration> {
+    let stamp = lookup(pid).ok_or_else(|| generation_error(window_id))?;
+    Ok((pid, stamp))
 }
 
 const WINDOW_PLAN_CACHE_TTL: Duration = Duration::from_secs(2);
@@ -607,14 +796,25 @@ fn build_window_capture_plan(
         .ok_or_else(|| {
             anyhow::anyhow!("ScreenCaptureKit: window id {window_id} has no owning application")
         })?;
-    let actual_identity = WindowCaptureIdentity::new(
+    let (_, stamp) = owner_generation(
+        window_id,
         owner_pid,
+        crate::ax::enablement::process_start_stamp,
+    )?;
+    let actual_identity = WindowCaptureIdentity::with_stamp(
+        owner_pid,
+        stamp,
         window.window_layer(),
         frame.origin.x,
         frame.origin.y,
         frame.size.width,
         frame.size.height,
     );
+    check_generation(
+        (expected_identity.pid, expected_identity.start_stamp),
+        actual_identity,
+        window_id,
+    )?;
     if actual_identity != expected_identity {
         anyhow::bail!(
             "ScreenCaptureKit: window id {window_id} changed identity while capture was prepared"
@@ -765,7 +965,25 @@ fn capture_window_from_plan_validated(
 
 fn evict_window_capture_plan(window_id: u32, plan: &std::sync::Arc<WindowCapturePlan>) {
     let mut cache = lock_window_plan_cache();
-    cache.remove_if(&window_id, |stored| std::sync::Arc::ptr_eq(stored, plan));
+    cache.remove_if(&window_id, |stored| same_cached_plan(stored, plan));
+}
+
+fn same_cached_plan<T>(stored: &std::sync::Arc<T>, plan: &std::sync::Arc<T>) -> bool {
+    std::sync::Arc::ptr_eq(stored, plan)
+}
+
+fn retry_identity_generation<T>(
+    window_id: u32,
+    pinned: ProcessGeneration,
+    actual: WindowCaptureIdentity,
+    retry: impl FnOnce() -> anyhow::Result<T>,
+) -> anyhow::Result<T> {
+    check_generation(pinned, actual, window_id)?;
+    retry()
+}
+
+fn should_rebuild_after_cached_error(error: &anyhow::Error) -> bool {
+    !is_generation_error(error)
 }
 
 /// A successful capture discovered that the window mutated. Rebuild once for
@@ -775,27 +993,30 @@ fn retry_after_identity_change(
     window_id: u32,
     stale_plan: &std::sync::Arc<WindowCapturePlan>,
     actual_identity: WindowCaptureIdentity,
+    pinned: ProcessGeneration,
 ) -> anyhow::Result<CapturedImage> {
-    evict_window_capture_plan(window_id, stale_plan);
-    let rebuilt = build_window_capture_plan(window_id, actual_identity)?;
-    {
-        let mut cache = lock_window_plan_cache();
-        cache.insert_at(window_id, std::sync::Arc::clone(&rebuilt), Instant::now());
-    }
-
-    match capture_window_from_plan_validated(window_id, &rebuilt) {
-        Ok(CaptureIdentityValidation::Matched(bytes)) => Ok(bytes),
-        Ok(CaptureIdentityValidation::Changed(_)) => {
-            evict_window_capture_plan(window_id, &rebuilt);
-            anyhow::bail!(
-                "ScreenCaptureKit: window id {window_id} changed identity again during retry"
-            )
+    retry_identity_generation(window_id, pinned, actual_identity, || {
+        evict_window_capture_plan(window_id, stale_plan);
+        let rebuilt = build_window_capture_plan(window_id, actual_identity)?;
+        {
+            let mut cache = lock_window_plan_cache();
+            cache.insert_if_absent_at(window_id, std::sync::Arc::clone(&rebuilt), Instant::now());
         }
-        Err(error) => {
-            evict_window_capture_plan(window_id, &rebuilt);
-            Err(error)
+        match capture_window_from_plan_validated(window_id, &rebuilt) {
+            Ok(CaptureIdentityValidation::Matched(bytes)) => Ok(bytes),
+            Ok(CaptureIdentityValidation::Changed(actual)) => {
+                evict_window_capture_plan(window_id, &rebuilt);
+                check_generation(pinned, actual, window_id)?;
+                anyhow::bail!(
+                    "ScreenCaptureKit: window id {window_id} changed identity again during retry"
+                )
+            }
+            Err(error) => {
+                evict_window_capture_plan(window_id, &rebuilt);
+                Err(error)
+            }
         }
-    }
+    })
 }
 
 /// Native ScreenCaptureKit single-frame window capture (in-process PNG).
@@ -803,8 +1024,12 @@ fn retry_after_identity_change(
 /// Uses a desktop-independent window filter and `SCScreenshotManager` —
 /// see module docs for Apple + crate source URLs. No subprocess/temp/base64.
 /// Warm hits reuse a bounded two-second filter/config plan cache.
-fn screenshot_window_bytes_sck_inner(window_id: u32) -> anyhow::Result<CapturedImage> {
+fn screenshot_window_bytes_sck_inner(
+    window_id: u32,
+    pinned: ProcessGeneration,
+) -> anyhow::Result<CapturedImage> {
     let identity = current_window_capture_identity(window_id)?;
+    check_generation(pinned, identity, window_id)?;
     let cached = {
         let mut cache = lock_window_plan_cache();
         cache.get_cloned_at(&window_id, Instant::now())
@@ -813,16 +1038,25 @@ fn screenshot_window_bytes_sck_inner(window_id: u32) -> anyhow::Result<CapturedI
     if let Some(plan) = cached {
         if plan.identity != identity {
             let mut cache = lock_window_plan_cache();
-            cache.remove_if(&window_id, |stored| std::sync::Arc::ptr_eq(stored, &plan));
+            cache.remove_if(&window_id, |stored| same_cached_plan(stored, &plan));
         } else {
             match capture_window_from_plan_validated(window_id, &plan) {
                 Ok(CaptureIdentityValidation::Matched(bytes)) => return Ok(bytes),
                 Ok(CaptureIdentityValidation::Changed(actual_identity)) => {
-                    return retry_after_identity_change(window_id, &plan, actual_identity);
+                    return retry_after_identity_change(window_id, &plan, actual_identity, pinned);
                 }
                 Err(first_err) => {
                     // Drop only this Arc if it is still the cached value.
                     evict_window_capture_plan(window_id, &plan);
+
+                    if !should_rebuild_after_cached_error(&first_err) {
+                        return Err(first_err);
+                    }
+                    check_generation(
+                        pinned,
+                        current_window_capture_identity(window_id)?,
+                        window_id,
+                    )?;
 
                     let rebuilt = match build_window_capture_plan(window_id, identity) {
                         Ok(plan) => plan,
@@ -836,13 +1070,18 @@ fn screenshot_window_bytes_sck_inner(window_id: u32) -> anyhow::Result<CapturedI
 
                     {
                         let mut cache = lock_window_plan_cache();
-                        cache.insert_at(window_id, std::sync::Arc::clone(&rebuilt), Instant::now());
+                        cache.insert_if_absent_at(
+                            window_id,
+                            std::sync::Arc::clone(&rebuilt),
+                            Instant::now(),
+                        );
                     }
 
                     match capture_window_from_plan_validated(window_id, &rebuilt) {
                         Ok(CaptureIdentityValidation::Matched(bytes)) => return Ok(bytes),
-                        Ok(CaptureIdentityValidation::Changed(_)) => {
+                        Ok(CaptureIdentityValidation::Changed(actual)) => {
                             evict_window_capture_plan(window_id, &rebuilt);
+                            check_generation(pinned, actual, window_id)?;
                             return Err(anyhow::anyhow!(
                                 "ScreenCaptureKit window {window_id}: cached plan capture failed: \
                              {first_err:#}; window changed identity during retry"
@@ -867,12 +1106,12 @@ fn screenshot_window_bytes_sck_inner(window_id: u32) -> anyhow::Result<CapturedI
     let plan = build_window_capture_plan(window_id, identity)?;
     {
         let mut cache = lock_window_plan_cache();
-        cache.insert_at(window_id, std::sync::Arc::clone(&plan), Instant::now());
+        cache.insert_if_absent_at(window_id, std::sync::Arc::clone(&plan), Instant::now());
     }
     match capture_window_from_plan_validated(window_id, &plan) {
         Ok(CaptureIdentityValidation::Matched(bytes)) => Ok(bytes),
         Ok(CaptureIdentityValidation::Changed(actual_identity)) => {
-            retry_after_identity_change(window_id, &plan, actual_identity)
+            retry_after_identity_change(window_id, &plan, actual_identity, pinned)
         }
         Err(error) => {
             evict_window_capture_plan(window_id, &plan);
@@ -884,9 +1123,19 @@ fn screenshot_window_bytes_sck_inner(window_id: u32) -> anyhow::Result<CapturedI
 /// Bound the dependency's synchronous callback wrappers without permitting an
 /// unbounded number of detached workers. Ownership of the gate permit and all
 /// ScreenCaptureKit/CF objects stays on the worker until it really returns.
-fn screenshot_window_bytes_sck(window_id: u32, budget: Duration) -> anyhow::Result<CapturedImage> {
+fn screenshot_window_bytes_sck(
+    window_id: u32,
+    budget: Duration,
+    pinned: ProcessGeneration,
+) -> anyhow::Result<CapturedImage> {
     run_native_capture_worker(native_capture_gate(), budget, move || {
-        screenshot_window_bytes_sck_inner(window_id)
+        let result = screenshot_window_bytes_sck_inner(window_id, pinned);
+        check_generation(
+            pinned,
+            current_window_capture_identity(window_id)?,
+            window_id,
+        )?;
+        result
     })
     .map_err(|error| {
         anyhow::anyhow!(
@@ -911,21 +1160,23 @@ pub fn screenshot_window_bytes(window_id: u32) -> anyhow::Result<Vec<u8>> {
 /// [`screenshot_window_bytes`].
 pub fn screenshot_window_image(window_id: u32) -> anyhow::Result<CapturedImage> {
     refuse_without_direct_capture_consent()?;
+    let identity = current_window_capture_identity(window_id)?;
+    let pinned = (identity.pid, identity.start_stamp);
     let off_space = crate::windows::window_on_current_space_by_id(window_id) == Some(false);
     // One budget for the whole read: a backend that stalls spends it, and the
     // next one gets only what is left instead of a fresh timeout of its own.
     let deadline = Instant::now() + WINDOW_CAPTURE_NATIVE_TIMEOUT;
     let remaining = move || deadline.saturating_duration_since(Instant::now());
     capture_window_routed(
-        window_id,
-        off_space,
-        skylight_first_on_space(),
+        (window_id, off_space, skylight_first_on_space()),
+        Some(pinned),
+        crate::ax::enablement::process_start_stamp,
         || current_window_capture_identity(window_id),
         |id| {
             capture_window_with_backends(
                 id,
-                |id| screenshot_window_bytes_sck(id, remaining()),
-                |id| screenshot_window_bytes_shell(id).map(CapturedImage::Png),
+                |id| screenshot_window_bytes_sck(id, remaining(), pinned),
+                |id| screenshot_window_bytes_shell(id, remaining()).map(CapturedImage::Png),
             )
         },
         |id| screenshot_window_bytes_skylight(id, remaining()),
@@ -1017,9 +1268,9 @@ where
     R: Fn() -> Duration,
 {
     capture_window_routed(
-        window_id,
-        off_space,
-        false,
+        (window_id, off_space, false),
+        None,
+        |_| None,
         || Ok(WindowCaptureIdentity::new(10, 0, 1.0, 2.0, 800.0, 600.0)),
         public,
         skylight,
@@ -1029,10 +1280,10 @@ where
 
 /// The routed capture. On the current Space with `skylight_first`, SkyLight is
 /// tried first and its answer is used unless it failed or is blank.
-fn capture_window_routed<P, S, R, I>(
-    window_id: u32,
-    off_space: bool,
-    skylight_first: bool,
+fn capture_window_routed<P, S, R, I, G>(
+    route: (u32, bool, bool),
+    pinned_generation: Option<ProcessGeneration>,
+    generation: G,
     identity: I,
     public: P,
     skylight: S,
@@ -1043,7 +1294,9 @@ where
     S: FnOnce(u32) -> anyhow::Result<CapturedImage>,
     R: Fn() -> Duration,
     I: Fn() -> anyhow::Result<WindowCaptureIdentity>,
+    G: Fn(i32) -> Option<crate::ax::enablement::ProcessStartStamp>,
 {
+    let (window_id, off_space, skylight_first) = route;
     // A second backend needs at least this much time to be worth starting.
     const MIN_BACKEND_BUDGET: Duration = Duration::from_millis(100);
     let spent = |next: &str| {
@@ -1055,19 +1308,35 @@ where
     // Every capture, whatever backend made it, must be of the window the
     // caller named (its owner, layer and bounds did not change while it was
     // captured) and must not be empty or blank.
-    fn accepted<I, F>(
+    fn accepted<I, F, G>(
         window_id: u32,
         label: &str,
+        pinned: Option<ProcessGeneration>,
+        generation: &G,
         identity: &I,
         capture: F,
     ) -> anyhow::Result<CapturedImage>
     where
         I: Fn() -> anyhow::Result<WindowCaptureIdentity>,
         F: FnOnce(u32) -> anyhow::Result<CapturedImage>,
+        G: Fn(i32) -> Option<crate::ax::enablement::ProcessStartStamp>,
     {
-        let before = identity()?;
-        let image = capture(window_id)?;
-        let after = identity()?;
+        let read = || -> anyhow::Result<WindowCaptureIdentity> {
+            // An unreadable start stamp already arrives as a generation
+            // error; a window that left the list keeps its own message.
+            let observed = identity()?;
+            if let Some(pinned) = pinned {
+                check_generation(pinned, observed, window_id)?;
+                if generation(observed.pid) != Some(pinned.1) {
+                    return Err(generation_error(window_id));
+                }
+            }
+            Ok(observed)
+        };
+        let before = read()?;
+        let image = capture(window_id);
+        let after = read()?;
+        let image = image?;
         if before != after {
             anyhow::bail!(
                 "{CAPTURE_REJECTED_MARKER}: window {window_id} changed identity (owner, layer or                  bounds) while {label} captured it"
@@ -1084,15 +1353,30 @@ where
     let mut public = Some(public);
     let mut skylight_capture = || {
         let capture = skylight.take().expect("SkyLight is asked once");
-        accepted(window_id, "SkyLight", &identity, capture)
+        accepted(
+            window_id,
+            "SkyLight",
+            pinned_generation,
+            &generation,
+            &identity,
+            capture,
+        )
     };
     let mut public_capture = || {
         let capture = public.take().expect("the public chain is asked once");
-        accepted(window_id, "the public chain", &identity, capture)
+        accepted(
+            window_id,
+            "the public chain",
+            pinned_generation,
+            &generation,
+            &identity,
+            capture,
+        )
     };
     if off_space {
         let skylight_err = match skylight_capture() {
             Ok(image) => return Ok(image),
+            Err(error) if is_generation_error(&error) => return Err(error),
             Err(error) => error,
         };
         if remaining() < MIN_BACKEND_BUDGET {
@@ -1111,6 +1395,7 @@ where
     if skylight_first {
         let skylight_err = match skylight_capture() {
             Ok(image) => return Ok(image),
+            Err(error) if is_generation_error(&error) => return Err(error),
             Err(error) => error,
         };
         // Failed, empty, blank or of another window: the public chain answers,
@@ -1120,6 +1405,7 @@ where
     }
     match public_capture() {
         Ok(image) => Ok(image),
+        Err(public_err) if is_generation_error(&public_err) => Err(public_err),
         Err(public_err) if remaining() < MIN_BACKEND_BUDGET => {
             Err(anyhow::anyhow!("{public_err:#}; {}", spent("SkyLight")))
         }
@@ -1556,6 +1842,400 @@ pub fn crosshair_png_bytes(png_bytes: &[u8], cx: f64, cy: f64) -> anyhow::Result
 /// Parse width and height from a PNG file's IHDR chunk.
 pub fn png_dimensions(data: &[u8]) -> anyhow::Result<(u32, u32)> {
     cua_driver_core::image_utils::png_dimensions(data)
+}
+
+#[cfg(test)]
+mod process_identity_tests {
+    use super::*;
+    use std::cell::Cell;
+
+    const MARKER: &str = "capture_generation_changed";
+
+    fn identity(pid: i32) -> WindowCaptureIdentity {
+        WindowCaptureIdentity::new(pid, 0, 1.0, 2.0, 8.0, 6.0)
+    }
+
+    fn image() -> CapturedImage {
+        CapturedImage::Png(vec![1, 2, 3])
+    }
+
+    #[test]
+    fn a_replacement_between_backends_is_terminal() {
+        let reads = Cell::new(0);
+        let public_calls = Cell::new(0);
+        let error = capture_window_routed(
+            (7, false, true),
+            Some((10, (1, 0))),
+            |_| Some((1, 0)),
+            || {
+                reads.set(reads.get() + 1);
+                Ok(identity(if reads.get() == 1 { 10 } else { 11 }))
+            },
+            |_| {
+                public_calls.set(public_calls.get() + 1);
+                Ok(image())
+            },
+            |_| Ok(image()),
+            || Duration::MAX,
+        )
+        .expect_err("replacement must be terminal");
+        assert!(format!("{error:#}").contains(MARKER));
+        assert_eq!(public_calls.get(), 0);
+    }
+
+    #[test]
+    fn a_recycled_pid_with_the_same_frame_discards_the_image() {
+        let reads = Cell::new(0);
+        let error = capture_window_routed(
+            (7, false, true),
+            Some((10, (1, 0))),
+            |_| {
+                reads.set(reads.get() + 1);
+                Some((if reads.get() == 1 { 1 } else { 2 }, 0))
+            },
+            || Ok(identity(10)),
+            |_| Ok(image()),
+            |_| Ok(image()),
+            || Duration::MAX,
+        )
+        .expect_err("a recycled pid must not return its pixels");
+        assert!(format!("{error:#}").contains(MARKER));
+    }
+
+    #[test]
+    fn an_unreadable_stamp_before_or_after_capture_is_terminal() {
+        for missing in [1, 2] {
+            let reads = Cell::new(0);
+            let error = capture_window_routed(
+                (7, false, true),
+                Some((10, (1, 0))),
+                |_| {
+                    reads.set(reads.get() + 1);
+                    (reads.get() != missing).then_some((1, 0))
+                },
+                || Ok(identity(10)),
+                |_| Ok(image()),
+                |_| Ok(image()),
+                || Duration::MAX,
+            )
+            .expect_err("unreadable process stamp must be terminal");
+            assert!(format!("{error:#}").contains(MARKER));
+        }
+    }
+
+    #[test]
+    fn an_sck_rebuild_for_another_generation_is_refused() {
+        let calls = Cell::new(0);
+        let error = retry_identity_generation(7, (10, (1, 0)), identity(11), || {
+            calls.set(calls.get() + 1);
+            Ok(image())
+        })
+        .expect_err("replacement must not be rebuilt");
+        assert!(format!("{error:#}").contains(MARKER));
+        assert_eq!(calls.get(), 0);
+    }
+
+    #[test]
+    fn same_generation_geometry_change_still_tries_the_next_backend() {
+        let reads = Cell::new(0);
+        let identity = || {
+            reads.set(reads.get() + 1);
+            let x = if reads.get() == 1 { 1.0 } else { 2.0 };
+            Ok(WindowCaptureIdentity::new(10, 0, x, 2.0, 8.0, 6.0))
+        };
+        let image = CapturedImage::Png(vec![1, 2, 3]);
+        let got = capture_window_routed(
+            (7, false, true),
+            Some((10, (1, 0))),
+            |_| Some((1, 0)),
+            identity,
+            |_| Ok(image.clone()),
+            |_| Ok(image.clone()),
+            || Duration::MAX,
+        )
+        .unwrap();
+        assert_eq!(got, image);
+        assert_eq!(reads.get(), 4);
+    }
+
+    #[test]
+    fn a_warm_cache_plan_for_another_generation_is_rebuilt_or_refused() {
+        let old = std::sync::Arc::new(identity(10));
+        let mut replacement = *old;
+        replacement.start_stamp = (2, 0);
+        let mut cache: TimedCache<u32, _, Duration> = TimedCache::new(Duration::from_secs(2), 1);
+        cache.insert_at(7, old.clone(), Duration::ZERO);
+        let cached = cache.get_cloned_at(&7, Duration::ZERO).unwrap();
+        assert_ne!(*cached, replacement);
+        assert!(check_generation((10, (2, 0)), *cached, 7).is_err());
+        assert!(cache.remove_if(&7, |stored| same_cached_plan(stored, &cached)));
+        cache.insert_at(7, std::sync::Arc::new(replacement), Duration::ZERO);
+        assert_eq!(
+            *cache.get_cloned_at(&7, Duration::ZERO).unwrap(),
+            replacement
+        );
+    }
+
+    #[test]
+    fn concurrent_replacement_keeps_the_newer_cache_entry() {
+        let old = std::sync::Arc::new(1);
+        let newer = std::sync::Arc::new(2);
+        let mut cache: TimedCache<u32, _, Duration> = TimedCache::new(Duration::from_secs(2), 1);
+        cache.insert_at(7, old.clone(), Duration::ZERO);
+        cache.insert_at(7, newer.clone(), Duration::ZERO);
+        assert!(!cache.remove_if(&7, |stored| same_cached_plan(stored, &old)));
+        assert!(!cache.insert_if_absent_at(7, old, Duration::ZERO));
+        assert!(same_cached_plan(
+            &cache.get_cloned_at(&7, Duration::ZERO).unwrap(),
+            &newer
+        ));
+    }
+
+    #[test]
+    fn an_sck_generation_error_calls_no_shell_and_no_rebuild() {
+        let shell_calls = Cell::new(0);
+        let error = capture_window_with_backends(
+            7,
+            |_| Err(generation_error(7)),
+            |_| {
+                shell_calls.set(shell_calls.get() + 1);
+                Ok(image())
+            },
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains(MARKER));
+        assert_eq!(shell_calls.get(), 0);
+        assert!(!should_rebuild_after_cached_error(&error));
+    }
+
+    #[test]
+    fn an_unchanged_process_still_captures() {
+        let got = capture_window_routed(
+            (7, false, true),
+            Some((10, (1, 0))),
+            |_| Some((1, 0)),
+            || Ok(identity(10)),
+            |_| panic!("no fallback"),
+            |_| Ok(image()),
+            || Duration::MAX,
+        )
+        .unwrap();
+        assert_eq!(got, image());
+    }
+
+    #[test]
+    fn build_plan_reads_owner_stamp_itself() {
+        let observed_pid = Cell::new(0);
+        let actual = owner_generation(7, 11, |pid| {
+            observed_pid.set(pid);
+            Some((2, 0))
+        })
+        .unwrap();
+        assert_eq!(observed_pid.get(), 11);
+        assert_eq!(actual, (11, (2, 0)));
+        assert!(owner_generation(7, 11, |_| None)
+            .unwrap_err()
+            .to_string()
+            .contains(MARKER));
+    }
+}
+
+#[cfg(test)]
+mod shell_deadline_tests {
+    use super::*;
+    use std::os::unix::process::ExitStatusExt;
+
+    #[derive(Default)]
+    struct FakeOps {
+        events: Vec<&'static str>,
+        path: Option<std::path::PathBuf>,
+        complete: bool,
+        status_error: bool,
+        kill_error: bool,
+        wait_error: bool,
+        missing_image: bool,
+        exit_code: i32,
+        stderr: Vec<u8>,
+        late_write: bool,
+        spawn_advance: Option<std::rc::Rc<std::cell::Cell<Duration>>>,
+    }
+    impl ShellChildOps for FakeOps {
+        type Child = ();
+        fn spawn(&mut self, command: &mut Command) -> std::io::Result<()> {
+            self.events.push("spawn");
+            let path = std::path::PathBuf::from(command.get_args().last().unwrap());
+            if !self.missing_image {
+                std::fs::write(&path, [1, 2, 3])?;
+            }
+            std::fs::write(path.parent().unwrap().join("stderr"), &self.stderr)?;
+            self.path = Some(path);
+            if let Some(ticks) = &self.spawn_advance {
+                ticks.set(Duration::from_millis(100));
+            }
+            Ok(())
+        }
+        fn try_wait(&mut self, _: &mut ()) -> std::io::Result<Option<std::process::ExitStatus>> {
+            self.events.push("try_wait");
+            if self.status_error {
+                return Err(std::io::Error::other("status failed"));
+            }
+            Ok(self
+                .complete
+                .then(|| std::process::ExitStatus::from_raw(self.exit_code << 8)))
+        }
+        fn kill(&mut self, _: &mut ()) -> std::io::Result<()> {
+            self.events.push("kill");
+            if self.late_write {
+                std::fs::write(self.path.as_ref().unwrap(), [9, 9, 9])?;
+                self.events.push("late_output");
+            }
+            if self.kill_error {
+                Err(std::io::Error::other("kill failed"))
+            } else {
+                Ok(())
+            }
+        }
+        fn wait(&mut self, _: &mut ()) -> std::io::Result<std::process::ExitStatus> {
+            self.events.push("wait");
+            if self.wait_error {
+                Err(std::io::Error::other("wait failed"))
+            } else {
+                Ok(std::process::ExitStatus::from_raw(self.exit_code << 8))
+            }
+        }
+    }
+    fn run(
+        ops: &mut FakeOps,
+        budget: Duration,
+        ticks: &std::cell::Cell<Duration>,
+    ) -> anyhow::Result<Vec<u8>> {
+        screenshot_window_bytes_shell_with(
+            7,
+            budget,
+            ops,
+            || ticks.get(),
+            |_| ticks.set(Duration::from_millis(100)),
+            || screencapture_command(false),
+        )
+    }
+    fn cleaned(ops: &FakeOps) {
+        if let Some(path) = &ops.path {
+            assert!(!path.parent().unwrap().exists());
+        }
+    }
+    #[test]
+    fn a_hung_screencapture_is_killed_and_reaped_at_the_deadline() {
+        let mut ops = FakeOps::default();
+        let result = run(
+            &mut ops,
+            Duration::from_millis(300),
+            &std::cell::Cell::new(Duration::ZERO),
+        );
+        assert!(result.is_err());
+        assert_eq!(ops.events, ["spawn", "try_wait", "kill", "wait"]);
+        cleaned(&ops);
+    }
+    #[test]
+    fn an_exhausted_budget_never_spawns() {
+        let mut ops = FakeOps::default();
+        assert!(run(
+            &mut ops,
+            Duration::from_millis(299),
+            &std::cell::Cell::new(Duration::ZERO)
+        )
+        .is_err());
+        assert!(ops.events.is_empty());
+    }
+    #[test]
+    fn a_shell_status_or_read_error_still_reaps_and_cleans() {
+        for status_error in [true, false] {
+            let mut ops = FakeOps {
+                status_error,
+                complete: !status_error,
+                missing_image: true,
+                ..Default::default()
+            };
+            assert!(run(
+                &mut ops,
+                Duration::from_millis(300),
+                &std::cell::Cell::new(Duration::ZERO)
+            )
+            .is_err());
+            assert!(ops.events.contains(&"wait"));
+            cleaned(&ops);
+        }
+    }
+    #[test]
+    fn late_output_after_timeout_is_ignored() {
+        let mut ops = FakeOps {
+            missing_image: true,
+            late_write: true,
+            ..Default::default()
+        };
+        assert!(run(
+            &mut ops,
+            Duration::from_millis(300),
+            &std::cell::Cell::new(Duration::ZERO)
+        )
+        .is_err());
+        assert_eq!(
+            ops.events,
+            ["spawn", "try_wait", "kill", "late_output", "wait"]
+        );
+        cleaned(&ops);
+    }
+    #[test]
+    fn a_kill_or_wait_failure_still_cleans_and_reports() {
+        for wait_error in [false, true] {
+            let mut ops = FakeOps {
+                kill_error: true,
+                wait_error,
+                ..Default::default()
+            };
+            let error = run(
+                &mut ops,
+                Duration::from_millis(300),
+                &std::cell::Cell::new(Duration::ZERO),
+            )
+            .unwrap_err();
+            let text = format!("{error:#}");
+            assert!(text.contains("kill failed"));
+            if wait_error {
+                assert!(text.contains("failed to reap child"));
+            }
+            assert_eq!(ops.events.last(), Some(&"wait"));
+            cleaned(&ops);
+        }
+    }
+    #[test]
+    fn spawn_time_is_charged_to_the_original_deadline() {
+        let ticks = std::rc::Rc::new(std::cell::Cell::new(Duration::ZERO));
+        let mut ops = FakeOps {
+            spawn_advance: Some(ticks.clone()),
+            ..Default::default()
+        };
+        assert!(run(&mut ops, Duration::from_millis(300), &ticks).is_err());
+        assert_eq!(ops.events, ["spawn", "kill", "wait"]);
+        cleaned(&ops);
+    }
+    #[test]
+    fn stderr_is_bounded() {
+        let mut ops = FakeOps {
+            complete: true,
+            exit_code: 1,
+            stderr: vec![b'x'; 8192],
+            ..Default::default()
+        };
+        let error = run(
+            &mut ops,
+            Duration::from_millis(300),
+            &std::cell::Cell::new(Duration::ZERO),
+        )
+        .unwrap_err();
+        let text = format!("{error:#}");
+        assert_eq!(text.rsplit(':').next().unwrap().trim().len(), 4096);
+        cleaned(&ops);
+    }
 }
 
 #[cfg(test)]
@@ -2201,9 +2881,9 @@ mod tests {
     fn skylight_answers_first_on_the_current_space_and_the_public_chain_is_not_asked() {
         let content = frame(vec![1, 2, 3, 255, 9, 9, 9, 255]);
         let got = capture_window_routed(
-            7,
-            false,
-            true,
+            (7, false, true),
+            None,
+            |_| None,
             || Ok(test_identity()),
             |_| panic!("the public chain must not run"),
             |_| Ok(content.clone()),
@@ -2220,9 +2900,9 @@ mod tests {
         let blank = frame([0, 0, 0, 255].repeat(4));
         for first in [Ok(blank), Err(anyhow::anyhow!("no image"))] {
             let got = capture_window_routed(
-                7,
-                false,
-                true,
+                (7, false, true),
+                None,
+                |_| None,
                 || Ok(test_identity()),
                 |_| Ok(public_image.clone()),
                 |_| first,
@@ -2233,9 +2913,9 @@ mod tests {
         }
         // Both fail: the error names SkyLight and the public backend.
         let error = capture_window_routed(
-            7,
-            false,
-            true,
+            (7, false, true),
+            None,
+            |_| None,
             || Ok(test_identity()),
             |_| Err(anyhow::anyhow!("sck down")),
             |_| Err(anyhow::anyhow!("no image")),
@@ -2305,9 +2985,9 @@ mod tests {
     #[test]
     fn a_blank_public_fallback_after_a_failed_skylight_is_rejected() {
         let error = capture_window_routed(
-            7,
-            false,
-            true,
+            (7, false, true),
+            None,
+            |_| None,
             || Ok(test_identity()),
             |_| Ok(blank_frame()),
             |_| Err(anyhow::anyhow!("skylight down")),
@@ -2327,9 +3007,9 @@ mod tests {
     #[test]
     fn a_blank_off_space_skylight_frame_is_not_returned() {
         let got = capture_window_routed(
-            7,
-            true,
-            false,
+            (7, true, false),
+            None,
+            |_| None,
             || Ok(test_identity()),
             |_| Ok(content_frame()),
             |_| Ok(blank_frame()),
@@ -2338,9 +3018,9 @@ mod tests {
         .expect("the public chain has content");
         assert_eq!(got, content_frame());
         let error = capture_window_routed(
-            7,
-            true,
-            false,
+            (7, true, false),
+            None,
+            |_| None,
             || Ok(test_identity()),
             |_| Err(anyhow::anyhow!("sck empty")),
             |_| Ok(blank_frame()),
@@ -2368,9 +3048,9 @@ mod tests {
             })
         };
         let got = capture_window_routed(
-            7,
-            false,
-            true,
+            (7, false, true),
+            None,
+            |_| None,
             identity,
             |_| Ok(content_frame()),
             |_| Ok(frame(vec![7, 7, 7, 255, 8, 8, 8, 255])),
@@ -2392,9 +3072,9 @@ mod tests {
             ))
         };
         let error = capture_window_routed(
-            7,
-            false,
-            true,
+            (7, false, true),
+            None,
+            |_| None,
             unstable,
             |_| Ok(content_frame()),
             |_| Ok(content_frame()),
@@ -2448,9 +3128,11 @@ mod tests {
             );
         }
         let budget = Duration::from_secs(3);
+        let identity = current_window_capture_identity(window_id).expect("window identity");
+        let pinned = (identity.pid, identity.start_stamp);
         // Do the two in-process backends agree on the pixels?
         if let (Ok(CapturedImage::Rgba(a)), Ok(CapturedImage::Rgba(b))) = (
-            screenshot_window_bytes_sck(window_id, budget),
+            screenshot_window_bytes_sck(window_id, budget, pinned),
             screenshot_window_bytes_skylight(window_id, budget),
         ) {
             if (a.width, a.height) == (b.width, b.height) {
@@ -2473,13 +3155,13 @@ mod tests {
             }
         }
         median_ms("ScreenCaptureKit window capture", || {
-            screenshot_window_bytes_sck(window_id, budget)?.dimensions()
+            screenshot_window_bytes_sck(window_id, budget, pinned)?.dimensions()
         });
         median_ms("SkyLight SLSHWCaptureWindowList window capture", || {
             screenshot_window_bytes_skylight(window_id, budget)?.dimensions()
         });
         median_ms("screencapture CLI (PNG file)", || {
-            let png = screenshot_window_bytes_shell(window_id)?;
+            let png = screenshot_window_bytes_shell(window_id, budget)?;
             crate::capture::png_dimensions(&png)
         });
     }
