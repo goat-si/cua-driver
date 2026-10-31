@@ -3370,6 +3370,8 @@ fn finish_pixel_uia_attempt(
 enum BackgroundElementClick {
     Refused {
         message: String,
+        transport: ActionTransport,
+        failed_calls: Vec<ActionTransport>,
     },
     Uncertain {
         message: String,
@@ -3428,6 +3430,54 @@ fn background_element_click_result(
     ToolResult::text(message)
         .with_structured(json!({ "path": path, "verified": false, "effect": "unverifiable" }))
         .with_action_record(record)
+}
+
+/// Read a UIA pattern, telling "the element has no such pattern" apart from
+/// "the read failed". Only the first may let a caller try another rung.
+fn acquire_uia_pattern<T: windows::core::Interface>(
+    element: &windows::Win32::UI::Accessibility::IUIAutomationElement,
+    pattern_id: windows::Win32::UI::Accessibility::UIA_PATTERN_ID,
+) -> Result<Option<T>, i32> {
+    let classify = |error: windows::core::Error| {
+        let code = error.code().0;
+        if crate::uia_mutation::pattern_absent(code) {
+            Ok(None)
+        } else {
+            Err(code)
+        }
+    };
+    match unsafe { element.GetCurrentPattern(pattern_id) } {
+        Ok(pattern) => match pattern.cast::<T>() {
+            Ok(pattern) => Ok(Some(pattern)),
+            Err(error) => classify(error),
+        },
+        Err(error) => classify(error),
+    }
+}
+
+/// A UIA click rung that nothing was delivered through: the element refused
+/// the write or its pattern could not be read.
+fn refused_element_click_result(
+    message: String,
+    transport: ActionTransport,
+    failed_calls: Vec<ActionTransport>,
+) -> ToolResult {
+    use cua_driver_core::action_record::{
+        ActionAttempt, ActionEffect, ActionExecutionRecord, ActualDelivery, RequestedDelivery,
+    };
+    let mut record = ActionExecutionRecord::new(
+        ActionEffect::Refused,
+        transport,
+        RequestedDelivery::Background,
+    );
+    for attempted in failed_calls {
+        record.attempts.push(ActionAttempt {
+            transport: attempted,
+            delivery: ActualDelivery::Background,
+            detail: Some("UIA provider reported the pattern as not supported".into()),
+        });
+    }
+    ToolResult::error(message).with_action_record(record)
 }
 
 async fn basis_click(state: &ToolState, tool: &str, args: &Value) -> Option<ToolResult> {
@@ -4318,13 +4368,12 @@ impl Tool for ClickTool {
                         macro_rules! uia_rung {
                             ($id:expr, $ty:ty, $method:ident) => {
                                 Box::new(|| {
-                                    let pattern = unsafe { elem.GetCurrentPattern($id) }
-                                        .ok().and_then(|pattern| pattern.cast::<$ty>().ok());
-                                    match pattern {
-                                        Some(pattern) => RungOutcome::Called(
+                                    match acquire_uia_pattern::<$ty>(&elem, $id) {
+                                        Ok(Some(pattern)) => RungOutcome::Called(
                                             crate::uia::fg_bypass::run_with_uwp_bypass(hwnd as isize, || unsafe { pattern.$method() })
                                                 .map_or_else(|error| error.code().0, |_| 0)),
-                                        None => RungOutcome::Absent,
+                                        Ok(None) => RungOutcome::Absent,
+                                        Err(hresult) => RungOutcome::AcquireFailed(hresult),
                                     }
                                 })
                             };
@@ -4347,8 +4396,9 @@ impl Tool for ClickTool {
                                 });
                             }
                             ClickPlan::Physical { failed } => failed_calls.extend(failed.into_iter().map(|i| transports[i])),
-                            ClickPlan::Refused { rung, kind, hresult, .. } => return Ok(BackgroundElementClick::Refused {
+                            ClickPlan::Refused { rung, kind, hresult, failed } => return Ok(BackgroundElementClick::Refused {
                                 message: format!("UIA {} on [{idx}]: {}", names[rung], crate::uia_mutation::refusal_text(kind, hresult)),
+                                transport: transports[rung], failed_calls: failed.into_iter().map(|i| transports[i]).collect(),
                             }),
                             ClickPlan::Uncertain { rung, kind, hresult, failed } => return Ok(BackgroundElementClick::Uncertain {
                                 message: format!("UIA {} on [{idx}] returned 0x{:08X} ({kind:?}); the action may have taken effect. Read the window state before acting again.", names[rung], hresult as u32),
@@ -4395,7 +4445,11 @@ impl Tool for ClickTool {
                 } => {
                     return background_element_click_result(message, transport, failed_calls);
                 }
-                BackgroundElementClick::Refused { message } => return ToolResult::error(message),
+                BackgroundElementClick::Refused {
+                    message,
+                    transport,
+                    failed_calls,
+                } => return refused_element_click_result(message, transport, failed_calls),
                 BackgroundElementClick::Uncertain {
                     message,
                     transport,
@@ -5270,11 +5324,10 @@ impl Tool for TypeTextTool {
                                     .map(|v| v.as_bool())
                             },
                             || {
-                                unsafe { elem.GetCurrentPattern(UIA_ValuePatternId) }
-                                    .ok()
-                                    .and_then(|pattern| {
-                                        pattern.cast::<IUIAutomationValuePattern>().ok()
-                                    })
+                                acquire_uia_pattern::<IUIAutomationValuePattern>(
+                                    &elem,
+                                    UIA_ValuePatternId,
+                                )
                             },
                             |vp| {
                                 unsafe { vp.CurrentValue() }
@@ -5317,13 +5370,20 @@ impl Tool for TypeTextTool {
                         "secure_state_unknown" => "type_text could not tell whether the field is a password field; wrote nothing",
                         "secure_no_value_pattern" => "type_text could not write the password field because it has no ValuePattern; wrote nothing. Use delivery_mode:\"foreground\".",
                         "value_unreadable" => "type_text could not read the field's current text, so it wrote nothing (appending would have replaced the text). Re-read the window and retry, or use set_value to replace the value.",
+                        "value_pattern_unreadable" => "type_text could not read the field's UIA ValuePattern, so it wrote nothing. Re-read the window and retry.",
                         _ => "type_text refused the write; wrote nothing",
                     };
                     return ToolResult::error(message);
                 }
                 Route::Continue(AppendOutcome::SecureWriteFailed { hresult }) => {
-                    return ToolResult::error(format!("the password field write failed or its effect is unknown; nothing else was sent (HRESULT 0x{:08X})", hresult as u32))
-                        .with_structured(value_write_structured_result(text_len, "unreadable", false));
+                    use crate::uia_mutation::{classify_write_hresult, WriteVerdict};
+                    let message = match classify_write_hresult(hresult) {
+                        WriteVerdict::Refused(_) | WriteVerdict::AffordanceAbsent => format!("the password field refused the write; nothing was written (HRESULT 0x{:08X})", hresult as u32),
+                        _ => format!("the password field write failed or its effect is unknown; nothing else was sent (HRESULT 0x{:08X})", hresult as u32),
+                    };
+                    return ToolResult::error(message).with_structured(
+                        value_write_structured_result(text_len, "unreadable", false),
+                    );
                 }
                 Route::Continue(AppendOutcome::WriteFailed { hresult }) => {
                     use crate::uia_mutation::{
@@ -6667,25 +6727,28 @@ impl Tool for SetValueTool {
                 use windows::Win32::UI::Accessibility::{
                     IUIAutomationRangeValuePattern, UIA_RangeValuePatternId,
                 };
-                let value_rung = match unsafe { elem.GetCurrentPattern(UIA_ValuePatternId) }
-                    .ok()
-                    .and_then(|pattern| pattern.cast::<IUIAutomationValuePattern>().ok())
-                {
-                    Some(vp) => RungOutcome::Called(
+                let value_rung = match acquire_uia_pattern::<IUIAutomationValuePattern>(
+                    &elem,
+                    UIA_ValuePatternId,
+                ) {
+                    Ok(Some(vp)) => RungOutcome::Called(
                         crate::uia::fg_bypass::run_with_uwp_bypass(hwnd as isize, || unsafe {
                             vp.SetValue(&BSTR::from(value.as_str()))
                         })
                         .map_or_else(|error| error.code().0, |_| 0),
                     ),
-                    None => RungOutcome::Absent,
+                    Ok(None) => RungOutcome::Absent,
+                    Err(hresult) => RungOutcome::AcquireFailed(hresult),
                 };
                 let mut parse_error = None;
                 let decision = set_value_route(value_rung, || {
-                    let Some(rv) = (unsafe { elem.GetCurrentPattern(UIA_RangeValuePatternId) })
-                        .ok()
-                        .and_then(|pattern| pattern.cast::<IUIAutomationRangeValuePattern>().ok())
-                    else {
-                        return RungOutcome::Absent;
+                    let rv = match acquire_uia_pattern::<IUIAutomationRangeValuePattern>(
+                        &elem,
+                        UIA_RangeValuePatternId,
+                    ) {
+                        Ok(Some(rv)) => rv,
+                        Ok(None) => return RungOutcome::Absent,
+                        Err(hresult) => return RungOutcome::AcquireFailed(hresult),
                     };
                     let parsed: f64 = match value.parse() {
                         Ok(parsed) => parsed,
@@ -6802,7 +6865,12 @@ fn set_value_write_failure_result(
         Some("foreground") => RequestedDelivery::Foreground,
         _ => RequestedDelivery::Background,
     };
-    let record = ActionExecutionRecord::new(ActionEffect::Unverifiable, transport, requested);
+    let effect = if refused {
+        ActionEffect::Refused
+    } else {
+        ActionEffect::Unverifiable
+    };
+    let record = ActionExecutionRecord::new(effect, transport, requested);
     if refused {
         ToolResult::error(message).with_action_record(record)
     } else {

@@ -178,3 +178,56 @@ fn last_range_write_is_classified_and_all_absent_is_terminal() {
         }
     );
 }
+
+#[test]
+fn pattern_absence_is_only_null_no_interface_or_not_supported() {
+    assert!(pattern_absent(0));
+    assert!(pattern_absent(1));
+    assert!(pattern_absent(0x8000_4002_u32 as i32));
+    assert!(pattern_absent(NOT_SUPPORTED));
+    for hr in [
+        TIMEOUT,
+        DENIED,
+        0x8004_0201_u32 as i32,
+        0x8000_4005_u32 as i32,
+        0x8001_0108_u32 as i32,
+    ] {
+        assert!(!pattern_absent(hr), "{hr:#x}");
+    }
+}
+
+#[test]
+fn failed_pattern_acquisition_stops_the_chain_without_delivery() {
+    let later = Cell::new(0);
+    let result = run_rungs(vec![
+        Box::new(|| RungOutcome::AcquireFailed(TIMEOUT)),
+        Box::new(|| {
+            later.set(later.get() + 1);
+            RungOutcome::Called(0)
+        }),
+    ]);
+    assert_eq!(later.get(), 0);
+    assert_eq!(
+        result,
+        ChainOutcome::Refused {
+            rung: 0,
+            kind: RefusalKind::PatternUnreadable,
+            hresult: TIMEOUT,
+            not_supported_calls: vec![],
+        }
+    );
+    let range_calls = Cell::new(0);
+    let decision = set_value_route(RungOutcome::AcquireFailed(DENIED), || {
+        range_calls.set(range_calls.get() + 1);
+        RungOutcome::Called(0)
+    });
+    assert_eq!(range_calls.get(), 0);
+    assert_eq!(
+        decision,
+        SetValueDecision::Refused {
+            rung: 0,
+            kind: RefusalKind::PatternUnreadable,
+            hresult: DENIED,
+        }
+    );
+}

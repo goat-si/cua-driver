@@ -107,7 +107,7 @@ fn routing_table_observes_calls_and_results() {
             },
             || {
                 events.borrow_mut().push("acquire");
-                pattern.then_some(())
+                Ok(pattern.then_some(()))
             },
             |_| {
                 events.borrow_mut().push("read");
@@ -245,5 +245,30 @@ fn document_requires_each_condition_and_explicit_non_password() {
         assert!(!focused_document_target_ok(
             args.0, args.1, args.2, args.3, args.4, args.5
         ));
+    }
+}
+
+#[test]
+fn failed_value_pattern_acquisition_writes_nothing_and_never_types() {
+    const TIMEOUT: i32 = 0x8013_1505_u32 as i32;
+    for password in [Some(true), Some(false)] {
+        let writes = std::cell::Cell::new(0);
+        let reads = std::cell::Cell::new(0);
+        let result = run_value_append(
+            || password,
+            || Err::<Option<()>, i32>(TIMEOUT),
+            |_| {
+                reads.set(reads.get() + 1);
+                Ok(String::new())
+            },
+            |_, _| {
+                writes.set(writes.get() + 1);
+                Ok(())
+            },
+            "secret",
+        );
+        assert_eq!(result, AppendOutcome::Refused("value_pattern_unreadable"));
+        assert_eq!((reads.get(), writes.get()), (0, 0));
+        assert!(!allows_wm_char_fallback(&result));
     }
 }
