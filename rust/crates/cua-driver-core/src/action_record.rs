@@ -2115,6 +2115,7 @@ mod tests {
             assert_eq!(record.effect, expected_effect);
             assert_eq!(record.transport, transport);
             assert_eq!(record.actual_delivery, delivery);
+            assert_eq!(record.delivered_count, Some(if effect == "refused" { 0 } else { 2 }));
         }
     }
 

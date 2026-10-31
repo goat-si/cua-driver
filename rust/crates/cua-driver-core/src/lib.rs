@@ -107,9 +107,10 @@ pub mod ffmpeg_install;
 pub mod health_report;
 pub mod history;
 pub mod image_utils;
-pub mod interactive_input;
+pub mod input_resource;
 #[cfg(test)]
 mod input_resource_tests;
+pub mod interactive_input;
 pub mod key_cancellation;
 pub mod key_pacing;
 pub mod launch_guard;

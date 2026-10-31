@@ -1,5 +1,5 @@
-use crate::input_resource::{ResourceState, ResourceTable};
 use crate::guarded_dispatch::Emitted;
+use crate::input_resource::{ResourceState, ResourceTable};
 
 #[test]
 fn resource_transitions_restore_and_cleanup_in_reverse_order() {
