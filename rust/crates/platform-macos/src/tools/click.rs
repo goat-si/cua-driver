@@ -314,6 +314,70 @@ mod label_reader_seam_tests {
     }
 }
 
+#[cfg(test)]
+mod hit_label_tests {
+    use super::*;
+    use crate::ax::label_reader::fake::FakeReader;
+
+    fn assert_value_not_requested(nested: bool, failed: bool) {
+        let mut reader = FakeReader::default();
+        let target = usize::from(nested);
+        if nested {
+            reader.children.insert(0, vec![1]);
+        }
+        reader.set(target, "AXRole", "AXTextField");
+        reader.set(target, "AXValue", "secret");
+        if failed {
+            reader.failures.insert((target, "AXHelp".into()));
+        } else {
+            reader.set(target, "AXSubrole", "AXSecureTextField");
+        }
+        element_name_with(&mut reader, 0);
+        assert!(
+            !reader
+                .trace
+                .iter()
+                .any(|(id, name)| *id == target && name == "AXValue"),
+            "{:?}",
+            reader.trace
+        );
+    }
+
+    #[test]
+    fn a_click_hit_label_never_requests_a_secure_value() {
+        for failed in [false, true] {
+            assert_value_not_requested(false, failed);
+        }
+    }
+    #[test]
+    fn a_click_nested_text_never_requests_a_secure_value() {
+        for failed in [false, true] {
+            assert_value_not_requested(true, failed);
+        }
+    }
+}
+
+#[cfg(test)]
+mod popup_summary_tests {
+    use super::*;
+    use crate::ax::label_reader::fake::FakeReader;
+    #[test]
+    fn popup_option_summary_omits_secure_and_unknown_values() {
+        for failed in [false, true] {
+            let mut reader = FakeReader::default();
+            reader.set(0, "AXRole", "AXTextField");
+            reader.set(0, "AXValue", "secret");
+            if failed {
+                reader.failures.insert((0, "AXHelp".into()));
+            } else {
+                reader.set(0, "AXSubrole", "AXSecureTextField");
+            }
+            assert_eq!(popup_option_with(&mut reader, 0), None);
+            assert!(!reader.trace.iter().any(|(_, name)| name == "AXValue"));
+        }
+    }
+}
+
 impl Drop for WindowTitleProbe {
     fn drop(&mut self) {
         unsafe { CFRelease(self.window as CFTypeRef) };

@@ -188,6 +188,20 @@ fn selection_exposure_allowed(attributes: &[OptionalStringAttr; 8]) -> bool {
     )
 }
 
+#[derive(Clone, Copy)]
+struct DocumentShape<'a> {
+    parent_role: Option<&'a str>,
+    window_subrole: Option<&'a str>,
+}
+
+fn selection_exposure_with_shape(
+    attributes: &[OptionalStringAttr; 8],
+    shape: DocumentShape<'_>,
+) -> bool {
+    let _ = (shape.parent_role, shape.window_subrole);
+    selection_exposure_allowed(attributes)
+}
+
 fn find_occurrences(value: &str, needle: &str) -> Vec<(usize, usize)> {
     if needle.is_empty() {
         return Vec::new();
@@ -287,7 +301,13 @@ unsafe fn select_text_blocking(
     selection: &str,
 ) -> Result<(String, SelectedTextRange, usize, usize), SelectError> {
     let attributes = selection_attributes_with(|name| optional_string_attr(element, name));
-    if !selection_exposure_allowed(&attributes) {
+    if !selection_exposure_with_shape(
+        &attributes,
+        DocumentShape {
+            parent_role: None,
+            window_subrole: None,
+        },
+    ) {
         return Err(
             "select_text refuses secure fields, and fields whose security attributes could not be read"
                 .into(),
@@ -582,6 +602,65 @@ mod tests {
             OptionalStringAttr::Value(None),
             OptionalStringAttr::Value(Some("text entry area".into())),
         ]
+    }
+
+    fn body_shape() -> DocumentShape<'static> {
+        DocumentShape {
+            parent_role: Some("AXScrollArea"),
+            window_subrole: Some("AXStandardWindow"),
+        }
+    }
+
+    #[test]
+    fn select_text_exception_requires_the_document_body_shape() {
+        let attrs = textedit_text_area();
+        for shape in [
+            DocumentShape {
+                parent_role: None,
+                window_subrole: Some("AXStandardWindow"),
+            },
+            DocumentShape {
+                parent_role: Some("AXGroup"),
+                window_subrole: Some("AXStandardWindow"),
+            },
+            DocumentShape {
+                parent_role: Some("AXScrollArea"),
+                window_subrole: None,
+            },
+        ] {
+            assert!(!selection_exposure_with_shape(&attrs, shape));
+        }
+        let mut other_hint = attrs;
+        other_hint[3] = OptionalStringAttr::Value(None);
+        other_hint[2] = OptionalStringAttr::StableFailure;
+        assert!(!selection_exposure_with_shape(&other_hint, body_shape()));
+    }
+
+    #[test]
+    fn a_non_body_custom_field_with_a_failing_hint_is_refused() {
+        assert!(!selection_exposure_with_shape(
+            &textedit_text_area(),
+            DocumentShape {
+                parent_role: Some("AXGroup"),
+                window_subrole: Some("AXStandardWindow")
+            }
+        ));
+    }
+
+    #[test]
+    fn textedit_body_shape_is_still_allowed() {
+        assert!(selection_exposure_with_shape(
+            &textedit_text_area(),
+            body_shape()
+        ));
+    }
+
+    #[test]
+    fn same_shape_custom_field_is_admitted_by_the_exception() {
+        assert!(selection_exposure_with_shape(
+            &textedit_text_area(),
+            body_shape()
+        ));
     }
 
     #[test]

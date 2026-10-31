@@ -38,6 +38,7 @@ pub(crate) mod fake {
         pub strings: HashMap<(usize, String), String>,
         pub children: HashMap<usize, Vec<usize>>,
         pub trace: Vec<(usize, String)>,
+        pub failures: std::collections::HashSet<(usize, String)>,
     }
 
     impl FakeReader {
@@ -50,6 +51,9 @@ pub(crate) mod fake {
         type Element = usize;
         fn string(&mut self, element: usize, name: &str) -> Option<String> {
             self.trace.push((element, name.into()));
+            if self.failures.contains(&(element, name.into())) {
+                return None;
+            }
             self.strings.get(&(element, name.into())).cloned()
         }
         fn boolean(&mut self, _element: usize, _name: &str) -> Option<bool> {

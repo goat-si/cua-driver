@@ -312,4 +312,51 @@ mod secure_label_tests {
         assert_eq!(first_label_with(&mut reader, 0), "ordinary");
         assert_eq!(reader.trace.last().unwrap().1, "AXValue");
     }
+
+    #[test]
+    fn a_hover_label_never_requests_a_secure_value() {
+        for failed in [false, true] {
+            let mut reader = FakeReader::default();
+            reader.set(0, "AXRole", "AXTextField");
+            if failed {
+                reader.failures.insert((0, "AXRole".into()));
+            } else {
+                reader.set(0, "AXSubrole", "AXSecureTextField");
+            }
+            reader.set(0, "AXValue", "secret");
+            first_label_with(&mut reader, 0);
+            assert!(
+                !reader
+                    .trace
+                    .iter()
+                    .any(|(id, name)| *id == 0 && name == "AXValue"),
+                "{:?}",
+                reader.trace
+            );
+        }
+    }
+
+    #[test]
+    fn a_hover_child_text_never_requests_a_secure_value() {
+        for failed in [false, true] {
+            let mut reader = FakeReader::default();
+            reader.children.insert(0, vec![1]);
+            reader.set(1, "AXRole", "AXTextField");
+            if failed {
+                reader.failures.insert((1, "AXHelp".into()));
+            } else {
+                reader.set(1, "AXSubrole", "AXSecureTextField");
+            }
+            reader.set(1, "AXValue", "secret");
+            first_label_with(&mut reader, 0);
+            assert!(
+                !reader
+                    .trace
+                    .iter()
+                    .any(|(id, name)| *id == 1 && name == "AXValue"),
+                "{:?}",
+                reader.trace
+            );
+        }
+    }
 }
