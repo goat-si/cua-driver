@@ -1192,6 +1192,227 @@ where
     )
 }
 
+pub(super) fn background_gesture_plan(
+    from: (f64, f64),
+    to: (f64, f64),
+    steps: usize,
+    duration_ms: u64,
+) -> Vec<super::gesture::Step> {
+    use BackgroundDragEventKind::*;
+    background_drag_plan(from, to, steps, duration_ms)
+        .into_iter()
+        .map(|step| {
+            let kind = match step.kind {
+                Move => super::gesture::Kind::Move,
+                PrimerDown => super::gesture::Kind::PrimerDown,
+                PrimerUp => super::gesture::Kind::PrimerUp,
+                Down => super::gesture::Kind::Down,
+                Dragged => super::gesture::Kind::Dragged,
+                Up => super::gesture::Kind::Up,
+            };
+            super::gesture::Step {
+                kind,
+                placement: super::gesture::Placement {
+                    screen: step.point,
+                    window_local: None,
+                },
+                delay_ms: step.delay_after_ms,
+                phase: step.phase,
+                click_state: step.click_state,
+            }
+        })
+        .collect()
+}
+
+#[derive(Clone, Copy)]
+enum GestureRoute {
+    Background {
+        pid: i32,
+        wid: u32,
+        origin: (f64, f64),
+        id: i64,
+        route: PostRoute,
+    },
+    Window {
+        pid: i32,
+        wid: Option<u32>,
+        id: Option<i64>,
+    },
+    Desktop,
+}
+
+struct MouseGestureIo<F> {
+    route: GestureRoute,
+    source: Option<CGEventSource>,
+    button: CGMouseButton,
+    down: CGEventType,
+    dragged: CGEventType,
+    up: CGEventType,
+    button_number: i64,
+    flags: CGEventFlags,
+    observe: F,
+}
+
+impl<F: FnMut(f64, f64)> super::gesture::GestureIo for MouseGestureIo<F> {
+    type Event = CGEvent;
+
+    fn prepare(&mut self, step: &super::gesture::Step) {
+        use super::gesture::Preparation;
+        use core_graphics::display::CGDisplay;
+        let route = match self.route {
+            GestureRoute::Background { .. } => super::gesture::RoutePolicy::Background,
+            GestureRoute::Window { .. } => super::gesture::RoutePolicy::Window,
+            GestureRoute::Desktop => super::gesture::RoutePolicy::Desktop,
+        };
+        for op in super::gesture::preparation(route, step.kind) {
+            match op {
+                Preparation::Warp => {
+                    let _ = CGDisplay::warp_mouse_cursor_position(CGPoint::new(
+                        step.placement.screen.0,
+                        step.placement.screen.1,
+                    ));
+                }
+                Preparation::Associate => {
+                    unsafe { CGAssociateMouseAndMouseCursorPosition(true) };
+                }
+                Preparation::Wait40 => std::thread::sleep(std::time::Duration::from_millis(40)),
+                Preparation::Wait50 => std::thread::sleep(std::time::Duration::from_millis(50)),
+            }
+        }
+    }
+
+    fn create(&mut self, step: &super::gesture::Step) -> anyhow::Result<CGEvent> {
+        use super::gesture::Kind;
+        let (ty, button) = match step.kind {
+            Kind::Move => (
+                CGEventType::MouseMoved,
+                if matches!(self.route, GestureRoute::Desktop) {
+                    self.button
+                } else {
+                    CGMouseButton::Left
+                },
+            ),
+            Kind::PrimerDown => (CGEventType::LeftMouseDown, CGMouseButton::Left),
+            Kind::PrimerUp => (CGEventType::LeftMouseUp, CGMouseButton::Left),
+            Kind::Down => (self.down, self.button),
+            Kind::Dragged => (self.dragged, self.button),
+            Kind::Up => (self.up, self.button),
+        };
+        let point = CGPoint::new(step.placement.screen.0, step.placement.screen.1);
+        match &self.source {
+            Some(source) => CGEvent::new_mouse_event(source.clone(), ty, point, button),
+            None => new_global_mouse_event(ty, point, button),
+        }
+        .map_err(|_| match self.route {
+            GestureRoute::Background { .. } => {
+                anyhow::anyhow!("background drag {:?} event creation failed", step.kind)
+            }
+            GestureRoute::Window { .. } => anyhow::anyhow!("foreground drag event creation failed"),
+            GestureRoute::Desktop => {
+                anyhow::anyhow!("foreground drag {:?} event creation failed", step.kind)
+            }
+        })
+    }
+
+    fn stamp(&mut self, event: &mut CGEvent, step: &super::gesture::Step) {
+        use super::gesture::Kind;
+        unsafe {
+            CGEventSetLocation(
+                event.as_ptr() as *mut std::ffi::c_void,
+                step.placement.screen.0,
+                step.placement.screen.1,
+            )
+        };
+        event.set_flags(self.flags);
+        let ptr = event.as_ptr() as *mut std::ffi::c_void;
+        let set = |field, value| crate::input::skylight::set_integer_field(ptr, field, value);
+        let primer = matches!(step.kind, Kind::PrimerDown | Kind::PrimerUp);
+        let subtype = if matches!(step.kind, Kind::Move | Kind::PrimerDown | Kind::PrimerUp) {
+            3
+        } else {
+            0
+        };
+        let button_number = if primer || step.kind == Kind::Move {
+            0
+        } else {
+            self.button_number
+        };
+        match self.route {
+            GestureRoute::Background {
+                pid,
+                wid,
+                origin,
+                id,
+                ..
+            } => {
+                set(0, step.phase);
+                set(1, step.click_state);
+                set(3, button_number);
+                set(7, subtype);
+                set(40, pid as i64);
+                set(51, wid as i64);
+                set(91, wid as i64);
+                set(92, wid as i64);
+                set(58, id);
+                let local = if primer {
+                    step.placement.screen
+                } else {
+                    (
+                        step.placement.screen.0 - origin.0,
+                        step.placement.screen.1 - origin.1,
+                    )
+                };
+                crate::input::skylight::set_window_location(ptr, local.0, local.1);
+                super::tag_synthetic_event(event);
+            }
+            GestureRoute::Window { pid, wid, id } => {
+                if let Some((x, y)) = step.placement.window_local {
+                    crate::input::skylight::set_window_location(ptr, x, y);
+                }
+                if let (Some(wid), Some(id)) = (wid, id) {
+                    set(1, step.click_state);
+                    set(3, button_number);
+                    set(7, subtype);
+                    set(51, wid as i64);
+                    set(58, id);
+                    set(91, wid as i64);
+                    set(92, wid as i64);
+                }
+                set(40, pid as i64);
+                super::tag_synthetic_event(event);
+            }
+            GestureRoute::Desktop => {}
+        }
+    }
+
+    fn post(&mut self, event: &CGEvent, _step: &super::gesture::Step) {
+        match self.route {
+            GestureRoute::Background { pid, route, .. } => dispatch_mouse_event(route, pid, event),
+            GestureRoute::Window { pid, .. } => dispatch_mouse_event(PostRoute::Hid, pid, event),
+            GestureRoute::Desktop => super::hid_history::post(|| {
+                event.post(core_graphics::event::CGEventTapLocation::HID)
+            }),
+        }
+    }
+
+    fn settle(&mut self, step: &super::gesture::Step) {
+        if step.delay_ms > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(step.delay_ms));
+        }
+    }
+
+    fn observe(&mut self, step: &super::gesture::Step) {
+        let route = match self.route {
+            GestureRoute::Background { .. } => super::gesture::RoutePolicy::Background,
+            GestureRoute::Window { .. } => super::gesture::RoutePolicy::Window,
+            GestureRoute::Desktop => super::gesture::RoutePolicy::Desktop,
+        };
+        if super::gesture::observes(route, step.kind) {
+            (self.observe)(step.placement.screen.0, step.placement.screen.1);
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn drag_at_xy_background_with_origin<F, G>(
     pid: i32,
@@ -1211,8 +1432,6 @@ where
     G: FnMut() -> bool,
 {
     use std::time::{SystemTime, UNIX_EPOCH};
-    use BackgroundDragEventKind::*;
-
     let source = CGEventSource::new(CGEventSourceStateID::HIDSystemState)
         .map_err(|_| anyhow::anyhow!("CGEventSource::new failed"))?;
     let flags = parse_modifier_flags(modifiers);
@@ -1244,107 +1463,85 @@ where
         .unwrap_or_default()
         .subsec_nanos() as i64;
     let route = post_route(MousePostMode::SkyLightPreferred, skylight_available());
-    let window_id = wid as i64;
-    let window_origin = origin;
-    let mut stopped_at: Option<(f64, f64)> = None;
-    let mut last_point = from;
-    for mut step in background_drag_plan(from, to, steps, duration_ms) {
-        if let Some(at) = stopped_at {
-            match step.kind {
-                Dragged => continue,
-                Up => step.point = at,
-                _ => {}
-            }
-        }
-        // (type, button, button number, subtype). Primers keep the click
-        // recipe's left button and touch subtype; the gesture itself is a
-        // plain mouse drag (subtype 0), like the foreground drag.
-        let (event_type, event_button, event_button_number, subtype) = match step.kind {
-            Move => (CGEventType::MouseMoved, CGMouseButton::Left, 0, 3),
-            PrimerDown => (CGEventType::LeftMouseDown, CGMouseButton::Left, 0, 3),
-            PrimerUp => (CGEventType::LeftMouseUp, CGMouseButton::Left, 0, 3),
-            Down => (down_type, cg_button, button_number, 0),
-            Dragged => (dragged_type, cg_button, button_number, 0),
-            Up => (up_type, cg_button, button_number, 0),
-        };
-        let point = CGPoint::new(step.point.0, step.point.1);
-        let event = CGEvent::new_mouse_event(source.clone(), event_type, point, event_button)
-            .map_err(|_| {
-                anyhow::anyhow!("background drag {:?} event creation failed", step.kind)
-            })?;
-        let ptr = event.as_ptr() as *mut std::ffi::c_void;
-        let set =
-            |field: u32, value: i64| crate::input::skylight::set_integer_field(ptr, field, value);
-        set(0, step.phase);
-        set(1, step.click_state);
-        set(3, event_button_number);
-        set(7, subtype);
-        set(40, pid as i64);
-        set(51, window_id);
-        set(91, window_id);
-        set(92, window_id);
-        set(58, gesture_id);
-        let local = match step.kind {
-            // Primers are identified by kind, not by the (-1,-1) sentinel:
-            // a negative-origin display makes that a valid screen point.
-            PrimerDown | PrimerUp => step.point,
-            _ => (
-                step.point.0 - window_origin.0,
-                step.point.1 - window_origin.1,
-            ),
-        };
-        crate::input::skylight::set_window_location(ptr, local.0, local.1);
-        set_explicit_flags(&event, flags);
-        dispatch_mouse_event(route, pid, &event);
-        if matches!(step.kind, Down | Dragged) {
-            observe(step.point.0, step.point.1);
-            last_point = step.point;
-        }
-        if step.delay_after_ms > 0 {
-            std::thread::sleep(std::time::Duration::from_millis(step.delay_after_ms));
-        }
-        if step.kind == Dragged && stopped_at.is_none() && !keep_going() {
-            stopped_at = Some(last_point);
+    let plan = background_gesture_plan(from, to, steps, duration_ms);
+    let mut io = MouseGestureIo {
+        route: GestureRoute::Background {
+            pid,
+            wid,
+            origin,
+            id: gesture_id,
+            route,
+        },
+        source: Some(source),
+        button: cg_button,
+        down: down_type,
+        dragged: dragged_type,
+        up: up_type,
+        button_number,
+        flags,
+        observe: &mut observe,
+    };
+    match super::gesture::run_gesture(&mut io, plan, &mut keep_going)? {
+        super::gesture::GestureOutcome::Completed => Ok(BackgroundDragOutcome::Completed),
+        super::gesture::GestureOutcome::StoppedEarly { at } => {
+            Ok(BackgroundDragOutcome::StoppedEarly { at: at.screen })
         }
     }
-    Ok(match stopped_at {
-        Some(at) => BackgroundDragOutcome::StoppedEarly { at },
-        None => BackgroundDragOutcome::Completed,
-    })
 }
 
-#[allow(clippy::too_many_arguments)]
-fn post_drag_mouse_event(
-    pid: i32,
-    event_type: CGEventType,
-    point: CGPoint,
-    button: CGMouseButton,
-    window_local: Option<(f64, f64)>,
-    wid: Option<u32>,
-    click_group_id: Option<i64>,
-    click_state: i64,
-    button_number: i64,
-    subtype: i64,
-    mode: MousePostMode,
-    flags: CGEventFlags,
-    error_context: &str,
-) -> anyhow::Result<()> {
-    debug_assert_eq!(mode, MousePostMode::HidOnly);
-    let event = new_global_mouse_event(event_type, point, button)
-        .map_err(|_| anyhow::anyhow!(error_context.to_owned()))?;
-    set_explicit_flags(&event, flags);
-    post_mouse_event_with_mode(
-        pid,
-        &event,
-        window_local,
-        wid,
-        click_group_id,
-        click_state,
-        button_number,
-        subtype,
-        mode,
-    );
-    Ok(())
+fn foreground_gesture_plan(
+    events: Vec<ForegroundDragEvent>,
+    from_local: Option<(f64, f64)>,
+    to_local: Option<(f64, f64)>,
+    step_delay_ms: u64,
+    desktop: bool,
+) -> Vec<super::gesture::Step> {
+    events
+        .into_iter()
+        .map(|spec| {
+            use super::gesture::Kind;
+            let kind = match spec.kind {
+                ForegroundDragEventKind::Move => Kind::Move,
+                ForegroundDragEventKind::Down => Kind::Down,
+                ForegroundDragEventKind::Dragged => Kind::Dragged,
+                ForegroundDragEventKind::Up => Kind::Up,
+            };
+            let local = from_local.zip(to_local).map(|((fx, fy), (tx, ty))| {
+                (
+                    fx + (tx - fx) * spec.progress,
+                    fy + (ty - fy) * spec.progress,
+                )
+            });
+            let delay_ms = match kind {
+                Kind::Move if desktop => 30,
+                Kind::Move => 12,
+                Kind::Down => 16,
+                Kind::Dragged => step_delay_ms,
+                _ => 0,
+            };
+            super::gesture::Step {
+                kind,
+                placement: super::gesture::Placement {
+                    screen: (spec.point.x, spec.point.y),
+                    window_local: local,
+                },
+                delay_ms,
+                phase: 0,
+                click_state: if kind == Kind::Move { 0 } else { 1 },
+            }
+        })
+        .collect()
+}
+
+#[cfg(test)]
+pub(super) fn test_foreground_gesture_plan(desktop: bool) -> Vec<super::gesture::Step> {
+    foreground_gesture_plan(
+        foreground_drag_events(0.0, 0.0, 10.0, 10.0, 1),
+        None,
+        None,
+        20,
+        desktop,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1366,7 +1563,6 @@ fn drag_at_xy_window_foreground_observed<F>(
 where
     F: FnMut(f64, f64),
 {
-    use core_graphics::display::CGDisplay;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     let (cg_button, down_type, dragged_type, up_type, button_number) = match button {
@@ -1406,74 +1602,24 @@ where
     };
     let events = foreground_drag_events(from_x, from_y, to_x, to_y, steps);
 
+    let plan = foreground_gesture_plan(events, from_local, to_local, step_delay_ms, false);
     super::keyboard::with_global_modifier_keys(modifiers, |flags| {
-        for spec in events {
-            let (event_type, click_state, event_button, event_button_number, subtype) = match spec
-                .kind
-            {
-                ForegroundDragEventKind::Move => {
-                    (CGEventType::MouseMoved, 0, CGMouseButton::Left, 0, 3)
-                }
-                ForegroundDragEventKind::Down => (down_type, 1, cg_button, button_number, 0),
-                ForegroundDragEventKind::Dragged => (dragged_type, 1, cg_button, button_number, 0),
-                ForegroundDragEventKind::Up => (up_type, 1, cg_button, button_number, 0),
-            };
-            let local = from_local.zip(to_local).map(|((fx, fy), (tx, ty))| {
-                (
-                    fx + (tx - fx) * spec.progress,
-                    fy + (ty - fy) * spec.progress,
-                )
-            });
-
-            match spec.kind {
-                ForegroundDragEventKind::Move => {
-                    let _ = CGDisplay::warp_mouse_cursor_position(spec.point);
-                    unsafe { CGAssociateMouseAndMouseCursorPosition(true) };
-                    std::thread::sleep(std::time::Duration::from_millis(40));
-                }
-                ForegroundDragEventKind::Dragged => {
-                    let _ = CGDisplay::warp_mouse_cursor_position(spec.point);
-                }
-                ForegroundDragEventKind::Up => {
-                    std::thread::sleep(std::time::Duration::from_millis(50));
-                }
-                ForegroundDragEventKind::Down => {}
-            }
-
-            post_drag_mouse_event(
+        let mut io = MouseGestureIo {
+            route: GestureRoute::Window {
                 pid,
-                event_type,
-                spec.point,
-                event_button,
-                local,
                 wid,
-                click_group_id,
-                click_state,
-                event_button_number,
-                subtype,
-                MousePostMode::HidOnly,
-                flags,
-                "foreground drag event creation failed",
-            )?;
-
-            match spec.kind {
-                ForegroundDragEventKind::Move => {
-                    std::thread::sleep(std::time::Duration::from_millis(12));
-                }
-                ForegroundDragEventKind::Down => {
-                    observe(spec.point.x, spec.point.y);
-                    std::thread::sleep(std::time::Duration::from_millis(16));
-                }
-                ForegroundDragEventKind::Dragged => {
-                    observe(spec.point.x, spec.point.y);
-                    if step_delay_ms > 0 {
-                        std::thread::sleep(std::time::Duration::from_millis(step_delay_ms));
-                    }
-                }
-                ForegroundDragEventKind::Up => {}
-            }
-        }
-        Ok(())
+                id: click_group_id,
+            },
+            source: None,
+            button: cg_button,
+            down: down_type,
+            dragged: dragged_type,
+            up: up_type,
+            button_number,
+            flags,
+            observe: &mut observe,
+        };
+        super::gesture::run_gesture(&mut io, plan, || true).map(|_| ())
     })?;
 
     std::thread::sleep(std::time::Duration::from_millis(100));
@@ -1501,7 +1647,6 @@ where
     F: FnMut(f64, f64),
 {
     use core_graphics::display::CGDisplay;
-    use core_graphics::event::CGEventTapLocation;
 
     let (cg_button, down_type, dragged_type, up_type) = match button {
         DragButton::Left => (
@@ -1539,42 +1684,20 @@ where
     observe(from_x, from_y);
     std::thread::sleep(std::time::Duration::from_millis(40));
 
+    let plan = foreground_gesture_plan(events, None, None, step_delay_ms, true);
     super::keyboard::with_global_modifier_keys(modifiers, |flags| {
-        for spec in events {
-            let event_type = match spec.kind {
-                ForegroundDragEventKind::Move => CGEventType::MouseMoved,
-                ForegroundDragEventKind::Down => down_type,
-                ForegroundDragEventKind::Dragged => dragged_type,
-                ForegroundDragEventKind::Up => up_type,
-            };
-            // A null source matches macOS's established global mouse-controller
-            // path. WindowServer then carries the pressed-button state from the
-            // down through every dragged event instead of treating each event as
-            // an independent HIDSystemState snapshot.
-            let event =
-                new_global_mouse_event(event_type, spec.point, cg_button).map_err(|_| {
-                    anyhow::anyhow!("foreground drag {:?} event creation failed", spec.kind)
-                })?;
-            event.set_flags(flags);
-            super::hid_history::post(|| event.post(CGEventTapLocation::HID));
-
-            match spec.kind {
-                ForegroundDragEventKind::Move => {
-                    std::thread::sleep(std::time::Duration::from_millis(30));
-                }
-                ForegroundDragEventKind::Down => {
-                    std::thread::sleep(std::time::Duration::from_millis(16));
-                }
-                ForegroundDragEventKind::Dragged => {
-                    observe(spec.point.x, spec.point.y);
-                    if step_delay_ms > 0 {
-                        std::thread::sleep(std::time::Duration::from_millis(step_delay_ms));
-                    }
-                }
-                ForegroundDragEventKind::Up => {}
-            }
-        }
-        Ok(())
+        let mut io = MouseGestureIo {
+            route: GestureRoute::Desktop,
+            source: None,
+            button: cg_button,
+            down: down_type,
+            dragged: dragged_type,
+            up: up_type,
+            button_number: 0,
+            flags,
+            observe: &mut observe,
+        };
+        super::gesture::run_gesture(&mut io, plan, || true).map(|_| ())
     })?;
     // The foreground wrapper restores the previous app immediately after this
     // function returns. Let the target's run loop consume the queued HID

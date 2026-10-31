@@ -10,6 +10,7 @@
 
 pub mod ax_actions;
 pub mod electron_drag;
+mod gesture;
 pub(crate) mod hid_history;
 pub mod hover;
 pub mod interactive;
