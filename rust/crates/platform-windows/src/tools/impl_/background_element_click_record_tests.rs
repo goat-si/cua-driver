@@ -60,3 +60,38 @@ fn single_provider_success_has_no_invented_attempts() {
         assert!(record.fallbacks.is_empty());
     }
 }
+
+#[test]
+fn write_failure_records_the_failing_value_transport_and_request() {
+    use super::set_value_write_failure_result;
+    use crate::uia_mutation::{RefusalKind, SetValueDecision, UncertainKind};
+    use cua_driver_core::action_record::{ActionEffect, RequestedDelivery};
+    let cases = [
+        (
+            SetValueDecision::Refused {
+                rung: 0,
+                kind: RefusalKind::AccessDenied,
+                hresult: 0x8007_0005_u32 as i32,
+            },
+            ActionTransport::WindowsUiaValue,
+        ),
+        (
+            SetValueDecision::Uncertain {
+                rung: 1,
+                kind: UncertainKind::Timeout,
+                hresult: 0x8013_1505_u32 as i32,
+            },
+            ActionTransport::WindowsUiaRangeValue,
+        ),
+    ];
+    for (decision, transport) in cases {
+        let result = set_value_write_failure_result(
+            decision,
+            &serde_json::json!({"delivery_mode": "foreground"}),
+        );
+        let record = result.action_record.unwrap();
+        assert_eq!(record.effect, ActionEffect::Unverifiable);
+        assert_eq!(record.transport, transport);
+        assert_eq!(record.requested_delivery, RequestedDelivery::Foreground);
+    }
+}

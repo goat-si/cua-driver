@@ -149,3 +149,32 @@ fn click_mapping_covers_every_outcome() {
         }
     );
 }
+
+#[test]
+fn last_range_write_is_classified_and_all_absent_is_terminal() {
+    assert_eq!(
+        run_rungs(vec![
+            Box::new(|| RungOutcome::Absent),
+            Box::new(|| RungOutcome::Absent)
+        ]),
+        ChainOutcome::NoAffordance {
+            not_supported_calls: vec![]
+        }
+    );
+    assert_eq!(
+        set_value_route(RungOutcome::Absent, || RungOutcome::Called(TIMEOUT)),
+        SetValueDecision::Uncertain {
+            rung: 1,
+            kind: UncertainKind::Timeout,
+            hresult: TIMEOUT
+        }
+    );
+    assert_eq!(
+        set_value_route(RungOutcome::Absent, || RungOutcome::Called(DENIED)),
+        SetValueDecision::Refused {
+            rung: 1,
+            kind: RefusalKind::AccessDenied,
+            hresult: DENIED
+        }
+    );
+}
