@@ -315,44 +315,56 @@ impl Tool for SetValueTool {
         let snapshot = WindowChangeDetector::snapshot(prior_front);
 
         let post_guard = element_guard.clone();
-        let result = focus_guard::with_focus_suppressed(
-            Some(pid),
-            prior_front,
-            "set_value.AXValue",
-            || async move {
-                latency::spawn_action_blocking(move || {
-                    set_value_blocking(
-                        element_guard.as_ptr(),
-                        element_index,
-                        pid,
-                        window_id,
-                        &value,
-                    )
-                })
-                .await
-            },
-        )
-        .await;
-
-        let changes = snapshot.detect_async().await;
-
-        // Read before the result is built: on web content an unchanged
-        // read-back is reported as unverifiable, not as not applied.
-        let write_not_applied = matches!(&result, Ok(Ok(outcome)) if outcome.not_applied);
-        let maybe_landed = matches!(&result, Ok(Ok(outcome)) if outcome.maybe_landed);
-        let result = set_value_tool_result(
-            result.map_err(|error| error.to_string()),
-            ax_echo_surface,
-            changes.result_suffix(),
-            pid,
-            element_index,
-        );
-        super::set_value_autosubmit::finish(
+        let document_key = move || unsafe {
+            crate::document_edit::ensure_marked_after_ax_write(
+                pid,
+                element_ptr as AXUIElementRef,
+                true,
+            )
+        };
+        dispatch_set_value(
             autosubmit,
             pid,
-            result,
-            write_not_applied,
-            maybe_landed,
+            move || unsafe {
+                let element = element_ptr as AXUIElementRef;
+                (
+                    copy_string_attr(element, "AXRole"),
+                    crate::ax::write_outcome::query_settable(element, "AXValue"),
+                )
+            },
+            move |document_key| async move {
+                let result = focus_guard::with_focus_suppressed(
+                    Some(pid),
+                    prior_front,
+                    "set_value.AXValue",
+                    || async move {
+                        latency::spawn_action_blocking(move || {
+                            set_value_blocking_with_document(
+                                element_guard.as_ptr(),
+                                element_index,
+                                pid,
+                                window_id,
+                                &value,
+                                document_key,
+                            )
+                        })
+                        .await
+                    },
+                )
+                .await;
+                let changes = snapshot.detect_async().await;
+                let write_not_applied = matches!(&result, Ok(Ok(outcome)) if outcome.not_applied);
+                let maybe_landed = matches!(&result, Ok(Ok(outcome)) if outcome.maybe_landed);
+                let result = set_value_tool_result(
+                    result.map_err(|error| error.to_string()),
+                    ax_echo_surface,
+                    changes.result_suffix(),
+                    pid,
+                    element_index,
+                );
+                (result, write_not_applied, maybe_landed)
+            },
+            document_key,
             |_, key| async move {
                 super::set_value_autosubmit::post_return(
                     _mutation_lease,
@@ -365,6 +377,32 @@ impl Tool for SetValueTool {
         )
         .await
     }
+}
+
+async fn dispatch_set_value<W, WF, D, R, RF>(
+    autosubmit: bool,
+    pid: i32,
+    _classify: impl FnOnce() -> (Option<String>, crate::ax::write_outcome::Settable),
+    write: W,
+    document_key: D,
+    return_key: R,
+) -> ToolResult
+where
+    W: FnOnce(D) -> WF,
+    WF: std::future::Future<Output = (ToolResult, bool, bool)>,
+    R: FnOnce(i32, &'static str) -> RF,
+    RF: std::future::Future<Output = Result<bool, String>>,
+{
+    let (result, write_not_applied, maybe_landed) = write(document_key).await;
+    super::set_value_autosubmit::finish(
+        autosubmit,
+        pid,
+        result,
+        write_not_applied,
+        maybe_landed,
+        return_key,
+    )
+    .await
 }
 
 /// The tool result for a finished set_value write.
@@ -1016,20 +1054,25 @@ fn apply_verification_label(outcome: &mut SetValueOutcome) {
     }
 }
 
-fn set_value_blocking(
+fn set_value_blocking_with_document(
     element_ptr: usize,
     element_index: usize,
     pid: i32,
     window_id: u32,
     value: &str,
+    mark: impl FnOnce() -> crate::document_edit::DocumentEdited,
 ) -> anyhow::Result<SetValueOutcome> {
-    set_value_blocking_with(element_ptr, element_index, pid, window_id, value, false)
+    set_value_blocking_inner(
+        element_ptr,
+        element_index,
+        pid,
+        window_id,
+        value,
+        false,
+        mark,
+    )
 }
 
-/// `restored_window`: the window was restored from the Dock for this write.
-/// The caller holds the key scope and the temporary restore; the restore
-/// waits for the scope's hand-back before minimizing the window again, and
-/// only a text field is written on this route.
 fn set_value_blocking_with(
     element_ptr: usize,
     element_index: usize,
@@ -1037,6 +1080,36 @@ fn set_value_blocking_with(
     window_id: u32,
     value: &str,
     restored_window: bool,
+) -> anyhow::Result<SetValueOutcome> {
+    set_value_blocking_inner(
+        element_ptr,
+        element_index,
+        pid,
+        window_id,
+        value,
+        restored_window,
+        || unsafe {
+            crate::document_edit::ensure_marked_after_ax_write(
+                pid,
+                element_ptr as AXUIElementRef,
+                true,
+            )
+        },
+    )
+}
+
+/// `restored_window`: the window was restored from the Dock for this write.
+/// The caller holds the key scope and the temporary restore; the restore
+/// waits for the scope's hand-back before minimizing the window again, and
+/// only a text field is written on this route.
+fn set_value_blocking_inner(
+    element_ptr: usize,
+    element_index: usize,
+    pid: i32,
+    window_id: u32,
+    value: &str,
+    restored_window: bool,
+    mark: impl FnOnce() -> crate::document_edit::DocumentEdited,
 ) -> anyhow::Result<SetValueOutcome> {
     let element = element_ptr as AXUIElementRef;
 
@@ -1119,7 +1192,15 @@ fn set_value_blocking_with(
         };
         let mut ops = LiveAxValueOps { element };
         let outcome = write_value_ladder(&mut ops, value, &ctx);
-        finish_ladder(outcome, element, pid, element_index, &role, restored_window)
+        finish_ladder_with_mark(
+            outcome,
+            element,
+            pid,
+            element_index,
+            &role,
+            restored_window,
+            mark,
+        )
     }
 }
 
@@ -1316,6 +1397,7 @@ fn write_value_ladder(
     out
 }
 
+#[cfg(test)]
 fn finish_ladder(
     out: LadderOutcome,
     element: AXUIElementRef,
@@ -1323,6 +1405,26 @@ fn finish_ladder(
     element_index: usize,
     role: &str,
     restored_window: bool,
+) -> anyhow::Result<SetValueOutcome> {
+    finish_ladder_with_mark(
+        out,
+        element,
+        pid,
+        element_index,
+        role,
+        restored_window,
+        || unsafe { crate::document_edit::ensure_marked_after_ax_write(pid, element, true) },
+    )
+}
+
+fn finish_ladder_with_mark(
+    out: LadderOutcome,
+    element: AXUIElementRef,
+    _pid: i32,
+    element_index: usize,
+    role: &str,
+    restored_window: bool,
+    mark: impl FnOnce() -> crate::document_edit::DocumentEdited,
 ) -> anyhow::Result<SetValueOutcome> {
     if !out.reached {
         let err = out.error.unwrap_or(kAXErrorSuccess);
@@ -1349,12 +1451,9 @@ fn finish_ladder(
         (Some(false), _) => " Read-back did not confirm the value; verify via screenshot.",
         (None, _) => " Value is not readable through AX; could not confirm.",
     };
-    let document = document_after_ladder(
-        &out,
-        restored_window,
-        || unsafe { crate::document_edit::ensure_marked_after_ax_write(pid, element, true) },
-        || unsafe { window_has_document(element) },
-    );
+    let document = document_after_ladder(&out, restored_window, mark, || unsafe {
+        window_has_document(element)
+    });
     let warning = if out.maybe_landed {
         " The value may have changed; read it before deciding what to do next."
     } else {
@@ -2879,5 +2978,38 @@ mod restored_role_tests {
         }
         // A visible window keeps every role's own route.
         assert!(restored_role_refusal(false, "AXPopUpButton").is_none());
+    }
+}
+
+#[cfg(test)]
+mod selectable_row_tests {
+    use super::*;
+    #[tokio::test]
+    async fn baseline_dispatch_calls_write_document_and_return() {
+        let calls = std::cell::RefCell::new(Vec::new());
+        let document: Box<dyn FnOnce()> = Box::new(|| calls.borrow_mut().push("document"));
+        let result = dispatch_set_value(
+            true,
+            0,
+            || {
+                (
+                    Some("AXButton".into()),
+                    crate::ax::write_outcome::Settable::No,
+                )
+            },
+            |document: Box<dyn FnOnce()>| async {
+                calls.borrow_mut().push("write");
+                document();
+                (ToolResult::text("ok"), false, false)
+            },
+            document,
+            |_, _| async {
+                calls.borrow_mut().push("return");
+                Ok(true)
+            },
+        )
+        .await;
+        assert_ne!(result.is_error, Some(true));
+        assert_eq!(*calls.borrow(), ["write", "document", "return"]);
     }
 }

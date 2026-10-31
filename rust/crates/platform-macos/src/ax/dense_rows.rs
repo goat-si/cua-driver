@@ -2,7 +2,7 @@
 
 use super::bindings::*;
 use super::snapshot::RetainedElement;
-use super::tree::{set_messaging_timeout, AXNode};
+use super::tree::{set_messaging_timeout, AXNode, LabelPath};
 use core_foundation::array::CFArray;
 use core_foundation::base::{CFEqual, CFGetTypeID, CFHash, CFTypeRef, TCFType};
 use core_foundation::string::CFString;
@@ -260,6 +260,8 @@ pub(crate) struct DeferredRow {
     pub element: RetainedElement,
     pub depth: usize,
     pub parent_index: Option<usize>,
+    pub parent_role: String,
+    pub label_path: LabelPath,
     pub in_web_content: bool,
     pub visible: bool,
     /// None means intentionally skipped (offscreen) or refused (visible).
@@ -492,6 +494,8 @@ mod tests {
             element: unsafe { RetainedElement::retain(0) },
             depth: 2,
             parent_index: Some(1),
+            parent_role: "AXTable".into(),
+            label_path: LabelPath::Inactive,
             in_web_content: false,
             visible,
             walked,
@@ -552,6 +556,8 @@ mod tests {
                     element: unsafe { RetainedElement::retain(0) },
                     depth: 2,
                     parent_index: parent,
+                    parent_role: "AXTable".into(),
+                    label_path: LabelPath::Inactive,
                     in_web_content: false,
                     visible,
                     walked: None,

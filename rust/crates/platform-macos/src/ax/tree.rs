@@ -308,6 +308,39 @@ fn is_actionless_control_role(role: &str) -> bool {
     )
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LabelPath {
+    Inactive,
+    Open(usize),
+    Blocked,
+}
+
+fn next_label_path(
+    _parent: LabelPath,
+    _parent_role: Option<&str>,
+    _child_role: Option<&str>,
+) -> LabelPath {
+    LabelPath::Inactive
+}
+
+fn row_label_candidate<'a>(
+    _path: LabelPath,
+    _role: &str,
+    _texts: [Option<&'a str>; 3],
+) -> Option<&'a str> {
+    None
+}
+
+fn selectable_row_eligible(
+    _role: &str,
+    _parent_role: Option<&str>,
+    _actions_empty: bool,
+    _value_settable: bool,
+    _probe: impl FnOnce() -> super::write_outcome::Settable,
+) -> bool {
+    false
+}
+
 fn is_addressable(
     role: &str,
     actions_present: bool,
@@ -599,6 +632,8 @@ fn walk_tree_with_web_content(
                     child,
                     0,
                     None,
+                    None,
+                    LabelPath::Inactive,
                     false,
                     &mut nodes,
                     &mut lines,
@@ -678,6 +713,8 @@ fn walk_tree_with_web_content(
                     menu,
                     0,
                     None,
+                    None,
+                    LabelPath::Inactive,
                     false,
                     &mut nodes,
                     &mut lines,
@@ -706,6 +743,8 @@ fn walk_tree_with_web_content(
                         row.element.as_ptr() as AXUIElementRef,
                         row.depth,
                         row.parent_index,
+                        Some(&row.parent_role),
+                        row.label_path,
                         row.in_web_content,
                         &mut chunk.nodes,
                         &mut chunk.lines,
@@ -984,6 +1023,8 @@ unsafe fn walk_element(
     element: AXUIElementRef,
     depth: usize,
     parent_index: Option<usize>,
+    parent_role: Option<&str>,
+    parent_path: LabelPath,
     in_web_content: bool,
     nodes: &mut Vec<AXNode>,
     lines: &mut Vec<(usize, String)>,
@@ -1014,6 +1055,7 @@ unsafe fn walk_element(
         "AXUnknown".into()
     });
 
+    let label_path = next_label_path(parent_path, parent_role, Some(&role));
     let in_web_content = in_web_content || is_web_content_role(&role);
     if in_web_content && !include_web_content {
         note_skipped();
@@ -1109,6 +1151,7 @@ unsafe fn walk_element(
                 &role,
                 depth + 1,
                 Some(idx),
+                label_path,
                 in_web_content,
                 nodes,
                 lines,
@@ -1162,6 +1205,7 @@ unsafe fn walk_element(
             &role,
             depth,
             parent_index,
+            label_path,
             in_web_content,
             nodes,
             lines,
@@ -1216,6 +1260,12 @@ unsafe fn walk_element(
         .map(str::to_owned)
         .unwrap_or(visible_description);
 
+    let _ = row_label_candidate(
+        label_path,
+        &role,
+        [title.as_deref(), value.as_deref(), description.as_deref()],
+    );
+
     let has_content =
         !visible_title.is_empty() || !visible_description.is_empty() || !visible_value.is_empty();
     // Some native controls expose no AX action names but do expose a writable
@@ -1232,7 +1282,14 @@ unsafe fn walk_element(
     // the same native state also causes dispatch to refuse it, and exposing an
     // index for it invites agents to retain an unusable menu target.
     let actionless_control =
-        actions.is_empty() && !value_settable && is_actionless_control_role(&role);
+        actions.is_empty() && !value_settable && is_actionless_control_role(&role)
+            || selectable_row_eligible(
+                &role,
+                parent_role,
+                actions.is_empty(),
+                value_settable,
+                || super::write_outcome::query_settable(element, "AXSelected"),
+            );
     // A row that may be indexed reads its control state and frame in one
     // batched call; any other row reads only its frame, later.
     // A batch that failed past the deadline stops the walk: like a content
@@ -1286,6 +1343,7 @@ unsafe fn walk_element(
             &role,
             depth + 1,
             parent_index,
+            label_path,
             in_web_content,
             nodes,
             lines,
@@ -1448,6 +1506,7 @@ unsafe fn walk_element(
         &role,
         depth + 1,
         next_parent,
+        label_path,
         in_web_content,
         nodes,
         lines,
@@ -1466,6 +1525,7 @@ unsafe fn walk_children(
     role: &str,
     depth: usize,
     parent_index: Option<usize>,
+    label_path: LabelPath,
     in_web_content: bool,
     nodes: &mut Vec<AXNode>,
     lines: &mut Vec<(usize, String)>,
@@ -1534,6 +1594,8 @@ unsafe fn walk_children(
                 element: RetainedElement::retain(child as usize),
                 depth,
                 parent_index,
+                parent_role: role.to_owned(),
+                label_path,
                 in_web_content,
                 visible,
                 walked: None,
@@ -1542,6 +1604,8 @@ unsafe fn walk_children(
                 child,
                 depth,
                 parent_index,
+                Some(role),
+                label_path,
                 in_web_content,
                 nodes,
                 lines,
@@ -1820,6 +1884,8 @@ mod secure_value_tests {
             element: unsafe { RetainedElement::retain(0) },
             depth: 0,
             parent_index: None,
+            parent_role: "AXTable".into(),
+            label_path: LabelPath::Inactive,
             in_web_content: false,
             visible: true,
             walked: None,
@@ -3182,5 +3248,36 @@ mod lean_row_tests {
         assert_eq!(lines[1], (1, "- AXRow = \"Sender Message preview\"".into()));
         assert_eq!(nodes[2].element_index, Some(1));
         assert_eq!(nodes[2].value.as_deref(), Some("[redacted]"));
+    }
+}
+
+#[cfg(test)]
+mod selectable_row_tests {
+    use super::*;
+    #[test]
+    fn baseline_rows_are_not_newly_eligible_or_labelled() {
+        assert!(!selectable_row_eligible(
+            "AXButton",
+            Some("AXOutline"),
+            true,
+            false,
+            || panic!("baseline never probes")
+        ));
+        assert_eq!(
+            next_label_path(LabelPath::Inactive, Some("AXRow"), Some("AXCell")),
+            LabelPath::Inactive
+        );
+        assert_eq!(
+            next_label_path(LabelPath::Inactive, None, None),
+            LabelPath::Inactive
+        );
+        assert_eq!(
+            row_label_candidate(
+                LabelPath::Inactive,
+                "AXStaticText",
+                [Some("label"), None, None]
+            ),
+            None
+        );
     }
 }

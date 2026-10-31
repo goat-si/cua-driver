@@ -90,8 +90,14 @@ fn nearest_selectable_container_center(element_ptr: usize) -> Option<(f64, f64)>
     let mut current = element_ptr as AXUIElementRef;
     let mut owns_current = false;
 
-    for _ in 0..8 {
-        let role = unsafe { copy_string_attr(current, "AXRole") }.unwrap_or_default();
+    let mut start_role = Some(unsafe { copy_string_attr(current, "AXRole") });
+    let limit =
+        crate::input::ax_actions::climb_limit(start_role.as_ref().and_then(|role| role.as_deref()));
+    for _ in 0..limit {
+        let role = start_role
+            .take()
+            .unwrap_or_else(|| unsafe { copy_string_attr(current, "AXRole") })
+            .unwrap_or_default();
         if matches!(role.as_str(), "AXRow" | "AXCell" | "AXListItem" | "AXImage")
             && unsafe { copy_bool_attr(current, "AXSelected") }.is_some()
         {
@@ -438,8 +444,15 @@ impl SelectionSnapshot {
         let mut items = Vec::new();
         let mut in_item = false;
         let mut current = Retained::retain(element);
-        for _ in 0..8 {
-            let role = copy_string_attr(current.0, "AXRole").unwrap_or_default();
+        let mut start_role = Some(copy_string_attr(current.0, "AXRole"));
+        let limit = crate::input::ax_actions::climb_limit(
+            start_role.as_ref().and_then(|role| role.as_deref()),
+        );
+        for _ in 0..limit {
+            let role = start_role
+                .take()
+                .unwrap_or_else(|| copy_string_attr(current.0, "AXRole"))
+                .unwrap_or_default();
             if is_selectable_item_role(&role) {
                 in_item = true;
                 if let Some(selected) = copy_bool_attr(current.0, "AXSelected") {

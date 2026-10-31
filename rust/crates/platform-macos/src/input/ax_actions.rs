@@ -5,6 +5,10 @@ use core_foundation::base::{CFEqual, CFRelease, CFRetain, CFTypeRef};
 
 const MAX_SELECTION_ANCESTORS: usize = 8;
 
+pub(crate) fn climb_limit(_start_role: Option<&str>) -> usize {
+    MAX_SELECTION_ANCESTORS
+}
+
 fn is_selectable_container_role(role: &str) -> bool {
     matches!(role, "AXRow" | "AXCell" | "AXListItem" | "AXImage")
 }
@@ -28,8 +32,13 @@ pub fn select_nearest_container(element_ptr: usize) -> Option<String> {
     let mut current = element_ptr as AXUIElementRef;
     let mut owns_current = false;
 
-    for _ in 0..MAX_SELECTION_ANCESTORS {
-        let role = unsafe { copy_string_attr(current, "AXRole") }.unwrap_or_default();
+    let mut start_role = Some(unsafe { copy_string_attr(current, "AXRole") });
+    let limit = climb_limit(start_role.as_ref().and_then(|role| role.as_deref()));
+    for _ in 0..limit {
+        let role = start_role
+            .take()
+            .unwrap_or_else(|| unsafe { copy_string_attr(current, "AXRole") })
+            .unwrap_or_default();
         if is_selectable_container_role(&role)
             && unsafe { copy_bool_attr(current, "AXSelected") }.is_some()
         {
@@ -66,8 +75,13 @@ pub fn nearest_container_selection_state(element_ptr: usize) -> Option<(String, 
     let mut current = element_ptr as AXUIElementRef;
     let mut owns_current = false;
 
-    for _ in 0..MAX_SELECTION_ANCESTORS {
-        let role = unsafe { copy_string_attr(current, "AXRole") }.unwrap_or_default();
+    let mut start_role = Some(unsafe { copy_string_attr(current, "AXRole") });
+    let limit = climb_limit(start_role.as_ref().and_then(|role| role.as_deref()));
+    for _ in 0..limit {
+        let role = start_role
+            .take()
+            .unwrap_or_else(|| unsafe { copy_string_attr(current, "AXRole") })
+            .unwrap_or_default();
         if is_selectable_container_role(&role) {
             if let Some(selected) = unsafe { copy_bool_attr(current, "AXSelected") } {
                 if owns_current {
@@ -141,8 +155,13 @@ pub fn capture_nearest_container_selection(element_ptr: usize) -> Option<Selecti
     let mut current = element_ptr as AXUIElementRef;
     let mut owns_current = false;
 
-    for _ in 0..MAX_SELECTION_ANCESTORS {
-        let role = unsafe { copy_string_attr(current, "AXRole") }.unwrap_or_default();
+    let mut start_role = Some(unsafe { copy_string_attr(current, "AXRole") });
+    let limit = climb_limit(start_role.as_ref().and_then(|role| role.as_deref()));
+    for _ in 0..limit {
+        let role = start_role
+            .take()
+            .unwrap_or_else(|| unsafe { copy_string_attr(current, "AXRole") })
+            .unwrap_or_default();
         if is_selectable_container_role(&role)
             && unsafe { copy_bool_attr(current, "AXSelected") }.is_some()
         {
@@ -899,6 +918,18 @@ mod tests {
             assert!(!is_web_or_safari_focus_fallback_candidate(
                 non_text, true, true
             ));
+        }
+    }
+}
+
+#[cfg(test)]
+mod climb_limit_tests {
+    use super::climb_limit;
+
+    #[test]
+    fn baseline_label_children_use_eight_steps() {
+        for role in [Some("AXStaticText"), Some("AXTextField")] {
+            assert_eq!(climb_limit(role), 8);
         }
     }
 }
