@@ -1351,6 +1351,8 @@ impl Tool for GetWindowStateTool {
                 == Some(true);
         let state = self.state.clone();
         let state_for_capture = state.clone();
+        // Held to the end of this call: ticketed publications borrow it, and
+        // dropping it retires a ticket that never landed (#133).
         let ticket = (should_capture && !observation_only)
             .then(|| state.snapshots.begin_capture(pid as i32, xid));
         let query_for_walk = query.clone();
@@ -1602,14 +1604,14 @@ impl Tool for GetWindowStateTool {
                             &state.snapshots,
                             pid as i32,
                             xid,
-                            ticket,
+                            ticket.as_ref(),
                         ));
                     }
                     let (snapshot_id, replaced) = (!observation_only && target_scoped)
                         .then(|| {
                             let payload =
                                 crate::atspi::snapshot::build_snapshot(&tr.nodes, &tr.bounds);
-                            let publication = if let Some(ticket) = ticket {
+                            let publication = if let Some(ticket) = ticket.as_ref() {
                                 state.snapshots.publish_basis_for_session(
                                     pid as i32,
                                     xid,
@@ -1785,7 +1787,7 @@ impl Tool for GetWindowStateTool {
                 if let (false, false, Some(scale)) =
                     (observation_only, published_snapshot, screenshot_scale)
                 {
-                    let ticket = ticket.expect("screenshot ticket reserved");
+                    let ticket = ticket.as_ref().expect("screenshot ticket reserved");
                     if let Some((id, basis)) = state.snapshots.refresh_basis_for_session(
                         pid as i32,
                         xid,

@@ -49,7 +49,7 @@ pub fn discard_untrusted_snapshot<S: cua_driver_core::snapshot_store::SnapshotPa
     store: &cua_driver_core::snapshot_store::SnapshotStore<S>,
     pid: i32,
     window_id: u64,
-    ticket: Option<u64>,
+    ticket: Option<&cua_driver_core::snapshot_store::CaptureTicket<S>>,
 ) -> Option<u32> {
     match ticket {
         Some(ticket) => store.remove_for_capture(pid, window_id, ticket),

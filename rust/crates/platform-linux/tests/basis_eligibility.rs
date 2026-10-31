@@ -61,7 +61,7 @@ fn untrusted_rows_are_removed_before_capture_only_publication() {
         .0;
     let ticket = store.begin_capture(42, 7);
     assert_eq!(
-        discard_untrusted_snapshot(&store, 42, 7, Some(ticket)),
+        discard_untrusted_snapshot(&store, 42, 7, Some(&ticket)),
         Some(old)
     );
     let f = frame();
@@ -78,10 +78,10 @@ fn untrusted_rows_are_removed_before_capture_only_publication() {
     )
     .unwrap();
     assert!(store
-        .refresh_basis_for_session(42, 7, None, 0.25, None, Some(basis.clone()), ticket)
+        .refresh_basis_for_session(42, 7, None, 0.25, None, Some(basis.clone()), &ticket)
         .is_none());
     let (_, _, stored) = store
-        .publish_capture_basis_for_session(42, 7, Payload, None, Some(0.25), Some(basis), ticket)
+        .publish_capture_basis_for_session(42, 7, Payload, None, Some(0.25), Some(basis), &ticket)
         .unwrap();
     let stored = stored.unwrap();
     assert!(store.basis_for(42, 7, &stored.snapshot_id, None).is_ok());

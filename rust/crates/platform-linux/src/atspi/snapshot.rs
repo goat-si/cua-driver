@@ -184,16 +184,16 @@ mod tests {
         let newer = cache.begin_capture(pid, xid);
         let fresh = build_snapshot(&[node(2)], &[(2, 100, 100, 10, 10)]);
         assert!(cache
-            .publish_basis_for_session(pid, xid, fresh, None, None, None, newer)
+            .publish_basis_for_session(pid, xid, fresh, None, None, None, &newer)
             .is_some());
         let stale = build_snapshot(&[node(1)], &[(1, 0, 0, 10, 10)]);
         assert!(cache
-            .publish_basis_for_session(pid, xid, stale, None, None, None, older)
+            .publish_basis_for_session(pid, xid, stale, None, None, None, &older)
             .is_none());
         let elements = cache.with_latest(pid, xid, |_, s| s.elements()).unwrap();
         assert!(hit_test(&elements, 5, 5).is_none());
         assert_eq!(hit_test(&elements, 105, 105).map(|(idx, _)| idx), Some(2));
-        assert_eq!(cache.remove_for_capture(pid, xid, older), None);
+        assert_eq!(cache.remove_for_capture(pid, xid, &older), None);
         assert!(cache
             .with_latest(pid, xid, |_, s| hit_test(&s.elements(), 105, 105))
             .flatten()
@@ -207,7 +207,7 @@ mod tests {
                 None,
                 None,
                 None,
-                ticket
+                &ticket
             )
             .is_some());
         assert!(cache
