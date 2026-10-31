@@ -337,6 +337,7 @@ impl Step {
 struct Plan {
     steps: Vec<Step>,
     delay: Duration,
+    pause: StepPause,
     observe: Option<Value>,
     /// Read-only calls (zoom) the batch ended with, run after `observe`.
     tail_reads: Vec<(&'static str, Value)>,
@@ -558,6 +559,32 @@ impl Drop for GateDropGuard {
             // Dropping the JoinHandle detaches the admitted worker. Its
             // platform guards must stay alive until the real work finishes.
             *self.slot.lock().unwrap_or_else(|error| error.into_inner()) = None;
+        }
+    }
+}
+
+#[cfg(test)]
+#[derive(Debug, PartialEq, Eq)]
+enum PaceEvent {
+    Step { tool: String },
+    Pause { before_step: usize, delay: Duration },
+}
+
+enum StepPause {
+    Real,
+    #[cfg(test)]
+    Recorded(Arc<Mutex<Vec<PaceEvent>>>),
+}
+
+impl StepPause {
+    async fn pause(&self, _index: usize, delay: Duration) {
+        match self {
+            Self::Real => tokio::time::sleep(delay).await,
+            #[cfg(test)]
+            Self::Recorded(events) => events.lock().unwrap().push(PaceEvent::Pause {
+                before_step: _index,
+                delay,
+            }),
         }
     }
 }
@@ -806,6 +833,7 @@ impl Plan {
         Ok(Self {
             steps,
             delay: Duration::from_millis(delay_ms),
+            pause: StepPause::Real,
             observe,
             tail_reads,
             default_window,
@@ -907,7 +935,7 @@ impl Plan {
 
         for (index, step) in self.steps.into_iter().enumerate() {
             if index > 0 && !self.delay.is_zero() {
-                tokio::time::sleep(self.delay).await;
+                self.pause.pause(index, self.delay).await;
             }
             let step_started = Instant::now();
             let (mut outcome, completion, timeout_snapshot) =

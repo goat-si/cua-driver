@@ -303,21 +303,23 @@ fn focused_document_matches_target(
     target: HWND,
     target_pid: u32,
 ) -> bool {
-    if unsafe { element.CurrentProcessId() }.ok() != Some(target_pid as i32)
-        || !unsafe { element.CurrentControlType() }
-            .is_ok_and(|control_type| control_type.0 == UIA_DocumentControlTypeId.0)
-        || !unsafe { element.CurrentIsEnabled() }.is_ok_and(|enabled| enabled.as_bool())
-        || !unsafe { element.CurrentHasKeyboardFocus() }.is_ok_and(|focused| focused.as_bool())
-    {
-        return false;
-    }
-    let Ok(element_hwnd) = (unsafe { element.CurrentNativeWindowHandle() }) else {
-        return false;
-    };
-    !element_hwnd.0.is_null()
-        && crate::win32::windows::window_owner_pid(element_hwnd.0 as usize as u64)
-            == Some(target_pid)
-        && unsafe { GetAncestor(element_hwnd, GA_ROOT) } == target
+    let hwnd_ok = unsafe { element.CurrentNativeWindowHandle() }.is_ok_and(|element_hwnd| {
+        !element_hwnd.0.is_null()
+            && crate::win32::windows::window_owner_pid(element_hwnd.0 as usize as u64)
+                == Some(target_pid)
+            && unsafe { GetAncestor(element_hwnd, GA_ROOT) } == target
+    });
+    crate::value_append::focused_document_target_ok(
+        unsafe { element.CurrentProcessId() }.ok() == Some(target_pid as i32),
+        unsafe { element.CurrentControlType() }
+            .is_ok_and(|control_type| control_type.0 == UIA_DocumentControlTypeId.0),
+        unsafe { element.CurrentIsEnabled() }.is_ok_and(|enabled| enabled.as_bool()),
+        unsafe { element.CurrentHasKeyboardFocus() }.is_ok_and(|focused| focused.as_bool()),
+        unsafe { element.CurrentIsPassword() }
+            .ok()
+            .map(|v| v.as_bool()),
+        hwnd_ok,
+    )
 }
 
 fn exact_foreground_target(target: HWND, expected_pid: Option<u32>) -> bool {

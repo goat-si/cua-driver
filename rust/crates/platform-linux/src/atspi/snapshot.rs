@@ -1,20 +1,11 @@
 //! AT-SPI element cache for Linux.
 //!
-//! Two views of the same `get_window_state` snapshot live here:
-//!
-//! 1. [`AtspiSnapshot`], the [`SnapshotPayload`] published into the runtime
-//!    snapshot store (`cua_driver_core::snapshot_store`). An `element_token`
-//!    resolves through it to a [`CachedElement`]: the
-//!    element's proven AT-SPI identity ([`AtspiIdentity`]) plus what a later
-//!    per-index action needs to act WITHOUT re-walking the application (its
-//!    D-Bus address ([`native::ObjectRef`]), role, and the screen frame the
-//!    snapshot reported). Re-walking large trees (LibreOffice, GIMP, Nautilus)
-//!    was the multi-second stall behind every element-index click.
-//!
-//! 2. A process-global (pid, xid) side index over the same elements, so the
-//!    free functions in `atspi` (perform_action, get_element_bounds,
-//!    perform_action_at_point_in, ...) can consult the last snapshot by window
-//!    without the tool state threaded through every input path.
+//! [`AtspiSnapshot`] is the [`SnapshotPayload`] published into the runtime
+//! snapshot store (`cua_driver_core::snapshot_store`). An `element_token`
+//! resolves through it to a [`CachedElement`]: the element's proven AT-SPI
+//! identity ([`AtspiIdentity`]) plus its D-Bus address ([`native::ObjectRef`]),
+//! role, and screen frame. Re-walking large trees was the multi-second stall
+//! behind every element-index click.
 //!
 //! Membership follows the runtime cache rule: only nodes with an
 //! `element_index` AND a proven identity are addressable. An unproven
@@ -25,8 +16,9 @@ use super::native::{self, ObjectRef};
 use super::{AtspiIdentity, AtspiNode};
 use cua_driver_core::snapshot_store::{SnapshotPayload, SnapshotStore};
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::Arc;
 
+/// Identifies a process and window.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct CacheKey {
     pub pid: u32,
@@ -56,6 +48,10 @@ pub struct AtspiSnapshot {
 }
 
 impl AtspiSnapshot {
+    pub fn elements(&self) -> Arc<HashMap<usize, CachedElement>> {
+        Arc::clone(&self.elements)
+    }
+
     pub fn from_nodes(nodes: &[AtspiNode]) -> Self {
         Self::from_nodes_with_bounds(nodes, &[])
     }
@@ -107,60 +103,22 @@ impl SnapshotPayload for AtspiSnapshot {
 
 pub type Snapshots = SnapshotStore<AtspiSnapshot>;
 
-// -- (pid, xid) side index ----------------------------------------------------
-
-type SideIndex = HashMap<CacheKey, Arc<HashMap<usize, CachedElement>>>;
-
-fn store() -> &'static Mutex<SideIndex> {
-    static STORE: OnceLock<Mutex<SideIndex>> = OnceLock::new();
-    STORE.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-/// Build the payload for (pid, xid) and record its elements in the side index.
-/// Returns the payload for the caller to publish into the runtime cache.
-pub(crate) fn update_snapshot(
-    pid: u32,
-    xid: u64,
+/// Build a payload without publishing it.
+pub(crate) fn build_snapshot(
     nodes: &[AtspiNode],
     bounds: &[(usize, i32, i32, u32, u32)],
 ) -> AtspiSnapshot {
-    let snapshot = AtspiSnapshot::from_nodes_with_bounds(nodes, bounds);
-    store()
-        .lock()
-        .unwrap()
-        .insert(CacheKey { pid, xid }, snapshot.elements.clone());
-    snapshot
-}
-
-/// Forget the side-index entry for (pid, xid) (the runtime cache is retired
-/// separately by the owning `SnapshotStore`).
-pub(crate) fn forget_window(pid: u32, xid: u64) {
-    store().lock().unwrap().remove(&CacheKey { pid, xid });
-}
-
-fn snapshot_for(pid: u32, xid: Option<u64>) -> Option<Arc<HashMap<usize, CachedElement>>> {
-    let store = store().lock().unwrap();
-    match xid {
-        Some(xid) => store.get(&CacheKey { pid, xid }).cloned(),
-        // Callers that lack an xid get the first snapshot found for the pid.
-        None => store
-            .iter()
-            .find(|(key, _)| key.pid == pid)
-            .map(|(_, elements)| elements.clone()),
-    }
-}
-
-/// The cached element at `idx` for (pid, xid); with `xid == None`, the first
-/// snapshot recorded for `pid`.
-pub(crate) fn cached_element(pid: u32, xid: Option<u64>, idx: usize) -> Option<CachedElement> {
-    snapshot_for(pid, xid)?.get(&idx).cloned()
+    AtspiSnapshot::from_nodes_with_bounds(nodes, bounds)
 }
 
 /// Hit-test a *screen* point against the cached frames of (pid, xid): the
 /// smallest covering real actuator wins, then a passive label. Returns the
 /// element index and its cached identity.
-pub(crate) fn hit_test(pid: u32, xid: u64, sx: i32, sy: i32) -> Option<(usize, CachedElement)> {
-    let elements = snapshot_for(pid, Some(xid))?;
+pub(crate) fn hit_test(
+    elements: &HashMap<usize, CachedElement>,
+    sx: i32,
+    sy: i32,
+) -> Option<(usize, CachedElement)> {
     let mut indexed: Vec<(&usize, &CachedElement)> = elements.iter().collect();
     indexed.sort_by_key(|(idx, _)| **idx);
     let frames: Vec<(usize, i32, i32, u32, u32, bool)> = indexed
@@ -216,6 +174,48 @@ mod tests {
                 path: format!("/node/{index}"),
             }),
         }
+    }
+
+    #[test]
+    fn side_index_ignores_capture_superseded_by_newer_publication() {
+        let (pid, xid) = (424_243, 78);
+        let cache = Snapshots::new();
+        let older = cache.begin_capture(pid as i32, xid);
+        let newer = cache.begin_capture(pid as i32, xid);
+        let fresh = build_snapshot(&[node(2)], &[(2, 100, 100, 10, 10)]);
+        assert!(cache
+            .publish_basis_for_session(pid as i32, xid, fresh, None, None, None, newer)
+            .is_some());
+        let stale = build_snapshot(&[node(1)], &[(1, 0, 0, 10, 10)]);
+        assert!(cache
+            .publish_basis_for_session(pid as i32, xid, stale, None, None, None, older)
+            .is_none());
+        let elements = cache
+            .with_latest(pid as i32, xid, |_, s| s.elements())
+            .unwrap();
+        assert!(hit_test(&elements, 5, 5).is_none());
+        assert_eq!(hit_test(&elements, 105, 105).map(|(idx, _)| idx), Some(2));
+        assert_eq!(cache.remove_for_capture(pid as i32, xid, older), None);
+        assert!(cache
+            .with_latest(pid as i32, xid, |_, s| hit_test(&s.elements(), 105, 105))
+            .flatten()
+            .is_some());
+        let ticket = cache.begin_capture(pid as i32, xid);
+        assert!(cache
+            .publish_capture_basis_for_session(
+                pid as i32,
+                xid,
+                AtspiSnapshot::from_nodes(&[]),
+                None,
+                None,
+                None,
+                ticket
+            )
+            .is_some());
+        assert!(cache
+            .with_latest(pid as i32, xid, |_, s| hit_test(&s.elements(), 105, 105))
+            .flatten()
+            .is_none());
     }
 
     #[test]
@@ -345,15 +345,12 @@ mod tests {
 
     #[test]
     fn snapshot_hit_test_prefers_smallest_real_actuator_and_keeps_refs() {
-        let pid = 424_242;
         let nodes = vec![
             node_with_role(0, "panel"),
             node_with_role(1, "push button"),
             node_with_role(2, "label"),
         ];
-        let snapshot = update_snapshot(
-            pid,
-            77,
+        let snapshot = build_snapshot(
             &nodes,
             &[
                 (0, 0, 0, 500, 500),
@@ -362,17 +359,13 @@ mod tests {
             ],
         );
         assert_eq!(snapshot.retain(1).unwrap().bounds, Some((100, 100, 50, 20)));
-        let (idx, element) = hit_test(pid, 77, 110, 110).expect("hit");
+        let elements = snapshot.elements();
+        let (idx, element) = hit_test(&elements, 110, 110).expect("hit");
         assert_eq!(idx, 1);
         assert_eq!(
             element.object_ref.as_ref().map(|r| r.path.as_str()),
             Some("/node/1")
         );
-        assert!(hit_test(pid, 77, 900, 900).is_none());
-        // Index lookup without an xid falls back to any snapshot for the pid.
-        assert_eq!(cached_element(pid, None, 2).unwrap().role, "label");
-        assert!(cached_element(pid, Some(78), 2).is_none());
-        forget_window(pid, 77);
-        assert!(cached_element(pid, None, 0).is_none());
+        assert!(hit_test(&elements, 900, 900).is_none());
     }
 }

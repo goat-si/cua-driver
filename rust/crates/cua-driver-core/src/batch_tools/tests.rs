@@ -22,6 +22,7 @@ struct Probe {
     pacings: Arc<Mutex<Vec<(String, crate::step_pacing::StepPacing)>>>,
     responses: Arc<Mutex<std::collections::HashMap<String, Value>>>,
     conditional: Arc<Mutex<Vec<(String, Value, Value)>>>,
+    events: Arc<Mutex<Vec<super::PaceEvent>>>,
 }
 
 #[async_trait]
@@ -31,6 +32,9 @@ impl Tool for Probe {
     }
 
     async fn invoke(&self, args: Value) -> ToolResult {
+        self.events.lock().unwrap().push(super::PaceEvent::Step {
+            tool: self.def.name.clone(),
+        });
         self.calls.lock().unwrap().push(args.clone());
         self.pacings
             .lock()
@@ -79,6 +83,7 @@ struct Harness {
     pacings: Arc<Mutex<Vec<(String, crate::step_pacing::StepPacing)>>>,
     responses: Arc<Mutex<std::collections::HashMap<String, Value>>>,
     conditional: Arc<Mutex<Vec<(String, Value, Value)>>>,
+    events: Arc<Mutex<Vec<super::PaceEvent>>>,
 }
 
 impl Harness {
@@ -88,6 +93,7 @@ impl Harness {
         let pacings: Arc<Mutex<Vec<(String, crate::step_pacing::StepPacing)>>> = Arc::default();
         let responses = Arc::new(Mutex::new(std::collections::HashMap::new()));
         let conditional = Arc::new(Mutex::new(Vec::new()));
+        let events: Arc<Mutex<Vec<super::PaceEvent>>> = Arc::default();
         for name in super::BATCHABLE_TOOLS.iter().copied().chain([
             "get_window_state",
             "zoom",
@@ -144,6 +150,7 @@ impl Harness {
                 pacings: pacings.clone(),
                 responses: responses.clone(),
                 conditional: conditional.clone(),
+                events: events.clone(),
             }));
         }
         registry.register_session_tools();
@@ -155,6 +162,7 @@ impl Harness {
             pacings,
             responses,
             conditional,
+            events,
         }
     }
 
@@ -788,16 +796,59 @@ async fn observation_inherits_the_window_and_stays_bounded() {
 #[tokio::test]
 async fn pauses_between_steps_but_not_after_the_last() {
     let harness = Harness::new();
-    let started = std::time::Instant::now();
-    harness
-        .run(json!({"delay_ms": 120, "steps": [
+    let mut plan = super::Plan::parse(
+        &harness.registry,
+        &json!({"delay_ms": 120, "steps": [
             {"tool": "click", "args": {"pid": 42}},
             {"tool": "click", "args": {"pid": 42}},
-        ]}))
-        .await;
-    let elapsed = started.elapsed();
-    assert!(elapsed >= Duration::from_millis(120), "{elapsed:?}");
-    assert!(elapsed < Duration::from_millis(240), "{elapsed:?}");
+        ]}),
+    )
+    .unwrap_or_else(|error| panic!("invalid plan: {}", error.message));
+    plan.pause = super::StepPause::Recorded(harness.events.clone());
+    let result = plan.run(harness.registry.clone(), None).await;
+    assert_ne!(result.is_error, Some(true), "{}", text(&result));
+    assert_eq!(
+        *harness.events.lock().unwrap(),
+        vec![
+            super::PaceEvent::Step {
+                tool: "click".into()
+            },
+            super::PaceEvent::Pause {
+                before_step: 1,
+                delay: Duration::from_millis(120)
+            },
+            super::PaceEvent::Step {
+                tool: "click".into()
+            },
+        ]
+    );
+}
+
+#[tokio::test]
+async fn zero_delay_does_not_pause_between_steps() {
+    let harness = Harness::new();
+    let mut plan = super::Plan::parse(
+        &harness.registry,
+        &json!({"delay_ms": 0, "steps": [
+            {"tool": "click", "args": {"pid": 42}},
+            {"tool": "click", "args": {"pid": 42}},
+        ]}),
+    )
+    .unwrap_or_else(|error| panic!("invalid plan: {}", error.message));
+    plan.pause = super::StepPause::Recorded(harness.events.clone());
+    let result = plan.run(harness.registry.clone(), None).await;
+    assert_ne!(result.is_error, Some(true), "{}", text(&result));
+    assert_eq!(
+        *harness.events.lock().unwrap(),
+        vec![
+            super::PaceEvent::Step {
+                tool: "click".into()
+            },
+            super::PaceEvent::Step {
+                tool: "click".into()
+            },
+        ]
+    );
 }
 
 #[tokio::test]

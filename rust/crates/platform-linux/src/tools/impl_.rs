@@ -1259,16 +1259,14 @@ impl Tool for GetWindowStateTool {
         });
         // Optional caps — when omitted, the AT-SPI walker uses its built-in
         // defaults (#22865).
-        let max_elements = Some(
-            view.max_elements(
-                &args,
-                LINUX_DEFAULT_MAX_ELEMENTS,
-                display_only
-                    || args
-                        .get("_observation_only")
-                        .and_then(|value| value.as_bool())
-                        == Some(true),
-            ),
+        let max_elements = view.max_elements(
+            &args,
+            LINUX_DEFAULT_MAX_ELEMENTS,
+            display_only
+                || args
+                    .get("_observation_only")
+                    .and_then(|value| value.as_bool())
+                    == Some(true),
         );
         let max_depth = args
             .get("max_depth")
@@ -1365,7 +1363,7 @@ impl Tool for GetWindowStateTool {
                     pid,
                     xid,
                     query_for_walk.as_deref(),
-                    max_elements,
+                    Some(max_elements),
                     max_depth,
                     walk_timeout,
                 ))
@@ -1606,13 +1604,11 @@ impl Tool for GetWindowStateTool {
                             xid,
                             ticket,
                         ));
-                        crate::atspi::snapshot::forget_window(pid, xid);
                     }
                     let (snapshot_id, replaced) = (!observation_only && target_scoped)
                         .then(|| {
-                            let payload = crate::atspi::snapshot::update_snapshot(
-                                pid, xid, &tr.nodes, &tr.bounds,
-                            );
+                            let payload =
+                                crate::atspi::snapshot::build_snapshot(&tr.nodes, &tr.bounds);
                             let publication = if let Some(ticket) = ticket {
                                 state.snapshots.publish_basis_for_session(
                                     pid as i32,
@@ -1969,7 +1965,7 @@ impl Tool for GetWindowStateTool {
                             window_id: xid,
                             key: cua_driver_core::window_state_view::ViewKey {
                                 query: query.clone(),
-                                max_elements: max_elements.unwrap_or(LINUX_DEFAULT_MAX_ELEMENTS),
+                                max_elements,
                                 max_depth,
                             },
                             focus_probe: None,
@@ -7383,6 +7379,7 @@ impl Tool for ClickTool {
         }
         let cursor_id_for_task = cursor_id.clone();
         let modifiers_for_task = modifiers.clone();
+        let snapshots_for_task = Arc::clone(&self.state.snapshots);
         // delivery_mode: background (default) = no-focus-steal injection;
         // foreground = activate the target window (EWMH) first, then inject,
         // then restore prior active. Mirrors macOS/Windows.
@@ -7441,12 +7438,14 @@ impl Tool for ClickTool {
                     let real_click_for_focus_roles =
                         crate::input::real_pointer_input_available();
                     let (hit, guard) = crate::input::focus_guard::guarded(Some(pid), || {
-                        Ok(crate::atspi::perform_action_at_point_in(
+                        let elements = snapshots_for_task.with_latest(pid as i32, xid, |_, snapshot| snapshot.elements());
+                        Ok(crate::atspi::perform_action_at_point_in_with_elements(
                             pid,
                             xid,
                             xi,
                             yi,
                             real_click_for_focus_roles,
+                            elements.as_deref(),
                         )
                         .ok()
                         .flatten())

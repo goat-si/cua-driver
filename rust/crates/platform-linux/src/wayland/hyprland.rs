@@ -1386,8 +1386,11 @@ mod tests {
         monitor
     }
 
-    // (output mode, scale, logical frame). 1.6666666 is the #4219 laptop.
-    const SCALED_OUTPUTS: [((u32, u32), f64, (u32, u32)); 5] = [
+    /// (output mode, scale, logical frame).
+    type ScaledOutput = ((u32, u32), f64, (u32, u32));
+
+    // 1.6666666 is the #4219 laptop.
+    const SCALED_OUTPUTS: [ScaledOutput; 5] = [
         ((1920, 1080), 1.0, (1920, 1080)),
         ((2560, 1600), 1.25, (2048, 1280)),
         ((2880, 1800), 1.5, (1920, 1200)),
