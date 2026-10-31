@@ -742,6 +742,88 @@ mod sheet_parent_lookup_baseline_tests {
     }
 }
 
+#[cfg(test)]
+mod sheet_enumeration_tests {
+    use super::SheetParentOnce;
+    use std::cell::{Cell, RefCell};
+
+    #[test]
+    fn the_gate_looks_up_the_sheet_parent_once() {
+        let calls = Cell::new(0);
+        let mut parent = SheetParentOnce::new(|| {
+            calls.set(calls.get() + 1);
+            Some(700)
+        });
+        assert_eq!(parent.get(), Some(700));
+        assert_eq!(parent.get(), Some(700));
+        assert_eq!(calls.get(), 1);
+    }
+
+    #[test]
+    fn a_missing_parent_is_remembered_as_missing() {
+        let calls = Cell::new(0);
+        let mut parent = SheetParentOnce::new(|| {
+            calls.set(calls.get() + 1);
+            None
+        });
+        assert_eq!(parent.get(), None);
+        assert_eq!(parent.get(), None);
+        assert_eq!(calls.get(), 1);
+    }
+
+    #[test]
+    fn a_changing_relationship_uses_the_first_sample() {
+        let calls = Cell::new(0);
+        let mut samples = [Some(700), None].into_iter();
+        let mut parent = SheetParentOnce::new(|| {
+            calls.set(calls.get() + 1);
+            samples.next().unwrap()
+        });
+        let requested_parent = parent.get();
+        let facts_parent = parent.get();
+        assert_eq!((requested_parent, facts_parent), (Some(700), Some(700)));
+        assert_eq!(calls.get(), 1);
+    }
+
+    #[test]
+    fn a_failed_first_lookup_is_used_for_both() {
+        let calls = Cell::new(0);
+        let mut samples = [None, Some(700)].into_iter();
+        let mut parent = SheetParentOnce::new(|| {
+            calls.set(calls.get() + 1);
+            samples.next().unwrap()
+        });
+        let requested_parent = parent.get();
+        let facts_parent = parent.get();
+        assert_eq!((requested_parent, facts_parent), (None, None));
+        assert_eq!(calls.get(), 1);
+    }
+
+    #[test]
+    fn the_first_lookup_happens_where_it_did() {
+        for has_element in [false, true] {
+            let events = RefCell::new(Vec::new());
+            let mut parent = SheetParentOnce::new(|| {
+                events.borrow_mut().push("lookup");
+                Some(700)
+            });
+            events.borrow_mut().push("constructed");
+            if has_element {
+                events.borrow_mut().push("element");
+                assert_eq!(parent.get(), Some(700));
+            }
+            events.borrow_mut().push("focused-window");
+            assert_eq!(parent.get(), Some(700));
+            let expected = if has_element {
+                vec!["constructed", "element", "lookup", "focused-window"]
+            } else {
+                vec!["constructed", "focused-window", "lookup"]
+            };
+            assert_eq!(*events.borrow(), expected);
+        }
+    }
+}
+
 /// Gather fresh background-input facts for one `(pid, window_id)` target.
 ///
 /// `element_ptr` is an optional retained `AXUIElementRef` (as `usize`) for an
