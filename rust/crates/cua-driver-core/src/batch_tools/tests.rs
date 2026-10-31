@@ -241,6 +241,17 @@ async fn gone_is_satisfied_when_the_window_left_the_list() {
 }
 
 #[tokio::test]
+async fn a_listing_without_a_window_list_never_proves_gone() {
+    let harness = Harness::new();
+    harness.respond("get_window_state", json!({"error": "window closed"}));
+    harness.respond("list_windows", json!({"note": "no windows key"}));
+    let result = harness.run(json!({"steps": [{"expect": {"pid": 42, "window_id": 7, "name": "Save", "gone": true, "timeout_ms": 0}}]})).await;
+    let result = result.structured_content.unwrap();
+    assert_eq!(result["steps"][0]["code"], "lookup_failed", "{result}");
+    assert_eq!(harness.hits("list_windows"), 1);
+}
+
+#[tokio::test]
 async fn list_apps_error_never_proves_gone() {
     let harness = Harness::new();
     harness.respond("list_windows", json!({"windows": []}));
