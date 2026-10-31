@@ -48,10 +48,10 @@ mod keycodes;
 // pass that lives in this commit).
 pub mod lparam;
 
+#[cfg(target_os = "windows")]
 mod basis_click;
+#[cfg(target_os = "windows")]
 mod basis_decision;
-#[cfg(test)]
-mod basis_decision_tests;
 
 #[cfg(any(target_os = "windows", test))]
 mod basis_capture;

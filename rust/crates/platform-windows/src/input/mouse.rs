@@ -241,37 +241,43 @@ impl InputSink for PostedClick<'_> {
         }
         effects
     }
-    fn send(&mut self, index: usize) -> std::result::Result<(), String> {
-        if let Some(error) = self.error.take() {
-            return Err(error);
-        }
-        let part = index % 3;
-        if index > 0 && part == 0 {
-            if let Some(thread) = self.suspended.take() {
-                thread.resume().map_err(|e| format!("target thread: {e}"))?;
+    fn send(
+        &mut self,
+        index: usize,
+    ) -> std::result::Result<(), crate::input::guarded_dispatch::SendFailure> {
+        (|| -> std::result::Result<(), String> {
+            if let Some(error) = self.error.take() {
+                return Err(error);
             }
-            sleep(Duration::from_millis(80));
-            self.suspended =
-                SuspendedThread::suspend(self.target).map_err(|e| format!("target thread: {e}"))?;
-        }
-        let (message, wparam) = match part {
-            0 => (WM_MOUSEMOVE, WPARAM(0)),
-            1 => (
-                posted_press_message(self.down, self.double, index / 3, self.wants_double),
-                WPARAM(self.flag as usize),
-            ),
-            _ => (self.up, WPARAM(0)),
-        };
-        unsafe {
-            PostMessageW(
-                self.target,
-                message,
-                wparam,
-                make_lparam(self.client.x, self.client.y),
-            )
-        }
-        .map_err(|e| e.to_string())?;
-        Ok(())
+            let part = index % 3;
+            if index > 0 && part == 0 {
+                if let Some(thread) = self.suspended.take() {
+                    thread.resume().map_err(|e| format!("target thread: {e}"))?;
+                }
+                sleep(Duration::from_millis(80));
+                self.suspended = SuspendedThread::suspend(self.target)
+                    .map_err(|e| format!("target thread: {e}"))?;
+            }
+            let (message, wparam) = match part {
+                0 => (WM_MOUSEMOVE, WPARAM(0)),
+                1 => (
+                    posted_press_message(self.down, self.double, index / 3, self.wants_double),
+                    WPARAM(self.flag as usize),
+                ),
+                _ => (self.up, WPARAM(0)),
+            };
+            unsafe {
+                PostMessageW(
+                    self.target,
+                    message,
+                    wparam,
+                    make_lparam(self.client.x, self.client.y),
+                )
+            }
+            .map_err(|e| e.to_string())?;
+            Ok(())
+        })()
+        .map_err(Into::into)
     }
     fn cleanup(&mut self, sent: usize) -> Vec<Value> {
         let mut results = vec![];
@@ -1002,7 +1008,11 @@ impl InputSink for ForegroundClick {
         }
         effects
     }
-    fn send(&mut self, index: usize) -> std::result::Result<(), String> {
+    fn send(
+        &mut self,
+        index: usize,
+    ) -> std::result::Result<(), crate::input::guarded_dispatch::SendFailure> {
+        (|| -> std::result::Result<(), String> {
         if let Some(error) = self.error.take() {
             return Err(error);
         }
@@ -1042,6 +1052,7 @@ impl InputSink for ForegroundClick {
         }
         self.batch_remaining = sent - 1;
         Ok(())
+        })().map_err(Into::into)
     }
     fn cleanup(&mut self, sent: usize) -> Vec<Value> {
         self.finish(sent)
@@ -1996,5 +2007,124 @@ mod wheel_tests {
         ] {
             assert_eq!(wheel_mouse_data(ticks), expected, "ticks={ticks}");
         }
+    }
+}
+
+#[cfg(test)]
+mod guarded_prefix_tests {
+    use super::*;
+    use crate::input::guarded_dispatch::SendFailure;
+
+    struct Harness<S> {
+        sink: S,
+        fail_at: Option<usize>,
+        cleaned: Option<usize>,
+    }
+
+    impl<S: InputSink> InputSink for Harness<S> {
+        fn prepare(&mut self) -> Vec<&'static str> {
+            vec![]
+        }
+        fn send(&mut self, index: usize) -> std::result::Result<(), SendFailure> {
+            if self.fail_at.is_some_and(|at| index < at) {
+                return Ok(());
+            }
+            // Foreground's pointer slot is already confirmed in this harness.
+            self.sink.send(if self.fail_at.is_none() {
+                index + 1
+            } else {
+                index
+            })
+        }
+        fn cleanup(&mut self, sent: usize) -> Vec<Value> {
+            self.cleaned = Some(sent);
+            vec![]
+        }
+    }
+
+    #[test]
+    fn posted_errors_preserve_the_confirmed_prefix() {
+        for prefix in [0, 2] {
+            let sink = PostedClick {
+                root: HWND::default(),
+                screen: POINT::default(),
+                button: "left",
+                target: HWND::default(),
+                client: POINT::default(),
+                prev_fg: HWND::default(),
+                target_root: HWND::default(),
+                down: 0,
+                double: 0,
+                up: 0,
+                flag: 0,
+                wants_double: false,
+                noact: None,
+                suspended: None,
+                error: Some("post failed".into()),
+                exact: true,
+            };
+            let mut sink = Harness {
+                sink,
+                fail_at: Some(prefix),
+                cleaned: None,
+            };
+            let GuardedResult::Sent { outcome } = run_guarded(&mut sink, 3, || Ok(())) else {
+                panic!()
+            };
+            assert_eq!(outcome.events_sent, prefix as u32);
+            assert_eq!(
+                outcome.effect,
+                if prefix == 0 {
+                    DispatchEffect::Refused
+                } else {
+                    DispatchEffect::Partial
+                }
+            );
+            assert_eq!(sink.cleaned, Some(prefix));
+            assert_eq!(outcome.cleanup_results, [json!({"error":"post failed"})]);
+        }
+    }
+
+    #[test]
+    fn foreground_positive_partial_batch_is_counted_before_failure() {
+        let sink = ForegroundClick {
+            target: HWND::default(),
+            sx: 0,
+            sy: 0,
+            mode: ClickMode::NonActivating,
+            count: 1,
+            downs: vec![],
+            ups: vec![],
+            move_input: INPUT::default(),
+            down_input: INPUT::default(),
+            up_input: INPUT::default(),
+            prev_fg: HWND::default(),
+            prev_cursor: POINT::default(),
+            prev_cursor_valid: false,
+            was_topmost: false,
+            noactivate: None,
+            foreground_target: None,
+            error: None,
+            batch_remaining: 2,
+            batch_failed: true,
+            activated: false,
+            allow_input_assist: false,
+            cursor_moved: false,
+        };
+        let mut sink = Harness {
+            sink,
+            fail_at: None,
+            cleaned: None,
+        };
+        let GuardedResult::Sent { outcome } = run_guarded(&mut sink, 3, || Ok(())) else {
+            panic!()
+        };
+        assert_eq!(outcome.events_sent, 2);
+        assert_eq!(outcome.effect, DispatchEffect::Partial);
+        assert_eq!(sink.cleaned, Some(2));
+        assert!(outcome.cleanup_results[0]["error"]
+            .as_str()
+            .unwrap()
+            .contains("SendInput inserted fewer"));
     }
 }
