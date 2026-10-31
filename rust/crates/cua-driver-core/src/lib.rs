@@ -12,8 +12,8 @@
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 pub mod goat_process_group;
-pub mod guide;
 pub mod guarded_dispatch;
+pub mod guide;
 pub mod mcp_skills;
 pub mod mcp_wire;
 
@@ -108,6 +108,8 @@ pub mod health_report;
 pub mod history;
 pub mod image_utils;
 pub mod interactive_input;
+#[cfg(test)]
+mod input_resource_tests;
 pub mod key_cancellation;
 pub mod key_pacing;
 pub mod launch_guard;
