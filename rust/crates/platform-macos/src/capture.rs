@@ -1652,6 +1652,98 @@ mod process_identity_tests {
     use super::*;
     use std::cell::Cell;
 
+    const MARKER: &str = "capture_generation_changed";
+
+    fn identity(pid: i32) -> WindowCaptureIdentity {
+        WindowCaptureIdentity::new(pid, 0, 1.0, 2.0, 8.0, 6.0)
+    }
+
+    fn image() -> CapturedImage {
+        CapturedImage::Png(vec![1, 2, 3])
+    }
+
+    #[test]
+    fn a_replacement_between_backends_is_terminal() {
+        let reads = Cell::new(0);
+        let public_calls = Cell::new(0);
+        let error = capture_window_routed(
+            7,
+            false,
+            true,
+            Some((10, (1, 0))),
+            |_| Some((1, 0)),
+            || {
+                reads.set(reads.get() + 1);
+                Ok(identity(if reads.get() == 1 { 10 } else { 11 }))
+            },
+            |_| {
+                public_calls.set(public_calls.get() + 1);
+                Ok(image())
+            },
+            |_| Ok(image()),
+            || Duration::MAX,
+        )
+        .expect_err("replacement must be terminal");
+        assert!(format!("{error:#}").contains(MARKER));
+        assert_eq!(public_calls.get(), 0);
+    }
+
+    #[test]
+    fn a_recycled_pid_with_the_same_frame_discards_the_image() {
+        let reads = Cell::new(0);
+        let error = capture_window_routed(
+            7,
+            false,
+            true,
+            Some((10, (1, 0))),
+            |_| {
+                reads.set(reads.get() + 1);
+                Some((if reads.get() == 1 { 1 } else { 2 }, 0))
+            },
+            || Ok(identity(10)),
+            |_| Ok(image()),
+            |_| Ok(image()),
+            || Duration::MAX,
+        )
+        .expect_err("a recycled pid must not return its pixels");
+        assert!(format!("{error:#}").contains(MARKER));
+    }
+
+    #[test]
+    fn an_unreadable_stamp_before_or_after_capture_is_terminal() {
+        for missing in [1, 2] {
+            let reads = Cell::new(0);
+            let error = capture_window_routed(
+                7,
+                false,
+                true,
+                Some((10, (1, 0))),
+                |_| {
+                    reads.set(reads.get() + 1);
+                    (reads.get() != missing).then_some((1, 0))
+                },
+                || Ok(identity(10)),
+                |_| Ok(image()),
+                |_| Ok(image()),
+                || Duration::MAX,
+            )
+            .expect_err("unreadable process stamp must be terminal");
+            assert!(format!("{error:#}").contains(MARKER));
+        }
+    }
+
+    #[test]
+    fn an_sck_rebuild_for_another_generation_is_refused() {
+        let calls = Cell::new(0);
+        let error = retry_identity_generation(Some((10, (1, 0))), identity(11), || {
+            calls.set(calls.get() + 1);
+            Ok(image())
+        })
+        .expect_err("replacement must not be rebuilt");
+        assert!(format!("{error:#}").contains(MARKER));
+        assert_eq!(calls.get(), 0);
+    }
+
     #[test]
     fn existing_route_retries_after_identity_changes_between_backends() {
         let reads = Cell::new(0);
@@ -1709,6 +1801,37 @@ mod shell_deadline_tests {
                 stderr: vec![],
             })
         }
+    }
+
+    #[test]
+    fn a_hung_screencapture_is_killed_and_reaped_at_the_deadline() {
+        let mut ops = FakeOps { events: vec![] };
+        let ticks = std::cell::Cell::new(Duration::ZERO);
+        let result = screenshot_window_bytes_shell_with(
+            7,
+            Duration::from_millis(300),
+            &mut ops,
+            || ticks.get(),
+            |d| ticks.set(ticks.get() + d),
+            || screencapture_command(false),
+        );
+        assert!(result.is_err(), "a hung process must time out");
+        assert_eq!(ops.events, ["spawn", "try_wait", "kill", "wait"]);
+    }
+
+    #[test]
+    fn an_exhausted_budget_never_spawns() {
+        let mut ops = FakeOps { events: vec![] };
+        let result = screenshot_window_bytes_shell_with(
+            7,
+            Duration::from_millis(299),
+            &mut ops,
+            || Duration::ZERO,
+            |_| panic!("no wait"),
+            || screencapture_command(false),
+        );
+        assert!(result.is_err());
+        assert!(ops.events.is_empty());
     }
 
     #[test]
