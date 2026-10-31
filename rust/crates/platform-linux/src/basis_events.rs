@@ -1,5 +1,5 @@
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Event {
+pub(crate) enum Event {
     Motion,
     KeyPress(u8),
     ButtonPress(u8),
@@ -7,7 +7,10 @@ enum Event {
     KeyRelease(u8),
 }
 
-trait Requests {
+pub(crate) trait Requests {
+    fn prepare(&mut self) -> Vec<&'static str> {
+        vec![]
+    }
     fn submit(
         &mut self,
         event: Event,
@@ -20,13 +23,20 @@ enum Resource {
     Button(u8),
 }
 
-struct Sink<R> {
+pub(crate) struct Sink<R> {
     requests: R,
     events: Vec<Event>,
     resources: cua_driver_core::input_resource::ResourceTable<Resource>,
 }
 
 impl<R: Requests> Sink<R> {
+    pub(crate) fn new(requests: R, events: Vec<Event>) -> Self {
+        Self {
+            requests,
+            events,
+            resources: Default::default(),
+        }
+    }
     fn send_event(
         &mut self,
         event: Event,
@@ -71,7 +81,7 @@ impl<R: Requests> Sink<R> {
 
 impl<R: Requests> cua_driver_core::guarded_dispatch::InputSink for Sink<R> {
     fn prepare(&mut self) -> Vec<&'static str> {
-        vec![]
+        self.requests.prepare()
     }
     fn send(&mut self, i: usize) -> Result<(), cua_driver_core::guarded_dispatch::SendFailure> {
         self.send_event(self.events[i])
@@ -84,7 +94,7 @@ impl<R: Requests> cua_driver_core::guarded_dispatch::InputSink for Sink<R> {
     }
 }
 
-fn plan(foreground: bool, modifiers: &[u8], button: u8, count: usize) -> Vec<Event> {
+pub(crate) fn plan(foreground: bool, modifiers: &[u8], button: u8, count: usize) -> Vec<Event> {
     let mut events = Vec::new();
     if foreground {
         events.push(Event::Motion);
@@ -100,6 +110,31 @@ fn plan(foreground: bool, modifiers: &[u8], button: u8, count: usize) -> Vec<Eve
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sink_records_preparation_before_guard() {
+        use cua_driver_core::guarded_dispatch::{run_guarded, GuardedResult, SendFailure};
+        struct Fake;
+        impl Requests for Fake {
+            fn prepare(&mut self) -> Vec<&'static str> {
+                vec!["activation", "input_focus"]
+            }
+            fn submit(&mut self, _: Event) -> Result<(), SendFailure> {
+                panic!("guard must refuse before input")
+            }
+        }
+        let mut sink = Sink::new(Fake, plan(true, &[], 1, 1));
+        let GuardedResult::Refused { outcome, .. } = run_guarded(&mut sink, 3, || {
+            Err(cua_driver_core::window_basis::BasisRefusal {
+                code: "stale_basis",
+                reason: "window_moved",
+            })
+        }) else {
+            panic!()
+        };
+        assert_eq!(outcome.prepared_side_effects, ["activation", "input_focus"]);
+        assert_eq!(outcome.events_sent, 0);
+    }
 
     #[test]
     fn guard_refusal_sends_no_input_or_cleanup_release() {
