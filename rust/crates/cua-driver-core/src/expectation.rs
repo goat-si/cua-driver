@@ -284,14 +284,33 @@ impl Tool for VerifyStateTool {
         let mut samples = 0u64;
         let mut consecutive_satisfied = 0u64;
         let mut stable = false;
-
+        let mut previous_outcomes = None;
         let mut last_outcomes = loop {
+            let now = tokio::time::Instant::now();
+            if timeout_ms > 0 && now >= deadline {
+                if let Some(outcomes) = previous_outcomes.take() {
+                    break outcomes;
+                }
+            }
+            let observation =
+                self.provider
+                    .observe(input.pid, input.window_id, include_elements, false);
+            let observation = if timeout_ms == 0 {
+                Some(observation.await)
+            } else {
+                tokio::time::timeout(deadline.saturating_duration_since(now), observation)
+                    .await
+                    .ok()
+                    .filter(|_| tokio::time::Instant::now() <= deadline)
+            };
+            let Some(observation) = observation else {
+                break unavailable_outcomes(
+                    &input.expect,
+                    "observation did not finish within timeout_ms",
+                );
+            };
             samples += 1;
-            let outcomes = match self
-                .provider
-                .observe(input.pid, input.window_id, include_elements, false)
-                .await
-            {
+            let outcomes = match observation {
                 Ok(sample) => evaluate_predicates(&input.expect, &sample.snapshot),
                 Err(error) => unavailable_outcomes(&input.expect, &error),
             };
@@ -308,6 +327,7 @@ impl Tool for VerifyStateTool {
             if timeout_ms == 0 || tokio::time::Instant::now() >= deadline {
                 break outcomes;
             }
+            previous_outcomes = Some(outcomes);
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
             tokio::time::sleep(remaining.min(Duration::from_millis(POLL_INTERVAL_MS))).await;
         };
@@ -322,6 +342,29 @@ impl Tool for VerifyStateTool {
             }
         }
         let status = aggregate_status(&last_outcomes);
+        let evidence = if input.include_screenshot == Some(true) {
+            let now = tokio::time::Instant::now();
+            if timeout_ms == 0 {
+                self.provider
+                    .observe(input.pid, input.window_id, false, true)
+                    .await
+                    .ok()
+            } else if now < deadline {
+                tokio::time::timeout(
+                    deadline.saturating_duration_since(now),
+                    self.provider
+                        .observe(input.pid, input.window_id, false, true),
+                )
+                .await
+                .ok()
+                .filter(|_| tokio::time::Instant::now() <= deadline)
+                .and_then(Result::ok)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
         let elapsed_ms = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
         let output = VerifyStateOutput {
             status,
@@ -338,14 +381,8 @@ impl Tool for VerifyStateTool {
         ))
         .with_structured(serde_json::to_value(&output).expect("VerifyStateOutput must serialize"));
 
-        if input.include_screenshot == Some(true) {
-            if let Ok(evidence) = self
-                .provider
-                .observe(input.pid, input.window_id, false, true)
-                .await
-            {
-                result.content.extend(evidence.visual_evidence);
-            }
+        if let Some(evidence) = evidence {
+            result.content.extend(evidence.visual_evidence);
         }
         result
     }
@@ -1362,6 +1399,258 @@ mod tests {
     struct FakeProvider {
         calls: std::sync::atomic::AtomicUsize,
         snapshot: ObservationSnapshot,
+    }
+
+    struct GatedProvider {
+        calls: std::sync::atomic::AtomicUsize,
+        gates: std::sync::Mutex<
+            std::collections::VecDeque<tokio::sync::oneshot::Receiver<ObservationSample>>,
+        >,
+    }
+
+    #[async_trait]
+    impl ObservationProvider for GatedProvider {
+        async fn observe(
+            &self,
+            _: i64,
+            _: u64,
+            _: bool,
+            _: bool,
+        ) -> Result<ObservationSample, String> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let gate = self
+                .gates
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("unexpected observation");
+            gate.await.map_err(|error| error.to_string())
+        }
+    }
+
+    fn gated_provider(
+        count: usize,
+    ) -> (
+        Arc<GatedProvider>,
+        Vec<tokio::sync::oneshot::Sender<ObservationSample>>,
+    ) {
+        let (senders, receivers): (Vec<_>, std::collections::VecDeque<_>) =
+            (0..count).map(|_| tokio::sync::oneshot::channel()).unzip();
+        (
+            Arc::new(GatedProvider {
+                calls: std::sync::atomic::AtomicUsize::new(0),
+                gates: std::sync::Mutex::new(receivers),
+            }),
+            senders,
+        )
+    }
+
+    fn sample(present: bool, screenshot: bool) -> ObservationSample {
+        ObservationSample {
+            snapshot: ObservationSnapshot {
+                window: present.then(window),
+                ..Default::default()
+            },
+            visual_evidence: screenshot
+                .then(|| Content::image_png("cG5n".into()))
+                .into_iter()
+                .collect(),
+        }
+    }
+
+    fn verify_args(timeout: u64, stable: u64, screenshot: bool) -> Value {
+        json!({"pid": 42, "window_id": 7, "expect": [{"window": {"exists": true}}],
+            "timeout_ms": timeout, "stable_samples": stable, "include_screenshot": screenshot})
+    }
+
+    fn assert_missed(result: &ToolResult, samples: u64) {
+        let output = result.structured_content.as_ref().unwrap();
+        assert_eq!(output["status"], "unknown");
+        assert_eq!(output["samples"], samples);
+        assert_eq!(
+            output["predicates"][0]["unknown_reason"],
+            "observation_unavailable"
+        );
+        let observed: Value =
+            serde_json::from_str(output["predicates"][0]["observed_json"].as_str().unwrap())
+                .unwrap();
+        assert_eq!(
+            observed,
+            json!({"error": "observation did not finish within timeout_ms"})
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn hung_observation_returns_unknown_at_deadline() {
+        let (provider, _gates) = gated_provider(1);
+        let task = tokio::spawn(async move {
+            VerifyStateTool::new(provider)
+                .invoke(verify_args(100, 1, false))
+                .await
+        });
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_millis(101)).await;
+        tokio::task::yield_now().await;
+        assert!(
+            task.is_finished(),
+            "hung observation must finish at deadline"
+        );
+        let result = task.await.unwrap();
+        assert_missed(&result, 0);
+        assert_eq!(result.structured_content.unwrap()["elapsed_ms"], 101);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn late_satisfied_sample_is_not_satisfied() {
+        let (provider, mut gates) = gated_provider(1);
+        let task = tokio::spawn(async move {
+            VerifyStateTool::new(provider)
+                .invoke(verify_args(100, 1, false))
+                .await
+        });
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_millis(101)).await;
+        let _ = gates.pop().unwrap().send(sample(true, false));
+        let result = task.await.unwrap();
+        assert_missed(&result, 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn ready_at_deadline_boundary() {
+        let (provider, mut gates) = gated_provider(1);
+        let task = tokio::spawn(async move {
+            VerifyStateTool::new(provider)
+                .invoke(verify_args(100, 1, false))
+                .await
+        });
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_millis(100)).await;
+        gates.pop().unwrap().send(sample(true, false)).unwrap();
+        let result = task.await.unwrap();
+        let output = result.structured_content.unwrap();
+        assert_eq!(output["status"], "satisfied");
+        assert_eq!(output["samples"], 1);
+        assert_eq!(output["elapsed_ms"], 100);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn expired_deadline_takes_no_new_sample() {
+        let (provider, mut gates) = gated_provider(1);
+        gates.pop().unwrap().send(sample(false, false)).unwrap();
+        let task = tokio::spawn({
+            let provider = provider.clone();
+            async move {
+                VerifyStateTool::new(provider)
+                    .invoke(verify_args(100, 1, false))
+                    .await
+            }
+        });
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_millis(100)).await;
+        let result = task.await.unwrap();
+        assert_eq!(result.structured_content.unwrap()["samples"], 1);
+        assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn screenshot_evidence_respects_deadline() {
+        let (provider, mut gates) = gated_provider(2);
+        let evidence_gate = gates.pop().unwrap();
+        gates.pop().unwrap().send(sample(true, false)).unwrap();
+        let task = tokio::spawn({
+            let provider = provider.clone();
+            async move {
+                VerifyStateTool::new(provider)
+                    .invoke(verify_args(100, 1, true))
+                    .await
+            }
+        });
+        tokio::task::yield_now().await;
+        assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+        tokio::time::advance(Duration::from_millis(101)).await;
+        tokio::task::yield_now().await;
+        assert!(task.is_finished());
+        drop(evidence_gate);
+        let result = task.await.unwrap();
+        assert_eq!(
+            result.structured_content.as_ref().unwrap()["status"],
+            "satisfied"
+        );
+        assert_eq!(
+            result.structured_content.as_ref().unwrap()["elapsed_ms"],
+            101
+        );
+        assert!(!result
+            .content
+            .iter()
+            .any(|c| matches!(c, Content::Image { .. })));
+
+        let (provider, mut gates) = gated_provider(1);
+        let task = tokio::spawn({
+            let provider = provider.clone();
+            async move {
+                VerifyStateTool::new(provider)
+                    .invoke(verify_args(100, 1, true))
+                    .await
+            }
+        });
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_millis(100)).await;
+        gates.pop().unwrap().send(sample(true, false)).unwrap();
+        let result = task.await.unwrap();
+        assert_eq!(result.structured_content.unwrap()["status"], "satisfied");
+        assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn fast_samples_unchanged() {
+        let (provider, gates) = gated_provider(3);
+        for gate in gates {
+            gate.send(sample(true, true)).unwrap();
+        }
+        let task = tokio::spawn({
+            let provider = provider.clone();
+            async move {
+                VerifyStateTool::new(provider)
+                    .invoke(verify_args(500, 2, true))
+                    .await
+            }
+        });
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_millis(100)).await;
+        let result = task.await.unwrap();
+        let output = result.structured_content.as_ref().unwrap();
+        assert_eq!(output["status"], "satisfied");
+        assert_eq!(output["samples"], 2);
+        assert_eq!(output["elapsed_ms"], 100);
+        assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 3);
+        assert!(result
+            .content
+            .iter()
+            .any(|c| matches!(c, Content::Image { .. })));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn zero_timeout_single_sample_unchanged() {
+        let (provider, mut gates) = gated_provider(1);
+        let task = tokio::spawn({
+            let provider = provider.clone();
+            async move {
+                VerifyStateTool::new(provider)
+                    .invoke(verify_args(0, 1, false))
+                    .await
+            }
+        });
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_millis(500)).await;
+        assert!(!task.is_finished());
+        gates.pop().unwrap().send(sample(true, false)).unwrap();
+        let result = task.await.unwrap();
+        let output = result.structured_content.unwrap();
+        assert_eq!(output["status"], "satisfied");
+        assert_eq!(output["samples"], 1);
+        assert_eq!(output["elapsed_ms"], 500);
+        assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     #[async_trait]
