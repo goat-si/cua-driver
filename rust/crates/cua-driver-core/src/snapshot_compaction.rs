@@ -318,20 +318,16 @@ pub fn redact_if_secure(
     (redacted_value, redacted_state)
 }
 
-/// Redact a secure field's accessible name when the provider mirrors the
-/// field's raw value into it. Win32 Edit controls without a label (common in
-/// WinForms) expose their text as the UIA Name, so redacting only the value
-/// would still leak the secret through the name/label.
+/// Withhold every non-blank secure field name: substring comparisons cannot
+/// prove that a label does not expose the secret. The raw value is not consulted.
 pub fn redact_mirrored_secure_name(
     secure: bool,
     name: Option<String>,
-    raw_value: Option<&str>,
+    _raw_value: Option<&str>,
 ) -> Option<String> {
-    match (secure, name, raw_value) {
-        (true, Some(n), Some(v)) if !v.trim().is_empty() && n.trim() == v.trim() => {
-            Some(REDACTED_VALUE.to_owned())
-        }
-        (_, name, _) => name,
+    match (secure, name) {
+        (true, Some(n)) if !n.trim().is_empty() => Some(REDACTED_VALUE.to_owned()),
+        (_, name) => name,
     }
 }
 
@@ -828,7 +824,7 @@ mod tests {
     }
 
     #[test]
-    fn mirrored_secure_name_is_redacted_but_real_labels_survive() {
+    fn secure_names_are_always_withheld_and_non_secure_names_survive() {
         assert_eq!(
             redact_mirrored_secure_name(
                 true,
@@ -841,7 +837,7 @@ mod tests {
         assert_eq!(
             redact_mirrored_secure_name(true, Some("Verification code".into()), Some("123456"))
                 .as_deref(),
-            Some("Verification code")
+            Some(REDACTED_VALUE)
         );
         assert_eq!(
             redact_mirrored_secure_name(false, Some("PLAINVALUE-77".into()), Some("PLAINVALUE-77"))
@@ -849,6 +845,35 @@ mod tests {
             Some("PLAINVALUE-77")
         );
         assert_eq!(redact_mirrored_secure_name(true, None, Some("x")), None);
+        assert_eq!(
+            redact_mirrored_secure_name(true, Some(" \t".into()), Some("x")).as_deref(),
+            Some(" \t")
+        );
+    }
+
+    #[test]
+    fn unknown_value_withholds_secure_name() {
+        assert_eq!(
+            redact_mirrored_secure_name(true, Some("Password".into()), None).as_deref(),
+            Some(REDACTED_VALUE)
+        );
+    }
+
+    #[test]
+    fn decorated_partial_mirror_is_withheld() {
+        assert_eq!(
+            redact_mirrored_secure_name(true, Some("PIN ending 4821".into()), Some("98764821"))
+                .as_deref(),
+            Some(REDACTED_VALUE)
+        );
+    }
+
+    #[test]
+    fn reformatted_mirror_is_withheld() {
+        assert_eq!(
+            redact_mirrored_secure_name(true, Some("123 456".into()), Some("123456")).as_deref(),
+            Some(REDACTED_VALUE)
+        );
     }
     use super::*;
 
