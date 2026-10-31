@@ -73,9 +73,19 @@ pub fn moved(before: f64, after: f64) -> bool {
 /// `area` must be a live AX element. Call from a blocking context.
 pub unsafe fn bar_position(area: AXUIElementRef, direction: &str) -> Option<f64> {
     let bar = copy_element_attr(area, bar_attribute(direction))?;
-    let value = copy_number_attr(bar, "AXValue");
+    let value = scrollbar_value(
+        || copy_string_attr(bar, "AXRole"),
+        || copy_number_attr(bar, "AXValue"),
+    );
     CFRelease(bar as CFTypeRef);
     value.filter(|value| value.is_finite())
+}
+
+pub(super) fn scrollbar_value(
+    role: impl FnOnce() -> Option<String>,
+    value: impl FnOnce() -> Option<f64>,
+) -> Option<f64> {
+    (role().as_deref() == Some("AXScrollBar")).then(value).flatten()
 }
 
 /// How a scroll area shows in a tree row: where each of its bars sits. None

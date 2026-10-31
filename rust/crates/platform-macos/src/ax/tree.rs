@@ -28,7 +28,7 @@ use core_foundation::{
 };
 use cua_driver_core::snapshot_compaction::{
     compact_tab_strip, fold_actionless_text_subtrees, format_omitted_tabs_line,
-    is_secure_text_field, redact_if_secure, should_probe_secure_text_role, CompactableNode,
+    is_secure_text_field, redact_if_secure, CompactableNode,
     FieldSecurityMeta, TabChildMeta, TabStripCompaction, TAB_STRIP_COMPACTION_THRESHOLD,
 };
 use cua_driver_core::walk_budget::{WalkBudget, WalkOutcome};
@@ -1034,7 +1034,7 @@ unsafe fn walk_element(
             // failures, so a selector naming it is answered; the bar
             // position stays the row's value.
             let ((title, description, own_value, identifier), exhaustive) = if exhaustive_nodes() {
-                match read_content_attrs(element, budget, batching_disabled) {
+                match read_content_attrs(element, &role, budget, batching_disabled) {
                     Some(attrs) => {
                         let (labels, complete) = scroll_area_labels(attrs);
                         if !complete {
@@ -1108,7 +1108,7 @@ unsafe fn walk_element(
         // An exhaustive walk keeps the container as a display-only row, so a
         // selector naming it is answered rather than assumed absent.
         if exhaustive_nodes() {
-            let node = match read_content_attrs(element, budget, batching_disabled) {
+            let node = match read_content_attrs(element, &role, budget, batching_disabled) {
                 Some(attrs) => {
                     if attrs.read_failed {
                         note_skipped();
@@ -1159,12 +1159,14 @@ unsafe fn walk_element(
         title,
         copied_value,
         value,
-        placeholder,
+        placeholder: _,
         description,
         identifier,
         help,
+        subrole,
         read_failed,
-    }) = read_content_attrs(element, budget, batching_disabled)
+        secure,
+    }) = read_content_attrs(element, &role, budget, batching_disabled)
     else {
         // Only the role is known: a selector on its label cannot be answered.
         note_skipped();
@@ -1178,20 +1180,12 @@ unsafe fn walk_element(
         note_skipped();
     }
     let actions = copy_action_names(element);
-    let (subrole, placeholder) = if should_probe_secure_text_role(&role, None) {
-        let subrole = copy_string_attr(element, "AXSubrole");
-        let placeholder = placeholder.or_else(|| copy_string_attr(element, "AXPlaceholderValue"));
-        (subrole, placeholder)
-    } else {
-        (None, placeholder)
-    };
-
     let visible_title = title.as_deref().unwrap_or("").trim().to_owned();
     let visible_description = description.as_deref().unwrap_or("").trim().to_owned();
     let visible_value = value.as_deref().unwrap_or("").trim().to_owned();
     let visible_description =
         window_chrome_button_description(&role, &visible_title, &visible_description, || {
-            copy_string_attr(element, "AXSubrole")
+            subrole.clone()
         })
         .map(str::to_owned)
         .unwrap_or(visible_description);
@@ -1320,21 +1314,11 @@ unsafe fn walk_element(
             selected: control.selected,
         }
     });
-    let security_meta = FieldSecurityMeta {
-        role: &role,
-        subrole: subrole.as_deref(),
-        title: (!visible_title.is_empty()).then_some(visible_title.as_str()),
-        description: (!visible_description.is_empty()).then_some(visible_description.as_str()),
-        placeholder: placeholder.as_deref(),
-        identifier: identifier.as_deref(),
-        help: help.as_deref(),
-        is_password_flag: false,
+    let (redacted_value, redacted_value_state) = if secure {
+        (Some("[redacted]".to_owned()), Some("[redacted]".to_owned()))
+    } else {
+        ((!visible_value.is_empty()).then(|| visible_value.clone()), control_state.value_state.clone())
     };
-    let (redacted_value, redacted_value_state) = redact_if_secure(
-        &security_meta,
-        (!visible_value.is_empty()).then(|| visible_value.clone()),
-        control_state.value_state.clone(),
-    );
     let node = if is_actionable {
         let idx = *counter;
         *counter += 1;
@@ -1476,7 +1460,7 @@ unsafe fn walk_children(
         return;
     };
     let tab_plan = if !in_web_content && children.len() >= TAB_STRIP_COMPACTION_THRESHOLD {
-        plan_macos_tab_strip(element, role, &children)
+        plan_macos_tab_strip(element, role, &children, budget, batching_disabled)
     } else {
         None
     };
@@ -1544,6 +1528,8 @@ unsafe fn plan_macos_tab_strip(
     parent: AXUIElementRef,
     parent_role: &str,
     children: &[AXUIElementRef],
+    budget: &mut WalkBudget,
+    batching_disabled: &mut bool,
 ) -> Option<TabStripCompaction> {
     if !matches!(
         parent_role,
@@ -1572,7 +1558,10 @@ unsafe fn plan_macos_tab_strip(
         if cua_driver_core::snapshot_compaction::is_tab_like_child(parent_role, &r, rd.as_deref()) {
             tab_like_count += 1;
             child_selected.push(copy_bool_attr(child, "AXSelected"));
-            child_values.push(copy_stringish_attr(child, "AXValue").map(|v| v.state_value));
+            let role = if r.is_empty() { "AXUnknown" } else { &r };
+            let attrs = read_content_attrs(child, role, budget, batching_disabled)?;
+            if attrs.read_failed { note_skipped(); }
+            child_values.push(attrs.copied_value.map(|v| v.state_value));
         } else {
             child_selected.push(None);
             child_values.push(None);
@@ -2723,7 +2712,9 @@ mod lean_row_tests {
             description: None,
             identifier: Some("editor-scroll".into()),
             help: None,
+            subrole: None,
             read_failed,
+            secure: false,
         };
         let ((title, _, _, identifier), complete) =
             super::scroll_area_labels(attrs(Some(" Editor "), None, false));
@@ -2751,7 +2742,9 @@ mod lean_row_tests {
             description: None,
             identifier: None,
             help: None,
+            subrole: None,
             read_failed: false,
+            secure: false,
         };
         let node = super::display_node("AXGroup", attrs, std::ptr::null_mut(), 1, None, false);
         assert_eq!(node.value.as_deref(), Some("Saved"));
