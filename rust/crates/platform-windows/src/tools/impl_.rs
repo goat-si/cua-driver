@@ -5279,36 +5279,79 @@ impl Tool for TypeTextTool {
                     };
                     let elem: IUIAutomationElement =
                         unsafe { IUIAutomationElement::from_raw(ptr as *mut _) };
-                    let result = (|| -> anyhow::Result<(String, String)> {
-                        let pattern = unsafe { elem.GetCurrentPattern(UIA_ValuePatternId) }?;
-                        let vp: IUIAutomationValuePattern = pattern.cast()?;
-                        // Shield the SetValue against host self-foreground. A
-                        // Chromium/Electron (or XAML) ValuePattern.SetValue handler
-                        // calls SetForegroundWindow(self), which WS_EX_NOACTIVATE
-                        // does NOT stop; the EnableWindow shield does (disabled
-                        // top-level can't be foregrounded) while the a11y-channel
-                        // SetValue still lands. Same fix as the UIA Invoke path.
-                        crate::uia::fg_bypass::run_with_uwp_bypass(hwnd as isize, || unsafe {
-                            // ValuePattern has no caret/selection insertion API. Preserve
-                            // the current document and append as the deterministic
-                            // background fallback; replacing the whole value violates
-                            // type_text's insertion contract for editors.
-                            let current = vp
-                                .CurrentValue()
-                                .map(|value| value.to_string())
-                                .unwrap_or_default();
-                            let inserted = format!("{current}{text_for_uia}");
-                            vp.SetValue(&BSTR::from(inserted.as_str()))?;
-                            Ok((current, inserted))
-                        })
-                    })()
-                    .ok();
+                    let result = (|| {
+                        use crate::value_append::run_value_append;
+                        Some(run_value_append(
+                            || {
+                                unsafe { elem.CurrentIsPassword() }
+                                    .ok()
+                                    .map(|v| v.as_bool())
+                            },
+                            || {
+                                unsafe { elem.GetCurrentPattern(UIA_ValuePatternId) }
+                                    .ok()
+                                    .and_then(|pattern| {
+                                        pattern.cast::<IUIAutomationValuePattern>().ok()
+                                    })
+                            },
+                            |vp| {
+                                unsafe { vp.CurrentValue() }
+                                    .map(|value| value.to_string())
+                                    .map_err(|error| error.code().0)
+                            },
+                            |vp, value| {
+                                // Keep the foreground shield around the UIA write.
+                                crate::uia::fg_bypass::run_with_uwp_bypass(hwnd as isize, || {
+                                    unsafe { vp.SetValue(&BSTR::from(value)) }
+                                        .map_err(|error| error.code().0)
+                                })
+                            },
+                            &text_for_uia,
+                        ))
+                    })();
                     std::mem::forget(elem);
                     result
                 }
             })
-            .await
-            .unwrap_or(None);
+            .await;
+            use crate::value_append::{route_after_worker, AppendOutcome, Route, WorkerFailed};
+            let worker_failed = set_result.is_err();
+            let set_result = match route_after_worker(set_result.map_err(|_| WorkerFailed)) {
+                Route::WmChar => None,
+                Route::Terminal => {
+                    return ToolResult::error(if worker_failed {
+                        "type_text's UIA write worker failed; the field may or may not have changed; nothing else was sent"
+                    } else {
+                        "type_text could not access the indexed UIA element; nothing was sent"
+                    })
+                        .with_structured(value_write_structured_result(text_len, "unreadable", false));
+                }
+                Route::Continue(AppendOutcome::Written { before, inserted }) => {
+                    Some((before, inserted))
+                }
+                Route::Continue(AppendOutcome::ReplacedSecure) => {
+                    return ToolResult::text("type_text replaced the password field's content (secure fields are replaced, not appended, and cannot be read back)")
+                        .with_structured(value_write_structured_result(text_len, "unreadable", false));
+                }
+                Route::Continue(AppendOutcome::Refused(reason)) => {
+                    let message = match reason {
+                        "secure_state_unknown" => "type_text could not tell whether the field is a password field; wrote nothing",
+                        "secure_no_value_pattern" => "type_text could not write the password field because it has no ValuePattern; wrote nothing. Use delivery_mode:\"foreground\".",
+                        "value_unreadable" => "type_text could not read the field's current text, so it wrote nothing (appending would have replaced the text). Re-read the window and retry, or use set_value to replace the value.",
+                        _ => "type_text refused the write; wrote nothing",
+                    };
+                    return ToolResult::error(message);
+                }
+                Route::Continue(AppendOutcome::SecureWriteFailed { hresult }) => {
+                    return ToolResult::error(format!("the password field write failed or its effect is unknown; nothing else was sent (HRESULT 0x{:08X})", hresult as u32))
+                        .with_structured(value_write_structured_result(text_len, "unreadable", false));
+                }
+                Route::Continue(
+                    AppendOutcome::NoValuePattern | AppendOutcome::WriteFailed { .. },
+                ) => {
+                    unreachable!("fallback outcomes are routed before continuation")
+                }
+            };
             if let Some((before, expected)) = set_result {
                 // Read the value back by element handle — focus-independent
                 // (works regardless of which window is foreground), proving the
@@ -5384,7 +5427,8 @@ impl Tool for TypeTextTool {
                     s
                 });
             }
-            // ValuePattern unavailable → fall through to the WM_CHAR path.
+            // Only a non-secure missing ValuePattern or failed write reaches WM_CHAR.
+            // The latter remains a W2 residual: the write effect may be unknown.
         }
 
         // 2. No element_index on a WPF target: WM_CHAR is dropped and there's no
@@ -5682,21 +5726,30 @@ fn read_cached_element_value(
     let guard = admitted.as_ref().filter(|element| element.is_uia())?;
     let ptr = guard.as_ptr();
     let elem: IUIAutomationElement = unsafe { IUIAutomationElement::from_raw(ptr as *mut _) };
-    let val = unsafe {
-        elem.GetCurrentPattern(UIA_ValuePatternId)
-            .ok()
-            .and_then(|p| p.cast::<IUIAutomationValuePattern>().ok())
-            .and_then(|vp| vp.CurrentValue().ok())
-            .map(|b| b.to_string())
-            .or_else(|| {
+    let val = (|| -> Option<String> {
+        crate::value_append::read_value_gated(
+            || {
+                unsafe { elem.CurrentIsPassword() }
+                    .ok()
+                    .map(|v| v.as_bool())
+            },
+            || unsafe {
+                elem.GetCurrentPattern(UIA_ValuePatternId)
+                    .ok()
+                    .and_then(|p| p.cast::<IUIAutomationValuePattern>().ok())
+                    .and_then(|vp| vp.CurrentValue().ok())
+                    .map(|b| b.to_string())
+            },
+            || unsafe {
                 elem.GetCurrentPattern(UIA_TextPatternId)
                     .ok()
                     .and_then(|p| p.cast::<IUIAutomationTextPattern>().ok())
                     .and_then(|tp| tp.DocumentRange().ok())
                     .and_then(|r| r.GetText(-1).ok())
                     .map(|b| b.to_string())
-            })
-    };
+            },
+        )
+    })();
     // The cache guard owns the ref; don't let `elem`'s Drop release it.
     std::mem::forget(elem);
     val
@@ -5732,9 +5785,19 @@ fn read_focused_value_uia(expect_pid: u32) -> Option<String> {
         if unsafe { focused.CurrentProcessId() }.ok()? as u32 != expect_pid {
             return None;
         }
-        let pattern = unsafe { focused.GetCurrentPattern(UIA_ValuePatternId) }.ok()?;
-        let vp: IUIAutomationValuePattern = pattern.cast().ok()?;
-        Some(unsafe { vp.CurrentValue() }.ok()?.to_string())
+        crate::value_append::read_value_gated(
+            || {
+                unsafe { focused.CurrentIsPassword() }
+                    .ok()
+                    .map(|v| v.as_bool())
+            },
+            || {
+                let pattern = unsafe { focused.GetCurrentPattern(UIA_ValuePatternId) }.ok()?;
+                let vp: IUIAutomationValuePattern = pattern.cast().ok()?;
+                Some(unsafe { vp.CurrentValue() }.ok()?.to_string())
+            },
+            || None,
+        )
     })();
     if coinit_ok {
         unsafe {
