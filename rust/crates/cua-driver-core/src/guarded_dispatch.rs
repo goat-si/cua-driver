@@ -289,3 +289,28 @@ mod pointer_slot_tests {
         assert_eq!((o.events_sent, o.effect), (1, DispatchEffect::Partial));
     }
 }
+
+#[cfg(test)]
+mod unknown_tests {
+    use super::*;
+    struct UnknownSink { fail: usize, cleaned: Option<usize> }
+    impl InputSink for UnknownSink {
+        fn prepare(&mut self) -> Vec<&'static str> { vec![] }
+        fn send(&mut self, i: usize) -> Result<(), SendFailure> {
+            if i == self.fail { Err(SendFailure { error: "lost reply".into(), emitted: Emitted::Unknown }) } else { Ok(()) }
+        }
+        fn cleanup(&mut self, sent: usize) -> Vec<Value> { self.cleaned = Some(sent); vec![json!("cleaned")] }
+    }
+    #[test]
+    fn unknown_preserves_confirmed_prefix_and_cleans_up() {
+        for i in [0, 2] {
+            let mut sink = UnknownSink { fail: i, cleaned: None };
+            let GuardedResult::Sent { outcome } = run_guarded(&mut sink, 3, || Ok(())) else { panic!() };
+            assert_eq!(outcome.effect, DispatchEffect::Uncertain);
+            assert_eq!(outcome.events_sent, i as u32);
+            assert!(outcome.to_json().get("nothing_sent").is_none());
+            assert_eq!(sink.cleaned, Some(i));
+            assert_eq!(outcome.cleanup_results, [json!("cleaned"), json!({"error":"lost reply"})]);
+        }
+    }
+}
