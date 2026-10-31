@@ -1603,23 +1603,27 @@ where
     let events = foreground_drag_events(from_x, from_y, to_x, to_y, steps);
 
     let plan = foreground_gesture_plan(events, from_local, to_local, step_delay_ms, false);
+    let mut io = MouseGestureIo {
+        route: GestureRoute::Window {
+            pid,
+            wid,
+            id: click_group_id,
+        },
+        source: None,
+        button: cg_button,
+        down: down_type,
+        dragged: dragged_type,
+        up: up_type,
+        button_number,
+        flags: CGEventFlags::CGEventFlagNull,
+        observe: &mut observe,
+    };
+    let prepared = super::gesture::prepare_gesture(&mut io, &plan)?;
     super::keyboard::with_global_modifier_keys(modifiers, |flags| {
-        let mut io = MouseGestureIo {
-            route: GestureRoute::Window {
-                pid,
-                wid,
-                id: click_group_id,
-            },
-            source: None,
-            button: cg_button,
-            down: down_type,
-            dragged: dragged_type,
-            up: up_type,
-            button_number,
-            flags,
-            observe: &mut observe,
-        };
-        super::gesture::run_gesture(&mut io, plan, || true).map(|_| ())
+        io.flags = flags;
+        super::gesture::run_prepared(&mut io, plan, prepared, || true)
+            .map(|_| ())
+            .map_err(Into::into)
     })?;
 
     std::thread::sleep(std::time::Duration::from_millis(100));
@@ -1685,19 +1689,23 @@ where
     std::thread::sleep(std::time::Duration::from_millis(40));
 
     let plan = foreground_gesture_plan(events, None, None, step_delay_ms, true);
+    let mut io = MouseGestureIo {
+        route: GestureRoute::Desktop,
+        source: None,
+        button: cg_button,
+        down: down_type,
+        dragged: dragged_type,
+        up: up_type,
+        button_number: 0,
+        flags: CGEventFlags::CGEventFlagNull,
+        observe: &mut observe,
+    };
+    let prepared = super::gesture::prepare_gesture(&mut io, &plan)?;
     super::keyboard::with_global_modifier_keys(modifiers, |flags| {
-        let mut io = MouseGestureIo {
-            route: GestureRoute::Desktop,
-            source: None,
-            button: cg_button,
-            down: down_type,
-            dragged: dragged_type,
-            up: up_type,
-            button_number: 0,
-            flags,
-            observe: &mut observe,
-        };
-        super::gesture::run_gesture(&mut io, plan, || true).map(|_| ())
+        io.flags = flags;
+        super::gesture::run_prepared(&mut io, plan, prepared, || true)
+            .map(|_| ())
+            .map_err(Into::into)
     })?;
     // The foreground wrapper restores the previous app immediately after this
     // function returns. Let the target's run loop consume the queued HID
