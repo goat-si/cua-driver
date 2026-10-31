@@ -7,6 +7,154 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::collections::BTreeMap;
 
+/// Evidence about input sent to a target application, not other side effects.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InputDelivery {
+    NotDelivered,
+    DeliveryUncertain,
+    DeliveredUnverified,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RetrySafety {
+    Safe,
+    Unsafe,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ErrorDisposition {
+    pub delivery: InputDelivery,
+    pub retry: RetrySafety,
+}
+
+impl ErrorDisposition {
+    pub const NOT_DELIVERED: Self = Self {
+        delivery: InputDelivery::NotDelivered,
+        retry: RetrySafety::Safe,
+    };
+    pub const UNCERTAIN: Self = Self {
+        delivery: InputDelivery::DeliveryUncertain,
+        retry: RetrySafety::Unknown,
+    };
+    pub const SUSPECTED_NOOP: Self = Self {
+        delivery: InputDelivery::DeliveryUncertain,
+        retry: RetrySafety::Unsafe,
+    };
+    pub const DELIVERED: Self = Self {
+        delivery: InputDelivery::DeliveredUnverified,
+        retry: RetrySafety::Unsafe,
+    };
+    pub const UNKNOWN: Self = Self {
+        delivery: InputDelivery::Unknown,
+        retry: RetrySafety::Unknown,
+    };
+
+    pub fn is_valid(self) -> bool {
+        matches!(
+            (self.delivery, self.retry),
+            (InputDelivery::NotDelivered, RetrySafety::Safe)
+                | (
+                    InputDelivery::DeliveryUncertain,
+                    RetrySafety::Unsafe | RetrySafety::Unknown
+                )
+                | (InputDelivery::DeliveredUnverified, RetrySafety::Unsafe)
+                | (InputDelivery::Unknown, RetrySafety::Unknown)
+        )
+    }
+}
+
+/// Derive only from evidence common to all tools; refusal markers and codes
+/// alone do not prove that input was not dispatched.
+pub fn derive_error_disposition(structured: &Value, read_only: Option<bool>) -> ErrorDisposition {
+    match structured.get("effect").and_then(Value::as_str) {
+        Some("partial" | "unverifiable") => ErrorDisposition::DELIVERED,
+        Some("suspected_noop") => ErrorDisposition::SUSPECTED_NOOP,
+        _ if read_only == Some(true) => ErrorDisposition::NOT_DELIVERED,
+        _ => ErrorDisposition::UNKNOWN,
+    }
+}
+
+#[cfg(test)]
+mod disposition_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn only_documented_pairs_validate() {
+        use InputDelivery::*;
+        use RetrySafety::*;
+        for delivery in [
+            NotDelivered,
+            DeliveryUncertain,
+            DeliveredUnverified,
+            InputDelivery::Unknown,
+        ] {
+            for retry in [Safe, Unsafe, RetrySafety::Unknown] {
+                let disposition = ErrorDisposition { delivery, retry };
+                let valid = matches!(
+                    (delivery, retry),
+                    (NotDelivered, Safe)
+                        | (DeliveryUncertain, Unsafe | RetrySafety::Unknown)
+                        | (DeliveredUnverified, Unsafe)
+                        | (InputDelivery::Unknown, RetrySafety::Unknown)
+                );
+                assert_eq!(disposition.is_valid(), valid, "{disposition:?}");
+            }
+        }
+        assert!(serde_json::from_value::<ErrorDisposition>(
+            json!({"delivery":"future", "retry":"safe"})
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn derives_only_from_supported_evidence() {
+        for (payload, read_only, expected) in [
+            (json!({}), Some(true), ErrorDisposition::NOT_DELIVERED),
+            (
+                json!({"effect":"partial"}),
+                None,
+                ErrorDisposition::DELIVERED,
+            ),
+            (
+                json!({"effect":"unverifiable"}),
+                None,
+                ErrorDisposition::DELIVERED,
+            ),
+            (
+                json!({"effect":"suspected_noop"}),
+                None,
+                ErrorDisposition::SUSPECTED_NOOP,
+            ),
+            (json!({"effect":"refused"}), None, ErrorDisposition::UNKNOWN),
+            (
+                json!({"code":"permission_denied"}),
+                None,
+                ErrorDisposition::UNKNOWN,
+            ),
+            (json!({}), None, ErrorDisposition::UNKNOWN),
+        ] {
+            assert_eq!(derive_error_disposition(&payload, read_only), expected);
+        }
+    }
+
+    #[test]
+    fn refusal_schema_stays_open_and_unchanged() {
+        assert_eq!(
+            refusal_envelope_schema(),
+            json!({
+                "type":"object", "additionalProperties":true,
+                "anyOf":[{"required":["refusal"]},{"required":["status"]},{"required":["code"]}]
+            })
+        );
+    }
+}
+
 /// Transport-free structured result used by both the live runtime and SDK generation.
 pub trait ToolOutput: Serialize + DeserializeOwned + JsonSchema {
     fn validate(&self) -> Result<(), String> {

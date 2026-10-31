@@ -61,18 +61,19 @@ pub use inputs::{
     ToolInput, TypeTextInput, MULTI_CALL_SESSION_DESCRIPTION,
 };
 pub use outputs::{
-    advertised_output_schema, conforming_error_envelope, is_refusal_envelope,
-    refusal_envelope_schema, ActionDelivery, ActionDeliveryMode, ActionEffect, ActionError,
-    ActionEscalation, ActionEscalationReason, ActionEscalationTarget, ActionEvidence,
+    advertised_output_schema, conforming_error_envelope, derive_error_disposition,
+    is_refusal_envelope, refusal_envelope_schema, ActionDelivery, ActionDeliveryMode, ActionEffect,
+    ActionError, ActionEscalation, ActionEscalationReason, ActionEscalationTarget, ActionEvidence,
     ActionEvidenceKind, ActionFocusRestoration, ActionFocusRestorationReason,
     ActionFocusRestorationStatus, ActionNextCall, ActionResult, ActionResultValidationError,
     ActionRoute, AgentOverlayCapture, AgentOverlayCaptureStatus, ClipboardReadOutput,
     ClipboardWriteOutput, CursorMotionOutput, CursorPointOutput, CursorPositionOutput,
     CursorThemeOutput, CursorVisualOutput, DesktopStateOutput, EffectiveScope, EndSessionOutput,
-    GetAgentCursorStateOutput, ListSessionsOutput, ScreenSizeOutput, SessionClientKindOutput,
-    SessionLifecycleState, SessionOutput, SessionStateOutput, SessionTransportOutput,
-    SetAgentCursorEnabledOutput, SetAgentCursorMotionOutput, SetAgentCursorThemeOutput,
-    StartSessionOutput, ToolOutput, TOOL_INVOCATION_FAILED_CODE,
+    ErrorDisposition, GetAgentCursorStateOutput, InputDelivery, ListSessionsOutput, RetrySafety,
+    ScreenSizeOutput, SessionClientKindOutput, SessionLifecycleState, SessionOutput,
+    SessionStateOutput, SessionTransportOutput, SetAgentCursorEnabledOutput,
+    SetAgentCursorMotionOutput, SetAgentCursorThemeOutput, StartSessionOutput, ToolOutput,
+    TOOL_INVOCATION_FAILED_CODE,
 };
 pub use verification::{
     BoundsExpectation, ElementPredicate, ElementSelector, PredicateOutcome, StatePredicate,

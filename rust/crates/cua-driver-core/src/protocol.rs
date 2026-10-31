@@ -294,18 +294,43 @@ impl Content {
 }
 
 /// The value placed in `result` for a `tools/call` response.
-#[derive(Debug, Serialize, Default)]
+#[derive(Debug, Default)]
 pub struct ToolResult {
     pub content: Vec<Content>,
-    #[serde(rename = "isError", skip_serializing_if = "Option::is_none")]
     pub is_error: Option<bool>,
-    #[serde(rename = "structuredContent", skip_serializing_if = "Option::is_none")]
     pub structured_content: Option<Value>,
     /// Rich actuator facts retained inside the daemon. This is deliberately
     /// skipped by serde so the nonbreaking truth-layer migration cannot alter
     /// the MCP result envelope or its legacy structured payload.
-    #[serde(skip)]
     pub action_record: Option<crate::action_record::ActionExecutionRecord>,
+    /// Trusted producer evidence; never accepted from a tool's JSON.
+    pub disposition: Option<cua_driver_contract::ErrorDisposition>,
+}
+
+impl Serialize for ToolResult {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        let mut map = serializer.serialize_map(None)?;
+        map.serialize_entry("content", &self.content)?;
+        if let Some(is_error) = self.is_error {
+            map.serialize_entry("isError", &is_error)?;
+        }
+        if let (Some(true), Some(disposition)) = (self.is_error, self.disposition) {
+            let mut structured = match self.structured_content.clone().unwrap_or(Value::Null) {
+                Value::Object(object) => object,
+                Value::Null => serde_json::Map::new(),
+                other => serde_json::Map::from_iter([("detail".to_owned(), other)]),
+            };
+            structured.insert(
+                "disposition".into(),
+                serde_json::to_value(disposition).map_err(serde::ser::Error::custom)?,
+            );
+            map.serialize_entry("structuredContent", &structured)?;
+        } else if let Some(structured) = &self.structured_content {
+            map.serialize_entry("structuredContent", structured)?;
+        }
+        map.end()
+    }
 }
 
 impl ToolResult {
@@ -326,6 +351,11 @@ impl ToolResult {
 
     pub fn with_structured(mut self, v: Value) -> Self {
         self.structured_content = Some(v);
+        self
+    }
+
+    pub fn with_disposition(mut self, disposition: cua_driver_contract::ErrorDisposition) -> Self {
+        self.disposition = Some(disposition);
         self
     }
 

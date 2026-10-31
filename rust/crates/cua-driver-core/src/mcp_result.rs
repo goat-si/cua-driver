@@ -28,7 +28,7 @@ use tracing::warn;
 
 use cua_driver_contract::{
     advertised_tool_output_schema, advertises_output_schema, conforming_error_envelope,
-    is_refusal_envelope, validate_success_output,
+    derive_error_disposition, is_refusal_envelope, validate_success_output, ErrorDisposition,
 };
 
 /// Marker code for a result the driver replaced because the tool's own payload
@@ -99,6 +99,120 @@ pub fn conforming_proxy_tool_result(
 }
 
 fn conforming_tool_result_inner(tool: &str, result: Value, has_schema: bool) -> Value {
+    finalize_error_disposition(tool, normalize_tool_result(tool, result, has_schema))
+}
+
+/// Finalize the disposition after a caller's result normalization. The SDK
+/// also uses this boundary for direct results, which have no MCP schema arm.
+pub fn finalize_error_disposition(tool: &str, mut normalized: Value) -> Value {
+    if normalized.get("isError").and_then(Value::as_bool) == Some(true) {
+        let result = normalized.as_object_mut().expect("isError on object");
+        let original = result.remove("structuredContent").unwrap_or(Value::Null);
+        let mut structured = match original {
+            Value::Object(object) => Value::Object(object),
+            Value::Null => json!({}),
+            other => json!({"detail": other}),
+        };
+        let effect_evidence = derive_error_disposition(&structured, None);
+        let evidence = if effect_evidence == ErrorDisposition::DELIVERED {
+            effect_evidence
+        } else {
+            aggregate_evidence(tool, &structured).unwrap_or(effect_evidence)
+        };
+        let candidate = structured
+            .get("disposition")
+            .and_then(|value| serde_json::from_value::<ErrorDisposition>(value.clone()).ok())
+            .filter(|value| value.is_valid());
+        let selected = match candidate {
+            Some(value)
+                if value == ErrorDisposition::NOT_DELIVERED
+                    && evidence != ErrorDisposition::UNKNOWN =>
+            {
+                evidence
+            }
+            Some(value)
+                if effect_evidence == ErrorDisposition::DELIVERED
+                    && matches!(
+                        value.delivery,
+                        cua_driver_contract::InputDelivery::DeliveryUncertain
+                    ) =>
+            {
+                effect_evidence
+            }
+            Some(value) => value,
+            None => evidence,
+        };
+        structured["disposition"] = serde_json::to_value(selected).expect("disposition serializes");
+        result.insert("structuredContent".to_owned(), structured);
+    }
+    normalized
+}
+
+/// An aggregate's own action history takes precedence over its leaf error.
+/// Only claim an attempted action when the public report proves one.
+fn aggregate_evidence(tool: &str, structured: &Value) -> Option<ErrorDisposition> {
+    if tool == "run_steps" {
+        let action = structured.get("steps")?.as_array()?.iter().any(|step| {
+            let action = step
+                .get("tool")
+                .and_then(Value::as_str)
+                .is_some_and(|name| crate::batch_tools::BATCHABLE_TOOLS.contains(&name));
+            action
+                && (step.get("phase").and_then(Value::as_str) == Some("action")
+                    || (step.get("ok").and_then(Value::as_bool) == Some(true)
+                        && step.get("skipped").and_then(Value::as_bool) != Some(true)))
+        });
+        return action.then_some(ErrorDisposition::DELIVERED);
+    }
+    if tool == "run_script" {
+        let calls = structured.get("calls").and_then(Value::as_array);
+        let action_tool = |entry: &Value| {
+            entry
+                .get("tool")
+                .and_then(Value::as_str)
+                .is_some_and(|name| {
+                    !matches!(
+                        name,
+                        "list_apps" | "list_windows" | "get_window_state" | "verify_state" | "zoom"
+                    )
+                })
+        };
+        let action = calls.is_some_and(|calls| {
+            calls.iter().any(|call| {
+                action_tool(call)
+                    || call
+                        .get("driver_calls")
+                        .and_then(Value::as_array)
+                        .is_some_and(|driver_calls| driver_calls.iter().any(action_tool))
+            })
+        });
+        if action {
+            return Some(ErrorDisposition::DELIVERED);
+        }
+        let incomplete = structured
+            .pointer("/error/kind")
+            .and_then(Value::as_str)
+            .is_some_and(|kind| {
+                matches!(
+                    kind,
+                    "timeout" | "cancelled" | "stalled" | "internal" | "memory"
+                )
+            })
+            || structured.pointer("/error/code").and_then(Value::as_str) == Some("timeout")
+            || calls.is_some_and(|calls| {
+                calls.iter().any(|call| {
+                    call.get("driver_calls_omitted")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0)
+                        > 0
+                })
+            });
+        return incomplete.then_some(ErrorDisposition::UNCERTAIN);
+    }
+    None
+}
+
+fn normalize_tool_result(tool: &str, result: Value, has_schema: bool) -> Value {
     let Value::Object(mut result) = result else {
         return internal_error_result(format!(
             "internal result mismatch for {tool}: tool result is not an object"
@@ -207,6 +321,179 @@ mod tests {
     const ACTION_TOOL: &str = "click";
     /// Advertises no `outputSchema` at all.
     const UNSCHEMED_TOOL: &str = "no_such_tool";
+
+    #[test]
+    fn malformed_result_replacement_is_unknown() {
+        let result = conforming_tool_result(ACTION_TOOL, json!("malformed"));
+        assert_eq!(
+            result["structuredContent"]["disposition"],
+            json!({
+                "delivery": "unknown", "retry": "unknown"
+            })
+        );
+    }
+
+    #[test]
+    fn not_delivered_with_partial_is_downgraded() {
+        let result = conforming_tool_result(
+            ACTION_TOOL,
+            tool_error_result(
+                "partial",
+                json!({
+                    "effect": "partial", "disposition": {"delivery": "not_delivered", "retry": "safe"}
+                }),
+            ),
+        );
+        assert_eq!(
+            result["structuredContent"]["disposition"],
+            json!({
+                "delivery": "delivered_unverified", "retry": "unsafe"
+            })
+        );
+    }
+
+    #[test]
+    fn effect_refused_alone_is_unknown() {
+        let result = conforming_tool_result(
+            ACTION_TOOL,
+            tool_error_result("refused", json!({"effect": "refused"})),
+        );
+        assert_eq!(
+            result["structuredContent"]["disposition"],
+            json!({
+                "delivery": "unknown", "retry": "unknown"
+            })
+        );
+    }
+
+    #[test]
+    fn suspected_noop_is_uncertain_and_unsafe() {
+        let result = conforming_tool_result(
+            ACTION_TOOL,
+            tool_error_result("uncertain", json!({"effect": "suspected_noop"})),
+        );
+        assert_eq!(
+            result["structuredContent"]["disposition"],
+            json!({
+                "delivery": "delivery_uncertain", "retry": "unsafe"
+            })
+        );
+    }
+
+    #[test]
+    fn invalid_pair_is_replaced() {
+        let result = conforming_tool_result(
+            ACTION_TOOL,
+            tool_error_result(
+                "bad",
+                json!({
+                    "disposition": {"delivery": "delivered_unverified", "retry": "safe"}
+                }),
+            ),
+        );
+        assert_eq!(
+            result["structuredContent"]["disposition"],
+            json!({
+                "delivery": "unknown", "retry": "unknown"
+            })
+        );
+    }
+
+    #[test]
+    fn unverifiable_effect_is_delivered_unverified() {
+        let result = conforming_tool_result(
+            ACTION_TOOL,
+            tool_error_result("unverified", json!({"effect": "unverifiable"})),
+        );
+        assert_eq!(
+            result["structuredContent"]["disposition"],
+            json!({
+                "delivery": "delivered_unverified", "retry": "unsafe"
+            })
+        );
+    }
+
+    #[test]
+    fn proxy_path_keeps_schema_equality() {
+        let schema = advertised_tool_output_schema(ACTION_TOOL).unwrap();
+        let result = conforming_proxy_tool_result(
+            ACTION_TOOL,
+            tool_error_result("error", json!({})),
+            Some(&schema),
+        )
+        .unwrap();
+        assert_conforms(ACTION_TOOL, &result);
+        assert_eq!(
+            result["structuredContent"]["disposition"],
+            json!({
+                "delivery": "unknown", "retry": "unknown"
+            })
+        );
+        assert!(validate_proxy_output_schema(ACTION_TOOL, Some(&schema)).is_ok());
+    }
+
+    #[test]
+    fn aggregate_dominates_leaf_refusal_code() {
+        let result = conforming_tool_result(
+            "run_steps",
+            tool_error_result(
+                "refused",
+                json!({
+                    "code":"permission_denied", "steps":[{"tool":"click","ok":true}, {"tool":"type_text","ok":false,"phase":"action","effect":"refused"}],
+                    "disposition":{"delivery":"not_delivered","retry":"safe"}
+                }),
+            ),
+        );
+        assert_eq!(
+            result["structuredContent"]["disposition"],
+            json!({"delivery":"delivered_unverified", "retry":"unsafe"})
+        );
+    }
+
+    #[test]
+    fn incomplete_history_is_not_not_delivered() {
+        let result = conforming_tool_result(
+            "run_script",
+            tool_error_result(
+                "timeout",
+                json!({
+                    "error":{"kind":"timeout"}, "calls":[],
+                    "disposition":{"delivery":"not_delivered","retry":"safe"}
+                }),
+            ),
+        );
+        assert_eq!(
+            result["structuredContent"]["disposition"],
+            json!({"delivery":"delivery_uncertain", "retry":"unknown"})
+        );
+    }
+
+    #[test]
+    fn nested_script_action_contradicts_not_delivered() {
+        let result = conforming_tool_result(
+            "run_script",
+            tool_error_result(
+                "failed",
+                json!({
+                    "calls":[{"tool":"get_window_state", "driver_calls":[{"tool":"click"}, {"tool":"get_window_state"}]}],
+                    "disposition":{"delivery":"not_delivered", "retry":"safe"}
+                }),
+            ),
+        );
+        assert_eq!(
+            result["structuredContent"]["disposition"],
+            json!({"delivery":"delivered_unverified", "retry":"unsafe"})
+        );
+    }
+
+    #[test]
+    fn success_payload_untouched() {
+        let result = json!({"isError":false, "content":[], "structuredContent":{"disposition":"tool value"}});
+        assert_eq!(
+            conforming_tool_result("no_such_tool", result.clone()),
+            result
+        );
+    }
 
     #[track_caller]
     fn assert_conforms(tool: &str, result: &Value) {
