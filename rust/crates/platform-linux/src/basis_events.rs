@@ -64,7 +64,7 @@ impl<R: Requests> Sink<R> {
         self.resources.needing_cleanup().into_iter().map(|resource| {
             let event = match resource { Resource::Key(key) => Event::KeyRelease(key), Resource::Button(button) => Event::ButtonRelease(button) };
             let result = self.send_event(event);
-            serde_json::json!({"resource": format!("{resource:?}"), "released": result.is_ok(), "error": result.err().map(|error| error.error), "state": format!("{:?}", self.resources.state(&resource))})
+            serde_json::json!({"resource": format!("{resource:?}"), "released": result.is_ok(), "cleanup_failed": result.is_err(), "error": result.err().map(|error| error.error), "state": format!("{:?}", self.resources.state(&resource))})
         }).collect()
     }
 }
@@ -100,6 +100,37 @@ fn plan(foreground: bool, modifiers: &[u8], button: u8, count: usize) -> Vec<Eve
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn failed_cleanup_reports_remaining_state() {
+        use cua_driver_core::guarded_dispatch::{run_guarded, Emitted, GuardedResult, SendFailure};
+        use cua_driver_core::window_basis::DispatchEffect;
+        struct Fake;
+        impl Requests for Fake {
+            fn submit(&mut self, event: Event) -> Result<(), SendFailure> {
+                if matches!(event, Event::ButtonRelease(_)) {
+                    Err(SendFailure {
+                        error: "release lost".into(),
+                        emitted: Emitted::Unknown,
+                    })
+                } else {
+                    Ok(())
+                }
+            }
+        }
+        let events = plan(false, &[], 1, 1);
+        let mut sink = Sink {
+            requests: Fake,
+            events,
+            resources: Default::default(),
+        };
+        let GuardedResult::Sent { outcome } = run_guarded(&mut sink, 2, || Ok(())) else {
+            panic!()
+        };
+        assert_eq!(outcome.effect, DispatchEffect::Uncertain);
+        assert_eq!(outcome.cleanup_results[0]["cleanup_failed"], true);
+        assert_eq!(outcome.cleanup_results[0]["state"], "PossiblyReleased");
+    }
 
     #[test]
     fn every_failure_index_cleans_possible_resources() {
