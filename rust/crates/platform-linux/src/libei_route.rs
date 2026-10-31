@@ -332,6 +332,12 @@ mod tests {
             plan_drag(&devices, (1.0, 2.0), (11.0, 2.0), 2),
             Err(RouteRefusal::CrossRegion)
         );
+        // Both endpoints are valid, but the emitted midpoint is in a gap.
+        let gap = [device(0, vec![region(0.0, 10.0), region(20.0, 10.0)])];
+        assert_eq!(
+            plan_drag(&gap, (1.0, 2.0), (29.0, 2.0), 2),
+            Err(RouteRefusal::CrossRegion)
+        );
     }
     #[test]
     fn keymaps_are_authoritative_and_admission_is_atomic() {
@@ -347,6 +353,12 @@ mod tests {
             Some(54)
         );
         assert_eq!(plan_keycodes("!", None, None).unwrap()[0].shift, Some(42));
+        map.insert('!', (2, true));
+        assert!(plan_keycodes("!", Some(&map), None).is_err());
+        assert_eq!(
+            plan_keycodes("!", Some(&map), Some(54)).unwrap()[0].shift,
+            Some(54)
+        );
         let refusal = plan_keycodes("a€b", None, None).unwrap_err();
         assert_eq!(refusal.count, 1);
         assert!(!format!("{refusal:?} {refusal}").contains('€'));
