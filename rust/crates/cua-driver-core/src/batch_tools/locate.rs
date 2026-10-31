@@ -911,48 +911,59 @@ impl<'a> Locator<'a> {
     }
 
     /// Classify closure from the same complete listings that supply candidates.
+    ///
+    /// Only a pid-scoped listing can prove a window closed: it must report a
+    /// complete enumeration and a readable authoritative id set. A pid-less
+    /// listing (macOS: layer 0 only, no id set) proves nothing. Without a
+    /// window_id the spec matches by app or title, which a window left out
+    /// of `windows` (an AX-less or helper window) cannot be checked against,
+    /// so any authoritative id missing from `windows` leaves closure unproven.
     async fn closure_listing(&self, spec: &WindowSpec) -> Result<Closure, Miss> {
         let mut resolved_app_pids = None;
         let pids = match (spec.pid, &spec.app) {
-            (Some(pid), _) => vec![Some(pid)],
+            (Some(pid), _) => vec![pid],
             (None, Some(app)) => {
                 let pids = self.app_pids(app).await?;
                 if pids.is_empty() {
                     return Ok(Closure::Closed);
                 }
-                let targets = pids.iter().copied().map(Some).collect();
+                let targets = pids.clone();
                 resolved_app_pids = Some(pids);
                 targets
             }
-            (None, None) => vec![None],
+            (None, None) => return Ok(Closure::Incomplete),
         };
         let mut windows = Vec::new();
         let mut hidden = false;
         for pid in pids {
-            let mut args = json!({"on_screen_only": false});
-            if let Some(pid) = pid {
-                args["pid"] = json!(pid);
-            }
             let listed = self
-                .call("list_windows", args)
+                .call("list_windows", json!({"pid": pid, "on_screen_only": false}))
                 .await
                 .map_err(|error| Miss::new("lookup_failed", error))?;
             if listed.get("enumeration_complete").and_then(Value::as_bool) != Some(true) {
                 return Ok(Closure::Incomplete);
             }
-            if let Some(entries) = listed.get("windows").and_then(Value::as_array) {
-                windows.extend(entries.iter().cloned());
-            }
-            if let (Some(window_id), Some(ids)) = (
-                spec.window_id,
-                listed
-                    .get("authoritative_window_ids")
-                    .and_then(Value::as_array),
-            ) {
-                if let Some(ids) = ids.iter().map(Value::as_u64).collect::<Option<Vec<_>>>() {
-                    hidden |= ids.contains(&window_id);
-                }
-            }
+            let Some(ids) = listed
+                .get("authoritative_window_ids")
+                .and_then(Value::as_array)
+                .and_then(|ids| ids.iter().map(Value::as_u64).collect::<Option<Vec<_>>>())
+            else {
+                return Ok(Closure::Incomplete);
+            };
+            let entries = listed
+                .get("windows")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            hidden |= match spec.window_id {
+                Some(window_id) => ids.contains(&window_id),
+                None => ids.iter().any(|id| {
+                    !entries
+                        .iter()
+                        .any(|entry| entry.get("window_id").and_then(Value::as_u64) == Some(*id))
+                }),
+            };
+            windows.extend(entries);
         }
         let pids = match (&spec.app, resolved_app_pids) {
             (_, Some(pids)) => pids,

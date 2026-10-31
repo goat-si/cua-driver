@@ -375,7 +375,19 @@ async fn a_window_missing_from_the_list_is_gone_only_when_the_listing_is_complet
     for (listing, closed) in [
         (json!({"windows": []}), false),
         (json!({"windows": [], "enumeration_complete": false}), false),
-        (json!({"windows": [], "enumeration_complete": true}), true),
+        (json!({"windows": [], "enumeration_complete": true}), false),
+        (
+            json!({"windows": [], "enumeration_complete": true, "authoritative_window_ids": ["7"]}),
+            false,
+        ),
+        (
+            json!({"windows": [], "enumeration_complete": true, "authoritative_window_ids": [7]}),
+            false,
+        ),
+        (
+            json!({"windows": [], "enumeration_complete": true, "authoritative_window_ids": []}),
+            true,
+        ),
     ] {
         let harness = Harness::new();
         harness.respond("list_windows", listing.clone());
@@ -392,6 +404,44 @@ async fn a_window_missing_from_the_list_is_gone_only_when_the_listing_is_complet
             );
         }
         assert_eq!(harness.hits("get_window_state"), 0, "{listing}");
+    }
+}
+
+#[tokio::test]
+async fn a_pidless_gone_check_is_never_proven_by_a_global_listing() {
+    let harness = Harness::new();
+    harness.respond(
+        "list_windows",
+        json!({"windows": [], "enumeration_complete": true}),
+    );
+    let result = harness
+        .run(json!({"steps": [{"expect": {"window": "Panel", "name": "Save", "gone": true, "timeout_ms": 0}}]}))
+        .await;
+    let result = result.structured_content.unwrap();
+    assert_eq!(result["steps"][0]["code"], "gone_unconfirmed", "{result}");
+}
+
+#[tokio::test]
+async fn a_hidden_window_leaves_a_title_closure_unproven() {
+    let main = json!({"pid": 42, "window_id": 7, "app_name": "Demo", "title": "Main", "bounds": {"x": 0, "y": 0, "width": 10, "height": 10}, "is_on_screen": true, "z_index": 1});
+    for (ids, closed) in [(json!([7, 9]), false), (json!([7]), true)] {
+        let harness = Harness::new();
+        harness.respond(
+            "list_windows",
+            json!({"windows": [main.clone()], "enumeration_complete": true, "authoritative_window_ids": ids.clone()}),
+        );
+        let result = harness
+            .run(json!({"steps": [{"expect": {"pid": 42, "window": "Panel", "name": "Save", "gone": true, "timeout_ms": 0}}]}))
+            .await;
+        if closed {
+            assert_ne!(result.is_error, Some(true), "{ids} {}", text(&result));
+        } else {
+            let result = result.structured_content.unwrap();
+            assert_eq!(
+                result["steps"][0]["code"], "gone_unconfirmed",
+                "{ids} {result}"
+            );
+        }
     }
 }
 
