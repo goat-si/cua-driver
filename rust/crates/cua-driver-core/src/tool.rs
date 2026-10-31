@@ -136,7 +136,7 @@ pub fn with_runtime_scope<T>(scope: String, action: impl FnOnce() -> T) -> T {
     action()
 }
 
-fn desktop_action_coordinator() -> &'static tokio::sync::Mutex<()> {
+pub(crate) fn desktop_action_coordinator() -> &'static tokio::sync::Mutex<()> {
     static COORDINATOR: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
     COORDINATOR.get_or_init(|| tokio::sync::Mutex::new(()))
 }
@@ -7315,6 +7315,151 @@ resources:
                 ..
             }
         ));
+    }
+
+    struct LeaseProbe {
+        hits: Arc<AtomicUsize>,
+        retain: bool,
+        def: super::ToolDef,
+    }
+
+    #[async_trait::async_trait]
+    impl super::Tool for LeaseProbe {
+        fn def(&self) -> &super::ToolDef {
+            &self.def
+        }
+        async fn invoke(&self, args: serde_json::Value) -> ToolResult {
+            self.hits.fetch_add(1, Ordering::SeqCst);
+            if self.retain {
+                crate::desktop_lease::retain_lease(args["_session_id"].as_str().unwrap()).unwrap();
+            }
+            ToolResult::text("input delivered")
+        }
+    }
+
+    fn lease_test_registry(
+        backend: Arc<crate::desktop_lease::test_support::TestBackend>,
+        retain: bool,
+        hits: Arc<AtomicUsize>,
+    ) -> super::ToolRegistry {
+        use crate::desktop_lease::{test_support::TestClock, LeaseManager};
+        let mut registry = super::ToolRegistry::new();
+        registry.desktop_lease = LeaseManager::new(backend, Arc::new(TestClock::default()));
+        registry.register(Box::new(LeaseProbe {
+            hits,
+            retain,
+            def: super::ToolDef {
+                name: "click".into(),
+                description: "probe".into(),
+                input_schema: serde_json::json!({"type":"object"}),
+                read_only: false,
+                destructive: false,
+                idempotent: false,
+                open_world: false,
+            },
+        }));
+        registry
+    }
+
+    async fn lease_click(
+        registry: &super::ToolRegistry,
+        context: &Arc<crate::session_authorization::EffectiveAuthorizationContext>,
+        session: &str,
+    ) -> ToolResult {
+        registry
+            .invoke_with_context(
+                "click",
+                serde_json::json!({
+                    "pid": 42, "window_id": 7, "x": 10, "y": 20, "session": session,
+                }),
+                context.clone(),
+            )
+            .await
+    }
+
+    #[tokio::test]
+    async fn acquires_after_release() {
+        let backend = Arc::new(crate::desktop_lease::test_support::TestBackend::default());
+        backend.hold();
+        backend.release_after.store(3, Ordering::SeqCst);
+        let hits = Arc::new(AtomicUsize::new(0));
+        let registry = lease_test_registry(backend.clone(), false, hits.clone());
+        let result = lease_click(&registry, &unrestricted_context(), "lease-polls").await;
+        assert_ne!(result.is_error, Some(true));
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        assert_eq!(backend.attempts.load(Ordering::SeqCst), 4);
+    }
+
+    #[tokio::test]
+    async fn unavailable_backend_refuses_without_dispatch() {
+        let backend = Arc::new(crate::desktop_lease::test_support::TestBackend::default());
+        backend.unavailable.store(true, Ordering::SeqCst);
+        let hits = Arc::new(AtomicUsize::new(0));
+        let registry = lease_test_registry(backend, false, hits.clone());
+        let result = lease_click(&registry, &unrestricted_context(), "lease-unavailable").await;
+        let body = result.structured_content.unwrap();
+        assert_eq!(body["effect"], "refused");
+        assert_eq!(body["code"], "desktop_lease_unavailable");
+        assert!(body["refusal"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("synthetic failure"));
+        assert_eq!(hits.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn retained_lease_is_reused_by_its_owner_and_blocks_others() {
+        let backend = Arc::new(crate::desktop_lease::test_support::TestBackend::default());
+        let hits = Arc::new(AtomicUsize::new(0));
+        let registry = lease_test_registry(backend.clone(), true, hits.clone());
+        let context = unrestricted_context();
+        let owner = context.runtime_session_key("lease-holder");
+        assert_ne!(
+            lease_click(&registry, &context, "lease-holder")
+                .await
+                .is_error,
+            Some(true)
+        );
+        assert_ne!(
+            lease_click(&registry, &context, "lease-holder")
+                .await
+                .is_error,
+            Some(true)
+        );
+        assert_eq!(backend.attempts.load(Ordering::SeqCst), 1);
+        let other = lease_click(&registry, &context, "lease-other").await;
+        assert_eq!(other.structured_content.unwrap()["code"], "desktop_busy");
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+        crate::desktop_lease::release_lease(&owner);
+        assert_ne!(
+            lease_click(&registry, &context, "lease-other")
+                .await
+                .is_error,
+            Some(true)
+        );
+        crate::desktop_lease::release_lease(&context.runtime_session_key("lease-other"));
+    }
+
+    #[tokio::test]
+    async fn session_end_releases_a_retained_lease() {
+        let backend = Arc::new(crate::desktop_lease::test_support::TestBackend::default());
+        let hits = Arc::new(AtomicUsize::new(0));
+        let registry = lease_test_registry(backend.clone(), true, hits);
+        let context = unrestricted_context();
+        assert_ne!(
+            lease_click(&registry, &context, "lease-ended")
+                .await
+                .is_error,
+            Some(true)
+        );
+        crate::session::end_session(&context.runtime_session_key("lease-ended"));
+        assert_ne!(
+            lease_click(&registry, &context, "lease-successor")
+                .await
+                .is_error,
+            Some(true)
+        );
+        crate::desktop_lease::release_lease(&context.runtime_session_key("lease-successor"));
     }
 
     #[tokio::test]

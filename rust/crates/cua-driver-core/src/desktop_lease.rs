@@ -22,13 +22,27 @@ pub struct FileLeaseBackend {
 
 impl Default for FileLeaseBackend {
     fn default() -> Self {
-        Self {
-            directory: canonical_directory(),
+        #[cfg(windows)]
+        {
+            Self::with_known_folder(canonical_directory)
+        }
+        #[cfg(not(windows))]
+        {
+            Self {
+                directory: canonical_directory(),
+            }
         }
     }
 }
 
 impl FileLeaseBackend {
+    #[cfg(windows)]
+    fn with_known_folder(resolver: impl FnOnce() -> io::Result<PathBuf>) -> Self {
+        Self {
+            directory: resolver().map(|path| path.join("cua-driver")),
+        }
+    }
+
     #[cfg(test)]
     fn at(directory: &Path) -> Self {
         Self {
@@ -51,7 +65,7 @@ fn canonical_directory() -> io::Result<PathBuf> {
         .map_err(io::Error::other)?;
     let path = unsafe { raw.to_string() };
     unsafe { CoTaskMemFree(Some(raw.0.cast())) };
-    Ok(PathBuf::from(path.map_err(io::Error::other)?).join("cua-driver"))
+    Ok(PathBuf::from(path.map_err(io::Error::other)?))
 }
 
 #[cfg(not(any(unix, windows)))]
@@ -104,19 +118,59 @@ fn prepare_directory(directory: &Path) -> io::Result<()> {
 
 #[cfg(unix)]
 fn open_lock(path: &Path) -> io::Result<File> {
-    use std::os::unix::fs::OpenOptionsExt;
-    OpenOptions::new()
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    let directory = path
+        .parent()
+        .ok_or_else(|| io::Error::other("missing lease directory"))?;
+    let dir = OpenOptions::new()
         .read(true)
-        .write(true)
-        .create(true)
-        .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(path)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(directory)?;
+    let fd_meta = dir.metadata()?;
+    let path_meta = fs::symlink_metadata(directory)?;
+    if !fd_meta.is_dir()
+        || !path_meta.file_type().is_dir()
+        || fd_meta.uid() != unsafe { libc::geteuid() }
+        || fd_meta.mode() & 0o077 != 0
+        || fd_meta.dev() != path_meta.dev()
+        || fd_meta.ino() != path_meta.ino()
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "unsafe desktop lease directory",
+        ));
+    }
+    let fd = unsafe {
+        libc::openat(
+            dir.as_raw_fd(),
+            c"desktop-input.lock".as_ptr(),
+            libc::O_RDWR | libc::O_CREAT | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            0o600,
+        )
+    };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(unsafe { File::from_raw_fd(fd) })
 }
 
 #[cfg(unix)]
 fn validate_locked(file: &File, path: &Path) -> io::Result<()> {
     use std::os::unix::fs::MetadataExt;
+    let parent = path
+        .parent()
+        .ok_or_else(|| io::Error::other("missing lease directory"))?;
+    let directory = fs::symlink_metadata(parent)?;
+    if !directory.file_type().is_dir()
+        || directory.uid() != unsafe { libc::geteuid() }
+        || directory.mode() & 0o077 != 0
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "unsafe desktop lease directory",
+        ));
+    }
     let fd = file.metadata()?;
     let entry = fs::symlink_metadata(path)?;
     if !entry.file_type().is_file() || fd.dev() != entry.dev() || fd.ino() != entry.ino() {
@@ -165,12 +219,31 @@ fn open_lock(path: &Path) -> io::Result<File> {
         .create(true)
         .custom_flags(OPEN_REPARSE)
         .open(path)?;
+    use std::os::windows::fs::MetadataExt;
+    if file.metadata()?.file_attributes() & 0x400 != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "unsafe desktop lease file",
+        ));
+    }
     refuse_reparse(path, false)?;
     Ok(file)
 }
 
 #[cfg(windows)]
-fn validate_locked(_file: &File, path: &Path) -> io::Result<()> {
+fn validate_locked(file: &File, path: &Path) -> io::Result<()> {
+    use std::os::windows::fs::MetadataExt;
+    if file.metadata()?.file_attributes() & 0x400 != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "unsafe desktop lease file",
+        ));
+    }
+    refuse_reparse(
+        path.parent()
+            .ok_or_else(|| io::Error::other("missing lease directory"))?,
+        true,
+    )?;
     refuse_reparse(path, false)
 }
 
@@ -201,6 +274,39 @@ mod tests {
         assert!(backend.try_acquire().unwrap().is_some());
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn windows_known_folder_failure_refuses() {
+        let backend = FileLeaseBackend::with_known_folder(|| {
+            Err(io::Error::other("known folder unavailable"))
+        });
+        let error = match backend.try_acquire() {
+            Ok(_) => panic!("known folder failure must refuse"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("known folder unavailable"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_backend_refuses_symlink_and_replacement() {
+        use std::os::unix::fs::symlink;
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("lease");
+        prepare_directory(&dir).unwrap();
+        let path = dir.join("desktop-input.lock");
+        let target = root.path().join("target");
+        fs::write(&target, b"").unwrap();
+        symlink(&target, &path).unwrap();
+        assert!(FileLeaseBackend::at(&dir).try_acquire().is_err());
+        fs::remove_file(&path).unwrap();
+        let file = open_lock(&path).unwrap();
+        file.try_lock_exclusive().unwrap();
+        fs::rename(&path, dir.join("old.lock")).unwrap();
+        File::create(&path).unwrap();
+        assert!(validate_locked(&file, &path).is_err());
+    }
+
     #[cfg(unix)]
     #[test]
     fn file_backend_refuses_unsafe_directory() {
@@ -227,10 +333,8 @@ pub trait LeaseClock: Send + Sync {
     async fn sleep(&self, duration: Duration);
 }
 
-#[cfg(not(test))]
 struct TokioClock(tokio::time::Instant);
 
-#[cfg(not(test))]
 #[async_trait::async_trait]
 impl LeaseClock for TokioClock {
     fn now(&self) -> Duration {
@@ -302,9 +406,36 @@ impl Drop for ActiveLease {
 }
 
 #[derive(Debug)]
-pub(crate) enum LeaseFailure {
+pub enum LeaseFailure {
     Busy,
     Unavailable(String),
+}
+
+/// An external interactive dispatch holds this guard until its native batch
+/// finishes. Call `retain_lease` before dropping it if input remains held.
+pub struct OwnedLease {
+    _lease: ActiveLease,
+    _coordinator: tokio::sync::MutexGuard<'static, ()>,
+}
+
+/// Admit an interactive batch that bypasses ToolRegistry. `owner` must be a
+/// trusted runtime session key (or `runtime_owner` for a sessionless runtime).
+/// The platform must perform this before delivering any native input.
+pub async fn acquire_owned(owner: &str) -> Result<OwnedLease, LeaseFailure> {
+    static MANAGER: OnceLock<LeaseManager> = OnceLock::new();
+    let coordinator = crate::tool::desktop_action_coordinator();
+    let coordinator = match coordinator.try_lock() {
+        Ok(guard) => guard,
+        Err(_) => coordinator.lock().await,
+    };
+    let lease = MANAGER
+        .get_or_init(LeaseManager::production)
+        .acquire(owner)
+        .await?;
+    Ok(OwnedLease {
+        _lease: lease,
+        _coordinator: coordinator,
+    })
 }
 
 pub(crate) struct LeaseManager {
@@ -317,7 +448,6 @@ impl LeaseManager {
         Self { backend, clock }
     }
 
-    #[cfg(not(test))]
     pub(crate) fn production() -> Self {
         Self::new(
             Arc::new(FileLeaseBackend::default()),
