@@ -763,6 +763,14 @@ fn legacy_has_publishable_readback(tool_name: &str, structured: &serde_json::Val
         && structured.get("effect").and_then(serde_json::Value::as_str) == Some("confirmed")
 }
 
+fn linux_basis_transport(mode: Option<&str>) -> Option<ActionTransport> {
+    match mode {
+        Some("foreground") => Some(ActionTransport::LinuxXTest),
+        Some("background") => Some(ActionTransport::LinuxXSendEvent),
+        _ => None,
+    }
+}
+
 fn transport_from_legacy(
     tool_name: &str,
     args: &serde_json::Value,
@@ -779,6 +787,11 @@ fn transport_from_legacy(
             Some("background") => ActionTransport::WindowsPostMessage,
             _ => return None,
         },
+        "pixel_basis" if cfg!(target_os = "linux") => linux_basis_transport(
+            structured
+                .get("delivery_mode")
+                .and_then(serde_json::Value::as_str),
+        )?,
         "pixel_basis" => return None,
         "ax" | "ax_fg" => {
             if cfg!(target_os = "macos") {
@@ -2123,9 +2136,67 @@ mod tests {
     }
 
     #[test]
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(not(any(target_os = "windows", target_os = "linux")))]
     fn pixel_basis_is_not_normalized_on_other_platforms() {
         assert!(ActionExecutionRecord::from_legacy("click", &serde_json::json!({}), &serde_json::json!({"path":"pixel_basis","effect":"refused","delivery_mode":"foreground"})).is_none());
+    }
+
+    #[test]
+    fn linux_pixel_basis_transport_maps_delivery_mode() {
+        assert_eq!(
+            linux_basis_transport(Some("foreground")),
+            Some(ActionTransport::LinuxXTest)
+        );
+        assert_eq!(
+            linux_basis_transport(Some("background")),
+            Some(ActionTransport::LinuxXSendEvent)
+        );
+        assert_eq!(linux_basis_transport(Some("other")), None);
+        assert_eq!(linux_basis_transport(None), None);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn linux_pixel_basis_results_normalize_using_actual_transport() {
+        for (effect, mode, expected_effect, transport, delivery) in [
+            (
+                "refused",
+                "foreground",
+                ActionEffect::Refused,
+                ActionTransport::LinuxXTest,
+                None,
+            ),
+            (
+                "unverifiable",
+                "background",
+                ActionEffect::Unverifiable,
+                ActionTransport::LinuxXSendEvent,
+                Some(ActualDelivery::Background),
+            ),
+            (
+                "partial",
+                "foreground",
+                ActionEffect::Partial,
+                ActionTransport::LinuxXTest,
+                Some(ActualDelivery::Foreground),
+            ),
+            (
+                "uncertain",
+                "background",
+                ActionEffect::Unverifiable,
+                ActionTransport::LinuxXSendEvent,
+                Some(ActualDelivery::Background),
+            ),
+        ] {
+            let record = ActionExecutionRecord::from_legacy("click", &serde_json::json!({"delivery_mode":"foreground"}), &serde_json::json!({"path":"pixel_basis", "effect":effect, "nothing_sent":effect == "refused", "code":"stale_basis", "events_sent":if effect == "refused" {0} else {2}, "delivery_mode":mode})).unwrap();
+            assert_eq!(record.effect, expected_effect);
+            assert_eq!(record.transport, transport);
+            assert_eq!(record.actual_delivery, delivery);
+            assert_eq!(
+                record.delivered_count,
+                Some(if effect == "refused" { 0 } else { 2 })
+            );
+        }
     }
 
     #[test]
