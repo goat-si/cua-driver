@@ -126,40 +126,70 @@ pub unsafe fn scroll_into_view_and_recenter(
 /// top-level host HWND ignores `WM_VSCROLL`. Keeping this on the UIA channel
 /// makes indexed background scrolls reach that container without activating
 /// the host window.
-pub unsafe fn scroll_element(
+#[derive(Debug)]
+pub(crate) struct ScrollWrite {
+    pub completed: u32,
+    pub requested: u32,
+    pub stop: Option<crate::uia_mutation::MutationStop>,
+}
+
+pub(crate) unsafe fn scroll_element(
     element_ptr: usize,
     direction: &str,
     amount: u32,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<ScrollWrite> {
+    use crate::uia_mutation::{pattern_absent, scroll_preflight, MutationStop};
     if element_ptr == 0 {
         anyhow::bail!("cached UIA scroll element is null");
     }
-    let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
-    let elem: IUIAutomationElement = IUIAutomationElement::from_raw(element_ptr as *mut _);
-    let pattern = elem
-        .GetCurrentPattern(UIA_ScrollPatternId)
-        .map_err(|e| anyhow::anyhow!("UIA ScrollPattern unavailable: {e}"))?;
-    let scroll = pattern
-        .cast::<IUIAutomationScrollPattern>()
-        .map_err(|e| anyhow::anyhow!("UIA ScrollPattern cast failed: {e}"))?;
-    let vertical = match direction {
-        "up" => ScrollAmount_LargeDecrement,
-        "down" => ScrollAmount_LargeIncrement,
-        "left" => ScrollAmount_LargeDecrement,
-        "right" => ScrollAmount_LargeIncrement,
-        other => anyhow::bail!("unknown scroll direction {other:?}"),
+    let requested = amount.max(1);
+    let mut outcome = ScrollWrite {
+        completed: 0,
+        requested,
+        stop: None,
     };
-    let horizontal = matches!(direction, "left" | "right");
-    for _ in 0..amount.max(1) {
+    let (horizontal, increment, read) = scroll_preflight(direction, || {
+        let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+        let elem =
+            std::mem::ManuallyDrop::new(IUIAutomationElement::from_raw(element_ptr as *mut _));
+        elem.GetCurrentPattern(UIA_ScrollPatternId)
+            .and_then(|pattern| pattern.cast::<IUIAutomationScrollPattern>())
+    })
+    .ok_or_else(|| anyhow::anyhow!("unknown scroll direction {direction:?}"))?;
+    let scroll = match read {
+        Ok(scroll) => scroll,
+        Err(error) => {
+            let hr = error.code().0;
+            outcome.stop = Some(if pattern_absent(hr) {
+                MutationStop::Absent
+            } else {
+                MutationStop::AcquireFailed(hr)
+            });
+            return Ok(outcome);
+        }
+    };
+    let step = if increment {
+        ScrollAmount_LargeIncrement
+    } else {
+        ScrollAmount_LargeDecrement
+    };
+    for _ in 0..requested {
         let result = if horizontal {
-            scroll.Scroll(vertical, ScrollAmount_NoAmount)
+            scroll.Scroll(step, ScrollAmount_NoAmount)
         } else {
-            scroll.Scroll(ScrollAmount_NoAmount, vertical)
+            scroll.Scroll(ScrollAmount_NoAmount, step)
         };
-        result.map_err(|e| anyhow::anyhow!("UIA scroll failed: {e}"))?;
+        match result {
+            Ok(()) => outcome.completed += 1,
+            Err(error) => {
+                let hr = error.code().0;
+                // Preserve the HRESULT, including NOTSUPPORTED, for routing.
+                outcome.stop = Some(MutationStop::Write(hr));
+                break;
+            }
+        }
     }
-    std::mem::forget(elem);
-    Ok(())
+    Ok(outcome)
 }
 
 /// Strategy 1: `ScrollItemPattern::ScrollIntoView` on the element itself.
