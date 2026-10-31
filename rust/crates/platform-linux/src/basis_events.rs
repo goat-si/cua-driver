@@ -102,6 +102,64 @@ mod tests {
     use super::*;
 
     #[test]
+    fn guard_refusal_sends_no_input_or_cleanup_release() {
+        use cua_driver_core::guarded_dispatch::{run_guarded, GuardedResult, SendFailure};
+        use cua_driver_core::window_basis::BasisRefusal;
+        struct Fake(Vec<Event>);
+        impl Requests for Fake {
+            fn submit(&mut self, event: Event) -> Result<(), SendFailure> {
+                self.0.push(event);
+                Ok(())
+            }
+        }
+        let events = plan(true, &[37], 1, 1);
+        let mut sink = Sink {
+            requests: Fake(vec![]),
+            events,
+            resources: Default::default(),
+        };
+        let GuardedResult::Refused { outcome, .. } = run_guarded(&mut sink, 4, || {
+            Err(BasisRefusal {
+                code: "stale_basis",
+                reason: "window_moved",
+            })
+        }) else {
+            panic!()
+        };
+        assert_eq!(outcome.events_sent, 0);
+        assert!(outcome.cleanup_results.is_empty());
+        assert!(sink.requests.0.is_empty());
+    }
+
+    #[test]
+    fn success_releases_modifiers_in_reverse_order() {
+        use cua_driver_core::guarded_dispatch::{run_guarded, GuardedResult, SendFailure};
+        struct Fake(Vec<Event>);
+        impl Requests for Fake {
+            fn submit(&mut self, event: Event) -> Result<(), SendFailure> {
+                self.0.push(event);
+                Ok(())
+            }
+        }
+        let events = plan(true, &[37, 50], 1, 1);
+        let mut sink = Sink {
+            requests: Fake(vec![]),
+            events: events.clone(),
+            resources: Default::default(),
+        };
+        let GuardedResult::Sent { outcome } = run_guarded(&mut sink, events.len(), || Ok(()))
+        else {
+            panic!()
+        };
+        assert_eq!(
+            &sink.requests.0[events.len()..],
+            &[Event::KeyRelease(50), Event::KeyRelease(37)]
+        );
+        assert_eq!(outcome.cleanup_results.len(), 2);
+        assert!(sink.resources.needing_cleanup().is_empty());
+    }
+
+    #[test]
     fn failed_cleanup_reports_remaining_state() {
         use cua_driver_core::guarded_dispatch::{run_guarded, Emitted, GuardedResult, SendFailure};
         use cua_driver_core::window_basis::DispatchEffect;
