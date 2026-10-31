@@ -7499,6 +7499,7 @@ resources:
             "desktop_busy"
         );
         assert_eq!(hits.load(Ordering::SeqCst), 0);
+        assert_eq!(backend.attempts.load(Ordering::SeqCst), 501);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
