@@ -87,12 +87,17 @@ impl LeaseBackend for FileLeaseBackend {
         let file = open_lock(&path)?;
         match file.try_lock_exclusive() {
             Ok(()) => {}
-            Err(error) if error.kind() == fs2::lock_contended_error().kind() => return Ok(None),
+            Err(error) if is_lock_contention(&error) => return Ok(None),
             Err(error) => return Err(error),
         }
         validate_locked(&file, &path)?;
         Ok(Some(Box::new(file)))
     }
+}
+
+fn is_lock_contention(error: &io::Error) -> bool {
+    error.raw_os_error().is_some()
+        && error.raw_os_error() == fs2::lock_contended_error().raw_os_error()
 }
 
 #[cfg(unix)]
@@ -244,7 +249,51 @@ fn validate_locked(file: &File, path: &Path) -> io::Result<()> {
             .ok_or_else(|| io::Error::other("missing lease directory"))?,
         true,
     )?;
-    refuse_reparse(path, false)
+    refuse_reparse(path, false)?;
+    use std::os::windows::fs::OpenOptionsExt;
+    let current = OpenOptions::new()
+        .read(true)
+        .custom_flags(0x0020_0000) // FILE_FLAG_OPEN_REPARSE_POINT
+        .open(path)?;
+    if current.metadata()?.file_attributes() & 0x400 != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "unsafe desktop lease file",
+        ));
+    }
+    validate_identity(file, &current, file_identity)
+}
+
+#[cfg(windows)]
+fn file_identity(file: &File) -> io::Result<(u32, u32, u32)> {
+    use std::os::windows::io::AsRawHandle;
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::Storage::FileSystem::{
+        GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
+    };
+    let mut info = BY_HANDLE_FILE_INFORMATION::default();
+    unsafe { GetFileInformationByHandle(HANDLE(file.as_raw_handle()), &mut info) }
+        .map_err(io::Error::other)?;
+    Ok((
+        info.dwVolumeSerialNumber,
+        info.nFileIndexHigh,
+        info.nFileIndexLow,
+    ))
+}
+
+#[cfg(windows)]
+fn validate_identity(
+    locked: &File,
+    current: &File,
+    read: impl Fn(&File) -> io::Result<(u32, u32, u32)>,
+) -> io::Result<()> {
+    if read(locked)? != read(current)? {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "desktop lease file was replaced",
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(not(any(unix, windows)))]
@@ -263,6 +312,111 @@ fn validate_locked(_: &File, _: &Path) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Default)]
+    struct GateClock {
+        requested: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+        sleeps: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl LeaseClock for GateClock {
+        fn now(&self) -> Duration {
+            Duration::ZERO
+        }
+        async fn sleep(&self, duration: Duration) {
+            assert_eq!(duration, CANCELLED_DISPATCH_GRACE);
+            self.sleeps.fetch_add(1, Ordering::SeqCst);
+            self.requested.notify_one();
+            self.release.notified().await;
+        }
+    }
+
+    async fn cancel_dispatch(
+        take_hold: bool,
+    ) -> (
+        Arc<test_support::TestBackend>,
+        Arc<GateClock>,
+        Option<WorkerHold>,
+    ) {
+        let backend = Arc::new(test_support::TestBackend::default());
+        let clock = Arc::new(GateClock::default());
+        let manager = LeaseManager::new(backend.clone(), clock.clone());
+        let mut lease = manager.acquire("cancel-test").await.unwrap();
+        let coordinator = crate::tool::desktop_action_coordinator().lock().await;
+        lease.activate();
+        let mut admission = DispatchAdmission::new(lease, coordinator, clock.clone());
+        let captured = Mutex::new(None);
+        let mut invocation = Box::pin(admission.invoke(async {
+            if take_hold {
+                *captured.lock().unwrap() = worker_hold();
+            }
+            std::future::pending::<()>().await;
+        }));
+        assert!(futures_util::poll!(invocation.as_mut()).is_pending());
+        drop(invocation);
+        drop(admission);
+        let hold = captured.into_inner().unwrap();
+        (backend, clock, hold)
+    }
+
+    #[tokio::test]
+    async fn cancelled_dispatch_keeps_the_lease_until_its_worker_hold_drops() {
+        let (backend, clock, hold) = cancel_dispatch(true).await;
+        let hold = hold.expect("worker hold installed");
+        let second = hold.clone();
+        assert!(backend.try_acquire().unwrap().is_none());
+        assert!(crate::tool::desktop_action_coordinator()
+            .try_lock()
+            .is_err());
+        drop(hold);
+        tokio::task::yield_now().await;
+        assert!(backend.try_acquire().unwrap().is_none());
+        drop(second);
+        let coordinator = crate::tool::desktop_action_coordinator().lock().await;
+        assert!(backend.try_acquire().unwrap().is_some());
+        assert_eq!(clock.sleeps.load(Ordering::SeqCst), 0);
+        drop(coordinator);
+    }
+
+    #[tokio::test]
+    async fn cancelled_dispatch_without_worker_hold_releases_after_grace() {
+        let (backend, clock, hold) = cancel_dispatch(false).await;
+        assert!(hold.is_none());
+        clock.requested.notified().await;
+        assert!(backend.try_acquire().unwrap().is_none());
+        assert!(crate::tool::desktop_action_coordinator()
+            .try_lock()
+            .is_err());
+        clock.release.notify_one();
+        let coordinator = crate::tool::desktop_action_coordinator().lock().await;
+        assert!(backend.try_acquire().unwrap().is_some());
+        assert_eq!(clock.sleeps.load(Ordering::SeqCst), 1);
+        drop(coordinator);
+    }
+
+    #[test]
+    fn contention_is_classified_by_raw_os_error() {
+        let synthetic = io::Error::from(io::ErrorKind::WouldBlock);
+        assert!(!is_lock_contention(&synthetic));
+        assert!(is_lock_contention(&fs2::lock_contended_error()));
+        assert!(!is_lock_contention(&io::Error::from_raw_os_error(1)));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_identity_reader_rejects_replacement() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let file = tempfile::tempfile().unwrap();
+        let calls = AtomicUsize::new(0);
+        let error = validate_identity(&file, &file, |_| {
+            Ok((7, 8, calls.fetch_add(1, Ordering::SeqCst) as u32))
+        })
+        .unwrap_err();
+        assert_eq!(error.to_string(), "desktop lease file was replaced");
+        validate_identity(&file, &file, |_| Ok((7, 8, 9))).unwrap();
+    }
 
     #[test]
     fn file_backend_contends_until_release() {
@@ -323,6 +477,7 @@ mod tests {
 }
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::Duration;
 
@@ -346,6 +501,128 @@ impl LeaseClock for TokioClock {
 }
 
 type SharedGuard = Arc<Mutex<LeaseGuard>>;
+
+const CANCELLED_DISPATCH_GRACE: Duration = Duration::from_secs(5);
+
+#[derive(Default)]
+struct WorkerTracker {
+    taken: AtomicBool,
+    count: AtomicUsize,
+    changed: tokio::sync::Notify,
+}
+
+struct DispatchHold {
+    lease: SharedGuard,
+    tracker: Arc<WorkerTracker>,
+}
+
+tokio::task_local! {
+    static DISPATCH_HOLD: DispatchHold;
+}
+
+/// Keeps the current desktop lease alive in a non-cancellable worker.
+///
+/// Call [`worker_hold`] inside `Tool::invoke`, before spawning a worker that
+/// can continue injecting input after the invocation future is cancelled.
+/// Move the returned hold into the worker closure and keep it until all input
+/// has stopped. Spawned tasks do not inherit the task-local dispatch context.
+pub struct WorkerHold {
+    lease: SharedGuard,
+    tracker: Arc<WorkerTracker>,
+}
+
+impl Clone for WorkerHold {
+    fn clone(&self) -> Self {
+        self.tracker.count.fetch_add(1, Ordering::SeqCst);
+        Self {
+            lease: self.lease.clone(),
+            tracker: self.tracker.clone(),
+        }
+    }
+}
+
+impl Drop for WorkerHold {
+    fn drop(&mut self) {
+        if self.tracker.count.fetch_sub(1, Ordering::SeqCst) == 1 {
+            self.tracker.changed.notify_one();
+        }
+    }
+}
+
+/// Acquire a hold for the currently admitted desktop dispatch, if any.
+pub fn worker_hold() -> Option<WorkerHold> {
+    DISPATCH_HOLD
+        .try_with(|dispatch| {
+            dispatch.tracker.taken.store(true, Ordering::SeqCst);
+            dispatch.tracker.count.fetch_add(1, Ordering::SeqCst);
+            WorkerHold {
+                lease: dispatch.lease.clone(),
+                tracker: dispatch.tracker.clone(),
+            }
+        })
+        .ok()
+}
+
+pub(crate) struct DispatchAdmission {
+    lease: Option<ActiveLease>,
+    coordinator: Option<tokio::sync::MutexGuard<'static, ()>>,
+    tracker: Arc<WorkerTracker>,
+    clock: Arc<dyn LeaseClock>,
+    completed: bool,
+}
+
+impl DispatchAdmission {
+    pub(crate) fn new(
+        lease: ActiveLease,
+        coordinator: tokio::sync::MutexGuard<'static, ()>,
+        clock: Arc<dyn LeaseClock>,
+    ) -> Self {
+        Self {
+            lease: Some(lease),
+            coordinator: Some(coordinator),
+            tracker: Arc::new(WorkerTracker::default()),
+            clock,
+            completed: false,
+        }
+    }
+
+    pub(crate) async fn invoke<F: std::future::Future>(&mut self, future: F) -> F::Output {
+        let hold = DispatchHold {
+            lease: self.lease.as_ref().unwrap().guard.clone(),
+            tracker: self.tracker.clone(),
+        };
+        let output = DISPATCH_HOLD.scope(hold, future).await;
+        self.completed = true;
+        output
+    }
+}
+
+impl Drop for DispatchAdmission {
+    fn drop(&mut self) {
+        if self.completed {
+            return;
+        }
+        let lease = self.lease.take().unwrap();
+        let coordinator = self.coordinator.take().unwrap();
+        let tracker = self.tracker.clone();
+        let clock = self.clock.clone();
+        tokio::spawn(async move {
+            if tracker.taken.load(Ordering::SeqCst) {
+                loop {
+                    let notified = tracker.changed.notified();
+                    if tracker.count.load(Ordering::SeqCst) == 0 {
+                        break;
+                    }
+                    notified.await;
+                }
+            } else {
+                clock.sleep(CANCELLED_DISPATCH_GRACE).await;
+            }
+            drop(coordinator);
+            drop(lease);
+        });
+    }
+}
 
 #[derive(Default)]
 struct Owners {
@@ -389,10 +666,14 @@ pub fn runtime_owner(runtime_scope: &str) -> String {
 pub(crate) struct ActiveLease {
     owner: String,
     guard: SharedGuard,
+    active: bool,
 }
 
 impl Drop for ActiveLease {
     fn drop(&mut self) {
+        if !self.active {
+            return;
+        }
         let mut owners = owners().lock().unwrap();
         if owners
             .active
@@ -402,6 +683,17 @@ impl Drop for ActiveLease {
         {
             owners.active.remove(&self.owner);
         }
+    }
+}
+
+impl ActiveLease {
+    pub(crate) fn activate(&mut self) {
+        owners()
+            .lock()
+            .unwrap()
+            .active
+            .insert(self.owner.clone(), Arc::downgrade(&self.guard));
+        self.active = true;
     }
 }
 
@@ -423,15 +715,16 @@ pub struct OwnedLease {
 /// The platform must perform this before delivering any native input.
 pub async fn acquire_owned(owner: &str) -> Result<OwnedLease, LeaseFailure> {
     static MANAGER: OnceLock<LeaseManager> = OnceLock::new();
+    let mut lease = MANAGER
+        .get_or_init(LeaseManager::production)
+        .acquire(owner)
+        .await?;
     let coordinator = crate::tool::desktop_action_coordinator();
     let coordinator = match coordinator.try_lock() {
         Ok(guard) => guard,
         Err(_) => coordinator.lock().await,
     };
-    let lease = MANAGER
-        .get_or_init(LeaseManager::production)
-        .acquire(owner)
-        .await?;
+    lease.activate();
     Ok(OwnedLease {
         _lease: lease,
         _coordinator: coordinator,
@@ -444,6 +737,9 @@ pub(crate) struct LeaseManager {
 }
 
 impl LeaseManager {
+    pub(crate) fn clock(&self) -> Arc<dyn LeaseClock> {
+        self.clock.clone()
+    }
     pub(crate) fn new(backend: Arc<dyn LeaseBackend>, clock: Arc<dyn LeaseClock>) -> Self {
         Self { backend, clock }
     }
@@ -476,14 +772,10 @@ impl LeaseManager {
                     .await;
             }
         };
-        owners()
-            .lock()
-            .unwrap()
-            .active
-            .insert(owner.to_owned(), Arc::downgrade(&guard));
         Ok(ActiveLease {
             owner: owner.to_owned(),
             guard,
+            active: false,
         })
     }
 }

@@ -2485,25 +2485,11 @@ impl ToolRegistry {
                     | "end_session"
             );
         let private_consent_turn = is_existing_profile_prepare(resolved_name, &args);
-        let _desktop_action = if requires_desktop_coordination(
+        let file_lease = if requires_desktop_coordination(
             resolved_name,
             &args,
             tool.has_independent_input_lane(&args),
         ) {
-            let coordinator = desktop_action_coordinator();
-            // Avoid yielding the dispatch task when the process-wide input
-            // lane is uncontended. On Windows, that yield creates a window in
-            // which the foreground target can lose keyboard eligibility
-            // between the fixture's focus proof and SendInput. Contended
-            // runtimes still wait and serialize through the same mutex.
-            Some(match coordinator.try_lock() {
-                Ok(guard) => guard,
-                Err(_) => coordinator.lock().await,
-            })
-        } else {
-            None
-        };
-        let _file_lease = if _desktop_action.is_some() {
             let owner = runtime_session.clone().unwrap_or_else(|| {
                 crate::desktop_lease::runtime_owner(&context.runtime_scope_key())
             });
@@ -2524,6 +2510,18 @@ impl ToolRegistry {
                     }));
                 }
             }
+        } else {
+            None
+        };
+        // File lease waiters must not block the retained owner's coordinator.
+        let admission = if let Some(mut lease) = file_lease {
+            let coordinator = desktop_action_coordinator();
+            let guard = match coordinator.try_lock() {
+                Ok(guard) => guard,
+                Err(_) => coordinator.lock().await,
+            };
+            lease.activate();
+            Some((lease, guard))
         } else {
             None
         };
@@ -2565,11 +2563,22 @@ impl ToolRegistry {
         // back to the uncapped capture before any platform interprets them.
         crate::desktop_capture_scale::map_desktop_args(&mut args);
         crate::tool_activity::note_tool_activity();
-        let mut result = crate::recording::scope_dispatch_click_capture(
+        let dispatch = crate::recording::scope_dispatch_click_capture(
             pending_turn.as_ref(),
             tool.invoke(args.clone()),
-        )
-        .await;
+        );
+        let mut admission = admission.map(|(lease, coordinator)| {
+            crate::desktop_lease::DispatchAdmission::new(
+                lease,
+                coordinator,
+                self.desktop_lease.clock(),
+            )
+        });
+        let mut result = if let Some(admission) = admission.as_mut() {
+            admission.invoke(dispatch).await
+        } else {
+            dispatch.await
+        };
         match resolved_name {
             "get_desktop_state" if result.is_error != Some(true) => {
                 crate::desktop_capture_scale::record_desktop_state(
@@ -2629,7 +2638,7 @@ impl ToolRegistry {
         // capture or result shaping. Keeping the global desktop lock through
         // recording/PiP screenshots would unnecessarily block an unrelated
         // runtime after the input side effect has already completed.
-        drop(_desktop_action);
+        drop(admission);
         restore_public_runtime_result(&mut result, &runtime_prefix);
         // Preserve the producer's private summary for recording/replay before
         // the public ActionResult projection deliberately replaces legacy
@@ -7375,6 +7384,59 @@ resources:
                 context.clone(),
             )
             .await
+    }
+
+    #[derive(Default)]
+    struct PausedLeaseClock(AtomicUsize);
+
+    #[async_trait::async_trait]
+    impl crate::desktop_lease::LeaseClock for PausedLeaseClock {
+        fn now(&self) -> Duration {
+            Duration::ZERO
+        }
+        async fn sleep(&self, _: Duration) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            std::future::pending::<()>().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn a_contender_waiting_for_the_file_lease_does_not_block_the_retained_owner() {
+        let backend = Arc::new(crate::desktop_lease::test_support::TestBackend::default());
+        let clock = Arc::new(PausedLeaseClock::default());
+        let hits = Arc::new(AtomicUsize::new(0));
+        let mut registry = lease_test_registry(backend.clone(), true, hits.clone());
+        registry.desktop_lease = crate::desktop_lease::LeaseManager::new(backend, clock.clone());
+        let context = unrestricted_context();
+        let owner = context.runtime_session_key("lease-order-owner");
+        assert_ne!(
+            lease_click(&registry, &context, "lease-order-owner")
+                .await
+                .is_error,
+            Some(true)
+        );
+        let mut contender = Box::pin(lease_click(&registry, &context, "lease-order-contender"));
+        assert!(futures_util::poll!(contender.as_mut()).is_pending());
+        assert_eq!(clock.0.load(Ordering::SeqCst), 1);
+        let mut next = Box::pin(lease_click(&registry, &context, "lease-order-owner"));
+        assert!(futures_util::poll!(next.as_mut()).is_ready());
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+        drop(next);
+        drop(contender);
+        crate::desktop_lease::release_lease(&owner);
+    }
+
+    #[tokio::test]
+    async fn uncontended_admission_does_not_yield() {
+        let backend = Arc::new(crate::desktop_lease::test_support::TestBackend::default());
+        let clock = Arc::new(PausedLeaseClock::default());
+        let mut registry =
+            lease_test_registry(backend.clone(), false, Arc::new(AtomicUsize::new(0)));
+        registry.desktop_lease = crate::desktop_lease::LeaseManager::new(backend, clock.clone());
+        let context = unrestricted_context();
+        let mut call = Box::pin(lease_click(&registry, &context, "lease-no-yield"));
+        assert!(futures_util::poll!(call.as_mut()).is_ready());
+        assert_eq!(clock.0.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
