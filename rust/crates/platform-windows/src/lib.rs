@@ -53,9 +53,6 @@ mod basis_click;
 #[cfg(target_os = "windows")]
 mod basis_decision;
 
-#[cfg(any(target_os = "windows", test))]
-mod basis_capture;
-
 /// UIA / `WM_NCHITTEST` / `IDC_*` -> cursor shape tables for presence (pure,
 /// every host).
 pub mod pointer_shape_map;

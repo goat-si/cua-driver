@@ -76,6 +76,7 @@ pub mod agent_cursor;
 mod application_identity;
 pub mod authorization;
 pub mod background_input;
+pub mod basis_capture;
 pub mod basis_click;
 pub mod basis_decision;
 #[cfg(test)]

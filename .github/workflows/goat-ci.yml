@@ -690,6 +690,12 @@ jobs:
           xvfb-run -a --server-args="-screen 0 640x480x24 -noreset" \
             cargo test -p platform-linux --test click_input_x11 --locked -- \
               --ignored --nocapture --test-threads=1
+      - name: Run X11 window basis regression
+        working-directory: rust
+        run: |
+          xvfb-run -a --server-args="-screen 0 640x480x24 -noreset" \
+            cargo test -p platform-linux --test window_basis_x11 --locked -- \
+              --ignored --nocapture --test-threads=1
       - name: Run X11 keyboard tap timing regression
         working-directory: rust
         run: |

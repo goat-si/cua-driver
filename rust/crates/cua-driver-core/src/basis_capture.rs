@@ -1,7 +1,7 @@
-use cua_driver_core::window_basis::{LiveFrame, WindowBasis};
+use crate::window_basis::{LiveFrame, WindowBasis};
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn build_capture_basis(
+pub fn build_capture_basis(
     window_id: u64,
     pid: i32,
     pre: Option<LiveFrame>,
@@ -49,7 +49,7 @@ pub(crate) fn build_capture_basis(
 /// `capture` is the basis decision for this capture (None when no capture
 /// decision was made), `published` says whether this capture's publication
 /// was applied by the store, and `stored` whether the store kept a basis.
-pub(crate) fn basis_unavailable_reason(
+pub fn basis_unavailable_reason(
     capture: Option<&Result<WindowBasis, &'static str>>,
     published: bool,
     stored: bool,
@@ -73,7 +73,7 @@ pub(crate) fn basis_unavailable_reason(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cua_driver_core::window_basis::LiveFrame;
+    use crate::window_basis::LiveFrame;
 
     fn frame() -> LiveFrame {
         LiveFrame {
