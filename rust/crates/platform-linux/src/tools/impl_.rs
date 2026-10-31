@@ -3064,6 +3064,42 @@ fn type_text_structured_electron(text_len: usize) -> Value {
     })
 }
 
+fn token_failure_structured(mut fields: Value, code: &str, effect: &str) -> Value {
+    fields["code"] = json!(code);
+    fields["effect"] = json!(effect);
+    fields
+}
+
+/// Stop a token-bound write unless the element proved it has no editable route.
+fn token_write_failure_result(idx: usize, error: &anyhow::Error) -> Option<ToolResult> {
+    use crate::token_action_policy::{write_failure_result, WriteFailure};
+    let failure = if crate::atspi::native::is_no_value_route(error) {
+        WriteFailure::NoRoute
+    } else if error.is::<crate::atspi::native::CachedElementGone>() {
+        WriteFailure::Gone
+    } else if error.is::<crate::atspi::native::TokenRouteUnavailable>() {
+        WriteFailure::BeforeDispatch
+    } else {
+        WriteFailure::Unknown
+    };
+    let (code, effect) = write_failure_result(failure)?;
+    Some(
+        ToolResult::error(format!(
+            "type_text: {code}: element [{idx}]: {error:#}; {}",
+            if effect == "unverifiable" {
+                "the write may have run; re-snapshot before retrying"
+            } else {
+                "no text was sent"
+            }
+        ))
+        .with_structured(token_failure_structured(
+            json!({ "element_index": idx }),
+            code,
+            effect,
+        )),
+    )
+}
+
 /// [`type_text_ax_result`] for an element-addressed insert: the snapshot
 /// object is read back (as `set_value` does) and, when the typed text is now
 /// part of its value, the result is `effect: confirmed` with a
@@ -6460,29 +6496,35 @@ impl ClickTool {
                         let mut extra = serde_json::Map::new();
                         extra.insert("ax_action".into(), json!(action));
                         extra.insert("bounds_reason".into(), json!(reason));
-                        if suspected_noop {
-                            extra.insert("effect".into(), json!("suspected_noop"));
-                            extra.insert("escalation".into(), non_ax_escalation());
-                        } else if unacknowledged {
+                        if unacknowledged {
                             // No doAction reply arrived in time: never let a
                             // coincidental window-change observation promote
                             // this to `confirmed` — the AT-SPI layer itself
                             // never confirmed dispatch, let alone effect.
                             extra.insert("effect".into(), json!("unverifiable"));
+                            extra.insert("code".into(), json!("element_action_unacknowledged"));
                             extra.insert("verified".into(), json!(false));
                             extra.insert(
                                 "note".into(),
                                 json!(
-                                    "no acknowledgement received for the doAction call within \
-                                     the AT-SPI timeout; its effect is unknown"
+                                    "no acknowledgement received for the doAction call; the action may \
+                                     have run. Re-snapshot before retrying"
                                 ),
                             );
+                        } else if suspected_noop {
+                            extra.insert("effect".into(), json!("suspected_noop"));
+                            extra.insert("escalation".into(), non_ax_escalation());
                         }
                         ToolResult::text(format!(
-                            "Clicked element [{idx}] (pid {pid}) through its AT-SPI action \
+                            "{} element [{idx}] (pid {pid}) through its AT-SPI action \
                              \"{action}\" with the window activated (delivery_mode=foreground, \
                              path=ax_fg, focus_after={}): the element had no usable \
                              on-screen bounds ({reason}), so no pointer was moved.{}",
+                            if unacknowledged {
+                                "Action may have run on"
+                            } else {
+                                "Clicked"
+                            },
                             report.focus_after.as_str(),
                             match &report.window_change {
                                 Some(change) => format!(" {change}."),
@@ -6492,38 +6534,46 @@ impl ClickTool {
                         .with_structured(foreground_structured("ax_fg", report, extra))
                     }
                     Ok(Err(error)) => {
-                        if error.is::<crate::atspi::native::CachedElementGone>() {
-                            return ToolResult::error(format!(
-                                "click: stale_element_token: observed AT-SPI object [{idx}] is no \
-                                 longer present ({error}); re-snapshot with get_window_state"
-                            ))
-                            .with_structured(json!({
-                                "code": "stale_element_token",
-                                "effect": "none",
-                            }));
+                        if let Some(stale) = stale_observed_element("click", idx, &error) {
+                            return stale;
                         }
                         if crate::input::foreground::error_code(&error).is_some() {
                             return input_error_result(error);
                         }
-                        ToolResult::error(format!(
-                            "click: element [{idx}] (pid {pid}) has no usable on-screen bounds \
-                             ({reason}) and its AT-SPI action failed ({error:#}); no input was \
-                             sent. Open the containing menu first, re-snapshot with \
-                             get_window_state, or click by pixel from a screenshot."
-                        ))
-                        .with_structured(json!({
-                            "code": "element_bounds_unavailable",
-                            "effect": "none",
-                            "element_index": idx,
-                            "reason": reason,
-                            "ax_error": format!("{error:#}"),
-                        }))
+                        click_action_failure_result(idx, pid, &reason, &error)
                     }
-                    Err(e) => ToolResult::error(format!("Task error: {e}")),
+                    Err(error) => click_action_failure_result(
+                        idx,
+                        pid,
+                        &reason,
+                        &anyhow::anyhow!("task failed: {error}"),
+                    ),
                 }
             }
         }
     }
+}
+
+fn click_action_failure_result(
+    idx: usize,
+    pid: u32,
+    reason: &str,
+    error: &anyhow::Error,
+) -> ToolResult {
+    use crate::token_action_policy::{action_failure_result, ActionFailure};
+    let failure = if error.is::<crate::atspi::native::TokenRouteUnavailable>() {
+        ActionFailure::BeforeDispatch
+    } else {
+        ActionFailure::Unknown
+    };
+    let (code, effect) = action_failure_result(failure);
+    let message = if effect == "none" {
+        "no input was sent; re-snapshot or click by pixel"
+    } else {
+        "the action may have run; re-snapshot before retrying"
+    };
+    ToolResult::error(format!("click: element [{idx}] (pid {pid}) has no usable on-screen bounds ({reason}) and its AT-SPI action failed ({error:#}); {message}."))
+        .with_structured(token_failure_structured(json!({ "element_index": idx, "reason": reason, "ax_error": format!("{error:#}") }), code, effect))
 }
 
 /// Decide whether a foreground element click has a real point to press.
@@ -7897,17 +7947,21 @@ impl Tool for TypeTextTool {
             if xid_opt.is_none() {
                 return foreground_hyprland_refusal("an exact window_id is required");
             }
-            // Native editables retain their verifiable, addressed AT-SPI route.
-            if !is_chromium_embedder(pid) && !is_webkitgtk_embedder(pid) {
-                if let Some(element) = token.clone() {
-                    let text_ax = text.clone();
-                    if matches!(
-                        tokio::task::spawn_blocking(move || crate::atspi::type_into_token(
-                            pid, &element, &text_ax
-                        ))
-                        .await,
-                        Ok(Ok(()))
-                    ) {
+            // Native editables retain their verifiable, addressed AT-SPI route; an
+            // explicit token must establish it before any key fallback. Chromium/WebKit
+            // stay on key events: their bridges can echo a write the renderer never sees.
+            if let Some(element) = token
+                .clone()
+                .filter(|_| !is_chromium_embedder(pid) && !is_webkitgtk_embedder(pid))
+            {
+                let text_ax = text.clone();
+                let target = element.clone();
+                let result = tokio::task::spawn_blocking(move || {
+                    crate::atspi::type_into_token(pid, &target, &text_ax)
+                })
+                .await;
+                match result {
+                    Ok(Ok(())) => {
                         position_named_session_keyboard_cursor(
                             &self.state,
                             &args,
@@ -7923,6 +7977,18 @@ impl Tool for TypeTextTool {
                             text.chars().count(),
                             "via targeted AT-SPI",
                         );
+                    }
+                    Ok(Err(error)) => {
+                        if let Some(refusal) = token_write_failure_result(element.index, &error) {
+                            return refusal;
+                        }
+                    }
+                    Err(error) => {
+                        return token_write_failure_result(
+                            element.index,
+                            &anyhow::anyhow!("task failed: {error}"),
+                        )
+                        .expect("unknown write outcome must refuse")
                     }
                 }
             }
@@ -7996,9 +8062,9 @@ impl Tool for TypeTextTool {
 
         let text_len = text.chars().count();
         // Native toolkit editables have a stronger focus-free route than raw
-        // compositor keyboard injection. Keep Chromium/WebKit on real key events
-        // because their accessibility bridges may echo a write that never reaches
-        // renderer-owned state.
+        // compositor keyboard injection; a token-bound route must be proven absent
+        // before key fallback. Keep Chromium/WebKit on real key events because their
+        // accessibility bridges may echo a write that never reaches renderer state.
         if let Some(element) = token.clone().filter(|_| {
             crate::wayland::is_inject_mode()
                 && !is_chromium_embedder(pid)
@@ -8006,13 +8072,27 @@ impl Tool for TypeTextTool {
         }) {
             let text_at = text.clone();
             let target = element.clone();
-            let targeted = tokio::task::spawn_blocking(move || {
+            match tokio::task::spawn_blocking(move || {
                 crate::atspi::type_into_token(pid, &target, &text_at)
             })
-            .await;
-            if let Ok(Ok(())) = targeted {
-                return type_text_ax_result_verified(pid, element, &text, "via targeted AT-SPI")
-                    .await;
+            .await
+            {
+                Ok(Ok(())) => {
+                    return type_text_ax_result_verified(pid, element, &text, "via targeted AT-SPI")
+                        .await
+                }
+                Ok(Err(error)) => {
+                    if let Some(refusal) = token_write_failure_result(element.index, &error) {
+                        return refusal;
+                    }
+                }
+                Err(error) => {
+                    return token_write_failure_result(
+                        element.index,
+                        &anyhow::anyhow!("task failed: {error}"),
+                    )
+                    .expect("unknown write outcome must refuse")
+                }
             }
         }
         // The private nested compositor can target the owning Wayland client
@@ -8125,30 +8205,23 @@ impl Tool for TypeTextTool {
                 crate::atspi::type_into_token(pid, &target, &text_at)
             })
             .await;
-            if let Ok(Err(error)) = &targeted {
-                // The observed object is gone: nothing was written to it.
-                if let Some(stale) = stale_observed_element("type_text", element.index, error) {
-                    return stale;
-                }
-            }
             match targeted {
                 Ok(Ok(())) => {
-                    return type_text_ax_result_verified(
-                        pid,
-                        element,
-                        &text,
-                        "via targeted AT-SPI",
+                    return type_text_ax_result_verified(pid, element, &text, "via targeted AT-SPI")
+                        .await
+                }
+                Ok(Err(error)) => {
+                    if let Some(refusal) = token_write_failure_result(element.index, &error) {
+                        return refusal;
+                    }
+                }
+                Err(error) => {
+                    return token_write_failure_result(
+                        element.index,
+                        &anyhow::anyhow!("task failed: {error}"),
                     )
-                    .await;
+                    .expect("unknown write outcome must refuse")
                 }
-                Ok(Err(_)) | Err(_)
-                    if !delivery.is_foreground() && crate::wayland::wayland_input_enabled() =>
-                {
-                    return crate::input::delivery::background_unavailable_error(
-                        crate::input::delivery::BackgroundUnavailable::FocusedInputOnly,
-                    );
-                }
-                _ => {}
             }
         }
 
@@ -9603,14 +9676,11 @@ impl Tool for SetValueTool {
         // 1. Focus-free accessibility write on the exact snapshot object.
         let target = token.clone();
         let ax = spawn_blocking_bounded("set_value", foreground_budget(0), move || {
-            crate::atspi::set_value_token_reporting_retarget(pid, &target, &value_for_task)
+            crate::atspi::set_value_token(pid, &target, &value_for_task)
         })
         .await;
         let ax_error = match ax {
-            Ok(Ok(retargeted)) => {
-                // A write that re-resolved the index may have reached another
-                // element; its secrecy is unknown, so it counts as secret.
-                let secret = secret || retargeted;
+            Ok(Ok(())) => {
                 let target = token.clone();
                 let readback =
                     tokio::task::spawn_blocking(move || crate::atspi::read_value_token(&target))
@@ -15116,5 +15186,65 @@ mod cursor_hook_emission_tests {
             ("agent-7", 10.0, 20.0, false)
         );
         assert!(seen[1].pressed);
+    }
+}
+
+#[cfg(test)]
+mod token_failure_tests {
+    use super::*;
+
+    #[test]
+    fn click_and_write_errors_keep_failure_classification() {
+        let no_action = anyhow::Error::new(crate::atspi::native::TokenRouteUnavailable(
+            "no Action interface".into(),
+        ));
+        let click = click_action_failure_result(3, 42, "no bounds", &no_action)
+            .structured_content
+            .unwrap();
+        assert_eq!(click["code"], "element_bounds_unavailable");
+        assert_eq!(click["effect"], "none");
+        let timeout = anyhow::anyhow!("doAction NoReply");
+        let click = click_action_failure_result(3, 42, "no bounds", &timeout)
+            .structured_content
+            .unwrap();
+        assert_eq!(click["code"], "element_action_unacknowledged");
+        assert_eq!(click["effect"], "unverifiable");
+        for error in [
+            anyhow::Error::new(crate::atspi::native::TokenRouteUnavailable(
+                "interfaces unavailable".into(),
+            )),
+            anyhow::anyhow!("write helper returned false"),
+        ] {
+            let value = token_write_failure_result(3, &error)
+                .unwrap()
+                .structured_content
+                .unwrap();
+            assert!(matches!(
+                value["code"].as_str(),
+                Some("token_route_unavailable" | "element_write_unacknowledged")
+            ));
+        }
+        assert!(
+            token_write_failure_result(3, &anyhow::anyhow!("no_value_route: no EditableText"))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn shared_failure_builder_preserves_metadata() {
+        for (code, effect) in [
+            ("element_action_unacknowledged", "unverifiable"),
+            ("token_route_unavailable", "none"),
+            ("element_write_unacknowledged", "unverifiable"),
+        ] {
+            let result = token_failure_structured(
+                json!({"note":"note", "warning":"warning", "focus_restoration":{"status":"failed"}}),
+                code,
+                effect,
+            );
+            assert_eq!(result["note"], "note");
+            assert_eq!(result["warning"], "warning");
+            assert_eq!(result["focus_restoration"]["status"], "failed");
+        }
     }
 }

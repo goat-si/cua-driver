@@ -576,23 +576,14 @@ pub fn require_window_element(pid: u32, xid: u64, element: WindowElement) -> Res
 /// snapshot saw, never the index in another snapshot of the process.
 #[derive(Clone, Debug)]
 pub struct TokenElement {
-    /// Position in the token's snapshot, for messages and re-resolution.
+    /// Position in the token's snapshot, for messages.
     pub index: usize,
     pub observed: cache::CachedElement,
-    /// Where no window proof applies (X11, Hyprland, compositors without a
-    /// GNOME Shell), an action whose observed object fails re-resolves
-    /// `index` in a fresh application walk, as before. After a window proof
-    /// it never does, so a gone object is a stale token.
-    pub may_reresolve: bool,
 }
 
 impl TokenElement {
-    pub fn new(index: usize, observed: cache::CachedElement, proof: WindowProof) -> Self {
-        Self {
-            index,
-            observed,
-            may_reresolve: proof == WindowProof::NotRequired,
-        }
+    pub fn new(index: usize, observed: cache::CachedElement, _proof: WindowProof) -> Self {
+        Self { index, observed }
     }
 
     /// The D-Bus object every token action addresses first.
@@ -602,73 +593,30 @@ impl TokenElement {
         })
     }
 
-    /// Act on the observed object. When that fails, re-resolve the index with
-    /// `by_index` only if `may_reresolve` allows it.
-    fn act<T>(
-        &self,
-        on_object: impl FnOnce(&native::ObjectRef) -> Result<T>,
-        by_index: impl FnOnce(usize) -> Result<T>,
-    ) -> Result<T> {
-        let error = match self.object().and_then(on_object) {
-            Ok(done) => return Ok(done),
-            Err(error) => error,
-        };
-        if !self.may_reresolve {
-            return Err(error);
-        }
-        tracing::debug!(
-            "observed element {} action failed, re-resolving: {error:#}",
-            self.index
-        );
-        by_index(self.index)
+    /// Act only on the object observed in the token's snapshot.
+    fn act<T>(&self, on_object: impl FnOnce(&native::ObjectRef) -> Result<T>) -> Result<T> {
+        crate::token_action_policy::observed(|| self.object().and_then(on_object))
     }
 }
 
 /// Give the token's element keyboard focus without activating its window.
-pub fn focus_token(pid: u32, token: &TokenElement) -> Result<bool> {
-    token.act(native::focus_element_ref, |idx| {
-        native::focus_element(pid, idx)
-    })
+pub fn focus_token(_pid: u32, token: &TokenElement) -> Result<bool> {
+    token.act(native::focus_element_ref)
 }
 
 /// Type into the token's editable.
-pub fn type_into_token(pid: u32, token: &TokenElement, text: &str) -> Result<()> {
-    token.act(
-        |object| native::type_into_editable_ref(object, text),
-        |idx| native::type_into_editable_at(pid, idx, text),
-    )
+pub fn type_into_token(_pid: u32, token: &TokenElement, text: &str) -> Result<()> {
+    token.act(|object| native::type_into_editable_ref(object, text))
 }
 
-/// [`set_value`] on the token's element. `Err` messages starting with
-/// [`native::NO_VALUE_ROUTE`] mean the element has no accessibility write
-/// route at all.
-pub fn set_value_token(pid: u32, token: &TokenElement, value: &str) -> Result<()> {
-    set_value_token_reporting_retarget(pid, token, value).map(|_| ())
-}
-
-/// [`set_value_token`], also saying whether the write re-resolved the index
-/// (the observed object was gone) and so may have reached another element.
-pub fn set_value_token_reporting_retarget(
-    pid: u32,
-    token: &TokenElement,
-    value: &str,
-) -> Result<bool> {
-    let retargeted = std::cell::Cell::new(false);
-    token
-        .act(
-            |object| match native::set_value_ref(object, value) {
-                Err(error) if native::is_no_value_route(&error) => {
-                    Ok(select_option(object, value).unwrap_or(Err(error)))
-                }
-                done => done.map(Ok),
-            },
-            |idx| {
-                retargeted.set(true);
-                Ok(native::set_value(pid, idx, value))
-            },
-        )
-        .and_then(|done| done)?;
-    Ok(retargeted.get())
+/// Write to the token's observed object.
+pub fn set_value_token(_pid: u32, token: &TokenElement, value: &str) -> Result<()> {
+    token.act(|object| match native::set_value_ref(object, value) {
+        Err(error) if native::is_no_value_route(&error) => {
+            select_option(object, value).unwrap_or(Err(error))
+        }
+        done => done,
+    })
 }
 
 /// The open popup of the token's combo box: activate the option `value`
@@ -706,23 +654,22 @@ pub fn token_bounds(
     xid: Option<u64>,
     token: &TokenElement,
 ) -> Result<(i32, i32, u32, u32)> {
-    if let Some(bounds) = token.observed.bounds {
-        return Ok(bounds);
-    }
-    token.act(
-        |object| {
-            native::element_bounds_ref(object, pid, xid.unwrap_or(0), token.observed.in_web_content)
-        },
-        |idx| match xid {
-            Some(xid) => native::get_element_bounds_for_window(pid, xid, idx),
-            None => native::get_element_bounds(pid, idx),
-        },
-    )
+    token_bounds_with(token, |object| {
+        native::element_bounds_ref(object, pid, xid.unwrap_or(0), token.observed.in_web_content)
+    })
 }
 
-/// Scroll the token's element. A fresh walk finds it by its observed
-/// identity; only where `may_reresolve` allows it does a gone identity fall
-/// back to the index.
+fn token_bounds_with(
+    token: &TokenElement,
+    read: impl FnOnce(&native::ObjectRef) -> Result<(i32, i32, u32, u32)>,
+) -> Result<(i32, i32, u32, u32)> {
+    match token.observed.bounds {
+        Some(bounds) => Ok(bounds),
+        None => token.act(read),
+    }
+}
+
+/// Scroll only the observed identity, never its former snapshot index.
 pub fn scroll_token(
     pid: u32,
     token: &TokenElement,
@@ -730,14 +677,16 @@ pub fn scroll_token(
     amount: usize,
     by: cua_driver_contract::ScrollBy,
 ) -> Result<ScrollProgress> {
-    let observed = WindowElement::Identity(token.observed.identity.clone());
-    match native::scroll_element(pid, &observed, direction, amount, by) {
-        Err(error) if token.may_reresolve && error.is::<native::CachedElementGone>() => {
-            let index = WindowElement::Index(token.index);
-            native::scroll_element(pid, &index, direction, amount, by)
-        }
-        result => result,
-    }
+    scroll_token_with(token, |element| {
+        native::scroll_element(pid, element, direction, amount, by)
+    })
+}
+
+fn scroll_token_with<T>(
+    token: &TokenElement,
+    scroll: impl FnOnce(&WindowElement) -> Result<T>,
+) -> Result<T> {
+    scroll(&WindowElement::Identity(token.observed.identity.clone()))
 }
 
 // ── Internal helpers ─────────────────────────────────────────────────────────
@@ -1049,12 +998,39 @@ mod token_dispatch_tests {
 
     #[test]
     fn a_proven_token_never_re_resolves_its_index() {
-        let error = token(WindowProof::Proven)
-            .act(gone, |_| {
-                panic!("re-resolved the index after a window proof")
+        let error = token(WindowProof::Proven).act(gone).unwrap_err();
+        assert!(error.is::<native::CachedElementGone>());
+    }
+
+    #[test]
+    fn scroll_gone_never_retries_by_index() {
+        for proof in [WindowProof::Proven, WindowProof::NotRequired] {
+            let calls = std::cell::Cell::new(0);
+            let error = scroll_token_with(&token(proof), |element| {
+                calls.set(calls.get() + 1);
+                assert!(matches!(element, WindowElement::Identity(_)));
+                Err::<(), _>(native::CachedElementGone("gone".into()).into())
             })
             .unwrap_err();
-        assert!(error.is::<native::CachedElementGone>());
+            assert!(error.is::<native::CachedElementGone>());
+            assert_eq!(calls.get(), 1);
+        }
+    }
+
+    #[test]
+    fn token_bounds_error_does_not_resolve_an_index() {
+        for proof in [WindowProof::Proven, WindowProof::NotRequired] {
+            let target = token(proof);
+            let calls = std::cell::Cell::new(0);
+            let error = token_bounds_with(&target, |object| {
+                calls.set(calls.get() + 1);
+                assert_eq!(object.path, "/window_b/text");
+                Err(anyhow::anyhow!("bounds unavailable"))
+            })
+            .unwrap_err();
+            assert_eq!(error.to_string(), "bounds unavailable");
+            assert_eq!(calls.get(), 1);
+        }
     }
 
     #[test]
@@ -1104,14 +1080,16 @@ mod token_dispatch_tests {
     }
 
     #[test]
-    fn an_unproven_session_re_resolves_only_after_the_observed_object_fails() {
-        let unproven = token(WindowProof::NotRequired);
-        let reresolved = unproven.act(gone, |idx| Ok(format!("index {idx}")));
-        assert_eq!(reresolved.unwrap(), "index 3");
-        let observed = unproven.act(
-            |object| Ok(object.path.clone()),
-            |_| panic!("re-resolved after the observed object answered"),
-        );
-        assert_eq!(observed.unwrap(), "/window_b/text");
+    fn both_window_proofs_keep_the_observed_error() {
+        for proof in [WindowProof::NotRequired, WindowProof::Proven] {
+            assert!(token(proof)
+                .act(gone)
+                .unwrap_err()
+                .is::<native::CachedElementGone>());
+            assert_eq!(
+                token(proof).act(|object| Ok(object.path.clone())).unwrap(),
+                "/window_b/text"
+            );
+        }
     }
 }
