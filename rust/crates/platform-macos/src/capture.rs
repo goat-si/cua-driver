@@ -518,8 +518,8 @@ impl WindowCaptureIdentity {
 }
 
 fn current_window_capture_identity(window_id: u32) -> anyhow::Result<WindowCaptureIdentity> {
-    let info =
-        crate::windows::window_info_by_id(window_id).ok_or_else(|| generation_error(window_id))?;
+    let info = crate::windows::window_info_by_id(window_id)
+        .ok_or_else(|| anyhow::anyhow!("WindowServer no longer lists window id {window_id}"))?;
     let stamp = crate::ax::enablement::process_start_stamp(info.pid)
         .ok_or_else(|| generation_error(window_id))?;
     Ok(WindowCaptureIdentity::with_stamp(
@@ -1322,13 +1322,9 @@ where
         G: Fn(i32) -> Option<crate::ax::enablement::ProcessStartStamp>,
     {
         let read = || -> anyhow::Result<WindowCaptureIdentity> {
-            let observed = identity().map_err(|error| {
-                if pinned.is_some() {
-                    generation_error(window_id)
-                } else {
-                    error
-                }
-            })?;
+            // An unreadable start stamp already arrives as a generation
+            // error; a window that left the list keeps its own message.
+            let observed = identity()?;
             if let Some(pinned) = pinned {
                 check_generation(pinned, observed, window_id)?;
                 if generation(observed.pid) != Some(pinned.1) {
