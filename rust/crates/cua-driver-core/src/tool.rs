@@ -4145,6 +4145,55 @@ mod runtime_isolation_tests {
         def: super::ToolDef,
     }
 
+    struct EchoInputProbe {
+        def: super::ToolDef,
+        hits: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl super::Tool for EchoInputProbe {
+        fn def(&self) -> &super::ToolDef {
+            &self.def
+        }
+        async fn invoke(&self, args: serde_json::Value) -> crate::protocol::ToolResult {
+            self.hits.fetch_add(1, Ordering::SeqCst);
+            crate::protocol::ToolResult::text(format!("echo: {}", args["text"].as_str().unwrap()))
+        }
+    }
+
+    #[tokio::test]
+    async fn withheld_turn_summary_is_content_free_with_echoing_probe() {
+        let root = tempfile::tempdir().unwrap();
+        let hits = Arc::new(AtomicUsize::new(0));
+        let mut registry = super::ToolRegistry::new();
+        registry.register(Box::new(EchoInputProbe { hits: hits.clone(), def: super::ToolDef {
+            name: "type_text".into(), description: "echo probe".into(),
+            input_schema: serde_json::json!({"type":"object", "properties":{"text":{"type":"string"}}, "required":["text"]}),
+            read_only: false, destructive: false, idempotent: false, open_world: false,
+        }}));
+        registry
+            .recording
+            .start(root.path().to_str().unwrap(), false, None)
+            .unwrap();
+        let _ = registry
+            .invoke_with_context(
+                "type_text",
+                serde_json::json!({"text":"secret"}),
+                unrestricted_context(),
+            )
+            .await;
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        let action = std::fs::read_to_string(root.path().join("turn-00001/action.json")).unwrap();
+        assert!(!action.contains("secret"));
+        assert!(!action.contains("echo"));
+        let parsed: serde_json::Value = serde_json::from_str(&action).unwrap();
+        assert_eq!(parsed["withheld_args"], serde_json::json!(["text"]));
+        assert_eq!(
+            parsed["result_summary"],
+            "type_text: input withheld (6 characters); result summary withheld"
+        );
+    }
+
     struct ObservationProbe {
         hits: Arc<AtomicUsize>,
         def: super::ToolDef,
@@ -7640,24 +7689,32 @@ fn is_existing_profile_prepare(tool_name: &str, args: &Value) -> bool {
 fn recording_args_for(tool_name: &str, args: &Value) -> Value {
     let mut redacted = args.clone();
     if let Some(arguments) = redacted.as_object_mut() {
+        arguments.remove("_withheld_args");
+        arguments.remove("_withheld_lengths");
+        let fields: &[&str] = match tool_name {
+            "type_text" | "browser_type" => &["text"],
+            "set_value" => &["value"],
+            "browser_dialog" => &["prompt_text"],
+            "clipboard_write" => &["text", "image_path", "file_path"],
+            _ => &[],
+        };
+        let mut withheld = Vec::new();
+        let mut lengths = serde_json::Map::new();
+        for &field in fields {
+            if let Some(value) = arguments.remove(field) {
+                withheld.push(field);
+                if let Some(value) = value.as_str() {
+                    lengths.insert(field.to_owned(), serde_json::json!(value.chars().count()));
+                }
+            }
+        }
+        if !withheld.is_empty() {
+            arguments.insert("_withheld_args".into(), serde_json::json!(withheld));
+            arguments.insert("_withheld_lengths".into(), Value::Object(lengths));
+        }
         match tool_name {
             "browser_prepare" => {
                 arguments.remove("_transport_session_id");
-            }
-            "browser_dialog" => {
-                if arguments.contains_key("prompt_text") {
-                    arguments.insert(
-                        "prompt_text".to_owned(),
-                        Value::String("[redacted]".to_owned()),
-                    );
-                }
-            }
-            "clipboard_write" => {
-                for field in ["text", "image_path", "file_path"] {
-                    if arguments.contains_key(field) {
-                        arguments.insert(field.to_owned(), Value::String("[redacted]".to_owned()));
-                    }
-                }
             }
             "browser_set_input_files" => {
                 if let Some(count) = arguments
@@ -7750,6 +7807,24 @@ mod capability_tests {
     use super::*;
 
     #[test]
+    fn recording_args_withhold_typed_text_and_values() {
+        for (tool, field) in [
+            ("type_text", "text"),
+            ("set_value", "value"),
+            ("browser_type", "text"),
+            ("browser_dialog", "prompt_text"),
+            ("clipboard_write", "text"),
+        ] {
+            let args = serde_json::json!({field: "séc", "pid": 1});
+            let recorded = recording_args_for(tool, &args);
+            assert!(recorded.get(field).is_none(), "{tool}: {recorded}");
+            assert_eq!(recorded["_withheld_args"], serde_json::json!([field]));
+            assert_eq!(recorded["_withheld_lengths"][field], 3);
+            assert_eq!(recorded["pid"], 1);
+        }
+    }
+
+    #[test]
     fn browser_prepare_recording_redacts_transport_identity() {
         let recorded = recording_args_for(
             "browser_prepare",
@@ -7773,7 +7848,8 @@ mod capability_tests {
             "browser_dialog",
             &serde_json::json!({"action": "accept", "prompt_text": "private reply"}),
         );
-        assert_eq!(dialog["prompt_text"], "[redacted]");
+        assert!(dialog.get("prompt_text").is_none());
+        assert_eq!(dialog["_withheld_args"], serde_json::json!(["prompt_text"]));
 
         let upload = recording_args_for(
             "browser_set_input_files",
@@ -7818,9 +7894,13 @@ mod capability_tests {
                 "session": "public-session",
             }),
         );
-        assert_eq!(recorded["text"], "[redacted]");
-        assert_eq!(recorded["image_path"], "[redacted]");
-        assert_eq!(recorded["file_path"], "[redacted]");
+        assert!(recorded.get("text").is_none());
+        assert!(recorded.get("image_path").is_none());
+        assert!(recorded.get("file_path").is_none());
+        assert_eq!(
+            recorded["_withheld_args"],
+            serde_json::json!(["text", "image_path", "file_path"])
+        );
         assert_eq!(recorded["session"], "public-session");
         let serialized = recorded.to_string();
         for forbidden in [

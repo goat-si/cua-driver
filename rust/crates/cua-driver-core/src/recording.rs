@@ -437,6 +437,8 @@ pub struct PendingTurn {
     turn_dir: PathBuf,
     tool_name: String,
     args: Value,
+    withheld_args: Vec<String>,
+    withheld_lengths: serde_json::Map<String, Value>,
     start_ms: u64,
     session_start_ms: u64,
     window_id: Option<u64>,
@@ -901,6 +903,22 @@ impl RecordingSession {
         // in action.json's `arguments`. The injection point is the daemon
         // `call` branch (serve.rs); recording is the single chokepoint where
         // those internal keys must not leak into the persisted trajectory.
+        let withheld_args = args
+            .get("_withheld_args")
+            .and_then(Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_owned)
+                    .collect()
+            })
+            .unwrap_or_default();
+        let withheld_lengths = args
+            .get("_withheld_lengths")
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or_default();
         let args = strip_internal_keys(args).into_owned();
         use crate::tool_args::ArgsExt;
         let pid = args.opt_i64("pid");
@@ -950,6 +968,8 @@ impl RecordingSession {
             turn_dir,
             tool_name: tool_name.to_owned(),
             args,
+            withheld_args,
+            withheld_lengths,
             start_ms,
             session_start_ms,
             window_id,
@@ -1331,6 +1351,8 @@ fn write_turn_with_after(
         turn_dir,
         tool_name,
         args,
+        withheld_args,
+        withheld_lengths,
         start_ms,
         session_start_ms,
         window_id: _,
@@ -1397,15 +1419,25 @@ fn write_turn_with_after(
     {
         before.state = StateCapture::unavailable(STATE_SKIPPED_PREDICTION_MISSED);
     }
+    let summary = if withheld_args.is_empty() {
+        result_text.to_owned()
+    } else {
+        let count: u64 = withheld_lengths.values().filter_map(Value::as_u64).sum();
+        format!("{tool_name}: input withheld ({count} characters); result summary withheld")
+    };
     let mut payload = serde_json::json!({
         "tool": tool_name,
         "arguments": args,
-        "result_summary": result_text,
+        "result_summary": summary,
         "result_error": result_is_error,
         "timestamp": iso8601_utc_from_unix_ms(now),
         "t_ms_from_session_start": now.saturating_sub(session_start_ms),
         "t_start_ms_from_session_start": start_ms.saturating_sub(session_start_ms),
     });
+    if !withheld_args.is_empty() {
+        payload["withheld_args"] = serde_json::json!(withheld_args);
+        payload["withheld_lengths"] = Value::Object(withheld_lengths);
+    }
     if let Some((cx, cy)) = click_point {
         payload["click_point"] = serde_json::json!({"x": cx, "y": cy});
     }
@@ -1413,7 +1445,23 @@ fn write_turn_with_after(
         payload["click_point_image"] = serde_json::json!("click_source.png");
     }
     if let Some(action_record) = action_record {
-        payload["action_truth"] = action_record.debug_json();
+        let mut truth = action_record.debug_json();
+        if !withheld_args.is_empty() {
+            if let Some(fields) = truth.as_object_mut() {
+                fields.retain(|key, _| {
+                    matches!(
+                        key.as_str(),
+                        "effect"
+                            | "transport"
+                            | "route"
+                            | "requested_delivery"
+                            | "actual_delivery"
+                            | "delivered_count"
+                    )
+                });
+            }
+        }
+        payload["action_truth"] = truth;
     }
     let semantic_without_point =
         supplemental.failure.is_none() && semantic_action_without_point(&payload);
@@ -1642,9 +1690,85 @@ mod tests {
         })
     }
 
+    fn withheld_action(
+        result: &str,
+        record: Option<&crate::action_record::ActionExecutionRecord>,
+    ) -> Value {
+        let root = tempfile::tempdir().unwrap();
+        let session = RecordingSession::new();
+        session
+            .start(root.path().to_str().unwrap(), false, None)
+            .unwrap();
+        let pending = session.begin_private_turn(
+            "type_text", &serde_json::json!({"pid": 1, "_withheld_args": ["text"], "_withheld_lengths": {"text": 6}}),
+            0, RecordingCaller::default(),
+        ).unwrap();
+        write_turn(pending, result, record, false).unwrap();
+        serde_json::from_slice(&std::fs::read(root.path().join("turn-00001/action.json")).unwrap())
+            .unwrap()
+    }
+
+    #[test]
+    fn action_json_records_withheld_args_outside_arguments() {
+        let action = withheld_action("ok", None);
+        assert_eq!(action["withheld_args"], serde_json::json!(["text"]));
+        assert_eq!(action["withheld_lengths"]["text"], 6);
+        assert!(action["arguments"].get("_withheld_args").is_none());
+        assert!(action["arguments"].get("text").is_none());
+    }
+
+    #[test]
+    fn withheld_turn_summary_is_content_free() {
+        let action = withheld_action("echo: secret", None);
+        assert_eq!(
+            action["result_summary"],
+            "type_text: input withheld (6 characters); result summary withheld"
+        );
+        assert!(!action.to_string().contains("secret"));
+        assert!(!action.to_string().contains("echo"));
+    }
+
+    #[test]
+    fn withheld_turn_action_truth_has_no_free_form_details() {
+        use crate::action_record::*;
+        let mut record = ActionExecutionRecord::new(
+            ActionEffect::Unverifiable,
+            ActionTransport::MacosCgEventPid,
+            RequestedDelivery::Background,
+        );
+        record.detail = Some("secret-detail".into());
+        record.attempts.push(ActionAttempt {
+            transport: ActionTransport::MacosCgEventPid,
+            delivery: ActualDelivery::Background,
+            detail: Some("secret-attempt".into()),
+        });
+        record.fallbacks.push(ActionFallback {
+            from: ActionTransport::MacosCgEventPid,
+            to: ActionTransport::MacosCgEventPid,
+            reason: "secret-reason".into(),
+        });
+        record.evidence.push(ActionEvidence {
+            kind: EvidenceKind::ValueReadback,
+            detail: "secret-evidence".into(),
+        });
+        record.escalation = Some(ActionEscalation {
+            kind: EscalationKind::RequestPermission,
+            detail: Some("secret-escalation".into()),
+        });
+        record.refusal = Some(ActionRefusal {
+            code: "secret-code".into(),
+            hint: Some("secret-hint".into()),
+        });
+        let action = withheld_action("ok", Some(&record));
+        assert_eq!(action["action_truth"]["effect"], "unverifiable");
+        assert!(!action["action_truth"].to_string().contains("secret"));
+    }
+
     fn dispatch_pending(root: &Path) -> PendingTurn {
         PendingTurn {
             generation: 0,
+            withheld_args: Vec::new(),
+            withheld_lengths: Default::default(),
             turn_dir: root.to_path_buf(),
             tool_name: "click".into(),
             args: serde_json::json!({"pid": 901, "window_id": 902, "element_token": "s00000001:3"}),
@@ -2092,6 +2216,8 @@ mod tests {
             .unwrap();
             let pending = PendingTurn {
                 generation: 0,
+                withheld_args: Vec::new(),
+                withheld_lengths: Default::default(),
                 turn_dir: root.path().to_path_buf(),
                 tool_name: "click".into(),
                 args: serde_json::json!({"pid":1,"element_token": "s00000001:3"}),
@@ -2159,6 +2285,8 @@ mod tests {
                 write_turn(
                     PendingTurn {
                         generation: 0,
+                        withheld_args: Vec::new(),
+                        withheld_lengths: Default::default(),
                         turn_dir: root.path().to_path_buf(),
                         tool_name: "click".into(),
                         args,
@@ -2621,6 +2749,8 @@ mod tests {
         .unwrap();
         let pending = |root: &Path| PendingTurn {
             generation: 0,
+            withheld_args: Vec::new(),
+            withheld_lengths: Default::default(),
             turn_dir: root.to_path_buf(),
             tool_name: "click".into(),
             args: serde_json::json!({"pid": 1, "window_id": 2, "x": 0, "y": 0}),
