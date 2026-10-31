@@ -868,9 +868,151 @@ async fn every_step_runs_in_the_batch_session() {
 }
 
 #[tokio::test]
+async fn later_denied_action_refuses_before_any_step_runs() {
+    let harness = Harness::new();
+    let manifest = "version: 1\nmode: bounded\nexpires_after: 1h\nidle_timeout: 30m\nresources:\n  desktop:\n    applications: [42]\nallow:\n  tools: [run_steps, click, press_key]\ndeny:\n  tools: [set_value]\n";
+    let result = harness
+        .registry
+        .invoke_with_context(
+            super::RUN_STEPS_TOOL,
+            json!({"steps": [
+                {"click": {"pid": 42}},
+                {"press_key": {"pid": 42, "key": "Tab"}},
+                {"set_value": {"pid": 42, "value": "secret"}}
+            ]}),
+            context(Some(manifest)),
+        )
+        .await;
+    let structured = result.structured_content.unwrap();
+    assert_eq!(
+        harness.hits("click"),
+        0,
+        "first action must not execute: {structured}"
+    );
+    assert_eq!(harness.hits("press_key"), 0);
+    assert_eq!(harness.hits("set_value"), 0);
+    assert_eq!(structured["status"], "refused");
+    assert_eq!(structured["failed_step"], 2);
+    assert_eq!(structured["executed"], 0);
+    assert_eq!(structured["code"], "permission_denied");
+    assert_eq!(structured["refusal"]["code"], "permission_denied");
+    assert_eq!(structured["total"], 3);
+    assert_eq!(structured["steps"], json!([]));
+    assert_eq!(
+        structured["preflight"],
+        json!({"step": 2, "tool": "set_value"})
+    );
+}
+
+fn batch_manifest(extra: &str) -> String {
+    format!("version: 1\nmode: bounded\nexpires_after: 1h\nidle_timeout: 30m\nresources:\n  desktop:\n    applications: [42]\nallow:\n  tools: [run_steps, click]\n{extra}")
+}
+
+#[tokio::test]
+async fn ask_and_undeclared_refuse() {
+    for extra in ["ask:\n  tools: [set_value]\n", ""] {
+        let harness = Harness::new();
+        let result = harness.registry.invoke_with_context(super::RUN_STEPS_TOOL,
+            json!({"steps": [{"click": {"pid": 42}}, {"set_value": {"pid": 42, "value": "x"}}]}),
+            context(Some(&batch_manifest(extra)))).await.structured_content.unwrap();
+        assert_eq!(
+            result["preflight"],
+            json!({"step": 1, "tool": "set_value"}),
+            "{result}"
+        );
+        assert_eq!(harness.hits("click"), 0);
+    }
+}
+
+#[tokio::test]
+async fn selector_action_preflights_get_window_state() {
+    let harness = Harness::new();
+    let result = harness.registry.invoke_with_context(super::RUN_STEPS_TOOL,
+        json!({"steps": [{"click": {"pid": 42}}, {"click": {"pid": 42, "window_id": 9, "role": "button", "name": "Save"}}]}),
+        context(Some(&batch_manifest("")))).await.structured_content.unwrap();
+    assert_eq!(
+        result["preflight"],
+        json!({"step": 1, "tool": "get_window_state"}),
+        "{result}"
+    );
+    assert_eq!(harness.hits("click"), 0);
+}
+
+#[tokio::test]
+async fn exact_token_and_click_do_not_require_conditional_tools() {
+    let harness = Harness::new();
+    let result = harness
+        .registry
+        .invoke_with_context(
+            super::RUN_STEPS_TOOL,
+            json!({"steps": [{"click": {"pid": 42, "element_token": "s00000001:1"}}]}),
+            context(Some(&batch_manifest(""))),
+        )
+        .await
+        .structured_content
+        .unwrap();
+    assert_eq!(result["ok"], true, "{result}");
+    assert_eq!(harness.hits("click"), 1);
+    assert_eq!(harness.hits("get_window_state"), 0);
+    assert_eq!(harness.hits("invoke_menu"), 0);
+}
+
+#[tokio::test]
+async fn observe_read_denied_does_not_preflight_refuse() {
+    let harness = Harness::new();
+    let result = harness
+        .registry
+        .invoke_with_context(
+            super::RUN_STEPS_TOOL,
+            json!({"steps": [{"click": {"pid": 42}}], "observe": {"pid": 42, "window_id": 9}}),
+            context(Some(&batch_manifest(""))),
+        )
+        .await
+        .structured_content
+        .unwrap();
+    assert!(result.get("preflight").is_none(), "{result}");
+    assert_eq!(harness.hits("click"), 1);
+}
+
+#[tokio::test]
+async fn gone_check_with_denied_list_windows_is_not_preflight_refused() {
+    let harness = Harness::new();
+    let result = harness.registry.invoke_with_context(super::RUN_STEPS_TOOL,
+        json!({"steps": [{"click": {"pid": 42}}, {"expect": {"pid": 42, "window_id": 9, "name": "Save", "gone": true, "timeout_ms": 0}}]}),
+        context(Some(&batch_manifest("")))).await.structured_content.unwrap();
+    assert!(result.get("preflight").is_none(), "{result}");
+    assert_eq!(harness.hits("click"), 1);
+}
+
+#[tokio::test]
+async fn no_dispatch_context_skips_preflight() {
+    let harness = Harness::new();
+    let slot = Arc::new(Mutex::new(Arc::downgrade(&harness.registry)));
+    let tool = super::RunStepsTool::new(slot);
+    let result = tool
+        .invoke(json!({"steps": [{"click": {"pid": 42}}]}))
+        .await
+        .structured_content
+        .unwrap();
+    assert!(result.get("preflight").is_none(), "{result}");
+}
+
+#[test]
+fn suspended_scope_refuses() {
+    let ctx = context(None);
+    let scope = ctx.runtime_scope_key();
+    assert!(crate::session::suspend_runtime_scope(&scope));
+    let result = crate::authorization::preflight_tool("click", &ctx);
+    assert!(crate::session::forget_suspended_runtime_scope(&scope));
+    assert!(result.unwrap_err().to_string().contains("suspended"));
+}
+
+#[tokio::test]
 async fn each_step_is_held_to_the_capability_manifest() {
     let harness = Harness::new();
-    let manifest = "version: 2\nmode: bounded\nexpires_after: 1h\nidle_timeout: 30m\nallow:\n  tools: [run_steps, click]\n";
+    // Keep both action tools statically allowed so this test continues to
+    // exercise the first action's argument-dependent application restriction.
+    let manifest = "version: 2\nmode: bounded\nexpires_after: 1h\nidle_timeout: 30m\nallow:\n  tools: [run_steps, click, set_value]\n";
     let result = harness
         .registry
         .invoke_with_context(
