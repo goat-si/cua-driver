@@ -296,6 +296,32 @@ impl Tool for RunStepsTool {
             Ok(plan) => plan,
             Err(error) => return error.into_result(),
         };
+        if let Some(context) = crate::tool::current_dispatch_authorization_context() {
+            for (index, step) in plan.steps.iter().enumerate() {
+                if let Some(action) = &step.action {
+                    let read = (!action.element.is_empty()).then_some(OBSERVE_TOOL);
+                    for tool in read.into_iter().chain(std::iter::once(action.tool)) {
+                        let tool = match tool {
+                            "type_text_chars" => "type_text",
+                            _ => crate::tool::renamed_tool(tool).unwrap_or(tool),
+                        };
+                        if let Err(error) = crate::authorization::preflight_tool(tool, &context) {
+                            let message = format!("run_steps refused before running anything: step {} ({tool}): {error}", index + 1);
+                            let mut structured = json!({
+                                "status": "refused", "refusal": {"code": "permission_denied", "message": message},
+                                "ok": false, "code": "permission_denied", "executed": 0,
+                                "failed_step": index, "total": plan.steps.len(), "steps": [],
+                                "preflight": {"step": index, "tool": tool},
+                            });
+                            if let Some(scope) = &plan.scope {
+                                structured["app_scope"] = scope.to_json();
+                            }
+                            return ToolResult::error(message).with_structured(structured);
+                        }
+                    }
+                }
+            }
+        }
         let scope = plan.scope.clone();
         crate::batch_scope::enter(scope, plan.run(registry, dispatch_context)).await
     }

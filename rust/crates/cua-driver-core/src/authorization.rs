@@ -1160,6 +1160,65 @@ pub fn authorize_tool_call(
     authorize_tool_call_with_context(tool, args, context.as_ref())
 }
 
+/// Argument-independent denials only; dispatch still performs full checks.
+pub(crate) fn preflight_tool(
+    tool: &str,
+    context: &crate::session_authorization::EffectiveAuthorizationContext,
+) -> Result<(), crate::policy::AuthorizationError> {
+    use crate::policy::AuthorizationError;
+    let tool = match tool {
+        "type_text_chars" => "type_text",
+        _ => crate::tool::renamed_tool(tool).unwrap_or(tool),
+    };
+    if crate::session::is_runtime_scope_suspended(&context.runtime_scope_key()) {
+        return Err(AuthorizationError::Denied(
+            "authorization for this Cua runtime has been suspended by revoke-all".into(),
+        ));
+    }
+    if context.is_revoked() {
+        return Err(AuthorizationError::Denied(
+            "this session authorization context has been revoked".into(),
+        ));
+    }
+    if context.is_expired() {
+        return Err(AuthorizationError::Denied(
+            "authorization context expired".into(),
+        ));
+    }
+    crate::policy::preflight_tool(tool)?;
+    if advertised_risk_for(tool).class == RiskClass::Unclassified {
+        return Err(AuthorizationError::Denied(format!(
+            "tool '{tool}' has no reviewed risk classification"
+        )));
+    }
+    let mode = context.mode();
+    if mode == PermissionMode::Bounded && context.capability_manifest().is_none() {
+        return Err(AuthorizationError::Loading(
+            "bounded mode capability manifest is unavailable".into(),
+        ));
+    }
+    if let Some(manifest) = context.capability_manifest() {
+        manifest
+            .validate_for_mode(mode)
+            .map_err(AuthorizationError::Denied)?;
+        match manifest.decision(tool) {
+            crate::session_manifest::ManifestDecision::Allow => {}
+            crate::session_manifest::ManifestDecision::Deny
+            | crate::session_manifest::ManifestDecision::Ask => {
+                return Err(AuthorizationError::Denied(format!(
+                    "capability manifest denies tool '{tool}'"
+                )))
+            }
+            crate::session_manifest::ManifestDecision::Undeclared => {
+                return Err(AuthorizationError::Denied(format!(
+                    "tool '{tool}' is outside the capability manifest"
+                )))
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Context-aware authorization entry point. The context must originate from
 /// the process-owned registry; caller-supplied session strings or tool
 /// arguments are never authorization inputs.

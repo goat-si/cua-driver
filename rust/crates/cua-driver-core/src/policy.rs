@@ -290,6 +290,51 @@ fn authorize_policy_layers<'a>(
     Ok(())
 }
 
+/// Refuse only when a YAML layer rules out every possible argument set.
+fn preflight_policy_layers<'a>(
+    tool: &str,
+    layers: impl IntoIterator<Item = (&'a str, &'a PolicyEngine)>,
+) -> Result<(), AuthorizationError> {
+    let tool = canonical_tool_name(tool);
+    for (name, policy) in layers {
+        let denied = match policy {
+            #[cfg(feature = "yaml")]
+            PolicyEngine::Yaml(policy) => !policy.is_potentially_listable(tool),
+            #[cfg(feature = "rego")]
+            PolicyEngine::Rego(_) => false,
+            #[cfg(not(any(feature = "yaml", feature = "rego")))]
+            PolicyEngine::Disabled => false,
+        };
+        if denied {
+            return Err(AuthorizationError::Denied(format!(
+                "{name} policy denies tool '{tool}' for all arguments"
+            )));
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn preflight_tool(tool: &str) -> Result<(), AuthorizationError> {
+    preflight_configured_layers(tool, configured_managed_policy(), configured_policy())
+}
+
+fn preflight_configured_layers<'a>(
+    tool: &str,
+    managed: Result<Option<&'a PolicyEngine>, String>,
+    user: Result<Option<&'a PolicyEngine>, String>,
+) -> Result<(), AuthorizationError> {
+    let managed = managed
+        .map_err(|message| AuthorizationError::Loading(format!("managed policy: {message}")))?;
+    let user =
+        user.map_err(|message| AuthorizationError::Loading(format!("user policy: {message}")))?;
+    preflight_policy_layers(
+        tool,
+        [("managed", managed), ("user", user)]
+            .into_iter()
+            .filter_map(|(name, policy)| policy.map(|policy| (name, policy))),
+    )
+}
+
 /// Canonical process-wide capability-policy decision for one tool call.
 ///
 /// Every daemon dispatch path must call this function immediately before
@@ -771,6 +816,39 @@ mod tests {
     #[cfg(feature = "yaml")]
     fn yaml_policy(source: &str) -> PolicyEngine {
         PolicyEngine::Yaml(YamlPolicy::from_str(source).unwrap())
+    }
+
+    #[cfg(feature = "yaml")]
+    #[test]
+    fn yaml_preflight_only_denies_tools_without_an_allow_path() {
+        let policy = yaml_policy("allow:\n  tools: [press_key]\n  rules:\n    - tool: click\n      constraints:\n        x: { min: 1 }\ndeny:\n  tools: [set_value]\n");
+        for tool in ["set_value", "scroll"] {
+            assert!(preflight_policy_layers(tool, [("user", &policy)]).is_err());
+        }
+        assert!(preflight_policy_layers("click", [("user", &policy)]).is_ok());
+        assert!(preflight_policy_layers("press_key", [("user", &policy)]).is_ok());
+    }
+
+    #[test]
+    fn policy_loading_error_refuses_preflight() {
+        assert!(matches!(
+            preflight_configured_layers("click", Err("bad managed policy".into()), Ok(None)),
+            Err(AuthorizationError::Loading(_))
+        ));
+        assert!(matches!(
+            preflight_configured_layers("click", Ok(None), Err("bad user policy".into())),
+            Err(AuthorizationError::Loading(_))
+        ));
+    }
+
+    #[cfg(feature = "rego")]
+    #[test]
+    fn rego_never_preflight_denies() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("policy.rego");
+        fs::write(&path, "package cua.policy\ndefault allow := false\n").unwrap();
+        let policy = PolicyEngine::load(&path).unwrap().unwrap();
+        assert!(preflight_policy_layers("click", [("user", &policy)]).is_ok());
     }
 
     #[cfg(feature = "yaml")]
