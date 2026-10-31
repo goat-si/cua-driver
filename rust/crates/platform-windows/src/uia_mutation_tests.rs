@@ -298,3 +298,38 @@ fn scroll_direction_rejects_unknown_values() {
     assert_eq!(scroll_direction("down"), Some((false, true)));
     assert_eq!(scroll_direction("sideways"), None);
 }
+
+#[test]
+fn scroll_preflight_rejects_bad_direction_before_com_acquisition() {
+    let calls = Cell::new(0);
+    assert_eq!(
+        scroll_preflight("sideways", || {
+            calls.set(calls.get() + 1);
+            42
+        }),
+        None
+    );
+    assert_eq!(calls.get(), 0);
+    assert_eq!(
+        scroll_preflight("left", || {
+            calls.set(calls.get() + 1);
+            42
+        }),
+        Some((true, false, 42))
+    );
+    assert_eq!(calls.get(), 1);
+}
+
+#[test]
+fn expand_route_classifies_all_terminal_results() {
+    use MutationRoute::*;
+    assert_eq!(expand_route(RungOutcome::Called(TIMEOUT)), Uncertain);
+    assert_eq!(expand_route(RungOutcome::Called(DENIED)), Refused);
+    assert_eq!(expand_route(RungOutcome::AcquireFailed(TIMEOUT)), Refused);
+    assert_eq!(
+        expand_route(RungOutcome::Called(NOT_SUPPORTED)),
+        FallThrough
+    );
+    assert_eq!(expand_route(RungOutcome::Absent), FallThrough);
+    assert_eq!(expand_route(RungOutcome::Called(0)), Done);
+}

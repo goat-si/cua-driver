@@ -138,23 +138,24 @@ pub(crate) unsafe fn scroll_element(
     direction: &str,
     amount: u32,
 ) -> anyhow::Result<ScrollWrite> {
-    use crate::uia_mutation::{pattern_absent, scroll_direction, MutationStop};
-    let (horizontal, increment) = scroll_direction(direction)
-        .ok_or_else(|| anyhow::anyhow!("unknown scroll direction {direction:?}"))?;
+    use crate::uia_mutation::{pattern_absent, scroll_preflight, MutationStop};
     if element_ptr == 0 {
         anyhow::bail!("cached UIA scroll element is null");
     }
-    let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
-    let elem = std::mem::ManuallyDrop::new(IUIAutomationElement::from_raw(element_ptr as *mut _));
     let requested = amount.max(1);
     let mut outcome = ScrollWrite {
         completed: 0,
         requested,
         stop: None,
     };
-    let read = elem
-        .GetCurrentPattern(UIA_ScrollPatternId)
-        .and_then(|pattern| pattern.cast::<IUIAutomationScrollPattern>());
+    let (horizontal, increment, read) = scroll_preflight(direction, || {
+        let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+        let elem =
+            std::mem::ManuallyDrop::new(IUIAutomationElement::from_raw(element_ptr as *mut _));
+        elem.GetCurrentPattern(UIA_ScrollPatternId)
+            .and_then(|pattern| pattern.cast::<IUIAutomationScrollPattern>())
+    })
+    .ok_or_else(|| anyhow::anyhow!("unknown scroll direction {direction:?}"))?;
     let scroll = match read {
         Ok(scroll) => scroll,
         Err(error) => {

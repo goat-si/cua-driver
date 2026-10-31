@@ -297,6 +297,28 @@ pub(crate) fn scroll_direction(direction: &str) -> Option<(bool, bool)> {
         _ => None,
     }
 }
+/// Validate the direction before acquiring a COM interface or calling a provider.
+pub(crate) fn scroll_preflight<T>(
+    direction: &str,
+    acquire: impl FnOnce() -> T,
+) -> Option<(bool, bool, T)> {
+    let (horizontal, increment) = scroll_direction(direction)?;
+    Some((horizontal, increment, acquire()))
+}
+
+pub(crate) fn expand_route(outcome: RungOutcome) -> MutationRoute {
+    match outcome {
+        RungOutcome::Absent => MutationRoute::FallThrough,
+        RungOutcome::AcquireFailed(_) => MutationRoute::Refused,
+        RungOutcome::Called(hr) => match classify_write_hresult(hr) {
+            WriteVerdict::Delivered => MutationRoute::Done,
+            WriteVerdict::AffordanceAbsent => MutationRoute::FallThrough,
+            WriteVerdict::Refused(_) => MutationRoute::Refused,
+            WriteVerdict::Uncertain(_) => MutationRoute::Uncertain,
+        },
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AccelOutcome {
     Delivered,
