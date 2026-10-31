@@ -7692,7 +7692,7 @@ fn recording_args_for(tool_name: &str, args: &Value) -> Value {
         arguments.remove("_withheld_args");
         arguments.remove("_withheld_lengths");
         let fields: &[&str] = match tool_name {
-            "type_text" | "browser_type" => &["text"],
+            "type_text" | "browser_type" | "page" => &["text"],
             "set_value" => &["value"],
             "browser_dialog" => &["prompt_text"],
             "clipboard_write" => &["text", "image_path", "file_path"],
@@ -7814,6 +7814,7 @@ mod capability_tests {
             ("browser_type", "text"),
             ("browser_dialog", "prompt_text"),
             ("clipboard_write", "text"),
+            ("page", "text"),
         ] {
             let args = serde_json::json!({field: "séc", "pid": 1});
             let recorded = recording_args_for(tool, &args);

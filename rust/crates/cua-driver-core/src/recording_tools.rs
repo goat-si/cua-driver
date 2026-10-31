@@ -547,11 +547,30 @@ fn parse_action_json(path: &std::path::Path) -> anyhow::Result<(String, Value, V
         .get("arguments")
         .cloned()
         .unwrap_or(Value::Object(Default::default()));
-    let withheld_args = match obj.get("withheld_args") {
+    let mut withheld_args: Vec<String> = match obj.get("withheld_args") {
         Some(value) => serde_json::from_value(value.clone())?,
         None => Vec::new(),
     };
+    if withheld_args.is_empty() {
+        withheld_args = legacy_placeholder_args(&tool, &tool_args);
+    }
     Ok((tool, tool_args, withheld_args))
+}
+
+/// Recordings made before input was withheld replaced these arguments with
+/// the literal "[redacted]". Replaying them would type or paste that
+/// placeholder, so they are treated as withheld.
+fn legacy_placeholder_args(tool: &str, args: &Value) -> Vec<String> {
+    let fields: &[&str] = match tool {
+        "browser_dialog" => &["prompt_text"],
+        "clipboard_write" => &["text", "image_path", "file_path"],
+        _ => &[],
+    };
+    fields
+        .iter()
+        .filter(|field| args.get(**field).and_then(Value::as_str) == Some("[redacted]"))
+        .map(|field| (*field).to_owned())
+        .collect()
 }
 
 // ── install_ffmpeg ────────────────────────────────────────────────────────────
@@ -752,6 +771,18 @@ mod tests {
         let (result, calls) = replay_probe(&[json!({"tool":"browser_dialog", "arguments":{"action":"accept"}, "withheld_args":["prompt_text"]})], true).await;
         assert!(calls.is_empty());
         assert_eq!(result["turns"][0]["code"], "input_withheld");
+    }
+
+    #[tokio::test]
+    async fn legacy_redacted_placeholders_are_never_replayed() {
+        for turn in [
+            json!({"tool":"browser_dialog", "arguments":{"action":"accept", "prompt_text":"[redacted]"}}),
+            json!({"tool":"clipboard_write", "arguments":{"text":"[redacted]"}}),
+        ] {
+            let (result, calls) = replay_probe(std::slice::from_ref(&turn), true).await;
+            assert!(calls.is_empty(), "{turn}");
+            assert_eq!(result["turns"][0]["code"], "input_withheld", "{turn}");
+        }
     }
 
     #[tokio::test]

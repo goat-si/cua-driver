@@ -80,9 +80,16 @@ Each action writes to `turn-NNNNN/` (five-digit zero-padded counter):
   has an explicit classification instead of disappearing from the turn.
 - `app_state.json` and `screenshot.png`: compatibility aliases for
   `after_state.json` and `after.png`.
-- `action.json`: the tool name, full input arguments, result
+- `action.json`: the tool name, input arguments, result
   summary, result-error flag, pid, click point (when applicable), ISO-8601
-  timestamp.
+  timestamp. Typed input is never stored: the `text` of `type_text`,
+  `browser_type` and `page`, the `value` of `set_value`, the `prompt_text`
+  of `browser_dialog` and the `text`/`image_path`/`file_path` of
+  `clipboard_write` are left out and listed in `withheld_args` (with
+  character counts in `withheld_lengths`); such a turn's result summary is
+  replaced by a content-free one. `replay_trajectory` does not run a turn
+  with withheld input and reports it as `input_withheld`. Screenshots,
+  accessibility state and video still show what the application displays.
 - `click.png`: for click-family actions (`click`, `double_click`,
   `right_click`): a copy of the pre-input image with a red marker drawn at
   the click point. Usually that source is `before.png`. When Windows scrolls
