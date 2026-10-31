@@ -69,7 +69,11 @@ pub(crate) fn read_value_if_allowed<R: DirectValueReader>(
     reader: &mut R,
     element: R::Element,
 ) -> ValueRead {
-    ValueRead::Allowed(reader.value(element))
+    if super::content_attrs::classify_value_read(reader, element) {
+        ValueRead::Allowed(reader.value(element))
+    } else {
+        ValueRead::Withheld
+    }
 }
 
 pub(crate) unsafe fn read_text_value(element: AXUIElementRef) -> Option<String> {

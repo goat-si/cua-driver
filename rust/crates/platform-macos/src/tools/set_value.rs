@@ -1248,7 +1248,7 @@ fn set_value_blocking_inner(
 }
 
 trait AxValueOps {
-    fn read_typed(&mut self) -> ValueObs;
+    fn read_typed(&mut self) -> ValueRead;
     fn query_settable(&mut self) -> Settable;
     fn set_number(&mut self, value: f64) -> i32;
     fn set_string(&mut self, value: &str) -> i32;
@@ -1260,14 +1260,11 @@ struct LiveAxValueOps {
     element: AXUIElementRef,
 }
 impl AxValueOps for LiveAxValueOps {
-    fn read_typed(&mut self) -> ValueObs {
-        match read_value_if_allowed(
+    fn read_typed(&mut self) -> ValueRead {
+        read_value_if_allowed(
             &mut crate::ax::label_reader::NativeLabelReader,
             self.element,
-        ) {
-            ValueRead::Allowed(value) => value,
-            ValueRead::Withheld => unreachable!("the preparatory reader always allows reads"),
-        }
+        )
     }
     fn query_settable(&mut self) -> Settable {
         unsafe { query_settable(self.element, "AXValue") }
@@ -1302,6 +1299,7 @@ struct LadderOutcome {
     stepped: bool,
     error: Option<i32>,
     reached: bool,
+    verification_withheld: bool,
 }
 impl LadderOutcome {
     fn new() -> Self {
@@ -1315,6 +1313,7 @@ impl LadderOutcome {
             stepped: false,
             error: None,
             reached: false,
+            verification_withheld: false,
         }
     }
 }
@@ -1325,6 +1324,15 @@ fn obs_string(obs: &ValueObs) -> Option<String> {
         _ => None,
     }
 }
+fn ladder_read(ops: &mut impl AxValueOps, out: &mut LadderOutcome) -> ValueObs {
+    match ops.read_typed() {
+        ValueRead::Allowed(value) => value,
+        ValueRead::Withheld => {
+            out.verification_withheld = true;
+            ValueObs::Missing
+        }
+    }
+}
 fn write_value_ladder(
     ops: &mut impl AxValueOps,
     value: &str,
@@ -1333,7 +1341,7 @@ fn write_value_ladder(
     let _ = ctx.role;
     let mut out = LadderOutcome::new();
     let target = value.trim().parse::<f64>().ok();
-    let before = ops.read_typed();
+    let before = ladder_read(ops, &mut out);
     let settable = ops.query_settable();
     if let (Settable::No, ValueObs::Number(mut current), Some(target), true) =
         (settable, &before, target, ctx.can_step)
@@ -1365,7 +1373,7 @@ fn write_value_ladder(
                     break;
                 }
             }
-            let ValueObs::Number(next) = ops.read_typed() else {
+            let ValueObs::Number(next) = ladder_read(ops, &mut out) else {
                 break;
             };
             if next == current {
@@ -1378,11 +1386,13 @@ fn write_value_ladder(
             out.reached = true;
         }
         if out.reached && !ctx.secure {
-            let after = ops.read_typed();
+            let after = ladder_read(ops, &mut out);
             let before_s = obs_string(&before);
             let after_s = obs_string(&after);
-            (out.verified, out.changed) =
-                classify_write(before_s.as_deref(), after_s.as_deref(), value, true);
+            if !out.verification_withheld {
+                (out.verified, out.changed) =
+                    classify_write(before_s.as_deref(), after_s.as_deref(), value, true);
+            }
         }
         return out;
     }
@@ -1425,17 +1435,23 @@ fn write_value_ladder(
     if !ctx.secure {
         let before_s = obs_string(&before);
         let numeric = !matches!(before, ValueObs::Text(_)) && target.is_some();
-        let after = ops.read_typed();
+        let after = ladder_read(ops, &mut out);
         let after_s = obs_string(&after);
-        (out.verified, out.changed) =
-            classify_write(before_s.as_deref(), after_s.as_deref(), value, numeric);
+        if !out.verification_withheld {
+            (out.verified, out.changed) =
+                classify_write(before_s.as_deref(), after_s.as_deref(), value, numeric);
+        }
         for _ in 0..NOT_APPLIED_REREADS {
             if !write_not_applied(out.verified, out.changed) {
                 break;
             }
             ops.settle_pause();
-            let after = ops.read_typed();
+            let after = ladder_read(ops, &mut out);
             let after_s = obs_string(&after);
+            if out.verification_withheld {
+                (out.verified, out.changed) = (None, None);
+                break;
+            }
             (out.verified, out.changed) =
                 classify_write(before_s.as_deref(), after_s.as_deref(), value, numeric);
         }
@@ -2762,11 +2778,11 @@ mod ladder_tests {
         }
     }
     impl AxValueOps for Fake {
-        fn read_typed(&mut self) -> ValueObs {
+        fn read_typed(&mut self) -> ValueRead {
             if let Some(v) = self.reads.pop_front() {
                 self.last = v;
             }
-            self.last.clone()
+            ValueRead::Allowed(self.last.clone())
         }
         fn query_settable(&mut self) -> Settable {
             self.settable
@@ -3105,11 +3121,8 @@ mod secure_read_tests {
     }
 
     impl AxValueOps for FakeLadder {
-        fn read_typed(&mut self) -> ValueObs {
-            match read_value_if_allowed(&mut self.reader, 0) {
-                ValueRead::Allowed(value) => value,
-                ValueRead::Withheld => ValueObs::Missing,
-            }
+        fn read_typed(&mut self) -> ValueRead {
+            read_value_if_allowed(&mut self.reader, 0)
         }
         fn query_settable(&mut self) -> Settable {
             Settable::Yes
