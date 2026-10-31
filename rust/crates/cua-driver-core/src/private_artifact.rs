@@ -8,6 +8,7 @@ mod platform {
     use std::io::{self, Write};
     use std::os::fd::{AsRawFd, FromRawFd, RawFd};
     use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::MetadataExt;
     use std::path::{Component, Path, PathBuf};
 
     pub(crate) struct PrivateDir {
@@ -58,7 +59,7 @@ mod platform {
         let root_sticky = s.st_uid == 0 && s.st_mode & libc::S_ISVTX != 0;
         if s.st_mode & libc::S_IFMT != libc::S_IFDIR
             || (s.st_uid != uid && s.st_uid != 0)
-            || (s.st_mode & 0o022 != 0 && !root_sticky)
+            || (s.st_mode & 0o022 != 0 && (destination || !root_sticky))
             || (destination && s.st_uid != uid)
             || (private && s.st_mode & 0o077 != 0)
         {
@@ -92,6 +93,37 @@ mod platform {
                 path.to_owned()
             } else {
                 std::env::current_dir()?.join(path)
+            };
+            let mut prefix = PathBuf::from("/");
+            let original_components = absolute
+                .components()
+                .filter_map(|c| match c {
+                    Component::RootDir | Component::CurDir => None,
+                    Component::Normal(n) => Some(Ok(n)),
+                    _ => Some(Err(fail("unsafe path component"))),
+                })
+                .collect::<io::Result<Vec<_>>>()?;
+            for (index, component) in original_components.iter().enumerate() {
+                prefix.push(component);
+                match std::fs::symlink_metadata(&prefix) {
+                    Ok(metadata) if metadata.file_type().is_symlink() => {
+                        if index + 1 == original_components.len()
+                            || (metadata.uid() != 0 && metadata.uid() != unsafe { libc::geteuid() })
+                        {
+                            return Err(fail("unsafe recording symlink"));
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(e)
+                        if e.kind() == io::ErrorKind::NotFound
+                            && index + 1 == original_components.len()
+                            && create => {}
+                    Err(e) => return Err(e),
+                }
+            }
+            let absolute = match (absolute.parent(), absolute.file_name()) {
+                (Some(parent), Some(name)) => parent.canonicalize()?.join(name),
+                _ => absolute,
             };
             let components = absolute
                 .components()
@@ -244,3 +276,21 @@ mod platform {
 
 #[cfg(unix)]
 pub(crate) use platform::PrivateDir;
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::PrivateDir;
+    use std::os::unix::fs::{symlink, PermissionsExt};
+
+    #[test]
+    fn owned_symlink_ancestor_is_allowed_but_destination_link_is_not() {
+        let root = tempfile::tempdir().unwrap();
+        let real = root.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let link = root.path().join("link");
+        symlink(&real, &link).unwrap();
+        assert!(PrivateDir::open(&link).is_err());
+        PrivateDir::open(&link.join("recording")).unwrap();
+    }
+}
