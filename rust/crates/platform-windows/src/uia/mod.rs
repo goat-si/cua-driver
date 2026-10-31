@@ -19,11 +19,9 @@ use cua_driver_core::snapshot_compaction::{
 };
 use cua_driver_core::walk_budget::WalkBudget;
 use windows::core::{Interface, BSTR};
-use windows::Win32::System::Com::{
-    CoCreateInstance, CoInitializeEx, CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED,
-};
+use windows::Win32::System::Com::{CoInitializeEx, COINIT_MULTITHREADED};
 use windows::Win32::UI::Accessibility::{
-    CUIAutomation, ExpandCollapseState_Collapsed, ExpandCollapseState_Expanded,
+    ExpandCollapseState_Collapsed, ExpandCollapseState_Expanded,
     ExpandCollapseState_PartiallyExpanded, IUIAutomation, IUIAutomationCacheRequest,
     IUIAutomationElement, IUIAutomationElementArray, IUIAutomationExpandCollapsePattern,
     IUIAutomationInvokePattern, IUIAutomationSelectionItemPattern, IUIAutomationTogglePattern,
@@ -39,6 +37,7 @@ use windows::Win32::UI::Accessibility::{
     UIA_ToggleToggleStatePropertyId, UIA_ValuePatternId, UIA_ValueValuePropertyId,
 };
 
+pub(crate) mod client;
 pub mod fg_bypass;
 pub(crate) mod focused_document;
 pub mod scroll;
@@ -485,17 +484,16 @@ unsafe fn walk_tree_unsafe(
 ) -> UiaTreeResult {
     let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
 
-    let automation: IUIAutomation =
-        match CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER) {
-            Ok(a) => a,
-            Err(e) => {
-                return UiaTreeResult {
-                    tree_markdown: format!("UIA init failed: {e}"),
-                    nodes: Vec::new(),
-                    elements_complete: false,
-                }
+    let automation: IUIAutomation = match client::new_uia_client() {
+        Ok(a) => a,
+        Err(e) => {
+            return UiaTreeResult {
+                tree_markdown: format!("UIA init failed: {e}"),
+                nodes: Vec::new(),
+                elements_complete: false,
             }
-        };
+        }
+    };
 
     // Build a cache request that fetches everything we need in ONE bulk RPC.
     let (cache_req, mut cache_request_complete) = match node_cache_request(&automation) {
@@ -547,6 +545,19 @@ unsafe fn walk_tree_unsafe(
     };
     if sal_class {
         return crate::msaa::walk_msaa_tree_budgeted(hwnd, budget);
+    }
+
+    let failure = match client::probe_root(hwnd_win) {
+        crate::uia_root::RootVerdict::Ok => None,
+        crate::uia_root::RootVerdict::WindowGone => Some("ElementFromHandle failed: window no longer exists".to_owned()),
+        crate::uia_root::RootVerdict::NoAnswer => Some(format!("window 0x{hwnd:x} did not answer a no-op message within 1 s (the app may be hung); no accessibility tree was read")),
+    };
+    if let Some(tree_markdown) = failure {
+        return UiaTreeResult {
+            tree_markdown,
+            nodes: Vec::new(),
+            elements_complete: false,
+        };
     }
 
     // A native ListView's bulk subtree cache materializes every row and
@@ -1430,17 +1441,21 @@ unsafe fn node_cache_request(
 pub fn walk_native_tree(hwnd: u64) -> Result<Vec<UiaNode>, String> {
     unsafe {
         let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
-        let automation: IUIAutomation =
-            CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER)
-                .map_err(|e| format!("UIA init failed: {e}"))?;
+        let automation = client::new_uia_client().map_err(|e| format!("UIA init failed: {e}"))?;
         let (cache_req, _) = node_cache_request(&automation)
             .map_err(|e| format!("CreateCacheRequest failed: {e}"))?;
         let _ = cache_req.SetTreeScope(TreeScope(TreeScope_Element.0 | TreeScope_Children.0));
         if let Ok(ctrl_cond) = automation.ControlViewCondition() {
             let _ = cache_req.SetTreeFilter(&ctrl_cond);
         }
+        let hwnd_win = windows::Win32::Foundation::HWND(hwnd as *mut _);
+        match client::probe_root(hwnd_win) {
+            crate::uia_root::RootVerdict::Ok => {},
+            crate::uia_root::RootVerdict::WindowGone => return Err("native UIA root could not be read: window no longer exists".to_owned()),
+            crate::uia_root::RootVerdict::NoAnswer => return Err(format!("window 0x{hwnd:x} did not answer a no-op message within 1 s (the app may be hung); no accessibility tree was read")),
+        }
         let root = automation
-            .ElementFromHandle(windows::Win32::Foundation::HWND(hwnd as *mut _))
+            .ElementFromHandle(hwnd_win)
             .and_then(|element| element.BuildUpdatedCache(&cache_req))
             .map_err(|e| format!("native UIA root could not be read: {e}"))?;
         let mut nodes = Vec::new();

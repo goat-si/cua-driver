@@ -3349,6 +3349,22 @@ fn finish_pixel_uia_attempt(
         PointInvokeOutcome::Busy => "busy",
         PointInvokeOutcome::Timeout => "timeout",
         PointInvokeOutcome::Unavailable => "unavailable",
+        PointInvokeOutcome::NotResponding => {
+            return Some(cua_driver_core::delivery::background_unavailable_result(
+                "the app did not answer a no-op message; nothing was sent".to_owned(),
+                "background_unavailable",
+                "the app did not answer a no-op message; nothing was sent".to_owned(),
+                json!({"uia_status": "not_responding", "path": "ax", "verified": false, "effect": "refused", "nothing_sent": true}),
+            ));
+        }
+        PointInvokeOutcome::WindowGone => {
+            return Some(cua_driver_core::delivery::background_unavailable_result(
+                "the target window no longer exists; nothing was sent".to_owned(),
+                "background_unavailable",
+                "the target window no longer exists; nothing was sent".to_owned(),
+                json!({"uia_status": "window_gone", "path": "ax", "verified": false, "effect": "refused", "nothing_sent": true}),
+            ));
+        }
     };
     Some(cua_driver_core::delivery::background_unavailable_result(
         format!(
@@ -5888,18 +5904,12 @@ fn read_cached_element_value(
 /// the `debug_window_info` tool.
 fn read_focused_value_uia(expect_pid: u32) -> Option<String> {
     use windows::core::Interface;
-    use windows::Win32::System::Com::{
-        CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_INPROC_SERVER,
-        COINIT_APARTMENTTHREADED,
-    };
-    use windows::Win32::UI::Accessibility::{
-        CUIAutomation, IUIAutomation, IUIAutomationValuePattern, UIA_ValuePatternId,
-    };
+    use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED};
+    use windows::Win32::UI::Accessibility::{IUIAutomationValuePattern, UIA_ValuePatternId};
 
     let coinit_ok = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED).is_ok() };
     let value = (|| -> Option<String> {
-        let uia: IUIAutomation =
-            unsafe { CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER) }.ok()?;
+        let uia = crate::uia::client::new_uia_client().ok()?;
         let focused = unsafe { uia.GetFocusedElement() }.ok()?;
         // Scope to the target: system focus may be on a different app when the
         // target is backgrounded; reading that element would give a bogus verdict.
@@ -10870,8 +10880,7 @@ impl Tool for DebugWindowInfoTool {
             use std::collections::HashSet;
             use windows::Win32::Foundation::{CloseHandle, HWND, LPARAM, BOOL, TRUE};
             use windows::Win32::System::Com::{
-                CoCreateInstance, CoInitializeEx, CoUninitialize,
-                CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED,
+                CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED,
             };
             use windows::Win32::System::RemoteDesktop::ProcessIdToSessionId;
             use windows::Win32::System::Threading::{
@@ -10880,7 +10889,6 @@ impl Tool for DebugWindowInfoTool {
                 PROCESS_QUERY_LIMITED_INFORMATION,
             };
             use windows::Win32::UI::Accessibility::{
-                CUIAutomation, IUIAutomation,
                 UIA_InvokePatternId, UIA_TextPatternId, UIA_TogglePatternId,
                 UIA_ValuePatternId, UIA_LegacyIAccessiblePatternId,
                 UIA_SelectionItemPatternId, UIA_ExpandCollapsePatternId,
@@ -10958,9 +10966,7 @@ impl Tool for DebugWindowInfoTool {
             // ── Init UIA (best-effort; non-fatal if it fails)
             let mut focused_info: Option<serde_json::Value> = None;
             let coinit_ok = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED).is_ok() };
-            if let Ok(uia) = unsafe {
-                CoCreateInstance::<_, IUIAutomation>(&CUIAutomation, None, CLSCTX_INPROC_SERVER)
-            } {
+            if let Ok(uia) = crate::uia::client::new_uia_client() {
                 if let Ok(focused) = unsafe { uia.GetFocusedElement() } {
                     // Patterns we care about for input routing
                     let pattern_ids = [
