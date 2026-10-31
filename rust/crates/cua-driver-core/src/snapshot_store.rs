@@ -798,6 +798,24 @@ impl<S: SnapshotPayload> SnapshotStore<S> {
         retired.map(|snapshot| snapshot.id)
     }
 
+    /// Retire the current snapshot while preserving this capture and newer ones.
+    /// An obsolete ticket cannot retire state published by a newer operation.
+    pub fn remove_for_capture(&self, pid: i32, window_id: u64, ticket: u64) -> Option<u32> {
+        let retired = {
+            let mut inner = self.inner.lock().unwrap();
+            if !inner.ticket_current(pid, window_id, ticket) {
+                return None;
+            }
+            let state = inner.tickets.get_mut(&(pid, window_id)).unwrap();
+            state.applied = state.applied.max(ticket - 1);
+            inner.get_mut(&pid).and_then(|lane| {
+                let position = lane.iter().position(|entry| entry.window_id == window_id)?;
+                Some(lane.remove(position))
+            })
+        };
+        retired.map(|snapshot| snapshot.id)
+    }
+
     pub fn clear(&self) -> usize {
         let retired = {
             let mut inner = self.inner.lock().unwrap();
