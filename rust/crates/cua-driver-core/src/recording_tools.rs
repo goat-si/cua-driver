@@ -410,7 +410,7 @@ impl Tool for ReplayTrajectoryTool {
                 .to_owned();
 
             let action_path = turn_dir.join("action.json");
-            let (tool_name, tool_args) = match parse_action_json(&action_path) {
+            let (tool_name, tool_args, withheld_args) = match parse_action_json(&action_path) {
                 Ok(v) => v,
                 Err(e) => {
                     failed += 1;
@@ -431,6 +431,24 @@ impl Tool for ReplayTrajectoryTool {
             };
 
             attempted += 1;
+            if !withheld_args.is_empty() {
+                failed += 1;
+                if first_failure.is_none() {
+                    first_failure = Some((
+                        turn_name.clone(),
+                        tool_name.clone(),
+                        "input_withheld".into(),
+                    ));
+                }
+                turns_json.push(json!({
+                    "turn": turn_name, "tool": tool_name, "ok": false,
+                    "code": "input_withheld", "withheld_args": withheld_args,
+                }));
+                if stop_on_error {
+                    break;
+                }
+                continue;
+            }
             let result = registry.invoke(&tool_name, tool_args).await;
             let is_err = result.is_error.unwrap_or(false);
             let summary = result
@@ -514,7 +532,7 @@ fn recording_state_json(state: &RecordingState) -> Value {
     })
 }
 
-fn parse_action_json(path: &std::path::Path) -> anyhow::Result<(String, Value)> {
+fn parse_action_json(path: &std::path::Path) -> anyhow::Result<(String, Value, Vec<String>)> {
     if !path.exists() {
         anyhow::bail!("Missing action.json");
     }
@@ -529,7 +547,30 @@ fn parse_action_json(path: &std::path::Path) -> anyhow::Result<(String, Value)> 
         .get("arguments")
         .cloned()
         .unwrap_or(Value::Object(Default::default()));
-    Ok((tool, tool_args))
+    let mut withheld_args: Vec<String> = match obj.get("withheld_args") {
+        Some(value) => serde_json::from_value(value.clone())?,
+        None => Vec::new(),
+    };
+    if withheld_args.is_empty() {
+        withheld_args = legacy_placeholder_args(&tool, &tool_args);
+    }
+    Ok((tool, tool_args, withheld_args))
+}
+
+/// Recordings made before input was withheld replaced these arguments with
+/// the literal "[redacted]". Replaying them would type or paste that
+/// placeholder, so they are treated as withheld.
+fn legacy_placeholder_args(tool: &str, args: &Value) -> Vec<String> {
+    let fields: &[&str] = match tool {
+        "browser_dialog" => &["prompt_text"],
+        "clipboard_write" => &["text", "image_path", "file_path"],
+        _ => &[],
+    };
+    fields
+        .iter()
+        .filter(|field| args.get(**field).and_then(Value::as_str) == Some("[redacted]"))
+        .map(|field| (*field).to_owned())
+        .collect()
 }
 
 // ── install_ffmpeg ────────────────────────────────────────────────────────────
@@ -626,6 +667,135 @@ impl Tool for InstallFfmpegTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct Probe {
+        def: ToolDef,
+        calls: Arc<Mutex<Vec<Value>>>,
+    }
+
+    #[async_trait]
+    impl Tool for Probe {
+        fn def(&self) -> &ToolDef {
+            &self.def
+        }
+        async fn invoke(&self, mut args: Value) -> ToolResult {
+            if let Some(map) = args.as_object_mut() {
+                map.retain(|key, _| !key.starts_with('_'));
+            }
+            self.calls.lock().unwrap().push(args);
+            ToolResult::text("probe ran")
+        }
+    }
+
+    async fn replay_probe(actions: &[Value], stop: bool) -> (Value, Vec<Value>) {
+        let root = tempfile::tempdir().unwrap();
+        for (i, action) in actions.iter().enumerate() {
+            let dir = root.path().join(format!("turn-{:05}", i + 1));
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("action.json"), action.to_string()).unwrap();
+        }
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let mut registry = ToolRegistry::new();
+        for name in ["type_text", "browser_dialog"] {
+            registry.register(Box::new(Probe {
+                calls: calls.clone(),
+                def: ToolDef {
+                    name: name.into(),
+                    description: "probe".into(),
+                    input_schema: json!({"type": "object"}),
+                    read_only: false,
+                    destructive: false,
+                    idempotent: false,
+                    open_world: false,
+                },
+            }));
+        }
+        let registry = Arc::new(registry);
+        let replay = ReplayTrajectoryTool::new(Arc::new(Mutex::new(Arc::downgrade(&registry))));
+        let result = replay
+            .invoke(
+                json!({"dir": root.path().to_str().unwrap(), "delay_ms": 0, "stop_on_error": stop}),
+            )
+            .await;
+        let seen = calls.lock().unwrap().clone();
+        (result.structured_content.unwrap(), seen)
+    }
+
+    #[tokio::test]
+    async fn replay_refuses_a_withheld_turn_without_dispatch() {
+        let (result, calls) = replay_probe(
+            &[
+                json!({"tool":"type_text", "arguments":{}, "withheld_args":["text"]}),
+                json!({"tool":"type_text", "arguments":{"text":"next"}}),
+            ],
+            true,
+        )
+        .await;
+        assert!(calls.is_empty());
+        assert_eq!(result["attempted"], 1);
+        assert_eq!(result["failed"], 1);
+        assert_eq!(result["turns"][0]["code"], "input_withheld");
+        assert_eq!(result["turns"][0]["withheld_args"], json!(["text"]));
+        assert_eq!(result["first_failure"]["tool"], "type_text");
+    }
+
+    #[tokio::test]
+    async fn replay_continues_after_a_withheld_turn_when_stop_on_error_is_false() {
+        let (result, calls) = replay_probe(
+            &[
+                json!({"tool":"type_text", "arguments":{}, "withheld_args":["text"]}),
+                json!({"tool":"type_text", "arguments":{"text":"next"}}),
+            ],
+            false,
+        )
+        .await;
+        assert_eq!(calls, vec![json!({"text":"next"})]);
+        assert_eq!(result["attempted"], 2);
+        assert_eq!(result["failed"], 1);
+        assert_eq!(result["succeeded"], 1);
+    }
+
+    #[tokio::test]
+    async fn legacy_literal_redacted_text_replays_unchanged() {
+        let (result, calls) = replay_probe(
+            &[json!({"tool":"type_text", "arguments":{"text":"[redacted]"}})],
+            true,
+        )
+        .await;
+        assert_eq!(calls, vec![json!({"text":"[redacted]"})]);
+        assert_eq!(result["succeeded"], 1);
+    }
+
+    #[tokio::test]
+    async fn browser_dialog_prompt_text_is_withheld_and_not_replayed() {
+        let (result, calls) = replay_probe(&[json!({"tool":"browser_dialog", "arguments":{"action":"accept"}, "withheld_args":["prompt_text"]})], true).await;
+        assert!(calls.is_empty());
+        assert_eq!(result["turns"][0]["code"], "input_withheld");
+    }
+
+    #[tokio::test]
+    async fn legacy_redacted_placeholders_are_never_replayed() {
+        for turn in [
+            json!({"tool":"browser_dialog", "arguments":{"action":"accept", "prompt_text":"[redacted]"}}),
+            json!({"tool":"clipboard_write", "arguments":{"text":"[redacted]"}}),
+        ] {
+            let (result, calls) = replay_probe(std::slice::from_ref(&turn), true).await;
+            assert!(calls.is_empty(), "{turn}");
+            assert_eq!(result["turns"][0]["code"], "input_withheld", "{turn}");
+        }
+    }
+
+    #[tokio::test]
+    async fn malformed_withheld_metadata_refuses_dispatch() {
+        let (result, calls) = replay_probe(
+            &[json!({"tool":"type_text", "arguments":{"text":"secret"}, "withheld_args":"text"})],
+            true,
+        )
+        .await;
+        assert!(calls.is_empty());
+        assert_eq!(result["failed"], 1);
+        assert!(result["turns"][0].get("parse_error").is_some());
+    }
 
     #[tokio::test]
     async fn start_recording_resolves_the_per_turn_state_budget() {
