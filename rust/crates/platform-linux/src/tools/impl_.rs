@@ -7061,22 +7061,20 @@ impl Tool for ClickTool {
                     }
                 };
                 if let Ok(Ok(((_action, suspected_noop, unacknowledged), guard))) = ax_result {
-                    let mut structured = json!({
-                        "path": "ax",
-                        "verified": false,
-                        "effect": if suspected_noop { "suspected_noop" } else { "unverifiable" },
-                    });
-                    if suspected_noop {
+                    let mut structured = crate::token_action_policy::ax_click_structured(
+                        suspected_noop,
+                        unacknowledged,
+                    );
+                    if suspected_noop && !unacknowledged {
                         structured["escalation"] = non_ax_escalation();
-                    } else if unacknowledged {
-                        structured["note"] = json!(
-                            "no acknowledgement received for the doAction call within the \
-                             AT-SPI timeout; its effect is unknown"
-                        );
                     }
+                    let message = if unacknowledged {
+                        format!("Action may have run on element [{idx}]")
+                    } else {
+                        format!("Clicked element [{idx}] (pid {pid}).")
+                    };
                     return attach_focus_guard(
-                        ToolResult::text(format!("Clicked element [{idx}] (pid {pid})."))
-                            .with_structured(structured),
+                        ToolResult::text(message).with_structured(structured),
                         guard.as_ref(),
                     );
                 }
