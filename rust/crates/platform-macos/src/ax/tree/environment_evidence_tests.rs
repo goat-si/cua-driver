@@ -5,6 +5,65 @@ use std::cell::{Cell, RefCell};
 use std::time::{Duration, Instant};
 
 #[test]
+fn recovery_probe_preserves_failure_and_no_match() {
+    use crate::ax::bindings::{kAXErrorCannotComplete, kAXErrorSuccess, recovery_hit_outcome};
+    use crate::ax::tree_source::ReadFailure;
+    let failed = recovery_hit_outcome::<usize>(kAXErrorCannotComplete, None, None);
+    assert!(failed.legacy.is_none());
+    assert!(
+        failed
+            .evidence
+            .iter()
+            .any(|entry| entry.site == ReadSite::RecoveryHit
+                && entry.status
+                    == EvidenceStatus::Unknown(ReadFailure::Ax(kAXErrorCannotComplete))),
+        "missing failed hit evidence"
+    );
+    let absent = recovery_hit_outcome::<usize>(kAXErrorSuccess, None, None);
+    assert!(absent.legacy.is_none());
+    assert!(
+        absent
+            .evidence
+            .iter()
+            .any(|entry| entry.site == ReadSite::RecoveryHit
+                && entry.status == EvidenceStatus::Absent)
+    );
+    let found = recovery_hit_outcome(kAXErrorSuccess, Some(42usize), Some(42));
+    assert_eq!(found.legacy, Some(42));
+    assert!(found
+        .evidence
+        .iter()
+        .any(|entry| entry.site == ReadSite::RecoveryHit && entry.status == EvidenceStatus::Known));
+    let now = Instant::now();
+    let scope = crate::ax::evidence::EvidenceScope::start();
+    let skipped: Option<()> =
+        super::window_center_hit_if_live(Some(now), now, || panic!("no hit after deadline"));
+    let observed = scope.finish(skipped);
+    assert!(observed.legacy.is_none());
+    assert!(observed
+        .evidence
+        .iter()
+        .any(|entry| entry.site == ReadSite::RecoveryDeadline
+            && entry.status == EvidenceStatus::DeadlineExpired));
+    for (ids, expected, status) in [
+        (vec![Some(1), Some(2)], None, EvidenceStatus::Absent),
+        (vec![Some(1), None], None, EvidenceStatus::Unavailable),
+        (
+            vec![Some(1), Some(42), Some(42)],
+            Some(2),
+            EvidenceStatus::Known,
+        ),
+    ] {
+        let result = super::recovery_root_outcome(&ids, 42);
+        assert_eq!(result.legacy, expected);
+        assert!(result
+            .evidence
+            .iter()
+            .any(|entry| entry.site == ReadSite::RecoveryRoot && entry.status == status));
+    }
+}
+
+#[test]
 fn scope_candidate_reads_preserve_unknown_and_absent() {
     use super::scope_candidate_with;
     use super::walker_seam_tests::{step, Fake, Reply};

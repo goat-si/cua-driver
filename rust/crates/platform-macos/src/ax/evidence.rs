@@ -113,6 +113,11 @@ pub(crate) enum ReadSite {
     ProviderCachedEnablement,
     ProviderOptIn,
     ScopeCandidate(&'static str),
+    RecoveryHit,
+    RecoveryDeadline,
+    RecoveryParent,
+    RecoveryWindowId,
+    RecoveryRoot,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

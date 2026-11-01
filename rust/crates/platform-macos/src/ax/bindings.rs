@@ -121,16 +121,63 @@ extern "C" {
 ///
 /// The caller must release any returned element exactly once with `CFRelease`.
 pub unsafe fn element_at_screen_position(pid: i32, x: f64, y: f64) -> Option<AXUIElementRef> {
+    element_at_screen_position_observed(pid, x, y).legacy
+}
+
+pub(crate) unsafe fn element_at_screen_position_observed(
+    pid: i32,
+    x: f64,
+    y: f64,
+) -> super::evidence::Observed<Option<AXUIElementRef>> {
     // The unbounded default keeps Electron reveal's existing AX timeout
     // behavior; U4's guard uses the bounded variant explicitly.
     let application = AXUIElementCreateApplication(pid);
     if application.is_null() {
-        return None;
+        use super::evidence::{EvidenceStatus, Observed, ReadEvidence, ReadSite};
+        return Observed {
+            legacy: None,
+            evidence: vec![ReadEvidence {
+                owner: None,
+                site: ReadSite::RecoveryHit,
+                status: EvidenceStatus::Unavailable,
+                attempt: 0,
+                listing: None,
+            }],
+        };
     }
     let mut element = std::ptr::null_mut();
     let error = AXUIElementCopyElementAtPosition(application, x as f32, y as f32, &mut element);
     CFRelease(application as CFTypeRef);
-    (error == kAXErrorSuccess && !element.is_null()).then_some(element)
+    let owner = (!element.is_null() && error == kAXErrorSuccess).then_some(element as usize);
+    recovery_hit_outcome(error, (!element.is_null()).then_some(element), owner)
+}
+
+/// Project an already completed hit test without repeating the AX request.
+pub(crate) fn recovery_hit_outcome<T>(
+    error: AXError,
+    hit: Option<T>,
+    owner: Option<usize>,
+) -> super::evidence::Observed<Option<T>> {
+    use super::evidence::{EvidenceStatus, Observed, ReadEvidence, ReadSite};
+    use super::tree_source::ReadFailure;
+    let status = if error != kAXErrorSuccess {
+        EvidenceStatus::Unknown(ReadFailure::Ax(error))
+    } else if hit.is_some() {
+        EvidenceStatus::Known
+    } else {
+        EvidenceStatus::Absent
+    };
+    let legacy = if error == kAXErrorSuccess { hit } else { None };
+    Observed {
+        legacy,
+        evidence: vec![ReadEvidence {
+            owner,
+            site: ReadSite::RecoveryHit,
+            status,
+            attempt: 0,
+            listing: None,
+        }],
+    }
 }
 
 /// element_at_screen_position with an explicit messaging timeout on the

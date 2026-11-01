@@ -1145,11 +1145,12 @@ unsafe fn copy_top_level(
         if !already_present && !recovery_deadline_reached(recovery_deadline, Instant::now()) {
             if let Some(bounds) = crate::windows::window_bounds_by_id(wid) {
                 let hit = window_center_hit_if_live(recovery_deadline, Instant::now(), || {
-                    element_at_screen_position(
+                    element_at_screen_position_observed(
                         pid,
                         bounds.x + bounds.width * 0.5,
                         bounds.y + bounds.height * 0.5,
                     )
+                    .into_walk_legacy()
                 });
                 if let Some(root) = hit.flatten().and_then(|element| {
                     recover_window_root_at_center(element, wid, recovery_deadline)
@@ -1172,7 +1173,15 @@ unsafe fn copy_top_level(
 const MAX_WINDOW_RECOVERY_ANCESTORS: usize = 32;
 
 fn recovery_deadline_reached(deadline: Option<Instant>, now: Instant) -> bool {
-    deadline.is_some_and(|deadline| now >= deadline)
+    let expired = deadline.is_some_and(|deadline| now >= deadline);
+    if expired {
+        super::evidence::record_status(
+            None,
+            super::evidence::ReadSite::RecoveryDeadline,
+            super::evidence::EvidenceStatus::DeadlineExpired,
+        );
+    }
+    expired
 }
 
 fn window_center_hit_if_live<T>(
@@ -1180,13 +1189,42 @@ fn window_center_hit_if_live<T>(
     now: Instant,
     hit: impl FnOnce() -> T,
 ) -> Option<T> {
-    (!recovery_deadline_reached(deadline, now)).then(hit)
+    if recovery_deadline_reached(deadline, now) {
+        None
+    } else {
+        Some(hit())
+    }
 }
 
 fn topmost_window_match(window_ids: &[Option<u32>], requested: u32) -> Option<usize> {
     window_ids
         .iter()
         .rposition(|window_id| *window_id == Some(requested))
+}
+
+fn recovery_root_outcome(
+    window_ids: &[Option<u32>],
+    requested: u32,
+) -> super::evidence::Observed<Option<usize>> {
+    use super::evidence::{EvidenceStatus, Observed, ReadEvidence, ReadSite};
+    let legacy = topmost_window_match(window_ids, requested);
+    let status = if legacy.is_some() {
+        EvidenceStatus::Known
+    } else if window_ids.iter().any(Option::is_none) {
+        EvidenceStatus::Unavailable
+    } else {
+        EvidenceStatus::Absent
+    };
+    Observed {
+        legacy,
+        evidence: vec![ReadEvidence {
+            owner: None,
+            site: ReadSite::RecoveryRoot,
+            status,
+            attempt: 0,
+            listing: None,
+        }],
+    }
 }
 
 /// Recover the highest matching ancestor of a center-hit element. The hit and
@@ -1204,7 +1242,17 @@ unsafe fn recover_window_root_at_center(
         }
         let current = *ancestors.last().expect("the hit is always present");
         set_messaging_timeout(current);
-        let Some(parent) = copy_element_attr(current, "AXParent") else {
+        let parent = copy_element_attr(current, "AXParent");
+        super::evidence::record_status(
+            Some(current as usize),
+            super::evidence::ReadSite::RecoveryParent,
+            if parent.is_some() {
+                super::evidence::EvidenceStatus::Known
+            } else {
+                super::evidence::EvidenceStatus::Unavailable
+            },
+        );
+        let Some(parent) = parent else {
             break;
         };
         ancestors.push(parent);
@@ -1221,13 +1269,27 @@ unsafe fn recover_window_root_at_center(
             return None;
         }
         set_messaging_timeout(element);
-        window_ids.push(ax_get_window_id(element));
+        let id = ax_get_window_id(element);
+        super::evidence::record_status(
+            Some(element as usize),
+            super::evidence::ReadSite::RecoveryWindowId,
+            if id.is_some() {
+                super::evidence::EvidenceStatus::Known
+            } else {
+                super::evidence::EvidenceStatus::Unavailable
+            },
+        );
+        window_ids.push(id);
         if recovery_deadline_reached(deadline, Instant::now()) {
             release_all(ancestors);
             return None;
         }
     }
-    let root = topmost_window_match(&window_ids, requested).map(|index| {
+    let mut observed = recovery_root_outcome(&window_ids, requested);
+    if let Some(index) = observed.legacy {
+        observed.evidence[0].owner = Some(ancestors[index] as usize);
+    }
+    let root = observed.into_walk_legacy().map(|index| {
         CFRetain(ancestors[index] as CFTypeRef);
         ancestors[index]
     });
