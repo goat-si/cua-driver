@@ -474,10 +474,36 @@ fn mark_boundaries(md: &str, structured: &Value) -> String {
             marker.push_str(": ");
             marker.push_str(&reasons.join(", "));
         }
-        if boundary.get("descendants_omitted").and_then(Value::as_bool) == Some(true) {
-            marker.push_str("; descendants omitted");
+        match boundary.get("descendants_omitted").and_then(Value::as_bool) {
+            Some(true) => marker.push_str("; descendants omitted"),
+            Some(false) => marker.push_str("; descendants not omitted"),
+            None => {}
         }
         marker.push(']');
+        // Detail names alone do not uniquely identify a reason: the public
+        // contract also carries its kind, independently of its detail.
+        let mut reason_kinds: Vec<(&str, &str)> = boundary
+            .get("reasons")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|reason| {
+                Some((
+                    reason.get("detail")?.as_str()?,
+                    reason.get("kind")?.as_str()?,
+                ))
+            })
+            .collect();
+        reason_kinds.sort_unstable();
+        reason_kinds.dedup();
+        if !reason_kinds.is_empty() {
+            let kinds = reason_kinds
+                .into_iter()
+                .map(|(detail, kind)| format!("{detail}={kind}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            marker.push_str(&format!(" [reason kinds: {kinds}]"));
+        }
         markers.insert(index, marker);
     }
     md.split('\n')
@@ -1482,6 +1508,41 @@ mod tests {
             {"kind":"budget","detail":"time_budget"}
         ]}}]});
         assert!(mark_boundaries(OLD, &boundary).contains("[+2 more: node_budget, time_budget]"));
+    }
+
+    #[test]
+    fn u20_boundary_reason_kind_change_is_a_changed_row() {
+        let (mut content, mut first) = payload("s0000ae01", OLD);
+        first["elements"][0]["boundary"] = json!({"reasons":[{"kind":"budget","detail":"node_budget"}],"children_skipped":{"known":3}});
+        apply(&opts(json!({})), &ctx(88005), &mut content, &mut first);
+        let (mut content, mut second) = payload("s0000ae02", OLD);
+        second["elements"][0]["boundary"] = json!({"reasons":[{"kind":"unknown","detail":"node_budget"}],"children_skipped":{"known":3}});
+        apply(
+            &opts(json!({"since":"s0000ae01"})),
+            &ctx(88005),
+            &mut content,
+            &mut second,
+        );
+        assert_eq!(second["since_status"], "diff");
+        assert!(second["tree_diff"].as_str().unwrap().contains("~ [1]"));
+    }
+
+    #[test]
+    fn u20_explicit_false_descendants_change_is_a_changed_row() {
+        let (mut content, mut first) = payload("s0000af01", OLD);
+        first["elements"][0]["boundary"] = json!({"reasons":[],"children_skipped":{"known":3}});
+        apply(&opts(json!({})), &ctx(88006), &mut content, &mut first);
+        let (mut content, mut second) = payload("s0000af02", OLD);
+        second["elements"][0]["boundary"] =
+            json!({"reasons":[],"children_skipped":{"known":3},"descendants_omitted":false});
+        apply(
+            &opts(json!({"since":"s0000af01"})),
+            &ctx(88006),
+            &mut content,
+            &mut second,
+        );
+        assert_eq!(second["since_status"], "diff");
+        assert!(second["tree_diff"].as_str().unwrap().contains("~ [1]"));
     }
 
     #[test]
