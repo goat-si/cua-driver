@@ -643,6 +643,105 @@ const BATCH_TOOLS: &[&str] = &[
 const NOTES_ONLY: &str = "com.example.notes";
 
 #[tokio::test]
+async fn u09_steps_predispatch_refusal_is_not_delivered() {
+    let harness = Harness::new();
+    let (result, out) = harness
+        .run(
+            "run_steps",
+            json!({
+                "app_scope":{"apps":[NOTES_ONLY]},
+                "steps":[{"click":{"pid":99,"window_id":9,"element_token":"s00000002:1"}}]
+            }),
+        )
+        .await;
+    assert_eq!(result.is_error, Some(true), "{out}");
+    assert_eq!(out["steps"][0]["code"], OUTSIDE_SCOPE);
+    assert_eq!(out["steps"][0]["delivery"], "not_delivered");
+    assert!(harness.sent("click").is_empty());
+    assert_eq!(
+        result.disposition,
+        Some(cua_driver_contract::ErrorDisposition::NOT_DELIVERED)
+    );
+    let wire = crate::mcp_result::conforming_tool_result(
+        "run_steps",
+        serde_json::to_value(result).unwrap(),
+    );
+    assert_eq!(
+        wire["structuredContent"]["disposition"],
+        json!({"delivery":"not_delivered","retry":"safe"})
+    );
+}
+
+#[cfg(feature = "script")]
+#[tokio::test]
+async fn u09_script_predispatch_refusal_is_not_delivered() {
+    let harness = Harness::new();
+    let (result, out) = harness.run("run_script", json!({
+        "app_scope":{"apps":[NOTES_ONLY]},
+        "script":"await cua.call('click', {pid: 99, window_id: 9, element_token: 's00000002:1'});"
+    })).await;
+    assert_eq!(result.is_error, Some(true), "{out}");
+    assert_eq!(out["error"]["code"], OUTSIDE_SCOPE);
+    assert_eq!(out["calls"][0]["delivery"], "not_delivered");
+    assert_eq!(
+        out["calls"][0]["driver_calls"][0]["delivery"],
+        "not_delivered"
+    );
+    assert!(harness.sent("click").is_empty());
+    assert_eq!(
+        result.disposition,
+        Some(cua_driver_contract::ErrorDisposition::NOT_DELIVERED)
+    );
+    let wire = crate::mcp_result::conforming_tool_result(
+        "run_script",
+        serde_json::to_value(result).unwrap(),
+    );
+    assert_eq!(
+        wire["structuredContent"]["disposition"],
+        json!({"delivery":"not_delivered","retry":"safe"})
+    );
+}
+
+#[tokio::test]
+async fn u09_steps_foreground_scope_refusal_is_not_delivered() {
+    let harness = Harness::new();
+    let (result, out) = harness.run("run_steps", json!({
+        "app_scope":{"apps":[NOTES_ONLY]},
+        "steps":[{"click":{"pid":42,"window_id":7,"element_token":"s00000001:1","delivery_mode":"foreground"}}]
+    })).await;
+    assert_eq!(out["steps"][0]["code"], FOREGROUND_NOT_ALLOWED);
+    assert!(harness.sent("click").is_empty());
+    let wire = crate::mcp_result::conforming_tool_result(
+        "run_steps",
+        serde_json::to_value(result).unwrap(),
+    );
+    assert_eq!(
+        wire["structuredContent"]["disposition"],
+        json!({"delivery":"not_delivered","retry":"safe"})
+    );
+}
+
+#[cfg(feature = "script")]
+#[tokio::test]
+async fn u09_script_foreground_scope_refusal_is_not_delivered() {
+    let harness = Harness::new();
+    let (result, out) = harness.run("run_script", json!({
+        "app_scope":{"apps":[NOTES_ONLY]},
+        "script":"await cua.call('click', {pid: 42, window_id: 7, element_token: 's00000001:1', delivery_mode: 'foreground'});"
+    })).await;
+    assert_eq!(out["error"]["code"], FOREGROUND_NOT_ALLOWED);
+    assert!(harness.sent("click").is_empty());
+    let wire = crate::mcp_result::conforming_tool_result(
+        "run_script",
+        serde_json::to_value(result).unwrap(),
+    );
+    assert_eq!(
+        wire["structuredContent"]["disposition"],
+        json!({"delivery":"not_delivered","retry":"safe"})
+    );
+}
+
+#[tokio::test]
 async fn run_steps_refuses_a_step_outside_the_scope_and_stops_there() {
     let harness = Harness::new();
     let (result, out) = harness
@@ -672,6 +771,10 @@ async fn run_steps_refuses_a_step_outside_the_scope_and_stops_there() {
     assert_eq!(clicks.len(), 1, "{clicks:?}");
     assert_eq!(clicks[0]["pid"], 42);
     assert!(harness.sent("press_key").is_empty(), "the batch stopped");
+    assert_eq!(
+        result.disposition,
+        Some(cua_driver_contract::ErrorDisposition::DELIVERED)
+    );
 }
 
 #[tokio::test]
@@ -805,6 +908,10 @@ async fn run_script_refuses_calls_outside_the_scope_and_journals_every_effect() 
     let clicks = harness.sent("click");
     assert_eq!(clicks.len(), 1, "{clicks:?}");
     assert_eq!(clicks[0]["pid"], 42);
+    assert_eq!(
+        result.disposition,
+        Some(cua_driver_contract::ErrorDisposition::DELIVERED)
+    );
     assert!(
         text(&result).contains("click ERROR, refused (outside_scope)"),
         "{}",

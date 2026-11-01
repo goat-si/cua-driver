@@ -1169,7 +1169,8 @@ async fn handle_proxy_tool_request(
                             &call.name,
                             cua_driver_core::mcp_result::tool_error_result(
                                 error.to_string(),
-                                serde_json::json!({"code": "permission_denied"}),
+                                // Constructed locally before any daemon call; never copied from tool JSON.
+                                serde_json::json!({"code": "permission_denied", "disposition": cua_driver_contract::ErrorDisposition::NOT_DELIVERED}),
                             ),
                             proxy_output_schema(cached_tools_list, &call.name),
                         ),
@@ -1818,6 +1819,10 @@ mod tests {
         let result = &value["result"];
         assert_eq!(result["isError"], true);
         assert_eq!(result["structuredContent"]["code"], "permission_denied");
+        assert_eq!(
+            result["structuredContent"]["disposition"],
+            serde_json::json!({"delivery":"not_delivered", "retry":"safe"})
+        );
         assert_eq!(result["content"][0]["type"], "text");
         assert!(result["content"][0]["text"]
             .as_str()

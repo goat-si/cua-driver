@@ -926,7 +926,9 @@ async fn dispatch_request(
                             &call.name,
                             tool_error_result(
                                 error.to_string(),
-                                serde_json::json!({"code": "permission_denied"}),
+                                // This JSON is constructed by the server before provider invocation;
+                                // no tool-provided disposition crosses this trusted boundary.
+                                serde_json::json!({"code": "permission_denied", "disposition": cua_driver_contract::ErrorDisposition::NOT_DELIVERED}),
                             ),
                         ),
                     );
@@ -939,7 +941,7 @@ async fn dispatch_request(
                             &call.name,
                             tool_error_result(
                                 format!("Unknown tool: {}", call.name),
-                                serde_json::json!({"code": "unknown_tool"}),
+                                serde_json::json!({"code": "unknown_tool", "disposition": cua_driver_contract::ErrorDisposition::NOT_DELIVERED}),
                             ),
                         ),
                     );
@@ -1104,6 +1106,61 @@ mod dispatch_contract_tests {
             ResponseBody::Result { result } => result,
             ResponseBody::Error { error } => panic!("expected a result, got {}", error.message),
         }
+    }
+
+    #[tokio::test]
+    async fn u09_unknown_tool_is_not_delivered() {
+        let result = result_of(
+            dispatch_request(
+                call_request("click"),
+                serde_json::json!(1),
+                &NeverInvokeProvider,
+                None,
+                crate::mcp_wire::ProtocolEra::Legacy,
+            )
+            .await,
+        );
+        assert_eq!(result["structuredContent"]["code"], "unknown_tool");
+        assert_eq!(
+            result["structuredContent"]["disposition"],
+            serde_json::json!({"delivery":"not_delivered","retry":"safe"})
+        );
+    }
+
+    #[tokio::test]
+    async fn u09_server_permission_denied_is_not_delivered() {
+        const CHILD: &str = "U09_SERVER_POLICY_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let dir = tempfile::tempdir().unwrap();
+            let policy = dir.path().join("deny.yaml");
+            std::fs::write(&policy, "deny:\n  tools: [click]\n").unwrap();
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "server::dispatch_contract_tests::u09_server_permission_denied_is_not_delivered", "--nocapture"])
+                .env(CHILD, "1").env(crate::policy::POLICY_FILE_ENV, &policy)
+                .env_remove(crate::policy::MANAGED_POLICY_FILE_ENV).output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        let result = result_of(
+            dispatch_request(
+                call_request("click"),
+                serde_json::json!(1),
+                &NeverInvokeProvider,
+                None,
+                crate::mcp_wire::ProtocolEra::Legacy,
+            )
+            .await,
+        );
+        assert_eq!(result["structuredContent"]["code"], "permission_denied");
+        assert_eq!(
+            result["structuredContent"]["disposition"],
+            serde_json::json!({"delivery":"not_delivered","retry":"safe"})
+        );
     }
 
     #[track_caller]

@@ -141,6 +141,44 @@ fn structured(result: &ToolResult) -> Value {
     result.structured_content.clone().unwrap_or(Value::Null)
 }
 
+#[test]
+fn u09_success_script_does_not_expose_error_delivery_markers() {
+    let outcome = super::engine::Outcome {
+        result: Ok(json!("recovered")),
+        console: Vec::new(),
+        console_truncated: false,
+        calls: 1,
+    };
+    let log = vec![super::CallRecord {
+        number: 1,
+        op: "click".into(),
+        line: 1,
+        ok: false,
+        elapsed: Duration::ZERO,
+        detail: "refused".into(),
+        facts: super::CallFacts {
+            tool: Some("click".into()),
+            delivery: Some("not_delivered"),
+            ..Default::default()
+        },
+        driver_calls: vec![json!({"tool":"click", "ok":false, "delivery":"not_delivered"})],
+        driver_calls_omitted: 0,
+    }];
+    let result = super::render(
+        Some(outcome),
+        log,
+        Vec::new(),
+        Duration::ZERO,
+        100,
+        None,
+        false,
+    );
+    let out = structured(&result);
+    assert_ne!(result.is_error, Some(true));
+    assert!(out["calls"][0].get("delivery").is_none());
+    assert!(out["calls"][0]["driver_calls"][0].get("delivery").is_none());
+}
+
 struct HangingAction {
     def: ToolDef,
     started: Arc<tokio::sync::Notify>,
