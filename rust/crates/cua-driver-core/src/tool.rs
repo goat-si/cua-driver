@@ -6341,6 +6341,99 @@ allow:
     }
 
     #[tokio::test]
+    async fn old_window_schema_refuses_root_without_invoking_or_retrying() {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let mut registry = super::ToolRegistry::new();
+        registry.register(Box::new(ArgumentProbe {
+            hits: hits.clone(),
+            last_args: Arc::new(Mutex::new(None)),
+            def: super::ToolDef {
+                name: "get_window_state".into(),
+                description: "old daemon schema".into(),
+                input_schema: serde_json::json!({
+                    "type":"object", "properties": {
+                        "pid":{"type":"integer"}, "window_id":{"type":"integer"}
+                    }, "additionalProperties":false
+                }),
+                read_only: true,
+                destructive: false,
+                idempotent: false,
+                open_world: false,
+            },
+        }));
+        let result = registry
+            .invoke_with_context(
+                "get_window_state",
+                serde_json::json!({"pid":42,"window_id":7,"root_element_token":"s0000002a:1"}),
+                standard_context(),
+            )
+            .await;
+        assert_eq!(result.is_error, Some(true));
+        assert_eq!(
+            result.structured_content.unwrap()["refusal"]["code"],
+            "invalid_arguments"
+        );
+        assert_eq!(hits.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn unadopted_registry_refuses_root_without_a_full_walk_or_retry() {
+        struct Unadopted {
+            def: super::ToolDef,
+            invocations: Arc<AtomicUsize>,
+            walks: Arc<AtomicUsize>,
+        }
+        #[async_trait::async_trait]
+        impl super::Tool for Unadopted {
+            fn def(&self) -> &super::ToolDef {
+                &self.def
+            }
+            async fn protected_resource_ownership(
+                &self,
+                _adapter: &str,
+                _args: &serde_json::Value,
+            ) -> super::ProtectedResourceOwnership {
+                super::ProtectedResourceOwnership::DriverOwned
+            }
+            async fn invoke(&self, args: serde_json::Value) -> crate::protocol::ToolResult {
+                self.invocations.fetch_add(1, Ordering::SeqCst);
+                if let Err(result) = crate::window_state_view::display_only(&args) {
+                    return result;
+                }
+                self.walks.fetch_add(1, Ordering::SeqCst);
+                crate::protocol::ToolResult::text("full walk")
+            }
+        }
+        let invocations = Arc::new(AtomicUsize::new(0));
+        let walks = Arc::new(AtomicUsize::new(0));
+        let mut registry = super::ToolRegistry::new();
+        registry.register(Box::new(Unadopted {
+            invocations: invocations.clone(), walks: walks.clone(),
+            def: super::ToolDef { name:"get_window_state".into(), description:String::new(),
+                input_schema: crate::window_state_view::extend_input_schema(serde_json::json!({
+                    "type":"object", "properties":{"pid":{"type":"integer"},"window_id":{"type":"integer"}},
+                    "additionalProperties":false})),
+                read_only:true, destructive:false, idempotent:false, open_world:false },
+        }));
+        let result = registry
+            .invoke_with_context(
+                "get_window_state",
+                serde_json::json!({
+                    "pid":42,"window_id":7,"root_element_token":"s0000002a:1"
+                }),
+                standard_context(),
+            )
+            .await;
+        assert_eq!(result.is_error, Some(true));
+        assert_eq!(
+            result.structured_content.unwrap()["refusal"]["code"],
+            "root_unsupported"
+        );
+        assert_eq!(invocations.load(Ordering::SeqCst), 1);
+        assert_eq!(walks.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
     async fn dispatch_resolves_type_text_chars_before_reading_the_wait() {
         use crate::post_action_wait::{PostActionWait, SKIP_SUPPORTED};
         use serde_json::json;

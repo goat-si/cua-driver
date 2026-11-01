@@ -94,6 +94,10 @@ pub fn schema_properties() -> Value {
         "display_only": {
             "type": "boolean",
             "description": DISPLAY_ONLY_DESCRIPTION
+        },
+        "root_element_token": {
+            "type": "string",
+            "description": "Snapshot-qualified token of the subtree root. Unsupported platforms refuse this argument."
         }
     })
 }
@@ -117,9 +121,54 @@ pub const DISPLAY_ONLY_NEEDS_NO_TREE: &str =
 /// `frame_note` on a display-only response.
 pub const DISPLAY_ONLY_FRAME_NOTE: &str = "Display-only preview; not registered for input actions. Obtain a normal get_window_state screenshot before acting.";
 
-/// Read `display_only`. A display-only read must skip the tree walk, because
-/// a walk is what produces element rows and tokens.
+/// Validate combinations supported by rooted reads, before any platform walk.
+pub fn validate_root_args(args: &Value) -> Result<(), ToolResult> {
+    if args.get("root_element_token").is_some_and(|v| !v.is_null()) {
+        if !args["root_element_token"].is_string() {
+            return Err(crate::element_token::refusal(
+                "invalid_element_token",
+                "root_element_token must be a snapshot-qualified string.".into(),
+            ));
+        }
+        let code = if args.get("since").is_some_and(|v| !v.is_null()) {
+            Some("root_since_unsupported")
+        } else if args.get("display_only").and_then(Value::as_bool) == Some(true) {
+            Some("root_display_only_unsupported")
+        } else if args
+            .get("include_accessibility_tree")
+            .and_then(Value::as_bool)
+            == Some(false)
+        {
+            Some("root_screenshot_only_unsupported")
+        } else {
+            None
+        };
+        if let Some(code) = code {
+            return Err(crate::element_token::refusal(code, code.into()));
+        }
+    }
+    Ok(())
+}
+
+/// Read `display_only` and refuse rooted walks on the current unadopted
+/// platforms. Adopters must use `validate_root_args` in their own preflight.
 pub fn display_only(args: &Value) -> Result<bool, ToolResult> {
+    validate_root_args(args)?;
+    if args.get("root_element_token").is_some_and(|v| !v.is_null()) {
+        let mut result = crate::element_token::refusal(
+            "root_unsupported",
+            "This platform does not support rooted reads.".into(),
+        );
+        if let Some(structured) = result.structured_content.as_mut() {
+            structured["drilldown_status"] = json!("unsupported");
+            for key in ["pid", "window_id"] {
+                if let Some(value) = args.get(key).and_then(Value::as_u64) {
+                    structured[key] = json!(value);
+                }
+            }
+        }
+        return Err(result);
+    }
     if args.get("display_only").and_then(Value::as_bool) != Some(true) {
         return Ok(false);
     }
@@ -263,6 +312,43 @@ pub struct ViewContext<'a> {
     pub focus_probe: Option<&'a dyn Fn() -> Option<String>>,
 }
 
+/// Shape a rooted result, refusing to render a complete view unless its scope
+/// describes the requested root and names its full parent.
+pub fn apply_scoped(
+    root_token: &str,
+    parent_snapshot_id: &str,
+    opts: &ViewOptions,
+    ctx: &ViewContext<'_>,
+    content: &mut [Content],
+    structured: &mut Value,
+) {
+    let status = structured.get("drilldown_status").and_then(Value::as_str);
+    let correct_scope = structured
+        .pointer("/scope/root_token")
+        .and_then(Value::as_str)
+        == Some(root_token)
+        && structured
+            .pointer("/scope/parent_snapshot_id")
+            .and_then(Value::as_str)
+            == Some(parent_snapshot_id);
+    let distinct_snapshot = structured
+        .get("snapshot_id")
+        .and_then(Value::as_str)
+        .and_then(crate::element_token::parse_snapshot_handle)
+        .zip(crate::element_token::parse_snapshot_handle(
+            parent_snapshot_id,
+        ))
+        .is_some_and(|(scope, parent)| scope != parent);
+    if !matches!(status, Some("incomplete" | "stale_parent" | "unsupported"))
+        && (status != Some("complete") || !correct_scope || !distinct_snapshot)
+    {
+        structured["drilldown_status"] = json!("incomplete");
+        structured["drilldown_diagnostics"] =
+            json!([{"kind":"provider_failure","detail":"scope_mismatch"}]);
+    }
+    apply(opts, ctx, content, structured);
+}
+
 /// Shape a finished `get_window_state` payload in place.
 pub fn apply(
     opts: &ViewOptions,
@@ -270,6 +356,102 @@ pub fn apply(
     content: &mut [Content],
     structured: &mut Value,
 ) {
+    if structured.get("drilldown_status").and_then(Value::as_str) == Some("complete")
+        && (structured
+            .get("observation_complete")
+            .and_then(Value::as_bool)
+            != Some(true)
+            || structured
+                .get("snapshot_id")
+                .and_then(Value::as_str)
+                .is_none()
+            || !structured.get("scope").is_some_and(Value::is_object))
+    {
+        structured["drilldown_status"] = json!("incomplete");
+    }
+    if matches!(
+        structured.get("drilldown_status").and_then(Value::as_str),
+        Some("incomplete" | "stale_parent" | "unsupported")
+    ) {
+        let status = structured["drilldown_status"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned();
+        let had_refusal = structured.get("refusal").is_some();
+        let refusal_code = structured
+            .pointer("/refusal/code")
+            .and_then(Value::as_str)
+            .filter(|code| {
+                !code.is_empty()
+                    && code.len() <= 128
+                    && code
+                        .bytes()
+                        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+            })
+            .map(str::to_owned);
+        let pid = structured.get("pid").and_then(Value::as_i64);
+        let window_id = structured.get("window_id").and_then(Value::as_u64);
+        let candidates = [
+            structured.get("drilldown_diagnostics"),
+            structured.get("observation_incomplete_reasons"),
+        ];
+        if status == "incomplete" || candidates.iter().any(Option::is_some) {
+            let mut reasons: Vec<_> = candidates
+                .into_iter()
+                .flatten()
+                .filter_map(|value| {
+                    serde_json::from_value::<Vec<cua_driver_contract::IncompleteReason>>(
+                        value.clone(),
+                    )
+                    .ok()
+                })
+                .flatten()
+                .collect();
+            reasons.sort_unstable();
+            reasons.dedup();
+            if reasons.is_empty() {
+                reasons.push(cua_driver_contract::IncompleteReason {
+                    kind: cua_driver_contract::IncompleteReasonKind::Unknown,
+                    detail: cua_driver_contract::IncompleteReasonDetail::NotAsserted,
+                });
+            }
+            structured["drilldown_diagnostics"] = json!(reasons);
+        }
+        if let Some(fields) = structured.as_object_mut() {
+            fields.retain(|key, _| {
+                matches!(
+                    key.as_str(),
+                    "drilldown_status" | "observation_complete" | "drilldown_diagnostics"
+                )
+            });
+        }
+        if let Some(pid) = pid {
+            structured["pid"] = json!(pid);
+        }
+        if let Some(window_id) = window_id {
+            structured["window_id"] = json!(window_id);
+        }
+        if status == "incomplete" {
+            structured["observation_complete"] = json!(false);
+        } else if let Some(fields) = structured.as_object_mut() {
+            fields.remove("observation_complete");
+        }
+        let message = if had_refusal {
+            let code = refusal_code
+                .as_deref()
+                .unwrap_or("invalid_drilldown_refusal");
+            let message = format!("Drill-down refused ({code}); no subtree was published.");
+            structured["status"] = json!("refused");
+            structured["refusal"] = json!({"code":code, "message":&message});
+            message
+        } else {
+            format!("Drill-down {status}; no subtree was published.")
+        };
+        for part in content.iter_mut() {
+            *part = Content::text(message.clone());
+        }
+        return;
+    }
     let original_md = structured
         .get("tree_markdown")
         .and_then(Value::as_str)
@@ -330,8 +512,10 @@ pub fn apply(
             resolve_since(since, snapshot_id.as_deref(), &md, ctx, structured)
         }
     });
-    if let Some(sid) = &snapshot_id {
-        remember(sid, ctx, &md, structured);
+    if structured.get("scope").is_none() && structured.get("drilldown_status").is_none() {
+        if let Some(sid) = &snapshot_id {
+            remember(sid, ctx, &md, structured);
+        }
     }
 
     // Header text added to the first line of the tree block.
@@ -1305,6 +1489,40 @@ mod tests {
     }
 
     #[test]
+    fn unadopted_platforms_refuse_root_before_observation() {
+        for (extra, code) in [
+            (json!({}), "root_unsupported"),
+            (json!({"since":"latest"}), "root_since_unsupported"),
+            (
+                json!({"display_only":true}),
+                "root_display_only_unsupported",
+            ),
+            (
+                json!({"include_accessibility_tree":false}),
+                "root_screenshot_only_unsupported",
+            ),
+        ] {
+            let mut args = json!({"root_element_token":"s0000002a:1"});
+            args.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            let refusal = display_only(&args).unwrap_err();
+            let structured = refusal.structured_content.unwrap();
+            assert_eq!(structured["refusal"]["code"], code);
+            if code == "root_unsupported" {
+                assert_eq!(structured["drilldown_status"], "unsupported");
+            }
+        }
+        let schema = extend_input_schema(json!({"type":"object","properties":{}}));
+        assert_eq!(schema["properties"]["root_element_token"]["type"], "string");
+        let malformed = display_only(&json!({"root_element_token":42})).unwrap_err();
+        assert_eq!(
+            malformed.structured_content.unwrap()["refusal"]["code"],
+            "invalid_element_token"
+        );
+    }
+
+    #[test]
     fn display_only_requires_a_screenshot_only_read() {
         assert_eq!(display_only(&json!({})).ok(), Some(false));
         assert_eq!(
@@ -1461,6 +1679,288 @@ mod tests {
             "element_count": 4
         });
         (content, structured)
+    }
+
+    #[test]
+    fn scoped_complete_view_never_replaces_full_since_baseline() {
+        for (i, args) in [
+            json!({"tree_format":"markdown"}),
+            json!({"tree_format":"elements"}),
+            json!({"tree_format":"both"}),
+            json!({"full_output":true}),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let full_id =
+                crate::element_token::format_snapshot_id(crate::element_token::mint_snapshot_id());
+            let scoped_id =
+                crate::element_token::format_snapshot_id(crate::element_token::mint_snapshot_id());
+            let ctx = ViewContext {
+                pid: 420001,
+                window_id: 97000 + i as u64,
+                key: ViewKey {
+                    query: Some("Save".into()),
+                    max_elements: 250,
+                    max_depth: None,
+                },
+                focus_probe: None,
+            };
+            let (mut content, mut full) = payload(&full_id, OLD);
+            let full_exclusions =
+                json!([{"kind":"closed_menus_not_expanded","element_indices":[1]}]);
+            let scoped_exclusions =
+                json!([{"kind":"closed_menus_not_expanded","element_indices":[2]}]);
+            full["observation_complete"] = json!(true);
+            full["observation_incomplete_reasons"] = json!([]);
+            full["observation_scope_exclusions"] = full_exclusions.clone();
+            apply(&opts(json!({})), &ctx, &mut content, &mut full);
+            let (mut content, mut scoped) = payload(&scoped_id, OLD);
+            scoped["drilldown_status"] = json!("complete");
+            scoped["observation_complete"] = json!(true);
+            scoped["observation_incomplete_reasons"] = json!([]);
+            scoped["observation_scope_exclusions"] = scoped_exclusions.clone();
+            scoped["scope"] =
+                json!({"root_token":format!("{full_id}:1"),"parent_snapshot_id":&full_id});
+            apply_scoped(
+                &format!("{full_id}:1"),
+                &full_id,
+                &opts(args.clone()),
+                &ctx,
+                &mut content,
+                &mut scoped,
+            );
+            assert_eq!(
+                scoped["observation_scope_exclusions"], scoped_exclusions,
+                "{args}"
+            );
+            assert_eq!(
+                latest_snapshot(&ctx, None).as_deref(),
+                Some(full_id.as_str()),
+                "{args}"
+            );
+            let next_id =
+                crate::element_token::format_snapshot_id(crate::element_token::mint_snapshot_id());
+            let (mut content, mut next) = payload(&next_id, OLD);
+            next["observation_complete"] = json!(true);
+            next["observation_incomplete_reasons"] = json!([]);
+            next["observation_scope_exclusions"] = full_exclusions.clone();
+            apply(
+                &opts(json!({"since":"latest"})),
+                &ctx,
+                &mut content,
+                &mut next,
+            );
+            assert_eq!(next["since_status"], "no_change", "{args}");
+            assert_eq!(
+                next["observation_scope_exclusions"], full_exclusions,
+                "{args}"
+            );
+        }
+    }
+
+    #[test]
+    fn incomplete_scoped_views_do_not_expose_partial_rows_in_any_format() {
+        for args in [
+            json!({"tree_format":"markdown"}),
+            json!({"tree_format":"elements"}),
+            json!({"tree_format":"both"}),
+            json!({"full_output":true}),
+        ] {
+            let ctx = ViewContext {
+                pid: 420002,
+                window_id: 97004,
+                key: ViewKey {
+                    query: Some("Save".into()),
+                    max_elements: 250,
+                    max_depth: None,
+                },
+                focus_probe: None,
+            };
+            let (mut content, mut result) = payload("s000000bb", OLD);
+            result["drilldown_status"] = json!("incomplete");
+            result["status"] = json!("refused");
+            result["refusal"] = json!({"code":"drilldown_incomplete","message":"partial"});
+            result["scope"] = json!({"root_token":"s000000aa:1","parent_snapshot_id":"s000000aa","element_token":"sdeadbeef:1"});
+            result["drilldown_diagnostics"] =
+                json!([{"kind":"budget","detail":"node_budget","element_token":"sdeadbeef:1"}]);
+            apply(&opts(args.clone()), &ctx, &mut content, &mut result);
+            assert!(result.get("snapshot_id").is_none(), "{args}");
+            assert!(result.get("tree_markdown").is_none(), "{args}");
+            assert!(result.get("elements").is_none(), "{args}");
+            assert!(
+                !serde_json::to_string(&content)
+                    .unwrap()
+                    .contains("AXButton"),
+                "{args}"
+            );
+            assert_eq!(result["drilldown_diagnostics"][0]["detail"], "node_budget");
+            assert_eq!(result["refusal"]["code"], "drilldown_incomplete");
+            assert!(!result.to_string().contains("sdeadbeef:1"));
+        }
+    }
+
+    #[test]
+    fn unasserted_scoped_completeness_is_not_actionable() {
+        let ctx = ViewContext {
+            pid: 420003,
+            window_id: 97005,
+            key: ViewKey {
+                query: None,
+                max_elements: 250,
+                max_depth: None,
+            },
+            focus_probe: None,
+        };
+        let (mut content, mut result) = payload("s000000bb", OLD);
+        result["drilldown_status"] = json!("complete");
+        result["scope"] = json!({"root_token":"s000000aa:1","parent_snapshot_id":"s000000aa"});
+        apply(
+            &opts(json!({"full_output":true})),
+            &ctx,
+            &mut content,
+            &mut result,
+        );
+        assert_eq!(result["drilldown_status"], "incomplete");
+        assert!(result.get("snapshot_id").is_none());
+        assert!(result.get("elements").is_none());
+        assert_eq!(result["drilldown_diagnostics"][0]["detail"], "not_asserted");
+    }
+
+    #[test]
+    fn rooted_read_without_scope_metadata_does_not_publish_a_view() {
+        let ctx = ViewContext {
+            pid: 420004,
+            window_id: 97006,
+            key: ViewKey {
+                query: None,
+                max_elements: 250,
+                max_depth: None,
+            },
+            focus_probe: None,
+        };
+        let (mut content, mut result) = payload("s000000bb", OLD);
+        result["observation_complete"] = json!(true);
+        apply_scoped(
+            "s000000aa:1",
+            "s000000aa",
+            &opts(json!({})),
+            &ctx,
+            &mut content,
+            &mut result,
+        );
+        assert_eq!(result["drilldown_status"], "incomplete");
+        assert!(result.get("snapshot_id").is_none());
+        assert!(latest_snapshot(&ctx, None).is_none());
+    }
+
+    #[test]
+    fn rooted_view_with_wrong_full_parent_is_not_actionable() {
+        let ctx = ViewContext {
+            pid: 420005,
+            window_id: 97007,
+            key: ViewKey {
+                query: None,
+                max_elements: 250,
+                max_depth: None,
+            },
+            focus_probe: None,
+        };
+        for scope in [
+            json!({"root_token":"s000000aa:1","parent_snapshot_id":"s000000cc"}),
+            json!({"root_token":"s000000aa:2","parent_snapshot_id":"s000000aa"}),
+        ] {
+            let (mut content, mut result) = payload("s000000bb", OLD);
+            result["drilldown_status"] = json!("complete");
+            result["observation_complete"] = json!(true);
+            result["scope"] = scope;
+            apply_scoped(
+                "s000000aa:1",
+                "s000000aa",
+                &opts(json!({})),
+                &ctx,
+                &mut content,
+                &mut result,
+            );
+            assert_eq!(result["drilldown_status"], "incomplete");
+            assert!(result.get("snapshot_id").is_none());
+        }
+        for id in ["s000000aa", "s000000AA", "s000000aa.f1"] {
+            let (mut content, mut result) = payload(id, OLD);
+            result["drilldown_status"] = json!("complete");
+            result["observation_complete"] = json!(true);
+            result["scope"] = json!({"root_token":"s000000aa:1","parent_snapshot_id":"s000000aa"});
+            apply_scoped(
+                "s000000aa:1",
+                "s000000aa",
+                &opts(json!({})),
+                &ctx,
+                &mut content,
+                &mut result,
+            );
+            assert_eq!(result["drilldown_status"], "incomplete", "{id}");
+            assert!(result.get("snapshot_id").is_none(), "{id}");
+        }
+    }
+
+    #[test]
+    fn failed_drilldown_view_preserves_unrelated_refusal_code() {
+        let ctx = ViewContext {
+            pid: 420006,
+            window_id: 97008,
+            key: ViewKey {
+                query: None,
+                max_elements: 250,
+                max_depth: None,
+            },
+            focus_probe: None,
+        };
+        let (mut content, mut result) = payload("s000000bb", OLD);
+        result["drilldown_status"] = json!("unsupported");
+        result["refusal"] = json!({"code":"permission_denied","message":"denied"});
+        apply(&opts(json!({})), &ctx, &mut content, &mut result);
+        assert_eq!(result["refusal"]["code"], "permission_denied");
+        assert!(result["refusal"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("permission_denied"));
+        assert!(result.get("snapshot_id").is_none());
+    }
+
+    #[test]
+    fn incomplete_view_keeps_observation_reasons_when_diagnostics_are_empty() {
+        let ctx = ViewContext {
+            pid: 420007,
+            window_id: 97009,
+            key: ViewKey {
+                query: None,
+                max_elements: 250,
+                max_depth: None,
+            },
+            focus_probe: None,
+        };
+        let (mut content, mut result) = payload("s000000bb", OLD);
+        result["drilldown_status"] = json!("incomplete");
+        result["drilldown_diagnostics"] = json!([]);
+        result["observation_incomplete_reasons"] =
+            json!([{"kind":"budget","detail":"time_budget"}]);
+        apply(&opts(json!({})), &ctx, &mut content, &mut result);
+        assert_eq!(result["drilldown_diagnostics"][0]["detail"], "time_budget");
+        assert!(result.get("snapshot_id").is_none());
+        let (mut content, mut result) = payload("s000000bc", OLD);
+        result["drilldown_status"] = json!("incomplete");
+        result["drilldown_diagnostics"] = json!([{"kind":"budget","detail":"node_budget"}]);
+        result["observation_incomplete_reasons"] =
+            json!([{"kind":"budget","detail":"time_budget"}]);
+        apply(&opts(json!({})), &ctx, &mut content, &mut result);
+        let diagnostics = result["drilldown_diagnostics"].as_array().unwrap();
+        assert_eq!(diagnostics.len(), 2);
+        assert!(diagnostics
+            .iter()
+            .any(|reason| reason["detail"] == "node_budget"));
+        assert!(diagnostics
+            .iter()
+            .any(|reason| reason["detail"] == "time_budget"));
     }
 
     #[test]

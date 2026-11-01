@@ -105,6 +105,56 @@ fn typed_methods_preserve_both_native_refusal_shapes() {
 }
 
 #[test]
+fn typed_snapshot_preserves_drilldown_outcomes_and_diagnostics() {
+    for (status, code) in [
+        ("incomplete", "drilldown_incomplete"),
+        ("stale_parent", "stale_parent"),
+        ("unsupported", "root_unsupported"),
+    ] {
+        let mut structured = json!({"pid":42,"window_id":73,"drilldown_status":status,
+            "status":"refused","refusal":{"code":code,"message":"not published"}});
+        if status == "incomplete" {
+            structured["observation_complete"] = json!(false);
+            structured["drilldown_diagnostics"] = json!([{"kind":"budget","detail":"node_budget"}]);
+        }
+        let result = normalize_result(
+            "get_window_state",
+            json!({"isError":true,"content":[],"structuredContent":structured}),
+        )
+        .unwrap();
+        let output = result.window_state_success().unwrap();
+        assert_eq!(
+            serde_json::to_value(&output).unwrap()["drilldown_status"],
+            status
+        );
+        assert!(output.snapshot_id.is_none());
+        if status == "incomplete" {
+            assert_eq!(output.drilldown_diagnostics.unwrap().len(), 1);
+        }
+    }
+    let unrelated = normalize_result(
+        "get_window_state",
+        json!({"isError":true,"content":[],
+        "structuredContent":{"pid":42,"window_id":73,"drilldown_status":"unsupported",
+            "status":"refused","refusal":{"code":"permission_denied","message":"denied"}}}),
+    )
+    .unwrap();
+    assert!(
+        matches!(unrelated.window_state_success(), Err(DriverError::Tool { error_code, .. }) if error_code == "permission_denied")
+    );
+    let missing_target = normalize_result(
+        "get_window_state",
+        json!({"isError":true,"content":[],
+        "structuredContent":{"drilldown_status":"unsupported","status":"refused",
+            "refusal":{"code":"root_unsupported","message":"unsupported"}}}),
+    )
+    .unwrap();
+    assert!(
+        matches!(missing_target.window_state_success(), Err(DriverError::Tool { error_code, .. }) if error_code == "root_unsupported")
+    );
+}
+
+#[test]
 fn typed_discovery_rejects_missing_and_malformed_success() {
     for structured in [
         Value::Null,
@@ -340,6 +390,29 @@ async fn typed_snapshot_request_forwards_an_explicit_tree_shape() {
         request["args"],
         json!({"pid":42,"window_id":73,"tree_format":"markdown","since":"s0000002a"})
     );
+}
+
+#[tokio::test]
+#[cfg(unix)]
+async fn rooted_snapshot_old_daemon_refusal_is_returned_without_full_read() {
+    let (_directory, socket, server) = serve_once(json!({"ok":true,"result":{
+        "isError":true,"content":[],"structuredContent":{
+            "status":"refused","refusal":{"code":"invalid_arguments","message":"unknown root_element_token"}
+        }
+    }}));
+    let driver = CuaDriver::connect(Some(socket)).unwrap();
+    let input: GetWindowStateInput = serde_json::from_value(json!({
+        "pid":42,"window_id":73,"root_element_token":"s0000002a:1"
+    }))
+    .unwrap();
+    let error = driver.get_window_state(input).await.unwrap_err();
+    assert!(
+        matches!(error, DriverError::Tool { error_code, message, .. }
+        if error_code == "invalid_arguments" && message == "unknown root_element_token")
+    );
+    let request = server.join().unwrap();
+    assert_eq!(request["name"], "get_window_state");
+    assert_eq!(request["args"]["root_element_token"], "s0000002a:1");
 }
 
 #[tokio::test]

@@ -768,6 +768,24 @@ mod tests {
         assert!(validate_proxy_schema_pair(tool, Some(&old), Some(&new)).is_err());
     }
 
+    #[test]
+    fn rooted_output_schema_refuses_pre_u18_proxy_in_both_directions() {
+        let tool = "get_window_state";
+        // Captured from origin/main b00e016c, which already includes U23.
+        let old: Value = serde_json::from_str(include_str!(
+            "../../../../contract/fixtures/get-window-state-pre-u18-success-schema.json"
+        ))
+        .unwrap();
+        assert!(old["properties"]
+            .get("observation_scope_exclusions")
+            .is_some());
+        assert!(old["properties"].get("scope").is_none());
+        let old = cua_driver_contract::advertised_output_schema(old);
+        let new = advertised_tool_output_schema(tool).unwrap();
+        assert!(validate_proxy_schema_pair(tool, Some(&new), Some(&old)).is_err());
+        assert!(validate_proxy_schema_pair(tool, Some(&old), Some(&new)).is_err());
+    }
+
     #[track_caller]
     fn assert_conforms(tool: &str, result: &Value) {
         let schema = advertised_tool_output_schema(tool).expect("tool advertises a schema");

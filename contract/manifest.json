@@ -2194,6 +2194,10 @@
           "query": {
             "type": "string"
           },
+          "root_element_token": {
+            "description": "Expand only the subtree rooted at this snapshot-qualified element token.",
+            "type": "string"
+          },
           "screenshot_out_file": {
             "type": "string"
           },
@@ -2254,6 +2258,58 @@
               "string",
               "null"
             ]
+          },
+          "drilldown_diagnostics": {
+            "items": {
+              "properties": {
+                "detail": {
+                  "enum": [
+                    "collapsed_menu",
+                    "offscreen",
+                    "inactive_tab",
+                    "web_content",
+                    "huge_container",
+                    "depth_limit",
+                    "node_budget",
+                    "time_budget",
+                    "child_enumeration_failed",
+                    "attribute_read_failed",
+                    "enumeration_error_unclassified",
+                    "untrusted_provider",
+                    "scope_mismatch",
+                    "not_asserted"
+                  ],
+                  "type": "string"
+                },
+                "kind": {
+                  "enum": [
+                    "policy_omission",
+                    "provider_failure",
+                    "budget",
+                    "unknown"
+                  ],
+                  "type": "string"
+                }
+              },
+              "required": [
+                "kind",
+                "detail"
+              ],
+              "type": "object"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "drilldown_status": {
+            "enum": [
+              "complete",
+              "incomplete",
+              "stale_parent",
+              "unsupported"
+            ],
+            "type": "string"
           },
           "element_count": {
             "minimum": 0,
@@ -2691,6 +2747,24 @@
             "minimum": 0,
             "type": [
               "integer",
+              "null"
+            ]
+          },
+          "scope": {
+            "properties": {
+              "parent_snapshot_id": {
+                "type": "string"
+              },
+              "root_token": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "root_token",
+              "parent_snapshot_id"
+            ],
+            "type": [
+              "object",
               "null"
             ]
           },
