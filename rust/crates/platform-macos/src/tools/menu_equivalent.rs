@@ -329,3 +329,39 @@ mod tests {
         assert_eq!(released, vec![1, 2]);
     }
 }
+
+#[cfg(test)]
+mod lookup_tristate_tests {
+    use super::*;
+
+    struct FailedItemReader;
+    impl MenuReader for FailedItemReader {
+        type Node = usize;
+        fn element(&self, _: usize, _: &str) -> Option<usize> { None }
+        fn children(&self, node: usize) -> Vec<usize> {
+            if node == 0 { vec![1] } else { vec![] }
+        }
+        fn string(&self, _: usize, attr: &str) -> Option<String> {
+            match attr {
+                "AXRole" => Some("AXMenuItem".into()),
+                "AXTitle" => Some("Save".into()),
+                // Simulate a failed AXMenuItemCmdChar read.
+                _ => None,
+            }
+        }
+        fn number(&self, _: usize, _: &str) -> Option<f64> { None }
+        fn boolean(&self, _: usize, _: &str) -> Option<bool> { None }
+        fn release(&self, _: usize) {}
+    }
+
+    #[test]
+    fn incomplete_lookup_sends_no_keys() {
+        let combo = Combo::parse(&["cmd".to_owned()], "s").unwrap();
+        let mut found = None;
+        let mut budget = MAX_ITEMS;
+        search(&FailedItemReader, 0, vec!["File".into()], &combo, &mut found, &mut budget, 0);
+        // The current callers dispatch raw keys on None.
+        let keys_sent = found.is_none();
+        assert!(!keys_sent, "failed menu read must not route to raw keys");
+    }
+}
