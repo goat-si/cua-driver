@@ -2898,7 +2898,7 @@ mod timeout_tests {
                     "delivery_mode":{"type":"string"}
                 }
             }),
-            read_only: false,
+            read_only: matches!(name, "list_apps" | "list_windows" | "get_window_state"),
             destructive: false,
             idempotent: false,
             open_world: false,
