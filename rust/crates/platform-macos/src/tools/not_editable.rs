@@ -419,21 +419,6 @@ pub(crate) async fn focused_cell_allows_typing(pid: i32, window_id: Option<u32>)
         .unwrap_or_default()
 }
 
-/// TOKEN rule for element_token type_text/set_value. The role is read
-/// first: non-text targets are never focused (their behavior is unchanged).
-/// A text-role target is focused when needed (the handoff's order), then
-/// evaluated. focus_element masks AX errors, so the focus read-back decides
-/// whether the focus action was delivered or is indeterminate.
-pub(crate) async fn token_not_editable_refusal(
-    pid: i32,
-    element: usize,
-    window_id: u32,
-) -> Option<ToolResult> {
-    token_not_editable_with_policy(pid, element, window_id, false)
-        .await
-        .err()
-}
-
 /// TOKEN rule plus the focus action preceding an allowed write.
 pub(crate) async fn token_not_editable_receipt(
     pid: i32,

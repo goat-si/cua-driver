@@ -467,13 +467,14 @@ impl Tool for TypeTextTool {
             && is_chromium_identity(&apps::bundle_id_for_pid(pid).unwrap_or_default());
         // TOKEN rule: after the gate, attempt focus and refuse a text-role
         // element that shows no editing evidence (handoff 3.7).
-        if let (Some((guard, _)), Some(wid)) = (&element_guard, window_id) {
-            if let Some(refusal) =
-                super::not_editable::token_not_editable_refusal(pid, guard.as_ptr(), wid).await
-            {
-                return refusal;
+        let token_receipt = if let (Some((guard, _)), Some(wid)) = (&element_guard, window_id) {
+            match super::not_editable::token_not_editable_receipt(pid, guard.as_ptr(), wid).await {
+                Ok(receipt) => Some(receipt),
+                Err(refusal) => return refusal,
             }
-        }
+        } else {
+            None
+        };
 
         // ── px form: focus by pixel-click, then type into the focused element ──
         // Pass x,y (no element_token) for an *element px action*: pixel-click the
@@ -579,6 +580,11 @@ impl Tool for TypeTextTool {
         }
         let text_clone = text.clone();
         let char_count = text.chars().count();
+        let mut prior = prior_for_receipt(token_receipt);
+        prior = combine_prior(prior, prior_for_receipt(px_receipt));
+        if let Some(scope) = &_px_key_scope {
+            prior = prior_for_key_entry(prior, scope.entry());
+        }
 
         // ── Focus-suppression wrap (Swift WindowChangeDetector + FocusGuard) ──
         // Typing into a field can trigger autocomplete popovers or
@@ -619,6 +625,7 @@ impl Tool for TypeTextTool {
                             replace,
                             force_key_events: replace,
                             chromium_native_candidate,
+                            prior,
                             focused_key_route: !delivery_mode.is_foreground()
                                 && element_ptr.is_some()
                                 && crate::input::skylight::is_focus_without_raise_available(),
@@ -637,20 +644,22 @@ impl Tool for TypeTextTool {
         let result = match result {
             Ok(Ok(TypeTextDelivery::Refused(refusal))) => {
                 let wid = window_id.expect("background refusals require a window target");
-                return super::not_editable::account_focus_receipt(
+                let result = super::not_editable::account_focus_receipt(
                     super::background_refusal_result(pid, wid, &refusal),
-                    px_receipt,
+                    token_receipt,
                 );
+                return super::not_editable::account_focus_receipt(result, px_receipt);
             }
             Ok(Ok(TypeTextDelivery::SynthesisRefused {
                 path,
                 refusal,
                 ax_attempt,
             })) => {
-                return super::not_editable::account_focus_receipt(
+                let result = super::not_editable::account_focus_receipt(
                     synthesis_refusal_result(path, &refusal, ax_attempt),
-                    px_receipt,
-                )
+                    token_receipt,
+                );
+                return super::not_editable::account_focus_receipt(result, px_receipt);
             }
             Ok(Ok(TypeTextDelivery::Typed(outcome))) => Ok(Ok(outcome)),
             Ok(Ok(TypeTextDelivery::InvalidArguments(reason))) => {
@@ -688,6 +697,7 @@ impl Tool for TypeTextTool {
             Err(e) => ToolResult::error(format!("Task error: {e}")),
         };
         // Any refusal after a delivered focus action carries its receipt.
+        let result = super::not_editable::account_focus_receipt(result, token_receipt);
         super::not_editable::account_focus_receipt(result, px_receipt)
     }
 }
@@ -1088,7 +1098,6 @@ const DELIVERY_DRAIN_POLL_INTERVAL: std::time::Duration = std::time::Duration::f
 /// Pause before the single `AXFocused` re-apply in the foreground rung. Covers
 /// an app that installs its own first responder just after activation is
 /// observable, which would otherwise clobber the first write.
-const FOCUS_REAPPLY_DELAY: std::time::Duration = std::time::Duration::from_millis(30);
 
 /// Keyboard-rung policy for one window-addressed background insert, decided
 /// once by the pure exact-target core before any input is posted.
@@ -1756,6 +1765,27 @@ struct KeyFocusChecks {
     /// A window-only or pixel receiver: re-run the editing-cell check after
     /// the first-key settle, because activation can end an editing session.
     recheck_editability_after_settle: bool,
+    prior: cua_driver_core::mutation::PriorInput,
+}
+
+fn focus_write_with(
+    settable: crate::ax::write_outcome::Settable,
+    prior: cua_driver_core::mutation::PriorInput,
+    send: impl FnOnce() -> i32,
+) -> Result<(), TextWriteError> {
+    use crate::ax::write_outcome::{native_write_outcome, NativeWriteKind};
+    use cua_driver_core::mutation::{ChainResult, WriteOutcome};
+    let error = send();
+    let outcome = native_write_outcome(NativeWriteKind::SetAttribute, true, &settable, error);
+    let chain = ChainResult::from_recorded(vec![outcome], prior).expect("one focus setter");
+    if outcome == WriteOutcome::Delivered {
+        Ok(())
+    } else {
+        Err(TextWriteError {
+            message: format!("AXFocused returned error {error}; no text was sent"),
+            chain,
+        })
+    }
 }
 
 /// Type via CGEvent keystrokes at the current insertion point, then verify by
@@ -1788,6 +1818,7 @@ fn cgevent_type_verified(
     let KeyFocusChecks {
         exact_focus: focused_key_route,
         recheck_editability_after_settle,
+        mut prior,
     } = checks;
     if replace {
         let (ptr, _) = element_ptr_and_idx.ok_or_else(|| {
@@ -1802,22 +1833,15 @@ fn cgevent_type_verified(
             )
         }
     }
-    // Focus the target element so the keystrokes land in IT. Critical in
-    // foreground mode: a freshly-fronted window's keyboard focus may be on the
-    // search box or nowhere, so without this the text goes into the void (or the
-    // wrong field). AXFocused is best-effort — harmless when unsupported.
-    //
-    // Ordering matters as much as the write itself. `with_foreground_assist` has
-    // already waited for the activation to land, so AppKit has installed the
-    // window's remembered first responder by now and this write lands *after*
-    // it rather than being clobbered by it. Re-applying once on a failed
-    // read-back covers apps that install their responder slightly late.
+    // A sent focus write is a separate mutation; never repeat it after an
+    // uncertain return or merely because a subsequent focus read is stale.
     if let Some((ptr, _)) = element_ptr_and_idx {
-        let _ = crate::input::ax_actions::focus_element(ptr);
-        if settle_ms > 0 && !crate::input::ax_actions::is_element_focused(pid, ptr) {
-            std::thread::sleep(FOCUS_REAPPLY_DELAY);
-            let _ = crate::input::ax_actions::focus_element(ptr);
-        }
+        let settable =
+            unsafe { crate::ax::write_outcome::query_settable(ptr as AXUIElementRef, "AXFocused") };
+        focus_write_with(settable, prior, || {
+            crate::input::ax_actions::focus_element_raw(ptr)
+        })?;
+        prior = cua_driver_core::mutation::PriorInput::MayHaveDelivered;
     }
     let web_delivery = element_ptr_and_idx.is_some()
         && classify_target_web_area(pid, element_ptr_and_idx, window_id)
@@ -1863,7 +1887,7 @@ fn cgevent_type_verified(
         } else {
             // The element focus write above has already run, independently of
             // the following selected-range setter.
-            match select_entire_native_value(pid, wid, ptr, before, cua_driver_core::mutation::PriorInput::MayHaveDelivered) {
+            match select_entire_native_value(pid, wid, ptr, before, prior) {
                 FullSelection::Selected => true,
                 FullSelection::Unsupported => false,
                 FullSelection::AllocationFailed(chain) => return Err(TextWriteError { message: "Could not allocate the full-selection range; no replacement payload was sent".into(), chain }.into()),
@@ -1895,7 +1919,7 @@ fn cgevent_type_verified(
                     settable: unsafe {
                         crate::ax::write_outcome::query_settable(element, "AXValue")
                     },
-                    prior: cua_driver_core::mutation::PriorInput::MayHaveDelivered,
+                    prior,
                 },
                 || unsafe { set_string_attr(element, "AXValue", text) },
                 || unsafe {
@@ -1926,7 +1950,7 @@ fn cgevent_type_verified(
                     settable: unsafe {
                         crate::ax::write_outcome::query_settable(element, "AXSelectedText")
                     },
-                    prior: cua_driver_core::mutation::PriorInput::MayHaveDelivered,
+                    prior,
                 },
                 || unsafe { set_string_attr(element, "AXSelectedText", text) },
                 || unsafe {
@@ -2456,6 +2480,41 @@ struct KeyboardRoute {
     force_key_events: bool,
     chromium_native_candidate: bool,
     focused_key_route: bool,
+    prior: cua_driver_core::mutation::PriorInput,
+}
+
+fn combine_prior(
+    a: cua_driver_core::mutation::PriorInput,
+    b: cua_driver_core::mutation::PriorInput,
+) -> cua_driver_core::mutation::PriorInput {
+    use cua_driver_core::mutation::PriorInput;
+    if a == PriorInput::MayHaveDelivered || b == PriorInput::MayHaveDelivered {
+        PriorInput::MayHaveDelivered
+    } else {
+        PriorInput::None
+    }
+}
+
+fn prior_for_receipt(
+    receipt: Option<super::not_editable::FocusDispatch>,
+) -> cua_driver_core::mutation::PriorInput {
+    use cua_driver_core::mutation::PriorInput;
+    match receipt {
+        None | Some(super::not_editable::FocusDispatch::None) => PriorInput::None,
+        Some(_) => PriorInput::MayHaveDelivered,
+    }
+}
+
+fn prior_for_key_entry(
+    prior: cua_driver_core::mutation::PriorInput,
+    entry: crate::input::skylight::KeyEntry,
+) -> cua_driver_core::mutation::PriorInput {
+    use cua_driver_core::mutation::PriorInput;
+    if entry.records_posted > 0 || entry.records_uncertain || entry.ax_write {
+        PriorInput::MayHaveDelivered
+    } else {
+        prior
+    }
 }
 
 /// Best-effort-background ladder for `type_text`.
@@ -2498,6 +2557,10 @@ fn type_text_blocking(
     };
     let route = KeyboardRoute {
         key_window_confirmed: _scope.is_some(),
+        prior: _scope
+            .as_ref()
+            .map(|scope| prior_for_key_entry(route.prior, scope.entry()))
+            .unwrap_or(route.prior),
         ..route
     };
     type_text_in_key_window(
@@ -2528,6 +2591,7 @@ fn type_text_in_key_window(
         force_key_events,
         chromium_native_candidate,
         focused_key_route,
+        prior,
     } = route;
     // Original field value before any rung drives read-back verification only.
     // An unreadable value is not evidence that the field is empty — and for a
@@ -2680,6 +2744,11 @@ fn type_text_in_key_window(
                 KeyFocusChecks {
                     exact_focus: focused_key_route,
                     recheck_editability_after_settle: !late_fg_targeted,
+                    prior: if window_id.is_some() {
+                        cua_driver_core::mutation::PriorInput::MayHaveDelivered
+                    } else {
+                        prior
+                    },
                 },
             )
         };
@@ -2871,6 +2940,7 @@ fn type_text_in_key_window(
             KeyFocusChecks {
                 exact_focus: focused_key_route,
                 recheck_editability_after_settle: false,
+                prior,
             },
         )?;
         return Ok(TypeTextDelivery::Typed(TypeTextOutcome {
@@ -3091,6 +3161,7 @@ fn type_text_in_key_window(
                 KeyFocusChecks {
                     exact_focus: focused_key_route,
                     recheck_editability_after_settle: false,
+                    prior,
                 },
             )
         })?;
@@ -3258,6 +3329,49 @@ mod selection_outcome_tests {
     use crate::ax::write_outcome::Settable;
     use cua_driver_core::mutation::{Postcondition, PriorInput};
     use std::cell::Cell;
+
+    #[test]
+    fn focus_error_stops_before_range_and_preserves_prior() {
+        let calls = Cell::new(0);
+        let error = focus_write_with(Settable::Yes, PriorInput::None, || {
+            calls.set(calls.get() + 1);
+            kAXErrorCannotComplete
+        })
+        .unwrap_err();
+        assert_eq!(calls.get(), 1);
+        assert_eq!(
+            error
+                .chain
+                .error_disposition(Postcondition::Indeterminate, false),
+            Some(cua_driver_contract::ErrorDisposition::SUSPECTED_NOOP)
+        );
+        let denied = focus_write_with(Settable::Yes, PriorInput::MayHaveDelivered, || {
+            kAXErrorAPIDisabled
+        })
+        .unwrap_err();
+        assert!(!denied.chain.no_input());
+        assert_eq!(
+            denied
+                .chain
+                .error_disposition(Postcondition::Indeterminate, false),
+            Some(cua_driver_contract::ErrorDisposition::SUSPECTED_NOOP)
+        );
+        assert!(focus_write_with(Settable::Yes, PriorInput::None, || kAXErrorSuccess).is_ok());
+        assert_eq!(
+            prior_for_receipt(Some(super::super::not_editable::FocusDispatch::SentAx)),
+            PriorInput::MayHaveDelivered
+        );
+        assert_eq!(
+            prior_for_key_entry(
+                PriorInput::None,
+                crate::input::skylight::KeyEntry {
+                    records_uncertain: true,
+                    ..Default::default()
+                }
+            ),
+            PriorInput::MayHaveDelivered
+        );
+    }
 
     #[test]
     fn select_all_keeps_preflight_allocation_write_and_confirmation_distinct() {
@@ -3655,6 +3769,7 @@ mod tests {
                 force_key_events: false,
                 chromium_native_candidate: false,
                 focused_key_route: false,
+                prior: cua_driver_core::mutation::PriorInput::None,
             },
         );
         match r {
@@ -3684,6 +3799,7 @@ mod tests {
                 force_key_events: false,
                 chromium_native_candidate: false,
                 focused_key_route: false,
+                prior: cua_driver_core::mutation::PriorInput::None,
             },
         )
         .expect("the refusal is a delivery outcome");
@@ -3732,6 +3848,7 @@ mod tests {
                 force_key_events: false,
                 chromium_native_candidate: false,
                 focused_key_route: false,
+                prior: cua_driver_core::mutation::PriorInput::None,
             },
         )
         .expect("preflight refusal must not attempt the invalid pid");
