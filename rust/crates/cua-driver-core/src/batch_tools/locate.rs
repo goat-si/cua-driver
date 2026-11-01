@@ -484,24 +484,73 @@ impl Read {
         let Some(wanted_role) = spec.role.as_deref() else {
             return false;
         };
-        self.markdown
-            .lines()
-            .filter_map(folded_children_row)
-            .any(|(role, text)| {
+        let text_matches_spec = |text: &str| {
+            let text = fold(text);
+            spec.name
+                .as_ref()
+                .is_some_and(|name| has_word_start(&text, &fold(name)))
+                || spec
+                    .text
+                    .as_ref()
+                    .is_some_and(|needle| text.contains(&fold(needle)))
+        };
+        let markdown_match =
+            self.markdown
+                .lines()
+                .filter_map(folded_children_row)
+                .any(|(role, text)| {
+                    if spec.name.is_none() && spec.text.is_none() {
+                        return true;
+                    }
+                    if role_matches(wanted_role, role) {
+                        return false;
+                    }
+                    text_matches_spec(text)
+                });
+        markdown_match
+            || self.elements.iter().any(|element| {
+                let folded = element
+                    .get("boundary")
+                    .and_then(|boundary| boundary.get("reasons"))
+                    .and_then(Value::as_array)
+                    .is_some_and(|reasons| {
+                        reasons.iter().any(|reason| {
+                            reason.get("kind").and_then(Value::as_str) == Some("policy_omission")
+                                && reason.get("detail").and_then(Value::as_str)
+                                    == Some("folded_children")
+                        })
+                    });
+                if !folded {
+                    return false;
+                }
                 if spec.name.is_none() && spec.text.is_none() {
                     return true;
                 }
-                if role_matches(wanted_role, role) {
+                if element_role_matches(wanted_role, element) {
                     return false;
                 }
-                let text = fold(text);
-                spec.name
-                    .as_ref()
-                    .is_some_and(|name| has_word_start(&text, &fold(name)))
-                    || spec
-                        .text
-                        .as_ref()
-                        .is_some_and(|needle| text.contains(&fold(needle)))
+                let fields = [
+                    element.get("label").and_then(Value::as_str),
+                    element.get("value").and_then(Value::as_str),
+                ];
+                if fields.iter().flatten().any(|text| text_matches_spec(text)) {
+                    return true;
+                }
+                if fields.iter().flatten().any(|text| !text.trim().is_empty()) {
+                    return false;
+                }
+                // If the structured row has no text, a corresponding marked
+                // markdown row can still establish what it displayed.
+                let represented = element
+                    .get("element_index")
+                    .and_then(Value::as_u64)
+                    .is_some_and(|index| {
+                        let prefix = format!("- [{index}] ");
+                        self.markdown.lines().map(str::trim).any(|line| {
+                            line.starts_with(&prefix) && folded_children_row(line).is_some()
+                        })
+                    });
+                !represented
             })
     }
 
@@ -1728,7 +1777,7 @@ fn evaluate(check: &Check, read: &Read) -> Result<Option<String>, Miss> {
         nth: None,
         ..check.element.clone()
     };
-    let structured = if element_spec.role.is_some() || element_spec.name.is_some() {
+    let mut structured = if element_spec.role.is_some() || element_spec.name.is_some() {
         matches(read, &element_spec)
     } else {
         Vec::new()
@@ -1740,8 +1789,29 @@ fn evaluate(check: &Check, read: &Read) -> Result<Option<String>, Miss> {
         .map(str::trim)
         .filter(|line| row_matches(line, &check.element))
         .collect();
+    if let Some(text) = &element_spec.text {
+        structured.retain(|element| {
+            [
+                "label",
+                "value",
+                "description",
+                "help",
+                "identifier",
+                "role",
+            ]
+            .into_iter()
+            .any(|key| text_matches(element.get(key), text))
+                || element
+                    .get("element_index")
+                    .and_then(Value::as_u64)
+                    .is_some_and(|index| {
+                        let prefix = format!("- [{index}] ");
+                        rows.iter().any(|row| row.starts_with(&prefix))
+                    })
+        });
+    }
     let by_text_only = element_spec.role.is_none() && element_spec.name.is_none();
-    let present = if by_text_only || element_spec.text.is_some() {
+    let present = if by_text_only {
         !rows.is_empty()
     } else {
         !structured.is_empty() || !rows.is_empty()
@@ -2759,6 +2829,57 @@ mod tests {
                 "incomplete_observation"
             );
         }
+    }
+
+    #[test]
+    fn u20b_a_structured_only_folded_rows_guard_roles() {
+        let mut folded = element(3, "AXRow", "Foo");
+        folded["boundary"] = json!({"reasons":[{"kind":"policy_omission","detail":"folded_children"}],"children_skipped":{"known":1},"descendants_omitted":false});
+        for completeness in [Completeness::Complete, Completeness::Unasserted] {
+            let mut observed = read(vec![folded.clone()], "");
+            observed.completeness = completeness;
+            let check = |raw: Value| Check::parse(&raw, 0).unwrap();
+            let miss = evaluate(
+                &check(json!({"role":"statictext","name":"Foo","gone":true})),
+                &observed,
+            )
+            .unwrap_err();
+            assert_eq!(miss.code, "incomplete_observation");
+            assert_eq!(
+                pick(&observed, &check(json!({"role":"statictext"})).element)
+                    .unwrap_err()
+                    .code,
+                "incomplete_observation"
+            );
+            assert!(evaluate(
+                &check(json!({"role":"button","name":"Bar","gone":true})),
+                &observed
+            )
+            .is_ok());
+        }
+        folded.as_object_mut().unwrap().remove("label");
+        let check = Check::parse(&json!({"role":"button","name":"Bar","gone":true}), 0).unwrap();
+        let observed = read(vec![folded.clone()], "");
+        assert_eq!(
+            evaluate(&check, &observed).unwrap_err().code,
+            "incomplete_observation"
+        );
+        let observed = read(vec![folded], "- [3] AXRow \"Foo\" [+1 more: folded_children; descendants not omitted] [reason kinds: folded_children=policy_omission]");
+        assert!(evaluate(&check, &observed).is_ok());
+    }
+    #[test]
+    fn u20b_a_structured_only_observed_text_proves_presence() {
+        let mut observed = read(vec![element(4, "AXStaticText", "Foo")], "");
+        observed.completeness = Completeness::Complete;
+        let check =
+            Check::parse(&json!({"role":"statictext","text":"Foo","gone":true}), 0).unwrap();
+        assert_eq!(
+            evaluate(&check, &observed).unwrap_err().code,
+            "still_present"
+        );
+        let check =
+            Check::parse(&json!({"role":"statictext","text":"Bar","gone":true}), 0).unwrap();
+        assert!(evaluate(&check, &observed).is_ok());
     }
 
     #[test]
