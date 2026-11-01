@@ -5024,12 +5024,6 @@ fn wait_for_cached_element_keyboard_focus(
     }
 }
 
-/// Establish exact UIA child focus after the owning top-level HWND is already
-/// confirmed foreground. Chromium providers sometimes reject UIA `SetFocus`;
-/// in that case a real click at the accessibility-derived center is the
-/// bounded fallback. Both routes require `CurrentHasKeyboardFocus` read-back
-/// before any keyboard input is allowed to leave the driver.
-#[derive(Debug)]
 fn keyboard_dispatch_error(e: anyhow::Error) -> ToolResult {
     let dispatch = e
         .downcast_ref::<crate::keyboard_dispatch::InputDispatchFailure>()
@@ -5055,6 +5049,12 @@ fn keyboard_join_error(e: tokio::task::JoinError) -> ToolResult {
     )
 }
 
+/// Establish exact UIA child focus after the owning top-level HWND is already
+/// confirmed foreground. Chromium providers sometimes reject UIA `SetFocus`;
+/// in that case a real click at the accessibility-derived center is the
+/// bounded fallback. Both routes require `CurrentHasKeyboardFocus` read-back
+/// before any keyboard input is allowed to leave the driver.
+#[derive(Debug)]
 struct FocusUncertain(String);
 impl std::fmt::Display for FocusUncertain {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

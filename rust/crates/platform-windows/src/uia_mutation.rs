@@ -295,7 +295,7 @@ pub(crate) fn uncertain_text_without_hresult(kind: UncertainKind) -> String {
         UncertainKind::Timeout => "the UI Automation call timed out",
         _ => "the worker ended without a result",
     };
-    format!("{text}; the shortcut may have been delivered")
+    format!("{text}; the shortcut may have been delivered. Read the window state before acting again.")
 }
 
 pub(crate) fn uncertain_text(kind: UncertainKind, hresult: i32) -> String {
