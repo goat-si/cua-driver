@@ -40,8 +40,8 @@ use crate::browser_standard_user::{
 };
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{
-    CloseHandle, BOOL, ERROR_INSUFFICIENT_BUFFER, E_ACCESSDENIED, FILETIME, HWND, LPARAM, NO_ERROR,
-    RECT,
+    CloseHandle, BOOL, ERROR_INSUFFICIENT_BUFFER, E_ACCESSDENIED, FILETIME, HANDLE, HWND, LPARAM,
+    NO_ERROR, RECT,
 };
 use windows::Win32::Graphics::Gdi::{
     EnumDisplayMonitors, GetMonitorInfoW, MonitorFromWindow, HDC, HMONITOR, MONITORINFO,
@@ -945,6 +945,19 @@ fn process_identity(pid: u32) -> Result<(u64, Option<String>), BrowserRefusal> {
                 format!("browser process {pid} is no longer available"),
             )
         })?;
+    let result = process_identity_from_handle(handle).map_err(|error| {
+        BrowserRefusal::new(
+            BrowserRefusalCode::BrowserRouteUnavailable,
+            format!("could not fingerprint browser process {pid}: {error}"),
+        )
+    });
+    let _ = unsafe { CloseHandle(handle) };
+    result
+}
+
+pub(crate) fn process_identity_from_handle(
+    handle: HANDLE,
+) -> windows::core::Result<(u64, Option<String>)> {
     let mut created = FILETIME::default();
     let mut exited = FILETIME::default();
     let mut kernel = FILETIME::default();
@@ -965,13 +978,7 @@ fn process_identity(pid: u32) -> Result<(u64, Option<String>), BrowserRefusal> {
     .filter(|_| path_len > 0)
     .map(|_| String::from_utf16_lossy(&path_buf[..path_len as usize]))
     .map(canonical_process_executable);
-    let _ = unsafe { CloseHandle(handle) };
-    times.map_err(|error| {
-        BrowserRefusal::new(
-            BrowserRefusalCode::BrowserRouteUnavailable,
-            format!("could not fingerprint browser process {pid}: {error}"),
-        )
-    })?;
+    times?;
     let started = (u64::from(created.dwHighDateTime) << 32) | u64::from(created.dwLowDateTime);
     Ok((started, path))
 }
