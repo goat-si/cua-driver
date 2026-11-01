@@ -4,10 +4,9 @@
 //!
 //! * **AXPopUpButton**: Find the option (a child, or an `AXMenuItem` under the
 //!   popup's `AXMenu`) whose AXTitle or AXValue matches `value`
-//!   (case-insensitive) and AXPress it.  AppKit and Chromium popups publish
-//!   their items only while the menu is open, so the menu is opened for the
-//!   selection and closed again.  Safari `<select>` elements are set through
-//!   `osascript do JavaScript` instead.
+//!   (case-insensitive) and AXPress it. AppKit menu selections use a stable,
+//!   unambiguous option list and only dismiss menus this call owns. Safari
+//!   `<select>` elements are set through `osascript do JavaScript` instead.
 //!
 //! * **Everything else**: Write `AXValue` directly (sliders, steppers, native
 //!   text fields that expose a settable AXValue).
@@ -36,6 +35,13 @@ use crate::window_change_detector::WindowChangeDetector;
 use core_foundation::base::CFRelease;
 
 mod minimized_restore;
+mod popup_ownership;
+#[cfg(test)]
+#[path = "set_value/popup_result_tests.rs"]
+mod popup_result_tests;
+#[cfg(test)]
+#[path = "set_value/popup_ownership_tests.rs"]
+mod popup_route_tests;
 
 use super::ToolState;
 
@@ -55,9 +61,10 @@ fn def() -> &'static ToolDef {
     DEF.get_or_init(|| ToolDef {
         name: "set_value".into(),
         description: "Set an element's value by `element_token`. Popup button / select: selects the item whose title \
-            or value matches `value` (case-insensitive); Safari `<select>` through the DOM, AppKit and \
-            Chromium popups by opening the menu, pressing the item and closing it (the user's front window \
-            keeps key focus). An unknown value lists the options. Other elements: writes AXValue (sliders, \
+            or value matches `value` (case-insensitive); Safari `<select>` through the DOM, Chromium by \
+            type-ahead when available, and otherwise through a menu item. A menu opened for the selection \
+            is dismissed only when still owned, and closure may be unconfirmed. An unknown value lists \
+            readable option titles. Other elements: writes AXValue (sliders, \
             steppers, date pickers, native text fields). A Finder file name cell (list or icon view, not \
             being edited) is renamed through Finder's scripting interface in the background and read back \
             from disk; `value` is the full new name with its extension (macOS asks once to allow controlling \
@@ -517,7 +524,13 @@ fn set_value_tool_result(
         Ok(Err(e)) if e.is::<PostSpiUnavailable>() => {
             super::pre_dispatch_refusal(super::WINDOW_NOT_KEY, format!("{e}.{suffix}"))
         }
-        Ok(Err(e)) => ToolResult::error(format!("set_value failed: {e}.{suffix}")),
+        Ok(Err(e)) => {
+            if let Some(popup) = e.downcast_ref::<popup_ownership::PopupError>() {
+                popup_ownership::tool_result(&popup.0, &suffix, ax_echo_surface)
+            } else {
+                ToolResult::error(format!("set_value failed: {e}.{suffix}"))
+            }
+        }
         Err(e) => ToolResult::error(format!("Task error: {e}.{suffix}")),
     }
 }
@@ -1731,12 +1744,6 @@ fn classify_write(
 
 // ── AXPopUpButton path ───────────────────────────────────────────────────────
 
-/// How long to wait for a popup's menu to publish its items after AXPress.
-const POPUP_OPEN_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(2500);
-/// Consecutive unchanged polls that mean the menu has finished filling in.
-const POPUP_STABLE_POLLS: u32 = 3;
-/// How long a dismissed menu may take to close before Escape is sent.
-const POPUP_CLOSE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(300);
 const POPUP_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
 /// AX messaging timeout while opening the menu. The target app enters its
 /// menu-tracking loop inside the AXPress, so the call would otherwise block
@@ -1787,37 +1794,6 @@ fn describe_option(element: AXUIElementRef) -> PopupOption {
     }
 }
 
-/// Index of the option whose title or value equals `value`, ignoring case and
-/// surrounding whitespace.
-fn matching_option(options: &[(String, String)], value: &str) -> Option<usize> {
-    let wanted = value.trim().to_lowercase();
-    options.iter().position(|(title, option_value)| {
-        title.trim().to_lowercase() == wanted || option_value.trim().to_lowercase() == wanted
-    })
-}
-
-fn option_pairs(options: &[PopupOption]) -> Vec<(String, String)> {
-    options
-        .iter()
-        .map(|option| (option.title.clone(), option.value.clone()))
-        .collect()
-}
-
-fn describe_available(options: &[PopupOption]) -> String {
-    options
-        .iter()
-        .map(|option| {
-            let label = if option.title.is_empty() {
-                &option.value
-            } else {
-                &option.title
-            };
-            format!("\"{label}\"")
-        })
-        .collect::<Vec<_>>()
-        .join(", ")
-}
-
 /// Whether the popup's menu is open right now: an `AXMenu` child that already
 /// lists items. A closed AppKit popup has an empty `AXMenu` (or none), and a
 /// closed Chromium popup lists only its selected item directly.
@@ -1834,28 +1810,6 @@ fn popup_menu_is_open(popup: AXUIElementRef) -> bool {
         unsafe { CFRelease(child as _) };
     }
     open
-}
-
-/// Close a menu this call opened, without choosing anything. `AXCancel` is
-/// enough for AppKit; Chromium's menu ignores it, so fall back to Escape sent
-/// to the app (the open menu is what receives it).
-fn dismiss_popup_menu(popup: AXUIElementRef, pid: i32) {
-    for child in unsafe { copy_children(popup) } {
-        let role = unsafe { copy_string_attr(child, "AXRole") }.unwrap_or_default();
-        if role == "AXMenu" {
-            let _ = unsafe { perform_action(child, "AXCancel") };
-        }
-        unsafe { CFRelease(child as _) };
-    }
-    let deadline = std::time::Instant::now() + POPUP_CLOSE_TIMEOUT;
-    while popup_menu_is_open(popup) {
-        if std::time::Instant::now() >= deadline {
-            let _ = crate::input::keyboard::press_key_no_auth(pid, "escape", &[]);
-            std::thread::sleep(POPUP_CLOSE_TIMEOUT);
-            return;
-        }
-        std::thread::sleep(POPUP_POLL_INTERVAL);
-    }
 }
 
 /// Whether a popup belongs to a Chromium renderer (Chrome-family browsers and
@@ -1973,6 +1927,7 @@ fn wait_typeahead_confirmation(
 enum TypeaheadResult {
     NotAttempted,
     PostUnavailable,
+    FallbackAfterInput,
     Selected(String),
     SentUnverified,
 }
@@ -2009,15 +1964,15 @@ fn select_chromium_popup_by_typeahead(
     unsafe { crate::ax::bindings::set_bool_attr_true(popup, "AXFocused") };
     std::thread::sleep(POPUP_POLL_INTERVAL);
     if unsafe { copy_bool_attr(popup, "AXFocused") } != Some(true) {
-        return TypeaheadResult::NotAttempted;
+        return TypeaheadResult::FallbackAfterInput;
     }
     // Keys go to the window's focused element, so the window must be the
     // app's key window (in-app records only; the app is not activated).
     let Ok(_scope) = super::key_scope(pid, Some(window_id)) else {
-        return TypeaheadResult::NotAttempted;
+        return TypeaheadResult::FallbackAfterInput;
     };
     if crate::input::keyboard::type_text(pid, wanted).is_err() {
-        return TypeaheadResult::NotAttempted;
+        return TypeaheadResult::FallbackAfterInput;
     }
     let deadline = std::time::Instant::now() + TYPEAHEAD_SETTLE;
     let confirmation = wait_typeahead_confirmation(
@@ -2038,7 +1993,7 @@ fn select_chromium_popup_by_typeahead(
                 wanted,
                 "type-ahead did not select the option; opening the menu"
             );
-            TypeaheadResult::NotAttempted
+            TypeaheadResult::FallbackAfterInput
         }
         TypeaheadConfirmation::SentUnverified => TypeaheadResult::SentUnverified,
     }
@@ -2062,7 +2017,7 @@ mod popup_secure_tests {
         );
         assert_eq!(reads, 1);
         assert_eq!(confirmation, TypeaheadConfirmation::SentUnverified);
-        let result = popup_route(TypeaheadResult::SentUnverified, || {
+        let result = popup_route(TypeaheadResult::SentUnverified, |_| {
             panic!("menu, JavaScript or option press after type-ahead")
         })
         .unwrap();
@@ -2083,14 +2038,40 @@ mod popup_secure_tests {
         assert_eq!(value.text(), None);
         assert!(!reader.trace.iter().any(|(_, name)| name == "AXValue"));
     }
+
+    #[test]
+    fn fallback_tracks_prior_focus_or_typeahead_input() {
+        let result = popup_route(TypeaheadResult::FallbackAfterInput, |prior| {
+            assert!(prior);
+            Ok("fallback".into())
+        })
+        .unwrap();
+        assert_eq!(result, "fallback");
+    }
+
+    #[test]
+    fn non_text_allowed_option_values_cannot_prove_list_completeness() {
+        use super::popup_ownership::option_value;
+        assert_eq!(
+            option_value(ValueRead::Allowed(ValueObs::Number(2.0))),
+            None
+        );
+        assert_eq!(option_value(ValueRead::Allowed(ValueObs::OtherType)), None);
+        assert_eq!(
+            option_value(ValueRead::Allowed(ValueObs::Missing)),
+            Some(String::new())
+        );
+        assert_eq!(option_value(ValueRead::Withheld), Some(String::new()));
+    }
 }
 
 fn popup_route(
     result: TypeaheadResult,
-    fallback: impl FnOnce() -> anyhow::Result<String>,
+    fallback: impl FnOnce(bool) -> anyhow::Result<String>,
 ) -> anyhow::Result<String> {
     match result {
-        TypeaheadResult::NotAttempted => fallback(),
+        TypeaheadResult::NotAttempted => fallback(false),
+        TypeaheadResult::FallbackAfterInput => fallback(true),
         TypeaheadResult::PostUnavailable => Err(PostSpiUnavailable.into()),
         TypeaheadResult::Selected(detail) => Ok(detail),
         TypeaheadResult::SentUnverified => Ok("📨 Type-ahead was sent, but the selected value could not be safely read; verify before repeating.".to_owned()),
@@ -2103,7 +2084,7 @@ mod hand_back_order_tests {
 
     #[test]
     fn unavailable_post_refuses_without_running_popup_fallback() {
-        let error = popup_route(TypeaheadResult::PostUnavailable, || {
+        let error = popup_route(TypeaheadResult::PostUnavailable, |_| {
             panic!("popup fallback must not run")
         })
         .unwrap_err();
@@ -2130,176 +2111,156 @@ fn select_popup_option(
         value,
         element_title,
     );
-    popup_route(result, || {
-        select_popup_option_after_typeahead(element, element_index, pid, value, element_title)
+    popup_route(result, |prior_input| {
+        // Preserve the existing Safari fallback decision. U27/U28 own the web
+        // route classification; the ownership rules apply to the menu route.
+        let options = popup_options(element);
+        let empty = options.is_empty();
+        release_options(&options);
+        if empty && crate::apps::get_app_name_for_pid(pid).as_deref() == Some("Safari") {
+            return set_select_via_js(element_index, element_title, value);
+        }
+        let mut env = unsafe { popup_ownership::NativePopupEnv::new(element) };
+        let outcome = popup_ownership::select(&mut env, value);
+        let outcome = match outcome {
+            popup_ownership::PopupOutcome::Refused {
+                reason,
+                preexisting,
+            } if prior_input => popup_ownership::PopupOutcome::SentUnverified {
+                reason,
+                preexisting,
+                close: None,
+            },
+            other => other,
+        };
+        Err(popup_ownership::PopupError(outcome).into())
     })
 }
 
-fn select_popup_option_after_typeahead(
-    element: AXUIElementRef,
-    element_index: usize,
-    pid: i32,
-    value: &str,
-    element_title: &str,
-) -> anyhow::Result<String> {
-    let mut options = popup_options(element);
-    let mut opened_menu = false;
-    let mut press_thread = None;
+#[cfg(test)]
+mod popup_match_tests {
+    use super::popup_ownership::{match_option, OptionEntry, OptionMatch};
 
-    if matching_option(&option_pairs(&options), value).is_none() {
-        // Safari/WebKit: no AX children while the popup is closed. Set the
-        // <select> through the DOM instead of opening a menu.
-        if options.is_empty() {
-            let app_name = crate::apps::get_app_name_for_pid(pid).unwrap_or_default();
-            if app_name == "Safari" {
-                return set_select_via_js(element_index, element_title, value);
-            }
-        }
-        // AppKit NSPopUpButton and Chromium <select> publish their items only
-        // while the menu is open (a closed Chromium popup lists just the
-        // selected one). Open it, wait for the full list, press the match,
-        // and close the menu again whatever happens. The menu's tracking
-        // steals key focus; in the background the key-focus guard armed by
-        // the caller hands it straight back to the user's front window.
-        //
-        // The AXPress returns only once the app's menu tracking lets it (or
-        // the messaging timeout fires), so run it on its own thread and read
-        // the items as soon as they appear: the menu, and with it the key
-        // focus it holds, stays open for the shortest time.
-        let already_open = popup_menu_is_open(element);
-        let closed_titles = if already_open {
-            Vec::new()
-        } else {
-            option_pairs(&options)
-        };
-        release_options(&options);
-        opened_menu = true;
-        // A menu left open by an earlier click is already showing its items;
-        // pressing again would close it.
-        if !already_open {
-            let popup_address = element as usize;
-            press_thread = Some(std::thread::spawn(move || unsafe {
-                let popup = popup_address as AXUIElementRef;
-                crate::ax::bindings::AXUIElementSetMessagingTimeout(
-                    popup,
-                    POPUP_PRESS_TIMEOUT_SECONDS,
-                );
-                let _ = perform_action(popup, "AXPress");
-                crate::ax::bindings::AXUIElementSetMessagingTimeout(popup, 0.0);
-            }));
-        }
-        let deadline = std::time::Instant::now() + POPUP_OPEN_TIMEOUT;
-        let mut last_seen: Vec<(String, String)> = Vec::new();
-        let mut stable_polls = 0;
-        loop {
-            options = popup_options(element);
-            let seen = option_pairs(&options);
-            if matching_option(&seen, value).is_some() {
-                break;
-            }
-            // The menu is open once the list differs from the closed one; it
-            // is complete once the list stops changing.
-            if !seen.is_empty() && seen != closed_titles {
-                stable_polls = if seen == last_seen {
-                    stable_polls + 1
-                } else {
-                    0
-                };
-                if stable_polls >= POPUP_STABLE_POLLS {
-                    break;
-                }
-            }
-            last_seen = seen;
-            if std::time::Instant::now() >= deadline {
-                break;
-            }
-            release_options(&options);
-            std::thread::sleep(POPUP_POLL_INTERVAL);
-        }
-        if options.is_empty() {
-            dismiss_popup_menu(element, pid);
-            if let Some(press) = press_thread.take() {
-                let _ = press.join();
-            }
-            anyhow::bail!(
-                "AXPopUpButton [{element_index}] \"{element_title}\" exposed no options even \
-                 after its menu was opened, so nothing was selected. Click the popup, then \
-                 choose the option with press_key (down, return) or a pixel click on the item."
-            )
-        }
+    fn entries(values: &[(&str, &str)]) -> Vec<OptionEntry<usize>> {
+        values
+            .iter()
+            .enumerate()
+            .map(|(id, (title, value))| OptionEntry {
+                id,
+                title: (*title).into(),
+                value: (*value).into(),
+            })
+            .collect()
     }
 
-    let result = match matching_option(&option_pairs(&options), value) {
-        Some(i) => {
-            let option = &options[i];
-            let err = unsafe { perform_action(option.element, "AXPress") };
-            if err == kAXErrorSuccess {
-                let label = if option.title.is_empty() {
-                    &option.value
-                } else {
-                    &option.title
-                };
-                Ok(format!(
-                    "✅ Selected '{label}' in AXPopUpButton [{element_index}] \
-                     \"{element_title}\" via AX menu item AXPress{}.",
-                    if opened_menu {
-                        " (the popup's menu was opened for the selection and closed again)"
-                    } else {
-                        ""
-                    }
-                ))
-            } else {
-                if opened_menu {
-                    dismiss_popup_menu(element, pid);
-                }
-                Err(anyhow::anyhow!(
-                    "AXPress on menu item failed with error {err}"
-                ))
-            }
-        }
-        None => {
-            if opened_menu {
-                dismiss_popup_menu(element, pid);
-            }
-            Err(anyhow::anyhow!(
-                "No option matching '{value}' in AXPopUpButton [{element_index}] \
-                 \"{element_title}\". Available: [{}]",
-                describe_available(&options)
-            ))
-        }
-    };
-    // The opening AXPress returns once the menu is closed or its timeout
-    // fires; wait for it so no AX call outlives this tool call.
-    if let Some(press) = press_thread {
-        let _ = press.join();
+    #[test]
+    fn duplicate_titles_are_ambiguous() {
+        assert_eq!(
+            match_option(&entries(&[("One", "a"), ("One", "b")]), "one"),
+            OptionMatch::Ambiguous(vec![0, 1])
+        );
     }
-    release_options(&options);
-    result
+    #[test]
+    fn title_value_cross_match_is_ambiguous() {
+        assert_eq!(
+            match_option(&entries(&[("Choice", "a"), ("Other", "choice")]), "choice"),
+            OptionMatch::Ambiguous(vec![0, 1])
+        );
+    }
+    #[test]
+    fn duplicate_values_are_ambiguous() {
+        assert_eq!(
+            match_option(
+                &entries(&[("First", " shared "), ("Second", "SHARED")]),
+                "shared"
+            ),
+            OptionMatch::Ambiguous(vec![0, 1])
+        );
+    }
+    #[test]
+    fn one_option_matching_title_and_value_is_unique() {
+        assert_eq!(
+            match_option(&entries(&[(" Choice ", "choice")]), "CHOICE"),
+            OptionMatch::Unique(0)
+        );
+    }
+    #[test]
+    fn matching_ignores_case_and_space() {
+        assert_eq!(
+            match_option(&entries(&[("Other", "a"), (" Choice ", "b")]), " CHOICE "),
+            OptionMatch::Unique(1)
+        );
+    }
+    #[test]
+    fn unmatched_value_has_no_match() {
+        assert_eq!(
+            match_option(&entries(&[("Other", "a")]), "missing"),
+            OptionMatch::None
+        );
+    }
+    #[test]
+    fn unique_value_matches() {
+        assert_eq!(
+            match_option(&entries(&[("Other", "token")]), "TOKEN"),
+            OptionMatch::Unique(0)
+        );
+    }
+    #[test]
+    fn empty_list_has_no_match() {
+        assert_eq!(match_option(&entries(&[]), "anything"), OptionMatch::None);
+    }
 }
 
 #[cfg(test)]
 mod popup_option_tests {
-    use super::matching_option;
+    use super::popup_ownership::{match_option, option_role, OptionEntry, OptionMatch};
 
-    fn pairs(titles: &[&str]) -> Vec<(String, String)> {
+    #[test]
+    fn unknown_item_roles_do_not_prove_a_complete_list() {
+        assert_eq!(option_role("AXMenuItem"), Some(true));
+        assert_eq!(option_role("AXSeparator"), Some(false));
+        assert_eq!(option_role("AXGroup"), None);
+    }
+
+    fn pairs(titles: &[&str]) -> Vec<OptionEntry<usize>> {
         titles
             .iter()
-            .map(|title| ((*title).to_owned(), String::new()))
+            .enumerate()
+            .map(|(id, title)| OptionEntry {
+                id,
+                title: (*title).to_owned(),
+                value: String::new(),
+            })
             .collect()
     }
 
     #[test]
     fn matches_title_ignoring_case_and_whitespace() {
         let options = pairs(&["Open", "Duplicate", "Closed"]);
-        assert_eq!(matching_option(&options, "duplicate"), Some(1));
-        assert_eq!(matching_option(&options, "  Closed "), Some(2));
-        assert_eq!(matching_option(&options, "Pending"), None);
+        assert_eq!(match_option(&options, "duplicate"), OptionMatch::Unique(1));
+        assert_eq!(match_option(&options, "  Closed "), OptionMatch::Unique(2));
+        assert_eq!(match_option(&options, "Pending"), OptionMatch::None);
     }
 
     #[test]
     fn matches_value_when_title_differs() {
-        let options = vec![("Duplicate of".to_owned(), "dup".to_owned())];
-        assert_eq!(matching_option(&options, "DUP"), Some(0));
+        let options = vec![OptionEntry {
+            id: 0,
+            title: "Duplicate of".into(),
+            value: "dup".into(),
+        }];
+        assert_eq!(match_option(&options, "DUP"), OptionMatch::Unique(0));
+    }
+
+    #[test]
+    fn option_title_and_value_both_address_the_same_item() {
+        let options = vec![OptionEntry {
+            id: 7,
+            title: "Visible".into(),
+            value: "token".into(),
+        }];
+        assert_eq!(match_option(&options, "VISIBLE"), OptionMatch::Unique(0));
+        assert_eq!(match_option(&options, "token"), OptionMatch::Unique(0));
     }
 }
 
