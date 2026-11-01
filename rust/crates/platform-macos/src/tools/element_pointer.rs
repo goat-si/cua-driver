@@ -426,11 +426,12 @@ fn dispatch(
     }
     Ok(
         match double_click_element(
+            target,
             idx,
             use_ax_open,
             foreground,
-            || target.ax_open(),
-            || pointer_clicks(target, count, foreground),
+            |target| target.ax_open(),
+            |target| pointer_clicks(target, count, foreground),
         )? {
             ElementDoubleClick::Ax(message) => Performed::AxOpen(message),
             ElementDoubleClick::Pixel(clicks) => Performed::Clicks(clicks),

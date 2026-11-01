@@ -7,6 +7,22 @@ use cua_driver_core::actionability::{
 use cua_driver_core::protocol::ToolResult;
 use std::{future::Future, time::Duration};
 
+pub(super) mod runner;
+pub(super) mod scope;
+pub(super) mod semantic;
+#[cfg(test)]
+#[path = "actionability/order_tests.rs"]
+mod u31_pointer_order_tests;
+#[cfg(test)]
+#[path = "actionability/pointer_tests.rs"]
+mod u31_pointer_tests;
+#[cfg(test)]
+#[path = "actionability/scope_tests.rs"]
+mod u31_scope_tests;
+#[cfg(test)]
+#[path = "actionability/target_tests.rs"]
+mod u31_semantic_target_tests;
+
 pub(crate) fn enabled<R: Reader>(reader: &mut R, element: R::Element) -> Evidence<bool> {
     observe(reader.boolean(element, "AXEnabled"))
 }
@@ -35,21 +51,6 @@ pub(crate) trait ScopeReader<E> {
     fn hit(&mut self, target: E, window: E, scope: Scope, point: Point) -> Hit;
 }
 
-/// The existing element pointer hit reader collapses errors into misses; it
-/// cannot prove either foreground or window-internal delivery evidence.
-pub(crate) struct UnprovenScope;
-impl<E> ScopeReader<E> for UnprovenScope {
-    fn visible(&mut self, _: E, _: E, _: Scope) -> Evidence<bool> {
-        Evidence::Unknown("visibility is unproven".into())
-    }
-    fn offscreen(&mut self, _: E, _: E, _: Scope) -> Evidence<bool> {
-        Evidence::Unknown("offscreen state is unproven".into())
-    }
-    fn hit(&mut self, _: E, _: E, _: Scope, _: Point) -> Hit {
-        Hit::Unknown
-    }
-}
-
 pub(crate) struct Adapter<E> {
     target: E,
     window: E,
@@ -70,6 +71,28 @@ impl<E: Copy> Adapter<E> {
         reader: &mut R,
         scope_reader: &mut H,
         clock: &C,
+    ) -> ElementFacts {
+        self.facts_with_hits(reader, scope_reader, clock, true)
+    }
+
+    /// Facts for semantic AX actions evaluated under the headless policy.
+    /// These actions do not require pointer hit evidence and must not perform
+    /// a desktop or window hit test while observing actionability.
+    pub(crate) fn semantic_facts<R: Reader<Element = E>, H: ScopeReader<E>, C: Clock>(
+        &mut self,
+        reader: &mut R,
+        scope_reader: &mut H,
+        clock: &C,
+    ) -> ElementFacts {
+        self.facts_with_hits(reader, scope_reader, clock, false)
+    }
+
+    fn facts_with_hits<R: Reader<Element = E>, H: ScopeReader<E>, C: Clock>(
+        &mut self,
+        reader: &mut R,
+        scope_reader: &mut H,
+        clock: &C,
+        collect_hits: bool,
     ) -> ElementFacts {
         let target = self.target;
         let actions = advertised_actions(reader, target);
@@ -94,30 +117,34 @@ impl<E: Copy> Adapter<E> {
         };
         let bounds = observe(reader.frame(target));
         let stable = self.stability.observe(clock, bounds.clone());
-        let receives_events = match bounds {
-            Evidence::Known(rect)
-                if rect.x.is_finite()
-                    && rect.y.is_finite()
-                    && rect.width.is_finite()
-                    && rect.height.is_finite()
-                    && rect.width > 0.0
-                    && rect.height > 0.0 =>
-            {
-                let mut hit = |p| match scope_reader.hit(target, self.window, self.scope, p) {
-                    Hit::Occluded(mut other) => {
-                        other.name = None;
-                        Hit::Occluded(other)
-                    }
-                    other => other,
-                };
-                Evidence::Known(match self.scope {
-                    Scope::Foreground => actionability::collect_hits(rect, &mut hit),
-                    Scope::WindowInternal => actionability::collect_window_hits(rect, &mut hit),
-                })
+        let receives_events = if !collect_hits {
+            Evidence::Absent
+        } else {
+            match bounds {
+                Evidence::Known(rect)
+                    if rect.x.is_finite()
+                        && rect.y.is_finite()
+                        && rect.width.is_finite()
+                        && rect.height.is_finite()
+                        && rect.width > 0.0
+                        && rect.height > 0.0 =>
+                {
+                    let mut hit = |p| match scope_reader.hit(target, self.window, self.scope, p) {
+                        Hit::Occluded(mut other) => {
+                            other.name = None;
+                            Hit::Occluded(other)
+                        }
+                        other => other,
+                    };
+                    Evidence::Known(match self.scope {
+                        Scope::Foreground => actionability::collect_hits(rect, &mut hit),
+                        Scope::WindowInternal => actionability::collect_window_hits(rect, &mut hit),
+                    })
+                }
+                Evidence::Known(_) => Evidence::Unknown("bounds cannot be hit tested".into()),
+                Evidence::Unknown(ref reason) => Evidence::Unknown(reason.clone()),
+                Evidence::Absent => Evidence::Absent,
             }
-            Evidence::Known(_) => Evidence::Unknown("bounds cannot be hit tested".into()),
-            Evidence::Unknown(ref reason) => Evidence::Unknown(reason.clone()),
-            Evidence::Absent => Evidence::Absent,
         };
         ElementFacts {
             visible: scope_reader.visible(target, self.window, self.scope),
@@ -222,7 +249,6 @@ pub(crate) enum Route<'a> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Selection<'a> {
     Battery { intent: Intent<'a>, policy: Policy },
-    UnresolvedWheel,
     Coordinate(CoordinateOutcome),
     OutsideBattery,
 }
@@ -252,7 +278,7 @@ pub(crate) fn select(route: Route<'_>) -> Selection<'_> {
         PhysicalTriple(f) => (Intent::TripleClick, physical(f)),
         PhysicalRightClick(f) => (Intent::RightClick, physical(f)),
         ScrollToVisible => (Intent::ScrollTo, Policy::headless()),
-        ElementWheel(_) => return Selection::UnresolvedWheel,
+        ElementWheel(f) => (Intent::ScrollWheel, physical(f)),
         Coordinate => return Selection::Coordinate(actionability::coordinate_only()),
         RawKey(f) => (Intent::PressKey, keyboard(f)),
         Focus => (Intent::Focus, Policy::headless()),
@@ -286,6 +312,57 @@ where
 {
     actionability::auto_wait(clock, budget, prologue_attempted, probe).await
 }
+pub(super) fn semantic_clock() -> impl Clock + Sync {
+    semantic::SemanticClock::default()
+}
+
+/// Dispatch one semantic action after its admitted target is sampled.
+pub(super) async fn dispatch_semantic<C, P, A, F, T>(
+    clock: &(impl Clock + Sync),
+    budget: Duration,
+    context: C,
+    mut probe: P,
+    perform: A,
+) -> Result<T, ToolResult>
+where
+    C: Sync,
+    P: for<'a> FnMut(
+            &'a C,
+            Duration,
+        )
+            -> std::pin::Pin<Box<dyn Future<Output = ActionabilityReport> + Send + 'a>>
+        + Send,
+    A: FnOnce(C) -> F,
+    F: Future<Output = T>,
+{
+    let report = wait(clock, budget, false, |remaining| probe(&context, remaining)).await;
+    match report.verdict {
+        Verdict::Pass => Ok(perform(context).await),
+        Verdict::Terminal { .. } => Err(report.refusal_result().expect("terminal report")),
+        Verdict::Transient { .. } => unreachable!("auto_wait returns pass or terminal"),
+    }
+}
+
+pub(super) fn click_probe<'a>(
+    lease: &'a Option<crate::tools::BackgroundMutationLease>,
+    target: crate::ax::snapshot::RetainedElement,
+    pid: i32,
+    window_id: u32,
+) -> std::pin::Pin<Box<dyn Future<Output = ActionabilityReport> + Send + 'a>> {
+    Box::pin(async move {
+        let bound = if let Some(lease) = lease {
+            semantic::bind_exact_after_lease(lease, target, window_id).await
+        } else {
+            semantic::bind_exact_after_admission(pid, target, window_id).await
+        };
+        match bound {
+            Evidence::Known(probe) => probe.sample(semantic::SemanticIntent::Click).await,
+            Evidence::Unknown(reason) => semantic::unavailable(reason),
+            Evidence::Absent => semantic::unavailable("target binding absent".into()),
+        }
+    })
+}
+
 pub(crate) enum ResultDecision {
     Continue(ToolResult),
     Wait(ToolResult),
@@ -453,6 +530,46 @@ mod u31_facts_tests {
             .verdict,
             Verdict::Transient { unknown: true, .. }
         ));
+        let mut scope = FakeScope::default();
+        let result = semantic::sample_with(
+            7,
+            13,
+            &mut reader,
+            &mut scope,
+            &FakeClock::default(),
+            &mut StabilitySampler::default(),
+            &semantic::SemanticIntent::PerformAction("AXCustom".into()),
+        );
+        assert!(matches!(
+            result.verdict,
+            Verdict::Transient { unknown: true, .. }
+        ));
+        reader.actions_result = Evidence::Known(
+            ["AXPress", "AXOpen", "AXShowMenu", "AXCancel"]
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
+        );
+        for intent in [
+            semantic::SemanticIntent::Click,
+            semantic::SemanticIntent::Open,
+            semantic::SemanticIntent::RightClick,
+            semantic::SemanticIntent::Select,
+            semantic::SemanticIntent::Focus,
+            semantic::SemanticIntent::PerformAction("AXCancel".into()),
+        ] {
+            let report = semantic::sample_with(
+                7,
+                13,
+                &mut reader,
+                &mut scope,
+                &FakeClock::default(),
+                &mut StabilitySampler::default(),
+                &intent,
+            );
+            assert_eq!(report.verdict, Verdict::Pass);
+        }
+        assert!(scope.calls.iter().all(|(_, _, _, kind)| *kind != "hit"));
     }
 
     #[test]
@@ -683,6 +800,31 @@ mod u31_facts_tests {
             .calls
             .iter()
             .all(|(e, w, s, _)| (*e, *w, *s) == (7, 13, Scope::WindowInternal)));
+        // The blocking semantic-sample seam carries only the sampler across
+        // reads; target and window are supplied afresh on every observation.
+        reader.frame_result = Evidence::Known(rectangle());
+        reader.actions_result = Evidence::Known(vec!["AXOpen".into()]);
+        let mut stability = StabilitySampler::default();
+        let mut semantic_scope = FakeScope::default();
+        for (time, expected) in [(100, false), (117, false), (134, true)] {
+            clock.0.store(time, Ordering::SeqCst);
+            let report = semantic::sample_with(
+                7,
+                13,
+                &mut reader,
+                &mut semantic_scope,
+                &clock,
+                &mut stability,
+                &semantic::SemanticIntent::Open,
+            );
+            assert_eq!(report.last_facts.unwrap().stable, Evidence::Known(expected));
+        }
+        assert!(semantic_scope
+            .calls
+            .iter()
+            .all(|(target, window, scope, kind)| {
+                (*target, *window, *scope) == (7, 13, Scope::WindowInternal) && *kind != "hit"
+            }));
     }
     #[test]
     fn hit_evidence_preserves_delivery_scope() {
@@ -717,6 +859,36 @@ mod u31_facts_tests {
                 .count(),
             5
         );
+        reader.actions_result = Evidence::Known(vec!["AXPress".into()]);
+        let calls_before = scope.calls.len();
+        let semantic = Adapter::new(7, 13, Scope::WindowInternal).semantic_facts(
+            &mut reader,
+            &mut scope,
+            &FakeClock::default(),
+        );
+        assert_eq!(semantic.receives_events, Evidence::Absent);
+        assert!(scope.calls[calls_before..]
+            .iter()
+            .all(|(_, _, _, kind)| *kind != "hit"));
+        assert!(matches!(
+            evaluate(Intent::Click, &semantic, Policy::headless()).verdict,
+            Verdict::Pass
+        ));
+        reader.actions_result = Evidence::Unknown("action read failed".into());
+        let semantic = Adapter::new(7, 13, Scope::WindowInternal).semantic_facts(
+            &mut reader,
+            &mut scope,
+            &FakeClock::default(),
+        );
+        assert!(matches!(
+            evaluate(
+                Intent::PerformAction { name: "AXCustom" },
+                &semantic,
+                Policy::headless()
+            )
+            .verdict,
+            Verdict::Transient { unknown: true, .. }
+        ));
     }
 }
 
@@ -871,10 +1043,16 @@ mod u31_result_tests {
             select(Route::Coordinate),
             Selection::Coordinate(CoordinateOutcome::NotEvaluated)
         );
-        for foreground in [false, true] {
+        for (foreground, policy) in [
+            (false, Policy::background_window()),
+            (true, Policy::headed()),
+        ] {
             assert_eq!(
                 select(Route::ElementWheel(foreground)),
-                Selection::UnresolvedWheel
+                Selection::Battery {
+                    intent: Intent::ScrollWheel,
+                    policy,
+                }
             );
         }
         assert_eq!(

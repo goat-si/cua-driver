@@ -109,6 +109,26 @@ pub(crate) enum ReadSite {
     SelectedSettable,
     MenuSelected,
     Batch(&'static str),
+    ProviderEnablement,
+    ProviderCachedEnablement,
+    ProviderOptIn,
+    ScopeCandidate(&'static str),
+    RecoveryHit,
+    RecoveryDeadline,
+    RecoveryParent,
+    RecoveryWindowId,
+    RecoveryRoot,
+    RecoverySheetRole,
+    TopLevelWindows,
+    TopLevelWindowsMember,
+    TopLevelRemoteWindow,
+    ApplicationRoot,
+    MenuWindowList,
+    MenuDiscoveryDeadline,
+    MenuWindowCap,
+    MenuResolution,
+    MenuFrame,
+    MenuOwnership,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -118,6 +138,7 @@ pub(crate) enum EvidenceStatus {
     Unknown(ReadFailure),
     Unavailable,
     DeadlineExpired,
+    DiscoveryLimit,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

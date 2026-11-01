@@ -1220,7 +1220,7 @@ impl Tool for ClickTool {
             .and_then(Value::as_f64)
             .zip(args.get("y").and_then(Value::as_f64));
         let result =
-            super::window_points::annotate(self.invoke_in(args, space, false).await, space, point);
+            super::window_points::annotate(self.invoke_in(args, space, None).await, space, point);
         with_screenshot_point(result, space, point)
     }
 }
@@ -1256,9 +1256,11 @@ impl ClickTool {
         &self,
         args: Value,
         space: super::window_points::PointSpace,
-        simulated: bool,
+        simulated_target: Option<&crate::ax::snapshot::RetainedElement>,
     ) -> ToolResult {
         use cua_driver_core::tool_args::ArgsExt;
+
+        let simulated = simulated_target.is_some();
 
         if let Err(refusal) = super::element_simulate::validate(&args) {
             return refusal;
@@ -1513,13 +1515,20 @@ impl ClickTool {
                     "click: the element frame could not be read; nothing was sent.",
                 )),
             };
-            return super::element_simulate::dispatch(prepared, |pixel_args| async move {
-                let pixel_space = match super::window_points::point_space(&pixel_args) {
-                    Ok(value) => value,
-                    Err(refusal) => return refusal,
-                };
-                Box::pin(self.invoke_in(pixel_args, pixel_space, true)).await
-            })
+            return super::element_simulate::dispatch(
+                prepared,
+                element.clone(),
+                |pixel_args, retained| async move {
+                    let pixel_space = match super::window_points::point_space(&pixel_args) {
+                        Ok(value) => value,
+                        Err(refusal) => return refusal,
+                    };
+                    let result =
+                        Box::pin(self.invoke_in(pixel_args, pixel_space, Some(&retained))).await;
+                    drop(retained);
+                    result
+                },
+            )
             .await;
         }
 
@@ -1805,13 +1814,7 @@ impl ClickTool {
             // itself via FocusGuard. After the action returns, detect any
             // new-window / foreground side-effects and append a one-liner
             // suffix matching Swift's wording.
-            let prior_front = apps::frontmost_pid();
             let foreground = delivery_mode.is_foreground();
-            let snapshot = if foreground {
-                WindowChangeDetector::snapshot_without_suppression(prior_front)
-            } else {
-                WindowChangeDetector::snapshot(prior_front)
-            };
 
             // Run AX work on a blocking thread (can't block async executor).
             // Use `effective_action` so button=right rewrites press → show_menu.
@@ -1826,69 +1829,99 @@ impl ClickTool {
             // its result: a cancelled caller cannot release it while the
             // action (and a text input's key hand-back) still runs.
             let action_lease = _mutation_lease.take();
-            let result = focus_guard::with_focus_suppressed(
-                if foreground { None } else { Some(pid) },
-                prior_front,
-                "click.AXPress",
-                || async move {
-                    latency::spawn_action_blocking(move || {
-                        let held = action_lease;
-                        let element_ptr = element_guard.as_ptr();
-                        let run = || -> anyhow::Result<(AxClickOutcome, bool)> {
-                            if foreground {
-                                let mut outcome = None;
-                                let has_modifiers = !selection_modifiers.is_empty();
-                                let action = || {
-                                    outcome = Some(perform_ax_click(
+            let probe_target = element_guard.clone();
+            let clock = super::actionability::semantic_clock();
+            let use_battery = effective_action == "press";
+            let perform = |action_lease| async move {
+                let prior_front = apps::frontmost_pid();
+                let snapshot = if foreground {
+                    WindowChangeDetector::snapshot_without_suppression(prior_front)
+                } else {
+                    WindowChangeDetector::snapshot(prior_front)
+                };
+                let result = focus_guard::with_focus_suppressed(
+                    if foreground { None } else { Some(pid) },
+                    prior_front,
+                    "click.AXPress",
+                    || async move {
+                        latency::spawn_action_blocking(move || {
+                            let held = action_lease;
+                            let element_ptr = element_guard.as_ptr();
+                            let run = || -> anyhow::Result<(AxClickOutcome, bool)> {
+                                if foreground {
+                                    let mut outcome = None;
+                                    let has_modifiers = !selection_modifiers.is_empty();
+                                    let action = || {
+                                        outcome = Some(perform_ax_click(
+                                            (element_ptr, idx),
+                                            (pid, wid),
+                                            &action_clone,
+                                            &ck,
+                                            selection_pixel,
+                                            &selection_modifiers,
+                                            foreground,
+                                            read_back,
+                                        )?);
+                                        Ok(())
+                                    };
+                                    let fronted = if has_modifiers {
+                                        crate::input::skylight::with_foreground_hid_activation(
+                                            pid as libc::pid_t,
+                                            wid,
+                                            action,
+                                        )?;
+                                        true
+                                    } else {
+                                        crate::input::skylight::with_foreground_assist(
+                                            pid as libc::pid_t,
+                                            wid,
+                                            action,
+                                        )?
+                                    };
+                                    let outcome = outcome.ok_or_else(|| {
+                                        anyhow::anyhow!("foreground AX click did not execute")
+                                    })?;
+                                    Ok((outcome, fronted))
+                                } else {
+                                    perform_ax_click(
                                         (element_ptr, idx),
                                         (pid, wid),
                                         &action_clone,
                                         &ck,
                                         selection_pixel,
                                         &selection_modifiers,
-                                        foreground,
+                                        false,
                                         read_back,
-                                    )?);
-                                    Ok(())
-                                };
-                                let fronted = if has_modifiers {
-                                    crate::input::skylight::with_foreground_hid_activation(
-                                        pid as libc::pid_t,
-                                        wid,
-                                        action,
-                                    )?;
-                                    true
-                                } else {
-                                    crate::input::skylight::with_foreground_assist(
-                                        pid as libc::pid_t,
-                                        wid,
-                                        action,
-                                    )?
-                                };
-                                let outcome = outcome.ok_or_else(|| {
-                                    anyhow::anyhow!("foreground AX click did not execute")
-                                })?;
-                                Ok((outcome, fronted))
-                            } else {
-                                perform_ax_click(
-                                    (element_ptr, idx),
-                                    (pid, wid),
-                                    &action_clone,
-                                    &ck,
-                                    selection_pixel,
-                                    &selection_modifiers,
-                                    false,
-                                    read_back,
-                                )
-                                .map(|outcome| (outcome, false))
-                            }
-                        };
-                        (run(), held)
-                    })
-                    .await
-                },
-            )
-            .await;
+                                    )
+                                    .map(|outcome| (outcome, false))
+                                }
+                            };
+                            (run(), held)
+                        })
+                        .await
+                    },
+                )
+                .await;
+                (snapshot, result)
+            };
+            let (snapshot, result) = if use_battery {
+                match super::actionability::dispatch_semantic(
+                    &clock,
+                    cua_driver_core::actionability::DEFAULT_BUDGET,
+                    action_lease,
+                    |lease, _| {
+                        super::actionability::click_probe(lease, probe_target.clone(), pid, wid)
+                    },
+                    perform,
+                )
+                .await
+                {
+                    Ok(result) => result,
+                    Err(refusal) => return refusal,
+                }
+            } else {
+                perform(action_lease).await
+            };
             let result = result.map(|(outcome, held)| {
                 _mutation_lease = held;
                 outcome
@@ -3266,6 +3299,88 @@ unsafe fn ancestor_roles(element: AXUIElementRef) -> Vec<String> {
     roles
 }
 
+/// Resolve the exact advertised action and check its enabled state on the
+/// selected target without dispatching it. The two reads are injectable so a
+/// caller can retain the selected target and action across later checks.
+pub(super) fn resolve_click_action<T: Copy>(
+    target: T,
+    requested: &str,
+    foreground: bool,
+    read_actions: impl FnOnce(T) -> Vec<String>,
+    check_enabled: impl FnOnce(T, &str, bool) -> anyhow::Result<()>,
+) -> anyhow::Result<(Vec<String>, String)> {
+    let advertised = read_actions(target);
+    let action =
+        crate::input::ax_actions::resolve_element_action(requested, &advertised, foreground)?
+            .to_owned();
+    check_enabled(target, &action, foreground)?;
+    Ok((advertised, action))
+}
+
+#[cfg(test)]
+mod u31_click_action_seam_tests {
+    use super::*;
+    use std::cell::RefCell;
+
+    #[test]
+    fn resolves_exact_action_on_the_same_target_before_enabled_check() {
+        for (requested, actual) in [
+            ("press", "AXPress"),
+            ("open", "AXOpen"),
+            ("AXCustomThing", "AXCustomThing"),
+        ] {
+            let calls = RefCell::new(Vec::new());
+            let (advertised, action) = resolve_click_action(
+                73_u32,
+                requested,
+                false,
+                |target| {
+                    calls.borrow_mut().push(("actions", target));
+                    vec![actual.to_owned()]
+                },
+                |target, action, foreground| {
+                    assert_eq!(action, actual);
+                    assert!(!foreground);
+                    calls.borrow_mut().push(("enabled", target));
+                    Ok(())
+                },
+            )
+            .unwrap();
+            assert_eq!(advertised, [actual]);
+            assert_eq!(action, actual);
+            assert_eq!(*calls.borrow(), [("actions", 73), ("enabled", 73)]);
+        }
+    }
+
+    #[test]
+    fn resolution_and_enabled_failures_stop_before_later_steps() {
+        let checked = std::cell::Cell::new(false);
+        let result = resolve_click_action(
+            73_u32,
+            "unadvertised custom action",
+            false,
+            |_| Vec::new(),
+            |_, _, _| {
+                checked.set(true);
+                Ok(())
+            },
+        );
+        assert!(result.is_err());
+        assert!(!checked.get());
+        let result = resolve_click_action(
+            73_u32,
+            "press",
+            false,
+            |_| vec!["AXPress".into()],
+            |target, action, _| {
+                assert_eq!((target, action), (73, "AXPress"));
+                Err(anyhow::anyhow!("disabled"))
+            },
+        );
+        assert_eq!(result.unwrap_err().to_string(), "disabled");
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn perform_ax_click(
     element: (usize, usize),
@@ -3285,15 +3400,16 @@ fn perform_ax_click(
     // Read live capabilities before dispatch: custom actions and
     // AXIncrement/AXDecrement are valid only on elements that expose them.
     let preflight = latency::span(latency::Stage::Preflight);
-    let advertised = unsafe { copy_action_names(element) };
-    let ax_action =
-        crate::input::ax_actions::resolve_element_action(action_str, &advertised, foreground)?;
-
-    // Check the live value immediately before dispatch. Foreground assist can
-    // enable menu items that were disabled in the cached snapshot, while a
-    // background transition can disable them after that snapshot. macOS may
-    // otherwise return success for a disabled action that did nothing.
-    crate::input::ax_actions::ensure_ax_action_enabled(element_ptr, ax_action, foreground)?;
+    // A live enabled-state check follows action resolution, as before. The
+    // resolved spelling belongs to this target's advertised actions.
+    let (advertised, resolved_action) = resolve_click_action(
+        element_ptr,
+        action_str,
+        foreground,
+        |target| unsafe { copy_action_names(target as AXUIElementRef) },
+        crate::input::ax_actions::ensure_ax_action_enabled,
+    )?;
+    let ax_action = resolved_action.as_str();
 
     // Capture advertised actions BEFORE dispatching so we can detect silent no-ops
     // (AX returns success even when the element doesn't advertise the action).

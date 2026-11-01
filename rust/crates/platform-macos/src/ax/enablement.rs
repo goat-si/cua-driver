@@ -43,7 +43,7 @@ enum WebContent {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Wait {
+pub(super) enum Wait {
     Complete,
     TimedOut {
         attempts: u32,
@@ -52,9 +52,9 @@ enum Wait {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct ProcessEnablement {
-    stamp: ProcessStartStamp,
-    wait: Wait,
+pub(super) struct ProcessEnablement {
+    pub(super) stamp: ProcessStartStamp,
+    pub(super) wait: Wait,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -242,20 +242,25 @@ fn await_web_content(
 ///
 /// `app_element` must be a valid application `AXUIElementRef` for `pid`.
 pub unsafe fn ensure_chromium_ax_enabled(pid: i32, app_element: AXUIElementRef) {
+    drop(ensure_chromium_ax_enabled_observed(pid, app_element));
+}
+
+/// The same enablement operations, with value-free diagnostic metadata.
+pub(crate) unsafe fn ensure_chromium_ax_enabled_observed(
+    pid: i32,
+    app_element: AXUIElementRef,
+) -> super::evidence::Observed<()> {
     let stamp = process_start_stamp(pid);
     let cached = ENABLEMENT_STATE
         .lock()
         .ok()
         .and_then(|state| state.get(&pid).copied());
     let attempted_at = Instant::now();
-    let prior_timeouts = match next_attempt(cached.as_ref(), stamp, attempted_at) {
-        Attempt::Skip => return,
-        Attempt::Run { prior_timeouts } => prior_timeouts,
-    };
-    let outcome = wait_outcome(
-        enable_chromium_accessibility(app_element),
-        prior_timeouts,
+    ensure_with(
+        cached,
+        stamp,
         attempted_at,
+        || enable_chromium_accessibility(app_element),
         || {
             await_web_content(
                 || probe_web_content(app_element),
@@ -265,11 +270,76 @@ pub unsafe fn ensure_chromium_ax_enabled(pid: i32, app_element: AXUIElementRef) 
                 pump_for,
             )
         },
-    );
-    if let (Some(stamp), Some(wait)) = (stamp, outcome) {
-        if let Ok(mut state) = ENABLEMENT_STATE.lock() {
-            state.insert(pid, ProcessEnablement { stamp, wait });
+        |stamp, wait| {
+            if let Ok(mut state) = ENABLEMENT_STATE.lock() {
+                state.insert(pid, ProcessEnablement { stamp, wait });
+            }
+        },
+        Some(app_element as usize),
+    )
+}
+
+/// Runs the existing cache and materialization decisions against supplied
+/// operations. No operation is repeated to obtain diagnostics.
+pub(super) fn ensure_with(
+    cached: Option<ProcessEnablement>,
+    stamp: Option<ProcessStartStamp>,
+    attempted_at: Instant,
+    opt_in: impl FnOnce() -> AccessibilityOptIn,
+    await_tree: impl FnOnce() -> bool,
+    persist: impl FnOnce(ProcessStartStamp, Wait),
+    owner: Option<usize>,
+) -> super::evidence::Observed<()> {
+    use super::evidence::{EvidenceStatus, Observed, ReadEvidence, ReadSite};
+    let prior_timeouts = match next_attempt(cached.as_ref(), stamp, attempted_at) {
+        Attempt::Skip => {
+            let (status, attempt) = match cached.expect("skip requires cached state").wait {
+                Wait::Complete => (EvidenceStatus::Known, 0),
+                Wait::TimedOut { attempts, .. } => (EvidenceStatus::Unavailable, attempts),
+            };
+            return Observed {
+                legacy: (),
+                evidence: vec![ReadEvidence {
+                    owner,
+                    site: ReadSite::ProviderCachedEnablement,
+                    status,
+                    attempt,
+                    listing: None,
+                }],
+            };
         }
+        Attempt::Run { prior_timeouts } => prior_timeouts,
+    };
+    let outcome = wait_outcome(opt_in(), prior_timeouts, attempted_at, await_tree);
+    if let (Some(stamp), Some(wait)) = (stamp, outcome) {
+        persist(stamp, wait);
+    }
+    let (site, status, attempt) = match outcome {
+        None => (
+            ReadSite::ProviderOptIn,
+            EvidenceStatus::Unavailable,
+            prior_timeouts + 1,
+        ),
+        Some(Wait::Complete) => (
+            ReadSite::ProviderEnablement,
+            EvidenceStatus::Known,
+            prior_timeouts + 1,
+        ),
+        Some(Wait::TimedOut { attempts, .. }) => (
+            ReadSite::ProviderEnablement,
+            EvidenceStatus::Unavailable,
+            attempts,
+        ),
+    };
+    Observed {
+        legacy: (),
+        evidence: vec![ReadEvidence {
+            owner,
+            site,
+            status,
+            attempt,
+            listing: None,
+        }],
     }
 }
 

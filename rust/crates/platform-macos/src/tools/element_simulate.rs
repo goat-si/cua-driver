@@ -161,13 +161,19 @@ pub(super) fn checked_pixel_args(
     Ok(pixel)
 }
 
-pub(super) async fn dispatch<F, Fut>(prepared: Result<Value, ToolResult>, send: F) -> ToolResult
+/// Carry the exact retained element alongside the translated coordinates so
+/// the caller can check that element again before the pointer operation.
+pub(super) async fn dispatch<T, F, Fut>(
+    prepared: Result<Value, ToolResult>,
+    element: T,
+    send: F,
+) -> ToolResult
 where
-    F: FnOnce(Value) -> Fut,
+    F: FnOnce(Value, T) -> Fut,
     Fut: std::future::Future<Output = ToolResult>,
 {
     match prepared {
-        Ok(pixel) => note(send(pixel).await),
+        Ok(pixel) => note(send(pixel, element).await),
         Err(refusal) => refusal,
     }
 }
@@ -259,24 +265,36 @@ mod tests {
             Some([30.0, 40.0, 20.0, 10.0]),
             Some(bounds()),
         );
-        let result = dispatch(prepared, |pixel| {
+        let retained = std::sync::Arc::new(73_u32);
+        let weak = std::sync::Arc::downgrade(&retained);
+        let result = dispatch(prepared, retained, |pixel, retained| {
             calls.set(calls.get() + 1);
+            assert_eq!(*retained, 73);
+            assert!(weak.upgrade().is_some());
             assert_eq!(
                 (pixel["x"].as_f64(), pixel["y"].as_f64()),
                 (Some(30.0), Some(25.0))
             );
-            async { ToolResult::text("sent").with_structured(json!({"effect":"unverifiable"})) }
+            async move {
+                assert_eq!(*retained, 73);
+                ToolResult::text("sent").with_structured(json!({"effect":"unverifiable"}))
+            }
         })
         .await;
         assert_eq!(calls.get(), 1);
+        assert!(weak.upgrade().is_none());
         assert_eq!(
             result.structured_content.unwrap()["note"],
             "Element click used the pointer route."
         );
-        let refused = dispatch(pixel_args(args, 7, 9, None, Some(bounds())), |_| {
-            calls.set(calls.get() + 1);
-            async { ToolResult::text("sent") }
-        })
+        let refused = dispatch(
+            pixel_args(args, 7, 9, None, Some(bounds())),
+            73_u32,
+            |_, _| {
+                calls.set(calls.get() + 1);
+                async { ToolResult::text("sent") }
+            },
+        )
         .await;
         assert_eq!(calls.get(), 1);
         assert_eq!(

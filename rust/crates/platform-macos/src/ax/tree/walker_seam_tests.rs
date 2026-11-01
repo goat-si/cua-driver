@@ -23,6 +23,7 @@ struct State {
 pub(super) struct Handle {
     id: usize,
     state: Rc<RefCell<State>>,
+    owns_credit: bool,
 }
 
 impl Clone for Handle {
@@ -34,11 +35,15 @@ impl Clone for Handle {
         Self {
             id: self.id,
             state: self.state.clone(),
+            owns_credit: true,
         }
     }
 }
 impl Drop for Handle {
     fn drop(&mut self) {
+        if !self.owns_credit {
+            return;
+        }
         let mut state = self.state.borrow_mut();
         let count = state.handles.get_mut(&self.id).expect("live handle");
         assert!(*count > 0);
@@ -101,6 +106,7 @@ impl Fake {
         Handle {
             id,
             state: self.state.clone(),
+            owns_credit: true,
         }
     }
     pub(super) fn assert_consumed(&self) {
@@ -108,6 +114,26 @@ impl Fake {
             self.state.borrow().scripts.is_empty(),
             "unconsumed required operations"
         );
+    }
+}
+
+impl WalkElementBorrow<Fake> for Fake {
+    type Raw = usize;
+
+    fn with_walk_element<R>(
+        &self,
+        source: &Fake,
+        raw: usize,
+        f: impl FnOnce(&Fake, &Handle) -> R,
+    ) -> R {
+        assert!(Rc::ptr_eq(&self.state, &source.state));
+        assert!(self.state.borrow().handles.get(&raw).copied().unwrap_or(0) > 0);
+        let borrowed = Handle {
+            id: raw,
+            state: self.state.clone(),
+            owns_credit: false,
+        };
+        f(source, &borrowed)
     }
 }
 impl AxTreeSource for Fake {
@@ -356,27 +382,19 @@ fn run_fake_inner(
     let mut disabled = false;
     let mut deferred = Vec::new();
     let mut claims = Vec::new();
-    dense_rows::with_visible_clip(rows_windowed().then_some(root.id), || {
-        walk_element(
-            source,
-            root,
-            root,
-            0,
-            None,
-            None,
-            LabelPath::Inactive,
-            false,
-            &mut nodes,
-            &mut lines,
-            &mut counter,
-            &mut budget,
-            &mut disabled,
-            max_depth,
-            include_web_content,
-            &mut deferred,
-            &mut claims,
-        );
-    });
+    walk_root(
+        source,
+        root,
+        &mut nodes,
+        &mut lines,
+        &mut counter,
+        &mut budget,
+        &mut disabled,
+        max_depth,
+        include_web_content,
+        &mut deferred,
+        &mut claims,
+    );
     let (lines, nodes, offscreen) = finish_deferred(
         source,
         lines,
@@ -1349,6 +1367,14 @@ fn decode_failure_replays_without_disabling_batching() {
     assert_eq!(source.trace(), ["adopt 1", "timeout 1", "text 1 AXRole", "batch 1 AXTitle,AXPlaceholderValue,AXDescription,AXIdentifier,AXHelp,AXSubrole,AXRoleDescription", "status 1 AXTitle", "status 1 AXPlaceholderValue", "status 1 AXDescription", "status 1 AXIdentifier", "status 1 AXHelp", "status 1 AXSubrole", "status 1 AXRoleDescription", "value 1", "actions 1", "batch 1 AXPosition,AXSize", "children 1", "release 1"]);
 }
 fn dense_case(search: bool, alias: bool) -> (TreeWalkResult, Vec<String>) {
+    dense_case_with_entry(search, alias, false)
+}
+
+pub(super) fn dense_case_with_entry(
+    search: bool,
+    alias: bool,
+    full_walk: bool,
+) -> (TreeWalkResult, Vec<String>) {
     let rows = if alias { vec![20, 40] } else { vec![2, 4] };
     let visible = if alias { vec![20] } else { vec![2] };
     let mut script = vec![
@@ -1462,18 +1488,26 @@ fn dense_case(search: bool, alias: bool) -> (TreeWalkResult, Vec<String>) {
         ],
         script,
     );
-    let root = source.handle(1);
     let result = with_dense_rows_windowed(true, || {
-        run_fake(
-            &source,
-            &root,
-            search.then_some("Beta"),
-            10,
-            WalkBudget::nodes_only(100),
-            true,
-        )
+        if full_walk {
+            super::environment_setup_tests::run_unscoped_source(
+                &source,
+                1,
+                search.then_some("Beta"),
+            )
+            .legacy
+        } else {
+            let root = source.handle(1);
+            run_fake(
+                &source,
+                &root,
+                search.then_some("Beta"),
+                10,
+                WalkBudget::nodes_only(100),
+                true,
+            )
+        }
     });
-    drop(root);
     source.assert_consumed();
     if search {
         source.assert_lifetimes(&[(1, 1), (2, 1), (3, 1), (4, 1)]);
@@ -2194,7 +2228,7 @@ pub(crate) fn canonical_metadata_fixture(
     }
     let source = Fake::new(&[(1, 1, 1, &[])], steps);
     let root = source.handle(1);
-    let start = std::time::Instant::now();
+    let start = super::scripted_clock_origin();
     let deadline = start + std::time::Duration::from_secs(1);
     let mut calls = 0;
     let mut evidence = CanonicalEvidence::default();
@@ -2338,7 +2372,7 @@ pub(crate) fn canonical_walk_and_collect() -> (AXNode, Vec<String>) {
         ],
     );
     let root = source.handle(1);
-    let start = std::time::Instant::now();
+    let start = super::scripted_clock_origin();
     super::super::vocabulary::collect_node_state_evidence(
         &source,
         &root,
