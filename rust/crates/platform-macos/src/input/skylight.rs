@@ -271,6 +271,7 @@ fn hand_back_outcome(posts: Option<RecordPosts>, confirmed: impl FnOnce() -> boo
 /// The live reads and posts a key scope's entry and hand-back make. The live
 /// environment is [`LiveKeyEnv`]; tests drive the same code with a fake.
 trait KeyEnv {
+    fn post_spi_available(&self) -> bool;
     fn key_focus(&self, pid: pid_t) -> KeyFocus;
     fn window_order(&self, pid: pid_t) -> Vec<u32>;
     fn post_records(
@@ -307,6 +308,9 @@ struct LiveKeyEnv;
 static NEEDS_FULL_RECORDS: std::sync::Mutex<Vec<pid_t>> = std::sync::Mutex::new(Vec::new());
 
 impl KeyEnv for LiveKeyEnv {
+    fn post_spi_available(&self) -> bool {
+        is_available()
+    }
     fn key_focus(&self, pid: pid_t) -> KeyFocus {
         key_focus_of_pid(pid)
     }
@@ -1245,6 +1249,7 @@ fn enter_scope_with(
     target_wid: u32,
     eligibility: FastPathEligibility,
 ) -> Result<WindowKeyScope, ScopeEntryError> {
+    let _post_spi_available = env.post_spi_available();
     // A hand-back in this app can move its key window. Wait for it;
     // refuse (nothing sent) if it does not finish.
     if !await_key_restores_for_pid(Some(pid), std::time::Duration::from_secs(2)) {

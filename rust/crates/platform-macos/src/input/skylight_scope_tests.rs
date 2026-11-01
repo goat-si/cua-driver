@@ -131,6 +131,9 @@ impl FakeEnv {
 }
 
 impl KeyEnv for FakeEnv {
+    fn post_spi_available(&self) -> bool {
+        true
+    }
     fn key_focus(&self, _: pid_t) -> KeyFocus {
         if self.notify_during_focus_read.get() > 0 {
             self.notify_during_focus_read

@@ -741,11 +741,28 @@ pub(crate) fn key_scope(
     pid: i32,
     window_id: Option<u32>,
 ) -> Result<Option<crate::input::skylight::WindowKeyScope>, String> {
-    match window_id {
-        Some(wid) if crate::input::skylight::is_focus_without_raise_available() => {
-            crate::input::skylight::enter_exact_window_key(pid as libc::pid_t, wid).map(Some)
-        }
-        _ => Ok(None),
+    key_scope_with(
+        pid,
+        window_id,
+        crate::input::skylight::is_focus_without_raise_available,
+        crate::input::skylight::is_available,
+        crate::input::skylight::enter_exact_window_key,
+    )
+}
+
+fn key_scope_with<T>(
+    pid: i32,
+    window_id: Option<u32>,
+    focus_available: impl FnOnce() -> bool,
+    post_available: impl FnOnce() -> bool,
+    enter: impl FnOnce(i32, u32) -> Result<T, String>,
+) -> Result<Option<T>, String> {
+    let Some(wid) = window_id else { return Ok(None) };
+    let _post_available = post_available();
+    if focus_available() {
+        enter(pid, wid).map(Some)
+    } else {
+        Ok(None)
     }
 }
 
