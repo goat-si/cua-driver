@@ -611,25 +611,31 @@ async fn minimized_set_value(
             Err(error) => {
                 return restore_task_failure(format!(
                     "set_value: restoring the minimized window failed ({error}); it may be left \
-                     restored. Nothing was written."
+                     restored. AXValue was not written."
                 ))
             }
         };
         let finish = |restore: MinimizedRestore<AxMinimizeOps>| async move {
-            latency::spawn_action_blocking(move || restore.finish())
+            latency::spawn_action_blocking(move || restore.finish_with_input())
                 .await
-                .unwrap_or(RestoreReport::ReminimizeNotConfirmed(None))
+                .unwrap_or((
+                    RestoreReport::ReminimizeNotConfirmed(None),
+                    PriorInput::MayHaveDelivered,
+                ))
         };
         let with_note =
             |result: ToolResult, report: RestoreReport| attach_restore_cleanup(result, report, "");
         if let Err(reason) = begun {
-            let report = finish(restore).await;
+            let (report, prior) = finish(restore).await;
             return with_note(
-                super::pre_dispatch_refusal(
-                    cua_driver_core::background_input::refusal_codes::MINIMIZED_OR_HIDDEN,
-                    format!(
+                account_prior_restore(
+                    super::pre_dispatch_refusal(
+                        cua_driver_core::background_input::refusal_codes::MINIMIZED_OR_HIDDEN,
+                        format!(
                         "window {window_id} is minimized and {reason}; AXValue was not written."
                     ),
+                    ),
+                    prior,
                 ),
                 report,
             );
@@ -681,21 +687,21 @@ async fn minimized_set_value(
         let (restore, scope) = match regated {
             Ok((restore, Ok(scope))) => (restore, scope),
             Ok((restore, Err((code, reason)))) => {
-                let report = finish(restore).await;
+                let (report, prior) = finish(restore).await;
                 return with_note(
-                    super::pre_dispatch_refusal(
+                    account_prior_restore(super::pre_dispatch_refusal(
                         code,
                         format!(
                             "window {window_id} was restored, but {reason}; AXValue was not written."
                         ),
-                    ),
+                    ), prior),
                     report,
                 );
             }
             Err(error) => {
                 return restore_task_failure(format!(
                     "set_value: re-checking the restored window failed ({error}); it may be left \
-                     restored. Nothing was written."
+                     restored. AXValue was not written."
                 ))
             }
         };
@@ -779,9 +785,13 @@ async fn minimized_set_value(
             let hand_back = latency::spawn_action_blocking(move || scope.finish())
                 .await
                 .unwrap_or(crate::input::skylight::HandBack::NotConfirmed);
-            let report = finish(restore).await;
+            let (report, prior) = finish(restore).await;
             let disclosure = crate::input::skylight::scope_disclosure(entry, Some(hand_back));
-            return attach_restore_cleanup(refusal, report, &disclosure);
+            return attach_restore_cleanup(
+                account_prior_restore(refusal, prior),
+                report,
+                &disclosure,
+            );
         }
         let ax_echo_surface = super::type_text::target_in_web_area(
             pid,
@@ -825,17 +835,21 @@ async fn minimized_set_value(
                 format!("{changed}; AXValue was not written."),
                 super::not_editable::FocusDispatch::Indeterminate,
             );
-            let report = finish(restore).await;
-            return attach_restore_cleanup(refusal, report, &disclosure);
+            let (report, prior) = finish(restore).await;
+            return attach_restore_cleanup(
+                account_prior_restore(refusal, prior),
+                report,
+                &disclosure,
+            );
         }
-        let report = finish(restore).await;
+        let (report, prior) = finish(restore).await;
         let suffix = [disclosure.clone(), report.describe()]
             .into_iter()
             .filter(|note| !note.is_empty())
             .map(|note| format!(" {note}"))
             .collect::<String>();
         let result = set_value_tool_result(Ok(result), ax_echo_surface, suffix, pid, element_index);
-        attach_restore_cleanup(result, report, &disclosure)
+        attach_restore_cleanup(account_prior_restore(result, prior), report, &disclosure)
     });
     task.await.unwrap_or_else(|error| {
         restore_task_failure(format!(
@@ -848,11 +862,35 @@ async fn minimized_set_value(
 /// A restored-window task that failed: the window may be left restored and
 /// the write may have happened; the whole text is structured too.
 fn restore_task_failure(message: String) -> ToolResult {
-    ToolResult::error(message.clone()).with_structured(serde_json::json!({
-        "effect": "unverifiable",
-        "restore_cleanup": "unknown",
-        "message": message,
-    }))
+    ToolResult::error(message.clone())
+        .with_structured(serde_json::json!({
+            "effect": "unverifiable",
+            "restore_cleanup": "unknown",
+            "message": message,
+        }))
+        .with_disposition(cua_driver_contract::ErrorDisposition::SUSPECTED_NOOP)
+}
+
+fn account_prior_restore(mut result: ToolResult, prior: PriorInput) -> ToolResult {
+    if prior != PriorInput::MayHaveDelivered || result.is_error != Some(true) {
+        return result;
+    }
+    let Some(serde_json::Value::Object(fields)) = result.structured_content.as_mut() else {
+        return result;
+    };
+    if fields.get("effect").and_then(serde_json::Value::as_str) == Some("refused")
+        || result.disposition == Some(cua_driver_contract::ErrorDisposition::NOT_DELIVERED)
+    {
+        fields.insert("effect".into(), serde_json::json!("unverifiable"));
+        fields.remove("dispatched");
+        result.disposition = Some(cua_driver_contract::ErrorDisposition::SUSPECTED_NOOP);
+        if let Some(cua_driver_core::protocol::Content::Text { text, .. }) =
+            result.content.first_mut()
+        {
+            text.push_str(" The window restore or cleanup may have changed state; inspect it before retrying.");
+        }
+    }
+    result
 }
 
 /// Every result of a temporary restore says what became of the window: in
@@ -3045,6 +3083,27 @@ mod restore_cleanup_tests {
             "",
         );
         assert_eq!(once.content.len(), 1);
+        for prior in [
+            cua_driver_core::mutation::PriorInput::None,
+            cua_driver_core::mutation::PriorInput::MayHaveDelivered,
+        ] {
+            let refusal = super::account_prior_restore(
+                super::super::pre_dispatch_refusal("window_not_key", "AXValue was not written"),
+                prior,
+            );
+            let fields = refusal.structured_content.as_ref().unwrap();
+            if prior == cua_driver_core::mutation::PriorInput::None {
+                assert_eq!(fields["effect"], "refused");
+                assert_eq!(fields["dispatched"], false);
+            } else {
+                assert_eq!(fields["effect"], "unverifiable");
+                assert!(fields.get("dispatched").is_none());
+                assert_eq!(
+                    refusal.disposition,
+                    Some(cua_driver_contract::ErrorDisposition::SUSPECTED_NOOP)
+                );
+            }
+        }
     }
 }
 
