@@ -2962,7 +2962,7 @@ async fn write_into_editable_acc(
     // A focus-free EditableText write is the strongest background route. Try it
     // before GrabFocus: WebKitGTK can invalidate the original proxy when focus
     // changes, and writing through that stale object then returns false.
-    if write_through_editable_proxies(&proxies, text).await? {
+    if write_through_editable_proxies(acc, &proxies, text).await? {
         return Ok(true);
     }
 
@@ -2985,10 +2985,11 @@ async fn write_into_editable_acc(
         dlog!("Target has no Component interface, skipping GrabFocus");
     }
 
-    write_through_editable_proxies(&proxies, text).await
+    write_through_editable_proxies(acc, &proxies, text).await
 }
 
 async fn write_through_editable_proxies(
+    acc: &AccessibleProxy<'_>,
     proxies: &atspi::proxy::proxy_ext::Proxies<'_>,
     text: &str,
 ) -> Result<bool> {
@@ -2998,12 +2999,56 @@ async fn write_through_editable_proxies(
         .map_err(|e| anyhow!("EditableText unavailable: {e}"))?;
 
     let off = match proxies.text().await {
-        Ok(tp) => tp.caret_offset().await.unwrap_or(0),
-        Err(_) => 0,
+        Ok(tp) => tp.caret_offset().await.ok(),
+        Err(_) => None,
     };
-    let len = text.chars().count() as i32;
+    let toolkit = editable_toolkit(acc).await;
+    write_at_caret(&et, off, text, toolkit).await
+}
 
-    write_through_insert_calls(&et, off, text, len).await
+async fn editable_toolkit(acc: &AccessibleProxy<'_>) -> crate::text_write_policy::Toolkit {
+    use crate::text_write_policy::Toolkit;
+    let Some(Ok(app)) = call(acc.get_application()).await else {
+        return Toolkit::Unknown;
+    };
+    let Some(name) = app.name_as_str() else {
+        return Toolkit::Unknown;
+    };
+    let Ok(builder) =
+        atspi::proxy::application::ApplicationProxy::builder(acc.inner().connection())
+            .destination(name)
+    else {
+        return Toolkit::Unknown;
+    };
+    let Ok(builder) = builder.path(app.path_as_str()) else {
+        return Toolkit::Unknown;
+    };
+    let Some(Ok(proxy)) = call(builder.build()).await else {
+        return Toolkit::Unknown;
+    };
+    let Some(Ok(name)) = call(proxy.toolkit_name()).await else {
+        return Toolkit::Unknown;
+    };
+    let name = name.trim().to_ascii_lowercase();
+    if name.starts_with("gtk") {
+        Toolkit::Gtk
+    } else if name.starts_with("qt") {
+        Toolkit::Qt
+    } else {
+        Toolkit::Unknown
+    }
+}
+
+async fn write_at_caret(
+    calls: &impl InsertCalls,
+    caret: Option<i32>,
+    text: &str,
+    toolkit: crate::text_write_policy::Toolkit,
+) -> Result<bool> {
+    let caret = caret.ok_or_else(|| anyhow!("editable caret unavailable"))?;
+    let len = crate::text_write_policy::text_units(text, toolkit)
+        .map_err(|reason| anyhow!("editable insert unavailable: {reason:?}"))?;
+    write_through_insert_calls(calls, caret, text, len).await
 }
 
 trait InsertCalls {
@@ -3083,11 +3128,13 @@ mod insert_regression_tests {
         failure: bool,
         contents: RefCell<String>,
         calls: RefCell<Vec<&'static str>>,
+        args: RefCell<Vec<(i32, i32)>>,
     }
 
     impl InsertCalls for Fake {
-        async fn insert(&self, _: i32, _: &str, _: i32) -> zbus::Result<bool> {
+        async fn insert(&self, offset: i32, _: &str, len: i32) -> zbus::Result<bool> {
             self.calls.borrow_mut().push("insert");
+            self.args.borrow_mut().push((offset, len));
             if self.failure {
                 Err(zbus::Error::InvalidReply)
             } else {
@@ -3102,6 +3149,7 @@ mod insert_regression_tests {
             failure: true,
             contents: RefCell::new("hello".into()),
             calls: RefCell::new(vec![]),
+            args: RefCell::new(vec![]),
         };
         let error = runtime()
             .block_on(write_through_insert_calls(&fake, 5, "abc", 3))
@@ -3116,10 +3164,60 @@ mod insert_regression_tests {
             failure: false,
             contents: RefCell::new("hello".into()),
             calls: RefCell::new(vec![]),
+            args: RefCell::new(vec![]),
         };
         let _ = runtime().block_on(write_through_insert_calls(&fake, 5, "abc", 3));
         assert_eq!(*fake.contents.borrow(), "hello");
         assert_eq!(*fake.calls.borrow(), ["insert"]);
+    }
+
+    #[test]
+    fn caret_failure_must_not_dispatch() {
+        let fake = Fake {
+            failure: false,
+            contents: RefCell::new("hello".into()),
+            calls: RefCell::new(vec![]),
+            args: RefCell::new(vec![]),
+        };
+        let _ = runtime().block_on(write_at_caret(
+            &fake,
+            None,
+            "abc",
+            crate::text_write_policy::Toolkit::Gtk,
+        ));
+        assert!(fake.calls.borrow().is_empty());
+    }
+
+    #[test]
+    fn toolkit_units_are_used_for_insert() {
+        for (toolkit, length) in [
+            (crate::text_write_policy::Toolkit::Gtk, 6),
+            (crate::text_write_policy::Toolkit::Qt, 3),
+        ] {
+            let fake = Fake {
+                failure: false,
+                contents: RefCell::new("hello".into()),
+                calls: RefCell::new(vec![]),
+                args: RefCell::new(vec![]),
+            };
+            let _ = runtime().block_on(write_at_caret(&fake, Some(5), "é😀", toolkit));
+            assert_eq!(*fake.args.borrow(), [(5, length)]);
+        }
+        let fake = Fake {
+            failure: false,
+            contents: RefCell::new("hello".into()),
+            calls: RefCell::new(vec![]),
+            args: RefCell::new(vec![]),
+        };
+        assert!(runtime()
+            .block_on(write_at_caret(
+                &fake,
+                Some(5),
+                "é😀",
+                crate::text_write_policy::Toolkit::Unknown,
+            ))
+            .is_err());
+        assert!(fake.calls.borrow().is_empty());
     }
 
     #[test]
