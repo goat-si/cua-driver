@@ -465,6 +465,75 @@ fn scanner_handles_comments_strings_aliases_and_multiline_calls() {
 }
 
 #[test]
+fn raw_identifiers_are_normalized_for_inventory() {
+    let fixtures = [
+        (
+            "raw include",
+            "r#include!(\"shared.rs\");",
+            "forbidden-include",
+            false,
+        ),
+        (
+            "raw include_str",
+            "r#include_str!(\"shared.rs\");",
+            "forbidden-include",
+            false,
+        ),
+        (
+            "raw renamed import",
+            "use std::thread::r#spawn as run;",
+            "std::thread::spawn",
+            true,
+        ),
+        (
+            "raw reexport",
+            "pub use std::thread::r#spawn;",
+            "std::thread::spawn",
+            true,
+        ),
+        (
+            "raw direct call",
+            "fn f() { std::thread::r#spawn(work); }",
+            "std::thread::spawn",
+            false,
+        ),
+        (
+            "raw module root",
+            "mod r#std {}",
+            "forbidden-path-root:std",
+            false,
+        ),
+        (
+            "raw method",
+            "fn f() { worker.r#spawn(work); }",
+            ".spawn",
+            false,
+        ),
+        (
+            "raw macro token",
+            "outer! { std::thread::r#spawn(work) }",
+            "macro-spawn",
+            false,
+        ),
+    ];
+    let mut missing = Vec::new();
+    for (label, source, primitive, raw_import) in fixtures {
+        let sites = scan("raw.rs", source).unwrap();
+        if !sites
+            .iter()
+            .any(|site| site.primitive == primitive && site.raw_import == raw_import)
+        {
+            missing.push(format!("{label}: {sites:#?}"));
+        }
+    }
+    assert!(
+        missing.is_empty(),
+        "raw identifier guard holes:\n{}",
+        missing.join("\n")
+    );
+}
+
+#[test]
 fn raw_primitive_renames_and_reexports_are_inventory_sites() {
     let fixtures = [
         ("renamed module reexport", "mod workers { pub use tokio::spawn as run; } fn mutate() { workers::run(async { native_mutation() }); }", "workers", "tokio::spawn"),
