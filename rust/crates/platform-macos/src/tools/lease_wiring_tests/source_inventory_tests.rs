@@ -104,6 +104,11 @@ fn check_reviewed_glob_targets(root: &Path) {
 #[test]
 fn all_in_scope_mutating_spawns_propagate_worker_context() {
     let sites = inventory();
+    let raw_imports: Vec<_> = sites.iter().filter(|site| site.raw_import).collect();
+    println!(
+        "production raw-primitive import sites: {} {raw_imports:#?}",
+        raw_imports.len()
+    );
     let unclassified = unclassified(&sites, ENTRIES);
     let entries: Vec<_> = ENTRIES.iter().collect();
     let errors = entry_errors(&entries, &sites);
@@ -185,9 +190,16 @@ fn scanner_handles_comments_strings_aliases_and_multiline_calls() {
     "###,
     )
     .unwrap();
-    assert_eq!(sites.len(), 1, "{sites:#?}");
-    assert_eq!(sites[0].primitive, "tokio::task::spawn_blocking");
-    assert_eq!(sites[0].item, "f");
+    assert_eq!(sites.len(), 2, "{sites:#?}");
+    assert!(sites.iter().any(|site| site.raw_import
+        && site.item == "<file>"
+        && site.primitive == "tokio::task::spawn_blocking"));
+    let call = sites
+        .iter()
+        .find(|site| {
+            !site.raw_import && site.item == "f" && site.primitive == "tokio::task::spawn_blocking"
+        })
+        .expect("raw aliased call");
 
     let fixture = tempfile::tempdir().unwrap();
     fs::write(
@@ -220,7 +232,7 @@ fn scanner_handles_comments_strings_aliases_and_multiline_calls() {
         file: "fixture.rs",
         item: "f",
         primitive: "tokio::task::spawn_blocking",
-        fingerprint: sites[0].fingerprint,
+        fingerprint: call.fingerprint,
         occurrence: 1,
         category: Category::Read,
         reason: "fixture",
@@ -229,7 +241,7 @@ fn scanner_handles_comments_strings_aliases_and_multiline_calls() {
     assert!(!entry_errors(&[&entry, &entry], &sites).is_empty());
     assert!(!entry_errors(&[&entry], &[]).is_empty());
     let extra = scan("fixture.rs", "fn f() { tokio::spawn(async {}); }").unwrap();
-    let mut repeated = sites[0].clone();
+    let mut repeated = call.clone();
     repeated.occurrence = 2;
     assert_eq!(unclassified(&extra, std::slice::from_ref(&entry)).len(), 1);
     assert_eq!(
@@ -263,8 +275,13 @@ fn scanner_handles_comments_strings_aliases_and_multiline_calls() {
     "#,
     )
     .unwrap();
-    assert_eq!(later_import.len(), 1, "{later_import:#?}");
-    assert_eq!(later_import[0].primitive, "tokio::task::spawn_blocking");
+    assert_eq!(later_import.len(), 2, "{later_import:#?}");
+    assert!(later_import.iter().any(|site| site.raw_import
+        && site.item == "nested"
+        && site.primitive == "tokio::task::spawn_blocking"));
+    assert!(later_import.iter().any(|site| !site.raw_import
+        && site.item == "nested::g"
+        && site.primitive == "tokio::task::spawn_blocking"));
 
     let builders = scan(
         "builders.rs",
@@ -318,7 +335,10 @@ fn scanner_handles_comments_strings_aliases_and_multiline_calls() {
     "#,
     )
     .unwrap();
-    assert_eq!(restored.len(), 2, "{restored:#?}");
+    assert_eq!(restored.len(), 3, "{restored:#?}");
+    assert!(restored.iter().any(|site| site.raw_import
+        && site.item == "<file>"
+        && site.primitive == "tokio::task::spawn_blocking"));
     assert!(restored
         .iter()
         .any(|site| site.primitive == "tokio::task::spawn_blocking"));
@@ -409,13 +429,15 @@ fn raw_primitive_renames_and_reexports_are_inventory_sites() {
         ("unrenamed module reexport", "mod workers { pub use tokio::task::spawn; } fn mutate() { workers::spawn(async { native_mutation() }); }", "workers", "tokio::task::spawn"),
         ("renamed Builder", "mod workers { use std::thread::Builder as Worker; }", "workers", "std::thread::Builder"),
         ("nested grouped use", "mod a { mod b { pub(crate) use tokio::{task::{spawn_blocking as run}}; } }", "a::b", "tokio::task::spawn_blocking"),
+        ("unknown prefix alias", "mod workers { use tokio as rt; pub use rt::spawn as run; }", "workers", "rt::spawn"),
+        ("function local import", "mod workers { fn f() { use tokio::spawn as run; } }", "workers", "tokio::spawn"),
     ];
     let mut missing = Vec::new();
     for (label, source, module, path) in fixtures {
         let sites = scan("fixture.rs", source).unwrap();
         if !sites
             .iter()
-            .any(|site| site.item == module && site.primitive == path)
+            .any(|site| site.raw_import && site.item == module && site.primitive == path)
         {
             missing.push(format!("{label}: expected {module} {path}; got {sites:#?}"));
         }
@@ -436,7 +458,7 @@ fn raw_primitive_renames_and_reexports_are_inventory_sites() {
             let sites = scan("matrix.rs", &format!("mod workers {{ {declaration} }}")).unwrap();
             if !sites
                 .iter()
-                .any(|site| site.item == "workers" && site.primitive == path)
+                .any(|site| site.raw_import && site.item == "workers" && site.primitive == path)
             {
                 missing.push(format!("{declaration}: {sites:#?}"));
             }
@@ -444,10 +466,9 @@ fn raw_primitive_renames_and_reexports_are_inventory_sites() {
     }
     for path in ["tokio", "tokio::task", "std::thread"] {
         let sites = scan("glob.rs", &format!("mod workers {{ use {path}::*; }}")).unwrap();
-        if !sites
-            .iter()
-            .any(|site| site.item == "workers" && site.primitive == format!("{path}::*"))
-        {
+        if !sites.iter().any(|site| {
+            site.raw_import && site.item == "workers" && site.primitive == format!("{path}::*")
+        }) {
             missing.push(format!("{path}::*: {sites:#?}"));
         }
     }
@@ -456,6 +477,49 @@ fn raw_primitive_renames_and_reexports_are_inventory_sites() {
         "raw primitive import sites missing:\n{}",
         missing.join("\n")
     );
+    for path in [
+        "tokio::spawn",
+        "tokio::task::spawn",
+        "tokio::task::spawn_blocking",
+        "tokio::task::spawn_local",
+        "std::thread::spawn",
+        "std::thread::Builder",
+        "std::thread::scope",
+    ] {
+        let original = path.rsplit("::").next().unwrap();
+        for declaration in [format!("use {path};"), format!("use {path} as {original};")] {
+            let sites = scan("private.rs", &format!("mod workers {{ {declaration} }}")).unwrap();
+            assert!(
+                !sites.iter().any(|site| site.raw_import),
+                "unrenamed private import changed handling: {declaration}: {sites:#?}"
+            );
+        }
+    }
+    let safe = scan(
+        "safe.rs",
+        "pub use crate::goat::action_latency::spawn_blocking as run;",
+    )
+    .unwrap();
+    assert!(
+        !safe.iter().any(|site| site.raw_import),
+        "trusted helper is not a raw primitive: {safe:#?}"
+    );
+    let test_only = scan("test_only.rs", "#[cfg(test)] pub use tokio::spawn as run;").unwrap();
+    assert!(
+        test_only.is_empty(),
+        "test-only import was scanned: {test_only:#?}"
+    );
+    let duplicates = scan(
+        "duplicate.rs",
+        "mod workers { use tokio::{spawn as a, spawn as b}; }",
+    )
+    .unwrap();
+    let occurrences: Vec<_> = duplicates
+        .iter()
+        .filter(|site| site.raw_import && site.primitive == "tokio::spawn")
+        .map(|site| site.occurrence)
+        .collect();
+    assert_eq!(occurrences, [1, 2]);
 }
 
 #[test]

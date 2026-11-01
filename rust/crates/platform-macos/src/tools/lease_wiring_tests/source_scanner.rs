@@ -16,6 +16,7 @@ pub(super) struct Site {
     pub fingerprint: u64,
     pub occurrence: usize,
     pub line: usize,
+    pub raw_import: bool,
 }
 
 fn cfg_value(meta: &Meta) -> Option<bool> {
@@ -245,6 +246,70 @@ fn has_glob(tree: &UseTree) -> bool {
     }
 }
 
+// These are scanner guard false greens, not production bypasses: the current
+// production inventory has zero renamed or re-exported raw spawn primitives.
+// This blunt rule records each such import as a thread-start inventory site.
+fn raw_primitive_imports(
+    tree: &UseTree,
+    prefix: &mut Vec<String>,
+    exported: bool,
+    out: &mut Vec<(String, usize)>,
+) {
+    match tree {
+        UseTree::Path(path) => {
+            prefix.push(path.ident.to_string());
+            raw_primitive_imports(&path.tree, prefix, exported, out);
+            prefix.pop();
+        }
+        UseTree::Group(group) => {
+            for item in &group.items {
+                raw_primitive_imports(item, prefix, exported, out);
+            }
+        }
+        UseTree::Name(name) => {
+            let mut path = prefix.clone();
+            if name.ident != "self" {
+                path.push(name.ident.to_string());
+            }
+            if exported && potential_raw_primitive(&path) {
+                out.push((path.join("::"), name.ident.span().start().line));
+            }
+        }
+        UseTree::Rename(rename) => {
+            let mut path = prefix.clone();
+            if rename.ident != "self" {
+                path.push(rename.ident.to_string());
+            }
+            let renamed = path
+                .last()
+                .is_none_or(|original| rename.rename != original.as_str());
+            if (exported || renamed) && potential_raw_primitive(&path) {
+                out.push((path.join("::"), rename.ident.span().start().line));
+            }
+        }
+        UseTree::Glob(glob) => {
+            let path = prefix.join("::");
+            if matches!(path.as_str(), "tokio" | "tokio::task" | "std::thread") {
+                out.push((format!("{path}::*"), glob.star_token.span.start().line));
+            }
+        }
+    }
+}
+
+fn potential_raw_primitive(path: &[String]) -> bool {
+    if path.join("::") == "crate::goat::action_latency::spawn_blocking" {
+        return false;
+    }
+    // Unknown prefixes can themselves be aliases or re-exports, so reject
+    // potentially raw names rather than trying to infer a safe origin.
+    path.last().is_some_and(|name| {
+        matches!(
+            name.as_str(),
+            "spawn" | "spawn_blocking" | "spawn_local" | "Builder" | "scope"
+        )
+    })
+}
+
 fn expr_attrs(expr: &Expr) -> &[Attribute] {
     match expr {
         Expr::Array(x) => &x.attrs,
@@ -412,6 +477,7 @@ impl<'ast> Visit<'ast> for BodyBindings {
 struct Scanner {
     file: String,
     item: Vec<String>,
+    modules: Vec<String>,
     scopes: Vec<Aliases>,
     module_scope: usize,
     body_bindings: Vec<BodyBindings>,
@@ -484,6 +550,7 @@ impl Scanner {
             fingerprint: hash,
             occurrence: *occurrence,
             line,
+            raw_import: false,
         });
     }
     fn with_item(&mut self, name: String, f: impl FnOnce(&mut Self)) {
@@ -639,6 +706,24 @@ impl<'ast> Visit<'ast> for Scanner {
         }
     }
     fn visit_item_use(&mut self, i: &'ast syn::ItemUse) {
+        if !test_only(&i.attrs) {
+            let mut raw = Vec::new();
+            raw_primitive_imports(
+                &i.tree,
+                &mut Vec::new(),
+                !matches!(i.vis, syn::Visibility::Inherited),
+                &mut raw,
+            );
+            for (path, line) in raw {
+                let saved = std::mem::replace(&mut self.item, self.modules.clone());
+                self.record(path, i.to_token_stream(), line);
+                self.sites
+                    .last_mut()
+                    .expect("site just recorded")
+                    .raw_import = true;
+                self.item = saved;
+            }
+        }
         if !test_only(&i.attrs) && has_glob(&i.tree) {
             self.record(
                 "glob-import".into(),
@@ -655,7 +740,9 @@ impl<'ast> Visit<'ast> for Scanner {
             let previous = self.module_scope;
             self.module_scope = self.scopes.len();
             self.scopes.push(item_imports(items.iter()));
+            self.modules.push(i.ident.to_string());
             self.with_item(i.ident.to_string(), |s| visit::visit_item_mod(s, i));
+            self.modules.pop();
             self.scopes.pop();
             self.module_scope = previous;
         }
@@ -923,6 +1010,7 @@ pub(super) fn scan(file: &str, source: &str) -> Result<Vec<Site>, syn::Error> {
     let mut scanner = Scanner {
         file: file.into(),
         item: Vec::new(),
+        modules: Vec::new(),
         scopes: vec![item_imports(syntax.items.iter())],
         module_scope: 0,
         body_bindings: Vec::new(),
