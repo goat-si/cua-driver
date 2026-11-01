@@ -242,7 +242,7 @@ fn await_web_content(
 ///
 /// `app_element` must be a valid application `AXUIElementRef` for `pid`.
 pub unsafe fn ensure_chromium_ax_enabled(pid: i32, app_element: AXUIElementRef) {
-    ensure_chromium_ax_enabled_observed(pid, app_element).legacy;
+    drop(ensure_chromium_ax_enabled_observed(pid, app_element));
 }
 
 /// The same enablement operations, with value-free diagnostic metadata.
