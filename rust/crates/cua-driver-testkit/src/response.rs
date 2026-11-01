@@ -20,6 +20,12 @@ pub struct ToolResponse {
 }
 
 impl ToolResponse {
+    /// Construct a normalized response for test drivers and fixtures.
+    /// The structured payload is also retained as the raw value.
+    pub fn from_structured(text: impl Into<String>, structured: Value, is_error: bool) -> Self {
+        Self::new(text.into(), structured.clone(), is_error, structured)
+    }
+
     pub(crate) fn new(text: String, structured: Value, is_error: bool, raw: Value) -> Self {
         Self {
             text,

@@ -41,6 +41,7 @@ pub mod ax;
 pub mod boundary_fuzz;
 mod browser_fixture;
 mod cli;
+pub mod conformance;
 mod daemon;
 mod driver;
 pub mod e2e;
