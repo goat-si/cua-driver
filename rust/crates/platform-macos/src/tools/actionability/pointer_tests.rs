@@ -309,3 +309,42 @@ async fn right_click_axshowmenu_refusal_blocks_dispatch() {
         assert_eq!(result.is_ok(), allowed);
     }
 }
+
+#[tokio::test]
+async fn coordinate_pointer_routes_remain_not_evaluated() {
+    assert_eq!(
+        select(Route::Coordinate),
+        Selection::Coordinate(CoordinateOutcome::NotEvaluated)
+    );
+    let clock = FakeClock::default();
+    let sent = AtomicUsize::new(0);
+    let sent_ref = &sent;
+    let result = super::super::right_click::dispatch_show_menu(
+        &clock,
+        Duration::ZERO,
+        false,
+        (),
+        |_, _| Box::pin(async { panic!("pixel fallback sampled as AXShowMenu") }),
+        |_| async move {
+            sent_ref.fetch_add(1, Ordering::SeqCst);
+            success()
+        },
+    )
+    .await;
+    assert!(result.is_ok());
+    let sent_ref = &sent;
+    let result = super::super::double_click::dispatch_open(
+        &clock,
+        Duration::ZERO,
+        false,
+        (),
+        |_, _| Box::pin(async { panic!("pixel fallback sampled as AXOpen") }),
+        |_| async move {
+            sent_ref.fetch_add(1, Ordering::SeqCst);
+            success()
+        },
+    )
+    .await;
+    assert!(result.is_ok());
+    assert_eq!(sent.load(Ordering::SeqCst), 2);
+}
