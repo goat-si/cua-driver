@@ -108,6 +108,34 @@ struct Scanner {
 }
 
 impl Scanner {
+    fn wrapped_thread_builder(&self, call: &syn::ExprMethodCall) -> bool {
+        fn builder(scanner: &Scanner, expr: &Expr) -> bool {
+            match expr {
+                Expr::MethodCall(method) => builder(scanner, &method.receiver),
+                Expr::Call(call) => match &*call.func {
+                    Expr::Path(path) => scanner
+                        .resolve(&path.path)
+                        .iter()
+                        .any(|name| name == "std::thread::Builder::new"),
+                    _ => false,
+                },
+                _ => false,
+            }
+        }
+        if call.method != "spawn" || call.args.len() != 1 || !builder(self, &call.receiver) {
+            return false;
+        }
+        match call.args.first() {
+            Some(Expr::Call(wrap)) if wrap.args.len() == 1 => match &*wrap.func {
+                Expr::Path(path) => self
+                    .resolve(&path.path)
+                    .iter()
+                    .any(|name| name == "crate::input::worker_context::wrap_blocking"),
+                _ => false,
+            },
+            _ => false,
+        }
+    }
     fn name(&self) -> String {
         if self.item.is_empty() {
             "<file>".into()
@@ -316,7 +344,9 @@ impl<'ast> Visit<'ast> for Scanner {
         visit::visit_expr_path(self, p);
     }
     fn visit_expr_method_call(&mut self, i: &'ast syn::ExprMethodCall) {
-        if i.method == "spawn" || i.method == "spawn_blocking" || i.method == "spawn_local" {
+        if (i.method == "spawn" || i.method == "spawn_blocking" || i.method == "spawn_local")
+            && !self.wrapped_thread_builder(i)
+        {
             self.record(
                 format!(".{}", i.method),
                 i.to_token_stream(),

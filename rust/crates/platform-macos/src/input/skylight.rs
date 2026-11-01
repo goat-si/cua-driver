@@ -572,7 +572,7 @@ fn spawn_hand_back(
     };
     match std::thread::Builder::new()
         .name("cua-key-restore".into())
-        .spawn(restore)
+        .spawn(crate::input::worker_context::wrap_blocking(restore))
     {
         Ok(_) => HandBack::Deferred,
         Err(error) => {

@@ -164,7 +164,7 @@ fn hold_then_release(lease: focus_steal::SuppressionLease, hold: Duration) {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .push((id, lease));
-    tokio::spawn(async move {
+    crate::input::worker_context::spawn_async(async move {
         tokio::time::sleep(hold).await;
         let released = {
             let mut holds = DETACHED_HOLDS.lock().unwrap_or_else(|e| e.into_inner());

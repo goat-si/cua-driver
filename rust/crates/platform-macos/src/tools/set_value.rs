@@ -550,7 +550,7 @@ async fn minimized_set_value(
     value: String,
 ) -> ToolResult {
     use minimized_restore::{AxMinimizeOps, MinimizedRestore, RestoreReport};
-    let task = tokio::spawn(async move {
+    let task = crate::input::worker_context::spawn_async(async move {
         let _lease = lease;
         let Some(ops) = latency::spawn_action_blocking(move || AxMinimizeOps::of(pid, window_id))
             .await

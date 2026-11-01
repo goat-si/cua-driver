@@ -441,7 +441,7 @@ pub(super) async fn held_window_insert(
     text: String,
 ) -> ToolResult {
     let char_count = text.chars().count();
-    let task = tokio::spawn(async move {
+    let task = crate::input::worker_context::spawn_async(async move {
         let _lease = lease;
         // Window enumeration blocks: off the runtime workers.
         let observed = crate::goat::action_latency::spawn_action_blocking(|| {

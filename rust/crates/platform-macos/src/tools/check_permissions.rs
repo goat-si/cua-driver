@@ -160,7 +160,7 @@ where
 async fn bounded_screen_recording_capturable() -> DirectCaptureProbeResult {
     run_direct_capture_probe(
         DIRECT_CAPTURE_PROBE_TIMEOUT,
-        tokio::task::spawn_blocking(screen_recording_capturable),
+        crate::goat::action_latency::spawn_blocking(screen_recording_capturable),
     )
     .await
 }

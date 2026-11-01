@@ -222,6 +222,20 @@ fn scanner_handles_comments_strings_aliases_and_multiline_calls() {
     .unwrap();
     assert_eq!(later_import.len(), 1, "{later_import:#?}");
     assert_eq!(later_import[0].primitive, "tokio::task::spawn_blocking");
+
+    let builders = scan(
+        "builders.rs",
+        r#"
+        fn run() {
+            std::thread::Builder::new().name("x".into())
+                .spawn(crate::input::worker_context::wrap_blocking(|| {}));
+            unknown.spawn(crate::input::worker_context::wrap_blocking(|| {}));
+            std::thread::Builder::new().spawn(|| {});
+        }
+    "#,
+    )
+    .unwrap();
+    assert_eq!(builders.len(), 2, "{builders:#?}");
 }
 
 #[test]

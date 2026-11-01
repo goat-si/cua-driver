@@ -1339,7 +1339,7 @@ where
     T: Send + 'static,
     F: std::future::Future<Output = T> + Send + 'static,
 {
-    tokio::spawn(work).await
+    crate::input::worker_context::spawn_async(work).await
 }
 
 /// The target app is frontmost now. WindowServer's answer is used when it
