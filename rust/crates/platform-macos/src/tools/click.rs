@@ -3275,6 +3275,88 @@ unsafe fn ancestor_roles(element: AXUIElementRef) -> Vec<String> {
     roles
 }
 
+/// Resolve the exact advertised action and check its enabled state on the
+/// selected target without dispatching it. The two reads are injectable so a
+/// caller can retain the selected target and action across later checks.
+pub(super) fn resolve_click_action<T: Copy>(
+    target: T,
+    requested: &str,
+    foreground: bool,
+    read_actions: impl FnOnce(T) -> Vec<String>,
+    check_enabled: impl FnOnce(T, &str, bool) -> anyhow::Result<()>,
+) -> anyhow::Result<(Vec<String>, String)> {
+    let advertised = read_actions(target);
+    let action =
+        crate::input::ax_actions::resolve_element_action(requested, &advertised, foreground)?
+            .to_owned();
+    check_enabled(target, &action, foreground)?;
+    Ok((advertised, action))
+}
+
+#[cfg(test)]
+mod u31_click_action_seam_tests {
+    use super::*;
+    use std::cell::RefCell;
+
+    #[test]
+    fn resolves_exact_action_on_the_same_target_before_enabled_check() {
+        for (requested, actual) in [
+            ("press", "AXPress"),
+            ("open", "AXOpen"),
+            ("AXCustomThing", "AXCustomThing"),
+        ] {
+            let calls = RefCell::new(Vec::new());
+            let (advertised, action) = resolve_click_action(
+                73_u32,
+                requested,
+                false,
+                |target| {
+                    calls.borrow_mut().push(("actions", target));
+                    vec![actual.to_owned()]
+                },
+                |target, action, foreground| {
+                    assert_eq!(action, actual);
+                    assert!(!foreground);
+                    calls.borrow_mut().push(("enabled", target));
+                    Ok(())
+                },
+            )
+            .unwrap();
+            assert_eq!(advertised, [actual]);
+            assert_eq!(action, actual);
+            assert_eq!(*calls.borrow(), [("actions", 73), ("enabled", 73)]);
+        }
+    }
+
+    #[test]
+    fn resolution_and_enabled_failures_stop_before_later_steps() {
+        let checked = std::cell::Cell::new(false);
+        let result = resolve_click_action(
+            73_u32,
+            "unadvertised custom action",
+            false,
+            |_| Vec::new(),
+            |_, _, _| {
+                checked.set(true);
+                Ok(())
+            },
+        );
+        assert!(result.is_err());
+        assert!(!checked.get());
+        let result = resolve_click_action(
+            73_u32,
+            "press",
+            false,
+            |_| vec!["AXPress".into()],
+            |target, action, _| {
+                assert_eq!((target, action), (73, "AXPress"));
+                Err(anyhow::anyhow!("disabled"))
+            },
+        );
+        assert_eq!(result.unwrap_err().to_string(), "disabled");
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn perform_ax_click(
     element: (usize, usize),
@@ -3294,15 +3376,16 @@ fn perform_ax_click(
     // Read live capabilities before dispatch: custom actions and
     // AXIncrement/AXDecrement are valid only on elements that expose them.
     let preflight = latency::span(latency::Stage::Preflight);
-    let advertised = unsafe { copy_action_names(element) };
-    let ax_action =
-        crate::input::ax_actions::resolve_element_action(action_str, &advertised, foreground)?;
-
-    // Check the live value immediately before dispatch. Foreground assist can
-    // enable menu items that were disabled in the cached snapshot, while a
-    // background transition can disable them after that snapshot. macOS may
-    // otherwise return success for a disabled action that did nothing.
-    crate::input::ax_actions::ensure_ax_action_enabled(element_ptr, ax_action, foreground)?;
+    // A live enabled-state check follows action resolution, as before. The
+    // resolved spelling belongs to this target's advertised actions.
+    let (advertised, resolved_action) = resolve_click_action(
+        element_ptr,
+        action_str,
+        foreground,
+        |target| unsafe { copy_action_names(target as AXUIElementRef) },
+        crate::input::ax_actions::ensure_ax_action_enabled,
+    )?;
+    let ax_action = resolved_action.as_str();
 
     // Capture advertised actions BEFORE dispatching so we can detect silent no-ops
     // (AX returns success even when the element doesn't advertise the action).
