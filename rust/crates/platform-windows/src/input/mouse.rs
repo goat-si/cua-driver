@@ -1275,6 +1275,50 @@ pub fn send_drag_synthesized_active(
 /// short poll covers targets whose activation is still settling.
 const DRAG_START_HIT_TEST_TIMEOUT: Duration = Duration::from_millis(150);
 
+fn send_modifier_downs(
+    inputs: &[INPUT],
+    edges: &[crate::input::keyboard::KeyEdge],
+    send: impl FnMut(&[INPUT]) -> u32,
+) -> std::result::Result<(), String> {
+    let outcome = crate::input::keyboard::send_input_releasing(inputs, edges, send);
+    if outcome.sent == inputs.len() {
+        Ok(())
+    } else {
+        Err(format!(
+            "SendInput inserted {}/{} modifier key presses; no mouse input was sent; {}",
+            outcome.sent,
+            inputs.len(),
+            outcome.cleanup
+        ))
+    }
+}
+
+#[cfg(test)]
+mod modifier_release_guard_tests {
+    use super::*;
+
+    #[test]
+    fn partial_modifier_down_reports_failed_corrective_send() {
+        let (downs, _, edges) =
+            crate::input::keyboard::modifier_hold_inputs_with_edges(&["ctrl", "shift"]);
+        let mut calls = 0;
+        let error = send_modifier_downs(&downs, &edges, |events| {
+            calls += 1;
+            if calls == 1 {
+                1
+            } else {
+                assert_eq!(events.len(), 1);
+                0
+            }
+        })
+        .unwrap_err();
+        assert_eq!(calls, 2);
+        assert!(error.contains("corrective key-ups were not all inserted (0 of 1)"));
+        assert!(error.contains("Ctrl"));
+        assert!(error.contains("no mouse input was sent"));
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn send_drag_synthesized_impl(
     target: u64,
@@ -1301,7 +1345,8 @@ fn send_drag_synthesized_impl(
         "middle" => (MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP),
         _ => (MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP),
     };
-    let (mod_downs, mod_ups) = crate::input::keyboard::modifier_hold_inputs(modifiers);
+    let (mod_downs, mod_ups, mod_edges) =
+        crate::input::keyboard::modifier_hold_inputs_with_edges(modifiers);
 
     let (vd_x, vd_y, vd_w, vd_h) = unsafe {
         (
@@ -1431,23 +1476,37 @@ fn send_drag_synthesized_impl(
 
         // Release the held modifiers, retrying once like the click path so a
         // partially inserted release does not leave system key state held.
-        let release_modifiers = || {
-            mod_ups.is_empty()
-                || crate::input::delivery::send_input(&mod_ups) as usize == mod_ups.len()
-                || crate::input::delivery::send_input(&mod_ups) as usize == mod_ups.len()
+        let release_modifiers = || -> Option<String> {
+            if mod_ups.is_empty() {
+                return None;
+            }
+            let first = (crate::input::delivery::send_input(&mod_ups) as usize).min(mod_ups.len());
+            let second = if first < mod_ups.len() {
+                (crate::input::delivery::send_input(&mod_ups[first..]) as usize)
+                    .min(mod_ups.len() - first)
+            } else {
+                0
+            };
+            let inserted = first + second;
+            if inserted == mod_ups.len() {
+                return None;
+            }
+            let names: Vec<_> = mod_edges
+                .iter()
+                .rev()
+                .map(|edge| crate::input::keyboard::key_name(*edge))
+                .collect();
+            Some(format!("corrective key-ups were not all inserted ({inserted} of {}); keys that may still be held: {}; whether the target processed inserted key-ups is not observable; press and release them to clear", mod_ups.len(), names.join(", ")))
         };
 
         // 0. Hold the modifiers before the press.
         if !mod_downs.is_empty() {
-            let sent = crate::input::delivery::send_input(&mod_downs);
-            if sent as usize != mod_downs.len() {
-                let _ = release_modifiers();
+            if let Err(error) = send_modifier_downs(&mod_downs, &mod_edges, |inputs| {
+                crate::input::delivery::send_input(inputs)
+            }) {
                 restore(true);
                 drop(noactivate);
-                bail!(
-                    "SendInput inserted {sent}/{} modifier key presses; no mouse input was sent",
-                    mod_downs.len()
-                );
+                bail!(error);
             }
             sleep(Duration::from_millis(5));
         }
@@ -1462,12 +1521,15 @@ fn send_drag_synthesized_impl(
         let sent = crate::input::delivery::send_input(&prelude);
         if sent as usize != prelude.len() {
             // Records insert in order, so a short prelude never pressed the button.
-            let _ = release_modifiers();
+            let modifier_error = release_modifiers();
             restore(true);
             drop(noactivate);
             bail!(
-                "SendInput drag-prelude inserted {sent}/{} events",
-                prelude.len()
+                "SendInput drag-prelude inserted {sent}/{} events{}",
+                prelude.len(),
+                modifier_error
+                    .map(|error| format!("; {error}"))
+                    .unwrap_or_default()
             );
         }
 
@@ -1507,7 +1569,7 @@ fn send_drag_synthesized_impl(
         // and restore z-order (demote target, restack user's window — no
         // activation) and the cursor.
         sleep(Duration::from_millis(40));
-        let modifiers_released = release_modifiers();
+        let modifier_error = release_modifiers();
         restore(released);
         drop(noactivate);
 
@@ -1515,14 +1577,15 @@ fn send_drag_synthesized_impl(
             let (cx, cy) = cursor_at;
             bail!(
                 "SendInput did not insert the drag's button release after a retry; the \
-                 button may still be held at screen ({cx},{cy}), so the cursor was left there."
+                 button may still be held at screen ({cx},{cy}), so the cursor was left there.{}",
+                modifier_error
+                    .as_ref()
+                    .map(|error| format!(" {error}"))
+                    .unwrap_or_default()
             );
         }
-        if !modifiers_released {
-            bail!(
-                "SendInput did not insert the drag's modifier key releases after a retry; \
-                 modifier keys may still be held."
-            );
+        if let Some(error) = modifier_error {
+            bail!("SendInput drag modifier release failed after a retry; {error}");
         }
         if !moves_ok {
             bail!("SendInput inserted fewer drag moves than expected; the button was released.");
