@@ -2633,6 +2633,87 @@ mod tests {
         }
     }
 
+    #[test]
+    fn u20b_omitted_seventh_snippet_cannot_be_proven_gone() {
+        use crate::snapshot_compaction::{
+            fold_actionless_text_subtrees_with_reasons, CompactableNode,
+        };
+        struct Node {
+            depth: usize,
+            text: Option<String>,
+        }
+        impl CompactableNode for Node {
+            fn element_index(&self) -> Option<usize> {
+                None
+            }
+            fn role(&self) -> &str {
+                if self.depth == 0 {
+                    "AXRow"
+                } else {
+                    "AXStaticText"
+                }
+            }
+            fn depth(&self) -> usize {
+                self.depth
+            }
+            fn set_depth(&mut self, depth: usize) {
+                self.depth = depth;
+            }
+            fn title(&self) -> Option<&str> {
+                None
+            }
+            fn value(&self) -> Option<&str> {
+                self.text.as_deref()
+            }
+            fn set_value(&mut self, value: Option<String>) {
+                self.text = value;
+            }
+            fn description(&self) -> Option<&str> {
+                None
+            }
+            fn format_line(&self) -> String {
+                format!("- {} {}", self.role(), self.value().unwrap_or_default())
+            }
+        }
+        let mut nodes = vec![Node {
+            depth: 0,
+            text: None,
+        }];
+        nodes.extend((0..7).map(|n| Node {
+            depth: 1,
+            text: Some(format!("item {n}")),
+        }));
+        let mut lines = nodes
+            .iter()
+            .map(|node| (node.depth(), node.format_line()))
+            .collect();
+        let reasons = fold_actionless_text_subtrees_with_reasons(&mut lines, &mut nodes);
+        let mut budget = crate::walk_budget::WalkBudget::nodes_only(100);
+        budget.assert_exhaustive();
+        for reason in reasons {
+            budget.record_skip(reason);
+        }
+        let mut state = json!({});
+        budget.outcome().apply(&mut state);
+        assert_eq!(state["observation_complete"], false);
+        let mut observed = read(vec![], &lines[0].1);
+        observed.completeness = completeness(&state);
+        let check = Check::parse(&json!({"text":"item 6","gone":true}), 0).unwrap();
+        assert_eq!(
+            evaluate(&check, &observed).unwrap_err().code,
+            "incomplete_observation"
+        );
+        observed.elements = vec![element(1, "AXButton", "Save")];
+        for nth in [None, Some(0)] {
+            let mut selector = Check::parse(&json!({"name":"Save"}), 0).unwrap().element;
+            selector.nth = nth;
+            assert_eq!(
+                pick(&observed, &selector).unwrap_err().code,
+                "incomplete_observation"
+            );
+        }
+    }
+
     fn element(index: u64, role: &str, label: &str) -> Value {
         json!({
             "element_index": index,

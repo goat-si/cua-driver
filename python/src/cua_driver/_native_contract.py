@@ -5594,6 +5594,8 @@ class IncompleteReasonDetail(enum.Enum):
 
     NOT_ASSERTED = 13
 
+    FOLDED_TEXT_TRUNCATED = 14
+
 
 
 class _UniffiFfiConverterTypeIncompleteReasonDetail(_UniffiConverterRustBuffer):
@@ -5628,6 +5630,8 @@ class _UniffiFfiConverterTypeIncompleteReasonDetail(_UniffiConverterRustBuffer):
             return IncompleteReasonDetail.SCOPE_MISMATCH
         if variant == 14:
             return IncompleteReasonDetail.NOT_ASSERTED
+        if variant == 15:
+            return IncompleteReasonDetail.FOLDED_TEXT_TRUNCATED
         raise InternalError("Raw enum value doesn't match any cases")
 
     @staticmethod
@@ -5659,6 +5663,8 @@ class _UniffiFfiConverterTypeIncompleteReasonDetail(_UniffiConverterRustBuffer):
         if value == IncompleteReasonDetail.SCOPE_MISMATCH:
             return
         if value == IncompleteReasonDetail.NOT_ASSERTED:
+            return
+        if value == IncompleteReasonDetail.FOLDED_TEXT_TRUNCATED:
             return
         raise ValueError(value)
 
@@ -5692,6 +5698,8 @@ class _UniffiFfiConverterTypeIncompleteReasonDetail(_UniffiConverterRustBuffer):
             buf.write_i32(13)
         if value == IncompleteReasonDetail.NOT_ASSERTED:
             buf.write_i32(14)
+        if value == IncompleteReasonDetail.FOLDED_TEXT_TRUNCATED:
+            buf.write_i32(15)
 
 
 

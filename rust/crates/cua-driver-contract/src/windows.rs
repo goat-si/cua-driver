@@ -400,6 +400,7 @@ pub enum IncompleteReasonDetail {
     UntrustedProvider,
     ScopeMismatch,
     NotAsserted,
+    FoldedTextTruncated,
 }
 
 #[derive(

@@ -49,14 +49,21 @@ skips, cuts, untrusted reads and timeouts remain incomplete.
 Its `element_indices` identify excluded owner rows in the returned snapshot's
 index namespace, sorted and deduplicated; omission means ownership is unknown
 or could not be retained. Absence of the field does not prove full scope,
-including for old producers. Neither it nor `observation_complete` is currently
-an input to absence or uniqueness proofs. U02c must propagate both into locate:
-with an exclusion, absence and uniqueness are unknown for selectors that could
+including for old producers. Locate uses completeness and exclusions in
+absence and uniqueness proofs: with an exclusion, those proofs are unknown for selectors that could
 match excluded content, including canonical or native menu/menuitem roles,
 untyped name/text selectors, or selectors scoped beneath an excluded owner.
 Selectors typed to a non-menu role are unaffected by this exclusion.
 
 Platform handoff (not implemented by this contract change):
+
+For text-folding completeness, Windows must use
+`fold_actionless_text_subtrees_with_reasons` at both UIA folding sites, merge
+every returned reason into the corresponding walk budget via `record_skip`,
+implement `CompactableNode::offscreen` from observed UIA visibility, and
+retain node boundaries in output. macOS and Linux must do the same wherever
+they fold before asserting observation completeness. A truncated folded
+snippet makes the read incomplete even if the native walk was exhaustive.
 
 - macOS: replace only the intentional `AXMenuBarItem` collapse's
   `note_skipped` with an exclusion; retain unrelated skips. Existing `query`

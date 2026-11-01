@@ -637,58 +637,7 @@ fn mark_boundaries(md: &str, structured: &Value) -> String {
         ) else {
             continue;
         };
-        let mut marker = match boundary
-            .get("children_skipped")
-            .and_then(|v| v.get("known"))
-            .and_then(Value::as_u64)
-        {
-            Some(n) => format!("[+{n} more"),
-            None => "[more: unknown".to_owned(),
-        };
-        let mut reasons: Vec<&str> = boundary
-            .get("reasons")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-            .filter_map(|reason| reason.get("detail").and_then(Value::as_str))
-            .collect();
-        reasons.sort_unstable();
-        reasons.dedup();
-        if !reasons.is_empty() {
-            marker.push_str(": ");
-            marker.push_str(&reasons.join(", "));
-        }
-        match boundary.get("descendants_omitted").and_then(Value::as_bool) {
-            Some(true) => marker.push_str("; descendants omitted"),
-            Some(false) => marker.push_str("; descendants not omitted"),
-            None => {}
-        }
-        marker.push(']');
-        // Detail names alone do not uniquely identify a reason: the public
-        // contract also carries its kind, independently of its detail.
-        let mut reason_kinds: Vec<(&str, &str)> = boundary
-            .get("reasons")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-            .filter_map(|reason| {
-                Some((
-                    reason.get("detail")?.as_str()?,
-                    reason.get("kind")?.as_str()?,
-                ))
-            })
-            .collect();
-        reason_kinds.sort_unstable();
-        reason_kinds.dedup();
-        if !reason_kinds.is_empty() {
-            let kinds = reason_kinds
-                .into_iter()
-                .map(|(detail, kind)| format!("{detail}={kind}"))
-                .collect::<Vec<_>>()
-                .join(", ");
-            marker.push_str(&format!(" [reason kinds: {kinds}]"));
-        }
-        markers.insert(index, marker);
+        markers.insert(index, boundary_marker(boundary));
     }
     md.split('\n')
         .map(|line| {
@@ -704,6 +653,61 @@ fn mark_boundaries(md: &str, structured: &Value) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+pub(crate) fn boundary_marker(boundary: &Value) -> String {
+    let mut marker = match boundary
+        .get("children_skipped")
+        .and_then(|v| v.get("known"))
+        .and_then(Value::as_u64)
+    {
+        Some(n) => format!("[+{n} more"),
+        None => "[more: unknown".to_owned(),
+    };
+    let mut reasons: Vec<&str> = boundary
+        .get("reasons")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|reason| reason.get("detail").and_then(Value::as_str))
+        .collect();
+    reasons.sort_unstable();
+    reasons.dedup();
+    if !reasons.is_empty() {
+        marker.push_str(": ");
+        marker.push_str(&reasons.join(", "));
+    }
+    match boundary.get("descendants_omitted").and_then(Value::as_bool) {
+        Some(true) => marker.push_str("; descendants omitted"),
+        Some(false) => marker.push_str("; descendants not omitted"),
+        None => {}
+    }
+    marker.push(']');
+    // Detail names alone do not uniquely identify a reason: the public
+    // contract also carries its kind, independently of its detail.
+    let mut reason_kinds: Vec<(&str, &str)> = boundary
+        .get("reasons")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|reason| {
+            Some((
+                reason.get("detail")?.as_str()?,
+                reason.get("kind")?.as_str()?,
+            ))
+        })
+        .collect();
+    reason_kinds.sort_unstable();
+    reason_kinds.dedup();
+    if !reason_kinds.is_empty() {
+        let kinds = reason_kinds
+            .into_iter()
+            .map(|(detail, kind)| format!("{detail}={kind}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        marker.push_str(&format!(" [reason kinds: {kinds}]"));
+    }
+    marker
 }
 
 /// Walk diagnostics cost every read context and no caller acts on them:
@@ -2092,6 +2096,29 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("[+3 more: time_budget]"));
+    }
+
+    #[test]
+    fn u20b_truncation_reason_change_is_a_diff() {
+        let (mut content, mut first) = payload("s0000ab01", OLD);
+        first["observation_complete"] = json!(true);
+        apply(&opts(json!({})), &ctx(88008), &mut content, &mut first);
+        let (mut content, mut second) = payload("s0000ab02", OLD);
+        second["observation_complete"] = json!(false);
+        second["observation_incomplete_reasons"] =
+            json!([{"kind":"policy_omission","detail":"folded_text_truncated"}]);
+        second["elements"][0]["boundary"] = json!({"reasons":[{"kind":"policy_omission","detail":"folded_text_truncated"}],"children_skipped":"unknown","descendants_omitted":true});
+        apply(
+            &opts(json!({"since":"s0000ab01"})),
+            &ctx(88008),
+            &mut content,
+            &mut second,
+        );
+        assert_eq!(second["since_status"], "diff");
+        assert!(second["tree_diff"]
+            .as_str()
+            .unwrap()
+            .contains("folded_text_truncated"));
     }
 
     #[test]

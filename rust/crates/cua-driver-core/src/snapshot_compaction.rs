@@ -1,5 +1,9 @@
 //! Cross-platform accessibility snapshot compaction, static-text summarization,
 //! credential/OTP value redaction, and dense-collection row scheduling.
+//!
+//! Completeness-asserting platforms must implement [`CompactableNode::offscreen`],
+//! use [`fold_actionless_text_subtrees_with_reasons`], and merge its reasons
+//! into their walk's read-level evidence.
 
 use crate::tree_boundary::{retain_boundary, BoundaryReason, NodeBoundary};
 use std::collections::HashMap;
@@ -506,6 +510,11 @@ pub trait CompactableNode {
     fn set_value(&mut self, value: Option<String>);
     fn description(&self) -> Option<&str>;
     fn format_line(&self) -> String;
+    /// Return observed visibility when available. Completeness-asserting
+    /// platforms should implement this to keep differing visibility separate.
+    fn offscreen(&self) -> Option<bool> {
+        None
+    }
     /// Return the node's boundary slot. `None` means this node type does not
     /// support boundaries; implementers must return the same slot on each call.
     /// Unavailable ancestor slots send dropped reasons to the read-level result.
@@ -514,11 +523,19 @@ pub trait CompactableNode {
     }
 }
 
-/// Fold nodes while returning boundary reasons that have no supporting retained
-/// ancestor. Callers must merge the returned reasons into read-level evidence.
+/// Fold nodes while returning read-level reasons, including any text lost to
+/// folding caps. Callers must merge these reasons into read-level evidence.
 pub fn fold_actionless_text_subtrees_with_reasons<N: CompactableNode>(
     lines: &mut Vec<(usize, String)>,
     nodes: &mut Vec<N>,
+) -> Vec<BoundaryReason> {
+    fold_actionless_text_subtrees_impl(lines, nodes, true)
+}
+
+fn fold_actionless_text_subtrees_impl<N: CompactableNode>(
+    lines: &mut Vec<(usize, String)>,
+    nodes: &mut Vec<N>,
+    render_loss_marker: bool,
 ) -> Vec<BoundaryReason> {
     let mut read_reasons = Vec::new();
     if lines.len() != nodes.len() || nodes.is_empty() {
@@ -567,7 +584,7 @@ pub fn fold_actionless_text_subtrees_with_reasons<N: CompactableNode>(
     }
 
     // Pass 2 follows below.
-    fold_after_elision(lines, nodes, &mut read_reasons);
+    fold_after_elision(lines, nodes, &mut read_reasons, render_loss_marker);
     read_reasons
 }
 
@@ -584,13 +601,14 @@ pub fn fold_actionless_text_subtrees<N: CompactableNode>(
     lines: &mut Vec<(usize, String)>,
     nodes: &mut Vec<N>,
 ) {
-    let _ = fold_actionless_text_subtrees_with_reasons(lines, nodes);
+    let _ = fold_actionless_text_subtrees_impl(lines, nodes, false);
 }
 
 fn fold_after_elision<N: CompactableNode>(
     lines: &mut Vec<(usize, String)>,
     nodes: &mut Vec<N>,
     read_reasons: &mut Vec<BoundaryReason>,
+    render_loss_marker: bool,
 ) {
     // Pass 2: Fold actionless row/cell/group subtrees that contain only plain static text
     // within MAX_SUMMARY_DEPTH, MAX_SUMMARY_SNIPPETS, and MAX_SUMMARY_CHARS.
@@ -629,6 +647,7 @@ fn fold_after_elision<N: CompactableNode>(
                 if desc.element_index().is_some()
                     || rel_depth > max_allowed_rel_depth
                     || !is_plain_text_subtree_role(desc.role())
+                    || matches!((node_ref.offscreen(), desc.offscreen()), (Some(a), Some(b)) if a != b)
                 {
                     all_plain = false;
                     break;
@@ -651,6 +670,17 @@ fn fold_after_elision<N: CompactableNode>(
             if all_plain && raw_snippets.len() >= min_snippets {
                 if let Some(summary) = summarize_static_text_snippets(&raw_snippets) {
                     let mut parent_node = old_nodes[idx].take().unwrap();
+                    let mut distinct = Vec::new();
+                    let mut lost_text = false;
+                    for raw in &raw_snippets {
+                        if let Some(full) = sanitize_snippet(raw, usize::MAX) {
+                            lost_text |= full.chars().count() > MAX_SNIPPET_CHARS;
+                            if !distinct.contains(&full) {
+                                distinct.push(full);
+                            }
+                        }
+                    }
+                    lost_text |= distinct.len() > MAX_SUMMARY_SNIPPETS;
                     for descendant in &mut old_nodes[(idx + 1)..sub_end] {
                         if let Some(boundary) = descendant
                             .as_mut()
@@ -668,6 +698,7 @@ fn fold_after_elision<N: CompactableNode>(
                                 if combined.chars().count() <= MAX_SUMMARY_CHARS {
                                     combined
                                 } else {
+                                    lost_text = true;
                                     summary
                                 }
                             }
@@ -675,7 +706,34 @@ fn fold_after_elision<N: CompactableNode>(
                         };
                         parent_node.set_value(Some(merged_val));
                     }
-                    let formatted = parent_node.format_line();
+                    if lost_text && render_loss_marker {
+                        let reason = BoundaryReason {
+                            kind: cua_driver_contract::IncompleteReasonKind::PolicyOmission,
+                            detail:
+                                cua_driver_contract::IncompleteReasonDetail::FoldedTextTruncated,
+                        };
+                        let dropped = NodeBoundary {
+                            reasons: vec![reason],
+                            children_skipped: crate::tree_boundary::CountEvidence::Unknown,
+                            descendants_omitted: Some(true),
+                        };
+                        retain_boundary(&dropped, parent_node.boundary_mut(), read_reasons);
+                        if !read_reasons.contains(&reason) {
+                            read_reasons.push(reason);
+                            read_reasons.sort_unstable();
+                        }
+                    }
+                    let mut formatted = parent_node.format_line();
+                    if lost_text && render_loss_marker {
+                        if let Some(boundary) =
+                            parent_node.boundary_mut().and_then(|slot| slot.as_ref())
+                        {
+                            let value =
+                                serde_json::to_value(boundary).expect("boundary serializes");
+                            formatted.push(' ');
+                            formatted.push_str(&crate::window_state_view::boundary_marker(&value));
+                        }
+                    }
                     out_lines.push((base_depth, formatted));
                     out_nodes.push(parent_node);
                     idx = sub_end;
@@ -1034,6 +1092,7 @@ mod tests {
     struct BoundaryNode {
         node: MockNode,
         boundary: Option<NodeBoundary>,
+        offscreen: Option<bool>,
     }
     impl CompactableNode for BoundaryNode {
         fn element_index(&self) -> Option<usize> {
@@ -1063,6 +1122,9 @@ mod tests {
         fn format_line(&self) -> String {
             self.node.format_line()
         }
+        fn offscreen(&self) -> Option<bool> {
+            self.offscreen
+        }
         fn boundary_mut(&mut self) -> Option<&mut Option<NodeBoundary>> {
             Some(&mut self.boundary)
         }
@@ -1084,6 +1146,7 @@ mod tests {
                 description: None,
             },
             boundary: None,
+            offscreen: None,
         }
     }
     fn u20_boundary(
@@ -1102,6 +1165,126 @@ mod tests {
     fn u20_fold(nodes: &mut Vec<BoundaryNode>) -> Vec<BoundaryReason> {
         let mut lines = nodes.iter().map(|n| (n.depth(), n.format_line())).collect();
         fold_actionless_text_subtrees_with_reasons(&mut lines, nodes)
+    }
+    #[test]
+    fn u20b_folding_reports_snippet_loss_and_preserves_boundary_count() {
+        let mut nodes = vec![u20_node("AXRow", 0, None, None)];
+        for n in 0..7 {
+            nodes.push(u20_node(
+                "AXStaticText",
+                1,
+                None,
+                Some(&format!("item {n}")),
+            ));
+        }
+        nodes[0].boundary = Some(u20_boundary(
+            cua_driver_contract::IncompleteReasonDetail::NodeBudget,
+            3,
+        ));
+        let mut lines = nodes.iter().map(|n| (n.depth(), n.format_line())).collect();
+        let reasons = fold_actionless_text_subtrees_with_reasons(&mut lines, &mut nodes);
+        assert_eq!(
+            serde_json::to_value(&reasons).unwrap(),
+            serde_json::json!([{"kind":"policy_omission","detail":"folded_text_truncated"}])
+        );
+        let boundary = nodes[0].boundary.as_ref().unwrap();
+        assert_eq!(
+            boundary.children_skipped,
+            crate::tree_boundary::CountEvidence::Known(3)
+        );
+        assert_eq!(boundary.descendants_omitted, Some(true));
+        assert_eq!(boundary.reasons.len(), 2);
+        assert!(!nodes[0].value().unwrap().contains("item 6"));
+        assert!(lines[0].1.contains("folded_text_truncated"));
+        assert!(lines[0].1.contains("descendants omitted"));
+    }
+    #[test]
+    fn u20b_long_snippet_reports_loss_but_six_short_snippets_do_not() {
+        let long = "x".repeat(81);
+        let mut nodes = vec![
+            u20_node("AXRow", 0, None, None),
+            u20_node("AXStaticText", 1, None, Some(&long)),
+        ];
+        let reasons = u20_fold(&mut nodes);
+        assert_eq!(
+            serde_json::to_value(reasons).unwrap(),
+            serde_json::json!([{"kind":"policy_omission","detail":"folded_text_truncated"}])
+        );
+        let mut nodes = vec![u20_node("AXRow", 0, None, None)];
+        for n in 0..6 {
+            nodes.push(u20_node(
+                "AXStaticText",
+                1,
+                None,
+                Some(&format!("item {n}")),
+            ));
+        }
+        assert!(u20_fold(&mut nodes).is_empty());
+        assert!(nodes[0].boundary.is_none());
+    }
+    #[test]
+    fn u20b_visibility_mismatch_is_retained_and_unknown_still_folds() {
+        for (parent, child, expected) in [
+            (Some(false), Some(true), 2),
+            (Some(true), Some(false), 2),
+            (None, Some(true), 1),
+            (Some(false), None, 1),
+            (Some(true), Some(true), 1),
+        ] {
+            let mut nodes = vec![
+                u20_node("AXRow", 0, None, None),
+                u20_node("AXStaticText", 1, None, Some("text")),
+            ];
+            nodes[0].offscreen = parent;
+            nodes[1].offscreen = child;
+            assert!(u20_fold(&mut nodes).is_empty());
+            assert_eq!(nodes.len(), expected, "{parent:?}, {child:?}");
+        }
+    }
+    #[test]
+    fn u20b_duplicate_snippets_are_not_loss_and_oversize_parent_merge_is() {
+        let mut nodes = vec![u20_node("AXRow", 0, None, None)];
+        for _ in 0..7 {
+            nodes.push(u20_node("AXStaticText", 1, None, Some("same")));
+        }
+        assert!(u20_fold(&mut nodes).is_empty());
+        let existing = "p".repeat(200);
+        let child = "c".repeat(30);
+        let mut nodes = vec![
+            u20_node("AXRow", 0, None, Some(&existing)),
+            u20_node("AXStaticText", 1, None, Some(&child)),
+        ];
+        assert_eq!(
+            serde_json::to_value(u20_fold(&mut nodes)).unwrap(),
+            serde_json::json!([{"kind":"policy_omission","detail":"folded_text_truncated"}])
+        );
+    }
+    #[test]
+    fn u20b_legacy_wrapper_discards_reasons() {
+        let mut nodes = vec![u20_node("AXRow", 0, None, None).node];
+        for n in 0..7 {
+            nodes.push(u20_node("AXStaticText", 1, None, Some(&format!("item {n}"))).node);
+        }
+        let mut lines = nodes.iter().map(|n| (n.depth(), n.format_line())).collect();
+        fold_actionless_text_subtrees(&mut lines, &mut nodes);
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(
+            nodes[0].value.as_deref(),
+            Some("item 0 item 1 item 2 item 3 item 4 item 5")
+        );
+        let mut nodes = vec![u20_node("AXRow", 0, None, None)];
+        for n in 0..7 {
+            nodes.push(u20_node(
+                "AXStaticText",
+                1,
+                None,
+                Some(&format!("item {n}")),
+            ));
+        }
+        let mut lines = nodes.iter().map(|n| (n.depth(), n.format_line())).collect();
+        fold_actionless_text_subtrees(&mut lines, &mut nodes);
+        assert!(nodes[0].boundary.is_none());
+        assert!(!lines[0].1.contains("folded_text_truncated"));
     }
     #[test]
     fn u20_elided_wrapper_boundary_reaches_nearest_retained_ancestor() {

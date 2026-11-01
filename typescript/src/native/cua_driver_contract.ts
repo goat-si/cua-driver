@@ -3858,7 +3858,8 @@ export enum IncompleteReasonDetail {
     EnumerationErrorUnclassified,
     UntrustedProvider,
     ScopeMismatch,
-    NotAsserted
+    NotAsserted,
+    FoldedTextTruncated
 }
 
 const FfiConverterTypeIncompleteReasonDetail = (() => {
@@ -3881,6 +3882,7 @@ const FfiConverterTypeIncompleteReasonDetail = (() => {
                 case 12: return IncompleteReasonDetail.UntrustedProvider;
                 case 13: return IncompleteReasonDetail.ScopeMismatch;
                 case 14: return IncompleteReasonDetail.NotAsserted;
+                case 15: return IncompleteReasonDetail.FoldedTextTruncated;
                 default: throw new UniffiInternalError.UnexpectedEnumCase();
             }
         }
@@ -3900,6 +3902,7 @@ const FfiConverterTypeIncompleteReasonDetail = (() => {
                 case IncompleteReasonDetail.UntrustedProvider: return ordinalConverter.write(12, into);
                 case IncompleteReasonDetail.ScopeMismatch: return ordinalConverter.write(13, into);
                 case IncompleteReasonDetail.NotAsserted: return ordinalConverter.write(14, into);
+                case IncompleteReasonDetail.FoldedTextTruncated: return ordinalConverter.write(15, into);
             }
         }
         allocationSize(value: TypeName): number {

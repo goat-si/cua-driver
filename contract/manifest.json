@@ -2277,7 +2277,8 @@
                     "enumeration_error_unclassified",
                     "untrusted_provider",
                     "scope_mismatch",
-                    "not_asserted"
+                    "not_asserted",
+                    "folded_text_truncated"
                   ],
                   "type": "string"
                 },
@@ -2379,7 +2380,8 @@
                               "enumeration_error_unclassified",
                               "untrusted_provider",
                               "scope_mismatch",
-                              "not_asserted"
+                              "not_asserted",
+                              "folded_text_truncated"
                             ],
                             "type": "string"
                           },
@@ -2684,7 +2686,8 @@
                     "enumeration_error_unclassified",
                     "untrusted_provider",
                     "scope_mismatch",
-                    "not_asserted"
+                    "not_asserted",
+                    "folded_text_truncated"
                   ],
                   "type": "string"
                 },
