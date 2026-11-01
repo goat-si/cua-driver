@@ -112,6 +112,15 @@ fn walk_state_keeps_the_callers_budget_across_walks() {
     let outcome = state.budget.outcome();
     assert_eq!((outcome.nodes_visited, outcome.nodes_pending), (2, 1));
     assert_eq!(outcome.reason(), Some("node_budget"));
+    assert!(!state.finish());
+    let mut output = serde_json::json!({});
+    budget.outcome().apply(&mut output);
+    assert_eq!(
+        output["observation_incomplete_reasons"],
+        serde_json::json!([
+            {"kind":"budget","detail":"node_budget"}, {"kind":"unknown","detail":"not_asserted"}
+        ])
+    );
 }
 
 #[test]
@@ -125,6 +134,15 @@ fn timed_out_walk_cannot_report_complete() {
     assert!(!state.complete);
     assert_eq!(state.budget.outcome().reason(), Some("timeout"));
     assert_eq!(state.budget.outcome().nodes_visited, 0);
+    assert!(!state.finish());
+    let mut output = serde_json::json!({});
+    budget.outcome().apply(&mut output);
+    assert_eq!(
+        output["observation_incomplete_reasons"],
+        serde_json::json!([
+            {"kind":"budget","detail":"time_budget"}, {"kind":"unknown","detail":"not_asserted"}
+        ])
+    );
 }
 
 /// Without a query the generic walk leaves offscreen deferred rows as a
@@ -145,5 +163,292 @@ fn unwalked_offscreen_rows_make_the_walk_incomplete() {
             state.complete, complete,
             "{visible:?} search={search_offscreen}"
         );
+        assert_eq!(state.finish(), complete);
+        let mut output = serde_json::json!({});
+        budget.outcome().apply(&mut output);
+        let expected = if complete {
+            serde_json::json!([])
+        } else {
+            serde_json::json!([
+                {"kind":"policy_omission","detail":"offscreen"}, {"kind":"unknown","detail":"not_asserted"}
+            ])
+        };
+        assert_eq!(output["observation_incomplete_reasons"], expected);
     }
+}
+
+#[test]
+fn complete_walk_reports_observation_complete() {
+    let mut budget = WalkBudget::nodes_only(10);
+    let mut state = WalkState::new(&mut budget, 25);
+    walk_synthetic_tree(&star(3), 0, 0, &mut state);
+    assert!(state.finish());
+    let mut output = serde_json::json!({});
+    budget.outcome().apply(&mut output);
+    assert_eq!(
+        output["observation_incomplete_reasons"],
+        serde_json::json!([])
+    );
+    assert_eq!(output["observation_complete"], true);
+}
+
+#[test]
+fn omissions_report_exact_reasons() {
+    use cua_driver_contract::{IncompleteReasonDetail as D, IncompleteReasonKind as K};
+    let cases = [
+        (Omission::DepthLimit, K::Budget, D::DepthLimit, true),
+        (
+            Omission::CacheRequestIncomplete,
+            K::ProviderFailure,
+            D::AttributeReadFailed,
+            true,
+        ),
+        (
+            Omission::ChildrenUnreadable,
+            K::ProviderFailure,
+            D::ChildEnumerationFailed,
+            true,
+        ),
+        (
+            Omission::ProcessIdUnreadable,
+            K::ProviderFailure,
+            D::AttributeReadFailed,
+            true,
+        ),
+        (
+            Omission::SubtreeCacheFailed,
+            K::ProviderFailure,
+            D::EnumerationErrorUnclassified,
+            true,
+        ),
+        (
+            Omission::EmptyWrapperFallback,
+            K::ProviderFailure,
+            D::ScopeMismatch,
+            true,
+        ),
+        (
+            Omission::OffscreenRowsDeferred,
+            K::PolicyOmission,
+            D::Offscreen,
+            true,
+        ),
+        (
+            Omission::TabsCompacted,
+            K::PolicyOmission,
+            D::InactiveTab,
+            true,
+        ),
+        (
+            Omission::OffscreenContentDropped,
+            K::PolicyOmission,
+            D::Offscreen,
+            false,
+        ),
+        (
+            Omission::AttributeReadFailed,
+            K::ProviderFailure,
+            D::AttributeReadFailed,
+            true,
+        ),
+        (
+            Omission::SiblingScanCapped,
+            K::PolicyOmission,
+            D::HugeContainer,
+            true,
+        ),
+    ];
+    for (omission, kind, detail, flips) in cases {
+        let mut budget = WalkBudget::nodes_only(10);
+        let mut state = WalkState::new(&mut budget, 25);
+        state.mark(omission);
+        assert_eq!(state.finish(), !flips, "{omission:?}");
+        let mut output = serde_json::json!({});
+        budget.outcome().apply(&mut output);
+        let mut expected = vec![cua_driver_contract::IncompleteReason { kind, detail }];
+        if flips {
+            expected.push(cua_driver_contract::IncompleteReason {
+                kind: K::Unknown,
+                detail: D::NotAsserted,
+            });
+        }
+        expected.sort_unstable();
+        assert_eq!(output["observation_complete"], false);
+        assert_eq!(
+            output["observation_incomplete_reasons"],
+            serde_json::json!(expected),
+            "{omission:?}"
+        );
+    }
+}
+
+#[test]
+fn cached_read_classifiers_and_log_fail_closed() {
+    for (raw, expected) in [
+        (
+            RawCached::Ok {
+                vt: 8,
+                unknown_is_not_supported_token: false,
+            },
+            CachedRead::Value,
+        ),
+        (
+            RawCached::Ok {
+                vt: 13,
+                unknown_is_not_supported_token: true,
+            },
+            CachedRead::Absent,
+        ),
+        (
+            RawCached::Ok {
+                vt: 13,
+                unknown_is_not_supported_token: false,
+            },
+            CachedRead::Failed,
+        ),
+        (
+            RawCached::Ok {
+                vt: 0,
+                unknown_is_not_supported_token: false,
+            },
+            CachedRead::Failed,
+        ),
+        (
+            RawCached::Ok {
+                vt: 11,
+                unknown_is_not_supported_token: false,
+            },
+            CachedRead::Failed,
+        ),
+        (RawCached::Err(-1), CachedRead::Failed),
+    ] {
+        assert_eq!(classify_cached_variant(raw, 8), expected);
+    }
+    for (result, expected) in [
+        (Ok(()), CachedRead::Value),
+        (Err(0), CachedRead::Absent),
+        (Err(0x80004002u32 as i32), CachedRead::Absent),
+        (Err(0x80040204u32 as i32), CachedRead::Absent),
+        (Err(0x80004005u32 as i32), CachedRead::Failed),
+    ] {
+        assert_eq!(classify_cached_pattern(result), expected);
+    }
+    let mut budget = WalkBudget::nodes_only(10);
+    let state = WalkState::new(&mut budget, 25);
+    state.reads.fail();
+    assert!(!state.finish());
+    let mut output = serde_json::json!({});
+    budget.outcome().apply(&mut output);
+    assert_eq!(
+        output["observation_incomplete_reasons"],
+        serde_json::json!([{"kind":"provider_failure","detail":"attribute_read_failed"},{"kind":"unknown","detail":"not_asserted"}])
+    );
+}
+
+#[test]
+fn real_tab_plan_marks_only_omitted_tabs() {
+    use cua_driver_core::snapshot_compaction::{compact_tab_strip, TabChildMeta};
+    let mut tabs = vec![
+        TabChildMeta {
+            role: "TabItem",
+            role_description: None,
+            title: None,
+            selected: Some(false),
+            value: None,
+            value_state: None
+        };
+        10
+    ];
+    tabs[0].selected = Some(true);
+    let plan = compact_tab_strip("Tab", None, None, None, &tabs);
+    assert!(plan.as_ref().is_some_and(|p| p.omitted_count > 0));
+    let mut budget = WalkBudget::nodes_only(10);
+    let mut state = WalkState::new(&mut budget, 25);
+    note_tab_plan(&mut state, plan.as_ref());
+    assert!(!state.finish());
+    let mut output = serde_json::json!({});
+    budget.outcome().apply(&mut output);
+    assert_eq!(
+        output["observation_incomplete_reasons"],
+        serde_json::json!([{"kind":"policy_omission","detail":"inactive_tab"},{"kind":"unknown","detail":"not_asserted"}])
+    );
+    for tab in &mut tabs {
+        tab.selected = Some(true);
+    }
+    let all = compact_tab_strip("Tab", None, None, None, &tabs);
+    assert!(all.is_none());
+    let mut budget = WalkBudget::nodes_only(10);
+    let mut state = WalkState::new(&mut budget, 25);
+    note_tab_plan(&mut state, all.as_ref());
+    let zero = cua_driver_core::snapshot_compaction::TabStripCompaction {
+        keep: vec![true],
+        omitted_count: 0,
+        first_omitted_index: 0,
+    };
+    note_tab_plan(&mut state, Some(&zero));
+    assert!(state.finish());
+}
+
+#[test]
+fn omissions_and_budget_stops_report_their_exact_union() {
+    for timeout in [false, true] {
+        let mut budget = WalkBudget::nodes_only(0);
+        if timeout {
+            budget.stop_for_timeout();
+        }
+        let mut state = WalkState::new(&mut budget, 0);
+        state.mark(Omission::ChildrenUnreadable);
+        assert!(!state.enter(0));
+        assert!(!state.finish());
+        let mut output = serde_json::json!({});
+        budget.outcome().apply(&mut output);
+        let stop = if timeout {
+            "time_budget"
+        } else {
+            "node_budget"
+        };
+        assert_eq!(
+            output["observation_incomplete_reasons"],
+            serde_json::json!([
+                {"kind":"provider_failure","detail":"child_enumeration_failed"},
+                {"kind":"budget","detail":stop},
+                {"kind":"unknown","detail":"not_asserted"}
+            ])
+        );
+        assert_eq!(output["truncated"], true);
+    }
+    let mut budget = WalkBudget::nodes_only(10);
+    let mut state = WalkState::new(&mut budget, 0);
+    assert!(!state.enter(1));
+    assert!(!state.finish());
+    let mut output = serde_json::json!({});
+    budget.outcome().apply(&mut output);
+    assert_eq!(
+        output["observation_incomplete_reasons"],
+        serde_json::json!([
+            {"kind":"budget","detail":"depth_limit"},
+            {"kind":"unknown","detail":"not_asserted"}
+        ])
+    );
+}
+
+#[test]
+fn disabled_node_value_pattern_failure_marks_read_untrusted() {
+    let mut budget = WalkBudget::nodes_only(10);
+    let state = WalkState::new(&mut budget, 25);
+    // Value-pattern projection probes even when action discovery is disabled.
+    assert_eq!(
+        record_pattern_read(Err(0x80004005u32 as i32), &state.reads),
+        CachedRead::Failed
+    );
+    assert!(!state.finish());
+    let mut output = serde_json::json!({});
+    budget.outcome().apply(&mut output);
+    assert_eq!(
+        output["observation_incomplete_reasons"],
+        serde_json::json!([
+            {"kind":"provider_failure","detail":"attribute_read_failed"},
+            {"kind":"unknown","detail":"not_asserted"}
+        ])
+    );
 }
