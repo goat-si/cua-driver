@@ -773,6 +773,251 @@ const FfiConverterTypeActionSelectedTextRange = (() => {
     return new FFIConverter();
 })();
 
+export enum OpenedSurfaceKind {
+    Menu,
+    Popover,
+    Alert,
+    Sheet,
+    Unknown
+}
+
+const FfiConverterTypeOpenedSurfaceKind = (() => {
+    const ordinalConverter = FfiConverterInt32;
+    type TypeName = OpenedSurfaceKind;
+    class FFIConverter extends AbstractFfiConverterByteArray<TypeName> {
+        read(from: RustBuffer): TypeName {
+            switch (ordinalConverter.read(from)) {
+                case 1: return OpenedSurfaceKind.Menu;
+                case 2: return OpenedSurfaceKind.Popover;
+                case 3: return OpenedSurfaceKind.Alert;
+                case 4: return OpenedSurfaceKind.Sheet;
+                case 5: return OpenedSurfaceKind.Unknown;
+                default: throw new UniffiInternalError.UnexpectedEnumCase();
+            }
+        }
+        write(value: TypeName, into: RustBuffer): void {
+            switch (value) {
+                case OpenedSurfaceKind.Menu: return ordinalConverter.write(1, into);
+                case OpenedSurfaceKind.Popover: return ordinalConverter.write(2, into);
+                case OpenedSurfaceKind.Alert: return ordinalConverter.write(3, into);
+                case OpenedSurfaceKind.Sheet: return ordinalConverter.write(4, into);
+                case OpenedSurfaceKind.Unknown: return ordinalConverter.write(5, into);
+            }
+        }
+        allocationSize(value: TypeName): number {
+            return ordinalConverter.allocationSize(0);
+        }
+    }
+    return new FFIConverter();
+})();
+
+/**
+ * A target addressable by `get_window_state`.
+ */
+export type OpenedSurfaceTarget = {
+    pid: number,
+    windowId: bigint
+}
+
+/**
+ * Generated factory for {@link OpenedSurfaceTarget} record objects.
+ */
+export const OpenedSurfaceTarget = (() => {
+    const defaults = () => ({
+    });
+    const create = (() => {
+        return uniffiCreateRecord<OpenedSurfaceTarget, ReturnType<typeof defaults>>(defaults);
+    })();
+    return Object.freeze({
+        create,
+        new: create,
+        defaults: () => Object.freeze(defaults()) as Partial<OpenedSurfaceTarget>,
+    });
+})();
+
+const FfiConverterTypeOpenedSurfaceTarget = (() => {
+    type TypeName = OpenedSurfaceTarget;
+    class FFIConverter extends AbstractFfiConverterByteArray<TypeName> {
+        read(from: RustBuffer): TypeName {
+            return {
+                pid: FfiConverterUInt32.read(from),
+                windowId: FfiConverterUInt64.read(from)
+            };
+        }
+        write(value: TypeName, into: RustBuffer): void {
+            FfiConverterUInt32.write(value.pid, into);
+            FfiConverterUInt64.write(value.windowId, into);
+        }
+        allocationSize(value: TypeName): number {
+            return FfiConverterUInt32.allocationSize(value.pid) +
+             FfiConverterUInt64.allocationSize(value.windowId);
+
+        }
+    };
+    return new FFIConverter();
+})();
+
+/**
+ * Bounds of a newly observed surface in screen coordinates.
+ */
+export type OpenedSurfaceBounds = {
+    x: number,
+    y: number,
+    width: number,
+    height: number
+}
+
+/**
+ * Generated factory for {@link OpenedSurfaceBounds} record objects.
+ */
+export const OpenedSurfaceBounds = (() => {
+    const defaults = () => ({
+    });
+    const create = (() => {
+        return uniffiCreateRecord<OpenedSurfaceBounds, ReturnType<typeof defaults>>(defaults);
+    })();
+    return Object.freeze({
+        create,
+        new: create,
+        defaults: () => Object.freeze(defaults()) as Partial<OpenedSurfaceBounds>,
+    });
+})();
+
+const FfiConverterTypeOpenedSurfaceBounds = (() => {
+    type TypeName = OpenedSurfaceBounds;
+    class FFIConverter extends AbstractFfiConverterByteArray<TypeName> {
+        read(from: RustBuffer): TypeName {
+            return {
+                x: FfiConverterFloat64.read(from),
+                y: FfiConverterFloat64.read(from),
+                width: FfiConverterFloat64.read(from),
+                height: FfiConverterFloat64.read(from)
+            };
+        }
+        write(value: TypeName, into: RustBuffer): void {
+            FfiConverterFloat64.write(value.x, into);
+            FfiConverterFloat64.write(value.y, into);
+            FfiConverterFloat64.write(value.width, into);
+            FfiConverterFloat64.write(value.height, into);
+        }
+        allocationSize(value: TypeName): number {
+            return FfiConverterFloat64.allocationSize(value.x) +
+             FfiConverterFloat64.allocationSize(value.y) +
+             FfiConverterFloat64.allocationSize(value.width) +
+             FfiConverterFloat64.allocationSize(value.height);
+
+        }
+    };
+    return new FFIConverter();
+})();
+
+/**
+ * A surface that appeared after dispatch, established by before/after comparison
+ * or an open notification tied to the input. Embedded AX/UIA surfaces may
+ * have no independently addressable target.
+ */
+export type OpenedSurface = {
+    kind: OpenedSurfaceKind,
+    /**
+     * The owner process, omitted when it could not be established.
+     */
+    ownerPid?: number,
+    windowId?: bigint,
+    target?: OpenedSurfaceTarget,
+    bounds?: OpenedSurfaceBounds,
+    title?: string
+}
+
+/**
+ * Generated factory for {@link OpenedSurface} record objects.
+ */
+export const OpenedSurface = (() => {
+    const defaults = () => ({
+    });
+    const create = (() => {
+        return uniffiCreateRecord<OpenedSurface, ReturnType<typeof defaults>>(defaults);
+    })();
+    return Object.freeze({
+        create,
+        new: create,
+        defaults: () => Object.freeze(defaults()) as Partial<OpenedSurface>,
+    });
+})();
+
+const FfiConverterTypeOpenedSurface = (() => {
+    type TypeName = OpenedSurface;
+    class FFIConverter extends AbstractFfiConverterByteArray<TypeName> {
+        read(from: RustBuffer): TypeName {
+            return {
+                kind: FfiConverterTypeOpenedSurfaceKind.read(from),
+                ownerPid: FfiConverterOptionalUInt32.read(from),
+                windowId: FfiConverterOptionalUInt64.read(from),
+                target: FfiConverterOptionalTypeOpenedSurfaceTarget.read(from),
+                bounds: FfiConverterOptionalTypeOpenedSurfaceBounds.read(from),
+                title: FfiConverterOptionalString.read(from)
+            };
+        }
+        write(value: TypeName, into: RustBuffer): void {
+            FfiConverterTypeOpenedSurfaceKind.write(value.kind, into);
+            FfiConverterOptionalUInt32.write(value.ownerPid, into);
+            FfiConverterOptionalUInt64.write(value.windowId, into);
+            FfiConverterOptionalTypeOpenedSurfaceTarget.write(value.target, into);
+            FfiConverterOptionalTypeOpenedSurfaceBounds.write(value.bounds, into);
+            FfiConverterOptionalString.write(value.title, into);
+        }
+        allocationSize(value: TypeName): number {
+            return FfiConverterTypeOpenedSurfaceKind.allocationSize(value.kind) +
+             FfiConverterOptionalUInt32.allocationSize(value.ownerPid) +
+             FfiConverterOptionalUInt64.allocationSize(value.windowId) +
+             FfiConverterOptionalTypeOpenedSurfaceTarget.allocationSize(value.target) +
+             FfiConverterOptionalTypeOpenedSurfaceBounds.allocationSize(value.bounds) +
+             FfiConverterOptionalString.allocationSize(value.title);
+
+        }
+    };
+    return new FFIConverter();
+})();
+
+/**
+ * Completeness of the observation performed after an input was dispatched.
+ * Observed is complete; partial means some surfaces were seen but absence
+ * of others is unknown; unavailable means observation could not complete.
+ */
+export enum OpenedSurfacesStatus {
+    Observed,
+    Partial,
+    Unavailable,
+    NotChecked
+}
+
+const FfiConverterTypeOpenedSurfacesStatus = (() => {
+    const ordinalConverter = FfiConverterInt32;
+    type TypeName = OpenedSurfacesStatus;
+    class FFIConverter extends AbstractFfiConverterByteArray<TypeName> {
+        read(from: RustBuffer): TypeName {
+            switch (ordinalConverter.read(from)) {
+                case 1: return OpenedSurfacesStatus.Observed;
+                case 2: return OpenedSurfacesStatus.Partial;
+                case 3: return OpenedSurfacesStatus.Unavailable;
+                case 4: return OpenedSurfacesStatus.NotChecked;
+                default: throw new UniffiInternalError.UnexpectedEnumCase();
+            }
+        }
+        write(value: TypeName, into: RustBuffer): void {
+            switch (value) {
+                case OpenedSurfacesStatus.Observed: return ordinalConverter.write(1, into);
+                case OpenedSurfacesStatus.Partial: return ordinalConverter.write(2, into);
+                case OpenedSurfacesStatus.Unavailable: return ordinalConverter.write(3, into);
+                case OpenedSurfacesStatus.NotChecked: return ordinalConverter.write(4, into);
+            }
+        }
+        allocationSize(value: TypeName): number {
+            return ordinalConverter.allocationSize(0);
+        }
+    }
+    return new FFIConverter();
+})();
+
 export type ActionResult = {
     effect: ActionEffect,
     route: ActionRoute,
@@ -813,8 +1058,21 @@ export type ActionResult = {
     selectionChanged?: boolean,
     selectedTextRange?: ActionSelectedTextRange,
     selectedText?: string,
+    /**
+     * Legacy macOS readback; false means unconfirmed, not proven absent.
+     * See `opened_surfaces` for the cross-platform observation.
+     */
     menuOpened?: boolean,
     menuItems?: Array<string>,
+    /**
+     * Surfaces appearing after this input was dispatched. Status absent means
+     * unknown; only observed with an empty list proves none opened.
+     */
+    openedSurfaces?: Array<OpenedSurface>,
+    /**
+     * A failed or deadline-limited observation cannot be `observed`.
+     */
+    openedSurfacesStatus?: OpenedSurfacesStatus,
     /**
      * The point a pointer action (click, double_click, right_click,
      * move_cursor, scroll, drag) aimed at, in `coordinate_space`, as its
@@ -872,6 +1130,8 @@ const FfiConverterTypeActionResult = (() => {
                 selectedText: FfiConverterOptionalString.read(from),
                 menuOpened: FfiConverterOptionalBoolean.read(from),
                 menuItems: FfiConverterOptionalSequenceString.read(from),
+                openedSurfaces: FfiConverterOptionalSequenceTypeOpenedSurface.read(from),
+                openedSurfacesStatus: FfiConverterOptionalTypeOpenedSurfacesStatus.read(from),
                 point: FfiConverterOptionalTypeActionPoint.read(from),
                 hit: FfiConverterOptionalTypeActionHit.read(from)
             };
@@ -895,6 +1155,8 @@ const FfiConverterTypeActionResult = (() => {
             FfiConverterOptionalString.write(value.selectedText, into);
             FfiConverterOptionalBoolean.write(value.menuOpened, into);
             FfiConverterOptionalSequenceString.write(value.menuItems, into);
+            FfiConverterOptionalSequenceTypeOpenedSurface.write(value.openedSurfaces, into);
+            FfiConverterOptionalTypeOpenedSurfacesStatus.write(value.openedSurfacesStatus, into);
             FfiConverterOptionalTypeActionPoint.write(value.point, into);
             FfiConverterOptionalTypeActionHit.write(value.hit, into);
         }
@@ -917,6 +1179,8 @@ const FfiConverterTypeActionResult = (() => {
              FfiConverterOptionalString.allocationSize(value.selectedText) +
              FfiConverterOptionalBoolean.allocationSize(value.menuOpened) +
              FfiConverterOptionalSequenceString.allocationSize(value.menuItems) +
+             FfiConverterOptionalSequenceTypeOpenedSurface.allocationSize(value.openedSurfaces) +
+             FfiConverterOptionalTypeOpenedSurfacesStatus.allocationSize(value.openedSurfacesStatus) +
              FfiConverterOptionalTypeActionPoint.allocationSize(value.point) +
              FfiConverterOptionalTypeActionHit.allocationSize(value.hit);
 
@@ -7858,6 +8122,21 @@ const FfiConverterSequenceString = new FfiConverterArray(FfiConverterString);
 // FfiConverter for Array<string> | undefined
 const FfiConverterOptionalSequenceString = new FfiConverterOptional(FfiConverterSequenceString);
 
+// FfiConverter for OpenedSurfaceTarget | undefined
+const FfiConverterOptionalTypeOpenedSurfaceTarget = new FfiConverterOptional(FfiConverterTypeOpenedSurfaceTarget);
+
+// FfiConverter for OpenedSurfaceBounds | undefined
+const FfiConverterOptionalTypeOpenedSurfaceBounds = new FfiConverterOptional(FfiConverterTypeOpenedSurfaceBounds);
+
+// FfiConverter for Array<OpenedSurface>
+const FfiConverterSequenceTypeOpenedSurface = new FfiConverterArray(FfiConverterTypeOpenedSurface);
+
+// FfiConverter for Array<OpenedSurface> | undefined
+const FfiConverterOptionalSequenceTypeOpenedSurface = new FfiConverterOptional(FfiConverterSequenceTypeOpenedSurface);
+
+// FfiConverter for OpenedSurfacesStatus | undefined
+const FfiConverterOptionalTypeOpenedSurfacesStatus = new FfiConverterOptional(FfiConverterTypeOpenedSurfacesStatus);
+
 // FfiConverter for ActionPoint | undefined
 const FfiConverterOptionalTypeActionPoint = new FfiConverterOptional(FfiConverterTypeActionPoint);
 
@@ -8099,6 +8378,11 @@ export default Object.freeze({
     FfiConverterTypeListWindowsOutput,
     FfiConverterTypeMoveCursorInput,
     FfiConverterTypeNodeBoundary,
+    FfiConverterTypeOpenedSurface,
+    FfiConverterTypeOpenedSurfaceBounds,
+    FfiConverterTypeOpenedSurfaceKind,
+    FfiConverterTypeOpenedSurfaceTarget,
+    FfiConverterTypeOpenedSurfacesStatus,
     FfiConverterTypeParseVisualRegionsInput,
     FfiConverterTypeParseVisualRegionsOptions,
     FfiConverterTypeParseVisualRegionsOutput,

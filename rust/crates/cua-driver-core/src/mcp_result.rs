@@ -389,6 +389,27 @@ mod tests {
     const UNSCHEMED_TOOL: &str = "no_such_tool";
 
     #[test]
+    fn opened_surfaces_refuse_mixed_proxy_daemon_schemas() {
+        let new = advertised_tool_output_schema(ACTION_TOOL).unwrap();
+        let old_success: Value = serde_json::from_str(include_str!(
+            "../../../../contract/fixtures/action-result-pre-u21-success-schema.json"
+        ))
+        .unwrap();
+        let old = cua_driver_contract::advertised_output_schema(old_success);
+        let legacy = json!({"effect":"unverifiable", "route":"accessibility"});
+        let current = json!({"effect":"unverifiable", "route":"accessibility",
+            "opened_surfaces_status":"observed", "opened_surfaces":[]});
+        let old_validator = jsonschema::validator_for(&old).unwrap();
+        let new_validator = jsonschema::validator_for(&new).unwrap();
+        assert!(old_validator.is_valid(&legacy));
+        assert!(new_validator.is_valid(&legacy));
+        assert!(!old_validator.is_valid(&current));
+        assert!(new_validator.is_valid(&current));
+        assert!(validate_proxy_schema_pair(ACTION_TOOL, Some(&new), Some(&old)).is_err());
+        assert!(validate_proxy_schema_pair(ACTION_TOOL, Some(&old), Some(&new)).is_err());
+    }
+
+    #[test]
     fn canonical_vocabulary_schema_and_mixed_proxy_versions() {
         let tool = "get_window_state";
         let new_schema = advertised_tool_output_schema(tool).unwrap();

@@ -866,6 +866,78 @@ fn deserialize_prior_pid<'de, D: serde::Deserializer<'de>>(
     Option::<i32>::deserialize(deserializer)
 }
 
+/// Completeness of the observation performed after an input was dispatched.
+/// Observed is complete; partial means some surfaces were seen but absence
+/// of others is unknown; unavailable means observation could not complete.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq, uniffi::Enum)]
+#[serde(rename_all = "snake_case")]
+pub enum OpenedSurfacesStatus {
+    Observed,
+    Partial,
+    Unavailable,
+    NotChecked,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq, uniffi::Enum)]
+#[serde(rename_all = "snake_case")]
+pub enum OpenedSurfaceKind {
+    Menu,
+    Popover,
+    Alert,
+    Sheet,
+    Unknown,
+}
+
+/// A target addressable by `get_window_state`.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq, uniffi::Record)]
+#[serde(deny_unknown_fields)]
+pub struct OpenedSurfaceTarget {
+    #[schemars(schema_with = "opened_pid_schema")]
+    pub pid: u32,
+    #[schemars(schema_with = "opened_window_id_schema")]
+    pub window_id: u64,
+}
+
+fn opened_pid_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    schemars::json_schema!({"type":"integer", "minimum":1, "maximum":4294967295_u64})
+}
+
+fn opened_window_id_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    schemars::json_schema!({"type":"integer", "minimum":1})
+}
+
+/// Bounds of a newly observed surface in screen coordinates.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, uniffi::Record)]
+#[serde(deny_unknown_fields)]
+pub struct OpenedSurfaceBounds {
+    pub x: f64,
+    pub y: f64,
+    pub width: f64,
+    pub height: f64,
+}
+
+/// A surface that appeared after dispatch, established by before/after comparison
+/// or an open notification tied to the input. Embedded AX/UIA surfaces may
+/// have no independently addressable target.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, uniffi::Record)]
+#[serde(deny_unknown_fields)]
+pub struct OpenedSurface {
+    pub kind: OpenedSurfaceKind,
+    /// The owner process, omitted when it could not be established.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(schema_with = "opened_pid_schema")]
+    pub owner_pid: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(schema_with = "opened_window_id_schema")]
+    pub window_id: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<OpenedSurfaceTarget>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bounds: Option<OpenedSurfaceBounds>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+}
+
 // `PartialEq` only: `point` carries floating-point coordinates.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, uniffi::Record)]
 #[serde(deny_unknown_fields)]
@@ -914,9 +986,19 @@ pub struct ActionResult {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub selected_text: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Legacy macOS readback; false means unconfirmed, not proven absent.
+    /// See `opened_surfaces` for the cross-platform observation.
     pub menu_opened: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub menu_items: Option<Vec<String>>,
+    /// Surfaces appearing after this input was dispatched. Status absent means
+    /// unknown; only observed with an empty list proves none opened.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub opened_surfaces: Option<Vec<OpenedSurface>>,
+    /// A failed or deadline-limited observation cannot be `observed`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "OpenedSurfacesStatus")]
+    pub opened_surfaces_status: Option<OpenedSurfacesStatus>,
     /// The point a pointer action (click, double_click, right_click,
     /// move_cursor, scroll, drag) aimed at, in `coordinate_space`, as its
     /// producer reports it; for drag, the end point. It says where the input
@@ -990,6 +1072,10 @@ pub enum ActionResultValidationError {
     ReadbackEffectMismatch,
     PointNotFinite,
     FocusRestorationReasonRequiresAbandoned,
+    OpenedSurfacesRequireList,
+    OpenedSurfacesForbidden,
+    OpenedSurfacesContradictEffect,
+    OpenedSurfaceInvalid,
 }
 
 impl std::fmt::Display for ActionResultValidationError {
@@ -1008,14 +1094,76 @@ impl std::fmt::Display for ActionResultValidationError {
             Self::FocusRestorationReasonRequiresAbandoned => {
                 "focus restoration reason requires abandoned status"
             }
+            Self::OpenedSurfacesRequireList => {
+                "observed requires a list and partial requires a non-empty list"
+            }
+            Self::OpenedSurfacesForbidden => {
+                "absent, unavailable, or not checked status cannot have a list"
+            }
+            Self::OpenedSurfacesContradictEffect => "opened surfaces contradict the action effect",
+            Self::OpenedSurfaceInvalid => "opened surface has invalid identity, target, or bounds",
         })
     }
 }
 
 impl std::error::Error for ActionResultValidationError {}
 
+/// Validate the shared surface observation contract for records and wire results.
+pub fn validate_opened_surfaces(
+    effect: ActionEffect,
+    status: Option<OpenedSurfacesStatus>,
+    surfaces: Option<&[OpenedSurface]>,
+) -> Result<(), ActionResultValidationError> {
+    use ActionResultValidationError as Error;
+    use OpenedSurfacesStatus as Status;
+    match status {
+        Some(Status::Observed) if surfaces.is_none() => {
+            return Err(Error::OpenedSurfacesRequireList)
+        }
+        Some(Status::Partial) if surfaces.is_none_or(|s| s.is_empty()) => {
+            return Err(Error::OpenedSurfacesRequireList)
+        }
+        None | Some(Status::Unavailable | Status::NotChecked) if surfaces.is_some() => {
+            return Err(Error::OpenedSurfacesForbidden)
+        }
+        _ => {}
+    }
+    if (effect == ActionEffect::Refused && !matches!(status, None | Some(Status::NotChecked)))
+        || (effect == ActionEffect::SuspectedNoop && surfaces.is_some_and(|s| !s.is_empty()))
+    {
+        return Err(Error::OpenedSurfacesContradictEffect);
+    }
+    for surface in surfaces.unwrap_or_default() {
+        if surface.owner_pid == Some(0)
+            || surface.window_id == Some(0)
+            || surface.target.as_ref().is_some_and(|t| {
+                t.pid == 0
+                    || t.window_id == 0
+                    || surface.owner_pid.is_some_and(|pid| pid != t.pid)
+                    || surface.window_id.is_some_and(|id| id != t.window_id)
+            })
+            || surface.bounds.as_ref().is_some_and(|b| {
+                !b.x.is_finite()
+                    || !b.y.is_finite()
+                    || !b.width.is_finite()
+                    || !b.height.is_finite()
+                    || b.width < 0.0
+                    || b.height < 0.0
+            })
+        {
+            return Err(Error::OpenedSurfaceInvalid);
+        }
+    }
+    Ok(())
+}
+
 impl ActionResult {
     pub fn validate_invariants(&self) -> Result<(), ActionResultValidationError> {
+        validate_opened_surfaces(
+            self.effect,
+            self.opened_surfaces_status,
+            self.opened_surfaces.as_deref(),
+        )?;
         if self
             .point
             .as_ref()
@@ -1183,9 +1331,173 @@ mod tests {
             selected_text: None,
             menu_opened: None,
             menu_items: None,
+            opened_surfaces: None,
+            opened_surfaces_status: None,
             point: None,
             hit: None,
         }
+    }
+
+    #[test]
+    fn opened_surfaces_observation_contract() {
+        let base = serde_json::to_value(confirmed_result()).unwrap();
+        let surface = json!({"kind":"menu", "owner_pid":7, "window_id":9,
+            "target":{"pid":7,"window_id":9},
+            "bounds":{"x":1.0,"y":2.0,"width":3.0,"height":4.0}, "title":"Menu"});
+        for (status, list, valid) in [
+            (Some("observed"), Some(vec![surface.clone()]), true),
+            (Some("observed"), Some(vec![]), true),
+            (Some("partial"), Some(vec![]), false),
+            (Some("partial"), Some(vec![surface.clone()]), true),
+            (Some("observed"), None, false),
+            (Some("partial"), None, false),
+            (Some("unavailable"), None, true),
+            (Some("unavailable"), Some(vec![]), false),
+            (Some("not_checked"), None, true),
+            (Some("not_checked"), Some(vec![]), false),
+            (Some("unavailable"), Some(vec![surface.clone()]), false),
+            (Some("not_checked"), Some(vec![surface.clone()]), false),
+            (None, None, true),
+            (None, Some(vec![surface.clone()]), false),
+        ] {
+            let mut value = base.clone();
+            if let Some(status) = status {
+                value["opened_surfaces_status"] = json!(status);
+            }
+            if let Some(list) = list {
+                value["opened_surfaces"] = json!(list);
+            }
+            let result: ActionResult = serde_json::from_value(value.clone()).unwrap();
+            assert_eq!(result.validate_invariants().is_ok(), valid, "{value}");
+            assert_eq!(serde_json::to_value(result).unwrap(), value);
+        }
+    }
+
+    #[test]
+    fn opened_surface_kinds_and_embedded_targets_round_trip() {
+        for kind in ["menu", "popover", "alert", "sheet", "unknown"] {
+            let surface: OpenedSurface = serde_json::from_value(json!({"kind": kind})).unwrap();
+            assert!(surface.target.is_none());
+            assert_eq!(
+                serde_json::to_value(surface).unwrap(),
+                json!({"kind": kind})
+            );
+        }
+        assert!(serde_json::from_value::<OpenedSurface>(json!({"kind":"dialog"})).is_err());
+        assert!(serde_json::from_value::<OpenedSurface>(
+            json!({"kind":"menu", "target":{"pid":7}})
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn opened_surfaces_reject_contradictions_and_invalid_details() {
+        let base = serde_json::to_value(confirmed_result()).unwrap();
+        let surface = json!({"kind":"menu", "owner_pid":7, "window_id":9,
+            "target":{"pid":7,"window_id":9},
+            "bounds":{"x":1.0,"y":2.0,"width":3.0,"height":4.0}});
+        let mut value = base.clone();
+        value["opened_surfaces_status"] = json!("partial");
+        value["opened_surfaces"] = json!([surface.clone()]);
+        for (path, invalid) in [
+            ("/opened_surfaces/0/owner_pid", json!(0)),
+            ("/opened_surfaces/0/window_id", json!(0)),
+            ("/opened_surfaces/0/target/pid", json!(8)),
+            ("/opened_surfaces/0/target/window_id", json!(10)),
+            ("/opened_surfaces/0/target/pid", json!(0)),
+            ("/opened_surfaces/0/target/window_id", json!(0)),
+            ("/opened_surfaces/0/bounds/width", json!(-1.0)),
+            ("/opened_surfaces/0/bounds/height", json!(-1.0)),
+        ] {
+            let mut invalid_value = value.clone();
+            *invalid_value.pointer_mut(path).unwrap() = invalid;
+            let result: ActionResult = serde_json::from_value(invalid_value).unwrap();
+            assert!(result.validate_invariants().is_err(), "{path}");
+        }
+        let mut refused = value.clone();
+        refused["effect"] = json!("refused");
+        refused.as_object_mut().unwrap().remove("delivery");
+        refused.as_object_mut().unwrap().remove("evidence");
+        assert!(serde_json::from_value::<ActionResult>(refused.clone())
+            .unwrap()
+            .validate_invariants()
+            .is_err());
+        refused["opened_surfaces_status"] = json!("observed");
+        refused["opened_surfaces"] = json!([]);
+        assert!(serde_json::from_value::<ActionResult>(refused.clone())
+            .unwrap()
+            .validate_invariants()
+            .is_err());
+        refused["opened_surfaces_status"] = json!("not_checked");
+        refused.as_object_mut().unwrap().remove("opened_surfaces");
+        assert!(serde_json::from_value::<ActionResult>(refused.clone())
+            .unwrap()
+            .validate_invariants()
+            .is_ok());
+        refused
+            .as_object_mut()
+            .unwrap()
+            .remove("opened_surfaces_status");
+        assert!(serde_json::from_value::<ActionResult>(refused)
+            .unwrap()
+            .validate_invariants()
+            .is_ok());
+        let mut noop = value;
+        noop["effect"] = json!("suspected_noop");
+        assert!(serde_json::from_value::<ActionResult>(noop)
+            .unwrap()
+            .validate_invariants()
+            .is_err());
+        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            for coordinate in 0..4 {
+                let mut result: ActionResult = serde_json::from_value(base.clone()).unwrap();
+                result.opened_surfaces_status = Some(OpenedSurfacesStatus::Partial);
+                let mut item: OpenedSurface = serde_json::from_value(surface.clone()).unwrap();
+                let bounds = item.bounds.as_mut().unwrap();
+                *match coordinate {
+                    0 => &mut bounds.x,
+                    1 => &mut bounds.y,
+                    2 => &mut bounds.width,
+                    _ => &mut bounds.height,
+                } = bad;
+                result.opened_surfaces = Some(vec![item]);
+                assert!(result.validate_invariants().is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn opened_surface_schema_is_closed_and_status_is_plain_enum() {
+        let schema = ActionResult::output_schema();
+        let status = &schema["properties"]["opened_surfaces_status"];
+        assert_eq!(status["type"], "string", "{status}");
+        assert_eq!(
+            status["enum"],
+            json!(["observed", "partial", "unavailable", "not_checked"])
+        );
+        let list = object_variant_or_array(&schema["properties"]["opened_surfaces"]);
+        let surface = &list["items"];
+        assert_eq!(surface["additionalProperties"], false);
+        assert_eq!(surface["properties"]["owner_pid"]["minimum"], 1);
+        assert_eq!(surface["properties"]["window_id"]["minimum"], 1);
+        let target = object_variant(&surface["properties"]["target"]);
+        assert_eq!(target["additionalProperties"], false);
+        assert_eq!(target["properties"]["pid"]["minimum"], 1);
+        assert_eq!(target["properties"]["window_id"]["minimum"], 1);
+        let bounds = object_variant(&surface["properties"]["bounds"]);
+        assert_eq!(bounds["additionalProperties"], false);
+    }
+
+    fn object_variant_or_array(schema: &Value) -> &Value {
+        if schema.get("items").is_some() {
+            return schema;
+        }
+        schema["anyOf"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|v| v.get("items").is_some())
+            .unwrap()
     }
 
     #[test]
@@ -1279,6 +1591,8 @@ mod tests {
                 "menu_opened",
                 "next_call",
                 "note",
+                "opened_surfaces",
+                "opened_surfaces_status",
                 "point",
                 "route",
                 "selected_text",
