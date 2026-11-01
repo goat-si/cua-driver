@@ -1115,10 +1115,6 @@ fn valid_chromium_native_submission(text: &str) -> bool {
 const DELIVERY_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 const DELIVERY_DRAIN_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(10);
 
-/// Pause before the single `AXFocused` re-apply in the foreground rung. Covers
-/// an app that installs its own first responder just after activation is
-/// observable, which would otherwise clobber the first write.
-
 /// Keyboard-rung policy for one window-addressed background insert, decided
 /// once by the pure exact-target core before any input is posted.
 #[derive(Clone, Debug)]
