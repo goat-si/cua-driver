@@ -56,6 +56,23 @@ where
     super::actionability::dispatch_semantic(clock, budget, context, probe, perform).await
 }
 
+pub(super) async fn dispatch_show_menu<C, P, A, F, T>(
+    _clock: &(impl cua_driver_core::actionability::Clock + Sync),
+    _budget: Duration,
+    _advertises_show_menu: bool,
+    context: C,
+    _probe: P,
+    perform: A,
+) -> Result<T, ToolResult>
+where
+    C: Sync,
+    P: for<'a> FnMut(&'a C, Duration) -> std::pin::Pin<Box<dyn std::future::Future<Output = cua_driver_core::actionability::ActionabilityReport> + Send + 'a>> + Send,
+    A: FnOnce(C) -> F,
+    F: std::future::Future<Output = T>,
+{
+    Ok(perform(context).await)
+}
+
 pub struct RightClickTool {
     state: Arc<ToolState>,
 }
@@ -345,9 +362,20 @@ impl RightClickTool {
                 Err(refusal_result) => return refusal_result,
             };
 
+            let action_guard = element_guard.clone();
+            let advertises_show_menu = match latency::spawn_blocking(move || unsafe {
+                copy_action_names(action_guard.as_ptr() as AXUIElementRef)
+                    .iter().any(|name| name == "AXShowMenu")
+            }).await {
+                Ok(advertises) => advertises,
+                Err(error) => return super::pre_dispatch_refusal("action_unavailable", format!("right_click: action resolution failed ({error}); nothing was sent.")),
+            };
+
             // The context menu steals key focus from the user's app when the
             // target is in the background; the guard hands it back.
-            let result = latency::spawn_blocking(move || -> anyhow::Result<_> {
+            let probe_target = element_guard.clone();
+            let clock = super::actionability::semantic_clock();
+            let perform = |mutation_lease| async move { latency::spawn_action_blocking(move || -> anyhow::Result<_> {
                 let _action = latency::span(latency::Stage::ActionBlocking);
                 let element_ptr = element_guard.as_ptr();
                 let input_watch = MenuInputWatch::start(pid);
@@ -360,7 +388,7 @@ impl RightClickTool {
                     unsafe {
                         AXUIElementSetMessagingTimeout(element, 0.25);
                     }
-                    let result = ax_show_menu(element_ptr, idx, pid, wid, dispatch);
+                    let result = ax_show_menu(element_ptr, idx, pid, wid, advertises_show_menu, dispatch);
                     unsafe {
                         AXUIElementSetMessagingTimeout(element, 0.0);
                     }
@@ -389,8 +417,21 @@ impl RightClickTool {
                     }
                 };
                 result.map(|delivery| (delivery, menu))
-            })
-            .await;
+            }).await };
+            let result = match dispatch_show_menu(
+                &clock,
+                cua_driver_core::actionability::DEFAULT_BUDGET,
+                advertises_show_menu,
+                mutation_lease,
+                |lease, _| super::actionability::semantic_probe(
+                    Some(lease), probe_target.clone(), pid, wid,
+                    super::actionability::semantic::SemanticIntent::RightClick,
+                ),
+                perform,
+            ).await {
+                Ok(result) => result,
+                Err(refusal) => return refusal,
+            };
 
             return match result {
                 Ok(Ok((ElementRightClick::Ax(msg), menu))) => right_click_result_with_ownership(
@@ -1568,14 +1609,13 @@ fn ax_show_menu(
     idx: usize,
     pid: i32,
     wid: u32,
+    advertises_show_menu: bool,
     dispatch: std::sync::mpsc::Sender<ActionEvent>,
 ) -> anyhow::Result<ElementRightClick> {
     let element = element_ptr as AXUIElementRef;
 
     let role = unsafe { copy_string_attr(element, "AXRole") }.unwrap_or_default();
     let title = unsafe { copy_string_attr(element, "AXTitle") }.unwrap_or_default();
-
-    let advertised = unsafe { copy_action_names(element) };
 
     // Only attempt the pure-AX AXShowMenu when the element actually advertises
     // it. Plain controls (NSButton, custom NSView click targets, most web
@@ -1590,7 +1630,7 @@ fn ax_show_menu(
     right_click_element(
         element,
         &format!("[{idx}] {role} \"{title}\""),
-        advertised.iter().any(|a| a == "AXShowMenu"),
+        advertises_show_menu,
         |target| {
             let _ = ax_dispatch.send(ActionEvent::Dispatching(Instant::now()));
             unsafe { perform_action(target, "AXShowMenu") }

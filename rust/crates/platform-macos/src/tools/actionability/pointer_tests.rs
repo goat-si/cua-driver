@@ -279,3 +279,32 @@ async fn double_click_axopen_gates_before_activation() {
         }
     }
 }
+
+#[tokio::test]
+async fn right_click_axshowmenu_refusal_blocks_dispatch() {
+    let clock = FakeClock::default();
+    for allowed in [false, true] {
+        let sent = AtomicUsize::new(0);
+        let sent_ref = &sent;
+        let result = super::super::right_click::dispatch_show_menu(
+            &clock,
+            Duration::ZERO,
+            true,
+            (),
+            |_, _| {
+                let mut f = facts();
+                f.enabled = Evidence::Known(allowed);
+                f.affordances = Evidence::Known(vec![Affordance::ShowMenu]);
+                f.advertised_actions = Evidence::Known(vec!["AXShowMenu".into()]);
+                let report = evaluate(Intent::RightClick, Policy::headless(), &f);
+                Box::pin(async move { report })
+            },
+            |_| async move {
+                sent_ref.fetch_add(1, Ordering::SeqCst);
+                success()
+            },
+        ).await;
+        assert_eq!(sent.load(Ordering::SeqCst), usize::from(allowed));
+        assert_eq!(result.is_ok(), allowed);
+    }
+}
