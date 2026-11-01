@@ -39,7 +39,10 @@ pub(super) enum CloseStatus {
 
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum PopupOutcome {
-    Refused(String),
+    Refused {
+        reason: String,
+        preexisting: bool,
+    },
     StoppedAfterOpen {
         reason: String,
         close: CloseStatus,
@@ -78,10 +81,24 @@ pub(super) fn tool_result(
         CloseStatus::Unconfirmed => "The menu may still be open; closure was not confirmed.",
     };
     match outcome {
-        PopupOutcome::Refused(reason) => super::super::pre_dispatch_refusal(
-            "popup_selection_refused",
-            format!("{reason}; no input was sent.{suffix}"),
-        ),
+        PopupOutcome::Refused {
+            reason,
+            preexisting,
+        } => {
+            let note = if *preexisting {
+                "Used a previously open menu."
+            } else {
+                ""
+            };
+            let mut result = super::super::pre_dispatch_refusal(
+                "popup_selection_refused",
+                format!("{reason}; no input was sent. {note}{suffix}"),
+            );
+            if let (true, Some(data)) = (*preexisting, &mut result.structured_content) {
+                data["note"] = serde_json::json!(note);
+            }
+            result
+        }
         PopupOutcome::StoppedAfterOpen { reason, close } => {
             let note = close_note(*close);
             ToolResult::error(format!("{reason}. {note}{suffix}")).with_structured(
@@ -108,7 +125,7 @@ pub(super) fn tool_result(
                 });
             }
             ToolResult::text(format!(
-                "Selected '{title}' via AX menu item AXPress. {note}{suffix}"
+                "Sent AXPress for '{title}'; selection is unverified. {note}{suffix}"
             ))
             .with_structured(structured)
         }
@@ -219,7 +236,12 @@ impl<E: PopupEnv> Drop for OwnedMenu<'_, E> {
 
 pub(super) fn select<E: PopupEnv>(env: &mut E, requested: &str) -> PopupOutcome {
     let (menu, owned) = match env.menu() {
-        MenuState::Unknown => return PopupOutcome::Refused("Menu state could not be read".into()),
+        MenuState::Unknown => {
+            return PopupOutcome::Refused {
+                reason: "Menu state could not be read".into(),
+                preexisting: false,
+            }
+        }
         MenuState::Open(menu) => (menu, false),
         MenuState::ClosedOrEmpty => {
             let t0 = env.now();
@@ -283,7 +305,10 @@ pub(super) fn select<E: PopupEnv>(env: &mut E, requested: &str) -> PopupOutcome 
             reason,
             close: close.unwrap_or(CloseStatus::Unconfirmed),
         },
-        Err(reason) => PopupOutcome::Refused(reason),
+        Err(reason) => PopupOutcome::Refused {
+            reason,
+            preexisting: true,
+        },
     }
 }
 
