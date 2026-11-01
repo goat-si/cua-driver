@@ -3817,6 +3817,14 @@ pub(crate) fn verify_assertion_requested(
     verify_read && !display_only && !full_output && query.is_none()
 }
 
+pub(crate) fn collapse_menus_for_request(
+    query: Option<&str>,
+    full_output: bool,
+    observation_only: bool,
+) -> bool {
+    query.is_none_or(|q| q.trim().is_empty()) && !full_output && !observation_only
+}
+
 /// Enable completeness assertion only for a trusted internal verify read.
 pub fn with_exhaustive_assertion<T>(enabled: bool, walk: impl FnOnce() -> T) -> T {
     struct Restore(bool);

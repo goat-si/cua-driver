@@ -582,9 +582,11 @@ impl Tool for GetWindowStateTool {
 
         // A model-facing read lists the menu bar's top-level titles only; a
         // query or full_output walks every menu as before.
-        let collapse_menus = query.as_deref().is_none_or(|q| q.trim().is_empty())
-            && !view.full_output
-            && !observation_only;
+        let collapse_menus = crate::ax::tree::collapse_menus_for_request(
+            query.as_deref(),
+            view.full_output,
+            observation_only,
+        );
         let assert_exhaustive = crate::ax::tree::verify_assertion_requested(
             verify_read,
             display_only,

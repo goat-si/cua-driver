@@ -582,6 +582,79 @@ pub(super) fn closed_menu_fixture() -> TreeWalkResult {
     collapsed_menu_fixture(Read::Known(false))
 }
 
+pub(super) fn expanded_scope_fixture(
+    parent_role: &str,
+    collapse: bool,
+    query: Option<&str>,
+    fail_child_enumeration: bool,
+) -> TreeWalkResult {
+    let mut script = vec![
+        step("timeout 1", Reply::Unit),
+        step(
+            "text 1 AXRole",
+            Reply::Text(Read::Known(parent_role.into())),
+        ),
+        step(
+            &format!("batch 1 {CONTENT}"),
+            Reply::Batch(Ok(content(Some("File")))),
+        ),
+        step("value 1", Reply::Value(Ok(None))),
+        step(
+            "actions 1",
+            Reply::Actions(Read::Known(vec!["AXPress".into()])),
+        ),
+        step(
+            &format!("batch 1 {CONTROL}"),
+            Reply::Batch(Ok(control_batch())),
+        ),
+        step("snapshot 1", Reply::Unit),
+    ];
+    if collapse && parent_role == "AXMenuBarItem" {
+        script.push(step("bool 1 AXSelected", Reply::Bool(Read::Known(true))));
+    }
+    script.extend([
+        step("children 1", Reply::Children(Read::Known(vec![2]))),
+        step("timeout 2", Reply::Unit),
+        step(
+            "text 2 AXRole",
+            Reply::Text(Read::Known("AXMenuItem".into())),
+        ),
+        step(
+            &format!("batch 2 {CONTENT}"),
+            Reply::Batch(Ok(content(Some("Open")))),
+        ),
+        step("value 2", Reply::Value(Ok(None))),
+        step(
+            "actions 2",
+            Reply::Actions(Read::Known(vec!["AXPress".into()])),
+        ),
+        step(
+            &format!("batch 2 {CONTROL}"),
+            Reply::Batch(Ok(control_batch())),
+        ),
+        step("snapshot 2", Reply::Unit),
+        step(
+            "children 2",
+            Reply::Children(if fail_child_enumeration {
+                Read::Unknown(super::super::tree_source::ReadFailure::Ax(
+                    kAXErrorCannotComplete,
+                ))
+            } else {
+                Read::Absent
+            }),
+        ),
+    ]);
+    let source = Fake::new(&[(1, 1, 1, &[2]), (2, 2, 2, &[])], script);
+    let root = source.handle(1);
+    let result = with_menus_collapsed(collapse, || {
+        run_fake(&source, &root, query, 10, WalkBudget::nodes_only(100), true)
+    });
+    drop(root);
+    source.assert_consumed();
+    source.assert_lifetimes(&[(1, 1), (2, 1)]);
+    result
+}
+
 pub(super) fn collapsed_menu_fixture(selection: Read<bool>) -> TreeWalkResult {
     let source = Fake::new(
         &[(1, 1, 1, &[2]), (2, 2, 2, &[])],

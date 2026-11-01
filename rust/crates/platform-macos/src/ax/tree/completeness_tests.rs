@@ -402,6 +402,61 @@ fn absent_menu_selection_stays_incomplete() {
     assert!(output.get("observation_scope_exclusions").is_none());
 }
 
+fn assert_menu_walked(tree: &TreeWalkResult) {
+    assert_eq!(tree.walk.nodes_visited, 2);
+    assert_eq!(tree.nodes[1].role, "AXMenuItem");
+    assert_eq!(tree.nodes[1].title.as_deref(), Some("Open"));
+    let mut output = json!({});
+    tree.walk.apply(&mut output);
+    assert!(output.get("observation_scope_exclusions").is_none());
+}
+
+#[test]
+fn open_menubar_menu_is_walked_and_counted() {
+    let tree = super::walker_seam_tests::expanded_scope_fixture("AXMenuBarItem", true, None, false);
+    assert_menu_walked(&tree);
+    assert!(!tree.nodes_skipped);
+}
+
+#[test]
+fn query_request_walks_closed_menus() {
+    let query = Some("Open");
+    let collapse = collapse_menus_for_request(query, false, false);
+    assert!(!collapse);
+    let tree =
+        super::walker_seam_tests::expanded_scope_fixture("AXMenuBarItem", collapse, query, false);
+    assert_menu_walked(&tree);
+    assert!(tree.tree_markdown.contains("Open"));
+}
+
+#[test]
+fn full_output_request_walks_closed_menus() {
+    let collapse = collapse_menus_for_request(None, true, false);
+    assert!(!collapse);
+    let tree =
+        super::walker_seam_tests::expanded_scope_fixture("AXMenuBarItem", collapse, None, false);
+    assert_menu_walked(&tree);
+}
+
+#[test]
+fn expanded_menu_request_counts_unread_items() {
+    let tree = super::walker_seam_tests::expanded_scope_fixture("AXMenuBarItem", false, None, true);
+    assert_menu_walked(&tree);
+    assert!(tree.nodes_skipped);
+    assert!(has_reason(
+        &tree,
+        "provider_failure",
+        "child_enumeration_failed"
+    ));
+}
+
+#[test]
+fn expanded_combobox_list_is_walked() {
+    let tree = super::walker_seam_tests::expanded_scope_fixture("AXComboBox", true, None, false);
+    assert_menu_walked(&tree);
+    assert!(!tree.nodes_skipped);
+}
+
 #[test]
 fn window_recovery_failure_never_asserts_complete() {
     use super::environment_evidence_tests::Scenario;
