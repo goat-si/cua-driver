@@ -18,6 +18,11 @@
 //!
 //! Adapters own fresh reads, target binding and settling. Nothing here performs
 //! I/O or upgrades an unbound observation into evidence.
+//! For already executed rungs, [`ChainResult::from_recorded`] preserves their
+//! outcomes and the adapter's assessment of earlier input via [`PriorInput`].
+//! The adapter must choose `MayHaveDelivered` for prior focus, caret, key, or
+//! other steps that ran, partly ran, or may have run, and `None` only when it
+//! can prove no input was sent. Core cannot verify that assessment.
 
 use cua_driver_contract::{ActionEffect, ErrorDisposition};
 use serde::{Deserialize, Serialize};
@@ -109,6 +114,21 @@ impl Reason {
 /// A lazy iterator of rung calls: requesting the next outcome executes that rung.
 pub struct WriteChain;
 
+/// The adapter's evidence about input before the recorded chain.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PriorInput {
+    None,
+    MayHaveDelivered,
+}
+
+/// Invalid sequences supplied to [`ChainResult::from_recorded`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RecordError {
+    Empty,
+    StepAfterTerminal,
+    RepeatedRetry,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ChainResult {
     outcomes: Vec<WriteOutcome>,
@@ -138,6 +158,39 @@ impl WriteChain {
 }
 
 impl ChainResult {
+    /// Build the result for one write chain whose rungs the adapter already executed, in order.
+    ///
+    /// The adapter is responsible for accurately reporting earlier input and
+    /// for ensuring retries are idempotent absolute sets of the same value.
+    pub fn from_recorded(
+        outcomes: Vec<WriteOutcome>,
+        prior: PriorInput,
+    ) -> Result<Self, RecordError> {
+        if outcomes.is_empty() {
+            return Err(RecordError::Empty);
+        }
+        if outcomes[..outcomes.len() - 1].iter().any(|outcome| {
+            !matches!(
+                outcome,
+                WriteOutcome::FallThrough(_) | WriteOutcome::RetryAfterUncertain(_)
+            )
+        }) {
+            return Err(RecordError::StepAfterTerminal);
+        }
+        if outcomes
+            .iter()
+            .filter(|outcome| matches!(outcome, WriteOutcome::RetryAfterUncertain(_)))
+            .count()
+            > 1
+        {
+            return Err(RecordError::RepeatedRetry);
+        }
+        Ok(Self {
+            outcomes,
+            side_effectful_prologue: prior == PriorInput::MayHaveDelivered,
+        })
+    }
+
     pub fn outcomes(&self) -> &[WriteOutcome] {
         &self.outcomes
     }
@@ -369,6 +422,123 @@ pub fn compare(expected: &Expected, observed: Observed<'_>, secure: bool) -> Pos
 mod tests {
     use super::*;
     use std::cell::Cell;
+
+    #[test]
+    fn last_chain_alone_loses_prior_delivery_evidence() {
+        let prior = WriteChain::run([WriteOutcome::Delivered], false);
+        assert!(!prior.no_input());
+        let last = WriteChain::run([WriteOutcome::StopNotDelivered(Reason::Disabled)], false);
+        assert!(last.no_input());
+        assert_eq!(
+            last.error_disposition(Postcondition::Confirmed, true),
+            Some(ErrorDisposition::NOT_DELIVERED)
+        );
+    }
+
+    #[test]
+    fn recorded_rejects_invalid_sequences() {
+        use WriteOutcome::*;
+        let fall = FallThrough(Reason::Unsupported);
+        let retry = RetryAfterUncertain(Reason::Failure);
+        assert_eq!(
+            ChainResult::from_recorded(vec![], PriorInput::None),
+            Err(RecordError::Empty)
+        );
+        for terminal in [
+            Delivered,
+            StopNotDelivered(Reason::Disabled),
+            StopUncertain(Reason::Timeout),
+        ] {
+            assert_eq!(
+                ChainResult::from_recorded(vec![terminal, fall], PriorInput::None),
+                Err(RecordError::StepAfterTerminal)
+            );
+        }
+        assert_eq!(
+            ChainResult::from_recorded(vec![retry, fall, retry], PriorInput::None),
+            Err(RecordError::RepeatedRetry)
+        );
+    }
+
+    #[test]
+    fn recorded_matches_run_for_enumerated_valid_sequences() {
+        use WriteOutcome::*;
+        let choices = [
+            FallThrough(Reason::Unsupported),
+            RetryAfterUncertain(Reason::Failure),
+            Delivered,
+            StopNotDelivered(Reason::Disabled),
+            StopUncertain(Reason::Timeout),
+        ];
+        for len in 1..=4u32 {
+            for mut code in 0..choices.len().pow(len) {
+                let mut seq = Vec::new();
+                for _ in 0..len {
+                    seq.push(choices[code % choices.len()]);
+                    code /= choices.len();
+                }
+                if seq[..seq.len() - 1]
+                    .iter()
+                    .any(|x| !matches!(x, FallThrough(_) | RetryAfterUncertain(_)))
+                    || seq
+                        .iter()
+                        .filter(|x| matches!(x, RetryAfterUncertain(_)))
+                        .count()
+                        > 1
+                {
+                    continue;
+                }
+                for (prior, prologue) in [
+                    (PriorInput::None, false),
+                    (PriorInput::MayHaveDelivered, true),
+                ] {
+                    assert_eq!(
+                        ChainResult::from_recorded(seq.clone(), prior).unwrap(),
+                        WriteChain::run(seq.clone(), prologue)
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn recorded_prior_input_stays_unsafe_through_finalization() {
+        for outcome in [
+            WriteOutcome::StopNotDelivered(Reason::Disabled),
+            WriteOutcome::FallThrough(Reason::Unsupported),
+        ] {
+            let chain =
+                ChainResult::from_recorded(vec![outcome], PriorInput::MayHaveDelivered).unwrap();
+            assert!(!chain.no_input());
+            assert_eq!(
+                chain.effect(Postcondition::Confirmed, true),
+                ActionEffect::Unverifiable
+            );
+            let disposition = chain
+                .error_disposition(Postcondition::Confirmed, true)
+                .unwrap();
+            assert_ne!(disposition, ErrorDisposition::NOT_DELIVERED);
+            let result = crate::mcp_result::finalize_error_disposition(
+                "click",
+                serde_json::json!({"isError": true, "structuredContent": {"effect": chain.effect(Postcondition::Confirmed, true), "disposition": disposition}}),
+            );
+            let final_disposition: ErrorDisposition =
+                serde_json::from_value(result["structuredContent"]["disposition"].clone()).unwrap();
+            assert_ne!(final_disposition, ErrorDisposition::NOT_DELIVERED);
+        }
+        let chain = ChainResult::from_recorded(
+            vec![
+                WriteOutcome::RetryAfterUncertain(Reason::Failure),
+                WriteOutcome::Delivered,
+            ],
+            PriorInput::None,
+        )
+        .unwrap();
+        assert_eq!(
+            chain.effect(Postcondition::Confirmed, true),
+            ActionEffect::Confirmed
+        );
+    }
 
     #[test]
     fn classifier_table_is_write_kind_sensitive() {

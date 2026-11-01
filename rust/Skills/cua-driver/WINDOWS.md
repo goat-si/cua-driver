@@ -370,6 +370,7 @@ When a cua-driver surprises you, diagnose cua-driver first:
   `get_window_state(pid, window_id)` and use `element_token` so the
   daemon can invoke the cached UIA element by identity instead of by
   point.
+- **`process_instance_mismatch` / `process_instance_unverified`?** Stop the action and take a fresh `get_window_state`; do not automatically retry or refind the old target.
 - **`stale_element_token` / `No cached UIA state`?** You either
   skipped `get_window_state` this turn or used a token from an older
   snapshot. Snapshots are keyed on `(pid, window_id)`: tokens don't carry across windows of

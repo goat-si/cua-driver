@@ -417,6 +417,7 @@ mod tests {
     ) -> AXNode {
         AXNode {
             owned_row_label: None,
+            canonical: Default::default(),
             element_index: index,
             role: role.into(),
             title: Some(title.into()),

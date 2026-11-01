@@ -271,6 +271,8 @@ pub fn stale(d: &mut dyn Driver, f: &mut dyn ConformanceFixture) -> ContractOutc
             // the contract requires a well-formed pair that never claims
             // delivery, and the dispatch counter proves nothing was sent.
             let delivery = r.structured()["disposition"]["delivery"].clone();
+            // Replaced snapshots are checked before process identity. An
+            // instance refusal here is terminal, not a passing stale probe.
             let valid = check_response(&r, &["stale_element_token"])
                 && disposition(&r)
                 && delivery != json!("delivered_unverified")

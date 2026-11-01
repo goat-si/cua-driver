@@ -50,6 +50,7 @@ impl Drop for Handle {
 #[derive(Clone)]
 enum Slot {
     Text(AttrStatus),
+    MixedText(String),
     Bool(Option<bool>),
     Number(Option<f64>),
     Point(Option<(f64, f64)>),
@@ -60,18 +61,24 @@ impl TreeBatch for Batch {
     fn text(&self, i: usize) -> AttrStatus {
         match &self.0[i] {
             Slot::Text(v) => v.clone(),
+            Slot::MixedText(v) => AttrStatus::Known(v.clone()),
             _ => panic!("wrong text slot"),
         }
     }
     fn boolean(&self, i: usize) -> Read<bool> {
         match self.0[i] {
             Slot::Bool(v) => read(v),
+            Slot::MixedText(_) => Read::Unknown(super::super::tree_source::ReadFailure::WrongType),
             _ => panic!("wrong bool slot"),
         }
     }
     fn number(&self, i: usize) -> Read<f64> {
         match self.0[i] {
             Slot::Number(v) => read(v),
+            Slot::Bool(None) => Read::Absent,
+            Slot::Bool(Some(_)) | Slot::MixedText(_) => {
+                Read::Unknown(super::super::tree_source::ReadFailure::WrongType)
+            }
             _ => panic!("wrong number slot"),
         }
     }
@@ -164,6 +171,16 @@ impl AxTreeSource for Fake {
     fn set_messaging_timeout(&self, e: &Handle) {
         assert!(matches!(
             self.step(format!("timeout {}", e.id)),
+            Reply::Unit
+        ));
+    }
+    fn set_optional_timeout(&self, e: &Handle, seconds: f32) {
+        assert!(matches!(
+            self.step(format!(
+                "optional_timeout {} {}",
+                e.id,
+                if seconds == 0.0 { "reset" } else { "set" }
+            )),
             Reply::Unit
         ));
     }
@@ -261,9 +278,15 @@ impl AxTreeSource for Fake {
             _ => panic!("wrong reply"),
         }
     }
-    fn value_settable(&self, e: &Handle) -> bool {
+    fn value_settable(&self, e: &Handle) -> Settable {
         match self.step(format!("value_settable {}", e.id)) {
-            Reply::Writable(v) => v,
+            Reply::Writable(v) => {
+                if v {
+                    Settable::Yes
+                } else {
+                    Settable::No
+                }
+            }
             _ => panic!("wrong reply"),
         }
     }
@@ -1846,7 +1869,7 @@ fn large_container_reads_surface_clip_lazily_once() {
 // Baseline 36279fdc: vertical then horizontal element/role/value reads are
 // released immediately; an invalid scrollbar role suppresses its value read.
 #[test]
-fn scroll_area_preserves_position_labels_and_read_order() {
+pub(crate) fn scroll_area_preserves_position_labels_and_read_order() {
     for exhaustive in [false, true] {
         let mut attrs = content(Some("Scroll"));
         attrs.0[2] = Slot::Text(AttrStatus::Known("Pane".into()));
@@ -1913,6 +1936,8 @@ fn scroll_area_preserves_position_labels_and_read_order() {
         let result = with_exhaustive_nodes(exhaustive, || {
             run_fake(&source, &root, None, 10, WalkBudget::nodes_only(10), true)
         });
+        assert!(result.nodes[0].canonical.role_read);
+        assert!(result.nodes[0].canonical.copied_value.is_none());
         drop(root);
         source.assert_consumed();
         source.assert_lifetimes(&[(1, 1)]);
@@ -2125,4 +2150,229 @@ fn nested_walks_restore_thread_local_state() {
     assert_eq!(source.trace(), ["adopt 1", "timeout 1", "text 1 AXRole", "batch 1 AXTitle,AXPlaceholderValue,AXDescription,AXIdentifier,AXHelp,AXSubrole,AXRoleDescription", "value 1", "actions 1", "batch 1 AXPosition,AXSize", "children 1", "release 1"]);
     assert!(WALK_SKIPPED.with(std::cell::Cell::get));
     assert!(enclosing.finish());
+}
+
+// Shared fake-only production walker entry for canonical-output regression tests.
+pub(crate) fn canonical_test_node(secure: bool, enabled: Option<bool>) -> (AXNode, Vec<String>) {
+    let role = if secure { "AXTextField" } else { "AXButton" };
+    let mut attrs = content(Some("Example"));
+    if secure {
+        attrs.0[5] = Slot::Text(AttrStatus::Known("AXSecureTextField".into()));
+    }
+    let mut controls = control_batch();
+    controls.0[0] = Slot::Bool(enabled);
+    let mut steps = vec![
+        step("timeout 1", Reply::Unit),
+        step("text 1 AXRole", Reply::Text(Read::Known(role.into()))),
+        step(&format!("batch 1 {CONTENT}"), Reply::Batch(Ok(attrs))),
+    ];
+    if !secure {
+        steps.push(step("value 1", Reply::Value(Ok(None))));
+    }
+    steps.push(step(
+        "actions 1",
+        Reply::Actions(Read::Known(vec!["AXPress".into()])),
+    ));
+    steps.push(step(
+        &format!("batch 1 {CONTROL}"),
+        Reply::Batch(Ok(controls)),
+    ));
+    steps.push(step("snapshot 1", Reply::Unit));
+    steps.push(step("children 1", Reply::Children(Read::Absent)));
+    let source = Fake::new(&[(1, 1, 1, &[])], steps);
+    let root = source.handle(1);
+    let result = run_fake(&source, &root, None, 10, WalkBudget::nodes_only(10), true);
+    drop(root);
+    source.assert_consumed();
+    source.assert_lifetimes(&[(1, 1)]);
+    (result.nodes.into_iter().next().unwrap(), source.trace())
+}
+
+/// Exercise the same post-walk collector used by the native output path.
+pub(crate) fn canonical_metadata_fixture(
+    role: &str,
+    mode: &str,
+) -> (super::super::vocabulary::CanonicalEvidence, Vec<String>) {
+    use super::super::vocabulary::{collect_state_evidence, CanonicalEvidence};
+    let names = "AXExpanded,AXRequired,AXInvalid,AXEditable,AXElementBusy,AXModal,AXMultiSelectable,AXPopupValue";
+    let mut steps = Vec::new();
+    if mode != "before" && mode != "reuse_late" {
+        steps.push(step("optional_timeout 1 set", Reply::Unit));
+        let reply = if mode == "failure" {
+            Err(BatchFailure::WholeCall(kAXErrorCannotComplete))
+        } else {
+            let mut slots = vec![Slot::Bool(None); 8];
+            if mode == "mixed" {
+                slots[2] = Slot::MixedText("grammar".into());
+                slots[7] = Slot::MixedText("menu".into());
+            } else if mode == "numeric" {
+                slots[0] = Slot::Number(Some(2.0));
+                slots[1] = Slot::Number(Some(1.0));
+            }
+            Ok(Batch(slots))
+        };
+        steps.push(step(&format!("batch 1 {names}"), Reply::Batch(reply)));
+        if role == "AXTextField" && mode != "late" && mode != "reuse" {
+            steps.push(step("optional_timeout 1 set", Reply::Unit));
+            steps.push(step("value_settable 1", Reply::Writable(false)));
+        }
+        steps.push(step("optional_timeout 1 reset", Reply::Unit));
+    }
+    let source = Fake::new(&[(1, 1, 1, &[])], steps);
+    let root = source.handle(1);
+    let start = std::time::Instant::now();
+    let deadline = start + std::time::Duration::from_secs(1);
+    let mut calls = 0;
+    let mut evidence = CanonicalEvidence::default();
+    if mode == "reuse" || mode == "reuse_late" {
+        evidence.states.value_settable = super::super::vocabulary::Observation::Known(Settable::No);
+        if mode == "reuse_late" {
+            evidence.value_settable_observed_at = Some(deadline);
+        }
+    }
+    collect_state_evidence(&source, &root, role, &mut evidence, deadline, || {
+        calls += 1;
+        if mode == "before"
+            || mode == "reuse_late"
+            || (mode == "late" && calls >= 3)
+            || (mode == "late_settable" && calls >= 6)
+        {
+            deadline
+        } else {
+            start
+        }
+    });
+    drop(root);
+    source.assert_consumed();
+    (evidence, source.trace())
+}
+
+pub(crate) fn canonical_walk_fixture(case: &str) -> (TreeWalkResult, Vec<String>) {
+    use super::super::content_attrs::AttributeListing;
+    let role = match case {
+        "role_failure" => None,
+        "role_unknown" => Some("AXUnknown"),
+        "secure" | "classification_failure" | "display" => Some("AXTextField"),
+        "u25" => Some("AXTextArea"),
+        "placeholder" | "copied" => Some("AXCheckBox"),
+        _ => Some("AXButton"),
+    };
+    let mut attrs = content(Some("Example"));
+    match case {
+        "secure" => attrs.0[5] = Slot::Text(AttrStatus::Known("AXSecureTextField".into())),
+        "classification_failure" => {
+            attrs.0[5] = Slot::Text(super::super::content_attrs::FAILED_TEST)
+        }
+        "placeholder" => attrs.0[1] = Slot::Text(AttrStatus::Known("1".into())),
+        "u25" => {
+            for i in [2, 3] {
+                attrs.0[i] = Slot::Text(AttrStatus::Failed {
+                    error: kAXErrorFailure,
+                    listed: AttributeListing::Listed,
+                });
+            }
+            attrs.0[6] = Slot::Text(AttrStatus::Known("text entry area".into()));
+        }
+        _ => (),
+    }
+    let role_reply = role.map_or(
+        Read::Unknown(super::super::tree_source::ReadFailure::WrongType),
+        |role| Read::Known(role.into()),
+    );
+    let mut steps = vec![
+        step("timeout 1", Reply::Unit),
+        step("text 1 AXRole", Reply::Text(role_reply)),
+    ];
+    if case == "u25" {
+        steps.push(step(
+            &format!("batch 1 {CONTENT}"),
+            Reply::Batch(Err(BatchFailure::WholeCall(kAXErrorAttributeUnsupported))),
+        ));
+        for (index, name) in CONTENT.split(',').enumerate() {
+            let Slot::Text(status) = attrs.0[index].clone() else {
+                unreachable!()
+            };
+            steps.push(step(&format!("status 1 {name}"), Reply::Status(status)));
+        }
+    } else {
+        steps.push(step(&format!("batch 1 {CONTENT}"), Reply::Batch(Ok(attrs))));
+    }
+    if !matches!(
+        case,
+        "role_failure" | "role_unknown" | "secure" | "classification_failure"
+    ) {
+        steps.push(step(
+            "value 1",
+            if case == "copied" {
+                str_value("1")
+            } else {
+                Reply::Value(Ok(None))
+            },
+        ));
+    }
+    steps.push(step(
+        "actions 1",
+        Reply::Actions(Read::Known(vec!["AXPress".into()])),
+    ));
+    if case == "u25" {
+        steps.extend([
+            step("bool 1 AXEnabled", Reply::Bool(Read::Absent)),
+            step("position 1", Reply::Point(Read::Absent)),
+            step("text 1 AXValueDescription", Reply::Text(Read::Absent)),
+            step("number 1 AXMinValue", Reply::Number(Read::Absent)),
+            step("number 1 AXMaxValue", Reply::Number(Read::Absent)),
+            step("bool 1 AXSelected", Reply::Bool(Read::Absent)),
+        ]);
+    } else {
+        steps.push(step(
+            &format!("batch 1 {CONTROL}"),
+            Reply::Batch(Ok(control_batch())),
+        ));
+    }
+    steps.push(step("snapshot 1", Reply::Unit));
+    steps.push(step("children 1", Reply::Children(Read::Absent)));
+    let source = Fake::new(&[(1, 1, 1, &[])], steps);
+    let root = source.handle(1);
+    let result = run_fake(&source, &root, None, 10, WalkBudget::nodes_only(10), true);
+    drop(root);
+    source.assert_consumed();
+    source.assert_lifetimes(&[(1, 1)]);
+    (result, source.trace())
+}
+
+pub(crate) fn canonical_folded_row_fixture() -> TreeWalkResult {
+    row_fixture(false, false).0
+}
+
+pub(crate) fn canonical_deferred_fixture() -> TreeWalkResult {
+    dense_case(false, false).0
+}
+
+/// Walker, post-walk collection and output tests share one node, without AX.
+pub(crate) fn canonical_walk_and_collect() -> (AXNode, Vec<String>) {
+    let (tree, _) = canonical_walk_fixture("button");
+    let mut node = tree.nodes.into_iter().next().unwrap();
+    let names = "AXExpanded,AXRequired,AXInvalid,AXEditable,AXElementBusy,AXModal,AXMultiSelectable,AXPopupValue";
+    let mut slots = vec![Slot::Bool(None); 8];
+    slots[1] = Slot::Bool(Some(true));
+    let source = Fake::new(
+        &[(1, 1, 1, &[])],
+        vec![
+            step("optional_timeout 1 set", Reply::Unit),
+            step(&format!("batch 1 {names}"), Reply::Batch(Ok(Batch(slots)))),
+            step("optional_timeout 1 reset", Reply::Unit),
+        ],
+    );
+    let root = source.handle(1);
+    let start = std::time::Instant::now();
+    super::super::vocabulary::collect_node_state_evidence(
+        &source,
+        &root,
+        &mut node,
+        start + std::time::Duration::from_secs(1),
+        || start,
+    );
+    drop(root);
+    source.assert_consumed();
+    (node, source.trace())
 }

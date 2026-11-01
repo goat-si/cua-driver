@@ -627,7 +627,7 @@ impl Tool for GetWindowStateTool {
                     let payload = crate::ax::snapshot::AxSnapshot::from_nodes(&tree.nodes);
                     return (tree, payload, std::collections::HashMap::new());
                 }
-                let tree = crate::ax::tree::with_menus_collapsed(collapse_menus, || {
+                let mut tree = crate::ax::tree::with_menus_collapsed(collapse_menus, || {
                     crate::ax::dense_rows::with_dense_rows_windowed(window_dense_rows, || {
                         crate::ax::tree::with_exhaustive_nodes(verify_read, || {
                             crate::ax::tree::walk_tree_budgeted(
@@ -643,6 +643,10 @@ impl Tool for GetWindowStateTool {
                 HUNG_TARGET_BREAKER.record_outcome(target_key, &tree.walk);
                 let payload = crate::ax::snapshot::AxSnapshot::from_nodes(&tree.nodes);
                 let selection = selection_observation_for_nodes(pid, &tree.nodes, shared_deadline);
+                crate::ax::vocabulary::collect_native_state_evidence(
+                    &mut tree.nodes,
+                    shared_deadline,
+                );
                 (tree, payload, selection)
             });
             // A launching app is waited on for up to `timeout_ms` before the
@@ -1691,6 +1695,22 @@ pub(crate) fn element_entry(
     if let Some(selected) = selected {
         entry["selected"] = serde_json::Value::Bool(selected);
     }
+    if let Some(role) = crate::ax::vocabulary::canonical_role(
+        node.canonical.role_read.then_some(node.role.as_str()),
+        &node.canonical.subrole,
+        node.in_web_content,
+    ) {
+        entry["role_canonical"] = serde_json::json!(role);
+    }
+    if let Some(states) = crate::ax::vocabulary::canonical_states(
+        &node.role,
+        &node.canonical,
+        node.enabled,
+        selected,
+        false,
+    ) {
+        entry["states"] = serde_json::json!(states);
+    }
     if !node.actions.is_empty() {
         let actions: Vec<&str> = node
             .actions
@@ -1794,6 +1814,16 @@ fn apply_selection_observation(
                 (entry.as_object_mut(), observation.as_object())
             {
                 entry.extend(observation.clone());
+                if observation.get("focused").and_then(Value::as_bool) == Some(true) {
+                    let states = entry
+                        .entry("states")
+                        .or_insert_with(|| serde_json::json!([]));
+                    if let Some(states) = states.as_array_mut() {
+                        if !states.iter().any(|state| state == "focused") {
+                            states.insert(0, serde_json::json!("focused"));
+                        }
+                    }
+                }
             }
         }
     }
@@ -2354,6 +2384,7 @@ mod tests {
     ) -> AXNode {
         AXNode {
             owned_row_label: None,
+            canonical: Default::default(),
             element_index: idx,
             role: role.into(),
             title: title.map(|s| s.to_string()),
@@ -3041,5 +3072,195 @@ mod row_label_tests {
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0]["element_index"], 4);
         assert_eq!(entries[0]["label"], "Applications");
+    }
+}
+
+#[cfg(test)]
+mod canonical_output_tests {
+    use super::*;
+
+    #[test]
+    fn ordinary_button_emits_canonical_role() {
+        let (node, _) = crate::ax::tree::canonical_test_node(false, None);
+        let entry = element_entry(&node, None, None);
+        assert_eq!(entry["role_canonical"], "button");
+    }
+
+    #[test]
+    fn disabled_control_emits_disabled_state() {
+        let (node, _) = crate::ax::tree::canonical_test_node(false, Some(false));
+        let entry = element_entry(&node, None, None);
+        assert_eq!(entry["states"], serde_json::json!(["disabled"]));
+    }
+
+    #[test]
+    fn secure_field_emits_secure_without_value_request() {
+        let (node, trace) = crate::ax::tree::canonical_test_node(true, None);
+        assert!(!trace.iter().any(|item| item == "value 1"));
+        let entry = element_entry(&node, None, None);
+        assert_eq!(entry["states"], serde_json::json!(["secure"]));
+    }
+
+    #[test]
+    fn focused_observation_reaches_states_after_merge() {
+        let (node, _) = crate::ax::tree::canonical_test_node(false, None);
+        let mut elements = build_elements_array_with_token(&[node], None);
+        apply_selection_observation(
+            &mut elements,
+            &[(0, serde_json::json!({"focused": true}))].into(),
+        );
+        assert_eq!(elements[0]["states"], serde_json::json!(["focused"]));
+    }
+
+    #[test]
+    fn omission_empty_and_existing_json_compatibility() {
+        let (mut node, _) = crate::ax::tree::canonical_test_node(false, None);
+        let mut entry = element_entry(&node, None, None);
+        assert_eq!(entry["states"], serde_json::json!([]));
+        entry.as_object_mut().unwrap().remove("role_canonical");
+        entry.as_object_mut().unwrap().remove("states");
+        assert_eq!(
+            entry,
+            serde_json::json!({"role":"AXButton", "depth":0, "element_index":0, "label":"Example", "actions":["AXPress"]})
+        );
+        node.canonical = Default::default();
+        let entry = element_entry(&node, None, None);
+        assert!(entry.get("states").is_none());
+        assert!(entry.get("role_canonical").is_none());
+    }
+
+    #[test]
+    fn batch_and_settable_are_each_called_at_most_once() {
+        let (node, trace) = crate::ax::tree::canonical_walk_and_collect();
+        let entry = element_entry(&node, None, None);
+        assert_eq!(entry["role_canonical"], "button");
+        assert_eq!(entry["states"], serde_json::json!(["required"]));
+        assert_eq!(trace.iter().filter(|s| s.starts_with("batch ")).count(), 1);
+        let (_, trace) = crate::ax::tree::canonical_metadata_fixture("AXTextField", "ok");
+        assert_eq!(trace.iter().filter(|s| s.starts_with("batch ")).count(), 1);
+        assert_eq!(
+            trace
+                .iter()
+                .filter(|s| s.starts_with("value_settable "))
+                .count(),
+            1
+        );
+        assert!(!trace.iter().any(|s| s.starts_with("value ")));
+        let (e, trace) = crate::ax::tree::canonical_metadata_fixture("AXButton", "failure");
+        assert_eq!(trace.iter().filter(|s| s.starts_with("batch ")).count(), 1);
+        assert!(matches!(
+            e.states.attributes[0],
+            crate::ax::vocabulary::Observation::Failed(_)
+        ));
+        assert!(!trace.iter().any(|s| s.starts_with("value_settable ")));
+        let (_, trace) = crate::ax::tree::canonical_metadata_fixture("AXTextField", "reuse");
+        assert!(!trace.iter().any(|s| s.starts_with("value_settable ")));
+        let (e, _) = crate::ax::tree::canonical_metadata_fixture("AXButton", "mixed");
+        let states =
+            crate::ax::vocabulary::canonical_states("AXButton", &e, None, None, false).unwrap();
+        assert_eq!(
+            states,
+            vec![
+                cua_driver_contract::State::Invalid,
+                cua_driver_contract::State::Haspopup
+            ]
+        );
+        let (e, _) = crate::ax::tree::canonical_metadata_fixture("AXButton", "numeric");
+        assert!(matches!(
+            e.states.attributes[0],
+            crate::ax::vocabulary::Observation::WrongType
+        ));
+        assert_eq!(
+            crate::ax::vocabulary::canonical_states("AXButton", &e, None, None, false),
+            Some(vec![cua_driver_contract::State::Required])
+        );
+        let (e, trace) =
+            crate::ax::tree::canonical_metadata_fixture("AXTextField", "late_settable");
+        assert_eq!(
+            trace
+                .iter()
+                .filter(|s| s.starts_with("value_settable "))
+                .count(),
+            1
+        );
+        assert!(matches!(
+            e.states.value_settable,
+            crate::ax::vocabulary::Observation::Expired
+        ));
+    }
+
+    #[test]
+    fn no_metadata_read_after_deadline() {
+        let (e, trace) = crate::ax::tree::canonical_metadata_fixture("AXTextField", "before");
+        assert!(!trace
+            .iter()
+            .any(|s| s.starts_with("batch ") || s.starts_with("value_settable ")));
+        assert!(matches!(
+            e.states.attributes[0],
+            crate::ax::vocabulary::Observation::Expired
+        ));
+        let (e, _) = crate::ax::tree::canonical_metadata_fixture("AXTextField", "reuse_late");
+        assert!(matches!(
+            e.states.value_settable,
+            crate::ax::vocabulary::Observation::Expired
+        ));
+    }
+
+    #[test]
+    fn late_batch_is_discarded_and_query_projection_is_preserved() {
+        let (e, trace) = crate::ax::tree::canonical_metadata_fixture("AXTextField", "late");
+        assert_eq!(trace.iter().filter(|s| s.starts_with("batch ")).count(), 1);
+        assert!(!trace.iter().any(|s| s.starts_with("value_settable ")));
+        assert!(matches!(
+            e.states.attributes[0],
+            crate::ax::vocabulary::Observation::Expired
+        ));
+        let (node, _) = crate::ax::tree::canonical_test_node(false, None);
+        let entries = build_elements_array_with_token(&[node], None);
+        let projected = cua_driver_core::element_query::project_elements_for_query(
+            entries.clone(),
+            Some("Example"),
+            "- [0] AXButton \"Example\"\n",
+        );
+        assert_eq!(projected, entries);
+
+        use cua_driver_core::window_state_view::{apply, ViewContext, ViewKey, ViewOptions};
+        let md = "- [0] AXButton \"Example\"\n";
+        let ctx = ViewContext {
+            pid: 91811,
+            window_id: 81811,
+            key: ViewKey {
+                query: None,
+                max_elements: 100,
+                max_depth: None,
+            },
+            focus_probe: None,
+        };
+        let first_id = "s34ab1801";
+        let second_id = "s34ab1802";
+        let mut first = serde_json::json!({"window_id":81811,"pid":91811,"snapshot_id":first_id,"tree_markdown":md,"elements":entries});
+        apply(
+            &ViewOptions::from_args(&serde_json::json!({"tree_format":"elements"})).unwrap(),
+            &ctx,
+            &mut [],
+            &mut first,
+        );
+        let mut changed = projected;
+        changed[0]["states"] = serde_json::json!(["disabled"]);
+        let mut second = serde_json::json!({"window_id":81811,"pid":91811,"snapshot_id":second_id,"tree_markdown":md,"elements":changed});
+        apply(
+            &ViewOptions::from_args(
+                &serde_json::json!({"since":first_id,"tree_format":"elements"}),
+            )
+            .unwrap(),
+            &ctx,
+            &mut [],
+            &mut second,
+        );
+        assert_eq!(second["since_status"], "no_change");
+        assert_eq!(
+            second["elements"][0]["states"],
+            serde_json::json!(["disabled"])
+        );
     }
 }

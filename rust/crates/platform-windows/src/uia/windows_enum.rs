@@ -636,15 +636,15 @@ fn try_invoke_in_window_at_point_unbounded(
 #[derive(Debug)]
 pub(crate) struct AcceleratorStop {
     pub verdict: crate::uia_mutation::AccelStop,
-    pub hresult: i32,
+    pub hresult: Option<i32>,
 }
 impl std::fmt::Display for AcceleratorStop {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "accelerator UIA write stopped: {:?} (HRESULT 0x{:08X})",
-            self.verdict, self.hresult as u32
-        )
+        write!(f, "accelerator UIA write stopped: {:?}", self.verdict)?;
+        if let Some(hr) = self.hresult {
+            write!(f, " (HRESULT 0x{:08X})", hr as u32)?;
+        }
+        Ok(())
     }
 }
 impl std::error::Error for AcceleratorStop {}
@@ -664,27 +664,27 @@ pub fn try_invoke_accelerator_in_window(hwnd: isize, combo: &str) -> anyhow::Res
             verdict: crate::uia_mutation::AccelStop::NotSent(
                 "another UI Automation operation is still running",
             ),
-            hresult: 0,
+            hresult: None,
         })),
         // The worker thread could not be spawned, so nothing ran.
         UiaDeadlineError::Unavailable => Err(anyhow::Error::new(AcceleratorStop {
             verdict: crate::uia_mutation::AccelStop::NotSent(
                 "the UI Automation worker could not be started",
             ),
-            hresult: 0,
+            hresult: None,
         })),
         UiaDeadlineError::Timeout => Err(anyhow::Error::new(AcceleratorStop {
             verdict: crate::uia_mutation::AccelStop::Uncertain(
                 crate::uia_mutation::UncertainKind::Timeout,
             ),
-            hresult: 0x8013_1505_u32 as i32,
+            hresult: None,
         })),
         // The worker ended without reporting; it may have sent the invoke.
         UiaDeadlineError::WorkerDisconnected => Err(anyhow::Error::new(AcceleratorStop {
             verdict: crate::uia_mutation::AccelStop::Uncertain(
                 crate::uia_mutation::UncertainKind::Unclassified,
             ),
-            hresult: 0x8000_FFFF_u32 as i32,
+            hresult: None,
         })),
     })
 }
@@ -785,7 +785,7 @@ fn try_invoke_accelerator_in_window_unbounded(
             match accelerator_scan(std::iter::once(try_invoke_via_patterns(&elem, hwnd, cancelled))) {
                 AccelOutcome::Delivered => return Ok((true, count as usize)),
                 AccelOutcome::Absent => matched_failure = Some(format!("matched AcceleratorKey `{accelerator}`, but the element exposes neither InvokePattern nor TogglePattern")),
-                AccelOutcome::Stop(verdict, hresult) => return Err(anyhow::Error::new(AcceleratorStop { verdict, hresult })),
+                AccelOutcome::Stop(verdict, hresult) => return Err(anyhow::Error::new(AcceleratorStop { verdict, hresult: Some(hresult) })),
             }
         }
 
@@ -1424,5 +1424,19 @@ fn point_shape_chain_unbounded(sx: i32, sy: i32) -> Option<PointShapeChain> {
         };
         let rects = elements.iter().map(rect_of).collect();
         Some((chain, rects, in_document))
+    }
+}
+
+#[cfg(test)]
+mod accelerator_stop_display_tests {
+    #[test]
+    fn absent_hresult_is_not_printed() {
+        let stop = super::AcceleratorStop {
+            verdict: crate::uia_mutation::AccelStop::Uncertain(
+                crate::uia_mutation::UncertainKind::Timeout,
+            ),
+            hresult: None,
+        };
+        assert!(!stop.to_string().contains("HRESULT"));
     }
 }

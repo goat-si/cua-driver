@@ -170,7 +170,8 @@ impl Tool for RunStepsTool {
                 foreground_not_allowed; a refused step sends nothing (effect \"refused\"). All steps are \
                 validated before the first runs. Element tokens come from a read before the batch and a step \
                 that reshuffles the window can stale later ones: put token steps first, or target later steps by \
-                role/name. A stale token is retried once on the single element with the same role and label.\n\
+                role/name. A stale token is retried once on the single element with the same role and label. \
+                On unprotected snapshots this refind carries a PID-reuse risk until the platform publishes protected snapshots.\n\
                 \n\
                 Result: per-step status (`ok` or the error) and, with `observe`, one bounded get_window_state \
                 read after the last executed step, a `since:\"latest\"` diff by default (a dialog that took \
@@ -1096,13 +1097,12 @@ impl Plan {
                         outcome.ok = false;
                         outcome.report["ok"] = json!(false);
                         outcome.report["phase"] = json!("find");
-                        outcome.report["message"] =
-                            json!("a read this step needed was refused by the batch scope");
+                        outcome.report["message"] = json!("a read this step needed was refused");
                         outcome.line = format!(
-                        "{}. {} ERROR (find): a read this step needed was refused by the batch scope ({code})",
-                        index + 1,
-                        outcome.report["tool"].as_str().unwrap_or("step")
-                    );
+                            "{}. {} ERROR (find): a read this step needed was refused ({code})",
+                            index + 1,
+                            outcome.report["tool"].as_str().unwrap_or("step")
+                        );
                     }
                     // An action that already ran keeps the effect it returned.
                     outcome.report["code"] = json!(code);
@@ -1233,6 +1233,8 @@ impl Plan {
             [
                 crate::batch_scope::OUTSIDE_SCOPE,
                 crate::batch_scope::FOREGROUND_NOT_ALLOWED,
+                "process_instance_mismatch",
+                "process_instance_unverified",
             ]
             .into_iter()
             .find(|known| *known == code)
@@ -1240,8 +1242,7 @@ impl Plan {
         let observe = if scope_refused.is_some() {
             if observe.is_some() {
                 lines.push(
-                    "observation skipped: the batch stopped at a call its app scope refused"
-                        .to_owned(),
+                    "observation skipped: the batch stopped at a terminal refusal".to_owned(),
                 );
             }
             None
@@ -1731,8 +1732,7 @@ async fn run_step(
                 label,
                 Phase::Find,
                 code,
-                "a read this step needed was refused by the batch scope; the action was not sent"
-                    .to_owned(),
+                "a read this step needed was refused; the action was not sent".to_owned(),
                 report,
             );
         }
@@ -1847,7 +1847,7 @@ async fn run_step(
             if let Some(code) = result
                 .structured_content
                 .as_ref()
-                .and_then(|value| value.get("code"))
+                .and_then(|value| value.get("code").or_else(|| value.pointer("/refusal/code")))
                 .and_then(Value::as_str)
             {
                 report["code"] = Value::String(code.to_owned());
@@ -2109,6 +2109,13 @@ impl Recovery {
     /// holds focus (read that dialog), or a pixel target in a window with no
     /// screenshot yet (capture it, so the next pixel step has a frame).
     fn after(report: &Value, last: Option<&Window>, worker_timed_out: bool) -> Option<Self> {
+        if report
+            .get("code")
+            .and_then(Value::as_str)
+            .is_some_and(terminal_instance_code)
+        {
+            return None;
+        }
         let message = report.get("message").and_then(Value::as_str)?;
         let last = last?;
         if let Some(holder) = focus_holder(message).filter(|id| *id != last.window_id) {
@@ -2205,6 +2212,9 @@ fn fit_error_text(content: &mut Vec<Content>, budget: usize) {
 /// Whether a refusal names foreground delivery as the route that works:
 /// the target ignores background input (Electron, LibreOffice VCL, ...).
 fn wants_foreground(result: &ToolResult) -> bool {
+    if terminal_instance_refusal(result) {
+        return false;
+    }
     let structured = result.structured_content.as_ref();
     let recommended = structured
         .and_then(|value| {
@@ -2231,6 +2241,9 @@ fn wants_foreground(result: &ToolResult) -> bool {
 /// Whether an action failed because its element target died: the element
 /// was re-rendered or its snapshot was replaced.
 fn stale_element(result: &ToolResult) -> bool {
+    if terminal_instance_refusal(result) {
+        return false;
+    }
     let code = result.structured_content.as_ref().and_then(|value| {
         value
             .get("code")
@@ -2251,6 +2264,41 @@ fn stale_element(result: &ToolResult) -> bool {
     ]
     .iter()
     .any(|needle| message.contains(needle))
+}
+
+pub(crate) fn terminal_instance_code(code: &str) -> bool {
+    matches!(
+        code,
+        "process_instance_mismatch" | "process_instance_unverified"
+    )
+}
+
+pub(crate) fn terminal_instance_refusal(result: &ToolResult) -> bool {
+    result.structured_content.as_ref().is_some_and(|value| {
+        [
+            value.get("code"),
+            value.pointer("/refusal/code"),
+            value.pointer("/error/code"),
+        ]
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .any(terminal_instance_code)
+    })
+}
+
+#[cfg(test)]
+#[test]
+fn instance_refusals_never_trigger_stale_or_foreground_recovery() {
+    for code in ["process_instance_mismatch", "process_instance_unverified"] {
+        let result =
+            ToolResult::error("element_token is stale; Retry with delivery_mode:\"foreground\"")
+                .with_structured(
+                    json!({"refusal":{"code":code},"escalation":{"recommended":"foreground"}}),
+                );
+        assert!(!stale_element(&result), "{code}");
+        assert!(!wants_foreground(&result), "{code}");
+    }
 }
 
 /// Act again on a target whose element token went stale: find the element

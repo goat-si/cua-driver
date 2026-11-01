@@ -106,23 +106,27 @@ mod budget {
 /// wrapper installed via [`wrap_javascript`] — JSON-stringified for
 /// JSON-stringifiable values; the value's `toString()` otherwise.
 ///
-/// On any failure (UIA call returns an error, favorites bar not present
-/// and not summonable, bookmark creation pre-conditions not met, title
-/// poll exceeds [`budget::TITLE_RESULT`]) returns `Err` so the caller
-/// can fall back to CDP.
-pub async fn try_bookmark_exec(pid: i32, window_id: u32, javascript: &str) -> Result<String> {
+/// Before-dispatch failures permit CDP fallback; later failures do not.
+pub(crate) async fn try_bookmark_exec(
+    pid: i32,
+    window_id: u32,
+    javascript: &str,
+) -> std::result::Result<String, crate::page_dispatch::BookmarkFailure> {
+    use crate::page_dispatch::BookmarkFailure;
     if javascript.is_empty() {
-        bail!("javascript expression is empty");
+        return Err(BookmarkFailure::BeforeDispatch(anyhow!(
+            "javascript expression is empty"
+        )));
     }
     let js = javascript.to_owned();
-    tokio::task::spawn_blocking(move || -> Result<String> {
-        let _g = BOOKMARK_EVAL_MUTEX
-            .lock()
-            .map_err(|_| anyhow!("bookmark-exec mutex poisoned"))?;
+    tokio::task::spawn_blocking(move || {
+        let _g = BOOKMARK_EVAL_MUTEX.lock().map_err(|_| {
+            BookmarkFailure::BeforeDispatch(anyhow!("bookmark-exec mutex poisoned"))
+        })?;
         unsafe { try_bookmark_exec_blocking(pid, window_id, &js) }
     })
     .await
-    .map_err(|e| anyhow!("bookmark-exec join error: {e}"))?
+    .map_err(|e| BookmarkFailure::AfterDispatch(anyhow!("bookmark-exec join error: {e}")))?
 }
 
 /// Build the `javascript:` URL we install into the bookmark.
@@ -174,35 +178,51 @@ setTimeout(function(){{ document.title = _orig; }}, 500);\
 
 // ── blocking implementation ───────────────────────────────────────────────
 
-unsafe fn try_bookmark_exec_blocking(pid: i32, window_id: u32, javascript: &str) -> Result<String> {
-    let automation = init_uia()?;
-    let hwnd_raw = window_id as u64;
+struct BookmarkExecution<'a> {
+    pid: i32,
+    window_id: u32,
+    javascript: &'a str,
+    automation: Option<IUIAutomation>,
+    edge_window: Option<IUIAutomationElement>,
+    bookmark: Option<IUIAutomationElement>,
+    original_title: String,
+    previous_foreground: windows::Win32::Foundation::HWND,
+}
 
-    // 1) Resolve the Edge/Chromium top-level window matching pid+window_id.
-    let edge_window = root_for_window(&automation, hwnd_raw, pid)
-        .context("could not resolve Edge top-level window for (pid, window_id)")?;
+impl crate::page_dispatch::BookmarkSteps for BookmarkExecution<'_> {
+    fn prepare(&mut self) -> Result<()> {
+        unsafe {
+            let pid = self.pid;
+            let window_id = self.window_id;
+            let javascript = self.javascript;
+            let automation = init_uia()?;
+            let hwnd_raw = window_id as u64;
 
-    // 2) Ensure the favorites bar is visible. If not, send Ctrl+Shift+B
-    //    via PostMessage (no foreground swap — Chromium's
-    //    Browser::HandleKeyboardEvent dispatches accelerators from
-    //    WM_KEYDOWN LPARAM modifier bits without consulting GetKeyState).
-    //
-    // Historical note: PR #1668 removed the auto-toggle here because it
-    // used `send_key_synthesized` (SendInput + SetForegroundWindow swap)
-    // which violated the no-foreground contract. With `post_key`
-    // (PostMessage) routing — verified safe on every Chromium browser +
-    // Electron app — the auto-toggle is restored. If the bar STILL isn't
-    // visible after a brief settle, we bail with the same actionable
-    // error (covers locked-down browser policies / classic Edge profiles).
-    let fav_bar = if let Some(bar) = find_favorites_bar(&automation, &edge_window) {
-        bar
-    } else {
-        // No SendInput, no SetForegroundWindow, no UIPI risk.
-        let _ = crate::input::post_key(hwnd_raw, "b", &["ctrl", "shift"]);
-        std::thread::sleep(std::time::Duration::from_millis(150));
-        find_favorites_bar(&automation, &edge_window).ok_or_else(|| {
-            anyhow!(
-                "Favorites bar not visible after Ctrl+Shift+B PostMessage \
+            // 1) Resolve the Edge/Chromium top-level window matching pid+window_id.
+            let edge_window = root_for_window(&automation, hwnd_raw, pid)
+                .context("could not resolve Edge top-level window for (pid, window_id)")?;
+
+            // 2) Ensure the favorites bar is visible. If not, send Ctrl+Shift+B
+            //    via PostMessage (no foreground swap — Chromium's
+            //    Browser::HandleKeyboardEvent dispatches accelerators from
+            //    WM_KEYDOWN LPARAM modifier bits without consulting GetKeyState).
+            //
+            // Historical note: PR #1668 removed the auto-toggle here because it
+            // used `send_key_synthesized` (SendInput + SetForegroundWindow swap)
+            // which violated the no-foreground contract. With `post_key`
+            // (PostMessage) routing — verified safe on every Chromium browser +
+            // Electron app — the auto-toggle is restored. If the bar STILL isn't
+            // visible after a brief settle, we bail with the same actionable
+            // error (covers locked-down browser policies / classic Edge profiles).
+            let fav_bar = if let Some(bar) = find_favorites_bar(&automation, &edge_window) {
+                bar
+            } else {
+                // No SendInput, no SetForegroundWindow, no UIPI risk.
+                let _ = crate::input::post_key(hwnd_raw, "b", &["ctrl", "shift"]);
+                std::thread::sleep(std::time::Duration::from_millis(150));
+                find_favorites_bar(&automation, &edge_window).ok_or_else(|| {
+                    anyhow!(
+                        "Favorites bar not visible after Ctrl+Shift+B PostMessage \
                  — cua-driver-rs's bookmark-URL JS exec needs the bar so \
                  we can invoke the `cua-driver-eval` bookmark. The toggle \
                  keystroke didn't take (browser policy override, locked-down \
@@ -210,84 +230,110 @@ unsafe fn try_bookmark_exec_blocking(pid: i32, window_id: u32, javascript: &str)
                  Ctrl+Shift+B in the browser — the setting persists across \
                  sessions. `execute_javascript` will fall through to the \
                  CDP fallback if it's configured."
-            )
-        })?
-    };
+                    )
+                })?
+            };
 
-    // 3) Find or create the cua-driver-eval bookmark.
-    let bookmark = find_bookmark(&automation, &fav_bar, BOOKMARK_NAME);
-    if bookmark.is_none() {
-        // Creation path requires driving the omnibox + Add-favorite dialog,
-        // which is the most fragile part of the workflow.  If we don't yet
-        // have a bookmark and a fresh creation attempt fails, surface a
-        // clear error so the caller falls through to CDP.
-        bail!(
-            "`{BOOKMARK_NAME}` bookmark is not present in the favorites bar. \
+            // 3) Find or create the cua-driver-eval bookmark.
+            let bookmark = find_bookmark(&automation, &fav_bar, BOOKMARK_NAME);
+            if bookmark.is_none() {
+                // Creation path requires driving the omnibox + Add-favorite dialog,
+                // which is the most fragile part of the workflow.  If we don't yet
+                // have a bookmark and a fresh creation attempt fails, surface a
+                // clear error so the caller falls through to CDP.
+                bail!(
+                    "`{BOOKMARK_NAME}` bookmark is not present in the favorites bar. \
              Automatic creation requires navigating the omnibox to \
              edge://favorites which is currently not implemented in this \
              release; create the bookmark manually (any URL is fine — the \
              driver overwrites it on first use) and retry, or relaunch the \
              browser with `--remote-debugging-port=N` to use the CDP path."
-        );
+                );
+            }
+            let bookmark = bookmark.unwrap();
+
+            // 4) Edit the bookmark URL via the right-click → Edit dialog.
+            set_bookmark_url(&automation, &bookmark, &wrap_javascript(javascript))?;
+
+            // 5) Capture the active tab's title before invocation. The wrapper
+            //    restores this after 500 ms so the user doesn't see our marker.
+            let active_tab = find_active_tab(&automation, &edge_window);
+            let original_title = active_tab
+                .as_ref()
+                .and_then(|t| read_name(t))
+                .unwrap_or_default();
+            tracing::debug!(
+                target: "page.bookmark_exec",
+                "captured original tab title: {:?}", original_title
+            );
+
+            self.automation = Some(automation);
+            self.edge_window = Some(edge_window);
+            self.bookmark = Some(bookmark);
+            self.original_title = original_title;
+            Ok(())
+        }
     }
-    let bookmark = bookmark.unwrap();
-
-    // 4) Edit the bookmark URL via the right-click → Edit dialog.
-    set_bookmark_url(&automation, &bookmark, &wrap_javascript(javascript))?;
-
-    // 5) Capture the active tab's title before invocation. The wrapper
-    //    restores this after 500 ms so the user doesn't see our marker.
-    let active_tab = find_active_tab(&automation, &edge_window);
-    let original_title = active_tab
-        .as_ref()
-        .and_then(|t| read_name(t))
-        .unwrap_or_default();
-    tracing::debug!(
-        target: "page.bookmark_exec",
-        "captured original tab title: {:?}", original_title
-    );
-
-    // 6) Invoke the bookmark with a no-foreground guard around it.
-    //
-    // Chromium activates the browser window when a bookmark is clicked
-    // because `WebContents::OpenURL` treats it as user-initiated
-    // navigation (the activation lives in Chromium's window-aura layer,
-    // not in our UIA call). Two-layer mitigation:
-    //
-    //   (a) Capture `GetForegroundWindow()` immediately before the Invoke.
-    //   (b) After the Invoke, briefly poll for "Chromium activated the
-    //       browser" and `SetForegroundWindow(prev)` the user's window
-    //       back. Same pattern `launch_app`'s `FocusRestoreGuard`
-    //       successfully uses; the restore is gated on the new
-    //       foreground being owned by Chromium so we never yank focus
-    //       from a window the user legitimately tabbed to.
-    //
-    // Without UIAccess (the daemon's normal integrity), the restore
-    // SetForegroundWindow may be blocked by the system foreground lock;
-    // we log at trace level and continue — the brief activation is
-    // unavoidable without forking Chromium, but the dwell time on the
-    // browser is < ~150 ms instead of "until next user action".
-    let prev_fg_for_invoke =
-        unsafe { windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow() };
-    invoke_element(&bookmark).context("InvokePattern.Invoke on bookmark failed")?;
-    // Restore in a tight loop — at this point the bookmark URL is firing
-    // and Chromium is about to activate. Poll for ~600 ms; once we see
-    // Chromium grab foreground, swap back. We do this synchronously
-    // (not via tokio::spawn) because we WANT to block the poll-marker
-    // step below until the foreground is restored — otherwise a slow
-    // restore leaves the browser frontmost while we read the title.
-    restore_foreground_after_browser_activation(prev_fg_for_invoke, pid as u32);
-
-    // 7) Poll the active tab's title until it starts with CUA: / CUA_ERR:
-    let result = poll_for_marker(&automation, &edge_window, &original_title)?;
-
-    if let Some(err) = result.strip_prefix("CUA_ERR:") {
-        bail!("bookmark-exec page exception: {}", err);
+    fn invoke(&mut self) -> crate::page_dispatch::InvokeResult {
+        use crate::page_dispatch::InvokeResult;
+        unsafe {
+            self.previous_foreground =
+                windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow();
+            let pattern = match self
+                .bookmark
+                .as_ref()
+                .unwrap()
+                .GetCurrentPattern(UIA_InvokePatternId)
+            {
+                Ok(pattern) => pattern,
+                Err(e) => {
+                    return InvokeResult::NotSent(anyhow!(
+                        "element does not support InvokePattern: {e}"
+                    ))
+                }
+            };
+            let inv: IUIAutomationInvokePattern = match pattern.cast() {
+                Ok(inv) => inv,
+                Err(e) => {
+                    return InvokeResult::NotSent(anyhow!(
+                        "cast to IUIAutomationInvokePattern failed: {e}"
+                    ))
+                }
+            };
+            InvokeResult::Sent(crate::uia::sent_call::invoke(&inv))
+        }
     }
-    let payload = result
-        .strip_prefix("CUA:")
-        .ok_or_else(|| anyhow!("internal: marker poll returned non-CUA result"))?;
-    Ok(payload.to_owned())
+    fn restore_foreground(&mut self) {
+        unsafe {
+            restore_foreground_after_browser_activation(self.previous_foreground, self.pid as u32)
+        }
+    }
+    fn poll_marker(&mut self) -> Result<String> {
+        unsafe {
+            poll_for_marker(
+                self.automation.as_ref().unwrap(),
+                self.edge_window.as_ref().unwrap(),
+                &self.original_title,
+            )
+        }
+    }
+}
+
+unsafe fn try_bookmark_exec_blocking(
+    pid: i32,
+    window_id: u32,
+    javascript: &str,
+) -> std::result::Result<String, crate::page_dispatch::BookmarkFailure> {
+    crate::page_dispatch::run_bookmark_steps(&mut BookmarkExecution {
+        pid,
+        window_id,
+        javascript,
+        automation: None,
+        edge_window: None,
+        bookmark: None,
+        original_title: String::new(),
+        previous_foreground: windows::Win32::Foundation::HWND::default(),
+    })
 }
 
 // ── UIA helpers ───────────────────────────────────────────────────────────

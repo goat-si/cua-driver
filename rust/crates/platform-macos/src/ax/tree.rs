@@ -179,10 +179,11 @@ pub(crate) fn is_selection_text_role(role: &str) -> bool {
 }
 
 /// A single node in the AX tree.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct AXNode {
     /// Internal marker and structurally owned label for row-like items.
     pub(crate) owned_row_label: Option<Option<String>>,
+    pub(crate) canonical: super::vocabulary::CanonicalEvidence,
     /// 0-based index (Some = actionable, None = non-actionable display-only node)
     pub element_index: Option<usize>,
     pub role: String,
@@ -228,6 +229,33 @@ pub struct AXNode {
     /// This trust marker is independent of actionable ancestry because
     /// AXWebArea is commonly non-actionable and therefore has no element index.
     pub in_web_content: bool,
+}
+
+impl std::fmt::Debug for AXNode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AXNode")
+            .field("owned_row_label", &self.owned_row_label)
+            .field("element_index", &self.element_index)
+            .field("role", &self.role)
+            .field("title", &self.title)
+            .field("value", &self.value)
+            .field("description", &self.description)
+            .field("identifier", &self.identifier)
+            .field("help", &self.help)
+            .field("actions", &self.actions)
+            .field("element_ptr", &self.element_ptr)
+            .field("depth", &self.depth)
+            .field("parent_element_index", &self.parent_element_index)
+            .field("frame", &self.frame)
+            .field("value_state", &self.value_state)
+            .field("value_description", &self.value_description)
+            .field("min_value", &self.min_value)
+            .field("max_value", &self.max_value)
+            .field("enabled", &self.enabled)
+            .field("selected", &self.selected)
+            .field("in_web_content", &self.in_web_content)
+            .finish()
+    }
 }
 
 #[derive(Default)]
@@ -548,6 +576,7 @@ impl AXNode {
     pub(crate) fn for_test(element_index: Option<usize>, element_ptr: usize) -> Self {
         Self {
             owned_row_label: None,
+            canonical: Default::default(),
             element_index,
             role: "AXLink".into(),
             title: None,
@@ -1256,7 +1285,9 @@ fn walk_element<S: AxTreeSource>(
     // element, so every descendant must be bounded before any attribute read.
     source.set_messaging_timeout(element);
 
-    let role = known(source.text(element, "AXRole")).unwrap_or_else(|| {
+    let role_observed = known(source.text(element, "AXRole"));
+    let role_read = role_observed.is_some();
+    let role = role_observed.unwrap_or_else(|| {
         // A selector on the role cannot be answered for this node.
         note_skipped();
         "AXUnknown".into()
@@ -1288,6 +1319,7 @@ fn walk_element<S: AxTreeSource>(
                 depth,
                 parent_index,
                 in_web_content,
+                role_read,
                 nodes,
                 lines,
             );
@@ -1306,6 +1338,15 @@ fn walk_element<S: AxTreeSource>(
             // failures, so a selector naming it is answered; the bar
             // position stays the row's value.
             let secure = attrs.secure;
+            let canonical = super::vocabulary::CanonicalEvidence {
+                role_read,
+                subrole: (&attrs.subrole_status).into(),
+                secure: (secure || !attrs.value_unknown).then_some(secure),
+                copied_value: None,
+                classification_failures: attrs.classification_failures.clone(),
+                value_settable_observed_at: None,
+                states: Default::default(),
+            };
             let value_unknown = attrs.value_unknown;
             let ((title, description, own_value, identifier), exhaustive) = if exhaustive_nodes() {
                 (scroll_area_labels(attrs).0, true)
@@ -1322,6 +1363,7 @@ fn walk_element<S: AxTreeSource>(
             };
             let node = AXNode {
                 owned_row_label: None,
+                canonical,
                 element_index: Some(idx),
                 role: role.clone(),
                 title,
@@ -1400,7 +1442,7 @@ fn walk_element<S: AxTreeSource>(
                     batching_disabled,
                 ),
             };
-            let node = match attrs {
+            let mut node = match attrs {
                 Some(attrs) => {
                     if attrs.read_failed {
                         note_skipped();
@@ -1425,6 +1467,7 @@ fn walk_element<S: AxTreeSource>(
                     )
                 }
             };
+            node.canonical.role_read = role_read;
             lines.push((depth, format_node_line(&node)));
             nodes.push(node);
         }
@@ -1467,6 +1510,8 @@ fn walk_element<S: AxTreeSource>(
         identifier,
         help,
         subrole,
+        subrole_status,
+        classification_failures,
         read_failed,
         secure,
         value_unknown,
@@ -1480,13 +1525,14 @@ fn walk_element<S: AxTreeSource>(
     else {
         // Only the role is known: a selector on its label cannot be answered.
         note_skipped();
-        let node = role_only_node(
+        let mut node = role_only_node(
             role,
             source.key(element),
             depth,
             parent_index,
             in_web_content,
         );
+        node.canonical.role_read = role_read;
         lines.push((depth, format_node_line(&node)));
         nodes.push(node);
         return;
@@ -1521,9 +1567,17 @@ fn walk_element<S: AxTreeSource>(
     // field but unable to call set_value on it. Probe writability only for the
     // small family of value controls so arbitrary display nodes do not pay an
     // extra AX round trip.
-    let value_settable = actions.is_empty()
-        && role_supports_value_addressing(&role)
-        && source.value_settable(element);
+    let value_settable_read = if actions.is_empty() && role_supports_value_addressing(&role) {
+        Some(source.value_settable(element))
+    } else {
+        None
+    };
+    let value_settable_observed_at = value_settable_read.map(|_| std::time::Instant::now());
+    let value_settable_in_time = !budget.expired();
+    let value_settable = matches!(
+        value_settable_read,
+        Some(super::write_outcome::Settable::Yes)
+    );
     // A closed submenu can keep its descendants in AXChildren while reporting
     // those controls disabled. Never assign such a row a live element index:
     // the same native state also causes dispatch to refuse it, and exposing an
@@ -1563,6 +1617,7 @@ fn walk_element<S: AxTreeSource>(
                     depth,
                     parent_index,
                     in_web_content,
+                    role_read,
                     nodes,
                     lines,
                 );
@@ -1583,6 +1638,15 @@ fn walk_element<S: AxTreeSource>(
     if !is_actionable && !has_content && role != "AXWindow" && role != "AXSheet" {
         if exhaustive_nodes() {
             let mut node = AXNode {
+                canonical: super::vocabulary::CanonicalEvidence {
+                    role_read,
+                    subrole: (&subrole_status).into(),
+                    secure: (secure || !value_unknown).then_some(secure),
+                    copied_value: None,
+                    classification_failures: classification_failures.clone(),
+                    value_settable_observed_at: None,
+                    states: Default::default(),
+                },
                 identifier: identifier.clone(),
                 help: help.clone(),
                 ..role_only_node(
@@ -1619,6 +1683,28 @@ fn walk_element<S: AxTreeSource>(
         return;
     }
 
+    let mut canonical = super::vocabulary::CanonicalEvidence {
+        role_read,
+        subrole: (&subrole_status).into(),
+        secure: (secure || !value_unknown).then_some(secure),
+        copied_value: if matches!(role.as_str(), "AXCheckBox" | "AXSwitch" | "AXRadioButton")
+            || (role == "AXButton" && subrole.as_deref() == Some("AXToggle"))
+        {
+            copied_value.as_ref().map(|value| value.state_value.clone())
+        } else {
+            None
+        },
+        classification_failures,
+        value_settable_observed_at,
+        states: Default::default(),
+    };
+    if let Some(settable) = value_settable_read {
+        canonical.states.value_settable = if value_settable_in_time {
+            super::vocabulary::Observation::Known(settable)
+        } else {
+            super::vocabulary::Observation::Expired
+        };
+    }
     let element_ptr = source.key(element);
     let frame = match &control {
         Some(control) => control.frame,
@@ -1633,6 +1719,7 @@ fn walk_element<S: AxTreeSource>(
                         depth,
                         parent_index,
                         in_web_content,
+                        role_read,
                         nodes,
                         lines,
                     );
@@ -1683,6 +1770,7 @@ fn walk_element<S: AxTreeSource>(
         let element_ptr = source.retain_for_snapshot(element);
         AXNode {
             owned_row_label: None,
+            canonical: canonical.clone(),
             element_index: Some(idx),
             role: role.clone(),
             title: if visible_title.is_empty() {
@@ -1714,6 +1802,7 @@ fn walk_element<S: AxTreeSource>(
     } else {
         AXNode {
             owned_row_label: None,
+            canonical,
             element_index: None,
             role: role.clone(),
             title: if visible_title.is_empty() {
@@ -2195,17 +2284,20 @@ mod secure_value_tests {
 /// Trimmed text, or `None` when empty.
 /// A row whose attribute read ran past the walk's deadline: its role only,
 /// with no index and no children, as for a content read that timed out.
+#[allow(clippy::too_many_arguments)]
 fn push_timed_out_row(
     role: String,
     element: usize,
     depth: usize,
     parent_index: Option<usize>,
     in_web_content: bool,
+    role_read: bool,
     nodes: &mut Vec<AXNode>,
     lines: &mut Vec<(usize, String)>,
 ) {
     note_skipped();
-    let node = role_only_node(role, element, depth, parent_index, in_web_content);
+    let mut node = role_only_node(role, element, depth, parent_index, in_web_content);
+    node.canonical.role_read = role_read;
     lines.push((depth, format_node_line(&node)));
     nodes.push(node);
 }
@@ -2246,6 +2338,7 @@ fn role_only_node(
 ) -> AXNode {
     AXNode {
         owned_row_label: None,
+        canonical: Default::default(),
         element_index: None,
         role,
         title: None,
@@ -2282,6 +2375,15 @@ fn display_node(
         text.map(|text| text.trim().to_owned())
             .filter(|text| !text.is_empty())
     };
+    let canonical = super::vocabulary::CanonicalEvidence {
+        role_read: true,
+        subrole: (&attrs.subrole_status).into(),
+        secure: (attrs.secure || !attrs.value_unknown).then_some(attrs.secure),
+        copied_value: None,
+        classification_failures: attrs.classification_failures.clone(),
+        value_settable_observed_at: None,
+        states: Default::default(),
+    };
     let title = label(attrs.title);
     let description = label(attrs.description);
     let meta = FieldSecurityMeta {
@@ -2296,6 +2398,7 @@ fn display_node(
     };
     let (value, _) = redact_if_secure(&meta, label(attrs.value), None);
     AXNode {
+        canonical,
         title,
         description,
         value,
@@ -2774,6 +2877,7 @@ mod tests {
             2,
             Some(4),
             false,
+            true,
             &mut nodes,
             &mut lines,
         );
@@ -3315,6 +3419,8 @@ mod lean_row_tests {
             identifier: Some("editor-scroll".into()),
             help: None,
             subrole: None,
+            subrole_status: crate::ax::content_attrs::AttrStatus::Absent,
+            classification_failures: [None, None],
             read_failed,
             secure: false,
             value_unknown: false,
@@ -3346,6 +3452,8 @@ mod lean_row_tests {
             identifier: None,
             help: None,
             subrole: None,
+            subrole_status: crate::ax::content_attrs::AttrStatus::Absent,
+            classification_failures: [None, None],
             read_failed: false,
             secure: false,
             value_unknown: false,
@@ -3420,6 +3528,7 @@ mod lean_row_tests {
         let mut nodes = vec![
             AXNode {
                 owned_row_label: None,
+                canonical: Default::default(),
                 element_index: Some(0),
                 role: "AXWindow".into(),
                 title: Some("Messages".into()),
@@ -3442,6 +3551,7 @@ mod lean_row_tests {
             },
             AXNode {
                 owned_row_label: None,
+                canonical: Default::default(),
                 element_index: None,
                 role: "AXRow".into(),
                 title: None,
@@ -3464,6 +3574,7 @@ mod lean_row_tests {
             },
             AXNode {
                 owned_row_label: None,
+                canonical: Default::default(),
                 element_index: None,
                 role: "AXStaticText".into(),
                 title: None,
@@ -3486,6 +3597,7 @@ mod lean_row_tests {
             },
             AXNode {
                 owned_row_label: None,
+                canonical: Default::default(),
                 element_index: None,
                 role: "AXStaticText".into(),
                 title: None,
@@ -3508,6 +3620,7 @@ mod lean_row_tests {
             },
             AXNode {
                 owned_row_label: None,
+                canonical: Default::default(),
                 element_index: Some(1),
                 role: "AXTextField".into(),
                 title: Some("Compose".into()),
@@ -3805,3 +3918,125 @@ mod selectable_row_tests {
 
 #[cfg(test)]
 mod walker_seam_tests;
+
+#[cfg(test)]
+pub(crate) use walker_seam_tests::{
+    canonical_deferred_fixture, canonical_folded_row_fixture, canonical_metadata_fixture,
+    canonical_test_node, canonical_walk_and_collect, canonical_walk_fixture,
+};
+
+#[cfg(test)]
+mod canonical_evidence_tests {
+    use super::*;
+    use crate::ax::vocabulary::{canonical_role, canonical_states, Subrole};
+    use cua_driver_contract::{Role, State};
+
+    #[test]
+    fn production_walker_assembles_role_evidence() {
+        let (tree, trace) = canonical_walk_fixture("button");
+        let node = &tree.nodes[0];
+        assert_eq!(
+            canonical_role(
+                node.canonical.role_read.then_some(node.role.as_str()),
+                &node.canonical.subrole,
+                node.in_web_content
+            ),
+            Some(Role::Button)
+        );
+        assert_eq!(trace.iter().filter(|s| *s == "value 1").count(), 1);
+    }
+    #[test]
+    fn role_failure_is_not_successful_unknown() {
+        let (failed, _) = canonical_walk_fixture("role_failure");
+        let (unknown, _) = canonical_walk_fixture("role_unknown");
+        assert!(!failed.nodes[0].canonical.role_read);
+        assert!(unknown.nodes[0].canonical.role_read);
+        for (node, want) in [
+            (&failed.nodes[0], None),
+            (&unknown.nodes[0], Some(Role::Unknown)),
+        ] {
+            assert_eq!(
+                canonical_role(
+                    node.canonical.role_read.then_some(node.role.as_str()),
+                    &node.canonical.subrole,
+                    false
+                ),
+                want
+            );
+        }
+    }
+    #[test]
+    fn secure_classification_forbids_value_read() {
+        let (tree, trace) = canonical_walk_fixture("secure");
+        assert!(!trace.iter().any(|s| s == "value 1"));
+        assert_eq!(tree.nodes[0].canonical.secure, Some(true));
+        assert_eq!(
+            canonical_states(
+                &tree.nodes[0].role,
+                &tree.nodes[0].canonical,
+                None,
+                None,
+                false
+            ),
+            Some(vec![State::Secure])
+        );
+    }
+    #[test]
+    fn failed_classification_forbids_value_read() {
+        let (tree, trace) = canonical_walk_fixture("classification_failure");
+        assert!(!trace.iter().any(|s| s == "value 1"));
+        assert_eq!(tree.nodes[0].canonical.subrole, Subrole::Unknown);
+        assert_eq!(tree.nodes[0].canonical.secure, None);
+    }
+    #[test]
+    fn u25_exception_retains_description_and_identifier_failures() {
+        let (tree, trace) = canonical_walk_fixture("u25");
+        assert!(trace.iter().any(|s| s == "value 1"));
+        for error in &tree.nodes[0].canonical.classification_failures {
+            assert!(
+                matches!(error,Some(crate::ax::content_attrs::AttrStatus::Failed { error, listed: crate::ax::content_attrs::AttributeListing::Listed }) if *error == kAXErrorFailure)
+            );
+        }
+    }
+    #[test]
+    fn placeholder_is_not_copied_value_evidence() {
+        let (tree, _) = canonical_walk_fixture("placeholder");
+        let node = &tree.nodes[0];
+        assert_eq!(node.value_state.as_deref(), Some("1"));
+        assert_eq!(node.canonical.copied_value, None);
+        let entry = crate::tools::test_element_entry(node, None, None);
+        assert_eq!(entry["selected"], true);
+        assert!(!entry["states"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|state| state == "checked"));
+        let (tree, _) = canonical_walk_fixture("copied");
+        let entry = crate::tools::test_element_entry(&tree.nodes[0], None, None);
+        assert!(entry["states"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|state| state == "checked"));
+    }
+    #[test]
+    fn folded_row_text_is_not_toggle_evidence() {
+        let tree = canonical_folded_row_fixture();
+        let row = tree.nodes.iter().find(|node| node.role == "AXRow").unwrap();
+        assert!(row
+            .owned_row_label
+            .as_ref()
+            .is_some_and(|label| label.as_deref() == Some("Alpha")));
+        assert!(row.canonical.copied_value.is_none());
+        assert!(row.canonical.role_read);
+    }
+    #[test]
+    fn deferred_scroll_and_display_paths_keep_role_provenance() {
+        let tree = canonical_deferred_fixture();
+        for node in &tree.nodes {
+            assert!(node.canonical.role_read);
+        }
+        assert!(tree.nodes.iter().any(|node| node.element_index.is_none()));
+        walker_seam_tests::scroll_area_preserves_position_labels_and_read_order();
+    }
+}

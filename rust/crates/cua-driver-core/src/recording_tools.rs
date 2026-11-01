@@ -314,7 +314,7 @@ impl Tool for ReplayTrajectoryTool {
             description: "Replay a recorded trajectory: `dir` is a `start_recording` directory, and each \
                 `turn-NNNNN/action.json` tool call is re-invoked in lexical order through the normal dispatch \
                 path. Element-token actions fail (tokens do not survive sessions); pixel clicks and keyboard \
-                tools replay. Failures are reported and stop the replay only with `stop_on_error`. Read-only \
+                tools replay. Failures are reported and stop the replay with `stop_on_error`; process-instance refusals always stop it. Read-only \
                 tools such as `get_window_state` are not recorded, so no element cache is rebuilt. If recording \
                 is on, the replay is itself recorded, so two builds' trajectories can be diffed.".into(),
             input_schema: json!({
@@ -451,6 +451,18 @@ impl Tool for ReplayTrajectoryTool {
             }
             let result = registry.invoke(&tool_name, tool_args).await;
             let is_err = result.is_error.unwrap_or(false);
+            let terminal = is_err && crate::batch_tools::terminal_instance_refusal(&result);
+            let code = result.structured_content.as_ref().and_then(|v| {
+                [
+                    v.get("code"),
+                    v.pointer("/refusal/code"),
+                    v.pointer("/error/code"),
+                ]
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .find(|code| crate::batch_tools::terminal_instance_code(code))
+            });
             let summary = result
                 .content
                 .iter()
@@ -464,19 +476,23 @@ impl Tool for ReplayTrajectoryTool {
                 .unwrap_or("")
                 .to_owned();
 
-            turns_json.push(json!({
+            let mut turn = json!({
                 "turn": turn_name,
                 "tool": &tool_name,
                 "ok": !is_err,
                 "result_summary": &summary,
-            }));
+            });
+            if let Some(code) = code.filter(|_| terminal) {
+                turn["code"] = json!(code);
+            }
+            turns_json.push(turn);
 
             if is_err {
                 failed += 1;
                 if first_failure.is_none() {
                     first_failure = Some((turn_name.clone(), tool_name.clone(), summary));
                 }
-                if stop_on_error {
+                if stop_on_error || terminal {
                     break;
                 }
             } else {
@@ -682,8 +698,29 @@ mod tests {
             if let Some(map) = args.as_object_mut() {
                 map.retain(|key, _| !key.starts_with('_'));
             }
-            self.calls.lock().unwrap().push(args);
+            self.calls.lock().unwrap().push(args.clone());
+            if let Some(code) = args.get("instance_refusal").and_then(Value::as_str) {
+                return ToolResult::error("identity refused; call get_window_state")
+                    .with_structured(json!({"refusal":{"code":code}}))
+                    .with_disposition(cua_driver_contract::ErrorDisposition::NOT_DELIVERED);
+            }
             ToolResult::text("probe ran")
+        }
+    }
+
+    #[tokio::test]
+    async fn replay_stops_on_instance_refusal_even_when_best_effort() {
+        for code in ["process_instance_mismatch", "process_instance_unverified"] {
+            let (result, calls) = replay_probe(
+                &[
+                    json!({"tool":"type_text", "arguments":{"instance_refusal":code}}),
+                    json!({"tool":"type_text", "arguments":{"text":"must not run"}}),
+                ],
+                false,
+            )
+            .await;
+            assert_eq!(calls.len(), 1, "{code}: {result}");
+            assert_eq!(result["turns"][0]["code"], code);
         }
     }
 
