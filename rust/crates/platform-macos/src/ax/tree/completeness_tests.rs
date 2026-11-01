@@ -204,6 +204,64 @@ fn geometry_clipped_rows_report_offscreen() {
     assert!(has_reason(&tree, "policy_omission", "offscreen"));
 }
 
+fn refused_deferred_row(mut budget: WalkBudget) -> Value {
+    let source = Fake::new(&[(1, 1, 1, &[])], vec![]);
+    let row = dense_rows::DeferredRow {
+        anchor: 0,
+        seq: 0,
+        position: 0,
+        collection: 1,
+        element: source.handle(1),
+        depth: 0,
+        parent_index: None,
+        parent_role: "AXTable".into(),
+        label_path: LabelPath::Inactive,
+        in_web_content: false,
+        visible: true,
+        walked: None,
+    };
+    let mut counter = 0;
+    let mut batching_disabled = false;
+    let (lines, nodes, offscreen) = finish_deferred(
+        &source,
+        vec![],
+        vec![],
+        vec![row],
+        None,
+        &mut counter,
+        &mut budget,
+        &mut batching_disabled,
+        10,
+        true,
+        vec![],
+    );
+    assert!(lines.is_empty() && nodes.is_empty() && offscreen.is_empty());
+    source.assert_consumed();
+    source.assert_lifetimes(&[]);
+    let mut output = json!({});
+    budget.outcome().apply(&mut output);
+    output
+}
+
+#[test]
+fn expired_classification_reports_time_budget_not_offscreen() {
+    let plans =
+        dense_rows::plan_children(1, |_| panic!("expired row classification"), None, || true);
+    assert_eq!(plans, [dense_rows::ChildPlan::Defer { visible: true }]);
+    let output = refused_deferred_row(WalkBudget::new(0, 10));
+    let reasons = output["observation_incomplete_reasons"].as_array().unwrap();
+    assert!(reasons.contains(&json!({"kind":"budget", "detail":"time_budget"})));
+    assert!(!reasons.contains(&json!({"kind":"policy_omission", "detail":"offscreen"})));
+}
+
+#[test]
+fn deferred_budget_refusal_keeps_typed_reason() {
+    let output = refused_deferred_row(WalkBudget::nodes_only(0));
+    let reasons = output["observation_incomplete_reasons"].as_array().unwrap();
+    assert!(reasons.contains(&json!({"kind":"budget", "detail":"node_budget"})));
+    assert!(!reasons.contains(&json!({"kind":"policy_omission", "detail":"offscreen"})));
+}
+
 #[test]
 fn inactive_tab_compaction_reports_inactive_tab() {
     let tree = super::walker_seam_tests::tab_compaction_fixture();
