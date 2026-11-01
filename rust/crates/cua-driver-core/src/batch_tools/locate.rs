@@ -1587,6 +1587,30 @@ pub(crate) fn matches<'r>(read: &'r Read, spec: &ElementSpec) -> Vec<&'r Value> 
                 .as_deref()
                 .is_none_or(|role| element_role_matches(role, element))
         })
+        .filter(|element| {
+            spec.text.as_deref().is_none_or(|text| {
+                [
+                    "label",
+                    "value",
+                    "description",
+                    "help",
+                    "identifier",
+                    "role",
+                ]
+                .into_iter()
+                .any(|key| text_matches(element.get(key), text))
+                    || element
+                        .get("element_index")
+                        .and_then(Value::as_u64)
+                        .is_some_and(|index| {
+                            let prefix = format!("- [{index}] ");
+                            read.markdown
+                                .lines()
+                                .map(str::trim)
+                                .any(|row| row.starts_with(&prefix) && row_matches(row, spec))
+                        })
+            })
+        })
         .collect();
     let named: Vec<&Value> = match &spec.name {
         None => by_role,
@@ -1777,7 +1801,7 @@ fn evaluate(check: &Check, read: &Read) -> Result<Option<String>, Miss> {
         nth: None,
         ..check.element.clone()
     };
-    let mut structured = if element_spec.role.is_some() || element_spec.name.is_some() {
+    let structured = if element_spec.role.is_some() || element_spec.name.is_some() {
         matches(read, &element_spec)
     } else {
         Vec::new()
@@ -1789,27 +1813,6 @@ fn evaluate(check: &Check, read: &Read) -> Result<Option<String>, Miss> {
         .map(str::trim)
         .filter(|line| row_matches(line, &check.element))
         .collect();
-    if let Some(text) = &element_spec.text {
-        structured.retain(|element| {
-            [
-                "label",
-                "value",
-                "description",
-                "help",
-                "identifier",
-                "role",
-            ]
-            .into_iter()
-            .any(|key| text_matches(element.get(key), text))
-                || element
-                    .get("element_index")
-                    .and_then(Value::as_u64)
-                    .is_some_and(|index| {
-                        let prefix = format!("- [{index}] ");
-                        rows.iter().any(|row| row.starts_with(&prefix))
-                    })
-        });
-    }
     let by_text_only = element_spec.role.is_none() && element_spec.name.is_none();
     let present = if by_text_only {
         !rows.is_empty()
@@ -2880,6 +2883,28 @@ mod tests {
         let check =
             Check::parse(&json!({"role":"statictext","text":"Bar","gone":true}), 0).unwrap();
         assert!(evaluate(&check, &observed).is_ok());
+    }
+    #[test]
+    fn u20b_a_text_filter_precedes_exact_name_ranking() {
+        let mut exact = element(1, "AXStaticText", "Save");
+        exact["value"] = json!("other");
+        let mut partial = element(2, "AXStaticText", "Save Draft");
+        partial["value"] = json!("target");
+        let mut observed = read(vec![exact, partial], "");
+        observed.completeness = Completeness::Complete;
+        let check = Check::parse(
+            &json!({"role":"statictext","name":"Save","text":"target","gone":true}),
+            0,
+        )
+        .unwrap();
+        assert_eq!(
+            evaluate(&check, &observed).unwrap_err().code,
+            "still_present"
+        );
+        assert_eq!(
+            pick(&observed, &check.element).unwrap().element["element_index"],
+            2
+        );
     }
 
     #[test]
