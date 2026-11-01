@@ -672,7 +672,7 @@ impl Tool for TypeTextTool {
         let result = match result {
             Ok(Ok(outcome)) if outcome.delivered_chars.is_some_and(|n| n < char_count) => {
                 let delivered_chars = outcome.delivered_chars.unwrap_or_default();
-                ToolResult::error(format!(
+                let mut result = ToolResult::error(format!(
                     "type_text incomplete: delivered {delivered_chars} of {char_count} character(s){}; retry only the remaining suffix",
                     outcome.detail
                 ))
@@ -684,7 +684,12 @@ impl Tool for TypeTextTool {
                     "delivered_chars": delivered_chars,
                     "retryable": true,
                     "retry_from_character": delivered_chars,
-                }))
+                }));
+                if outcome.path == PATH_AX {
+                    result =
+                        result.with_disposition(cua_driver_contract::ErrorDisposition::DELIVERED);
+                }
+                result
             }
             Ok(Ok(outcome)) => type_text_outcome_result(
                 outcome,
@@ -726,12 +731,14 @@ fn type_text_outcome_result(
     // chrome (address bar, toolbar) stays trusted. Probe ONLY when a
     // path with AXValue-only verification would otherwise confirm, so
     // native types and already-unverified deliveries pay nothing.
-    let web_area = (verified && path_has_untrusted_web_readback(path)).then_some(web_area);
+    let web_area = ((verified || path == PATH_AX) && path_has_untrusted_web_readback(path))
+        .then_some(web_area);
     let target_is_web_content = web_area
         .is_some_and(|classification| target_readback_is_untrusted(classification, electron));
     let verification = surface_verification(path, verified, target_is_web_content);
     let verified = verification.verified;
-    let untrusted_web_readback = verification.untrusted_web_readback;
+    let untrusted_web_readback =
+        verification.untrusted_web_readback || (path == PATH_AX && target_is_web_content);
     let electron_web_content = untrusted_web_readback && electron;
 
     // `verified:false` means the driver could not confirm the text
@@ -790,8 +797,10 @@ fn type_text_outcome_result(
             "verified": verified,
             "effect": if verified { "confirmed" } else { "unverifiable" },
         });
-        if let Some(delivered_chars) = delivered_chars {
-            s["delivered_chars"] = serde_json::json!(delivered_chars);
+        if !untrusted_web_readback {
+            if let Some(delivered_chars) = delivered_chars {
+                s["delivered_chars"] = serde_json::json!(delivered_chars);
+            }
         }
         if untrusted_web_readback {
             // Web-content AXValue read-back. A real browser TAB → the
@@ -921,8 +930,8 @@ struct SynthesisRefusal {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum AxAttempt {
     NotAttempted,
+    #[cfg(test)]
     Rejected,
-    Unchanged,
     Unverifiable,
 }
 
@@ -930,27 +939,10 @@ impl AxAttempt {
     fn as_str(self) -> &'static str {
         match self {
             Self::NotAttempted => "not_attempted",
+            #[cfg(test)]
             Self::Rejected => "rejected",
-            Self::Unchanged => "unchanged",
             Self::Unverifiable => "unverifiable",
         }
-    }
-}
-
-fn ax_insert_then_keys<T>(_attempt: AxAttempt, send_keys: impl FnOnce() -> T) -> T {
-    send_keys()
-}
-
-fn ax_attempt_from_progress(
-    progress: Option<TypedProgress>,
-    unchanged_web_readback: bool,
-) -> AxAttempt {
-    match progress {
-        Some(TypedProgress::Unchanged) if unchanged_web_readback => AxAttempt::Unverifiable,
-        Some(TypedProgress::Unchanged) => AxAttempt::Unchanged,
-        Some(TypedProgress::Unverifiable) => AxAttempt::Unverifiable,
-        None => AxAttempt::Rejected,
-        Some(TypedProgress::Complete | TypedProgress::Partial(_)) => unreachable!(),
     }
 }
 
@@ -1282,7 +1274,8 @@ fn replace_ax_with(
 }
 
 enum InsertRead {
-    Withheld,
+    Unsupported,
+    Withheld { error: i32 },
     Readable { error: i32, value: Option<String> },
 }
 
@@ -1294,13 +1287,51 @@ fn send_ax_insert_and_read(
     let error = send();
     let value = read();
     if before_withheld || value == crate::ax::write_outcome::ValueRead::Withheld {
-        InsertRead::Withheld
+        InsertRead::Withheld { error }
     } else {
         InsertRead::Readable {
             error,
             value: value.text(),
         }
     }
+}
+
+fn insert_ax_write(
+    before_withheld: bool,
+    context: TextWriteContext,
+    send: impl FnOnce() -> i32,
+    read: impl FnOnce() -> crate::ax::write_outcome::ValueRead,
+) -> Result<InsertRead, TextWriteError> {
+    use crate::ax::write_outcome::{native_write_outcome, NativeWriteKind, Settable};
+    use cua_driver_core::mutation::{ChainResult, WriteOutcome};
+    if context.settable == Settable::No {
+        let outcome = native_write_outcome(
+            NativeWriteKind::SetAttribute,
+            false,
+            &context.settable,
+            kAXErrorSuccess,
+        );
+        let _chain =
+            ChainResult::from_recorded(vec![outcome], context.prior).expect("one insert setter");
+        return Ok(InsertRead::Unsupported);
+    }
+    let observation = send_ax_insert_and_read(before_withheld, send, read);
+    let error = match &observation {
+        InsertRead::Withheld { error } | InsertRead::Readable { error, .. } => *error,
+        InsertRead::Unsupported => unreachable!("the setter was called"),
+    };
+    let outcome = native_write_outcome(
+        NativeWriteKind::SetAttribute,
+        true,
+        &context.settable,
+        error,
+    );
+    let chain =
+        ChainResult::from_recorded(vec![outcome], context.prior).expect("one insert setter");
+    if outcome != WriteOutcome::Delivered {
+        return Err(TextWriteError { message: format!("AXSelectedText returned error {error}; insertion was not confirmed and no retry was sent"), chain });
+    }
+    Ok(observation)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2996,7 +3027,7 @@ fn type_text_in_key_window(
         }
     }
 
-    let mut ax_attempt = AxAttempt::NotAttempted;
+    let ax_attempt = AxAttempt::NotAttempted;
     if force_key_events {
         if let Some((element, true, _)) = ax_target {
             unsafe { CFRelease(element as _) };
@@ -3011,8 +3042,11 @@ fn type_text_in_key_window(
         };
         let bound = element_ptr_and_idx.is_some_and(|(ptr, _)| ptr == element as usize)
             && window_id.is_some_and(|wid| element_in_requested_window(pid, wid, element as usize));
-        let insertion = send_ax_insert_and_read(
+        let settable =
+            unsafe { crate::ax::write_outcome::query_settable(element, "AXSelectedText") };
+        let insertion = insert_ax_write(
             before_withheld,
+            TextWriteContext { settable, prior },
             || unsafe { set_string_attr(element, "AXSelectedText", text) },
             || {
                 crate::ax::write_outcome::read_value_if_allowed(
@@ -3021,13 +3055,22 @@ fn type_text_in_key_window(
                 )
             },
         );
-        // Classify the atomic write before considering synthesis. Complete AX
-        // delivery returns immediately. Partial delivery is surfaced as such
-        // instead of appending the full payload again. When synthesis would
-        // exceed its transport-safe budget, rejected/unchanged AX writes fail
-        // safely and unreadable AX state is reported as indeterminate.
-        let (err, after) = match insertion {
-            InsertRead::Withheld => {
+        let insertion = match insertion {
+            Ok(insertion) => insertion,
+            Err(error) => {
+                if owns {
+                    unsafe { CFRelease(element as _) };
+                }
+                return Err(error.into());
+            }
+        };
+        match insertion {
+            InsertRead::Unsupported => {
+                if owns {
+                    unsafe { CFRelease(element as _) };
+                }
+            }
+            InsertRead::Withheld { .. } => {
                 let document =
                     unsafe { crate::document_edit::document_status_without_value(element) };
                 let outcome_web_area =
@@ -3042,80 +3085,69 @@ fn type_text_in_key_window(
                     outcome_web_area,
                 )));
             }
-            InsertRead::Readable { error, value } => (error, value),
-        };
-        let ax_progress = if err == kAXErrorSuccess {
-            Some(ax_insert_progress(
-                before.as_deref(),
-                after.as_deref(),
-                text,
-                selection,
-                bound,
-            ))
-        } else {
-            None
-        };
-        // AXValue is not renderer evidence in web content. An unchanged echo
-        // there cannot prove that zero characters landed, so blind retry is
-        // unsafe even though no synthesis has run yet.
-        let unchanged_web_readback = ax_progress == Some(TypedProgress::Unchanged)
-            && target_in_web_area(pid, Some((element as usize, idx_opt)), window_id);
-        // An AX insert bypasses NSTextView's edit model, so a document is
-        // not marked edited and would never save the new text (DS-07).
-        let document = if ax_progress == Some(TypedProgress::Complete) {
-            unsafe { crate::document_edit::ensure_marked_after_ax_write(pid, element, false) }
-        } else {
-            crate::document_edit::DocumentEdited::NotADocument
-        };
-        let outcome_web_area =
-            classify_target_web_area(pid, Some((element as usize, idx_opt)), window_id);
-        if owns {
-            unsafe {
-                CFRelease(element as _);
+            InsertRead::Readable {
+                error: _,
+                value: after,
+            } => {
+                let outcome_web_area =
+                    classify_target_web_area(pid, Some((element as usize, idx_opt)), window_id);
+                let web_untrusted = target_readback_is_untrusted(
+                    outcome_web_area,
+                    crate::browser::electron_js::ElectronJs::is_electron(pid),
+                );
+                let ax_progress = if web_untrusted {
+                    TypedProgress::Unverifiable
+                } else {
+                    ax_insert_progress(before.as_deref(), after.as_deref(), text, selection, bound)
+                };
+                // An AX insert bypasses NSTextView's edit model, so a document is
+                // not marked edited and would never save the new text (DS-07).
+                let document = if ax_progress == TypedProgress::Complete {
+                    unsafe {
+                        crate::document_edit::ensure_marked_after_ax_write(pid, element, false)
+                    }
+                } else {
+                    crate::document_edit::DocumentEdited::NotADocument
+                };
+                if owns {
+                    unsafe {
+                        CFRelease(element as _);
+                    }
+                }
+                if ax_progress == TypedProgress::Complete {
+                    let idx_str = idx_opt.map(|i| format!(" [{i}]")).unwrap_or_default();
+                    return Ok(TypeTextDelivery::Typed(TypeTextOutcome {
+                        detail: format!(
+                            " into{idx_str} {role} \"{title}\"{}",
+                            document.note().trim_end_matches('.')
+                        ),
+                        path: PATH_AX,
+                        verified: true,
+                        delivered_chars: Some(text.chars().count()),
+                        web_area: outcome_web_area,
+                    }));
+                }
+                if let TypedProgress::Partial(delivered_chars) = ax_progress {
+                    let idx_str = idx_opt.map(|i| format!(" [{i}]")).unwrap_or_default();
+                    return Ok(TypeTextDelivery::Typed(TypeTextOutcome {
+                        detail: format!(" via partial AX write into{idx_str} {role} \"{title}\""),
+                        path: PATH_AX,
+                        verified: false,
+                        delivered_chars: Some(delivered_chars),
+                        web_area: outcome_web_area,
+                    }));
+                }
+                return Ok(TypeTextDelivery::Typed(TypeTextOutcome {
+                    detail: format!(
+                        " via AX write into {role} \"{title}\"; delivery could not be confirmed"
+                    ),
+                    path: PATH_AX,
+                    verified: false,
+                    delivered_chars: None,
+                    web_area: outcome_web_area,
+                }));
             }
         }
-        if ax_progress == Some(TypedProgress::Complete) {
-            let idx_str = idx_opt.map(|i| format!(" [{i}]")).unwrap_or_default();
-            return Ok(TypeTextDelivery::Typed(TypeTextOutcome {
-                detail: format!(
-                    " into{idx_str} {role} \"{title}\"{}",
-                    document.note().trim_end_matches('.')
-                ),
-                path: PATH_AX,
-                verified: true,
-                delivered_chars: Some(text.chars().count()),
-                web_area: outcome_web_area,
-            }));
-        }
-        if let Some(TypedProgress::Partial(delivered_chars)) = ax_progress {
-            let idx_str = idx_opt.map(|i| format!(" [{i}]")).unwrap_or_default();
-            return Ok(TypeTextDelivery::Typed(TypeTextOutcome {
-                detail: format!(" via partial AX write into{idx_str} {role} \"{title}\""),
-                path: PATH_AX,
-                verified: false,
-                delivered_chars: Some(delivered_chars),
-                web_area: outcome_web_area,
-            }));
-        }
-        if matches!(
-            ax_progress,
-            Some(TypedProgress::Unchanged | TypedProgress::Unverifiable)
-        ) {
-            return Ok(TypeTextDelivery::Typed(TypeTextOutcome {
-                detail: format!(
-                    " via AX write into {role} \"{title}\"; delivery could not be confirmed"
-                ),
-                path: PATH_AX,
-                verified: false,
-                delivered_chars: None,
-                web_area: outcome_web_area,
-            }));
-        }
-        ax_attempt = ax_attempt_from_progress(ax_progress, unchanged_web_readback);
-        tracing::debug!(
-            "AX write did not land for {role} \"{title}\" (err={err}); \
-             falling back to CGEvent keystrokes"
-        );
     } else {
         tracing::debug!("No focused element for pid {pid}; using CGEvent keystrokes");
     }
@@ -3142,29 +3174,26 @@ fn type_text_in_key_window(
     // --- Background rung 2: CGEvent keystrokes with read-back. ---
     // Never clear here: a partial AX write is rare, and clearing would violate
     // insert-at-cursor semantics.
-    let (verified, delivered_chars, ax_replacement, document) =
-        ax_insert_then_keys(ax_attempt, || {
-            cgevent_type_verified(
-                KeyReceiver {
-                    pid,
-                    window_id,
-                    element: element_ptr_and_idx,
-                },
-                KeyTextRequest {
-                    text,
-                    delay_ms,
-                    settle_ms: 0,
-                    replace,
-                    single_terminal_return: chromium_native_submission,
-                },
-                before.as_deref(),
-                KeyFocusChecks {
-                    exact_focus: focused_key_route,
-                    recheck_editability_after_settle: false,
-                    prior,
-                },
-            )
-        })?;
+    let (verified, delivered_chars, ax_replacement, document) = cgevent_type_verified(
+        KeyReceiver {
+            pid,
+            window_id,
+            element: element_ptr_and_idx,
+        },
+        KeyTextRequest {
+            text,
+            delay_ms,
+            settle_ms: 0,
+            replace,
+            single_terminal_return: chromium_native_submission,
+        },
+        before.as_deref(),
+        KeyFocusChecks {
+            exact_focus: focused_key_route,
+            recheck_editability_after_settle: false,
+            prior,
+        },
+    )?;
     Ok(TypeTextDelivery::Typed(TypeTextOutcome {
         detail: if ax_replacement {
             format!(" via native whole-field replacement{}", document.note())
@@ -3548,20 +3577,82 @@ mod u32_outcome_tests {
 
     #[test]
     fn insert_timeout_never_falls_through_to_keys() {
-        let insertion = send_ax_insert_and_read(
+        let insertion = insert_ax_write(
             false,
+            TextWriteContext {
+                settable: Settable::Yes,
+                prior: PriorInput::MayHaveDelivered,
+            },
             || kAXErrorCannotComplete,
             || ValueRead::Allowed(ValueObs::Text("old".into())),
         );
-        let attempt = match insertion {
-            InsertRead::Readable { error, .. } if error != kAXErrorSuccess => {
-                ax_attempt_from_progress(None, false)
-            }
-            _ => panic!("expected the native timeout"),
-        };
         let keys = Cell::new(0);
-        ax_insert_then_keys(attempt, || keys.set(keys.get() + 1));
+        if matches!(&insertion, Ok(InsertRead::Unsupported)) {
+            keys.set(keys.get() + 1);
+        }
         assert_eq!(keys.get(), 0, "a timed-out insertion must not post keys");
+        let error = insertion.err().expect("timeout must remain an error");
+        let projected = text_delivery_failure("type_text failed", &error.into());
+        assert_eq!(
+            projected.structured_content.unwrap()["effect"],
+            "unverifiable"
+        );
+        assert_eq!(
+            projected.disposition,
+            Some(cua_driver_contract::ErrorDisposition::SUSPECTED_NOOP)
+        );
+        let withheld =
+            send_ax_insert_and_read(false, || kAXErrorCannotComplete, || ValueRead::Withheld);
+        assert!(
+            matches!(withheld, InsertRead::Withheld { error } if error == kAXErrorCannotComplete)
+        );
+        for observation in [
+            ValueRead::Withheld,
+            ValueRead::Allowed(ValueObs::Text("old".into())),
+        ] {
+            let writes = Cell::new(0);
+            let result = insert_ax_write(
+                false,
+                TextWriteContext {
+                    settable: Settable::Yes,
+                    prior: PriorInput::None,
+                },
+                || {
+                    writes.set(writes.get() + 1);
+                    kAXErrorSuccess
+                },
+                || observation,
+            );
+            assert!(matches!(
+                result,
+                Ok(InsertRead::Withheld { .. } | InsertRead::Readable { .. })
+            ));
+            assert_eq!(writes.get(), 1, "a delivered write must never be resent");
+        }
+        let withheld_error = insert_ax_write(
+            false,
+            TextWriteContext {
+                settable: Settable::Yes,
+                prior: PriorInput::None,
+            },
+            || kAXErrorCannotComplete,
+            || ValueRead::Withheld,
+        )
+        .err()
+        .expect("withheld timeout must remain an error");
+        assert!(withheld_error
+            .message
+            .contains(&kAXErrorCannotComplete.to_string()));
+        let unsupported = insert_ax_write(
+            false,
+            TextWriteContext {
+                settable: Settable::No,
+                prior: PriorInput::None,
+            },
+            || panic!("unsupported setter must not run"),
+            || panic!("unsupported setter must not read"),
+        );
+        assert!(matches!(unsupported, Ok(InsertRead::Unsupported)));
     }
 
     #[test]
@@ -4234,7 +4325,7 @@ mod secure_read_tests {
             },
             || ValueRead::Withheld,
         );
-        assert!(matches!(result, InsertRead::Withheld));
+        assert!(matches!(result, InsertRead::Withheld { error } if error == kAXErrorSuccess));
         assert_eq!(*sent.borrow(), ["insert"]);
     }
 }
