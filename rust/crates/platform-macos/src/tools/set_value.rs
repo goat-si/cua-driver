@@ -1803,7 +1803,8 @@ fn finish_ladder_with_document_readers(
         changed: out.changed,
         not_applied: out.not_applied,
         document_edited: document.structured(),
-        maybe_landed: out.maybe_landed,
+        maybe_landed: out.maybe_landed
+            || document == crate::document_edit::DocumentEdited::NotMarked,
         verification_withheld: out.verification_withheld,
     })
 }

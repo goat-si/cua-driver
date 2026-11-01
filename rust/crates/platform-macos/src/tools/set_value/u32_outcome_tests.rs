@@ -243,6 +243,39 @@ async fn uncertain_delayed_match_stays_unverifiable_and_blocks_document_and_retu
     let (result, _, _, _) = project(out, "AXSlider", &mark);
     assert_eq!(result.structured_content.unwrap()["effect"], "confirmed");
     assert_eq!(mark.get(), 1);
+
+    let mut text_write = Fake::new(text("old")).read(text("new"));
+    let out = run(&mut text_write, "new", "AXTextField", false);
+    let outcome = finish_ladder_with_document_readers(
+        out,
+        1,
+        "AXTextField",
+        false,
+        || DocumentEdited::NotMarked,
+        || false,
+        || DocumentEdited::NotMarked,
+    )
+    .unwrap();
+    assert!(outcome.maybe_landed);
+    let maybe_landed = outcome.maybe_landed;
+    let result =
+        set_value_tool_result_with_toolkit(Ok(Ok(outcome)), false, String::new(), 1, || false);
+    let return_count = Cell::new(0);
+    let result = super::super::set_value_autosubmit::finish(
+        true,
+        1,
+        result,
+        false,
+        maybe_landed,
+        false,
+        |_, _| async {
+            return_count.set(return_count.get() + 1);
+            Ok(true)
+        },
+    )
+    .await;
+    assert_eq!(result.structured_content.unwrap()["verified"], true);
+    assert_eq!(return_count.get(), 0);
 }
 
 #[tokio::test]

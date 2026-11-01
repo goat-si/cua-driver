@@ -285,7 +285,11 @@ pub unsafe fn ensure_marked_in_held_window(
     if !keys_reach_element_window(pid, element) || !can_post() {
         return HeldMark::NothingSent;
     }
-    let _ = crate::input::ax_actions::focus_element(element as usize);
+    let settable = crate::ax::write_outcome::query_settable(element, "AXFocused");
+    let error = crate::input::ax_actions::focus_element_raw(element as usize);
+    if !document_ax_write_delivered(error, &settable) {
+        return HeldMark::NothingSent;
+    }
     net_zero_edit_held(
         collapsed_caret_of(element),
         can_post,
@@ -336,10 +340,16 @@ unsafe fn send_net_zero_edit(
     element: AXUIElementRef,
     caret_to_end: bool,
 ) -> DocumentEdited {
-    if caret_to_end && !caret_to_end_of(element) {
+    if !document_ax_prologue(
+        || !caret_to_end || caret_to_end_of(element),
+        || {
+            let settable = crate::ax::write_outcome::query_settable(element, "AXFocused");
+            let error = crate::input::ax_actions::focus_element_raw(element as usize);
+            document_ax_write_delivered(error, &settable)
+        },
+    ) {
         return DocumentEdited::NotMarked;
     }
-    let _ = crate::input::ax_actions::focus_element(element as usize);
     net_zero_edit(
         collapsed_caret_of(element),
         |key| crate::input::keyboard::press_key(pid, key, &[]),
@@ -538,13 +548,28 @@ unsafe fn caret_to_end_of(element: AXUIElementRef) -> bool {
         length: 0,
     };
     let value = AXValueCreate(kAXValueCFRangeType, &range as *const CfRange as *const _);
-    if !value.is_null() {
-        use core_foundation::{base::TCFType, string::CFString};
-        let attr = CFString::new("AXSelectedTextRange");
-        let _ = AXUIElementSetAttributeValue(element, attr.as_concrete_TypeRef(), value as _);
-        core_foundation::base::CFRelease(value as _);
+    if value.is_null() {
+        return false;
     }
-    true
+    use core_foundation::{base::TCFType, string::CFString};
+    let attr = CFString::new("AXSelectedTextRange");
+    let settable = crate::ax::write_outcome::query_settable(element, "AXSelectedTextRange");
+    let error = AXUIElementSetAttributeValue(element, attr.as_concrete_TypeRef(), value as _);
+    core_foundation::base::CFRelease(value as _);
+    document_ax_write_delivered(error, &settable)
+}
+
+fn document_ax_write_delivered(error: i32, settable: &crate::ax::write_outcome::Settable) -> bool {
+    use crate::ax::write_outcome::{native_write_outcome, NativeWriteKind};
+    use cua_driver_core::mutation::{ChainResult, PriorInput, WriteOutcome};
+    let outcome = native_write_outcome(NativeWriteKind::SetAttribute, true, settable, error);
+    let chain = ChainResult::from_recorded(vec![outcome], PriorInput::MayHaveDelivered)
+        .expect("a document AX write is a valid recorded chain");
+    matches!(chain.outcomes().last(), Some(WriteOutcome::Delivered))
+}
+
+fn document_ax_prologue(caret: impl FnOnce() -> bool, focus: impl FnOnce() -> bool) -> bool {
+    caret() && focus()
 }
 
 #[cfg(test)]
@@ -625,7 +650,10 @@ mod secure_read_tests {
 
 #[cfg(test)]
 mod tests {
-    use super::{net_zero_edit, net_zero_edit_held, with_space_at, DocumentEdited, HeldMark};
+    use super::{
+        document_ax_prologue, document_ax_write_delivered, net_zero_edit, net_zero_edit_held,
+        with_space_at, DocumentEdited, HeldMark,
+    };
     use std::cell::RefCell;
 
     /// A text field that applies the keys it is given, after `lag` reads.
@@ -767,6 +795,25 @@ mod tests {
             DocumentEdited::NotMarked
         );
         assert!(field.sent.borrow().is_empty());
+
+        let focus_calls = std::cell::Cell::new(0);
+        for error in [
+            crate::ax::bindings::kAXErrorCannotComplete,
+            crate::ax::bindings::kAXErrorAPIDisabled,
+        ] {
+            assert!(!document_ax_prologue(
+                || document_ax_write_delivered(error, &crate::ax::write_outcome::Settable::Yes),
+                || {
+                    focus_calls.set(focus_calls.get() + 1);
+                    true
+                },
+            ));
+            assert!(!document_ax_prologue(
+                || true,
+                || document_ax_write_delivered(error, &crate::ax::write_outcome::Settable::Yes),
+            ));
+        }
+        assert_eq!(focus_calls.get(), 0);
     }
 
     #[test]
