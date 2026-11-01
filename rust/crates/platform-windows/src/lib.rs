@@ -38,6 +38,9 @@ pub mod tools;
 pub mod virtualdesk;
 
 #[cfg(any(target_os = "windows", test))]
+mod actionability;
+
+#[cfg(any(target_os = "windows", test))]
 mod keycodes;
 
 #[cfg(any(target_os = "windows", test))]
