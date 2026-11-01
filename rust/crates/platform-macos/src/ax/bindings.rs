@@ -189,8 +189,6 @@ use core_foundation::{
     string::CFString as CFStr,
 };
 
-pub(crate) use super::batch_attrs::copy_attrs_batch;
-
 /// Whether an AX attribute is currently writable on this element.
 ///
 /// # Safety

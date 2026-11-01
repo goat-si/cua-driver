@@ -1,6 +1,9 @@
+#[cfg(test)]
+use super::batch_attrs::BatchRead;
 use super::batch_attrs::BatchSlots;
-use super::batch_attrs::{batch_failure_action, BatchFailureAction, BatchRead};
+use super::batch_attrs::{batch_failure_action, BatchFailureAction};
 use super::bindings::*;
+use super::tree_source::{AxTreeSource, TreeBatch};
 use cua_driver_core::snapshot_compaction::{
     is_secure_text_field, FieldSecurityMeta, REDACTED_VALUE,
 };
@@ -474,6 +477,18 @@ pub(crate) unsafe fn read_content_attrs(
     budget: &mut WalkBudget,
     batching_disabled: &mut bool,
 ) -> Option<ContentAttrs> {
+    super::tree_source::native::with_borrowed(element, |source, element| {
+        read_content_attrs_with(source, element, role, budget, batching_disabled)
+    })
+}
+
+fn read_content_attrs_with<S: AxTreeSource>(
+    source: &S,
+    element: &S::Element,
+    role: &str,
+    budget: &mut WalkBudget,
+    batching_disabled: &mut bool,
+) -> Option<ContentAttrs> {
     let role = if role == "AXUnknown" {
         AttrStatus::WrongType
     } else {
@@ -481,7 +496,11 @@ pub(crate) unsafe fn read_content_attrs(
     };
     let result = read_with(
         role,
-        &mut NativeReader { element, budget },
+        &mut SourceContentReader {
+            source,
+            element,
+            budget,
+        },
         batching_disabled,
     );
     if result.is_none() {
@@ -490,25 +509,24 @@ pub(crate) unsafe fn read_content_attrs(
     result
 }
 
-struct NativeReader<'a> {
-    element: AXUIElementRef,
+struct SourceContentReader<'a, S: AxTreeSource> {
+    source: &'a S,
+    element: &'a S::Element,
     budget: &'a WalkBudget,
 }
 
-impl ContentReader for NativeReader<'_> {
+impl<S: AxTreeSource> ContentReader for SourceContentReader<'_, S> {
     fn batch(&mut self) -> Result<[AttrStatus; 7], super::batch_attrs::BatchFailure> {
-        match unsafe { copy_attrs_batch(self.element, &CONTENT_ATTRIBUTES) } {
-            BatchRead::Fallback(failure) => Err(failure),
-            BatchRead::Slots(slots) => Ok(std::array::from_fn(|index| string_slot(&slots, index))),
-        }
+        let slots = self.source.batch(self.element, &CONTENT_ATTRIBUTES)?;
+        Ok(std::array::from_fn(|index| slots.text(index)))
     }
 
     fn string(&mut self, name: &str) -> AttrStatus {
-        unsafe { read_string_status(self.element, name) }
+        self.source.text_status(self.element, name)
     }
 
     fn value(&mut self) -> Result<Option<StringishAttrValue>, AXError> {
-        unsafe { single_read(self.element, "AXValue", |value| stringish_from_cf(value)) }
+        self.source.value(self.element)
     }
 
     fn expired(&self) -> bool {
@@ -1371,5 +1389,155 @@ mod tests {
             || Ok(None),
         );
         assert!(placeholder_failed.read_failed);
+    }
+}
+
+#[cfg(test)]
+mod source_adapter_tests {
+    use super::*;
+    use crate::ax::batch_attrs::BatchFailure;
+    use crate::ax::tree_source::{Read, TreeBatch};
+    use crate::ax::write_outcome::Settable;
+    use std::cell::RefCell;
+
+    struct FakeBatch([AttrStatus; 7]);
+    impl TreeBatch for FakeBatch {
+        fn text(&self, index: usize) -> AttrStatus {
+            self.0[index].clone()
+        }
+        fn boolean(&self, _: usize) -> Read<bool> {
+            panic!("unexpected boolean slot")
+        }
+        fn number(&self, _: usize) -> Read<f64> {
+            panic!("unexpected number slot")
+        }
+        fn position(&self, _: usize) -> Read<(f64, f64)> {
+            panic!("unexpected position slot")
+        }
+        fn size(&self, _: usize) -> Read<(f64, f64)> {
+            panic!("unexpected size slot")
+        }
+    }
+
+    struct Source {
+        attrs: [AttrStatus; 7],
+        trace: RefCell<Vec<String>>,
+    }
+    impl AxTreeSource for Source {
+        type Element = ();
+        type Batch = FakeBatch;
+        type ElementSet = ();
+        fn key(&self, _: &()) -> usize {
+            panic!("unexpected key")
+        }
+        fn set_messaging_timeout(&self, _: &()) {
+            panic!("unexpected timeout")
+        }
+        fn text(&self, _: &(), _: &str) -> Read<String> {
+            panic!("unexpected plain text")
+        }
+        fn text_status(&self, _: &(), name: &str) -> AttrStatus {
+            self.trace.borrow_mut().push(name.into());
+            self.attrs[CONTENT_ATTRIBUTES
+                .iter()
+                .position(|item| *item == name)
+                .unwrap()]
+            .clone()
+        }
+        fn boolean(&self, _: &(), _: &str) -> Read<bool> {
+            panic!("unexpected boolean")
+        }
+        fn number(&self, _: &(), _: &str) -> Read<f64> {
+            panic!("unexpected number")
+        }
+        fn position(&self, _: &()) -> Read<(f64, f64)> {
+            panic!("unexpected position")
+        }
+        fn size(&self, _: &()) -> Read<(f64, f64)> {
+            panic!("unexpected size")
+        }
+        fn value(&self, _: &()) -> Result<Option<StringishAttrValue>, AXError> {
+            self.trace.borrow_mut().push("AXValue".into());
+            Ok(Some(StringishAttrValue {
+                string_value: Some("value".into()),
+                state_value: "value".into(),
+            }))
+        }
+        fn batch(&self, _: &(), names: &[&str]) -> Result<FakeBatch, BatchFailure> {
+            self.trace
+                .borrow_mut()
+                .push(format!("batch:{}", names.join(",")));
+            Ok(FakeBatch(self.attrs.clone()))
+        }
+        fn children(&self, _: &()) -> Read<Vec<()>> {
+            panic!("unexpected children")
+        }
+        fn element_attribute(&self, _: &(), _: &str) -> Read<()> {
+            panic!("unexpected element")
+        }
+        fn element_set(&self, _: &(), _: &str) -> Read<()> {
+            panic!("unexpected set")
+        }
+        fn set_contains(&self, _: &(), _: &()) -> bool {
+            panic!("unexpected membership")
+        }
+        fn action_names(&self, _: &()) -> Read<Vec<String>> {
+            panic!("unexpected actions")
+        }
+        fn value_settable(&self, _: &()) -> bool {
+            panic!("unexpected writable")
+        }
+        fn selected_settable(&self, _: &()) -> Settable {
+            panic!("unexpected selected")
+        }
+        fn frame(&self, _: &()) -> Read<[f64; 4]> {
+            panic!("unexpected frame")
+        }
+        fn retain_for_snapshot(&self, _: &()) -> usize {
+            panic!("unexpected retain")
+        }
+    }
+
+    fn read(role: &str, attrs: [AttrStatus; 7], disabled: bool) -> (ContentAttrs, Vec<String>) {
+        let source = Source {
+            attrs,
+            trace: RefCell::new(Vec::new()),
+        };
+        let mut budget = WalkBudget::nodes_only(10);
+        let _ = budget.admit();
+        let mut disabled = disabled;
+        let output =
+            read_content_attrs_with(&source, &(), role, &mut budget, &mut disabled).unwrap();
+        (output, source.trace.into_inner())
+    }
+
+    #[test]
+    fn secure_value_is_not_requested_via_source() {
+        let mut attrs = std::array::from_fn(|_| AttrStatus::Absent);
+        attrs[1] = AttrStatus::Known("Password".into());
+        let (output, trace) = read("AXTextField", attrs, false);
+        assert_eq!(output.value.as_deref(), Some("[redacted]"));
+        assert_eq!(trace, [format!("batch:{}", CONTENT_ATTRIBUTES.join(","))]);
+    }
+
+    #[test]
+    fn nstextview_exception_reads_value_after_classification_singles() {
+        let mut attrs = std::array::from_fn(|_| AttrStatus::Absent);
+        for index in [2, 3] {
+            attrs[index] = AttrStatus::Failed {
+                error: kAXErrorFailure,
+                listed: AttributeListing::Listed,
+            };
+        }
+        attrs[6] = AttrStatus::Known("text entry area".into());
+        let (output, trace) = read("AXTextArea", attrs, true);
+        assert_eq!(output.value.as_deref(), Some("value"));
+        assert_eq!(
+            trace,
+            CONTENT_ATTRIBUTES
+                .into_iter()
+                .chain(["AXValue"])
+                .collect::<Vec<_>>()
+        );
     }
 }

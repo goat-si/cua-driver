@@ -66,6 +66,7 @@ pub(crate) struct BatchSlots {
 }
 
 impl BatchSlots {
+    #[cfg(test)]
     pub(crate) fn string(&self, index: usize) -> Option<String> {
         match self.slots[index] {
             Slot::Value(value) => unsafe { string_from_cf(value) },
