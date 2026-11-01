@@ -39,6 +39,53 @@ pub(crate) enum ValueObs {
     Failed(AXError),
     OtherType,
 }
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum ValueRead {
+    Allowed(ValueObs),
+    Withheld,
+}
+
+impl ValueRead {
+    pub(crate) fn text(self) -> Option<String> {
+        match self {
+            Self::Allowed(ValueObs::Text(value)) => Some(value),
+            _ => None,
+        }
+    }
+}
+
+pub(crate) trait DirectValueReader: super::label_reader::LabelReader {
+    fn value(&mut self, element: Self::Element) -> ValueObs;
+}
+
+impl DirectValueReader for super::label_reader::NativeLabelReader {
+    fn value(&mut self, element: Self::Element) -> ValueObs {
+        unsafe { read_value_typed(element) }
+    }
+}
+
+pub(crate) fn read_value_if_allowed<R: DirectValueReader>(
+    reader: &mut R,
+    element: R::Element,
+) -> ValueRead {
+    if super::content_attrs::classify_value_read(reader, element) {
+        ValueRead::Allowed(reader.value(element))
+    } else {
+        ValueRead::Withheld
+    }
+}
+
+pub(crate) unsafe fn read_text_value(element: AXUIElementRef) -> Option<String> {
+    read_text_value_with(&mut super::label_reader::NativeLabelReader, element)
+}
+
+pub(crate) fn read_text_value_with<R: DirectValueReader>(
+    reader: &mut R,
+    element: R::Element,
+) -> Option<String> {
+    read_value_if_allowed(reader, element).text()
+}
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Settable {
     Yes,

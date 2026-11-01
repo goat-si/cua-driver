@@ -96,4 +96,13 @@ pub(crate) mod fake {
             }
         }
     }
+
+    impl super::super::write_outcome::DirectValueReader for FakeReader {
+        fn value(&mut self, element: usize) -> super::super::write_outcome::ValueObs {
+            match self.string(element, "AXValue") {
+                Some(value) => super::super::write_outcome::ValueObs::Text(value),
+                None => super::super::write_outcome::ValueObs::Missing,
+            }
+        }
+    }
 }

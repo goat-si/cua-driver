@@ -16,6 +16,9 @@
 
 use cua_driver_core::protocol::ToolResult;
 
+#[cfg(test)]
+use crate::ax::write_outcome::ValueObs;
+use crate::ax::write_outcome::ValueRead;
 use crate::document_edit::HeldMark;
 use crate::input::skylight::{scope_disclosure, HandBack, KeyEntry, ScopeEntryError};
 
@@ -180,7 +183,7 @@ pub(super) trait HoldOps {
     fn can_dispatch(&mut self, element: &Self::Element) -> Dispatch;
     /// The one AXSelectedText write; the AX error (0 on success).
     fn write(&mut self, element: &Self::Element, text: &str) -> i32;
-    fn read_value(&mut self, element: &Self::Element) -> Option<String>;
+    fn read_value(&mut self, element: &Self::Element) -> ValueRead;
     /// Mark the document edited, reading can_dispatch before each post.
     fn mark(&mut self, element: &Self::Element) -> HeldMark;
     /// Role and title for the result line.
@@ -227,7 +230,10 @@ fn held<O: HoldOps>(ops: &mut O, text: &str) -> HoldOutcome {
     }
     let ax_error = ops.write(&element, text);
     let after = ops.read_value(&element);
-    let readback = judge(&before, text, ax_error, after.as_deref());
+    let readback = match after {
+        ValueRead::Withheld => Readback::Unverifiable,
+        value => judge(&before, text, ax_error, value.text().as_deref()),
+    };
     let mark = (readback == Readback::Confirmed).then(|| ops.mark(&element));
     HoldOutcome::Inserted {
         readback,
@@ -550,7 +556,7 @@ impl HoldOps for LiveHoldOps {
 
     fn before(&mut self, element: &Self::Element) -> Option<Before> {
         let ptr = element.as_ptr() as crate::ax::bindings::AXUIElementRef;
-        let value = unsafe { crate::ax::bindings::copy_string_attr(ptr, "AXValue") }?;
+        let value = unsafe { crate::ax::write_outcome::read_text_value(ptr) }?;
         let range = unsafe { crate::ax::tree::read_selected_text_range(ptr) }?;
         Some(Before {
             value,
@@ -595,13 +601,11 @@ impl HoldOps for LiveHoldOps {
         }
     }
 
-    fn read_value(&mut self, element: &Self::Element) -> Option<String> {
-        unsafe {
-            crate::ax::bindings::copy_string_attr(
-                element.as_ptr() as crate::ax::bindings::AXUIElementRef,
-                "AXValue",
-            )
-        }
+    fn read_value(&mut self, element: &Self::Element) -> ValueRead {
+        crate::ax::write_outcome::read_value_if_allowed(
+            &mut crate::ax::label_reader::NativeLabelReader,
+            element.as_ptr() as crate::ax::bindings::AXUIElementRef,
+        )
     }
 
     fn mark(&mut self, element: &Self::Element) -> HeldMark {
@@ -627,26 +631,59 @@ impl HoldOps for LiveHoldOps {
 }
 
 #[cfg(test)]
+mod secure_read_tests {
+    use super::tests::{run, Fake};
+
+    #[test]
+    fn hold_before_withheld_refuses_without_sending() {
+        let mut fake = Fake::ok();
+        fake.before = None;
+        let (_, result) = run(&mut fake);
+        assert!(!fake.log.contains(&"write"));
+        let data = result.structured_content.unwrap();
+        assert_eq!(data["effect"], "refused");
+        assert_eq!(data["text_sent"], false);
+    }
+
+    #[test]
+    fn hold_after_withheld_is_sent_unverifiable() {
+        let mut fake = Fake::ok();
+        fake.after_withheld = true;
+        fake.ax_error = -25204;
+        let (_, result) = run(&mut fake);
+        assert_eq!(
+            fake.log.iter().filter(|event| **event == "write").count(),
+            1
+        );
+        assert!(!fake.log.contains(&"mark"));
+        let data = result.structured_content.unwrap();
+        assert_eq!(data["effect"], "unverifiable");
+        assert_eq!(data["readback"], "unverifiable");
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
     /// Scripted live reads and writes, with every call logged.
-    struct Fake {
+    pub(super) struct Fake {
         enter: Result<(), (KeyEntry, Option<HandBack>)>,
         entry: KeyEntry,
         hand_back: HandBack,
         focused: bool,
         assessment: Assessment,
-        before: Option<Before>,
+        pub(super) before: Option<Before>,
         dispatch: Dispatch,
-        ax_error: i32,
+        pub(super) ax_error: i32,
         after: Option<String>,
+        pub(super) after_withheld: bool,
         mark: HeldMark,
-        log: Vec<&'static str>,
+        pub(super) log: Vec<&'static str>,
     }
 
     impl Fake {
-        fn ok() -> Self {
+        pub(super) fn ok() -> Self {
             Self {
                 enter: Ok(()),
                 entry: KeyEntry {
@@ -664,6 +701,7 @@ mod tests {
                 dispatch: Dispatch::Ok,
                 ax_error: 0,
                 after: Some(" TOKhello alpha".into()),
+                after_withheld: false,
                 mark: HeldMark::Marked,
                 log: Vec::new(),
             }
@@ -708,9 +746,18 @@ mod tests {
             self.log.push("write");
             self.ax_error
         }
-        fn read_value(&mut self, _: &()) -> Option<String> {
+        fn read_value(&mut self, _: &()) -> ValueRead {
             self.log.push("read_value");
-            self.after.clone()
+            if self.after_withheld {
+                ValueRead::Withheld
+            } else {
+                ValueRead::Allowed(
+                    self.after
+                        .clone()
+                        .map(ValueObs::Text)
+                        .unwrap_or(ValueObs::Missing),
+                )
+            }
         }
         fn mark(&mut self, _: &()) -> HeldMark {
             self.log.push("mark");
@@ -736,7 +783,7 @@ mod tests {
             .collect()
     }
 
-    fn run(fake: &mut Fake) -> (HoldStep, ToolResult) {
+    pub(super) fn run(fake: &mut Fake) -> (HoldStep, ToolResult) {
         let step = run_hold(fake, " TOK");
         let result = hold_result(step.clone(), 42, 7, 4);
         (step, result)

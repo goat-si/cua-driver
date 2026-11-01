@@ -84,6 +84,40 @@ unsafe fn in_document_window(element: AXUIElementRef) -> bool {
     document.is_some_and(|url| !url.is_empty())
 }
 
+fn status_without_value(document: Option<bool>) -> DocumentEdited {
+    if document == Some(false) {
+        DocumentEdited::NotADocument
+    } else {
+        DocumentEdited::NotMarked
+    }
+}
+
+/// Return the document warning state without reading the field's value.
+///
+/// # Safety
+/// `element` must be a live `AXUIElementRef`.
+pub(crate) unsafe fn document_status_without_value(element: AXUIElementRef) -> DocumentEdited {
+    status_without_value(document_window_state(element))
+}
+
+fn stop_on_withheld(
+    mut read: impl FnMut() -> crate::ax::write_outcome::ValueRead,
+) -> impl FnMut() -> Option<String> {
+    let mut withheld = false;
+    move || {
+        if withheld {
+            return None;
+        }
+        match read() {
+            crate::ax::write_outcome::ValueRead::Withheld => {
+                withheld = true;
+                None
+            }
+            value => value.text(),
+        }
+    }
+}
+
 /// Whether the app's key window (its `AXFocusedWindow`) is the element's
 /// window, so pid-routed key events reach this text and not another window.
 ///
@@ -256,7 +290,12 @@ pub unsafe fn ensure_marked_in_held_window(
         collapsed_caret_of(element),
         can_post,
         |key| crate::input::keyboard::press_key(pid, key, &[]),
-        || copy_string_attr(element, "AXValue"),
+        stop_on_withheld(|| {
+            crate::ax::write_outcome::read_value_if_allowed(
+                &mut crate::ax::label_reader::NativeLabelReader,
+                element,
+            )
+        }),
         || std::thread::sleep(NET_ZERO_POLL_INTERVAL),
     )
 }
@@ -297,14 +336,19 @@ unsafe fn send_net_zero_edit(
     element: AXUIElementRef,
     caret_to_end: bool,
 ) -> DocumentEdited {
-    if caret_to_end {
-        caret_to_end_of(element);
+    if caret_to_end && !caret_to_end_of(element) {
+        return DocumentEdited::NotMarked;
     }
     let _ = crate::input::ax_actions::focus_element(element as usize);
     net_zero_edit(
         collapsed_caret_of(element),
         |key| crate::input::keyboard::press_key(pid, key, &[]),
-        || copy_string_attr(element, "AXValue"),
+        stop_on_withheld(|| {
+            crate::ax::write_outcome::read_value_if_allowed(
+                &mut crate::ax::label_reader::NativeLabelReader,
+                element,
+            )
+        }),
         || std::thread::sleep(NET_ZERO_POLL_INTERVAL),
     )
 }
@@ -475,10 +519,20 @@ unsafe fn element_window_id(element: AXUIElementRef) -> Option<u32> {
 ///
 /// # Safety
 /// `element` must be a live `AXUIElementRef`.
-unsafe fn caret_to_end_of(element: AXUIElementRef) {
-    let len = copy_string_attr(element, "AXValue")
-        .map(|v| v.encode_utf16().count())
-        .unwrap_or(0);
+fn caret_end_offset(value: crate::ax::write_outcome::ValueRead) -> Option<usize> {
+    match value {
+        crate::ax::write_outcome::ValueRead::Withheld => None,
+        value => Some(value.text().map(|v| v.encode_utf16().count()).unwrap_or(0)),
+    }
+}
+
+unsafe fn caret_to_end_of(element: AXUIElementRef) -> bool {
+    let Some(len) = caret_end_offset(crate::ax::write_outcome::read_value_if_allowed(
+        &mut crate::ax::label_reader::NativeLabelReader,
+        element,
+    )) else {
+        return false;
+    };
     let range = CfRange {
         location: len as isize,
         length: 0,
@@ -489,6 +543,83 @@ unsafe fn caret_to_end_of(element: AXUIElementRef) {
         let attr = CFString::new("AXSelectedTextRange");
         let _ = AXUIElementSetAttributeValue(element, attr.as_concrete_TypeRef(), value as _);
         core_foundation::base::CFRelease(value as _);
+    }
+    true
+}
+
+#[cfg(test)]
+mod secure_read_tests {
+    use super::*;
+    use crate::ax::write_outcome::{ValueObs, ValueRead};
+    use std::cell::RefCell;
+    use std::collections::VecDeque;
+
+    #[test]
+    fn held_withheld_keeps_each_heldmark_label() {
+        for (values, expected, sent) in [
+            (vec![ValueRead::Withheld], HeldMark::NothingSent, vec![]),
+            (
+                vec![
+                    ValueRead::Allowed(ValueObs::Text("a".into())),
+                    ValueRead::Withheld,
+                ],
+                HeldMark::SpaceMayRemain,
+                vec!["space"],
+            ),
+            (
+                vec![
+                    ValueRead::Allowed(ValueObs::Text("a".into())),
+                    ValueRead::Allowed(ValueObs::Text("a ".into())),
+                    ValueRead::Withheld,
+                ],
+                HeldMark::Unconfirmed,
+                vec!["space", "delete"],
+            ),
+        ] {
+            let mut values = VecDeque::from(values);
+            let keys = RefCell::new(Vec::new());
+            let mark = net_zero_edit_held(
+                Some(1),
+                || true,
+                |key| {
+                    keys.borrow_mut().push(key.to_owned());
+                    Ok(())
+                },
+                stop_on_withheld(|| values.pop_front().unwrap_or(ValueRead::Withheld)),
+                || {},
+            );
+            assert_eq!(mark, expected);
+            assert_eq!(*keys.borrow(), sent);
+        }
+    }
+
+    #[test]
+    fn caret_move_is_skipped_when_withheld() {
+        assert_eq!(caret_end_offset(ValueRead::Withheld), None);
+        assert_eq!(
+            caret_end_offset(ValueRead::Allowed(ValueObs::Text("😀".into()))),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn document_edit_withheld_keeps_the_save_warning() {
+        let status = status_without_value(Some(true));
+        assert_eq!(status, DocumentEdited::NotMarked);
+        assert!(status.note().contains("may keep the old content"));
+        assert_eq!(status.structured(), Some(false));
+        assert_eq!(
+            status_without_value(Some(false)),
+            DocumentEdited::NotADocument
+        );
+        assert_eq!(status_without_value(None), DocumentEdited::NotMarked);
+    }
+
+    #[test]
+    fn document_key_edit_sent_mapping_is_unchanged() {
+        assert_eq!(DocumentEdited::Marked.structured(), Some(true));
+        assert_eq!(DocumentEdited::NotMarked.structured(), Some(false));
+        assert_eq!(DocumentEdited::NotADocument.structured(), None);
     }
 }
 
