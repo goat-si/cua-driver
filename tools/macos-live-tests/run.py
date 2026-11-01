@@ -57,6 +57,11 @@ def ignore_reasons(binary, ignored, failures):
     missing = sorted(set(ignored) - set(reasons))
     if missing:
         failures.append(f"libtest gave no ignore report for: {missing}")
+    unlisted = sorted(set(reasons) - set(ignored))
+    if unlisted:
+        # A reason containing a newline can print what looks like another
+        # test's report line.
+        failures.append(f"libtest reported tests the binary does not list as ignored: {unlisted}")
     return reasons
 
 
@@ -69,6 +74,12 @@ def main():
         print("the binary lists no ignored tests: wrong binary?")
         sys.exit(1)
     reasons = ignore_reasons(binary, ignored, failures)
+    if failures:
+        # The live list is only trustworthy when every report was read cleanly:
+        # stop before any test process starts.
+        print("could not read the ignore reasons; no test was run")
+        print("\n".join(failures))
+        sys.exit(1)
     tests = [name for name in ignored if reasons.get(name, "").startswith("live:")]
     env = dict(os.environ, CUA_TEST_ALLOW_CLIPBOARD="1")
     passed = 0
