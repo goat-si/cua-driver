@@ -401,6 +401,30 @@ pub(crate) fn menu_outcome(completed_hops: usize, failure: Option<MenuFailure>) 
     }
 }
 
+/// Preserve a producer error while accounting for a prior side effect.
+pub(crate) fn after_prologue(
+    mut result: cua_driver_core::protocol::ToolResult,
+) -> cua_driver_core::protocol::ToolResult {
+    use cua_driver_core::mutation::{Postcondition, Reason, WriteChain, WriteOutcome};
+    let chain = WriteChain::run(
+        [WriteOutcome::StopNotDelivered(Reason::UnconfirmedAlive)],
+        true,
+    );
+    let structured = result
+        .structured_content
+        .get_or_insert_with(|| serde_json::json!({}));
+    if !structured.is_object() {
+        *structured = serde_json::json!({ "detail": structured.take() });
+    }
+    structured["effect"] = serde_json::to_value(chain.effect(Postcondition::Indeterminate, false))
+        .expect("effect serializes");
+    result.disposition = chain.error_disposition(Postcondition::Indeterminate, false);
+    if let Some(record) = result.action_record.as_mut() {
+        record.effect = cua_driver_core::action_record::ActionEffect::Unverifiable;
+    }
+    result
+}
+
 /// Construct an error from the complete chain, retaining the producer's legacy fields.
 pub(crate) fn chain_error(
     message: impl Into<String>,

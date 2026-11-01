@@ -512,3 +512,27 @@ fn set_value_failure_producer_finalizes_with_uncertain_delivery() {
         );
     }
 }
+
+#[test]
+fn prior_prologue_preserves_refusal_fields_and_makes_delivery_uncertain() {
+    let result = cua_driver_core::protocol::ToolResult::error("offscreen")
+        .with_structured(
+            serde_json::json!({"code":"element_not_visible", "note":"kept", "effect":"refused"}),
+        )
+        .with_disposition(cua_driver_contract::ErrorDisposition::NOT_DELIVERED);
+    let result = after_prologue(result);
+    let wire = cua_driver_core::mcp_result::conforming_tool_result(
+        "click",
+        serde_json::to_value(result).unwrap(),
+    );
+    assert_eq!(wire["structuredContent"]["code"], "element_not_visible");
+    assert_eq!(wire["structuredContent"]["note"], "kept");
+    assert_eq!(wire["structuredContent"]["effect"], "unverifiable");
+    assert_eq!(
+        serde_json::from_value::<cua_driver_contract::ErrorDisposition>(
+            wire["structuredContent"]["disposition"].clone()
+        )
+        .unwrap(),
+        cua_driver_contract::ErrorDisposition::SUSPECTED_NOOP
+    );
+}

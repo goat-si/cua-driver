@@ -4372,7 +4372,7 @@ impl Tool for ClickTool {
                     "a foreground click",
                 ) {
                     Ok(p) => p,
-                    Err(result) => return result,
+                    Err(result) => return crate::uia_mutation::after_prologue(result),
                 };
                 if (cx, cy) != recorded_center {
                     crate::recording_hooks::capture_dispatch_click_target(hwnd, pid, cx, cy);
@@ -4497,8 +4497,7 @@ impl Tool for ClickTool {
                 {
                     let (cx, cy) = resolve_onscreen_point_with_scroll(
                         &admitted, hwnd, idx, cx, cy, "clicking",
-                    )
-                    ?;
+                    ).map_err(crate::uia_mutation::after_prologue)?;
                     return Ok(BackgroundElementClick::Inject { x: cx, y: cy, failed_calls });
                 }
                 if use_uia_invoke {
@@ -4576,14 +4575,13 @@ impl Tool for ClickTool {
                         cx,
                         cy,
                         "clicking",
-                    )
-                    ?;
+                    ).map_err(crate::uia_mutation::after_prologue)?;
                     return Ok(BackgroundElementClick::Inject { x: cx, y: cy, failed_calls });
                 }
                 if admitted.as_ref().is_some_and(|element| element.read_while_minimized) {
                     let (x, y) =
                         resolve_onscreen_point_with_scroll(&admitted, hwnd, idx, cx, cy, "clicking")
-                            ?;
+                            .map_err(crate::uia_mutation::after_prologue)?;
                     return Ok(BackgroundElementClick::Post { x, y, failed_calls });
                 }
                 Ok(BackgroundElementClick::Post { x: cx, y: cy, failed_calls })
@@ -6238,7 +6236,7 @@ impl Tool for PressKeyTool {
                 "focusing for key delivery",
             ) {
                 Ok(point) => point,
-                Err(result) => return result,
+                Err(result) => return crate::uia_mutation::after_prologue(result),
             };
             let (px, py) = screen_to_bitmap(hwnd, cx, cy);
             // Release the outer guard before the shared pixel helper. ClickTool
