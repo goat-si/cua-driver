@@ -7,7 +7,9 @@ use crate::element_token::{
 };
 use crate::protocol::ToolResult;
 pub use basis::CaptureTicket;
-pub use scoped::{ScopedCapture, ScopedWalk, ValidatedScopedCapture, SCOPED_CAP_PER_PARENT};
+pub use scoped::{
+    RootValidationError, ScopedCapture, ScopedWalk, ValidatedScopedCapture, SCOPED_CAP_PER_PARENT,
+};
 use std::any::Any;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock, Weak};

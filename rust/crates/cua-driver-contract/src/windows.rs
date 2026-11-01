@@ -23,6 +23,12 @@ fn nonnegative_integer_schema(_: &mut SchemaGenerator) -> Schema {
     json_schema!({"type":"integer", "minimum":0})
 }
 
+fn plain_snapshot_id(value: &str) -> bool {
+    value
+        .strip_prefix('s')
+        .is_some_and(|hex| hex.len() == 8 && hex.bytes().all(|b| b.is_ascii_hexdigit()))
+}
+
 fn nullable_pid_schema(_: &mut SchemaGenerator) -> Schema {
     json_schema!({"type":["integer","null"], "minimum":0, "maximum":4294967295_u64})
 }
@@ -600,14 +606,17 @@ impl ToolOutput for WindowStateOutput {
     fn validate(&self) -> Result<(), String> {
         match self.drilldown_status {
             Some(DrilldownStatus::Complete) => {
-                if self.scope.is_none()
-                    || self.snapshot_id.is_none()
-                    || self.observation_complete != Some(true)
-                {
-                    return Err(
-                        "complete drill-down requires a scope, snapshot and complete observation"
-                            .into(),
-                    );
+                let distinct = self
+                    .scope
+                    .as_ref()
+                    .zip(self.snapshot_id.as_deref())
+                    .is_some_and(|(scope, id)| {
+                        plain_snapshot_id(id)
+                            && plain_snapshot_id(&scope.parent_snapshot_id)
+                            && !id.eq_ignore_ascii_case(&scope.parent_snapshot_id)
+                    });
+                if self.observation_complete != Some(true) || !distinct {
+                    return Err("complete drill-down requires a scope, a distinct snapshot and a complete observation".into());
                 }
             }
             Some(
@@ -789,6 +798,18 @@ mod tests {
             "scope":{"root_token":"s000000aa:1","parent_snapshot_id":"s000000aa"}}))
         .unwrap();
         assert!(output.validate().is_err());
+        for id in ["s000000aa", "s000000AA", "s000000aa.f1"] {
+            let output: WindowStateOutput = serde_json::from_value(json!({"pid":7,"window_id":9,
+                "drilldown_status":"complete","observation_complete":true,"snapshot_id":id,
+                "scope":{"root_token":"s000000aa:1","parent_snapshot_id":"s000000aa"}}))
+            .unwrap();
+            assert!(output.validate().is_err(), "{id}");
+        }
+        let valid: WindowStateOutput = serde_json::from_value(json!({"pid":7,"window_id":9,
+            "drilldown_status":"complete","observation_complete":true,"snapshot_id":"s000000bb",
+            "scope":{"root_token":"s000000aa:1","parent_snapshot_id":"s000000aa"}}))
+        .unwrap();
+        valid.validate().unwrap();
         let output: WindowStateOutput = serde_json::from_value(json!({"pid":7,"window_id":9,
             "drilldown_status":"incomplete","drilldown_diagnostics":[{"kind":"unknown","detail":"not_asserted"}]})).unwrap();
         assert!(output.validate().is_err());

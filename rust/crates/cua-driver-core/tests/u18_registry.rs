@@ -76,7 +76,10 @@ impl Tool for FakePlatform {
                 if *old == 11 && path == [1] && window == 7 && process.start_time == Some(1) {
                     Ok(11)
                 } else {
-                    Err(ToolResult::error("fake root is no longer live"))
+                    Err(cua_driver_core::snapshot_store::RootValidationError::new(
+                        "stale_element_token",
+                        "fake root is no longer live",
+                    ))
                 }
             }) {
                 Ok(value) => value,

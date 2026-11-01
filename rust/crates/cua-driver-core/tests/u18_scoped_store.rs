@@ -63,8 +63,10 @@ fn commit(
     store: &SnapshotStore<Payload>,
     capture: ValidatedScopedCapture<Payload>,
     payload: Payload,
-) -> Result<u32, cua_driver_core::protocol::ToolResult> {
-    store.commit_scoped_capture(capture, ScopedWalk::Complete(payload))
+) -> Result<u32, Box<cua_driver_core::protocol::ToolResult>> {
+    store
+        .commit_scoped_capture(capture, ScopedWalk::Complete(payload))
+        .map_err(Box::new)
 }
 
 #[test]
@@ -214,17 +216,19 @@ fn scoped_capacity_evicts_oldest_without_affecting_full_or_other_scopes() {
         scopes.push(commit(&store, capture, Payload(vec![i])).unwrap());
     }
     let resolve = |id| {
-        store.resolve_for_instance(
-            42,
-            &json!({
-                "element_token":token_for(id, 0), "_session_id":"owner"
-            }),
-            InstanceEvidence::Live(fingerprint(1)),
-        )
+        store
+            .resolve_for_instance(
+                42,
+                &json!({
+                    "element_token":token_for(id, 0), "_session_id":"owner"
+                }),
+                InstanceEvidence::Live(fingerprint(1)),
+            )
+            .is_ok()
     };
-    assert!(resolve(scopes[0]).is_err());
-    assert!(resolve(scopes[1]).is_ok());
-    assert!(resolve(parent).is_ok());
+    assert!(!resolve(scopes[0]));
+    assert!(resolve(scopes[1]));
+    assert!(resolve(parent));
     assert_eq!(store.with_latest(42, 7, |id, _| id), Some(parent));
 }
 
@@ -288,9 +292,17 @@ fn a_root_that_moved_vanished_or_changed_window_is_not_published() {
             )
             .unwrap();
         let error = candidate
-            .validate_root(|_, _, _, _| Err(cua_driver_core::protocol::ToolResult::error(reason)))
+            .validate_root(|_, _, _, _| {
+                Err(cua_driver_core::snapshot_store::RootValidationError::new(
+                    "stale_element_token",
+                    reason,
+                ))
+            })
             .unwrap_err();
         assert_eq!(error.is_error, Some(true), "{reason}");
+        let data = error.structured_content.unwrap();
+        assert_eq!(data["refusal"]["code"], "stale_element_token");
+        assert_eq!(data["refusal"]["message"], reason);
         assert_eq!(store.with_latest(42, 7, |id, _| id), Some(parent));
     }
 }

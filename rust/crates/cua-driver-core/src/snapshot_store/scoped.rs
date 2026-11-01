@@ -55,6 +55,22 @@ impl<S: SnapshotPayload> std::fmt::Debug for ValidatedScopedCapture<S> {
     }
 }
 
+/// A platform refusal while freshly resolving the root.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RootValidationError {
+    pub code: String,
+    pub message: String,
+}
+
+impl RootValidationError {
+    pub fn new(code: impl Into<String>, message: impl Into<String>) -> Self {
+        Self {
+            code: code.into(),
+            message: message.into(),
+        }
+    }
+}
+
 impl<S: SnapshotPayload> ScopedCapture<S> {
     /// Re-resolve the structural path from the live window, check its process
     /// and window identity, compare it to the retained root, and return the
@@ -66,9 +82,10 @@ impl<S: SnapshotPayload> ScopedCapture<S> {
             &[usize],
             u64,
             &ProcessFingerprint,
-        ) -> Result<S::Element, ToolResult>,
+        ) -> Result<S::Element, RootValidationError>,
     ) -> Result<ValidatedScopedCapture<S>, ToolResult> {
-        let live_element = validate(&self.element, &self.path, self.window_id, &self.instance)?;
+        let live_element = validate(&self.element, &self.path, self.window_id, &self.instance)
+            .map_err(|error| refusal(&error.code, error.message))?;
         Ok(ValidatedScopedCapture {
             capture: self,
             live_element,

@@ -25,7 +25,8 @@ An adopting backend must:
 4. Call `ScopedCapture::validate_root` outside the store lock. Its callback
    must re-resolve the structural path from the live window, verify the process
    instance and exact window, and compare the result with the selected root.
-   Return the freshly resolved native element; a retained AX/UIA handle or a
+   Return the freshly resolved native element, or a `RootValidationError` with
+   an explicit refusal code and message. A retained AX/UIA handle or a
    cached AT-SPI identity alone is not proof of liveness. Walk only the element
    returned by `ValidatedScopedCapture::root_element`.
 5. Submit `ScopedWalk::Complete(payload)` only when the platform can assert

@@ -331,8 +331,16 @@ pub fn apply_scoped(
             .pointer("/scope/parent_snapshot_id")
             .and_then(Value::as_str)
             == Some(parent_snapshot_id);
+    let distinct_snapshot = structured
+        .get("snapshot_id")
+        .and_then(Value::as_str)
+        .and_then(crate::element_token::parse_snapshot_handle)
+        .zip(crate::element_token::parse_snapshot_handle(
+            parent_snapshot_id,
+        ))
+        .is_some_and(|(scope, parent)| scope != parent);
     if !matches!(status, Some("incomplete" | "stale_parent" | "unsupported"))
-        && (status != Some("complete") || !correct_scope)
+        && (status != Some("complete") || !correct_scope || !distinct_snapshot)
     {
         structured["drilldown_status"] = json!("incomplete");
         structured["drilldown_diagnostics"] =
@@ -383,24 +391,30 @@ pub fn apply(
             .map(str::to_owned);
         let pid = structured.get("pid").and_then(Value::as_i64);
         let window_id = structured.get("window_id").and_then(Value::as_u64);
-        let diagnostics = structured
-            .get("drilldown_diagnostics")
-            .or_else(|| structured.get("observation_incomplete_reasons"));
-        if status == "incomplete" || diagnostics.is_some() {
-            let reasons = diagnostics
-                .and_then(|value| {
+        let candidates = [
+            structured.get("drilldown_diagnostics"),
+            structured.get("observation_incomplete_reasons"),
+        ];
+        if status == "incomplete" || candidates.iter().any(Option::is_some) {
+            let mut reasons: Vec<_> = candidates
+                .into_iter()
+                .flatten()
+                .filter_map(|value| {
                     serde_json::from_value::<Vec<cua_driver_contract::IncompleteReason>>(
                         value.clone(),
                     )
                     .ok()
                 })
-                .filter(|reasons| !reasons.is_empty())
-                .unwrap_or_else(|| {
-                    vec![cua_driver_contract::IncompleteReason {
-                        kind: cua_driver_contract::IncompleteReasonKind::Unknown,
-                        detail: cua_driver_contract::IncompleteReasonDetail::NotAsserted,
-                    }]
+                .flatten()
+                .collect();
+            reasons.sort_unstable();
+            reasons.dedup();
+            if reasons.is_empty() {
+                reasons.push(cua_driver_contract::IncompleteReason {
+                    kind: cua_driver_contract::IncompleteReasonKind::Unknown,
+                    detail: cua_driver_contract::IncompleteReasonDetail::NotAsserted,
                 });
+            }
             structured["drilldown_diagnostics"] = json!(reasons);
         }
         if let Some(fields) = structured.as_object_mut() {
@@ -1787,6 +1801,22 @@ mod tests {
             assert_eq!(result["drilldown_status"], "incomplete");
             assert!(result.get("snapshot_id").is_none());
         }
+        for id in ["s000000aa", "s000000AA", "s000000aa.f1"] {
+            let (mut content, mut result) = payload(id, OLD);
+            result["drilldown_status"] = json!("complete");
+            result["observation_complete"] = json!(true);
+            result["scope"] = json!({"root_token":"s000000aa:1","parent_snapshot_id":"s000000aa"});
+            apply_scoped(
+                "s000000aa:1",
+                "s000000aa",
+                &opts(json!({})),
+                &ctx,
+                &mut content,
+                &mut result,
+            );
+            assert_eq!(result["drilldown_status"], "incomplete", "{id}");
+            assert!(result.get("snapshot_id").is_none(), "{id}");
+        }
     }
 
     #[test]
@@ -1811,6 +1841,42 @@ mod tests {
             .unwrap()
             .contains("permission_denied"));
         assert!(result.get("snapshot_id").is_none());
+    }
+
+    #[test]
+    fn incomplete_view_keeps_observation_reasons_when_diagnostics_are_empty() {
+        let ctx = ViewContext {
+            pid: 420007,
+            window_id: 97009,
+            key: ViewKey {
+                query: None,
+                max_elements: 250,
+                max_depth: None,
+            },
+            focus_probe: None,
+        };
+        let (mut content, mut result) = payload("s000000bb", OLD);
+        result["drilldown_status"] = json!("incomplete");
+        result["drilldown_diagnostics"] = json!([]);
+        result["observation_incomplete_reasons"] =
+            json!([{"kind":"budget","detail":"time_budget"}]);
+        apply(&opts(json!({})), &ctx, &mut content, &mut result);
+        assert_eq!(result["drilldown_diagnostics"][0]["detail"], "time_budget");
+        assert!(result.get("snapshot_id").is_none());
+        let (mut content, mut result) = payload("s000000bc", OLD);
+        result["drilldown_status"] = json!("incomplete");
+        result["drilldown_diagnostics"] = json!([{"kind":"budget","detail":"node_budget"}]);
+        result["observation_incomplete_reasons"] =
+            json!([{"kind":"budget","detail":"time_budget"}]);
+        apply(&opts(json!({})), &ctx, &mut content, &mut result);
+        let diagnostics = result["drilldown_diagnostics"].as_array().unwrap();
+        assert_eq!(diagnostics.len(), 2);
+        assert!(diagnostics
+            .iter()
+            .any(|reason| reason["detail"] == "node_budget"));
+        assert!(diagnostics
+            .iter()
+            .any(|reason| reason["detail"] == "time_budget"));
     }
 
     #[test]
