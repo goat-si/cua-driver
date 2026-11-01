@@ -893,6 +893,11 @@ fn fold_after_elision<N: CompactableNode>(
                         }
                     }
                     let mut parent_node = old_nodes[idx].take().unwrap();
+                    let original_description = parent_node.description().and_then(|description| {
+                        let text = description.trim();
+                        (!text.is_empty() && field_is_rendered(&parent_node.format_line(), text))
+                            .then(|| description.to_owned())
+                    });
                     if report_folds {
                         if let Some(slot) = parent_node.boundary_mut() {
                             mark_folded_children(slot, absorbed_children);
@@ -920,11 +925,13 @@ fn fold_after_elision<N: CompactableNode>(
                     }
                     let existing_title = parent_node.title().map(str::trim).unwrap_or("");
                     let mut written_value = None;
+                    let mut written_parent_component = None;
                     if existing_title != summary {
                         let merged_val = match parent_node.value().map(str::trim) {
                             Some(v) if !v.is_empty() && v != summary => {
                                 let combined = format!("{v} {summary}");
                                 if combined.chars().count() <= MAX_SUMMARY_CHARS {
+                                    written_parent_component = Some(v.to_owned());
                                     combined
                                 } else {
                                     summary.clone()
@@ -938,7 +945,7 @@ fn fold_after_elision<N: CompactableNode>(
                     let mut formatted = parent_node.format_line();
                     let (rendered_label, rendered_value) =
                         rendered_label_value(&formatted, parent_node.role());
-                    let retained_fields: Vec<(String, String)> = [
+                    let mut retained_fields: Vec<(String, String)> = [
                         parent_node.title().zip(rendered_label),
                         parent_node.value().zip(rendered_value),
                     ]
@@ -953,12 +960,31 @@ fn fold_after_elision<N: CompactableNode>(
                             .map(|normalized| (raw.to_owned(), normalized))
                     })
                     .collect();
-                    let normalized_written = written_value
-                        .as_deref()
-                        .and_then(|value| sanitize_snippet(value, usize::MAX));
-                    let summary_rendered = retained_fields.iter().any(|(_, normalized)| {
-                        normalized == &summary || normalized_written.as_ref() == Some(normalized)
+                    // Verify that the assigned value was actually rendered. The
+                    // components themselves come from the construction above,
+                    // not from splitting the resulting formatted text.
+                    let assigned_value_rendered = written_value.as_deref().is_some_and(|written| {
+                        parent_node.value() == Some(written) && rendered_value == Some(written)
                     });
+                    if assigned_value_rendered {
+                        if let Some(component) = written_parent_component {
+                            if let Some(normalized) = sanitize_snippet(&component, usize::MAX) {
+                                retained_fields.push((component, normalized));
+                            }
+                        }
+                    }
+                    if let Some(description) = original_description {
+                        if parent_node.description() == Some(description.as_str()) {
+                            let raw = description.trim();
+                            if let Some(normalized) = sanitize_snippet(raw, usize::MAX) {
+                                retained_fields.push((raw.to_owned(), normalized));
+                            }
+                        }
+                    }
+                    let summary_rendered = assigned_value_rendered
+                        || retained_fields
+                            .iter()
+                            .any(|(_, normalized)| normalized == &summary);
                     lost_text |= visible_text.iter().any(|text| {
                         let Some(normalized) = sanitize_snippet(text, usize::MAX) else {
                             return false;
@@ -1381,13 +1407,17 @@ mod tests {
             self.node.description.as_deref()
         }
         fn format_line(&self) -> String {
-            if self.hide_value {
+            let mut line = if self.hide_value {
                 let mut node = self.node.clone();
                 node.value = None;
                 node.format_line()
             } else {
                 self.node.format_line()
+            };
+            if let Some(description) = &self.node.description {
+                line.push_str(&format!(" ({description})"));
             }
+            line
         }
         fn offscreen(&self) -> Option<bool> {
             self.offscreen
@@ -1434,6 +1464,65 @@ mod tests {
     fn u20_fold(nodes: &mut Vec<BoundaryNode>) -> Vec<BoundaryReason> {
         let mut lines = nodes.iter().map(|n| (n.depth(), n.format_line())).collect();
         fold_actionless_text_subtrees_with_reasons(&mut lines, nodes)
+    }
+    #[test]
+    fn u20b_r3_parent_value_and_child_are_preserved_and_complete() {
+        let mut nodes = vec![
+            u20_node("AXRow", 0, None, Some("parent")),
+            u20_node("AXStaticText", 1, None, Some("child")),
+        ];
+        let reasons = u20_fold(&mut nodes);
+        assert_eq!(nodes[0].value(), Some("parent child"));
+        let mut budget = crate::walk_budget::WalkBudget::nodes_only(10);
+        budget.assert_exhaustive();
+        for reason in &reasons {
+            budget.record_skip(*reason);
+        }
+        let mut output = serde_json::json!({});
+        budget.outcome().apply(&mut output);
+        assert_eq!(output["observation_complete"], true, "{reasons:?}");
+        assert!(reasons.is_empty());
+        assert_eq!(
+            nodes[0].boundary.as_ref().unwrap().descendants_omitted,
+            Some(false)
+        );
+    }
+    #[test]
+    fn u20b_r3_unchanged_rendered_parent_description_is_preserved() {
+        let mut nodes = vec![
+            u20_node("AXRow", 0, None, None),
+            u20_node("AXStaticText", 1, None, Some("child")),
+        ];
+        nodes[0].node.description = Some("parent description".into());
+        assert!(nodes[0].format_line().contains("parent description"));
+        let reasons = u20_fold(&mut nodes);
+        assert!(nodes[0].format_line().contains("parent description"));
+        assert!(reasons.is_empty(), "{reasons:?}");
+        assert_eq!(
+            nodes[0].boundary.as_ref().unwrap().descendants_omitted,
+            Some(false)
+        );
+    }
+    #[test]
+    fn u20b_r3_parent_value_dropped_by_summary_cap_is_loss() {
+        let parent = "p".repeat(200);
+        let child = "c".repeat(30);
+        let mut nodes = vec![
+            u20_node("AXRow", 0, None, Some(&parent)),
+            u20_node("AXStaticText", 1, None, Some(&child)),
+        ];
+        let reasons = u20_fold(&mut nodes);
+        assert_eq!(nodes[0].value(), Some(child.as_str()));
+        assert_eq!(
+            serde_json::to_value(reasons).unwrap(),
+            serde_json::json!([
+                {"kind":"policy_omission","detail":"folded_text_truncated"}
+            ])
+        );
+        assert_eq!(
+            nodes[0].boundary.as_ref().unwrap().descendants_omitted,
+            Some(true)
+        );
     }
     #[test]
     fn u20b_a_lossless_fold_records_absorbed_children_without_read_incompleteness() {
