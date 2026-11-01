@@ -1325,10 +1325,72 @@ fn ax_insert_progress(
     before: Option<&str>,
     after: Option<&str>,
     text: &str,
-    _selection: Option<(usize, usize)>,
-    _bound: bool,
+    selection: Option<(usize, usize)>,
+    bound: bool,
 ) -> TypedProgress {
-    typed_progress(before, after, text)
+    use cua_driver_core::mutation::{
+        compare, expected_after, Action, Before, Observed, Postcondition,
+    };
+    if !bound {
+        return TypedProgress::Unverifiable;
+    }
+    let range = match selection {
+        Some((start, len)) => match start.checked_add(len) {
+            Some(end) => Some(start..end),
+            None => return TypedProgress::Unverifiable,
+        },
+        None => None,
+    };
+    if let Some(value) = before {
+        let units: Vec<u16> = value.encode_utf16().collect();
+        match &range {
+            Some(range)
+                if range.start <= range.end
+                    && range.end <= units.len()
+                    && String::from_utf16(&units[..range.start]).is_ok()
+                    && String::from_utf16(&units[range.end..]).is_ok() => {}
+            None if value.is_empty() => {}
+            _ => return TypedProgress::Unverifiable,
+        }
+    }
+    let expected = expected_after(
+        Action::TypeText(text),
+        Before::Value {
+            value: before,
+            selection: range.clone(),
+        },
+    );
+    match compare(&expected, Observed::Value(after), false) {
+        Postcondition::Confirmed => TypedProgress::Complete,
+        Postcondition::Unchanged => TypedProgress::Unchanged,
+        Postcondition::Subset => {
+            let Some((original, current)) = before.zip(after) else {
+                return TypedProgress::Unverifiable;
+            };
+            let range = range.unwrap_or(0..0);
+            let units: Vec<u16> = original.encode_utf16().collect();
+            let Some(prefix_units) = units.get(..range.start) else {
+                return TypedProgress::Unverifiable;
+            };
+            let Some(suffix_units) = units.get(range.end..) else {
+                return TypedProgress::Unverifiable;
+            };
+            let (Ok(prefix), Ok(suffix)) = (
+                String::from_utf16(prefix_units),
+                String::from_utf16(suffix_units),
+            ) else {
+                return TypedProgress::Unverifiable;
+            };
+            let Some(inserted) = current
+                .strip_prefix(&prefix)
+                .and_then(|s| s.strip_suffix(&suffix))
+            else {
+                return TypedProgress::Unverifiable;
+            };
+            TypedProgress::Partial(inserted.chars().count())
+        }
+        Postcondition::Indeterminate | Postcondition::Unavailable(_) => TypedProgress::Unverifiable,
+    }
 }
 
 /// Read the focused/target field's `AXValue`, for before/after read-back.
@@ -2731,8 +2793,8 @@ fn type_text_in_key_window(
         } else {
             unsafe { selected_range(element) }
         };
-        let bound =
-            window_id.is_some_and(|wid| element_in_requested_window(pid, wid, element as usize));
+        let bound = element_ptr_and_idx.is_some_and(|(ptr, _)| ptr == element as usize)
+            && window_id.is_some_and(|wid| element_in_requested_window(pid, wid, element as usize));
         let insertion = send_ax_insert_and_read(
             before_withheld,
             || unsafe { set_string_attr(element, "AXSelectedText", text) },
@@ -2816,6 +2878,20 @@ fn type_text_in_key_window(
                 path: PATH_AX,
                 verified: false,
                 delivered_chars: Some(delivered_chars),
+                web_area: outcome_web_area,
+            }));
+        }
+        if matches!(
+            ax_progress,
+            Some(TypedProgress::Unchanged | TypedProgress::Unverifiable)
+        ) {
+            return Ok(TypeTextDelivery::Typed(TypeTextOutcome {
+                detail: format!(
+                    " via AX write into {role} \"{title}\"; delivery could not be confirmed"
+                ),
+                path: PATH_AX,
+                verified: false,
+                delivered_chars: None,
                 web_area: outcome_web_area,
             }));
         }
@@ -3098,6 +3174,32 @@ mod u32_outcome_tests {
             progress,
             TypedProgress::Unverifiable,
             "a pre-existing substring is not an inserted splice"
+        );
+        assert_eq!(
+            ax_insert_progress(Some("😀old"), Some("😀new"), "new", Some((2, 3)), true),
+            TypedProgress::Complete
+        );
+        assert_eq!(
+            ax_insert_progress(Some("😀old"), Some("😀ne"), "new", Some((2, 3)), true),
+            TypedProgress::Partial(2)
+        );
+        assert_eq!(
+            ax_insert_progress(Some("😀old"), Some("😀new"), "new", Some((1, 1)), true),
+            TypedProgress::Unverifiable
+        );
+        assert_eq!(
+            ax_insert_progress(
+                Some("😀old"),
+                Some("😀new"),
+                "new",
+                Some((usize::MAX, 2)),
+                true
+            ),
+            TypedProgress::Unverifiable
+        );
+        assert_eq!(
+            ax_insert_progress(Some("😀old"), Some("😀new"), "new", None, true),
+            TypedProgress::Unverifiable
         );
     }
 }
