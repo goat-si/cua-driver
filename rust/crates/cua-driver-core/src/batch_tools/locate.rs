@@ -463,22 +463,7 @@ impl Read {
                 use cua_driver_contract::Role;
                 match Role::from_token(role) {
                     Role::Menu | Role::MenuItem => true,
-                    Role::Unknown => {
-                        let role: String = role
-                            .chars()
-                            .filter(char::is_ascii_alphanumeric)
-                            .flat_map(char::to_lowercase)
-                            .collect();
-                        matches!(
-                            role.as_str(),
-                            "axmenu"
-                                | "axmenuitem"
-                                | "menu"
-                                | "menuitem"
-                                | "checkmenuitem"
-                                | "radiomenuitem"
-                        )
-                    }
+                    Role::Unknown => matches!(role_family(role).as_str(), "menu" | "menuitem"),
                     _ => false,
                 }
             });
@@ -507,7 +492,7 @@ impl Read {
         Miss::new("incomplete_observation", format!(
             "cannot establish {} in {}: {}; observed candidates: {}; target by element_token or narrow the window/app",
             spec.describe(), self.window.describe(), details.join(", "), listed
-        )).in_window(&self.window)
+        )).with_reasons(details.to_vec()).in_window(&self.window)
     }
 }
 
@@ -610,6 +595,7 @@ pub(crate) struct Miss {
     pub code: &'static str,
     pub message: String,
     pub window: Option<Window>,
+    safe_reasons: Vec<String>,
 }
 
 impl Miss {
@@ -618,6 +604,7 @@ impl Miss {
             code,
             message: message.into(),
             window: None,
+            safe_reasons: Vec::new(),
         }
     }
 
@@ -640,6 +627,42 @@ impl Miss {
     fn in_window(mut self, window: &Window) -> Self {
         self.window = Some(window.clone());
         self
+    }
+
+    fn with_reasons(mut self, reasons: Vec<String>) -> Self {
+        self.safe_reasons = reasons;
+        self
+    }
+
+    fn late<T>(operation: &str, result: &Result<T, Miss>) -> Self {
+        let mut message = format!("{operation} completed after its deadline");
+        if let Err(miss) = result {
+            message.push_str(&format!("; last miss: {}", miss.code));
+            if !miss.safe_reasons.is_empty() {
+                message.push_str(&format!("; reasons: {}", miss.safe_reasons.join(", ")));
+            }
+        }
+        Self::new("timeout", message)
+    }
+}
+
+enum CallError {
+    Deadline,
+    MalformedCompleteness(Vec<String>),
+    Failed(String),
+}
+
+impl CallError {
+    fn into_miss(self, code: &'static str) -> Miss {
+        match self {
+            Self::Deadline => Miss::new("timeout", "locator deadline expired"),
+            Self::MalformedCompleteness(details) => Miss::new(
+                "incomplete_observation",
+                format!("incomplete observation: {}", details.join(", ")),
+            )
+            .with_reasons(details),
+            Self::Failed(message) => Miss::new(code, message),
+        }
     }
 }
 
@@ -800,26 +823,26 @@ impl<'a> Locator<'a> {
         args
     }
 
-    async fn call(&self, tool: &str, args: Value) -> Result<Value, String> {
+    async fn call(&self, tool: &str, args: Value) -> Result<Value, CallError> {
         let deadline = LOCATOR_READ_DEADLINE
             .try_with(|deadline| *deadline)
             .unwrap_or(self.clock_deadline);
         if self.clock.now() >= deadline {
-            return Err("locator_deadline_expired".to_owned());
+            return Err(CallError::Deadline);
         }
         // Once the batch scope refused a read in this step or script call,
         // the locator sends nothing more (a discarded baseline read must not
         // lead to a second attempt).
         if let Some(code) = self.scope_refusal() {
-            return Err(format!(
+            return Err(CallError::Failed(format!(
                 "{tool}: not sent, because an earlier read was refused by the batch scope ({code})"
-            ));
+            )));
         }
         if self.read_admission_closed() {
-            return Err(format!("{tool}: read admission closed"));
+            return Err(CallError::Failed(format!("{tool}: read admission closed")));
         }
         if self.read_admission.as_ref().is_some_and(|admit| !admit()) {
-            return Err(format!("{tool}: read admission closed"));
+            return Err(CallError::Failed(format!("{tool}: read admission closed")));
         }
         let (pid, window_id) = call_target(&args);
         let result = self.registry().invoke(tool, self.with_session(args)).await;
@@ -858,7 +881,7 @@ impl<'a> Locator<'a> {
                 .and_then(|content| content.get("malformed_completeness_details"))
                 .and_then(Value::as_array)
             {
-                let safe = details
+                let mut safe = details
                     .iter()
                     .filter_map(Value::as_str)
                     .filter(|detail| {
@@ -876,11 +899,17 @@ impl<'a> Locator<'a> {
                         )
                         .is_ok()
                     })
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                return Err(format!("malformed_completeness:{safe}"));
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>();
+                if !safe.iter().any(|detail| detail == "malformed_completeness") {
+                    safe.push("malformed_completeness".to_owned());
+                }
+                return Err(CallError::MalformedCompleteness(safe));
             }
-            return Err(format!("{tool}: {}", first_text(&result)));
+            return Err(CallError::Failed(format!(
+                "{tool}: {}",
+                first_text(&result)
+            )));
         }
         Ok(result.structured_content.unwrap_or(Value::Null))
     }
@@ -923,7 +952,7 @@ impl<'a> Locator<'a> {
         let listed = self
             .call("list_windows", list_args)
             .await
-            .map_err(|error| Miss::new("lookup_failed", error))?;
+            .map_err(|error| error.into_miss("lookup_failed"))?;
         let windows: Vec<Value> = listed
             .get("windows")
             .and_then(Value::as_array)
@@ -967,7 +996,7 @@ impl<'a> Locator<'a> {
         let listed = self
             .call("list_apps", json!({}))
             .await
-            .map_err(|error| Miss::new("lookup_failed", error))?;
+            .map_err(|error| error.into_miss("lookup_failed"))?;
         Ok(listed
             .get("apps")
             .and_then(Value::as_array)
@@ -1036,17 +1065,10 @@ impl<'a> Locator<'a> {
                 "include_screenshot": false,
             })
         };
-        let state = self.call("get_window_state", args).await.map_err(|error| {
-            if let Some(details) = error.strip_prefix("malformed_completeness:") {
-                Miss::new(
-                    "incomplete_observation",
-                    format!("incomplete observation: {details}"),
-                )
-                .in_window(window)
-            } else {
-                Miss::new("read_failed", error).in_window(window)
-            }
-        })?;
+        let state = self
+            .call("get_window_state", args)
+            .await
+            .map_err(|error| error.into_miss("read_failed").in_window(window))?;
         let elements = state
             .get("elements")
             .and_then(Value::as_array)
@@ -1100,14 +1122,7 @@ impl<'a> Locator<'a> {
             }
             let now = self.clock.now();
             if now > self.clock_deadline || (!timeout.is_zero() && now > deadline) {
-                return Err(Miss::new("timeout", "lookup completed after its deadline"));
-            }
-            if attempt
-                .as_ref()
-                .err()
-                .is_some_and(|miss| miss.message.contains("locator_deadline_expired"))
-            {
-                return Err(Miss::new("timeout", "lookup deadline expired"));
+                return Err(Miss::late("lookup", &attempt));
             }
             match attempt {
                 Ok(found) => return Ok(found),
@@ -1224,7 +1239,7 @@ impl<'a> Locator<'a> {
             let listed = self
                 .call("list_windows", json!({"pid": pid, "on_screen_only": false}))
                 .await
-                .map_err(|error| Miss::new("lookup_failed", error))?;
+                .map_err(|error| error.into_miss("lookup_failed"))?;
             if listed.get("enumeration_complete").and_then(Value::as_bool) != Some(true) {
                 return Ok(Closure::Incomplete);
             }
@@ -1306,6 +1321,7 @@ impl<'a> Locator<'a> {
         for window in &windows {
             let read = match self.read(window).await {
                 Ok(read) => read,
+                Err(miss) if miss.code == "timeout" => return Err(miss),
                 Err(miss) if miss.code == "incomplete_observation" => return Err(miss),
                 // A read the batch scope refused proves nothing about the
                 // window, least of all that something is gone: fail now.
@@ -1326,7 +1342,7 @@ impl<'a> Locator<'a> {
                             }),
                         )
                         .await
-                        .map_err(|error| Miss::new("lookup_failed", error))?;
+                        .map_err(|error| error.into_miss("lookup_failed"))?;
                     // The window list leaves out live helper and AX-less
                     // windows, so only the complete authoritative id set
                     // for the pid can prove the window closed.
@@ -1416,14 +1432,7 @@ impl<'a> Locator<'a> {
             }
             let now = self.clock.now();
             if now > self.clock_deadline || (!check.timeout.is_zero() && now > deadline) {
-                return Err(Miss::new("timeout", "check completed after its deadline"));
-            }
-            if outcome
-                .as_ref()
-                .err()
-                .is_some_and(|miss| miss.message.contains("locator_deadline_expired"))
-            {
-                return Err(Miss::new("timeout", "check deadline expired"));
+                return Err(Miss::late("check", &outcome));
             }
             match outcome {
                 Ok(checked) => return Ok(checked),
@@ -2257,7 +2266,9 @@ pub(crate) fn role_family(role: &str) -> String {
         "checkbox" | "checkbutton" | "check" => "checkbox",
         "radiobutton" | "radio" => "radiobutton",
         "popupbutton" | "combobox" | "menubutton" | "dropdown" | "select" => "popupbutton",
-        "menuitem" | "menuitemcheckbox" | "menuitemradio" => "menuitem",
+        "menuitem" | "menuitemcheckbox" | "menuitemradio" | "checkmenuitem" | "radiomenuitem" => {
+            "menuitem"
+        }
         "pagetab" | "tabitem" | "tab" => "tab",
         "image" | "img" | "icon" => "image",
         "row" | "listitem" | "tablerow" | "outlinerow" => "row",
@@ -2440,6 +2451,60 @@ mod tests {
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
         let miss = outcome.unwrap_err();
         assert_eq!(miss.code, "timeout");
+    }
+
+    #[tokio::test]
+    async fn late_incomplete_miss_preserves_code_and_typed_reasons() {
+        for is_find in [false, true] {
+            let clock = Arc::new(TestClock::default());
+            let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let mut registry = ToolRegistry::new();
+            registry.register(Box::new(TimedRead {
+                def: crate::tool::ToolDef {
+                    name: "get_window_state".into(),
+                    description: "test".into(),
+                    input_schema: json!({"type":"object","additionalProperties":true}),
+                    read_only: true,
+                    destructive: false,
+                    idempotent: true,
+                    open_world: false,
+                },
+                clock: clock.clone(),
+                duration: Duration::from_millis(101),
+                calls,
+                incomplete: true,
+            }));
+            let locator = Locator::new(&registry, None, Instant::now() + Duration::from_secs(5))
+                .with_clock(clock, Duration::from_secs(5));
+            let check = Check::parse(
+                &json!({"pid":1,"window_id":2,"name":"SECRET-QUERY","gone":true,"timeout_ms":100}),
+                0,
+            )
+            .unwrap();
+            let miss = if is_find {
+                locator
+                    .find(&check.window, &check.element, Duration::from_millis(100))
+                    .await
+                    .unwrap_err()
+            } else {
+                locator
+                    .check(&check, &WindowSpec::default())
+                    .await
+                    .unwrap_err()
+            };
+            assert_eq!(miss.code, "timeout");
+            assert!(
+                miss.message.contains("incomplete_observation"),
+                "{}",
+                miss.message
+            );
+            assert!(
+                miss.message.contains("budget/node_budget"),
+                "{}",
+                miss.message
+            );
+            assert!(!miss.message.contains("SECRET-QUERY"), "{}", miss.message);
+        }
     }
 
     #[tokio::test]

@@ -567,9 +567,13 @@ async fn exclusion_scope_applies_only_to_menu_or_roleless_selectors() {
         (None, true),
         (Some("AXMenuItem"), true),
         (Some("check menu item"), true),
+        (Some("menuitemcheckbox"), true),
+        (Some("menuitemradio"), true),
         (Some("button"), false),
+        (Some("push button"), false),
         (Some("menu_button"), false),
         (Some("menu_bar"), false),
+        (Some("menu_bar_item"), false),
     ] {
         let harness = Harness::new();
         let mut state = empty_state();
@@ -591,6 +595,90 @@ async fn exclusion_scope_applies_only_to_menu_or_roleless_selectors() {
             "role={role:?} result={result}"
         );
     }
+    for role in ["menuitemcheckbox", "menuitemradio"] {
+        let harness = Harness::new();
+        let mut state = save_state();
+        state["elements"][0]["role"] = json!("AXMenuItem");
+        state["observation_complete"] = json!(true);
+        state["observation_scope_exclusions"] = json!([{"kind":"closed_menus_not_expanded"}]);
+        harness.respond("get_window_state", state);
+        let result = harness.run(json!({"steps":[{"click":{"pid":42,"window_id":9,"role":role,"name":"Save"},"timeout_ms":0}]})).await.structured_content.unwrap();
+        assert_eq!(
+            result["steps"][0]["code"], "incomplete_observation",
+            "{role}: {result}"
+        );
+        assert_eq!(harness.hits("click"), 0);
+    }
+}
+
+#[tokio::test]
+async fn malformed_registry_output_reaches_locator_as_incomplete_for_gone_and_unique() {
+    for has_candidate in [false, true] {
+        let harness = Harness::new();
+        let mut state = if has_candidate {
+            save_state()
+        } else {
+            empty_state()
+        };
+        state["observation_complete"] = json!("untrusted secret");
+        state["observation_incomplete_reasons"] = json!([{"kind":"budget","detail":"node_budget"}]);
+        harness.respond("get_window_state", state);
+        let direct = harness
+            .registry
+            .invoke(
+                "get_window_state",
+                json!({"pid":42,"window_id":9,"full_output":true}),
+            )
+            .await;
+        assert_eq!(direct.is_error, Some(true));
+        let details =
+            &direct.structured_content.as_ref().unwrap()["malformed_completeness_details"];
+        assert!(
+            details
+                .as_array()
+                .unwrap()
+                .contains(&json!("malformed_completeness")),
+            "{details}"
+        );
+        assert!(
+            details
+                .as_array()
+                .unwrap()
+                .contains(&json!("budget/node_budget")),
+            "{details}"
+        );
+        let step = if has_candidate {
+            json!({"click":{"pid":42,"window_id":9,"name":"Save"},"timeout_ms":0})
+        } else {
+            json!({"expect":{"pid":42,"window_id":9,"name":"Save","gone":true,"timeout_ms":0}})
+        };
+        let result = harness
+            .run(json!({"steps":[step]}))
+            .await
+            .structured_content
+            .unwrap();
+        assert_eq!(
+            result["steps"][0]["code"], "incomplete_observation",
+            "{result}"
+        );
+        assert!(!result.to_string().contains("untrusted secret"));
+        assert_eq!(harness.hits("click"), 0);
+    }
+}
+
+#[tokio::test]
+async fn provider_error_cannot_spoof_the_locator_deadline_sentinel() {
+    let harness = Harness::new();
+    harness.respond(
+        "get_window_state",
+        json!({"error":"locator_deadline_expired"}),
+    );
+    let result = harness
+        .run(json!({"steps":[{"expect":{"pid":42,"window_id":9,"name":"Save","timeout_ms":0}}]}))
+        .await
+        .structured_content
+        .unwrap();
+    assert_eq!(result["steps"][0]["code"], "read_failed", "{result}");
 }
 
 #[tokio::test]
