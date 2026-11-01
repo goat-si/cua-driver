@@ -432,7 +432,7 @@ async fn run(registry: &ToolRegistry, request: Request) -> ToolResult {
                 // over: nothing more is dispatched, even if it caught the error.
                 let mut result = if let Some(stop) = &scope_stop {
                     Err(HostError::new(
-                        "the script already stopped at a call its app scope refused",
+                        "the script already stopped at a terminal refusal",
                         stop.code,
                     ))
                 } else {
@@ -468,7 +468,7 @@ async fn run(registry: &ToolRegistry, request: Request) -> ToolResult {
                     match &mut result {
                         Ok(_) => {
                             result = Err(HostError::new(
-                                "a read this call needed was refused by the batch scope",
+                                "a read this call needed was refused",
                                 code,
                             ))
                         }
@@ -505,6 +505,8 @@ async fn run(registry: &ToolRegistry, request: Request) -> ToolResult {
                         let refused = [
                             crate::batch_scope::OUTSIDE_SCOPE,
                             crate::batch_scope::FOREGROUND_NOT_ALLOWED,
+                            "process_instance_mismatch",
+                            "process_instance_unverified",
                         ]
                         .into_iter()
                         .find(|code| error.code.as_deref() == Some(*code));
@@ -535,10 +537,7 @@ async fn run(registry: &ToolRegistry, request: Request) -> ToolResult {
         (Some(mut outcome), Some(stop)) => {
             outcome.result = Err(engine::Failure {
                 kind: FailureKind::Exception,
-                message: format!(
-                    "stopped at the first call the app scope refused: {}",
-                    stop.message
-                ),
+                message: format!("stopped at the first terminal refusal: {}", stop.message),
                 line: (stop.line > 0).then_some(stop.line),
                 op: Some(stop.op),
                 code: Some(stop.code.to_owned()),
@@ -728,7 +727,14 @@ impl<'a> Api<'a> {
                 .map(str::to_owned)
         };
         facts.effect = structured_str("effect");
-        facts.code = structured_str("code");
+        facts.code = structured_str("code").or_else(|| {
+            result
+                .structured_content
+                .as_ref()
+                .and_then(|value| value.pointer("/refusal/code"))
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        });
         let mut entry = locate::journal_entry(tool, facts.pid, facts.window_id, &result);
         if not_delivered {
             entry["delivery"] = json!("not_delivered");
@@ -756,7 +762,7 @@ impl<'a> Api<'a> {
             let code = result
                 .structured_content
                 .as_ref()
-                .and_then(|value| value.get("code"))
+                .and_then(|value| value.get("code").or_else(|| value.pointer("/refusal/code")))
                 .and_then(Value::as_str)
                 .unwrap_or("tool_error");
             let mut message = clip(text.lines().next().unwrap_or("failed"), 500);

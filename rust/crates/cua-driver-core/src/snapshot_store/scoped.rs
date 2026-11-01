@@ -182,25 +182,21 @@ impl<S: SnapshotPayload> SnapshotStore<S> {
                 "Root belongs to another or retired session.".into(),
             ));
         }
-        let instance = match (&parent.instance, live) {
+        let instance = match (&parent.instance, &live) {
             (None, _) => {
                 return Err(refusal(
                     "root_requires_protected_snapshot",
                     "Root requires a process-protected snapshot.".into(),
                 ))
             }
-            (Some(InstanceCapture::Captured(stored)), InstanceEvidence::Live(live))
-                if stored.start_time.is_some()
-                    && live.start_time.is_some()
-                    && stored.matches(&live) =>
-            {
-                stored.clone()
-            }
-            _ => {
-                return Err(refusal(
-                    "stale_element_token",
-                    "Root process identity is unavailable or changed.".into(),
-                ))
+            (Some(instance), _) => {
+                if let Some(error) = super::instance_failure(instance, &live) {
+                    return Err(error);
+                }
+                match instance {
+                    InstanceCapture::Captured(stored) => stored.clone(),
+                    InstanceCapture::Failed(_) => unreachable!("failed capture is refused"),
+                }
             }
         };
         path.extend(source.payload.structural_path(index).ok_or_else(|| {

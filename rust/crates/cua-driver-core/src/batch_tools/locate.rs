@@ -830,12 +830,12 @@ impl<'a> Locator<'a> {
         if self.clock.now() >= deadline {
             return Err(CallError::Deadline);
         }
-        // Once the batch scope refused a read in this step or script call,
+        // Once a terminal refusal occurred in this step or script call,
         // the locator sends nothing more (a discarded baseline read must not
         // lead to a second attempt).
         if let Some(code) = self.scope_refusal() {
             return Err(CallError::Failed(format!(
-                "{tool}: not sent, because an earlier read was refused by the batch scope ({code})"
+                "{tool}: not sent, because an earlier read was refused ({code})"
             )));
         }
         if self.read_admission_closed() {
@@ -849,12 +849,14 @@ impl<'a> Locator<'a> {
         let scope_code = result
             .structured_content
             .as_ref()
-            .and_then(|value| value.get("code"))
+            .and_then(|value| value.get("code").or_else(|| value.pointer("/refusal/code")))
             .and_then(Value::as_str)
             .and_then(|code| {
                 [
                     crate::batch_scope::OUTSIDE_SCOPE,
                     crate::batch_scope::FOREGROUND_NOT_ALLOWED,
+                    "process_instance_mismatch",
+                    "process_instance_unverified",
                 ]
                 .into_iter()
                 .find(|known| *known == code)
@@ -2323,7 +2325,7 @@ pub(crate) fn journal_entry(
         "window_id": window_id,
         "ok": result.is_error != Some(true),
         "effect": field("effect"),
-        "code": field("code"),
+        "code": field("code").or_else(|| result.structured_content.as_ref().and_then(|value| value.pointer("/refusal/code")).and_then(Value::as_str).map(str::to_owned)),
     })
 }
 

@@ -157,6 +157,31 @@ fn rooted_capture_requires_snapshot_ownership_and_live_process() {
         "root_requires_protected_snapshot"
     );
     let parent = full(&store);
+    for (evidence, expected) in [
+        (
+            InstanceEvidence::Live(fingerprint(2)),
+            "process_instance_mismatch",
+        ),
+        (InstanceEvidence::NotChecked, "process_instance_unverified"),
+        (
+            InstanceEvidence::Unavailable("denied".into()),
+            "process_instance_unverified",
+        ),
+    ] {
+        let error = store
+            .begin_scoped_capture(42, 7, &token_for(parent, 0), Some("owner"), evidence)
+            .unwrap_err();
+        assert_eq!(
+            error.disposition,
+            Some(cua_driver_contract::ErrorDisposition::NOT_DELIVERED)
+        );
+        let data = error.structured_content.unwrap();
+        assert_eq!(data["refusal"]["code"], expected);
+        assert!(data["refusal"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("get_window_state"));
+    }
     for (token, session, evidence) in [
         (
             "0".to_owned(),

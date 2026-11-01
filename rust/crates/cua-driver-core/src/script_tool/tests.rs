@@ -56,11 +56,38 @@ impl Tool for Fake {
                 ]
             })),
             "launch_app" => ToolResult::text("launched").with_structured(json!({"pid": 42})),
+            _ if args["instance_refusal"].is_string() => ToolResult::error("element_token is stale; Retry with delivery_mode:\"foreground\"")
+                .with_structured(json!({"refusal":{"code":args["instance_refusal"]},"escalation":{"recommended":"foreground"}}))
+                .with_disposition(cua_driver_contract::ErrorDisposition::NOT_DELIVERED),
             _ if args["refuse"] == true => ToolResult::error(format!("{name} refused: stale token"))
                 .with_structured(json!({"code": "stale_element_token"})),
             _ if args["fail"] == true => ToolResult::error(format!("{name} refused: asked to fail")),
             _ => ToolResult::text(format!("{name} done")),
         }
+    }
+}
+
+#[tokio::test]
+async fn instance_refusals_stop_script_without_refind_or_redispatch() {
+    for code in ["process_instance_mismatch", "process_instance_unverified"] {
+        let harness = Harness::new();
+        crate::window_state_view::remember_for_test(
+            "s00000009",
+            42,
+            7,
+            "- [2] AXButton \"Save\"\n",
+        );
+        let script = format!("const app = await cua.getApp('Notes');\ntry {{ await app.click('s00000009:2', {{instance_refusal: '{code}'}}); }} catch (e) {{ await app.click('s00000009:2'); }}");
+        let result = harness.run(&script).await;
+        assert_eq!(result.is_error, Some(true), "{code}: {}", text(&result));
+        assert_eq!(
+            structured(&result)["error"]["code"],
+            code,
+            "{}",
+            text(&result)
+        );
+        assert_eq!(harness.calls("click").len(), 1, "{code}");
+        assert!(harness.calls("get_window_state").is_empty(), "{code}");
     }
 }
 
