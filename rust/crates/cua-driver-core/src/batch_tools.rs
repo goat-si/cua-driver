@@ -194,7 +194,9 @@ impl Tool for RunStepsTool {
                 or be only a check: {role?, name?, text?, gone?, value?, value_contains?, enabled?, selected?, \
                 app?, window?, timeout_ms?}. `text` matches any row, static text included; `gone:true` waits for \
                 it to disappear. Checks poll (wait_for 5 s, expect 2 s, max 10 s); one that does not hold fails \
-                the step with what was found. Missing field state is unknown. If a window cannot be read, \
+                the step with what was found. Missing field state is unknown. `incomplete_observation` means \
+                the read cannot establish absence or uniqueness; narrow the window/app or target by token. \
+                If a window cannot be read, \
                 `gone_unconfirmed` means the window listing does not prove it closed; `lookup_failed` means a window or app listing \
                 failed. A failure names the step, its phase (wait_for, find, action, \
                 expect) and why.\n\

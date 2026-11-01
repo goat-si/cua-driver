@@ -137,6 +137,7 @@ impl Harness {
                             "button": {"type": "string", "enum": ["left", "right", "middle"]},
                             "target": {"type": "object"},
                             "full_output": {"type": "boolean"},
+                            "tree_format": {"type": "string"},
                             "max_elements": {"type": "integer", "minimum": 1}
                         },
                         "additionalProperties": false
@@ -252,6 +253,234 @@ fn empty_state() -> Value {
     state["elements"] = json!([]);
     state["tree_markdown"] = json!("");
     state
+}
+
+#[tokio::test]
+async fn incomplete_observation_never_proves_gone_and_preserves_result_shape() {
+    let harness = Harness::new();
+    let mut state = empty_state();
+    state["observation_complete"] = json!(false);
+    state["observation_incomplete_reasons"] = json!([
+        {"kind":"unknown","detail":"not_asserted"},
+        {"kind":"budget","detail":"node_budget"}
+    ]);
+    harness.respond("get_window_state", state);
+    let result = harness.run(json!({"steps":[{"expect":{"pid":42,"window_id":9,"name":"Save","gone":true,"timeout_ms":0}}]})).await.structured_content.unwrap();
+    assert_eq!(
+        result["steps"][0]["code"], "incomplete_observation",
+        "{result}"
+    );
+    assert!(result["steps"][0]["message"]
+        .as_str()
+        .unwrap()
+        .contains("node_budget"));
+    for key in ["total", "executed", "failed_step", "steps"] {
+        assert!(result.get(key).is_some(), "{result}");
+    }
+    assert_eq!(harness.hits("get_window_state"), 1);
+}
+
+#[tokio::test]
+async fn incomplete_observation_never_proves_a_unique_target() {
+    let harness = Harness::new();
+    let mut state = save_state();
+    state["observation_complete"] = json!(false);
+    state["observation_incomplete_reasons"] = json!([{"kind":"budget","detail":"node_budget"}]);
+    harness.respond("get_window_state", state);
+    let result = harness.run(json!({"steps":[{"click":{"pid":42,"window_id":9,"role":"button","name":"Save"},"timeout_ms":0}]})).await.structured_content.unwrap();
+    assert_eq!(
+        result["steps"][0]["code"], "incomplete_observation",
+        "{result}"
+    );
+    assert_eq!(harness.hits("click"), 0);
+}
+
+#[tokio::test]
+async fn excluded_menu_scope_never_proves_absence() {
+    let harness = Harness::new();
+    let mut state = empty_state();
+    state["observation_complete"] = json!(true);
+    state["observation_scope_exclusions"] =
+        json!([{"kind":"closed_menus_not_expanded","element_indices":null}]);
+    harness.respond("get_window_state", state);
+    let result = harness.run(json!({"steps":[{"expect":{"pid":42,"window_id":9,"role":"menu_item","name":"Save","gone":true,"timeout_ms":0}}]})).await.structured_content.unwrap();
+    assert_eq!(
+        result["steps"][0]["code"], "incomplete_observation",
+        "{result}"
+    );
+    assert!(result["steps"][0]["message"]
+        .as_str()
+        .unwrap()
+        .contains("closed_menus_not_expanded"));
+}
+
+#[tokio::test]
+async fn completeness_metadata_truth_table_for_gone() {
+    let cases = [
+        (json!({"observation_complete":true}), false),
+        (json!({}), false),
+        (
+            json!({"observation_complete":false,"observation_incomplete_reasons":[{"kind":"unknown","detail":"not_asserted"}]}),
+            false,
+        ),
+        (
+            json!({"observation_incomplete_reasons":[{"kind":"budget","detail":"time_budget"}]}),
+            true,
+        ),
+        (
+            json!({"observation_complete":true,"observation_incomplete_reasons":[{"kind":"unknown","detail":"not_asserted"}]}),
+            true,
+        ),
+        (
+            json!({"observation_complete":false,"observation_incomplete_reasons":[]}),
+            true,
+        ),
+        (json!({"observation_complete":"yes"}), true),
+        (
+            json!({"observation_incomplete_reasons":[{"kind":"arbitrary","detail":"secret"}]}),
+            true,
+        ),
+    ];
+    for (metadata, incomplete) in cases {
+        let harness = Harness::new();
+        let mut state = empty_state();
+        state
+            .as_object_mut()
+            .unwrap()
+            .extend(metadata.as_object().unwrap().clone());
+        harness.respond("get_window_state", state);
+        let result = harness.run(json!({"steps":[{"expect":{"pid":42,"window_id":9,"name":"Save","gone":true,"timeout_ms":0}}]})).await.structured_content.unwrap();
+        assert_eq!(
+            result["steps"][0]["code"] == "incomplete_observation",
+            incomplete,
+            "metadata={metadata} result={result}"
+        );
+        if metadata.to_string().contains("secret") {
+            assert!(!result.to_string().contains("secret"), "{result}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn incomplete_nth_cannot_prove_field_state() {
+    let harness = Harness::new();
+    let mut state = save_state();
+    state["elements"][0]["enabled"] = json!(true);
+    state["observation_complete"] = json!(false);
+    state["observation_incomplete_reasons"] = json!([{"kind":"budget","detail":"node_budget"}]);
+    harness.respond("get_window_state", state);
+    let result = harness.run(json!({"steps":[{"expect":{"pid":42,"window_id":9,"name":"Save","nth":0,"enabled":true,"timeout_ms":0}}]})).await.structured_content.unwrap();
+    assert_eq!(
+        result["steps"][0]["code"], "incomplete_observation",
+        "{result}"
+    );
+}
+
+#[tokio::test]
+async fn incomplete_miss_is_not_lost_to_a_larger_complete_window() {
+    let harness = Harness::new();
+    harness.respond(
+        "list_windows",
+        json!({"windows":[test_window(7,true),test_window(8,true)]}),
+    );
+    let mut incomplete = empty_state();
+    incomplete["window_id"] = json!(7);
+    incomplete["observation_complete"] = json!(false);
+    incomplete["observation_incomplete_reasons"] =
+        json!([{"kind":"budget","detail":"node_budget"}]);
+    let mut complete = save_state();
+    complete["window_id"] = json!(8);
+    complete["observation_complete"] = json!(true);
+    complete["elements"][0]["label"] = json!("Other");
+    complete["tree_markdown"] = json!("");
+    harness.respond_when("get_window_state", json!({"window_id":7}), incomplete);
+    harness.respond_when("get_window_state", json!({"window_id":8}), complete);
+    let result = harness
+        .run(json!({"steps":[{"expect":{"pid":42,"name":"Save","timeout_ms":0}}]}))
+        .await
+        .structured_content
+        .unwrap();
+    assert_eq!(
+        result["steps"][0]["code"], "incomplete_observation",
+        "{result}"
+    );
+}
+
+#[tokio::test]
+async fn observed_ambiguity_wins_except_for_positional_targets() {
+    for (nth, expected) in [(None, "ambiguous"), (Some(0), "incomplete_observation")] {
+        let harness = Harness::new();
+        let mut state = save_state();
+        let mut second = state["elements"][0].clone();
+        second["element_index"] = json!(2);
+        second["element_token"] = json!("s00000001:2");
+        state["elements"].as_array_mut().unwrap().push(second);
+        state["observation_complete"] = json!(false);
+        state["observation_incomplete_reasons"] = json!([{"kind":"budget","detail":"node_budget"}]);
+        harness.respond("get_window_state", state);
+        let mut target = json!({"pid":42,"window_id":9,"name":"Save"});
+        if let Some(nth) = nth {
+            target["nth"] = json!(nth);
+        }
+        let result = harness
+            .run(json!({"steps":[{"click":target,"timeout_ms":0}]}))
+            .await
+            .structured_content
+            .unwrap();
+        assert_eq!(result["steps"][0]["code"], expected, "{result}");
+        assert_eq!(harness.hits("click"), 0);
+    }
+}
+
+#[tokio::test]
+async fn incomplete_visible_exact_match_does_not_hide_full_read() {
+    let harness = Harness::new();
+    let mut visible = save_state();
+    visible["observation_complete"] = json!(false);
+    visible["observation_incomplete_reasons"] = json!([{"kind":"budget","detail":"node_budget"}]);
+    let mut full = save_state();
+    full["observation_complete"] = json!(true);
+    full["elements"][0]["element_token"] = json!("s00000002:1");
+    harness.respond("get_window_state", full);
+    harness.respond_when("get_window_state", json!({"tree_format":"both"}), visible);
+    let result = harness.run(json!({"steps":[{"click":{"pid":42,"window_id":9,"role":"button","name":"Save"},"timeout_ms":0}]})).await.structured_content.unwrap();
+    assert_eq!(
+        harness.last("click")["element_token"],
+        "s00000002:1",
+        "{result}"
+    );
+}
+
+#[tokio::test]
+async fn exclusion_scope_applies_only_to_menu_or_roleless_selectors() {
+    for (role, blocked) in [
+        (None, true),
+        (Some("AXMenuItem"), true),
+        (Some("check menu item"), true),
+        (Some("button"), false),
+        (Some("menu_button"), false),
+        (Some("menu_bar"), false),
+    ] {
+        let harness = Harness::new();
+        let mut state = empty_state();
+        state["observation_complete"] = json!(true);
+        state["observation_scope_exclusions"] = json!([{"kind":"closed_menus_not_expanded"}]);
+        harness.respond("get_window_state", state);
+        let mut check = json!({"pid":42,"window_id":9,"name":"Save","gone":true,"timeout_ms":0});
+        if let Some(role) = role {
+            check["role"] = json!(role);
+        }
+        let result = harness
+            .run(json!({"steps":[{"expect":check}]}))
+            .await
+            .structured_content
+            .unwrap();
+        assert_eq!(
+            result["steps"][0]["code"] == "incomplete_observation",
+            blocked,
+            "role={role:?} result={result}"
+        );
+    }
 }
 
 #[tokio::test]

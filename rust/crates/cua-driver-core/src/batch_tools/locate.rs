@@ -10,6 +10,10 @@
 //! Lookup reads ask for `full_output`, which the `since` snapshot memory does
 //! not remember, so they never become the baseline of the caller's next
 //! `since:"latest"` diff.
+//!
+//! `incomplete_observation` means a read cannot prove absence or uniqueness.
+//! Raw markdown fallback lines come from producer-sanitized markdown; structured
+//! candidate descriptions independently redact secure names and values.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -55,6 +59,34 @@ const POLL_INTERVAL: Duration = Duration::from_millis(250);
 const CANDIDATES_SHOWN: usize = 5;
 /// Most windows of one app a lookup reads per poll.
 const MAX_WINDOWS_SEARCHED: usize = 4;
+
+tokio::task_local! {
+    static LOCATOR_READ_DEADLINE: Duration;
+}
+
+struct LocatorClock(Instant);
+
+impl crate::actionability::Clock for LocatorClock {
+    fn now(&self) -> Duration {
+        self.0.elapsed()
+    }
+    fn sleep(
+        &self,
+        duration: Duration,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+        Box::pin(tokio::time::sleep(duration))
+    }
+}
+
+fn locator_clock(
+    deadline: Instant,
+) -> (Arc<dyn crate::actionability::Clock + Send + Sync>, Duration) {
+    let clock: Arc<dyn crate::actionability::Clock + Send + Sync> =
+        Arc::new(LocatorClock(Instant::now()));
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    let deadline = clock.now().saturating_add(remaining);
+    (clock, deadline)
+}
 
 /// Which window a step or check addresses.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -409,6 +441,149 @@ pub(crate) struct Read {
     pub window: Window,
     pub elements: Vec<Value>,
     pub markdown: String,
+    completeness: Completeness,
+    closed_menus_excluded: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Completeness {
+    Complete,
+    Unasserted,
+    Incomplete(Vec<String>),
+}
+
+impl Read {
+    fn incomplete_for(&self, spec: &ElementSpec) -> Option<Vec<String>> {
+        let mut details = match &self.completeness {
+            Completeness::Incomplete(reasons) => reasons.clone(),
+            _ => Vec::new(),
+        };
+        let excluded = self.closed_menus_excluded
+            && spec.role.as_deref().is_none_or(|role| {
+                use cua_driver_contract::Role;
+                match Role::from_token(role) {
+                    Role::Menu | Role::MenuItem => true,
+                    Role::Unknown => {
+                        let role: String = role
+                            .chars()
+                            .filter(char::is_ascii_alphanumeric)
+                            .flat_map(char::to_lowercase)
+                            .collect();
+                        matches!(
+                            role.as_str(),
+                            "axmenu"
+                                | "axmenuitem"
+                                | "menu"
+                                | "menuitem"
+                                | "checkmenuitem"
+                                | "radiomenuitem"
+                        )
+                    }
+                    _ => false,
+                }
+            });
+        if excluded {
+            details.push("closed_menus_not_expanded".to_owned());
+        }
+        if details.is_empty() {
+            None
+        } else {
+            Some(details)
+        }
+    }
+
+    fn incomplete_miss(
+        &self,
+        spec: &ElementSpec,
+        details: &[String],
+        candidates: &[&Value],
+    ) -> Miss {
+        let listed = candidates
+            .iter()
+            .take(CANDIDATES_SHOWN)
+            .map(|e| describe_element(e))
+            .collect::<Vec<_>>()
+            .join("; ");
+        Miss::new("incomplete_observation", format!(
+            "cannot establish {} in {}: {}; observed candidates: {}; target by element_token or narrow the window/app",
+            spec.describe(), self.window.describe(), details.join(", "), listed
+        )).in_window(&self.window)
+    }
+}
+
+fn completeness(state: &Value) -> Completeness {
+    use cua_driver_contract::{IncompleteReason, IncompleteReasonDetail, IncompleteReasonKind};
+
+    let mut malformed = false;
+    let flag = match state.get("observation_complete") {
+        None => None,
+        Some(Value::Bool(flag)) => Some(*flag),
+        Some(_) => {
+            malformed = true;
+            None
+        }
+    };
+    let mut reasons = Vec::new();
+    if let Some(value) = state.get("observation_incomplete_reasons") {
+        if let Some(items) = value.as_array() {
+            for item in items {
+                match serde_json::from_value::<IncompleteReason>(item.clone()) {
+                    Ok(reason) => reasons.push(reason),
+                    Err(_) => malformed = true,
+                }
+            }
+        } else {
+            malformed = true;
+        }
+    }
+    let substantive = reasons.iter().any(|reason| {
+        reason.kind != IncompleteReasonKind::Unknown
+            || reason.detail != IncompleteReasonDetail::NotAsserted
+    });
+    let inconsistent = !substantive
+        && ((flag == Some(true) && !reasons.is_empty())
+            || (flag == Some(false) && reasons.is_empty()));
+    if malformed || substantive || inconsistent {
+        let mut details = reasons
+            .iter()
+            .map(|reason| {
+                let item = serde_json::to_value(reason).expect("typed reason serializes");
+                format!(
+                    "{}/{}",
+                    item["kind"]
+                        .as_str()
+                        .expect("typed reason kind is a string"),
+                    item["detail"]
+                        .as_str()
+                        .expect("typed reason detail is a string")
+                )
+            })
+            .collect::<Vec<_>>();
+        if malformed {
+            details.push("malformed_completeness".to_owned());
+        }
+        if inconsistent {
+            details.push("inconsistent_completeness".to_owned());
+        }
+        Completeness::Incomplete(details)
+    } else if flag == Some(true) {
+        Completeness::Complete
+    } else {
+        Completeness::Unasserted
+    }
+}
+
+pub(crate) fn malformed_completeness_details(state: &Value) -> Option<Vec<String>> {
+    match completeness(state) {
+        Completeness::Incomplete(details)
+            if details
+                .iter()
+                .any(|detail| detail == "malformed_completeness") =>
+        {
+            Some(details)
+        }
+        _ => None,
+    }
 }
 
 /// An element found by description.
@@ -458,6 +633,7 @@ impl Miss {
                 | "still_present"
                 | "gone_unconfirmed"
                 | "unexpected_state"
+                | "incomplete_observation"
         )
     }
 
@@ -480,7 +656,8 @@ pub(crate) struct Locator<'a> {
     registry: LocatorRegistry<'a>,
     session: Option<String>,
     /// Hard stop for every poll loop (the batch's own time budget).
-    deadline: Instant,
+    clock: Arc<dyn crate::actionability::Clock + Send + Sync>,
+    clock_deadline: Duration,
     /// When the batch ends with a default `observe`, the `max_elements` of
     /// that read: the first lookup of each window also makes one plain
     /// read with that budget, which `since:"latest"` remembers, so the end
@@ -510,11 +687,24 @@ pub(crate) type ReadOutcome = Arc<dyn Fn(Option<&'static str>) + Send + Sync>;
 pub(crate) type ReadClosed = Arc<dyn Fn() -> bool + Send + Sync>;
 
 impl<'a> Locator<'a> {
+    #[cfg(test)]
+    pub(crate) fn with_clock(
+        mut self,
+        clock: Arc<dyn crate::actionability::Clock + Send + Sync>,
+        remaining: Duration,
+    ) -> Self {
+        self.clock_deadline = clock.now().saturating_add(remaining);
+        self.clock = clock;
+        self
+    }
+
     pub fn new(registry: &'a ToolRegistry, session: Option<String>, deadline: Instant) -> Self {
+        let (clock, clock_deadline) = locator_clock(deadline);
         Self {
             registry: LocatorRegistry::Borrowed(registry),
             session,
-            deadline,
+            clock,
+            clock_deadline,
             baseline_max_elements: None,
             baselined: Default::default(),
             scope_refusal: Default::default(),
@@ -533,10 +723,12 @@ impl<'a> Locator<'a> {
         read_outcome: Option<ReadOutcome>,
         read_closed: Option<ReadClosed>,
     ) -> Locator<'static> {
+        let (clock, clock_deadline) = locator_clock(deadline);
         Locator {
             registry: LocatorRegistry::Owned(registry),
             session,
-            deadline,
+            clock,
+            clock_deadline,
             baseline_max_elements: None,
             baselined: Default::default(),
             scope_refusal: Default::default(),
@@ -609,6 +801,12 @@ impl<'a> Locator<'a> {
     }
 
     async fn call(&self, tool: &str, args: Value) -> Result<Value, String> {
+        let deadline = LOCATOR_READ_DEADLINE
+            .try_with(|deadline| *deadline)
+            .unwrap_or(self.clock_deadline);
+        if self.clock.now() >= deadline {
+            return Err("locator_deadline_expired".to_owned());
+        }
         // Once the batch scope refused a read in this step or script call,
         // the locator sends nothing more (a discarded baseline read must not
         // lead to a second attempt).
@@ -648,6 +846,39 @@ impl<'a> Locator<'a> {
                     .scope_refusal
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(scope_code);
+            }
+            if let Some(details) = result
+                .structured_content
+                .as_ref()
+                .filter(|content| {
+                    tool == "get_window_state"
+                        && content.get("code").and_then(Value::as_str)
+                            == Some("typed_output_mismatch")
+                })
+                .and_then(|content| content.get("malformed_completeness_details"))
+                .and_then(Value::as_array)
+            {
+                let safe = details
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .filter(|detail| {
+                        if matches!(
+                            *detail,
+                            "malformed_completeness" | "inconsistent_completeness"
+                        ) {
+                            return true;
+                        }
+                        let Some((kind, detail)) = detail.split_once('/') else {
+                            return false;
+                        };
+                        serde_json::from_value::<cua_driver_contract::IncompleteReason>(
+                            json!({"kind":kind,"detail":detail}),
+                        )
+                        .is_ok()
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                return Err(format!("malformed_completeness:{safe}"));
             }
             return Err(format!("{tool}: {}", first_text(&result)));
         }
@@ -805,10 +1036,17 @@ impl<'a> Locator<'a> {
                 "include_screenshot": false,
             })
         };
-        let state = self
-            .call("get_window_state", args)
-            .await
-            .map_err(|error| Miss::new("read_failed", error).in_window(window))?;
+        let state = self.call("get_window_state", args).await.map_err(|error| {
+            if let Some(details) = error.strip_prefix("malformed_completeness:") {
+                Miss::new(
+                    "incomplete_observation",
+                    format!("incomplete observation: {details}"),
+                )
+                .in_window(window)
+            } else {
+                Miss::new("read_failed", error).in_window(window)
+            }
+        })?;
         let elements = state
             .get("elements")
             .and_then(Value::as_array)
@@ -823,6 +1061,16 @@ impl<'a> Locator<'a> {
             window: window.clone(),
             elements,
             markdown,
+            completeness: completeness(&state),
+            closed_menus_excluded: state
+                .get("observation_scope_exclusions")
+                .and_then(Value::as_array)
+                .is_some_and(|items| {
+                    items.iter().any(|item| {
+                        item.get("kind").and_then(Value::as_str)
+                            == Some("closed_menus_not_expanded")
+                    })
+                }),
         })
     }
 
@@ -833,19 +1081,40 @@ impl<'a> Locator<'a> {
         element: &ElementSpec,
         timeout: Duration,
     ) -> Result<Found, Miss> {
-        let started = Instant::now();
-        let deadline = (started + timeout).min(self.deadline);
+        let started = self.clock.now();
+        let deadline = started.saturating_add(timeout).min(self.clock_deadline);
+        if started >= self.clock_deadline {
+            return Err(Miss::new("timeout", "enclosing deadline expired"));
+        }
         loop {
-            let attempt = self.find_once(window, element).await;
+            let read_deadline = if timeout.is_zero() {
+                self.clock_deadline
+            } else {
+                deadline
+            };
+            let attempt = LOCATOR_READ_DEADLINE
+                .scope(read_deadline, self.find_once(window, element))
+                .await;
             if self.read_admission_closed() {
                 return Err(Miss::new("step_timeout", "read admission closed"));
+            }
+            let now = self.clock.now();
+            if now > self.clock_deadline || (!timeout.is_zero() && now > deadline) {
+                return Err(Miss::new("timeout", "lookup completed after its deadline"));
+            }
+            if attempt
+                .as_ref()
+                .err()
+                .is_some_and(|miss| miss.message.contains("locator_deadline_expired"))
+            {
+                return Err(Miss::new("timeout", "lookup deadline expired"));
             }
             match attempt {
                 Ok(found) => return Ok(found),
                 Err(miss) if !miss.worth_waiting() => return Err(miss),
                 Err(miss) => {
-                    if Instant::now() + POLL_INTERVAL > deadline {
-                        let waited = started.elapsed().as_millis();
+                    if timeout.is_zero() || now >= deadline {
+                        let waited = now.saturating_sub(started).as_millis();
                         let mut miss = miss;
                         if waited > 0 {
                             miss.message = format!("{} (waited {waited} ms)", miss.message);
@@ -855,7 +1124,17 @@ impl<'a> Locator<'a> {
                     if self.read_admission_closed() {
                         return Err(Miss::new("step_timeout", "read admission closed"));
                     }
-                    tokio::time::sleep(POLL_INTERVAL).await;
+                    self.clock
+                        .sleep(POLL_INTERVAL.min(deadline.saturating_sub(now)))
+                        .await;
+                    if self.clock.now() >= deadline {
+                        let waited = self.clock.now().saturating_sub(started).as_millis();
+                        let mut miss = miss;
+                        if waited > 0 {
+                            miss.message = format!("{} (waited {waited} ms)", miss.message);
+                        }
+                        return Err(miss);
+                    }
                 }
             }
         }
@@ -893,7 +1172,13 @@ impl<'a> Locator<'a> {
                 }
                 Err(miss) => {
                     let size = read.elements.len();
-                    if best_miss.as_ref().is_none_or(|(best, _)| size > *best) {
+                    if best_miss.as_ref().is_none_or(|(best, previous)| {
+                        (miss.code == "incomplete_observation"
+                            && previous.code != "incomplete_observation")
+                            || ((miss.code == "incomplete_observation")
+                                == (previous.code == "incomplete_observation")
+                                && size > *best)
+                    }) {
                         best_miss = Some((size, miss.in_window(window)));
                     }
                 }
@@ -995,7 +1280,7 @@ impl<'a> Locator<'a> {
         &self,
         check: &Check,
         spec: &WindowSpec,
-        started: Instant,
+        started: Duration,
     ) -> Result<Checked, Miss> {
         let windows = if check.gone && spec.exact().is_none() {
             match self.closure_listing(spec).await? {
@@ -1003,7 +1288,7 @@ impl<'a> Locator<'a> {
                     Closure::Closed => return Ok(Checked {
                         window: None,
                         observed: Some(format!("{} is closed", spec.describe())),
-                        waited: started.elapsed(),
+                        waited: self.clock.now().saturating_sub(started),
                     }),
                     Closure::Incomplete => return Err(Miss::new(
                         "gone_unconfirmed",
@@ -1021,6 +1306,7 @@ impl<'a> Locator<'a> {
         for window in &windows {
             let read = match self.read(window).await {
                 Ok(read) => read,
+                Err(miss) if miss.code == "incomplete_observation" => return Err(miss),
                 // A read the batch scope refused proves nothing about the
                 // window, least of all that something is gone: fail now.
                 Err(miss) if self.scope_refusal().is_some() => {
@@ -1064,14 +1350,20 @@ impl<'a> Locator<'a> {
                     return Ok(Checked {
                         window: Some(window.clone()),
                         observed,
-                        waited: started.elapsed(),
+                        waited: self.clock.now().saturating_sub(started),
                     })
                 }
                 Ok(_) => {}
                 Err(miss) if check.gone => return Err(miss),
                 Err(miss) => {
                     let size = read.elements.len();
-                    if best_miss.as_ref().is_none_or(|(best, _)| size > *best) {
+                    if best_miss.as_ref().is_none_or(|(best, previous)| {
+                        (miss.code == "incomplete_observation"
+                            && previous.code != "incomplete_observation")
+                            || ((miss.code == "incomplete_observation")
+                                == (previous.code == "incomplete_observation")
+                                && size > *best)
+                    }) {
                         best_miss = Some((size, miss));
                     }
                 }
@@ -1081,7 +1373,7 @@ impl<'a> Locator<'a> {
             None => Ok(Checked {
                 window: windows.first().cloned(),
                 observed: None,
-                waited: started.elapsed(),
+                waited: self.clock.now().saturating_sub(started),
             }),
             Some((_, mut miss)) => {
                 if windows.len() > 1 {
@@ -1103,30 +1395,64 @@ impl<'a> Locator<'a> {
         } else {
             check.window.clone()
         };
-        let started = Instant::now();
-        let deadline = (started + check.timeout).min(self.deadline);
+        let started = self.clock.now();
+        let deadline = started
+            .saturating_add(check.timeout)
+            .min(self.clock_deadline);
+        if started >= self.clock_deadline {
+            return Err(Miss::new("timeout", "enclosing deadline expired"));
+        }
         loop {
-            let outcome = self.check_once(check, &window_spec, started).await;
+            let read_deadline = if check.timeout.is_zero() {
+                self.clock_deadline
+            } else {
+                deadline
+            };
+            let outcome = LOCATOR_READ_DEADLINE
+                .scope(read_deadline, self.check_once(check, &window_spec, started))
+                .await;
             if self.read_admission_closed() {
                 return Err(Miss::new("step_timeout", "read admission closed"));
+            }
+            let now = self.clock.now();
+            if now > self.clock_deadline || (!check.timeout.is_zero() && now > deadline) {
+                return Err(Miss::new("timeout", "check completed after its deadline"));
+            }
+            if outcome
+                .as_ref()
+                .err()
+                .is_some_and(|miss| miss.message.contains("locator_deadline_expired"))
+            {
+                return Err(Miss::new("timeout", "check deadline expired"));
             }
             match outcome {
                 Ok(checked) => return Ok(checked),
                 Err(miss) if !miss.worth_waiting() => return Err(miss),
                 Err(miss) => {
-                    if Instant::now() + POLL_INTERVAL > deadline {
+                    if check.timeout.is_zero() || now >= deadline {
                         let mut miss = miss;
                         miss.message = format!(
                             "{} (checked for {} ms)",
                             miss.message,
-                            started.elapsed().as_millis()
+                            now.saturating_sub(started).as_millis()
                         );
                         return Err(miss);
                     }
                     if self.read_admission_closed() {
                         return Err(Miss::new("step_timeout", "read admission closed"));
                     }
-                    tokio::time::sleep(POLL_INTERVAL).await;
+                    self.clock
+                        .sleep(POLL_INTERVAL.min(deadline.saturating_sub(now)))
+                        .await;
+                    if self.clock.now() >= deadline {
+                        let mut miss = miss;
+                        miss.message = format!(
+                            "{} (checked for {} ms)",
+                            miss.message,
+                            self.clock.now().saturating_sub(started).as_millis()
+                        );
+                        return Err(miss);
+                    }
                 }
             }
         }
@@ -1243,6 +1569,12 @@ fn narrow<'r>(found: Vec<&'r Value>, spec: &ElementSpec) -> Vec<&'r Value> {
 
 fn pick(read: &Read, spec: &ElementSpec) -> Result<Found, Miss> {
     let found = narrow(matches(read, spec), spec);
+    if let (true, Some(details)) = (
+        spec.nth.is_some() || found.len() < 2,
+        read.incomplete_for(spec),
+    ) {
+        return Err(read.incomplete_miss(spec, &details, &found));
+    }
     let chosen = match (found.len(), spec.nth) {
         (0, _) => {
             // The tree may show the element as a row without an index: it
@@ -1349,6 +1681,12 @@ fn evaluate(check: &Check, read: &Read) -> Result<Option<String>, Miss> {
         !structured.is_empty() || !rows.is_empty()
     };
     let window = &read.window;
+    if let (true, Some(details)) = (
+        check.element.nth.is_some() || !present,
+        read.incomplete_for(&check.element),
+    ) {
+        return Err(read.incomplete_miss(&check.element, &details, &structured));
+    }
     if check.gone {
         return if present {
             let shown = structured
@@ -1999,6 +2337,221 @@ pub(crate) fn call_target(args: &Value) -> (Option<i64>, Option<u64>) {
 mod tests {
     use super::*;
 
+    #[derive(Default)]
+    struct TestClock(std::sync::atomic::AtomicU64);
+    impl TestClock {
+        fn advance(&self, duration: Duration) {
+            self.0.fetch_add(
+                duration.as_millis() as u64,
+                std::sync::atomic::Ordering::SeqCst,
+            );
+        }
+    }
+    impl crate::actionability::Clock for TestClock {
+        fn now(&self) -> Duration {
+            Duration::from_millis(self.0.load(std::sync::atomic::Ordering::SeqCst))
+        }
+        fn sleep(
+            &self,
+            duration: Duration,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+            Box::pin(async move {
+                self.advance(duration);
+            })
+        }
+    }
+    struct TimedRead {
+        def: crate::tool::ToolDef,
+        clock: Arc<TestClock>,
+        duration: Duration,
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+        incomplete: bool,
+    }
+
+    struct PendingRead {
+        def: crate::tool::ToolDef,
+        started: Arc<tokio::sync::Notify>,
+    }
+    #[async_trait::async_trait]
+    impl crate::tool::Tool for PendingRead {
+        fn def(&self) -> &crate::tool::ToolDef {
+            &self.def
+        }
+        async fn invoke(&self, _args: Value) -> ToolResult {
+            self.started.notify_one();
+            std::future::pending().await
+        }
+    }
+    #[async_trait::async_trait]
+    impl crate::tool::Tool for TimedRead {
+        fn def(&self) -> &crate::tool::ToolDef {
+            &self.def
+        }
+        async fn invoke(&self, _args: Value) -> ToolResult {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.clock.advance(self.duration);
+            let mut state = json!({"pid":1,"window_id":2,"elements":[{"element_index":1,"role":"AXButton","label":"Save","depth":0}],"tree_markdown":""});
+            if self.incomplete {
+                state["observation_complete"] = json!(false);
+                state["observation_incomplete_reasons"] =
+                    json!([{"kind":"budget","detail":"node_budget"}]);
+                state["elements"] = json!([]);
+            }
+            ToolResult::text("state").with_structured(state)
+        }
+    }
+    fn timed_registry(
+        clock: Arc<TestClock>,
+        duration: Duration,
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    ) -> ToolRegistry {
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(TimedRead {
+            def: crate::tool::ToolDef {
+                name: "get_window_state".into(),
+                description: "test".into(),
+                input_schema: json!({"type":"object","additionalProperties":true}),
+                read_only: true,
+                destructive: false,
+                idempotent: true,
+                open_world: false,
+            },
+            clock,
+            duration,
+            calls,
+            incomplete: false,
+        }));
+        registry
+    }
+
+    #[tokio::test]
+    async fn locator_rejects_a_success_after_the_local_deadline() {
+        let clock = Arc::new(TestClock::default());
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let registry = timed_registry(clock.clone(), Duration::from_millis(101), calls.clone());
+        let locator = Locator::new(&registry, None, Instant::now() + Duration::from_secs(5))
+            .with_clock(clock, Duration::from_secs(5));
+        let check = Check::parse(
+            &json!({"pid":1,"window_id":2,"name":"Save","timeout_ms":100}),
+            0,
+        )
+        .unwrap();
+        let outcome = locator.check(&check, &WindowSpec::default()).await;
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let miss = outcome.unwrap_err();
+        assert_eq!(miss.code, "timeout");
+    }
+
+    #[tokio::test]
+    async fn locator_clock_accepts_equality_and_zero_but_not_expired_enclosing_budget() {
+        for (local_ms, elapsed_ms, enclosing_ms, allowed, expected_calls) in [
+            (100, 100, 500, true, 1),
+            (0, 101, 500, true, 1),
+            (0, 0, 0, false, 0),
+            (0, 501, 500, false, 1),
+        ] {
+            let clock = Arc::new(TestClock::default());
+            let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let registry = timed_registry(
+                clock.clone(),
+                Duration::from_millis(elapsed_ms),
+                calls.clone(),
+            );
+            let locator = Locator::new(&registry, None, Instant::now() + Duration::from_secs(5))
+                .with_clock(clock, Duration::from_millis(enclosing_ms));
+            let check = Check::parse(
+                &json!({"pid":1,"window_id":2,"name":"Save","timeout_ms":local_ms}),
+                0,
+            )
+            .unwrap();
+            assert_eq!(
+                locator.check(&check, &WindowSpec::default()).await.is_ok(),
+                allowed,
+                "local={local_ms} elapsed={elapsed_ms} enclosing={enclosing_ms}"
+            );
+            assert_eq!(
+                calls.load(std::sync::atomic::Ordering::SeqCst),
+                expected_calls
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn incomplete_observation_waits_until_deadline_without_extra_reads() {
+        let clock = Arc::new(TestClock::default());
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(TimedRead {
+            def: crate::tool::ToolDef {
+                name: "get_window_state".into(),
+                description: "test".into(),
+                input_schema: json!({"type":"object","additionalProperties":true}),
+                read_only: true,
+                destructive: false,
+                idempotent: true,
+                open_world: false,
+            },
+            clock: clock.clone(),
+            duration: Duration::ZERO,
+            calls: calls.clone(),
+            incomplete: true,
+        }));
+        let locator = Locator::new(&registry, None, Instant::now() + Duration::from_secs(5))
+            .with_clock(clock.clone(), Duration::from_secs(5));
+        let check = Check::parse(
+            &json!({"pid":1,"window_id":2,"name":"Save","gone":true,"timeout_ms":600}),
+            0,
+        )
+        .unwrap();
+        let miss = locator
+            .check(&check, &WindowSpec::default())
+            .await
+            .unwrap_err();
+        assert_eq!(miss.code, "incomplete_observation");
+        assert_eq!(clock.0.load(std::sync::atomic::Ordering::SeqCst), 600);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn zero_timeout_probe_can_be_cancelled() {
+        let started = Arc::new(tokio::sync::Notify::new());
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(PendingRead {
+            def: crate::tool::ToolDef {
+                name: "get_window_state".into(),
+                description: "test".into(),
+                input_schema: json!({"type":"object","additionalProperties":true}),
+                read_only: true,
+                destructive: false,
+                idempotent: true,
+                open_world: false,
+            },
+            started: started.clone(),
+        }));
+        let locator = Locator::new_owned(
+            Arc::new(registry),
+            None,
+            Instant::now() + Duration::from_secs(5),
+            None,
+            None,
+            None,
+        )
+        .with_clock(Arc::new(TestClock::default()), Duration::from_secs(5));
+        let check = Check::parse(
+            &json!({"pid":1,"window_id":2,"name":"Save","timeout_ms":0}),
+            0,
+        )
+        .unwrap();
+        let mut task =
+            tokio::spawn(async move { locator.check(&check, &WindowSpec::default()).await });
+        tokio::select! {
+            _ = started.notified() => {},
+            result = &mut task => panic!("probe completed before cancellation: {result:?}"),
+        }
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+    }
+
     fn read(elements: Vec<Value>, markdown: &str) -> Read {
         Read {
             window: Window {
@@ -2010,6 +2563,8 @@ mod tests {
             },
             elements,
             markdown: markdown.to_owned(),
+            completeness: Completeness::Unasserted,
+            closed_menus_excluded: false,
         }
     }
 
