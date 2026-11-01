@@ -71,7 +71,7 @@ pub(crate) enum ValueWrite {
     RangeValue,
 }
 
-pub(crate) fn element_facts(raw: &RawLiveFacts, write: ValueWrite) -> ElementFacts {
+pub(crate) fn element_facts(raw: &RawLiveFacts, _write: ValueWrite) -> ElementFacts {
     let checks = [
         (&raw.is_offscreen, false),
         (&raw.window_visible, true),
@@ -100,11 +100,23 @@ pub(crate) fn element_facts(raw: &RawLiveFacts, write: ValueWrite) -> ElementFac
                 .unwrap_or_else(|| "visibility unavailable".into()),
         )
     };
-    let editable = match match write {
-        ValueWrite::Value => &raw.value_read_only,
-        ValueWrite::RangeValue => &raw.range_read_only,
-    } {
-        LiveRead::Value(v) => Evidence::Known(!v),
+    let editable = match &raw.patterns {
+        LiveRead::Value(patterns) => {
+            let reads = [
+                (PatternKind::Value, &raw.value_read_only),
+                (PatternKind::RangeValue, &raw.range_read_only),
+            ];
+            let present: Vec<_> = reads.iter().filter(|(kind, _)| patterns.contains(kind)).collect();
+            if present.is_empty() {
+                Evidence::Absent
+            } else if present.iter().any(|(_, read)| matches!(read, LiveRead::Value(false))) {
+                Evidence::Known(true)
+            } else if present.iter().all(|(_, read)| matches!(read, LiveRead::Value(true))) {
+                Evidence::Known(false)
+            } else {
+                Evidence::Unknown("read-only state unavailable".into())
+            }
+        }
         LiveRead::NotSupported => Evidence::Absent,
         LiveRead::Failed(e) => Evidence::Unknown(e.clone()),
     };
@@ -165,8 +177,13 @@ pub(crate) enum AdmittedRoute {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Admission {
     pub route: AdmittedRoute,
-    pub value_admitted: bool,
-    pub range_admitted: bool,
+    pub value: PatternAdmission,
+    pub range: PatternAdmission,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PatternAdmission {
+    Absent,
+    Present { read_only: Option<bool> },
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Rung {
@@ -176,8 +193,8 @@ pub(crate) enum Rung {
 pub(crate) fn may_write(rung: Rung, a: &Admission) -> bool {
     a.route == AdmittedRoute::UiaWrite
         && match rung {
-            Rung::Value => a.value_admitted,
-            Rung::RangeValue => a.range_admitted,
+            Rung::Value => matches!(a.value, PatternAdmission::Present { read_only: Some(false) }),
+            Rung::RangeValue => matches!(a.range, PatternAdmission::Present { read_only: Some(false) }),
         }
 }
 pub(crate) fn route_agrees(route: AdmittedRoute, worker_native: bool) -> bool {
@@ -193,13 +210,17 @@ impl Probe {
     }
 }
 fn admission(raw: &RawLiveFacts) -> Admission {
-    let has = |p| matches!(&raw.patterns, LiveRead::Value(patterns) if patterns.contains(&p));
+    let rung = |kind, read: &LiveRead<bool>| {
+        if matches!(&raw.patterns, LiveRead::Value(patterns) if patterns.contains(&kind)) {
+            PatternAdmission::Present { read_only: match read { LiveRead::Value(v) => Some(*v), _ => None } }
+        } else {
+            PatternAdmission::Absent
+        }
+    };
     Admission {
         route: AdmittedRoute::UiaWrite,
-        value_admitted: has(PatternKind::Value)
-            && matches!(raw.value_read_only, LiveRead::Value(false)),
-        range_admitted: has(PatternKind::RangeValue)
-            && matches!(raw.range_read_only, LiveRead::Value(false)),
+        value: rung(PatternKind::Value, &raw.value_read_only),
+        range: rung(PatternKind::RangeValue, &raw.range_read_only),
     }
 }
 
@@ -229,8 +250,8 @@ where
                     // as Select). Pass without facts rather than inventing evidence.
                     *admitted.lock().expect("admission lock") = Some(Admission {
                         route: AdmittedRoute::NativeCombo,
-                        value_admitted: false,
-                        range_admitted: false,
+                        value: PatternAdmission::Absent,
+                        range: PatternAdmission::Absent,
                     });
                     return ActionabilityReport {
                         verdict: Verdict::Pass,

@@ -275,8 +275,8 @@ async fn admission_and_route_changes() {
     assert!(may_write(Rung::RangeValue, &a));
     let a = Admission {
         route: AdmittedRoute::UiaWrite,
-        value_admitted: true,
-        range_admitted: false,
+        value: PatternAdmission::Present { read_only: Some(false) },
+        range: PatternAdmission::Absent,
     };
     assert!(!may_write(Rung::RangeValue, &a));
     assert!(!route_agrees(AdmittedRoute::UiaWrite, true));
@@ -369,8 +369,8 @@ fn value_notsupported_only_calls_admitted_range() {
     for range_allowed in [false, true] {
         let admission = Admission {
             route: AdmittedRoute::UiaWrite,
-            value_admitted: true,
-            range_admitted: range_allowed,
+            value: PatternAdmission::Present { read_only: Some(false) },
+            range: if range_allowed { PatternAdmission::Present { read_only: Some(false) } } else { PatternAdmission::Absent },
         };
         let calls = AtomicUsize::new(0);
         let mut refused = false;
@@ -423,8 +423,8 @@ fn changed_patterns_never_call_an_unadmitted_rung() {
         (
             Admission {
                 route: AdmittedRoute::UiaWrite,
-                value_admitted: true,
-                range_admitted: false,
+                value: PatternAdmission::Present { read_only: Some(false) },
+                range: PatternAdmission::Absent,
             },
             false,
             0,
@@ -433,8 +433,8 @@ fn changed_patterns_never_call_an_unadmitted_rung() {
         (
             Admission {
                 route: AdmittedRoute::UiaWrite,
-                value_admitted: false,
-                range_admitted: true,
+                value: PatternAdmission::Absent,
+                range: PatternAdmission::Present { read_only: Some(false) },
             },
             true,
             0,
@@ -443,8 +443,8 @@ fn changed_patterns_never_call_an_unadmitted_rung() {
         (
             Admission {
                 route: AdmittedRoute::UiaWrite,
-                value_admitted: true,
-                range_admitted: true,
+                value: PatternAdmission::Present { read_only: Some(false) },
+                range: PatternAdmission::Present { read_only: Some(false) },
             },
             true,
             1,
@@ -477,4 +477,16 @@ fn changed_patterns_never_call_an_unadmitted_rung() {
             assert_eq!(result, SetValueDecision::Delivered { rung: 1 });
         }
     }
+}
+
+#[test]
+fn writable_range_admits_when_value_read_only_is_unknown() {
+    let mut f = raw();
+    f.patterns = LiveRead::Value(vec![PatternKind::Value, PatternKind::RangeValue]);
+    f.value_read_only = LiveRead::Failed("value read failed".into());
+    f.range_read_only = LiveRead::Value(false);
+    assert_eq!(evaluated(&f, ValueWrite::Value).verdict, Verdict::Pass);
+    let a = admission(&f);
+    assert!(!may_write(Rung::Value, &a));
+    assert!(may_write(Rung::RangeValue, &a));
 }
