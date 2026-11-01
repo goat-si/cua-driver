@@ -26,3 +26,41 @@ be explicit and reviewable. The matrix is a handoff requirement, not a claim
 that any platform fixture has been implemented or passed. Contracts 6 and 7
 remain `NotWired` until platform adoption. Text editing, window identity,
 batch session overrides and FFI identity are outside this battery.
+
+### Observation scope and closed menus
+
+Closed menubar menus, context/popup menus, and collapsed combobox lists are
+outside the default observation scope. Open menus and contents explicitly
+requested by a read are in scope; a failed attempt to read them is incomplete.
+An exclusion alone does not make `observation_complete` false, and a
+`collapsed_menu` row boundary is permitted without a read-level reason. Other
+skips, cuts, untrusted reads and timeouts remain incomplete.
+
+`observation_scope_exclusions` optionally records `closed_menus_not_expanded`.
+Its `element_indices` identify excluded owner rows in the returned snapshot's
+index namespace, sorted and deduplicated; omission means ownership is unknown
+or could not be retained. Absence of the field does not prove full scope,
+including for old producers. Neither it nor `observation_complete` is currently
+an input to absence or uniqueness proofs. U02c must propagate both into locate:
+with an exclusion, absence and uniqueness are unknown for selectors that could
+match excluded content, including canonical or native menu/menuitem roles,
+untyped name/text selectors, or selectors scoped beneath an excluded owner.
+Selectors typed to a non-menu role are unaffected by this exclusion.
+
+Platform handoff (not implemented by this contract change):
+
+- macOS: replace only the intentional `AXMenuBarItem` collapse's
+  `note_skipped` with an exclusion; retain unrelated skips. Existing `query`
+  and `full_output:true` request menu traversal.
+- Linux: record exclusions only on positive closed evidence; failed state or
+  peek reads remain uncertainty.
+- Windows: add a closed-menu policy hook using positive collapsed
+  ExpandCollapse state; missing/unknown state is not evidence. Cover the MSAA
+  fallback as well.
+- All platforms must cover collapsed combobox lists. A targeted menu/item read
+  attempts that scope and reports failure as incomplete; it must not silently
+  open UI. Platform implementations must map walk-local owners to the final
+  returned snapshot indices using `WalkOutcome::apply_with_owner_mapping`, or
+  preserve the exclusion with unknown ownership when a row is dropped or its
+  identity after renumbering cannot be proven. Plain `apply` conservatively
+  leaves all recorded ownership unknown.

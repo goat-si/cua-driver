@@ -7,6 +7,7 @@ use cua_driver_core::snapshot_store::{
 use cua_driver_core::tool::{ProtectedResourceOwnership, Tool, ToolDef, ToolRegistry};
 use cua_driver_core::window_state_view::{self, ViewContext, ViewKey, ViewOptions};
 use serde_json::{json, Value};
+use std::collections::HashMap;
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
     Arc, Mutex,
@@ -163,6 +164,17 @@ impl Tool for FakePlatform {
         let mut structured = json!({"pid":42,"window_id":7,"snapshot_id":format_snapshot_id(id),
             "tree_markdown":md,"elements":elements,"observation_complete":true,
             "observation_incomplete_reasons":[]});
+        let mut budget = cua_driver_core::walk_budget::WalkBudget::nodes_only(10);
+        budget.assert_exhaustive();
+        let owner = if root_token.is_some() { 11 } else { 10 };
+        budget.record_scope_exclusion(
+            cua_driver_contract::ScopeExclusionKind::ClosedMenusNotExpanded,
+            Some(owner),
+        );
+        budget.outcome().apply_with_owner_mapping(
+            &mut structured,
+            &HashMap::from([(owner, if root_token.is_some() { 1 } else { 0 })]),
+        );
         if let Some(scope) = scope {
             structured["scope"] = scope;
             structured["drilldown_status"] = json!("complete");
@@ -291,6 +303,10 @@ async fn registry_fake_platform_drills_without_replacing_the_full_snapshot() {
         .invoke("get_window_state", json!({"pid":42,"window_id":7}))
         .await;
     assert_ne!(full.is_error, Some(true), "{full:?}");
+    assert_eq!(
+        full.structured_content.as_ref().unwrap()["observation_scope_exclusions"],
+        json!([{"kind":"closed_menus_not_expanded","element_indices":[0]}])
+    );
     let parent = full.structured_content.unwrap()["snapshot_id"]
         .as_str()
         .unwrap()
@@ -303,6 +319,10 @@ async fn registry_fake_platform_drills_without_replacing_the_full_snapshot() {
         let output = result.structured_content.unwrap();
         assert_eq!(output["drilldown_status"], "complete");
         assert_eq!(output["scope"]["parent_snapshot_id"], parent);
+        assert_eq!(
+            output["observation_scope_exclusions"],
+            json!([{"kind":"closed_menus_not_expanded","element_indices":[1]}])
+        );
         if format == "markdown" {
             assert!(output.get("elements").is_none());
         }
@@ -350,10 +370,11 @@ async fn registry_fake_platform_drills_without_replacing_the_full_snapshot() {
             assert_eq!(*live.root_element(), 12);
         }
         assert_eq!(
-            store
-                .with_latest(42, 7, |id, _| format_snapshot_id(id))
-                .as_deref(),
-            Some(parent.as_str())
+            store.with_latest(42, 7, |id, payload| (
+                format_snapshot_id(id),
+                payload.0.clone()
+            )),
+            Some((parent.clone(), vec![10, 11]))
         );
     }
     *live_action.lock().unwrap() = None;
@@ -379,6 +400,10 @@ async fn registry_fake_platform_drills_without_replacing_the_full_snapshot() {
     assert_ne!(full_output.is_error, Some(true), "{full_output:?}");
     let output = full_output.structured_content.unwrap();
     assert_eq!(output["drilldown_status"], "complete");
+    assert_eq!(
+        output["observation_scope_exclusions"],
+        json!([{"kind":"closed_menus_not_expanded","element_indices":[1]}])
+    );
     assert_eq!(output["elements"].as_array().unwrap().len(), 1);
     assert!(output.get("tree_markdown").is_some());
     assert_eq!(

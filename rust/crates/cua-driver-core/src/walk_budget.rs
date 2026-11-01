@@ -8,6 +8,7 @@
 
 use cua_driver_contract::{
     IncompleteReason, IncompleteReasonDetail as Detail, IncompleteReasonKind as Kind,
+    ScopeExclusion, ScopeExclusionKind,
 };
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -63,6 +64,7 @@ pub struct WalkBudget {
     stop: Option<WalkStop>,
     exhaustive: bool,
     incomplete_reasons: Vec<IncompleteReason>,
+    scope_exclusions: Vec<(ScopeExclusionKind, Option<u64>)>,
 }
 
 impl WalkBudget {
@@ -80,6 +82,7 @@ impl WalkBudget {
             stop: None,
             exhaustive: false,
             incomplete_reasons: Vec::new(),
+            scope_exclusions: Vec::new(),
         }
     }
 
@@ -174,12 +177,20 @@ impl WalkBudget {
         self.record_skip(reason);
     }
 
+    /// Record intentionally excluded scope without affecting completeness.
+    /// `owner` is a walk-local identity, not a returned element index. Use a
+    /// separate node boundary for a closed-menu row; do not call `record_cut`.
+    pub fn record_scope_exclusion(&mut self, kind: ScopeExclusionKind, owner: Option<u64>) {
+        self.scope_exclusions.push((kind, owner));
+    }
+
     pub fn outcome(&self) -> WalkOutcome {
         WalkOutcome {
             timeout_ms: self.timeout_ms,
             stop: self.stop,
             exhaustive: self.exhaustive,
             incomplete_reasons: self.incomplete_reasons.clone(),
+            scope_exclusions: self.scope_exclusions.clone(),
             nodes_visited: self.visited,
             nodes_pending: self.pending,
             elapsed_ms: self
@@ -199,6 +210,7 @@ pub struct WalkOutcome {
     pub elapsed_ms: u64,
     exhaustive: bool,
     incomplete_reasons: Vec<IncompleteReason>,
+    scope_exclusions: Vec<(ScopeExclusionKind, Option<u64>)>,
 }
 
 impl WalkOutcome {
@@ -213,6 +225,7 @@ impl WalkOutcome {
             elapsed_ms: elapsed.as_millis() as u64,
             exhaustive: false,
             incomplete_reasons: Vec::new(),
+            scope_exclusions: Vec::new(),
         }
     }
 
@@ -226,6 +239,13 @@ impl WalkOutcome {
 
     /// Write the shared walk fields into a `get_window_state` payload.
     pub fn apply(&self, structured: &mut Value) {
+        self.apply_with_owner_mapping(structured, &HashMap::new());
+    }
+
+    /// `owners` maps walk-local identities to indices in the final returned
+    /// snapshot after filtering and renumbering. Missing mappings preserve the
+    /// exclusion but make its ownership unknown, even if other owners map.
+    pub fn apply_with_owner_mapping(&self, structured: &mut Value, owners: &HashMap<u64, u64>) {
         let mut reasons = self.incomplete_reasons.clone();
         if !self.exhaustive {
             reasons.push(IncompleteReason {
@@ -249,6 +269,37 @@ impl WalkOutcome {
         reasons.dedup();
         structured["observation_complete"] = json!(reasons.is_empty());
         structured["observation_incomplete_reasons"] = json!(reasons);
+        let mut grouped = std::collections::BTreeMap::<ScopeExclusionKind, Option<Vec<u64>>>::new();
+        for &(kind, owner) in &self.scope_exclusions {
+            let mapped = owner.and_then(|id| owners.get(&id).copied());
+            let entry = grouped.entry(kind).or_insert_with(|| Some(Vec::new()));
+            match (entry.as_mut(), mapped) {
+                (Some(indices), Some(index)) => indices.push(index),
+                (_, None) => *entry = None,
+                _ => {}
+            }
+        }
+        let exclusions: Vec<ScopeExclusion> = grouped
+            .into_iter()
+            .map(|(kind, indices)| {
+                let element_indices = indices.and_then(|mut indices| {
+                    indices.sort_unstable();
+                    indices.dedup();
+                    (!indices.is_empty()).then_some(indices)
+                });
+                ScopeExclusion {
+                    kind,
+                    element_indices,
+                }
+            })
+            .collect();
+        if let Some(object) = structured.as_object_mut() {
+            if exclusions.is_empty() {
+                object.remove("observation_scope_exclusions");
+            } else {
+                object.insert("observation_scope_exclusions".into(), json!(exclusions));
+            }
+        }
         structured["truncated"] = json!(self.truncated());
         if let Some(reason) = self.reason() {
             structured["truncation_reason"] = json!(reason);
@@ -446,6 +497,82 @@ impl HungTargetCircuitBreaker {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scope_exclusions_are_localized_conservatively_without_affecting_completeness() {
+        let kind = ScopeExclusionKind::ClosedMenusNotExpanded;
+        let mut budget = WalkBudget::nodes_only(10);
+        budget.assert_exhaustive();
+        for owner in [Some(7), Some(3), Some(7)] {
+            budget.record_scope_exclusion(kind, owner);
+        }
+        let mut out = json!({"elements":[{"element_index":9,"boundary":{
+            "reasons":[{"kind":"policy_omission","detail":"collapsed_menu"}],
+            "children_skipped":"unknown"
+        }},{"element_index":2}]});
+        budget
+            .outcome()
+            .apply_with_owner_mapping(&mut out, &HashMap::from([(7, 9), (3, 2)]));
+        assert_eq!(out["observation_complete"], true);
+        assert_eq!(out["observation_incomplete_reasons"], json!([]));
+        assert_eq!(
+            out["elements"][0]["boundary"]["reasons"][0]["detail"],
+            "collapsed_menu"
+        );
+        assert_eq!(
+            out["observation_scope_exclusions"],
+            json!([{ "kind":"closed_menus_not_expanded", "element_indices":[2,9] }])
+        );
+        budget
+            .outcome()
+            .apply_with_owner_mapping(&mut out, &HashMap::from([(7, 9)]));
+        assert_eq!(
+            out["observation_scope_exclusions"],
+            json!([{ "kind":"closed_menus_not_expanded" }])
+        );
+        budget.outcome().apply(&mut out);
+        assert_eq!(
+            out["observation_scope_exclusions"],
+            json!([{ "kind":"closed_menus_not_expanded" }])
+        );
+        budget.record_skip(IncompleteReason {
+            kind: Kind::ProviderFailure,
+            detail: Detail::ChildEnumerationFailed,
+        });
+        budget.outcome().apply(&mut out);
+        assert_eq!(out["observation_complete"], false);
+        assert_eq!(
+            out["observation_incomplete_reasons"][0]["detail"],
+            "child_enumeration_failed"
+        );
+        for is_cut in [true, false] {
+            let mut other = WalkBudget::nodes_only(10);
+            other.assert_exhaustive();
+            other.record_scope_exclusion(kind, None);
+            let reason = IncompleteReason {
+                kind: Kind::Unknown,
+                detail: Detail::UntrustedProvider,
+            };
+            if is_cut {
+                other.record_cut(reason);
+            } else {
+                other.record_untrusted(reason);
+            }
+            other.outcome().apply(&mut out);
+            assert_eq!(out["observation_complete"], false);
+            assert_eq!(out["observation_incomplete_reasons"], json!([reason]));
+        }
+        let mut timed = WalkBudget::nodes_only(10);
+        timed.assert_exhaustive();
+        timed.record_scope_exclusion(kind, None);
+        timed.stop_for_timeout();
+        timed.outcome().apply(&mut out);
+        assert_eq!(out["observation_complete"], false);
+        assert_eq!(
+            out["observation_incomplete_reasons"][0]["detail"],
+            "time_budget"
+        );
+    }
 
     #[test]
     fn unasserted_walk_is_explicitly_incomplete() {

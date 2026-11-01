@@ -423,6 +423,35 @@ pub struct IncompleteReason {
 /// A boundary and a read-level omission use the same vocabulary.
 pub type BoundaryReason = IncompleteReason;
 
+/// Scope deliberately not read, distinct from an incomplete requested read.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Serialize,
+    Deserialize,
+    JsonSchema,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    uniffi::Enum,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum ScopeExclusionKind {
+    ClosedMenusNotExpanded,
+}
+
+#[derive(
+    Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq, PartialOrd, Ord, uniffi::Record,
+)]
+pub struct ScopeExclusion {
+    pub kind: ScopeExclusionKind,
+    /// Excluded owner rows in this snapshot; absent when ownership is unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub element_indices: Option<Vec<u64>>,
+}
+
 /// Evidence for the number of direct children omitted at this node.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq, uniffi::Enum)]
 #[serde(rename_all = "snake_case")]
@@ -556,6 +585,9 @@ pub struct WindowStateOutput {
     pub observation_complete: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub observation_incomplete_reasons: Option<Vec<IncompleteReason>>,
+    /// Deliberately excluded scope. Absence does not prove full scope.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observation_scope_exclusions: Option<Vec<ScopeExclusion>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub degraded: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -750,6 +782,13 @@ mod tests {
             "drilldown_diagnostics":[{"kind":"budget","detail":"node_budget"}]});
         let decoded: WindowStateOutput = serde_json::from_value(output.clone()).unwrap();
         assert_eq!(serde_json::to_value(decoded).unwrap(), output);
+        let complete = json!({"pid":7,"window_id":9,"drilldown_status":"complete",
+            "observation_complete":true,"snapshot_id":"s0000002b",
+            "scope":{"root_token":"s0000002a:1","parent_snapshot_id":"s0000002a"},
+            "observation_scope_exclusions":[{"kind":"closed_menus_not_expanded","element_indices":[1]}]});
+        let decoded: WindowStateOutput = serde_json::from_value(complete.clone()).unwrap();
+        decoded.validate().unwrap();
+        assert_eq!(serde_json::to_value(decoded).unwrap(), complete);
         let old_output = json!({"pid":7,"window_id":9});
         let decoded: WindowStateOutput = serde_json::from_value(old_output.clone()).unwrap();
         assert_eq!(serde_json::to_value(decoded).unwrap(), old_output);
@@ -813,6 +852,22 @@ mod tests {
         let output: WindowStateOutput = serde_json::from_value(json!({"pid":7,"window_id":9,
             "drilldown_status":"incomplete","drilldown_diagnostics":[{"kind":"unknown","detail":"not_asserted"}]})).unwrap();
         assert!(output.validate().is_err());
+    }
+
+    #[test]
+    fn scope_exclusions_roundtrip_and_reject_unknown_kind() {
+        let old = json!({"pid":7,"window_id":9});
+        let parsed: WindowStateOutput = serde_json::from_value(old.clone()).unwrap();
+        assert_eq!(serde_json::to_value(parsed).unwrap(), old);
+        let new = json!({"pid":7,"window_id":9,"observation_scope_exclusions":[
+            {"kind":"closed_menus_not_expanded","element_indices":[1,2]},
+            {"kind":"closed_menus_not_expanded"}
+        ]});
+        let parsed: WindowStateOutput = serde_json::from_value(new.clone()).unwrap();
+        assert_eq!(serde_json::to_value(parsed).unwrap(), new);
+        let mut invalid = new;
+        invalid["observation_scope_exclusions"][0]["kind"] = json!("unknown_kind");
+        assert!(serde_json::from_value::<WindowStateOutput>(invalid).is_err());
     }
 
     #[test]

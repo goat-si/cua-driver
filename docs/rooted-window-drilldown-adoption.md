@@ -41,6 +41,13 @@ An adopting backend must:
    original root token and independently selected parent ID. Scoped responses
    do not replace the full-window `since` baseline or screenshot.
 
+For intentionally excluded scope such as closed menus, record exclusions on
+the subtree's `WalkBudget` and call `WalkOutcome::apply_with_owner_mapping`
+using the scoped walk's final returned element indices. Return those exclusions
+only with that scoped result; they do not modify the full-window observation
+or its `since` metadata. An owner that is not present in the returned mapping
+is reported with unknown ownership.
+
 The store keeps scoped entries independently of full-window LRU entries, and
 invalidates them with their parent. Scoped tokens resolve only by exact ID;
 bare row numbers, screenshot and zoom lookups continue to use the full

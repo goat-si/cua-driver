@@ -875,7 +875,39 @@ struct StoredSnapshot {
     markdown: String,
     observation_complete: Value,
     observation_incomplete_reasons: Value,
+    observation_scope_exclusions: Value,
     at: Instant,
+}
+
+fn canonical_scope_exclusions(structured: &Value) -> Value {
+    let value = structured
+        .get("observation_scope_exclusions")
+        .cloned()
+        .unwrap_or(Value::Null);
+    if value.is_null() {
+        return Value::Null;
+    }
+    let Ok(mut exclusions) =
+        serde_json::from_value::<Vec<cua_driver_contract::ScopeExclusion>>(value.clone())
+    else {
+        return value;
+    };
+    for exclusion in &mut exclusions {
+        if let Some(indices) = &mut exclusion.element_indices {
+            indices.sort_unstable();
+            indices.dedup();
+            if indices.is_empty() {
+                exclusion.element_indices = None;
+            }
+        }
+    }
+    exclusions.sort_unstable();
+    exclusions.dedup();
+    if exclusions.is_empty() {
+        Value::Null
+    } else {
+        json!(exclusions)
+    }
 }
 
 fn store() -> &'static Mutex<VecDeque<StoredSnapshot>> {
@@ -916,6 +948,7 @@ fn remember(snapshot_id: &str, ctx: &ViewContext<'_>, md: &str, structured: &Val
             .get("observation_incomplete_reasons")
             .cloned()
             .unwrap_or(Value::Null),
+        observation_scope_exclusions: canonical_scope_exclusions(structured),
         at: Instant::now(),
     });
     let same_window = |s: &StoredSnapshot| s.pid == ctx.pid && s.window_id == ctx.window_id;
@@ -1130,6 +1163,20 @@ fn resolve_since(
                         json!(added),
                         json!(removed)
                     ));
+                }
+                let exclusions = canonical_scope_exclusions(structured);
+                if old.observation_scope_exclusions != exclusions {
+                    let line = format!(
+                        "observation_scope_exclusions: {} → {}",
+                        old.observation_scope_exclusions, exclusions
+                    );
+                    match &mut report.metadata {
+                        Some(metadata) => {
+                            metadata.push('\n');
+                            metadata.push_str(&line);
+                        }
+                        None => report.metadata = Some(line),
+                    }
                 }
                 SinceOutcome::Diff(report)
             }
@@ -1660,16 +1707,53 @@ mod tests {
                 focus_probe: None,
             };
             let (mut content, mut full) = payload(&full_id, OLD);
+            let full_exclusions =
+                json!([{"kind":"closed_menus_not_expanded","element_indices":[1]}]);
+            let scoped_exclusions =
+                json!([{"kind":"closed_menus_not_expanded","element_indices":[2]}]);
+            full["observation_complete"] = json!(true);
+            full["observation_incomplete_reasons"] = json!([]);
+            full["observation_scope_exclusions"] = full_exclusions.clone();
             apply(&opts(json!({})), &ctx, &mut content, &mut full);
             let (mut content, mut scoped) = payload(&scoped_id, OLD);
             scoped["drilldown_status"] = json!("complete");
             scoped["observation_complete"] = json!(true);
+            scoped["observation_incomplete_reasons"] = json!([]);
+            scoped["observation_scope_exclusions"] = scoped_exclusions.clone();
             scoped["scope"] =
                 json!({"root_token":format!("{full_id}:1"),"parent_snapshot_id":&full_id});
-            apply(&opts(args.clone()), &ctx, &mut content, &mut scoped);
+            apply_scoped(
+                &format!("{full_id}:1"),
+                &full_id,
+                &opts(args.clone()),
+                &ctx,
+                &mut content,
+                &mut scoped,
+            );
+            assert_eq!(
+                scoped["observation_scope_exclusions"], scoped_exclusions,
+                "{args}"
+            );
             assert_eq!(
                 latest_snapshot(&ctx, None).as_deref(),
                 Some(full_id.as_str()),
+                "{args}"
+            );
+            let next_id =
+                crate::element_token::format_snapshot_id(crate::element_token::mint_snapshot_id());
+            let (mut content, mut next) = payload(&next_id, OLD);
+            next["observation_complete"] = json!(true);
+            next["observation_incomplete_reasons"] = json!([]);
+            next["observation_scope_exclusions"] = full_exclusions.clone();
+            apply(
+                &opts(json!({"since":"latest"})),
+                &ctx,
+                &mut content,
+                &mut next,
+            );
+            assert_eq!(next["since_status"], "no_change", "{args}");
+            assert_eq!(
+                next["observation_scope_exclusions"], full_exclusions,
                 "{args}"
             );
         }
@@ -1919,6 +2003,74 @@ mod tests {
         assert_eq!(third["since_status"], "no_change");
         assert_eq!(third["observation_complete"], true);
         assert_eq!(third["observation_incomplete_reasons"], json!([]));
+    }
+
+    #[test]
+    fn scope_exclusion_changes_are_canonical_metadata_diffs() {
+        let window = 88013;
+        let exclusion =
+            |owners| json!([{"kind":"closed_menus_not_expanded", "element_indices":owners}]);
+        let samples = [
+            ("s0000b301", None, None, None),
+            (
+                "s0000b302",
+                Some("s0000b301"),
+                Some(exclusion(json!([2, 1, 2]))),
+                Some("diff"),
+            ),
+            (
+                "s0000b303",
+                Some("s0000b302"),
+                Some(exclusion(json!([1, 2]))),
+                Some("no_change"),
+            ),
+            (
+                "s0000b304",
+                Some("s0000b303"),
+                Some(exclusion(json!([2]))),
+                Some("diff"),
+            ),
+            ("s0000b305", Some("s0000b304"), None, Some("diff")),
+            (
+                "s0000b306",
+                Some("s0000b305"),
+                Some(json!([
+                    {"kind":"closed_menus_not_expanded", "element_indices":[2]},
+                    {"kind":"closed_menus_not_expanded", "element_indices":[1]}
+                ])),
+                Some("diff"),
+            ),
+            (
+                "s0000b307",
+                Some("s0000b306"),
+                Some(json!([
+                    {"kind":"closed_menus_not_expanded", "element_indices":[1]},
+                    {"kind":"closed_menus_not_expanded", "element_indices":[2]}
+                ])),
+                Some("no_change"),
+            ),
+        ];
+        for (id, since, exclusions, expected) in samples {
+            let (mut content, mut value) = payload(id, OLD);
+            if let Some(exclusions) = exclusions {
+                value["observation_scope_exclusions"] = exclusions;
+            }
+            apply(
+                &opts(json!({"since":since})),
+                &ctx(window),
+                &mut content,
+                &mut value,
+            );
+            if let Some(expected) = expected {
+                assert_eq!(value["since_status"], expected);
+                if expected == "diff" {
+                    assert!(value["tree_diff"]
+                        .as_str()
+                        .unwrap()
+                        .contains("observation_scope_exclusions"));
+                }
+            }
+        }
     }
 
     #[test]
