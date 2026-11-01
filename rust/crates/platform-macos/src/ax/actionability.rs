@@ -20,11 +20,36 @@ pub(crate) trait Reader {
 /// A native reader; callers must provide a live retained element for every read.
 pub(crate) struct NativeReader;
 
+#[cfg(test)]
+fn forbid_live_tests() {
+    panic!("live AX access is forbidden in tests");
+}
+#[cfg(not(test))]
+fn forbid_live_tests() {}
+
 fn error<T>(code: AXError) -> Evidence<T> {
     if code == kAXErrorAttributeUnsupported || code == kAXErrorNoValue {
         Evidence::Absent
     } else {
         Evidence::Unknown(format!("AX error {code}"))
+    }
+}
+
+pub(crate) fn classify_attribute<T>(
+    code: AXError,
+    present: bool,
+    decoded: Option<T>,
+    name: &str,
+) -> Evidence<T> {
+    if code != kAXErrorSuccess {
+        error(code)
+    } else if !present {
+        Evidence::Absent
+    } else {
+        decoded.map_or_else(
+            || Evidence::Unknown(format!("wrong CF type for {name}")),
+            Evidence::Known,
+        )
     }
 }
 
@@ -40,16 +65,12 @@ unsafe fn attr<T>(
     let attribute = CFString::new(name);
     let mut value: CFTypeRef = std::ptr::null();
     let code = AXUIElementCopyAttributeValue(element, attribute.as_concrete_TypeRef(), &mut value);
-    let result = if code != kAXErrorSuccess {
-        error(code)
-    } else if value.is_null() {
-        Evidence::Absent
+    let decoded = if code == kAXErrorSuccess && !value.is_null() {
+        decode(value)
     } else {
-        decode(value).map_or_else(
-            || Evidence::Unknown(format!("wrong CF type for {name}")),
-            Evidence::Known,
-        )
+        None
     };
+    let result = classify_attribute(code, !value.is_null(), decoded, name);
     if !value.is_null() {
         CFRelease(value);
     }
@@ -59,7 +80,7 @@ unsafe fn attr<T>(
 impl Reader for NativeReader {
     type Element = AXUIElementRef;
     fn boolean(&mut self, element: Self::Element, attribute: &str) -> Evidence<bool> {
-        assert!(!cfg!(test), "live AX access is forbidden in tests");
+        forbid_live_tests();
         unsafe {
             attr(element, attribute, |v| {
                 (CFGetTypeID(v) == CFBoolean::type_id())
@@ -68,12 +89,12 @@ impl Reader for NativeReader {
         }
     }
     fn string(&mut self, element: Self::Element, attribute: &str) -> Evidence<String> {
-        assert!(!cfg!(test), "live AX access is forbidden in tests");
+        forbid_live_tests();
         assert_eq!(attribute, "AXRole", "only target role can be read");
         unsafe { attr(element, attribute, |v| string_from_cf(v)) }
     }
     fn actions(&mut self, element: Self::Element) -> Evidence<Vec<String>> {
-        assert!(!cfg!(test), "live AX access is forbidden in tests");
+        forbid_live_tests();
         unsafe {
             let mut names: CFArrayRef = std::ptr::null();
             let code = AXUIElementCopyActionNames(element, &mut names);
@@ -106,7 +127,7 @@ impl Reader for NativeReader {
         }
     }
     fn frame(&mut self, element: Self::Element) -> Evidence<Rect> {
-        assert!(!cfg!(test), "live AX access is forbidden in tests");
+        forbid_live_tests();
         let (position, size) = unsafe {
             (
                 attr(element, "AXPosition", |v| point_from_cf(v)),
@@ -125,7 +146,7 @@ impl Reader for NativeReader {
         }
     }
     fn settable(&mut self, element: Self::Element, attribute: &str) -> Evidence<bool> {
-        assert!(!cfg!(test), "live AX access is forbidden in tests");
+        forbid_live_tests();
         unsafe {
             let name = CFString::new(attribute);
             let mut value = 0_u8;
