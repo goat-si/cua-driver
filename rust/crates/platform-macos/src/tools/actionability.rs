@@ -7,7 +7,11 @@ use cua_driver_core::actionability::{
 use cua_driver_core::protocol::ToolResult;
 use std::{future::Future, time::Duration};
 
+pub(super) mod runner;
 pub(super) mod scope;
+#[cfg(test)]
+#[path = "actionability/order_tests.rs"]
+mod u31_pointer_order_tests;
 #[cfg(test)]
 #[path = "actionability/scope_tests.rs"]
 mod u31_scope_tests;
