@@ -98,6 +98,24 @@ the producer leaves completeness unasserted. Nodes without a boundary slot
 keep their child rows. Platforms must also preserve the emitted markdown marker
 and typed boundary; the legacy wrapper does not supply this evidence.
 
+Before asserting completeness, folding implementations must override
+`CompactableNode::rendered_text_fields` to list exactly the text slots rendered
+by `format_line`. Its default conservatively returns non-whitespace title,
+value and description, including fields a renderer might omit; this can report
+loss for invisible data. Values are compared after trimming their outer
+whitespace, without collapsing internal whitespace. Quotes, backslashes and
+control characters cannot prove preservation; rendered fields longer than
+1,000 Unicode scalars cannot prove preservation either. These cases are
+deliberately reported as incomplete when the fold must preserve them.
+
+- Windows UIA: unindexed rows render name and value; indexed rows also render
+  help and automation id. Do not list unindexed help text as description.
+- macOS AX: render title and value; render description only when it differs
+  from title. Identifier and help are rendered only on indexed rows. Implement
+  the accessor in line with the actual formatter, including future changes.
+- Linux: if it adds folding, list its renderer's actual text slots before it
+  asserts completeness.
+
 - macOS: replace only the intentional `AXMenuBarItem` collapse's
   `note_skipped` with an exclusion; retain unrelated skips. Existing `query`
   and `full_output:true` request menu traversal.

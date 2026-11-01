@@ -3,7 +3,8 @@
 //!
 //! Completeness-asserting platforms must implement [`CompactableNode::offscreen`],
 //! use [`fold_actionless_text_subtrees_with_reasons`], and merge its reasons
-//! into their walk's read-level evidence.
+//! into their walk's read-level evidence. They should also implement
+//! [`CompactableNode::rendered_text_fields`] to describe their formatter's text.
 
 use crate::tree_boundary::{retain_boundary, BoundaryReason, NodeBoundary};
 use std::collections::HashMap;
@@ -22,6 +23,9 @@ pub const MAX_SUMMARY_CHARS: usize = 220;
 
 /// Maximum character length of each individual snippet before joining.
 pub const MAX_SNIPPET_CHARS: usize = 80;
+
+/// Conservative maximum number of Unicode scalars in a rendered field.
+pub const MAX_RENDERED_FIELD_CHARS: usize = 1_000;
 
 /// Replacement string emitted for redacted secret or verification-code values.
 pub const REDACTED_VALUE: &str = "[redacted]";
@@ -436,58 +440,6 @@ fn summarize_static_text_snippets_with_parts<S: AsRef<str>>(
     (joined.chars().count() <= MAX_SUMMARY_CHARS).then_some((joined, distinct))
 }
 
-/// Check whether a field is visibly delimited in its formatted row. This is
-/// only used to identify shown fields; preservation requires full equality.
-fn field_is_rendered(row: &str, field: &str) -> bool {
-    row.match_indices(field).any(|(start, _)| {
-        let before = row[..start].chars().next_back();
-        let after = row[start + field.len()..].chars().next();
-        let boundary = |character: char| !character.is_alphanumeric() && character != '_';
-        before.is_none_or(boundary) && after.is_none_or(boundary)
-    })
-}
-
-/// Recover only the retained row's complete, delimited label and value.
-/// Ambiguous or unsupported formatting cannot prove a field was retained.
-fn rendered_label_value<'a>(
-    row: &'a str,
-    role: &str,
-    expected_title: Option<&str>,
-) -> (Option<&'a str>, Option<&'a str>) {
-    let Some(rest) = row
-        .strip_prefix("- ")
-        .and_then(|row| row.strip_prefix(role))
-    else {
-        return (None, None);
-    };
-    if !rest.is_empty() && !rest.starts_with(char::is_whitespace) {
-        return (None, None);
-    }
-    let mut rest = rest.trim_start();
-    let mut label = None;
-    if let Some(quoted) = rest.strip_prefix('"') {
-        let Some((text, tail)) = expected_title
-            .and_then(|title| {
-                quoted
-                    .strip_prefix(title)
-                    .and_then(|tail| tail.strip_prefix('"'))
-                    .map(|tail| (&quoted[..title.len()], tail))
-            })
-            .or_else(|| quoted.split_once('"'))
-        else {
-            return (None, None);
-        };
-        label = Some(text);
-        rest = tail.trim_start();
-    }
-    let value = rest
-        .strip_prefix('=')
-        .map(str::trim_start)
-        .and_then(|tail| tail.strip_prefix('"'))
-        .and_then(|tail| tail.split_once('"').map(|(text, _)| text));
-    (label, value)
-}
-
 /// Roles that act as rows or generic containers eligible for actionless static-text folding.
 pub fn is_summarizable_container_or_row_role(role: &str) -> bool {
     matches!(
@@ -572,6 +524,17 @@ pub fn is_text_bearing_leaf_role(role: &str) -> bool {
     )
 }
 
+/// A text field rendered by a compactable node.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FieldSlot {
+    Title,
+    Value,
+    Description,
+    Help,
+    Identifier,
+    Other,
+}
+
 /// Minimal view of a walked node used for generic actionless subtree folding and wrapper elision.
 pub trait CompactableNode {
     fn element_index(&self) -> Option<usize>;
@@ -583,6 +546,24 @@ pub trait CompactableNode {
     fn set_value(&mut self, value: Option<String>);
     fn description(&self) -> Option<&str>;
     fn format_line(&self) -> String;
+    /// Text fields shown by `format_line`, with their slots. The conservative
+    /// default includes title, value and description even when not rendered;
+    /// whitespace-only fields are ignored. Platforms should override this to
+    /// describe exactly the rendered fields, including help and identifiers.
+    fn rendered_text_fields(&self) -> Vec<(FieldSlot, &str)> {
+        [
+            (FieldSlot::Title, self.title()),
+            (FieldSlot::Value, self.value()),
+            (FieldSlot::Description, self.description()),
+        ]
+        .into_iter()
+        .filter_map(|(slot, value)| {
+            value
+                .filter(|text| !text.trim().is_empty())
+                .map(|text| (slot, text))
+        })
+        .collect()
+    }
     /// Return observed visibility when available. Completeness-asserting
     /// platforms should report `Some` for rows so differing visibility stays separate.
     fn offscreen(&self) -> Option<bool> {
@@ -594,6 +575,13 @@ pub trait CompactableNode {
     fn boundary_mut(&mut self) -> Option<&mut Option<NodeBoundary>> {
         None
     }
+}
+
+fn plain_component(text: &str, limit: usize) -> bool {
+    text.chars().count() <= limit
+        && !text
+            .chars()
+            .any(|c| c == '"' || c == '\\' || c.is_control())
 }
 
 fn mark_folded_children(slot: &mut Option<NodeBoundary>, count: u32) {
@@ -681,7 +669,12 @@ fn fold_actionless_text_subtrees_impl<N: CompactableNode>(
             && nodes[i]
                 .description()
                 .map(|s| s.trim().is_empty())
-                .unwrap_or(true);
+                .unwrap_or(true)
+            && (!report_folds
+                || nodes[i]
+                    .rendered_text_fields()
+                    .iter()
+                    .all(|(_, text)| text.trim().is_empty()));
         if !is_empty_wrapper {
             i += 1;
             continue;
@@ -882,54 +875,26 @@ fn fold_after_elision<N: CompactableNode>(
                             .count(),
                     )
                     .unwrap_or(u32::MAX);
-                    // A node can render more than the one field selected for
-                    // the summary, and a platform can decline set_value.
-                    // Keep evidence for all fields actually shown before folding.
-                    let mut visible_text: Vec<String> = Vec::new();
-                    if report_folds {
-                        for node in &old_nodes[idx..sub_end] {
-                            let node = node.as_ref().unwrap();
-                            let rendered = node.format_line();
-                            for field in [node.title(), node.value(), node.description()]
-                                .into_iter()
-                                .flatten()
-                            {
-                                let text = field.trim();
-                                if !text.is_empty()
-                                    && field_is_rendered(&rendered, text)
-                                    && !visible_text.iter().any(|seen| seen == text)
-                                {
-                                    visible_text.push(text.to_owned());
-                                }
-                            }
-                        }
-                    }
+                    // Capture the must-keep fields before mutating or discarding nodes.
+                    let mut must_keep: Vec<String> = old_nodes[(idx + 1)..sub_end]
+                        .iter()
+                        .flat_map(|node| node.as_ref().unwrap().rendered_text_fields())
+                        .filter_map(|(_, text)| {
+                            let trimmed = text.trim();
+                            (!trimmed.is_empty()).then(|| trimmed.to_owned())
+                        })
+                        .collect();
                     let mut parent_node = old_nodes[idx].take().unwrap();
-                    let original_line = parent_node.format_line();
-                    let unchanged_fields =
-                        [parent_node.title(), parent_node.description()].map(|field| {
-                            field.and_then(|value| {
-                                let text = value.trim();
-                                (!text.is_empty() && field_is_rendered(&original_line, text))
-                                    .then(|| value.to_owned())
-                            })
-                        });
+                    let parent_fields: Vec<(FieldSlot, String)> = parent_node
+                        .rendered_text_fields()
+                        .into_iter()
+                        .map(|(slot, text)| (slot, text.to_owned()))
+                        .collect();
                     if report_folds {
                         if let Some(slot) = parent_node.boundary_mut() {
                             mark_folded_children(slot, absorbed_children);
                         }
                     }
-                    let mut distinct = Vec::new();
-                    let mut lost_text = false;
-                    for raw in &raw_snippets {
-                        if let Some(full) = sanitize_snippet(raw, usize::MAX) {
-                            lost_text |= full.chars().count() > MAX_SNIPPET_CHARS;
-                            if !distinct.contains(&full) {
-                                distinct.push(full);
-                            }
-                        }
-                    }
-                    lost_text |= distinct.len() > MAX_SUMMARY_SNIPPETS;
                     for descendant in &mut old_nodes[(idx + 1)..sub_end] {
                         if let Some(boundary) = descendant
                             .as_mut()
@@ -939,15 +904,24 @@ fn fold_after_elision<N: CompactableNode>(
                             retain_boundary(&boundary, parent_node.boundary_mut(), read_reasons);
                         }
                     }
-                    let existing_title = parent_node.title().map(str::trim).unwrap_or("");
-                    let mut written_value = None;
-                    let mut written_parent_component = None;
+                    let existing_title =
+                        parent_node.title().map(str::trim).unwrap_or("").to_owned();
+                    let old_value = parent_node
+                        .value()
+                        .map(str::trim)
+                        .filter(|v| !v.is_empty())
+                        .map(str::to_owned);
+                    let mut intended_value = None;
+                    let mut parent_component = None;
                     if existing_title != summary {
-                        let merged_val = match parent_node.value().map(str::trim) {
-                            Some(v) if !v.is_empty() && v != summary => {
+                        if let Some(value) = &old_value {
+                            must_keep.push(value.clone());
+                        }
+                        let merged_val = match old_value.as_deref() {
+                            Some(v) if v != summary => {
                                 let combined = format!("{v} {summary}");
                                 if combined.chars().count() <= MAX_SUMMARY_CHARS {
-                                    written_parent_component = Some(v.to_owned());
+                                    parent_component = Some(v.to_owned());
                                     combined
                                 } else {
                                     summary.clone()
@@ -955,69 +929,59 @@ fn fold_after_elision<N: CompactableNode>(
                             }
                             _ => summary.clone(),
                         };
-                        written_value = Some(merged_val.clone());
+                        intended_value = Some(merged_val.clone());
                         parent_node.set_value(Some(merged_val));
                     }
-                    let mut formatted = parent_node.format_line();
-                    let (rendered_label, rendered_value) =
-                        rendered_label_value(&formatted, parent_node.role(), parent_node.title());
-                    let mut retained_fields: Vec<(String, String)> = [
-                        parent_node.title().zip(rendered_label),
-                        parent_node.value().zip(rendered_value),
-                    ]
-                    .into_iter()
-                    .flatten()
-                    .filter_map(|(field, shown)| {
-                        let raw = field.trim();
-                        if raw.is_empty() || raw != shown.trim() {
-                            return None;
-                        }
-                        sanitize_snippet(raw, usize::MAX)
-                            .map(|normalized| (raw.to_owned(), normalized))
-                    })
-                    .collect();
-                    // Verify that the assigned value was actually rendered. The
-                    // components themselves come from the construction above,
-                    // not from splitting the resulting formatted text.
-                    let assigned_value_rendered = written_value.as_deref().is_some_and(|written| {
-                        parent_node.value() == Some(written) && rendered_value == Some(written)
-                    });
-                    if assigned_value_rendered {
-                        if let Some(component) = written_parent_component {
-                            if let Some(normalized) = sanitize_snippet(&component, usize::MAX) {
-                                retained_fields.push((component, normalized));
-                            }
-                        }
-                    }
-                    for (original, current) in unchanged_fields
+                    let final_fields = parent_node.rendered_text_fields();
+                    let mut written: Vec<String> = parent_fields
                         .iter()
-                        .zip([parent_node.title(), parent_node.description()])
-                    {
-                        if let Some(value) =
-                            original.as_deref().filter(|value| Some(*value) == current)
+                        .filter_map(|(slot, text)| {
+                            let trimmed = text.trim();
+                            (*slot != FieldSlot::Value || intended_value.is_none())
+                                .then_some(())
+                                .filter(|_| {
+                                    final_fields
+                                        .iter()
+                                        .any(|(s, value)| s == slot && *value == text)
+                                })
+                                .filter(|_| plain_component(text, MAX_RENDERED_FIELD_CHARS))
+                                .map(|_| trimmed.to_owned())
+                        })
+                        .collect();
+                    let value_written = intended_value.as_deref().is_some_and(|intended| {
+                        parent_node.value() == Some(intended)
+                            && plain_component(intended, MAX_RENDERED_FIELD_CHARS)
+                            && final_fields.iter().any(|(slot, value)| {
+                                *slot == FieldSlot::Value && *value == intended
+                            })
+                    });
+                    if value_written {
+                        written.push(intended_value.as_ref().expect("checked value").clone());
+                        if let Some(component) = parent_component
+                            .filter(|value| plain_component(value, MAX_RENDERED_FIELD_CHARS))
                         {
-                            let raw = value.trim();
-                            if let Some(normalized) = sanitize_snippet(raw, usize::MAX) {
-                                retained_fields.push((raw.to_owned(), normalized));
-                            }
+                            written.push(component);
                         }
                     }
-                    let summary_rendered = assigned_value_rendered
-                        || retained_fields
-                            .iter()
-                            .any(|(_, normalized)| normalized == &summary);
-                    lost_text |= visible_text.iter().any(|text| {
-                        let Some(normalized) = sanitize_snippet(text, usize::MAX) else {
-                            return false;
-                        };
-                        let raw_retained = retained_fields.iter().any(|(raw, _)| raw == text);
-                        let exact_retained = retained_fields
-                            .iter()
-                            .any(|(_, field)| field == &normalized);
-                        let exact_snippet = summary_rendered
-                            && kept_snippets.iter().any(|snippet| snippet == &normalized);
-                        !raw_retained && (text != &normalized || !(exact_retained || exact_snippet))
-                    });
+                    let title_contains_summary = intended_value.is_none()
+                        && plain_component(&summary, MAX_RENDERED_FIELD_CHARS)
+                        && final_fields.iter().any(|(slot, text)| {
+                            *slot == FieldSlot::Title
+                                && text.trim() == summary
+                                && plain_component(text, MAX_RENDERED_FIELD_CHARS)
+                        });
+                    if value_written || title_contains_summary {
+                        written.extend(
+                            kept_snippets
+                                .iter()
+                                .filter(|text| plain_component(text, MAX_SNIPPET_CHARS))
+                                .cloned(),
+                        );
+                    }
+                    let lost_text = must_keep
+                        .iter()
+                        .any(|text| !written.iter().any(|item| item == text));
+                    let mut formatted = parent_node.format_line();
                     if lost_text && report_folds {
                         let reason = BoundaryReason {
                             kind: cua_driver_contract::IncompleteReasonKind::PolicyOmission,
@@ -1399,6 +1363,15 @@ mod tests {
         offscreen: Option<bool>,
         refuse_value: bool,
         hide_value: bool,
+        hide_description: bool,
+        escape_value: bool,
+        cap_value: bool,
+        transform_value: bool,
+        render_mode: u8,
+        hide_title: bool,
+        help: Option<String>,
+        identifier: Option<String>,
+        extra: Option<String>,
     }
     impl CompactableNode for BoundaryNode {
         fn element_index(&self) -> Option<usize> {
@@ -1421,24 +1394,84 @@ mod tests {
         }
         fn set_value(&mut self, value: Option<String>) {
             if !self.refuse_value {
-                self.node.value = value;
+                self.node.value = if self.transform_value {
+                    value.map(|s| s.to_uppercase())
+                } else {
+                    value
+                };
             }
         }
         fn description(&self) -> Option<&str> {
             self.node.description.as_deref()
         }
         fn format_line(&self) -> String {
+            let mut node = self.node.clone();
+            if self.hide_title {
+                node.title = None;
+            }
+            if self.escape_value {
+                node.value = node.value.map(|s| s.replace('\n', "\\n"));
+            }
+            if self.cap_value {
+                node.value = node.value.map(|s| s.chars().take(1000).collect());
+            }
             let mut line = if self.hide_value {
-                let mut node = self.node.clone();
                 node.value = None;
                 node.format_line()
             } else {
-                self.node.format_line()
+                node.format_line()
             };
-            if let Some(description) = &self.node.description {
+            if let Some(description) = self.node.description.as_ref().filter(|d| {
+                !self.hide_description
+                    && self.render_mode != 1
+                    && (self.render_mode != 2 || self.node.title.as_ref() != Some(*d))
+            }) {
                 line.push_str(&format!(" ({description})"));
             }
+            if self.render_mode != 0 && self.element_index().is_some() {
+                if let Some(help) = &self.help {
+                    line.push_str(&format!(" help=\"{help}\""));
+                }
+                if let Some(id) = &self.identifier {
+                    line.push_str(&format!(" id={id}"));
+                }
+            }
+            if let Some(extra) = &self.extra {
+                line.push_str(extra);
+            }
             line
+        }
+        fn rendered_text_fields(&self) -> Vec<(FieldSlot, &str)> {
+            let mut fields = Vec::new();
+            if !self.hide_title {
+                if let Some(v) = self.title().filter(|v| !v.trim().is_empty()) {
+                    fields.push((FieldSlot::Title, v));
+                }
+            }
+            if !self.hide_value {
+                if let Some(v) = self.value().filter(|v| !v.trim().is_empty()) {
+                    fields.push((FieldSlot::Value, v));
+                }
+            }
+            if self.render_mode != 1 {
+                if let Some(v) = self.description().filter(|v| !v.trim().is_empty()) {
+                    if self.render_mode != 2 || self.title() != Some(v) {
+                        fields.push((FieldSlot::Description, v));
+                    }
+                }
+            }
+            if self.render_mode != 0 && self.element_index().is_some() {
+                if let Some(v) = self.help.as_deref().filter(|v| !v.trim().is_empty()) {
+                    fields.push((FieldSlot::Help, v));
+                }
+                if let Some(v) = self.identifier.as_deref().filter(|v| !v.trim().is_empty()) {
+                    fields.push((FieldSlot::Identifier, v));
+                }
+            }
+            if let Some(v) = self.extra.as_deref().filter(|v| !v.trim().is_empty()) {
+                fields.push((FieldSlot::Other, v));
+            }
+            fields
         }
         fn offscreen(&self) -> Option<bool> {
             self.offscreen
@@ -1467,6 +1500,15 @@ mod tests {
             offscreen: None,
             refuse_value: false,
             hide_value: false,
+            hide_description: false,
+            escape_value: false,
+            cap_value: false,
+            transform_value: false,
+            render_mode: 0,
+            hide_title: false,
+            help: None,
+            identifier: None,
+            extra: None,
         }
     }
     fn u20_boundary(
@@ -1485,6 +1527,171 @@ mod tests {
     fn u20_fold(nodes: &mut Vec<BoundaryNode>) -> Vec<BoundaryReason> {
         let mut lines = nodes.iter().map(|n| (n.depth(), n.format_line())).collect();
         fold_actionless_text_subtrees_with_reasons(&mut lines, nodes)
+    }
+    #[test]
+    fn u20b_r4_escaped_child_is_reported() {
+        let mut nodes = vec![
+            u20_node("AXRow", 0, None, None),
+            u20_node("AXStaticText", 1, None, Some("foo\nbar")),
+        ];
+        nodes[1].escape_value = true;
+        assert!(!u20_fold(&mut nodes).is_empty());
+    }
+    #[test]
+    fn u20b_r4_capped_overwritten_parent_is_reported() {
+        let value = "x".repeat(1001);
+        let mut nodes = vec![
+            u20_node("AXRow", 0, None, Some(&value)),
+            u20_node("AXStaticText", 1, None, Some("child")),
+        ];
+        nodes[0].cap_value = true;
+        assert!(!u20_fold(&mut nodes).is_empty());
+    }
+    #[test]
+    fn u20b_r4_default_unrendered_child_field_is_conservative() {
+        let mut nodes = vec![
+            u20_node("AXRow", 0, None, None),
+            u20_node("AXStaticText", 1, None, Some("child")),
+        ];
+        nodes[1].node.description = Some("unrendered help".into());
+        nodes[1].hide_description = true;
+        assert!(nodes[1]
+            .node
+            .rendered_text_fields()
+            .iter()
+            .any(|(slot, _)| *slot == FieldSlot::Description));
+        assert!(!u20_fold(&mut nodes).is_empty());
+    }
+    #[test]
+    fn u20b_revision_b_raw_text_and_nonplain_are_conservative() {
+        for child in ["foo  bar", "foo\nbar", "foo\"bar", "foo\\bar"] {
+            let mut nodes = vec![
+                u20_node("AXRow", 0, None, None),
+                u20_node("AXStaticText", 1, None, Some(child)),
+            ];
+            nodes[0].node.title = Some("foo bar".into());
+            assert!(!u20_fold(&mut nodes).is_empty(), "{child:?}");
+        }
+        let mut nodes = vec![
+            u20_node("AXRow", 0, None, Some("same")),
+            u20_node("AXStaticText", 1, None, Some("same")),
+        ];
+        assert!(u20_fold(&mut nodes).is_empty());
+    }
+    #[test]
+    fn u20b_revision_b_setter_rejection_transform_and_hidden_skip() {
+        for mode in 0..3 {
+            let mut nodes = vec![
+                u20_node("AXRow", 0, None, None),
+                u20_node("AXStaticText", 1, None, Some("child")),
+            ];
+            match mode {
+                0 => nodes[0].refuse_value = true,
+                1 => nodes[0].transform_value = true,
+                _ => {
+                    nodes[0].node.title = Some("child".into());
+                    nodes[0].hide_title = true;
+                }
+            }
+            assert!(!u20_fold(&mut nodes).is_empty(), "mode {mode}");
+        }
+        let mut nodes = vec![
+            u20_node("AXRow", 0, None, None),
+            u20_node("AXStaticText", 1, None, Some("child")),
+        ];
+        nodes[0].node.title = Some("child\t".into());
+        assert!(!u20_fold(&mut nodes).is_empty());
+    }
+    #[test]
+    fn u20b_revision_b_wrapper_extra_field_cannot_be_elided() {
+        let mut nodes = vec![
+            u20_node("AXRow", 0, None, None),
+            u20_node("AXGroup", 1, None, None),
+        ];
+        nodes[1].extra = Some("wrapper text".into());
+        assert!(u20_fold(&mut nodes).is_empty());
+        assert_eq!(nodes.len(), 2);
+    }
+    #[test]
+    fn u20b_revision_b_final_field_caps_and_unicode() {
+        for (length, loss) in [(80, false), (81, true)] {
+            let value = "x".repeat(length);
+            let mut nodes = vec![
+                u20_node("AXRow", 0, None, None),
+                u20_node("AXStaticText", 1, None, Some(&value)),
+            ];
+            assert_eq!(!u20_fold(&mut nodes).is_empty(), loss, "snippet {length}");
+        }
+        let parent = "p".repeat(190);
+        let child = "c".repeat(29);
+        let mut nodes = vec![
+            u20_node("AXRow", 0, None, Some(&parent)),
+            u20_node("AXStaticText", 1, None, Some(&child)),
+        ];
+        assert!(u20_fold(&mut nodes).is_empty());
+        assert_eq!(nodes[0].value().unwrap().chars().count(), 220);
+        let mut nodes = vec![
+            u20_node("AXRow", 0, None, Some("one two")),
+            u20_node("AXStaticText", 1, None, Some("one")),
+            u20_node("AXStaticText", 1, None, Some("two")),
+        ];
+        assert!(u20_fold(&mut nodes).is_empty());
+        for (length, loss) in [(1000, false), (1001, true)] {
+            let text = "é".repeat(length);
+            let mut nodes = vec![
+                u20_node("AXRow", 0, None, None),
+                u20_node("AXStaticText", 1, None, Some("child")),
+            ];
+            nodes[0].node.title = Some(text.clone());
+            nodes[1].node.title = Some(text);
+            assert_eq!(!u20_fold(&mut nodes).is_empty(), loss, "field {length}");
+        }
+    }
+    #[test]
+    fn u20b_revision_b_platform_renderer_overrides() {
+        for mode in [1, 2] {
+            let mut node = u20_node("Text", 1, None, Some("value"));
+            node.render_mode = mode;
+            node.node.title = Some("title".into());
+            node.node.description = Some(if mode == 1 { "help" } else { "title" }.into());
+            node.help = Some("help".into());
+            node.identifier = Some("id".into());
+            let slots = node
+                .rendered_text_fields()
+                .iter()
+                .map(|(slot, _)| *slot)
+                .collect::<Vec<_>>();
+            assert_eq!(slots, vec![FieldSlot::Title, FieldSlot::Value]);
+            node.node.element_index = Some(4);
+            let slots = node
+                .rendered_text_fields()
+                .iter()
+                .map(|(slot, _)| *slot)
+                .collect::<Vec<_>>();
+            assert_eq!(
+                slots,
+                vec![
+                    FieldSlot::Title,
+                    FieldSlot::Value,
+                    FieldSlot::Help,
+                    FieldSlot::Identifier
+                ]
+            );
+            if mode == 2 {
+                node.node.description = Some("different".into());
+                assert!(node
+                    .rendered_text_fields()
+                    .iter()
+                    .any(|(slot, _)| *slot == FieldSlot::Description));
+            }
+        }
+        let mut nodes = vec![
+            u20_node("AXRow", 0, None, None),
+            u20_node("Text", 1, None, Some("child")),
+        ];
+        nodes[1].render_mode = 1;
+        nodes[1].node.description = Some("unrendered help".into());
+        assert!(u20_fold(&mut nodes).is_empty());
     }
     #[test]
     fn u20b_r3_parent_value_and_child_are_preserved_and_complete() {

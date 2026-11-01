@@ -577,14 +577,20 @@ impl Read {
             if element_role_matches(wanted_role, element) {
                 return false;
             }
-            let fields = [
-                element.get("label").and_then(Value::as_str),
-                element.get("value").and_then(Value::as_str),
-            ];
+            let fields: Vec<_> = LOCATOR_TEXT_FIELDS
+                .iter()
+                .map(|key| element.get(*key).and_then(Value::as_str))
+                .collect();
             if fields.iter().flatten().any(|text| text_matches_spec(text)) {
                 return true;
             }
-            if fields.iter().flatten().any(|text| !text.trim().is_empty()) {
+            if LOCATOR_TEXT_FIELDS
+                .iter()
+                .zip(&fields)
+                .filter(|(key, _)| **key != "role")
+                .filter_map(|(_, text)| *text)
+                .any(|text| !text.trim().is_empty())
+            {
                 return false;
             }
             // If the structured row has no text, a corresponding marked
@@ -604,24 +610,7 @@ impl Read {
         }
         self.markdown
             .lines()
-            .filter_map(|line| {
-                let row = folded_children_row(line)?;
-                // Both fields together supply the structured row's label and
-                // folded value; otherwise markdown remains necessary evidence.
-                let complete_structured = markdown_row_index(line).is_some_and(|index| {
-                    self.elements.iter().any(|element| {
-                        element.get("element_index").and_then(Value::as_u64) == Some(index)
-                            && has_folded_children_boundary(element)
-                            && ["label", "value"].into_iter().all(|key| {
-                                element
-                                    .get(key)
-                                    .and_then(Value::as_str)
-                                    .is_some_and(|text| !text.trim().is_empty())
-                            })
-                    })
-                });
-                (!complete_structured).then_some(row)
-            })
+            .filter_map(folded_children_row)
             .any(|(role, text)| {
                 if spec.name.is_none() && spec.text.is_none() {
                     return true;
@@ -660,15 +649,6 @@ fn has_folded_children_boundary(element: &Value) -> bool {
                     && reason.get("detail").and_then(Value::as_str) == Some("folded_children")
             })
         })
-}
-
-fn markdown_row_index(line: &str) -> Option<u64> {
-    line.trim()
-        .strip_prefix("- [")?
-        .split_once(']')?
-        .0
-        .parse()
-        .ok()
 }
 
 /// Identify a folded row and exclude its rendered boundary metadata.
@@ -1706,6 +1686,15 @@ impl<'a> Locator<'a> {
     }
 }
 
+const LOCATOR_TEXT_FIELDS: [&str; 6] = [
+    "label",
+    "value",
+    "description",
+    "help",
+    "identifier",
+    "role",
+];
+
 /// Elements of a read that match `spec`. Exact name matches win over
 /// substring matches; zero-size elements only count when nothing visible
 /// matches.
@@ -1721,16 +1710,9 @@ pub(crate) fn matches<'r>(read: &'r Read, spec: &ElementSpec) -> Vec<&'r Value> 
         })
         .filter(|element| {
             spec.text.as_deref().is_none_or(|text| {
-                [
-                    "label",
-                    "value",
-                    "description",
-                    "help",
-                    "identifier",
-                    "role",
-                ]
-                .into_iter()
-                .any(|key| text_matches(element.get(key), text))
+                LOCATOR_TEXT_FIELDS
+                    .into_iter()
+                    .any(|key| text_matches(element.get(key), text))
                     || element
                         .get("element_index")
                         .and_then(Value::as_u64)
@@ -3146,6 +3128,28 @@ mod tests {
     }
 
     #[test]
+    fn u20b_r4_structured_description_and_markdown_union_guard() {
+        for completeness in [Completeness::Complete, Completeness::Unasserted] {
+            let mut row = element(4, "AXRow", "ordinary");
+            row["value"] = json!("other");
+            row["description"] = json!("description_target");
+            row["boundary"] = json!({"reasons":[{"kind":"policy_omission","detail":"folded_children"}],"children_skipped":{"known":1},"descendants_omitted":false});
+            let markdown = "- [4] AXRow \"markdown_target\" [+1 more: folded_children; descendants not omitted] [reason kinds: folded_children=policy_omission]";
+            let mut observed = read(vec![row], markdown);
+            observed.completeness = completeness;
+            for target in ["description_target", "markdown_target"] {
+                let check =
+                    Check::parse(&json!({"role":"statictext","text":target,"gone":true}), 0)
+                        .unwrap();
+                assert_eq!(
+                    evaluate(&check, &observed).unwrap_err().code,
+                    "incomplete_observation",
+                    "{target}"
+                );
+            }
+        }
+    }
+    #[test]
     fn u20b_review_structured_fold_text_precedes_markdown_fallback() {
         let mut row = element(4, "AXRow", "Foo");
         row["value"] = json!("summary");
@@ -3153,7 +3157,12 @@ mod tests {
         let markdown = "- [4] AXRow \"Foo [more: decoy [+ fake] target\" [+1 more: folded_children; descendants not omitted] [reason kinds: folded_children=policy_omission]";
         let check =
             Check::parse(&json!({"role":"statictext","name":"target","gone":true}), 0).unwrap();
-        assert!(evaluate(&check, &read(vec![row.clone()], markdown)).is_ok());
+        assert_eq!(
+            evaluate(&check, &read(vec![row.clone()], markdown))
+                .unwrap_err()
+                .code,
+            "incomplete_observation"
+        );
         row.as_object_mut().unwrap().remove("value");
         assert_eq!(
             evaluate(&check, &read(vec![row], markdown))
