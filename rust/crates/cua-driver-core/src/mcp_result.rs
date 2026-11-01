@@ -140,12 +140,11 @@ pub fn finalize_error_disposition(tool: &str, mut normalized: Value) -> Value {
             }
             Some(value)
                 if effect_evidence == ErrorDisposition::DELIVERED
-                    && matches!(
-                        value.delivery,
-                        cua_driver_contract::InputDelivery::DeliveryUncertain
-                    ) =>
+                    && value.delivery == cua_driver_contract::InputDelivery::DeliveryUncertain =>
             {
-                effect_evidence
+                // The explicit delivery evidence is more specific than the
+                // effect-derived default; either way retry is unsafe.
+                ErrorDisposition::SUSPECTED_NOOP
             }
             Some(value) => value,
             None => evidence,
@@ -321,6 +320,44 @@ mod tests {
     //! payload leaving it is validated against the schema the tool actually
     //! advertises.
 
+    #[test]
+    fn typed_uncertain_survives_unverifiable_effect() {
+        let result = super::finalize_error_disposition(
+            "click",
+            serde_json::json!({"isError": true, "structuredContent": {
+                "effect": "unverifiable",
+                "disposition": {"delivery": "delivery_uncertain", "retry": "unsafe"}
+            }}),
+        );
+        assert_eq!(
+            result["structuredContent"]["disposition"],
+            serde_json::json!({
+                "delivery": "delivery_uncertain", "retry": "unsafe"
+            })
+        );
+        let unknown_retry = super::finalize_error_disposition(
+            "click",
+            serde_json::json!({"isError": true, "structuredContent": {
+                "effect": "unverifiable",
+                "disposition": {"delivery": "delivery_uncertain", "retry": "unknown"}
+            }}),
+        );
+        assert_eq!(
+            unknown_retry["structuredContent"]["disposition"],
+            serde_json::json!({"delivery": "delivery_uncertain", "retry": "unsafe"})
+        );
+        let partial = super::finalize_error_disposition(
+            "click",
+            serde_json::json!({"isError": true, "structuredContent": {
+                "effect": "partial",
+                "disposition": {"delivery": "delivery_uncertain", "retry": "unsafe"}
+            }}),
+        );
+        assert_eq!(
+            partial["structuredContent"]["disposition"],
+            serde_json::json!({"delivery": "delivery_uncertain", "retry": "unsafe"})
+        );
+    }
     use super::*;
     use cua_driver_contract::{advertised_tool_output_schema, TOOL_INVOCATION_FAILED_CODE};
 
