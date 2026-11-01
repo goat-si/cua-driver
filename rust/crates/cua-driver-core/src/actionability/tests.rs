@@ -40,6 +40,8 @@ fn facts() -> ElementFacts {
             Affordance::KeyDown,
             Affordance::KeyUp,
         ]),
+        advertised_actions: Evidence::Absent,
+        selectable_text: Evidence::Absent,
         role: Evidence::Known("textfield".into()),
         nonspatial_visible: false,
     }
@@ -339,7 +341,7 @@ async fn wait_zero_clamp_transitions_disposition_json() {
     .await;
     assert_eq!(report.verdict, Verdict::Pass);
     assert_eq!(report.samples, 2);
-    assert_eq!(report.refusal_json(), None);
+    assert!(report.refusal_result().is_none());
     let c = TestClock::default();
     let mut calls = 0;
     let report = auto_wait(&c, Duration::from_secs(1), true, |_| {
@@ -365,10 +367,12 @@ async fn wait_zero_clamp_transitions_disposition_json() {
     ));
     assert_eq!(report.disposition, None);
     assert_eq!(calls, 2);
-    assert_eq!(
-        report.refusal_json().unwrap()["actionability"]["code"],
-        "policy_denied"
-    );
+    let body = report.refusal_result().unwrap().structured_content.unwrap();
+    assert_eq!(body["refusal"]["code"], "element_not_actionable");
+    assert!(body["refusal"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("policy_denied"));
 }
 
 #[test]
@@ -477,12 +481,13 @@ async fn pending_probe_is_bounded_and_preserves_last_report() {
         report.disposition,
         Some(DispositionIntent::NotDeliveredSafe)
     );
-    assert_eq!(
-        report.refusal_json(),
-        Some(
-            serde_json::json!({"actionability":{"verdict":"terminal","code":"timeout","reason":"enabled is false or absent","waited_ms":150}})
-        )
-    );
+    let result = report.refusal_result().unwrap();
+    let body = result.structured_content.unwrap();
+    assert_eq!(body["refusal"]["code"], "element_not_actionable");
+    assert!(body["refusal"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("timeout: enabled is false or absent (waited 150 ms)"));
 }
 
 #[test]
