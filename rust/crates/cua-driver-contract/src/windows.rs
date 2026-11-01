@@ -68,6 +68,11 @@ pub struct GetWindowStateInput {
     pub pid: u32,
     #[schemars(schema_with = "positive_integer_schema")]
     pub window_id: u64,
+    /// Expand only the subtree rooted at this snapshot-qualified element token.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(schema_with = "string_schema")]
+    #[uniffi(default = None)]
+    pub root_element_token: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(schema_with = "string_schema")]
     pub session: Option<String>,
@@ -150,6 +155,14 @@ impl ToolInput for GetWindowStateInput {
     fn validate(&self) -> Result<(), String> {
         if self.pid == 0 || self.window_id == 0 {
             return Err("window observation requires positive process and window IDs".into());
+        }
+        if self.root_element_token.is_some() {
+            if self.since.is_some() {
+                return Err("root_since_unsupported".into());
+            }
+            if self.include_accessibility_tree == Some(false) {
+                return Err("root requires an accessibility tree".into());
+            }
         }
         if [self.max_elements, self.max_depth, self.max_dimension].contains(&Some(0)) {
             return Err("window observation limits must be positive".into());
@@ -481,10 +494,36 @@ pub struct SnapshotImage {
     pub data_base64: String,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq, uniffi::Enum)]
+#[serde(rename_all = "snake_case")]
+pub enum DrilldownStatus {
+    Complete,
+    Incomplete,
+    StaleParent,
+    Unsupported,
+}
+
+fn drilldown_status_schema(generator: &mut SchemaGenerator) -> Schema {
+    DrilldownStatus::json_schema(generator)
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq, uniffi::Record)]
+pub struct DrilldownScope {
+    pub root_token: String,
+    pub parent_snapshot_id: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, uniffi::Record)]
 pub struct WindowStateOutput {
     pub pid: u32,
     pub window_id: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(schema_with = "drilldown_status_schema")]
+    pub drilldown_status: Option<DrilldownStatus>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<DrilldownScope>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub drilldown_diagnostics: Option<Vec<IncompleteReason>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub snapshot_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -559,6 +598,47 @@ pub struct WindowStateOutput {
 
 impl ToolOutput for WindowStateOutput {
     fn validate(&self) -> Result<(), String> {
+        match self.drilldown_status {
+            Some(DrilldownStatus::Complete) => {
+                if self.scope.is_none()
+                    || self.snapshot_id.is_none()
+                    || self.observation_complete != Some(true)
+                {
+                    return Err(
+                        "complete drill-down requires a scope, snapshot and complete observation"
+                            .into(),
+                    );
+                }
+            }
+            Some(
+                DrilldownStatus::Incomplete
+                | DrilldownStatus::StaleParent
+                | DrilldownStatus::Unsupported,
+            ) => {
+                if self.snapshot_id.is_some()
+                    || self.tree_markdown.is_some()
+                    || self.elements.is_some()
+                    || self.tree_diff.is_some()
+                {
+                    return Err(
+                        "incomplete drill-down cannot expose a snapshot or replacement rows".into(),
+                    );
+                }
+                if self.drilldown_status == Some(DrilldownStatus::Incomplete)
+                    && (self.observation_complete != Some(false)
+                        || self
+                            .drilldown_diagnostics
+                            .as_ref()
+                            .is_none_or(Vec::is_empty))
+                {
+                    return Err(
+                        "incomplete drill-down requires an incomplete observation and diagnostics"
+                            .into(),
+                    );
+                }
+            }
+            _ => {}
+        }
         match (self.screenshot_width, self.screenshot_height) {
             (None, None) => {}
             (Some(width), Some(height)) if width > 0 && height > 0 => {}
@@ -642,6 +722,76 @@ mod tests {
         assert!(schema["properties"]["elements"]
             .to_string()
             .contains("boundary"));
+    }
+
+    #[test]
+    fn drilldown_contract_roundtrips_and_omits_absent_fields() {
+        let old = json!({"pid":7,"window_id":9});
+        let input: GetWindowStateInput = serde_json::from_value(old.clone()).unwrap();
+        assert_eq!(serde_json::to_value(input).unwrap(), old);
+        let scoped = json!({"pid":7,"window_id":9,"root_element_token":"s0000002a:1"});
+        let input: GetWindowStateInput = serde_json::from_value(scoped.clone()).unwrap();
+        assert_eq!(serde_json::to_value(input).unwrap(), scoped);
+        assert!(serde_json::from_value::<GetWindowStateInput>(json!({
+            "pid":7,"window_id":9,"root_element_tokenn":"s0000002a:1"
+        }))
+        .is_err());
+        let output = json!({"pid":7,"window_id":9,"drilldown_status":"incomplete",
+            "scope":{"root_token":"s0000002a:1","parent_snapshot_id":"s0000002a"},
+            "drilldown_diagnostics":[{"kind":"budget","detail":"node_budget"}]});
+        let decoded: WindowStateOutput = serde_json::from_value(output.clone()).unwrap();
+        assert_eq!(serde_json::to_value(decoded).unwrap(), output);
+        let old_output = json!({"pid":7,"window_id":9});
+        let decoded: WindowStateOutput = serde_json::from_value(old_output.clone()).unwrap();
+        assert_eq!(serde_json::to_value(decoded).unwrap(), old_output);
+        let schema = WindowStateOutput::output_schema();
+        assert_eq!(schema["properties"]["drilldown_status"]["type"], "string");
+        assert!(!schema["properties"]["drilldown_status"]["enum"]
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::Value::Null));
+    }
+
+    #[test]
+    fn drilldown_rejects_since_and_screenshot_only() {
+        for extra in [
+            json!({"since":"latest"}),
+            json!({"include_accessibility_tree":false}),
+        ] {
+            let mut value = json!({"pid":7,"window_id":9,"root_element_token":"s0000002a:1"});
+            value
+                .as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            let input: GetWindowStateInput = serde_json::from_value(value).unwrap();
+            assert!(input.validate().is_err());
+        }
+    }
+
+    #[test]
+    fn drilldown_outcome_refuses_actionable_incomplete_results() {
+        for extra in [
+            json!({"snapshot_id":"s000000bb"}),
+            json!({"tree_markdown":"- [0] button"}),
+            json!({"elements":[{"element_index":0,"role":"button","depth":0}]}),
+        ] {
+            let mut value = json!({"pid":7,"window_id":9,"drilldown_status":"incomplete",
+                "drilldown_diagnostics":[{"kind":"budget","detail":"node_budget"}]});
+            value
+                .as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            let output: WindowStateOutput = serde_json::from_value(value).unwrap();
+            assert!(output.validate().is_err());
+        }
+        let output: WindowStateOutput = serde_json::from_value(json!({"pid":7,"window_id":9,
+            "drilldown_status":"complete","observation_complete":false,"snapshot_id":"s000000bb",
+            "scope":{"root_token":"s000000aa:1","parent_snapshot_id":"s000000aa"}}))
+        .unwrap();
+        assert!(output.validate().is_err());
+        let output: WindowStateOutput = serde_json::from_value(json!({"pid":7,"window_id":9,
+            "drilldown_status":"incomplete","drilldown_diagnostics":[{"kind":"unknown","detail":"not_asserted"}]})).unwrap();
+        assert!(output.validate().is_err());
     }
 
     #[test]

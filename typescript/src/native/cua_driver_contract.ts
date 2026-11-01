@@ -2629,6 +2629,49 @@ const FfiConverterTypeDragInput = (() => {
     return new FFIConverter();
 })();
 
+export type DrilldownScope = {
+    rootToken: string,
+    parentSnapshotId: string
+}
+
+/**
+ * Generated factory for {@link DrilldownScope} record objects.
+ */
+export const DrilldownScope = (() => {
+    const defaults = () => ({
+    });
+    const create = (() => {
+        return uniffiCreateRecord<DrilldownScope, ReturnType<typeof defaults>>(defaults);
+    })();
+    return Object.freeze({
+        create,
+        new: create,
+        defaults: () => Object.freeze(defaults()) as Partial<DrilldownScope>,
+    });
+})();
+
+const FfiConverterTypeDrilldownScope = (() => {
+    type TypeName = DrilldownScope;
+    class FFIConverter extends AbstractFfiConverterByteArray<TypeName> {
+        read(from: RustBuffer): TypeName {
+            return {
+                rootToken: FfiConverterString.read(from),
+                parentSnapshotId: FfiConverterString.read(from)
+            };
+        }
+        write(value: TypeName, into: RustBuffer): void {
+            FfiConverterString.write(value.rootToken, into);
+            FfiConverterString.write(value.parentSnapshotId, into);
+        }
+        allocationSize(value: TypeName): number {
+            return FfiConverterString.allocationSize(value.rootToken) +
+             FfiConverterString.allocationSize(value.parentSnapshotId);
+
+        }
+    };
+    return new FFIConverter();
+})();
+
 export type ElementFrame = {
     x: number,
     y: number,
@@ -3304,6 +3347,10 @@ const FfiConverterTypeGetSessionStateInput = (() => {
 export type GetWindowStateInput = {
     pid: number,
     windowId: bigint,
+    /**
+     * Expand only the subtree rooted at this snapshot-qualified element token.
+     */
+    rootElementToken?: string,
     session?: string,
     query?: string,
     includeAccessibilityTree?: boolean,
@@ -3348,6 +3395,7 @@ export type GetWindowStateInput = {
  */
 export const GetWindowStateInput = (() => {
     const defaults = () => ({
+        rootElementToken: undefined,
         timeoutMs: undefined,
         treeFormat: undefined,
         since: undefined,
@@ -3371,6 +3419,7 @@ const FfiConverterTypeGetWindowStateInput = (() => {
             return {
                 pid: FfiConverterUInt32.read(from),
                 windowId: FfiConverterUInt64.read(from),
+                rootElementToken: FfiConverterOptionalString.read(from),
                 session: FfiConverterOptionalString.read(from),
                 query: FfiConverterOptionalString.read(from),
                 includeAccessibilityTree: FfiConverterOptionalBoolean.read(from),
@@ -3390,6 +3439,7 @@ const FfiConverterTypeGetWindowStateInput = (() => {
         write(value: TypeName, into: RustBuffer): void {
             FfiConverterUInt32.write(value.pid, into);
             FfiConverterUInt64.write(value.windowId, into);
+            FfiConverterOptionalString.write(value.rootElementToken, into);
             FfiConverterOptionalString.write(value.session, into);
             FfiConverterOptionalString.write(value.query, into);
             FfiConverterOptionalBoolean.write(value.includeAccessibilityTree, into);
@@ -3408,6 +3458,7 @@ const FfiConverterTypeGetWindowStateInput = (() => {
         allocationSize(value: TypeName): number {
             return FfiConverterUInt32.allocationSize(value.pid) +
              FfiConverterUInt64.allocationSize(value.windowId) +
+             FfiConverterOptionalString.allocationSize(value.rootElementToken) +
              FfiConverterOptionalString.allocationSize(value.session) +
              FfiConverterOptionalString.allocationSize(value.query) +
              FfiConverterOptionalBoolean.allocationSize(value.includeAccessibilityTree) +
@@ -7512,9 +7563,47 @@ const FfiConverterTypeWindowElement = (() => {
     return new FFIConverter();
 })();
 
+export enum DrilldownStatus {
+    Complete,
+    Incomplete,
+    StaleParent,
+    Unsupported
+}
+
+const FfiConverterTypeDrilldownStatus = (() => {
+    const ordinalConverter = FfiConverterInt32;
+    type TypeName = DrilldownStatus;
+    class FFIConverter extends AbstractFfiConverterByteArray<TypeName> {
+        read(from: RustBuffer): TypeName {
+            switch (ordinalConverter.read(from)) {
+                case 1: return DrilldownStatus.Complete;
+                case 2: return DrilldownStatus.Incomplete;
+                case 3: return DrilldownStatus.StaleParent;
+                case 4: return DrilldownStatus.Unsupported;
+                default: throw new UniffiInternalError.UnexpectedEnumCase();
+            }
+        }
+        write(value: TypeName, into: RustBuffer): void {
+            switch (value) {
+                case DrilldownStatus.Complete: return ordinalConverter.write(1, into);
+                case DrilldownStatus.Incomplete: return ordinalConverter.write(2, into);
+                case DrilldownStatus.StaleParent: return ordinalConverter.write(3, into);
+                case DrilldownStatus.Unsupported: return ordinalConverter.write(4, into);
+            }
+        }
+        allocationSize(value: TypeName): number {
+            return ordinalConverter.allocationSize(0);
+        }
+    }
+    return new FFIConverter();
+})();
+
 export type WindowStateOutput = {
     pid: number,
     windowId: bigint,
+    drilldownStatus?: DrilldownStatus,
+    scope?: DrilldownScope,
+    drilldownDiagnostics?: Array<IncompleteReason>,
     snapshotId?: string,
     appName?: string,
     windowTitle?: string,
@@ -7594,6 +7683,9 @@ const FfiConverterTypeWindowStateOutput = (() => {
             return {
                 pid: FfiConverterUInt32.read(from),
                 windowId: FfiConverterUInt64.read(from),
+                drilldownStatus: FfiConverterOptionalTypeDrilldownStatus.read(from),
+                scope: FfiConverterOptionalTypeDrilldownScope.read(from),
+                drilldownDiagnostics: FfiConverterOptionalSequenceTypeIncompleteReason.read(from),
                 snapshotId: FfiConverterOptionalString.read(from),
                 appName: FfiConverterOptionalString.read(from),
                 windowTitle: FfiConverterOptionalString.read(from),
@@ -7628,6 +7720,9 @@ const FfiConverterTypeWindowStateOutput = (() => {
         write(value: TypeName, into: RustBuffer): void {
             FfiConverterUInt32.write(value.pid, into);
             FfiConverterUInt64.write(value.windowId, into);
+            FfiConverterOptionalTypeDrilldownStatus.write(value.drilldownStatus, into);
+            FfiConverterOptionalTypeDrilldownScope.write(value.scope, into);
+            FfiConverterOptionalSequenceTypeIncompleteReason.write(value.drilldownDiagnostics, into);
             FfiConverterOptionalString.write(value.snapshotId, into);
             FfiConverterOptionalString.write(value.appName, into);
             FfiConverterOptionalString.write(value.windowTitle, into);
@@ -7661,6 +7756,9 @@ const FfiConverterTypeWindowStateOutput = (() => {
         allocationSize(value: TypeName): number {
             return FfiConverterUInt32.allocationSize(value.pid) +
              FfiConverterUInt64.allocationSize(value.windowId) +
+             FfiConverterOptionalTypeDrilldownStatus.allocationSize(value.drilldownStatus) +
+             FfiConverterOptionalTypeDrilldownScope.allocationSize(value.scope) +
+             FfiConverterOptionalSequenceTypeIncompleteReason.allocationSize(value.drilldownDiagnostics) +
              FfiConverterOptionalString.allocationSize(value.snapshotId) +
              FfiConverterOptionalString.allocationSize(value.appName) +
              FfiConverterOptionalString.allocationSize(value.windowTitle) +
@@ -7896,14 +7994,20 @@ const FfiConverterOptionalTypeToggleState = new FfiConverterOptional(FfiConverte
 // FfiConverter for ElementFrame | undefined
 const FfiConverterOptionalTypeElementFrame = new FfiConverterOptional(FfiConverterTypeElementFrame);
 
+// FfiConverter for DrilldownStatus | undefined
+const FfiConverterOptionalTypeDrilldownStatus = new FfiConverterOptional(FfiConverterTypeDrilldownStatus);
+
+// FfiConverter for DrilldownScope | undefined
+const FfiConverterOptionalTypeDrilldownScope = new FfiConverterOptional(FfiConverterTypeDrilldownScope);
+
+// FfiConverter for Array<IncompleteReason> | undefined
+const FfiConverterOptionalSequenceTypeIncompleteReason = new FfiConverterOptional(FfiConverterSequenceTypeIncompleteReason);
+
 // FfiConverter for Array<WindowElement>
 const FfiConverterSequenceTypeWindowElement = new FfiConverterArray(FfiConverterTypeWindowElement);
 
 // FfiConverter for Array<WindowElement> | undefined
 const FfiConverterOptionalSequenceTypeWindowElement = new FfiConverterOptional(FfiConverterSequenceTypeWindowElement);
-
-// FfiConverter for Array<IncompleteReason> | undefined
-const FfiConverterOptionalSequenceTypeIncompleteReason = new FfiConverterOptional(FfiConverterSequenceTypeIncompleteReason);
 
 // FfiConverter for WindowBounds | undefined
 const FfiConverterOptionalTypeWindowBounds = new FfiConverterOptional(FfiConverterTypeWindowBounds);
@@ -7981,6 +8085,8 @@ export default Object.freeze({
     FfiConverterTypeCursorVisualOutput,
     FfiConverterTypeDesktopScope,
     FfiConverterTypeDragInput,
+    FfiConverterTypeDrilldownScope,
+    FfiConverterTypeDrilldownStatus,
     FfiConverterTypeEffectiveScope,
     FfiConverterTypeElementFrame,
     FfiConverterTypeElementPredicate,
