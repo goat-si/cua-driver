@@ -199,8 +199,12 @@ async fn right_click_unknown_action_names_block_pixel_and_ax() {
 #[test]
 fn click_right_uses_semantic_right_click_intent() {
     use semantic::SemanticIntent;
+    let request = super::super::click::effective_click_action("press", "right");
+    let advertised = vec!["AXShowMenu".into()];
+    let resolved =
+        crate::input::ax_actions::resolve_element_action(&request, &advertised, false).unwrap();
     assert!(matches!(
-        super::super::click::click_semantic_intent("AXShowMenu"),
+        super::super::click::click_semantic_intent(resolved),
         SemanticIntent::RightClick
     ));
 }
@@ -208,8 +212,12 @@ fn click_right_uses_semantic_right_click_intent() {
 #[test]
 fn click_open_uses_semantic_open_intent() {
     use semantic::SemanticIntent;
+    let request = super::super::click::effective_click_action("open", "left");
+    let advertised = vec!["AXOpen".into()];
+    let resolved =
+        crate::input::ax_actions::resolve_element_action(&request, &advertised, false).unwrap();
     assert!(matches!(
-        super::super::click::click_semantic_intent("AXOpen"),
+        super::super::click::click_semantic_intent(resolved),
         SemanticIntent::Open
     ));
     assert!(matches!(

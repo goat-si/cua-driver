@@ -39,6 +39,14 @@ use core_foundation::base::{CFRelease, CFTypeRef, TCFType};
 use super::pixel_route::PixelClickRoute;
 use super::ToolState;
 
+pub(super) fn effective_click_action(action: &str, button: &str) -> String {
+    if button == "right" && action == "press" {
+        "show_menu".to_owned()
+    } else {
+        action.to_owned()
+    }
+}
+
 pub(super) fn click_semantic_intent(
     action: &str,
 ) -> super::actionability::semantic::SemanticIntent {
@@ -1643,11 +1651,7 @@ impl ClickTool {
             // Surface 5: button=right on the AX path → AXShowMenu (the same surface
             // the dedicated `right_click` tool dispatches). Threads through the
             // identical perform_ax_click code path with the action remapped.
-            let effective_action = if button_str == "right" && action == "press" {
-                "show_menu".to_string()
-            } else {
-                action.clone()
-            };
+            let effective_action = effective_click_action(&action, &button_str);
 
             // Resolve the action against what this element lists right now,
             // before the cursor glides or the window can be fronted, so a name
