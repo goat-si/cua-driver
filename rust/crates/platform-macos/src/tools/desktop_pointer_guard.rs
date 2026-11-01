@@ -151,14 +151,8 @@ pub(crate) async fn check(
     args: &Value,
     points: Vec<(f64, f64)>,
 ) -> Option<ToolResult> {
-    if let Some(refusal) = protected_refusal(tool, &points).await {
-        return Some(refusal);
-    }
-    let delivery = DeliveryMode::from_args(args);
-    if delivery.is_foreground() {
-        return None;
-    }
-    tokio::task::spawn_blocking(move || {
+    let protection = protected_refusal(tool, &points).await;
+    check_with(tool, args, points, protection, |points, delivery| {
         let frontmost = crate::apps::frontmost_pid();
         points.into_iter().find_map(|point| {
             let under = window_under_point(point.0, point.1);
@@ -166,8 +160,32 @@ pub(crate) async fn check(
         })
     })
     .await
-    .ok()
-    .flatten()
+}
+
+async fn check_with<F>(
+    tool: &str,
+    args: &Value,
+    points: Vec<(f64, f64)>,
+    protection: Option<ToolResult>,
+    user_window_check: F,
+) -> Option<ToolResult>
+where
+    F: FnOnce(Vec<(f64, f64)>, DeliveryMode) -> Option<ToolResult> + Send + 'static,
+{
+    if let Some(refusal) = protection {
+        return Some(refusal);
+    }
+    let delivery = DeliveryMode::from_args(args);
+    if delivery.is_foreground() {
+        return None;
+    }
+    match tokio::task::spawn_blocking(move || user_window_check(points, delivery)).await {
+        Ok(refusal) => refusal,
+        Err(_) => Some(super::pre_dispatch_refusal(
+            "background_unavailable",
+            format!("{tool} was refused: the user-window protection check could not complete. Nothing was sent."),
+        )),
+    }
 }
 
 /// A browser holding an origin-scoped attachment is reachable only through
@@ -175,7 +193,18 @@ pub(crate) async fn check(
 /// `points` (every point an event is delivered at) lands on one of its
 /// windows.
 pub(crate) async fn protected_refusal(tool: &str, points: &[(f64, f64)]) -> Option<ToolResult> {
-    let windows = tokio::task::spawn_blocking(crate::windows::visible_windows)
+    protected_refusal_with(tool, points, crate::windows::visible_windows).await
+}
+
+async fn protected_refusal_with<F>(
+    tool: &str,
+    points: &[(f64, f64)],
+    inventory: F,
+) -> Option<ToolResult>
+where
+    F: FnOnce() -> Vec<crate::windows::WindowInfo> + Send + 'static,
+{
+    let windows = tokio::task::spawn_blocking(inventory)
         .await
         .unwrap_or_default();
     cua_driver_core::browser::protection::desktop_point_refusal(tool, points, |x, y| {
@@ -332,5 +361,168 @@ mod tests {
             DeliveryMode::Background,
         )
         .is_some());
+    }
+}
+
+#[cfg(test)]
+mod task_failure_tests {
+    use super::*;
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+
+    #[tokio::test]
+    async fn a_failed_user_window_check_refuses() {
+        let dispatched = Arc::new(AtomicUsize::new(0));
+        let refusal = check_with("click", &json!({}), vec![(1.0, 2.0)], None, |_, _| {
+            panic!("fake user-window check failed")
+        })
+        .await;
+        if refusal.is_none() {
+            dispatched.fetch_add(1, Ordering::SeqCst);
+        }
+        assert_eq!(
+            dispatched.load(Ordering::SeqCst),
+            0,
+            "no input should be dispatched"
+        );
+        let result = refusal.expect("a failed check must refuse");
+        assert_eq!(result.is_error, Some(true));
+        let structured = result.structured_content.expect("refusal details");
+        assert_eq!(structured["effect"], "refused");
+        assert_eq!(structured["dispatched"], false);
+        assert!(format!("{:?}", result.content).contains("could not complete"));
+    }
+    #[tokio::test]
+    async fn a_clean_check_still_allows() {
+        let sent = AtomicUsize::new(0);
+        let refusal = check_with("click", &json!({}), vec![(1.0, 2.0)], None, |_, _| None).await;
+        if refusal.is_none() {
+            sent.fetch_add(1, Ordering::SeqCst);
+        }
+        assert!(refusal.is_none());
+        assert_eq!(sent.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn a_real_refusal_is_unchanged() {
+        let window = WindowUnderPoint {
+            pid: 4242,
+            window_id: 77,
+            app_name: "Example".into(),
+            bundle_id: "example.app".into(),
+        };
+        let expected = refusal_for(
+            "click",
+            (1.0, 2.0),
+            Some(&window),
+            Some(1),
+            DeliveryMode::Background,
+        )
+        .unwrap();
+        let result = check_with(
+            "click",
+            &json!({}),
+            vec![(1.0, 2.0)],
+            None,
+            move |_, delivery| refusal_for("click", (1.0, 2.0), Some(&window), Some(1), delivery),
+        )
+        .await
+        .expect("background window must still be refused");
+        assert_eq!(
+            serde_json::to_value(result).unwrap(),
+            serde_json::to_value(expected).unwrap()
+        );
+    }
+
+    struct InventoryProbe {
+        definition: cua_driver_core::tool::ToolDef,
+        dispatched: Arc<AtomicUsize>,
+        refusal: Arc<std::sync::Mutex<Option<ToolResult>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl cua_driver_core::tool::Tool for InventoryProbe {
+        fn def(&self) -> &cua_driver_core::tool::ToolDef {
+            &self.definition
+        }
+
+        async fn invoke(&self, _args: Value) -> ToolResult {
+            let points = vec![(1.0, 2.0)];
+            let protection =
+                protected_refusal_with("click", &points, || panic!("fake inventory failed")).await;
+            match check_with("click", &json!({}), points, protection, |_, _| None).await {
+                Some(refusal) => *self.refusal.lock().unwrap() = Some(refusal),
+                None => {
+                    self.dispatched.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+            ToolResult::text("fake display").with_structured(json!({
+                "width": 100, "height": 100, "scale_factor": 1.0
+            }))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failed_inventory_with_a_protected_browser_still_refuses() {
+        use cua_driver_core::{
+            authorization::PermissionMode,
+            session_authorization::{SessionAuthorizationRegistry, SessionModeCeiling},
+            session_manifest::load_manifest,
+            tool::{ToolDef, ToolRegistry},
+        };
+        use std::time::Duration;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("manifest.yaml");
+        std::fs::write(&path, "version: 3\nresources:\n  browser:\n    origins: [\"https://app.example\"]\n    existing_profiles:\n      - {pid: 4343, window_id: 9}\nallow:\n  tools: [get_screen_size]\n").unwrap();
+        let manifest = load_manifest(&path).unwrap();
+        let context = SessionAuthorizationRegistry::with_ceiling(
+            SessionModeCeiling::for_trusted_sessions(
+                [PermissionMode::Standard],
+                false,
+                Duration::from_secs(60),
+                Duration::from_secs(30),
+            )
+            .unwrap(),
+        )
+        .compatibility_context(PermissionMode::Standard, Some(Arc::new(manifest)))
+        .unwrap();
+        let sent = Arc::new(AtomicUsize::new(0));
+        let refusal = Arc::new(std::sync::Mutex::new(None));
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(InventoryProbe {
+            definition: ToolDef {
+                name: "get_screen_size".into(),
+                description: "fake inventory probe".into(),
+                input_schema: json!({"type":"object"}),
+                read_only: true,
+                destructive: false,
+                idempotent: true,
+                open_world: false,
+            },
+            dispatched: sent.clone(),
+            refusal: refusal.clone(),
+        }));
+        let result = registry
+            .invoke_with_context("get_screen_size", json!({}), context)
+            .await;
+        assert_ne!(result.is_error, Some(true), "{result:?}");
+        let result = refusal
+            .lock()
+            .unwrap()
+            .take()
+            .expect("protected browser refused");
+        assert_eq!(result.is_error, None);
+        assert_eq!(
+            result.structured_content.as_ref().unwrap()["status"],
+            "refused"
+        );
+        assert_eq!(
+            result.structured_content.unwrap()["refusal"]["code"],
+            "browser_process_protected"
+        );
+        assert_eq!(sent.load(Ordering::SeqCst), 0);
     }
 }
