@@ -417,6 +417,9 @@ mod source_adapter_tests {
         fn set_messaging_timeout(&self, _: &()) {
             panic!("unexpected timeout")
         }
+        fn set_optional_timeout(&self, _: &(), _: f32) {
+            panic!("unexpected timeout")
+        }
         fn text(&self, _: &(), name: &str) -> Read<String> {
             self.trace.borrow_mut().push(name.into());
             Read::Absent
@@ -468,7 +471,7 @@ mod source_adapter_tests {
         fn action_names(&self, _: &()) -> Read<Vec<String>> {
             panic!("unexpected actions")
         }
-        fn value_settable(&self, _: &()) -> bool {
+        fn value_settable(&self, _: &()) -> Settable {
             panic!("unexpected writable")
         }
         fn selected_settable(&self, _: &()) -> Settable {

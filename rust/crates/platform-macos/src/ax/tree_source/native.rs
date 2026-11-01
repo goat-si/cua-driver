@@ -59,6 +59,11 @@ impl AxTreeSource for NativeSource {
     fn set_messaging_timeout(&self, element: &NativeElement) {
         unsafe { crate::ax::tree::set_messaging_timeout(element.raw()) }
     }
+    fn set_optional_timeout(&self, element: &NativeElement, seconds: f32) {
+        unsafe {
+            AXUIElementSetMessagingTimeout(element.raw(), seconds);
+        }
+    }
     fn text(&self, element: &NativeElement, name: &str) -> Read<String> {
         unsafe { scalar(element.raw(), name, string_from_cf) }
     }
@@ -216,8 +221,8 @@ impl AxTreeSource for NativeSource {
             )
         }
     }
-    fn value_settable(&self, element: &NativeElement) -> bool {
-        unsafe { is_attribute_settable(element.raw(), "AXValue") }
+    fn value_settable(&self, element: &NativeElement) -> Settable {
+        unsafe { query_settable(element.raw(), "AXValue") }
     }
     fn selected_settable(&self, element: &NativeElement) -> Settable {
         unsafe { query_settable(element.raw(), "AXSelected") }

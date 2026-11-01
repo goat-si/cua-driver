@@ -78,6 +78,7 @@ pub(crate) trait AxTreeSource {
 
     fn key(&self, element: &Self::Element) -> usize;
     fn set_messaging_timeout(&self, element: &Self::Element);
+    fn set_optional_timeout(&self, element: &Self::Element, seconds: f32);
     fn text(&self, element: &Self::Element, name: &str) -> Read<String>;
     fn text_status(&self, element: &Self::Element, name: &str) -> AttrStatus;
     fn boolean(&self, element: &Self::Element, name: &str) -> Read<bool>;
@@ -91,7 +92,7 @@ pub(crate) trait AxTreeSource {
     fn element_set(&self, element: &Self::Element, name: &str) -> Read<Self::ElementSet>;
     fn set_contains(&self, set: &Self::ElementSet, element: &Self::Element) -> bool;
     fn action_names(&self, element: &Self::Element) -> Read<Vec<String>>;
-    fn value_settable(&self, element: &Self::Element) -> bool;
+    fn value_settable(&self, element: &Self::Element) -> Settable;
     fn selected_settable(&self, element: &Self::Element) -> Settable;
     fn frame(&self, element: &Self::Element) -> Read<[f64; 4]>;
     fn retain_for_snapshot(&self, element: &Self::Element) -> usize;
@@ -141,6 +142,11 @@ impl NativeElement {
 
     fn into_raw(self) -> AXUIElementRef {
         self.0.into_raw()
+    }
+
+    pub(crate) unsafe fn from_borrowed(raw: AXUIElementRef) -> Self {
+        CFRetain(raw as CFTypeRef);
+        Self::from_owned(raw)
     }
 }
 
