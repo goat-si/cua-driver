@@ -91,6 +91,9 @@ mod uia_mutation;
 mod uia_root;
 
 #[cfg(any(target_os = "windows", test))]
+mod walk_completeness;
+
+#[cfg(any(target_os = "windows", test))]
 mod value_append;
 
 #[cfg(any(target_os = "windows", test))]

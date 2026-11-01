@@ -26,6 +26,9 @@ use windows::Win32::UI::Accessibility::{AccessibleObjectFromWindow, IAccessible}
 
 use crate::secure_field::msaa_name_withheld;
 use crate::uia::{UiaNode, UiaTreeResult};
+use cua_driver_contract::{
+    IncompleteReason, IncompleteReasonDetail as Detail, IncompleteReasonKind as Kind,
+};
 use cua_driver_core::snapshot_compaction::redact_mirrored_secure_name;
 use cua_driver_core::walk_budget::WalkBudget;
 
@@ -78,6 +81,10 @@ pub fn walk_msaa_tree_budgeted(hwnd: u64, budget: &mut WalkBudget) -> UiaTreeRes
 }
 
 unsafe fn walk_unsafe(hwnd: u64, budget: &mut WalkBudget) -> UiaTreeResult {
+    budget.record_untrusted(IncompleteReason {
+        kind: Kind::ProviderFailure,
+        detail: Detail::UntrustedProvider,
+    });
     let hwnd_win = HWND(hwnd as *mut _);
     let mut raw_root: *mut std::ffi::c_void = null_mut();
     // AccessibleObjectFromWindow returns IAccessible (as `*mut c_void` typed
@@ -124,7 +131,14 @@ unsafe fn walk(
     counter: &mut usize,
     budget: &mut WalkBudget,
 ) {
-    if depth >= MAX_DEPTH || !budget.admit() {
+    if depth >= MAX_DEPTH {
+        budget.record_cut(IncompleteReason {
+            kind: Kind::Budget,
+            detail: Detail::DepthLimit,
+        });
+        return;
+    }
+    if !budget.admit() {
         return;
     }
 

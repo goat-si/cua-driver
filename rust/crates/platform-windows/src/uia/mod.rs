@@ -10,6 +10,10 @@
 //!  take >4s when reading each property individually).
 
 use crate::secure_field::{project_node_text, ProjectedNodeText, RawNodeText};
+use crate::walk_completeness::{
+    classify_cached_variant, collect_pattern_evidence, note_tab_plan, note_unwalked_offscreen_rows,
+    record_pattern_read, CachedRead, Omission, RawCached, ReadLog, WalkState,
+};
 use cua_driver_core::snapshot_compaction::{
     compact_tab_strip, fold_actionless_text_subtrees, format_omitted_tabs_line,
     format_uncounted_offscreen_rows_line, is_compaction_summary_line, is_uia_dense_collection,
@@ -176,38 +180,6 @@ pub struct UiaTreeResult {
     /// node/subtree. A `query` only projects the response and does not change
     /// this underlying snapshot property.
     pub elements_complete: bool,
-}
-
-#[derive(Debug)]
-struct WalkState<'a> {
-    budget: &'a mut WalkBudget,
-    max_depth: usize,
-    complete: bool,
-}
-
-impl<'a> WalkState<'a> {
-    fn new(budget: &'a mut WalkBudget, max_depth: usize) -> Self {
-        Self {
-            budget,
-            max_depth,
-            complete: true,
-        }
-    }
-
-    /// Admit one node to the walk. Reaching a bound exactly is not itself
-    /// truncation; completeness changes only when a node beyond that bound is
-    /// actually encountered and skipped.
-    fn enter(&mut self, depth: usize) -> bool {
-        if depth > self.max_depth || !self.budget.admit() {
-            self.complete = false;
-            return false;
-        }
-        true
-    }
-
-    fn mark_incomplete(&mut self) {
-        self.complete = false;
-    }
 }
 
 /// Walk the UIA tree for the window with the given HWND.
@@ -487,11 +459,12 @@ unsafe fn walk_tree_unsafe(
     let automation: IUIAutomation = match client::new_uia_client() {
         Ok(a) => a,
         Err(e) => {
+            budget.record_skip(Omission::SubtreeCacheFailed.reason());
             return UiaTreeResult {
                 tree_markdown: format!("UIA init failed: {e}"),
                 nodes: Vec::new(),
                 elements_complete: false,
-            }
+            };
         }
     };
 
@@ -499,11 +472,12 @@ unsafe fn walk_tree_unsafe(
     let (cache_req, mut cache_request_complete) = match node_cache_request(&automation) {
         Ok(r) => r,
         Err(e) => {
+            budget.record_skip(Omission::SubtreeCacheFailed.reason());
             return UiaTreeResult {
                 tree_markdown: format!("CreateCacheRequest failed: {e}"),
                 nodes: Vec::new(),
                 elements_complete: false,
-            }
+            };
         }
     };
 
@@ -553,6 +527,7 @@ unsafe fn walk_tree_unsafe(
         crate::uia_root::RootVerdict::NoAnswer => Some(format!("window 0x{hwnd:x} did not answer a no-op message within 1 s (the app may be hung); no accessibility tree was read")),
     };
     if let Some(tree_markdown) = failure {
+        budget.record_skip(Omission::SubtreeCacheFailed.reason());
         return UiaTreeResult {
             tree_markdown,
             nodes: Vec::new(),
@@ -575,11 +550,12 @@ unsafe fn walk_tree_unsafe(
     let uncached = match automation.ElementFromHandle(hwnd_win) {
         Ok(e) => e,
         Err(e) => {
+            budget.record_skip(Omission::SubtreeCacheFailed.reason());
             return UiaTreeResult {
                 tree_markdown: format!("ElementFromHandle failed: {e}"),
                 nodes: Vec::new(),
                 elements_complete: false,
-            }
+            };
         }
     };
     // A single transient provider error (commonly E_FAIL / 0x80004005 from a
@@ -598,6 +574,7 @@ unsafe fn walk_tree_unsafe(
                 Err(e) => {
                     attempt += 1;
                     if attempt >= MAX_ATTEMPTS {
+                        budget.record_skip(Omission::SubtreeCacheFailed.reason());
                         return UiaTreeResult {
                             tree_markdown: format!(
                                 "BuildUpdatedCache failed after {attempt} attempts: {e}"
@@ -616,8 +593,12 @@ unsafe fn walk_tree_unsafe(
     let mut lines: Vec<(usize, String)> = Vec::new();
     let mut counter = 0usize;
     let mut walk_state = WalkState::new(budget, max_depth);
+    walk_state.not_supported = automation
+        .ReservedNotSupportedValue()
+        .ok()
+        .and_then(|v| v.cast().ok());
     if !cache_request_complete {
-        walk_state.mark_incomplete();
+        walk_state.mark(Omission::CacheRequestIncomplete);
     }
     let search_offscreen = query.is_some_and(|q| !q.trim().is_empty());
 
@@ -652,7 +633,7 @@ unsafe fn walk_tree_unsafe(
         // An empty HWND wrapper cannot prove a complete window snapshot. The
         // fallback may discover controls in other windows of the process, so
         // it remains discovery evidence rather than an exact-window proof.
-        walk_state.mark_incomplete();
+        walk_state.mark(Omission::EmptyWrapperFallback);
         // SAL windows already returned through the MSAA path above.
         if !walk_state.budget.expired() {
             if let Some(target_pid) = pid_from_hwnd(hwnd_win) {
@@ -681,6 +662,8 @@ unsafe fn walk_tree_unsafe(
                     lines = fallback_lines;
                 }
             }
+        } else {
+            walk_state.budget.stop_for_timeout();
         }
     }
 
@@ -696,7 +679,7 @@ unsafe fn walk_tree_unsafe(
     UiaTreeResult {
         tree_markdown,
         nodes,
-        elements_complete: walk_state.complete,
+        elements_complete: walk_state.finish(),
     }
 }
 
@@ -752,12 +735,28 @@ unsafe fn walk_list_view_window(
     let mut lines = Vec::new();
     let mut counter = 0;
     let mut state = WalkState::new(budget, max_depth);
+    state.not_supported = automation
+        .ReservedNotSupportedValue()
+        .ok()
+        .and_then(|v| v.cast().ok());
+    let mut cache_configuration_failed = false;
     let result = (|| -> windows::core::Result<()> {
         let (cache, complete) = node_cache_request(automation)?;
-        cache.SetTreeScope(TreeScope_Element)?;
-        cache.SetTreeFilter(&automation.ControlViewCondition()?)?;
+        if let Err(error) = cache.SetTreeScope(TreeScope_Element) {
+            state.mark(Omission::CacheRequestIncomplete);
+            cache_configuration_failed = true;
+            return Err(error);
+        }
+        if let Err(error) = automation
+            .ControlViewCondition()
+            .and_then(|c| cache.SetTreeFilter(&c))
+        {
+            state.mark(Omission::CacheRequestIncomplete);
+            cache_configuration_failed = true;
+            return Err(error);
+        }
         if !complete {
-            state.mark_incomplete();
+            state.mark(Omission::CacheRequestIncomplete);
         }
         let root = automation
             .ElementFromHandle(hwnd)?
@@ -778,7 +777,9 @@ unsafe fn walk_list_view_window(
         Ok(())
     })();
     if let Err(error) = result {
-        state.mark_incomplete();
+        if !cache_configuration_failed {
+            state.mark(Omission::SubtreeCacheFailed);
+        }
         lines.push((0, format!("UIA shallow cache failed: {error}")));
     }
     fold_actionless_text_subtrees(&mut lines, &mut nodes);
@@ -786,7 +787,7 @@ unsafe fn walk_list_view_window(
     UiaTreeResult {
         tree_markdown: query.map_or_else(|| raw.clone(), |q| filter_tree(&raw, q)),
         nodes,
-        elements_complete: state.complete,
+        elements_complete: state.finish(),
     }
 }
 
@@ -807,12 +808,43 @@ unsafe fn walk_list_view_level(
     if !state.enter(depth) {
         return;
     }
-    let (kind, parent) = emit_cached_node(element, depth, parent, in_web, nodes, lines, counter);
+    let emitted = {
+        let ctx = UiaReadCtx {
+            log: &state.reads,
+            not_supported: state.not_supported.as_ref(),
+        };
+        emit_cached_node(
+            element,
+            EmitLocation {
+                depth,
+                parent_index: parent,
+                in_web_content: in_web,
+            },
+            nodes,
+            lines,
+            counter,
+            &ctx,
+        )
+    };
+    if emitted.dropped_offscreen_content {
+        state.mark(Omission::OffscreenContentDropped);
+    }
+    let (kind, parent) = (emitted.control_type, emitted.emitted_parent);
     let next_web = in_web || kind.eq_ignore_ascii_case("Document");
     let dense = is_uia_dense_collection(&kind);
+    let mut scan_capped = false;
     let native_children = dense
-        .then(|| native_visible_list_rows(automation, cache, element))
+        .then(|| {
+            let ctx = UiaReadCtx {
+                log: &state.reads,
+                not_supported: state.not_supported.as_ref(),
+            };
+            native_visible_list_rows(automation, cache, element, &ctx, &mut scan_capped)
+        })
         .flatten();
+    if scan_capped {
+        state.mark(Omission::SiblingScanCapped);
+    }
     let children = native_children.map(Ok).unwrap_or_else(|| {
         (|| -> windows::core::Result<Vec<IUIAutomationElement>> {
             let control = automation.ControlViewCondition()?;
@@ -823,7 +855,7 @@ unsafe fn walk_list_view_level(
                     UIA_IsOffscreenPropertyId,
                     &windows::core::VARIANT::from(false),
                 )?;
-                state.mark_incomplete();
+                state.mark(Omission::OffscreenRowsDeferred);
                 automation.CreateAndCondition(&control, &visible)?
             } else {
                 control
@@ -837,7 +869,7 @@ unsafe fn walk_list_view_level(
     let children = match children {
         Ok(children) => children,
         Err(error) => {
-            state.mark_incomplete();
+            state.mark(Omission::ChildrenUnreadable);
             lines.push((depth + 1, format!("(UIA children unavailable: {error})")));
             return;
         }
@@ -845,7 +877,14 @@ unsafe fn walk_list_view_level(
     let mut pending = children;
     // Visit sibling controls (including editors below a list) before rows
     // consume the remaining budget. Stable ordering within each group.
-    pending.sort_by_key(|child| is_uia_dense_collection(&read_cached_control_type(child)));
+    {
+        let ctx = UiaReadCtx {
+            log: &state.reads,
+            not_supported: state.not_supported.as_ref(),
+        };
+        pending
+            .sort_by_key(|child| is_uia_dense_collection(&read_cached_control_type(child, &ctx)));
+    }
     for child in pending {
         walk_list_view_level(
             automation,
@@ -862,8 +901,12 @@ unsafe fn walk_list_view_level(
         );
     }
     if dense {
-        state.mark_incomplete();
-        let search = search_offscreen && !state.budget.expired();
+        state.mark(Omission::OffscreenRowsDeferred);
+        let expired = search_offscreen && state.budget.expired();
+        if expired {
+            state.budget.stop_for_timeout();
+        }
+        let search = search_offscreen && !expired;
         if !search {
             lines.push((depth + 1, format_uncounted_offscreen_rows_line()));
         }
@@ -880,27 +923,42 @@ unsafe fn walk_list_view_level(
                         .CreateAndCondition(&automation.ControlViewCondition()?, &offscreen)?,
                 )
             })();
-            if let Ok(walker) = walker {
-                let mut row = walker.GetFirstChildElementBuildCache(element, cache);
-                while let Ok(child) = row {
-                    let outcome = state.budget.outcome();
-                    if state.budget.expired() || outcome.stop.is_some() {
-                        break;
+            match walker {
+                Err(_) => state.mark(Omission::ChildrenUnreadable),
+                Ok(walker) => {
+                    let mut row = walker.GetFirstChildElementBuildCache(element, cache);
+                    loop {
+                        let child = match row {
+                            Ok(child) => child,
+                            Err(error) => {
+                                if error.code().0 != 0 {
+                                    state.mark(Omission::ChildrenUnreadable);
+                                }
+                                break;
+                            }
+                        };
+                        if state.budget.expired() {
+                            state.budget.stop_for_timeout();
+                            break;
+                        }
+                        if state.budget.outcome().stop.is_some() {
+                            break;
+                        }
+                        walk_list_view_level(
+                            automation,
+                            cache,
+                            &child,
+                            depth + 1,
+                            parent,
+                            next_web,
+                            nodes,
+                            lines,
+                            counter,
+                            state,
+                            false,
+                        );
+                        row = walker.GetNextSiblingElementBuildCache(&child, cache);
                     }
-                    walk_list_view_level(
-                        automation,
-                        cache,
-                        &child,
-                        depth + 1,
-                        parent,
-                        next_web,
-                        nodes,
-                        lines,
-                        counter,
-                        state,
-                        false,
-                    );
-                    row = walker.GetNextSiblingElementBuildCache(&child, cache);
                 }
             }
         }
@@ -914,6 +972,8 @@ unsafe fn native_visible_list_rows(
     automation: &IUIAutomation,
     cache: &IUIAutomationCacheRequest,
     element: &IUIAutomationElement,
+    ctx: &UiaReadCtx<'_>,
+    capped: &mut bool,
 ) -> Option<Vec<IUIAutomationElement>> {
     use windows::Win32::Foundation::{LPARAM, WPARAM};
     use windows::Win32::UI::Accessibility::{AccessibleObjectFromWindow, IAccessible};
@@ -963,13 +1023,18 @@ unsafe fn native_visible_list_rows(
     let mut child = walker.GetFirstChildElementBuildCache(element, cache);
     // Header/scrollbar siblings precede or follow the contiguous row block.
     // Never traverse the row block to reach the opposite end.
+    let mut found_row = false;
     for _ in 0..16 {
         let current = child.ok()?;
-        if read_cached_control_type(&current) == "ListItem" {
+        if read_cached_control_type(&current, ctx) == "ListItem" {
+            found_row = true;
             break;
         }
         child = walker.GetNextSiblingElementBuildCache(&current, cache);
         children.push(current);
+    }
+    if !found_row {
+        *capped = true;
     }
     for index in top..count.min(top.saturating_add(page).saturating_add(1)) {
         children.push(
@@ -984,13 +1049,18 @@ unsafe fn native_visible_list_rows(
     }
     let mut tail = Vec::new();
     let mut child = walker.GetLastChildElementBuildCache(element, cache);
+    let mut found_row = false;
     for _ in 0..16 {
         let current = child.ok()?;
-        if read_cached_control_type(&current) == "ListItem" {
+        if read_cached_control_type(&current, ctx) == "ListItem" {
+            found_row = true;
             break;
         }
         child = walker.GetPreviousSiblingElementBuildCache(&current, cache);
         tail.push(current);
+    }
+    if !found_row {
+        *capped = true;
     }
     children.extend(tail.into_iter().rev());
     Some(children)
@@ -1020,7 +1090,7 @@ unsafe fn walk_root_by_pid(
         Ok(r) => r,
         Err(e) => {
             tracing::debug!(target: "uia", "GetRootElement failed: {e}");
-            walk_state.mark_incomplete();
+            walk_state.mark(Omission::ChildrenUnreadable);
             return;
         }
     };
@@ -1028,7 +1098,7 @@ unsafe fn walk_root_by_pid(
         Ok(c) => c,
         Err(e) => {
             tracing::debug!(target: "uia", "CreateTrueCondition failed: {e}");
-            walk_state.mark_incomplete();
+            walk_state.mark(Omission::ChildrenUnreadable);
             return;
         }
     };
@@ -1036,7 +1106,7 @@ unsafe fn walk_root_by_pid(
         Ok(a) => a,
         Err(e) => {
             tracing::debug!(target: "uia", "root.FindAll(Children) failed: {e}");
-            walk_state.mark_incomplete();
+            walk_state.mark(Omission::ChildrenUnreadable);
             return;
         }
     };
@@ -1044,7 +1114,7 @@ unsafe fn walk_root_by_pid(
         Ok(count) => count,
         Err(e) => {
             tracing::debug!(target: "uia", "root child count failed: {e}");
-            walk_state.mark_incomplete();
+            walk_state.mark(Omission::ChildrenUnreadable);
             return;
         }
     };
@@ -1053,7 +1123,7 @@ unsafe fn walk_root_by_pid(
             Ok(e) => e,
             Err(e) => {
                 tracing::debug!(target: "uia", "root child {i} fetch failed: {e}");
-                walk_state.mark_incomplete();
+                walk_state.mark(Omission::ChildrenUnreadable);
                 continue;
             }
         };
@@ -1067,14 +1137,14 @@ unsafe fn walk_root_by_pid(
                 if raw.Anonymous.Anonymous.vt != 3
                 /* VT_I4 */
                 {
-                    walk_state.mark_incomplete();
+                    walk_state.mark(Omission::ProcessIdUnreadable);
                     continue;
                 }
                 raw.Anonymous.Anonymous.Anonymous.lVal as u32
             }
             Err(e) => {
                 tracing::debug!(target: "uia", "root child {i} ProcessId read failed: {e}");
-                walk_state.mark_incomplete();
+                walk_state.mark(Omission::ProcessIdUnreadable);
                 continue;
             }
         };
@@ -1088,7 +1158,7 @@ unsafe fn walk_root_by_pid(
             Ok(e) => e,
             Err(e) => {
                 tracing::debug!(target: "uia", "BuildUpdatedCache on pid={target_pid} match failed: {e}");
-                walk_state.mark_incomplete();
+                walk_state.mark(Omission::SubtreeCacheFailed);
                 continue;
             }
         };
@@ -1134,19 +1204,6 @@ struct DeferredUiaRow {
     element: IUIAutomationElement,
     in_web_content: bool,
     chunk: DeferredChunk<UiaNode>,
-}
-
-/// Offscreen deferred rows are walked only when a query searches them;
-/// otherwise they stay a summary row, the element list misses them, and the
-/// walk is not complete.
-fn note_unwalked_offscreen_rows(
-    walk_state: &mut WalkState<'_>,
-    visible: impl IntoIterator<Item = bool>,
-    search_offscreen: bool,
-) {
-    if !search_offscreen && visible.into_iter().any(|visible| !visible) {
-        walk_state.mark_incomplete();
-    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1232,29 +1289,42 @@ unsafe fn walk_cached_element(
         return;
     }
 
-    let (control_type, emitted_parent) = emit_cached_node(
-        element,
-        depth,
-        parent_index,
-        in_web_content,
-        nodes,
-        lines,
-        counter,
-    );
+    let emitted = {
+        let ctx = UiaReadCtx {
+            log: &walk_state.reads,
+            not_supported: walk_state.not_supported.as_ref(),
+        };
+        emit_cached_node(
+            element,
+            EmitLocation {
+                depth,
+                parent_index,
+                in_web_content,
+            },
+            nodes,
+            lines,
+            counter,
+            &ctx,
+        )
+    };
+    if emitted.dropped_offscreen_content {
+        walk_state.mark(Omission::OffscreenContentDropped);
+    }
+    let (control_type, emitted_parent) = (emitted.control_type, emitted.emitted_parent);
     let next_web = in_web_content || control_type.eq_ignore_ascii_case("Document");
 
     let children = match cached_children(element) {
         Ok(Some(children)) => children,
         Ok(None) => return,
         Err(_) => {
-            walk_state.mark_incomplete();
+            walk_state.mark(Omission::ChildrenUnreadable);
             return;
         }
     };
     let len = match children.Length() {
         Ok(len) => len,
         Err(_) => {
-            walk_state.mark_incomplete();
+            walk_state.mark(Omission::ChildrenUnreadable);
             return;
         }
     };
@@ -1262,51 +1332,71 @@ unsafe fn walk_cached_element(
     for i in 0..len {
         match children.GetElement(i) {
             Ok(child) => child_elems.push(child),
-            Err(_) => walk_state.mark_incomplete(),
+            Err(_) => walk_state.mark(Omission::ChildrenUnreadable),
         }
     }
-    let tab_plan = if !next_web && child_elems.len() >= TAB_STRIP_COMPACTION_THRESHOLD {
-        let child_types: Vec<String> = child_elems.iter().map(read_cached_control_type).collect();
-        let child_selected: Vec<Option<bool>> =
-            child_elems.iter().map(read_cached_selected).collect();
-        let child_values: Vec<Option<String>> =
-            child_elems.iter().map(read_cached_bstr_value).collect();
-        let metas: Vec<TabChildMeta<'_>> = (0..child_elems.len())
-            .map(|i| TabChildMeta {
-                role: &child_types[i],
-                role_description: None,
-                title: None,
-                selected: child_selected[i],
-                value: child_values[i].as_deref(),
-                value_state: child_values[i].as_deref(),
-            })
-            .collect();
-        let parent_name = read_cached_bstr_name(element);
-        compact_tab_strip(&control_type, parent_name.as_deref(), None, None, &metas)
-    } else {
-        None
-    };
+    let (tab_plan, dense_plan) = {
+        let ctx = UiaReadCtx {
+            log: &walk_state.reads,
+            not_supported: walk_state.not_supported.as_ref(),
+        };
+        let tab_plan = if !next_web && child_elems.len() >= TAB_STRIP_COMPACTION_THRESHOLD {
+            let child_types: Vec<String> = child_elems
+                .iter()
+                .map(|child| read_cached_control_type(child, &ctx))
+                .collect();
+            let child_selected: Vec<Option<bool>> = child_elems
+                .iter()
+                .map(|child| read_cached_selected(child, &ctx))
+                .collect();
+            let child_values: Vec<Option<String>> = child_elems
+                .iter()
+                .map(|child| read_cached_bstr_value(child, &ctx))
+                .collect();
+            let metas: Vec<TabChildMeta<'_>> = (0..child_elems.len())
+                .map(|i| TabChildMeta {
+                    role: &child_types[i],
+                    role_description: None,
+                    title: None,
+                    selected: child_selected[i],
+                    value: child_values[i].as_deref(),
+                    value_state: child_values[i].as_deref(),
+                })
+                .collect();
+            let parent_name = read_cached_bstr_name(element, &ctx);
+            compact_tab_strip(&control_type, parent_name.as_deref(), None, None, &metas)
+        } else {
+            None
+        };
 
-    let dense_plan = if defer_dense_rows && !next_web && is_uia_dense_collection(&control_type) {
-        let (_, _, parent_rect) = read_cached_bounding_rect_full(element);
-        let child_types: Vec<String> = child_elems.iter().map(read_cached_control_type).collect();
-        let candidates: Vec<UiaChildCandidate<'_>> = child_elems
-            .iter()
-            .enumerate()
-            .map(|(i, c)| {
-                let is_offscreen = read_cached_bool(c, UIA_IsOffscreenPropertyId);
-                let (_, _, rect) = read_cached_bounding_rect_full(c);
-                UiaChildCandidate {
-                    control_type: &child_types[i],
-                    is_offscreen,
-                    rect,
-                }
-            })
-            .collect();
-        Some(plan_uia_collection_children(parent_rect, &candidates))
-    } else {
-        None
+        let dense_plan = if defer_dense_rows && !next_web && is_uia_dense_collection(&control_type)
+        {
+            let (_, _, parent_rect) = read_cached_bounding_rect_full(element, &ctx);
+            let child_types: Vec<String> = child_elems
+                .iter()
+                .map(|child| read_cached_control_type(child, &ctx))
+                .collect();
+            let candidates: Vec<UiaChildCandidate<'_>> = child_elems
+                .iter()
+                .enumerate()
+                .map(|(i, c)| {
+                    let is_offscreen = read_cached_bool(c, UIA_IsOffscreenPropertyId, &ctx);
+                    let (_, _, rect) = read_cached_bounding_rect_full(c, &ctx);
+                    UiaChildCandidate {
+                        control_type: &child_types[i],
+                        is_offscreen,
+                        rect,
+                    }
+                })
+                .collect();
+            Some(plan_uia_collection_children(parent_rect, &candidates))
+        } else {
+            None
+        };
+
+        (tab_plan, dense_plan)
     };
+    note_tab_plan(walk_state, tab_plan.as_ref());
 
     for (index, child) in child_elems.into_iter().enumerate() {
         if let Some(ref tp) = tab_plan {
@@ -1499,8 +1589,24 @@ unsafe fn walk_native_level(
     if !budget.admit() {
         return Err("the native UIA tree exceeded the element budget".to_owned());
     }
-    let (control_type, emitted_parent) =
-        emit_cached_node(element, depth, parent_index, false, nodes, lines, counter);
+    let log = ReadLog::default();
+    let ctx = UiaReadCtx {
+        log: &log,
+        not_supported: None,
+    };
+    let emitted = emit_cached_node(
+        element,
+        EmitLocation {
+            depth,
+            parent_index,
+            in_web_content: false,
+        },
+        nodes,
+        lines,
+        counter,
+        &ctx,
+    );
+    let (control_type, emitted_parent) = (emitted.control_type, emitted.emitted_parent);
     if control_type.eq_ignore_ascii_case("Document") {
         return Ok(());
     }
@@ -1528,32 +1634,63 @@ unsafe fn walk_native_level(
 
 /// Project one cached element into `nodes`/`lines`. Returns its control type
 /// and the parent index its descendants should inherit.
-fn emit_cached_node(
-    element: &IUIAutomationElement,
+struct UiaReadCtx<'a> {
+    log: &'a ReadLog,
+    not_supported: Option<&'a windows::core::IUnknown>,
+}
+struct EmitOutcome {
+    control_type: String,
+    emitted_parent: Option<usize>,
+    dropped_offscreen_content: bool,
+}
+
+struct EmitLocation {
     depth: usize,
     parent_index: Option<usize>,
     in_web_content: bool,
+}
+
+fn emit_cached_node(
+    element: &IUIAutomationElement,
+    location: EmitLocation,
     nodes: &mut Vec<UiaNode>,
     lines: &mut Vec<(usize, String)>,
     counter: &mut usize,
-) -> (String, Option<usize>) {
-    let control_type = read_cached_control_type(element);
-    let name = read_cached_bstr_name(element);
-    let value = read_cached_bstr_value(element);
-    let automation_id = read_cached_bstr(element, UIA_AutomationIdPropertyId);
-    let help_text = read_cached_bstr(element, UIA_HelpTextPropertyId);
-    let is_offscreen = read_cached_bool(element, UIA_IsOffscreenPropertyId);
+    ctx: &UiaReadCtx<'_>,
+) -> EmitOutcome {
+    let EmitLocation {
+        depth,
+        parent_index,
+        in_web_content,
+    } = location;
+    let control_type = read_cached_control_type(element, ctx);
+    let name = read_cached_bstr_name(element, ctx);
+    let value = read_cached_bstr_value(element, ctx);
+    let automation_id = read_cached_bstr(element, UIA_AutomationIdPropertyId, ctx);
+    let help_text = read_cached_bstr(element, UIA_HelpTextPropertyId, ctx);
+    let is_offscreen = read_cached_bool(element, UIA_IsOffscreenPropertyId, ctx);
     // WinForms `AccessibleDescription` reaches UIA only as the MSAA
     // description (LegacyIAccessible.Description); UIA providers use
     // FullDescription. Either can be the only hint that a field holds an OTP.
     let description = [
-        read_cached_bstr(element, UIA_FullDescriptionPropertyId),
-        read_cached_bstr(element, UIA_LegacyIAccessibleDescriptionPropertyId),
+        read_cached_bstr(element, UIA_FullDescriptionPropertyId, ctx),
+        read_cached_bstr(element, UIA_LegacyIAccessibleDescriptionPropertyId, ctx),
     ]
     .into_iter()
     .flatten()
     .collect::<Vec<_>>();
     let description = (!description.is_empty()).then(|| description.join(" "));
+    let raw_has_content = name.as_deref().is_some_and(|s| !s.trim().is_empty())
+        || value.as_deref().is_some_and(|s| !s.trim().is_empty());
+    let enabled = read_cached_bool(element, UIA_IsEnabledPropertyId, ctx);
+    // Missing UIA state must remain unknown on the structured observation
+    // surface. Action discovery keeps its historical best-effort assumption.
+    let is_enabled = enabled.unwrap_or(true);
+    let (has_value_pattern, actions) = collect_pattern_evidence(
+        is_enabled,
+        || unsafe { cached_pattern(element, UIA_ValuePatternId, ctx) }.is_some(),
+        || detect_cached_actions(element, &control_type, is_enabled, ctx),
+    );
     let ProjectedNodeText {
         name,
         value,
@@ -1566,21 +1703,13 @@ fn emit_cached_node(
         help: help_text,
         description,
         automation_id: automation_id.clone(),
-        is_password: read_cached_bool(element, UIA_IsPasswordPropertyId),
-        has_value_pattern: unsafe { element.GetCachedPattern(UIA_ValuePatternId) }.is_ok(),
+        is_password: read_cached_bool(element, UIA_IsPasswordPropertyId, ctx),
+        has_value_pattern,
     });
-    let enabled = read_cached_bool(element, UIA_IsEnabledPropertyId);
-    // Missing UIA state must remain unknown on the structured observation
-    // surface. Action discovery keeps its historical best-effort assumption.
-    let is_enabled = enabled.unwrap_or(true);
-    let selected = read_cached_selected(element);
-    let checked = read_cached_checked(element);
-    let expanded = read_cached_expanded(element);
-    let actions = detect_cached_actions(element, &control_type, is_enabled);
+    let selected = read_cached_selected(element, ctx);
+    let checked = read_cached_checked(element, ctx);
+    let expanded = read_cached_expanded(element, ctx);
     let is_actionable = !actions.is_empty() && is_enabled;
-    if is_offscreen == Some(true) && !is_uia_offscreen_exempt(&control_type) && !is_actionable {
-        return (control_type, parent_index);
-    }
     let has_content = name
         .as_deref()
         .map(|s| !s.trim().is_empty())
@@ -1590,6 +1719,14 @@ fn emit_cached_node(
             .map(|s| !s.trim().is_empty())
             .unwrap_or(false);
 
+    if is_offscreen == Some(true) && !is_uia_offscreen_exempt(&control_type) && !is_actionable {
+        return EmitOutcome {
+            control_type,
+            emitted_parent: parent_index,
+            dropped_offscreen_content: raw_has_content,
+        };
+    }
+
     let mut emitted_parent: Option<usize> = parent_index;
     if is_actionable || has_content {
         let node = if is_actionable {
@@ -1598,7 +1735,7 @@ fn emit_cached_node(
             std::mem::forget(retained);
             let idx = *counter;
             *counter += 1;
-            let (center_x, center_y, rect) = read_cached_bounding_rect_full(element);
+            let (center_x, center_y, rect) = read_cached_bounding_rect_full(element, ctx);
             emitted_parent = Some(idx);
             UiaNode {
                 element_index: Some(idx),
@@ -1648,75 +1785,114 @@ fn emit_cached_node(
         lines.push((depth, format_node_line(&node)));
         nodes.push(node);
     }
-    (control_type, emitted_parent)
-}
-
-fn read_cached_control_type(element: &IUIAutomationElement) -> String {
-    unsafe {
-        element
-            .CachedControlType()
-            .ok()
-            .map(|ct| control_type_name(ct.0))
-            .unwrap_or_else(|| "Unknown".into())
+    EmitOutcome {
+        control_type,
+        emitted_parent,
+        dropped_offscreen_content: false,
     }
 }
 
-fn read_cached_bstr_name(element: &IUIAutomationElement) -> Option<String> {
+fn read_cached_control_type(element: &IUIAutomationElement, ctx: &UiaReadCtx<'_>) -> String {
     unsafe {
-        let bstr = element.CachedName().ok()?;
-        let s = bstr.to_string();
-        if s.trim().is_empty() {
-            None
-        } else {
-            Some(s)
+        match element.CachedControlType() {
+            Ok(ct) => control_type_name(ct.0),
+            Err(_) => {
+                ctx.log.fail();
+                "Unknown".into()
+            }
         }
     }
 }
-
-fn read_cached_bstr_value(element: &IUIAutomationElement) -> Option<String> {
-    read_cached_bstr(element, UIA_ValueValuePropertyId)
+fn read_cached_bstr_name(element: &IUIAutomationElement, ctx: &UiaReadCtx<'_>) -> Option<String> {
+    unsafe {
+        match element.CachedName() {
+            Ok(bstr) => {
+                let s = bstr.to_string();
+                (!s.trim().is_empty()).then_some(s)
+            }
+            Err(_) => {
+                ctx.log.fail();
+                None
+            }
+        }
+    }
 }
-
+fn read_cached_bstr_value(element: &IUIAutomationElement, ctx: &UiaReadCtx<'_>) -> Option<String> {
+    read_cached_bstr(element, UIA_ValueValuePropertyId, ctx)
+}
+fn read_variant(
+    element: &IUIAutomationElement,
+    property_id: windows::Win32::UI::Accessibility::UIA_PROPERTY_ID,
+    expected: u16,
+    ctx: &UiaReadCtx<'_>,
+) -> Option<windows::core::VARIANT> {
+    unsafe {
+        let result = element.GetCachedPropertyValue(property_id);
+        let raw = match &result {
+            Err(e) => RawCached::Err(e.code().0),
+            Ok(v) => {
+                let variant = v.as_raw().Anonymous.Anonymous;
+                let token = if variant.vt == 13 {
+                    let ptr = variant.Anonymous.punkVal;
+                    windows::core::IUnknown::from_raw_borrowed(&ptr)
+                        .and_then(|p| p.cast::<windows::core::IUnknown>().ok())
+                        .zip(ctx.not_supported)
+                        .is_some_and(|(actual, expected)| actual.as_raw() == expected.as_raw())
+                } else {
+                    false
+                };
+                RawCached::Ok {
+                    vt: variant.vt,
+                    unknown_is_not_supported_token: token,
+                }
+            }
+        };
+        match classify_cached_variant(raw, expected) {
+            CachedRead::Value => result.ok(),
+            CachedRead::Absent => None,
+            CachedRead::Failed => {
+                ctx.log.fail();
+                None
+            }
+        }
+    }
+}
 fn read_cached_bstr(
     element: &IUIAutomationElement,
     property_id: windows::Win32::UI::Accessibility::UIA_PROPERTY_ID,
+    ctx: &UiaReadCtx<'_>,
 ) -> Option<String> {
     unsafe {
-        let variant = element.GetCachedPropertyValue(property_id).ok()?;
-        if variant.as_raw().Anonymous.Anonymous.vt == 8 {
-            let bstr = BSTR::from_raw(variant.as_raw().Anonymous.Anonymous.Anonymous.bstrVal);
-            let s = bstr.to_string();
-            std::mem::forget(bstr);
-            if s.trim().is_empty() {
-                None
-            } else {
-                Some(s)
-            }
-        } else {
-            None
-        }
+        let variant = read_variant(element, property_id, 8, ctx)?;
+        let bstr = BSTR::from_raw(variant.as_raw().Anonymous.Anonymous.Anonymous.bstrVal);
+        let s = bstr.to_string();
+        std::mem::forget(bstr);
+        (!s.trim().is_empty()).then_some(s)
     }
 }
-
 fn read_cached_bool(
     element: &IUIAutomationElement,
     property_id: windows::Win32::UI::Accessibility::UIA_PROPERTY_ID,
+    ctx: &UiaReadCtx<'_>,
 ) -> Option<bool> {
     unsafe {
-        let variant = element.GetCachedPropertyValue(property_id).ok()?;
-        if variant.as_raw().Anonymous.Anonymous.vt == 11 {
-            Some(variant.as_raw().Anonymous.Anonymous.Anonymous.boolVal != 0)
-        } else {
-            None
-        }
+        Some(
+            read_variant(element, property_id, 11, ctx)?
+                .as_raw()
+                .Anonymous
+                .Anonymous
+                .Anonymous
+                .boolVal
+                != 0,
+        )
     }
 }
-
 /// Read bounding rect as (center_x, center_y, Some((l,t,r,b))). Returns
 /// rect=None when the element has no meaningful BoundingRectangle (offscreen
-/// containers, structure-only elements).
+/// containers, structure-only elements); a failed read is also logged.
 fn read_cached_bounding_rect_full(
     element: &IUIAutomationElement,
+    ctx: &UiaReadCtx<'_>,
 ) -> (i32, i32, Option<(i32, i32, i32, i32)>) {
     unsafe {
         match element.CachedBoundingRectangle() {
@@ -1725,51 +1901,54 @@ fn read_cached_bounding_rect_full(
                 (r.top + r.bottom) / 2,
                 Some((r.left, r.top, r.right, r.bottom)),
             ),
-            _ => (0, 0, None),
+            Ok(_) => (0, 0, None),
+            Err(_) => {
+                ctx.log.fail();
+                (0, 0, None)
+            }
         }
     }
 }
-
+unsafe fn cached_pattern(
+    element: &IUIAutomationElement,
+    id: windows::Win32::UI::Accessibility::UIA_PATTERN_ID,
+    ctx: &UiaReadCtx<'_>,
+) -> Option<windows::core::IUnknown> {
+    let result = element.GetCachedPattern(id);
+    match record_pattern_read(result.as_ref().map(|_| ()).map_err(|e| e.code().0), ctx.log) {
+        CachedRead::Value => result.ok(),
+        CachedRead::Absent => None,
+        CachedRead::Failed => None,
+    }
+}
 fn detect_cached_actions(
     element: &IUIAutomationElement,
     control_type: &str,
     is_enabled: bool,
+    ctx: &UiaReadCtx<'_>,
 ) -> Vec<String> {
     if !is_enabled {
         return vec![];
     }
     let mut actions = Vec::new();
     unsafe {
-        if element.GetCachedPattern(UIA_InvokePatternId).is_ok() {
-            actions.push("invoke".into());
-        }
-        if element.GetCachedPattern(UIA_TogglePatternId).is_ok() {
-            actions.push("toggle".into());
-        }
-        if element.GetCachedPattern(UIA_SelectionItemPatternId).is_ok() {
-            actions.push("select".into());
-        }
-        if element
-            .GetCachedPattern(UIA_ExpandCollapsePatternId)
-            .is_ok()
-        {
-            actions.push("expand".into());
-        }
-        if element.GetCachedPattern(UIA_ValuePatternId).is_ok() {
-            actions.push("set_value".into());
-        }
-        // RangeValuePattern is exposed by Sliders, ProgressBars, and other
-        // numeric-range controls. Without this entry the slider parent
-        // gets actions=[] → marked non-actionable → no `[N]` index in the
-        // flat tree, making the slider unaddressable by AutomationId.
-        if element.GetCachedPattern(UIA_RangeValuePatternId).is_ok() {
-            actions.push("set_value".into());
-        }
-        if element.GetCachedPattern(UIA_TextPatternId).is_ok() {
-            actions.push("text".into());
-        }
-        if element.GetCachedPattern(UIA_ScrollPatternId).is_ok() {
-            actions.push("scroll".into());
+        for (id, action) in [
+            (UIA_InvokePatternId, "invoke"),
+            (UIA_TogglePatternId, "toggle"),
+            (UIA_SelectionItemPatternId, "select"),
+            (UIA_ExpandCollapsePatternId, "expand"),
+            (UIA_ValuePatternId, "set_value"),
+            // RangeValuePattern is exposed by Sliders, ProgressBars, and other
+            // numeric-range controls. Without this entry the slider parent
+            // gets actions=[] → marked non-actionable → no [N] index in the
+            // flat tree, making the slider unaddressable by AutomationId.
+            (UIA_RangeValuePatternId, "set_value"),
+            (UIA_TextPatternId, "text"),
+            (UIA_ScrollPatternId, "scroll"),
+        ] {
+            if cached_pattern(element, id, ctx).is_some() {
+                actions.push(action.into());
+            }
         }
     }
     if actions.is_empty() && control_type == "MenuItem" {
@@ -1781,24 +1960,34 @@ fn detect_cached_actions(
     }
     actions
 }
-
-fn read_cached_checked(element: &IUIAutomationElement) -> Option<CheckedState> {
+fn read_cached_checked(
+    element: &IUIAutomationElement,
+    ctx: &UiaReadCtx<'_>,
+) -> Option<CheckedState> {
     unsafe {
-        let pattern = element.GetCachedPattern(UIA_TogglePatternId).ok()?;
-        let toggle = pattern.cast::<IUIAutomationTogglePattern>().ok()?;
+        let pattern = cached_pattern(element, UIA_TogglePatternId, ctx)?;
+        let toggle = pattern
+            .cast::<IUIAutomationTogglePattern>()
+            .map_err(|_| ctx.log.fail())
+            .ok()?;
         match toggle.CachedToggleState() {
             Ok(state) if state == ToggleState_On => Some(CheckedState::On),
             Ok(state) if state == ToggleState_Off => Some(CheckedState::Off),
             Ok(state) if state == ToggleState_Indeterminate => Some(CheckedState::Mixed),
-            _ => None,
+            _ => {
+                ctx.log.fail();
+                None
+            }
         }
     }
 }
-
-fn read_cached_expanded(element: &IUIAutomationElement) -> Option<bool> {
+fn read_cached_expanded(element: &IUIAutomationElement, ctx: &UiaReadCtx<'_>) -> Option<bool> {
     unsafe {
-        let pattern = element.GetCachedPattern(UIA_ExpandCollapsePatternId).ok()?;
-        let expand = pattern.cast::<IUIAutomationExpandCollapsePattern>().ok()?;
+        let pattern = cached_pattern(element, UIA_ExpandCollapsePatternId, ctx)?;
+        let expand = pattern
+            .cast::<IUIAutomationExpandCollapsePattern>()
+            .map_err(|_| ctx.log.fail())
+            .ok()?;
         match expand.CachedExpandCollapseState() {
             Ok(state) if state == ExpandCollapseState_Collapsed => Some(false),
             Ok(state)
@@ -1808,32 +1997,49 @@ fn read_cached_expanded(element: &IUIAutomationElement) -> Option<bool> {
                 Some(true)
             }
             // LeafNode: nothing to expand, so no state.
-            _ => None,
+            Ok(state)
+                if state == windows::Win32::UI::Accessibility::ExpandCollapseState_LeafNode =>
+            {
+                None
+            }
+            _ => {
+                ctx.log.fail();
+                None
+            }
         }
     }
 }
-
-fn read_cached_selected(element: &IUIAutomationElement) -> Option<bool> {
+fn read_cached_selected(element: &IUIAutomationElement, ctx: &UiaReadCtx<'_>) -> Option<bool> {
     unsafe {
-        if let Ok(pattern) = element.GetCachedPattern(UIA_TogglePatternId) {
+        if let Some(pattern) = cached_pattern(element, UIA_TogglePatternId, ctx) {
             if let Ok(toggle) = pattern.cast::<IUIAutomationTogglePattern>() {
                 return match toggle.CachedToggleState() {
                     Ok(state) if state == ToggleState_On => Some(true),
                     Ok(state) if state == ToggleState_Off => Some(false),
-                    _ => None,
+                    Ok(state) if state == ToggleState_Indeterminate => None,
+                    _ => {
+                        ctx.log.fail();
+                        None
+                    }
                 };
             }
+            ctx.log.fail();
         }
-        if let Ok(pattern) = element.GetCachedPattern(UIA_SelectionItemPatternId) {
-            if let Ok(selection) = pattern.cast::<IUIAutomationSelectionItemPattern>() {
-                return selection
-                    .CachedIsSelected()
-                    .ok()
-                    .map(|selected| selected.as_bool());
-            }
+        if let Some(pattern) = cached_pattern(element, UIA_SelectionItemPatternId, ctx) {
+            let selection = pattern
+                .cast::<IUIAutomationSelectionItemPattern>()
+                .map_err(|_| ctx.log.fail())
+                .ok()?;
+            return match selection.CachedIsSelected() {
+                Ok(v) => Some(v.as_bool()),
+                Err(_) => {
+                    ctx.log.fail();
+                    None
+                }
+            };
         }
+        None
     }
-    None
 }
 
 fn control_type_name(id: i32) -> String {
@@ -1998,153 +2204,5 @@ mod tests {
         assert!(!native_list_view_class(
             "WindowsForms10.LISTBOX.app.0.34f5582_r7_ad1"
         ));
-    }
-
-    fn star(child_count: usize) -> Vec<Vec<usize>> {
-        let mut children = vec![Vec::new(); child_count + 1];
-        children[0] = (1..=child_count).collect();
-        children
-    }
-
-    fn chain(len: usize) -> Vec<Vec<usize>> {
-        let mut children = vec![Vec::new(); len];
-        for i in 0..len.saturating_sub(1) {
-            children[i] = vec![i + 1];
-        }
-        children
-    }
-
-    fn walk_synthetic_tree(
-        children: &[Vec<usize>],
-        node: usize,
-        depth: usize,
-        state: &mut WalkState<'_>,
-    ) {
-        if !state.enter(depth) {
-            return;
-        }
-        for child in &children[node] {
-            walk_synthetic_tree(children, *child, depth + 1, state);
-        }
-    }
-
-    #[test]
-    fn walk_state_is_complete_only_when_no_bound_skips_a_node() {
-        struct Case {
-            name: &'static str,
-            children: Vec<Vec<usize>>,
-            max_elements: usize,
-            max_depth: usize,
-            expected_visited: usize,
-            expected_complete: bool,
-        }
-
-        let cases = [
-            Case {
-                name: "default bounds admit a 55-node tree",
-                children: star(54),
-                max_elements: DEFAULT_MAX_TOTAL_ELEMENTS,
-                max_depth: DEFAULT_MAX_DEPTH,
-                expected_visited: 55,
-                expected_complete: true,
-            },
-            Case {
-                name: "visiting exactly max_elements is still complete",
-                children: star(54),
-                max_elements: 55,
-                max_depth: DEFAULT_MAX_DEPTH,
-                expected_visited: 55,
-                expected_complete: true,
-            },
-            Case {
-                name: "skipping a node past max_elements is incomplete",
-                children: star(54),
-                max_elements: 54,
-                max_depth: DEFAULT_MAX_DEPTH,
-                expected_visited: 54,
-                expected_complete: false,
-            },
-            Case {
-                name: "a leaf at exactly max_depth is still complete",
-                children: chain(3),
-                max_elements: 10,
-                max_depth: 2,
-                expected_visited: 3,
-                expected_complete: true,
-            },
-            Case {
-                name: "skipping a descendant past max_depth is incomplete",
-                children: chain(3),
-                max_elements: 10,
-                max_depth: 1,
-                expected_visited: 2,
-                expected_complete: false,
-            },
-        ];
-
-        for case in cases {
-            let mut budget = WalkBudget::nodes_only(case.max_elements);
-            let mut state = WalkState::new(&mut budget, case.max_depth);
-            walk_synthetic_tree(&case.children, 0, 0, &mut state);
-            assert_eq!(
-                state.budget.outcome().nodes_visited,
-                case.expected_visited,
-                "{}: visited",
-                case.name
-            );
-            assert_eq!(
-                state.complete, case.expected_complete,
-                "{}: complete",
-                case.name
-            );
-        }
-    }
-
-    #[test]
-    fn walk_state_keeps_the_callers_budget_across_walks() {
-        let mut budget = WalkBudget::nodes_only(2);
-        assert!(budget.admit());
-        let mut state = WalkState::new(&mut budget, DEFAULT_MAX_DEPTH);
-
-        walk_synthetic_tree(&star(1), 0, 0, &mut state);
-
-        assert!(!state.complete);
-        let outcome = state.budget.outcome();
-        assert_eq!((outcome.nodes_visited, outcome.nodes_pending), (2, 1));
-        assert_eq!(outcome.reason(), Some("node_budget"));
-    }
-
-    #[test]
-    fn timed_out_walk_cannot_report_complete() {
-        let mut budget = WalkBudget::new(100, 10);
-        budget.stop_for_timeout();
-        let mut state = WalkState::new(&mut budget, DEFAULT_MAX_DEPTH);
-
-        walk_synthetic_tree(&star(0), 0, 0, &mut state);
-
-        assert!(!state.complete);
-        assert_eq!(state.budget.outcome().reason(), Some("timeout"));
-        assert_eq!(state.budget.outcome().nodes_visited, 0);
-    }
-
-    /// Without a query the generic walk leaves offscreen deferred rows as a
-    /// summary row; the element list then misses them and is not complete.
-    #[test]
-    fn unwalked_offscreen_rows_make_the_walk_incomplete() {
-        for (visible, search_offscreen, complete) in [
-            (vec![true, false], false, false),
-            (vec![false], false, false),
-            (vec![true, true], false, true),
-            (vec![true, false], true, true),
-            (vec![], false, true),
-        ] {
-            let mut budget = WalkBudget::nodes_only(10);
-            let mut state = WalkState::new(&mut budget, DEFAULT_MAX_DEPTH);
-            note_unwalked_offscreen_rows(&mut state, visible.clone(), search_offscreen);
-            assert_eq!(
-                state.complete, complete,
-                "{visible:?} search={search_offscreen}"
-            );
-        }
     }
 }
