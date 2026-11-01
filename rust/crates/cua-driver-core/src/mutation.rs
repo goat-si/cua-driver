@@ -560,6 +560,54 @@ mod tests {
     }
 
     #[test]
+    fn retry_after_uncertain_combinations_never_prove_no_input() {
+        let retry = WriteOutcome::RetryAfterUncertain(Reason::InvalidArgument);
+        let fall = WriteOutcome::FallThrough(Reason::Unsupported);
+        for prologue in [false, true] {
+            for rungs in [
+                vec![retry, fall, WriteOutcome::Delivered],
+                vec![retry, retry, WriteOutcome::Delivered],
+            ] {
+                let chain = WriteChain::run(rungs.clone(), prologue);
+                assert_eq!(chain.outcomes(), rungs.as_slice());
+                assert!(!chain.no_input());
+                assert_eq!(
+                    chain.effect(Postcondition::Confirmed, true),
+                    ActionEffect::Confirmed
+                );
+                assert_eq!(
+                    chain.error_disposition(Postcondition::Unchanged, true),
+                    Some(ErrorDisposition::SUSPECTED_NOOP)
+                );
+                assert_eq!(
+                    chain.effect(Postcondition::Subset, true),
+                    ActionEffect::Unverifiable
+                );
+                assert_eq!(
+                    chain.error_disposition(Postcondition::Subset, true),
+                    Some(ErrorDisposition::DELIVERED)
+                );
+            }
+            for rungs in [
+                vec![retry, fall],
+                vec![retry, retry],
+                vec![retry, fall, fall],
+            ] {
+                let chain = WriteChain::run(rungs, prologue);
+                assert!(!chain.no_input());
+                assert_ne!(
+                    chain.effect(Postcondition::Confirmed, true),
+                    ActionEffect::Refused
+                );
+                assert_eq!(
+                    chain.error_disposition(Postcondition::Confirmed, true),
+                    Some(ErrorDisposition::SUSPECTED_NOOP)
+                );
+            }
+        }
+    }
+
+    #[test]
     fn toggle_direction_is_fixed_before_dispatch() {
         let toggle = expected_after(Action::Toggle, Before::Checked(Some(true)));
         assert_eq!(
