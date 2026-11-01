@@ -2417,7 +2417,12 @@ fn select_popup_option(
             return set_select_via_js(element_index, element_title, value);
         }
         let mut env = unsafe { popup_ownership::NativePopupEnv::new(element) };
-        let outcome = popup_ownership::select(&mut env, value);
+        let prior = if prior_input {
+            PriorInput::MayHaveDelivered
+        } else {
+            PriorInput::None
+        };
+        let outcome = popup_ownership::select_with_prior(&mut env, value, prior);
         let outcome = popup_after_prior(outcome, prior_input);
         Err(popup_ownership::PopupError(outcome).into())
     })
@@ -2435,6 +2440,7 @@ fn popup_after_prior(
             reason,
             preexisting,
             close: None,
+            disposition: cua_driver_contract::ErrorDisposition::SUSPECTED_NOOP,
         },
         other => other,
     }

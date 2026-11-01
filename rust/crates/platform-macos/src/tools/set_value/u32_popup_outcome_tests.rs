@@ -6,6 +6,7 @@ struct Fake {
     opened: bool,
     replace_after_press: bool,
     cancel_code: i32,
+    press_code: i32,
     cancel_panics: bool,
     opener: PressReturn,
     presses: usize,
@@ -21,6 +22,7 @@ impl Fake {
             opened: false,
             replace_after_press: false,
             cancel_code: 0,
+            press_code: crate::ax::bindings::kAXErrorCannotComplete,
             cancel_panics: false,
             opener: PressReturn::Success,
             presses: 0,
@@ -75,7 +77,7 @@ impl PopupEnv for Fake {
         if self.replace_after_press {
             self.menu = Some(3);
         }
-        crate::ax::bindings::kAXErrorCannotComplete
+        self.press_code
     }
     fn cancel(&mut self, _: &u8) -> i32 {
         self.cancels += 1;
@@ -165,4 +167,19 @@ fn popup_refusal_after_prior_typeahead_is_not_clean_refusal() {
     );
     assert_eq!(result.structured_content.unwrap()["effect"], "unverifiable");
     assert_eq!((fake.presses, fake.cancels), (0, 0));
+
+    let mut prior = Fake::owned();
+    prior.menu = Some(1);
+    prior.press_code = crate::ax::bindings::kAXErrorAPIDisabled;
+    let outcome = popup_ownership::select_with_prior(
+        &mut prior,
+        "choice",
+        cua_driver_core::mutation::PriorInput::MayHaveDelivered,
+    );
+    let result = popup_ownership::tool_result(&outcome, "", false);
+    assert_eq!(
+        result.disposition,
+        Some(cua_driver_contract::ErrorDisposition::SUSPECTED_NOOP)
+    );
+    assert_eq!((prior.presses, prior.cancels), (1, 0));
 }
