@@ -215,7 +215,10 @@ mod tests {
 
     /// The next action or intentional activation (`end_tail`) ends a
     /// post-action hold that would otherwise stay armed for its 50 ms.
+    /// Installs the live NSWorkspace activation observer, so it runs alone in
+    /// the macOS slow lane (goat-si/cua-driver#151).
     #[tokio::test]
+    #[ignore = "installs a live NSWorkspace observer; the macOS slow lane runs it alone"]
     async fn the_next_action_ends_a_detached_hold() {
         let _serial = HOLD_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let lease = focus_steal::begin_suppression(Some(-41), -42, "test.hold");
@@ -228,7 +231,10 @@ mod tests {
     /// A background key hand-back runs on its own thread right after the
     /// action returns. It is not a new action: the action's own post-action
     /// hold must stay armed through it.
+    /// Installs the live NSWorkspace activation observer and reads SkyLight
+    /// window owners, so it runs alone in the macOS slow lane (#151).
     #[tokio::test]
+    #[ignore = "installs a live NSWorkspace observer and reads SkyLight; the macOS slow lane runs it alone"]
     async fn a_key_hand_back_keeps_the_actions_hold() {
         let _serial = HOLD_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         crate::window_change_detector::end_tail();
