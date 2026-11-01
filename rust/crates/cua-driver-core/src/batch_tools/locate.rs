@@ -12,6 +12,11 @@
 //! `since:"latest"` diff.
 //!
 //! `incomplete_observation` means a read cannot prove absence or uniqueness.
+//! Verified closed-menu exclusions guard menu content, and verified collapsed
+//! list exclusions guard list rows and cells. Both guard role-less and textual
+//! content selectors. Unverified content makes the entire read incomplete;
+//! unknown exclusion kinds guard every selector. Owner indices cannot scope
+//! these checks because selectors do not encode ancestry.
 //! Raw markdown fallback lines come from producer-sanitized markdown; structured
 //! candidate descriptions independently redact secure names and values.
 
@@ -442,7 +447,70 @@ pub(crate) struct Read {
     pub elements: Vec<Value>,
     pub markdown: String,
     completeness: Completeness,
-    closed_menus_excluded: bool,
+    scope_exclusions: Vec<ScopeExclusion>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ScopeExclusion {
+    ClosedMenus,
+    CollapsedLists,
+    Unknown,
+}
+
+fn scope_exclusions(state: &Value) -> Vec<ScopeExclusion> {
+    match state.get("observation_scope_exclusions") {
+        None | Some(Value::Null) => Vec::new(),
+        Some(Value::Array(items)) => items
+            .iter()
+            .map(|item| match item.get("kind").and_then(Value::as_str) {
+                Some("closed_menus_not_expanded") => ScopeExclusion::ClosedMenus,
+                Some("collapsed_lists_not_expanded") => ScopeExclusion::CollapsedLists,
+                _ => ScopeExclusion::Unknown,
+            })
+            .collect(),
+        Some(_) => vec![ScopeExclusion::Unknown],
+    }
+}
+
+/// Classify content for exclusion guards without changing role matching.
+fn is_content_role(role: &str) -> bool {
+    use cua_driver_contract::Role;
+    // AT-SPI uses `text` for editable fields, while other providers can use
+    // the same token for static content. Guard the token conservatively.
+    if normalized_role(role) == "text" {
+        return true;
+    }
+    match Role::from_token(role) {
+        Role::StaticText | Role::Heading | Role::Paragraph | Role::Image | Role::Link => true,
+        Role::Unknown => matches!(
+            role_family(role).as_str(),
+            "statictext" | "heading" | "paragraph" | "image" | "link"
+        ),
+        _ => false,
+    }
+}
+
+fn exclusion_guards(exclusion: ScopeExclusion, spec: &ElementSpec) -> bool {
+    use cua_driver_contract::Role;
+    if exclusion == ScopeExclusion::Unknown || spec.text.is_some() {
+        return true;
+    }
+    let Some(role) = spec.role.as_deref() else {
+        return true;
+    };
+    if is_content_role(role) {
+        return true;
+    }
+    match Role::from_token(role) {
+        Role::Menu | Role::MenuItem => exclusion == ScopeExclusion::ClosedMenus,
+        Role::Option | Role::Row | Role::Cell => exclusion == ScopeExclusion::CollapsedLists,
+        Role::Unknown => match role_family(role).as_str() {
+            "menu" | "menuitem" => exclusion == ScopeExclusion::ClosedMenus,
+            "row" | "cell" | "option" => exclusion == ScopeExclusion::CollapsedLists,
+            _ => false,
+        },
+        _ => false,
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -458,17 +526,17 @@ impl Read {
             Completeness::Incomplete(reasons) => reasons.clone(),
             _ => Vec::new(),
         };
-        let excluded = self.closed_menus_excluded
-            && spec.role.as_deref().is_none_or(|role| {
-                use cua_driver_contract::Role;
-                match Role::from_token(role) {
-                    Role::Menu | Role::MenuItem => true,
-                    Role::Unknown => matches!(role_family(role).as_str(), "menu" | "menuitem"),
-                    _ => false,
+        for exclusion in &self.scope_exclusions {
+            if exclusion_guards(*exclusion, spec) {
+                let detail = match exclusion {
+                    ScopeExclusion::ClosedMenus => "closed_menus_not_expanded",
+                    ScopeExclusion::CollapsedLists => "collapsed_lists_not_expanded",
+                    ScopeExclusion::Unknown => "unknown_scope_exclusion",
+                };
+                if !details.iter().any(|item| item == detail) {
+                    details.push(detail.to_owned());
                 }
-            });
-        if excluded {
-            details.push("closed_menus_not_expanded".to_owned());
+            }
         }
         if details.is_empty() {
             None
@@ -559,16 +627,20 @@ fn completeness(state: &Value) -> Completeness {
 }
 
 pub(crate) fn malformed_completeness_details(state: &Value) -> Option<Vec<String>> {
-    match completeness(state) {
+    let mut details = match completeness(state) {
         Completeness::Incomplete(details)
             if details
                 .iter()
                 .any(|detail| detail == "malformed_completeness") =>
         {
-            Some(details)
+            details
         }
-        _ => None,
+        _ => Vec::new(),
+    };
+    if scope_exclusions(state).contains(&ScopeExclusion::Unknown) {
+        details.push("unknown_scope_exclusion".to_owned());
     }
+    (!details.is_empty()).then_some(details)
 }
 
 /// An element found by description.
@@ -889,7 +961,9 @@ impl<'a> Locator<'a> {
                     .filter(|detail| {
                         if matches!(
                             *detail,
-                            "malformed_completeness" | "inconsistent_completeness"
+                            "malformed_completeness"
+                                | "inconsistent_completeness"
+                                | "unknown_scope_exclusion"
                         ) {
                             return true;
                         }
@@ -903,7 +977,7 @@ impl<'a> Locator<'a> {
                     })
                     .map(str::to_owned)
                     .collect::<Vec<_>>();
-                if !safe.iter().any(|detail| detail == "malformed_completeness") {
+                if safe.is_empty() {
                     safe.push("malformed_completeness".to_owned());
                 }
                 return Err(CallError::MalformedCompleteness(safe));
@@ -1086,15 +1160,7 @@ impl<'a> Locator<'a> {
             elements,
             markdown,
             completeness: completeness(&state),
-            closed_menus_excluded: state
-                .get("observation_scope_exclusions")
-                .and_then(Value::as_array)
-                .is_some_and(|items| {
-                    items.iter().any(|item| {
-                        item.get("kind").and_then(Value::as_str)
-                            == Some("closed_menus_not_expanded")
-                    })
-                }),
+            scope_exclusions: scope_exclusions(&state),
         })
     }
 
@@ -2247,18 +2313,22 @@ fn first_text(result: &ToolResult) -> String {
     clip(text.lines().next().unwrap_or(text), 300)
 }
 
-/// Role names models use, folded to one family per control kind, across the
-/// macOS (AX), Windows (UIA) and Linux (AT-SPI) vocabularies.
-pub(crate) fn role_family(role: &str) -> String {
+fn normalized_role(role: &str) -> String {
     let normalized: String = role
         .chars()
         .filter(char::is_ascii_alphanumeric)
         .flat_map(|c| c.to_lowercase())
         .collect();
-    let normalized = normalized
+    normalized
         .strip_prefix("ax")
         .unwrap_or(&normalized)
-        .to_owned();
+        .to_owned()
+}
+
+/// Role names models use, folded to one family per control kind, across the
+/// macOS (AX), Windows (UIA) and Linux (AT-SPI) vocabularies.
+pub(crate) fn role_family(role: &str) -> String {
+    let normalized = normalized_role(role);
     let family = match normalized.as_str() {
         "button" | "pushbutton" | "togglebutton" => "button",
         "textfield" | "textarea" | "textbox" | "edit" | "entry" | "input" | "searchfield"
@@ -2273,7 +2343,7 @@ pub(crate) fn role_family(role: &str) -> String {
         }
         "pagetab" | "tabitem" | "tab" => "tab",
         "image" | "img" | "icon" => "image",
-        "row" | "listitem" | "tablerow" | "outlinerow" => "row",
+        "row" | "listitem" | "dataitem" | "tablerow" | "outlinerow" => "row",
         "cell" | "tablecell" | "gridcell" => "cell",
         other => return other.to_owned(),
     };
@@ -2631,7 +2701,37 @@ mod tests {
             elements,
             markdown: markdown.to_owned(),
             completeness: Completeness::Unasserted,
-            closed_menus_excluded: false,
+            scope_exclusions: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn exclusion_guards_text_queries_and_malformed_kinds() {
+        let typed_text = ElementSpec {
+            role: Some("button".into()),
+            text: Some("Save".into()),
+            ..Default::default()
+        };
+        for kind in [ScopeExclusion::ClosedMenus, ScopeExclusion::CollapsedLists] {
+            assert!(exclusion_guards(kind, &typed_text));
+        }
+        for malformed in [
+            json!([{}]),
+            json!([{"kind":null}]),
+            json!([{"kind":"future_kind"}]),
+            json!({}),
+        ] {
+            let state = json!({"observation_scope_exclusions":malformed});
+            let mut observation = read(Vec::new(), "");
+            observation.scope_exclusions = scope_exclusions(&state);
+            let button = ElementSpec {
+                role: Some("button".into()),
+                ..Default::default()
+            };
+            assert_eq!(
+                observation.incomplete_for(&button),
+                Some(vec!["unknown_scope_exclusion".into()])
+            );
         }
     }
 
@@ -2742,6 +2842,59 @@ mod tests {
         assert_eq!(pick(&read, &field).unwrap().element["element_index"], 3);
         assert_eq!(role_family("Push Button"), "button");
         assert_eq!(role_family("Hyperlink"), "link");
+    }
+
+    #[test]
+    fn atspi_text_matches_textfield_selector() {
+        let read = read(vec![element(1, "text", "Reason")], "");
+        let spec = ElementSpec {
+            role: Some("textfield".into()),
+            name: Some("Reason".into()),
+            ..Default::default()
+        };
+        assert_eq!(pick(&read, &spec).unwrap().element["element_index"], 1);
+    }
+
+    #[test]
+    fn atspi_text_is_preferred_for_roleless_text_actions() {
+        let read = read(
+            vec![element(1, "label", "Reason"), element(2, "text", "Reason")],
+            "",
+        );
+        for action in ["set_value", "type_text"] {
+            let spec = ElementSpec {
+                name: Some("Reason".into()),
+                action: Some(action),
+                ..Default::default()
+            };
+            assert_eq!(
+                pick(&read, &spec).unwrap().element["element_index"],
+                2,
+                "{action}"
+            );
+        }
+    }
+
+    #[test]
+    fn text_role_is_guarded_without_guarding_other_textfield_family_roles() {
+        for kind in [ScopeExclusion::ClosedMenus, ScopeExclusion::CollapsedLists] {
+            let mut read = read(Vec::new(), "");
+            read.scope_exclusions.push(kind);
+            for role in ["text", " Text ", "AXText", "t-e-x-t"] {
+                let spec = ElementSpec {
+                    role: Some(role.into()),
+                    ..Default::default()
+                };
+                assert!(read.incomplete_for(&spec).is_some(), "{kind:?} {role}");
+            }
+            for role in ["textfield", "edit", "entry"] {
+                let spec = ElementSpec {
+                    role: Some(role.into()),
+                    ..Default::default()
+                };
+                assert!(read.incomplete_for(&spec).is_none(), "{kind:?} {role}");
+            }
+        }
     }
 
     #[test]
