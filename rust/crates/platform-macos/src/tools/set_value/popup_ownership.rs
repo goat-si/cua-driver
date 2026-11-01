@@ -369,6 +369,14 @@ impl NativePopupEnv {
     }
 }
 
+impl Drop for NativePopupEnv {
+    fn drop(&mut self) {
+        if let Some(opener) = self.opener.take() {
+            let _ = opener.join();
+        }
+    }
+}
+
 fn children(element: &Retained) -> Option<Vec<Retained>> {
     use crate::ax::bindings::{
         kAXErrorNoValue, kAXErrorSuccess, AXUIElementCopyAttributeValue, AXUIElementGetTypeID,
