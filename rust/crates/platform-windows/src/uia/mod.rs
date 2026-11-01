@@ -1683,6 +1683,8 @@ fn emit_cached_node(
     let raw_has_content = name.as_deref().is_some_and(|s| !s.trim().is_empty())
         || value.as_deref().is_some_and(|s| !s.trim().is_empty());
     let enabled = read_cached_bool(element, UIA_IsEnabledPropertyId, ctx);
+    // Missing UIA state must remain unknown on the structured observation
+    // surface. Action discovery keeps its historical best-effort assumption.
     let is_enabled = enabled.unwrap_or(true);
     let (has_value_pattern, actions) = collect_pattern_evidence(
         is_enabled,
@@ -1885,6 +1887,9 @@ fn read_cached_bool(
         )
     }
 }
+/// Read bounding rect as (center_x, center_y, Some((l,t,r,b))). Returns
+/// rect=None when the element has no meaningful BoundingRectangle (offscreen
+/// containers, structure-only elements); a failed read is also logged.
 fn read_cached_bounding_rect_full(
     element: &IUIAutomationElement,
     ctx: &UiaReadCtx<'_>,
@@ -1933,6 +1938,10 @@ fn detect_cached_actions(
             (UIA_SelectionItemPatternId, "select"),
             (UIA_ExpandCollapsePatternId, "expand"),
             (UIA_ValuePatternId, "set_value"),
+            // RangeValuePattern is exposed by Sliders, ProgressBars, and other
+            // numeric-range controls. Without this entry the slider parent
+            // gets actions=[] → marked non-actionable → no [N] index in the
+            // flat tree, making the slider unaddressable by AutomationId.
             (UIA_RangeValuePatternId, "set_value"),
             (UIA_TextPatternId, "text"),
             (UIA_ScrollPatternId, "scroll"),
@@ -1943,6 +1952,10 @@ fn detect_cached_actions(
         }
     }
     if actions.is_empty() && control_type == "MenuItem" {
+        // Some WPF MenuItem peers show up in ControlView with a usable name
+        // and bounding rectangle, but without cached Invoke/ExpandCollapse
+        // patterns. Index them anyway so click can retry live patterns and then
+        // fall back to the coordinate injector if UIA still reports no pattern.
         actions.push("invoke".into());
     }
     actions
@@ -1983,6 +1996,7 @@ fn read_cached_expanded(element: &IUIAutomationElement, ctx: &UiaReadCtx<'_>) ->
             {
                 Some(true)
             }
+            // LeafNode: nothing to expand, so no state.
             Ok(state)
                 if state == windows::Win32::UI::Accessibility::ExpandCollapseState_LeafNode =>
             {

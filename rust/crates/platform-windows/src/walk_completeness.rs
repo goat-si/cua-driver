@@ -129,6 +129,9 @@ impl<'a> WalkState<'a> {
             not_supported: None,
         }
     }
+    /// Admit one node to the walk. Reaching a bound exactly is not itself
+    /// truncation; completeness changes only when a node beyond that bound is
+    /// actually encountered and skipped.
     pub(crate) fn enter(&mut self, depth: usize) -> bool {
         if depth > self.max_depth {
             self.mark(Omission::DepthLimit);
@@ -150,6 +153,8 @@ impl<'a> WalkState<'a> {
             self.budget.record_skip(omission.reason());
         }
     }
+    /// End the walk: a logged cached-read failure makes it incomplete, and only
+    /// a walk that skipped nothing asserts exhaustiveness to the budget.
     pub(crate) fn finish(mut self) -> bool {
         if self.reads.failed() {
             self.mark(Omission::AttributeReadFailed);
@@ -160,6 +165,9 @@ impl<'a> WalkState<'a> {
         self.complete
     }
 }
+/// Offscreen deferred rows are walked only when a query searches them;
+/// otherwise they stay a summary row, the element list misses them, and the
+/// walk is not complete.
 pub(crate) fn note_unwalked_offscreen_rows(
     state: &mut WalkState<'_>,
     visible: impl IntoIterator<Item = bool>,
