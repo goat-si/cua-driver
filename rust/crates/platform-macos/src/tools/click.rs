@@ -3172,6 +3172,72 @@ fn post_press_should_select(err: crate::ax::bindings::AXError) -> bool {
     )
 }
 
+fn direct_perform_evidence(
+    reason: cua_driver_core::mutation::Reason,
+    observe: impl FnOnce() -> Option<ClickEvidence>,
+) -> (cua_driver_core::mutation::WriteOutcome, Option<ClickEvidence>) {
+    let evidence = observe().filter(|evidence| *evidence == ClickEvidence::ToggleChanged);
+    (reason.classify_perform_with_observed_effect(evidence.is_some()), evidence)
+}
+
+fn ancestor_perform_evidence(
+    outcome: cua_driver_core::mutation::WriteOutcome,
+    observe: impl FnOnce() -> Option<ClickEvidence>,
+) -> (cua_driver_core::mutation::WriteOutcome, Option<ClickEvidence>) {
+    let evidence = if outcome == cua_driver_core::mutation::WriteOutcome::Delivered {
+        observe()
+    } else {
+        None
+    };
+    (outcome, evidence)
+}
+
+#[cfg(test)]
+mod u32_fresh_perform_tests {
+    use super::{ancestor_action_kind, ancestor_perform_evidence, direct_perform_evidence, ClickEvidence};
+    use cua_driver_core::mutation::{Reason, WriteOutcome};
+
+    macro_rules! fresh_case {
+        ($name:ident, $path:ident, $reason:ident, $evidence:ident) => {
+            #[test]
+            fn $name() {
+                let reason = Reason::$reason;
+                let evidence = ClickEvidence::$evidence;
+                let (outcome, observed) = $path(reason, evidence);
+                assert_eq!(outcome, WriteOutcome::Delivered);
+                assert_eq!(observed, Some(evidence));
+            }
+        };
+    }
+    fn direct(reason: Reason, evidence: ClickEvidence) -> (WriteOutcome, Option<ClickEvidence>) {
+        direct_perform_evidence(reason, || Some(evidence))
+    }
+    fn ancestor(reason: Reason, evidence: ClickEvidence) -> (WriteOutcome, Option<ClickEvidence>) {
+        let chain = vec![(Some("AXCell".into()), vec!["AXOpen".into()], false), (Some("AXOutline".into()), vec![], true)];
+        assert_eq!(ancestor_action_kind(&chain, true), Some((0, "AXOpen")));
+        ancestor_perform_evidence(WriteOutcome::StopUncertain(reason), || Some(evidence))
+    }
+    fresh_case!(direct_unsupported_selected, direct, AttributeUnsupported, Selected);
+    fresh_case!(direct_unsupported_title, direct, AttributeUnsupported, TitleNamesTarget);
+    fresh_case!(direct_no_value_selected, direct, NoValue, Selected);
+    fresh_case!(direct_no_value_title, direct, NoValue, TitleNamesTarget);
+    fresh_case!(ancestor_unsupported_selected, ancestor, AttributeUnsupported, Selected);
+    fresh_case!(ancestor_unsupported_title, ancestor, AttributeUnsupported, TitleNamesTarget);
+    fresh_case!(ancestor_no_value_selected, ancestor, NoValue, Selected);
+    fresh_case!(ancestor_no_value_title, ancestor, NoValue, TitleNamesTarget);
+
+    #[test]
+    fn sheet_close_and_missing_effect_remain_uncertain() {
+        for reason in [Reason::AttributeUnsupported, Reason::NoValue] {
+            for evidence in [None, Some(ClickEvidence::SheetClosed)] {
+                let expected = (WriteOutcome::StopUncertain(reason), None);
+                assert_eq!(direct_perform_evidence(reason, || evidence), expected);
+                assert_eq!(ancestor_perform_evidence(WriteOutcome::StopUncertain(reason), || evidence), expected);
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod u32_outcome_tests {
     use super::{ax_click_structured, post_press_should_select, selection_attempt_outcome};
@@ -4128,10 +4194,8 @@ fn perform_ax_click(
         {
             // A press the app reported as failed never claims the sheet's
             // closing: only a delivered AXPress may.
-            let evidence = probe
-                .observe()
-                .filter(|evidence| *evidence == ClickEvidence::ToggleChanged);
-            if reason.classify_perform_with_observed_effect(evidence.is_some())
+            let (classified, evidence) = direct_perform_evidence(reason, || probe.observe());
+            if classified
                 == cua_driver_core::mutation::WriteOutcome::Delivered
             {
                 let evidence = evidence.expect("fresh tied effect");
@@ -4602,11 +4666,7 @@ unsafe fn ax_press_with_ancestors(
         cua_driver_core::mutation::PriorInput::None,
     )
     .expect("one write");
-    let evidence = if outcome == cua_driver_core::mutation::WriteOutcome::Delivered {
-        probe.observe()
-    } else {
-        None
-    };
+    let (outcome, evidence) = ancestor_perform_evidence(outcome, || probe.observe());
     for (_, _, el, _) in chain {
         CFRelease(el as _);
     }
