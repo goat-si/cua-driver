@@ -190,8 +190,9 @@ fn try_type_focused_document_append_unbounded(
         let expected_value = text.to_owned();
         let write_result = (|| -> Result<(), &'static str> {
             let value = BSTR::from(expected_value.as_str());
-            unsafe { value_pattern.SetValue(&value) }
-                .map_err(|_| "ValuePattern.SetValue failed after dispatch")?;
+            if unsafe { super::sent_call::set_value(&value_pattern, &value) } != 0 {
+                return Err("ValuePattern.SetValue failed after dispatch");
+            }
             let actual_value = unsafe { value_pattern.CurrentValue() }
                 .map_err(|_| "ValuePattern read-back failed after dispatch")?;
             if !normalized_text_matches(&expected_value, &actual_value.to_string()) {
@@ -202,15 +203,18 @@ fn try_type_focused_document_append_unbounded(
                 .map_err(|_| "TextPattern DocumentRange failed after dispatch")?;
             let caret_range = unsafe { document_range.Clone() }
                 .map_err(|_| "TextPattern range clone failed after dispatch")?;
-            unsafe {
-                caret_range.MoveEndpointByRange(
+            let move_hr = unsafe {
+                super::sent_call::move_endpoint_by_range(
+                    &caret_range,
                     TextPatternRangeEndpoint_Start,
                     &document_range,
                     TextPatternRangeEndpoint_End,
                 )
-            }
-            .map_err(|_| "TextPattern caret collapse failed after dispatch")?;
-            unsafe { caret_range.Select() }
+            };
+            crate::uia_mutation::after_sent_call(move_hr, || ())
+                .map_err(|_| "TextPattern caret collapse failed after dispatch")?;
+            let select_hr = unsafe { super::sent_call::select_text_range(&caret_range) };
+            crate::uia_mutation::after_sent_call(select_hr, || ())
                 .map_err(|_| "TextPattern caret placement failed after dispatch")?;
 
             let fresh_document_range = unsafe { text_pattern.DocumentRange() }
@@ -372,6 +376,9 @@ fn focused_document_worker_error(
             FocusedDocumentTypeOutcome::Unknown("focused UIA call timed out")
         }
         UiaDeadlineError::Unavailable => {
+            FocusedDocumentTypeOutcome::Unknown("focused UIA worker could not be started")
+        }
+        UiaDeadlineError::WorkerDisconnected => {
             FocusedDocumentTypeOutcome::Unknown("focused UIA worker ended without a result")
         }
     }
@@ -433,6 +440,7 @@ mod tests {
             UiaDeadlineError::Busy,
             UiaDeadlineError::Timeout,
             UiaDeadlineError::Unavailable,
+            UiaDeadlineError::WorkerDisconnected,
         ] {
             assert_eq!(
                 focused_document_worker_error(error, 0, false),
@@ -443,7 +451,11 @@ mod tests {
 
     #[test]
     fn worker_errors_after_write_never_enable_a_second_input_route() {
-        for error in [UiaDeadlineError::Timeout, UiaDeadlineError::Unavailable] {
+        for error in [
+            UiaDeadlineError::Timeout,
+            UiaDeadlineError::Unavailable,
+            UiaDeadlineError::WorkerDisconnected,
+        ] {
             assert!(matches!(
                 focused_document_worker_error(error, 1, false),
                 FocusedDocumentTypeOutcome::Unknown(_)

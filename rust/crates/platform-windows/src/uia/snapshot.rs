@@ -42,14 +42,22 @@ impl RetainedElement {
         self.kind == SnapshotKind::Uia
     }
 
-    pub fn focus_element(&self) -> anyhow::Result<()> {
-        if !self.is_uia() {
-            anyhow::bail!("element is an MSAA element, not a UIA element");
+    pub fn focus_hresult(&self) -> Option<i32> {
+        if !self.is_uia() || self.ptr == 0 {
+            return None;
         }
-        let element = unsafe { IUIAutomationElement::from_raw(self.ptr as *mut _) };
-        let result = unsafe { element.SetFocus() };
-        std::mem::forget(element);
-        result.map_err(|e| anyhow::anyhow!("UIA SetFocus failed: {e}"))
+        let element = std::mem::ManuallyDrop::new(unsafe {
+            IUIAutomationElement::from_raw(self.ptr as *mut _)
+        });
+        Some(unsafe { super::sent_call::set_focus(&element) })
+    }
+
+    pub fn focus_element(&self) -> anyhow::Result<()> {
+        let Some(hr) = self.focus_hresult() else {
+            anyhow::bail!("element is an MSAA element, not a UIA element");
+        };
+        crate::uia_mutation::after_sent_call(hr, || ())
+            .map_err(|hr| anyhow::anyhow!("UIA SetFocus returned HRESULT 0x{:08X}", hr as u32))
     }
 
     pub fn element_has_keyboard_focus(&self) -> Option<bool> {

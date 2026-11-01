@@ -63,6 +63,7 @@ pub(crate) enum UiaDeadlineError {
     Timeout,
     Busy,
     Unavailable,
+    WorkerDisconnected,
 }
 
 /// Process-wide gate for blocking UIA calls.
@@ -129,7 +130,7 @@ where
         }
         Err(mpsc::RecvTimeoutError::Disconnected) => {
             tracing::warn!(target: "uia_windows_enum", "UIA {stage} thread exited without a result");
-            Err(UiaDeadlineError::Unavailable)
+            Err(UiaDeadlineError::WorkerDisconnected)
         }
     }
 }
@@ -228,9 +229,12 @@ pub fn enumerate_top_level_windows() -> Vec<WindowInfo> {
         enumerate_top_level_windows_unbounded,
     ) {
         Ok(windows) => windows,
-        Err(UiaDeadlineError::Timeout | UiaDeadlineError::Busy | UiaDeadlineError::Unavailable) => {
-            Vec::new()
-        }
+        Err(
+            UiaDeadlineError::Timeout
+            | UiaDeadlineError::Busy
+            | UiaDeadlineError::Unavailable
+            | UiaDeadlineError::WorkerDisconnected,
+        ) => Vec::new(),
     }
 }
 
@@ -299,7 +303,7 @@ pub(crate) fn probe_desktop_availability() -> Result<(), String> {
             "UI Automation is busy with an earlier timed-out provider call; window tools are temporarily using Win32-only enumeration."
                 .to_owned(),
         ),
-        Err(UiaDeadlineError::Unavailable) => {
+        Err(UiaDeadlineError::Unavailable | UiaDeadlineError::WorkerDisconnected) => {
             Err("UI Automation health worker is unavailable".to_owned())
         }
     }
@@ -416,6 +420,7 @@ pub(crate) enum PointInvokeOutcome {
     Busy,
     Timeout,
     Unavailable,
+    SentFailure,
     NotResponding,
     WindowGone,
 }
@@ -427,6 +432,7 @@ impl PointInvokeOutcome {
             Err(UiaDeadlineError::Busy) => Self::Busy,
             Err(UiaDeadlineError::Timeout) => Self::Timeout,
             Err(UiaDeadlineError::Unavailable) => Self::Unavailable,
+            Err(UiaDeadlineError::WorkerDisconnected) => Self::SentFailure,
         }
     }
 }
@@ -595,7 +601,7 @@ fn try_invoke_in_window_at_point_unbounded(
                         if cancelled.load(Ordering::Acquire) {
                             return Timeout;
                         }
-                        return if ec.Expand().is_ok() { Invoked } else { Unavailable };
+                        return if super::sent_call::expand(&ec) == 0 { Invoked } else { PointInvokeOutcome::SentFailure };
                     }
                 }
                 return Unavailable;
@@ -611,12 +617,10 @@ fn try_invoke_in_window_at_point_unbounded(
             if cancelled.load(Ordering::Acquire) {
                 return Timeout;
             }
-            match inv.Invoke() {
-                Ok(()) => Invoked,
-                Err(e) => {
-                    tracing::debug!(target: "click", "UIA Invoke (windowed) at ({sx},{sy}) failed: {e}");
-                    Unavailable
-                }
+            if super::sent_call::invoke(&inv) == 0 {
+                Invoked
+            } else {
+                PointInvokeOutcome::SentFailure
             }
         })
     }
@@ -631,7 +635,7 @@ fn try_invoke_in_window_at_point_unbounded(
 /// AcceleratorKey match before invoking anything.
 #[derive(Debug)]
 pub(crate) struct AcceleratorStop {
-    pub verdict: crate::uia_mutation::WriteVerdict,
+    pub verdict: crate::uia_mutation::AccelStop,
     pub hresult: i32,
 }
 impl std::fmt::Display for AcceleratorStop {
@@ -656,17 +660,32 @@ pub fn try_invoke_accelerator_in_window(hwnd: isize, combo: &str) -> anyhow::Res
     .unwrap_or_else(|error| match error {
         // Another UIA operation held the single-flight gate, so this scan
         // never started and nothing was sent.
-        UiaDeadlineError::Busy => Err(anyhow::anyhow!(
-            "another UI Automation operation is still running; the shortcut was not sent. Retry shortly."
-        )),
-        UiaDeadlineError::Timeout | UiaDeadlineError::Unavailable => {
-            Err(anyhow::Error::new(AcceleratorStop {
-                verdict: crate::uia_mutation::WriteVerdict::Uncertain(
-                    crate::uia_mutation::UncertainKind::Timeout,
-                ),
-                hresult: 0x8013_1505_u32 as i32,
-            }))
-        }
+        UiaDeadlineError::Busy => Err(anyhow::Error::new(AcceleratorStop {
+            verdict: crate::uia_mutation::AccelStop::NotSent(
+                "another UI Automation operation is still running",
+            ),
+            hresult: 0,
+        })),
+        // The worker thread could not be spawned, so nothing ran.
+        UiaDeadlineError::Unavailable => Err(anyhow::Error::new(AcceleratorStop {
+            verdict: crate::uia_mutation::AccelStop::NotSent(
+                "the UI Automation worker could not be started",
+            ),
+            hresult: 0,
+        })),
+        UiaDeadlineError::Timeout => Err(anyhow::Error::new(AcceleratorStop {
+            verdict: crate::uia_mutation::AccelStop::Uncertain(
+                crate::uia_mutation::UncertainKind::Timeout,
+            ),
+            hresult: 0x8013_1505_u32 as i32,
+        })),
+        // The worker ended without reporting; it may have sent the invoke.
+        UiaDeadlineError::WorkerDisconnected => Err(anyhow::Error::new(AcceleratorStop {
+            verdict: crate::uia_mutation::AccelStop::Uncertain(
+                crate::uia_mutation::UncertainKind::Unclassified,
+            ),
+            hresult: 0x8000_FFFF_u32 as i32,
+        })),
     })
 }
 
@@ -872,10 +891,11 @@ unsafe fn try_invoke_via_patterns(
     cancelled: &AtomicBool,
 ) -> crate::uia_mutation::AccelOutcome {
     use crate::uia_mutation::{
-        classify_write_hresult, pattern_absent, AccelOutcome, RefusalKind, WriteVerdict,
+        classify_acquisition, classify_sent_call, pattern_absent, AccelOutcome, AccelStop,
+        AcquireVerdict, SentVerdict,
     };
     macro_rules! attempt {
-        ($ty:ty, $id:expr, $method:ident) => {{
+        ($ty:ty, $id:expr, $call:path) => {{
             let pattern = elem
                 .GetCurrentPattern($id)
                 .and_then(|value| value.cast::<$ty>());
@@ -883,7 +903,10 @@ unsafe fn try_invoke_via_patterns(
                 Err(error) if pattern_absent(error.code().0) => {}
                 Err(error) => {
                     return AccelOutcome::Stop(
-                        WriteVerdict::Refused(RefusalKind::PatternUnreadable),
+                        AccelStop::Refused(match classify_acquisition(error.code().0) {
+                            AcquireVerdict::NotDelivered(kind) => kind,
+                            AcquireVerdict::Absent => unreachable!(),
+                        }),
                         error.code().0,
                     )
                 }
@@ -895,25 +918,32 @@ unsafe fn try_invoke_via_patterns(
                         if cancelled.load(Ordering::Acquire) {
                             return None;
                         }
-                        Some(pattern.$method())
+                        Some($call(&pattern))
                     });
                     match result {
                         None => return AccelOutcome::Absent,
-                        Some(Ok(())) => return AccelOutcome::Delivered,
-                        Some(Err(error)) => {
-                            let hr = error.code().0;
-                            match classify_write_hresult(hr) {
-                                WriteVerdict::AffordanceAbsent => {}
-                                verdict => return AccelOutcome::Stop(verdict, hr),
-                            }
+                        Some(0) => return AccelOutcome::Delivered,
+                        Some(hr) => {
+                            let SentVerdict::Uncertain(kind) = classify_sent_call(hr) else {
+                                unreachable!()
+                            };
+                            return AccelOutcome::Stop(AccelStop::Uncertain(kind), hr);
                         }
                     }
                 }
             }
         }};
     }
-    attempt!(IUIAutomationInvokePattern, UIA_InvokePatternId, Invoke);
-    attempt!(IUIAutomationTogglePattern, UIA_TogglePatternId, Toggle);
+    attempt!(
+        IUIAutomationInvokePattern,
+        UIA_InvokePatternId,
+        super::sent_call::invoke
+    );
+    attempt!(
+        IUIAutomationTogglePattern,
+        UIA_TogglePatternId,
+        super::sent_call::toggle
+    );
     AccelOutcome::Absent
 }
 
@@ -1139,6 +1169,10 @@ mod tests {
         for (error, expected) in [
             (UiaDeadlineError::Busy, PointInvokeOutcome::Busy),
             (UiaDeadlineError::Timeout, PointInvokeOutcome::Timeout),
+            (
+                UiaDeadlineError::WorkerDisconnected,
+                PointInvokeOutcome::SentFailure,
+            ),
             (
                 UiaDeadlineError::Unavailable,
                 PointInvokeOutcome::Unavailable,

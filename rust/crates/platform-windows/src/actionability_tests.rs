@@ -54,7 +54,7 @@ fn evidence_conversion_and_visibility() {
     assert_eq!(evidence(&LiveRead::Value(true)), Evidence::Known(true));
     assert_eq!(evidence::<bool>(&LiveRead::NotSupported), Evidence::Absent);
     assert_eq!(
-        evidence::<bool>(&LiveRead::Failed("COM".into())),
+        evidence::<bool>(&LiveRead::Failed("COM".into(), None)),
         Evidence::Unknown("COM".into())
     );
     assert_eq!(
@@ -76,7 +76,7 @@ fn evidence_conversion_and_visibility() {
         assert_transient(&f);
     }
     let mut f = raw();
-    f.window_cloaked = LiveRead::Failed("dwm".into());
+    f.window_cloaked = LiveRead::Failed("dwm".into(), None);
     assert_eq!(
         element_facts(&f, ValueWrite::Value).visible,
         Evidence::Unknown("dwm".into())
@@ -94,7 +94,7 @@ fn editable_enabled_geometry_and_roles() {
     assert_eq!(evaluated(&f, ValueWrite::Value).verdict, Verdict::Pass);
     f.is_enabled = LiveRead::Value(false);
     assert_transient(&f);
-    f.is_enabled = LiveRead::Failed("enabled".into());
+    f.is_enabled = LiveRead::Failed("enabled".into(), None);
     assert_transient(&f);
     f.is_enabled = LiveRead::Value(true);
     f.value_read_only = LiveRead::Value(true);
@@ -105,7 +105,7 @@ fn editable_enabled_geometry_and_roles() {
             ..
         }
     ));
-    f.value_read_only = LiveRead::Failed("readonly".into());
+    f.value_read_only = LiveRead::Failed("readonly".into(), None);
     assert_transient(&f);
     f.value_read_only = LiveRead::NotSupported;
     f.patterns = LiveRead::Value(vec![]);
@@ -145,7 +145,7 @@ fn editable_enabled_geometry_and_roles() {
         evaluated(&f, ValueWrite::RangeValue).verdict,
         Verdict::Transient { unknown: true, .. }
     ));
-    f.patterns = LiveRead::Failed("scan".into());
+    f.patterns = LiveRead::Failed("scan".into(), None);
     assert_eq!(
         element_facts(&f, ValueWrite::RangeValue).affordances,
         Evidence::Unknown("scan".into())
@@ -187,6 +187,18 @@ async fn disabled_facts_never_write() {
         refusal.disposition,
         Some(cua_driver_contract::ErrorDisposition::NOT_DELIVERED)
     );
+    let wire = cua_driver_core::mcp_result::conforming_tool_result(
+        "set_value",
+        serde_json::to_value(refusal).unwrap(),
+    );
+    assert_eq!(wire["structuredContent"]["code"], "element_not_actionable");
+    assert_eq!(
+        serde_json::from_value::<cua_driver_contract::ErrorDisposition>(
+            wire["structuredContent"]["disposition"].clone()
+        )
+        .unwrap(),
+        cua_driver_contract::ErrorDisposition::NOT_DELIVERED
+    );
 }
 #[tokio::test]
 async fn passing_and_unknown_then_passing_write_once() {
@@ -201,7 +213,7 @@ async fn passing_and_unknown_then_passing_write_once() {
                 count += 1;
                 let mut f = raw();
                 if unknown_first && count == 1 {
-                    f.is_enabled = LiveRead::Failed("busy".into());
+                    f.is_enabled = LiveRead::Failed("busy".into(), None);
                 }
                 std::future::ready(Probe::uia(f))
             },
@@ -275,8 +287,10 @@ async fn admission_and_route_changes() {
     assert!(may_write(Rung::RangeValue, &a));
     let a = Admission {
         route: AdmittedRoute::UiaWrite,
-        value_admitted: true,
-        range_admitted: false,
+        value: PatternAdmission::Present {
+            read_only: LiveRead::Value(false),
+        },
+        range: PatternAdmission::Absent,
     };
     assert!(!may_write(Rung::RangeValue, &a));
     assert!(!route_agrees(AdmittedRoute::UiaWrite, true));
@@ -369,8 +383,16 @@ fn value_notsupported_only_calls_admitted_range() {
     for range_allowed in [false, true] {
         let admission = Admission {
             route: AdmittedRoute::UiaWrite,
-            value_admitted: true,
-            range_admitted: range_allowed,
+            value: PatternAdmission::Present {
+                read_only: LiveRead::Value(false),
+            },
+            range: if range_allowed {
+                PatternAdmission::Present {
+                    read_only: LiveRead::Value(false),
+                }
+            } else {
+                PatternAdmission::Absent
+            },
         };
         let calls = AtomicUsize::new(0);
         let mut refused = false;
@@ -382,11 +404,12 @@ fn value_notsupported_only_calls_admitted_range() {
             calls.fetch_add(1, Ordering::SeqCst);
             RungOutcome::Called(0)
         });
-        assert_eq!(calls.load(Ordering::SeqCst), usize::from(range_allowed));
-        assert_eq!(refused, !range_allowed);
-        if range_allowed {
-            assert_eq!(decision, SetValueDecision::Delivered { rung: 1 });
-        }
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert!(!refused);
+        assert!(matches!(
+            decision,
+            SetValueDecision::Uncertain { rung: 0, .. }
+        ));
     }
 }
 #[test]
@@ -425,8 +448,10 @@ fn changed_patterns_never_call_an_unadmitted_rung() {
         (
             Admission {
                 route: AdmittedRoute::UiaWrite,
-                value_admitted: true,
-                range_admitted: false,
+                value: PatternAdmission::Present {
+                    read_only: LiveRead::Value(false),
+                },
+                range: PatternAdmission::Absent,
             },
             false,
             0,
@@ -435,8 +460,10 @@ fn changed_patterns_never_call_an_unadmitted_rung() {
         (
             Admission {
                 route: AdmittedRoute::UiaWrite,
-                value_admitted: false,
-                range_admitted: true,
+                value: PatternAdmission::Absent,
+                range: PatternAdmission::Present {
+                    read_only: LiveRead::Value(false),
+                },
             },
             true,
             0,
@@ -445,12 +472,16 @@ fn changed_patterns_never_call_an_unadmitted_rung() {
         (
             Admission {
                 route: AdmittedRoute::UiaWrite,
-                value_admitted: true,
-                range_admitted: true,
+                value: PatternAdmission::Present {
+                    read_only: LiveRead::Value(false),
+                },
+                range: PatternAdmission::Present {
+                    read_only: LiveRead::Value(false),
+                },
             },
             true,
             1,
-            1,
+            0,
         ),
     ] {
         let values = AtomicUsize::new(0);
@@ -479,4 +510,118 @@ fn changed_patterns_never_call_an_unadmitted_rung() {
             assert_eq!(result, SetValueDecision::Delivered { rung: 1 });
         }
     }
+}
+
+#[test]
+fn writable_range_admits_when_value_read_only_is_unknown() {
+    let mut f = raw();
+    f.patterns = LiveRead::Value(vec![PatternKind::Value, PatternKind::RangeValue]);
+    f.value_read_only = LiveRead::Failed("value read failed".into(), None);
+    f.range_read_only = LiveRead::Value(false);
+    assert_eq!(evaluated(&f, ValueWrite::Value).verdict, Verdict::Pass);
+    let a = admission(&f);
+    assert!(!may_write(Rung::Value, &a));
+    assert!(may_write(Rung::RangeValue, &a));
+}
+
+#[test]
+fn admission_controls_value_and_range_calls() {
+    use crate::uia_mutation::{set_value_route, RungOutcome, SetValueDecision};
+    for (value, range, acquired, expected_value, expected_range, changed) in [
+        (
+            PatternAdmission::Present {
+                read_only: LiveRead::Failed("unknown".into(), Some(-1)),
+            },
+            PatternAdmission::Present {
+                read_only: LiveRead::Value(false),
+            },
+            true,
+            0,
+            1,
+            false,
+        ),
+        (
+            PatternAdmission::Present {
+                read_only: LiveRead::Value(true),
+            },
+            PatternAdmission::Present {
+                read_only: LiveRead::Value(false),
+            },
+            true,
+            0,
+            1,
+            false,
+        ),
+        (
+            PatternAdmission::Absent,
+            PatternAdmission::Present {
+                read_only: LiveRead::Value(false),
+            },
+            true,
+            0,
+            0,
+            true,
+        ),
+        (
+            PatternAdmission::Present {
+                read_only: LiveRead::Value(false),
+            },
+            PatternAdmission::Present {
+                read_only: LiveRead::Value(false),
+            },
+            true,
+            1,
+            0,
+            false,
+        ),
+    ] {
+        let admission = Admission {
+            route: AdmittedRoute::UiaWrite,
+            value,
+            range,
+        };
+        let value_calls = AtomicUsize::new(0);
+        let range_calls = AtomicUsize::new(0);
+        let value = match value_pattern_route(&admission, acquired) {
+            ValuePatternRoute::Changed => {
+                assert!(changed);
+                assert_eq!(value_calls.load(Ordering::SeqCst), expected_value);
+                assert_eq!(range_calls.load(Ordering::SeqCst), expected_range);
+                continue;
+            }
+            ValuePatternRoute::Absent | ValuePatternRoute::Skip => RungOutcome::Absent,
+            ValuePatternRoute::Call => {
+                value_calls.fetch_add(1, Ordering::SeqCst);
+                RungOutcome::Called(1)
+            }
+        };
+        let result = set_value_route(value, || {
+            if may_write(Rung::RangeValue, &admission) {
+                range_calls.fetch_add(1, Ordering::SeqCst);
+                RungOutcome::Called(0)
+            } else {
+                RungOutcome::Absent
+            }
+        });
+        assert_eq!(value_calls.load(Ordering::SeqCst), expected_value);
+        assert_eq!(range_calls.load(Ordering::SeqCst), expected_range);
+        if expected_value == 1 {
+            assert!(matches!(
+                result,
+                SetValueDecision::Uncertain { rung: 0, .. }
+            ));
+        } else {
+            assert_eq!(result, SetValueDecision::Delivered { rung: 1 });
+        }
+    }
+}
+
+#[test]
+fn failed_live_property_names_stale_or_unconfirmed() {
+    assert!(
+        matches!(evidence(&LiveRead::<bool>::Failed("read".into(), Some(0x80040201u32 as i32))), Evidence::Unknown(message) if message.contains("stale element"))
+    );
+    assert!(
+        matches!(evidence(&LiveRead::<bool>::Failed("read".into(), Some(0x80004005u32 as i32))), Evidence::Unknown(message) if message.contains("unconfirmed"))
+    );
 }

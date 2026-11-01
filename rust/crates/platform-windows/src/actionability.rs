@@ -9,18 +9,26 @@ use std::{
     time::Duration,
 };
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum LiveRead<T> {
     Value(T),
     NotSupported,
-    Failed(String),
+    Failed(String, Option<i32>),
+}
+
+fn failure_text(message: &str, code: Option<i32>) -> String {
+    match code.map(|hr| hr as u32) {
+        Some(0x8004_0201) => format!("stale element: {message}"),
+        Some(_) => format!("target unconfirmed: {message}"),
+        None => message.to_owned(),
+    }
 }
 
 pub(crate) fn evidence<T: Clone>(read: &LiveRead<T>) -> Evidence<T> {
     match read {
         LiveRead::Value(v) => Evidence::Known(v.clone()),
         LiveRead::NotSupported => Evidence::Absent,
-        LiveRead::Failed(e) => Evidence::Unknown(e.clone()),
+        LiveRead::Failed(e, code) => Evidence::Unknown(failure_text(e, *code)),
     }
 }
 
@@ -52,16 +60,16 @@ impl RawLiveFacts {
     pub(crate) fn failed(reason: impl Into<String>) -> Self {
         let reason = reason.into();
         Self {
-            is_offscreen: LiveRead::Failed(reason.clone()),
-            is_enabled: LiveRead::Failed(reason.clone()),
-            bounds: LiveRead::Failed(reason.clone()),
-            window_visible: LiveRead::Failed(reason.clone()),
-            window_minimized: LiveRead::Failed(reason.clone()),
-            window_cloaked: LiveRead::Failed(reason.clone()),
-            control_type: LiveRead::Failed(reason.clone()),
-            patterns: LiveRead::Failed(reason.clone()),
-            value_read_only: LiveRead::Failed(reason.clone()),
-            range_read_only: LiveRead::Failed(reason),
+            is_offscreen: LiveRead::Failed(reason.clone(), None),
+            is_enabled: LiveRead::Failed(reason.clone(), None),
+            bounds: LiveRead::Failed(reason.clone(), None),
+            window_visible: LiveRead::Failed(reason.clone(), None),
+            window_minimized: LiveRead::Failed(reason.clone(), None),
+            window_cloaked: LiveRead::Failed(reason.clone(), None),
+            control_type: LiveRead::Failed(reason.clone(), None),
+            patterns: LiveRead::Failed(reason.clone(), None),
+            value_read_only: LiveRead::Failed(reason.clone(), None),
+            range_read_only: LiveRead::Failed(reason, None),
         }
     }
 }
@@ -71,7 +79,7 @@ pub(crate) enum ValueWrite {
     RangeValue,
 }
 
-pub(crate) fn element_facts(raw: &RawLiveFacts, write: ValueWrite) -> ElementFacts {
+pub(crate) fn element_facts(raw: &RawLiveFacts, _write: ValueWrite) -> ElementFacts {
     let checks = [
         (&raw.is_offscreen, false),
         (&raw.window_visible, true),
@@ -93,20 +101,49 @@ pub(crate) fn element_facts(raw: &RawLiveFacts, write: ValueWrite) -> ElementFac
             checks
                 .iter()
                 .find_map(|(r, _)| match r {
-                    LiveRead::Failed(e) => Some(e.clone()),
+                    LiveRead::Failed(e, _) => Some(e.clone()),
                     LiveRead::NotSupported => Some("visibility unavailable".into()),
                     _ => None,
                 })
                 .unwrap_or_else(|| "visibility unavailable".into()),
         )
     };
-    let editable = match match write {
-        ValueWrite::Value => &raw.value_read_only,
-        ValueWrite::RangeValue => &raw.range_read_only,
-    } {
-        LiveRead::Value(v) => Evidence::Known(!v),
+    let editable = match &raw.patterns {
+        LiveRead::Value(patterns) => {
+            let reads = [
+                (PatternKind::Value, &raw.value_read_only),
+                (PatternKind::RangeValue, &raw.range_read_only),
+            ];
+            let present: Vec<_> = reads
+                .iter()
+                .filter(|(kind, _)| patterns.contains(kind))
+                .collect();
+            if present.is_empty() {
+                Evidence::Absent
+            } else if present
+                .iter()
+                .any(|(_, read)| matches!(read, LiveRead::Value(false)))
+            {
+                Evidence::Known(true)
+            } else if present
+                .iter()
+                .all(|(_, read)| matches!(read, LiveRead::Value(true)))
+            {
+                Evidence::Known(false)
+            } else {
+                let detail = present
+                    .iter()
+                    .find_map(|(_, read)| match read {
+                        LiveRead::Failed(message, code) => Some(failure_text(message, *code)),
+                        LiveRead::NotSupported => Some("read-only state unavailable".into()),
+                        LiveRead::Value(_) => None,
+                    })
+                    .unwrap_or_else(|| "read-only state unavailable".into());
+                Evidence::Unknown(detail)
+            }
+        }
         LiveRead::NotSupported => Evidence::Absent,
-        LiveRead::Failed(e) => Evidence::Unknown(e.clone()),
+        LiveRead::Failed(e, code) => Evidence::Unknown(failure_text(e, *code)),
     };
     let affordances = match &raw.patterns {
         LiveRead::Value(patterns) => {
@@ -130,7 +167,7 @@ pub(crate) fn element_facts(raw: &RawLiveFacts, write: ValueWrite) -> ElementFac
             Evidence::Known(actions)
         }
         LiveRead::NotSupported => Evidence::Absent,
-        LiveRead::Failed(e) => Evidence::Unknown(e.clone()),
+        LiveRead::Failed(e, code) => Evidence::Unknown(failure_text(e, *code)),
     };
     let role = match &raw.control_type {
         LiveRead::Value(name) => Evidence::Known(match name.as_str() {
@@ -139,7 +176,7 @@ pub(crate) fn element_facts(raw: &RawLiveFacts, write: ValueWrite) -> ElementFac
             _ => name.to_lowercase(),
         }),
         LiveRead::NotSupported => Evidence::Absent,
-        LiveRead::Failed(e) => Evidence::Unknown(e.clone()),
+        LiveRead::Failed(e, code) => Evidence::Unknown(failure_text(e, *code)),
     };
     ElementFacts {
         visible,
@@ -162,11 +199,16 @@ pub(crate) enum AdmittedRoute {
     UiaWrite,
     NativeCombo,
 }
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Admission {
     pub route: AdmittedRoute,
-    pub value_admitted: bool,
-    pub range_admitted: bool,
+    pub value: PatternAdmission,
+    pub range: PatternAdmission,
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum PatternAdmission {
+    Absent,
+    Present { read_only: LiveRead<bool> },
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Rung {
@@ -176,10 +218,40 @@ pub(crate) enum Rung {
 pub(crate) fn may_write(rung: Rung, a: &Admission) -> bool {
     a.route == AdmittedRoute::UiaWrite
         && match rung {
-            Rung::Value => a.value_admitted,
-            Rung::RangeValue => a.range_admitted,
+            Rung::Value => matches!(
+                &a.value,
+                PatternAdmission::Present {
+                    read_only: LiveRead::Value(false)
+                }
+            ),
+            Rung::RangeValue => matches!(
+                &a.range,
+                PatternAdmission::Present {
+                    read_only: LiveRead::Value(false)
+                }
+            ),
         }
 }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ValuePatternRoute {
+    Absent,
+    Skip,
+    Call,
+    Changed,
+}
+
+pub(crate) fn value_pattern_route(a: &Admission, acquired: bool) -> ValuePatternRoute {
+    if !acquired {
+        ValuePatternRoute::Absent
+    } else if matches!(&a.value, PatternAdmission::Absent) {
+        ValuePatternRoute::Changed
+    } else if may_write(Rung::Value, a) {
+        ValuePatternRoute::Call
+    } else {
+        ValuePatternRoute::Skip
+    }
+}
+
 pub(crate) fn route_agrees(route: AdmittedRoute, worker_native: bool) -> bool {
     (route == AdmittedRoute::NativeCombo) == worker_native
 }
@@ -193,13 +265,19 @@ impl Probe {
     }
 }
 fn admission(raw: &RawLiveFacts) -> Admission {
-    let has = |p| matches!(&raw.patterns, LiveRead::Value(patterns) if patterns.contains(&p));
+    let rung = |kind, read: &LiveRead<bool>| {
+        if matches!(&raw.patterns, LiveRead::Value(patterns) if patterns.contains(&kind)) {
+            PatternAdmission::Present {
+                read_only: read.clone(),
+            }
+        } else {
+            PatternAdmission::Absent
+        }
+    };
     Admission {
         route: AdmittedRoute::UiaWrite,
-        value_admitted: has(PatternKind::Value)
-            && matches!(raw.value_read_only, LiveRead::Value(false)),
-        range_admitted: has(PatternKind::RangeValue)
-            && matches!(raw.range_read_only, LiveRead::Value(false)),
+        value: rung(PatternKind::Value, &raw.value_read_only),
+        range: rung(PatternKind::RangeValue, &raw.range_read_only),
     }
 }
 
@@ -229,8 +307,8 @@ where
                     // as Select). Pass without facts rather than inventing evidence.
                     *admitted.lock().expect("admission lock") = Some(Admission {
                         route: AdmittedRoute::NativeCombo,
-                        value_admitted: false,
-                        range_admitted: false,
+                        value: PatternAdmission::Absent,
+                        range: PatternAdmission::Absent,
                     });
                     return ActionabilityReport {
                         verdict: Verdict::Pass,
@@ -267,6 +345,7 @@ where
         let admission = admitted
             .lock()
             .expect("admission lock")
+            .take()
             .expect("passing probe records admission");
         Ok(write(admission).await)
     } else {
@@ -302,6 +381,7 @@ where
     }
 }
 
+#[cfg(test)]
 pub(crate) fn admission_refusal(reason: &str) -> ToolResult {
     ToolResult::error(reason).with_structured(serde_json::json!({"code":"element_not_actionable", "effect":"refused", "refusal":{"code":"element_not_actionable", "message":reason}}))
 }

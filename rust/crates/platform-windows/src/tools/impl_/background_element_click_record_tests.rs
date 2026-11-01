@@ -70,11 +70,11 @@ fn write_failure_records_the_failing_value_transport_and_request() {
         (
             SetValueDecision::Refused {
                 rung: 0,
-                kind: RefusalKind::AccessDenied,
+                kind: RefusalKind::PermissionDenied,
                 hresult: 0x8007_0005_u32 as i32,
             },
             ActionTransport::WindowsUiaValue,
-            ActionEffect::Refused,
+            ActionEffect::Unverifiable,
         ),
         (
             SetValueDecision::Uncertain {
@@ -105,17 +105,34 @@ fn refused_click_records_the_refusing_rung_and_delivers_nothing() {
     let result = refused_element_click_result(
         "UIA Toggle on [3]: refused".into(),
         ActionTransport::WindowsUiaToggle,
-        vec![ActionTransport::WindowsUiaInvoke],
+        vec![],
+        crate::uia_mutation::RefusalKind::PermissionDenied,
     );
     assert!(result.is_error.unwrap_or(false));
     let record = result.action_record.unwrap();
-    assert_eq!(record.effect, ActionEffect::Refused);
+    assert_eq!(record.effect, ActionEffect::Unverifiable);
     assert_eq!(record.transport, ActionTransport::WindowsUiaToggle);
     assert!(record.actual_delivery.is_none());
-    assert_eq!(record.attempts.len(), 1);
-    assert_eq!(
-        record.attempts[0].transport,
-        ActionTransport::WindowsUiaInvoke
+    assert!(record.attempts.is_empty());
+    assert!(record.validate().is_ok());
+}
+
+#[test]
+fn sent_click_failure_records_uncertain_delivery_without_fallback() {
+    use cua_driver_core::action_record::{ActionEffect, ActualDelivery};
+    let result = super::uncertain_element_click_result(
+        "write may have landed".into(),
+        ActionTransport::WindowsUiaInvoke,
+        vec![],
     );
+    assert_eq!(
+        result.disposition,
+        Some(cua_driver_contract::ErrorDisposition::SUSPECTED_NOOP)
+    );
+    let record = result.action_record.unwrap();
+    assert_eq!(record.effect, ActionEffect::Unverifiable);
+    assert_eq!(record.actual_delivery, Some(ActualDelivery::Unknown));
+    assert_eq!(record.attempts.len(), 1);
+    assert!(record.fallbacks.is_empty());
     assert!(record.validate().is_ok());
 }

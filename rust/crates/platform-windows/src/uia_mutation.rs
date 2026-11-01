@@ -1,45 +1,115 @@
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RefusalKind {
-    AccessDenied,
-    ElementUnavailable,
-    InvalidArgument,
-    NotEnabled,
-    /// Reading the pattern itself failed with something other than "not
-    /// supported"; no method of that pattern was called.
-    PatternUnreadable,
+    StaleElement,
+    PermissionDenied,
+    UnconfirmedAlive,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum UncertainKind {
+    Provider(ProviderCode),
     Transport,
     Timeout,
     Unclassified,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum WriteVerdict {
+pub(crate) enum ProviderCode {
+    NotSupported,
+    AccessDenied,
+    ElementUnavailable,
+    InvalidArgument,
+    NotEnabled,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SentVerdict {
     Delivered,
-    AffordanceAbsent,
-    Refused(RefusalKind),
     Uncertain(UncertainKind),
 }
 
-pub(crate) fn classify_write_hresult(hresult: i32) -> WriteVerdict {
-    use RefusalKind::*;
+pub(crate) fn classify_sent_call(hresult: i32) -> SentVerdict {
+    use ProviderCode::*;
     use UncertainKind::*;
-    use WriteVerdict::*;
-    match hresult as u32 {
-        0 => Delivered,
-        0x8004_0204 => AffordanceAbsent,
-        0x8007_0005 => Refused(AccessDenied),
-        0x8004_0201 => Refused(ElementUnavailable),
-        0x8007_0057 => Refused(InvalidArgument),
-        0x8004_0200 => Refused(NotEnabled),
-        0x8001_0105 | 0x8001_0108 | 0x8007_06ba | 0x8007_06be => Uncertain(Transport),
-        0x8013_1505 => Uncertain(Timeout),
-        _ => Uncertain(Unclassified),
+    let kind = match hresult as u32 {
+        0 => return SentVerdict::Delivered,
+        0x8004_0204 => Provider(NotSupported),
+        0x8007_0005 => Provider(AccessDenied),
+        0x8004_0201 => Provider(ElementUnavailable),
+        0x8007_0057 => Provider(InvalidArgument),
+        0x8004_0200 => Provider(NotEnabled),
+        0x8001_0105 | 0x8001_0108 | 0x8007_06ba | 0x8007_06be => Transport,
+        0x8013_1505 => Timeout,
+        _ => Unclassified,
+    };
+    SentVerdict::Uncertain(kind)
+}
+
+/// Run a post-call step only when the provider returned exactly S_OK.
+pub(crate) fn after_sent_call<T>(hresult: i32, next: impl FnOnce() -> T) -> Result<T, i32> {
+    match classify_sent_call(hresult) {
+        SentVerdict::Delivered => Ok(next()),
+        SentVerdict::Uncertain(_) => Err(hresult),
     }
 }
-pub(crate) fn may_fall_through(verdict: &WriteVerdict) -> bool {
-    matches!(verdict, WriteVerdict::AffordanceAbsent)
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FocusRoute {
+    Confirmed,
+    ClickBeforeSend,
+    Uncertain,
+}
+
+pub(crate) fn focus_route(hresult: Option<i32>, confirm: impl FnOnce() -> bool) -> FocusRoute {
+    match hresult {
+        None => FocusRoute::ClickBeforeSend,
+        Some(hr) => match after_sent_call(hr, confirm) {
+            Ok(true) => FocusRoute::Confirmed,
+            Ok(false) | Err(_) => FocusRoute::Uncertain,
+        },
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AcquireVerdict {
+    Absent,
+    NotDelivered(RefusalKind),
+}
+
+pub(crate) fn classify_acquisition(code: i32) -> AcquireVerdict {
+    if pattern_absent(code) {
+        return AcquireVerdict::Absent;
+    }
+    AcquireVerdict::NotDelivered(match code as u32 {
+        0x8004_0201 => RefusalKind::StaleElement,
+        0x8007_0005 => RefusalKind::PermissionDenied,
+        _ => RefusalKind::UnconfirmedAlive,
+    })
+}
+
+impl SentVerdict {
+    pub(crate) fn to_core(self) -> cua_driver_core::mutation::WriteOutcome {
+        use cua_driver_core::mutation::{Reason, WriteOutcome};
+        match self {
+            Self::Delivered => WriteOutcome::Delivered,
+            Self::Uncertain(kind) => WriteOutcome::StopUncertain(match kind {
+                UncertainKind::Transport => Reason::Transport,
+                UncertainKind::Timeout => Reason::Timeout,
+                UncertainKind::Provider(_) | UncertainKind::Unclassified => Reason::Unknown,
+            }),
+        }
+    }
+}
+impl AcquireVerdict {
+    pub(crate) fn to_core(self) -> cua_driver_core::mutation::WriteOutcome {
+        use cua_driver_core::mutation::{Reason, WriteOutcome};
+        match self {
+            Self::Absent => WriteOutcome::FallThrough(Reason::Unsupported),
+            Self::NotDelivered(kind) => WriteOutcome::StopNotDelivered(match kind {
+                RefusalKind::StaleElement => Reason::StaleElement,
+                RefusalKind::PermissionDenied => Reason::PermissionDenied,
+                RefusalKind::UnconfirmedAlive => Reason::UnconfirmedAlive,
+            }),
+        }
+    }
 }
 /// Whether a failed `GetCurrentPattern` or interface cast means the pattern
 /// is simply not there. windows-rs reports a successful null pattern as an
@@ -59,67 +129,61 @@ pub(crate) enum RungOutcome {
 pub(crate) enum ChainOutcome {
     Delivered {
         rung: usize,
-        not_supported_calls: Vec<usize>,
     },
     Refused {
         rung: usize,
         kind: RefusalKind,
         hresult: i32,
-        not_supported_calls: Vec<usize>,
     },
     Uncertain {
         rung: usize,
         kind: UncertainKind,
         hresult: i32,
-        not_supported_calls: Vec<usize>,
     },
-    NoAffordance {
-        not_supported_calls: Vec<usize>,
-    },
+    NoAffordance,
 }
 pub(crate) fn run_rungs(rungs: Vec<Box<dyn FnOnce() -> RungOutcome + '_>>) -> ChainOutcome {
-    let mut not_supported_calls = Vec::new();
-    for (rung, call) in rungs.into_iter().enumerate() {
-        let hresult = match call() {
-            RungOutcome::Absent => continue,
-            RungOutcome::AcquireFailed(hresult) => {
-                return ChainOutcome::Refused {
-                    rung,
-                    kind: RefusalKind::PatternUnreadable,
-                    hresult,
-                    not_supported_calls,
-                }
+    use cua_driver_core::mutation::{WriteChain, WriteOutcome};
+    let mut last = None;
+    let chain = WriteChain::run(
+        rungs.into_iter().enumerate().map(|(index, call)| {
+            let outcome = call();
+            last = Some((index, outcome));
+            match outcome {
+                RungOutcome::Absent => AcquireVerdict::Absent.to_core(),
+                RungOutcome::AcquireFailed(hr) => classify_acquisition(hr).to_core(),
+                RungOutcome::Called(hr) => classify_sent_call(hr).to_core(),
             }
-            RungOutcome::Called(hresult) => hresult,
-        };
-        match classify_write_hresult(hresult) {
-            WriteVerdict::Delivered => {
-                return ChainOutcome::Delivered {
-                    rung,
-                    not_supported_calls,
-                }
-            }
-            WriteVerdict::AffordanceAbsent => not_supported_calls.push(rung),
-            WriteVerdict::Refused(kind) => {
-                return ChainOutcome::Refused {
-                    rung,
-                    kind,
-                    hresult,
-                    not_supported_calls,
-                }
-            }
-            WriteVerdict::Uncertain(kind) => {
-                return ChainOutcome::Uncertain {
-                    rung,
-                    kind,
-                    hresult,
-                    not_supported_calls,
-                }
+        }),
+        false,
+    );
+    match (chain.outcomes().last(), last) {
+        (Some(WriteOutcome::Delivered), Some((rung, _))) => ChainOutcome::Delivered { rung },
+        (
+            Some(WriteOutcome::StopNotDelivered(_)),
+            Some((rung, RungOutcome::AcquireFailed(hresult))),
+        ) => {
+            let AcquireVerdict::NotDelivered(kind) = classify_acquisition(hresult) else {
+                unreachable!()
+            };
+            ChainOutcome::Refused {
+                rung,
+                kind,
+                hresult,
             }
         }
-    }
-    ChainOutcome::NoAffordance {
-        not_supported_calls,
+        (Some(WriteOutcome::StopUncertain(_)), Some((rung, RungOutcome::Called(hresult)))) => {
+            let SentVerdict::Uncertain(kind) = classify_sent_call(hresult) else {
+                unreachable!()
+            };
+            ChainOutcome::Uncertain {
+                rung,
+                kind,
+                hresult,
+            }
+        }
+        (None | Some(WriteOutcome::FallThrough(_)), _) => ChainOutcome::NoAffordance,
+        _ => unreachable!("rung outcome and core result disagree"),
     }
 }
 #[derive(Debug, PartialEq, Eq)]
@@ -146,39 +210,30 @@ pub(crate) enum ClickPlan {
 }
 pub(crate) fn click_plan_from_chain(outcome: ChainOutcome) -> ClickPlan {
     match outcome {
-        ChainOutcome::Delivered {
+        ChainOutcome::Delivered { rung } => ClickPlan::Semantic {
             rung,
-            not_supported_calls,
-        } => ClickPlan::Semantic {
-            rung,
-            failed: not_supported_calls,
+            failed: vec![],
         },
-        ChainOutcome::NoAffordance {
-            not_supported_calls,
-        } => ClickPlan::Physical {
-            failed: not_supported_calls,
-        },
+        ChainOutcome::NoAffordance => ClickPlan::Physical { failed: vec![] },
         ChainOutcome::Refused {
             rung,
             kind,
             hresult,
-            not_supported_calls,
         } => ClickPlan::Refused {
             rung,
             kind,
             hresult,
-            failed: not_supported_calls,
+            failed: vec![],
         },
         ChainOutcome::Uncertain {
             rung,
             kind,
             hresult,
-            not_supported_calls,
         } => ClickPlan::Uncertain {
             rung,
             kind,
             hresult,
-            failed: not_supported_calls,
+            failed: vec![],
         },
     }
 }
@@ -225,21 +280,16 @@ pub(crate) fn set_value_route(
             kind,
             hresult,
         },
-        ChainOutcome::NoAffordance { .. } => SetValueDecision::NoAffordance,
+        ChainOutcome::NoAffordance => SetValueDecision::NoAffordance,
     }
 }
-#[cfg(target_os = "windows")]
 pub(crate) fn refusal_text(kind: RefusalKind, hresult: i32) -> String {
-    let what = match kind {
-        RefusalKind::PatternUnreadable => "could not read the UIA pattern",
-        _ => "UIA refused the write",
-    };
+    let what = "could not read the UIA pattern";
     format!(
         "{what}: {kind:?} (HRESULT 0x{:08X}); nothing was sent. Read the window state before retrying.",
         hresult as u32
     )
 }
-#[cfg(target_os = "windows")]
 pub(crate) fn uncertain_text(kind: UncertainKind, hresult: i32) -> String {
     format!("HRESULT 0x{:08X} ({kind:?}); the UIA write may have landed. Read the window state before acting again.", hresult as u32)
 }
@@ -270,18 +320,9 @@ fn mutation_route(completed: usize, stop: Option<MutationStop>) -> MutationRoute
     match stop {
         None => Done,
         Some(MutationStop::WorkerFailed) => Uncertain,
-        Some(MutationStop::Write(hr))
-            if matches!(classify_write_hresult(hr), WriteVerdict::Uncertain(_)) =>
-        {
-            Uncertain
-        }
+        Some(MutationStop::Write(_)) => Uncertain,
         Some(_) if completed > 0 => Partial,
         Some(MutationStop::Absent) => FallThrough,
-        Some(MutationStop::Write(hr))
-            if matches!(classify_write_hresult(hr), WriteVerdict::AffordanceAbsent) =>
-        {
-            FallThrough
-        }
         Some(_) => Refused,
     }
 }
@@ -309,21 +350,29 @@ pub(crate) fn scroll_preflight<T>(
 pub(crate) fn expand_route(outcome: RungOutcome) -> MutationRoute {
     match outcome {
         RungOutcome::Absent => MutationRoute::FallThrough,
-        RungOutcome::AcquireFailed(_) => MutationRoute::Refused,
-        RungOutcome::Called(hr) => match classify_write_hresult(hr) {
-            WriteVerdict::Delivered => MutationRoute::Done,
-            WriteVerdict::AffordanceAbsent => MutationRoute::FallThrough,
-            WriteVerdict::Refused(_) => MutationRoute::Refused,
-            WriteVerdict::Uncertain(_) => MutationRoute::Uncertain,
+        RungOutcome::AcquireFailed(hr) => match classify_acquisition(hr) {
+            AcquireVerdict::Absent => MutationRoute::FallThrough,
+            AcquireVerdict::NotDelivered(_) => MutationRoute::Refused,
+        },
+        RungOutcome::Called(hr) => match classify_sent_call(hr) {
+            SentVerdict::Delivered => MutationRoute::Done,
+            SentVerdict::Uncertain(_) => MutationRoute::Uncertain,
         },
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AccelStop {
+    Refused(RefusalKind),
+    Uncertain(UncertainKind),
+    /// The scan never started (gate busy, or the worker could not be spawned).
+    NotSent(&'static str),
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AccelOutcome {
     Delivered,
     Absent,
-    Stop(WriteVerdict, i32),
+    Stop(AccelStop, i32),
 }
 pub(crate) fn accelerator_scan(outcomes: impl Iterator<Item = AccelOutcome>) -> AccelOutcome {
     for outcome in outcomes {
@@ -352,4 +401,164 @@ pub(crate) fn menu_outcome(completed_hops: usize, failure: Option<MenuFailure>) 
         Some(MenuFailure::Refused) if completed_hops > 0 => MenuResult::Partial { completed_hops },
         Some(MenuFailure::Refused) => MenuResult::Refused,
     }
+}
+
+/// Preserve a producer error while accounting for a prior side effect.
+pub(crate) fn after_prologue(
+    mut result: cua_driver_core::protocol::ToolResult,
+) -> cua_driver_core::protocol::ToolResult {
+    use cua_driver_core::mutation::{Postcondition, Reason, WriteChain, WriteOutcome};
+    let chain = WriteChain::run(
+        [WriteOutcome::StopNotDelivered(Reason::UnconfirmedAlive)],
+        true,
+    );
+    let structured = result
+        .structured_content
+        .get_or_insert_with(|| serde_json::json!({}));
+    if !structured.is_object() {
+        *structured = serde_json::json!({ "detail": structured.take() });
+    }
+    structured["effect"] = serde_json::to_value(chain.effect(Postcondition::Indeterminate, false))
+        .expect("effect serializes");
+    result.disposition = chain.error_disposition(Postcondition::Indeterminate, false);
+    if let Some(record) = result.action_record.as_mut() {
+        record.effect = cua_driver_core::action_record::ActionEffect::Unverifiable;
+    }
+    result
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PointFailure {
+    Busy,
+    Unavailable,
+    Timeout,
+    SentFailure,
+}
+
+pub(crate) fn point_failure_result(
+    failure: PointFailure,
+    pid: u32,
+) -> cua_driver_core::protocol::ToolResult {
+    use cua_driver_core::mutation::{Reason, WriteOutcome};
+    let (status, outcome, message) = match failure {
+        PointFailure::Busy => (
+            "busy",
+            WriteOutcome::StopNotDelivered(Reason::UnconfirmedAlive),
+            "nothing was sent",
+        ),
+        PointFailure::Unavailable => (
+            "unavailable",
+            WriteOutcome::StopNotDelivered(Reason::UnconfirmedAlive),
+            "nothing was sent",
+        ),
+        PointFailure::Timeout => (
+            "timeout",
+            WriteOutcome::StopUncertain(Reason::Timeout),
+            "the click may have landed; inspect the target state before acting again",
+        ),
+        PointFailure::SentFailure => (
+            "sent_failure",
+            WriteOutcome::StopUncertain(Reason::Unknown),
+            "the click may have landed; inspect the target state before acting again",
+        ),
+    };
+    let mut fields = serde_json::json!({"uia_status":status, "path":"ax", "verified":false, "code":"background_unavailable"});
+    if matches!(failure, PointFailure::Busy | PointFailure::Unavailable) {
+        fields["nothing_sent"] = true.into();
+        fields["suggestion"] = "Retry this action with delivery_mode:\"foreground\".".into();
+        fields["escalation"] = serde_json::json!({"recommended":"foreground", "reason":format!("the UIA provider is {status}; retry this action with delivery_mode:\"foreground\".")});
+    }
+    chain_error(
+        format!("UIA pixel click {status} for pid {pid}; {message}. No fallback input was sent."),
+        fields,
+        [outcome],
+        false,
+    )
+}
+
+pub(crate) fn foreground_focus_uncertain_result(
+    message: impl Into<String>,
+) -> cua_driver_core::protocol::ToolResult {
+    use cua_driver_core::mutation::{Reason, WriteOutcome};
+    chain_error(
+        message,
+        serde_json::json!({"path":"uia", "verified":false}),
+        [WriteOutcome::StopUncertain(Reason::Unknown)],
+        true,
+    )
+}
+
+/// Construct an error from the complete chain, retaining the producer's legacy fields.
+pub(crate) fn chain_error(
+    message: impl Into<String>,
+    mut structured: serde_json::Value,
+    outcomes: impl IntoIterator<Item = cua_driver_core::mutation::WriteOutcome>,
+    side_effectful_prologue: bool,
+) -> cua_driver_core::protocol::ToolResult {
+    use cua_driver_core::mutation::{Postcondition, WriteChain};
+    let chain = WriteChain::run(outcomes, side_effectful_prologue);
+    structured["effect"] = serde_json::to_value(chain.effect(Postcondition::Indeterminate, false))
+        .expect("action effect serializes");
+    let disposition = chain
+        .error_disposition(Postcondition::Indeterminate, false)
+        .expect("an indeterminate error has a disposition");
+    cua_driver_core::protocol::ToolResult::error(message)
+        .with_structured(structured)
+        .with_disposition(disposition)
+}
+
+pub(crate) fn set_value_write_failure_result(
+    decision: SetValueDecision,
+    args: &serde_json::Value,
+) -> cua_driver_core::protocol::ToolResult {
+    use cua_driver_core::action_record::{
+        ActionEffect, ActionExecutionRecord, ActionTransport, RequestedDelivery,
+    };
+    let (rung, message, outcome) = match decision {
+        SetValueDecision::Refused {
+            rung,
+            kind,
+            hresult,
+        } => (
+            rung,
+            refusal_text(kind, hresult),
+            AcquireVerdict::NotDelivered(kind).to_core(),
+        ),
+        SetValueDecision::Uncertain {
+            rung,
+            kind,
+            hresult,
+        } => (
+            rung,
+            uncertain_text(kind, hresult),
+            classify_sent_call(hresult).to_core(),
+        ),
+        _ => unreachable!("only write failures are returned here"),
+    };
+    let transport = if rung == 0 {
+        ActionTransport::WindowsUiaValue
+    } else {
+        ActionTransport::WindowsUiaRangeValue
+    };
+    let requested = match args
+        .get("delivery_mode")
+        .and_then(serde_json::Value::as_str)
+    {
+        Some("foreground") => RequestedDelivery::Foreground,
+        _ => RequestedDelivery::Background,
+    };
+    let mut record = ActionExecutionRecord::new(ActionEffect::Unverifiable, transport, requested);
+    if matches!(
+        outcome,
+        cua_driver_core::mutation::WriteOutcome::StopUncertain(_)
+    ) {
+        record.actual_delivery = Some(cua_driver_core::action_record::ActualDelivery::Unknown);
+    }
+    chain_error(
+        message,
+        serde_json::json!({ "path": "ax", "verified": false }),
+        [outcome],
+        true,
+    )
+    .with_action_record(record)
 }

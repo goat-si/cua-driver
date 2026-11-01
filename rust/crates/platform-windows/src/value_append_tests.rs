@@ -149,10 +149,10 @@ fn routing_table_observes_calls_and_results() {
 }
 
 #[test]
-fn uia_mutation_write_failure_only_falls_back_when_not_supported() {
+fn uia_mutation_write_failure_never_falls_back_to_wm_char() {
     for (hresult, expected) in [
         (0x8013_1505_u32 as i32, false),
-        (0x8004_0204_u32 as i32, true),
+        (0x8004_0204_u32 as i32, false),
     ] {
         let outcome = AppendOutcome::WriteFailed { hresult };
         assert_eq!(allows_wm_char_fallback(&outcome), expected);
@@ -270,5 +270,39 @@ fn failed_value_pattern_acquisition_writes_nothing_and_never_types() {
         assert_eq!(result, AppendOutcome::Refused("value_pattern_unreadable"));
         assert_eq!((reads.get(), writes.get()), (0, 0));
         assert!(!allows_wm_char_fallback(&result));
+    }
+}
+
+#[test]
+fn secure_and_ordinary_failed_writes_never_reach_wm_char() {
+    for secure in [false, true] {
+        for hr in [
+            1,
+            0x8004_0204_u32 as i32,
+            0x8007_0005_u32 as i32,
+            0x8013_1505_u32 as i32,
+        ] {
+            let writes = Cell::new(0);
+            let outcome = run_value_append(
+                || Some(secure),
+                || Ok(Some(())),
+                |_| Ok(String::new()),
+                |_, _| {
+                    writes.set(writes.get() + 1);
+                    Err(hr)
+                },
+                "x",
+            );
+            assert_eq!(writes.get(), 1);
+            assert!(matches!(
+                outcome,
+                AppendOutcome::WriteFailed { .. } | AppendOutcome::SecureWriteFailed { .. }
+            ));
+            assert!(!allows_wm_char_fallback(&outcome));
+            assert_eq!(
+                route_after_worker(Ok(Some(outcome.clone()))),
+                Route::Continue(outcome)
+            );
+        }
     }
 }
