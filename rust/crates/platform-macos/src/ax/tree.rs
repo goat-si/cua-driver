@@ -461,6 +461,36 @@ fn selected_probe_before_deadline(
     }
 }
 
+fn selected_probe_observed(
+    owner: Option<usize>,
+    expired: bool,
+    probe: impl FnOnce() -> super::write_outcome::Settable,
+    skipped: impl FnOnce(),
+) -> super::evidence::Observed<super::write_outcome::Settable> {
+    use super::evidence::{EvidenceStatus, Observed, ReadEvidence, ReadSite};
+    use super::tree_source::ReadFailure;
+    use super::write_outcome::Settable;
+    let legacy = selected_probe_before_deadline(expired, probe, skipped);
+    let status = if expired {
+        EvidenceStatus::DeadlineExpired
+    } else {
+        match legacy {
+            Settable::Yes | Settable::No => EvidenceStatus::Known,
+            Settable::Unknown(error) => EvidenceStatus::Unknown(ReadFailure::Ax(error)),
+        }
+    };
+    Observed {
+        legacy,
+        evidence: vec![ReadEvidence {
+            owner,
+            site: ReadSite::SelectedSettable,
+            status,
+            attempt: 0,
+            listing: None,
+        }],
+    }
+}
+
 pub(super) fn apply_owned_label_claims(nodes: &mut [AXNode], claims: Vec<(usize, String)>) {
     for (owner, label) in claims {
         if let Some(node) = nodes
@@ -1659,11 +1689,13 @@ fn walk_element<S: AxTreeSource>(
         actions.is_empty(),
         value_settable,
         || {
-            selected_probe_before_deadline(
+            selected_probe_observed(
+                Some(element_key),
                 budget.expired(),
                 || source.selected_settable(element),
                 note_skipped,
             )
+            .into_walk_legacy()
         },
     );
     let actionless_control = selectable_row

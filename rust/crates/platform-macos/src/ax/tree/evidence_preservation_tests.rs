@@ -752,6 +752,49 @@ fn frame_singles_preserve_unknown_and_absent() {
 }
 
 #[test]
+fn selected_settable_preserves_unknown_and_no() {
+    use crate::ax::write_outcome::Settable;
+    for value in [
+        Settable::Unknown(kAXErrorCannotComplete),
+        Settable::No,
+        Settable::Yes,
+    ] {
+        let called = std::cell::Cell::new(0);
+        let observed = selected_probe_observed(
+            Some(7),
+            false,
+            || {
+                called.set(called.get() + 1);
+                value
+            },
+            || panic!("deadline not reached"),
+        );
+        assert_eq!(observed.legacy, value);
+        assert_eq!(called.get(), 1);
+        let status = match value {
+            Settable::Unknown(code) => EvidenceStatus::Unknown(ReadFailure::Ax(code)),
+            _ => EvidenceStatus::Known,
+        };
+        assert_evidence(&observed.evidence, ReadSite::SelectedSettable, status);
+        assert_eq!(observed.evidence[0].owner, Some(7));
+    }
+    let skipped = std::cell::Cell::new(false);
+    let observed = selected_probe_observed(
+        Some(7),
+        true,
+        || panic!("no probe after deadline"),
+        || skipped.set(true),
+    );
+    assert_eq!(observed.legacy, Settable::Unknown(kAXErrorCannotComplete));
+    assert!(skipped.get());
+    assert_evidence(
+        &observed.evidence,
+        ReadSite::SelectedSettable,
+        EvidenceStatus::DeadlineExpired,
+    );
+}
+
+#[test]
 fn scrollbar_owner_preserves_unknown_and_absent() {
     let fake = Fake::new(
         &[(1, 1, 1, &[])],
