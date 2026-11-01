@@ -2,6 +2,7 @@
 
 use crate::ax::bindings::*;
 use core_foundation::base::{CFEqual, CFRelease, CFRetain, CFTypeRef};
+use cua_driver_core::mutation::WriteOutcome;
 
 const MAX_SELECTION_ANCESTORS: usize = 8;
 
@@ -126,8 +127,8 @@ fn selectable(role: Option<&str>) -> bool {
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum SelectAttempt {
     NotAttempted,
-    WriteSentUnconfirmed(String),
-    Confirmed(String),
+    WriteSentUnconfirmed(String, AXError, WriteOutcome),
+    Confirmed(String, AXError, WriteOutcome),
 }
 
 pub(crate) fn select_with<B: SelectionOps>(ops: &mut B, start: B::Element) -> SelectAttempt {
@@ -144,10 +145,20 @@ pub(crate) fn select_target_with<B: SelectionOps>(
     role: String,
 ) -> SelectAttempt {
     let sent = ops.select(item);
-    if sent.is_ok() && ops.selected(item) == Some(true) {
-        SelectAttempt::Confirmed(role)
+    let error = match sent {
+        Ok(()) => kAXErrorSuccess,
+        Err(error) => error,
+    };
+    let outcome = crate::ax::write_outcome::native_write_outcome(
+        crate::ax::write_outcome::NativeWriteKind::SetAttribute,
+        true,
+        &crate::ax::write_outcome::Settable::Unknown(kAXErrorFailure),
+        error,
+    );
+    if outcome == WriteOutcome::Delivered && ops.selected(item) == Some(true) {
+        SelectAttempt::Confirmed(role, error, outcome)
     } else {
-        SelectAttempt::WriteSentUnconfirmed(role)
+        SelectAttempt::WriteSentUnconfirmed(role, error, outcome)
     }
 }
 
@@ -218,9 +229,9 @@ pub(crate) fn selection_snapshot_with<B: SelectionOps>(
 /// Finder and other AppKit collection views commonly expose an item's label as
 /// an actionable child (`AXTextField`) while the selectable object is its
 /// parent `AXRow`. Neither object necessarily advertises `AXPress`, and Finder
-/// can return `kAXErrorCannotComplete` for a press on the row. A pointer click
-/// selects that row, so the AX equivalent is to set the row's `AXSelected`
-/// attribute rather than treating the failed press as terminal.
+/// can return `kAXErrorCannotComplete` for a press on the row. Selection is
+/// an alternative when it is safe to dispatch; an uncertain press remains
+/// terminal and does not authorize this write.
 ///
 /// Finder icon views expose each selectable file directly as an `AXImage` with
 /// an `AXSelected` attribute, so that role is included alongside the standard
@@ -232,12 +243,27 @@ pub(crate) fn select_nearest_container_attempt(element_ptr: usize) -> SelectAtte
     select_with(&mut LiveSelectionOps, start)
 }
 
+/// Keep the written target alive for same-worker attribution of read-back.
+pub(crate) fn select_nearest_container_attempt_with_target(
+    element_ptr: usize,
+) -> (SelectAttempt, Option<SelectionElement>) {
+    let start = unsafe { SelectionElement::retain(element_ptr as AXUIElementRef) };
+    let mut ops = LiveSelectionOps;
+    match selection_target_with(&mut ops, start) {
+        Some((role, item)) => {
+            let attempt = select_target_with(&mut ops, &item, role);
+            (attempt, Some(item))
+        }
+        None => (SelectAttempt::NotAttempted, None),
+    }
+}
+
 /// Legacy result form. `None` does not prove that no write was sent; callers
 /// must not use it to decide whether another input is safe.
 pub fn select_nearest_container(element_ptr: usize) -> Option<String> {
     match select_nearest_container_attempt(element_ptr) {
-        SelectAttempt::Confirmed(role) => Some(role),
-        SelectAttempt::NotAttempted | SelectAttempt::WriteSentUnconfirmed(_) => None,
+        SelectAttempt::Confirmed(role, _, _) => Some(role),
+        SelectAttempt::NotAttempted | SelectAttempt::WriteSentUnconfirmed(_, _, _) => None,
     }
 }
 
@@ -597,14 +623,29 @@ pub(crate) fn focus_element_raw(element_ptr: usize) -> i32 {
     unsafe { set_bool_attr_true(element_ptr as AXUIElementRef, "AXFocused") }
 }
 
+#[derive(Debug, thiserror::Error)]
+#[error("AXSetAttribute(AXFocused) returned {error} ({outcome:?})")]
+pub struct FocusWriteError {
+    pub error: AXError,
+    pub outcome: WriteOutcome,
+}
+
 pub fn focus_element(element_ptr: usize) -> anyhow::Result<()> {
     let err = focus_element_raw(element_ptr);
     if err == kAXErrorSuccess {
         Ok(())
     } else {
-        // Focus errors are often benign (element doesn't support focus).
-        tracing::warn!("AXSetAttribute(AXFocused) returned {err}");
-        Ok(())
+        let outcome = crate::ax::write_outcome::native_write_outcome(
+            crate::ax::write_outcome::NativeWriteKind::SetAttribute,
+            true,
+            &crate::ax::write_outcome::Settable::Unknown(kAXErrorFailure),
+            err,
+        );
+        Err(FocusWriteError {
+            error: err,
+            outcome,
+        }
+        .into())
     }
 }
 
@@ -1141,7 +1182,11 @@ mod selection_boundary_tests {
         ops.fail_after_write = true;
         assert_eq!(
             select_with(&mut ops, 0),
-            SelectAttempt::WriteSentUnconfirmed("AXCell".into())
+            SelectAttempt::WriteSentUnconfirmed(
+                "AXCell".into(),
+                kAXErrorIllegalArgument,
+                WriteOutcome::StopUncertain(cua_driver_core::mutation::Reason::Unknown)
+            )
         );
         assert_eq!(ops.selected[1], Some(true));
         assert_eq!(ops.writes, [1]);
@@ -1157,7 +1202,11 @@ mod selection_boundary_tests {
         ops.fail_readback = true;
         assert_eq!(
             select_with(&mut ops, 0),
-            SelectAttempt::WriteSentUnconfirmed("AXCell".into())
+            SelectAttempt::WriteSentUnconfirmed(
+                "AXCell".into(),
+                kAXErrorSuccess,
+                WriteOutcome::Delivered
+            )
         );
         assert_eq!(ops.writes, [1]);
         assert!(!ops.parents.contains(&1));
@@ -1185,7 +1234,7 @@ mod selection_boundary_tests {
             let mut ops = fake(&[Some(role)], &[Some(false)]);
             assert_eq!(
                 select_with(&mut ops, 0),
-                SelectAttempt::Confirmed(role.into())
+                SelectAttempt::Confirmed(role.into(), kAXErrorSuccess, WriteOutcome::Delivered)
             );
         }
     }
@@ -1195,7 +1244,7 @@ mod selection_boundary_tests {
         let mut ops = fake(&[Some("AXStaticText"), Some("AXRow")], &[None, Some(false)]);
         assert_eq!(
             select_with(&mut ops, 0),
-            SelectAttempt::Confirmed("AXRow".into())
+            SelectAttempt::Confirmed("AXRow".into(), kAXErrorSuccess, WriteOutcome::Delivered)
         );
         let mut ops = fake(&[Some("AXStaticText"), Some("AXRow")], &[None, Some(false)]);
         let (role, item) = selection_target_with(&mut ops, 0).expect("selection target");
@@ -1203,7 +1252,7 @@ mod selection_boundary_tests {
         assert!(ops.writes.is_empty());
         assert_eq!(
             select_target_with(&mut ops, &item, role),
-            SelectAttempt::Confirmed("AXRow".into())
+            SelectAttempt::Confirmed("AXRow".into(), kAXErrorSuccess, WriteOutcome::Delivered)
         );
         assert_eq!(ops.writes, [1]);
     }
@@ -1221,7 +1270,7 @@ mod selection_boundary_tests {
         );
         assert_eq!(
             select_with(&mut ops, 0),
-            SelectAttempt::Confirmed("AXRow".into())
+            SelectAttempt::Confirmed("AXRow".into(), kAXErrorSuccess, WriteOutcome::Delivered)
         );
         assert_eq!(ops.writes, [2]);
     }
@@ -1297,7 +1346,7 @@ mod climb_limit_tests {
             let mut ops = fake(role, Some(false));
             assert!(matches!(
                 select_with(&mut ops, 0),
-                SelectAttempt::NotAttempted | SelectAttempt::WriteSentUnconfirmed(_)
+                SelectAttempt::NotAttempted | SelectAttempt::WriteSentUnconfirmed(_, _, _)
             ));
             assert!(ops.parents.is_empty());
             assert!(ops.writes.iter().all(|n| *n == 0));
