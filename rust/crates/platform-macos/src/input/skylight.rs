@@ -540,6 +540,13 @@ impl WindowKeyScope {
 /// the confirmation read are not part of the action, so nothing waits for
 /// them; the next scope for this pid waits for it. A hand-back
 /// that does not complete is logged, never turned into a refusal.
+/// In one AppKit fixture on one Mac, a queued B key was consumed by B even
+/// though hand-back was attempted during a main-thread stall. Key-down was
+/// posted shortly before the stall; key-up and the first hand-back record
+/// batch during it, with retry batches after it. This does not establish
+/// WindowServer FIFO or a general consumption fence. Chromium, Electron,
+/// the CGEventPostToPid fallback, and apps processing keys on their own
+/// threads were not measured.
 fn spawn_hand_back(
     ops: ScopeOps,
     pid: pid_t,
