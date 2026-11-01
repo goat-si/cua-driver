@@ -220,9 +220,18 @@ pub(crate) fn selection_snapshot_with<B: SelectionOps>(
 /// row-like containers. The fallback remains bounded and requires a successful
 /// `AXSelected=true` read-back, so an arbitrary failed image/button press cannot
 /// become a claimed success.
-pub(crate) fn select_nearest_container(element_ptr: usize) -> SelectAttempt {
+pub(crate) fn select_nearest_container_attempt(element_ptr: usize) -> SelectAttempt {
     let start = unsafe { SelectionElement::retain(element_ptr as AXUIElementRef) };
     select_with(&mut LiveSelectionOps, start)
+}
+
+/// Legacy result form. `None` does not prove that no write was sent; callers
+/// must not use it to decide whether another input is safe.
+pub fn select_nearest_container(element_ptr: usize) -> Option<String> {
+    match select_nearest_container_attempt(element_ptr) {
+        SelectAttempt::Confirmed(role) => Some(role),
+        SelectAttempt::NotAttempted | SelectAttempt::WriteSentUnconfirmed(_) => None,
+    }
 }
 
 /// Read the selection state of the nearest collection-like element without

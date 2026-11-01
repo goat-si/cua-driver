@@ -179,7 +179,7 @@ pub(crate) fn is_selection_text_role(role: &str) -> bool {
 /// A single node in the AX tree.
 #[derive(Debug, Clone)]
 pub struct AXNode {
-    /// Internal marker and structurally owned label for newly indexed rows.
+    /// Internal marker and structurally owned label for row-like items.
     pub(crate) owned_row_label: Option<Option<String>>,
     /// 0-based index (Some = actionable, None = non-actionable display-only node)
     pub element_index: Option<usize>,
