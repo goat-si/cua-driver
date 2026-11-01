@@ -3057,6 +3057,68 @@ fn ax_click_structured(
 /// selection_verified, selection_via_pixel)`.
 type AxClickOutcome = (String, bool, Option<ClickEvidence>, bool);
 
+// The current post-press path writes in its worker without consulting Select
+// actionability. This seam lets the caller own that decision in the next step.
+#[allow(dead_code)]
+async fn dispatch_post_press_selection<C, P, A, F, T>(
+    _clock: &(impl cua_driver_core::actionability::Clock + Sync),
+    _budget: std::time::Duration,
+    _prior: cua_driver_core::mutation::PriorInput,
+    candidate: C,
+    _probe: P,
+    write: A,
+) -> Result<T, ToolResult>
+where
+    C: Sync,
+    P: for<'a> FnMut(
+            &'a C,
+            std::time::Duration,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = cua_driver_core::actionability::ActionabilityReport> + Send + 'a>>
+        + Send,
+    A: FnOnce(C) -> F,
+    F: std::future::Future<Output = T>,
+{
+    Ok(write(candidate).await)
+}
+
+#[cfg(test)]
+mod u32_stage_tests {
+    use super::*;
+    use cua_driver_core::actionability::{ActionabilityReport, Clock, Verdict};
+    use cua_driver_core::mutation::PriorInput;
+    use std::{future::Future, pin::Pin, sync::atomic::{AtomicUsize, Ordering}, time::Duration};
+
+    struct FakeClock;
+    impl Clock for FakeClock {
+        fn now(&self) -> Duration { Duration::ZERO }
+        fn sleep(&self, _: Duration) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+            Box::pin(std::future::pending())
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn post_press_selection_gate_refusal_blocks_write() {
+        let writes = AtomicUsize::new(0);
+        let write_count = &writes;
+        let result = dispatch_post_press_selection(
+            &FakeClock, Duration::ZERO, PriorInput::None, 73_u32,
+            |candidate, _| Box::pin(async move {
+                assert_eq!(*candidate, 73);
+                ActionabilityReport {
+                    verdict: Verdict::Terminal { code: "disabled", reason: "disabled".into() },
+                    checks: vec![], waited_ms: 0, samples: 0, last_facts: None, disposition: None,
+                }
+            }),
+            |candidate| async move {
+                assert_eq!(candidate, 73);
+                write_count.fetch_add(1, Ordering::SeqCst);
+            },
+        ).await;
+        assert_eq!(writes.load(Ordering::SeqCst), 0, "refusal must prevent AXSelected");
+        assert!(result.is_err());
+    }
+}
+
 fn elapsed_ms(started: std::time::Instant) -> u64 {
     u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
