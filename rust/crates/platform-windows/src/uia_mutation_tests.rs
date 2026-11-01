@@ -411,23 +411,16 @@ fn producer_errors_keep_disposition_and_legacy_fields_after_finalization() {
 }
 
 #[test]
-fn sent_reveal_and_focus_failures_stop_before_followup() {
+fn after_sent_call_runs_followup_only_for_s_ok() {
     for hr in [1, NOT_SUPPORTED, DENIED, TIMEOUT, 0x80004005u32 as i32] {
-        for _site in [
-            "scroll_into_view",
-            "ancestor_scroll",
-            "set_focus",
-            "text_range_select",
-        ] {
-            let calls = Cell::new(0);
-            assert_eq!(
-                after_sent_call(hr, || {
-                    calls.set(calls.get() + 1);
-                }),
-                Err(hr)
-            );
-            assert_eq!(calls.get(), 0);
-        }
+        let calls = Cell::new(0);
+        assert_eq!(
+            after_sent_call(hr, || {
+                calls.set(calls.get() + 1);
+            }),
+            Err(hr)
+        );
+        assert_eq!(calls.get(), 0);
     }
     let calls = Cell::new(0);
     assert_eq!(after_sent_call(0, || calls.set(calls.get() + 1)), Ok(()));
@@ -535,4 +528,61 @@ fn prior_prologue_preserves_refusal_fields_and_makes_delivery_uncertain() {
         .unwrap(),
         cua_driver_contract::ErrorDisposition::SUSPECTED_NOOP
     );
+}
+
+#[test]
+fn foreground_focus_uncertain_finalizes_as_delivery_uncertain() {
+    use cua_driver_contract::ErrorDisposition;
+    let result = foreground_focus_uncertain_result("focus failed");
+    let wire = cua_driver_core::mcp_result::conforming_tool_result(
+        "press_key",
+        serde_json::to_value(result).unwrap(),
+    );
+    assert_eq!(wire["structuredContent"]["effect"], "unverifiable");
+    assert_eq!(
+        serde_json::from_value::<ErrorDisposition>(
+            wire["structuredContent"]["disposition"].clone()
+        )
+        .unwrap(),
+        ErrorDisposition::SUSPECTED_NOOP
+    );
+}
+
+#[test]
+fn point_failures_finalize_with_truthful_dispositions() {
+    use cua_driver_contract::ErrorDisposition;
+    for (failure, effect, expected) in [
+        (
+            PointFailure::Busy,
+            "refused",
+            ErrorDisposition::NOT_DELIVERED,
+        ),
+        (
+            PointFailure::Unavailable,
+            "refused",
+            ErrorDisposition::NOT_DELIVERED,
+        ),
+        (
+            PointFailure::Timeout,
+            "unverifiable",
+            ErrorDisposition::SUSPECTED_NOOP,
+        ),
+        (
+            PointFailure::SentFailure,
+            "unverifiable",
+            ErrorDisposition::SUSPECTED_NOOP,
+        ),
+    ] {
+        let wire = cua_driver_core::mcp_result::conforming_tool_result(
+            "click",
+            serde_json::to_value(point_failure_result(failure, 7)).unwrap(),
+        );
+        let data = &wire["structuredContent"];
+        assert_eq!(data["effect"], effect, "{failure:?}");
+        assert_eq!(
+            serde_json::from_value::<ErrorDisposition>(data["disposition"].clone()).unwrap(),
+            expected,
+            "{failure:?}"
+        );
+    }
 }

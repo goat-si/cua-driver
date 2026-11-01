@@ -203,14 +203,16 @@ fn try_type_focused_document_append_unbounded(
                 .map_err(|_| "TextPattern DocumentRange failed after dispatch")?;
             let caret_range = unsafe { document_range.Clone() }
                 .map_err(|_| "TextPattern range clone failed after dispatch")?;
-            unsafe {
-                caret_range.MoveEndpointByRange(
+            let move_hr = unsafe {
+                super::sent_call::move_endpoint_by_range(
+                    &caret_range,
                     TextPatternRangeEndpoint_Start,
                     &document_range,
                     TextPatternRangeEndpoint_End,
                 )
-            }
-            .map_err(|_| "TextPattern caret collapse failed after dispatch")?;
+            };
+            crate::uia_mutation::after_sent_call(move_hr, || ())
+                .map_err(|_| "TextPattern caret collapse failed after dispatch")?;
             let select_hr = unsafe { super::sent_call::select_text_range(&caret_range) };
             crate::uia_mutation::after_sent_call(select_hr, || ())
                 .map_err(|_| "TextPattern caret placement failed after dispatch")?;

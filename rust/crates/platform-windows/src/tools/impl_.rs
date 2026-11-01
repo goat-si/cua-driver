@@ -3353,59 +3353,47 @@ fn finish_pixel_uia_attempt(
     sy: i32,
 ) -> Option<ToolResult> {
     use crate::uia::windows_enum::PointInvokeOutcome;
-    let status = match outcome {
-        PointInvokeOutcome::Miss => return None,
-        PointInvokeOutcome::Invoked => {
-            return Some(
-                ToolResult::text(format!(
-                    "✅ Performed UIA Invoke at ({sx},{sy}) for pid {pid}."
-                ))
-                .with_structured(json!({
-                    "path": "ax", "verified": false, "effect": "unverifiable"
-                })),
-            );
+    match outcome {
+        PointInvokeOutcome::Miss => None,
+        PointInvokeOutcome::Invoked => Some(
+            ToolResult::text(format!(
+                "✅ Performed UIA Invoke at ({sx},{sy}) for pid {pid}."
+            ))
+            .with_structured(json!({
+                "path": "ax", "verified": false, "effect": "unverifiable"
+            })),
+        ),
+        PointInvokeOutcome::SentFailure
+        | PointInvokeOutcome::Busy
+        | PointInvokeOutcome::Unavailable
+        | PointInvokeOutcome::Timeout => {
+            use crate::uia_mutation::PointFailure;
+            let failure = match outcome {
+                PointInvokeOutcome::SentFailure => PointFailure::SentFailure,
+                PointInvokeOutcome::Busy => PointFailure::Busy,
+                PointInvokeOutcome::Unavailable => PointFailure::Unavailable,
+                PointInvokeOutcome::Timeout => PointFailure::Timeout,
+                _ => unreachable!(),
+            };
+            Some(crate::uia_mutation::point_failure_result(failure, pid))
         }
-        PointInvokeOutcome::SentFailure => return Some(crate::uia_mutation::chain_error(
-            format!("UIA pixel click for pid {pid} may have landed; no fallback input was sent. Inspect the target state before acting again."),
-            json!({"uia_status":"sent_failure", "path":"ax", "verified":false, "code":"background_unavailable"}),
-            [cua_driver_core::mutation::WriteOutcome::StopUncertain(cua_driver_core::mutation::Reason::Unknown)], false)),
-        PointInvokeOutcome::Busy => "busy",
-        PointInvokeOutcome::Timeout => "timeout",
-        PointInvokeOutcome::Unavailable => "unavailable",
         PointInvokeOutcome::NotResponding => {
-            return Some(cua_driver_core::delivery::background_unavailable_result(
+            Some(cua_driver_core::delivery::background_unavailable_result(
                 "the app did not answer a no-op message; nothing was sent".to_owned(),
                 "background_unavailable",
                 "the app did not answer a no-op message; nothing was sent".to_owned(),
                 json!({"uia_status": "not_responding", "path": "ax", "verified": false, "effect": "refused", "nothing_sent": true}),
-            ));
+            ))
         }
         PointInvokeOutcome::WindowGone => {
-            return Some(cua_driver_core::delivery::background_unavailable_result(
+            Some(cua_driver_core::delivery::background_unavailable_result(
                 "the target window no longer exists; nothing was sent".to_owned(),
                 "background_unavailable",
                 "the target window no longer exists; nothing was sent".to_owned(),
                 json!({"uia_status": "window_gone", "path": "ax", "verified": false, "effect": "refused", "nothing_sent": true}),
-            ));
+            ))
         }
-    };
-    Some(cua_driver_core::delivery::background_unavailable_result(
-        format!(
-            "UIA pixel click {status} for pid {pid}. No fallback input was sent. \
-         The click effect is unknown; inspect the target state before another action. \
-         If the provider does not recover, retry this action with delivery_mode:\"foreground\"."
-        ),
-        "background_unavailable",
-        format!(
-            "the UIA provider is {status}; retry this action with delivery_mode:\"foreground\"."
-        ),
-        json!({
-            "uia_status": status,
-            "path": "ax",
-            "verified": false,
-            "effect": "unverifiable",
-        }),
-    ))
+    }
 }
 
 enum BackgroundElementClick {
@@ -4852,7 +4840,7 @@ impl Tool for ClickTool {
                     }
                 })
                 .await
-                .unwrap_or(crate::uia::windows_enum::PointInvokeOutcome::Unavailable);
+                .unwrap_or(crate::uia::windows_enum::PointInvokeOutcome::SentFailure);
                 if let Some(result) = finish_pixel_uia_attempt(outcome, pid, sx_i, sy_i) {
                     return result;
                 }
@@ -6320,6 +6308,7 @@ impl Tool for PressKeyTool {
                 Ok(Ok(())) => ToolResult::text(format!(
                     "✅ Sent {key_display} via SendInput on pid {raw_pid} (delivery_mode:foreground)."
                 )),
+                Ok(Err(e)) if e.downcast_ref::<FocusUncertain>().is_some() => crate::uia_mutation::foreground_focus_uncertain_result(e.to_string()),
                 Ok(Err(e)) => ToolResult::error(e.to_string()),
                 Err(e)     => ToolResult::error(format!("Task error: {e}")),
             };
@@ -6644,7 +6633,7 @@ impl Tool for HotkeyTool {
                     use crate::uia_mutation::{refusal_text, uncertain_text, AccelStop};
                     match e.downcast_ref::<crate::uia::windows_enum::AcceleratorStop>() {
                         Some(stop) => match stop.verdict {
-                            AccelStop::Refused(kind) => ToolResult::error(refusal_text(kind, stop.hresult)),
+                            AccelStop::Refused(kind) => crate::uia_mutation::chain_error(refusal_text(kind, stop.hresult), json!({"path":"uia", "verified":false}), [crate::uia_mutation::classify_acquisition(stop.hresult).to_core()], false),
                             AccelStop::Uncertain(kind) => crate::uia_mutation::chain_error(format!("{} The shortcut may have been delivered.", uncertain_text(kind, stop.hresult)), json!({"path":"uia", "verified":false}), [crate::uia_mutation::classify_sent_call(stop.hresult).to_core()], false),
                         },
                         None => ToolResult::error(format!("hotkey (UIA path): {e}")),
@@ -6744,6 +6733,9 @@ impl Tool for HotkeyTool {
                 "✅ Pressed {key_display} on pid {raw_pid} via {path} \
                  (Win32 target)."
             )),
+            Ok(Err(e)) if e.downcast_ref::<FocusUncertain>().is_some() => {
+                crate::uia_mutation::foreground_focus_uncertain_result(e.to_string())
+            }
             Ok(Err(e)) => ToolResult::error(e.to_string()),
             Err(e) => ToolResult::error(format!("Task error: {e}")),
         }
@@ -6967,7 +6959,7 @@ impl Tool for SetValueTool {
                             });
                         }
                         if let Some(error) = parse_error {
-                            return Err(error);
+                            return Ok(SetValueRoute::InvalidValue(error.to_string()));
                         }
                         match decision {
                             SetValueDecision::Delivered { rung: 0 } => {
@@ -7007,6 +6999,8 @@ impl Tool for SetValueTool {
                          did not react, click the combo box and then the option."
                     ))
                     .with_structured(json!({ "path": "ax", "verified": false, "effect": "unverifiable" })),
+                    Ok(Ok(SetValueRoute::InvalidValue(message))) => crate::uia_mutation::chain_error(message, json!({"path":"ax", "verified":false}),
+                        [cua_driver_core::mutation::WriteOutcome::StopNotDelivered(cua_driver_core::mutation::Reason::InvalidArgument)], true),
                     Ok(Ok(SetValueRoute::WriteFailure(failure))) => {
                         set_value_write_failure_result(failure, &args)
                     }
@@ -7032,6 +7026,7 @@ impl Tool for SetValueTool {
 
 /// How `set_value` wrote the value.
 enum SetValueRoute {
+    InvalidValue(String),
     AdmissionRefused {
         reason: &'static str,
     },
@@ -7761,7 +7756,10 @@ async fn winui3_background_gesture(
                          (pid {pid}, background, no foreground swap)."
                     ))),
                     MutationRoute::FallThrough => {},
-                    MutationRoute::Refused => return Some(ToolResult::error(format!("UIA Invoke was refused ({:?}); nothing was sent. Read the window state before retrying.", result.stop))),
+                    MutationRoute::Refused => {
+                        let Some(crate::uia_mutation::MutationStop::AcquireFailed(hr)) = result.stop else { unreachable!("refusal requires acquisition failure") };
+                        return Some(crate::uia_mutation::chain_error(format!("UIA Invoke was refused ({:?}); nothing was sent. Read the window state before retrying.", result.stop), json!({"path":"uia", "verified":false}), [crate::uia_mutation::classify_acquisition(hr).to_core()], true));
+                    },
                     MutationRoute::Partial | MutationRoute::Uncertain => return Some(mutation_uncertain(format!("Double-click accepted {} of {} UIA invokes; the next may have landed. Read the window state before acting again.", result.delivered, result.requested), "uia", ActionTransport::WindowsUiaInvoke, cua_driver_core::action_record::RequestedDelivery::Background, cua_driver_core::action_record::ActualDelivery::Background)),
                 },
                 Ok(Ok(None)) => {},

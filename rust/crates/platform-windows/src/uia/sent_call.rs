@@ -5,7 +5,7 @@ use windows::Win32::UI::Accessibility::{
     IUIAutomationElement, IUIAutomationExpandCollapsePattern, IUIAutomationInvokePattern,
     IUIAutomationRangeValuePattern, IUIAutomationScrollItemPattern, IUIAutomationScrollPattern,
     IUIAutomationSelectionItemPattern, IUIAutomationTextRange, IUIAutomationTogglePattern,
-    IUIAutomationValuePattern, ScrollAmount,
+    IUIAutomationValuePattern, ScrollAmount, TextPatternRangeEndpoint,
 };
 
 macro_rules! no_args {
@@ -52,4 +52,19 @@ pub(crate) unsafe fn scroll(
     vertical: ScrollAmount,
 ) -> i32 {
     (Interface::vtable(target).Scroll)(Interface::as_raw(target), horizontal, vertical).0
+}
+
+pub(crate) unsafe fn move_endpoint_by_range(
+    target: &IUIAutomationTextRange,
+    endpoint: TextPatternRangeEndpoint,
+    range: &IUIAutomationTextRange,
+    range_endpoint: TextPatternRangeEndpoint,
+) -> i32 {
+    (Interface::vtable(target).MoveEndpointByRange)(
+        Interface::as_raw(target),
+        endpoint,
+        Interface::as_raw(range),
+        range_endpoint,
+    )
+    .0
 }

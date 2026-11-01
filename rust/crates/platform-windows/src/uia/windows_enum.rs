@@ -63,6 +63,7 @@ pub(crate) enum UiaDeadlineError {
     Timeout,
     Busy,
     Unavailable,
+    WorkerDisconnected,
 }
 
 /// Process-wide gate for blocking UIA calls.
@@ -129,7 +130,7 @@ where
         }
         Err(mpsc::RecvTimeoutError::Disconnected) => {
             tracing::warn!(target: "uia_windows_enum", "UIA {stage} thread exited without a result");
-            Err(UiaDeadlineError::Unavailable)
+            Err(UiaDeadlineError::WorkerDisconnected)
         }
     }
 }
@@ -228,9 +229,12 @@ pub fn enumerate_top_level_windows() -> Vec<WindowInfo> {
         enumerate_top_level_windows_unbounded,
     ) {
         Ok(windows) => windows,
-        Err(UiaDeadlineError::Timeout | UiaDeadlineError::Busy | UiaDeadlineError::Unavailable) => {
-            Vec::new()
-        }
+        Err(
+            UiaDeadlineError::Timeout
+            | UiaDeadlineError::Busy
+            | UiaDeadlineError::Unavailable
+            | UiaDeadlineError::WorkerDisconnected,
+        ) => Vec::new(),
     }
 }
 
@@ -299,7 +303,7 @@ pub(crate) fn probe_desktop_availability() -> Result<(), String> {
             "UI Automation is busy with an earlier timed-out provider call; window tools are temporarily using Win32-only enumeration."
                 .to_owned(),
         ),
-        Err(UiaDeadlineError::Unavailable) => {
+        Err(UiaDeadlineError::Unavailable | UiaDeadlineError::WorkerDisconnected) => {
             Err("UI Automation health worker is unavailable".to_owned())
         }
     }
@@ -428,6 +432,7 @@ impl PointInvokeOutcome {
             Err(UiaDeadlineError::Busy) => Self::Busy,
             Err(UiaDeadlineError::Timeout) => Self::Timeout,
             Err(UiaDeadlineError::Unavailable) => Self::Unavailable,
+            Err(UiaDeadlineError::WorkerDisconnected) => Self::SentFailure,
         }
     }
 }
@@ -658,7 +663,7 @@ pub fn try_invoke_accelerator_in_window(hwnd: isize, combo: &str) -> anyhow::Res
         UiaDeadlineError::Busy => Err(anyhow::anyhow!(
             "another UI Automation operation is still running; the shortcut was not sent. Retry shortly."
         )),
-        UiaDeadlineError::Timeout | UiaDeadlineError::Unavailable => {
+        UiaDeadlineError::Timeout | UiaDeadlineError::Unavailable | UiaDeadlineError::WorkerDisconnected => {
             Err(anyhow::Error::new(AcceleratorStop {
                 verdict: crate::uia_mutation::AccelStop::Uncertain(
                     crate::uia_mutation::UncertainKind::Timeout,
@@ -1149,6 +1154,10 @@ mod tests {
         for (error, expected) in [
             (UiaDeadlineError::Busy, PointInvokeOutcome::Busy),
             (UiaDeadlineError::Timeout, PointInvokeOutcome::Timeout),
+            (
+                UiaDeadlineError::WorkerDisconnected,
+                PointInvokeOutcome::SentFailure,
+            ),
             (
                 UiaDeadlineError::Unavailable,
                 PointInvokeOutcome::Unavailable,

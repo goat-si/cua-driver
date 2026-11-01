@@ -425,6 +425,67 @@ pub(crate) fn after_prologue(
     result
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PointFailure {
+    Busy,
+    Unavailable,
+    Timeout,
+    SentFailure,
+}
+
+pub(crate) fn point_failure_result(
+    failure: PointFailure,
+    pid: u32,
+) -> cua_driver_core::protocol::ToolResult {
+    use cua_driver_core::mutation::{Reason, WriteOutcome};
+    let (status, outcome, message) = match failure {
+        PointFailure::Busy => (
+            "busy",
+            WriteOutcome::StopNotDelivered(Reason::UnconfirmedAlive),
+            "nothing was sent",
+        ),
+        PointFailure::Unavailable => (
+            "unavailable",
+            WriteOutcome::StopNotDelivered(Reason::UnconfirmedAlive),
+            "nothing was sent",
+        ),
+        PointFailure::Timeout => (
+            "timeout",
+            WriteOutcome::StopUncertain(Reason::Timeout),
+            "the click may have landed; inspect the target state before acting again",
+        ),
+        PointFailure::SentFailure => (
+            "sent_failure",
+            WriteOutcome::StopUncertain(Reason::Unknown),
+            "the click may have landed; inspect the target state before acting again",
+        ),
+    };
+    let mut fields = serde_json::json!({"uia_status":status, "path":"ax", "verified":false, "code":"background_unavailable"});
+    if matches!(failure, PointFailure::Busy | PointFailure::Unavailable) {
+        fields["nothing_sent"] = true.into();
+        fields["suggestion"] = "Retry this action with delivery_mode:\"foreground\".".into();
+        fields["escalation"] = serde_json::json!({"recommended":"foreground", "reason":format!("the UIA provider is {status}; retry this action with delivery_mode:\"foreground\".")});
+    }
+    chain_error(
+        format!("UIA pixel click {status} for pid {pid}; {message}. No fallback input was sent."),
+        fields,
+        [outcome],
+        false,
+    )
+}
+
+pub(crate) fn foreground_focus_uncertain_result(
+    message: impl Into<String>,
+) -> cua_driver_core::protocol::ToolResult {
+    use cua_driver_core::mutation::{Reason, WriteOutcome};
+    chain_error(
+        message,
+        serde_json::json!({"path":"uia", "verified":false}),
+        [WriteOutcome::StopUncertain(Reason::Unknown)],
+        true,
+    )
+}
+
 /// Construct an error from the complete chain, retaining the producer's legacy fields.
 pub(crate) fn chain_error(
     message: impl Into<String>,
