@@ -2048,6 +2048,21 @@ mod popup_secure_tests {
         .unwrap();
         assert_eq!(result, "fallback");
     }
+
+    #[test]
+    fn non_text_allowed_option_values_cannot_prove_list_completeness() {
+        use super::popup_ownership::option_value;
+        assert_eq!(
+            option_value(ValueRead::Allowed(ValueObs::Number(2.0))),
+            None
+        );
+        assert_eq!(option_value(ValueRead::Allowed(ValueObs::OtherType)), None);
+        assert_eq!(
+            option_value(ValueRead::Allowed(ValueObs::Missing)),
+            Some(String::new())
+        );
+        assert_eq!(option_value(ValueRead::Withheld), Some(String::new()));
+    }
 }
 
 fn popup_route(
