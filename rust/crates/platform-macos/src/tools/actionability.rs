@@ -16,6 +16,9 @@ mod u31_pointer_order_tests;
 #[cfg(test)]
 #[path = "actionability/scope_tests.rs"]
 mod u31_scope_tests;
+#[cfg(test)]
+#[path = "actionability/target_tests.rs"]
+mod u31_semantic_target_tests;
 
 pub(crate) fn enabled<R: Reader>(reader: &mut R, element: R::Element) -> Evidence<bool> {
     observe(reader.boolean(element, "AXEnabled"))

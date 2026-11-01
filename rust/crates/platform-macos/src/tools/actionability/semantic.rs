@@ -4,17 +4,89 @@
 //! lease or performs a mutation. A cancelled blocking sample may continue to
 //! read, but cannot start an action or dispatch an input event.
 use super::{
-    evaluate, ActionabilityReport, Adapter, Clock, Duration, ElementFacts, Intent, Policy, Reader,
-    Scope, ScopeReader, StabilitySampler, Verdict,
+    evaluate, ActionabilityReport, Adapter, Clock, Duration, ElementFacts, Evidence, Intent,
+    Policy, Reader, Scope, ScopeReader, StabilitySampler, Verdict,
 };
-use crate::ax::{actionability::NativeReader, bindings::AXUIElementRef, snapshot::RetainedElement};
+use crate::ax::{
+    actionability::NativeReader,
+    bindings::{self, AXUIElementRef},
+    snapshot::RetainedElement,
+};
 use crate::goat::action_latency as latency;
+use core_foundation::base::{CFRelease, CFTypeRef};
 use std::{
     future::Future,
     pin::Pin,
     sync::{Arc, Mutex},
     time::Instant,
 };
+
+#[link(name = "ApplicationServices", kind = "framework")]
+extern "C" {
+    fn AXUIElementGetPid(element: AXUIElementRef, pid: *mut i32) -> i32;
+}
+
+/// Read only identity data; an absent or failed read never proves a target.
+pub(super) trait WindowReader {
+    type Element;
+    fn pid(&mut self, target: &Self::Element) -> Evidence<i32>;
+    fn window(&mut self, target: &Self::Element) -> Evidence<Self::Element>;
+    fn window_id(&mut self, window: &Self::Element) -> Evidence<u32>;
+}
+
+struct NativeWindowReader;
+impl WindowReader for NativeWindowReader {
+    type Element = RetainedElement;
+    fn pid(&mut self, target: &Self::Element) -> Evidence<i32> {
+        let mut pid = 0;
+        let status = unsafe { AXUIElementGetPid(target.as_ptr() as AXUIElementRef, &mut pid) };
+        if status == bindings::kAXErrorSuccess && pid > 0 {
+            Evidence::Known(pid)
+        } else {
+            Evidence::Unknown("target PID unavailable".into())
+        }
+    }
+    fn window(&mut self, target: &Self::Element) -> Evidence<Self::Element> {
+        let window =
+            unsafe { bindings::copy_element_attr(target.as_ptr() as AXUIElementRef, "AXWindow") };
+        match window {
+            Some(window) => {
+                let retained = unsafe { RetainedElement::retain(window as usize) };
+                unsafe { CFRelease(window as CFTypeRef) };
+                Evidence::Known(retained)
+            }
+            None => Evidence::Unknown("target AXWindow unavailable".into()),
+        }
+    }
+    fn window_id(&mut self, window: &Self::Element) -> Evidence<u32> {
+        match unsafe { bindings::ax_get_window_id(window.as_ptr() as AXUIElementRef) } {
+            Some(id) => Evidence::Known(id),
+            None => Evidence::Unknown("AX window ID unavailable".into()),
+        }
+    }
+}
+
+/// Bind the actual target and its AX window to the admission's exact PID and
+/// window. Every incomplete read remains unknown; this does not dispatch.
+pub(super) fn bind_exact_with<R: WindowReader>(
+    reader: &mut R,
+    target: R::Element,
+    pid: i32,
+    window_id: u32,
+) -> Evidence<(R::Element, R::Element)> {
+    match reader.pid(&target) {
+        Evidence::Known(actual) if actual == pid => {}
+        _ => return Evidence::Unknown("target PID does not match admission".into()),
+    }
+    let window = match reader.window(&target) {
+        Evidence::Known(window) => window,
+        _ => return Evidence::Unknown("target AXWindow is unproven".into()),
+    };
+    match reader.window_id(&window) {
+        Evidence::Known(actual) if actual == window_id => Evidence::Known((target, window)),
+        _ => Evidence::Unknown("target AXWindow does not match admission".into()),
+    }
+}
 
 /// Owned intent names cross worker boundaries without sending a raw AX pointer.
 #[derive(Clone)]
@@ -148,5 +220,28 @@ impl SemanticProbe {
             Ok(report) => report,
             Err(error) => unavailable(format!("semantic sample worker failed: {error}")),
         }
+    }
+}
+
+/// Resolve an already admitted target while borrowing its existing per-PID
+/// lease. Callers must treat an unknown binding as transient and retry it in
+/// `auto_wait`; this helper neither acquires a lease nor makes a refusal.
+pub(super) async fn bind_exact_after_lease(
+    lease: &crate::tools::BackgroundMutationLease,
+    target: RetainedElement,
+    window_id: u32,
+) -> Evidence<SemanticProbe> {
+    let pid = lease.pid();
+    let binding = latency::spawn_blocking(move || {
+        bind_exact_with(&mut NativeWindowReader, target, pid, window_id)
+    })
+    .await;
+    match binding {
+        Ok(Evidence::Known((target, window))) => {
+            Evidence::Known(SemanticProbe::new(pid, target, window))
+        }
+        Ok(Evidence::Unknown(reason)) => Evidence::Unknown(reason),
+        Ok(Evidence::Absent) => Evidence::Unknown("target window is absent".into()),
+        Err(error) => Evidence::Unknown(format!("target binding worker failed: {error}")),
     }
 }
