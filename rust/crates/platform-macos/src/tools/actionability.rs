@@ -14,6 +14,9 @@ pub(super) mod semantic;
 #[path = "actionability/order_tests.rs"]
 mod u31_pointer_order_tests;
 #[cfg(test)]
+#[path = "actionability/pointer_tests.rs"]
+mod u31_pointer_tests;
+#[cfg(test)]
 #[path = "actionability/scope_tests.rs"]
 mod u31_scope_tests;
 #[cfg(test)]
@@ -309,6 +312,51 @@ where
 {
     actionability::auto_wait(clock, budget, prologue_attempted, probe).await
 }
+pub(super) fn semantic_clock() -> impl Clock + Sync {
+    semantic::SemanticClock::default()
+}
+
+/// Dispatch one semantic action after its admitted target is sampled.
+pub(super) async fn dispatch_semantic<C, P, A, F, T>(
+    _clock: &impl Clock,
+    _budget: Duration,
+    context: C,
+    _probe: P,
+    perform: A,
+) -> Result<T, ToolResult>
+where
+    P: for<'a> FnMut(
+            &'a C,
+            Duration,
+        )
+            -> std::pin::Pin<Box<dyn Future<Output = ActionabilityReport> + Send + 'a>>
+        + Send,
+    A: FnOnce(C) -> F,
+    F: Future<Output = T>,
+{
+    Ok(perform(context).await)
+}
+
+pub(super) fn click_probe<'a>(
+    lease: &'a Option<crate::tools::BackgroundMutationLease>,
+    target: crate::ax::snapshot::RetainedElement,
+    pid: i32,
+    window_id: u32,
+) -> std::pin::Pin<Box<dyn Future<Output = ActionabilityReport> + Send + 'a>> {
+    Box::pin(async move {
+        let bound = if let Some(lease) = lease {
+            semantic::bind_exact_after_lease(lease, target, window_id).await
+        } else {
+            semantic::bind_exact_after_admission(pid, target, window_id).await
+        };
+        match bound {
+            Evidence::Known(probe) => probe.sample(semantic::SemanticIntent::Click).await,
+            Evidence::Unknown(reason) => semantic::unavailable(reason),
+            Evidence::Absent => semantic::unavailable("target binding absent".into()),
+        }
+    })
+}
+
 pub(crate) enum ResultDecision {
     Continue(ToolResult),
     Wait(ToolResult),

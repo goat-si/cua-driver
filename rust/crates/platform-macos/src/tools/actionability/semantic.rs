@@ -155,7 +155,7 @@ where
     evaluate(intent.intent(), Policy::headless(), &facts)
 }
 
-fn unavailable(reason: String) -> ActionabilityReport {
+pub(super) fn unavailable(reason: String) -> ActionabilityReport {
     ActionabilityReport {
         verdict: Verdict::Transient {
             reason,
@@ -231,7 +231,14 @@ pub(super) async fn bind_exact_after_lease(
     target: RetainedElement,
     window_id: u32,
 ) -> Evidence<SemanticProbe> {
-    let pid = lease.pid();
+    bind_exact_after_admission(lease.pid(), target, window_id).await
+}
+
+pub(super) async fn bind_exact_after_admission(
+    pid: i32,
+    target: RetainedElement,
+    window_id: u32,
+) -> Evidence<SemanticProbe> {
     let binding = latency::spawn_blocking(move || {
         bind_exact_with(&mut NativeWindowReader, target, pid, window_id)
     })

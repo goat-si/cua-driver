@@ -1835,69 +1835,91 @@ impl ClickTool {
             // its result: a cancelled caller cannot release it while the
             // action (and a text input's key hand-back) still runs.
             let action_lease = _mutation_lease.take();
-            let result = focus_guard::with_focus_suppressed(
-                if foreground { None } else { Some(pid) },
-                prior_front,
-                "click.AXPress",
-                || async move {
-                    latency::spawn_action_blocking(move || {
-                        let held = action_lease;
-                        let element_ptr = element_guard.as_ptr();
-                        let run = || -> anyhow::Result<(AxClickOutcome, bool)> {
-                            if foreground {
-                                let mut outcome = None;
-                                let has_modifiers = !selection_modifiers.is_empty();
-                                let action = || {
-                                    outcome = Some(perform_ax_click(
+            let probe_target = element_guard.clone();
+            let clock = super::actionability::semantic_clock();
+            let use_battery = effective_action == "press";
+            let perform = |action_lease| {
+                focus_guard::with_focus_suppressed(
+                    if foreground { None } else { Some(pid) },
+                    prior_front,
+                    "click.AXPress",
+                    || async move {
+                        latency::spawn_action_blocking(move || {
+                            let held = action_lease;
+                            let element_ptr = element_guard.as_ptr();
+                            let run = || -> anyhow::Result<(AxClickOutcome, bool)> {
+                                if foreground {
+                                    let mut outcome = None;
+                                    let has_modifiers = !selection_modifiers.is_empty();
+                                    let action = || {
+                                        outcome = Some(perform_ax_click(
+                                            (element_ptr, idx),
+                                            (pid, wid),
+                                            &action_clone,
+                                            &ck,
+                                            selection_pixel,
+                                            &selection_modifiers,
+                                            foreground,
+                                            read_back,
+                                        )?);
+                                        Ok(())
+                                    };
+                                    let fronted = if has_modifiers {
+                                        crate::input::skylight::with_foreground_hid_activation(
+                                            pid as libc::pid_t,
+                                            wid,
+                                            action,
+                                        )?;
+                                        true
+                                    } else {
+                                        crate::input::skylight::with_foreground_assist(
+                                            pid as libc::pid_t,
+                                            wid,
+                                            action,
+                                        )?
+                                    };
+                                    let outcome = outcome.ok_or_else(|| {
+                                        anyhow::anyhow!("foreground AX click did not execute")
+                                    })?;
+                                    Ok((outcome, fronted))
+                                } else {
+                                    perform_ax_click(
                                         (element_ptr, idx),
                                         (pid, wid),
                                         &action_clone,
                                         &ck,
                                         selection_pixel,
                                         &selection_modifiers,
-                                        foreground,
+                                        false,
                                         read_back,
-                                    )?);
-                                    Ok(())
-                                };
-                                let fronted = if has_modifiers {
-                                    crate::input::skylight::with_foreground_hid_activation(
-                                        pid as libc::pid_t,
-                                        wid,
-                                        action,
-                                    )?;
-                                    true
-                                } else {
-                                    crate::input::skylight::with_foreground_assist(
-                                        pid as libc::pid_t,
-                                        wid,
-                                        action,
-                                    )?
-                                };
-                                let outcome = outcome.ok_or_else(|| {
-                                    anyhow::anyhow!("foreground AX click did not execute")
-                                })?;
-                                Ok((outcome, fronted))
-                            } else {
-                                perform_ax_click(
-                                    (element_ptr, idx),
-                                    (pid, wid),
-                                    &action_clone,
-                                    &ck,
-                                    selection_pixel,
-                                    &selection_modifiers,
-                                    false,
-                                    read_back,
-                                )
-                                .map(|outcome| (outcome, false))
-                            }
-                        };
-                        (run(), held)
-                    })
-                    .await
-                },
-            )
-            .await;
+                                    )
+                                    .map(|outcome| (outcome, false))
+                                }
+                            };
+                            (run(), held)
+                        })
+                        .await
+                    },
+                )
+            };
+            let result = if use_battery {
+                match super::actionability::dispatch_semantic(
+                    &clock,
+                    cua_driver_core::actionability::DEFAULT_BUDGET,
+                    action_lease,
+                    |lease, _| {
+                        super::actionability::click_probe(lease, probe_target.clone(), pid, wid)
+                    },
+                    perform,
+                )
+                .await
+                {
+                    Ok(result) => result,
+                    Err(refusal) => return refusal,
+                }
+            } else {
+                perform(action_lease).await
+            };
             let result = result.map(|(outcome, held)| {
                 _mutation_lease = held;
                 outcome
