@@ -115,13 +115,15 @@ fn failed_control_attribute_reports_attribute_read_failed() {
 
 #[test]
 fn failed_role_reports_attribute_read_failed() {
-    let (tree, _) = super::walker_seam_tests::canonical_walk_fixture("role_failure");
-    let mut output = json!({});
-    tree.walk.apply(&mut output);
-    assert!(output["observation_incomplete_reasons"]
-        .as_array()
-        .unwrap()
-        .contains(&json!({"kind":"provider_failure", "detail":"attribute_read_failed"})));
+    for case in ["role_failure", "role_unknown"] {
+        let (tree, _) = super::walker_seam_tests::canonical_walk_fixture(case);
+        let mut output = json!({});
+        tree.walk.apply(&mut output);
+        assert!(output["observation_incomplete_reasons"]
+            .as_array()
+            .unwrap()
+            .contains(&json!({"kind":"provider_failure", "detail":"attribute_read_failed"})));
+    }
 }
 
 #[test]
@@ -212,6 +214,160 @@ fn failed_tab_probe_reports_attribute_read_failed() {
     drop(root);
     source.assert_consumed();
     source.assert_lifetimes(&[]);
+
+    // A failed child classification probe is recovered by a later full walk
+    // only when the same child and attribute are successfully read again.
+    for (recovered, expected_failure) in [(true, false), (false, true)] {
+        let output = tab_role_probe_then_full_walk(recovered);
+        assert_eq!(
+            output["observation_incomplete_reasons"]
+                .as_array()
+                .unwrap()
+                .contains(&json!({"kind":"provider_failure", "detail":"attribute_read_failed"})),
+            expected_failure,
+            "recovered={recovered}, output={output}"
+        );
+    }
+    use crate::ax::evidence::{record_status, EvidenceStatus, ReadSite};
+    for (probe, later_owner, later_site, later_status, expected_failure) in [
+        (
+            "AXRole",
+            Some(2),
+            ReadSite::Role,
+            EvidenceStatus::Known,
+            true,
+        ),
+        (
+            "AXRole",
+            Some(1),
+            ReadSite::Content("AXTitle"),
+            EvidenceStatus::Known,
+            true,
+        ),
+        (
+            "AXRole",
+            Some(1),
+            ReadSite::Role,
+            EvidenceStatus::Absent,
+            true,
+        ),
+        (
+            "AXDescription",
+            Some(1),
+            ReadSite::Content("AXDescription"),
+            EvidenceStatus::Absent,
+            false,
+        ),
+        (
+            "AXSelected",
+            Some(1),
+            ReadSite::Control("AXSelected"),
+            EvidenceStatus::Known,
+            false,
+        ),
+    ] {
+        let scope = crate::ax::evidence::EvidenceScope::start();
+        record_status(
+            Some(1),
+            ReadSite::Tab(probe),
+            EvidenceStatus::Unknown(ReadFailure::WrongType),
+        );
+        record_status(later_owner, later_site, later_status);
+        let mut budget = WalkBudget::nodes_only(10);
+        record_attribute_failures(&mut budget);
+        let mut output = json!({});
+        budget.outcome().apply(&mut output);
+        assert_eq!(
+            output["observation_incomplete_reasons"]
+                .as_array()
+                .unwrap()
+                .contains(&json!({"kind":"provider_failure", "detail":"attribute_read_failed"})),
+            expected_failure,
+            "probe={probe}, later={later_site:?}, owner={later_owner:?}"
+        );
+        let _ = scope.finish(());
+    }
+}
+
+fn tab_role_probe_then_full_walk(recovered: bool) -> Value {
+    use crate::ax::tree_source::ReadFailure;
+    let ids: Vec<usize> = (2..12).collect();
+    let mut nodes: Vec<(usize, usize, usize, &[usize])> = vec![(1, 1, 1, &ids)];
+    nodes.extend(ids.iter().map(|&id| (id, id, id, &[][..])));
+    let content =
+        "AXTitle,AXPlaceholderValue,AXDescription,AXIdentifier,AXHelp,AXSubrole,AXRoleDescription";
+    let mut script = vec![
+        step("timeout 1", Reply::Unit),
+        step(
+            "text 1 AXRole",
+            Reply::Text(Read::Known("AXTabGroup".into())),
+        ),
+        step(
+            &format!("batch 1 {content}"),
+            Reply::Batch(Ok(Batch(vec![Slot::Text(AttrStatus::Absent); 7]))),
+        ),
+        step("value 1", Reply::Value(Ok(None))),
+        step("actions 1", Reply::Actions(Read::Known(vec![]))),
+        step("children 1", Reply::Children(Read::Known(ids.clone()))),
+        step("text 1 AXTitle", Reply::Text(Read::Absent)),
+        step("text 1 AXDescription", Reply::Text(Read::Absent)),
+        step("text 1 AXRoleDescription", Reply::Text(Read::Absent)),
+    ];
+    for &id in &ids {
+        script.extend([
+            step(&format!("timeout {id}"), Reply::Unit),
+            step(
+                &format!("text {id} AXRole"),
+                Reply::Text(if id == 2 {
+                    Read::Unknown(ReadFailure::WrongType)
+                } else {
+                    Read::Known("AXStaticText".into())
+                }),
+            ),
+            step(
+                &format!("text {id} AXRoleDescription"),
+                Reply::Text(Read::Absent),
+            ),
+        ]);
+    }
+    for &id in &ids {
+        let role_failure = id == 2 && !recovered;
+        script.extend([
+            step(&format!("timeout {id}"), Reply::Unit),
+            step(
+                &format!("text {id} AXRole"),
+                Reply::Text(if role_failure {
+                    Read::Unknown(ReadFailure::WrongType)
+                } else {
+                    Read::Known("AXStaticText".into())
+                }),
+            ),
+            step(
+                &format!("batch {id} {content}"),
+                Reply::Batch(Ok(Batch(vec![Slot::Text(AttrStatus::Absent); 7]))),
+            ),
+        ]);
+        if !role_failure {
+            script.push(step(&format!("value {id}"), Reply::Value(Ok(None))));
+        }
+        script.extend([
+            step(
+                &format!("actions {id}"),
+                Reply::Actions(Read::Known(vec![])),
+            ),
+            step(&format!("children {id}"), Reply::Children(Read::Absent)),
+        ]);
+    }
+    let source = Fake::new(&nodes, script);
+    let root = source.handle(1);
+    let tree =
+        run_fake_observed(&source, &root, None, 10, WalkBudget::nodes_only(100), true).legacy;
+    drop(root);
+    source.assert_consumed();
+    source.assert_lifetimes(&[]);
+    let mut output = json!({});
+    tree.walk.apply(&mut output);
+    output
 }
 
 #[test]

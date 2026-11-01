@@ -1442,9 +1442,10 @@ fn finalize_with_deadline_sample(
 /// carry the eventual result, and a fully recovered replay is not incomplete.
 fn record_attribute_failures(budget: &mut WalkBudget) {
     use super::evidence::{current_evidence, EvidenceStatus, ReadSite};
-    let failed = current_evidence().iter().any(|evidence| {
+    let evidence = current_evidence();
+    let failed = evidence.iter().enumerate().any(|(index, entry)| {
         let attribute_site = matches!(
-            evidence.site,
+            entry.site,
             ReadSite::Role
                 | ReadSite::ActionNames
                 | ReadSite::Content(_)
@@ -1456,12 +1457,35 @@ fn record_attribute_failures(budget: &mut WalkBudget) {
                 | ReadSite::SelectedSettable
                 | ReadSite::MenuSelected
         );
-        attribute_site
-            && (matches!(evidence.status, EvidenceStatus::Unknown(_))
+        let read_failed = attribute_site
+            && (matches!(entry.status, EvidenceStatus::Unknown(_))
                 || matches!(
-                    (evidence.site, evidence.status),
-                    (ReadSite::Role, EvidenceStatus::Absent)
-                ))
+                    (entry.site, entry.status),
+                    (
+                        ReadSite::Role,
+                        EvidenceStatus::Absent | EvidenceStatus::Unavailable
+                    )
+                ));
+        if !read_failed {
+            return false;
+        }
+        let recovery_site = match entry.site {
+            ReadSite::Tab("AXRole") => Some(ReadSite::Role),
+            ReadSite::Tab("AXSelected") => Some(ReadSite::Control("AXSelected")),
+            ReadSite::Tab(name @ ("AXTitle" | "AXDescription" | "AXRoleDescription")) => {
+                Some(ReadSite::Content(name))
+            }
+            _ => None,
+        };
+        let Some((owner, site)) = entry.owner.zip(recovery_site) else {
+            return true;
+        };
+        !evidence[index + 1..].iter().any(|later| {
+            later.owner == Some(owner)
+                && later.site == site
+                && (later.status == EvidenceStatus::Known
+                    || (site != ReadSite::Role && later.status == EvidenceStatus::Absent))
+        })
     });
     if failed {
         budget.record_skip(IncompleteReason {
@@ -2090,6 +2114,13 @@ fn walk_element<S: AxTreeSource>(
         super::evidence::ReadSite::Role,
         role_status,
     );
+    if role_read && (role.trim().is_empty() || role == "AXUnknown") {
+        super::evidence::record_status(
+            Some(element_key),
+            super::evidence::ReadSite::Role,
+            super::evidence::EvidenceStatus::Unavailable,
+        );
+    }
     let child_label_path = child_label_path(label_path, &role, parent_role, element_key);
     let in_web_content = in_web_content || is_web_content_role(&role);
     if in_web_content && !include_web_content {
