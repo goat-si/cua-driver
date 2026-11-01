@@ -633,6 +633,9 @@ struct SourceContentReader<'a, S: AxTreeSource> {
 }
 
 impl<S: AxTreeSource> ContentReader for SourceContentReader<'_, S> {
+    fn owner(&self) -> Option<usize> {
+        super::evidence::current_owner()
+    }
     fn batch(&mut self) -> Result<[AttrStatus; 7], super::batch_attrs::BatchFailure> {
         let slots = self.source.batch(self.element, &CONTENT_ATTRIBUTES)?;
         Ok(std::array::from_fn(|index| slots.text(index)))

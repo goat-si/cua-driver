@@ -11,18 +11,24 @@ use std::cell::RefCell;
 
 thread_local! {
     static WALK_EVIDENCE: RefCell<Option<Vec<ReadEvidence>>> = const { RefCell::new(None) };
+    static WALK_OWNER: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
 }
 
 /// A walk owns its evidence until it returns. Nested walks temporarily replace
 /// the collector and restore it even if they unwind.
 pub(crate) struct EvidenceScope {
     previous: Option<Vec<ReadEvidence>>,
+    previous_owner: Option<usize>,
 }
 
 impl EvidenceScope {
     pub(crate) fn start() -> Self {
         let previous = WALK_EVIDENCE.with(|cell| cell.replace(Some(Vec::new())));
-        Self { previous }
+        let previous_owner = WALK_OWNER.with(|cell| cell.replace(None));
+        Self {
+            previous,
+            previous_owner,
+        }
     }
 
     pub(crate) fn finish<T>(self, legacy: T) -> Observed<T> {
@@ -38,6 +44,25 @@ impl EvidenceScope {
 impl Drop for EvidenceScope {
     fn drop(&mut self) {
         WALK_EVIDENCE.with(|cell| *cell.borrow_mut() = self.previous.take());
+        WALK_OWNER.with(|cell| cell.set(self.previous_owner));
+    }
+}
+
+pub(crate) fn current_owner() -> Option<usize> {
+    WALK_OWNER.with(std::cell::Cell::get)
+}
+
+pub(crate) struct EvidenceOwner(Option<usize>);
+
+impl EvidenceOwner {
+    pub(crate) fn start(owner: usize) -> Self {
+        Self(WALK_OWNER.with(|cell| cell.replace(Some(owner))))
+    }
+}
+
+impl Drop for EvidenceOwner {
+    fn drop(&mut self) {
+        WALK_OWNER.with(|cell| cell.set(self.0));
     }
 }
 

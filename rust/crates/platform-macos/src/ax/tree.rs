@@ -1366,6 +1366,7 @@ fn walk_element<S: AxTreeSource>(
 
     let label_path = next_label_path(parent_path, parent_role, Some(&role));
     let element_key = source.key(element);
+    let _evidence_owner = super::evidence::EvidenceOwner::start(element_key);
     super::evidence::record_status(
         Some(element_key),
         super::evidence::ReadSite::Role,
@@ -2144,6 +2145,7 @@ fn plan_macos_tab_strip<S: AxTreeSource>(
     let mut tab_like_count = 0usize;
 
     for child in children {
+        let _evidence_owner = super::evidence::EvidenceOwner::start(source.key(child));
         source.set_messaging_timeout(child);
         let r = known(source.text(child, "AXRole")).unwrap_or_default();
         let rd = if r == "AXTab" || r == "AXRadioButton" {

@@ -89,22 +89,30 @@ impl<'a, S: AxTreeSource> EvidenceSource<'a, S> {
         }
     }
     pub(crate) fn note(&self, site: ReadSite, status: EvidenceStatus) {
+        let owner = self.owner.or_else(super::evidence::current_owner);
         let mut state = self.state.borrow_mut();
         let attempt = state.attempt;
         state.evidence.push(ReadEvidence {
-            owner: self.owner,
+            owner,
             site,
             status,
             attempt,
             listing: None,
         });
     }
-    fn record<T>(&self, _element: &S::Element, name: &str, result: &Read<T>) {
+    fn owner_for(&self, element: &S::Element) -> Option<usize> {
+        match self.domain {
+            Domain::Scrollbar | Domain::Tab | Domain::Dense => Some(self.source.key(element)),
+            Domain::Control | Domain::Frame => self.owner.or_else(super::evidence::current_owner),
+        }
+    }
+    fn record<T>(&self, element: &S::Element, name: &str, result: &Read<T>) {
         if let Some(site) = self.domain.site(name) {
+            let owner = self.owner_for(element);
             let mut state = self.state.borrow_mut();
             let attempt = state.attempt;
             state.evidence.push(ReadEvidence {
-                owner: self.owner,
+                owner,
                 site,
                 status: read_status(result),
                 attempt,
@@ -189,10 +197,11 @@ impl<S: AxTreeSource> AxTreeSource for EvidenceSource<'_, S> {
         let v = self.source.text_status(e, name);
         if let Some(site) = self.domain.site(name) {
             let (status, listing) = attr_status(&v);
+            let owner = self.owner_for(e);
             let mut state = self.state.borrow_mut();
             let attempt = state.attempt;
             state.evidence.push(ReadEvidence {
-                owner: self.owner,
+                owner,
                 site,
                 status,
                 attempt,
@@ -226,11 +235,13 @@ impl<S: AxTreeSource> AxTreeSource for EvidenceSource<'_, S> {
     }
     fn batch(&self, e: &Self::Element, names: &[&str]) -> Result<Self::Batch, BatchFailure> {
         let attempt = self.state.borrow().attempt;
-        match self.source.batch(e, names) {
+        let result = self.source.batch(e, names);
+        let owner = self.owner_for(e);
+        match result {
             Ok(inner) => Ok(EvidenceBatch {
                 inner,
                 sites: names.iter().map(|name| self.domain.site(name)).collect(),
-                owner: self.owner,
+                owner,
                 attempt,
                 state: self.state.clone(),
             }),
@@ -241,7 +252,7 @@ impl<S: AxTreeSource> AxTreeSource for EvidenceSource<'_, S> {
                 };
                 let mut state = self.state.borrow_mut();
                 state.evidence.push(ReadEvidence {
-                    owner: self.owner,
+                    owner,
                     site: self.domain.batch_site(),
                     status,
                     attempt,

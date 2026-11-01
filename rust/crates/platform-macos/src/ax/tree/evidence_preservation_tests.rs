@@ -19,6 +19,15 @@ fn assert_evidence(evidence: &[ReadEvidence], site: ReadSite, status: EvidenceSt
     );
 }
 
+fn assert_owned(evidence: &[ReadEvidence], site: ReadSite, status: EvidenceStatus, owner: usize) {
+    assert!(
+        evidence.iter().any(|entry| entry.site == site
+            && entry.status == status
+            && entry.owner == Some(owner)),
+        "missing owner {owner} for {site:?}: {status:?}"
+    );
+}
+
 #[derive(Clone, Copy)]
 enum Case {
     Known,
@@ -856,7 +865,12 @@ fn scrollbar_owner_preserves_unknown_and_absent() {
             ReadSite::Scrollbar("AXVerticalScrollBar"),
             case.status(),
         );
-        assert!(result.evidence.iter().all(|entry| entry.owner.is_none()));
+        assert_owned(
+            &result.evidence,
+            ReadSite::Scrollbar("AXVerticalScrollBar"),
+            case.status(),
+            1,
+        );
     }
 }
 
@@ -895,6 +909,12 @@ fn scrollbar_role_preserves_unknown_and_absent() {
             ReadSite::Scrollbar("AXRole"),
             case.status(),
         );
+        assert_owned(
+            &observed.evidence,
+            ReadSite::Scrollbar("AXRole"),
+            case.status(),
+            2,
+        );
     }
 }
 
@@ -932,6 +952,12 @@ fn scrollbar_value_preserves_unknown_and_absent() {
             &observed.evidence,
             ReadSite::Scrollbar("AXValue"),
             case.status(),
+        );
+        assert_owned(
+            &observed.evidence,
+            ReadSite::Scrollbar("AXValue"),
+            case.status(),
+            2,
         );
     }
 }
@@ -1080,7 +1106,7 @@ fn tab_parent_metadata_preserves_unknown_and_absent() {
             drop(element);
             fake.assert_lifetimes(&[]);
             assert_evidence(&result.evidence, ReadSite::Tab(name), case.status());
-            assert!(result.evidence.iter().all(|entry| entry.owner.is_none()));
+            assert_owned(&result.evidence, ReadSite::Tab(name), case.status(), 1);
         }
     }
 }
@@ -1147,6 +1173,7 @@ fn tab_child_metadata_preserves_unknown_and_absent() {
             drop(root);
             fake.assert_lifetimes(&[]);
             assert_evidence(&observed.evidence, ReadSite::Tab(name), case.status());
+            assert_owned(&observed.evidence, ReadSite::Tab(name), case.status(), 2);
         }
     }
 }
@@ -1471,6 +1498,12 @@ fn dense_geometry_preserves_unknown_and_absent() {
             ReadSite::Dense("AXPosition"),
             case.status(),
         );
+        assert_owned(
+            &observed.evidence,
+            ReadSite::Dense("AXPosition"),
+            case.status(),
+            2,
+        );
     }
 }
 
@@ -1587,6 +1620,12 @@ fn nested_walk_evidence_is_isolated() {
         ReadSite::Content("AXIdentifier"),
         EvidenceStatus::Unknown(ReadFailure::WrongType),
     );
+    assert_owned(
+        inner,
+        ReadSite::Content("AXIdentifier"),
+        EvidenceStatus::Unknown(ReadFailure::WrongType),
+        2,
+    );
     assert!(!inner
         .iter()
         .any(|entry| entry.site == ReadSite::Content("AXDescription")
@@ -1595,6 +1634,12 @@ fn nested_walk_evidence_is_isolated() {
         &observed.evidence,
         ReadSite::Content("AXDescription"),
         EvidenceStatus::Unknown(ReadFailure::WrongType),
+    );
+    assert_owned(
+        &observed.evidence,
+        ReadSite::Content("AXDescription"),
+        EvidenceStatus::Unknown(ReadFailure::WrongType),
+        1,
     );
     assert!(!observed
         .evidence
