@@ -3003,13 +3003,166 @@ async fn write_through_editable_proxies(
     };
     let len = text.chars().count() as i32;
 
-    if et.insert_text(off, text, len).await.unwrap_or(false) {
-        return Ok(true);
+    write_through_insert_calls(&et, off, text, len).await
+}
+
+trait InsertCalls {
+    async fn insert(&self, offset: i32, text: &str, len: i32) -> zbus::Result<bool>;
+}
+
+impl InsertCalls for atspi::proxy::editable_text::EditableTextProxy<'_> {
+    async fn insert(&self, offset: i32, text: &str, len: i32) -> zbus::Result<bool> {
+        self.insert_text(offset, text, len).await
     }
-    if et.set_text_contents(text).await.unwrap_or(false) {
-        return Ok(true);
+}
+
+#[derive(Debug)]
+pub struct WriteUncertain {
+    pub step: crate::text_write_policy::WriteStep,
+}
+
+impl std::fmt::Display for WriteUncertain {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "AT-SPI write unacknowledged: {:?}", self.step)
     }
-    Ok(false)
+}
+impl std::error::Error for WriteUncertain {}
+
+fn classify_mutator_error(error: &zbus::Error) -> crate::text_write_policy::CallClass {
+    use crate::text_write_policy::CallClass;
+    match error {
+        zbus::Error::MethodError(name, _, _)
+            if name.as_str() == "org.freedesktop.DBus.Error.UnknownMethod"
+                || name.as_str() == "org.freedesktop.DBus.Error.UnknownInterface" =>
+        {
+            CallClass::KnownUnsupported
+        }
+        zbus::Error::FDO(error)
+            if matches!(
+                error.as_ref(),
+                zbus::fdo::Error::UnknownMethod(_) | zbus::fdo::Error::UnknownInterface(_)
+            ) =>
+        {
+            CallClass::KnownUnsupported
+        }
+        _ => CallClass::PossiblyExecuted,
+    }
+}
+
+async fn write_through_insert_calls(
+    calls: &impl InsertCalls,
+    off: i32,
+    text: &str,
+    len: i32,
+) -> Result<bool> {
+    match calls.insert(off, text, len).await {
+        Ok(written) => Ok(written),
+        Err(error)
+            if classify_mutator_error(&error)
+                == crate::text_write_policy::CallClass::KnownUnsupported =>
+        {
+            Ok(false)
+        }
+        Err(_) => Err(WriteUncertain {
+            step: crate::text_write_policy::WriteStep {
+                step: crate::text_write_policy::Step::InsertText,
+                bytes: text.len(),
+                units: Some(len),
+            },
+        }
+        .into()),
+    }
+}
+
+#[cfg(test)]
+mod insert_regression_tests {
+    use super::*;
+    use std::cell::RefCell;
+
+    struct Fake {
+        failure: bool,
+        contents: RefCell<String>,
+        calls: RefCell<Vec<&'static str>>,
+    }
+
+    impl InsertCalls for Fake {
+        async fn insert(&self, _: i32, _: &str, _: i32) -> zbus::Result<bool> {
+            self.calls.borrow_mut().push("insert");
+            if self.failure {
+                Err(zbus::Error::InvalidReply)
+            } else {
+                Ok(false)
+            }
+        }
+    }
+
+    #[test]
+    fn insert_error_must_not_trigger_second_write() {
+        let fake = Fake {
+            failure: true,
+            contents: RefCell::new("hello".into()),
+            calls: RefCell::new(vec![]),
+        };
+        let error = runtime()
+            .block_on(write_through_insert_calls(&fake, 5, "abc", 3))
+            .unwrap_err();
+        assert!(error.downcast_ref::<WriteUncertain>().is_some());
+        assert_eq!(*fake.calls.borrow(), ["insert"]);
+    }
+
+    #[test]
+    fn refused_insert_must_not_replace_existing_content() {
+        let fake = Fake {
+            failure: false,
+            contents: RefCell::new("hello".into()),
+            calls: RefCell::new(vec![]),
+        };
+        let _ = runtime().block_on(write_through_insert_calls(&fake, 5, "abc", 3));
+        assert_eq!(*fake.contents.borrow(), "hello");
+        assert_eq!(*fake.calls.borrow(), ["insert"]);
+    }
+
+    #[test]
+    fn classify_real_zbus_mutator_errors() {
+        use crate::text_write_policy::CallClass::{KnownUnsupported, PossiblyExecuted};
+        let message = zbus::Message::method_call("/test", "Test")
+            .unwrap()
+            .build(&())
+            .unwrap();
+        for name in [
+            "org.freedesktop.DBus.Error.UnknownMethod",
+            "org.freedesktop.DBus.Error.UnknownInterface",
+        ] {
+            let error = zbus::Error::MethodError(name.try_into().unwrap(), None, message.clone());
+            assert_eq!(classify_mutator_error(&error), KnownUnsupported);
+        }
+        for error in [
+            zbus::fdo::Error::UnknownMethod(String::new()),
+            zbus::fdo::Error::UnknownInterface(String::new()),
+        ] {
+            assert_eq!(
+                classify_mutator_error(&zbus::Error::FDO(Box::new(error))),
+                KnownUnsupported
+            );
+        }
+        for error in [
+            zbus::Error::InvalidReply,
+            zbus::Error::InputOutput(std::sync::Arc::new(std::io::Error::from(
+                std::io::ErrorKind::TimedOut,
+            ))),
+            zbus::Error::FDO(Box::new(zbus::fdo::Error::NoReply(String::new()))),
+            zbus::Error::Variant(zbus::zvariant::Error::IncorrectType),
+            zbus::Error::MethodError(
+                "org.freedesktop.DBus.Error.AccessDenied"
+                    .try_into()
+                    .unwrap(),
+                None,
+                message,
+            ),
+        ] {
+            assert_eq!(classify_mutator_error(&error), PossiblyExecuted);
+        }
+    }
 }
 
 /// Write into the best editable exposed by the current AT-SPI tree without
@@ -3020,7 +3173,7 @@ pub fn type_into_editable(pid: u32, text: &str) -> Result<()> {
         async {
             let conn = shared_connection().await?;
             // Focused editable known from the event log: write there directly.
-            if let Some(true) = write_into_focused_editable(conn, pid, text).await {
+            if let Some(true) = write_into_focused_editable(conn, pid, text).await? {
                 return Ok(());
             }
             let Collected {
@@ -3092,7 +3245,7 @@ pub fn insert_text(pid: u32, text: &str) -> Result<bool> {
         INPUT_QUERY_BUDGET,
         async {
             let conn = shared_connection().await?;
-            if let Some(true) = write_into_focused_editable(conn, pid, text).await {
+            if let Some(true) = write_into_focused_editable(conn, pid, text).await? {
                 return Ok(true);
             }
             let Collected {
@@ -4069,18 +4222,23 @@ async fn write_into_focused_editable(
     conn: &AccessibilityConnection,
     pid: u32,
     text: &str,
-) -> Option<bool> {
-    let (acc, oref) = focused_accessible_via_events(conn, pid).await?;
-    let ifaces = call(acc.get_interfaces()).await?.ok()?;
+) -> Result<Option<bool>> {
+    let Some((acc, oref)) = focused_accessible_via_events(conn, pid).await else {
+        return Ok(None);
+    };
+    let Some(Ok(ifaces)) = call(acc.get_interfaces()).await else {
+        return Ok(None);
+    };
     if !ifaces.contains(Interface::EditableText) {
         dlog!("focused object {} is not editable", oref.path);
-        return Some(false);
+        return Ok(Some(false));
     }
     match write_into_editable_acc(&acc, ifaces.contains(Interface::Component), text).await {
-        Ok(written) => Some(written),
+        Ok(written) => Ok(Some(written)),
+        Err(error) if error.downcast_ref::<WriteUncertain>().is_some() => Err(error),
         Err(error) => {
             dlog!("focused editable write failed: {error:#}");
-            Some(false)
+            Ok(Some(false))
         }
     }
 }
