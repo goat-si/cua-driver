@@ -304,42 +304,40 @@ fn search<R: MenuReader>(
                 continue;
             }
         };
-        if !cmd_char.is_empty() {
-            if cmd_char.to_uppercase() == combo.character {
-                let modifiers = match reader.number(item, "AXMenuItemCmdModifiers") {
-                    Read::Present(n)
-                        if n.is_finite() && n.fract() == 0.0 && (0.0..=15.0).contains(&n) =>
-                    {
-                        n as i64
-                    }
+        if !cmd_char.is_empty() && cmd_char.to_uppercase() == combo.character {
+            let modifiers = match reader.number(item, "AXMenuItemCmdModifiers") {
+                Read::Present(n)
+                    if n.is_finite() && n.fract() == 0.0 && (0.0..=15.0).contains(&n) =>
+                {
+                    n as i64
+                }
+                _ => {
+                    state.incomplete = true;
+                    reader.release(item);
+                    continue;
+                }
+            };
+            if combo.matches(&cmd_char, modifiers) {
+                if title.is_empty() {
+                    state.incomplete = true;
+                    reader.release(item);
+                    continue;
+                }
+                let enabled = match reader.boolean(item, "AXEnabled") {
+                    Read::Present(enabled) => enabled,
                     _ => {
                         state.incomplete = true;
                         reader.release(item);
                         continue;
                     }
                 };
-                if combo.matches(&cmd_char, modifiers) {
-                    if title.is_empty() {
-                        state.incomplete = true;
-                        reader.release(item);
-                        continue;
-                    }
-                    let enabled = match reader.boolean(item, "AXEnabled") {
-                        Read::Present(enabled) => enabled,
-                        _ => {
-                            state.incomplete = true;
-                            reader.release(item);
-                            continue;
-                        }
-                    };
-                    if state.found.is_none() || enabled {
-                        let mut item_path = path.clone();
-                        item_path.push(title.clone());
-                        state.found = Some(MenuMatch {
-                            path: item_path,
-                            enabled,
-                        });
-                    }
+                if state.found.is_none() || enabled {
+                    let mut item_path = path.clone();
+                    item_path.push(title.clone());
+                    state.found = Some(MenuMatch {
+                        path: item_path,
+                        enabled,
+                    });
                 }
             }
         }
