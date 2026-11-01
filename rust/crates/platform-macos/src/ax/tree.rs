@@ -2921,7 +2921,7 @@ fn walk_children<S: AxTreeSource>(
 ) {
     if depth > max_depth {
         // A tree that ends exactly at the cap is still complete.
-        match source.observed_children(element).into_walk_legacy() {
+        match observed_walk_children(source, element, budget) {
             Read::Absent => {}
             Read::Known(below) if below.is_empty() => {}
             Read::Known(_below) => {
@@ -2935,7 +2935,7 @@ fn walk_children<S: AxTreeSource>(
         }
         return;
     }
-    let children = match source.observed_children(element).into_walk_legacy() {
+    let children = match observed_walk_children(source, element, budget) {
         Read::Known(children) => children,
         Read::Absent => Vec::new(),
         Read::Unknown(_) => {
@@ -3016,6 +3016,32 @@ fn walk_children<S: AxTreeSource>(
             ),
         }
     }
+}
+
+fn observed_walk_children<S: AxTreeSource>(
+    source: &S,
+    element: &S::Element,
+    budget: &mut WalkBudget,
+) -> Read<Vec<S::Element>> {
+    record_children_observation(source.observed_children(element), budget)
+}
+
+fn record_children_observation<T>(
+    observed: super::evidence::Observed<Read<T>>,
+    budget: &mut WalkBudget,
+) -> Read<T> {
+    use super::evidence::{EvidenceStatus, ReadSite};
+    if matches!(&observed.legacy, Read::Unknown(_))
+        || observed.evidence.iter().any(|entry| {
+            entry.site == ReadSite::Children && matches!(entry.status, EvidenceStatus::Unknown(_))
+        })
+    {
+        budget.record_skip(IncompleteReason {
+            kind: IncompleteReasonKind::ProviderFailure,
+            detail: IncompleteReasonDetail::ChildEnumerationFailed,
+        });
+    }
+    observed.into_walk_legacy()
 }
 
 fn plan_macos_tab_strip<S: AxTreeSource>(

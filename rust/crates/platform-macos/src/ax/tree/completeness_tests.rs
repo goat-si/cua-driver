@@ -324,6 +324,83 @@ fn depth_omission_reports_depth_limit() {
         .contains(&json!({"kind":"policy_omission", "detail":"depth_limit"})));
 }
 
+fn failed_child_walk(max_depth: usize) -> TreeWalkResult {
+    use crate::ax::tree_source::ReadFailure;
+    let source = Fake::new(&[(1, 1, 1, &[])], vec![
+        step("timeout 1", Reply::Unit),
+        step("text 1 AXRole", Reply::Text(Read::Known("AXWindow".into()))),
+        step("batch 1 AXTitle,AXPlaceholderValue,AXDescription,AXIdentifier,AXHelp,AXSubrole,AXRoleDescription", Reply::Batch(Ok(Batch(vec![Slot::Text(AttrStatus::Absent); 7])))),
+        step("value 1", Reply::Value(Ok(None))),
+        step("actions 1", Reply::Actions(Read::Known(vec![]))),
+        step("batch 1 AXPosition,AXSize", Reply::Batch(Ok(Batch(vec![Slot::Point(None), Slot::Size(None)])))),
+        step("children 1", Reply::Children(Read::Unknown(ReadFailure::WrongType))),
+    ]);
+    let root = source.handle(1);
+    let tree = run_fake_observed(
+        &source,
+        &root,
+        None,
+        max_depth,
+        WalkBudget::nodes_only(10),
+        true,
+    )
+    .legacy;
+    drop(root);
+    source.assert_consumed();
+    source.assert_lifetimes(&[]);
+    tree
+}
+
+#[test]
+fn failed_depth_probe_reports_child_enumeration_failed() {
+    let tree = failed_child_walk(0);
+    assert!(has_reason(
+        &tree,
+        "provider_failure",
+        "child_enumeration_failed"
+    ));
+    assert!(!has_reason(&tree, "policy_omission", "depth_limit"));
+}
+
+#[test]
+fn child_enumeration_failure_reports_child_enumeration_failed() {
+    let tree = failed_child_walk(10);
+    assert!(has_reason(
+        &tree,
+        "provider_failure",
+        "child_enumeration_failed"
+    ));
+    let decoded =
+        crate::ax::tree_source::native::decode_child_members([Some(7), None], |member| member);
+    let observed = crate::ax::evidence::Observed {
+        legacy: Read::Known(decoded.legacy),
+        evidence: decoded.evidence,
+    };
+    let evidence = crate::ax::evidence::EvidenceScope::start();
+    let mut budget = WalkBudget::nodes_only(10);
+    assert!(
+        matches!(record_children_observation(observed, &mut budget), Read::Known(children) if children == [7])
+    );
+    let mut output = json!({});
+    budget.outcome().apply(&mut output);
+    assert!(output["observation_incomplete_reasons"]
+        .as_array()
+        .unwrap()
+        .contains(&json!({"kind":"provider_failure", "detail":"child_enumeration_failed"})));
+    let _ = evidence.finish(());
+}
+
+#[test]
+fn node_budget_refusal_reports_node_budget() {
+    let source = Fake::new(&[(1, 1, 1, &[])], vec![]);
+    let root = source.handle(1);
+    let tree = run_fake_observed(&source, &root, None, 10, WalkBudget::nodes_only(0), true).legacy;
+    drop(root);
+    source.assert_consumed();
+    source.assert_lifetimes(&[]);
+    assert!(has_reason(&tree, "budget", "node_budget"));
+}
+
 #[test]
 fn query_with_an_omission_is_false_with_its_typed_reason() {
     let output = depth_limited_walk(Some("missing"));
