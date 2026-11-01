@@ -8,9 +8,7 @@ use cua_driver_core::{
 use serde_json::Value;
 use std::sync::Arc;
 
-use crate::ax::bindings::{
-    copy_action_names, element_screen_center, kAXErrorSuccess, perform_action, AXUIElementRef,
-};
+use crate::ax::bindings::{element_screen_center, kAXErrorSuccess, perform_action, AXUIElementRef};
 
 use super::ToolState;
 
@@ -149,16 +147,19 @@ impl Tool for DoubleClickTool {
             // elements require the stricter routed-pointer proof. Do not let a
             // failed AXOpen silently cross into an ungated pointer fallback.
             let probe_guard = element_guard.clone();
-            let has_ax_open = latency::spawn_action_blocking(move || unsafe {
-                copy_action_names(probe_guard.as_ptr() as AXUIElementRef)
-                    .iter()
-                    .any(|action| action == "AXOpen")
+            let advertised = latency::spawn_action_blocking(move || {
+                super::actionability::action_advertised(
+                    probe_guard.as_ptr() as AXUIElementRef,
+                    "AXOpen",
+                )
             })
             .await
-            .unwrap_or(false);
-            let has_ax_open = super::actionability::may_use_semantic_route(
-                &cua_driver_core::actionability::Evidence::Known(has_ax_open),
-            );
+            .unwrap_or_else(|error| {
+                cua_driver_core::actionability::Evidence::Unknown(format!(
+                    "action read worker failed: {error}"
+                ))
+            });
+            let has_ax_open = super::actionability::may_use_semantic_route(&advertised);
             let mutation_lease = if !delivery_mode.is_foreground() {
                 let action = background_action_for_element(has_ax_open);
                 match super::gate_background_window_action(pid, wid, Some(element_ptr), action)
@@ -219,7 +220,8 @@ impl Tool for DoubleClickTool {
                 has_ax_open,
                 mutation_lease,
                 |lease, _| {
-                    super::actionability::semantic_probe(
+                    super::actionability::route_semantic_probe(
+                        &advertised,
                         lease.as_ref(),
                         probe_target.clone(),
                         pid,

@@ -39,11 +39,15 @@ use core_foundation::base::{CFRelease, CFTypeRef, TCFType};
 use super::pixel_route::PixelClickRoute;
 use super::ToolState;
 
-pub(super) fn click_semantic_intent(action: &str) -> super::actionability::semantic::SemanticIntent {
-    if action == "AXPress" {
-        super::actionability::semantic::SemanticIntent::Click
-    } else {
-        super::actionability::semantic::SemanticIntent::PerformAction(action.to_owned())
+pub(super) fn click_semantic_intent(
+    action: &str,
+) -> super::actionability::semantic::SemanticIntent {
+    use super::actionability::semantic::SemanticIntent;
+    match action {
+        "AXPress" => SemanticIntent::Click,
+        "AXShowMenu" => SemanticIntent::RightClick,
+        "AXOpen" => SemanticIntent::Open,
+        _ => SemanticIntent::PerformAction(action.to_owned()),
     }
 }
 
@@ -1875,7 +1879,10 @@ impl ClickTool {
             let action_lease = _mutation_lease.take();
             let probe_target = element_guard.clone();
             let clock = super::actionability::semantic_clock();
-            let use_battery = matches!(click_semantic_intent(&resolved_action), super::actionability::semantic::SemanticIntent::Click);
+            let use_battery = matches!(
+                click_semantic_intent(&resolved_action),
+                super::actionability::semantic::SemanticIntent::Click
+            );
             let perform = |action_lease| async move {
                 let prior_front = apps::frontmost_pid();
                 let snapshot = if foreground {

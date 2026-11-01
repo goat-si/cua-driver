@@ -21,9 +21,9 @@ use std::{
 };
 
 use crate::ax::bindings::{
-    ax_get_window_id, copy_action_names, copy_children_checked, copy_element_attr,
-    copy_string_attr, kAXErrorSuccess, perform_action, AXUIElementCopyAttributeValue,
-    AXUIElementCreateApplication, AXUIElementRef, AXUIElementSetMessagingTimeout,
+    ax_get_window_id, copy_children_checked, copy_element_attr, copy_string_attr, kAXErrorSuccess,
+    perform_action, AXUIElementCopyAttributeValue, AXUIElementCreateApplication, AXUIElementRef,
+    AXUIElementSetMessagingTimeout,
 };
 
 use super::ToolState;
@@ -377,24 +377,19 @@ impl RightClickTool {
             };
 
             let action_guard = element_guard.clone();
-            let advertises_show_menu = match latency::spawn_blocking(move || unsafe {
-                copy_action_names(action_guard.as_ptr() as AXUIElementRef)
-                    .iter()
-                    .any(|name| name == "AXShowMenu")
+            let advertised = latency::spawn_blocking(move || {
+                super::actionability::action_advertised(
+                    action_guard.as_ptr() as AXUIElementRef,
+                    "AXShowMenu",
+                )
             })
             .await
-            {
-                Ok(advertises) => advertises,
-                Err(error) => {
-                    let message = format!(
-                        "right_click: action resolution failed ({error}); nothing was sent."
-                    );
-                    return super::pre_dispatch_refusal("action_unavailable", message);
-                }
-            };
-            let advertises_show_menu = super::actionability::may_use_semantic_route(
-                &cua_driver_core::actionability::Evidence::Known(advertises_show_menu),
-            );
+            .unwrap_or_else(|error| {
+                cua_driver_core::actionability::Evidence::Unknown(format!(
+                    "action read worker failed: {error}"
+                ))
+            });
+            let advertises_show_menu = super::actionability::may_use_semantic_route(&advertised);
 
             // The context menu steals key focus from the user's app when the
             // target is in the background; the guard hands it back.
@@ -451,7 +446,8 @@ impl RightClickTool {
                 advertises_show_menu,
                 mutation_lease,
                 |lease, _| {
-                    super::actionability::semantic_probe(
+                    super::actionability::route_semantic_probe(
+                        &advertised,
                         Some(lease),
                         probe_target.clone(),
                         pid,

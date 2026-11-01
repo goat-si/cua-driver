@@ -154,7 +154,7 @@ pub(super) trait ElementTarget: Send + Sync {
     /// The background refusal for a Chromium `<select>`, which a click would open
     /// and raise.
     fn web_select_refusal(&self) -> Option<ToolResult>;
-    fn lists_ax_open(&self) -> bool;
+    fn lists_ax_open(&self) -> cua_driver_core::actionability::Evidence<bool>;
     fn ax_open(&self) -> AXError;
     /// Whether pointer events may go to the exact window now (always true
     /// in the foreground, where activation was proven first).
@@ -745,15 +745,19 @@ pub(super) async fn click_element(state: &ToolState, request: ElementClick) -> T
             return refusal;
         }
     }
-    let use_ax_open = count == 2 && {
+    let advertised = if count == 2 {
         let probe = target.clone();
         latency::spawn_action_blocking(move || probe.lists_ax_open())
             .await
-            .unwrap_or(false)
+            .unwrap_or_else(|error| {
+                cua_driver_core::actionability::Evidence::Unknown(format!(
+                    "action read worker failed: {error}"
+                ))
+            })
+    } else {
+        cua_driver_core::actionability::Evidence::Known(false)
     };
-    let use_ax_open = super::actionability::may_use_semantic_route(
-        &cua_driver_core::actionability::Evidence::Known(use_ax_open),
-    );
+    let use_ax_open = super::actionability::may_use_semantic_route(&advertised);
     let lease = if foreground {
         None
     } else {
@@ -877,7 +881,8 @@ pub(super) async fn click_element(state: &ToolState, request: ElementClick) -> T
         use_ax_open,
         lease,
         |lease, _| {
-            super::actionability::semantic_probe(
+            super::actionability::route_semantic_probe(
+                &advertised,
                 lease.as_ref(),
                 probe_target.clone(),
                 pid,
@@ -972,10 +977,8 @@ impl ElementTarget for LiveTarget {
         )
     }
 
-    fn lists_ax_open(&self) -> bool {
-        unsafe { crate::ax::bindings::copy_action_names(self.element()) }
-            .iter()
-            .any(|action| action == "AXOpen")
+    fn lists_ax_open(&self) -> cua_driver_core::actionability::Evidence<bool> {
+        super::actionability::action_advertised(self.element(), "AXOpen")
     }
 
     fn ax_open(&self) -> AXError {

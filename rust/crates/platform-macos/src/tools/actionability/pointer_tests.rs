@@ -59,28 +59,65 @@ fn assert_same(a: &ToolResult, b: &ToolResult) {
 }
 
 async fn open_action_read_failure_blocks_fallback(route: &'static str) {
-    for reason in ["AX error -25204", "wrong CF type in action names"] {
+    for actions in [
+        Evidence::Unknown("AX error -25204".into()),
+        Evidence::Unknown("wrong CF type in action names".into()),
+        Evidence::Absent,
+    ] {
         let clock = FakeClock::default();
         let pixel = AtomicUsize::new(0);
         let ax = AtomicUsize::new(0);
-        let chosen = may_use_semantic_route(&Evidence::Unknown(reason.into()));
+        let advertised = advertised_action_status(actions, "AXOpen");
+        let chosen = may_use_semantic_route(&advertised);
         let result = super::super::double_click::dispatch_open(
-            &clock, Duration::from_millis(200), chosen, route,
-            |_, _| Box::pin(async move { semantic::unavailable(reason.into()) }),
-            |_| async { if chosen { ax.fetch_add(1, Ordering::SeqCst); } else { pixel.fetch_add(1, Ordering::SeqCst); } success() },
-        ).await;
-        assert!(result.is_err(), "{route}: unknown action names must not dispatch");
+            &clock,
+            Duration::from_millis(200),
+            chosen,
+            route,
+            |_, _| {
+                route_semantic_probe(
+                    &advertised,
+                    None,
+                    unsafe { crate::ax::snapshot::RetainedElement::retain(0) },
+                    0,
+                    0,
+                    semantic::SemanticIntent::Open,
+                )
+            },
+            |_| async {
+                if chosen {
+                    ax.fetch_add(1, Ordering::SeqCst);
+                } else {
+                    pixel.fetch_add(1, Ordering::SeqCst);
+                }
+                success()
+            },
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "{route}: unknown action names must not dispatch"
+        );
         assert_eq!(pixel.load(Ordering::SeqCst), 0);
         assert_eq!(ax.load(Ordering::SeqCst), 0);
+        assert!(clock.now() > Duration::ZERO);
     }
     let clock = FakeClock::default();
     let pixel = AtomicUsize::new(0);
-    let chosen = may_use_semantic_route(&Evidence::Known(false));
+    let chosen =
+        may_use_semantic_route(&advertised_action_status(Evidence::Known(vec![]), "AXOpen"));
     let result = super::super::double_click::dispatch_open(
-        &clock, Duration::ZERO, chosen, route,
+        &clock,
+        Duration::ZERO,
+        chosen,
+        route,
         |_, _| Box::pin(async { panic!("proven absent should use pixel fallback") }),
-        |_| async { pixel.fetch_add(1, Ordering::SeqCst); success() },
-    ).await;
+        |_| async {
+            pixel.fetch_add(1, Ordering::SeqCst);
+            success()
+        },
+    )
+    .await;
     assert!(result.is_ok());
     assert_eq!(pixel.load(Ordering::SeqCst), 1);
 }
@@ -97,39 +134,91 @@ async fn click_count_two_unknown_action_names_block_pixel_and_ax() {
 
 #[tokio::test]
 async fn right_click_unknown_action_names_block_pixel_and_ax() {
-    for reason in ["AX error -25204", "wrong CF type in action names"] {
+    for actions in [
+        Evidence::Unknown("AX error -25204".into()),
+        Evidence::Unknown("wrong CF type in action names".into()),
+        Evidence::Absent,
+    ] {
         let clock = FakeClock::default();
         let pixel = AtomicUsize::new(0);
         let ax = AtomicUsize::new(0);
-        let chosen = may_use_semantic_route(&Evidence::Unknown(reason.into()));
+        let advertised = advertised_action_status(actions, "AXShowMenu");
+        let chosen = may_use_semantic_route(&advertised);
         let result = super::super::right_click::dispatch_show_menu(
-            &clock, Duration::from_millis(200), chosen, (),
-            |_, _| Box::pin(async move { semantic::unavailable(reason.into()) }),
-            |_| async { if chosen { ax.fetch_add(1, Ordering::SeqCst); } else { pixel.fetch_add(1, Ordering::SeqCst); } success() },
-        ).await;
+            &clock,
+            Duration::from_millis(200),
+            chosen,
+            (),
+            |_, _| {
+                route_semantic_probe(
+                    &advertised,
+                    None,
+                    unsafe { crate::ax::snapshot::RetainedElement::retain(0) },
+                    0,
+                    0,
+                    semantic::SemanticIntent::RightClick,
+                )
+            },
+            |_| async {
+                if chosen {
+                    ax.fetch_add(1, Ordering::SeqCst);
+                } else {
+                    pixel.fetch_add(1, Ordering::SeqCst);
+                }
+                success()
+            },
+        )
+        .await;
         assert!(result.is_err(), "unknown action names must not dispatch");
         assert_eq!(pixel.load(Ordering::SeqCst), 0);
         assert_eq!(ax.load(Ordering::SeqCst), 0);
+        assert!(clock.now() > Duration::ZERO);
     }
     let clock = FakeClock::default();
     let pixel = AtomicUsize::new(0);
-    let chosen = may_use_semantic_route(&Evidence::Known(false));
+    let chosen = may_use_semantic_route(&advertised_action_status(
+        Evidence::Known(vec![]),
+        "AXShowMenu",
+    ));
     let result = super::super::right_click::dispatch_show_menu(
-        &clock, Duration::ZERO, chosen, (),
+        &clock,
+        Duration::ZERO,
+        chosen,
+        (),
         |_, _| Box::pin(async { panic!("proven absent should use pixel fallback") }),
-        |_| async { pixel.fetch_add(1, Ordering::SeqCst); success() },
-    ).await;
+        |_| async {
+            pixel.fetch_add(1, Ordering::SeqCst);
+            success()
+        },
+    )
+    .await;
     assert!(result.is_ok());
     assert_eq!(pixel.load(Ordering::SeqCst), 1);
 }
 
 #[test]
-fn click_right_and_open_use_semantic_intents() {
+fn click_right_uses_semantic_right_click_intent() {
     use semantic::SemanticIntent;
-    assert!(matches!(super::super::click::click_semantic_intent("AXShowMenu"), SemanticIntent::RightClick));
-    assert!(matches!(super::super::click::click_semantic_intent("AXOpen"), SemanticIntent::Open));
-    assert!(matches!(super::super::click::click_semantic_intent("AXPress"), SemanticIntent::Click));
-    assert!(matches!(super::super::click::click_semantic_intent("Name:exact"), SemanticIntent::PerformAction(name) if name == "Name:exact"));
+    assert!(matches!(
+        super::super::click::click_semantic_intent("AXShowMenu"),
+        SemanticIntent::RightClick
+    ));
+}
+
+#[test]
+fn click_open_uses_semantic_open_intent() {
+    use semantic::SemanticIntent;
+    assert!(matches!(
+        super::super::click::click_semantic_intent("AXOpen"),
+        SemanticIntent::Open
+    ));
+    assert!(matches!(
+        super::super::click::click_semantic_intent("AXPress"),
+        SemanticIntent::Click
+    ));
+    assert!(
+        matches!(super::super::click::click_semantic_intent("Name:exact"), SemanticIntent::PerformAction(name) if name == "Name:exact")
+    );
 }
 #[tokio::test]
 async fn click_axpress_refusal_prevents_first_effect() {

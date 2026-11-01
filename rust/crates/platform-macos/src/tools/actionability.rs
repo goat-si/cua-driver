@@ -301,7 +301,49 @@ pub(crate) fn evaluate(
 }
 
 pub(super) fn may_use_semantic_route(advertised: &Evidence<bool>) -> bool {
-    matches!(advertised, Evidence::Known(true))
+    !matches!(advertised, Evidence::Known(false))
+}
+
+/// Only a successfully decoded action list can prove an action is absent.
+pub(super) fn action_advertised(
+    element: crate::ax::bindings::AXUIElementRef,
+    action: &str,
+) -> Evidence<bool> {
+    advertised_action_status(
+        crate::ax::actionability::NativeReader.actions(element),
+        action,
+    )
+}
+
+pub(super) fn advertised_action_status(
+    actions: Evidence<Vec<String>>,
+    action: &str,
+) -> Evidence<bool> {
+    match actions {
+        Evidence::Known(actions) => Evidence::Known(actions.iter().any(|name| name == action)),
+        Evidence::Unknown(reason) => Evidence::Unknown(reason),
+        Evidence::Absent => Evidence::Unknown("action names unavailable".into()),
+    }
+}
+
+pub(super) fn route_semantic_probe<'a>(
+    advertised: &Evidence<bool>,
+    lease: Option<&'a crate::tools::BackgroundMutationLease>,
+    target: crate::ax::snapshot::RetainedElement,
+    pid: i32,
+    window_id: u32,
+    intent: semantic::SemanticIntent,
+) -> std::pin::Pin<Box<dyn Future<Output = ActionabilityReport> + Send + 'a>> {
+    match advertised {
+        Evidence::Known(_) => semantic_probe(lease, target, pid, window_id, intent),
+        Evidence::Unknown(reason) => {
+            let reason = reason.clone();
+            Box::pin(async move { semantic::unavailable(reason) })
+        }
+        Evidence::Absent => {
+            Box::pin(async { semantic::unavailable("action names unavailable".into()) })
+        }
+    }
 }
 pub(crate) async fn wait<C, P, F>(
     clock: &C,
