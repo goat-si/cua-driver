@@ -16,6 +16,7 @@ use crate::ax::bindings::{
 };
 use crate::ax::editable::{
     cell_verdict, facts_for_element_with_deadline, is_text_role, token_refused, CellVerdict,
+    ElementFacts,
 };
 use crate::goat::action_latency as latency;
 use core_foundation::base::{CFRelease, CFTypeRef};
@@ -428,65 +429,88 @@ pub(crate) async fn token_not_editable_refusal(
     element: usize,
     window_id: u32,
 ) -> Option<ToolResult> {
+    token_not_editable_receipt(pid, element, window_id)
+        .await
+        .err()
+}
+
+/// TOKEN rule plus the focus action preceding an allowed write.
+pub(crate) async fn token_not_editable_receipt(
+    pid: i32,
+    element: usize,
+    window_id: u32,
+) -> Result<FocusDispatch, ToolResult> {
     match latency::spawn_action_blocking(move || unsafe {
         let element = element as AXUIElementRef;
         let deadline = std::time::Instant::now() + std::time::Duration::from_millis(800);
-        let Some(initial) = facts_for_element_with_deadline(element, deadline) else {
-            return Some(not_editable_result(
-                "the target element could not be read; no text or keys were sent.".into(),
-                FocusDispatch::None,
-            ));
-        };
-        if initial.role.is_none() {
-            return Some(not_editable_result(
-                "the target element's role could not be read; no text or keys were sent.".into(),
-                FocusDispatch::None,
-            ));
-        }
-        if !initial.role.as_deref().is_some_and(is_text_role) {
-            return None;
-        }
-        let mut focus = FocusDispatch::None;
-        if initial.focused != Some(true) {
-            let _ = crate::input::ax_actions::focus_element(element as usize);
-            focus = FocusDispatch::Indeterminate;
-        }
-        let Some(facts) = facts_for_element_with_deadline(element, deadline) else {
-            return Some(not_editable_result(
-                "the target element could not be read; no text or keys were sent.".into(),
-                focus,
-            ));
-        };
-        if facts.role.is_none() {
-            return Some(not_editable_result(
-                "the target element's role could not be read after the focus attempt; no text                  or keys were sent."
-                    .into(),
-                focus,
-            ));
-        }
-        if matches!(focus, FocusDispatch::Indeterminate) && facts.focused == Some(true) {
-            // The read-back proves the focus action landed.
-            focus = FocusDispatch::SentAx;
-        }
-        if token_refused(&facts) {
-            return Some(not_editable_result(
-                format!("{CELL_MESSAGE_TOKEN}; no text or keys were sent."),
-                focus,
-            ));
-        }
         let _ = (pid, window_id);
-        None
+        token_guard_with(
+            || facts_for_element_with_deadline(element, deadline),
+            || {
+                let _ = crate::input::ax_actions::focus_element(element as usize);
+            },
+        )
     })
     .await
     {
         Ok(result) => result,
         // The task may have failed after the focus attempt: never treat a
         // classification failure as permission to write.
-        Err(_) => Some(not_editable_result(
+        Err(_) => Err(not_editable_result(
             "the target's editability could not be classified; no text or keys were sent.".into(),
             FocusDispatch::Indeterminate,
         )),
     }
+}
+
+fn token_guard_with(
+    mut read: impl FnMut() -> Option<ElementFacts>,
+    focus_element: impl FnOnce(),
+) -> Result<FocusDispatch, ToolResult> {
+    let Some(initial) = read() else {
+        return Err(not_editable_result(
+            "the target element could not be read; no text or keys were sent.".into(),
+            FocusDispatch::None,
+        ));
+    };
+    if initial.role.is_none() {
+        return Err(not_editable_result(
+            "the target element's role could not be read; no text or keys were sent.".into(),
+            FocusDispatch::None,
+        ));
+    }
+    if !initial.role.as_deref().is_some_and(is_text_role) {
+        return Ok(FocusDispatch::None);
+    }
+    let mut focus = FocusDispatch::None;
+    if initial.focused != Some(true) {
+        focus_element();
+        focus = FocusDispatch::Indeterminate;
+    }
+    let Some(facts) = read() else {
+        return Err(not_editable_result(
+            "the target element could not be read; no text or keys were sent.".into(),
+            focus,
+        ));
+    };
+    if facts.role.is_none() {
+        return Err(not_editable_result(
+                "the target element's role could not be read after the focus attempt; no text                  or keys were sent."
+                    .into(),
+                focus,
+            ));
+    }
+    if matches!(focus, FocusDispatch::Indeterminate) && facts.focused == Some(true) {
+        // The read-back proves the focus action landed.
+        focus = FocusDispatch::SentAx;
+    }
+    if token_refused(&facts) {
+        return Err(not_editable_result(
+            format!("{CELL_MESSAGE_TOKEN}; no text or keys were sent."),
+            focus,
+        ));
+    }
+    Ok(focus)
 }
 
 /// Desktop-scope dispatch recheck, inside the posting closure: the
@@ -517,6 +541,47 @@ pub(crate) fn desktop_dispatch_guard(expected_pid: i32, printable: bool) -> anyh
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn token_guard_retains_successful_focus_receipts() {
+        use std::cell::Cell;
+        use std::collections::VecDeque;
+        let facts = |focused| ElementFacts {
+            role: Some("AXTextField".into()),
+            focused,
+            value_settable: Some(true),
+            ..ElementFacts::default()
+        };
+        for (before, after, expected, calls) in [
+            (Some(true), Some(true), FocusDispatch::None, 0),
+            (Some(false), Some(true), FocusDispatch::SentAx, 1),
+            (Some(false), Some(false), FocusDispatch::Indeterminate, 1),
+        ] {
+            let mut reads = VecDeque::from([Some(facts(before)), Some(facts(after))]);
+            let focus_calls = Cell::new(0);
+            let receipt = token_guard_with(
+                || reads.pop_front().expect("unexpected read"),
+                || focus_calls.set(focus_calls.get() + 1),
+            )
+            .expect("editable");
+            assert_eq!(receipt, expected);
+            assert_eq!(focus_calls.get(), calls);
+        }
+    }
+
+    #[test]
+    fn token_guard_retains_uncertain_focus_on_failed_read() {
+        let mut reads = std::collections::VecDeque::from([
+            Some(ElementFacts {
+                role: Some("AXTextField".into()),
+                focused: Some(false),
+                ..ElementFacts::default()
+            }),
+            None,
+        ]);
+        let result = token_guard_with(|| reads.pop_front().unwrap(), || {}).unwrap_err();
+        assert_eq!(result.structured_content.unwrap()["effect"], "unverifiable");
+    }
 
     fn text_of(result: &ToolResult) -> String {
         result
