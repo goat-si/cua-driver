@@ -155,6 +155,10 @@ pub(super) trait ElementTarget: Send + Sync {
     /// and raise.
     fn web_select_refusal(&self) -> Option<ToolResult>;
     fn lists_ax_open(&self) -> cua_driver_core::actionability::Evidence<bool>;
+    async fn open_actionability(
+        &self,
+        lease: Option<&BackgroundMutationLease>,
+    ) -> cua_driver_core::actionability::ActionabilityReport;
     fn ax_open(&self) -> AXError;
     /// Whether pointer events may go to the exact window now (always true
     /// in the foreground, where activation was proven first).
@@ -724,6 +728,40 @@ pub(super) struct ElementClick {
     pub(super) cursor_key: String,
 }
 
+async fn dispatch_element_open<A, F, T>(
+    clock: &(impl cua_driver_core::actionability::Clock + Sync),
+    budget: std::time::Duration,
+    advertised: cua_driver_core::actionability::Evidence<bool>,
+    target: Arc<dyn ElementTarget>,
+    lease: Option<BackgroundMutationLease>,
+    perform: A,
+) -> Result<T, ToolResult>
+where
+    A: FnOnce(Option<BackgroundMutationLease>) -> F,
+    F: std::future::Future<Output = T>,
+{
+    use cua_driver_core::actionability::Evidence;
+    let use_ax_open = super::actionability::may_use_semantic_route(&advertised);
+    super::double_click::dispatch_open(
+        clock,
+        budget,
+        use_ax_open,
+        (lease, target, advertised),
+        |(lease, target, advertised), _| match advertised {
+            Evidence::Known(_) => target.open_actionability(lease.as_ref()),
+            Evidence::Unknown(reason) => {
+                let reason = reason.clone();
+                Box::pin(async move { super::actionability::semantic::unavailable(reason) })
+            }
+            Evidence::Absent => Box::pin(async {
+                super::actionability::semantic::unavailable("action names unavailable".into())
+            }),
+        },
+        |(lease, _, _)| perform(lease),
+    )
+    .await
+}
+
 pub(super) async fn click_element(state: &ToolState, request: ElementClick) -> ToolResult {
     let ElementClick {
         pid,
@@ -734,7 +772,6 @@ pub(super) async fn click_element(state: &ToolState, request: ElementClick) -> T
         foreground,
         cursor_key,
     } = request;
-    let probe_target = element.clone();
     let target = target_for(pid, window_id, idx, element);
 
     if !foreground {
@@ -875,21 +912,12 @@ pub(super) async fn click_element(state: &ToolState, request: ElementClick) -> T
         })
         .await
     };
-    let action = super::double_click::dispatch_open(
+    let action = dispatch_element_open(
         &clock,
         cua_driver_core::actionability::DEFAULT_BUDGET,
-        use_ax_open,
+        advertised,
+        target,
         lease,
-        |lease, _| {
-            super::actionability::route_semantic_probe(
-                &advertised,
-                lease.as_ref(),
-                probe_target.clone(),
-                pid,
-                window_id,
-                super::actionability::semantic::SemanticIntent::Open,
-            )
-        },
         perform,
     )
     .await;
@@ -979,6 +1007,20 @@ impl ElementTarget for LiveTarget {
 
     fn lists_ax_open(&self) -> cua_driver_core::actionability::Evidence<bool> {
         super::actionability::action_advertised(self.element(), "AXOpen")
+    }
+
+    async fn open_actionability(
+        &self,
+        lease: Option<&BackgroundMutationLease>,
+    ) -> cua_driver_core::actionability::ActionabilityReport {
+        super::actionability::semantic_probe(
+            lease,
+            self.element.clone(),
+            self.pid,
+            self.window_id,
+            super::actionability::semantic::SemanticIntent::Open,
+        )
+        .await
     }
 
     fn ax_open(&self) -> AXError {

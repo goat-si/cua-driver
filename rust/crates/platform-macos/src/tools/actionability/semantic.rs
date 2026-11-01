@@ -27,7 +27,7 @@ extern "C" {
 }
 
 /// Read only identity data; an absent or failed read never proves a target.
-pub(super) trait WindowReader {
+pub(in crate::tools) trait WindowReader {
     type Element;
     fn pid(&mut self, target: &Self::Element) -> Evidence<i32>;
     fn window(&mut self, target: &Self::Element) -> Evidence<Self::Element>;
@@ -68,7 +68,7 @@ impl WindowReader for NativeWindowReader {
 
 /// Bind the actual target and its AX window to the admission's exact PID and
 /// window. Every incomplete read remains unknown; this does not dispatch.
-pub(super) fn bind_exact_with<R: WindowReader>(
+pub(in crate::tools) fn bind_exact_with<R: WindowReader>(
     reader: &mut R,
     target: R::Element,
     pid: i32,
@@ -155,7 +155,7 @@ where
     evaluate(intent.intent(), Policy::headless(), &facts)
 }
 
-pub(super) fn unavailable(reason: String) -> ActionabilityReport {
+pub(crate) fn unavailable(reason: String) -> ActionabilityReport {
     ActionabilityReport {
         verdict: Verdict::Transient {
             reason,

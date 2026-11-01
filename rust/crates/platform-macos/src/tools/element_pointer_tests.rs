@@ -92,6 +92,8 @@ struct Fake {
     prologue_activates: bool,
     hit_reads: AtomicUsize,
     lists_ax_open: bool,
+    binding_window_id: cua_driver_core::actionability::Evidence<u32>,
+    battery_evidence: cua_driver_core::actionability::ActionabilityReport,
     ax_open_result: AXError,
     activates: bool,
     prologue_refuses: bool,
@@ -116,6 +118,8 @@ impl Fake {
             prologue_activates: true,
             hit_reads: AtomicUsize::new(0),
             lists_ax_open: false,
+            binding_window_id: cua_driver_core::actionability::Evidence::Known(WINDOW),
+            battery_evidence: fake_battery(cua_driver_core::actionability::Verdict::Pass),
             ax_open_result: kAXErrorSuccess,
             activates: true,
             prologue_refuses: false,
@@ -139,6 +143,42 @@ impl Fake {
     }
 }
 
+fn fake_battery(
+    verdict: cua_driver_core::actionability::Verdict,
+) -> cua_driver_core::actionability::ActionabilityReport {
+    cua_driver_core::actionability::ActionabilityReport {
+        verdict,
+        checks: vec![],
+        waited_ms: 0,
+        samples: 1,
+        last_facts: None,
+        disposition: None,
+    }
+}
+
+struct FakeBindingReader<'a> {
+    pid: i32,
+    window_id: &'a cua_driver_core::actionability::Evidence<u32>,
+}
+
+impl super::super::actionability::semantic::WindowReader for FakeBindingReader<'_> {
+    type Element = u8;
+    fn pid(&mut self, _: &u8) -> cua_driver_core::actionability::Evidence<i32> {
+        cua_driver_core::actionability::Evidence::Known(self.pid)
+    }
+    fn window(&mut self, _: &u8) -> cua_driver_core::actionability::Evidence<u8> {
+        use cua_driver_core::actionability::Evidence;
+        match self.window_id {
+            Evidence::Known(_) => Evidence::Known(2),
+            Evidence::Unknown(reason) => Evidence::Unknown(reason.clone()),
+            Evidence::Absent => Evidence::Absent,
+        }
+    }
+    fn window_id(&mut self, _: &u8) -> cua_driver_core::actionability::Evidence<u32> {
+        self.window_id.clone()
+    }
+}
+
 #[async_trait]
 impl ElementTarget for Fake {
     async fn gate(&self, _action: BackgroundAction) -> Result<BackgroundMutationLease, ToolResult> {
@@ -150,6 +190,28 @@ impl ElementTarget for Fake {
     }
     fn lists_ax_open(&self) -> cua_driver_core::actionability::Evidence<bool> {
         cua_driver_core::actionability::Evidence::Known(self.lists_ax_open)
+    }
+    async fn open_actionability(
+        &self,
+        _lease: Option<&BackgroundMutationLease>,
+    ) -> cua_driver_core::actionability::ActionabilityReport {
+        use cua_driver_core::actionability::Evidence;
+        let mut reader = FakeBindingReader {
+            pid: self.pid,
+            window_id: &self.binding_window_id,
+        };
+        match super::super::actionability::semantic::bind_exact_with(
+            &mut reader,
+            1,
+            self.pid,
+            WINDOW,
+        ) {
+            Evidence::Known(_) => self.battery_evidence.clone(),
+            Evidence::Unknown(reason) => super::super::actionability::semantic::unavailable(reason),
+            Evidence::Absent => {
+                super::super::actionability::semantic::unavailable("target binding absent".into())
+            }
+        }
     }
     fn ax_open(&self) -> AXError {
         self.note("ax_open");
@@ -238,6 +300,184 @@ impl ElementTarget for Fake {
     async fn restore_after_pointer(&self, _prior_front: Option<i32>, _prologue: PointerPrologue) {
         self.note("restore");
     }
+}
+
+#[tokio::test]
+async fn fake_axopen_battery_uses_registered_target_evidence() {
+    let pid = 1_100_106;
+    let mut fake = Fake::new(pid);
+    fake.lists_ax_open = true;
+    let fake = Arc::new(fake);
+    let _registered = test_targets::register(pid, fake.clone());
+    let target = target_for(pid, WINDOW, 0, unsafe { RetainedElement::retain(0) });
+    let advertised = target.lists_ax_open();
+    let lease = target.gate(BackgroundAction::AxSemantic).await.unwrap();
+    let clock = super::super::actionability::semantic_clock();
+    let action_target = target.clone();
+    let result = dispatch_element_open(
+        &clock,
+        std::time::Duration::ZERO,
+        advertised,
+        target,
+        Some(lease),
+        |_| async move { run_blocking(&*action_target, 0, 2, true, false) },
+    )
+    .await;
+    assert!(
+        matches!(result, Ok(Ok(Performed::AxOpen(_)))),
+        "fake AXOpen should use fake evidence"
+    );
+    assert_eq!(fake.calls(), ["gate", "ax_open"]);
+    assert!(fake.posts().is_empty());
+}
+
+async fn assert_fake_binding_refused(
+    pid: i32,
+    binding: cua_driver_core::actionability::Evidence<u32>,
+    expected_reason: &str,
+) {
+    let mut fake = Fake::new(pid);
+    fake.lists_ax_open = true;
+    fake.binding_window_id = binding;
+    let fake = Arc::new(fake);
+    let _registered = test_targets::register(pid, fake.clone());
+    let target = target_for(pid, WINDOW, 0, unsafe { RetainedElement::retain(0) });
+    let advertised = target.lists_ax_open();
+    let lease = target.gate(BackgroundAction::AxSemantic).await.unwrap();
+    let clock = super::super::actionability::semantic_clock();
+    let action_target = target.clone();
+    let result = dispatch_element_open(
+        &clock,
+        std::time::Duration::ZERO,
+        advertised,
+        target,
+        Some(lease),
+        |_| async move { run_blocking(&*action_target, 0, 2, true, false) },
+    )
+    .await;
+    let refusal = match result {
+        Err(refusal) => refusal,
+        Ok(_) => panic!("unproven binding must refuse"),
+    };
+    let structured = refusal.structured_content.unwrap();
+    assert_eq!(structured["code"], "element_not_actionable");
+    assert!(structured["refusal"]["message"]
+        .as_str()
+        .unwrap()
+        .contains(expected_reason));
+    assert_eq!(fake.calls(), ["gate"]);
+    assert!(fake.posts().is_empty());
+}
+
+#[tokio::test]
+async fn fake_axopen_battery_unknown_window_binding_refuses() {
+    assert_fake_binding_refused(
+        1_100_110,
+        cua_driver_core::actionability::Evidence::Unknown("AXWindow missing".into()),
+        "target AXWindow is unproven",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn fake_axopen_battery_mismatched_window_binding_refuses() {
+    assert_fake_binding_refused(
+        1_100_111,
+        cua_driver_core::actionability::Evidence::Known(WINDOW + 1),
+        "target AXWindow does not match admission",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn fake_axopen_battery_refusal_blocks_ax_and_pointer() {
+    let pid = 1_100_107;
+    let mut fake = Fake::new(pid);
+    fake.lists_ax_open = true;
+    fake.battery_evidence = fake_battery(cua_driver_core::actionability::Verdict::Terminal {
+        code: "disabled",
+        reason: "fake target disabled".into(),
+    });
+    let fake = Arc::new(fake);
+    let _registered = test_targets::register(pid, fake.clone());
+    let target = target_for(pid, WINDOW, 0, unsafe { RetainedElement::retain(0) });
+    let advertised = target.lists_ax_open();
+    let lease = target.gate(BackgroundAction::AxSemantic).await.unwrap();
+    let clock = super::super::actionability::semantic_clock();
+    let action_target = target.clone();
+    let result = dispatch_element_open(
+        &clock,
+        std::time::Duration::ZERO,
+        advertised,
+        target,
+        Some(lease),
+        |_| async move { run_blocking(&*action_target, 0, 2, true, false) },
+    )
+    .await;
+    let refusal = match result {
+        Err(refusal) => refusal,
+        Ok(_) => panic!("disabled fake must refuse"),
+    };
+    assert_eq!(
+        refusal.structured_content.unwrap()["code"],
+        "element_not_actionable"
+    );
+    assert_eq!(fake.calls(), ["gate"]);
+    assert!(fake.posts().is_empty());
+}
+
+#[tokio::test]
+async fn fake_axopen_battery_unknown_action_list_still_refuses() {
+    let pid = 1_100_108;
+    let mut fake = Fake::new(pid);
+    fake.lists_ax_open = true;
+    let fake = Arc::new(fake);
+    let _registered = test_targets::register(pid, fake.clone());
+    let target = target_for(pid, WINDOW, 0, unsafe { RetainedElement::retain(0) });
+    let lease = target.gate(BackgroundAction::AxSemantic).await.unwrap();
+    let clock = super::super::actionability::semantic_clock();
+    let action_target = target.clone();
+    let result = dispatch_element_open(
+        &clock,
+        std::time::Duration::ZERO,
+        cua_driver_core::actionability::Evidence::Unknown("action read failed".into()),
+        target,
+        Some(lease),
+        |_| async move { run_blocking(&*action_target, 0, 2, true, false) },
+    )
+    .await;
+    assert!(result.is_err());
+    assert_eq!(fake.calls(), ["gate"]);
+    assert!(fake.posts().is_empty());
+}
+
+#[tokio::test]
+async fn fake_axopen_battery_absent_action_keeps_pointer_fallback() {
+    let pid = 1_100_109;
+    let mut fake = Fake::new(pid);
+    fake.battery_evidence = fake_battery(cua_driver_core::actionability::Verdict::Terminal {
+        code: "disabled",
+        reason: "battery must not run for pixel route".into(),
+    });
+    let fake = Arc::new(fake);
+    let _registered = test_targets::register(pid, fake.clone());
+    let target = target_for(pid, WINDOW, 0, unsafe { RetainedElement::retain(0) });
+    let advertised = target.lists_ax_open();
+    let lease = target.gate(BackgroundAction::WindowPointer).await.unwrap();
+    let clock = super::super::actionability::semantic_clock();
+    let action_target = target.clone();
+    let result = dispatch_element_open(
+        &clock,
+        std::time::Duration::ZERO,
+        advertised,
+        target,
+        Some(lease),
+        |_| async move { run_blocking(&*action_target, 0, 2, false, false) },
+    )
+    .await;
+    assert!(matches!(result, Ok(Ok(Performed::Clicks(_)))));
+    assert_eq!(fake.posts().len(), 1);
+    assert!(!fake.calls().contains(&"ax_open"));
 }
 
 fn position(calls: &[&str], call: &str) -> usize {
