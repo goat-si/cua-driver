@@ -472,6 +472,24 @@ fn scope_exclusions(state: &Value) -> Vec<ScopeExclusion> {
     }
 }
 
+/// Classify content for exclusion guards without changing role matching.
+fn is_content_role(role: &str) -> bool {
+    use cua_driver_contract::Role;
+    // AT-SPI uses `text` for editable fields, while other providers can use
+    // the same token for static content. Guard the token conservatively.
+    if normalized_role(role) == "text" {
+        return true;
+    }
+    match Role::from_token(role) {
+        Role::StaticText | Role::Heading | Role::Paragraph | Role::Image | Role::Link => true,
+        Role::Unknown => matches!(
+            role_family(role).as_str(),
+            "statictext" | "heading" | "paragraph" | "image" | "link"
+        ),
+        _ => false,
+    }
+}
+
 fn exclusion_guards(exclusion: ScopeExclusion, spec: &ElementSpec) -> bool {
     use cua_driver_contract::Role;
     if exclusion == ScopeExclusion::Unknown || spec.text.is_some() {
@@ -480,12 +498,13 @@ fn exclusion_guards(exclusion: ScopeExclusion, spec: &ElementSpec) -> bool {
     let Some(role) = spec.role.as_deref() else {
         return true;
     };
+    if is_content_role(role) {
+        return true;
+    }
     match Role::from_token(role) {
-        Role::StaticText | Role::Heading | Role::Paragraph | Role::Image | Role::Link => true,
         Role::Menu | Role::MenuItem => exclusion == ScopeExclusion::ClosedMenus,
         Role::Option | Role::Row | Role::Cell => exclusion == ScopeExclusion::CollapsedLists,
         Role::Unknown => match role_family(role).as_str() {
-            "statictext" | "text" | "heading" | "paragraph" | "image" | "link" => true,
             "menu" | "menuitem" => exclusion == ScopeExclusion::ClosedMenus,
             "row" | "cell" | "option" => exclusion == ScopeExclusion::CollapsedLists,
             _ => false,
@@ -2292,22 +2311,26 @@ fn first_text(result: &ToolResult) -> String {
     clip(text.lines().next().unwrap_or(text), 300)
 }
 
-/// Role names models use, folded to one family per control kind, across the
-/// macOS (AX), Windows (UIA) and Linux (AT-SPI) vocabularies.
-pub(crate) fn role_family(role: &str) -> String {
+fn normalized_role(role: &str) -> String {
     let normalized: String = role
         .chars()
         .filter(char::is_ascii_alphanumeric)
         .flat_map(|c| c.to_lowercase())
         .collect();
-    let normalized = normalized
+    normalized
         .strip_prefix("ax")
         .unwrap_or(&normalized)
-        .to_owned();
+        .to_owned()
+}
+
+/// Role names models use, folded to one family per control kind, across the
+/// macOS (AX), Windows (UIA) and Linux (AT-SPI) vocabularies.
+pub(crate) fn role_family(role: &str) -> String {
+    let normalized = normalized_role(role);
     let family = match normalized.as_str() {
         "button" | "pushbutton" | "togglebutton" => "button",
         "textfield" | "textarea" | "textbox" | "edit" | "entry" | "input" | "searchfield"
-        | "securetextfield" | "passwordtext" => "textfield",
+        | "securetextfield" | "passwordtext" | "text" => "textfield",
         "statictext" | "label" | "static" => "statictext",
         "link" | "hyperlink" => "link",
         "checkbox" | "checkbutton" | "check" => "checkbox",
@@ -2817,6 +2840,59 @@ mod tests {
         assert_eq!(pick(&read, &field).unwrap().element["element_index"], 3);
         assert_eq!(role_family("Push Button"), "button");
         assert_eq!(role_family("Hyperlink"), "link");
+    }
+
+    #[test]
+    fn atspi_text_matches_textfield_selector() {
+        let read = read(vec![element(1, "text", "Reason")], "");
+        let spec = ElementSpec {
+            role: Some("textfield".into()),
+            name: Some("Reason".into()),
+            ..Default::default()
+        };
+        assert_eq!(pick(&read, &spec).unwrap().element["element_index"], 1);
+    }
+
+    #[test]
+    fn atspi_text_is_preferred_for_roleless_text_actions() {
+        let read = read(
+            vec![element(1, "label", "Reason"), element(2, "text", "Reason")],
+            "",
+        );
+        for action in ["set_value", "type_text"] {
+            let spec = ElementSpec {
+                name: Some("Reason".into()),
+                action: Some(action),
+                ..Default::default()
+            };
+            assert_eq!(
+                pick(&read, &spec).unwrap().element["element_index"],
+                2,
+                "{action}"
+            );
+        }
+    }
+
+    #[test]
+    fn text_role_is_guarded_without_guarding_other_textfield_family_roles() {
+        for kind in [ScopeExclusion::ClosedMenus, ScopeExclusion::CollapsedLists] {
+            let mut read = read(Vec::new(), "");
+            read.scope_exclusions.push(kind);
+            for role in ["text", " Text ", "AXText", "t-e-x-t"] {
+                let spec = ElementSpec {
+                    role: Some(role.into()),
+                    ..Default::default()
+                };
+                assert!(read.incomplete_for(&spec).is_some(), "{kind:?} {role}");
+            }
+            for role in ["textfield", "edit", "entry"] {
+                let spec = ElementSpec {
+                    role: Some(role.into()),
+                    ..Default::default()
+                };
+                assert!(read.incomplete_for(&spec).is_none(), "{kind:?} {role}");
+            }
+        }
     }
 
     #[test]
