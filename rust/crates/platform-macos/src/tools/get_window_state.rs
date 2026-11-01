@@ -1605,32 +1605,9 @@ fn inherited_row_label(nodes: &[crate::ax::tree::AXNode], row_index: usize) -> O
         return None;
     }
 
-    if let Some(label) = &row.owned_row_label {
-        return label.as_deref();
-    }
-
-    for candidate in &nodes[row_index + 1..] {
-        if candidate.depth <= row.depth {
-            break;
-        }
-        if !matches!(candidate.role.as_str(), "AXStaticText" | "AXTextField") {
-            continue;
-        }
-        for text in [
-            candidate.title.as_deref(),
-            candidate.value.as_deref(),
-            candidate.description.as_deref(),
-        ]
-        .into_iter()
-        .flatten()
-        {
-            let text = text.trim();
-            if !text.is_empty() {
-                return Some(text);
-            }
-        }
-    }
-    None
+    row.owned_row_label
+        .as_ref()
+        .and_then(|label| label.as_deref())
 }
 
 pub(crate) fn element_entry(
@@ -3052,9 +3029,9 @@ mod row_label_tests {
     }
 
     #[test]
-    fn existing_indexed_rows_keep_their_inheritance() {
+    fn rows_without_ownership_evidence_do_not_inherit() {
         let nodes = vec![row(4, None), text("legacy", 1)];
-        assert_eq!(inherited_row_label(&nodes, 0), Some("legacy"));
+        assert_eq!(inherited_row_label(&nodes, 0), None);
     }
 
     #[test]

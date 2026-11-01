@@ -314,6 +314,7 @@ fn is_actionless_control_role(role: &str) -> bool {
 pub(crate) enum LabelPath {
     Inactive,
     Open(usize),
+    Cell(usize, usize),
     Blocked,
 }
 
@@ -333,6 +334,13 @@ pub(super) fn next_label_path(
             }
             Some(_) => LabelPath::Open(owner),
         },
+        LabelPath::Cell(cell, row) => match child_role {
+            None
+            | Some("AXUnknown" | "AXRow" | "AXCell" | "AXOutlineRow" | "AXListItem" | "AXImage") => {
+                LabelPath::Blocked
+            }
+            Some(_) => LabelPath::Cell(cell, row),
+        },
     }
 }
 
@@ -341,7 +349,9 @@ fn row_label_candidate<'a>(
     role: &str,
     texts: [Option<&'a str>; 3],
 ) -> Option<&'a str> {
-    if !matches!(path, LabelPath::Open(_)) || !matches!(role, "AXStaticText" | "AXTextField") {
+    if !matches!(path, LabelPath::Open(_) | LabelPath::Cell(_, _))
+        || !matches!(role, "AXStaticText" | "AXTextField")
+    {
         return None;
     }
     texts
@@ -351,20 +361,20 @@ fn row_label_candidate<'a>(
         .find(|text| !text.is_empty())
 }
 
-pub(super) fn initial_owned_row_label(selectable_row: bool) -> Option<Option<String>> {
-    selectable_row.then_some(None)
+pub(super) fn initial_owned_row_label(role: &str) -> Option<Option<String>> {
+    matches!(role, "AXRow" | "AXCell" | "AXOutlineRow").then_some(None)
 }
 
 pub(super) fn child_label_path(
     path: LabelPath,
-    selectable_row: bool,
-    indexed: bool,
+    role: &str,
+    parent_role: Option<&str>,
     ptr: usize,
 ) -> LabelPath {
-    if selectable_row && indexed {
-        LabelPath::Open(ptr)
-    } else {
-        path
+    match (role, parent_role, path) {
+        ("AXCell", Some("AXRow"), LabelPath::Open(row)) => LabelPath::Cell(ptr, row),
+        ("AXRow" | "AXCell" | "AXOutlineRow", _, _) => LabelPath::Open(ptr),
+        _ => path,
     }
 }
 
@@ -374,8 +384,15 @@ pub(super) fn collect_label_claim(
     role: &str,
     texts: [Option<&str>; 3],
 ) {
-    if let (LabelPath::Open(owner), Some(label)) = (path, row_label_candidate(path, role, texts)) {
-        claims.push((owner, label.to_owned()));
+    if let Some(label) = row_label_candidate(path, role, texts) {
+        match path {
+            LabelPath::Open(owner) => claims.push((owner, label.to_owned())),
+            LabelPath::Cell(cell, row) => {
+                claims.push((cell, label.to_owned()));
+                claims.push((row, label.to_owned()));
+            }
+            _ => {}
+        }
     }
 }
 
@@ -1143,6 +1160,7 @@ unsafe fn walk_element(
     });
 
     let label_path = next_label_path(parent_path, parent_role, Some(&role));
+    let child_label_path = child_label_path(label_path, &role, parent_role, element as usize);
     let in_web_content = in_web_content || is_web_content_role(&role);
     if in_web_content && !include_web_content {
         note_skipped();
@@ -1294,7 +1312,7 @@ unsafe fn walk_element(
             &role,
             depth,
             parent_index,
-            label_path,
+            child_label_path,
             in_web_content,
             nodes,
             lines,
@@ -1422,6 +1440,7 @@ unsafe fn walk_element(
     if !is_actionable && !has_content && role != "AXWindow" && role != "AXSheet" {
         if exhaustive_nodes() {
             let node = AXNode {
+                owned_row_label: initial_owned_row_label(&role),
                 identifier: identifier.clone(),
                 help: help.clone(),
                 ..role_only_node(
@@ -1440,7 +1459,7 @@ unsafe fn walk_element(
             &role,
             depth + 1,
             parent_index,
-            label_path,
+            child_label_path,
             in_web_content,
             nodes,
             lines,
@@ -1515,7 +1534,7 @@ unsafe fn walk_element(
         // releases the per-child ref at the end of the caller's loop.
         CFRetain(element as CFTypeRef);
         AXNode {
-            owned_row_label: initial_owned_row_label(selectable_row),
+            owned_row_label: initial_owned_row_label(&role),
             element_index: Some(idx),
             role: role.clone(),
             title: if visible_title.is_empty() {
@@ -1546,7 +1565,7 @@ unsafe fn walk_element(
         }
     } else {
         AXNode {
-            owned_row_label: None,
+            owned_row_label: initial_owned_row_label(&role),
             element_index: None,
             role: role.clone(),
             title: if visible_title.is_empty() {
@@ -1580,12 +1599,6 @@ unsafe fn walk_element(
     // Track this node as the parent for its descendants only when it was
     // assigned an element_index (mirrors what the markdown shows: only
     // indexed rows are addressable in click(element_index=N)).
-    let child_label_path = child_label_path(
-        label_path,
-        selectable_row,
-        node.element_index.is_some(),
-        element_ptr,
-    );
     let next_parent = node.element_index.or(parent_index);
 
     // A closed menu of the menu bar stays collapsed when the caller asked for
