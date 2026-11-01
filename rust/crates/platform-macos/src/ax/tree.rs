@@ -28,6 +28,7 @@ use core_foundation::{
     base::{CFEqual, CFGetTypeID, CFRelease, CFRetain, CFTypeRef, TCFType},
     string::CFString,
 };
+use cua_driver_contract::{IncompleteReason, IncompleteReasonDetail, IncompleteReasonKind};
 use cua_driver_core::snapshot_compaction::{
     compact_tab_strip, fold_actionless_text_subtrees, format_omitted_tabs_line,
     is_secure_text_field, redact_if_secure, CompactableNode, FieldSecurityMeta, TabChildMeta,
@@ -1407,12 +1408,18 @@ fn finalize_with_deadline_sample(
     nodes: Vec<AXNode>,
     offscreen_rows: Vec<dense_rows::OffscreenRows>,
     query: Option<&str>,
-    budget: WalkBudget,
+    mut budget: WalkBudget,
     ledger: SkipLedger,
     window_scope: Option<WindowScope>,
     sample: impl FnOnce(&WalkBudget) -> bool,
 ) -> (TreeWalkResult, bool) {
     let final_deadline_sample = sample(&budget);
+    if final_deadline_sample {
+        budget.record_cut(IncompleteReason {
+            kind: IncompleteReasonKind::Budget,
+            detail: IncompleteReasonDetail::TimeBudget,
+        });
+    }
     let walk = budget.outcome();
     let nodes_skipped = ledger.finish();
     (

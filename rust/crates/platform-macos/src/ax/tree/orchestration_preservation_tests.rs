@@ -525,6 +525,15 @@ fn production_finalizer_samples_deadline_without_enforcing_it() {
         |_| true,
     );
     assert!(sampled);
+    let mut payload = json!({});
+    result.walk.apply(&mut payload);
+    assert_eq!(
+        payload["observation_incomplete_reasons"],
+        json!([
+            {"kind":"budget","detail":"time_budget"},
+            {"kind":"unknown","detail":"not_asserted"}
+        ])
+    );
     assert!(!result.truncated);
     assert!(!result.nodes_skipped);
     assert_eq!(result.walk.stop, None);
