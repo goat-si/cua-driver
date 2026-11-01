@@ -98,12 +98,14 @@ the producer leaves completeness unasserted. Nodes without a boundary slot
 keep their child rows. Platforms must also preserve the emitted markdown marker
 and typed boundary; the legacy wrapper does not supply this evidence.
 
-Before asserting completeness, folding implementations must override
-`CompactableNode::rendered_text_fields` to list exactly the text slots rendered
-by `format_line`. Its default conservatively returns non-whitespace title,
-value and description, including fields a renderer might omit; this can report
-loss for invisible data. Values are compared after trimming their outer
-whitespace, without collapsing internal whitespace. Quotes, backslashes and
+Before calling `fold_actionless_text_subtrees_with_reasons` or asserting
+completeness, platforms must override `CompactableNode::rendered_text_fields`
+to list exactly the text slots rendered by `format_line`. Its default returns
+non-whitespace title, value and description, including fields a renderer might
+omit. An unrendered parent description can otherwise count as preserved, and
+an unrendered child field can cause an unnecessary loss report. Values are
+compared after trimming their outer whitespace, without collapsing internal
+whitespace. Quotes, backslashes and
 control characters cannot prove preservation; rendered fields longer than
 1,000 Unicode scalars cannot prove preservation either. These cases are
 deliberately reported as incomplete when the fold must preserve them.

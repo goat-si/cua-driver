@@ -520,6 +520,11 @@ enum Completeness {
     Incomplete(Vec<String>),
 }
 
+fn role_may_be_absorbed(role: &str) -> bool {
+    crate::snapshot_compaction::absorbed_role_tokens()
+        .any(|candidate| role_matches(role, candidate))
+}
+
 impl Read {
     fn incomplete_for(&self, spec: &ElementSpec) -> Option<Vec<String>> {
         let mut details = match &self.completeness {
@@ -552,9 +557,7 @@ impl Read {
         let Some(wanted_role) = spec.role.as_deref() else {
             return false;
         };
-        if !crate::snapshot_compaction::absorbed_role_tokens()
-            .any(|role| role_matches(wanted_role, role))
-        {
+        if !role_may_be_absorbed(wanted_role) {
             return false;
         }
         let text_matches_spec = |text: &str| {
@@ -617,6 +620,31 @@ impl Read {
                 }
                 !role_matches(wanted_role, role) && text_matches_spec(text)
             })
+    }
+
+    /// A retained matching row can itself have hidden a same-role match.
+    /// This affects choosing a unique match or a position, not existence.
+    fn incomplete_for_selection(&self, spec: &ElementSpec) -> Option<Vec<String>> {
+        let mut details = self.incomplete_for(spec).unwrap_or_default();
+        let same_role_may_hide_match = spec.role.as_deref().is_some_and(|role| {
+            role_may_be_absorbed(role)
+                && (spec.name.is_some() || spec.text.is_some())
+                && (self.elements.iter().any(|element| {
+                    has_folded_children_boundary(element)
+                        && element_role_matches(role, element)
+                        && spec.name.as_deref().is_none_or(|name| {
+                            label_of(element)
+                                .is_some_and(|label| has_word_start(&fold(label), &fold(name)))
+                        })
+                        && element_matches_text(self, element, spec)
+                }) || self.markdown.lines().any(|row| {
+                    strip_folded_children_marker(row).is_some() && row_matches(row, spec)
+                }))
+        });
+        if same_role_may_hide_match && !details.iter().any(|detail| detail == "folded_children") {
+            details.push("folded_children".to_owned());
+        }
+        (!details.is_empty()).then_some(details)
     }
 
     fn incomplete_miss(
@@ -1695,6 +1723,24 @@ const LOCATOR_TEXT_FIELDS: [&str; 6] = [
     "role",
 ];
 
+fn element_matches_text(read: &Read, element: &Value, spec: &ElementSpec) -> bool {
+    spec.text.as_deref().is_none_or(|text| {
+        LOCATOR_TEXT_FIELDS
+            .into_iter()
+            .any(|key| text_matches(element.get(key), text))
+            || element
+                .get("element_index")
+                .and_then(Value::as_u64)
+                .is_some_and(|index| {
+                    let prefix = format!("- [{index}] ");
+                    read.markdown
+                        .lines()
+                        .map(str::trim)
+                        .any(|row| row.starts_with(&prefix) && row_matches(row, spec))
+                })
+    })
+}
+
 /// Elements of a read that match `spec`. Exact name matches win over
 /// substring matches; zero-size elements only count when nothing visible
 /// matches.
@@ -1708,23 +1754,7 @@ pub(crate) fn matches<'r>(read: &'r Read, spec: &ElementSpec) -> Vec<&'r Value> 
                 .as_deref()
                 .is_none_or(|role| element_role_matches(role, element))
         })
-        .filter(|element| {
-            spec.text.as_deref().is_none_or(|text| {
-                LOCATOR_TEXT_FIELDS
-                    .into_iter()
-                    .any(|key| text_matches(element.get(key), text))
-                    || element
-                        .get("element_index")
-                        .and_then(Value::as_u64)
-                        .is_some_and(|index| {
-                            let prefix = format!("- [{index}] ");
-                            read.markdown
-                                .lines()
-                                .map(str::trim)
-                                .any(|row| row.starts_with(&prefix) && row_matches(row, spec))
-                        })
-            })
-        })
+        .filter(|element| element_matches_text(read, element, spec))
         .collect();
     let named: Vec<&Value> = match &spec.name {
         None => by_role,
@@ -1824,7 +1854,7 @@ fn pick(read: &Read, spec: &ElementSpec) -> Result<Found, Miss> {
     let found = narrow(matches(read, spec), spec);
     if let (true, Some(details)) = (
         spec.nth.is_some() || found.len() < 2,
-        read.incomplete_for(spec),
+        read.incomplete_for_selection(spec),
     ) {
         return Err(read.incomplete_miss(spec, &details, &found));
     }
@@ -1934,10 +1964,12 @@ fn evaluate(check: &Check, read: &Read) -> Result<Option<String>, Miss> {
         !structured.is_empty() || !rows.is_empty()
     };
     let window = &read.window;
-    if let (true, Some(details)) = (
-        check.element.nth.is_some() || !present,
-        read.incomplete_for(&check.element),
-    ) {
+    let incomplete = if check.element.nth.is_some() && !check.gone {
+        read.incomplete_for_selection(&check.element)
+    } else {
+        read.incomplete_for(&check.element)
+    };
+    if let (true, Some(details)) = (check.element.nth.is_some() || !present, incomplete) {
         return Err(read.incomplete_miss(&check.element, &details, &structured));
     }
     if check.gone {
@@ -2970,6 +3002,88 @@ mod tests {
         assert!(miss.message.contains("folded_children"));
     }
 
+    #[test]
+    fn u20b_r5_same_role_folded_row_blocks_unique_and_nth() {
+        let mut row = element(4, "AXGroup", "Foo");
+        row["boundary"] = json!({"reasons":[{"kind":"policy_omission","detail":"folded_children"}],"children_skipped":{"known":1},"descendants_omitted":false});
+        for completeness in [Completeness::Complete, Completeness::Unasserted] {
+            let mut observed = read(vec![row.clone()], "");
+            observed.completeness = completeness;
+            for selector in [
+                json!({"role":"group","name":"Foo"}),
+                json!({"role":"group","name":"Foo","nth":0}),
+                json!({"role":"group","text":"Foo","nth":0}),
+            ] {
+                let check = Check::parse(&selector, 0).unwrap();
+                let miss = pick(&observed, &check.element).unwrap_err();
+                assert_eq!(miss.code, "incomplete_observation", "{selector}");
+                assert!(miss.message.contains("folded_children"));
+                if check.element.nth.is_some() {
+                    assert_eq!(
+                        evaluate(&check, &observed).unwrap_err().code,
+                        "incomplete_observation"
+                    );
+                }
+            }
+            let gone = Check::parse(&json!({"role":"group","name":"Foo","gone":true}), 0).unwrap();
+            assert_eq!(
+                evaluate(&gone, &observed).unwrap_err().code,
+                "still_present"
+            );
+            let gone_nth =
+                Check::parse(&json!({"role":"group","name":"Foo","nth":0,"gone":true}), 0).unwrap();
+            assert_eq!(
+                evaluate(&gone_nth, &observed).unwrap_err().code,
+                "still_present"
+            );
+            let present = Check::parse(&json!({"role":"group","name":"Foo"}), 0).unwrap();
+            assert!(evaluate(&present, &observed).is_ok());
+        }
+    }
+    #[test]
+    fn u20b_r5_folded_partial_match_is_guarded_even_with_an_exact_match() {
+        let mut folded = element(4, "AXGroup", "Foo details");
+        folded["boundary"] = json!({"reasons":[{"kind":"policy_omission","detail":"folded_children"}],"children_skipped":{"known":1},"descendants_omitted":false});
+        let observed = read(vec![element(3, "AXGroup", "Foo"), folded], "");
+        let check = Check::parse(&json!({"role":"group","name":"Foo"}), 0).unwrap();
+        assert_eq!(
+            pick(&observed, &check.element).unwrap_err().code,
+            "incomplete_observation"
+        );
+    }
+    #[test]
+    fn u20b_r5_same_role_markdown_fold_blocks_unique_and_nth() {
+        let markdown = "- AXGroup \"Foo\" [+1 more: folded_children; descendants not omitted] [reason kinds: folded_children=policy_omission]";
+        let observed = read(vec![], markdown);
+        for nth in [None, Some(0)] {
+            let mut check = Check::parse(&json!({"role":"group","name":"Foo"}), 0).unwrap();
+            check.element.nth = nth;
+            assert_eq!(
+                pick(&observed, &check.element).unwrap_err().code,
+                "incomplete_observation"
+            );
+        }
+        let gone = Check::parse(&json!({"role":"group","name":"Foo","gone":true}), 0).unwrap();
+        assert_eq!(
+            evaluate(&gone, &observed).unwrap_err().code,
+            "still_present"
+        );
+    }
+    #[test]
+    fn u20b_r5_same_role_unfolded_and_nonabsorbable_are_unaffected() {
+        for (role, folded) in [("AXGroup", false), ("AXButton", true)] {
+            let mut row = element(4, role, "Foo");
+            if folded {
+                row["boundary"] = json!({"reasons":[{"kind":"policy_omission","detail":"folded_children"}],"children_skipped":{"known":1},"descendants_omitted":false});
+            }
+            let observed = read(vec![row], "");
+            for nth in [None, Some(0)] {
+                let mut check = Check::parse(&json!({"role":role,"name":"Foo"}), 0).unwrap();
+                check.element.nth = nth;
+                assert!(pick(&observed, &check.element).is_ok(), "{role} {nth:?}");
+            }
+        }
+    }
     #[test]
     fn u20b_a_folded_role_makes_absence_uniqueness_and_nth_incomplete() {
         let markdown = "- AXRow = \"Foo\" [+1 more: folded_children; descendants not omitted] [reason kinds: folded_children=policy_omission]";
