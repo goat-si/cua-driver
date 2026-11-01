@@ -1543,7 +1543,9 @@ fn write_value_ladder_with_prior(
 ) -> LadderOutcome {
     let mut out = LadderOutcome::new();
     let target = value.trim().parse::<f64>().ok();
-    let text_role = ctx.secure || text_value_role_requires_exact_focus(ctx.role);
+    let text_role = ctx.secure
+        || text_value_role_requires_exact_focus(ctx.role)
+        || crate::ax::editable::is_text_role(ctx.role);
     let numeric_role = matches!(
         ctx.role,
         "AXSlider" | "AXIncrementor" | "AXStepper" | "AXScrollBar"

@@ -154,6 +154,52 @@ fn setter_illegal_argument_after_change_is_never_not_delivered() {
         Some(&serde_json::json!(false))
     );
     assert_unsafe(&result);
+    for focus in [
+        super::super::not_editable::FocusDispatch::SentAx,
+        super::super::not_editable::FocusDispatch::Indeterminate,
+    ] {
+        let mut denied = Fake::new(num(0.0)).result(kAXErrorAPIDisabled);
+        let out = write_value_ladder_with_prior(
+            &mut denied,
+            "5",
+            &LadderContext {
+                secure: false,
+                can_step: false,
+                role: "AXSlider",
+            },
+            prior_for_focus(focus),
+        );
+        let (result, _, _, _) = project(out, "AXSlider", &Cell::new(0));
+        assert_eq!(denied.writes, [("number", "5".into())]);
+        assert_eq!(
+            result.structured_content.as_ref().unwrap()["effect"],
+            "unverifiable"
+        );
+        assert!(result
+            .structured_content
+            .as_ref()
+            .unwrap()
+            .get("dispatched")
+            .is_none());
+        assert_unsafe(&result);
+    }
+    let mut denied = Fake::new(num(0.0)).result(kAXErrorAPIDisabled);
+    let out = write_value_ladder_with_prior(
+        &mut denied,
+        "5",
+        &LadderContext {
+            secure: false,
+            can_step: false,
+            role: "AXSlider",
+        },
+        prior_for_focus(super::super::not_editable::FocusDispatch::None),
+    );
+    let (result, _, _, _) = project(out, "AXSlider", &Cell::new(0));
+    assert_eq!(
+        result.structured_content.as_ref().unwrap()["effect"],
+        "refused"
+    );
+    assert_eq!(result.disposition, Some(ErrorDisposition::NOT_DELIVERED));
 }
 
 #[test]
@@ -197,6 +243,9 @@ fn rejected_numeric_write_allows_only_one_string_alternate() {
     let mut reverse = Fake::new(text("0")).result(kAXErrorIllegalArgument);
     let _ = run(&mut reverse, "5", "AXUnknown", false);
     assert_eq!(reverse.writes, [("string", "5".into())]);
+    let mut text_view = Fake::new(num(0.0)).result(kAXErrorIllegalArgument);
+    let _ = run(&mut text_view, "5", "AXTextView", false);
+    assert_eq!(text_view.writes, [("string", "5".into())]);
     let mut step = Fake::new(num(0.0))
         .unsettable()
         .step(kAXErrorIllegalArgument);
