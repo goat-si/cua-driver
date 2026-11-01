@@ -52,6 +52,23 @@ pub(crate) fn after_sent_call<T>(hresult: i32, next: impl FnOnce() -> T) -> Resu
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FocusRoute {
+    Confirmed,
+    ClickBeforeSend,
+    Uncertain,
+}
+
+pub(crate) fn focus_route(hresult: Option<i32>, confirm: impl FnOnce() -> bool) -> FocusRoute {
+    match hresult {
+        None => FocusRoute::ClickBeforeSend,
+        Some(hr) => match after_sent_call(hr, confirm) {
+            Ok(true) => FocusRoute::Confirmed,
+            Ok(false) | Err(_) => FocusRoute::Uncertain,
+        },
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AcquireVerdict {
     Absent,
     NotDelivered(RefusalKind),

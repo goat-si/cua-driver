@@ -103,6 +103,15 @@ fn keyboard_window_center(hwnd: u64) -> Option<(f64, f64)> {
 /// (wrapped in the UWP fg-steal bypass) and does not raise or activate the
 /// window. MSAA-walked elements are skipped (no ScrollItemPattern) and keep the
 /// existing failure.
+fn reveal_uncertain_result() -> ToolResult {
+    crate::uia_mutation::chain_error(
+        "UIA reveal may have changed the window; no further input was sent. Read the window state before acting again.",
+        json!({"path":"uia", "verified":false}),
+        [cua_driver_core::mutation::WriteOutcome::StopUncertain(cua_driver_core::mutation::Reason::Unknown)],
+        false,
+    )
+}
+
 fn resolve_onscreen_point_with_scroll(
     admitted: &Option<crate::uia::snapshot::RetainedElement>,
     hwnd: u64,
@@ -169,9 +178,7 @@ fn resolve_onscreen_point_with_scroll(
                 RevealOutcome::Uncertain
                 | RevealOutcome::NotRevealed { writes_sent: true }
                 | RevealOutcome::Revealed(_) => {
-                    return Err(ToolResult::error("UIA reveal may have changed the window; the target was not clicked. Read the window state before acting again.")
-                        .with_structured(json!({"path":"uia", "verified":false, "effect":"unverifiable"}))
-                        .with_disposition(cua_driver_contract::ErrorDisposition::SUSPECTED_NOOP));
+                    return Err(reveal_uncertain_result());
                 }
                 RevealOutcome::NotRevealed { writes_sent: false } => {}
             }
@@ -4300,18 +4307,14 @@ impl Tool for ClickTool {
                 // to scroll itself into view before trusting that rectangle.
                 let recorded_center = (cx, cy);
                 let (cx, cy) = if !modifiers.is_empty() {
-                    admitted
-                        .clone()
-                        .and_then(|retained| {
-                            retained.is_uia().then(|| unsafe {
-                                crate::uia::scroll::scroll_into_view_and_recenter(
-                                    hwnd,
-                                    retained.as_ptr(),
-                                )
-                            })
-                        })
-                        .flatten()
-                        .unwrap_or((cx, cy))
+                    if let Some(retained) = admitted.as_ref().filter(|element| element.is_uia()) {
+                        use crate::uia::scroll::RevealOutcome;
+                        match unsafe { crate::uia::scroll::scroll_into_view_and_recenter(hwnd, retained.as_ptr()) } {
+                            RevealOutcome::Revealed(point) => point,
+                            RevealOutcome::NotRevealed { writes_sent: false } => (cx, cy),
+                            RevealOutcome::Uncertain | RevealOutcome::NotRevealed { writes_sent: true } => return reveal_uncertain_result(),
+                        }
+                    } else { (cx, cy) }
                 } else {
                     (cx, cy)
                 };
@@ -5042,25 +5045,16 @@ fn focus_cached_element_for_foreground(
     // which would make the enclosing verify-before-SendInput transaction
     // fail closed. The foreground route has already activated the exact HWND,
     // so focus the cached element directly and verify it below.
-    if let Some(hr) = admitted
-        .as_ref()
-        .and_then(|element| element.focus_hresult())
-    {
-        let confirmed = crate::uia_mutation::after_sent_call(hr, || {
-            wait_for_cached_element_keyboard_focus(admitted, std::time::Duration::from_millis(350))
-        });
-        return match confirmed {
-            Ok(true) => Ok(()),
-            Ok(false) => Err(FocusUncertain(
-                "focus may have changed but could not be confirmed; nothing typed".into(),
-            )
-            .into()),
-            Err(hr) => Err(FocusUncertain(format!(
-                "UIA SetFocus returned HRESULT 0x{:08X}; focus may have changed; nothing typed",
-                hr as u32
-            ))
-            .into()),
-        };
+    let focus_hr = admitted.as_ref().and_then(|element| element.focus_hresult());
+    match crate::uia_mutation::focus_route(focus_hr, ||
+        wait_for_cached_element_keyboard_focus(admitted, std::time::Duration::from_millis(350))) {
+        crate::uia_mutation::FocusRoute::Confirmed => return Ok(()),
+        crate::uia_mutation::FocusRoute::Uncertain => return Err(FocusUncertain(
+            match focus_hr {
+                Some(hr) if hr != 0 => format!("UIA SetFocus returned HRESULT 0x{:08X}; focus may have changed; nothing typed", hr as u32),
+                _ => "focus may have changed but could not be confirmed; nothing typed".into(),
+            }).into()),
+        crate::uia_mutation::FocusRoute::ClickBeforeSend => {}
     }
     if let Some((x, y)) = click_point {
         crate::input::send_click_synthesized_active_mods(hwnd, x, y, 1, "left", &[])?;

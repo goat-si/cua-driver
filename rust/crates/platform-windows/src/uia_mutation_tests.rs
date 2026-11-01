@@ -433,3 +433,21 @@ fn sent_reveal_and_focus_failures_stop_before_followup() {
     assert_eq!(after_sent_call(0, || calls.set(calls.get() + 1)), Ok(()));
     assert_eq!(calls.get(), 1);
 }
+
+#[test]
+fn focus_failure_never_clicks_or_types() {
+    for hr in [1, NOT_SUPPORTED, DENIED, TIMEOUT] {
+        let confirms = Cell::new(0);
+        let clicks = Cell::new(0);
+        let types = Cell::new(0);
+        match focus_route(Some(hr), || { confirms.set(confirms.get() + 1); true }) {
+            FocusRoute::Confirmed => types.set(types.get() + 1),
+            FocusRoute::ClickBeforeSend => clicks.set(clicks.get() + 1),
+            FocusRoute::Uncertain => {}
+        }
+        assert_eq!((confirms.get(), clicks.get(), types.get()), (0, 0, 0));
+    }
+    assert_eq!(focus_route(None, || panic!("no focus was sent")), FocusRoute::ClickBeforeSend);
+    assert_eq!(focus_route(Some(0), || false), FocusRoute::Uncertain);
+    assert_eq!(focus_route(Some(0), || true), FocusRoute::Confirmed);
+}
