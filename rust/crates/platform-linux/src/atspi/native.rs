@@ -96,9 +96,62 @@ fn bounded_text_for<T>(
     work: impl std::future::Future<Output = Result<T>>,
     on_timeout: impl FnOnce() -> Result<T>,
 ) -> Result<T> {
-    let dispatch = Arc::new(TextWriteDispatch::default());
+    bounded_text_for_with_dispatch(
+        budget,
+        text,
+        Arc::new(TextWriteDispatch::default()),
+        work,
+        on_timeout,
+    )
+}
+
+fn bounded_text_for_with_dispatch<T>(
+    budget: Duration,
+    text: &str,
+    dispatch: Arc<TextWriteDispatch>,
+    work: impl std::future::Future<Output = Result<T>>,
+    on_timeout: impl FnOnce() -> Result<T>,
+) -> Result<T> {
     bounded_for(budget, TEXT_DISPATCH.scope(dispatch.clone(), work), || {
         write_timeout_result(&dispatch, text.len(), on_timeout)
+    })
+}
+
+/// Close the gate when the caller stops waiting for its worker.
+pub fn text_write_timeout_error(
+    dispatch: &TextWriteDispatch,
+    bytes: usize,
+) -> Option<anyhow::Error> {
+    write_timeout_result(dispatch, bytes, || Ok(())).err()
+}
+
+fn gated_input_action(
+    dispatch: &TextWriteDispatch,
+    bytes: usize,
+    action: impl FnOnce() -> std::result::Result<(), ()>,
+) -> Result<()> {
+    use crate::text_write_policy::{CallClass, MutationResult, Step, WriteStep};
+    dispatch
+        .gate
+        .enter_mutator()
+        .map_err(|_| WriteDispatchClosed)?;
+    dispatch.ledger.record_sent();
+    let result = action();
+    dispatch.ledger.record_result(if result.is_ok() {
+        Ok(MutationResult::Acknowledged)
+    } else {
+        Err(CallClass::PossiblyExecuted)
+    });
+    dispatch.gate.finish_mutator();
+    result.map_err(|_| {
+        WriteUncertain {
+            step: WriteStep {
+                step: Step::InsertText,
+                bytes,
+                units: None,
+            },
+        }
+        .into()
     })
 }
 
@@ -3151,6 +3204,10 @@ fn classify_mutator_error(error: &zbus::Error) -> crate::text_write_policy::Call
     }
 }
 
+fn classify_acquisition_error(_: &atspi::proxy::AtspiError) -> crate::text_write_policy::CallClass {
+    crate::text_write_policy::CallClass::PreDispatchUnavailable
+}
+
 #[cfg(test)]
 mod insert_regression_tests {
     use super::*;
@@ -3327,15 +3384,33 @@ mod insert_regression_tests {
         ] {
             assert_eq!(classify_mutator_error(&error), PossiblyExecuted);
         }
+        for error in [
+            atspi::proxy::AtspiError::InterfaceNotAvailable("EditableText"),
+            atspi::proxy::AtspiError::Zbus("acquisition failed".into()),
+        ] {
+            assert_eq!(
+                classify_acquisition_error(&error),
+                CallClass::PreDispatchUnavailable
+            );
+        }
     }
 }
 
 /// Write into the best editable exposed by the current AT-SPI tree without
 /// falling through to synthetic X11 input.
 pub fn type_into_editable(pid: u32, text: &str) -> Result<()> {
-    bounded_text_for(
+    type_into_editable_with_dispatch(pid, text, Arc::new(TextWriteDispatch::default()))
+}
+
+pub fn type_into_editable_with_dispatch(
+    pid: u32,
+    text: &str,
+    dispatch: Arc<TextWriteDispatch>,
+) -> Result<()> {
+    bounded_text_for_with_dispatch(
         INPUT_QUERY_BUDGET,
         text,
+        dispatch,
         async {
             let conn = shared_connection().await?;
             // Focused editable known from the event log: write there directly.
@@ -3408,9 +3483,18 @@ pub fn type_into_editable_at(pid: u32, idx: usize, text: &str) -> Result<()> {
 }
 
 pub fn insert_text(pid: u32, text: &str) -> Result<bool> {
-    bounded_text_for(
+    insert_text_with_dispatch(pid, text, Arc::new(TextWriteDispatch::default()))
+}
+
+pub fn insert_text_with_dispatch(
+    pid: u32,
+    text: &str,
+    dispatch: Arc<TextWriteDispatch>,
+) -> Result<bool> {
+    bounded_text_for_with_dispatch(
         INPUT_QUERY_BUDGET,
         text,
+        dispatch,
         async {
             let conn = shared_connection().await?;
             if let Some(true) = write_into_focused_editable(conn, pid, text).await? {
@@ -3494,20 +3578,19 @@ pub fn insert_text(pid: u32, text: &str) -> Result<bool> {
                             dlog!("GTK3 fallback: window XID {xid}, local coords ({wx},{wy})");
 
                             // Click the entry to focus the widget (widget focus, not window focus).
-                            if let Err(e) = crate::input::send_click(xid, wx, wy, 1, 1) {
-                                dlog!("GTK3 fallback: click failed: {e}");
-                                return Ok(false);
-                            };
+                            let dispatch = TEXT_DISPATCH.with(Arc::clone);
+                            gated_input_action(&dispatch, text.len(), || {
+                                crate::input::send_click(xid, wx, wy, 1, 1).map_err(|_| ())
+                            })?;
 
                             // Small delay for the click to register and the widget to update focus.
                             tokio::time::sleep(tokio::time::Duration::from_millis(150)).await;
 
                             // Now type via X11 XSendEvent — the entry widget has internal focus
                             // so it should accept the keystrokes even though the window is unfocused.
-                            if let Err(e) = crate::input::send_type_text(xid, text) {
-                                dlog!("GTK3 fallback: send_type_text failed: {e}");
-                                return Ok(false);
-                            }
+                            gated_input_action(&dispatch, text.len(), || {
+                                crate::input::send_type_text(xid, text).map_err(|_| ())
+                            })?;
 
                             dlog!("GTK3 fallback: X11 click+type succeeded");
                             return Ok(true);
@@ -3553,6 +3636,20 @@ mod write_timeout_tests {
         let error = write_timeout_result(&dispatch, 3, || Ok(false)).unwrap_err();
         assert!(error.downcast_ref::<WritePartial>().is_some());
         assert!(!format!("{error:?}").contains("abc"));
+    }
+
+    #[test]
+    fn tool_timeout_blocks_late_input_action() {
+        let dispatch = TextWriteDispatch::default();
+        assert!(text_write_timeout_error(&dispatch, 3).is_none());
+        let called = std::cell::Cell::new(false);
+        assert!(gated_input_action(&dispatch, 3, || {
+            called.set(true);
+            Ok(())
+        })
+        .is_err());
+        assert!(!called.get());
+        assert!(!dispatch.ledger.sent());
     }
 }
 
@@ -4382,9 +4479,18 @@ pub fn focus_element_ref(object_ref: &ObjectRef) -> Result<bool> {
 
 /// [`type_into_editable_at`] on a snapshot-cached element identity.
 pub fn type_into_editable_ref(object_ref: &ObjectRef, text: &str) -> Result<()> {
-    bounded_text_for(
+    type_into_editable_ref_with_dispatch(object_ref, text, Arc::new(TextWriteDispatch::default()))
+}
+
+pub fn type_into_editable_ref_with_dispatch(
+    object_ref: &ObjectRef,
+    text: &str,
+    dispatch: Arc<TextWriteDispatch>,
+) -> Result<()> {
+    bounded_text_for_with_dispatch(
         REF_ACTION_BUDGET,
         text,
+        dispatch,
         async {
             let conn = shared_connection().await.map_err(token_pre_dispatch)?;
             let (acc, _) = live_accessible(conn, object_ref)
@@ -5992,14 +6098,18 @@ async fn run_native_editable_route(
                 .path(path)?
                 .build()
                 .await?;
-            let proxies = acc
-                .proxies()
-                .await
-                .map_err(|e| anyhow!("interface proxies unavailable: {e}"))?;
-            let editable = proxies
-                .editable_text()
-                .await
-                .map_err(|e| anyhow!("EditableText unavailable: {e}"))?;
+            let proxies = acc.proxies().await.map_err(|e| {
+                anyhow!(
+                    "interface acquisition: {:?}",
+                    classify_acquisition_error(&e)
+                )
+            })?;
+            let editable = proxies.editable_text().await.map_err(|e| {
+                anyhow!(
+                    "EditableText acquisition: {:?}",
+                    classify_acquisition_error(&e)
+                )
+            })?;
             Ok::<_, anyhow::Error>((proxies, editable))
         })?;
         let mut ops = NativeEditableOps {
@@ -6124,12 +6234,7 @@ async fn set_value_on(
         }
     }
     if has_value {
-        let v: f64 = value
-            .parse()
-            .map_err(|_| anyhow!("value '{value}' is not numeric for a Value element"))?;
-        if !v.is_finite() {
-            return Err(anyhow!("numeric Value must be finite"));
-        }
+        let v = parse_value_number(value)?;
         let value_proxy = proxies
             .value()
             .await
@@ -6166,10 +6271,42 @@ async fn set_value_on(
     ))
 }
 
+fn parse_value_number(value: &str) -> Result<f64> {
+    let number: f64 = value
+        .parse()
+        .map_err(|_| anyhow!("value '{value}' is not numeric for a Value element"))?;
+    if !number.is_finite() {
+        return Err(anyhow!("numeric Value must be finite"));
+    }
+    Ok(number)
+}
+
+#[cfg(test)]
+mod numeric_value_tests {
+    use super::parse_value_number;
+    #[test]
+    fn non_finite_value_is_rejected_before_dispatch() {
+        for value in ["NaN", "inf", "-inf"] {
+            assert!(parse_value_number(value).is_err(), "{value}");
+        }
+        assert_eq!(parse_value_number("2.5").unwrap(), 2.5);
+    }
+}
+
 pub fn set_value(pid: u32, idx: usize, value: &str) -> Result<()> {
-    bounded_text_for(
+    set_value_with_dispatch(pid, idx, value, Arc::new(TextWriteDispatch::default()))
+}
+
+pub fn set_value_with_dispatch(
+    pid: u32,
+    idx: usize,
+    value: &str,
+    dispatch: Arc<TextWriteDispatch>,
+) -> Result<()> {
+    bounded_text_for_with_dispatch(
         INDEX_RESOLVE_BUDGET,
         value,
+        dispatch,
         async {
             let conn = shared_connection().await?;
             let visited = collect_visited(conn, pid)
@@ -6198,9 +6335,18 @@ pub fn set_value(pid: u32, idx: usize, value: &str) -> Result<()> {
 /// [`set_value`] on a snapshot-cached element identity (the exact object the
 /// caller's `element_index` named, not the same ordinal in a fresh walk).
 pub fn set_value_ref(object_ref: &ObjectRef, value: &str) -> Result<()> {
-    bounded_text_for(
+    set_value_ref_with_dispatch(object_ref, value, Arc::new(TextWriteDispatch::default()))
+}
+
+pub fn set_value_ref_with_dispatch(
+    object_ref: &ObjectRef,
+    value: &str,
+    dispatch: Arc<TextWriteDispatch>,
+) -> Result<()> {
+    bounded_text_for_with_dispatch(
         REF_ACTION_BUDGET,
         value,
+        dispatch,
         async {
             let conn = shared_connection().await?;
             let (acc, _) = live_accessible(conn, object_ref).await?;
