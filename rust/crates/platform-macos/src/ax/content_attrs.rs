@@ -543,6 +543,25 @@ mod tests {
     use crate::ax::label_reader::fake::FakeReader as LabelFakeReader;
 
     #[test]
+    fn an_nstextview_body_value_is_readable() {
+        let mut reader = FakeReader::new();
+        for index in [2, 3] {
+            reader.attrs[index] = AttrStatus::Failed {
+                error: kAXErrorFailure,
+                listed: Listed::Listed,
+            };
+        }
+        reader.attrs[6] = AttrStatus::Known("text entry area".into());
+        let attrs = read_with(
+            AttrStatus::Known("AXTextArea".into()),
+            &mut reader,
+            &mut false,
+        )
+        .unwrap();
+        assert_eq!(attrs.value.as_deref(), Some("value"));
+    }
+
+    #[test]
     fn classification_only_preserves_failed_and_absent_evidence() {
         for reject_batch in [false, true] {
             let mut reader = LabelFakeReader {

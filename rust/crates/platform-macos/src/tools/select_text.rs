@@ -690,6 +690,13 @@ mod tests {
     }
 
     #[test]
+    fn a_textedit_like_body_is_selectable() {
+        let mut attributes = textedit_text_area();
+        attributes[5] = OptionalStringAttr::StableFailure;
+        assert!(selection_exposure_allowed(&attributes));
+    }
+
+    #[test]
     fn textedit_text_area_is_selectable() {
         assert!(selection_exposure_allowed(&textedit_text_area()));
         // Ordinary text area and text field with every hint absent.
