@@ -264,6 +264,51 @@ fn verify_read_with_no_omission_is_complete() {
     assert_eq!(output["observation_incomplete_reasons"], json!([]));
 }
 
+fn clean_verify_with_limits(depth: usize, nodes: usize, empty_children: bool) -> TreeWalkResult {
+    use super::environment_evidence_tests::Scenario;
+    with_exhaustive_assertion(true, || {
+        with_exhaustive_nodes(true, || {
+            super::orchestration_preservation_tests::run_scenario_with_limits(
+                Scenario::Launching,
+                Some((2, "AXWindow")),
+                depth,
+                nodes,
+                empty_children,
+            )
+            .0
+            .legacy
+        })
+    })
+}
+
+#[test]
+fn unused_node_cap_does_not_make_verify_incomplete() {
+    let tree = clean_verify_with_limits(10, 2, false);
+    assert_eq!(tree.walk.nodes_visited, 1);
+    let mut output = json!({});
+    tree.walk.apply(&mut output);
+    assert_eq!(output["observation_complete"], true);
+    assert_eq!(output["observation_incomplete_reasons"], json!([]));
+}
+
+#[test]
+fn empty_depth_cap_leaf_is_complete() {
+    let tree = clean_verify_with_limits(0, 100, true);
+    let mut output = json!({});
+    tree.walk.apply(&mut output);
+    assert_eq!(output["observation_complete"], true, "{output}");
+    assert!(!tree.nodes_skipped);
+}
+
+#[test]
+fn absent_children_are_complete() {
+    let tree = clean_verify_with_limits(10, 100, false);
+    let mut output = json!({});
+    tree.walk.apply(&mut output);
+    assert_eq!(output["observation_complete"], true, "{output}");
+    assert_eq!(tree.nodes.len(), 1);
+}
+
 #[test]
 fn ordinary_read_is_not_asserted() {
     use super::environment_evidence_tests::Scenario;

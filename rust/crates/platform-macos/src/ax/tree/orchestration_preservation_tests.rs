@@ -203,6 +203,16 @@ pub(super) fn run_scenario(
     scenario: super::environment_evidence_tests::Scenario,
     root: Option<(usize, &str)>,
 ) -> (CompletedWalk, Vec<String>, Vec<String>) {
+    run_scenario_with_limits(scenario, root, 10, 100, false)
+}
+
+pub(super) fn run_scenario_with_limits(
+    scenario: super::environment_evidence_tests::Scenario,
+    root: Option<(usize, &str)>,
+    max_depth: usize,
+    max_nodes: usize,
+    empty_children: bool,
+) -> (CompletedWalk, Vec<String>, Vec<String>) {
     use super::super::content_attrs::AttrStatus;
     use super::environment_evidence_tests::Environment;
     use super::walker_seam_tests::{step, Fake, Reply};
@@ -218,7 +228,11 @@ pub(super) fn run_scenario(
             step(&format!("value {id}"), Reply::Value(Ok(None))),
             step(&format!("actions {id}"), Reply::Actions(Read::Known(vec![]))),
             step(&format!("batch {id} AXPosition,AXSize"), Reply::Batch(Ok(Batch(vec![Slot::Point(None), Slot::Size(None)])))),
-            step(&format!("children {id}"), Reply::Children(Read::Absent)),
+            step(&format!("children {id}"), Reply::Children(if empty_children {
+                Read::Known(vec![])
+            } else {
+                Read::Absent
+            })),
         ]);
     }
     let source = Fake::new(
@@ -242,10 +256,10 @@ pub(super) fn run_scenario(
             pid: 42,
             window_id: Some(99),
             query: None,
-            max_depth: 10,
+            max_depth,
             include_web_content: true,
         },
-        WalkBudget::new(200, 100),
+        WalkBudget::new(200, max_nodes),
     );
     assert!(environment.credits.borrow().values().all(Vec::is_empty));
     environment.environment.assert_released();
