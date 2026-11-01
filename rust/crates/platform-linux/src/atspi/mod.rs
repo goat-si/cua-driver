@@ -98,6 +98,8 @@ pub struct AtspiTreeResult {
     pub bounds_complete: bool,
     /// Wall time the native snapshot took (walk + bounds), in milliseconds.
     pub elapsed_ms: u128,
+    pub(crate) completeness: crate::walk_completeness::Completeness,
+    pub(crate) boundaries: std::collections::HashMap<usize, cua_driver_contract::NodeBoundary>,
 }
 
 /// Total budget for callers that did not ask for one (browser flows, the
@@ -129,6 +131,8 @@ impl AtspiTreeResult {
             nodes_pending,
             bounds_complete: walked.bounds_complete,
             elapsed_ms: walked.elapsed.as_millis(),
+            completeness: walked.completeness,
+            boundaries: walked.boundaries,
         }
     }
 }
@@ -250,6 +254,11 @@ pub fn walk_tree_bounded_within(
                 let mut fallback = walk_via_x11_properties(xid, query);
                 fallback.truncated = true;
                 fallback.truncation_reason = result.truncation_reason.take();
+                for reason in result.completeness.reasons {
+                    if !fallback.completeness.reasons.contains(&reason) {
+                        fallback.completeness.reasons.push(reason);
+                    }
+                }
                 fallback.elapsed_ms = started.elapsed().as_millis();
                 fallback.degraded_reason = Some(match fallback.truncation_reason.as_deref() {
                     Some("app_unresponsive") => "atspi_app_unresponsive: the application is \
@@ -711,6 +720,8 @@ fn walk_via_x11_properties(xid: u64, query: Option<&str>) -> AtspiTreeResult {
                 nodes_pending: 0,
                 bounds_complete: true,
                 elapsed_ms: 0,
+                completeness: untrusted_completeness(),
+                boundaries: Default::default(),
             }
         }
     };
@@ -782,7 +793,19 @@ fn walk_via_x11_properties(xid: u64, query: Option<&str>) -> AtspiTreeResult {
         nodes_pending: 0,
         bounds_complete: true,
         elapsed_ms: 0,
+        completeness: untrusted_completeness(),
+        boundaries: Default::default(),
     }
+}
+
+fn untrusted_completeness() -> crate::walk_completeness::Completeness {
+    let mut completeness = crate::walk_completeness::Completeness::new(false);
+    completeness.record(
+        true,
+        crate::walk_completeness::Event::UntrustedProvider,
+        None,
+    );
+    completeness
 }
 
 fn get_x11_title(conn: &x11rb::rust_connection::RustConnection, window: u32) -> Option<String> {
@@ -904,6 +927,8 @@ mod budget_tests {
             bounds: vec![(1, 10, 10, 50, 20)],
             window_scoped: true,
             truncation,
+            completeness: crate::walk_completeness::Completeness::new(true),
+            boundaries: Default::default(),
             bounds_complete: false,
             elapsed: std::time::Duration::from_millis(1234),
         }

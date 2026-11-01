@@ -513,6 +513,7 @@ struct Collected<'a> {
     visited: Vec<Visited<'a>>,
     scoped_frame: Option<usize>,
     truncation: Option<Truncation>,
+    completeness: crate::walk_completeness::Completeness,
 }
 
 /// Role names that denote embedded web/document content. An editable beneath
@@ -1351,11 +1352,16 @@ async fn collect_visited_bounded_opts<'a>(
     // chrome. `frame_ordinal` is the seed's position in `get_children()` order
     // and is likewise inherited, so every node carries the identity of the
     // top-level window it belongs to.
+    let mut dropped_app_child = false;
     let (seeds, app_answered): (Vec<RawObjectRef>, bool) = match probed {
         Some(children) => (
             children
                 .iter()
-                .filter_map(RawObjectRef::from_atspi)
+                .filter_map(|child| {
+                    let raw = RawObjectRef::from_atspi(child);
+                    dropped_app_child |= raw.is_none();
+                    raw
+                })
                 .collect(),
             true,
         ),
@@ -1363,7 +1369,11 @@ async fn collect_visited_bounded_opts<'a>(
             Some(Ok(children)) => (
                 children
                     .iter()
-                    .filter_map(RawObjectRef::from_atspi)
+                    .filter_map(|child| {
+                        let raw = RawObjectRef::from_atspi(child);
+                        dropped_app_child |= raw.is_none();
+                        raw
+                    })
                     .collect(),
                 true,
             ),
@@ -1384,6 +1394,12 @@ async fn collect_visited_bounded_opts<'a>(
                 visited: 0,
                 pending: 0,
             }),
+            completeness: {
+                let mut c = crate::walk_completeness::Completeness::new(false);
+                c.record(true, crate::walk_completeness::Event::ChildrenFailed, None);
+                c.record(true, crate::walk_completeness::Event::TimeBudget, None);
+                c
+            },
         }));
     }
 
@@ -1396,6 +1412,15 @@ async fn collect_visited_bounded_opts<'a>(
     } else {
         resolve_window_frame(conn, pid, xid, &seeds).await
     };
+    use crate::walk_completeness::{Completeness, Event};
+    use cua_driver_contract::CountEvidence;
+    let mut completeness = Completeness::new(xid == 0 || scoped_frame.is_some());
+    if dropped_app_child {
+        completeness.record(true, Event::ChildrenFailed, None);
+    }
+    if xid != 0 && scoped_frame.is_none() {
+        completeness.record(true, Event::ScopeMismatch, None);
+    }
 
     // Walk the caller's window FIRST when it was resolved: under a short
     // budget an application-wide pre-order (main window, then dialogs) could
@@ -1403,22 +1428,23 @@ async fn collect_visited_bounded_opts<'a>(
     // about. Ordinals stay the application's own, so `render` still scopes
     // by the same identity; only the visiting order (and thus the index
     // space of this snapshot) changes.
-    let mut ordered: Vec<(RawObjectRef, usize, bool, usize)> = seeds
+    let mut ordered: Vec<(RawObjectRef, usize, bool, usize, Option<usize>)> = seeds
         .iter()
         .cloned()
         .enumerate()
-        .map(|(ordinal, r)| (r, 0usize, false, ordinal))
+        .map(|(ordinal, r)| (r, 0usize, false, ordinal, None))
         .collect();
     if let Some(scope) = scoped_frame {
         if let Some(position) = ordered
             .iter()
-            .position(|(_, _, _, ordinal)| *ordinal == scope)
+            .position(|(_, _, _, ordinal, _)| *ordinal == scope)
         {
             let scoped = ordered.remove(position);
             ordered.insert(0, scoped);
         }
     }
-    let mut stack: Vec<(RawObjectRef, usize, bool, usize)> = ordered.into_iter().rev().collect();
+    let mut stack: Vec<(RawObjectRef, usize, bool, usize, Option<usize>)> =
+        ordered.into_iter().rev().collect();
     // Direct children of a `menu bar`: a top-level menu whose popup is not
     // open keeps its child count but is not descended into.
     let mut menubar_children: std::collections::HashSet<(String, String)> =
@@ -1457,17 +1483,44 @@ async fn collect_visited_bounded_opts<'a>(
         .map(|cap| cap.max(CHILD_ENUMERATION_CAP))
         .unwrap_or(CHILD_ENUMERATION_CAP);
 
-    while let Some((oref, depth, inherited_web_doc, frame_ordinal)) = stack.pop() {
+    while let Some((oref, depth, inherited_web_doc, frame_ordinal, parent_position)) = stack.pop() {
+        let in_scope = scoped_frame.is_none_or(|scope| scope == frame_ordinal);
         if budget == 0 {
             dlog!("node budget exhausted; truncating walk");
             truncation = Some("node_budget");
-            stack.push((oref, depth, inherited_web_doc, frame_ordinal));
+            stack.push((
+                oref,
+                depth,
+                inherited_web_doc,
+                frame_ordinal,
+                parent_position,
+            ));
+            completeness.record(
+                stack
+                    .iter()
+                    .any(|entry| scoped_frame.is_none_or(|scope| entry.3 == scope)),
+                Event::NodeBudget,
+                None,
+            );
             break;
         }
         if tokio::time::Instant::now() >= deadline {
             dlog!("collect_visited time budget exhausted; returning partial walk");
             truncation = Some("timeout");
-            stack.push((oref, depth, inherited_web_doc, frame_ordinal));
+            stack.push((
+                oref,
+                depth,
+                inherited_web_doc,
+                frame_ordinal,
+                parent_position,
+            ));
+            completeness.record(
+                stack
+                    .iter()
+                    .any(|entry| scoped_frame.is_none_or(|scope| entry.3 == scope)),
+                Event::TimeBudget,
+                None,
+            );
             break;
         }
         // WebKitGTK publishes its embedded page on a distinct WebProcess
@@ -1493,12 +1546,27 @@ async fn collect_visited_bounded_opts<'a>(
             Some(Ok(a)) => a,
             Some(Err(error)) => {
                 dlog!("  accessible_for failed: {error:#}");
+                completeness.record(in_scope, Event::AttributeFailed, None);
                 continue;
             }
             None => {
+                completeness.record(in_scope, Event::AttributeFailed, None);
                 if tokio::time::Instant::now() >= deadline {
                     truncation = Some("timeout");
-                    stack.push((oref, depth, inherited_web_doc, frame_ordinal));
+                    stack.push((
+                        oref,
+                        depth,
+                        inherited_web_doc,
+                        frame_ordinal,
+                        parent_position,
+                    ));
+                    completeness.record(
+                        stack
+                            .iter()
+                            .any(|entry| scoped_frame.is_none_or(|scope| entry.3 == scope)),
+                        Event::TimeBudget,
+                        None,
+                    );
                     break;
                 }
                 consecutive_timeouts += 1;
@@ -1508,7 +1576,20 @@ async fn collect_visited_bounded_opts<'a>(
                         consecutive_timeouts
                     );
                     truncation = Some("app_unresponsive");
-                    stack.push((oref, depth, inherited_web_doc, frame_ordinal));
+                    stack.push((
+                        oref,
+                        depth,
+                        inherited_web_doc,
+                        frame_ordinal,
+                        parent_position,
+                    ));
+                    completeness.record(
+                        stack
+                            .iter()
+                            .any(|entry| scoped_frame.is_none_or(|scope| entry.3 == scope)),
+                        Event::TimeBudget,
+                        None,
+                    );
                     break;
                 }
                 continue;
@@ -1525,14 +1606,29 @@ async fn collect_visited_bounded_opts<'a>(
             // A completed-but-errored call is node-specific; keep walking.
             Some(Err(error)) => {
                 dlog!("  get_interfaces failed: {error:#}");
+                completeness.record(in_scope, Event::AttributeFailed, None);
                 continue;
             }
             // A timeout means the app didn't answer in CALL_TIMEOUT. A run of
             // these means the whole app is wedged — bail so callers fall back.
             None => {
+                completeness.record(in_scope, Event::AttributeFailed, None);
                 if tokio::time::Instant::now() >= deadline {
                     truncation = Some("timeout");
-                    stack.push((oref, depth, inherited_web_doc, frame_ordinal));
+                    stack.push((
+                        oref,
+                        depth,
+                        inherited_web_doc,
+                        frame_ordinal,
+                        parent_position,
+                    ));
+                    completeness.record(
+                        stack
+                            .iter()
+                            .any(|entry| scoped_frame.is_none_or(|scope| entry.3 == scope)),
+                        Event::TimeBudget,
+                        None,
+                    );
                     break;
                 }
                 consecutive_timeouts += 1;
@@ -1542,7 +1638,20 @@ async fn collect_visited_bounded_opts<'a>(
                         consecutive_timeouts
                     );
                     truncation = Some("app_unresponsive");
-                    stack.push((oref, depth, inherited_web_doc, frame_ordinal));
+                    stack.push((
+                        oref,
+                        depth,
+                        inherited_web_doc,
+                        frame_ordinal,
+                        parent_position,
+                    ));
+                    completeness.record(
+                        stack
+                            .iter()
+                            .any(|entry| scoped_frame.is_none_or(|scope| entry.3 == scope)),
+                        Event::TimeBudget,
+                        None,
+                    );
                     break;
                 }
                 continue;
@@ -1579,6 +1688,17 @@ async fn collect_visited_bounded_opts<'a>(
             call(acc.get_state()),
             call(raw_child_count(zconn, &oref)),
         );
+        if !matches!(&role_r, Some(Ok(_)))
+            || !matches!(&name_r, Some(Ok(_)))
+            || !matches!(&state_r, Some(Ok(_)))
+        {
+            completeness.record(in_scope, Event::AttributeFailed, None);
+        }
+        let child_count = match &count_r {
+            Some(Ok(count)) if *count >= 0 => CountEvidence::Known(*count as u32),
+            _ => CountEvidence::Unknown,
+        };
+        let huge = matches!(&count_r, Some(Ok(count)) if *count > 0 && *count as usize > child_cap);
         // Fetch the child list only for real containers within the cap: leaves
         // (the majority of nodes) save a round-trip, and a huge container is
         // never enumerated (see CHILD_ENUMERATION_CAP).
@@ -1615,6 +1735,9 @@ async fn collect_visited_bounded_opts<'a>(
         } else {
             RoleRead::NotRead
         };
+        if matches!(role_read, RoleRead::Failed) {
+            completeness.record(in_scope, Event::AttributeFailed, None);
+        }
         let is_password = is_password_field(role_read, &role_lower);
         let checked = if role_lower.contains("check") {
             state_r
@@ -1677,20 +1800,25 @@ async fn collect_visited_bounded_opts<'a>(
             if let Some(Ok(proxies)) = call(acc.proxies()).await {
                 if has_action {
                     if let Some(Ok(ap)) = call(proxies.action()).await {
-                        let n = call(ap.n_actions()).await.and_then(|r| r.ok()).unwrap_or(0);
+                        let count = call(ap.n_actions()).await.and_then(|r| r.ok());
+                        if count.is_none() {
+                            completeness.record(in_scope, Event::AttributeFailed, None);
+                        }
+                        let n = count.unwrap_or(0);
                         for i in 0..n {
                             // Preserve the AT-SPI action index even when an
                             // individual name lookup fails. `do_action` takes
                             // this original index, so compacting the vector
                             // could otherwise actuate a different action than
                             // the name we selected.
-                            actions.push(
-                                call(ap.get_name(i))
-                                    .await
-                                    .and_then(|result| result.ok())
-                                    .unwrap_or_default(),
-                            );
+                            let action = call(ap.get_name(i)).await.and_then(|result| result.ok());
+                            if action.is_none() {
+                                completeness.record(in_scope, Event::AttributeFailed, None);
+                            }
+                            actions.push(action.unwrap_or_default());
                         }
+                    } else {
+                        completeness.record(in_scope, Event::AttributeFailed, None);
                     }
                 }
                 if has_value {
@@ -1699,6 +1827,11 @@ async fn collect_visited_bounded_opts<'a>(
                             .await
                             .and_then(|r| r.ok())
                             .map(format_value);
+                        if value.is_none() {
+                            completeness.record(in_scope, Event::AttributeFailed, None);
+                        }
+                    } else {
+                        completeness.record(in_scope, Event::AttributeFailed, None);
                     }
                 }
                 // Text content is where editable/entry text (the typed string)
@@ -1713,12 +1846,18 @@ async fn collect_visited_bounded_opts<'a>(
                                 if let Some(Ok(t)) = call(tp.get_text(0, end)).await {
                                     text_complete = count <= 4096;
                                     text_content = t;
+                                } else {
+                                    completeness.record(in_scope, Event::AttributeFailed, None);
                                 }
                             }
-                            None => {}
+                            None => completeness.record(in_scope, Event::AttributeFailed, None),
                         }
+                    } else {
+                        completeness.record(in_scope, Event::AttributeFailed, None);
                     }
                 }
+            } else {
+                completeness.record(in_scope, Event::AttributeFailed, None);
             }
         }
 
@@ -1768,6 +1907,24 @@ async fn collect_visited_bounded_opts<'a>(
         // Honor max_depth (#22865): skip enqueueing descendants whose depth
         // would exceed the cap.
         let descend = max_depth.map(|d| depth < d).unwrap_or(true);
+        let position = visited.len();
+        if !matches!(&children_r, Some(Ok(_))) {
+            completeness.record(
+                in_scope,
+                Event::ChildrenFailed,
+                Some((position, child_count)),
+            );
+        }
+        if huge {
+            completeness.record(
+                in_scope,
+                Event::HugeContainer,
+                Some((position, child_count)),
+            );
+        }
+        if !descend {
+            completeness.depth_cut(in_scope, position, child_count);
+        }
         // A menu that is not open (a menubar entry that is not expanded, or
         // any menu that is not showing) keeps its child count and is not
         // walked: its items are hidden, never indexed, and cost a round-trip
@@ -1851,6 +2008,13 @@ async fn collect_visited_bounded_opts<'a>(
             if let Some(Ok(children)) = &children_r {
                 collapsed_children = Some(children.len());
             }
+            if child_count != CountEvidence::Known(0) {
+                completeness.record(
+                    in_scope,
+                    Event::CollapsedMenu,
+                    Some((position, child_count)),
+                );
+            }
         }
         if descend && !closed_menu {
             match children_r {
@@ -1861,11 +2025,21 @@ async fn collect_visited_bounded_opts<'a>(
                         }
                     }
                     for c in children.into_iter().rev() {
-                        stack.push((c, depth + 1, child_in_web_doc, frame_ordinal));
+                        stack.push((
+                            c,
+                            depth + 1,
+                            child_in_web_doc,
+                            frame_ordinal,
+                            Some(position),
+                        ));
                     }
                 }
-                Some(Err(error)) => dlog!("  get_children failed: {error:#}"),
-                None => dlog!("  get_children timed out"),
+                Some(Err(error)) => {
+                    dlog!("  get_children failed: {error:#}");
+                }
+                None => {
+                    dlog!("  get_children timed out");
+                }
             }
         }
 
@@ -1924,6 +2098,23 @@ async fn collect_visited_bounded_opts<'a>(
         });
     }
 
+    if let Some(event) = match truncation {
+        Some("node_budget") => Some(Event::NodeBudget),
+        Some("timeout" | "app_unresponsive") => Some(Event::TimeBudget),
+        _ => None,
+    } {
+        let mut pending_by_parent = std::collections::HashMap::<usize, u32>::new();
+        for (_, _, _, frame, parent) in &stack {
+            if scoped_frame.is_none_or(|scope| scope == *frame) {
+                if let Some(parent) = parent {
+                    *pending_by_parent.entry(*parent).or_default() += 1;
+                }
+            }
+        }
+        for (parent, pending) in pending_by_parent {
+            completeness.record(true, event, Some((parent, CountEvidence::Known(pending))));
+        }
+    }
     if truncation.is_none() && !huge_containers.is_empty() {
         for (count, at) in &huge_containers {
             dlog!(
@@ -1947,6 +2138,7 @@ async fn collect_visited_bounded_opts<'a>(
         visited,
         scoped_frame,
         truncation,
+        completeness,
     }))
 }
 
@@ -2229,9 +2421,18 @@ fn sibling_ordinal(visited: &[Visited<'_>], _parents: &[Option<usize>], pos: usi
 /// (`perform_action`, `focus_element`, `set_value`, …), and those resolve an
 /// index against the whole application. Renumbering per window would make a
 /// window-scoped snapshot's indices name different elements at actuation time.
-fn render(visited: &[Visited<'_>], only_frame: Option<usize>) -> (String, Vec<AtspiNode>) {
+fn render(
+    visited: &[Visited<'_>],
+    only_frame: Option<usize>,
+    completeness: &crate::walk_completeness::Completeness,
+) -> (
+    String,
+    Vec<AtspiNode>,
+    std::collections::HashMap<usize, cua_driver_contract::NodeBoundary>,
+) {
     let mut md = String::new();
     let mut nodes = Vec::new();
+    let mut boundaries = std::collections::HashMap::new();
     let mut idx = 0usize;
     // The real AT-SPI parent of every node, so `parent_element_index` is the
     // nearest *indexed ancestor* — never a preceding cousin at a lower depth
@@ -2285,6 +2486,9 @@ fn render(visited: &[Visited<'_>], only_frame: Option<usize>) -> (String, Vec<At
                 // the application-wide walk the actuators perform.
                 idx += 1;
                 continue;
+            }
+            if let Some(boundary) = completeness.boundaries.get(&pos) {
+                boundaries.insert(idx, boundary.clone());
             }
             let role_lower = v.role.to_ascii_lowercase();
             // An unnamed value control: name it from the sibling label of its
@@ -2380,8 +2584,16 @@ fn render(visited: &[Visited<'_>], only_frame: Option<usize>) -> (String, Vec<At
             });
             idx += 1;
         } else if emit && !v.name.is_empty() && v.showing {
+            let boundary_marker = completeness
+                .boundaries
+                .get(&pos)
+                .map(|boundary| match boundary.children_skipped {
+                    cua_driver_contract::CountEvidence::Known(n) => format!(" [+{n} more]"),
+                    cua_driver_contract::CountEvidence::Unknown => " [more: unknown]".to_owned(),
+                })
+                .unwrap_or_default();
             md.push_str(&format!(
-                "{indent}- {role} = \"{name}\"{marker}
+                "{indent}- {role} = \"{name}\"{marker}{boundary_marker}
 ",
                 role = v.role,
                 name = v.name,
@@ -2390,7 +2602,7 @@ fn render(visited: &[Visited<'_>], only_frame: Option<usize>) -> (String, Vec<At
         }
     }
 
-    (md, nodes)
+    (md, nodes, boundaries)
 }
 
 /// Why a visible, named control is listed without an index. A disabled
@@ -2568,6 +2780,8 @@ pub struct WalkedTree {
     pub bounds_complete: bool,
     /// Wall time of the walk + bounds phases.
     pub elapsed: Duration,
+    pub(crate) completeness: crate::walk_completeness::Completeness,
+    pub(crate) boundaries: std::collections::HashMap<usize, cua_driver_contract::NodeBoundary>,
 }
 
 /// Walk the AT-SPI tree with caller-supplied node + depth caps.
@@ -2621,6 +2835,12 @@ pub(super) fn walk_tree_bounded_with_timeout(
                     }),
                     bounds_complete: false,
                     elapsed: walk_started.elapsed(),
+                    completeness: {
+                        let mut c = crate::walk_completeness::Completeness::new(false);
+                        c.record(true, crate::walk_completeness::Event::TimeBudget, None);
+                        c
+                    },
+                    boundaries: Default::default(),
                 }));
             }
             Ok(Err(error)) => return Err(error),
@@ -2638,6 +2858,12 @@ pub(super) fn walk_tree_bounded_with_timeout(
                     }),
                     bounds_complete: false,
                     elapsed: walk_started.elapsed(),
+                    completeness: {
+                        let mut c = crate::walk_completeness::Completeness::new(false);
+                        c.record(true, crate::walk_completeness::Event::TimeBudget, None);
+                        c
+                    },
+                    boundaries: Default::default(),
                 }));
             }
         };
@@ -2645,12 +2871,13 @@ pub(super) fn walk_tree_bounded_with_timeout(
             visited,
             scoped_frame,
             truncation,
+            completeness,
         }) = walked
         else {
             return Ok(None);
         };
         let walk_elapsed = walk_started.elapsed();
-        let (markdown, nodes) = render(&visited, scoped_frame);
+        let (markdown, nodes, boundaries) = render(&visited, scoped_frame, &completeness);
         let bounds_started = std::time::Instant::now();
         // Bounds resolution shares the deadline, but a walk that consumed the
         // whole budget must still yield *some* frames (element-index clicks
@@ -2702,6 +2929,8 @@ pub(super) fn walk_tree_bounded_with_timeout(
             truncation,
             bounds_complete,
             elapsed: walk_started.elapsed(),
+            completeness,
+            boundaries,
         }))
     })
 }

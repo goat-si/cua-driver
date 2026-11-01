@@ -63,3 +63,97 @@ fn element_entry_reports_toggle_state_and_expanded() {
     assert!(entry.get("toggle_state").is_none());
     assert!(entry.get("expanded").is_none());
 }
+
+fn tree_for_completeness() -> crate::atspi::AtspiTreeResult {
+    crate::atspi::AtspiTreeResult {
+        tree_markdown: String::new(),
+        nodes: Vec::new(),
+        bounds: Vec::new(),
+        trusted: true,
+        degraded_reason: None,
+        window_scoped: true,
+        truncated: false,
+        truncation_reason: None,
+        nodes_visited: 7,
+        nodes_pending: 0,
+        bounds_complete: true,
+        elapsed_ms: 123,
+        completeness: crate::walk_completeness::Completeness::new(true),
+        boundaries: Default::default(),
+    }
+}
+
+#[test]
+fn get_window_state_completeness_adapter_preserves_legacy_fields_and_schema() {
+    use crate::walk_completeness::Event;
+    let mut tree = tree_for_completeness();
+    tree.completeness.record(true, Event::ChildrenFailed, None);
+    let mut structured = json!({"pid": 7, "window_id": 9, "truncation_reason": "stale"});
+    apply_linux_walk_completeness(&mut structured, &tree, 500);
+    assert_eq!(structured["observation_complete"], false);
+    assert_eq!(structured["elements_complete"], false);
+    assert!(structured.get("truncation_reason").is_none());
+    assert_eq!(structured["nodes_visited"], 7);
+    assert_eq!(structured["nodes_pending"], 0);
+    assert_eq!(structured["walk_elapsed_ms"], 123);
+    assert_eq!(structured["timeout_ms"], 500);
+    structured["elements"] = json!([{
+        "element_index": 1, "role": "button", "depth": 0,
+        "boundary": {"reasons": [{"kind": "provider_failure", "detail": "child_enumeration_failed"}], "children_skipped": {"known": 3}}
+    }]);
+    let wire =
+        json!({"content": [{"type": "text", "text": "tree"}], "structuredContent": structured});
+    let checked =
+        cua_driver_core::mcp_result::conforming_tool_result("get_window_state", wire.clone());
+    assert_eq!(
+        checked, wire,
+        "core MCP result validation rejected the Linux output"
+    );
+
+    tree.truncated = true;
+    tree.truncation_reason = Some("huge_container".into());
+    tree.nodes_pending = 3;
+    tree.completeness.record(true, Event::HugeContainer, None);
+    apply_linux_walk_completeness(&mut structured, &tree, 500);
+    assert_eq!(structured["truncation_reason"], "huge_container");
+    assert_eq!(structured["nodes_pending"], 3);
+    assert_eq!(structured["elements_complete"], false);
+}
+
+#[test]
+fn sibling_only_stop_keeps_the_legacy_truncation_and_complete_observation() {
+    let mut tree = tree_for_completeness();
+    tree.truncated = true;
+    tree.truncation_reason = Some("node_budget".into());
+    tree.nodes_pending = 4;
+    let mut structured = json!({"pid": 7, "window_id": 9});
+    apply_linux_walk_completeness(&mut structured, &tree, 500);
+    assert_eq!(structured["observation_complete"], true);
+    assert_eq!(structured["elements_complete"], false);
+    assert_eq!(structured["truncation_reason"], "node_budget");
+    assert_eq!(structured["nodes_pending"], 4);
+}
+
+#[test]
+fn get_window_state_fallback_preserves_timeout_and_is_untrusted() {
+    use crate::walk_completeness::{Completeness, Event};
+    let mut tree = tree_for_completeness();
+    tree.trusted = false;
+    tree.truncated = true;
+    tree.truncation_reason = Some("timeout".into());
+    tree.nodes_pending = 4;
+    tree.completeness = Completeness::new(false);
+    tree.completeness
+        .record(true, Event::UntrustedProvider, None);
+    tree.completeness.record(true, Event::TimeBudget, None);
+    let mut structured = json!({"pid": 7, "window_id": 9});
+    apply_linux_walk_completeness(&mut structured, &tree, 500);
+    assert_eq!(structured["truncation_reason"], "timeout");
+    assert_eq!(structured["nodes_pending"], 4);
+    assert_eq!(structured["observation_complete"], false);
+    let reasons = structured["observation_incomplete_reasons"]
+        .as_array()
+        .unwrap();
+    assert!(reasons.iter().any(|r| r["detail"] == "untrusted_provider"));
+    assert!(reasons.iter().any(|r| r["detail"] == "time_budget"));
+}

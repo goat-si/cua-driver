@@ -686,6 +686,47 @@ fn megapixel_long_edge_cap(w: u32, h: u32, max_pixels: u64) -> Option<u32> {
 #[cfg(test)]
 mod megapixel_cap_tests;
 
+fn apply_linux_walk_completeness(
+    structured: &mut serde_json::Value,
+    tree: &crate::atspi::AtspiTreeResult,
+    timeout_ms: u64,
+) {
+    use cua_driver_contract::{IncompleteReasonDetail, IncompleteReasonKind};
+    let mut budget = cua_driver_core::walk_budget::WalkBudget::new(timeout_ms, usize::MAX);
+    if tree.completeness.exhaustive {
+        budget.assert_exhaustive();
+    }
+    for reason in &tree.completeness.reasons {
+        match reason.kind {
+            IncompleteReasonKind::ProviderFailure
+                if reason.detail == IncompleteReasonDetail::UntrustedProvider =>
+            {
+                budget.record_untrusted(*reason)
+            }
+            IncompleteReasonKind::ProviderFailure => budget.record_skip(*reason),
+            IncompleteReasonKind::PolicyOmission | IncompleteReasonKind::Budget => {
+                budget.record_cut(*reason)
+            }
+            IncompleteReasonKind::Unknown => budget.record_skip(*reason),
+        }
+    }
+    budget.outcome().apply(structured);
+    // Linux's walk owns admission and its historical diagnostics; the core
+    // budget above accumulates reasons only and never admits a node.
+    structured["truncated"] = json!(tree.truncated);
+    if let Some(reason) = &tree.truncation_reason {
+        structured["truncation_reason"] = json!(reason);
+    } else if let Some(object) = structured.as_object_mut() {
+        object.remove("truncation_reason");
+    }
+    structured["nodes_visited"] = json!(tree.nodes_visited);
+    structured["nodes_pending"] = json!(tree.nodes_pending);
+    structured["walk_elapsed_ms"] = json!(tree.elapsed_ms as u64);
+    structured["timeout_ms"] = json!(timeout_ms);
+    structured["elements_complete"] =
+        json!(tree.trusted && !tree.truncated && structured["observation_complete"] == true);
+}
+
 /// Build a single structured element entry for `get_window_state`.
 /// Returns `None` when the node has no `element_index` (non-actionable rows).
 fn build_element_entry(
@@ -1584,16 +1625,8 @@ impl Tool for GetWindowStateTool {
                     // finished without hitting the deadline / node budget saw
                     // every node the application publishes. Truncated or
                     // fallback trees keep negative existence unknown.
-                    structured["elements_complete"] = json!(tr.trusted && !tr.truncated);
-                    structured["truncated"] = json!(tr.truncated);
-                    if let Some(reason) = &tr.truncation_reason {
-                        structured["truncation_reason"] = json!(reason);
-                    }
-                    structured["nodes_visited"] = json!(tr.nodes_visited);
-                    structured["nodes_pending"] = json!(tr.nodes_pending);
+                    apply_linux_walk_completeness(&mut structured, &tr, timeout_ms);
                     structured["bounds_complete"] = json!(tr.bounds_complete);
-                    structured["walk_elapsed_ms"] = json!(tr.elapsed_ms as u64);
-                    structured["timeout_ms"] = json!(timeout_ms);
                     structured["tree_markdown"] = json!(tr.tree_markdown);
 
                     // Elements bind to this window only when the walk proved
@@ -1676,11 +1709,15 @@ impl Tool for GetWindowStateTool {
                         .nodes
                         .iter()
                         .filter_map(|n| {
-                            build_element_entry(
+                            let mut element = build_element_entry(
                                 n,
                                 snapshot_id,
                                 bounds_by_idx.get(&n.element_index?).copied(),
-                            )
+                            )?;
+                            if let Some(boundary) = tr.boundaries.get(&n.element_index?) {
+                                element["boundary"] = json!(boundary);
+                            }
+                            Some(element)
                         })
                         .collect();
                     let elements = cua_driver_core::element_query::project_elements_for_query(

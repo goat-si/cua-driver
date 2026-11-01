@@ -53,6 +53,12 @@ impl Completeness {
         }
     }
 
+    pub(crate) fn depth_cut(&mut self, in_scope: bool, position: usize, count: CountEvidence) {
+        if count != CountEvidence::Known(0) {
+            self.record(in_scope, Event::DepthLimit, Some((position, count)));
+        }
+    }
+
     pub(crate) fn record(
         &mut self,
         in_scope: bool,
@@ -172,5 +178,45 @@ mod tests {
         assert_eq!(output(&clean)["observation_complete"], true);
         assert_eq!(output(&clean)["observation_incomplete_reasons"], json!([]));
         assert!(has(&Completeness::new(false), "not_asserted"));
+    }
+
+    #[test]
+    fn depth_cut_distinguishes_leaves_and_unknown_counts() {
+        let mut c = Completeness::new(true);
+        c.depth_cut(true, 0, CountEvidence::Known(0));
+        assert_eq!(output(&c)["observation_complete"], true);
+        c.depth_cut(true, 1, CountEvidence::Known(3));
+        c.depth_cut(true, 2, CountEvidence::Unknown);
+        assert!(has(&c, "depth_limit"));
+        assert_eq!(c.boundaries[&1].children_skipped, CountEvidence::Known(3));
+        assert_eq!(c.boundaries[&2].children_skipped, CountEvidence::Unknown);
+    }
+
+    #[test]
+    fn retained_attribute_failures_deduplicate_and_keep_sibling_evidence() {
+        let mut c = Completeness::new(true);
+        // Role name, numeric role and state each failed on retained nodes.
+        for _ in 0..3 {
+            c.record(true, Event::AttributeFailed, None);
+        }
+        // A sibling's failed read is outside this window's scope.
+        c.record(
+            false,
+            Event::ChildrenFailed,
+            Some((4, CountEvidence::Known(2))),
+        );
+        assert_eq!(c.reasons.len(), 1);
+        assert!(has(&c, "attribute_read_failed"));
+        assert!(c.boundaries.is_empty());
+    }
+
+    #[test]
+    fn timeout_and_untrusted_fallback_remain_distinct_evidence() {
+        let mut c = Completeness::new(false);
+        c.record(true, Event::TimeBudget, None);
+        c.record(true, Event::UntrustedProvider, None);
+        assert!(has(&c, "time_budget"));
+        assert!(has(&c, "untrusted_provider"));
+        assert!(has(&c, "not_asserted"));
     }
 }
