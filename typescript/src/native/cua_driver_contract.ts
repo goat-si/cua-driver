@@ -912,9 +912,9 @@ const FfiConverterTypeOpenedSurfaceBounds = (() => {
 })();
 
 /**
- * A surface that appeared after dispatch, established by before/after comparison
- * or an open notification tied to the input. Embedded AX/UIA surfaces may
- * have no independently addressable target.
+ * A surface observed after dispatch. Partial observations may include surfaces
+ * the input did not cause. Kind unknown makes no menu, popover, alert, or sheet
+ * claim. Embedded AX/UIA surfaces may have no independently addressable target.
  */
 export type OpenedSurface = {
     kind: OpenedSurfaceKind,
@@ -980,8 +980,9 @@ const FfiConverterTypeOpenedSurface = (() => {
 
 /**
  * Completeness of the observation performed after an input was dispatched.
- * Observed is complete; partial means some surfaces were seen but absence
- * of others is unknown; unavailable means observation could not complete.
+ * Observed is complete; partial may include surfaces the input did not cause
+ * and does not establish the absence of others. Unavailable means observation
+ * could not complete. Only observed with an empty list asserts nothing opened.
  */
 export enum OpenedSurfacesStatus {
     Observed,
