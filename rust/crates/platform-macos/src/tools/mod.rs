@@ -757,12 +757,61 @@ fn key_scope_with<T>(
     post_available: impl FnOnce() -> bool,
     enter: impl FnOnce(i32, u32) -> Result<T, String>,
 ) -> Result<Option<T>, String> {
-    let Some(wid) = window_id else { return Ok(None) };
+    let Some(wid) = window_id else {
+        return Ok(None);
+    };
     let _post_available = post_available();
     if focus_available() {
         enter(pid, wid).map(Some)
     } else {
         Ok(None)
+    }
+}
+
+#[cfg(test)]
+mod hand_back_order_outer_tests {
+    use super::key_scope_with;
+    use std::cell::Cell;
+
+    #[test]
+    fn missing_post_spi_refuses_with_and_without_focus_spis() {
+        for focus_available in [false, true] {
+            let records = Cell::new(0);
+            let key_posts = Cell::new(0);
+            let ax_writes = Cell::new(0);
+            let result = key_scope_with(
+                7,
+                Some(9),
+                || focus_available,
+                || false,
+                |_, _| {
+                    records.set(records.get() + 1);
+                    ax_writes.set(ax_writes.get() + 1);
+                    Ok(())
+                },
+            );
+            if result.is_ok() {
+                key_posts.set(key_posts.get() + 1);
+            }
+            assert!(result.is_err(), "focus_available={focus_available}");
+            assert_eq!((key_posts.get(), records.get(), ax_writes.get()), (0, 0, 0));
+        }
+    }
+
+    #[test]
+    fn available_post_spi_preserves_scope_selection() {
+        assert_eq!(
+            key_scope_with(7, Some(9), || false, || true, |_, _| Ok(())).unwrap(),
+            None
+        );
+        assert_eq!(
+            key_scope_with(7, Some(9), || true, || true, |_, _| Ok(())).unwrap(),
+            Some(())
+        );
+        assert_eq!(
+            key_scope_with(7, None, || panic!(), || panic!(), |_, _| Ok(())).unwrap(),
+            None
+        );
     }
 }
 

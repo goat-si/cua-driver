@@ -4031,3 +4031,7 @@ mod entry_hand_back_tests {
 #[cfg(test)]
 #[path = "skylight_scope_tests.rs"]
 mod frontmost_scope_tests;
+
+#[cfg(test)]
+#[path = "skylight_hand_back_order_tests.rs"]
+mod hand_back_order_tests;
