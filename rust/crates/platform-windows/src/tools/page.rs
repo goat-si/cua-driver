@@ -88,52 +88,38 @@ impl PageBackend for WindowsPageBackend {
         window_id: u64,
         javascript: &str,
     ) -> anyhow::Result<String> {
-        // 1) Bookmark-based UIA exec — zero config, no launch flag needed.
-        //    Requires that a `cua-driver-eval` bookmark exists in the
-        //    Favorites bar (or that we can summon the bar and one already
-        //    sits there).  Any failure (favorites bar hidden + Ctrl+Shift+B
-        //    fails to summon, dialog drift, title-poll timeout) is logged
-        //    and falls through to the CDP path.
-        let bookmark_result = match u32::try_from(window_id) {
-            Ok(window_id) => {
-                super::page_bookmark::try_bookmark_exec(pid, window_id, javascript).await
-            }
-            Err(_) => Err(anyhow::anyhow!(
-                "window_id {window_id} is outside the legacy bookmark transport's u32 range"
-            )),
-        };
-        match bookmark_result {
-            Ok(v) => {
-                return Ok(format!("uia.bookmark_exec: {v}"));
-            }
-            Err(e) => tracing::debug!(
-                target: "page.execute_javascript",
-                "bookmark exec path failed: {e:?}; falling back to CDP"
-            ),
-        }
-
-        // 2) CDP fallback.  Discover CDP port from env.  Extracting
-        //    `--remote-debugging-port` from the process's command line is
-        //    PEB-reading territory; the conventional env var is good
-        //    enough for now and fails with an actionable message if
-        //    neither path applies.
-        let port: u16 = match std::env::var("CUA_DRIVER_CDP_PORT")
-            .ok()
-            .and_then(|s| s.parse::<u16>().ok())
-        {
-            Some(p) => p,
-            None => anyhow::bail!(
-                "Chromium's `execute_javascript` on Windows tried the bookmark-URL UIA \
+        crate::page_dispatch::run_bookmark_then_cdp(
+            async {
+                let window_id = u32::try_from(window_id).map_err(|_| {
+                    crate::page_dispatch::BookmarkFailure::BeforeDispatch(anyhow::anyhow!(
+                        "window_id {window_id} is outside the legacy bookmark transport's u32 range"
+                    ))
+                })?;
+                super::page_bookmark::try_bookmark_exec(pid, window_id, javascript)
+                    .await
+                    .map(|value| format!("uia.bookmark_exec: {value}"))
+            },
+            || async {
+                let port: u16 = match std::env::var("CUA_DRIVER_CDP_PORT")
+                    .ok()
+                    .and_then(|s| s.parse::<u16>().ok())
+                {
+                    Some(p) => p,
+                    None => anyhow::bail!(
+                        "Chromium's `execute_javascript` on Windows tried the bookmark-URL UIA \
                  bypass and the CDP fallback. The bookmark path failed (see debug logs); \
                  for the CDP path, relaunch the browser with `--remote-debugging-port=N` \
                  and export CUA_DRIVER_CDP_PORT=N before starting cua-driver. \
                  Alternatively, create a bookmark named `cua-driver-eval` (any URL — the \
                  driver overwrites it on first use) in the Favorites bar to enable the \
                  bookmark-URL bypass.  Or use `get_text` / `query_dom` for read-only access."
-            ),
-        };
-        let result = cua_driver_core::cdp::evaluate(port, javascript, true).await?;
-        Ok(format!("cdp.runtime.evaluate.user_gesture: {result}"))
+                    ),
+                };
+                let result = cua_driver_core::cdp::evaluate(port, javascript, true).await?;
+                Ok(format!("cdp.runtime.evaluate.user_gesture: {result}"))
+            },
+        )
+        .await
     }
 
     async fn execute_javascript_targeted(
