@@ -11,6 +11,7 @@ use std::rc::Rc;
 #[derive(Clone, Copy)]
 pub(crate) enum Domain {
     Control,
+    Frame,
     Scrollbar,
     Tab,
     Dense,
@@ -42,6 +43,7 @@ impl Domain {
         };
         Some(match self {
             Self::Control => ReadSite::Control(name),
+            Self::Frame => ReadSite::Frame(name),
             Self::Scrollbar => ReadSite::Scrollbar(name),
             Self::Tab => ReadSite::Tab(name),
             Self::Dense => ReadSite::Dense(name),
@@ -50,6 +52,7 @@ impl Domain {
     fn batch_site(self) -> ReadSite {
         ReadSite::Batch(match self {
             Self::Control => "control",
+            Self::Frame => "frame",
             Self::Scrollbar => "scrollbar",
             Self::Tab => "tab",
             Self::Dense => "dense",
@@ -84,6 +87,17 @@ impl<'a, S: AxTreeSource> EvidenceSource<'a, S> {
             legacy,
             evidence: std::mem::take(&mut self.state.borrow_mut().evidence),
         }
+    }
+    pub(crate) fn note(&self, site: ReadSite, status: EvidenceStatus) {
+        let mut state = self.state.borrow_mut();
+        let attempt = state.attempt;
+        state.evidence.push(ReadEvidence {
+            owner: self.owner,
+            site,
+            status,
+            attempt,
+            listing: None,
+        });
     }
     fn record<T>(&self, _element: &S::Element, name: &str, result: &Read<T>) {
         if let Some(site) = self.domain.site(name) {

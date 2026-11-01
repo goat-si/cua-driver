@@ -219,13 +219,35 @@ pub(crate) fn read_frame_with<S: AxTreeSource>(
     budget: &mut WalkBudget,
     batching_disabled: &mut bool,
 ) -> Option<Option<[f64; 4]>> {
-    read_within_deadline(
+    read_frame_observed_with(source, element, budget, batching_disabled, None).into_walk_legacy()
+}
+
+pub(crate) fn read_frame_observed_with<S: AxTreeSource>(
+    source: &S,
+    element: &S::Element,
+    budget: &mut WalkBudget,
+    batching_disabled: &mut bool,
+    owner: Option<usize>,
+) -> super::evidence::Observed<Option<Option<[f64; 4]>>> {
+    let source = super::evidence_source::EvidenceSource::new(
+        source,
+        super::evidence_source::Domain::Frame,
+        owner,
+    );
+    let result = read_within_deadline(
         budget,
         batching_disabled,
         || source.batch(element, &FRAME_ATTRIBUTES),
         frame_from_slots,
-        |step| frame_from_singles(source, element, step),
-    )
+        |step| frame_from_singles(&source, element, step),
+    );
+    if result.is_none() {
+        source.note(
+            super::evidence::ReadSite::Frame("deadline"),
+            super::evidence::EvidenceStatus::DeadlineExpired,
+        );
+    }
+    source.finish(result)
 }
 
 #[cfg(test)]

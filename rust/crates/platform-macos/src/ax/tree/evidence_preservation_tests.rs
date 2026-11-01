@@ -662,6 +662,96 @@ fn recovered_batch_failure_preserves_attempt_history() {
 }
 
 #[test]
+fn frame_batch_preserves_unknown_and_absent() {
+    const FRAME: &str = "AXPosition,AXSize";
+    for (index, name) in [(1, "AXPosition"), (2, "AXSize")] {
+        for case in [Case::AxFailure, Case::Known, Case::Absent, Case::WrongType] {
+            let mut slots = vec![Case::Known.slot(1), Case::Known.slot(2)];
+            slots[index - 1] = case.slot(index);
+            let fake = Fake::new(
+                &[(1, 1, 1, &[])],
+                vec![step(
+                    &format!("batch 1 {FRAME}"),
+                    Reply::Batch(Ok(Batch(slots))),
+                )],
+            );
+            let root = fake.handle(1);
+            let observed = crate::ax::control_attrs::read_frame_observed_with(
+                &fake,
+                &root,
+                &mut WalkBudget::nodes_only(10),
+                &mut false,
+                Some(1),
+            );
+            assert_eq!(
+                observed.legacy,
+                Some(if matches!(case, Case::Known) {
+                    Some([1.0, 2.0, 3.0, 4.0])
+                } else {
+                    None
+                })
+            );
+            fake.assert_consumed();
+            drop(root);
+            fake.assert_lifetimes(&[]);
+            assert_evidence(&observed.evidence, ReadSite::Frame(name), case.status());
+            assert!(observed
+                .evidence
+                .iter()
+                .any(|entry| entry.site == ReadSite::Frame(name) && entry.owner == Some(1)));
+        }
+    }
+}
+
+#[test]
+fn frame_singles_preserve_unknown_and_absent() {
+    const FRAME: &str = "AXPosition,AXSize";
+    for (index, name) in [(1, "AXPosition"), (2, "AXSize")] {
+        for case in [Case::AxFailure, Case::Known, Case::Absent, Case::WrongType] {
+            let position = if index == 1 { case } else { Case::Known };
+            let size = if index == 2 { case } else { Case::Known };
+            let mut steps = vec![
+                step(
+                    &format!("batch 1 {FRAME}"),
+                    Reply::Batch(Err(BatchFailure::Decode)),
+                ),
+                step("position 1", Reply::Point(position.read((1.0, 2.0)))),
+            ];
+            if matches!(position, Case::Known) {
+                steps.push(step("size 1", Reply::Point(size.read((3.0, 4.0)))));
+            }
+            let fake = Fake::new(&[(1, 1, 1, &[])], steps);
+            let root = fake.handle(1);
+            let observed = crate::ax::control_attrs::read_frame_observed_with(
+                &fake,
+                &root,
+                &mut WalkBudget::nodes_only(10),
+                &mut false,
+                Some(1),
+            );
+            assert_eq!(
+                observed.legacy,
+                Some(if matches!(case, Case::Known) {
+                    Some([1.0, 2.0, 3.0, 4.0])
+                } else {
+                    None
+                })
+            );
+            fake.assert_consumed();
+            drop(root);
+            fake.assert_lifetimes(&[]);
+            assert_evidence(&observed.evidence, ReadSite::Frame(name), case.status());
+            assert!(observed
+                .evidence
+                .iter()
+                .any(|entry| entry.site == ReadSite::Frame(name)
+                    && entry.owner == Some(1)
+                    && entry.attempt == 1));
+        }
+    }
+}
+
+#[test]
 fn scrollbar_owner_preserves_unknown_and_absent() {
     let fake = Fake::new(
         &[(1, 1, 1, &[])],
