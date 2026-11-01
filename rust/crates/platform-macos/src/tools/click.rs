@@ -1646,14 +1646,14 @@ impl ClickTool {
                 let foreground = delivery_mode.is_foreground();
                 let resolved = latency::spawn_action_blocking(move || {
                     let _span = latency::span(latency::Stage::Preflight);
-                    let element = action_guard.as_ptr() as AXUIElementRef;
-                    let advertised = unsafe { copy_action_names(element) };
-                    crate::input::ax_actions::resolve_element_action(
+                    resolve_click_action(
+                        action_guard.as_ptr(),
                         &requested,
-                        &advertised,
                         foreground,
+                        |target| unsafe { copy_action_names(target as AXUIElementRef) },
+                        |_, _, _| Ok(()),
                     )
-                    .map(str::to_owned)
+                    .map(|(_, action)| action)
                 })
                 .await;
                 match resolved {
@@ -3358,10 +3358,9 @@ unsafe fn ancestor_roles(element: AXUIElementRef) -> Vec<String> {
     roles
 }
 
-/// Resolve the exact advertised action and check its enabled state on the
-/// selected target without dispatching it. The two reads are injectable so a
-/// caller can retain the selected target and action across later checks.
-#[cfg(test)]
+/// Resolve the exact advertised action without dispatching it. The caller
+/// retains this name for the actionability sample and worker; enabled-state
+/// validation remains immediately before the action in the worker.
 pub(super) fn resolve_click_action<T: Copy>(
     target: T,
     requested: &str,
