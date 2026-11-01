@@ -4208,4 +4208,6 @@ mod canonical_evidence_tests {
     }
 }
 #[cfg(test)]
+mod environment_evidence_tests;
+#[cfg(test)]
 mod walker_test_support;

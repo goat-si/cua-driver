@@ -109,6 +109,9 @@ pub(crate) enum ReadSite {
     SelectedSettable,
     MenuSelected,
     Batch(&'static str),
+    ProviderEnablement,
+    ProviderCachedEnablement,
+    ProviderOptIn,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

@@ -267,6 +267,7 @@ pub unsafe fn ensure_chromium_ax_enabled(pid: i32, app_element: AXUIElementRef) 
                 state.insert(pid, ProcessEnablement { stamp, wait });
             }
         },
+        Some(app_element as usize),
     )
     .legacy;
 }
@@ -280,6 +281,7 @@ pub(super) fn ensure_with(
     opt_in: impl FnOnce() -> AccessibilityOptIn,
     await_tree: impl FnOnce() -> bool,
     persist: impl FnOnce(ProcessStartStamp, Wait),
+    _owner: Option<usize>,
 ) -> super::evidence::Observed<()> {
     let prior_timeouts = match next_attempt(cached.as_ref(), stamp, attempted_at) {
         Attempt::Skip => return super::evidence::Observed::legacy_only(()),
