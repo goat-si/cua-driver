@@ -166,6 +166,7 @@ fn aggregate_evidence(tool: &str, structured: &Value) -> Option<ErrorDisposition
                 .and_then(Value::as_str)
                 .is_some_and(|name| crate::batch_tools::BATCHABLE_TOOLS.contains(&name));
             action
+                && !recorded_not_delivered(step)
                 && (step.get("phase").and_then(Value::as_str) == Some("action")
                     || (step.get("ok").and_then(Value::as_bool) == Some(true)
                         && step.get("skipped").and_then(Value::as_bool) != Some(true)))
@@ -175,15 +176,20 @@ fn aggregate_evidence(tool: &str, structured: &Value) -> Option<ErrorDisposition
     if tool == "run_script" {
         let calls = structured.get("calls").and_then(Value::as_array);
         let action_tool = |entry: &Value| {
-            entry
-                .get("tool")
-                .and_then(Value::as_str)
-                .is_some_and(|name| {
-                    !matches!(
-                        name,
-                        "list_apps" | "list_windows" | "get_window_state" | "verify_state" | "zoom"
-                    )
-                })
+            !recorded_not_delivered(entry)
+                && entry
+                    .get("tool")
+                    .and_then(Value::as_str)
+                    .is_some_and(|name| {
+                        !matches!(
+                            name,
+                            "list_apps"
+                                | "list_windows"
+                                | "get_window_state"
+                                | "verify_state"
+                                | "zoom"
+                        )
+                    })
         };
         let action = calls.is_some_and(|calls| {
             calls.iter().any(|call| {
@@ -218,6 +224,12 @@ fn aggregate_evidence(tool: &str, structured: &Value) -> Option<ErrorDisposition
         return incomplete.then_some(ErrorDisposition::UNCERTAIN);
     }
     None
+}
+
+fn recorded_not_delivered(entry: &Value) -> bool {
+    entry.get("delivery").and_then(Value::as_str) == Some("not_delivered")
+        && entry.get("ok").and_then(Value::as_bool) == Some(false)
+        && crate::protocol::no_delivery_effect(entry)
 }
 
 fn normalize_tool_result(tool: &str, result: Value, has_schema: bool) -> Value {
@@ -492,6 +504,97 @@ mod tests {
             result["structuredContent"]["disposition"],
             json!({"delivery":"delivered_unverified", "retry":"unsafe"})
         );
+    }
+
+    #[test]
+    fn u09_contradictory_step_evidence_is_not_safe() {
+        let result = conforming_tool_result(
+            "run_steps",
+            tool_error_result(
+                "partial",
+                json!({
+                    "steps":[{"tool":"click", "phase":"action", "delivery":"not_delivered", "effect":"partial"}],
+                    "disposition":{"delivery":"not_delivered", "retry":"safe"}
+                }),
+            ),
+        );
+        assert_eq!(
+            result["structuredContent"]["disposition"],
+            json!({"delivery":"delivered_unverified", "retry":"unsafe"})
+        );
+    }
+
+    #[test]
+    fn u09_contradictory_script_evidence_is_not_safe() {
+        let result = conforming_tool_result(
+            "run_script",
+            tool_error_result(
+                "uncertain",
+                json!({
+                    "calls":[{"tool":"click", "delivery":"not_delivered", "effect":"suspected_noop"}],
+                    "disposition":{"delivery":"not_delivered", "retry":"safe"}
+                }),
+            ),
+        );
+        assert_ne!(result["structuredContent"]["disposition"]["retry"], "safe");
+    }
+
+    #[test]
+    fn u09_successful_step_cannot_claim_no_delivery() {
+        let result = conforming_tool_result(
+            "run_steps",
+            tool_error_result(
+                "later failure",
+                json!({
+                    "steps":[{"tool":"click", "ok":true, "delivery":"not_delivered"}],
+                    "disposition":{"delivery":"not_delivered", "retry":"safe"}
+                }),
+            ),
+        );
+        assert_eq!(
+            result["structuredContent"]["disposition"],
+            json!({"delivery":"delivered_unverified", "retry":"unsafe"})
+        );
+    }
+
+    #[test]
+    fn u09_successful_script_call_cannot_claim_no_delivery() {
+        let result = conforming_tool_result(
+            "run_script",
+            tool_error_result(
+                "later failure",
+                json!({
+                    "calls":[{"tool":"click", "ok":true, "delivery":"not_delivered"}],
+                    "disposition":{"delivery":"not_delivered", "retry":"safe"}
+                }),
+            ),
+        );
+        assert_eq!(
+            result["structuredContent"]["disposition"],
+            json!({"delivery":"delivered_unverified", "retry":"unsafe"})
+        );
+    }
+
+    #[test]
+    fn u09_incomplete_call_marker_is_not_safe() {
+        for (tool, history) in [
+            (
+                "run_steps",
+                json!({"steps":[{"tool":"click", "phase":"action", "delivery":"not_delivered"}]}),
+            ),
+            (
+                "run_script",
+                json!({"calls":[{"tool":"click", "delivery":"not_delivered"}]}),
+            ),
+        ] {
+            let mut history = history;
+            history["disposition"] = json!({"delivery":"not_delivered", "retry":"safe"});
+            let result = conforming_tool_result(tool, tool_error_result("error", history));
+            assert_ne!(
+                result["structuredContent"]["disposition"]["retry"], "safe",
+                "{tool}"
+            );
+        }
     }
 
     #[test]

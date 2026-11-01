@@ -334,6 +334,17 @@ impl Serialize for ToolResult {
 }
 
 impl ToolResult {
+    /// Only trusted, internally typed refusals without contradictory effects
+    /// prove that an application received no input.
+    pub(crate) fn proves_no_input(&self) -> bool {
+        self.is_error == Some(true)
+            && self.disposition == Some(cua_driver_contract::ErrorDisposition::NOT_DELIVERED)
+            && self
+                .structured_content
+                .as_ref()
+                .is_none_or(no_delivery_effect)
+    }
+
     pub fn text(msg: impl Into<String>) -> Self {
         Self {
             content: vec![Content::text(msg)],
@@ -365,6 +376,14 @@ impl ToolResult {
     ) -> Self {
         self.action_record = Some(record);
         self
+    }
+}
+
+pub(crate) fn no_delivery_effect(value: &Value) -> bool {
+    match value.get("effect") {
+        None | Some(Value::Null) => true,
+        Some(Value::String(effect)) => effect == "refused",
+        _ => false,
     }
 }
 

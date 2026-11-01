@@ -377,6 +377,14 @@ struct CallFacts {
     window_id: Option<u64>,
     effect: Option<String>,
     code: Option<String>,
+    delivery: Option<&'static str>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ActionAttempt {
+    Pending,
+    NotDelivered,
+    MayHaveDelivered,
 }
 
 async fn run(registry: &ToolRegistry, request: Request) -> ToolResult {
@@ -546,9 +554,12 @@ async fn run(registry: &ToolRegistry, request: Request) -> ToolResult {
                 matches!(failure.kind, FailureKind::Exception | FailureKind::Syntax)
             })
         });
-    let disposition = if api.action_history.iter().any(|completed| *completed) {
+    let disposition = if api
+        .action_history
+        .contains(&ActionAttempt::MayHaveDelivered)
+    {
         cua_driver_contract::ErrorDisposition::DELIVERED
-    } else if !complete || !api.action_history.is_empty() {
+    } else if !complete || api.action_history.contains(&ActionAttempt::Pending) {
         cua_driver_contract::ErrorDisposition::UNCERTAIN
     } else {
         cua_driver_contract::ErrorDisposition::NOT_DELIVERED
@@ -580,7 +591,7 @@ struct Api<'a> {
     /// `verify: "checkpoint"`: actions skip their post-action report wait.
     checkpoint: bool,
     /// One entry per attempted non-read-only call, inserted before awaiting it.
-    action_history: Vec<bool>,
+    action_history: Vec<ActionAttempt>,
 }
 
 impl<'a> Api<'a> {
@@ -689,16 +700,24 @@ impl<'a> Api<'a> {
         };
         let action = self.registry.get_def(tool).is_none_or(|def| !def.read_only);
         if action {
-            self.action_history.push(false);
+            self.action_history.push(ActionAttempt::Pending);
         }
         let result =
             crate::step_pacing::scope(pacing, self.registry.invoke(tool, Value::Object(args)))
                 .await;
+        let not_delivered = action && result.proves_no_input();
         if action {
             *self
                 .action_history
                 .last_mut()
-                .expect("action attempt recorded") = true;
+                .expect("action attempt recorded") = if not_delivered {
+                ActionAttempt::NotDelivered
+            } else {
+                ActionAttempt::MayHaveDelivered
+            };
+            if not_delivered {
+                facts.delivery = Some("not_delivered");
+            }
         }
         let structured_str = |key: &str| {
             result
@@ -710,12 +729,11 @@ impl<'a> Api<'a> {
         };
         facts.effect = structured_str("effect");
         facts.code = structured_str("code");
-        self.locator.record(locate::journal_entry(
-            tool,
-            facts.pid,
-            facts.window_id,
-            &result,
-        ));
+        let mut entry = locate::journal_entry(tool, facts.pid, facts.window_id, &result);
+        if not_delivered {
+            entry["delivery"] = json!("not_delivered");
+        }
+        self.locator.record(entry);
         self.last = Some(facts);
         let mut text = String::new();
         for content in &result.content {
@@ -991,10 +1009,19 @@ fn render(
         console_truncated: false,
         calls: log.len() as u32,
     });
+    let error_result = outcome.result.is_err();
     let calls_json: Vec<Value> = log
         .iter()
         .map(|record| {
-            json!({
+            let mut driver_calls = record.driver_calls.clone();
+            if !error_result {
+                for call in &mut driver_calls {
+                    if let Some(object) = call.as_object_mut() {
+                        object.remove("delivery");
+                    }
+                }
+            }
+            let mut call = json!({
                 "call": record.number,
                 "op": record.op,
                 "tool": record.facts.tool,
@@ -1004,11 +1031,15 @@ fn render(
                 "code": record.facts.code,
                 "pid": record.facts.pid,
                 "window_id": record.facts.window_id,
-                "driver_calls": record.driver_calls,
+                "driver_calls": driver_calls,
                 "driver_calls_omitted": (record.driver_calls_omitted > 0).then_some(record.driver_calls_omitted),
                 "ms": record.elapsed.as_millis() as u64,
                 "detail": record.detail,
-            })
+            });
+            if let (true, Some(delivery)) = (error_result, record.facts.delivery) {
+                call["delivery"] = json!(delivery);
+            }
+            call
         })
         .collect();
     let mut lines = Vec::new();

@@ -478,6 +478,8 @@ struct GateData {
     read_pending: bool,
     scope_refusal: Option<&'static str>,
     action_dispatched: Arc<AtomicBool>,
+    attempted_action: bool,
+    action_may_have_delivered: bool,
 }
 
 #[derive(Clone)]
@@ -496,6 +498,8 @@ impl StepGate {
             read_pending: false,
             scope_refusal: None,
             action_dispatched,
+            attempted_action: false,
+            action_may_have_delivered: false,
         })))
     }
 
@@ -509,12 +513,16 @@ impl StepGate {
             return false;
         }
         data.state = GateState::Dispatching;
-        data.action_dispatched.store(true, Ordering::SeqCst);
+        data.attempted_action = true;
         true
     }
 
-    fn complete_dispatch(&self, scope_refusal: Option<&'static str>) {
+    fn complete_dispatch(&self, scope_refusal: Option<&'static str>, not_delivered: bool) {
         let mut data = self.lock();
+        if !not_delivered {
+            data.action_may_have_delivered = true;
+            data.action_dispatched.store(true, Ordering::SeqCst);
+        }
         if let Some(code) = scope_refusal {
             data.scope_refusal = Some(code);
         }
@@ -558,6 +566,10 @@ impl StepGate {
     fn timeout(&self) -> GateSnapshot {
         let mut data = self.lock();
         let dispatching = data.state == GateState::Dispatching;
+        if dispatching {
+            data.action_may_have_delivered = true;
+            data.action_dispatched.store(true, Ordering::SeqCst);
+        }
         data.state = GateState::TimedOut;
         GateSnapshot {
             window: data.window.clone(),
@@ -565,6 +577,13 @@ impl StepGate {
             scope_refusal: data.scope_refusal,
             dispatching,
         }
+    }
+
+    fn no_action_delivered(&self) -> bool {
+        let data = self.lock();
+        data.attempted_action
+            && !data.action_may_have_delivered
+            && data.state != GateState::Dispatching
     }
 }
 
@@ -1494,6 +1513,8 @@ async fn execute_step(
         }
         _ = deadline.wait() => {
             let snapshot = gate.timeout();
+            // Even a pre-dispatch timeout retains the legacy unverifiable effect;
+            // the finalizer therefore conservatively reports delivered/unsafe.
             StepExecution::Timeout {
                 outcome: failure(
                     index,
@@ -1794,6 +1815,10 @@ async fn run_step(
             ));
         }
         let ok = result.is_error != Some(true);
+        if gate.no_action_delivered() {
+            // This is derived from the registry's typed results, never a leaf's JSON.
+            report["delivery"] = json!("not_delivered");
+        }
         let mut message = bounded_message(&result);
         // The step reports the effect its action returned, as a direct call
         // would (confirmed, unverifiable, refused, ...).
@@ -1934,7 +1959,8 @@ async fn dispatch_action(
         return None;
     }
     let result = registry.invoke(tool, args).await;
-    gate.complete_dispatch(scope_refusal_code(&result));
+    let not_delivered = result.proves_no_input();
+    gate.complete_dispatch(scope_refusal_code(&result), not_delivered);
     Some(result)
 }
 
@@ -3159,7 +3185,7 @@ mod timeout_tests {
         assert!(gate.begin_dispatch());
         let snapshot = gate.timeout();
         assert!(snapshot.dispatching);
-        gate.complete_dispatch(None);
+        gate.complete_dispatch(None, false);
         assert!(!gate.begin_dispatch());
     }
 
@@ -3167,7 +3193,7 @@ mod timeout_tests {
     fn dispatch_completion_records_scope_refusal_atomically() {
         let gate = StepGate::new();
         assert!(gate.begin_dispatch());
-        gate.complete_dispatch(Some(crate::batch_scope::OUTSIDE_SCOPE));
+        gate.complete_dispatch(Some(crate::batch_scope::OUTSIDE_SCOPE), true);
         let snapshot = gate.timeout();
         assert_eq!(
             snapshot.scope_refusal,
@@ -3177,11 +3203,62 @@ mod timeout_tests {
     }
 
     #[test]
+    fn u09_gate_tracks_refused_and_mixed_attempts() {
+        let dispatched = Arc::new(AtomicBool::new(false));
+        let gate = StepGate::with_action_tracker(dispatched.clone());
+        assert!(gate.begin_dispatch());
+        gate.complete_dispatch(Some(crate::batch_scope::OUTSIDE_SCOPE), true);
+        assert!(gate.no_action_delivered());
+        assert!(!dispatched.load(Ordering::SeqCst));
+        assert!(gate.begin_dispatch());
+        gate.complete_dispatch(None, false);
+        assert!(!gate.no_action_delivered());
+        assert!(dispatched.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn u09_typed_non_delivery_must_not_conflict_with_effect() {
+        for (effect, expected) in [
+            (None, true),
+            (Some("refused"), true),
+            (Some("partial"), false),
+            (Some("unverifiable"), false),
+            (Some("suspected_noop"), false),
+            (Some("confirmed"), false),
+        ] {
+            let mut structured = json!({"code":"denied"});
+            if let Some(effect) = effect {
+                structured["effect"] = json!(effect);
+            }
+            let result = ToolResult::error("denied")
+                .with_structured(structured)
+                .with_disposition(cua_driver_contract::ErrorDisposition::NOT_DELIVERED);
+            assert_eq!(result.proves_no_input(), expected, "{effect:?}");
+        }
+        assert!(!ToolResult::error("untyped")
+            .with_structured(json!({
+                "disposition":{"delivery":"not_delivered", "retry":"safe"}
+            }))
+            .proves_no_input());
+    }
+
+    #[test]
+    fn u09_timeout_during_dispatch_stays_conservative_after_late_refusal() {
+        let dispatched = Arc::new(AtomicBool::new(false));
+        let gate = StepGate::with_action_tracker(dispatched.clone());
+        assert!(gate.begin_dispatch());
+        assert!(gate.timeout().dispatching);
+        gate.complete_dispatch(Some(crate::batch_scope::OUTSIDE_SCOPE), true);
+        assert!(dispatched.load(Ordering::SeqCst));
+        assert!(!gate.no_action_delivered());
+    }
+
+    #[test]
     fn refreshed_timeout_snapshot_observes_late_scope_refusal() {
         let gate = StepGate::new();
         assert!(gate.begin_dispatch());
         assert_eq!(gate.timeout().scope_refusal, None);
-        gate.complete_dispatch(Some(crate::batch_scope::OUTSIDE_SCOPE));
+        gate.complete_dispatch(Some(crate::batch_scope::OUTSIDE_SCOPE), true);
         assert_eq!(
             gate.timeout().scope_refusal,
             Some(crate::batch_scope::OUTSIDE_SCOPE)
