@@ -1,17 +1,15 @@
-# GOAT's fork of Cua Driver
+# goat-cu: GOAT's fork of Cua Driver
 
 This repository is [GOAT](https://github.com/goat-si/goat)'s fork of Cua Driver, the computer-use driver
 from [trycua/cua](https://github.com/trycua/cua) (`libs/cua-driver`, MIT, Copyright (c) 2025 Cua AI, Inc.).
 GOAT builds the driver from here and ships it inside its own signed helper app instead of downloading
-upstream release binaries. Tracking issue: goat-si/goat#1595.
+upstream release binaries. The repository was named goat-si/cua-driver until 2026-11-01. Tracking issue: goat-si/goat#1595.
 
-## Branches and versions
+## History, branches and versions
 
-- `upstream` holds pure `git subtree split --prefix=libs/cua-driver` output of trycua/cua, with upstream
-  history. Nothing else is committed there. `upstream-v0.37.0` tags the split of
-  `cua-driver-rs-v0.37.0` (trycua/cua `2d2f99228d`).
-- `main` is `upstream` plus GOAT's changes. Changes land through pull requests.
-- Releases are tagged `cua-driver-rs-v<upstream version>-goat.<N>`, for example `cua-driver-rs-v0.37.0-goat.1`.
+- The history of this repository starts from one commit made on 2026-11-01. It holds Cua Driver as last synced from upstream (trycua/cua `main` `aeae5569473b`, after `cua-driver-rs-v0.38.0`) plus every GOAT change made before that date. The earlier history, including the upstream subtree split, is kept in a private archive.
+- `main` is the only long-lived branch. Changes land through pull requests.
+- Releases are tagged `cua-driver-rs-v<upstream version>-goat.<N>`, for example `cua-driver-rs-v0.38.0-goat.17`. Tags made before 2026-11-01 point into the archived history.
 
 ## What differs from upstream
 
@@ -73,10 +71,10 @@ atomic. Package identities, explicit PID/window grants, and non-Windows grants a
 
 Upstream moves several times a day; we sync deliberately, not continuously.
 
-1. In a trycua/cua clone: `git subtree split --prefix=libs/cua-driver <tag or commit>`, then fast-forward
-   `upstream` here to the result.
-2. Review the `upstream` diff for security and behavior changes.
-3. Merge `upstream` into a branch from `main`, refresh `vendor/`, and run `cargo deny check`. If the
+1. In a trycua/cua clone, diff `libs/cua-driver` between the last synced upstream commit (recorded in the
+   newest sync pull request, `aeae5569473b` at the 2026-11-01 restart) and the target tag or commit.
+2. Review that diff for security and behavior changes.
+3. Apply that diff to a branch from `main` as one pull request that names both upstream commits, refresh `vendor/`, and run `cargo deny check`. If the
    `uniffi-bindgen-react-native` pin in `typescript/package.json` changed, run
    `node scripts/build-node-runtime.mjs --update-lockfile` and commit `scripts/node-runtime/Cargo.lock`:
    the Node runtime builds with `--locked` against it, and CI checks it with

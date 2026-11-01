@@ -1,13 +1,54 @@
-> GOAT's fork of Cua Driver, maintained by [GOAT](https://github.com/goat-si/goat); not affiliated with or endorsed by Cua AI, Inc. Upstream: [trycua/cua](https://github.com/trycua/cua) `libs/cua-driver`. See [GOAT.md](GOAT.md).
+<h1 align="center">goat-cu</h1>
 
-# Cua Driver
+<p align="center">GOAT's computer-use driver for macOS, Windows and Linux</p>
 
-Background computer-use driver for any agents. Speaks MCP over stdio; drives native macOS apps without stealing focus.
+<p align="center">
+  <a href="https://github.com/goat-si/goat-cu/releases">Releases</a> ·
+  <a href="GOAT.md">How this fork works</a> ·
+  <a href="https://github.com/goat-si/goat">GOAT</a> ·
+  <a href="LICENSE.md">License (MIT)</a>
+</p>
 
-See [MCP protocol and skills](docs/mcp-protocol-and-skills.md) for the modern
-stdio profile, legacy compatibility, bundled skill resources, and HTTP limits.
+<p align="center">
+  <a href="https://github.com/goat-si/goat-cu/releases"><img alt="Latest release" src="https://img.shields.io/github/v/release/goat-si/goat-cu?label=release&color=111111"></a>
+  <a href="LICENSE.md"><img alt="MIT license" src="https://img.shields.io/badge/license-MIT-111111"></a>
+  <img alt="macOS, Windows and Linux" src="https://img.shields.io/badge/platforms-macOS%20%7C%20Windows%20%7C%20Linux-111111">
+  <img alt="MCP over stdio" src="https://img.shields.io/badge/protocol-MCP-111111">
+</p>
 
-## Optional visual perception
+goat-cu reads and operates native desktop apps for coding agents. It sees an app through the operating system's accessibility tree, acts on the elements it found there, and falls back to pointer input only when it can prove which window and point the input will land on. It speaks MCP over stdio, and on macOS it drives apps in the background without taking focus from the person at the keyboard.
+
+[GOAT](https://github.com/goat-si/goat) pins a goat-cu release and runs it for its built-in computer use. The executable, crates and SDK packages keep the upstream name `cua-driver`, so every command below still uses it.
+
+## Built on Cua Driver
+
+goat-cu is built from [Cua Driver](https://github.com/trycua/cua) (`libs/cua-driver`, MIT, Copyright (c) 2025 Cua AI, Inc.). It is maintained by GOAT and is not affiliated with or endorsed by Cua AI, Inc. Thank you to the Cua team for the driver this work starts from. [GOAT.md](GOAT.md) describes how the fork is maintained, released and kept in step with upstream.
+
+## What goat-cu changes
+
+The rule throughout is to fail closed: when the driver cannot prove where input will land or what a read covered, it refuses or says so instead of guessing.
+
+- **Inputs land where they were aimed.** Element tokens never re-target a different element, a session can act only on tokens from its own reads, and pointer input on macOS and Windows is checked against the window it was aimed at. A stale screenshot point is refused with nothing sent.
+- **Results say what happened.** A failed call reports whether input was delivered and whether a retry is safe. A window read says whether it covered the whole window and where it stopped. Successful actions carry structured `focus_restoration`, `note` and `warning` fields.
+- **Secrets stay out of reach.** Password and secure fields are classified before any value is read and are never echoed in results. Typed text is never stored in recordings or replayed.
+- **The desktop stays safe.** Desktop input is serialized across driver processes, session-critical processes such as the window server, shell or compositor can never be force-terminated, and recordings are written owner-only.
+- **macOS** gets background pixel clicks without fixed sleeps, cached key focus for repeated keys, menu chords on frontmost apps, `set_value` with autosubmit for search fields, and SkyLight-first window capture with model-sized screenshots.
+- **Windows** gets screenshot-point clicks checked against a window basis, guarded mouse dispatch, bounded UI Automation calls, and value writes that never overwrite a field the driver could not read.
+- **Linux** gets X11 window bases in `get_window_state`, element clicks read from the published snapshot, libei input that stays inside one display region, and typing that sends every character or none.
+
+Pull requests list each change with its tests: [merged pull requests](https://github.com/goat-si/goat-cu/pulls?q=is%3Apr+is%3Amerged).
+
+## Releases
+
+Releases are tagged `cua-driver-rs-v<upstream version>-goat.<N>` and carry unsigned archives for macOS (universal), Windows (x64, arm64) and Linux (x64, arm64), with build-provenance attestations and a `SHA256SUMS` file. GOAT signs the driver inside its own helper app; this repository holds no signing keys.
+
+## Cua Driver reference
+
+The sections below are Cua Driver's own documentation, kept from upstream. Links to cua.ai describe the upstream project.
+
+See [MCP protocol and skills](docs/mcp-protocol-and-skills.md) for the stdio profile, legacy compatibility, bundled skill resources and HTTP limits.
+
+### Optional visual perception
 
 The default MIT-licensed Driver works without model artifacts. An explicitly
 installed `cua-perception` extension can parse one retained native window or
@@ -41,7 +82,7 @@ see the extension contract for the stable codes.
 
 **[Documentation](https://cua.ai/docs/cua-driver)** - Installation, guides, and API reference.
 
-## Integration surfaces
+### Integration surfaces
 
 - **Cua as an agent MCP or CLI:** MCP-capable agents connect directly to
   `cua-driver mcp`; shell-oriented agents and automation can use
@@ -57,7 +98,7 @@ language-native MCP facade and have no `/sdk`, `/mcp`, or `/native` public
 suffix. MCP remains implemented by the `cua-driver` executable as the
 runtime-neutral agent boundary.
 
-## Computer History macOS preview
+### Computer History macOS preview
 
 Nightly macOS builds can provide an opt-in, encrypted history of actions
 performed through Cua Driver. The preview stores a strict metadata allowlist,
@@ -72,7 +113,7 @@ inspection, deletion, and stable-channel return instructions. The [architecture
 and staged plan](docs/computer-history-architecture.md) defines the format,
 security boundary, release gates, and later NVIDIA OpenShell integration.
 
-## Permission modes
+### Permission modes
 
 `standard` is the promptless default for normal automation. `bounded` admits
 only the tools and resources in a reviewed manifest. `unrestricted` requires
@@ -98,7 +139,7 @@ Driver does not render its own authorization modal or banner.
 See the hosted [permission mode
 reference](https://cua.ai/docs/cua-driver/guides/permissions).
 
-## Repository Layout
+### Repository Layout
 
 | Path                            | Purpose                                                                |
 | ------------------------------- | ---------------------------------------------------------------------- |
@@ -162,7 +203,7 @@ For direct agent integrations, see the
 SDK examples. They connect the agent to `cua-driver mcp` without importing a
 generated Cua client.
 
-## Muse Code
+### Muse Code
 
 [Muse Code](https://research.meta.ai/blog/introducing-muse-code-and-muse-spark-1-2)
 can use Cua Driver as a local stdio MCP server on macOS and Linux. Merge the
@@ -197,7 +238,7 @@ Contributor documentation:
 - `docs/linux-desktop-validation.md` covers representative Linux sessions.
 - `docs/linux-support-completion-plan.md` preserves the historical Linux plan.
 
-## Claude Code computer-use compatibility
+### Claude Code computer-use compatibility
 
 Standard Claude Code MCP registration:
 
@@ -215,7 +256,7 @@ This keeps CuaDriver's normal MCP tools and changes only `screenshot`, which req
 
 Use MCP for this Claude Code vision/computer-use-style path. CLI screenshots still work as CuaDriver calls, but they do not expose the `mcp__cua-computer-use__screenshot` tool name that Claude Code appears to use as the image-grounding cue.
 
-## macOS process identity and permissions
+### macOS process identity and permissions
 
 macOS attributes Accessibility and Screen Recording grants to a responsible app identity, not simply to an executable path. Use one of these supported launch modes:
 
@@ -228,7 +269,7 @@ macOS attributes Accessibility and Screen Recording grants to a responsible app 
 
 Directly spawning a raw `cua-driver serve` outside `CuaDriver.app` without embedded mode is unsupported: it has no stable bundle identity for TCC attribution. Do not grant permissions to arbitrary binary paths or rely on that configuration in production. See [`rust/Skills/cua-driver/EMBEDDING.md`](rust/Skills/cua-driver/EMBEDDING.md) for the embedding contract and examples.
 
-## Publishing the agent skill to ClawHub
+### Publishing the agent skill to ClawHub
 
 The canonical skill source is `rust/Skills/cua-driver`. It is published as one
 cross-platform ClawHub skill at `@cua/driver`; the bundle includes the
