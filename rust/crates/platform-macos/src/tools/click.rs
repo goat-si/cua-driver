@@ -1814,13 +1814,7 @@ impl ClickTool {
             // itself via FocusGuard. After the action returns, detect any
             // new-window / foreground side-effects and append a one-liner
             // suffix matching Swift's wording.
-            let prior_front = apps::frontmost_pid();
             let foreground = delivery_mode.is_foreground();
-            let snapshot = if foreground {
-                WindowChangeDetector::snapshot_without_suppression(prior_front)
-            } else {
-                WindowChangeDetector::snapshot(prior_front)
-            };
 
             // Run AX work on a blocking thread (can't block async executor).
             // Use `effective_action` so button=right rewrites press → show_menu.
@@ -1838,8 +1832,14 @@ impl ClickTool {
             let probe_target = element_guard.clone();
             let clock = super::actionability::semantic_clock();
             let use_battery = effective_action == "press";
-            let perform = |action_lease| {
-                focus_guard::with_focus_suppressed(
+            let perform = |action_lease| async move {
+                let prior_front = apps::frontmost_pid();
+                let snapshot = if foreground {
+                    WindowChangeDetector::snapshot_without_suppression(prior_front)
+                } else {
+                    WindowChangeDetector::snapshot(prior_front)
+                };
+                let result = focus_guard::with_focus_suppressed(
                     if foreground { None } else { Some(pid) },
                     prior_front,
                     "click.AXPress",
@@ -1901,8 +1901,10 @@ impl ClickTool {
                         .await
                     },
                 )
+                .await;
+                (snapshot, result)
             };
-            let result = if use_battery {
+            let (snapshot, result) = if use_battery {
                 match super::actionability::dispatch_semantic(
                     &clock,
                     cua_driver_core::actionability::DEFAULT_BUDGET,

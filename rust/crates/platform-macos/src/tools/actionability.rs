@@ -318,13 +318,14 @@ pub(super) fn semantic_clock() -> impl Clock + Sync {
 
 /// Dispatch one semantic action after its admitted target is sampled.
 pub(super) async fn dispatch_semantic<C, P, A, F, T>(
-    _clock: &impl Clock,
-    _budget: Duration,
+    clock: &(impl Clock + Sync),
+    budget: Duration,
     context: C,
-    _probe: P,
+    mut probe: P,
     perform: A,
 ) -> Result<T, ToolResult>
 where
+    C: Sync,
     P: for<'a> FnMut(
             &'a C,
             Duration,
@@ -334,7 +335,12 @@ where
     A: FnOnce(C) -> F,
     F: Future<Output = T>,
 {
-    Ok(perform(context).await)
+    let report = wait(clock, budget, false, |remaining| probe(&context, remaining)).await;
+    match report.verdict {
+        Verdict::Pass => Ok(perform(context).await),
+        Verdict::Terminal { .. } => Err(report.refusal_result().expect("terminal report")),
+        Verdict::Transient { .. } => unreachable!("auto_wait returns pass or terminal"),
+    }
 }
 
 pub(super) fn click_probe<'a>(
