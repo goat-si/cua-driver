@@ -4,10 +4,9 @@
 //!
 //! * **AXPopUpButton**: Find the option (a child, or an `AXMenuItem` under the
 //!   popup's `AXMenu`) whose AXTitle or AXValue matches `value`
-//!   (case-insensitive) and AXPress it.  AppKit and Chromium popups publish
-//!   their items only while the menu is open, so the menu is opened for the
-//!   selection and closed again.  Safari `<select>` elements are set through
-//!   `osascript do JavaScript` instead.
+//!   (case-insensitive) and AXPress it. AppKit menu selections use a stable,
+//!   unambiguous option list and only dismiss menus this call owns. Safari
+//!   `<select>` elements are set through `osascript do JavaScript` instead.
 //!
 //! * **Everything else**: Write `AXValue` directly (sliders, steppers, native
 //!   text fields that expose a settable AXValue).
@@ -62,9 +61,10 @@ fn def() -> &'static ToolDef {
     DEF.get_or_init(|| ToolDef {
         name: "set_value".into(),
         description: "Set an element's value by `element_token`. Popup button / select: selects the item whose title \
-            or value matches `value` (case-insensitive); Safari `<select>` through the DOM, AppKit and \
-            Chromium popups by opening the menu, pressing the item and closing it (the user's front window \
-            keeps key focus). An unknown value lists the options. Other elements: writes AXValue (sliders, \
+            or value matches `value` (case-insensitive); Safari `<select>` through the DOM, Chromium by \
+            type-ahead when available, and otherwise through a menu item. A menu opened for the selection \
+            is dismissed only when still owned, and closure may be unconfirmed. An unknown value lists \
+            readable option titles. Other elements: writes AXValue (sliders, \
             steppers, date pickers, native text fields). A Finder file name cell (list or icon view, not \
             being edited) is renamed through Finder's scripting interface in the background and read back \
             from disk; `value` is the full new name with its extension (macOS asks once to allow controlling \
