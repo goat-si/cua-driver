@@ -151,6 +151,35 @@ pub(crate) fn plan_collection_children<S: AxTreeSource>(
     children: &[S::Element],
     budget: &WalkBudget,
 ) -> Vec<ChildPlan> {
+    plan_collection_children_observed(source, element, surface, role, children, budget)
+        .into_walk_legacy()
+}
+
+pub(crate) fn plan_collection_children_observed<S: AxTreeSource>(
+    source: &S,
+    element: &S::Element,
+    surface: &S::Element,
+    role: &str,
+    children: &[S::Element],
+    budget: &WalkBudget,
+) -> super::evidence::Observed<Vec<ChildPlan>> {
+    let source = super::evidence_source::EvidenceSource::new(
+        source,
+        super::evidence_source::Domain::Dense,
+        None,
+    );
+    let result = plan_collection_children_legacy(&source, element, surface, role, children, budget);
+    source.finish(result)
+}
+
+fn plan_collection_children_legacy<S: AxTreeSource>(
+    source: &S,
+    element: &S::Element,
+    surface: &S::Element,
+    role: &str,
+    children: &[S::Element],
+    budget: &WalkBudget,
+) -> Vec<ChildPlan> {
     let dense = DENSE_COLLECTION_ROLES.contains(&role);
     // Every read below asks the app, so each one first checks the deadline;
     // a child left unclassified is deferred as visible and refused by the

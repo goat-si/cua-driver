@@ -86,6 +86,28 @@ pub(crate) fn bar_position_with<S: super::tree_source::AxTreeSource>(
     area: &S::Element,
     direction: &str,
 ) -> Option<f64> {
+    bar_position_observed_with(source, area, direction).into_walk_legacy()
+}
+
+pub(crate) fn bar_position_observed_with<S: super::tree_source::AxTreeSource>(
+    source: &S,
+    area: &S::Element,
+    direction: &str,
+) -> super::evidence::Observed<Option<f64>> {
+    let source = super::evidence_source::EvidenceSource::new(
+        source,
+        super::evidence_source::Domain::Scrollbar,
+        None,
+    );
+    let result = bar_position_legacy_with(&source, area, direction);
+    source.finish(result)
+}
+
+fn bar_position_legacy_with<S: super::tree_source::AxTreeSource>(
+    source: &S,
+    area: &S::Element,
+    direction: &str,
+) -> Option<f64> {
     use super::tree_source::Read;
     let bar = match source.element_attribute(area, bar_attribute(direction)) {
         Read::Known(bar) => bar,
