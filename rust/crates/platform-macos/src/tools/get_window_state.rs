@@ -1586,6 +1586,11 @@ fn tree_output_fields(
     if let Some(tree) = tree {
         tree.walk.apply(&mut structured);
         apply_offscreen_rows(&mut structured, &tree.offscreen_rows);
+    } else {
+        structured["observation_complete"] = serde_json::json!(false);
+        structured["observation_incomplete_reasons"] = serde_json::json!([
+            {"kind": "unknown", "detail": "not_asserted"}
+        ]);
     }
     if let Some(sid) = snapshot_id {
         structured["snapshot_id"] =
@@ -3133,6 +3138,60 @@ mod row_label_tests {
 
 #[cfg(test)]
 mod evidence_refactor_output_tests;
+
+#[cfg(test)]
+mod completeness_output_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn no_walk_success_modes_report_explicit_false() {
+        for args in [
+            json!({"include_accessibility_tree": false}),
+            json!({"include_accessibility_tree": false, "full_output": true}),
+            json!({"include_accessibility_tree": false, "display_only": true}),
+            json!({"include_accessibility_tree": false, "display_only": true, "full_output": true}),
+        ] {
+            assert!(!wants_tree(&args));
+            let mut payload = tree_output_fields(
+                99,
+                42,
+                0,
+                0,
+                false,
+                String::new(),
+                vec![],
+                false,
+                None,
+                None,
+                42,
+                None,
+            );
+            if cua_driver_core::window_state_view::display_only(&args).unwrap() {
+                cua_driver_core::window_state_view::mark_display_only(&mut payload);
+            }
+            let options =
+                cua_driver_core::window_state_view::ViewOptions::from_args(&args).unwrap();
+            let context = cua_driver_core::window_state_view::ViewContext {
+                pid: 42,
+                window_id: 99,
+                key: cua_driver_core::window_state_view::ViewKey {
+                    query: None,
+                    max_elements: 100,
+                    max_depth: None,
+                },
+                focus_probe: None,
+            };
+            cua_driver_core::window_state_view::apply(&options, &context, &mut [], &mut payload);
+            assert_eq!(payload["observation_complete"], false, "args={args}");
+            assert_eq!(
+                payload["observation_incomplete_reasons"],
+                json!([{"kind":"unknown", "detail":"not_asserted"}]),
+                "args={args}"
+            );
+        }
+    }
+}
 
 #[cfg(test)]
 mod canonical_output_tests {
