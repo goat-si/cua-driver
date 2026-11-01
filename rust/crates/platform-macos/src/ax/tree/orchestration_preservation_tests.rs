@@ -283,7 +283,10 @@ fn production_root_creation_failure_follows_legacy_return() {
     assert_eq!(fields["observation_complete"], false);
     assert_eq!(
         fields["observation_incomplete_reasons"],
-        json!([{"kind":"unknown","detail":"not_asserted"}])
+        json!([
+            {"kind":"provider_failure","detail":"enumeration_error_unclassified"},
+            {"kind":"unknown","detail":"not_asserted"}
+        ])
     );
     assert!(fields.get("observation_scope_exclusions").is_none());
 }

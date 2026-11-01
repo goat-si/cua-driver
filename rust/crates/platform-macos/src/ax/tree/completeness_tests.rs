@@ -4,6 +4,96 @@ use super::*;
 use crate::ax::content_attrs::AttrStatus;
 use serde_json::{json, Value};
 
+fn reasons(tree: &TreeWalkResult) -> Value {
+    let mut output = json!({});
+    tree.walk.apply(&mut output);
+    output["observation_incomplete_reasons"].clone()
+}
+
+fn has_reason(tree: &TreeWalkResult, kind: &str, detail: &str) -> bool {
+    reasons(tree)
+        .as_array()
+        .unwrap()
+        .contains(&json!({"kind": kind, "detail": detail}))
+}
+
+#[test]
+fn missing_application_root_reports_enumeration_error() {
+    let (walk, _) = super::environment_setup_tests::run_application_failure();
+    assert!(has_reason(
+        &walk.legacy,
+        "provider_failure",
+        "enumeration_error_unclassified"
+    ));
+}
+
+#[test]
+fn menu_window_list_failure_reports_enumeration_error() {
+    let (walk, _) = super::environment_setup_tests::run_menu_case(None, vec![]);
+    assert!(has_reason(
+        &walk.legacy,
+        "provider_failure",
+        "enumeration_error_unclassified"
+    ));
+}
+
+#[test]
+fn menu_discovery_deadline_reports_time_budget() {
+    let (walk, _) = super::environment_setup_tests::run_menu_deadline_case();
+    assert!(has_reason(&walk.legacy, "budget", "time_budget"));
+}
+
+#[test]
+fn menu_window_cap_reports_enumeration_error() {
+    let frame = [0.0, 0.0, 40.0, 40.0];
+    let (walk, _) =
+        super::environment_setup_tests::run_menu_case(Some(vec![frame; 5]), vec![None; 4]);
+    assert!(has_reason(
+        &walk.legacy,
+        "provider_failure",
+        "enumeration_error_unclassified"
+    ));
+}
+
+#[test]
+fn unresolved_menu_reports_enumeration_error() {
+    let frame = [0.0, 0.0, 40.0, 40.0];
+    let (walk, _) = super::environment_setup_tests::run_menu_case(Some(vec![frame]), vec![None]);
+    assert!(has_reason(
+        &walk.legacy,
+        "provider_failure",
+        "enumeration_error_unclassified"
+    ));
+}
+
+#[test]
+fn unknown_menu_owner_reports_scope_mismatch() {
+    use crate::ax::context_menus::MenuOwner;
+    let frame = [0.0, 0.0, 40.0, 40.0];
+    for reply in [
+        Some((3, Some(frame), None)),
+        Some((3, None, Some(MenuOwner::Window(99)))),
+        Some((
+            3,
+            Some([500.0, 500.0, 40.0, 40.0]),
+            Some(MenuOwner::Window(99)),
+        )),
+    ] {
+        let (walk, _) =
+            super::environment_setup_tests::run_menu_case(Some(vec![frame]), vec![reply]);
+        assert!(has_reason(&walk.legacy, "unknown", "scope_mismatch"));
+    }
+}
+
+#[test]
+fn duplicate_or_foreign_menu_is_not_an_omission() {
+    let (walk, _, _) = super::environment_setup_tests::run_published_menu_case();
+    assert_eq!(
+        reasons(&walk.legacy),
+        json!([{"kind":"unknown", "detail":"not_asserted"}])
+    );
+}
+
 fn depth_limited_walk(query: Option<&str>) -> Value {
     let source = Fake::new(
         &[(1, 1, 1, &[2]), (2, 2, 2, &[])],

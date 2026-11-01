@@ -1218,6 +1218,10 @@ where
 
     {
         let Some(app_elem) = create_application_with(environment, pid).into_walk_legacy() else {
+            budget.record_skip(IncompleteReason {
+                kind: IncompleteReasonKind::ProviderFailure,
+                detail: IncompleteReasonDetail::EnumerationErrorUnclassified,
+            });
             return (
                 TreeWalkResult {
                     offscreen_rows: Vec::new(),
@@ -1274,6 +1278,10 @@ where
                 .menu_frames(pid)
                 .into_walk_legacy()
                 .unwrap_or_else(|| {
+                    budget.record_skip(IncompleteReason {
+                        kind: IncompleteReasonKind::ProviderFailure,
+                        detail: IncompleteReasonDetail::EnumerationErrorUnclassified,
+                    });
                     budget.stop_for_timeout();
                     Vec::new()
                 }),
@@ -1289,11 +1297,21 @@ where
             })
             .flatten();
         if !menu_frames.is_empty() && discovery.is_none() {
+            if !budget.outcome().truncated() || environment.budget_expired(&budget) {
+                budget.record_cut(IncompleteReason {
+                    kind: IncompleteReasonKind::Budget,
+                    detail: IncompleteReasonDetail::TimeBudget,
+                });
+            }
             budget.stop_for_timeout();
         }
         if let (Some(wid), Some(deadline)) = (window_id, discovery) {
             let mut incomplete = menu_frames.len() > super::context_menus::MAX_MENU_WINDOWS;
             if incomplete {
+                budget.record_skip(IncompleteReason {
+                    kind: IncompleteReasonKind::ProviderFailure,
+                    detail: IncompleteReasonDetail::EnumerationErrorUnclassified,
+                });
                 super::evidence::record_status(
                     None,
                     super::evidence::ReadSite::MenuWindowCap,
@@ -1315,6 +1333,16 @@ where
                 else {
                     // Nothing readable reached a menu in this menu window.
                     incomplete = true;
+                    budget.record_skip(IncompleteReason {
+                        kind: IncompleteReasonKind::ProviderFailure,
+                        detail: IncompleteReasonDetail::EnumerationErrorUnclassified,
+                    });
+                    if environment.budget_expired(&budget) {
+                        budget.record_cut(IncompleteReason {
+                            kind: IncompleteReasonKind::Budget,
+                            detail: IncompleteReasonDetail::TimeBudget,
+                        });
+                    }
                     continue;
                 };
                 // Released with the other top-level elements after the walk.
@@ -1330,6 +1358,10 @@ where
                     super::context_menus::MenuDecision::Skip => continue,
                     super::context_menus::MenuDecision::Unknown => {
                         incomplete = true;
+                        budget.record_untrusted(IncompleteReason {
+                            kind: IncompleteReasonKind::Unknown,
+                            detail: IncompleteReasonDetail::ScopeMismatch,
+                        });
                         continue;
                     }
                 }
