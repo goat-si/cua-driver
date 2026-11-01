@@ -1326,7 +1326,7 @@ fn with_libei_fallback<T>(
                 tracing::info!(
                     "wlroots virtual-pointer unavailable ({e}); falling back to libei/portal"
                 );
-                return fallback();
+                fallback()
             }
             #[cfg(not(feature = "portal-input"))]
             {
@@ -2477,14 +2477,14 @@ pub fn hotkey(window_id: u64, keys: &[String]) -> anyhow::Result<()> {
             let stderr = other.map(|o| String::from_utf8_lossy(&o.stderr).into_owned());
             #[cfg(feature = "portal-input")]
             {
-                return with_wtype_libei_fallback(
+                with_wtype_libei_fallback(
                     || {
                         libei::wait_keyboard_ready()?;
                         activate_window_for_input(window_id)?;
                         libei_hotkey(&mods, &final_key)
                     },
                     stderr,
-                );
+                )
             }
             #[cfg(not(feature = "portal-input"))]
             {
@@ -2517,13 +2517,13 @@ pub fn hotkey_focused(keys: &[String]) -> anyhow::Result<()> {
             let stderr = other.map(|out| String::from_utf8_lossy(&out.stderr).into_owned());
             #[cfg(feature = "portal-input")]
             {
-                return with_wtype_libei_fallback(
+                with_wtype_libei_fallback(
                     || {
                         libei::wait_keyboard_ready()?;
                         libei_hotkey(&mods, &final_key)
                     },
                     stderr,
-                );
+                )
             }
             #[cfg(not(feature = "portal-input"))]
             {
