@@ -255,6 +255,15 @@ impl Tool for SetValueTool {
             }
         }
 
+        if row_role
+            .as_deref()
+            .is_some_and(text_value_role_requires_exact_focus)
+        {
+            if let Err(refusal) = super::key_post_preflight(crate::input::skylight::is_available) {
+                return refusal;
+            }
+        }
+
         // A text field in a minimized window: restore the window for the
         // write (its key priming and focus need a visible window), then
         // minimize it again, all under this lease.
@@ -457,6 +466,10 @@ where
 }
 
 /// The tool result for a finished set_value write.
+#[derive(Debug, thiserror::Error)]
+#[error("{0}", crate::input::skylight::KEY_POST_SPI_UNAVAILABLE)]
+struct PostSpiUnavailable;
+
 fn set_value_tool_result(
     result: Result<anyhow::Result<SetValueOutcome>, String>,
     ax_echo_surface: bool,
@@ -500,6 +513,9 @@ fn set_value_tool_result(
                 });
             }
             ToolResult::text(msg).with_structured(structured)
+        }
+        Ok(Err(e)) if e.is::<PostSpiUnavailable>() => {
+            super::pre_dispatch_refusal(super::WINDOW_NOT_KEY, format!("{e}.{suffix}"))
         }
         Ok(Err(e)) => ToolResult::error(format!("set_value failed: {e}.{suffix}")),
         Err(e) => ToolResult::error(format!("Task error: {e}.{suffix}")),
@@ -1956,6 +1972,7 @@ fn wait_typeahead_confirmation(
 /// Distinguishes a route that did not select from a sent, unverified one.
 enum TypeaheadResult {
     NotAttempted,
+    PostUnavailable,
     Selected(String),
     SentUnverified,
 }
@@ -1984,6 +2001,9 @@ fn select_chromium_popup_by_typeahead(
             "✅ '{wanted}' is already selected in AXPopUpButton [{element_index}] \
              \"{element_title}\"; nothing was changed."
         ));
+    }
+    if !crate::input::skylight::is_available() {
+        return TypeaheadResult::PostUnavailable;
     }
     // Focus moves inside the page only: no activation, no window order change.
     unsafe { crate::ax::bindings::set_bool_attr_true(popup, "AXFocused") };
@@ -2071,8 +2091,26 @@ fn popup_route(
 ) -> anyhow::Result<String> {
     match result {
         TypeaheadResult::NotAttempted => fallback(),
+        TypeaheadResult::PostUnavailable => Err(PostSpiUnavailable.into()),
         TypeaheadResult::Selected(detail) => Ok(detail),
         TypeaheadResult::SentUnverified => Ok("📨 Type-ahead was sent, but the selected value could not be safely read; verify before repeating.".to_owned()),
+    }
+}
+
+#[cfg(test)]
+mod hand_back_order_tests {
+    use super::*;
+
+    #[test]
+    fn unavailable_post_refuses_without_running_popup_fallback() {
+        let error = popup_route(TypeaheadResult::PostUnavailable, || {
+            panic!("popup fallback must not run")
+        })
+        .unwrap_err();
+        let result = set_value_tool_result(Ok(Err(error)), false, String::new(), 1, 0);
+        let structured = result.structured_content.unwrap();
+        assert_eq!(structured["effect"], "refused");
+        assert_eq!(structured["dispatched"], false);
     }
 }
 

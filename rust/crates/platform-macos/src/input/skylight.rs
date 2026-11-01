@@ -1189,6 +1189,9 @@ pub struct ScopeEntryError {
     pub hand_back: Option<HandBack>,
 }
 
+pub(crate) const KEY_POST_SPI_UNAVAILABLE: &str =
+    "SLEventPostToPid is unavailable; no keys were sent";
+
 /// [`enter_exact_window_key_inline`] with the failed entry's side effects
 /// kept structured for the caller's receipt.
 pub fn enter_exact_window_key_inline_detailed(
@@ -1249,7 +1252,11 @@ fn enter_scope_with(
     target_wid: u32,
     eligibility: FastPathEligibility,
 ) -> Result<WindowKeyScope, ScopeEntryError> {
-    let _post_spi_available = env.post_spi_available();
+    // The posting function uses the same OnceLock, so availability cannot
+    // disappear between this check and a later post.
+    if !env.post_spi_available() {
+        return Err(untouched(KEY_POST_SPI_UNAVAILABLE.to_owned()));
+    }
     // A hand-back in this app can move its key window. Wait for it;
     // refuse (nothing sent) if it does not finish.
     if !await_key_restores_for_pid(Some(pid), std::time::Duration::from_secs(2)) {

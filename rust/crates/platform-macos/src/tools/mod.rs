@@ -760,7 +760,9 @@ fn key_scope_with<T>(
     let Some(wid) = window_id else {
         return Ok(None);
     };
-    let _post_available = post_available();
+    if !post_available() {
+        return Err(crate::input::skylight::KEY_POST_SPI_UNAVAILABLE.to_owned());
+    }
     if focus_available() {
         enter(pid, wid).map(Some)
     } else {
@@ -770,7 +772,7 @@ fn key_scope_with<T>(
 
 #[cfg(test)]
 mod hand_back_order_outer_tests {
-    use super::key_scope_with;
+    use super::{key_post_preflight, key_scope_with};
     use std::cell::Cell;
 
     #[test]
@@ -813,6 +815,15 @@ mod hand_back_order_outer_tests {
             None
         );
     }
+
+    #[test]
+    fn preflight_refusal_has_pre_dispatch_shape() {
+        let result = key_post_preflight(|| false).unwrap_err();
+        let structured = result.structured_content.unwrap();
+        assert_eq!(structured["effect"], "refused");
+        assert_eq!(structured["dispatched"], false);
+        assert!(key_post_preflight(|| true).is_ok());
+    }
 }
 
 /// [`key_scope`] for an async tool: runs the blocking prime off the runtime and
@@ -835,6 +846,7 @@ pub(crate) async fn acquire_key_scope_with_eligibility(
     let Some(wid) = window_id.filter(|_| !foreground) else {
         return Ok(None);
     };
+    key_post_preflight(crate::input::skylight::is_available)?;
     // The latency trace's key_belief/scope fields are recorded inside the
     // scope entry, so the blocking prime must carry the trace with it.
     match crate::goat::action_latency::spawn_blocking(move || {
@@ -866,6 +878,17 @@ pub(crate) async fn acquire_key_scope_with_eligibility(
         Err(error) => Err(cua_driver_core::protocol::ToolResult::error(format!(
             "Could not prepare the key window for pid {pid}: {error}"
         ))),
+    }
+}
+
+fn key_post_preflight(available: impl FnOnce() -> bool) -> Result<(), ToolResult> {
+    if available() {
+        Ok(())
+    } else {
+        Err(pre_dispatch_refusal(
+            WINDOW_NOT_KEY,
+            crate::input::skylight::KEY_POST_SPI_UNAVAILABLE,
+        ))
     }
 }
 

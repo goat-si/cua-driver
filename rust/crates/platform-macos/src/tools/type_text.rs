@@ -396,6 +396,17 @@ impl Tool for TypeTextTool {
             _ => (None, BackgroundKeyboardPolicy::Allowed),
         };
 
+        // The exact-window keyboard route must refuse before the TOKEN guard
+        // can write AX focus, even when focus-record SPIs are unavailable.
+        if window_id.is_some()
+            && !delivery_mode.is_foreground()
+            && matches!(keyboard_policy, BackgroundKeyboardPolicy::Allowed)
+        {
+            if let Err(refusal) = super::key_post_preflight(crate::input::skylight::is_available) {
+                return refusal;
+            }
+        }
+
         // CELL rule for untargeted typing: a non-editing cell of a
         // row/outline/table (or an unreadable focused element) refuses the
         // call before any key.
