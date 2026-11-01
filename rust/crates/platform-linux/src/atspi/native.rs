@@ -2031,47 +2031,35 @@ async fn collect_visited_bounded_opts<'a>(
                 }
             }
         }
-        if !peek_read {
-            completeness.record(in_scope, Event::AttributeFailed, None);
-        }
         let excluded_menu = proven_closed_menu(
             closed_menu,
             expanded_state,
             !huge && matches!(&children_r, Some(Ok(_))),
             peek_read,
         );
-        if excluded_menu {
-            completeness.closed_menu(in_scope, position);
+        let children = if huge {
+            crate::walk_completeness::ChildRead::Capped
         } else {
-            if !matches!(&children_r, Some(Ok(_))) {
-                completeness.record(
-                    in_scope,
-                    Event::ChildrenFailed,
-                    Some((position, child_count)),
-                );
+            match &children_r {
+                Some(Ok(_)) => crate::walk_completeness::ChildRead::Complete,
+                Some(Err(_)) => crate::walk_completeness::ChildRead::Failed,
+                None => crate::walk_completeness::ChildRead::TimedOut,
             }
-            if huge {
-                completeness.record(
-                    in_scope,
-                    Event::HugeContainer,
-                    Some((position, child_count)),
-                );
-            }
-            if !descend {
-                completeness.depth_cut(in_scope, position, child_count);
-            }
-        }
+        };
+        completeness.node_omission(crate::walk_completeness::NodeOmission {
+            in_scope,
+            position,
+            child_count,
+            children,
+            descend,
+            skipped_menu: closed_menu,
+            excluded_menu,
+            peek_read,
+        });
         let mut collapsed_children = None;
         if descend && closed_menu {
             if let Some(Ok(children)) = &children_r {
                 collapsed_children = Some(children.len());
-            }
-            if !excluded_menu && child_count != CountEvidence::Known(0) {
-                completeness.record(
-                    in_scope,
-                    Event::CollapsedMenu,
-                    Some((position, child_count)),
-                );
             }
         }
         if descend && !closed_menu {
@@ -2692,6 +2680,91 @@ mod boundary_markdown_tests {
         indexed_closed_menu_owners, insert_passive_markers, menu_skip_after_open_evidence,
         menu_skip_candidate, proven_closed_menu,
     };
+    use crate::walk_completeness::{ChildRead, Completeness, NodeOmission};
+    use cua_driver_contract::CountEvidence;
+    use cua_driver_core::walk_budget::WalkBudget;
+    use serde_json::json;
+
+    fn menu_evidence(
+        skipped: bool,
+        expanded: Option<bool>,
+        children: ChildRead,
+        peek_read: bool,
+        state_ok: bool,
+    ) -> (Completeness, serde_json::Value) {
+        let mut c = Completeness::new(true);
+        c.retained_attributes(true, true, true, state_ok, false);
+        let excluded = proven_closed_menu(
+            skipped,
+            expanded,
+            children == ChildRead::Complete,
+            peek_read,
+        );
+        c.node_omission(NodeOmission {
+            in_scope: true,
+            position: 3,
+            child_count: CountEvidence::Known(2),
+            children,
+            descend: true,
+            skipped_menu: skipped,
+            excluded_menu: excluded,
+            peek_read,
+        });
+        let mut budget = WalkBudget::new(1000, usize::MAX);
+        budget.assert_exhaustive();
+        for reason in &c.reasons {
+            budget.record_skip(*reason);
+        }
+        let mut output = json!({});
+        budget.outcome().apply(&mut output);
+        (c, output)
+    }
+
+    #[test]
+    fn menu_read_evidence_drives_completeness_and_exclusion() {
+        let (closed, result) = menu_evidence(true, Some(false), ChildRead::Complete, true, true);
+        assert_eq!(result["observation_complete"], true);
+        assert_eq!(result["observation_incomplete_reasons"], json!([]));
+        assert_eq!(closed.closed_menu_owners, [3]);
+        assert!(closed.boundaries.is_empty());
+
+        for (expanded, peek_read, state_ok) in [
+            (None, true, false),
+            (None, true, true),
+            (Some(false), false, true),
+        ] {
+            let (uncertain, result) =
+                menu_evidence(true, expanded, ChildRead::Complete, peek_read, state_ok);
+            assert_eq!(result["observation_complete"], false);
+            assert!(uncertain.closed_menu_owners.is_empty());
+            let reasons = result["observation_incomplete_reasons"].as_array().unwrap();
+            assert!(reasons
+                .iter()
+                .any(|reason| reason["detail"] == "collapsed_menu"));
+            if !state_ok || !peek_read {
+                assert!(reasons
+                    .iter()
+                    .any(|reason| reason["detail"] == "attribute_read_failed"));
+            }
+        }
+
+        // The normal focused, SHOWING-child and explicit-target decisions all
+        // leave the menu in scope; a failed item enumeration remains visible.
+        for skipped in [
+            menu_skip_after_open_evidence(true, true, false),
+            menu_skip_after_open_evidence(true, false, true),
+            menu_skip_candidate(true, "menu", true, true, false),
+        ] {
+            let (open, result) = menu_evidence(skipped, Some(false), ChildRead::Failed, true, true);
+            assert!(open.closed_menu_owners.is_empty());
+            assert_eq!(result["observation_complete"], false);
+            assert!(result["observation_incomplete_reasons"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|reason| reason["detail"] == "child_enumeration_failed"));
+        }
+    }
 
     #[test]
     fn closed_menu_requires_positive_state_and_successful_reads() {

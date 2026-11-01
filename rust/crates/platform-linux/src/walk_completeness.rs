@@ -6,6 +6,25 @@ use cua_driver_contract::{
 };
 use std::collections::HashMap;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ChildRead {
+    Complete,
+    Failed,
+    TimedOut,
+    Capped,
+}
+
+pub(crate) struct NodeOmission {
+    pub(crate) in_scope: bool,
+    pub(crate) position: usize,
+    pub(crate) child_count: CountEvidence,
+    pub(crate) children: ChildRead,
+    pub(crate) descend: bool,
+    pub(crate) skipped_menu: bool,
+    pub(crate) excluded_menu: bool,
+    pub(crate) peek_read: bool,
+}
+
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum Event {
     ChildrenFailed,
@@ -80,6 +99,31 @@ impl Completeness {
     pub(crate) fn closed_menu(&mut self, in_scope: bool, position: usize) {
         if in_scope {
             self.closed_menu_owners.push(position);
+        }
+    }
+
+    /// Classify direct-child read and traversal facts after menu peeking.
+    pub(crate) fn node_omission(&mut self, node: NodeOmission) {
+        let boundary = Some((node.position, node.child_count));
+        if !node.peek_read {
+            self.record(node.in_scope, Event::AttributeFailed, None);
+        }
+        if node.excluded_menu {
+            self.closed_menu(node.in_scope, node.position);
+            return;
+        }
+        match node.children {
+            ChildRead::Failed | ChildRead::TimedOut => {
+                self.record(node.in_scope, Event::ChildrenFailed, boundary);
+            }
+            ChildRead::Capped => self.record(node.in_scope, Event::HugeContainer, boundary),
+            ChildRead::Complete => {}
+        }
+        if !node.descend {
+            self.depth_cut(node.in_scope, node.position, node.child_count);
+        }
+        if node.descend && node.skipped_menu && node.child_count != CountEvidence::Known(0) {
+            self.record(node.in_scope, Event::CollapsedMenu, boundary);
         }
     }
 
@@ -219,6 +263,60 @@ mod tests {
         assert_eq!(output(&c)["observation_complete"], false);
         assert!(has(&c, "child_enumeration_failed"));
         assert_eq!(c.boundaries[&1].children_skipped, CountEvidence::Unknown);
+    }
+
+    #[test]
+    fn child_read_failure_timeout_depth_and_sibling_scope_are_classified() {
+        for children in [ChildRead::Failed, ChildRead::TimedOut] {
+            let mut c = Completeness::new(true);
+            c.node_omission(NodeOmission {
+                in_scope: true,
+                position: 4,
+                child_count: CountEvidence::Known(3),
+                children,
+                descend: true,
+                skipped_menu: false,
+                excluded_menu: false,
+                peek_read: true,
+            });
+            assert!(has(&c, "child_enumeration_failed"));
+            assert_eq!(c.boundaries[&4].children_skipped, CountEvidence::Known(3));
+        }
+        let mut sibling = Completeness::new(true);
+        sibling.node_omission(NodeOmission {
+            in_scope: false,
+            position: 4,
+            child_count: CountEvidence::Unknown,
+            children: ChildRead::TimedOut,
+            descend: true,
+            skipped_menu: false,
+            excluded_menu: false,
+            peek_read: true,
+        });
+        assert_eq!(output(&sibling)["observation_complete"], true);
+        assert!(sibling.boundaries.is_empty());
+
+        for (count, expected_complete) in [
+            (CountEvidence::Known(0), true),
+            (CountEvidence::Known(3), false),
+            (CountEvidence::Unknown, false),
+        ] {
+            let mut c = Completeness::new(true);
+            c.node_omission(NodeOmission {
+                in_scope: true,
+                position: 4,
+                child_count: count,
+                children: ChildRead::Complete,
+                descend: false,
+                skipped_menu: false,
+                excluded_menu: false,
+                peek_read: true,
+            });
+            assert_eq!(output(&c)["observation_complete"], expected_complete);
+            if !expected_complete {
+                assert_eq!(c.boundaries[&4].children_skipped, count);
+            }
+        }
     }
 
     #[test]
