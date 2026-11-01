@@ -7,7 +7,7 @@ use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
 use std::rc::Rc;
 
-struct Fake {
+pub(super) struct Fake {
     state: Rc<RefCell<State>>,
 }
 
@@ -20,7 +20,7 @@ struct State {
     snapshot_credits: HashMap<usize, usize>,
 }
 
-struct Handle {
+pub(super) struct Handle {
     id: usize,
     state: Rc<RefCell<State>>,
 }
@@ -48,7 +48,7 @@ impl Drop for Handle {
 }
 
 // Every target read must be explicitly scripted; scripts are in global order.
-enum Reply {
+pub(super) enum Reply {
     Unit,
     Nested(Box<dyn FnOnce()>),
     Text(Read<String>),
@@ -65,7 +65,7 @@ enum Reply {
     Writable(bool),
     Selected(Settable),
 }
-struct Step {
+pub(super) struct Step {
     operation: String,
     reply: Reply,
 }
@@ -90,7 +90,7 @@ impl Fake {
             }
         }
     }
-    fn handle(&self, id: usize) -> Handle {
+    pub(super) fn handle(&self, id: usize) -> Handle {
         assert_ne!(id, 0);
         let mut state = self.state.borrow_mut();
         assert!(state.identities.contains_key(&id), "unknown fake id {id}");
@@ -102,7 +102,7 @@ impl Fake {
             state: self.state.clone(),
         }
     }
-    fn assert_consumed(&self) {
+    pub(super) fn assert_consumed(&self) {
         assert!(
             self.state.borrow().scripts.is_empty(),
             "unconsumed required operations"
@@ -275,7 +275,7 @@ impl AxTreeSource for Fake {
 }
 
 impl Fake {
-    fn new(nodes: &[(usize, usize, usize, &[usize])], steps: Vec<Step>) -> Self {
+    pub(super) fn new(nodes: &[(usize, usize, usize, &[usize])], steps: Vec<Step>) -> Self {
         let mut identities = HashMap::new();
         let mut children = HashMap::new();
         for &(id, hash, identity, descendants) in nodes {
@@ -299,10 +299,10 @@ impl Fake {
             })),
         }
     }
-    fn trace(&self) -> Vec<String> {
+    pub(super) fn trace(&self) -> Vec<String> {
         self.state.borrow().trace.clone()
     }
-    fn assert_lifetimes(&self, snapshot_credits: &[(usize, usize)]) {
+    pub(super) fn assert_lifetimes(&self, snapshot_credits: &[(usize, usize)]) {
         let state = self.state.borrow();
         assert!(
             state.handles.values().all(|count| *count == 0),
@@ -376,7 +376,7 @@ fn run_fake(
     )
 }
 
-fn step(operation: &str, reply: Reply) -> Step {
+pub(super) fn step(operation: &str, reply: Reply) -> Step {
     Step {
         operation: operation.to_owned(),
         reply,

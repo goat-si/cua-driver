@@ -26,6 +26,7 @@ mod control_attrs;
 pub mod dense_rows;
 pub mod editable;
 pub mod enablement;
+mod evidence;
 pub mod exact_target;
 #[cfg(test)]
 mod item_owner_tests;

@@ -18,6 +18,18 @@ pub(crate) struct NativeElementSet {
     buckets: HashMap<usize, Vec<CFTypeRef>>,
 }
 
+/// Decode members without changing their order or discarding usable elements
+/// when another member has the wrong type.
+pub(crate) fn decode_child_members<I, T>(
+    items: I,
+    decode: impl FnMut(I::Item) -> Option<T>,
+) -> crate::ax::evidence::Observed<Vec<T>>
+where
+    I: IntoIterator,
+{
+    crate::ax::evidence::Observed::legacy_only(items.into_iter().filter_map(decode).collect())
+}
+
 impl NativeElement {
     fn raw(&self) -> AXUIElementRef {
         self.0.as_ptr()
@@ -116,16 +128,15 @@ impl AxTreeSource for NativeSource {
             }
             let array = CFArray::<CFTypeRef>::wrap_under_create_rule(value as _);
             let ax_type = AXUIElementGetTypeID();
-            let children = (0..array.len())
-                .filter_map(|i| {
-                    let item = *array.get(i)?;
-                    if CFGetTypeID(item) != ax_type {
-                        return None;
-                    }
-                    CFRetain(item);
-                    Some(NativeElement::from_owned(item as AXUIElementRef))
-                })
-                .collect();
+            let children = decode_child_members(0..array.len(), |i| {
+                let item = *array.get(i)?;
+                if CFGetTypeID(item) != ax_type {
+                    return None;
+                }
+                CFRetain(item);
+                Some(NativeElement::from_owned(item as AXUIElementRef))
+            })
+            .legacy;
             Read::Known(children)
         }
     }

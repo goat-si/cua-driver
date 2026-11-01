@@ -171,6 +171,14 @@ pub(super) trait ContentReader {
     fn classified(&mut self) {}
 }
 
+pub(super) fn read_with_observed<R: ContentReader>(
+    role: AttrStatus,
+    reader: &mut R,
+    batching_disabled: &mut bool,
+) -> super::evidence::Observed<Option<ContentAttrs>> {
+    super::evidence::Observed::legacy_only(read_with(role, reader, batching_disabled))
+}
+
 pub(super) fn read_with<R: ContentReader>(
     role: AttrStatus,
     reader: &mut R,
@@ -493,7 +501,7 @@ pub(crate) fn read_content_attrs_with<S: AxTreeSource>(
     } else {
         AttrStatus::Known(role.to_owned())
     };
-    let result = read_with(
+    let result = read_with_observed(
         role,
         &mut SourceContentReader {
             source,
@@ -501,7 +509,8 @@ pub(crate) fn read_content_attrs_with<S: AxTreeSource>(
             budget,
         },
         batching_disabled,
-    );
+    )
+    .legacy;
     if result.is_none() {
         budget.stop_for_timeout();
     }

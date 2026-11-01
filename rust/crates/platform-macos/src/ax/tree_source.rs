@@ -21,6 +21,7 @@ pub(crate) enum Read<T> {
     Unknown(ReadFailure),
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ReadFailure {
     Ax(AXError),
     WrongType,
@@ -88,6 +89,12 @@ pub(crate) trait AxTreeSource {
     fn value(&self, element: &Self::Element) -> Result<Option<StringishAttrValue>, AXError>;
     fn batch(&self, element: &Self::Element, names: &[&str]) -> Result<Self::Batch, BatchFailure>;
     fn children(&self, element: &Self::Element) -> Read<Vec<Self::Element>>;
+    fn observed_children(
+        &self,
+        element: &Self::Element,
+    ) -> super::evidence::Observed<Read<Vec<Self::Element>>> {
+        super::evidence::Observed::legacy_only(self.children(element))
+    }
     fn element_attribute(&self, element: &Self::Element, name: &str) -> Read<Self::Element>;
     fn element_set(&self, element: &Self::Element, name: &str) -> Read<Self::ElementSet>;
     fn set_contains(&self, set: &Self::ElementSet, element: &Self::Element) -> bool;

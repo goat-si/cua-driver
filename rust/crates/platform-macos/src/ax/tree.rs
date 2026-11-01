@@ -1901,7 +1901,7 @@ fn walk_children<S: AxTreeSource>(
 ) {
     if depth > max_depth {
         // A tree that ends exactly at the cap is still complete.
-        match source.children(element) {
+        match source.observed_children(element).legacy {
             Read::Absent => {}
             Read::Known(below) if below.is_empty() => {}
             Read::Known(_below) => note_skipped(),
@@ -1909,7 +1909,7 @@ fn walk_children<S: AxTreeSource>(
         }
         return;
     }
-    let children = match source.children(element) {
+    let children = match source.observed_children(element).legacy {
         Read::Known(children) => children,
         Read::Absent => Vec::new(),
         Read::Unknown(_) => {
@@ -1918,7 +1918,8 @@ fn walk_children<S: AxTreeSource>(
         }
     };
     let tab_plan = if !in_web_content && children.len() >= TAB_STRIP_COMPACTION_THRESHOLD {
-        plan_macos_tab_strip(source, element, role, &children, budget, batching_disabled)
+        plan_macos_tab_strip_observed(source, element, role, &children, budget, batching_disabled)
+            .legacy
     } else {
         None
     };
@@ -2062,6 +2063,24 @@ fn plan_macos_tab_strip<S: AxTreeSource>(
         parent_role_desc.as_deref(),
         &metas,
     )
+}
+
+fn plan_macos_tab_strip_observed<S: AxTreeSource>(
+    source: &S,
+    parent: &S::Element,
+    parent_role: &str,
+    children: &[S::Element],
+    budget: &mut WalkBudget,
+    batching_disabled: &mut bool,
+) -> super::evidence::Observed<Option<TabStripCompaction>> {
+    super::evidence::Observed::legacy_only(plan_macos_tab_strip(
+        source,
+        parent,
+        parent_role,
+        children,
+        budget,
+        batching_disabled,
+    ))
 }
 
 fn tab_child_value(attrs: ContentAttrs) -> (Option<String>, bool) {
