@@ -65,6 +65,28 @@ impl<E: Copy> Adapter<E> {
         scope_reader: &mut H,
         clock: &C,
     ) -> ElementFacts {
+        self.facts_with_hits(reader, scope_reader, clock, true)
+    }
+
+    /// Facts for semantic AX actions evaluated under the headless policy.
+    /// These actions do not require pointer hit evidence and must not perform
+    /// a desktop or window hit test while observing actionability.
+    pub(crate) fn semantic_facts<R: Reader<Element = E>, H: ScopeReader<E>, C: Clock>(
+        &mut self,
+        reader: &mut R,
+        scope_reader: &mut H,
+        clock: &C,
+    ) -> ElementFacts {
+        self.facts_with_hits(reader, scope_reader, clock, false)
+    }
+
+    fn facts_with_hits<R: Reader<Element = E>, H: ScopeReader<E>, C: Clock>(
+        &mut self,
+        reader: &mut R,
+        scope_reader: &mut H,
+        clock: &C,
+        collect_hits: bool,
+    ) -> ElementFacts {
         let target = self.target;
         let actions = advertised_actions(reader, target);
         let value_settable = observe(reader.settable(target, "AXValue"));
@@ -88,30 +110,34 @@ impl<E: Copy> Adapter<E> {
         };
         let bounds = observe(reader.frame(target));
         let stable = self.stability.observe(clock, bounds.clone());
-        let receives_events = match bounds {
-            Evidence::Known(rect)
-                if rect.x.is_finite()
-                    && rect.y.is_finite()
-                    && rect.width.is_finite()
-                    && rect.height.is_finite()
-                    && rect.width > 0.0
-                    && rect.height > 0.0 =>
-            {
-                let mut hit = |p| match scope_reader.hit(target, self.window, self.scope, p) {
-                    Hit::Occluded(mut other) => {
-                        other.name = None;
-                        Hit::Occluded(other)
-                    }
-                    other => other,
-                };
-                Evidence::Known(match self.scope {
-                    Scope::Foreground => actionability::collect_hits(rect, &mut hit),
-                    Scope::WindowInternal => actionability::collect_window_hits(rect, &mut hit),
-                })
+        let receives_events = if !collect_hits {
+            Evidence::Absent
+        } else {
+            match bounds {
+                Evidence::Known(rect)
+                    if rect.x.is_finite()
+                        && rect.y.is_finite()
+                        && rect.width.is_finite()
+                        && rect.height.is_finite()
+                        && rect.width > 0.0
+                        && rect.height > 0.0 =>
+                {
+                    let mut hit = |p| match scope_reader.hit(target, self.window, self.scope, p) {
+                        Hit::Occluded(mut other) => {
+                            other.name = None;
+                            Hit::Occluded(other)
+                        }
+                        other => other,
+                    };
+                    Evidence::Known(match self.scope {
+                        Scope::Foreground => actionability::collect_hits(rect, &mut hit),
+                        Scope::WindowInternal => actionability::collect_window_hits(rect, &mut hit),
+                    })
+                }
+                Evidence::Known(_) => Evidence::Unknown("bounds cannot be hit tested".into()),
+                Evidence::Unknown(ref reason) => Evidence::Unknown(reason.clone()),
+                Evidence::Absent => Evidence::Absent,
             }
-            Evidence::Known(_) => Evidence::Unknown("bounds cannot be hit tested".into()),
-            Evidence::Unknown(ref reason) => Evidence::Unknown(reason.clone()),
-            Evidence::Absent => Evidence::Absent,
         };
         ElementFacts {
             visible: scope_reader.visible(target, self.window, self.scope),
@@ -710,6 +736,36 @@ mod u31_facts_tests {
                 .count(),
             5
         );
+        reader.actions_result = Evidence::Known(vec!["AXPress".into()]);
+        let calls_before = scope.calls.len();
+        let semantic = Adapter::new(7, 13, Scope::WindowInternal).semantic_facts(
+            &mut reader,
+            &mut scope,
+            &FakeClock::default(),
+        );
+        assert_eq!(semantic.receives_events, Evidence::Absent);
+        assert!(scope.calls[calls_before..]
+            .iter()
+            .all(|(_, _, _, kind)| *kind != "hit"));
+        assert!(matches!(
+            evaluate(Intent::Click, &semantic, Policy::headless()).verdict,
+            Verdict::Pass
+        ));
+        reader.actions_result = Evidence::Unknown("action read failed".into());
+        let semantic = Adapter::new(7, 13, Scope::WindowInternal).semantic_facts(
+            &mut reader,
+            &mut scope,
+            &FakeClock::default(),
+        );
+        assert!(matches!(
+            evaluate(
+                Intent::PerformAction { name: "AXCustom" },
+                &semantic,
+                Policy::headless()
+            )
+            .verdict,
+            Verdict::Transient { unknown: true, .. }
+        ));
     }
 }
 
