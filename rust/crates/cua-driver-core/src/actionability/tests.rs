@@ -1,10 +1,5 @@
 use super::*;
-use std::{
-    cell::{Cell, RefCell},
-    future::Future,
-    pin::Pin,
-    time::Duration,
-};
+use std::{future::Future, pin::Pin, sync::Mutex, time::Duration};
 fn rect(x: f64) -> Rect {
     Rect {
         x,
@@ -172,16 +167,26 @@ fn hit_test_five_points() {
 }
 #[derive(Default)]
 struct TestClock {
-    time: Cell<Duration>,
-    sleeps: RefCell<Vec<Duration>>,
+    time: TestTime,
+    sleeps: Mutex<Vec<Duration>>,
+}
+#[derive(Default)]
+struct TestTime(Mutex<Duration>);
+impl TestTime {
+    fn get(&self) -> Duration {
+        *self.0.lock().unwrap()
+    }
+    fn set(&self, value: Duration) {
+        *self.0.lock().unwrap() = value;
+    }
 }
 impl Clock for TestClock {
     fn now(&self) -> Duration {
         self.time.get()
     }
-    fn sleep(&self, d: Duration) -> Pin<Box<dyn Future<Output = ()> + '_>> {
+    fn sleep(&self, d: Duration) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
         Box::pin(async move {
-            self.sleeps.borrow_mut().push(d);
+            self.sleeps.lock().unwrap().push(d);
             self.time.set(self.time.get() + d);
         })
     }
@@ -315,7 +320,7 @@ async fn wait_zero_clamp_transitions_disposition_json() {
     .await;
     assert_eq!(calls, 2);
     assert_eq!(
-        *c.sleeps.borrow(),
+        *c.sleeps.lock().unwrap(),
         vec![Duration::from_millis(100), Duration::from_millis(50)]
     );
     assert_eq!(report.waited_ms, 150);

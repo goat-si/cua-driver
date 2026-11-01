@@ -12,7 +12,7 @@ pub fn default_type_budget(text: &str) -> Duration {
 /// Monotonic elapsed time and a cancellation-safe sleep from the same clock.
 pub trait Clock {
     fn now(&self) -> Duration;
-    fn sleep(&self, duration: Duration) -> Pin<Box<dyn Future<Output = ()> + '_>>;
+    fn sleep(&self, duration: Duration) -> Pin<Box<dyn Future<Output = ()> + Send + '_>>;
 }
 
 /// Probe futures receive their remaining budget and are cancelled at its end.
@@ -24,9 +24,9 @@ pub async fn auto_wait<C, P, F>(
     mut probe: P,
 ) -> ActionabilityReport
 where
-    C: Clock,
-    P: FnMut(Duration) -> F,
-    F: Future<Output = ActionabilityReport>,
+    C: Clock + Sync,
+    P: FnMut(Duration) -> F + Send,
+    F: Future<Output = ActionabilityReport> + Send,
 {
     let start = clock.now();
     let deadline = start.saturating_add(budget);
