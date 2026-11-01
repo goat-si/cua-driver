@@ -1470,6 +1470,9 @@ fn ax_insert_progress(
             _ => return TypedProgress::Unverifiable,
         }
     }
+    if before.is_some() && before == after {
+        return TypedProgress::Unchanged;
+    }
     let expected = expected_after(
         Action::TypeText(text),
         Before::Value {
