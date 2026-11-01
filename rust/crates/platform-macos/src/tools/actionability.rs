@@ -7,6 +7,11 @@ use cua_driver_core::actionability::{
 use cua_driver_core::protocol::ToolResult;
 use std::{future::Future, time::Duration};
 
+pub(super) mod scope;
+#[cfg(test)]
+#[path = "actionability/scope_tests.rs"]
+mod u31_scope_tests;
+
 pub(crate) fn enabled<R: Reader>(reader: &mut R, element: R::Element) -> Evidence<bool> {
     observe(reader.boolean(element, "AXEnabled"))
 }
@@ -33,21 +38,6 @@ pub(crate) trait ScopeReader<E> {
     fn visible(&mut self, target: E, window: E, scope: Scope) -> Evidence<bool>;
     fn offscreen(&mut self, target: E, window: E, scope: Scope) -> Evidence<bool>;
     fn hit(&mut self, target: E, window: E, scope: Scope, point: Point) -> Hit;
-}
-
-/// The existing element pointer hit reader collapses errors into misses; it
-/// cannot prove either foreground or window-internal delivery evidence.
-pub(crate) struct UnprovenScope;
-impl<E> ScopeReader<E> for UnprovenScope {
-    fn visible(&mut self, _: E, _: E, _: Scope) -> Evidence<bool> {
-        Evidence::Unknown("visibility is unproven".into())
-    }
-    fn offscreen(&mut self, _: E, _: E, _: Scope) -> Evidence<bool> {
-        Evidence::Unknown("offscreen state is unproven".into())
-    }
-    fn hit(&mut self, _: E, _: E, _: Scope, _: Point) -> Hit {
-        Hit::Unknown
-    }
 }
 
 pub(crate) struct Adapter<E> {
