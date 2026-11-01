@@ -6,9 +6,9 @@ use core_foundation::base::{CFEqual, CFRelease, CFRetain, CFTypeRef};
 const MAX_SELECTION_ANCESTORS: usize = 8;
 
 pub(crate) fn climb_limit(start_role: Option<&str>) -> usize {
-    if start_role.is_none_or(|role| {
-        role.is_empty() || role == "AXUnknown" || is_selectable_container_role(role)
-    }) {
+    if start_role
+        .is_none_or(|role| role.is_empty() || role == "AXUnknown" || is_item_boundary_role(role))
+    {
         1
     } else {
         MAX_SELECTION_ANCESTORS
@@ -17,6 +17,10 @@ pub(crate) fn climb_limit(start_role: Option<&str>) -> usize {
 
 fn is_selectable_container_role(role: &str) -> bool {
     matches!(role, "AXRow" | "AXCell" | "AXListItem" | "AXImage")
+}
+
+fn is_item_boundary_role(role: &str) -> bool {
+    is_selectable_container_role(role) || role == "AXOutlineRow"
 }
 
 pub(crate) trait SelectionOps {
@@ -80,12 +84,26 @@ fn walk_selection<B: SelectionOps, T>(
     let mut current = start;
     let mut role = ops.role(&current);
     let limit = climb_limit(role.as_deref());
+    let mut cell_parent_only = false;
     for step in 0..limit {
+        if cell_parent_only && role.as_deref() != Some("AXRow") {
+            break;
+        }
         if let std::ops::ControlFlow::Break(value) = visit(ops, &current, role.as_deref()) {
             return Some(value);
         }
-        if step + 1 == limit {
+        let unknown = role
+            .as_deref()
+            .is_none_or(|r| r.is_empty() || r == "AXUnknown");
+        let boundary = role.as_deref().is_some_and(is_item_boundary_role);
+        if step + 1 == limit || unknown || cell_parent_only {
             break;
+        }
+        if boundary {
+            if role.as_deref() != Some("AXCell") {
+                break;
+            }
+            cell_parent_only = true;
         }
         current = ops.parent(&current)?;
         role = ops.role(&current);
@@ -97,18 +115,28 @@ fn selectable(role: Option<&str>) -> bool {
     role.is_some_and(is_selectable_container_role)
 }
 
-pub(crate) fn select_with<B: SelectionOps>(ops: &mut B, start: B::Element) -> Option<String> {
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum SelectAttempt {
+    NotAttempted,
+    WriteSentUnconfirmed(String),
+    Confirmed(String),
+}
+
+pub(crate) fn select_with<B: SelectionOps>(ops: &mut B, start: B::Element) -> SelectAttempt {
     walk_selection(ops, start, |ops, item, role| {
-        if selectable(role)
-            && ops.selected(item).is_some()
-            && ops.select(item)
-            && ops.selected(item) == Some(true)
-        {
-            std::ops::ControlFlow::Break(role.unwrap().to_owned())
-        } else {
-            std::ops::ControlFlow::Continue(())
+        if selectable(role) && ops.selected(item).is_some() {
+            let role = role.unwrap().to_owned();
+            let sent = ops.select(item);
+            let result = if sent && ops.selected(item) == Some(true) {
+                SelectAttempt::Confirmed(role)
+            } else {
+                SelectAttempt::WriteSentUnconfirmed(role)
+            };
+            return std::ops::ControlFlow::Break(result);
         }
+        std::ops::ControlFlow::Continue(())
     })
+    .unwrap_or(SelectAttempt::NotAttempted)
 }
 
 pub(crate) fn selection_state_with<B: SelectionOps>(
@@ -159,10 +187,12 @@ pub(crate) fn selection_snapshot_with<B: SelectionOps>(
     let mut items = Vec::new();
     let mut in_item = false;
     let _: Option<()> = walk_selection(ops, start, |ops, item, role| {
-        if selectable(role) {
+        if role.is_some_and(is_item_boundary_role) {
             in_item = true;
-            if let Some(selected) = ops.selected(item) {
-                items.push((item.clone(), selected));
+            if selectable(role) {
+                if let Some(selected) = ops.selected(item) {
+                    items.push((item.clone(), selected));
+                }
             }
         }
         std::ops::ControlFlow::Continue(())
@@ -185,7 +215,7 @@ pub(crate) fn selection_snapshot_with<B: SelectionOps>(
 /// row-like containers. The fallback remains bounded and requires a successful
 /// `AXSelected=true` read-back, so an arbitrary failed image/button press cannot
 /// become a claimed success.
-pub fn select_nearest_container(element_ptr: usize) -> Option<String> {
+pub(crate) fn select_nearest_container(element_ptr: usize) -> SelectAttempt {
     let start = unsafe { SelectionElement::retain(element_ptr as AXUIElementRef) };
     select_with(&mut LiveSelectionOps, start)
 }
@@ -1044,7 +1074,10 @@ mod climb_limit_tests {
         ] {
             // A failed write or unreadable selection cannot fall through to the outer item.
             let mut ops = fake(role, Some(false));
-            assert_eq!(select_with(&mut ops, 0), None);
+            assert!(matches!(
+                select_with(&mut ops, 0),
+                SelectAttempt::NotAttempted | SelectAttempt::WriteSentUnconfirmed(_)
+            ));
             assert!(ops.parents.is_empty());
             assert!(ops.writes.iter().all(|n| *n == 0));
             let mut ops = fake(role, None);

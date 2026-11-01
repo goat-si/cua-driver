@@ -2910,6 +2910,19 @@ fn selection_write_outcome(
     )
 }
 
+fn unconfirmed_selection_write(
+    selected_role: &str,
+    element: (usize, &str, &str),
+) -> AxClickOutcome {
+    let (idx, role, title) = element;
+    (
+        format!("⚠️ Sent an AXSelected write to the nearest {selected_role} for [{idx}] {role} \"{title}\", but could not confirm it. Read the window before repeating it."),
+        false,
+        None,
+        false,
+    )
+}
+
 /// Whether a non-success `AXUIElementPerformAction` return proves the app
 /// never received the action. Only the accessibility client's own refusals
 /// do: a bad argument, a dead element reference, or accessibility turned off.
@@ -3212,23 +3225,30 @@ fn perform_ax_click(
             let snapshot = reads
                 .selection
                 .then(|| unsafe { SelectionSnapshot::capture(element) });
-            if let Some(selected_role) =
-                crate::input::ax_actions::select_nearest_container(element_ptr)
-            {
-                let tied = snapshot
-                    .as_ref()
-                    .is_some_and(SelectionSnapshot::transitioned)
-                    && input_quiet(
-                        idle_before,
-                        super::physical_input_idle_ms(),
-                        elapsed_ms(started),
-                    );
-                return Ok(selection_write_outcome(
-                    tied,
-                    &selected_role,
-                    (idx, &role, &title),
-                    None,
-                ));
+            match crate::input::ax_actions::select_nearest_container(element_ptr) {
+                crate::input::ax_actions::SelectAttempt::Confirmed(selected_role) => {
+                    let tied = snapshot
+                        .as_ref()
+                        .is_some_and(SelectionSnapshot::transitioned)
+                        && input_quiet(
+                            idle_before,
+                            super::physical_input_idle_ms(),
+                            elapsed_ms(started),
+                        );
+                    return Ok(selection_write_outcome(
+                        tied,
+                        &selected_role,
+                        (idx, &role, &title),
+                        None,
+                    ));
+                }
+                crate::input::ax_actions::SelectAttempt::WriteSentUnconfirmed(selected_role) => {
+                    return Ok(unconfirmed_selection_write(
+                        &selected_role,
+                        (idx, &role, &title),
+                    ));
+                }
+                crate::input::ax_actions::SelectAttempt::NotAttempted => {}
             }
         }
 
@@ -3524,23 +3544,30 @@ fn perform_ax_click(
         // kAXErrorCannotComplete. Use the same verified selection fallback
         // before surfacing the dispatch error.
         if let Some((snapshot, idle_before, started)) = fallback_selection {
-            if let Some(selected_role) =
-                crate::input::ax_actions::select_nearest_container(element_ptr)
-            {
-                let tied = snapshot
-                    .as_ref()
-                    .is_some_and(SelectionSnapshot::transitioned)
-                    && input_quiet(
-                        idle_before,
-                        super::physical_input_idle_ms(),
-                        elapsed_ms(started),
-                    );
-                return Ok(selection_write_outcome(
-                    tied,
-                    &selected_role,
-                    (idx, &role, &title),
-                    Some(err),
-                ));
+            match crate::input::ax_actions::select_nearest_container(element_ptr) {
+                crate::input::ax_actions::SelectAttempt::Confirmed(selected_role) => {
+                    let tied = snapshot
+                        .as_ref()
+                        .is_some_and(SelectionSnapshot::transitioned)
+                        && input_quiet(
+                            idle_before,
+                            super::physical_input_idle_ms(),
+                            elapsed_ms(started),
+                        );
+                    return Ok(selection_write_outcome(
+                        tied,
+                        &selected_role,
+                        (idx, &role, &title),
+                        Some(err),
+                    ));
+                }
+                crate::input::ax_actions::SelectAttempt::WriteSentUnconfirmed(selected_role) => {
+                    return Ok(unconfirmed_selection_write(
+                        &selected_role,
+                        (idx, &role, &title),
+                    ));
+                }
+                crate::input::ax_actions::SelectAttempt::NotAttempted => {}
             }
         }
         return unresolved_perform_error(ax_action, err, (idx, &role, &title));

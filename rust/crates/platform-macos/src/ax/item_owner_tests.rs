@@ -31,11 +31,11 @@ fn walk_fake(root: &FakeNode) -> Vec<AXNode> {
             out.role = node.role.into();
             out.depth = depth;
             out.value = node.text.map(str::to_owned);
-            out.owned_row_label = initial_owned_row_label(false);
+            out.owned_row_label = initial_owned_row_label(node.role);
             nodes.push(out);
-            child_label_path(path, false, node.indexed, id)
+            child_label_path(path, node.role, parent_role, id)
         } else {
-            path
+            child_label_path(path, node.role, parent_role, id)
         };
         for child in &node.children {
             walk(
