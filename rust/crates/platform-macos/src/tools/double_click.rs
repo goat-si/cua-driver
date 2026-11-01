@@ -15,20 +15,34 @@ use crate::ax::bindings::{
 use super::ToolState;
 
 pub(super) async fn dispatch_open<C, P, A, F, T>(
-    _clock: &(impl cua_driver_core::actionability::Clock + Sync),
-    _budget: std::time::Duration,
-    _use_ax_open: bool,
+    clock: &(impl cua_driver_core::actionability::Clock + Sync),
+    budget: std::time::Duration,
+    use_ax_open: bool,
     context: C,
-    _probe: P,
+    probe: P,
     perform: A,
 ) -> Result<T, ToolResult>
 where
     C: Sync,
-    P: for<'a> FnMut(&'a C, std::time::Duration) -> std::pin::Pin<Box<dyn std::future::Future<Output = cua_driver_core::actionability::ActionabilityReport> + Send + 'a>> + Send,
+    P: for<'a> FnMut(
+            &'a C,
+            std::time::Duration,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = cua_driver_core::actionability::ActionabilityReport,
+                    > + Send
+                    + 'a,
+            >,
+        > + Send,
     A: FnOnce(C) -> F,
     F: std::future::Future<Output = T>,
 {
-    Ok(perform(context).await)
+    if use_ax_open {
+        super::actionability::dispatch_semantic(clock, budget, context, probe, perform).await
+    } else {
+        Ok(perform(context).await)
+    }
 }
 
 pub struct DoubleClickTool {
@@ -164,49 +178,56 @@ impl Tool for DoubleClickTool {
             let probe_target = element_guard.clone();
             let clock = super::actionability::semantic_clock();
             let perform = |lease| async move {
-            let prior_front = crate::apps::frontmost_pid();
-            let snapshot = if foreground {
-                crate::window_change_detector::WindowChangeDetector::snapshot_without_suppression(
+                let prior_front = crate::apps::frontmost_pid();
+                let snapshot = if foreground {
+                    crate::window_change_detector::WindowChangeDetector::snapshot_without_suppression(
                     prior_front,
                 )
-            } else {
-                crate::window_change_detector::WindowChangeDetector::snapshot(prior_front)
-            };
-            let result = crate::focus_guard::with_focus_suppressed(
-                (!foreground).then_some(pid),
-                prior_front,
-                "double_click.ax",
-                || async move {
-                    latency::spawn_action_blocking(move || {
-                        let _lease = lease;
-                        ax_double_click(
-                            pid,
-                            wid,
-                            element_guard.as_ptr(),
-                            idx,
-                            &ck,
-                            has_ax_open,
-                            foreground,
-                        )
-                    })
-                    .await
-                },
-            )
-            .await;
-            let changes = super::finish_window_observation(snapshot).await;
-            (result, changes)
+                } else {
+                    crate::window_change_detector::WindowChangeDetector::snapshot(prior_front)
+                };
+                let result = crate::focus_guard::with_focus_suppressed(
+                    (!foreground).then_some(pid),
+                    prior_front,
+                    "double_click.ax",
+                    || async move {
+                        latency::spawn_action_blocking(move || {
+                            let _lease = lease;
+                            ax_double_click(
+                                pid,
+                                wid,
+                                element_guard.as_ptr(),
+                                idx,
+                                &ck,
+                                has_ax_open,
+                                foreground,
+                            )
+                        })
+                        .await
+                    },
+                )
+                .await;
+                let changes = super::finish_window_observation(snapshot).await;
+                (result, changes)
             };
             let (result, changes) = match dispatch_open(
                 &clock,
                 cua_driver_core::actionability::DEFAULT_BUDGET,
                 has_ax_open,
                 mutation_lease,
-                |lease, _| super::actionability::semantic_probe(
-                    lease.as_ref(), probe_target.clone(), pid, wid,
-                    super::actionability::semantic::SemanticIntent::Open,
-                ),
+                |lease, _| {
+                    super::actionability::semantic_probe(
+                        lease.as_ref(),
+                        probe_target.clone(),
+                        pid,
+                        wid,
+                        super::actionability::semantic::SemanticIntent::Open,
+                    )
+                },
                 perform,
-            ).await {
+            )
+            .await
+            {
                 Ok(result) => result,
                 Err(refusal) => return refusal,
             };

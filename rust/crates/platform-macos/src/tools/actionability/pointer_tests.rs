@@ -272,7 +272,8 @@ async fn double_click_axopen_gates_before_activation() {
                     activated_ref.fetch_add(1, Ordering::SeqCst);
                     success()
                 },
-            ).await;
+            )
+            .await;
             assert_eq!(activated.load(Ordering::SeqCst), usize::from(allowed));
             assert_eq!(result.is_ok(), allowed);
         }

@@ -772,110 +772,119 @@ pub(super) async fn click_element(state: &ToolState, request: ElementClick) -> T
     // without raising (the pixel-click prologue); AXOpen keeps it suppressed.
     let background_pointer = !foreground && !use_ax_open;
     let clock = super::actionability::semantic_clock();
-    let perform = |lease| async move { crate::input::worker_context::spawn_async(async move {
-        use crate::window_change_detector::WindowChangeDetector;
-        let prior_front = crate::apps::frontmost_pid();
-        let snapshot = if foreground {
-            WindowChangeDetector::snapshot_without_suppression(prior_front)
-        } else if background_pointer {
-            WindowChangeDetector::snapshot_allowing_activation(prior_front, pid)
-        } else {
-            WindowChangeDetector::snapshot(prior_front)
-        };
-        let prologue = if background_pointer {
-            // Prove the point before the prologue sends a focus record, so a
-            // bad point is refused with nothing sent; it is proven again
-            // after activation and right before the first click.
-            let preflight_target = action_target.clone();
-            match latency::spawn_action_blocking(move || {
-                checked_point(&*preflight_target, false).map(|_| ())
-            })
-            .await
-            {
-                Ok(Ok(())) => {}
-                Ok(Err(refusal)) => return Err(error_result(count, refusal.into())),
-                Err(error) => {
-                    return Err(super::pre_dispatch_refusal(
-                        "background_unavailable",
-                        format!("The point check task failed ({error}); nothing was sent."),
-                    ))
-                }
-            }
-            match action_target.background_pointer_prologue(prior_front).await {
-                Ok(prologue) => Some(prologue),
-                Err(mut refusal) => {
-                    if let Some(structured) = refusal.structured_content.as_mut() {
-                        structured["count"] = json!(count);
-                        structured["clicks_posted"] = json!(0);
-                    }
-                    return Err(refusal);
-                }
-            }
-        } else {
-            None
-        };
-        let activation = match &prologue {
-            None => Activation::None,
-            Some(prologue) if prologue.activated => Activation::Background,
-            Some(_) => Activation::BackgroundUncertain,
-        };
-        let blocking_target = action_target.clone();
-        let result = crate::focus_guard::with_focus_suppressed(
-            (!foreground && !background_pointer).then_some(pid),
-            prior_front,
-            "click.element_count",
-            || async move {
-                latency::spawn_action_blocking(move || {
-                    let held = lease;
-                    let outcome =
-                        run_blocking(&*blocking_target, idx, count, use_ax_open, foreground);
-                    (outcome, held)
+    let perform = |lease| async move {
+        crate::input::worker_context::spawn_async(async move {
+            use crate::window_change_detector::WindowChangeDetector;
+            let prior_front = crate::apps::frontmost_pid();
+            let snapshot = if foreground {
+                WindowChangeDetector::snapshot_without_suppression(prior_front)
+            } else if background_pointer {
+                WindowChangeDetector::snapshot_allowing_activation(prior_front, pid)
+            } else {
+                WindowChangeDetector::snapshot(prior_front)
+            };
+            let prologue = if background_pointer {
+                // Prove the point before the prologue sends a focus record, so a
+                // bad point is refused with nothing sent; it is proven again
+                // after activation and right before the first click.
+                let preflight_target = action_target.clone();
+                match latency::spawn_action_blocking(move || {
+                    checked_point(&*preflight_target, false).map(|_| ())
                 })
                 .await
-            },
-        )
-        .await;
-        if let Some(prologue) = prologue {
-            action_target
-                .restore_after_pointer(prior_front, prologue)
-                .await;
-        }
-        let changes = super::finish_window_observation(snapshot).await;
-        // The cursor follows clicks that went out, even for a cancelled
-        // caller; it moves before the lease is released below.
-        if let Ok((Ok(Performed::Clicks(clicks)), _held)) = &result {
-            let (x, y) = clicks.point.screen;
-            cursor_registry.update_position(&cursor_key, x, y);
-            cursor_registry.note_press(&cursor_key, x, y);
-            crate::cursor::overlay::send_command(
-                cursor_key.clone(),
-                cursor_overlay::OverlayCommand::ClickPulse { x, y },
-            );
-        }
-        // Background failures after the prologue carry what it sent; the
-        // foreground route tags its own.
-        let result = result.map(|(outcome, _held)| {
-            outcome.map_err(|source| {
-                if activation == Activation::None || source.is::<AfterActivation>() {
-                    source
-                } else {
-                    AfterActivation { activation, source }.into()
+                {
+                    Ok(Ok(())) => {}
+                    Ok(Err(refusal)) => return Err(error_result(count, refusal.into())),
+                    Err(error) => {
+                        return Err(super::pre_dispatch_refusal(
+                            "background_unavailable",
+                            format!("The point check task failed ({error}); nothing was sent."),
+                        ))
+                    }
                 }
-            })
-        });
-        Ok((result, changes.result_suffix()))
-    }).await };
+                match action_target.background_pointer_prologue(prior_front).await {
+                    Ok(prologue) => Some(prologue),
+                    Err(mut refusal) => {
+                        if let Some(structured) = refusal.structured_content.as_mut() {
+                            structured["count"] = json!(count);
+                            structured["clicks_posted"] = json!(0);
+                        }
+                        return Err(refusal);
+                    }
+                }
+            } else {
+                None
+            };
+            let activation = match &prologue {
+                None => Activation::None,
+                Some(prologue) if prologue.activated => Activation::Background,
+                Some(_) => Activation::BackgroundUncertain,
+            };
+            let blocking_target = action_target.clone();
+            let result = crate::focus_guard::with_focus_suppressed(
+                (!foreground && !background_pointer).then_some(pid),
+                prior_front,
+                "click.element_count",
+                || async move {
+                    latency::spawn_action_blocking(move || {
+                        let held = lease;
+                        let outcome =
+                            run_blocking(&*blocking_target, idx, count, use_ax_open, foreground);
+                        (outcome, held)
+                    })
+                    .await
+                },
+            )
+            .await;
+            if let Some(prologue) = prologue {
+                action_target
+                    .restore_after_pointer(prior_front, prologue)
+                    .await;
+            }
+            let changes = super::finish_window_observation(snapshot).await;
+            // The cursor follows clicks that went out, even for a cancelled
+            // caller; it moves before the lease is released below.
+            if let Ok((Ok(Performed::Clicks(clicks)), _held)) = &result {
+                let (x, y) = clicks.point.screen;
+                cursor_registry.update_position(&cursor_key, x, y);
+                cursor_registry.note_press(&cursor_key, x, y);
+                crate::cursor::overlay::send_command(
+                    cursor_key.clone(),
+                    cursor_overlay::OverlayCommand::ClickPulse { x, y },
+                );
+            }
+            // Background failures after the prologue carry what it sent; the
+            // foreground route tags its own.
+            let result = result.map(|(outcome, _held)| {
+                outcome.map_err(|source| {
+                    if activation == Activation::None || source.is::<AfterActivation>() {
+                        source
+                    } else {
+                        AfterActivation { activation, source }.into()
+                    }
+                })
+            });
+            Ok((result, changes.result_suffix()))
+        })
+        .await
+    };
     let action = super::double_click::dispatch_open(
         &clock,
         cua_driver_core::actionability::DEFAULT_BUDGET,
         use_ax_open,
         lease,
-        |lease, _| super::actionability::semantic_probe(
-            lease.as_ref(), probe_target.clone(), pid, window_id,
-            super::actionability::semantic::SemanticIntent::Open,
-        ),
+        |lease, _| {
+            super::actionability::semantic_probe(
+                lease.as_ref(),
+                probe_target.clone(),
+                pid,
+                window_id,
+                super::actionability::semantic::SemanticIntent::Open,
+            )
+        },
         perform,
-    ).await;
+    )
+    .await;
     let action = match action {
         Ok(action) => action,
         Err(refusal) => return refusal,
