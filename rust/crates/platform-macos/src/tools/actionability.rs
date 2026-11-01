@@ -349,7 +349,13 @@ pub(super) fn click_probe<'a>(
     pid: i32,
     window_id: u32,
 ) -> std::pin::Pin<Box<dyn Future<Output = ActionabilityReport> + Send + 'a>> {
-    semantic_probe(lease.as_ref(), target, pid, window_id, semantic::SemanticIntent::Click)
+    semantic_probe(
+        lease.as_ref(),
+        target,
+        pid,
+        window_id,
+        semantic::SemanticIntent::Click,
+    )
 }
 
 pub(super) fn semantic_probe<'a>(

@@ -193,7 +193,11 @@ async fn right_click_owned_cancel_checks_recorded_menu() {
                 } else {
                     vec![]
                 });
-                let report = evaluate(Intent::PerformAction { name: "AXCancel" }, Policy::headless(), &f);
+                let report = evaluate(
+                    Intent::PerformAction { name: "AXCancel" },
+                    Policy::headless(),
+                    &f,
+                );
                 Box::pin(async move { report })
             },
             |menu| async move {
@@ -201,7 +205,8 @@ async fn right_click_owned_cancel_checks_recorded_menu() {
                 sent_ref.fetch_add(1, Ordering::SeqCst);
                 success()
             },
-        ).await;
+        )
+        .await;
         assert!(sampled.load(Ordering::SeqCst) > 0);
         assert_eq!(sent.load(Ordering::SeqCst), usize::from(allowed));
         assert_eq!(result.is_ok(), allowed);

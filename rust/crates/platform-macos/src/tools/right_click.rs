@@ -31,10 +31,10 @@ use super::ToolState;
 // This seam keeps the menu identity and its lease together across the async
 // admission and the worker that closes it.
 pub(super) async fn dispatch_owned_cancel<C, P, A, F, T>(
-    _clock: &(impl cua_driver_core::actionability::Clock + Sync),
-    _budget: Duration,
+    clock: &(impl cua_driver_core::actionability::Clock + Sync),
+    budget: Duration,
     context: C,
-    _probe: P,
+    probe: P,
     perform: A,
 ) -> Result<T, ToolResult>
 where
@@ -42,12 +42,18 @@ where
     P: for<'a> FnMut(
             &'a C,
             Duration,
-        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = cua_driver_core::actionability::ActionabilityReport> + Send + 'a>>
-        + Send,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = cua_driver_core::actionability::ActionabilityReport,
+                    > + Send
+                    + 'a,
+            >,
+        > + Send,
     A: FnOnce(C) -> F,
     F: std::future::Future<Output = T>,
 {
-    Ok(perform(context).await)
+    super::actionability::dispatch_semantic(clock, budget, context, probe, perform).await
 }
 
 pub struct RightClickTool {
@@ -174,38 +180,53 @@ impl RightClickTool {
             Err(error) => return error,
         };
         let clock = super::actionability::semantic_clock();
-        let result = dispatch_owned_cancel(
+        let result = match dispatch_owned_cancel(
             &clock,
             cua_driver_core::actionability::DEFAULT_BUDGET,
             (_mutation_lease, menu, target),
             |(lease, menu, _), _| {
                 let target = unsafe { crate::ax::snapshot::RetainedElement::retain(menu.0) };
                 super::actionability::semantic_probe(
-                    Some(lease), target, pid, window_id,
-                    super::actionability::semantic::SemanticIntent::PerformAction("AXCancel".into()),
+                    Some(lease),
+                    target,
+                    pid,
+                    window_id,
+                    super::actionability::semantic::SemanticIntent::PerformAction(
+                        "AXCancel".into(),
+                    ),
                 )
             },
-            |(lease, menu, target)| async move { latency::spawn_action_blocking(move || unsafe {
-            let _lease = lease;
-            let error = perform_action(menu.0 as AXUIElementRef, "AXCancel");
-            if error != kAXErrorSuccess {
-                return Err(format!("AXCancel failed with AXError {error}"));
-            }
-            let deadline = Instant::now() + Duration::from_millis(750);
-            while Instant::now() < deadline {
-                let menus = ax_menus(pid, target.as_ref().map(|target| target.0), Some(window_id))
-                    .ok_or_else(|| "context-menu close readback is unavailable".to_owned())?;
-                if !menus
-                    .iter()
-                    .any(|candidate| CFEqual(candidate.0 as CFTypeRef, menu.0 as CFTypeRef) != 0)
-                {
-                    return Ok(());
-                }
-                std::thread::sleep(Duration::from_millis(25));
-            }
-            Err("context menu did not disappear after AXCancel".into())
-            }).await },
-        ).await.expect("dispatch currently always performs");
+            |(lease, menu, target)| async move {
+                latency::spawn_action_blocking(move || unsafe {
+                    let _lease = lease;
+                    let error = perform_action(menu.0 as AXUIElementRef, "AXCancel");
+                    if error != kAXErrorSuccess {
+                        return Err(format!("AXCancel failed with AXError {error}"));
+                    }
+                    let deadline = Instant::now() + Duration::from_millis(750);
+                    while Instant::now() < deadline {
+                        let menus =
+                            ax_menus(pid, target.as_ref().map(|target| target.0), Some(window_id))
+                                .ok_or_else(|| {
+                                    "context-menu close readback is unavailable".to_owned()
+                                })?;
+                        if !menus.iter().any(|candidate| {
+                            CFEqual(candidate.0 as CFTypeRef, menu.0 as CFTypeRef) != 0
+                        }) {
+                            return Ok(());
+                        }
+                        std::thread::sleep(Duration::from_millis(25));
+                    }
+                    Err("context menu did not disappear after AXCancel".into())
+                })
+                .await
+            },
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(refusal) => return refusal,
+        };
         match result {
             Ok(Ok(())) => {
                 crate::ax::exact_target::finish_context_menu_close(opener_id);
