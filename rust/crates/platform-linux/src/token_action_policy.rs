@@ -189,6 +189,29 @@ pub(crate) fn final_insert_step<E>(
     }
 }
 
+/// Pick an option from an open popup, let the toolkit settle, then close the
+/// popup if it is still open. A pick that may have changed the control ends
+/// here: no cleanup key follows it.
+pub(crate) fn pick_then_close<T, E>(
+    pick: impl FnOnce() -> Result<T, E>,
+    settle: impl FnOnce(),
+    close: impl FnOnce() -> Result<(), E>,
+    classify: impl Fn(&E) -> Option<TextWriteStop>,
+) -> Result<T, E> {
+    let picked = pick();
+    if picked
+        .as_ref()
+        .err()
+        .is_some_and(|error| classify(error).is_some())
+    {
+        return picked;
+    }
+    settle();
+    let closed = close();
+    let value = picked?;
+    closed.map(|()| value)
+}
+
 #[cfg(test)]
 mod write_tests {
     use super::*;
@@ -311,6 +334,50 @@ mod write_tests {
                 Err(E::Stop(stop))
             );
         }
+    }
+
+    #[test]
+    fn possible_option_write_sends_no_cleanup_key() {
+        for stop in [
+            TextWriteStop::Uncertain,
+            TextWriteStop::Partial,
+            TextWriteStop::Closed,
+        ] {
+            let mut closes = 0;
+            let result = pick_then_close(
+                || Err::<(), E>(E::Stop(stop)),
+                || {},
+                || {
+                    closes += 1;
+                    Ok(())
+                },
+                classify,
+            );
+            assert_eq!(result, Err(E::Stop(stop)));
+            assert_eq!(closes, 0, "{stop:?}: Escape sent after a possible write");
+        }
+    }
+
+    #[test]
+    fn ordinary_pick_outcomes_still_close_the_popup() {
+        let mut closes = 0;
+        let mut close = || {
+            closes += 1;
+            Ok(())
+        };
+        assert_eq!(
+            pick_then_close(|| Ok::<_, E>(7), || {}, &mut close, classify),
+            Ok(7)
+        );
+        assert_eq!(
+            pick_then_close(|| Err::<(), E>(E::Plain), || {}, &mut close, classify),
+            Err(E::Plain)
+        );
+        assert_eq!(closes, 2);
+        assert_eq!(
+            pick_then_close(|| Ok::<_, E>(7), || {}, || Err(E::Plain), classify),
+            Err(E::Plain)
+        );
     }
 
     #[test]

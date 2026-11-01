@@ -10379,12 +10379,14 @@ fn pick_from_popup(
         }
     };
     let open_and_pick = || -> anyhow::Result<()> {
-        let picked = pick();
-        // Let the toolkit close the popup on activation before checking.
-        std::thread::sleep(std::time::Duration::from_millis(150));
-        let closed = close_popup();
-        picked?;
-        closed
+        crate::token_action_policy::pick_then_close(
+            pick,
+            // Let the toolkit close the popup on activation before checking.
+            || std::thread::sleep(std::time::Duration::from_millis(150)),
+            close_popup,
+            crate::atspi::native::text_write_stop,
+        )
+        .map(|_| ())
     };
     if foreground {
         let (sx, sy) = window_local_to_screen(win, lx, ly)?;
