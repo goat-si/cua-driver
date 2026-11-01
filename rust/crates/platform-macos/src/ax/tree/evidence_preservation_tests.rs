@@ -1086,6 +1086,72 @@ fn tab_parent_metadata_preserves_unknown_and_absent() {
 }
 
 #[test]
+fn tab_child_metadata_preserves_unknown_and_absent() {
+    const CONTENT: &str =
+        "AXTitle,AXPlaceholderValue,AXDescription,AXIdentifier,AXHelp,AXSubrole,AXRoleDescription";
+    for name in ["AXRole", "AXRoleDescription", "AXSelected"] {
+        for case in CASES {
+            let is_tab = name == "AXSelected" || (name == "AXRole" && matches!(case, Case::Known));
+            let role = if name == "AXRole" {
+                case.read("AXTab".into())
+            } else if is_tab {
+                Read::Known("AXTab".into())
+            } else {
+                Read::Known("AXButton".into())
+            };
+            let mut steps = vec![
+                step("text 1 AXTitle", Reply::Text(Read::Absent)),
+                step("text 1 AXDescription", Reply::Text(Read::Absent)),
+                step("text 1 AXRoleDescription", Reply::Text(Read::Absent)),
+                step("timeout 2", Reply::Unit),
+                step("text 2 AXRole", Reply::Text(role)),
+            ];
+            if !is_tab {
+                let value = if name == "AXRoleDescription" {
+                    case.read("ordinary".into())
+                } else {
+                    Read::Absent
+                };
+                steps.push(step("text 2 AXRoleDescription", Reply::Text(value)));
+            } else {
+                let selected = if name == "AXSelected" {
+                    case.read(false)
+                } else {
+                    Read::Known(false)
+                };
+                let mut attrs = vec![Slot::Text(AttrStatus::Absent); 7];
+                attrs[0] = Slot::Text(AttrStatus::Known("Tab".into()));
+                steps.extend([
+                    step("bool 2 AXSelected", Reply::Bool(selected)),
+                    step(
+                        &format!("batch 2 {CONTENT}"),
+                        Reply::Batch(Ok(Batch(attrs))),
+                    ),
+                    step("value 2", Reply::Value(Ok(None))),
+                ]);
+            }
+            let fake = Fake::new(&[(1, 1, 1, &[2]), (2, 2, 2, &[])], steps);
+            let root = fake.handle(1);
+            let child = fake.handle(2);
+            let observed = plan_macos_tab_strip_observed(
+                &fake,
+                &root,
+                "AXTabGroup",
+                std::slice::from_ref(&child),
+                &mut WalkBudget::nodes_only(10),
+                &mut false,
+            );
+            assert!(observed.legacy.is_none());
+            fake.assert_consumed();
+            drop(child);
+            drop(root);
+            fake.assert_lifetimes(&[]);
+            assert_evidence(&observed.evidence, ReadSite::Tab(name), case.status());
+        }
+    }
+}
+
+#[test]
 fn dense_visibility_sets_preserve_unknown_and_absent() {
     let fake = Fake::new(
         &[(1, 1, 1, &[])],
