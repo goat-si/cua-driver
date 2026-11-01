@@ -6034,7 +6034,7 @@ impl crate::text_write_policy::EditableOps for NativeEditableOps<'_> {
         }
         result
     }
-    fn prepare_commit(&mut self) -> std::result::Result<(), crate::text_write_policy::CallClass> {
+    fn prepare_commit(&mut self) -> std::result::Result<bool, crate::text_write_policy::CallClass> {
         self.dispatch.step.store(4, Ordering::SeqCst);
         self.commit_action = runtime().block_on(async {
             let ap = call(self.proxies.action()).await?.ok()?;
@@ -6044,7 +6044,7 @@ impl crate::text_write_policy::EditableOps for NativeEditableOps<'_> {
                 .position(|name| normalized_action_verb(name) == "activate")?;
             Some((ap, index as i32))
         });
-        Ok(())
+        Ok(self.commit_action.is_some())
     }
     fn commit(&mut self) -> crate::text_write_policy::MutationReply {
         runtime().block_on(commit_editable_write(self.commit_action.as_ref()))

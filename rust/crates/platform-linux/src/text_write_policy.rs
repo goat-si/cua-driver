@@ -164,8 +164,8 @@ pub trait EditableOps {
     fn set_text(&mut self, text: &str) -> MutationReply;
     fn delete_text(&mut self, start: i32, end: i32) -> MutationReply;
     fn insert_text(&mut self, offset: i32, text: &str, length: i32) -> MutationReply;
-    fn prepare_commit(&mut self) -> Result<(), CallClass> {
-        Ok(())
+    fn prepare_commit(&mut self) -> Result<bool, CallClass> {
+        Ok(true)
     }
     fn commit(&mut self) -> MutationReply;
 }
@@ -284,10 +284,14 @@ fn commit(
     gate: &DispatchGate,
     ledger: &DispatchLedger,
 ) -> TextWriteOutcome {
-    if ops.prepare_commit().is_err() {
-        return TextWriteOutcome::Uncertain {
-            step: step(Step::Commit, text, units),
-        };
+    match ops.prepare_commit() {
+        Ok(false) => return TextWriteOutcome::Acknowledged,
+        Ok(true) => {}
+        Err(_) => {
+            return TextWriteOutcome::Uncertain {
+                step: step(Step::Commit, text, units),
+            }
+        }
     }
     match dispatch(gate, ledger, || ops.commit()) {
         Ok(Ok(MutationResult::Acknowledged)) => TextWriteOutcome::Acknowledged,
@@ -321,6 +325,7 @@ mod tests {
         delete_args: Vec<(i32, i32)>,
         pause: Option<(&'static str, Arc<Barrier>, Arc<Barrier>)>,
         close_on_prepare: Option<Arc<DispatchGate>>,
+        no_commit: bool,
     }
     impl Default for Fake {
         fn default() -> Self {
@@ -337,6 +342,7 @@ mod tests {
                 delete_args: vec![],
                 pause: None,
                 close_on_prepare: None,
+                no_commit: false,
             }
         }
     }
@@ -378,12 +384,12 @@ mod tests {
             self.call("insert");
             self.insert
         }
-        fn prepare_commit(&mut self) -> Result<(), CallClass> {
+        fn prepare_commit(&mut self) -> Result<bool, CallClass> {
             if let Some(gate) = &self.close_on_prepare {
                 self.calls.push("prepare");
                 gate.close_on_timeout();
             }
-            Ok(())
+            Ok(!self.no_commit)
         }
         fn commit(&mut self) -> Reply {
             self.call("commit");
@@ -636,6 +642,16 @@ mod tests {
             }
         ));
         assert_eq!(f.calls, ["set", "prepare"]);
+    }
+
+    #[test]
+    fn absent_activation_does_not_dispatch_a_commit() {
+        let mut f = Fake {
+            no_commit: true,
+            ..Fake::default()
+        };
+        assert_eq!(replace(&mut f, "abc"), TextWriteOutcome::Acknowledged);
+        assert_eq!(f.calls, ["set"]);
     }
     #[test]
     fn timeout_before_first_send_closes_gate() {
