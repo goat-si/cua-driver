@@ -139,4 +139,3 @@ __attribute__((constructor)) static void setup(void) {
   try_all();
   live_log("PROBE_READY", 0);
 }
-

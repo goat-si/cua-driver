@@ -64,6 +64,8 @@ def main():
         result = run([args.binary], args.probe)
         if "LIVECALL PROBE_READY" not in result.stdout:
             failures.append("probe not loaded (no PROBE_READY)")
+        if result.returncode != 0:
+            failures.append(f"control binary exited {result.returncode}")
         seen = calls(result.stdout)
         for family in CONTROL_FAMILIES:
             if not any(call.startswith(family) for call in seen):
@@ -112,4 +114,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

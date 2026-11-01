@@ -20,12 +20,24 @@ SRC = ROOT / "rust" / "crates" / "platform-macos" / "src"
 MARKER = re.compile(
     r'#\[ignore\s*=\s*"live:[^"]*"\]\s*\n(?:\s*#\[[^\n]*\]\s*\n)*\s*(?:pub(?:\([^)]*\))?\s+)?(?:async\s+)?fn\s+(\w+)\s*\('
 )
+# Every live attribute, parsed or not: a marker MARKER cannot tie to its fn
+# (a comment or an unusual layout in between) must fail the run instead of
+# silently dropping that test from the lane.
+ANY_LIVE = re.compile(r'#\[\s*ignore\s*=\s*"live:')
 
 
-def marked_fns():
+def marked_fns(failures):
     names = []
     for path in sorted(SRC.rglob("*.rs")):
-        names += MARKER.findall(path.read_text())
+        source = path.read_text()
+        found = MARKER.findall(source)
+        attributes = len(ANY_LIVE.findall(source))
+        if attributes != len(found):
+            failures.append(
+                f"{path.relative_to(ROOT)}: {attributes} live attributes but only {len(found)} "
+                "tied to a fn; put the fn (or other attributes) directly after each marker"
+            )
+        names += found
     return names
 
 
@@ -38,10 +50,10 @@ def listed_ignored(binary):
 
 def main():
     binary = sys.argv[1]
-    fns = marked_fns()
+    failures = []
+    fns = marked_fns(failures)
     ignored = listed_ignored(binary)
     tests = []
-    failures = []
     for fn in fns:
         matches = [t for t in ignored if t.split("::")[-1] == fn]
         if len(matches) != 1:
@@ -78,4 +90,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

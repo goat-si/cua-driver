@@ -48,4 +48,3 @@ int main(void) {
   class_call("NSPasteboard", "generalPasteboard");
   return 0;
 }
-
