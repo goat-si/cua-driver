@@ -1152,6 +1152,84 @@ fn tab_child_metadata_preserves_unknown_and_absent() {
 }
 
 #[test]
+fn tab_content_preserves_shadowed_failures() {
+    const CONTENT: &str =
+        "AXTitle,AXPlaceholderValue,AXDescription,AXIdentifier,AXHelp,AXSubrole,AXRoleDescription";
+    for case in CASES {
+        let mut attrs = vec![Slot::Text(AttrStatus::Absent); 7];
+        attrs[0] = Slot::Text(AttrStatus::Known("Tab".into()));
+        attrs[2] = Slot::Text(if matches!(case, Case::AxFailure) {
+            AttrStatus::Failed {
+                error: kAXErrorFailure,
+                listed: AttributeListing::Listed,
+            }
+        } else {
+            case.text()
+        });
+        attrs[6] = Slot::Text(AttrStatus::Known("text entry".into()));
+        let mut steps = vec![
+            step("text 1 AXTitle", Reply::Text(Read::Absent)),
+            step("text 1 AXDescription", Reply::Text(Read::Absent)),
+            step("text 1 AXRoleDescription", Reply::Text(Read::Absent)),
+            step("timeout 2", Reply::Unit),
+            step(
+                "text 2 AXRole",
+                Reply::Text(Read::Known("AXTextArea".into())),
+            ),
+            step(
+                "text 2 AXRoleDescription",
+                Reply::Text(Read::Known("tab".into())),
+            ),
+            step("bool 2 AXSelected", Reply::Bool(Read::Known(false))),
+            step(
+                &format!("batch 2 {CONTENT}"),
+                Reply::Batch(Ok(Batch(attrs))),
+            ),
+        ];
+        if !matches!(case, Case::WrongType) {
+            steps.push(step(
+                "value 2",
+                Reply::Value(Ok(Some(StringishAttrValue {
+                    string_value: Some("visible".into()),
+                    state_value: "visible".into(),
+                }))),
+            ));
+        }
+        let fake = Fake::new(&[(1, 1, 1, &[2]), (2, 2, 2, &[])], steps);
+        let root = fake.handle(1);
+        let child = fake.handle(2);
+        let scope = crate::ax::evidence::EvidenceScope::start();
+        let ledger = SkipLedger::start();
+        let result = plan_macos_tab_strip_observed(
+            &fake,
+            &root,
+            "AXTabGroup",
+            std::slice::from_ref(&child),
+            &mut WalkBudget::nodes_only(10),
+            &mut false,
+        )
+        .into_walk_legacy();
+        assert!(result.is_none());
+        assert_eq!(ledger.finish(), matches!(case, Case::WrongType));
+        let observed = scope.finish(result);
+        fake.assert_consumed();
+        drop(child);
+        drop(root);
+        fake.assert_lifetimes(&[]);
+        let status = if matches!(case, Case::AxFailure) {
+            EvidenceStatus::Unknown(ReadFailure::Ax(kAXErrorFailure))
+        } else {
+            case.status()
+        };
+        assert_evidence(
+            &observed.evidence,
+            ReadSite::Content("AXDescription"),
+            status,
+        );
+    }
+}
+
+#[test]
 fn dense_visibility_sets_preserve_unknown_and_absent() {
     let fake = Fake::new(
         &[(1, 1, 1, &[])],
