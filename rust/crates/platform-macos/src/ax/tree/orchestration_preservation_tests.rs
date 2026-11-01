@@ -199,7 +199,7 @@ impl WalkOrchestration<super::walker_seam_tests::Fake> for ScenarioWalk<'_> {
     }
 }
 
-fn run_scenario(
+pub(super) fn run_scenario(
     scenario: super::environment_evidence_tests::Scenario,
     root: Option<(usize, &str)>,
 ) -> (CompletedWalk, Vec<String>, Vec<String>) {
@@ -283,7 +283,10 @@ fn production_root_creation_failure_follows_legacy_return() {
     assert_eq!(fields["observation_complete"], false);
     assert_eq!(
         fields["observation_incomplete_reasons"],
-        json!([{"kind":"unknown","detail":"not_asserted"}])
+        json!([
+            {"kind":"provider_failure","detail":"enumeration_error_unclassified"},
+            {"kind":"unknown","detail":"not_asserted"}
+        ])
     );
     assert!(fields.get("observation_scope_exclusions").is_none());
 }
@@ -513,6 +516,7 @@ fn production_duplicate_and_foreign_menus_keep_legacy_skip() {
 
 #[test]
 fn production_finalizer_samples_deadline_without_enforcing_it() {
+    let evidence = super::super::evidence::EvidenceScope::start();
     let ledger = SkipLedger::start();
     let (result, sampled) = finalize_with_deadline_sample(
         vec![],
@@ -525,6 +529,15 @@ fn production_finalizer_samples_deadline_without_enforcing_it() {
         |_| true,
     );
     assert!(sampled);
+    let mut payload = json!({});
+    result.walk.apply(&mut payload);
+    assert_eq!(
+        payload["observation_incomplete_reasons"],
+        json!([
+            {"kind":"budget","detail":"time_budget"},
+            {"kind":"unknown","detail":"not_asserted"}
+        ])
+    );
     assert!(!result.truncated);
     assert!(!result.nodes_skipped);
     assert_eq!(result.walk.stop, None);
@@ -534,6 +547,7 @@ fn production_finalizer_samples_deadline_without_enforcing_it() {
     );
     assert_eq!(result.tree_markdown, "");
     assert!(result.nodes.is_empty());
+    assert!(evidence.finish(()).evidence.is_empty());
 }
 
 #[test]

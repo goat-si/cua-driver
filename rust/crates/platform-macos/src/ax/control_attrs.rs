@@ -112,8 +112,9 @@ fn replay_after_batch_failure(
     kind: super::batch_attrs::BatchFailure,
     budget: &mut WalkBudget,
     batching_disabled: &mut bool,
+    expired: bool,
 ) -> bool {
-    match batch_failure_action(kind, budget.expired(), *batching_disabled) {
+    match batch_failure_action(kind, expired, *batching_disabled) {
         BatchFailureAction::DisableAndReplay => *batching_disabled = true,
         BatchFailureAction::Replay => {}
         BatchFailureAction::StopForTimeout => {
@@ -130,6 +131,7 @@ fn replay_after_batch_failure(
 fn read_within_deadline<T, B>(
     budget: &mut WalkBudget,
     batching_disabled: &mut bool,
+    deadline_expired: impl Fn(&WalkBudget) -> bool,
     batch: impl FnOnce() -> Result<B, BatchFailure>,
     from_slots: impl FnOnce(&B) -> T,
     singles: impl FnOnce(&Stepper) -> Option<T>,
@@ -138,24 +140,25 @@ fn read_within_deadline<T, B>(
         if !*batching_disabled {
             let batched = {
                 let budget = &*budget;
-                let expired = || budget.expired();
+                let expired = || deadline_expired(budget);
                 Stepper { expired: &expired }.read(batch)
             };
             match batched {
                 None => break 'read None,
                 Some(Ok(slots)) => break 'read Some(from_slots(&slots)),
                 Some(Err(kind)) => {
-                    if !replay_after_batch_failure(kind, budget, batching_disabled) {
+                    let expired = deadline_expired(budget);
+                    if !replay_after_batch_failure(kind, budget, batching_disabled, expired) {
                         return None;
                     }
                 }
             }
         }
         let budget = &*budget;
-        let expired = || budget.expired();
+        let expired = || deadline_expired(budget);
         singles(&Stepper { expired: &expired })
     };
-    if read.is_none() || budget.expired() {
+    if read.is_none() || deadline_expired(budget) {
         budget.stop_for_timeout();
         return None;
     }
@@ -170,7 +173,7 @@ pub(crate) fn frame_batched_with<S: AxTreeSource>(
     element: &S::Element,
     budget: &WalkBudget,
 ) -> Option<Option<[f64; 4]>> {
-    let expired = || budget.expired();
+    let expired = || source.budget_expired(budget);
     let step = Stepper { expired: &expired };
     let frame = match step.read(|| source.batch(element, &FRAME_ATTRIBUTES))? {
         Ok(slots) => Some(frame_from_slots(&slots)),
@@ -205,6 +208,7 @@ pub(crate) fn read_control_attrs_observed_with<S: AxTreeSource>(
     let result = read_within_deadline(
         budget,
         batching_disabled,
+        |budget| source.budget_expired(budget),
         || source.batch(element, &CONTROL_ATTRIBUTES),
         ControlAttrs::from_slots,
         |step| ControlAttrs::from_singles(&source, element, step),
@@ -237,6 +241,7 @@ pub(crate) fn read_frame_observed_with<S: AxTreeSource>(
     let result = read_within_deadline(
         budget,
         batching_disabled,
+        |budget| source.budget_expired(budget),
         || source.batch(element, &FRAME_ATTRIBUTES),
         frame_from_slots,
         |step| frame_from_singles(&source, element, step),
@@ -303,6 +308,7 @@ mod tests {
         let read = read_within_deadline(
             &mut expired,
             &mut disabled,
+            WalkBudget::expired,
             never,
             |_| 1,
             |_| panic!("no single read past the deadline"),
@@ -315,6 +321,7 @@ mod tests {
         let read = read_within_deadline(
             &mut expired,
             &mut disabled,
+            WalkBudget::expired,
             never,
             |_| 1,
             |step| step.read(|| panic!("no single read past the deadline")),
@@ -327,6 +334,7 @@ mod tests {
         let read = read_within_deadline(
             &mut live,
             &mut disabled,
+            WalkBudget::expired,
             never,
             |_| 1,
             |step| step.read(|| 7),
@@ -339,6 +347,7 @@ mod tests {
         let read = read_within_deadline(
             &mut live,
             &mut disabled,
+            WalkBudget::expired,
             || Err::<NativeBatch, _>(BatchFailure::Decode),
             |_| 1,
             |step| step.read(|| 9),
@@ -356,7 +365,8 @@ mod tests {
         assert!(!replay_after_batch_failure(
             BatchFailure::Decode,
             &mut expired,
-            &mut disabled
+            &mut disabled,
+            true
         ));
         assert_eq!(expired.outcome().reason(), Some("timeout"));
 
@@ -365,13 +375,15 @@ mod tests {
         assert!(replay_after_batch_failure(
             BatchFailure::Decode,
             &mut live,
-            &mut disabled
+            &mut disabled,
+            false
         ));
         assert!(!disabled, "a decode failure keeps batching on");
         assert!(replay_after_batch_failure(
             BatchFailure::WholeCall(kAXErrorNotImplemented),
             &mut live,
-            &mut disabled
+            &mut disabled,
+            false
         ));
         assert!(disabled, "an app that rejects batching is not asked again");
     }

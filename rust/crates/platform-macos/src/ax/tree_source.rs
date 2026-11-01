@@ -77,6 +77,11 @@ pub(crate) trait AxTreeSource {
     type Batch: TreeBatch;
     type ElementSet;
 
+    /// Observe the current walk deadline without making an AX request.
+    fn budget_expired(&self, budget: &cua_driver_core::walk_budget::WalkBudget) -> bool {
+        budget.expired()
+    }
+
     fn key(&self, element: &Self::Element) -> usize;
     fn set_messaging_timeout(&self, element: &Self::Element);
     fn set_optional_timeout(&self, element: &Self::Element, seconds: f32);

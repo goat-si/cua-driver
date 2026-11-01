@@ -18,6 +18,7 @@ struct State {
     children: HashMap<usize, Vec<usize>>,
     handles: HashMap<usize, usize>,
     snapshot_credits: HashMap<usize, usize>,
+    scripted_clock: Option<Rc<std::cell::Cell<std::time::Instant>>>,
 }
 
 pub(super) struct Handle {
@@ -140,6 +141,15 @@ impl AxTreeSource for Fake {
     type Element = Handle;
     type Batch = Batch;
     type ElementSet = Vec<usize>;
+    fn budget_expired(&self, budget: &WalkBudget) -> bool {
+        let state = self.state.borrow();
+        match &state.scripted_clock {
+            Some(clock) => budget.time_limit().is_some_and(|limit| {
+                clock.get().duration_since(super::scripted_clock_origin()) >= limit
+            }),
+            None => budget.expired(),
+        }
+    }
     fn key(&self, e: &Handle) -> usize {
         e.id
     }
@@ -324,11 +334,15 @@ impl Fake {
                 children,
                 handles: HashMap::new(),
                 snapshot_credits: HashMap::new(),
+                scripted_clock: None,
             })),
         }
     }
     pub(super) fn trace(&self) -> Vec<String> {
         self.state.borrow().trace.clone()
+    }
+    pub(super) fn set_scripted_clock(&self, clock: Rc<std::cell::Cell<std::time::Instant>>) {
+        self.state.borrow_mut().scripted_clock = Some(clock);
     }
     pub(super) fn assert_lifetimes(&self, snapshot_credits: &[(usize, usize)]) {
         let state = self.state.borrow();
@@ -395,7 +409,7 @@ fn run_fake_inner(
         &mut deferred,
         &mut claims,
     );
-    let (lines, nodes, offscreen) = finish_deferred(
+    let (mut lines, mut nodes, offscreen) = finish_deferred(
         source,
         lines,
         nodes,
@@ -408,6 +422,11 @@ fn run_fake_inner(
         include_web_content,
         claims,
     );
+    record_attribute_failures(&mut budget);
+    if !exhaustive_nodes() {
+        let reasons = fold_with_owned_items(&mut lines, &mut nodes);
+        merge_fold_reasons(&mut budget, reasons);
+    }
     let outcome = budget.outcome();
     finalize_walk(
         lines,
@@ -570,6 +589,8 @@ fn collapsed_menu_keeps_legacy_skip() {
             kAXErrorCannotComplete,
         )),
     ] {
+        let collapsed_reason = !matches!(&selection, Read::Known(false));
+        let read_failed = matches!(&selection, Read::Unknown(_));
         let source = Fake::new(
             &[(1, 1, 1, &[2]), (2, 2, 2, &[])],
             vec![
@@ -604,6 +625,23 @@ fn collapsed_menu_keeps_legacy_skip() {
         source.assert_lifetimes(&[(1, 1)]);
         assert!(result.nodes_skipped);
         assert!(!result.truncated);
+        let mut payload = serde_json::json!({});
+        result.walk.apply(&mut payload);
+        let reasons = payload["observation_incomplete_reasons"]
+            .as_array()
+            .unwrap();
+        assert_eq!(
+            reasons.contains(
+                &serde_json::json!({"kind":"policy_omission", "detail":"collapsed_menu"})
+            ),
+            collapsed_reason
+        );
+        assert_eq!(
+            reasons.contains(
+                &serde_json::json!({"kind":"provider_failure", "detail":"attribute_read_failed"})
+            ),
+            read_failed
+        );
         assert_eq!(
             result.tree_markdown,
             "- [0] AXMenuBarItem \"File\" [actions=[press]]\n"
@@ -1762,8 +1800,7 @@ fn unindexed_cell_survives_owned_item_folding() {
 }
 // Baseline 36279fdc: a large generic container without visibility lists
 // reads child frames, lazily reads its surface once, and summarizes all 50.
-#[test]
-fn large_container_reads_surface_clip_lazily_once() {
+pub(super) fn large_container_fixture() -> TreeWalkResult {
     let ids: Vec<usize> = (2..52).collect();
     let mut node_specs: Vec<(usize, usize, usize, &[usize])> = vec![(1, 1, 1, ids.as_slice())];
     node_specs.extend(ids.iter().map(|&id| (id, id, id, &[][..])));
@@ -1872,6 +1909,12 @@ fn large_container_reads_surface_clip_lazily_once() {
         &trace[trace.len() - 3..],
         ["release 51", "release 2", "release 1"]
     );
+    result
+}
+
+#[test]
+fn large_container_reads_surface_clip_lazily_once() {
+    let _ = large_container_fixture();
 }
 
 // Baseline 36279fdc: vertical then horizontal element/role/value reads are
@@ -1966,8 +2009,7 @@ pub(crate) fn scroll_area_preserves_position_labels_and_read_order() {
 }
 // Baseline 36279fdc: ten tabs are planned with their selection metadata,
 // nine are omitted and the selected tab keeps its actionable index.
-#[test]
-fn tab_compaction_keeps_summary_indices_and_skip() {
+pub(super) fn tab_compaction_fixture() -> TreeWalkResult {
     let ids: Vec<usize> = (2..12).collect();
     let mut nodes: Vec<(usize, usize, usize, &[usize])> = vec![(1, 1, 1, ids.as_slice())];
     nodes.extend(ids.iter().map(|&id| (id, id, id, &[][..])));
@@ -2072,6 +2114,12 @@ fn tab_compaction_keeps_summary_indices_and_skip() {
             "release 1"
         ]
     );
+    result
+}
+
+#[test]
+fn tab_compaction_keeps_summary_indices_and_skip() {
+    let _ = tab_compaction_fixture();
 }
 // Baseline 36279fdc: nested traversal restores menu, exhaustive and dense
 // modes and its skip ledger without leaking its skipped web subtree outward.
@@ -2291,7 +2339,7 @@ pub(crate) fn canonical_walk_fixture(case: &str) -> (TreeWalkResult, Vec<String>
         step("timeout 1", Reply::Unit),
         step("text 1 AXRole", Reply::Text(role_reply)),
     ];
-    if case == "u25" {
+    if matches!(case, "u25" | "recovered") {
         steps.push(step(
             &format!("batch 1 {CONTENT}"),
             Reply::Batch(Err(BatchFailure::WholeCall(kAXErrorAttributeUnsupported))),
@@ -2322,7 +2370,7 @@ pub(crate) fn canonical_walk_fixture(case: &str) -> (TreeWalkResult, Vec<String>
         "actions 1",
         Reply::Actions(Read::Known(vec!["AXPress".into()])),
     ));
-    if case == "u25" {
+    if matches!(case, "u25" | "recovered") {
         steps.extend([
             step("bool 1 AXEnabled", Reply::Bool(Read::Absent)),
             step("position 1", Reply::Point(Read::Absent)),

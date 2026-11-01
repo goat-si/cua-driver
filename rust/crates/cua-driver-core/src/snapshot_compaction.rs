@@ -575,6 +575,13 @@ pub trait CompactableNode {
     fn boundary_mut(&mut self) -> Option<&mut Option<NodeBoundary>> {
         None
     }
+
+    /// Preserve a legacy output that has no node-boundary slot. Folded
+    /// boundary reasons then move to the enclosing read instead of a node.
+    /// Implementations opting in must render lines without literal newlines.
+    fn fold_to_read_level_without_boundary(&self) -> bool {
+        false
+    }
 }
 
 fn plain_component(text: &str, limit: usize) -> bool {
@@ -717,11 +724,16 @@ fn fold_actionless_text_subtrees_impl<N: CompactableNode>(
             }
         }
         let ancestor = (0..i).rev().find(|&j| nodes[j].depth() < wrapper_depth);
-        if report_folds
-            && ancestor.is_none_or(|j| {
-                nodes[j].boundary_mut().is_none() || nodes[j].format_line().contains(['\n', '\r'])
-            })
-        {
+        let unavailable = report_folds
+            && match ancestor {
+                None => !nodes[i].fold_to_read_level_without_boundary(),
+                Some(j) => {
+                    (nodes[j].boundary_mut().is_none()
+                        && !nodes[j].fold_to_read_level_without_boundary())
+                        || nodes[j].format_line().contains(['\n', '\r'])
+                }
+            };
+        if unavailable {
             if let Some(boundary) = nodes[i].boundary_mut().and_then(|slot| slot.as_ref()) {
                 retain_boundary(boundary, None, &mut read_reasons);
             }
@@ -729,20 +741,23 @@ fn fold_actionless_text_subtrees_impl<N: CompactableNode>(
             continue;
         }
         if report_folds {
-            let parent = ancestor.expect("checked retained ancestor");
-            let direct = u32::from(original_parent[node_ids[i]] == Some(node_ids[parent]));
-            mark_folded_children(
-                nodes[parent].boundary_mut().expect("checked boundary slot"),
-                direct,
-            );
+            if let Some(parent) = ancestor {
+                let direct = u32::from(original_parent[node_ids[i]] == Some(node_ids[parent]));
+                if let Some(slot) = nodes[parent].boundary_mut() {
+                    mark_folded_children(slot, direct);
+                }
+            }
         }
         if let Some(boundary) = nodes[i].boundary_mut().and_then(Option::take) {
             let slot = ancestor.and_then(|j| nodes[j].boundary_mut());
             retain_boundary(&boundary, slot, &mut read_reasons);
         }
         if report_folds {
-            let parent = ancestor.expect("checked retained ancestor");
-            lines[parent].1 = line_with_boundary(&mut nodes[parent]);
+            if let Some(parent) = ancestor {
+                if nodes[parent].boundary_mut().is_some() {
+                    lines[parent].1 = line_with_boundary(&mut nodes[parent]);
+                }
+            }
         }
         for j in (i + 1)..sub_end {
             let new_d = nodes[j].depth().saturating_sub(1);
@@ -801,8 +816,12 @@ fn fold_after_elision<N: CompactableNode>(
     while idx < old_nodes.len() {
         // A fold marker must be retained as typed node evidence. Without a
         // boundary slot, leave these rows intact for the reason-aware path.
-        let can_retain_boundary =
-            !report_folds || old_nodes[idx].as_mut().unwrap().boundary_mut().is_some();
+        let can_retain_boundary = !report_folds
+            || old_nodes[idx].as_mut().unwrap().boundary_mut().is_some()
+            || old_nodes[idx]
+                .as_ref()
+                .unwrap()
+                .fold_to_read_level_without_boundary();
         let node_ref = old_nodes[idx].as_ref().unwrap();
         let base_depth = node_ref.depth();
         let mut sub_end = idx + 1;
@@ -998,7 +1017,7 @@ fn fold_after_elision<N: CompactableNode>(
                             read_reasons.sort_unstable();
                         }
                     }
-                    if report_folds {
+                    if report_folds && parent_node.boundary_mut().is_some() {
                         formatted = line_with_boundary(&mut parent_node);
                     }
                     out_lines.push((base_depth, formatted));
@@ -1526,6 +1545,91 @@ mod tests {
     fn u20_fold(nodes: &mut Vec<BoundaryNode>) -> Vec<BoundaryReason> {
         let mut lines = nodes.iter().map(|n| (n.depth(), n.format_line())).collect();
         fold_actionless_text_subtrees_with_reasons(&mut lines, nodes)
+    }
+
+    #[test]
+    fn read_level_only_fold_preserves_dropped_boundary_and_legacy_output() {
+        #[derive(Clone)]
+        struct ReadLevelNode {
+            inner: BoundaryNode,
+            slot: bool,
+        }
+        impl CompactableNode for ReadLevelNode {
+            fn element_index(&self) -> Option<usize> {
+                self.inner.element_index()
+            }
+            fn role(&self) -> &str {
+                self.inner.role()
+            }
+            fn depth(&self) -> usize {
+                self.inner.depth()
+            }
+            fn set_depth(&mut self, depth: usize) {
+                self.inner.set_depth(depth);
+            }
+            fn title(&self) -> Option<&str> {
+                self.inner.title()
+            }
+            fn value(&self) -> Option<&str> {
+                self.inner.value()
+            }
+            fn set_value(&mut self, value: Option<String>) {
+                self.inner.set_value(value);
+            }
+            fn description(&self) -> Option<&str> {
+                self.inner.description()
+            }
+            fn format_line(&self) -> String {
+                self.inner.format_line()
+            }
+            fn boundary_mut(&mut self) -> Option<&mut Option<NodeBoundary>> {
+                self.slot.then_some(&mut self.inner.boundary)
+            }
+            fn fold_to_read_level_without_boundary(&self) -> bool {
+                true
+            }
+        }
+        let mut group = u20_node("AXGroup", 1, None, None);
+        group.boundary = Some(u20_boundary(
+            cua_driver_contract::IncompleteReasonDetail::TimeBudget,
+            1,
+        ));
+        let mut nodes = vec![
+            ReadLevelNode {
+                inner: u20_node("AXWindow", 0, Some(0), None),
+                slot: false,
+            },
+            ReadLevelNode {
+                inner: group,
+                slot: true,
+            },
+            ReadLevelNode {
+                inner: u20_node("AXStaticText", 2, None, Some("visible")),
+                slot: false,
+            },
+        ];
+        let mut lines: Vec<_> = nodes
+            .iter()
+            .map(|node| (node.depth(), node.format_line()))
+            .collect();
+        let mut legacy_nodes = nodes.clone();
+        let mut legacy_lines = lines.clone();
+        fold_actionless_text_subtrees(&mut legacy_lines, &mut legacy_nodes);
+        let reasons = fold_actionless_text_subtrees_with_reasons(&mut lines, &mut nodes);
+        assert_eq!(lines, legacy_lines);
+        assert_eq!(
+            nodes.iter().map(CompactableNode::depth).collect::<Vec<_>>(),
+            legacy_nodes
+                .iter()
+                .map(CompactableNode::depth)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            serde_json::to_value(reasons).unwrap(),
+            serde_json::json!([
+                {"kind":"budget", "detail":"time_budget"}
+            ])
+        );
     }
     #[test]
     fn u20b_r4_escaped_child_is_reported() {

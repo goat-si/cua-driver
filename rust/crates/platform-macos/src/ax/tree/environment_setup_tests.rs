@@ -1,6 +1,7 @@
 use super::{create_application_with, AxWalkEnvironment};
 use crate::ax::evidence::{EvidenceStatus, ReadSite};
 use std::cell::{Cell, RefCell};
+use std::rc::Rc;
 
 struct SingleRoot<'a> {
     source: &'a super::walker_seam_tests::Fake,
@@ -12,7 +13,7 @@ struct SingleRoot<'a> {
     menu_frames: Option<Option<Vec<[f64; 4]>>>,
     menu_replies: RefCell<std::collections::VecDeque<Option<super::MenuObservation<usize>>>>,
     menu_credits: RefCell<std::collections::HashMap<usize, super::walker_seam_tests::Handle>>,
-    clock: Cell<std::time::Instant>,
+    clock: Rc<Cell<std::time::Instant>>,
     menu_advance: Option<std::time::Duration>,
 }
 
@@ -259,7 +260,7 @@ pub(super) fn run_application_failure() -> (super::CompletedWalk, Vec<&'static s
         menu_frames: None,
         menu_replies: RefCell::new(Default::default()),
         menu_credits: RefCell::new(Default::default()),
-        clock: Cell::new(super::scripted_clock_origin()),
+        clock: Rc::new(Cell::new(super::scripted_clock_origin())),
         menu_advance: None,
     };
     let result = super::walk_with_environment(
@@ -296,7 +297,7 @@ pub(super) fn run_unscoped_source(
         menu_frames: None,
         menu_replies: RefCell::new(Default::default()),
         menu_credits: RefCell::new(Default::default()),
-        clock: Cell::new(super::scripted_clock_origin()),
+        clock: Rc::new(Cell::new(super::scripted_clock_origin())),
         menu_advance: None,
     };
     let result = super::walk_with_environment(
@@ -325,6 +326,95 @@ pub(super) fn run_unscoped_source(
             "release-app"
         ]
     );
+    result
+}
+
+pub(super) fn run_timed_source(
+    source: &super::walker_seam_tests::Fake,
+    clock: Rc<Cell<std::time::Instant>>,
+) -> super::CompletedWalk {
+    source.set_scripted_clock(clock.clone());
+    let environment = SingleRoot {
+        source,
+        root: RefCell::new(None),
+        trace: RefCell::new(vec![]),
+        create: true,
+        root_id: 2,
+        scoped: false,
+        menu_frames: None,
+        menu_replies: RefCell::new(Default::default()),
+        menu_credits: RefCell::new(Default::default()),
+        clock,
+        menu_advance: None,
+    };
+    let result = super::walk_with_environment(
+        source,
+        &environment,
+        super::WalkRequest {
+            pid: 42,
+            window_id: None,
+            query: None,
+            max_depth: 10,
+            include_web_content: true,
+        },
+        cua_driver_core::walk_budget::WalkBudget::new(1_000_000, 10),
+    );
+    assert!(environment.root.borrow().is_none());
+    result
+}
+
+pub(super) fn run_late_final_enumeration() -> super::CompletedWalk {
+    use super::walker_seam_tests::{step, Fake, Reply};
+    use super::walker_test_support::{Batch, Slot};
+    use crate::ax::content_attrs::AttrStatus;
+    use crate::ax::tree_source::Read;
+    use cua_driver_core::walk_budget::WalkBudget;
+    let clock = Rc::new(Cell::new(super::scripted_clock_origin()));
+    let finish_clock = clock.clone();
+    let source = Fake::new(&[(2, 2, 2, &[])], vec![
+        step("timeout 2", Reply::Unit),
+        step("text 2 AXRole", Reply::Text(Read::Known("AXWindow".into()))),
+        step("batch 2 AXTitle,AXPlaceholderValue,AXDescription,AXIdentifier,AXHelp,AXSubrole,AXRoleDescription", Reply::Batch(Ok(Batch(vec![Slot::Text(AttrStatus::Absent); 7])))),
+        step("value 2", Reply::Value(Ok(None))),
+        step("actions 2", Reply::Actions(Read::Known(vec![]))),
+        step("batch 2 AXPosition,AXSize", Reply::Batch(Ok(Batch(vec![Slot::Point(None), Slot::Size(None)])))),
+        step("children 2", Reply::Nested(Box::new(move || {
+            finish_clock.set(super::scripted_clock_origin() + std::time::Duration::from_millis(2_000_000));
+        }))),
+        step("children 2", Reply::Children(Read::Absent)),
+    ]);
+    let environment = SingleRoot {
+        source: &source,
+        root: RefCell::new(None),
+        trace: RefCell::new(vec![]),
+        create: true,
+        root_id: 2,
+        scoped: false,
+        menu_frames: None,
+        menu_replies: RefCell::new(Default::default()),
+        menu_credits: RefCell::new(Default::default()),
+        clock,
+        menu_advance: None,
+    };
+    let result = super::walk_with_environment(
+        &source,
+        &environment,
+        super::WalkRequest {
+            pid: 42,
+            window_id: None,
+            query: None,
+            max_depth: 10,
+            include_web_content: true,
+        },
+        WalkBudget::new(1_000_000, 10),
+    );
+    assert_eq!(result.completion.final_deadline_sample, Some(true));
+    assert!(environment.root.borrow().is_none());
+    assert!(source
+        .trace()
+        .ends_with(&["children 2".into(), "release 2".into()]));
+    source.assert_consumed();
+    source.assert_lifetimes(&[]);
     result
 }
 
@@ -405,7 +495,7 @@ fn run_published_menu_case_inner(
             .into(),
         ),
         menu_credits: RefCell::new(Default::default()),
-        clock: Cell::new(super::scripted_clock_origin()),
+        clock: Rc::new(Cell::new(super::scripted_clock_origin())),
         menu_advance: None,
     };
     let observed = super::walk_with_environment(
@@ -461,7 +551,7 @@ fn run_menu_case_with_budget(
         menu_frames: Some(frames),
         menu_replies: RefCell::new(replies.into()),
         menu_credits: RefCell::new(Default::default()),
-        clock: Cell::new(super::scripted_clock_origin()),
+        clock: Rc::new(Cell::new(super::scripted_clock_origin())),
         menu_advance,
     };
     let observed = super::walk_with_environment(
@@ -528,7 +618,7 @@ fn shared_entry_walks_fake_root_and_releases_its_credit() {
         menu_frames: None,
         menu_replies: RefCell::new(Default::default()),
         menu_credits: RefCell::new(Default::default()),
-        clock: Cell::new(super::scripted_clock_origin()),
+        clock: Rc::new(Cell::new(super::scripted_clock_origin())),
         menu_advance: None,
     };
     let observed = super::walk_with_environment(
@@ -597,7 +687,7 @@ fn shared_entry_preserves_application_creation_failure() {
         menu_frames: None,
         menu_replies: RefCell::new(Default::default()),
         menu_credits: RefCell::new(Default::default()),
-        clock: Cell::new(super::scripted_clock_origin()),
+        clock: Rc::new(Cell::new(super::scripted_clock_origin())),
         menu_advance: None,
     };
     let observed = super::walk_with_environment(
@@ -637,6 +727,7 @@ fn shared_entry_preserves_application_creation_failure() {
 #[test]
 fn final_deadline_sample_is_diagnostic_only() {
     use cua_driver_core::walk_budget::WalkBudget;
+    let evidence = crate::ax::evidence::EvidenceScope::start();
     let budget = WalkBudget::nodes_only(100);
     let ledger = super::SkipLedger::start();
     let (result, sample) = super::finalize_with_deadline_sample(
@@ -654,6 +745,7 @@ fn final_deadline_sample_is_diagnostic_only() {
     assert_eq!(result.walk.stop, None);
     assert!(!result.nodes_skipped);
     assert!(result.tree_markdown.is_empty());
+    assert!(evidence.finish(()).evidence.is_empty());
 }
 
 #[test]

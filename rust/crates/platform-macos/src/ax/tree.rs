@@ -28,8 +28,11 @@ use core_foundation::{
     base::{CFEqual, CFGetTypeID, CFRelease, CFRetain, CFTypeRef, TCFType},
     string::CFString,
 };
+use cua_driver_contract::{IncompleteReason, IncompleteReasonDetail, IncompleteReasonKind};
+#[cfg(test)]
+use cua_driver_core::snapshot_compaction::fold_actionless_text_subtrees;
 use cua_driver_core::snapshot_compaction::{
-    compact_tab_strip, fold_actionless_text_subtrees, format_omitted_tabs_line,
+    compact_tab_strip, fold_actionless_text_subtrees_with_reasons, format_omitted_tabs_line,
     is_secure_text_field, redact_if_secure, CompactableNode, FieldSecurityMeta, TabChildMeta,
     TabStripCompaction, TAB_STRIP_COMPACTION_THRESHOLD,
 };
@@ -294,6 +297,9 @@ fn role_supports_value_addressing(role: &str) -> bool {
 }
 
 impl CompactableNode for AXNode {
+    fn fold_to_read_level_without_boundary(&self) -> bool {
+        true
+    }
     fn element_index(&self) -> Option<usize> {
         self.element_index
     }
@@ -504,7 +510,10 @@ pub(super) fn apply_owned_label_claims(nodes: &mut [AXNode], claims: Vec<(usize,
     }
 }
 
-fn fold_with_owned_items(lines: &mut Vec<(usize, String)>, nodes: &mut Vec<AXNode>) {
+fn fold_with_owned_items(
+    lines: &mut Vec<(usize, String)>,
+    nodes: &mut Vec<AXNode>,
+) -> Vec<IncompleteReason> {
     // The core folder only sees rendered depth; a missing item wrapper can
     // make unrelated text appear to belong to an unindexed row or cell.
     // Protect those owners during folding so their original children remain.
@@ -519,10 +528,77 @@ fn fold_with_owned_items(lines: &mut Vec<(usize, String)>, nodes: &mut Vec<AXNod
             }
         })
         .collect();
-    fold_actionless_text_subtrees(lines, nodes);
+    let reasons = fold_actionless_text_subtrees_with_reasons(lines, nodes);
     for node in nodes {
         if node.element_index == Some(usize::MAX) && protected.contains(&node.element_ptr) {
             node.element_index = None;
+        }
+    }
+    reasons
+}
+
+fn merge_fold_reasons(
+    budget: &mut WalkBudget,
+    reasons: impl IntoIterator<Item = IncompleteReason>,
+) {
+    for reason in reasons {
+        budget.record_skip(reason);
+    }
+}
+
+#[cfg(test)]
+mod folding_reason_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn folded_boundary_reaches_read_outcome_without_changing_tree_output() {
+        for count in [2, 7] {
+            let mut nodes = vec![role_only_node("AXRow".into(), 1, 0, None, false)];
+            for index in 0..count {
+                let mut child = role_only_node("AXStaticText".into(), index + 2, 1, None, false);
+                child.value = Some(format!("item {index}"));
+                nodes.push(child);
+            }
+            let lines: Vec<_> = nodes
+                .iter()
+                .map(|node| (node.depth, format_node_line(node)))
+                .collect();
+            let mut old_nodes = nodes.clone();
+            let mut old_lines = lines.clone();
+            fold_actionless_text_subtrees(&mut old_lines, &mut old_nodes);
+            let expected_markdown = render_lines(&old_lines);
+            let scope = super::super::evidence::EvidenceScope::start();
+            let (result, _) = finalize_with_deadline_sample(
+                lines,
+                nodes,
+                vec![],
+                None,
+                WalkBudget::nodes_only(100),
+                SkipLedger::start(),
+                None,
+                |_| false,
+            );
+            assert_eq!(result.tree_markdown, expected_markdown);
+            assert_eq!(
+                result
+                    .nodes
+                    .iter()
+                    .map(|node| (&node.role, &node.value, node.depth, node.element_index))
+                    .collect::<Vec<_>>(),
+                old_nodes
+                    .iter()
+                    .map(|node| (&node.role, &node.value, node.depth, node.element_index))
+                    .collect::<Vec<_>>()
+            );
+            let mut output = json!({});
+            result.walk.apply(&mut output);
+            let truncated = output["observation_incomplete_reasons"]
+                .as_array()
+                .unwrap()
+                .contains(&json!({"kind":"policy_omission", "detail":"folded_text_truncated"}));
+            assert_eq!(truncated, count > 6);
+            let _ = scope.finish(());
         }
     }
 }
@@ -1217,6 +1293,10 @@ where
 
     {
         let Some(app_elem) = create_application_with(environment, pid).into_walk_legacy() else {
+            budget.record_skip(IncompleteReason {
+                kind: IncompleteReasonKind::ProviderFailure,
+                detail: IncompleteReasonDetail::EnumerationErrorUnclassified,
+            });
             return (
                 TreeWalkResult {
                     offscreen_rows: Vec::new(),
@@ -1273,6 +1353,10 @@ where
                 .menu_frames(pid)
                 .into_walk_legacy()
                 .unwrap_or_else(|| {
+                    budget.record_skip(IncompleteReason {
+                        kind: IncompleteReasonKind::ProviderFailure,
+                        detail: IncompleteReasonDetail::EnumerationErrorUnclassified,
+                    });
                     budget.stop_for_timeout();
                     Vec::new()
                 }),
@@ -1288,11 +1372,21 @@ where
             })
             .flatten();
         if !menu_frames.is_empty() && discovery.is_none() {
+            if !budget.outcome().truncated() || environment.budget_expired(&budget) {
+                budget.record_cut(IncompleteReason {
+                    kind: IncompleteReasonKind::Budget,
+                    detail: IncompleteReasonDetail::TimeBudget,
+                });
+            }
             budget.stop_for_timeout();
         }
         if let (Some(wid), Some(deadline)) = (window_id, discovery) {
             let mut incomplete = menu_frames.len() > super::context_menus::MAX_MENU_WINDOWS;
             if incomplete {
+                budget.record_skip(IncompleteReason {
+                    kind: IncompleteReasonKind::ProviderFailure,
+                    detail: IncompleteReasonDetail::EnumerationErrorUnclassified,
+                });
                 super::evidence::record_status(
                     None,
                     super::evidence::ReadSite::MenuWindowCap,
@@ -1314,6 +1408,16 @@ where
                 else {
                     // Nothing readable reached a menu in this menu window.
                     incomplete = true;
+                    budget.record_skip(IncompleteReason {
+                        kind: IncompleteReasonKind::ProviderFailure,
+                        detail: IncompleteReasonDetail::EnumerationErrorUnclassified,
+                    });
+                    if environment.budget_expired(&budget) {
+                        budget.record_cut(IncompleteReason {
+                            kind: IncompleteReasonKind::Budget,
+                            detail: IncompleteReasonDetail::TimeBudget,
+                        });
+                    }
                     continue;
                 };
                 // Released with the other top-level elements after the walk.
@@ -1329,6 +1433,10 @@ where
                     super::context_menus::MenuDecision::Skip => continue,
                     super::context_menus::MenuDecision::Unknown => {
                         incomplete = true;
+                        budget.record_untrusted(IncompleteReason {
+                            kind: IncompleteReasonKind::Unknown,
+                            detail: IncompleteReasonDetail::ScopeMismatch,
+                        });
                         continue;
                     }
                 }
@@ -1403,16 +1511,28 @@ fn scripted_clock_origin() -> Instant {
 
 #[allow(clippy::too_many_arguments)]
 fn finalize_with_deadline_sample(
-    lines: Vec<(usize, String)>,
-    nodes: Vec<AXNode>,
+    mut lines: Vec<(usize, String)>,
+    mut nodes: Vec<AXNode>,
     offscreen_rows: Vec<dense_rows::OffscreenRows>,
     query: Option<&str>,
-    budget: WalkBudget,
+    mut budget: WalkBudget,
     ledger: SkipLedger,
     window_scope: Option<WindowScope>,
     sample: impl FnOnce(&WalkBudget) -> bool,
 ) -> (TreeWalkResult, bool) {
     let final_deadline_sample = sample(&budget);
+    record_attribute_failures(&mut budget);
+    record_discovery_failures(&mut budget, window_scope.as_ref());
+    if final_deadline_sample {
+        budget.record_cut(IncompleteReason {
+            kind: IncompleteReasonKind::Budget,
+            detail: IncompleteReasonDetail::TimeBudget,
+        });
+    }
+    if !exhaustive_nodes() {
+        let reasons = fold_with_owned_items(&mut lines, &mut nodes);
+        merge_fold_reasons(&mut budget, reasons);
+    }
     let walk = budget.outcome();
     let nodes_skipped = ledger.finish();
     (
@@ -1427,6 +1547,166 @@ fn finalize_with_deadline_sample(
         ),
         final_deadline_sample,
     )
+}
+
+fn record_discovery_failures(budget: &mut WalkBudget, scope: Option<&WindowScope>) {
+    use super::evidence::{current_evidence, EvidenceStatus, ReadSite};
+    let evidence = current_evidence();
+    let application = evidence.iter().find_map(|entry| {
+        (entry.site == ReadSite::ApplicationRoot && entry.status == EvidenceStatus::Known)
+            .then_some(entry.owner)
+            .flatten()
+    });
+    let unresolved = scope.is_some_and(|scope| !scope.is_matched());
+    if unresolved {
+        budget.record_untrusted(IncompleteReason {
+            kind: IncompleteReasonKind::Unknown,
+            detail: IncompleteReasonDetail::ScopeMismatch,
+        });
+    }
+    if evidence
+        .iter()
+        .rev()
+        .find(|entry| {
+            matches!(
+                entry.site,
+                ReadSite::ProviderEnablement | ReadSite::ProviderCachedEnablement
+            )
+        })
+        .is_some_and(|entry| {
+            matches!(
+                entry.status,
+                EvidenceStatus::Unavailable | EvidenceStatus::Unknown(_)
+            )
+        })
+    {
+        budget.record_untrusted(IncompleteReason {
+            kind: IncompleteReasonKind::ProviderFailure,
+            detail: IncompleteReasonDetail::UntrustedProvider,
+        });
+    }
+    for (index, entry) in evidence.iter().enumerate() {
+        let detail = match (entry.site, entry.status) {
+            (ReadSite::Children, EvidenceStatus::Unknown(_))
+                if entry.owner == application && application.is_some() =>
+            {
+                Some(IncompleteReasonDetail::ChildEnumerationFailed)
+            }
+            (
+                ReadSite::TopLevelWindows | ReadSite::TopLevelWindowsMember,
+                EvidenceStatus::Unknown(_),
+            ) => Some(IncompleteReasonDetail::EnumerationErrorUnclassified),
+            (ReadSite::TopLevelRemoteWindow, EvidenceStatus::Unavailable) if unresolved => {
+                Some(IncompleteReasonDetail::EnumerationErrorUnclassified)
+            }
+            (ReadSite::RecoveryHit, EvidenceStatus::Unknown(_)) if unresolved => {
+                Some(IncompleteReasonDetail::EnumerationErrorUnclassified)
+            }
+            (
+                ReadSite::ScopeCandidate("AXRole" | "AXSubrole" | "AXIdentifier")
+                | ReadSite::RecoverySheetRole,
+                EvidenceStatus::Unknown(_),
+            ) if unresolved => Some(IncompleteReasonDetail::AttributeReadFailed),
+            (
+                ReadSite::MenuFrame | ReadSite::MenuOwnership,
+                EvidenceStatus::Unavailable | EvidenceStatus::Unknown(_),
+            ) => Some(IncompleteReasonDetail::AttributeReadFailed),
+            _ => None,
+        };
+        let Some(detail) = detail else { continue };
+        let retry_site = if entry.site == ReadSite::TopLevelWindowsMember {
+            ReadSite::TopLevelWindows
+        } else {
+            entry.site
+        };
+        let recovered = evidence[index + 1..].iter().any(|later| {
+            later.owner == entry.owner
+                && later.site == retry_site
+                && matches!(later.status, EvidenceStatus::Known | EvidenceStatus::Absent)
+        });
+        if !recovered {
+            budget.record_skip(IncompleteReason {
+                kind: IncompleteReasonKind::ProviderFailure,
+                detail,
+            });
+        }
+    }
+    if unresolved
+        && evidence.iter().any(|entry| {
+            entry.site == ReadSite::RecoveryDeadline
+                && entry.status == EvidenceStatus::DeadlineExpired
+        })
+    {
+        budget.record_cut(IncompleteReason {
+            kind: IncompleteReasonKind::Budget,
+            detail: IncompleteReasonDetail::TimeBudget,
+        });
+    }
+}
+
+/// Different probes of the same attribute share a key, while writability and
+/// action probes stay separate from the attributes they may act on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AttributeReadKey {
+    Attribute(&'static str),
+    ActionNames,
+    ValueSettable,
+    SelectedSettable,
+    CombinedFrame,
+}
+
+fn attribute_read_key(site: super::evidence::ReadSite) -> Option<AttributeReadKey> {
+    use super::evidence::ReadSite;
+    match site {
+        ReadSite::Role => Some(AttributeReadKey::Attribute("AXRole")),
+        ReadSite::ActionNames => Some(AttributeReadKey::ActionNames),
+        ReadSite::ValueSettable => Some(AttributeReadKey::ValueSettable),
+        ReadSite::SelectedSettable => Some(AttributeReadKey::SelectedSettable),
+        ReadSite::MenuSelected => Some(AttributeReadKey::Attribute("AXSelected")),
+        ReadSite::Frame("scroll") => Some(AttributeReadKey::CombinedFrame),
+        ReadSite::Content(name)
+        | ReadSite::Control(name)
+        | ReadSite::Frame(name)
+        | ReadSite::Scrollbar(name)
+        | ReadSite::Tab(name) => Some(AttributeReadKey::Attribute(name)),
+        _ => None,
+    }
+}
+
+/// Attribute failures are distinct from an unsupported or absent attribute.
+/// Batch-call failures are excluded here: their individual replayed reads
+/// carry the eventual result, and a fully recovered replay is not incomplete.
+fn record_attribute_failures(budget: &mut WalkBudget) {
+    use super::evidence::{current_evidence, EvidenceStatus, ReadSite};
+    let evidence = current_evidence();
+    let failed = evidence.iter().enumerate().any(|(index, entry)| {
+        let Some(key) = attribute_read_key(entry.site) else {
+            return false;
+        };
+        let read_failed = matches!(entry.status, EvidenceStatus::Unknown(_))
+            || (key == AttributeReadKey::Attribute("AXRole")
+                && (entry.status == EvidenceStatus::Unavailable
+                    || (entry.site == ReadSite::Role && entry.status == EvidenceStatus::Absent)));
+        if !read_failed {
+            return false;
+        }
+        let Some(owner) = entry.owner else {
+            return true;
+        };
+        !evidence[index + 1..].iter().any(|later| {
+            later.owner == Some(owner)
+                && attribute_read_key(later.site) == Some(key)
+                && (later.status == EvidenceStatus::Known
+                    || (key != AttributeReadKey::Attribute("AXRole")
+                        && later.status == EvidenceStatus::Absent))
+        })
+    });
+    if failed {
+        budget.record_skip(IncompleteReason {
+            kind: IncompleteReasonKind::ProviderFailure,
+            detail: IncompleteReasonDetail::AttributeReadFailed,
+        });
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1518,6 +1798,10 @@ fn finish_deferred<S: AxTreeSource>(
         });
         if skipped {
             note_skipped();
+            budget.record_skip(IncompleteReason {
+                kind: IncompleteReasonKind::PolicyOmission,
+                detail: IncompleteReasonDetail::Offscreen,
+            });
         }
         (lines, nodes, offscreen_rows) = dense_rows::splice_and_renumber(lines, nodes, deferred);
     }
@@ -1535,11 +1819,6 @@ fn finalize_walk(
     nodes_skipped: bool,
     window_scope: Option<WindowScope>,
 ) -> TreeWalkResult {
-    // Folding merges text rows into their parent; an exhaustive walk keeps
-    // every row it visited.
-    if !exhaustive_nodes() {
-        fold_with_owned_items(&mut lines, &mut nodes);
-    }
     nodes.retain(|n| n.role != "AXTabStripSummary");
     let mut line_nodes = align_line_nodes(&lines, &nodes);
     prune_echo_text_rows(&mut lines, &mut line_nodes, &nodes);
@@ -2014,6 +2293,10 @@ fn walk_element<S: AxTreeSource>(
 ) {
     if depth > max_depth {
         note_skipped();
+        budget.record_cut(IncompleteReason {
+            kind: IncompleteReasonKind::PolicyOmission,
+            detail: IncompleteReasonDetail::DepthLimit,
+        });
         return;
     }
     // Node and time budget: a refused node is counted as discovered but not
@@ -2044,10 +2327,21 @@ fn walk_element<S: AxTreeSource>(
         super::evidence::ReadSite::Role,
         role_status,
     );
+    if role_read && (role.trim().is_empty() || role == "AXUnknown") {
+        super::evidence::record_status(
+            Some(element_key),
+            super::evidence::ReadSite::Role,
+            super::evidence::EvidenceStatus::Unavailable,
+        );
+    }
     let child_label_path = child_label_path(label_path, &role, parent_role, element_key);
     let in_web_content = in_web_content || is_web_content_role(&role);
     if in_web_content && !include_web_content {
         note_skipped();
+        budget.record_skip(IncompleteReason {
+            kind: IncompleteReasonKind::PolicyOmission,
+            detail: IncompleteReasonDetail::WebContent,
+        });
         return;
     }
 
@@ -2647,16 +2941,27 @@ fn walk_element<S: AxTreeSource>(
     // it: its items are reachable through invoke_menu or a query, and walking
     // them cost most of a read (94% of a Chrome window read in a VM check)
     // and ate the node budget before the window content.
-    let collapse_here = role == "AXMenuBarItem"
-        && MENUS_COLLAPSED.with(std::cell::Cell::get)
-        && known(
-            super::evidence::observe_read(
-                Some(element_key),
-                super::evidence::ReadSite::MenuSelected,
-                source.boolean(element, "AXSelected"),
-            )
-            .into_walk_legacy(),
-        ) != Some(true);
+    let collapse_here = if role == "AXMenuBarItem" && MENUS_COLLAPSED.with(std::cell::Cell::get) {
+        match super::evidence::observe_read(
+            Some(element_key),
+            super::evidence::ReadSite::MenuSelected,
+            source.boolean(element, "AXSelected"),
+        )
+        .into_walk_legacy()
+        {
+            Read::Known(true) => false,
+            Read::Known(false) => true,
+            Read::Absent | Read::Unknown(_) => {
+                budget.record_skip(IncompleteReason {
+                    kind: IncompleteReasonKind::PolicyOmission,
+                    detail: IncompleteReasonDetail::CollapsedMenu,
+                });
+                true
+            }
+        }
+    } else {
+        false
+    };
     let line = if role == "AXMenuBar" && MENUS_COLLAPSED.with(std::cell::Cell::get) {
         format!("{} {COLLAPSED_MENU_NOTE}", format_node_line(&node))
     } else {
@@ -2712,15 +3017,21 @@ fn walk_children<S: AxTreeSource>(
 ) {
     if depth > max_depth {
         // A tree that ends exactly at the cap is still complete.
-        match source.observed_children(element).into_walk_legacy() {
+        match observed_walk_children(source, element, budget) {
             Read::Absent => {}
             Read::Known(below) if below.is_empty() => {}
-            Read::Known(_below) => note_skipped(),
+            Read::Known(_below) => {
+                note_skipped();
+                budget.record_cut(IncompleteReason {
+                    kind: IncompleteReasonKind::PolicyOmission,
+                    detail: IncompleteReasonDetail::DepthLimit,
+                });
+            }
             Read::Unknown(_) => note_skipped(),
         }
         return;
     }
-    let children = match source.observed_children(element).into_walk_legacy() {
+    let children = match observed_walk_children(source, element, budget) {
         Read::Known(children) => children,
         Read::Absent => Vec::new(),
         Read::Unknown(_) => {
@@ -2757,6 +3068,10 @@ fn walk_children<S: AxTreeSource>(
             }
             if !tp.keep[index] {
                 note_skipped();
+                budget.record_skip(IncompleteReason {
+                    kind: IncompleteReasonKind::PolicyOmission,
+                    detail: IncompleteReasonDetail::InactiveTab,
+                });
                 continue;
             }
         }
@@ -2797,6 +3112,32 @@ fn walk_children<S: AxTreeSource>(
             ),
         }
     }
+}
+
+fn observed_walk_children<S: AxTreeSource>(
+    source: &S,
+    element: &S::Element,
+    budget: &mut WalkBudget,
+) -> Read<Vec<S::Element>> {
+    record_children_observation(source.observed_children(element), budget)
+}
+
+fn record_children_observation<T>(
+    observed: super::evidence::Observed<Read<T>>,
+    budget: &mut WalkBudget,
+) -> Read<T> {
+    use super::evidence::{EvidenceStatus, ReadSite};
+    if matches!(&observed.legacy, Read::Unknown(_))
+        || observed.evidence.iter().any(|entry| {
+            entry.site == ReadSite::Children && matches!(entry.status, EvidenceStatus::Unknown(_))
+        })
+    {
+        budget.record_skip(IncompleteReason {
+            kind: IncompleteReasonKind::ProviderFailure,
+            detail: IncompleteReasonDetail::ChildEnumerationFailed,
+        });
+    }
+    observed.into_walk_legacy()
 }
 
 fn plan_macos_tab_strip<S: AxTreeSource>(
@@ -4497,7 +4838,7 @@ pub(crate) fn test_fold_and_filter(mut nodes: Vec<AXNode>, query: &str) -> (Vec<
         .iter()
         .map(|node| (node.depth, format_node_line(node)))
         .collect();
-    fold_with_owned_items(&mut lines, &mut nodes);
+    let _ = fold_with_owned_items(&mut lines, &mut nodes);
     let mapping = align_line_nodes(&lines, &nodes);
     let rendered = filter_tree_with_original_text(&lines, &mapping, &nodes, query);
     (nodes, rendered)
@@ -4753,6 +5094,8 @@ mod selectable_row_tests {
     }
 }
 
+#[cfg(test)]
+mod completeness_tests;
 #[cfg(test)]
 mod evidence_preservation_tests;
 #[cfg(test)]
