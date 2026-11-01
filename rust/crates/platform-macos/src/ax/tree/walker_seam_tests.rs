@@ -23,6 +23,7 @@ struct State {
 pub(super) struct Handle {
     id: usize,
     state: Rc<RefCell<State>>,
+    owns_credit: bool,
 }
 
 impl Clone for Handle {
@@ -34,11 +35,15 @@ impl Clone for Handle {
         Self {
             id: self.id,
             state: self.state.clone(),
+            owns_credit: true,
         }
     }
 }
 impl Drop for Handle {
     fn drop(&mut self) {
+        if !self.owns_credit {
+            return;
+        }
         let mut state = self.state.borrow_mut();
         let count = state.handles.get_mut(&self.id).expect("live handle");
         assert!(*count > 0);
@@ -101,6 +106,7 @@ impl Fake {
         Handle {
             id,
             state: self.state.clone(),
+            owns_credit: true,
         }
     }
     pub(super) fn assert_consumed(&self) {
@@ -108,6 +114,26 @@ impl Fake {
             self.state.borrow().scripts.is_empty(),
             "unconsumed required operations"
         );
+    }
+}
+
+impl WalkElementBorrow<Fake> for Fake {
+    type Raw = usize;
+
+    fn with_walk_element<R>(
+        &self,
+        source: &Fake,
+        raw: usize,
+        f: impl FnOnce(&Fake, &Handle) -> R,
+    ) -> R {
+        assert!(Rc::ptr_eq(&self.state, &source.state));
+        assert!(self.state.borrow().handles.get(&raw).copied().unwrap_or(0) > 0);
+        let borrowed = Handle {
+            id: raw,
+            state: self.state.clone(),
+            owns_credit: false,
+        };
+        f(source, &borrowed)
     }
 }
 impl AxTreeSource for Fake {

@@ -2,6 +2,31 @@ use super::{create_application_with, AxWalkEnvironment};
 use crate::ax::evidence::{EvidenceStatus, ReadSite};
 use std::cell::RefCell;
 
+#[test]
+fn walker_element_borrow_preserves_credits_and_clone_ownership() {
+    use super::walker_seam_tests::Fake;
+    use super::WalkElementBorrow;
+    use crate::ax::tree_source::AxTreeSource;
+
+    let source = Fake::new(&[(7, 7, 7, &[])], vec![]);
+    let owned = source.handle(7);
+    source.with_walk_element(&source, 7, |source, borrowed| {
+        assert_eq!(source.key(borrowed), 7);
+        assert_eq!(source.trace(), ["adopt 7"]);
+        let retained = borrowed.clone();
+        assert_eq!(source.trace(), ["adopt 7", "retain 7"]);
+        drop(retained);
+    });
+    assert_eq!(source.trace(), ["adopt 7", "retain 7", "release 7"]);
+    drop(owned);
+    assert_eq!(
+        source.trace(),
+        ["adopt 7", "retain 7", "release 7", "release 7"]
+    );
+    source.assert_lifetimes(&[]);
+    source.assert_consumed();
+}
+
 struct Script {
     application: Option<usize>,
     trace: RefCell<Vec<&'static str>>,

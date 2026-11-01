@@ -791,6 +791,36 @@ trait AxWalkEnvironment {
 
 struct NativeWalkEnvironment;
 
+/// Expose an existing orchestration retain credit to the attribute walker.
+/// The borrow itself must neither acquire nor release a credit.
+trait WalkElementBorrow<S: AxTreeSource> {
+    type Raw: Copy;
+
+    fn with_walk_element<R>(
+        &self,
+        source: &S,
+        raw: Self::Raw,
+        f: impl FnOnce(&S, &S::Element) -> R,
+    ) -> R;
+}
+
+impl WalkElementBorrow<super::tree_source::native::NativeSource> for NativeWalkEnvironment {
+    type Raw = AXUIElementRef;
+
+    fn with_walk_element<R>(
+        &self,
+        source: &super::tree_source::native::NativeSource,
+        raw: Self::Raw,
+        f: impl FnOnce(
+            &super::tree_source::native::NativeSource,
+            &super::tree_source::NativeElement,
+        ) -> R,
+    ) -> R {
+        // The orchestration retains `raw` until the callback has returned.
+        unsafe { super::tree_source::native::with_borrowed(raw, |_, element| f(source, element)) }
+    }
+}
+
 impl AxWalkEnvironment for NativeWalkEnvironment {
     type Application = AXUIElementRef;
     type Element = AXUIElementRef;
@@ -972,30 +1002,34 @@ fn walk_tree_with_web_content_inner(
         // a large container needs it, bounds what is on screen for children
         // whose app does not list the visible ones.
         for child in walk_these {
-            super::tree_source::native::with_borrowed(child, |source, child| {
-                let surface = rows_windowed().then_some(source.key(child));
-                dense_rows::with_visible_clip(surface, || {
-                    walk_element(
-                        source,
-                        child,
-                        child,
-                        0,
-                        None,
-                        None,
-                        LabelPath::Inactive,
-                        false,
-                        &mut nodes,
-                        &mut lines,
-                        &mut index_counter,
-                        &mut budget,
-                        &mut batching_disabled,
-                        max_depth,
-                        include_web_content,
-                        &mut deferred,
-                        &mut label_claims,
-                    )
-                });
-            });
+            NativeWalkEnvironment.with_walk_element(
+                &super::tree_source::native::NativeSource,
+                child,
+                |source, child| {
+                    let surface = rows_windowed().then_some(source.key(child));
+                    dense_rows::with_visible_clip(surface, || {
+                        walk_element(
+                            source,
+                            child,
+                            child,
+                            0,
+                            None,
+                            None,
+                            LabelPath::Inactive,
+                            false,
+                            &mut nodes,
+                            &mut lines,
+                            &mut index_counter,
+                            &mut budget,
+                            &mut batching_disabled,
+                            max_depth,
+                            include_web_content,
+                            &mut deferred,
+                            &mut label_claims,
+                        )
+                    });
+                },
+            );
         }
 
         // An open context menu of the walked window hangs off a view that
@@ -1060,27 +1094,31 @@ fn walk_tree_with_web_content_inner(
                     }
                 }
                 walked_menus.extend(menu_frame);
-                super::tree_source::native::with_borrowed(menu, |source, menu| {
-                    walk_element(
-                        source,
-                        menu,
-                        menu,
-                        0,
-                        None,
-                        None,
-                        LabelPath::Inactive,
-                        false,
-                        &mut nodes,
-                        &mut lines,
-                        &mut index_counter,
-                        &mut budget,
-                        &mut batching_disabled,
-                        max_depth,
-                        include_web_content,
-                        &mut deferred,
-                        &mut label_claims,
-                    )
-                });
+                NativeWalkEnvironment.with_walk_element(
+                    &super::tree_source::native::NativeSource,
+                    menu,
+                    |source, menu| {
+                        walk_element(
+                            source,
+                            menu,
+                            menu,
+                            0,
+                            None,
+                            None,
+                            LabelPath::Inactive,
+                            false,
+                            &mut nodes,
+                            &mut lines,
+                            &mut index_counter,
+                            &mut budget,
+                            &mut batching_disabled,
+                            max_depth,
+                            include_web_content,
+                            &mut deferred,
+                            &mut label_claims,
+                        )
+                    },
+                );
             }
             if incomplete {
                 budget.stop_for_timeout();
