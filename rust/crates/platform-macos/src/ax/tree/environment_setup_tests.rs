@@ -66,6 +66,33 @@ impl AxWalkEnvironment for Script {
     fn now(&self) -> std::time::Instant {
         panic!("unexpected clock")
     }
+    fn enable(&self, _: i32, _: usize) -> crate::ax::evidence::Observed<()> {
+        panic!("unexpected enablement")
+    }
+    fn scope_candidate(
+        &self,
+        _: usize,
+    ) -> crate::ax::evidence::Observed<crate::ax::window_scope::TopLevelCandidate> {
+        panic!("unexpected candidate")
+    }
+    fn window_owner(&self, _: i32, _: u32) -> crate::windows::WindowOwner {
+        panic!("unexpected owner")
+    }
+    fn sheet_role(&self, _: usize) -> crate::ax::tree_source::Read<String> {
+        panic!("unexpected sheet role")
+    }
+    fn sheet_children(
+        &self,
+        _: usize,
+    ) -> crate::ax::evidence::Observed<crate::ax::tree_source::Read<Vec<usize>>> {
+        panic!("unexpected sheet children")
+    }
+    fn is_still_launching(&self, _: i32) -> bool {
+        panic!("unexpected launch query")
+    }
+    fn pause(&self, _: std::time::Duration) {
+        panic!("unexpected pause")
+    }
 }
 
 #[test]
@@ -97,4 +124,100 @@ fn application_setup_preserves_early_return_and_single_timeout() {
             }
         );
     }
+}
+
+#[test]
+fn root_resolution_retries_from_observations_without_extra_retain() {
+    use super::environment_evidence_tests::{Environment, Scenario};
+    use crate::ax::window_scope::WindowScope;
+    use cua_driver_core::walk_budget::WalkBudget;
+
+    let environment = Environment::new(Scenario::Launching);
+    let scope = crate::ax::evidence::EvidenceScope::start();
+    let (roots, walk, window_scope) = super::resolve_top_level_with(
+        &environment,
+        1,
+        42,
+        Some(99),
+        &mut WalkBudget::new(200, 100),
+    );
+    assert_eq!(roots, [2]);
+    assert_eq!(walk, [2]);
+    assert_eq!(window_scope, Some(WindowScope::Matched));
+    let observed = scope.finish(roots);
+    super::release_environment(&environment, observed.legacy);
+    environment.assert_released();
+    let trace = environment.trace.borrow();
+    assert_eq!(
+        trace
+            .iter()
+            .filter(|entry| entry.as_str() == "enable")
+            .count(),
+        2
+    );
+    assert_eq!(
+        trace
+            .iter()
+            .filter(|entry| entry.as_str() == "children")
+            .count(),
+        2
+    );
+    assert_eq!(
+        trace
+            .iter()
+            .filter(|entry| entry.as_str() == "owner")
+            .count(),
+        1
+    );
+    assert_eq!(
+        trace
+            .iter()
+            .filter(|entry| entry.as_str() == "pause 50")
+            .count(),
+        1
+    );
+    assert!(!trace.iter().any(|entry| entry.starts_with("retain ")));
+}
+
+#[test]
+fn sheet_scope_is_derived_from_observations_and_credits_transfer() {
+    use super::environment_evidence_tests::{Environment, Scenario};
+    use crate::ax::window_scope::WindowScope;
+    use cua_driver_core::walk_budget::WalkBudget;
+
+    let environment = Environment::new(Scenario::Sheet);
+    let scope = crate::ax::evidence::EvidenceScope::start();
+    let (roots, walk, window_scope) = super::resolve_top_level_with(
+        &environment,
+        1,
+        42,
+        Some(99),
+        &mut WalkBudget::nodes_only(100),
+    );
+    assert_eq!(roots, [3]);
+    assert_eq!(walk, [3]);
+    assert_eq!(
+        window_scope,
+        Some(WindowScope::SheetOfWindow {
+            parent_window_id: 55
+        })
+    );
+    let observed = scope.finish(roots);
+    assert!(
+        observed
+            .evidence
+            .iter()
+            .any(|entry| entry.site == ReadSite::RecoverySheetRole
+                && entry.owner == Some(3)
+                && entry.status == EvidenceStatus::Known),
+        "missing sheet role evidence"
+    );
+    super::release_environment(&environment, observed.legacy);
+    environment.assert_released();
+    let trace = environment.trace.borrow();
+    assert!(
+        trace.iter().position(|entry| entry == "sheet-children")
+            < trace.iter().position(|entry| entry == "release 2")
+    );
+    assert!(!trace.iter().any(|entry| entry.starts_with("retain ")));
 }

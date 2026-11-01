@@ -118,6 +118,7 @@ pub(crate) enum ReadSite {
     RecoveryParent,
     RecoveryWindowId,
     RecoveryRoot,
+    RecoverySheetRole,
     TopLevelWindows,
     TopLevelWindowsMember,
     TopLevelRemoteWindow,

@@ -774,6 +774,19 @@ trait AxWalkEnvironment {
     fn hit(&self, pid: i32, x: f64, y: f64) -> super::evidence::Observed<Option<Self::Element>>;
     fn parent(&self, element: Self::Element) -> Option<Self::Element>;
     fn now(&self) -> Instant;
+    fn enable(&self, pid: i32, application: Self::Application) -> super::evidence::Observed<()>;
+    fn scope_candidate(
+        &self,
+        element: Self::Element,
+    ) -> super::evidence::Observed<TopLevelCandidate>;
+    fn window_owner(&self, pid: i32, window_id: u32) -> crate::windows::WindowOwner;
+    fn sheet_role(&self, element: Self::Element) -> Read<String>;
+    fn sheet_children(
+        &self,
+        element: Self::Element,
+    ) -> super::evidence::Observed<Read<Vec<Self::Element>>>;
+    fn is_still_launching(&self, pid: i32) -> bool;
+    fn pause(&self, duration: std::time::Duration);
 }
 
 struct NativeWalkEnvironment;
@@ -844,6 +857,41 @@ impl AxWalkEnvironment for NativeWalkEnvironment {
     fn now(&self) -> Instant {
         Instant::now()
     }
+    fn enable(&self, pid: i32, application: Self::Application) -> super::evidence::Observed<()> {
+        unsafe { super::enablement::ensure_chromium_ax_enabled_observed(pid, application) }
+    }
+    fn scope_candidate(
+        &self,
+        element: Self::Element,
+    ) -> super::evidence::Observed<TopLevelCandidate> {
+        unsafe {
+            super::tree_source::native::with_borrowed(element, |source, child| {
+                scope_candidate_with(source, child, || ax_get_window_id(element))
+            })
+        }
+    }
+    fn window_owner(&self, pid: i32, window_id: u32) -> crate::windows::WindowOwner {
+        crate::windows::resolve_window_owner(pid, window_id)
+    }
+    fn sheet_role(&self, element: Self::Element) -> Read<String> {
+        unsafe {
+            super::tree_source::native::with_borrowed(element, |source, child| {
+                source.text(child, "AXRole")
+            })
+        }
+    }
+    fn sheet_children(
+        &self,
+        element: Self::Element,
+    ) -> super::evidence::Observed<Read<Vec<Self::Element>>> {
+        unsafe { super::tree_source::native::children_observed_raw(element) }
+    }
+    fn is_still_launching(&self, pid: i32) -> bool {
+        is_still_launching(pid)
+    }
+    fn pause(&self, duration: std::time::Duration) {
+        std::thread::sleep(duration)
+    }
 }
 
 fn create_application_with<E: AxWalkEnvironment>(
@@ -890,7 +938,7 @@ fn walk_tree_with_web_content_inner(
     let mut deferred = Vec::new();
     let offscreen_rows;
     let mut batching_disabled = false;
-    let mut window_scope: Option<WindowScope> = None;
+    let window_scope;
 
     unsafe {
         let Some(app_elem) =
@@ -909,75 +957,14 @@ fn walk_tree_with_web_content_inner(
             };
         };
 
-        // A window-scoped walk of an app that is still launching waits, within
-        // the caller's budget, for the app to answer AX (see `super::launch`).
-        let mut launch_wait = LaunchWait::new(budget.time_limit());
-        let (mut top_level, walk_these) = loop {
-            // Chromium/Electron apps (Arc, VS Code, Electron shells) ship their
-            // web-content AX tree OFF and only build it once an assistive client
-            // asks for it. Without this, the first walk of such an app returns an
-            // empty/title-bar-only tree (#1616). Flip the enablement attribute,
-            // then — only when the flip actually took and only the first time we
-            // see this process lifetime — let the asynchronously-built tree settle
-            // before we read it. Native Cocoa apps reject the attribute, so they
-            // pay no settle cost. This relies on the MAX_ELEMENTS node cap to keep
-            // the now-materialized (potentially large) tree bounded. An app that
-            // has not started answering AX rejects the flip without caching the
-            // refusal, so each launch-wait attempt asks again.
-            let attempt_started = Instant::now();
-            super::enablement::ensure_chromium_ax_enabled_observed(pid, app_elem)
-                .into_walk_legacy();
-
-            let recovery_deadline = budget
-                .time_limit()
-                .and_then(|limit| attempt_started.checked_add(limit));
-            let mut top_level = copy_top_level(app_elem, pid, window_id, recovery_deadline);
-
-            // Scope: keep non-window children (menu bar) + the target window —
-            // but ONLY once the target window has actually been identified. When
-            // nothing claims the requested id, `decide_window_scope` reports why
-            // and walks nothing; it must never fall back to "everything that isn't
-            // a window", which is how issue #2237 returned menu bars as panels.
-            let Some(wid) = window_id else {
-                let walk = top_level.clone();
-                break (top_level, walk);
-            };
-            let mut decision = scope_top_level(&top_level, pid, wid);
-            // A save sheet has a CGWindowID of its own but lives under its
-            // document's AXWindow. Walk that parent so the live sheet root and
-            // its controls are published instead of returning an empty panel.
-            if matches!(decision.scope, WindowScope::AxUnresolved { .. }) {
-                if let Some((parent_window_id, sheet)) = window_holding_sheet(&top_level, wid) {
-                    release_all(std::mem::take(&mut top_level));
-                    top_level.push(sheet);
-                    decision = ScopeDecision {
-                        scope: WindowScope::SheetOfWindow { parent_window_id },
-                        walk: vec![0],
-                    };
-                }
-            }
-            if matches!(decision.scope, WindowScope::AxUnresolved { .. }) {
-                match launch_wait.step(attempt_started, Instant::now(), || is_still_launching(pid))
-                {
-                    LaunchStep::Retry(pause) => {
-                        release_all(top_level);
-                        std::thread::sleep(pause);
-                        continue;
-                    }
-                    // Still unresolved because the app never finished
-                    // launching: say so instead of blaming the window scope.
-                    LaunchStep::TimedOut => budget.stop_for_app_lookup_timeout(),
-                    LaunchStep::Proceed => {}
-                }
-            }
-            let walk = decision
-                .walk
-                .iter()
-                .map(|&index| top_level[index])
-                .collect();
-            window_scope = Some(decision.scope);
-            break (top_level, walk);
-        };
+        let (mut top_level, walk_these, resolved_scope) = resolve_top_level_with(
+            &NativeWalkEnvironment,
+            app_elem,
+            pid,
+            window_id,
+            &mut budget,
+        );
+        window_scope = resolved_scope;
 
         let mut label_claims = Vec::new();
 
@@ -1231,27 +1218,70 @@ fn finalize_walk(
     }
 }
 
+/// Resolve requested scope from environment observations using the shared
+/// production decisions. Values returned for walking are borrowed aliases;
+/// only the first vector owns retain credits.
+fn resolve_top_level_with<E: AxWalkEnvironment>(
+    environment: &E,
+    app_elem: E::Application,
+    pid: i32,
+    window_id: Option<u32>,
+    budget: &mut WalkBudget,
+) -> (Vec<E::Element>, Vec<E::Element>, Option<WindowScope>) {
+    let mut launch_wait = LaunchWait::new(budget.time_limit());
+    loop {
+        let attempt_started = environment.now();
+        environment.enable(pid, app_elem).into_walk_legacy();
+        let recovery_deadline = budget
+            .time_limit()
+            .and_then(|limit| attempt_started.checked_add(limit));
+        let mut top_level =
+            top_level_with(environment, app_elem, pid, window_id, recovery_deadline);
+        let Some(wid) = window_id else {
+            let walk = top_level.clone();
+            return (top_level, walk, None);
+        };
+        let mut decision = scope_top_level_with(environment, &top_level, pid, wid);
+        if matches!(decision.scope, WindowScope::AxUnresolved { .. }) {
+            if let Some((parent_window_id, sheet)) =
+                window_holding_sheet_with(environment, &top_level, wid)
+            {
+                release_environment(environment, std::mem::take(&mut top_level));
+                top_level.push(sheet);
+                decision = ScopeDecision {
+                    scope: WindowScope::SheetOfWindow { parent_window_id },
+                    walk: vec![0],
+                };
+            }
+        }
+        if matches!(decision.scope, WindowScope::AxUnresolved { .. }) {
+            match launch_wait.step(attempt_started, environment.now(), || {
+                environment.is_still_launching(pid)
+            }) {
+                LaunchStep::Retry(pause) => {
+                    release_environment(environment, top_level);
+                    environment.pause(pause);
+                    continue;
+                }
+                LaunchStep::TimedOut => budget.stop_for_app_lookup_timeout(),
+                LaunchStep::Proceed => {}
+            }
+        }
+        let walk = decision
+            .walk
+            .iter()
+            .map(|&index| top_level[index])
+            .collect();
+        return (top_level, walk, Some(decision.scope));
+    }
+}
+
 /// The application's top-level AX children: `AXChildren` ∪ `AXWindows`.
 ///
 /// `AXChildren` omits windows when the app isn't frontmost (AppKit
 /// limitation); `AXWindows` returns the window list regardless of activation
 /// state, so the union is the only way to see background windows. Every
 /// returned element is retained; release them with [`release_all`].
-fn copy_top_level(
-    app_elem: AXUIElementRef,
-    pid: i32,
-    window_id: Option<u32>,
-    recovery_deadline: Option<Instant>,
-) -> Vec<AXUIElementRef> {
-    top_level_with(
-        &NativeWalkEnvironment,
-        app_elem,
-        pid,
-        window_id,
-        recovery_deadline,
-    )
-}
-
 fn top_level_with<E: AxWalkEnvironment>(
     environment: &E,
     app_elem: E::Application,
@@ -1468,18 +1498,17 @@ fn children_or_skipped<T>(read: Option<Vec<T>>) -> Vec<T> {
 }
 
 /// Decide which of `top_level` a walk scoped to `wid` covers.
-unsafe fn scope_top_level(top_level: &[AXUIElementRef], pid: i32, wid: u32) -> ScopeDecision {
+fn scope_top_level_with<E: AxWalkEnvironment>(
+    environment: &E,
+    top_level: &[E::Element],
+    pid: i32,
+    wid: u32,
+) -> ScopeDecision {
     let candidates: Vec<TopLevelCandidate> = top_level
         .iter()
-        .map(|&child| {
-            super::tree_source::native::with_borrowed(child, |source, element| {
-                scope_candidate_with(source, element, || ax_get_window_id(child)).into_walk_legacy()
-            })
-        })
+        .map(|&child| environment.scope_candidate(child).into_walk_legacy())
         .collect();
-    decide_window_scope(&candidates, wid, || {
-        crate::windows::resolve_window_owner(pid, wid)
-    })
+    decide_window_scope(&candidates, wid, || environment.window_owner(pid, wid))
 }
 
 fn scope_candidate_with<S: AxTreeSource>(
@@ -1544,38 +1573,72 @@ fn scope_candidate_with<S: AxTreeSource>(
 
 /// The CGWindowID of the app window holding an `AXSheet` whose own
 /// CGWindowID is `wid`.
-unsafe fn window_holding_sheet(
-    top_level: &[AXUIElementRef],
+fn window_holding_sheet_with<E: AxWalkEnvironment>(
+    environment: &E,
+    top_level: &[E::Element],
     wid: u32,
-) -> Option<(u32, AXUIElementRef)> {
+) -> Option<(u32, E::Element)> {
     for &window in top_level {
-        if copy_string_attr(window, "AXRole").as_deref() != Some("AXWindow") {
+        if sheet_role_with(environment, window).as_deref() != Some("AXWindow") {
             continue;
         }
-        let children = copy_children(window);
+        let children = match environment.sheet_children(window).into_walk_legacy() {
+            Read::Known(children) => children,
+            Read::Absent | Read::Unknown(_) => Vec::new(),
+        };
         let mut sheet = None;
         for child in children {
-            set_messaging_timeout(child);
+            environment.set_element_timeout(child);
             if sheet.is_none()
-                && copy_string_attr(child, "AXRole").as_deref() == Some("AXSheet")
-                && ax_get_window_id(child) == Some(wid)
+                && sheet_role_with(environment, child).as_deref() == Some("AXSheet")
+                && recovery_window_id_with(environment, child) == Some(wid)
             {
                 sheet = Some(child);
             } else {
-                CFRelease(child as CFTypeRef);
+                environment.release(child);
             }
         }
         if let Some(sheet) = sheet {
-            if let Some(parent) = ax_get_window_id(window).filter(|&parent| parent != wid) {
+            if let Some(parent) =
+                recovery_window_id_with(environment, window).filter(|&parent| parent != wid)
+            {
                 return Some((parent, sheet));
             }
-            CFRelease(sheet as CFTypeRef);
+            environment.release(sheet);
         }
     }
     None
 }
 
-/// Release elements retained by [`copy_top_level`].
+fn sheet_role_with<E: AxWalkEnvironment>(environment: &E, element: E::Element) -> Option<String> {
+    known(
+        super::evidence::observe_read(
+            Some(environment.element_key(element)),
+            super::evidence::ReadSite::RecoverySheetRole,
+            environment.sheet_role(element),
+        )
+        .into_walk_legacy(),
+    )
+}
+
+fn recovery_window_id_with<E: AxWalkEnvironment>(
+    environment: &E,
+    element: E::Element,
+) -> Option<u32> {
+    let id = environment.window_id(element);
+    super::evidence::record_status(
+        Some(environment.element_key(element)),
+        super::evidence::ReadSite::RecoveryWindowId,
+        if id.is_some() {
+            super::evidence::EvidenceStatus::Known
+        } else {
+            super::evidence::EvidenceStatus::Unavailable
+        },
+    );
+    id
+}
+
+/// Release retained top-level elements.
 unsafe fn release_all(elements: Vec<AXUIElementRef>) {
     for element in elements {
         CFRelease(element as CFTypeRef);

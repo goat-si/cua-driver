@@ -5,34 +5,38 @@ use std::cell::{Cell, RefCell};
 use std::time::{Duration, Instant};
 
 #[derive(Clone, Copy)]
-enum Scenario {
+pub(super) enum Scenario {
     Union,
     Recovered,
     NoMatch,
     FailedHit,
+    Sheet,
+    Launching,
 }
 
-struct Environment {
+pub(super) struct Environment {
     scenario: Scenario,
-    trace: RefCell<Vec<String>>,
+    pub(super) trace: RefCell<Vec<String>>,
     credits: RefCell<std::collections::HashMap<usize, usize>>,
-    now: Instant,
+    now: Cell<Instant>,
+    enumerations: Cell<usize>,
 }
 
 impl Environment {
-    fn new(scenario: Scenario) -> Self {
+    pub(super) fn new(scenario: Scenario) -> Self {
         Self {
             scenario,
             trace: RefCell::new(Vec::new()),
             credits: RefCell::new(std::collections::HashMap::new()),
-            now: Instant::now(),
+            now: Cell::new(Instant::now()),
+            enumerations: Cell::new(0),
         }
     }
     fn adopt(&self, id: usize) {
         *self.credits.borrow_mut().entry(id).or_default() += 1;
         self.trace.borrow_mut().push(format!("adopt {id}"));
     }
-    fn assert_released(&self) {
+    pub(super) fn assert_released(&self) {
         assert!(self.credits.borrow().values().all(|credits| *credits == 0));
     }
 }
@@ -56,7 +60,11 @@ impl super::AxWalkEnvironment for Environment {
         use crate::ax::tree_source::Read;
         assert_eq!(application, 1);
         self.trace.borrow_mut().push("children".into());
-        let elements = if matches!(self.scenario, Scenario::Union) {
+        let count = self.enumerations.get();
+        self.enumerations.set(count + 1);
+        let elements = if matches!(self.scenario, Scenario::Union | Scenario::Sheet)
+            || matches!(self.scenario, Scenario::Launching) && count > 0
+        {
             vec![2]
         } else {
             vec![]
@@ -121,7 +129,9 @@ impl super::AxWalkEnvironment for Environment {
     }
     fn window_id(&self, element: usize) -> Option<u32> {
         self.trace.borrow_mut().push(format!("id {element}"));
-        if matches!(self.scenario, Scenario::Recovered) {
+        if matches!(self.scenario, Scenario::Sheet) {
+            Some(if element == 2 { 55 } else { 99 })
+        } else if matches!(self.scenario, Scenario::Recovered | Scenario::Launching) {
             Some(99)
         } else {
             Some(8)
@@ -130,7 +140,11 @@ impl super::AxWalkEnvironment for Environment {
     fn window_bounds(&self, id: u32) -> Option<[f64; 4]> {
         assert_eq!(id, 99);
         self.trace.borrow_mut().push("bounds".into());
-        Some([10.0, 20.0, 40.0, 60.0])
+        if matches!(self.scenario, Scenario::Sheet | Scenario::Launching) {
+            None
+        } else {
+            Some([10.0, 20.0, 40.0, 60.0])
+        }
     }
     fn hit(&self, pid: i32, x: f64, y: f64) -> crate::ax::evidence::Observed<Option<usize>> {
         assert_eq!((pid, x, y), (42, 30.0, 50.0));
@@ -161,7 +175,64 @@ impl super::AxWalkEnvironment for Environment {
     }
     fn now(&self) -> Instant {
         self.trace.borrow_mut().push("now".into());
-        self.now
+        self.now.get()
+    }
+    fn enable(&self, pid: i32, application: usize) -> crate::ax::evidence::Observed<()> {
+        assert_eq!((pid, application), (42, 1));
+        self.trace.borrow_mut().push("enable".into());
+        crate::ax::evidence::Observed::legacy_only(())
+    }
+    fn scope_candidate(
+        &self,
+        element: usize,
+    ) -> crate::ax::evidence::Observed<crate::ax::window_scope::TopLevelCandidate> {
+        self.trace.borrow_mut().push(format!("candidate {element}"));
+        let id = if matches!(self.scenario, Scenario::Sheet) {
+            55
+        } else {
+            99
+        };
+        crate::ax::evidence::Observed::legacy_only(crate::ax::window_scope::TopLevelCandidate::new(
+            "AXWindow",
+            Some(id),
+        ))
+    }
+    fn window_owner(&self, pid: i32, window_id: u32) -> crate::windows::WindowOwner {
+        assert_eq!((pid, window_id), (42, 99));
+        self.trace.borrow_mut().push("owner".into());
+        crate::windows::WindowOwner::SamePid
+    }
+    fn sheet_role(&self, element: usize) -> crate::ax::tree_source::Read<String> {
+        self.trace
+            .borrow_mut()
+            .push(format!("sheet-role {element}"));
+        crate::ax::tree_source::Read::Known(
+            if element == 2 { "AXWindow" } else { "AXSheet" }.into(),
+        )
+    }
+    fn sheet_children(
+        &self,
+        element: usize,
+    ) -> crate::ax::evidence::Observed<crate::ax::tree_source::Read<Vec<usize>>> {
+        assert_eq!(element, 2);
+        self.trace.borrow_mut().push("sheet-children".into());
+        self.adopt(3);
+        crate::ax::evidence::observe_read(
+            Some(element),
+            ReadSite::Children,
+            crate::ax::tree_source::Read::Known(vec![3]),
+        )
+    }
+    fn is_still_launching(&self, pid: i32) -> bool {
+        assert_eq!(pid, 42);
+        self.trace.borrow_mut().push("launching".into());
+        matches!(self.scenario, Scenario::Launching)
+    }
+    fn pause(&self, duration: Duration) {
+        self.trace
+            .borrow_mut()
+            .push(format!("pause {}", duration.as_millis()));
+        self.now.set(self.now.get() + duration);
     }
 }
 
