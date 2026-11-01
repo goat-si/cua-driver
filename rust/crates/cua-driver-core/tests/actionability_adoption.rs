@@ -99,6 +99,174 @@ fn semantic_intents_do_not_ignore_explicit_offscreen_state() {
     }
 }
 
+macro_rules! semantic_geometry_cases {
+    ($unknown:ident, $invalid:ident, $collapsed:ident, $unproven:ident, $exemptions:ident, $intent:expr) => {
+        #[test]
+        fn $unknown() {
+            let mut f = facts();
+            f.bounds = Evidence::Unknown("bounds unavailable".into());
+            assert!(matches!(
+                evaluate($intent, &f, Policy::headless()).verdict,
+                Verdict::Transient { unknown: true, .. }
+            ));
+        }
+        #[test]
+        fn $invalid() {
+            let mut f = facts();
+            for (width, height) in [(f64::NAN, 10.0), (-1.0, 10.0), (10.0, -1.0)] {
+                f.bounds = Evidence::Known(Rect {
+                    x: 0.0,
+                    y: 0.0,
+                    width,
+                    height,
+                });
+                assert!(
+                    matches!(
+                        evaluate($intent, &f, Policy::headless()).verdict,
+                        Verdict::Transient { unknown: true, .. }
+                    ),
+                    "{width:?}, {height:?}"
+                );
+            }
+        }
+        #[test]
+        fn $collapsed() {
+            let mut f = facts();
+            f.bounds = Evidence::Known(Rect {
+                x: 0.0,
+                y: 0.0,
+                width: 0.0,
+                height: 0.0,
+            });
+            assert!(matches!(
+                evaluate($intent, &f, Policy::headless()).verdict,
+                Verdict::Transient { unknown: false, .. }
+            ));
+        }
+        #[test]
+        fn $unproven() {
+            let mut f = facts();
+            f.bounds = Evidence::Absent;
+            f.offscreen = Evidence::Absent;
+            f.nonspatial_visible = false;
+            assert!(matches!(
+                evaluate($intent, &f, Policy::headless()).verdict,
+                Verdict::Transient { unknown: true, .. }
+            ));
+        }
+        #[test]
+        fn $exemptions() {
+            let mut f = facts();
+            f.bounds = Evidence::Known(Rect {
+                x: 0.0,
+                y: 0.0,
+                width: 0.0,
+                height: 0.0,
+            });
+            f.offscreen = Evidence::Absent;
+            assert_eq!(
+                evaluate($intent, &f, Policy::headless()).verdict,
+                Verdict::Pass
+            );
+            assert!(matches!(
+                evaluate($intent, &f, Policy::focus_fallback()).verdict,
+                Verdict::Transient { .. }
+            ));
+            f.bounds = Evidence::Absent;
+            f.offscreen = Evidence::Known(false);
+            assert_eq!(
+                evaluate($intent, &f, Policy::headless()).verdict,
+                Verdict::Pass
+            );
+            f.offscreen = Evidence::Absent;
+            f.nonspatial_visible = true;
+            assert_eq!(
+                evaluate($intent, &f, Policy::headless()).verdict,
+                Verdict::Pass
+            );
+            assert!(matches!(
+                evaluate($intent, &f, Policy::focus_fallback()).verdict,
+                Verdict::Transient { .. }
+            ));
+        }
+    };
+}
+
+semantic_geometry_cases!(
+    open_unknown,
+    open_invalid,
+    open_collapsed,
+    open_unproven,
+    open_exemptions,
+    Intent::Open
+);
+semantic_geometry_cases!(
+    select_text_unknown,
+    select_text_invalid,
+    select_text_collapsed,
+    select_text_unproven,
+    select_text_exemptions,
+    Intent::SelectText
+);
+semantic_geometry_cases!(
+    custom_action_unknown,
+    custom_action_invalid,
+    custom_action_collapsed,
+    custom_action_unproven,
+    custom_action_exemptions,
+    Intent::PerformAction { name: "AXCustom" }
+);
+
+#[test]
+fn semantic_geometry_exemptions_require_proven_support() {
+    for intent in [
+        Intent::Open,
+        Intent::SelectText,
+        Intent::PerformAction { name: "AXCustom" },
+    ] {
+        for unknown in [false, true] {
+            let mut f = facts();
+            f.offscreen = Evidence::Absent;
+            f.bounds = Evidence::Known(Rect {
+                x: 0.0,
+                y: 0.0,
+                width: 0.0,
+                height: 0.0,
+            });
+            match intent {
+                Intent::Open => {
+                    f.affordances = if unknown {
+                        Evidence::Unknown("actions".into())
+                    } else {
+                        Evidence::Absent
+                    }
+                }
+                Intent::SelectText => {
+                    f.selectable_text = if unknown {
+                        Evidence::Unknown("text".into())
+                    } else {
+                        Evidence::Known(false)
+                    }
+                }
+                Intent::PerformAction { .. } => {
+                    f.advertised_actions = if unknown {
+                        Evidence::Unknown("actions".into())
+                    } else {
+                        Evidence::Absent
+                    }
+                }
+                _ => unreachable!(),
+            }
+            let report = evaluate(intent, &f, Policy::headless());
+            assert!(
+                report.checks.iter().any(|check| check.name == "geometry"
+                    && matches!(check.status, CheckStatus::Transient { .. })),
+                "{intent:?}, unknown={unknown}"
+            );
+        }
+    }
+}
+
 #[test]
 fn background_pointer_uses_window_hit_evidence_and_all_gates() {
     let mut f = facts();

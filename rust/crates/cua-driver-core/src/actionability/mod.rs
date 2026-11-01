@@ -8,7 +8,9 @@
 //! Platform adopters: use `Click` with `Policy::headless()` for AXPress and
 //! `RightClick` with that policy for AXShowMenu; use `Open` for AXOpen,
 //! `PerformAction { name }` for an exact advertised custom action, and
-//! `SelectText` for text-range selection. For physical background-window pointer
+//! `SelectText` for text-range selection. For these three semantic operations in
+//! the background, use `Policy::headless()`; `Policy::background_window()` is
+//! only for physical pointer delivery. For physical background-window pointer
 //! input, use `Policy::background_window()` and collect hits with
 //! `collect_window_hits` against the target window. In that policy `visible`,
 //! `offscreen` and bounds must describe visibility within that same window, not

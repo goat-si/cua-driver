@@ -112,12 +112,21 @@ pub fn evaluate(intent: Intent<'_>, facts: &ElementFacts, policy: Policy) -> Act
     };
     let semantic_pointer =
         requirements.receives_events && !policy.is_headed() && !policy.background_window && direct;
+    let semantic_nonpointer = match intent {
+        Open => has(&[Affordance::Open]),
+        SelectText => matches!(facts.selectable_text, Evidence::Known(true)),
+        PerformAction { name } => {
+            matches!(&facts.advertised_actions, Evidence::Known(actions) if actions.iter().any(|action| action == name))
+        }
+        _ => false,
+    };
     let without_pointer = policy == Policy::headless()
         && (semantic_pointer
+            || semantic_nonpointer
             || (!requirements.receives_events && has(supported_affordances(intent))));
     let keyboard = matches!(intent, TypeText | PressKey | KeyDown | KeyUp);
-    let geometry_needed =
-        !keyboard && !(without_pointer && (semantic_pointer || requirements.editable));
+    let geometry_needed = !keyboard
+        && !(without_pointer && (semantic_pointer || requirements.editable || semantic_nonpointer));
     if requirements.visible {
         gate(&mut checks, "visible", &facts.visible, false);
         match &facts.offscreen {
@@ -135,40 +144,38 @@ pub fn evaluate(intent: Intent<'_>, facts: &ElementFacts, policy: Policy) -> Act
             ),
             Evidence::Known(false) | Evidence::Absent => {}
         }
-        if !matches!(intent, Open | SelectText | PerformAction { .. }) {
-            match &facts.bounds {
-                Evidence::Known(r) if !r.valid() => push(
-                    &mut checks,
-                    "geometry",
-                    CheckStatus::Transient { unknown: true },
-                    "bounds are invalid",
-                ),
-                Evidence::Known(r)
-                    if (r.width > 0.0 && r.height > 0.0)
-                        || (!geometry_needed && matches!(facts.offscreen, Evidence::Absent)) => {}
-                Evidence::Known(_) => push(
-                    &mut checks,
-                    "geometry",
-                    CheckStatus::Transient { unknown: false },
-                    "bounds are empty",
-                ),
-                Evidence::Absent
-                    if ((!geometry_needed || without_pointer)
-                        && matches!(facts.offscreen, Evidence::Known(false)))
-                        || (without_pointer && facts.nonspatial_visible) => {}
-                Evidence::Absent => push(
-                    &mut checks,
-                    "geometry",
-                    CheckStatus::Transient { unknown: true },
-                    "bounds are absent",
-                ),
-                Evidence::Unknown(reason) => push(
-                    &mut checks,
-                    "geometry",
-                    CheckStatus::Transient { unknown: true },
-                    reason,
-                ),
-            }
+        match &facts.bounds {
+            Evidence::Known(r) if !r.valid() => push(
+                &mut checks,
+                "geometry",
+                CheckStatus::Transient { unknown: true },
+                "bounds are invalid",
+            ),
+            Evidence::Known(r)
+                if (r.width > 0.0 && r.height > 0.0)
+                    || (!geometry_needed && matches!(facts.offscreen, Evidence::Absent)) => {}
+            Evidence::Known(_) => push(
+                &mut checks,
+                "geometry",
+                CheckStatus::Transient { unknown: false },
+                "bounds are empty",
+            ),
+            Evidence::Absent
+                if ((!geometry_needed || without_pointer)
+                    && matches!(facts.offscreen, Evidence::Known(false)))
+                    || (without_pointer && facts.nonspatial_visible) => {}
+            Evidence::Absent => push(
+                &mut checks,
+                "geometry",
+                CheckStatus::Transient { unknown: true },
+                "bounds are absent",
+            ),
+            Evidence::Unknown(reason) => push(
+                &mut checks,
+                "geometry",
+                CheckStatus::Transient { unknown: true },
+                reason,
+            ),
         }
     }
     if requirements.stable && !semantic_pointer {
