@@ -484,11 +484,22 @@ fn set_value_tool_result(
     pid: i32,
     element_index: usize,
 ) -> ToolResult {
+    set_value_tool_result_with_toolkit(result, ax_echo_surface, suffix, element_index, || {
+        crate::input::pointer_toolkit::detect(pid)
+            == Some(crate::input::pointer_toolkit::PointerReadingToolkit::Vcl)
+    })
+}
+
+fn set_value_tool_result_with_toolkit(
+    result: Result<anyhow::Result<SetValueOutcome>, String>,
+    ax_echo_surface: bool,
+    suffix: String,
+    element_index: usize,
+    is_vcl: impl FnOnce() -> bool,
+) -> ToolResult {
     match result {
         Ok(Ok(outcome)) if outcome.not_applied && !ax_echo_surface => {
-            let vcl = crate::input::pointer_toolkit::detect(pid)
-                == Some(crate::input::pointer_toolkit::PointerReadingToolkit::Vcl);
-            let mut result = not_applied_result(element_index, vcl);
+            let mut result = not_applied_result(element_index, is_vcl());
             // The first text block is the published summary.
             if let Some(cua_driver_core::protocol::Content::Text { text, .. }) =
                 result.content.first_mut()
@@ -1553,6 +1564,26 @@ fn finish_ladder_with_mark(
     restored_window: bool,
     mark: impl FnOnce() -> crate::document_edit::DocumentEdited,
 ) -> anyhow::Result<SetValueOutcome> {
+    finish_ladder_with_document_readers(
+        out,
+        element_index,
+        role,
+        restored_window,
+        mark,
+        || unsafe { window_has_document(element) },
+        || unsafe { crate::document_edit::document_status_without_value(element) },
+    )
+}
+
+fn finish_ladder_with_document_readers(
+    out: LadderOutcome,
+    element_index: usize,
+    role: &str,
+    restored_window: bool,
+    mark: impl FnOnce() -> crate::document_edit::DocumentEdited,
+    has_document: impl FnOnce() -> bool,
+    status_without_value: impl FnOnce() -> crate::document_edit::DocumentEdited,
+) -> anyhow::Result<SetValueOutcome> {
     if !out.reached {
         let err = out.error.unwrap_or(kAXErrorSuccess);
         if out.maybe_landed || out.steps_sent > 0 {
@@ -1562,7 +1593,7 @@ fn finish_ladder_with_mark(
     }
     if out.stepped {
         let document = if out.verification_withheld {
-            unsafe { crate::document_edit::document_status_without_value(element) }
+            status_without_value()
         } else {
             crate::document_edit::DocumentEdited::NotADocument
         };
@@ -1588,8 +1619,8 @@ fn finish_ladder_with_mark(
         &out,
         restored_window,
         mark,
-        || unsafe { window_has_document(element) },
-        || unsafe { crate::document_edit::document_status_without_value(element) },
+        has_document,
+        status_without_value,
     );
     let warning = if out.maybe_landed {
         " The value may have changed; read it before deciding what to do next."
