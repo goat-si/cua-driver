@@ -386,6 +386,14 @@ pub(super) fn option_value(read: crate::ax::write_outcome::ValueRead) -> Option<
     }
 }
 
+pub(super) fn option_role(role: &str) -> Option<bool> {
+    match role {
+        "AXMenuItem" => Some(true),
+        "AXSeparator" => Some(false),
+        _ => None,
+    }
+}
+
 fn children(element: &Retained) -> Option<Vec<Retained>> {
     use crate::ax::bindings::{
         kAXErrorNoValue, kAXErrorSuccess, AXUIElementCopyAttributeValue, AXUIElementGetTypeID,
@@ -478,11 +486,18 @@ impl PopupEnv for NativePopupEnv {
             else {
                 return ListRead::Incomplete;
             };
+            let selectable = match option_role(&role) {
+                Some(selectable) => selectable,
+                None => return ListRead::Incomplete,
+            };
             let Some(title) =
                 (unsafe { crate::ax::bindings::copy_string_attr(element, "AXTitle") })
             else {
                 return ListRead::Incomplete;
             };
+            if !selectable {
+                continue;
+            }
             let value = match option_value(read_value_if_allowed(
                 &mut crate::ax::label_reader::NativeLabelReader,
                 element,
@@ -490,13 +505,11 @@ impl PopupEnv for NativePopupEnv {
                 Some(value) => value,
                 None => return ListRead::Incomplete,
             };
-            if role == "AXMenuItem" {
-                result.push(OptionEntry {
-                    id: item,
-                    title,
-                    value,
-                });
-            }
+            result.push(OptionEntry {
+                id: item,
+                title,
+                value,
+            });
         }
         ListRead::Complete(result)
     }
