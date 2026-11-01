@@ -24,6 +24,8 @@ mod invoke_menu;
 mod key_delivery_guard;
 mod kill_app;
 mod launch_app;
+#[cfg(test)]
+mod lease_wiring_tests;
 mod list_apps;
 mod list_windows;
 mod menu_bar_extras;
