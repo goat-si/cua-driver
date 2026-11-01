@@ -733,7 +733,7 @@ pub(crate) fn walk_tree_with_web_content_observed(
     max_depth: usize,
     budget: WalkBudget,
     include_web_content: bool,
-) -> super::evidence::Observed<TreeWalkResult> {
+) -> CompletedWalk {
     walk_with_environment(
         &super::tree_source::native::NativeSource,
         &NativeWalkEnvironment,
@@ -756,19 +756,104 @@ struct WalkRequest<'a> {
     include_web_content: bool,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WalkRequestMode {
+    Application,
+    Window,
+}
+
+/// Internal completion metadata; it is never attached to an AX node or output.
+#[allow(dead_code)]
+struct CompletionEvidence {
+    request_mode: WalkRequestMode,
+    scope_observations: Vec<super::evidence::ReadEvidence>,
+    provider_observations: Vec<super::evidence::ReadEvidence>,
+    discovery_observations: Vec<super::evidence::ReadEvidence>,
+    read_evidence: Vec<super::evidence::ReadEvidence>,
+    final_deadline_sample: Option<bool>,
+}
+
+#[allow(dead_code)]
+pub(crate) struct CompletedWalk {
+    legacy: TreeWalkResult,
+    completion: CompletionEvidence,
+}
+
 fn walk_with_environment<S, E>(
     source: &S,
     environment: &E,
     request: WalkRequest<'_>,
     budget: WalkBudget,
-) -> super::evidence::Observed<TreeWalkResult>
+) -> CompletedWalk
 where
     S: AxTreeSource,
     E: WalkOrchestration<S>,
 {
+    use super::evidence::ReadSite;
+    let request_mode = if request.window_id.is_some() {
+        WalkRequestMode::Window
+    } else {
+        WalkRequestMode::Application
+    };
     let scope = super::evidence::EvidenceScope::start();
-    let result = walk_tree_with_web_content_inner(source, environment, request, budget);
-    scope.finish(result)
+    let (result, final_deadline_sample) =
+        walk_tree_with_web_content_inner(source, environment, request, budget);
+    let observed = scope.finish(result);
+    let scope_observations = observed
+        .evidence
+        .iter()
+        .copied()
+        .filter(|e| matches!(e.site, ReadSite::ScopeCandidate(_)))
+        .collect();
+    let provider_observations = observed
+        .evidence
+        .iter()
+        .copied()
+        .filter(|e| {
+            matches!(
+                e.site,
+                ReadSite::ProviderEnablement
+                    | ReadSite::ProviderCachedEnablement
+                    | ReadSite::ProviderOptIn
+            )
+        })
+        .collect();
+    let discovery_observations = observed
+        .evidence
+        .iter()
+        .copied()
+        .filter(|e| {
+            matches!(
+                e.site,
+                ReadSite::MenuWindowList
+                    | ReadSite::MenuDiscoveryDeadline
+                    | ReadSite::MenuWindowCap
+                    | ReadSite::MenuResolution
+                    | ReadSite::MenuFrame
+                    | ReadSite::MenuOwnership
+                    | ReadSite::RecoveryHit
+                    | ReadSite::RecoveryDeadline
+                    | ReadSite::RecoveryParent
+                    | ReadSite::RecoveryWindowId
+                    | ReadSite::RecoveryRoot
+                    | ReadSite::RecoverySheetRole
+                    | ReadSite::TopLevelWindows
+                    | ReadSite::TopLevelWindowsMember
+                    | ReadSite::TopLevelRemoteWindow
+            )
+        })
+        .collect();
+    CompletedWalk {
+        legacy: observed.legacy,
+        completion: CompletionEvidence {
+            request_mode,
+            scope_observations,
+            provider_observations,
+            discovery_observations,
+            read_evidence: observed.evidence,
+            final_deadline_sample,
+        },
+    }
 }
 
 /// Supplies native setup observations to shared walk code.
@@ -1101,7 +1186,7 @@ fn walk_tree_with_web_content_inner<S, E>(
     environment: &E,
     request: WalkRequest<'_>,
     mut budget: WalkBudget,
-) -> TreeWalkResult
+) -> (TreeWalkResult, Option<bool>)
 where
     S: AxTreeSource,
     E: WalkOrchestration<S>,
@@ -1124,17 +1209,21 @@ where
 
     {
         let Some(app_elem) = create_application_with(environment, pid).into_walk_legacy() else {
-            return TreeWalkResult {
-                offscreen_rows: Vec::new(),
-                tree_markdown: String::new(),
-                nodes,
-                truncated: false,
-                nodes_skipped: true,
-                walk: budget.outcome(),
-                // No application AX element at all, so a requested window
-                // certainly did not resolve.
-                window_scope: window_id.map(|_| WindowScope::AxUnresolved { ax_window_count: 0 }),
-            };
+            return (
+                TreeWalkResult {
+                    offscreen_rows: Vec::new(),
+                    tree_markdown: String::new(),
+                    nodes,
+                    truncated: false,
+                    nodes_skipped: true,
+                    walk: budget.outcome(),
+                    // No application AX element at all, so a requested window
+                    // certainly did not resolve.
+                    window_scope: window_id
+                        .map(|_| WindowScope::AxUnresolved { ax_window_count: 0 }),
+                },
+                None,
+            );
         };
 
         let (mut top_level, walk_these, resolved_scope) =
@@ -1283,16 +1372,44 @@ where
         environment.release_application(app_elem);
     }
 
-    let walk = budget.outcome();
-    let nodes_skipped = ledger.finish();
-    finalize_walk(
+    let (result, sample) = finalize_with_deadline_sample(
         lines,
         nodes,
         offscreen_rows,
         query,
-        walk,
-        nodes_skipped,
+        budget,
+        ledger,
         window_scope,
+        WalkBudget::expired,
+    );
+    (result, Some(sample))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn finalize_with_deadline_sample(
+    lines: Vec<(usize, String)>,
+    nodes: Vec<AXNode>,
+    offscreen_rows: Vec<dense_rows::OffscreenRows>,
+    query: Option<&str>,
+    budget: WalkBudget,
+    ledger: SkipLedger,
+    window_scope: Option<WindowScope>,
+    sample: impl FnOnce(&WalkBudget) -> bool,
+) -> (TreeWalkResult, bool) {
+    let final_deadline_sample = sample(&budget);
+    let walk = budget.outcome();
+    let nodes_skipped = ledger.finish();
+    (
+        finalize_walk(
+            lines,
+            nodes,
+            offscreen_rows,
+            query,
+            walk,
+            nodes_skipped,
+            window_scope,
+        ),
+        final_deadline_sample,
     )
 }
 

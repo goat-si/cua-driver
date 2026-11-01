@@ -197,10 +197,7 @@ impl super::WalkOrchestration<super::walker_seam_tests::Fake> for SingleRoot<'_>
 pub(super) fn run_menu_case(
     frames: Option<Vec<[f64; 4]>>,
     replies: Vec<Option<super::MenuObservation<usize>>>,
-) -> (
-    crate::ax::evidence::Observed<super::TreeWalkResult>,
-    Vec<&'static str>,
-) {
+) -> (super::CompletedWalk, Vec<&'static str>) {
     use super::walker_seam_tests::{step, Fake, Reply};
     use super::walker_test_support::{Batch, Slot};
     use crate::ax::content_attrs::AttrStatus;
@@ -298,8 +295,14 @@ fn shared_entry_walks_fake_root_and_releases_its_credit() {
     assert_eq!(observed.legacy.nodes.len(), 1);
     assert!(!observed.legacy.nodes_skipped);
     assert!(!observed.legacy.truncated);
+    assert_eq!(
+        observed.completion.request_mode,
+        super::WalkRequestMode::Application
+    );
+    assert_eq!(observed.completion.final_deadline_sample, Some(false));
     assert!(observed
-        .evidence
+        .completion
+        .read_evidence
         .iter()
         .any(|e| e.site == ReadSite::ApplicationRoot && e.status == EvidenceStatus::Known));
     assert_eq!(
@@ -363,9 +366,39 @@ fn shared_entry_preserves_application_creation_failure() {
         Some(WindowScope::AxUnresolved { ax_window_count: 0 })
     );
     assert_eq!(*environment.trace.borrow(), ["create"]);
-    assert_eq!(observed.evidence[0].status, EvidenceStatus::Unavailable);
+    assert_eq!(
+        observed.completion.read_evidence[0].status,
+        EvidenceStatus::Unavailable
+    );
+    assert_eq!(
+        observed.completion.request_mode,
+        super::WalkRequestMode::Window
+    );
+    assert_eq!(observed.completion.final_deadline_sample, None);
     source.assert_consumed();
     source.assert_lifetimes(&[]);
+}
+
+#[test]
+fn final_deadline_sample_is_diagnostic_only() {
+    use cua_driver_core::walk_budget::WalkBudget;
+    let budget = WalkBudget::nodes_only(100);
+    let ledger = super::SkipLedger::start();
+    let (result, sample) = super::finalize_with_deadline_sample(
+        vec![],
+        vec![],
+        vec![],
+        None,
+        budget,
+        ledger,
+        None,
+        |_| true,
+    );
+    assert!(sample);
+    assert!(!result.truncated);
+    assert_eq!(result.walk.stop, None);
+    assert!(!result.nodes_skipped);
+    assert!(result.tree_markdown.is_empty());
 }
 
 #[test]

@@ -15,7 +15,8 @@ fn menu_discovery_preserves_failure_deadline_and_cap() {
     let (failed_list, trace) = run_menu_case(None, vec![]);
     assert_eq!(failed_list.legacy.walk.stop, Some(WalkStop::Timeout));
     assert!(failed_list
-        .evidence
+        .completion
+        .read_evidence
         .iter()
         .any(|e| e.site == ReadSite::MenuWindowList && e.status == EvidenceStatus::Unavailable));
     assert!(!trace.contains(&"menu-lookup"));
@@ -35,12 +36,14 @@ fn menu_discovery_preserves_failure_deadline_and_cap() {
     let (capped, trace) = run_menu_case(Some(vec![frame; 5]), vec![None, None, None, None]);
     assert_eq!(capped.legacy.walk.stop, Some(WalkStop::Timeout));
     assert!(capped
-        .evidence
+        .completion
+        .read_evidence
         .iter()
         .any(|e| e.site == ReadSite::MenuWindowCap && e.status == EvidenceStatus::DiscoveryLimit));
     assert_eq!(
         capped
-            .evidence
+            .completion
+            .read_evidence
             .iter()
             .filter(
                 |e| e.site == ReadSite::MenuResolution && e.status == EvidenceStatus::Unavailable
@@ -59,7 +62,8 @@ fn menu_discovery_preserves_failure_deadline_and_cap() {
     let (uncertain, trace) = run_menu_case(Some(vec![frame]), vec![Some((3, Some(frame), None))]);
     assert_eq!(uncertain.legacy.walk.stop, Some(WalkStop::Timeout));
     assert!(uncertain
-        .evidence
+        .completion
+        .read_evidence
         .iter()
         .any(|e| e.site == ReadSite::MenuOwnership
             && e.owner == Some(3)
@@ -72,7 +76,8 @@ fn menu_discovery_preserves_failure_deadline_and_cap() {
     );
     assert_eq!(missing_frame.legacy.walk.stop, Some(WalkStop::Timeout));
     assert!(missing_frame
-        .evidence
+        .completion
+        .read_evidence
         .iter()
         .any(|e| e.site == ReadSite::MenuFrame
             && e.owner == Some(3)
@@ -85,7 +90,8 @@ fn menu_discovery_preserves_failure_deadline_and_cap() {
     );
     assert_eq!(foreign.legacy.walk.stop, None);
     assert!(foreign
-        .evidence
+        .completion
+        .read_evidence
         .iter()
         .any(|e| e.site == ReadSite::MenuOwnership
             && e.owner == Some(3)
