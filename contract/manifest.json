@@ -355,6 +355,7 @@
               "additionalProperties": false,
               "properties": {
                 "bounds": {
+                  "additionalProperties": false,
                   "properties": {
                     "height": {
                       "type": "number"
@@ -391,21 +392,20 @@
                   "type": "string"
                 },
                 "owner_pid": {
-                  "minimum": 0,
-                  "type": [
-                    "integer",
-                    "null"
-                  ]
+                  "maximum": 4294967295,
+                  "minimum": 1,
+                  "type": "integer"
                 },
                 "target": {
                   "additionalProperties": false,
                   "properties": {
                     "pid": {
-                      "minimum": 0,
+                      "maximum": 4294967295,
+                      "minimum": 1,
                       "type": "integer"
                     },
                     "window_id": {
-                      "minimum": 0,
+                      "minimum": 1,
                       "type": "integer"
                     }
                   },
@@ -425,11 +425,8 @@
                   ]
                 },
                 "window_id": {
-                  "minimum": 0,
-                  "type": [
-                    "integer",
-                    "null"
-                  ]
+                  "minimum": 1,
+                  "type": "integer"
                 }
               },
               "required": [
@@ -443,33 +440,13 @@
             ]
           },
           "opened_surfaces_status": {
-            "anyOf": [
-              {
-                "oneOf": [
-                  {
-                    "enum": [
-                      "not_checked"
-                    ],
-                    "type": "string"
-                  },
-                  {
-                    "const": "observed",
-                    "type": "string"
-                  },
-                  {
-                    "const": "partial",
-                    "type": "string"
-                  },
-                  {
-                    "const": "unavailable",
-                    "type": "string"
-                  }
-                ]
-              },
-              {
-                "type": "null"
-              }
-            ]
+            "enum": [
+              "observed",
+              "partial",
+              "unavailable",
+              "not_checked"
+            ],
+            "type": "string"
           },
           "point": {
             "additionalProperties": false,
@@ -1083,6 +1060,7 @@
               "additionalProperties": false,
               "properties": {
                 "bounds": {
+                  "additionalProperties": false,
                   "properties": {
                     "height": {
                       "type": "number"
@@ -1119,21 +1097,20 @@
                   "type": "string"
                 },
                 "owner_pid": {
-                  "minimum": 0,
-                  "type": [
-                    "integer",
-                    "null"
-                  ]
+                  "maximum": 4294967295,
+                  "minimum": 1,
+                  "type": "integer"
                 },
                 "target": {
                   "additionalProperties": false,
                   "properties": {
                     "pid": {
-                      "minimum": 0,
+                      "maximum": 4294967295,
+                      "minimum": 1,
                       "type": "integer"
                     },
                     "window_id": {
-                      "minimum": 0,
+                      "minimum": 1,
                       "type": "integer"
                     }
                   },
@@ -1153,11 +1130,8 @@
                   ]
                 },
                 "window_id": {
-                  "minimum": 0,
-                  "type": [
-                    "integer",
-                    "null"
-                  ]
+                  "minimum": 1,
+                  "type": "integer"
                 }
               },
               "required": [
@@ -1171,33 +1145,13 @@
             ]
           },
           "opened_surfaces_status": {
-            "anyOf": [
-              {
-                "oneOf": [
-                  {
-                    "enum": [
-                      "not_checked"
-                    ],
-                    "type": "string"
-                  },
-                  {
-                    "const": "observed",
-                    "type": "string"
-                  },
-                  {
-                    "const": "partial",
-                    "type": "string"
-                  },
-                  {
-                    "const": "unavailable",
-                    "type": "string"
-                  }
-                ]
-              },
-              {
-                "type": "null"
-              }
-            ]
+            "enum": [
+              "observed",
+              "partial",
+              "unavailable",
+              "not_checked"
+            ],
+            "type": "string"
           },
           "point": {
             "additionalProperties": false,
@@ -3177,6 +3131,7 @@
               "additionalProperties": false,
               "properties": {
                 "bounds": {
+                  "additionalProperties": false,
                   "properties": {
                     "height": {
                       "type": "number"
@@ -3213,21 +3168,20 @@
                   "type": "string"
                 },
                 "owner_pid": {
-                  "minimum": 0,
-                  "type": [
-                    "integer",
-                    "null"
-                  ]
+                  "maximum": 4294967295,
+                  "minimum": 1,
+                  "type": "integer"
                 },
                 "target": {
                   "additionalProperties": false,
                   "properties": {
                     "pid": {
-                      "minimum": 0,
+                      "maximum": 4294967295,
+                      "minimum": 1,
                       "type": "integer"
                     },
                     "window_id": {
-                      "minimum": 0,
+                      "minimum": 1,
                       "type": "integer"
                     }
                   },
@@ -3247,11 +3201,8 @@
                   ]
                 },
                 "window_id": {
-                  "minimum": 0,
-                  "type": [
-                    "integer",
-                    "null"
-                  ]
+                  "minimum": 1,
+                  "type": "integer"
                 }
               },
               "required": [
@@ -3265,33 +3216,13 @@
             ]
           },
           "opened_surfaces_status": {
-            "anyOf": [
-              {
-                "oneOf": [
-                  {
-                    "enum": [
-                      "not_checked"
-                    ],
-                    "type": "string"
-                  },
-                  {
-                    "const": "observed",
-                    "type": "string"
-                  },
-                  {
-                    "const": "partial",
-                    "type": "string"
-                  },
-                  {
-                    "const": "unavailable",
-                    "type": "string"
-                  }
-                ]
-              },
-              {
-                "type": "null"
-              }
-            ]
+            "enum": [
+              "observed",
+              "partial",
+              "unavailable",
+              "not_checked"
+            ],
+            "type": "string"
           },
           "point": {
             "additionalProperties": false,
@@ -3695,6 +3626,7 @@
               "additionalProperties": false,
               "properties": {
                 "bounds": {
+                  "additionalProperties": false,
                   "properties": {
                     "height": {
                       "type": "number"
@@ -3731,21 +3663,20 @@
                   "type": "string"
                 },
                 "owner_pid": {
-                  "minimum": 0,
-                  "type": [
-                    "integer",
-                    "null"
-                  ]
+                  "maximum": 4294967295,
+                  "minimum": 1,
+                  "type": "integer"
                 },
                 "target": {
                   "additionalProperties": false,
                   "properties": {
                     "pid": {
-                      "minimum": 0,
+                      "maximum": 4294967295,
+                      "minimum": 1,
                       "type": "integer"
                     },
                     "window_id": {
-                      "minimum": 0,
+                      "minimum": 1,
                       "type": "integer"
                     }
                   },
@@ -3765,11 +3696,8 @@
                   ]
                 },
                 "window_id": {
-                  "minimum": 0,
-                  "type": [
-                    "integer",
-                    "null"
-                  ]
+                  "minimum": 1,
+                  "type": "integer"
                 }
               },
               "required": [
@@ -3783,33 +3711,13 @@
             ]
           },
           "opened_surfaces_status": {
-            "anyOf": [
-              {
-                "oneOf": [
-                  {
-                    "enum": [
-                      "not_checked"
-                    ],
-                    "type": "string"
-                  },
-                  {
-                    "const": "observed",
-                    "type": "string"
-                  },
-                  {
-                    "const": "partial",
-                    "type": "string"
-                  },
-                  {
-                    "const": "unavailable",
-                    "type": "string"
-                  }
-                ]
-              },
-              {
-                "type": "null"
-              }
-            ]
+            "enum": [
+              "observed",
+              "partial",
+              "unavailable",
+              "not_checked"
+            ],
+            "type": "string"
           },
           "point": {
             "additionalProperties": false,
@@ -4624,6 +4532,7 @@
               "additionalProperties": false,
               "properties": {
                 "bounds": {
+                  "additionalProperties": false,
                   "properties": {
                     "height": {
                       "type": "number"
@@ -4660,21 +4569,20 @@
                   "type": "string"
                 },
                 "owner_pid": {
-                  "minimum": 0,
-                  "type": [
-                    "integer",
-                    "null"
-                  ]
+                  "maximum": 4294967295,
+                  "minimum": 1,
+                  "type": "integer"
                 },
                 "target": {
                   "additionalProperties": false,
                   "properties": {
                     "pid": {
-                      "minimum": 0,
+                      "maximum": 4294967295,
+                      "minimum": 1,
                       "type": "integer"
                     },
                     "window_id": {
-                      "minimum": 0,
+                      "minimum": 1,
                       "type": "integer"
                     }
                   },
@@ -4694,11 +4602,8 @@
                   ]
                 },
                 "window_id": {
-                  "minimum": 0,
-                  "type": [
-                    "integer",
-                    "null"
-                  ]
+                  "minimum": 1,
+                  "type": "integer"
                 }
               },
               "required": [
@@ -4712,33 +4617,13 @@
             ]
           },
           "opened_surfaces_status": {
-            "anyOf": [
-              {
-                "oneOf": [
-                  {
-                    "enum": [
-                      "not_checked"
-                    ],
-                    "type": "string"
-                  },
-                  {
-                    "const": "observed",
-                    "type": "string"
-                  },
-                  {
-                    "const": "partial",
-                    "type": "string"
-                  },
-                  {
-                    "const": "unavailable",
-                    "type": "string"
-                  }
-                ]
-              },
-              {
-                "type": "null"
-              }
-            ]
+            "enum": [
+              "observed",
+              "partial",
+              "unavailable",
+              "not_checked"
+            ],
+            "type": "string"
           },
           "point": {
             "additionalProperties": false,
@@ -5654,6 +5539,7 @@
               "additionalProperties": false,
               "properties": {
                 "bounds": {
+                  "additionalProperties": false,
                   "properties": {
                     "height": {
                       "type": "number"
@@ -5690,21 +5576,20 @@
                   "type": "string"
                 },
                 "owner_pid": {
-                  "minimum": 0,
-                  "type": [
-                    "integer",
-                    "null"
-                  ]
+                  "maximum": 4294967295,
+                  "minimum": 1,
+                  "type": "integer"
                 },
                 "target": {
                   "additionalProperties": false,
                   "properties": {
                     "pid": {
-                      "minimum": 0,
+                      "maximum": 4294967295,
+                      "minimum": 1,
                       "type": "integer"
                     },
                     "window_id": {
-                      "minimum": 0,
+                      "minimum": 1,
                       "type": "integer"
                     }
                   },
@@ -5724,11 +5609,8 @@
                   ]
                 },
                 "window_id": {
-                  "minimum": 0,
-                  "type": [
-                    "integer",
-                    "null"
-                  ]
+                  "minimum": 1,
+                  "type": "integer"
                 }
               },
               "required": [
@@ -5742,33 +5624,13 @@
             ]
           },
           "opened_surfaces_status": {
-            "anyOf": [
-              {
-                "oneOf": [
-                  {
-                    "enum": [
-                      "not_checked"
-                    ],
-                    "type": "string"
-                  },
-                  {
-                    "const": "observed",
-                    "type": "string"
-                  },
-                  {
-                    "const": "partial",
-                    "type": "string"
-                  },
-                  {
-                    "const": "unavailable",
-                    "type": "string"
-                  }
-                ]
-              },
-              {
-                "type": "null"
-              }
-            ]
+            "enum": [
+              "observed",
+              "partial",
+              "unavailable",
+              "not_checked"
+            ],
+            "type": "string"
           },
           "point": {
             "additionalProperties": false,
@@ -6216,6 +6078,7 @@
               "additionalProperties": false,
               "properties": {
                 "bounds": {
+                  "additionalProperties": false,
                   "properties": {
                     "height": {
                       "type": "number"
@@ -6252,21 +6115,20 @@
                   "type": "string"
                 },
                 "owner_pid": {
-                  "minimum": 0,
-                  "type": [
-                    "integer",
-                    "null"
-                  ]
+                  "maximum": 4294967295,
+                  "minimum": 1,
+                  "type": "integer"
                 },
                 "target": {
                   "additionalProperties": false,
                   "properties": {
                     "pid": {
-                      "minimum": 0,
+                      "maximum": 4294967295,
+                      "minimum": 1,
                       "type": "integer"
                     },
                     "window_id": {
-                      "minimum": 0,
+                      "minimum": 1,
                       "type": "integer"
                     }
                   },
@@ -6286,11 +6148,8 @@
                   ]
                 },
                 "window_id": {
-                  "minimum": 0,
-                  "type": [
-                    "integer",
-                    "null"
-                  ]
+                  "minimum": 1,
+                  "type": "integer"
                 }
               },
               "required": [
@@ -6304,33 +6163,13 @@
             ]
           },
           "opened_surfaces_status": {
-            "anyOf": [
-              {
-                "oneOf": [
-                  {
-                    "enum": [
-                      "not_checked"
-                    ],
-                    "type": "string"
-                  },
-                  {
-                    "const": "observed",
-                    "type": "string"
-                  },
-                  {
-                    "const": "partial",
-                    "type": "string"
-                  },
-                  {
-                    "const": "unavailable",
-                    "type": "string"
-                  }
-                ]
-              },
-              {
-                "type": "null"
-              }
-            ]
+            "enum": [
+              "observed",
+              "partial",
+              "unavailable",
+              "not_checked"
+            ],
+            "type": "string"
           },
           "point": {
             "additionalProperties": false,
@@ -7151,6 +6990,7 @@
               "additionalProperties": false,
               "properties": {
                 "bounds": {
+                  "additionalProperties": false,
                   "properties": {
                     "height": {
                       "type": "number"
@@ -7187,21 +7027,20 @@
                   "type": "string"
                 },
                 "owner_pid": {
-                  "minimum": 0,
-                  "type": [
-                    "integer",
-                    "null"
-                  ]
+                  "maximum": 4294967295,
+                  "minimum": 1,
+                  "type": "integer"
                 },
                 "target": {
                   "additionalProperties": false,
                   "properties": {
                     "pid": {
-                      "minimum": 0,
+                      "maximum": 4294967295,
+                      "minimum": 1,
                       "type": "integer"
                     },
                     "window_id": {
-                      "minimum": 0,
+                      "minimum": 1,
                       "type": "integer"
                     }
                   },
@@ -7221,11 +7060,8 @@
                   ]
                 },
                 "window_id": {
-                  "minimum": 0,
-                  "type": [
-                    "integer",
-                    "null"
-                  ]
+                  "minimum": 1,
+                  "type": "integer"
                 }
               },
               "required": [
@@ -7239,33 +7075,13 @@
             ]
           },
           "opened_surfaces_status": {
-            "anyOf": [
-              {
-                "oneOf": [
-                  {
-                    "enum": [
-                      "not_checked"
-                    ],
-                    "type": "string"
-                  },
-                  {
-                    "const": "observed",
-                    "type": "string"
-                  },
-                  {
-                    "const": "partial",
-                    "type": "string"
-                  },
-                  {
-                    "const": "unavailable",
-                    "type": "string"
-                  }
-                ]
-              },
-              {
-                "type": "null"
-              }
-            ]
+            "enum": [
+              "observed",
+              "partial",
+              "unavailable",
+              "not_checked"
+            ],
+            "type": "string"
           },
           "point": {
             "additionalProperties": false,
@@ -8084,6 +7900,7 @@
               "additionalProperties": false,
               "properties": {
                 "bounds": {
+                  "additionalProperties": false,
                   "properties": {
                     "height": {
                       "type": "number"
@@ -8120,21 +7937,20 @@
                   "type": "string"
                 },
                 "owner_pid": {
-                  "minimum": 0,
-                  "type": [
-                    "integer",
-                    "null"
-                  ]
+                  "maximum": 4294967295,
+                  "minimum": 1,
+                  "type": "integer"
                 },
                 "target": {
                   "additionalProperties": false,
                   "properties": {
                     "pid": {
-                      "minimum": 0,
+                      "maximum": 4294967295,
+                      "minimum": 1,
                       "type": "integer"
                     },
                     "window_id": {
-                      "minimum": 0,
+                      "minimum": 1,
                       "type": "integer"
                     }
                   },
@@ -8154,11 +7970,8 @@
                   ]
                 },
                 "window_id": {
-                  "minimum": 0,
-                  "type": [
-                    "integer",
-                    "null"
-                  ]
+                  "minimum": 1,
+                  "type": "integer"
                 }
               },
               "required": [
@@ -8172,33 +7985,13 @@
             ]
           },
           "opened_surfaces_status": {
-            "anyOf": [
-              {
-                "oneOf": [
-                  {
-                    "enum": [
-                      "not_checked"
-                    ],
-                    "type": "string"
-                  },
-                  {
-                    "const": "observed",
-                    "type": "string"
-                  },
-                  {
-                    "const": "partial",
-                    "type": "string"
-                  },
-                  {
-                    "const": "unavailable",
-                    "type": "string"
-                  }
-                ]
-              },
-              {
-                "type": "null"
-              }
-            ]
+            "enum": [
+              "observed",
+              "partial",
+              "unavailable",
+              "not_checked"
+            ],
+            "type": "string"
           },
           "point": {
             "additionalProperties": false,

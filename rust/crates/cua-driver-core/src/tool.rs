@@ -4055,6 +4055,67 @@ fn preserve_pointer_fields(
     Ok(())
 }
 
+/// MPX compares root override-redirect windows around the input. That
+/// observation is neither exhaustive for all surfaces nor causally bound to
+/// this action, so it cannot prove an empty result or a complete observation.
+fn preserve_linux_mpx_popups(
+    public: &mut cua_driver_contract::ActionResult,
+    producer: &Value,
+) -> Result<(), String> {
+    use cua_driver_contract::{
+        OpenedSurface, OpenedSurfaceBounds, OpenedSurfaceKind, OpenedSurfaceTarget,
+        OpenedSurfacesStatus,
+    };
+    #[derive(serde::Deserialize)]
+    struct Popup {
+        window_id: u64,
+        pid: Option<u32>,
+        bounds: OpenedSurfaceBounds,
+        title: String,
+    }
+    let count = match producer.get("popups_appeared") {
+        None => return Ok(()),
+        Some(Value::Bool(false)) => return Ok(()),
+        Some(Value::Bool(true)) => None,
+        Some(value) => match value.as_u64() {
+            Some(0) => return Ok(()),
+            Some(count) => Some(count),
+            None => return Err("popups_appeared must be a non-negative count or boolean".into()),
+        },
+    };
+    let values = match producer.get("popups") {
+        Some(Value::Array(values)) if !values.is_empty() => values.clone(),
+        Some(_) => return Err("popups must be a non-empty array".into()),
+        None => vec![producer
+            .get("popup")
+            .cloned()
+            .ok_or("popup evidence omitted its entries")?],
+    };
+    if count.is_some_and(|count| count != values.len() as u64) {
+        return Err("popup count does not match entries".into());
+    }
+    let mut surfaces = Vec::with_capacity(values.len());
+    for value in values {
+        let popup: Popup =
+            serde_json::from_value(value).map_err(|e| format!("invalid popup: {e}"))?;
+        let target = popup.pid.map(|pid| OpenedSurfaceTarget {
+            pid,
+            window_id: popup.window_id,
+        });
+        surfaces.push(OpenedSurface {
+            kind: OpenedSurfaceKind::Unknown,
+            owner_pid: popup.pid,
+            window_id: Some(popup.window_id),
+            target,
+            bounds: Some(popup.bounds),
+            title: Some(popup.title),
+        });
+    }
+    public.opened_surfaces_status = Some(OpenedSurfacesStatus::Partial);
+    public.opened_surfaces = Some(surfaces);
+    Ok(())
+}
+
 fn publish_successful_action_result(
     result: &mut ToolResult,
     tool_name: &str,
@@ -4116,6 +4177,15 @@ fn publish_action_result(result: &mut ToolResult, tool_name: &str) -> Result<(),
     if POINTER_RESULT_TOOLS.contains(&tool_name) {
         if let Some(producer) = producer_structured.as_ref() {
             preserve_pointer_fields(&mut public, producer)?;
+        }
+    }
+    if matches!(tool_name, "click" | "right_click")
+        && action.transport == crate::action_record::ActionTransport::LinuxX11MpxUinput
+        && public.opened_surfaces_status.is_none()
+        && public.opened_surfaces.is_none()
+    {
+        if let Some(producer) = producer_structured.as_ref() {
+            preserve_linux_mpx_popups(&mut public, producer)?;
         }
     }
     public
@@ -4266,6 +4336,130 @@ mod runtime_isolation_tests {
 
     struct OpenedSurfaceProbe {
         def: super::ToolDef,
+    }
+
+    struct LinuxPopupProbe {
+        def: super::ToolDef,
+    }
+
+    #[async_trait::async_trait]
+    impl super::Tool for LinuxPopupProbe {
+        fn def(&self) -> &super::ToolDef {
+            &self.def
+        }
+        async fn invoke(&self, args: serde_json::Value) -> ToolResult {
+            ToolResult::text("clicked").with_structured(args)
+        }
+    }
+
+    #[tokio::test]
+    async fn linux_popup_legacy_reaches_mcp() {
+        use serde_json::json;
+        let mut registry = super::ToolRegistry::new();
+        registry.register(Box::new(LinuxPopupProbe {
+            def: super::ToolDef {
+                name: "click".into(),
+                description: "test".into(),
+                input_schema: json!({"type":"object"}),
+                read_only: false,
+                destructive: false,
+                idempotent: false,
+                open_world: false,
+            },
+        }));
+        registry.register(Box::new(LinuxPopupProbe {
+            def: super::ToolDef {
+                name: "right_click".into(),
+                description: "test".into(),
+                input_schema: json!({"type":"object"}),
+                read_only: false,
+                destructive: false,
+                idempotent: false,
+                open_world: false,
+            },
+        }));
+        let popup = json!({"window_id":9,"pid":7,"title":"menu",
+            "bounds":{"x":1,"y":2,"width":30,"height":40}});
+        let args = json!({"path":"mpx_pointer", "effect":"confirmed", "delivery_mode":"background",
+            "evidence":[{"kind":"window_change","detail":"popup"}],
+            "popups_appeared":1,"popup":popup,"popups":[popup]});
+        let result = registry
+            .invoke_with_context("click", args, unrestricted_context())
+            .await;
+        let wire = crate::mcp_result::conforming_tool_result(
+            "click",
+            serde_json::to_value(result).unwrap(),
+        );
+        assert_ne!(wire["isError"], true, "{wire}");
+        assert_eq!(
+            wire["structuredContent"]["opened_surfaces_status"],
+            "partial"
+        );
+        assert_eq!(
+            wire["structuredContent"]["opened_surfaces"][0]["target"],
+            json!({"pid":7,"window_id":9})
+        );
+        assert_eq!(
+            wire["structuredContent"]["opened_surfaces"][0]["kind"],
+            "unknown"
+        );
+        assert!(wire["structuredContent"].get("popup").is_none());
+        let right = json!({"path":"mpx_pointer", "effect":"unverifiable", "delivery_mode":"background",
+            "popups_appeared":1, "popup":{"window_id":9,"pid":7,"title":"",
+            "bounds":{"x":1,"y":2,"width":30,"height":40}}});
+        let wire = crate::mcp_result::conforming_tool_result(
+            "right_click",
+            serde_json::to_value(
+                registry
+                    .invoke_with_context("right_click", right, unrestricted_context())
+                    .await,
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            wire["structuredContent"]["opened_surfaces_status"], "partial",
+            "{wire}"
+        );
+        let unknown_pid = json!({"path":"mpx_pointer", "effect":"unverifiable", "delivery_mode":"background",
+            "popups_appeared":1, "popup":{"window_id":9,"pid":null,"title":"",
+            "bounds":{"x":1,"y":2,"width":30,"height":40}}});
+        let wire = crate::mcp_result::conforming_tool_result(
+            "click",
+            serde_json::to_value(
+                registry
+                    .invoke_with_context("click", unknown_pid, unrestricted_context())
+                    .await,
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            wire["structuredContent"]["opened_surfaces_status"],
+            "partial"
+        );
+        assert!(wire["structuredContent"]["opened_surfaces"][0]
+            .get("target")
+            .is_none());
+        assert!(wire["structuredContent"]["opened_surfaces"][0]
+            .get("owner_pid")
+            .is_none());
+        let empty = json!({"path":"mpx_pointer", "effect":"unverifiable", "delivery_mode":"background", "popups_appeared":0});
+        let wire = crate::mcp_result::conforming_tool_result(
+            "click",
+            serde_json::to_value(
+                registry
+                    .invoke_with_context("click", empty, unrestricted_context())
+                    .await,
+            )
+            .unwrap(),
+        );
+        assert!(wire["structuredContent"]
+            .get("opened_surfaces_status")
+            .is_none());
+        let malformed = json!({"path":"mpx_pointer", "effect":"unverifiable", "delivery_mode":"background", "popups_appeared":1});
+        let result = registry
+            .invoke_with_context("click", malformed, unrestricted_context())
+            .await;
+        assert_eq!(result.is_error, Some(true));
     }
 
     #[async_trait::async_trait]

@@ -14,6 +14,18 @@ pub enum ActionEffect {
     Refused,
 }
 
+impl From<ActionEffect> for cua_driver_contract::ActionEffect {
+    fn from(effect: ActionEffect) -> Self {
+        match effect {
+            ActionEffect::Confirmed => Self::Confirmed,
+            ActionEffect::Partial => Self::Partial,
+            ActionEffect::Unverifiable => Self::Unverifiable,
+            ActionEffect::SuspectedNoop => Self::SuspectedNoop,
+            ActionEffect::Refused => Self::Refused,
+        }
+    }
+}
+
 /// Classify an idempotent native mutation using an independent value readback.
 /// A missing readback never confirms success, while a readable unchanged value
 /// is stronger evidence of a no-op than of an unknown outcome.
@@ -305,6 +317,12 @@ impl ActionExecutionRecord {
     }
 
     pub fn validate(&self) -> Result<(), ActionRecordValidationError> {
+        cua_driver_contract::validate_opened_surfaces(
+            self.effect.into(),
+            self.opened_surfaces_status,
+            self.opened_surfaces.as_deref(),
+        )
+        .map_err(ActionRecordValidationError::OpenedSurfaces)?;
         match self.effect {
             ActionEffect::Confirmed if projected_evidence(&self.evidence).is_none() => {
                 Err(ActionRecordValidationError::ConfirmedRequiresEvidence)
@@ -349,13 +367,7 @@ impl ActionExecutionRecord {
     ) -> Result<cua_driver_contract::ActionResult, ActionRecordValidationError> {
         let projection = self.stable_projection()?;
         Ok(cua_driver_contract::ActionResult {
-            effect: match projection.effect {
-                ActionEffect::Confirmed => cua_driver_contract::ActionEffect::Confirmed,
-                ActionEffect::Partial => cua_driver_contract::ActionEffect::Partial,
-                ActionEffect::Unverifiable => cua_driver_contract::ActionEffect::Unverifiable,
-                ActionEffect::SuspectedNoop => cua_driver_contract::ActionEffect::SuspectedNoop,
-                ActionEffect::Refused => cua_driver_contract::ActionEffect::Refused,
-            },
+            effect: projection.effect.into(),
             route: match projection.route {
                 ActionRoute::Accessibility => cua_driver_contract::ActionRoute::Accessibility,
                 ActionRoute::SyntheticEvents => cua_driver_contract::ActionRoute::SyntheticEvents,
@@ -1232,6 +1244,16 @@ impl ActionExecutionRecordBuilder {
         self
     }
 
+    pub fn opened_surfaces(
+        mut self,
+        status: Option<cua_driver_contract::OpenedSurfacesStatus>,
+        surfaces: Option<Vec<cua_driver_contract::OpenedSurface>>,
+    ) -> Self {
+        self.0.opened_surfaces_status = status;
+        self.0.opened_surfaces = surfaces;
+        self
+    }
+
     pub fn refusal(mut self, code: impl Into<String>, hint: Option<String>) -> Self {
         self.0.refusal = Some(ActionRefusal {
             code: code.into(),
@@ -1289,11 +1311,36 @@ pub enum ActionRecordValidationError {
     PartialRequiresDeliveredCount,
     RefusedCannotHaveDelivery,
     RefusedCannotHaveEvidence,
+    OpenedSurfaces(cua_driver_contract::ActionResultValidationError),
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn opened_surfaces_invalid_record_is_rejected_before_publication() {
+        let mut record = ActionExecutionRecord::new(
+            ActionEffect::Unverifiable,
+            ActionTransport::MacosAxAction,
+            RequestedDelivery::Background,
+        );
+        record.opened_surfaces_status = Some(cua_driver_contract::OpenedSurfacesStatus::Partial);
+        record.opened_surfaces = Some(vec![]);
+        assert!(record.validate().is_err());
+        assert!(record.public_result().is_err());
+        assert!(ActionExecutionRecord::builder(
+            ActionEffect::Unverifiable,
+            ActionTransport::MacosAxAction,
+            RequestedDelivery::Background
+        )
+        .opened_surfaces(
+            Some(cua_driver_contract::OpenedSurfacesStatus::Partial),
+            Some(vec![])
+        )
+        .build()
+        .is_err());
+    }
 
     fn evidence() -> ActionEvidence {
         ActionEvidence {
