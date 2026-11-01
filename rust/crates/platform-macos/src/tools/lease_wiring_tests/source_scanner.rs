@@ -5,6 +5,13 @@
 //! resolved; nonliteral `include_str!` is also banned when its target is
 //! unknown. Associated items such as methods and fields cannot shadow those
 //! path roots and are not banned. Ambiguous inclusion scans all source files.
+//! Renamed imports of raw spawn primitives (`tokio::spawn`, the
+//! `tokio::task` spawn functions, `std::thread::spawn`, `std::thread::Builder`,
+//! `std::thread::scope`, or globs of `tokio`, `tokio::task`, `std::thread`)
+//! and any re-export of one are recorded as thread-start sites, so they fail
+//! the inventory unless listed. A finding is blocking only if it is a real
+//! unrouted thread start in production code or one of these banned constructs
+//! goes unflagged.
 
 use proc_macro2::{TokenStream, TokenTree};
 use quote::ToTokens;
