@@ -283,7 +283,6 @@ pub(crate) fn set_value_route(
         ChainOutcome::NoAffordance => SetValueDecision::NoAffordance,
     }
 }
-#[cfg(target_os = "windows")]
 pub(crate) fn refusal_text(kind: RefusalKind, hresult: i32) -> String {
     let what = "could not read the UIA pattern";
     format!(
@@ -291,7 +290,6 @@ pub(crate) fn refusal_text(kind: RefusalKind, hresult: i32) -> String {
         hresult as u32
     )
 }
-#[cfg(target_os = "windows")]
 pub(crate) fn uncertain_text(kind: UncertainKind, hresult: i32) -> String {
     format!("HRESULT 0x{:08X} ({kind:?}); the UIA write may have landed. Read the window state before acting again.", hresult as u32)
 }
@@ -420,4 +418,57 @@ pub(crate) fn chain_error(
     cua_driver_core::protocol::ToolResult::error(message)
         .with_structured(structured)
         .with_disposition(disposition)
+}
+
+pub(crate) fn set_value_write_failure_result(
+    decision: SetValueDecision,
+    args: &serde_json::Value,
+) -> cua_driver_core::protocol::ToolResult {
+    use cua_driver_core::action_record::{
+        ActionEffect, ActionExecutionRecord, ActionTransport, RequestedDelivery,
+    };
+    let (rung, message, outcome) = match decision {
+        SetValueDecision::Refused {
+            rung,
+            kind,
+            hresult,
+        } => (
+            rung,
+            refusal_text(kind, hresult),
+            AcquireVerdict::NotDelivered(kind).to_core(),
+        ),
+        SetValueDecision::Uncertain {
+            rung,
+            kind,
+            hresult,
+        } => (
+            rung,
+            uncertain_text(kind, hresult),
+            classify_sent_call(hresult).to_core(),
+        ),
+        _ => unreachable!("only write failures are returned here"),
+    };
+    let transport = if rung == 0 {
+        ActionTransport::WindowsUiaValue
+    } else {
+        ActionTransport::WindowsUiaRangeValue
+    };
+    let requested = match args.get("delivery_mode").and_then(serde_json::Value::as_str) {
+        Some("foreground") => RequestedDelivery::Foreground,
+        _ => RequestedDelivery::Background,
+    };
+    let mut record = ActionExecutionRecord::new(ActionEffect::Unverifiable, transport, requested);
+    if matches!(
+        outcome,
+        cua_driver_core::mutation::WriteOutcome::StopUncertain(_)
+    ) {
+        record.actual_delivery = Some(cua_driver_core::action_record::ActualDelivery::Unknown);
+    }
+    chain_error(
+        message,
+        serde_json::json!({ "path": "ax", "verified": false }),
+        [outcome],
+        true,
+    )
+    .with_action_record(record)
 }

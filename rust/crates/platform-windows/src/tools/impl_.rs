@@ -7037,54 +7037,7 @@ fn set_value_write_failure_result(
     decision: crate::uia_mutation::SetValueDecision,
     args: &Value,
 ) -> ToolResult {
-    use crate::uia_mutation::{refusal_text, uncertain_text, SetValueDecision};
-    use cua_driver_core::action_record::{
-        ActionEffect, ActionExecutionRecord, ActionTransport, RequestedDelivery,
-    };
-    let (rung, message, outcome) = match decision {
-        SetValueDecision::Refused {
-            rung,
-            kind,
-            hresult,
-        } => (
-            rung,
-            refusal_text(kind, hresult),
-            crate::uia_mutation::AcquireVerdict::NotDelivered(kind).to_core(),
-        ),
-        SetValueDecision::Uncertain {
-            rung,
-            kind,
-            hresult,
-        } => (
-            rung,
-            uncertain_text(kind, hresult),
-            crate::uia_mutation::classify_sent_call(hresult).to_core(),
-        ),
-        _ => unreachable!("only write failures are returned here"),
-    };
-    let transport = if rung == 0 {
-        ActionTransport::WindowsUiaValue
-    } else {
-        ActionTransport::WindowsUiaRangeValue
-    };
-    let requested = match args.get("delivery_mode").and_then(Value::as_str) {
-        Some("foreground") => RequestedDelivery::Foreground,
-        _ => RequestedDelivery::Background,
-    };
-    let mut record = ActionExecutionRecord::new(ActionEffect::Unverifiable, transport, requested);
-    if matches!(
-        outcome,
-        cua_driver_core::mutation::WriteOutcome::StopUncertain(_)
-    ) {
-        record.actual_delivery = Some(cua_driver_core::action_record::ActualDelivery::Unknown);
-    }
-    crate::uia_mutation::chain_error(
-        message,
-        json!({ "path": "ax", "verified": false }),
-        [outcome],
-        true,
-    )
-    .with_action_record(record)
+    crate::uia_mutation::set_value_write_failure_result(decision, args)
 }
 
 fn win32_combo_set_value_result(
