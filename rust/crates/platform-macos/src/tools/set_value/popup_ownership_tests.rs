@@ -327,6 +327,33 @@ fn opener_timeout_then_items_gone_is_unconfirmed() {
 }
 
 #[test]
+fn empty_list_during_cleanup_is_unconfirmed_until_opener_returns_success() {
+    for (result, expected) in [
+        (PressReturn::Timeout, CloseStatus::Unconfirmed),
+        (PressReturn::Success, CloseStatus::Confirmed),
+    ] {
+        let mut f = Fake::new(
+            vec![
+                MenuState::ClosedOrEmpty,
+                MenuState::Open(1),
+                MenuState::Open(1),
+                MenuState::Open(1),
+                MenuState::Open(1),
+                MenuState::Open(1),
+                MenuState::ClosedOrEmpty,
+                MenuState::ClosedOrEmpty,
+            ],
+            list(&[(2, "x", "a")]),
+        );
+        f.result = result;
+        assert!(
+            matches!(select(&mut f, "x"), PopupOutcome::Selected { close: Some(actual), .. } if actual == expected)
+        );
+        assert_eq!(f.effects, ["open", "press", "join"]);
+    }
+}
+
+#[test]
 fn changed_menu_is_never_cancelled_or_reported_closed() {
     let mut f = Fake::new(
         vec![
