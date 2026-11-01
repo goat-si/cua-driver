@@ -2333,6 +2333,23 @@ fn select_popup_option_with_env(
 }
 
 #[cfg(test)]
+mod popup_match_tests {
+    use super::matching_option;
+
+    #[test]
+    fn duplicate_titles_do_not_resolve_to_unique() {
+        let options = vec![("One".into(), "a".into()), ("One".into(), "b".into())];
+        assert_eq!(matching_option(&options, "one"), None);
+    }
+
+    #[test]
+    fn title_value_cross_match_does_not_resolve_to_unique() {
+        let options = vec![("Choice".into(), "a".into()), ("Other".into(), "choice".into())];
+        assert_eq!(matching_option(&options, "choice"), None);
+    }
+}
+
+#[cfg(test)]
 mod popup_option_tests {
     use super::matching_option;
 
