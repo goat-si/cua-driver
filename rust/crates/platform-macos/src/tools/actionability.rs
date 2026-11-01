@@ -9,6 +9,7 @@ use std::{future::Future, time::Duration};
 
 pub(super) mod runner;
 pub(super) mod scope;
+pub(super) mod semantic;
 #[cfg(test)]
 #[path = "actionability/order_tests.rs"]
 mod u31_pointer_order_tests;
@@ -472,6 +473,21 @@ mod u31_facts_tests {
             .verdict,
             Verdict::Transient { unknown: true, .. }
         ));
+        let mut scope = FakeScope::default();
+        let result = semantic::sample_with(
+            7,
+            13,
+            &mut reader,
+            &mut scope,
+            &FakeClock::default(),
+            &mut StabilitySampler::default(),
+            &semantic::SemanticIntent::PerformAction("AXCustom".into()),
+        );
+        assert!(matches!(
+            result.verdict,
+            Verdict::Transient { unknown: true, .. }
+        ));
+        assert!(scope.calls.iter().all(|(_, _, _, kind)| *kind != "hit"));
     }
 
     #[test]
@@ -702,6 +718,31 @@ mod u31_facts_tests {
             .calls
             .iter()
             .all(|(e, w, s, _)| (*e, *w, *s) == (7, 13, Scope::WindowInternal)));
+        // The blocking semantic-sample seam carries only the sampler across
+        // reads; target and window are supplied afresh on every observation.
+        reader.frame_result = Evidence::Known(rectangle());
+        reader.actions_result = Evidence::Known(vec!["AXOpen".into()]);
+        let mut stability = StabilitySampler::default();
+        let mut semantic_scope = FakeScope::default();
+        for (time, expected) in [(100, false), (117, false), (134, true)] {
+            clock.0.store(time, Ordering::SeqCst);
+            let report = semantic::sample_with(
+                7,
+                13,
+                &mut reader,
+                &mut semantic_scope,
+                &clock,
+                &mut stability,
+                &semantic::SemanticIntent::Open,
+            );
+            assert_eq!(report.last_facts.unwrap().stable, Evidence::Known(expected));
+        }
+        assert!(semantic_scope
+            .calls
+            .iter()
+            .all(|(target, window, scope, kind)| {
+                (*target, *window, *scope) == (7, 13, Scope::WindowInternal) && *kind != "hit"
+            }));
     }
     #[test]
     fn hit_evidence_preserves_delivery_scope() {
