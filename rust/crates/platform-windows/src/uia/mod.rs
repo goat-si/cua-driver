@@ -11,8 +11,8 @@
 
 use crate::secure_field::{project_node_text, ProjectedNodeText, RawNodeText};
 use crate::walk_completeness::{
-    classify_cached_variant, note_tab_plan, note_unwalked_offscreen_rows, record_pattern_read,
-    CachedRead, Omission, RawCached, ReadLog, WalkState,
+    classify_cached_variant, collect_pattern_evidence, note_tab_plan, note_unwalked_offscreen_rows,
+    record_pattern_read, CachedRead, Omission, RawCached, ReadLog, WalkState,
 };
 use cua_driver_core::snapshot_compaction::{
     compact_tab_strip, fold_actionless_text_subtrees, format_omitted_tabs_line,
@@ -1682,6 +1682,13 @@ fn emit_cached_node(
     let description = (!description.is_empty()).then(|| description.join(" "));
     let raw_has_content = name.as_deref().is_some_and(|s| !s.trim().is_empty())
         || value.as_deref().is_some_and(|s| !s.trim().is_empty());
+    let enabled = read_cached_bool(element, UIA_IsEnabledPropertyId, ctx);
+    let is_enabled = enabled.unwrap_or(true);
+    let (has_value_pattern, actions) = collect_pattern_evidence(
+        is_enabled,
+        || unsafe { cached_pattern(element, UIA_ValuePatternId, ctx) }.is_some(),
+        || detect_cached_actions(element, &control_type, is_enabled, ctx),
+    );
     let ProjectedNodeText {
         name,
         value,
@@ -1695,16 +1702,11 @@ fn emit_cached_node(
         description,
         automation_id: automation_id.clone(),
         is_password: read_cached_bool(element, UIA_IsPasswordPropertyId, ctx),
-        has_value_pattern: unsafe { cached_pattern(element, UIA_ValuePatternId, ctx) }.is_some(),
+        has_value_pattern,
     });
-    let enabled = read_cached_bool(element, UIA_IsEnabledPropertyId, ctx);
-    // Missing UIA state must remain unknown on the structured observation
-    // surface. Action discovery keeps its historical best-effort assumption.
-    let is_enabled = enabled.unwrap_or(true);
     let selected = read_cached_selected(element, ctx);
     let checked = read_cached_checked(element, ctx);
     let expanded = read_cached_expanded(element, ctx);
-    let actions = detect_cached_actions(element, &control_type, is_enabled, ctx);
     let is_actionable = !actions.is_empty() && is_enabled;
     let has_content = name
         .as_deref()

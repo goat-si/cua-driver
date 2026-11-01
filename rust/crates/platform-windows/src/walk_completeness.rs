@@ -94,6 +94,21 @@ pub(crate) fn record_pattern_read(result: Result<(), i32>, log: &ReadLog) -> Cac
     classified
 }
 
+/// Value-pattern evidence is needed for secure projection even when disabled.
+pub(crate) fn collect_pattern_evidence<A: Default>(
+    enabled: bool,
+    probe_value: impl FnOnce() -> bool,
+    detect_actions: impl FnOnce() -> A,
+) -> (bool, A) {
+    let has_value = probe_value();
+    let actions = if enabled {
+        detect_actions()
+    } else {
+        A::default()
+    };
+    (has_value, actions)
+}
+
 #[derive(Debug)]
 pub(crate) struct WalkState<'a> {
     pub(crate) budget: &'a mut WalkBudget,

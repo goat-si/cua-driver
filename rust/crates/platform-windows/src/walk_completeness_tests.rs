@@ -436,11 +436,22 @@ fn omissions_and_budget_stops_report_their_exact_union() {
 fn disabled_node_value_pattern_failure_marks_read_untrusted() {
     let mut budget = WalkBudget::nodes_only(10);
     let state = WalkState::new(&mut budget, 25);
-    // Value-pattern projection probes even when action discovery is disabled.
-    assert_eq!(
-        record_pattern_read(Err(0x80004005u32 as i32), &state.reads),
-        CachedRead::Failed
+    let mut value_reads = 0;
+    let mut action_reads = 0;
+    let (has_value, actions): (bool, Vec<()>) = collect_pattern_evidence(
+        false,
+        || {
+            value_reads += 1;
+            record_pattern_read(Err(0x80004005u32 as i32), &state.reads) == CachedRead::Value
+        },
+        || {
+            action_reads += 1;
+            vec![()]
+        },
     );
+    assert!(!has_value);
+    assert!(actions.is_empty());
+    assert_eq!((value_reads, action_reads), (1, 0));
     assert!(!state.finish());
     let mut output = serde_json::json!({});
     budget.outcome().apply(&mut output);
@@ -451,4 +462,11 @@ fn disabled_node_value_pattern_failure_marks_read_untrusted() {
             {"kind":"unknown","detail":"not_asserted"}
         ])
     );
+}
+
+#[test]
+fn enabled_node_collects_value_and_actions() {
+    let (value, actions) = collect_pattern_evidence(true, || true, || vec!["invoke"]);
+    assert!(value);
+    assert_eq!(actions, vec!["invoke"]);
 }
