@@ -63,6 +63,7 @@ pub(super) enum Reply {
     Set(Read<Vec<usize>>),
     Actions(Read<Vec<String>>),
     Writable(bool),
+    WritableFailure(AXError),
     Selected(Settable),
 }
 pub(super) struct Step {
@@ -235,6 +236,7 @@ impl AxTreeSource for Fake {
                     Settable::No
                 }
             }
+            Reply::WritableFailure(error) => Settable::Unknown(error),
             _ => panic!("wrong reply"),
         }
     }

@@ -257,7 +257,7 @@ impl<S: AxTreeSource> AxTreeSource for EvidenceSource<'_, S> {
     fn action_names(&self, e: &Self::Element) -> Read<Vec<String>> {
         self.source.action_names(e)
     }
-    fn value_settable(&self, e: &Self::Element) -> bool {
+    fn value_settable(&self, e: &Self::Element) -> Settable {
         self.source.value_settable(e)
     }
     fn selected_settable(&self, e: &Self::Element) -> Settable {

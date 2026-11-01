@@ -746,3 +746,108 @@ fn nested_walk_evidence_is_isolated() {
         .any(|entry| entry.site == ReadSite::Content("AXIdentifier")
             && entry.status == EvidenceStatus::Unknown(ReadFailure::WrongType)));
 }
+
+#[test]
+fn value_settable_preserves_failure_and_false() {
+    const CONTENT: &str =
+        "AXTitle,AXPlaceholderValue,AXDescription,AXIdentifier,AXHelp,AXSubrole,AXRoleDescription";
+    const FRAME: &str = "AXPosition,AXSize";
+    for failed in [true, false] {
+        let mut attrs = vec![Slot::Text(AttrStatus::Absent); 7];
+        attrs[0] = Slot::Text(AttrStatus::Known("Edit".into()));
+        let reply = if failed {
+            Reply::WritableFailure(kAXErrorCannotComplete)
+        } else {
+            Reply::Writable(false)
+        };
+        let fake = Fake::new(
+            &[(1, 1, 1, &[])],
+            vec![
+                step("timeout 1", Reply::Unit),
+                step(
+                    "text 1 AXRole",
+                    Reply::Text(Read::Known("AXTextField".into())),
+                ),
+                step(
+                    &format!("batch 1 {CONTENT}"),
+                    Reply::Batch(Ok(Batch(attrs))),
+                ),
+                step("value 1", Reply::Value(Ok(None))),
+                step("actions 1", Reply::Actions(Read::Known(vec![]))),
+                step("value_settable 1", reply),
+                step(
+                    &format!("batch 1 {FRAME}"),
+                    Reply::Batch(Ok(Batch(vec![Slot::Point(None), Slot::Size(None)]))),
+                ),
+                step("children 1", Reply::Children(Read::Absent)),
+            ],
+        );
+        let root = fake.handle(1);
+        let observed = run_fake_observed(&fake, &root, None, 10, WalkBudget::nodes_only(10), true);
+        assert!(observed.legacy.tree_markdown.contains("Edit"));
+        assert!(observed
+            .legacy
+            .nodes
+            .iter()
+            .all(|node| node.element_index.is_none()));
+        drop(root);
+        fake.assert_consumed();
+        fake.assert_lifetimes(&[]);
+        assert_evidence(
+            &observed.evidence,
+            ReadSite::ValueSettable,
+            if failed {
+                EvidenceStatus::Unknown(failure())
+            } else {
+                EvidenceStatus::Known
+            },
+        );
+        assert!(observed
+            .evidence
+            .iter()
+            .any(|entry| entry.site == ReadSite::ValueSettable && entry.owner == Some(1)));
+    }
+
+    let mut attrs = vec![Slot::Text(AttrStatus::Absent); 7];
+    attrs[0] = Slot::Text(AttrStatus::Known("Edit".into()));
+    let control = Batch(vec![
+        Slot::Bool(None),
+        Slot::Point(None),
+        Slot::Size(None),
+        Slot::Text(AttrStatus::Absent),
+        Slot::Number(None),
+        Slot::Number(None),
+        Slot::Bool(None),
+    ]);
+    let fake = Fake::new(
+        &[(1, 1, 1, &[])],
+        vec![
+            step("timeout 1", Reply::Unit),
+            step(
+                "text 1 AXRole",
+                Reply::Text(Read::Known("AXTextField".into())),
+            ),
+            step(
+                &format!("batch 1 {CONTENT}"),
+                Reply::Batch(Ok(Batch(attrs))),
+            ),
+            step("value 1", Reply::Value(Ok(None))),
+            step("actions 1", Reply::Actions(Read::Known(vec![]))),
+            step("value_settable 1", Reply::Writable(true)),
+            step(&format!("batch 1 {CONTROL}"), Reply::Batch(Ok(control))),
+            step("snapshot 1", Reply::Unit),
+            step("children 1", Reply::Children(Read::Absent)),
+        ],
+    );
+    let root = fake.handle(1);
+    let observed = run_fake_observed(&fake, &root, None, 10, WalkBudget::nodes_only(10), true);
+    assert_eq!(observed.legacy.nodes[0].element_index, Some(0));
+    drop(root);
+    fake.assert_consumed();
+    fake.assert_lifetimes(&[(1, 1)]);
+    assert_evidence(
+        &observed.evidence,
+        ReadSite::ValueSettable,
+        EvidenceStatus::Known,
+    );
+}

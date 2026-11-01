@@ -1333,7 +1333,8 @@ fn walk_element<S: AxTreeSource>(
     });
 
     let label_path = next_label_path(parent_path, parent_role, Some(&role));
-    let child_label_path = child_label_path(label_path, &role, parent_role, source.key(element));
+    let element_key = source.key(element);
+    let child_label_path = child_label_path(label_path, &role, parent_role, element_key);
     let in_web_content = in_web_content || is_web_content_role(&role);
     if in_web_content && !include_web_content {
         note_skipped();
@@ -1613,6 +1614,14 @@ fn walk_element<S: AxTreeSource>(
     };
     let value_settable_observed_at = value_settable_read.map(|_| std::time::Instant::now());
     let value_settable_in_time = !budget.expired();
+    if let Some(value) = value_settable_read {
+        let read = match value {
+            super::write_outcome::Settable::Yes => Read::Known(true),
+            super::write_outcome::Settable::No => Read::Known(false),
+            super::write_outcome::Settable::Unknown(error) => Read::Unknown(super::tree_source::ReadFailure::Ax(error)),
+        };
+        super::evidence::observe_read(Some(element_key), super::evidence::ReadSite::ValueSettable, read).into_walk_legacy();
+    }
     let value_settable = matches!(
         value_settable_read,
         Some(super::write_outcome::Settable::Yes)

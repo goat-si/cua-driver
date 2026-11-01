@@ -114,6 +114,24 @@ pub(crate) fn read_status<T>(read: &Read<T>) -> EvidenceStatus {
     }
 }
 
+pub(crate) fn observe_read<T>(
+    owner: Option<usize>,
+    site: ReadSite,
+    legacy: Read<T>,
+) -> Observed<Read<T>> {
+    let status = read_status(&legacy);
+    Observed {
+        legacy,
+        evidence: vec![ReadEvidence {
+            owner,
+            site,
+            status,
+            attempt: 0,
+            listing: None,
+        }],
+    }
+}
+
 pub(crate) fn attr_status(status: &AttrStatus) -> (EvidenceStatus, Option<AttributeListing>) {
     match status {
         AttrStatus::Known(_) => (EvidenceStatus::Known, None),
