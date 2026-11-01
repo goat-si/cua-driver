@@ -303,7 +303,8 @@ async fn right_click_axshowmenu_refusal_blocks_dispatch() {
                 sent_ref.fetch_add(1, Ordering::SeqCst);
                 success()
             },
-        ).await;
+        )
+        .await;
         assert_eq!(sent.load(Ordering::SeqCst), usize::from(allowed));
         assert_eq!(result.is_ok(), allowed);
     }

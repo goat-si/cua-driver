@@ -57,20 +57,34 @@ where
 }
 
 pub(super) async fn dispatch_show_menu<C, P, A, F, T>(
-    _clock: &(impl cua_driver_core::actionability::Clock + Sync),
-    _budget: Duration,
-    _advertises_show_menu: bool,
+    clock: &(impl cua_driver_core::actionability::Clock + Sync),
+    budget: Duration,
+    advertises_show_menu: bool,
     context: C,
-    _probe: P,
+    probe: P,
     perform: A,
 ) -> Result<T, ToolResult>
 where
     C: Sync,
-    P: for<'a> FnMut(&'a C, Duration) -> std::pin::Pin<Box<dyn std::future::Future<Output = cua_driver_core::actionability::ActionabilityReport> + Send + 'a>> + Send,
+    P: for<'a> FnMut(
+            &'a C,
+            Duration,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = cua_driver_core::actionability::ActionabilityReport,
+                    > + Send
+                    + 'a,
+            >,
+        > + Send,
     A: FnOnce(C) -> F,
     F: std::future::Future<Output = T>,
 {
-    Ok(perform(context).await)
+    if advertises_show_menu {
+        super::actionability::dispatch_semantic(clock, budget, context, probe, perform).await
+    } else {
+        Ok(perform(context).await)
+    }
 }
 
 pub struct RightClickTool {
@@ -363,19 +377,29 @@ impl RightClickTool {
             };
 
             let action_guard = element_guard.clone();
-            let advertises_show_menu = match latency::spawn_blocking(move || unsafe {
-                copy_action_names(action_guard.as_ptr() as AXUIElementRef)
-                    .iter().any(|name| name == "AXShowMenu")
-            }).await {
-                Ok(advertises) => advertises,
-                Err(error) => return super::pre_dispatch_refusal("action_unavailable", format!("right_click: action resolution failed ({error}); nothing was sent.")),
-            };
+            let advertises_show_menu =
+                match latency::spawn_blocking(move || unsafe {
+                    copy_action_names(action_guard.as_ptr() as AXUIElementRef)
+                        .iter()
+                        .any(|name| name == "AXShowMenu")
+                })
+                .await
+                {
+                    Ok(advertises) => advertises,
+                    Err(error) => return super::pre_dispatch_refusal(
+                        "action_unavailable",
+                        format!(
+                            "right_click: action resolution failed ({error}); nothing was sent."
+                        ),
+                    ),
+                };
 
             // The context menu steals key focus from the user's app when the
             // target is in the background; the guard hands it back.
             let probe_target = element_guard.clone();
             let clock = super::actionability::semantic_clock();
-            let perform = |mutation_lease| async move { latency::spawn_action_blocking(move || -> anyhow::Result<_> {
+            let perform = |mutation_lease| async move {
+                latency::spawn_action_blocking(move || -> anyhow::Result<_> {
                 let _action = latency::span(latency::Stage::ActionBlocking);
                 let element_ptr = element_guard.as_ptr();
                 let input_watch = MenuInputWatch::start(pid);
@@ -417,18 +441,26 @@ impl RightClickTool {
                     }
                 };
                 result.map(|delivery| (delivery, menu))
-            }).await };
+            }).await
+            };
             let result = match dispatch_show_menu(
                 &clock,
                 cua_driver_core::actionability::DEFAULT_BUDGET,
                 advertises_show_menu,
                 mutation_lease,
-                |lease, _| super::actionability::semantic_probe(
-                    Some(lease), probe_target.clone(), pid, wid,
-                    super::actionability::semantic::SemanticIntent::RightClick,
-                ),
+                |lease, _| {
+                    super::actionability::semantic_probe(
+                        Some(lease),
+                        probe_target.clone(),
+                        pid,
+                        wid,
+                        super::actionability::semantic::SemanticIntent::RightClick,
+                    )
+                },
                 perform,
-            ).await {
+            )
+            .await
+            {
                 Ok(result) => result,
                 Err(refusal) => return refusal,
             };
