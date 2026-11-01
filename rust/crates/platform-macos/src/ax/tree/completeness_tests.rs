@@ -278,6 +278,29 @@ fn ordinary_read_is_not_asserted() {
 }
 
 #[test]
+fn closed_menubar_menu_is_scope_exclusion_not_incomplete() {
+    let tree = super::walker_seam_tests::closed_menu_fixture();
+    let mut output = json!({});
+    tree.walk
+        .apply_with_owner_mapping(&mut output, &std::collections::HashMap::from([(1, 0)]));
+    // The frozen name predates core #253: unverified excluded content is incomplete.
+    assert_eq!(
+        output["observation_scope_exclusions"],
+        json!([{
+            "kind":"closed_menus_not_expanded", "element_indices":[0]
+        }])
+    );
+    assert_eq!(output["observation_complete"], false);
+    assert!(has_reason(
+        &tree,
+        "unknown",
+        "excluded_content_unclassified"
+    ));
+    assert!(!has_reason(&tree, "policy_omission", "collapsed_menu"));
+    assert!(!tree.nodes_skipped);
+}
+
+#[test]
 fn window_recovery_failure_never_asserts_complete() {
     use super::environment_evidence_tests::Scenario;
     for (scenario, root) in [

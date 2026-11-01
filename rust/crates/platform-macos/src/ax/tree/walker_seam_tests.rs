@@ -578,8 +578,43 @@ fn representative_window_markdown_and_nodes_are_pinned() {
     ]);
 }
 
-// Baseline 36279fdc: false, absent and failed AXSelected all take the old
-// collapsed-menu branch and call note_skipped without enumerating children.
+pub(super) fn closed_menu_fixture() -> TreeWalkResult {
+    let source = Fake::new(
+        &[(1, 1, 1, &[2]), (2, 2, 2, &[])],
+        vec![
+            step("timeout 1", Reply::Unit),
+            step(
+                "text 1 AXRole",
+                Reply::Text(Read::Known("AXMenuBarItem".into())),
+            ),
+            step(
+                &format!("batch 1 {CONTENT}"),
+                Reply::Batch(Ok(content(Some("File")))),
+            ),
+            step("value 1", Reply::Value(Ok(None))),
+            step(
+                "actions 1",
+                Reply::Actions(Read::Known(vec!["AXPress".into()])),
+            ),
+            step(
+                &format!("batch 1 {CONTROL}"),
+                Reply::Batch(Ok(control_batch())),
+            ),
+            step("snapshot 1", Reply::Unit),
+            step("bool 1 AXSelected", Reply::Bool(Read::Known(false))),
+        ],
+    );
+    let root = source.handle(1);
+    let result = with_menus_collapsed(true, || {
+        run_fake(&source, &root, None, 10, WalkBudget::nodes_only(100), true)
+    });
+    drop(root);
+    source.assert_consumed();
+    source.assert_lifetimes(&[(1, 1)]);
+    result
+}
+
+// A positively closed menu is excluded; absent and failed selection still skip.
 #[test]
 fn collapsed_menu_keeps_legacy_skip() {
     for selection in [
@@ -623,7 +658,7 @@ fn collapsed_menu_keeps_legacy_skip() {
         drop(root);
         source.assert_consumed();
         source.assert_lifetimes(&[(1, 1)]);
-        assert!(result.nodes_skipped);
+        assert_eq!(result.nodes_skipped, collapsed_reason);
         assert!(!result.truncated);
         let mut payload = serde_json::json!({});
         result.walk.apply(&mut payload);
