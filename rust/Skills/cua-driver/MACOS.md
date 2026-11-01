@@ -223,6 +223,7 @@ When a cua-driver call surprises you, diagnose cua-driver first:
   race against a close, or the window has no backing store yet).
   Re-snapshot; if persistent, pick a different `window_id` via
   `list_windows`.
+- **`process_instance_mismatch` / `process_instance_unverified`?** Stop the action and take a fresh `get_window_state`; do not automatically retry or refind the old target.
 - **`stale_element_token` / no cached AX state?**
   Re-snapshot the exact window and use the new `element_token`. A new
   snapshot of that window invalidates older targets immediately; the refusal

@@ -16,6 +16,7 @@ read/act round trip; otherwise set `session_evidence` to an error, producing
 | ForeignSession | session A token refused in B, zero dispatches | Required | Required | Required |
 | GoneReadError | actual injected read error, gone_unconfirmed/lookup_failed | Required | Required | Required |
 | Disposition | well-formed delivery/retry pair on every refusal above | Required | Required | Required |
+| Process instance | `process_instance_mismatch` or `process_instance_unverified` is terminal, pre-send and requires a fresh `get_window_state` | Not wired | Not wired | Not wired |
 | Actionability | disabled action refused before dispatch | Not wired | Not wired | Not wired |
 | Completeness | observation_complete for adopting platform | Not wired | Not wired | Not wired |
 
@@ -35,6 +36,12 @@ be explicit and reviewable. The matrix is a handoff requirement, not a claim
 that any platform fixture has been implemented or passed. Contracts 6 and 7
 remain `NotWired` until platform adoption. Text editing, window identity,
 batch session overrides and FFI identity are outside this battery.
+
+The stale and foreign-session probes still require `stale_element_token`:
+lookup and session ownership take precedence over process-instance evidence.
+They must not accept an instance refusal as a successful stale probe. Legacy
+unprotected snapshots carry a PID-reuse residual when a batch refinds a stale
+token by role and label; this remains until platforms publish protected snapshots.
 
 ### Observation scope and closed menus
 

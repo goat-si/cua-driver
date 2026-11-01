@@ -38,6 +38,34 @@ pub enum InstanceEvidence {
     NotChecked,
 }
 
+fn instance_failure(instance: &InstanceCapture, live: &InstanceEvidence) -> Option<ToolResult> {
+    let (code, reason) = match (instance, live) {
+        (InstanceCapture::Failed(_), _) => (
+            "process_instance_unverified",
+            "process identity could not be captured",
+        ),
+        (InstanceCapture::Captured(stored), InstanceEvidence::Live(live))
+            if stored.start_time.is_some() && live.start_time.is_some() =>
+        {
+            if stored.matches(live) {
+                return None;
+            }
+            (
+                "process_instance_mismatch",
+                "the process that owned this snapshot has exited or restarted",
+            )
+        }
+        _ => (
+            "process_instance_unverified",
+            "process identity could not be verified",
+        ),
+    };
+    Some(
+        refusal(code, format!("{reason}; call get_window_state again"))
+            .with_disposition(cua_driver_contract::ErrorDisposition::NOT_DELIVERED),
+    )
+}
+
 pub trait SnapshotPayload: Send + Sync + 'static {
     type Element;
     fn len(&self) -> usize;
@@ -1105,18 +1133,13 @@ impl<S: SnapshotPayload> SnapshotStore<S> {
                 "snapshot belongs to another session; call get_window_state in this session".into(),
             ));
         }
-        let failure = match (&snapshot.instance, live) {
-            (None, _) => None,
-            (Some(InstanceCapture::Failed(_)), _) => Some("process identity could not be captured"),
-            (Some(InstanceCapture::Captured(stored)), InstanceEvidence::Live(live))
-                if stored.start_time.is_some() && live.start_time.is_some() => {
-                    (!stored.matches(&live)).then_some("the process that owned this snapshot has exited or restarted; call get_window_state again")
-                }
-            (Some(InstanceCapture::Captured(_)), _) => Some("process identity could not be verified"),
-        };
-        if let Some(message) = failure {
+        if let Some(failure) = snapshot
+            .instance
+            .as_ref()
+            .and_then(|instance| instance_failure(instance, &live))
+        {
             drop(element);
-            return Err(refusal("stale_element_token", message.into()));
+            return Err(failure);
         }
         Ok(ResolvedElement::Element {
             window_id: snapshot.window_id,
@@ -1300,8 +1323,12 @@ mod tests {
                 InstanceEvidence::Live(fingerprint(Some(2), Some("/app"))),
             )
             .unwrap_err();
+        assert_eq!(
+            err.disposition,
+            Some(cua_driver_contract::ErrorDisposition::NOT_DELIVERED)
+        );
         let content = err.structured_content.unwrap();
-        assert_eq!(content["refusal"]["code"], "stale_element_token");
+        assert_eq!(content["refusal"]["code"], "process_instance_mismatch");
         assert!(content["refusal"]["message"].as_str().unwrap().contains("the process that owned this snapshot has exited or restarted; call get_window_state again"));
     }
 
@@ -1324,17 +1351,28 @@ mod tests {
         };
         let id = publish(InstanceCapture::Captured(fp.clone()));
         let args = serde_json::json!({"element_token": token_for(id, 0), "_session_id": "owner"});
-        for live in [
-            InstanceEvidence::NotChecked,
-            InstanceEvidence::Unavailable("denied".into()),
-            InstanceEvidence::Live(fingerprint(None, Some("/app"))),
-            InstanceEvidence::Live(fingerprint(Some(1), Some("/updated"))),
+        for (live, expected) in [
+            (InstanceEvidence::NotChecked, "process_instance_unverified"),
+            (
+                InstanceEvidence::Unavailable("denied".into()),
+                "process_instance_unverified",
+            ),
+            (
+                InstanceEvidence::Live(fingerprint(None, Some("/app"))),
+                "process_instance_unverified",
+            ),
+            (
+                InstanceEvidence::Live(fingerprint(Some(1), Some("/updated"))),
+                "process_instance_mismatch",
+            ),
         ] {
             let err = cache.resolve_for_instance(42, &args, live).unwrap_err();
             assert_eq!(
-                err.structured_content.unwrap()["refusal"]["code"],
-                "stale_element_token"
+                err.disposition,
+                Some(cua_driver_contract::ErrorDisposition::NOT_DELIVERED)
             );
+            assert!(crate::snapshot_test_support::text(&err).contains("get_window_state"));
+            assert_eq!(err.structured_content.unwrap()["refusal"]["code"], expected);
         }
         assert!(cache.resolve(42, &args).is_err());
         for capture in [
@@ -1347,6 +1385,10 @@ mod tests {
             let err = cache
                 .resolve_for_instance(42, &args, InstanceEvidence::Live(fp.clone()))
                 .unwrap_err();
+            assert_eq!(
+                err.structured_content.as_ref().unwrap()["refusal"]["code"],
+                "process_instance_unverified"
+            );
             assert!(crate::snapshot_test_support::text(&err)
                 .contains("process identity could not be captured"));
         }

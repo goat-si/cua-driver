@@ -414,6 +414,10 @@ struct RerenderState {
     rows: Vec<(&'static str, &'static str)>,
     clicked: Vec<String>,
     incomplete: bool,
+    refusal: Option<&'static str>,
+    click_calls: usize,
+    plain_stale: bool,
+    read_refusal: Option<&'static str>,
 }
 
 #[async_trait]
@@ -427,6 +431,13 @@ impl Tool for Rerender {
         match self.def.name.as_str() {
             "get_window_state" => {
                 state.snapshot += 1;
+                if let Some(code) = state.read_refusal {
+                    return ToolResult::error(
+                        "process identity could not be verified; call get_window_state",
+                    )
+                    .with_structured(json!({"refusal":{"code":code}}))
+                    .with_disposition(cua_driver_contract::ErrorDisposition::NOT_DELIVERED);
+                }
                 let snapshot = format!("s{:08x}", state.snapshot);
                 let elements: Vec<Value> = state
                     .rows
@@ -454,12 +465,26 @@ impl Tool for Rerender {
                 ToolResult::text("read").with_structured(read)
             }
             "click" => {
+                state.click_calls += 1;
+                if let Some(code) = state.refusal {
+                    return ToolResult::error(
+                        "element_token is stale; Retry with delivery_mode:\"foreground\"",
+                    )
+                    .with_structured(
+                        json!({"refusal":{"code":code},"escalation":{"recommended":"foreground"}}),
+                    )
+                    .with_disposition(cua_driver_contract::ErrorDisposition::NOT_DELIVERED);
+                }
                 let token = args["element_token"]
                     .as_str()
                     .unwrap_or_default()
                     .to_owned();
                 let current = format!("s{:08x}:", state.snapshot);
                 if !token.starts_with(&current) {
+                    if state.plain_stale {
+                        return ToolResult::error("element_token is stale")
+                            .with_structured(json!({"refusal":{"code":"stale_element_token"}}));
+                    }
                     return ToolResult::error(
                         "Background input refused (element_outside_target_window): the addressed \
                          element could not be proven to belong to window 7; take a fresh \
@@ -478,6 +503,61 @@ impl Tool for Rerender {
             }]})),
             _ => ToolResult::text("ok"),
         }
+    }
+}
+
+#[tokio::test]
+async fn instance_refusal_on_lookup_read_stops_locator() {
+    for code in ["process_instance_mismatch", "process_instance_unverified"] {
+        let (registry, state) = rerender_registry(425108, vec![("AXButton", "Save")]);
+        state.lock().unwrap().read_refusal = Some(code);
+        let clock = Arc::new(RefindClock::default());
+        let locator = super::super::locate::Locator::new(
+            &registry,
+            None,
+            std::time::Instant::now() + std::time::Duration::from_secs(10),
+        )
+        .with_clock(clock, std::time::Duration::from_secs(10));
+        let window = super::super::locate::WindowSpec {
+            pid: Some(425108),
+            window_id: Some(7),
+            ..Default::default()
+        };
+        let element = super::super::locate::ElementSpec {
+            role: Some("AXButton".into()),
+            name: Some("Save".into()),
+            ..Default::default()
+        };
+        assert!(locator
+            .find(&window, &element, std::time::Duration::from_secs(2))
+            .await
+            .is_err());
+        assert_eq!(locator.scope_refusal(), Some(code));
+        assert_eq!(state.lock().unwrap().snapshot, 41, "{code}: one read");
+    }
+}
+
+#[tokio::test]
+async fn instance_refusals_stop_batch_without_refind_or_redispatch() {
+    for code in ["process_instance_mismatch", "process_instance_unverified"] {
+        let (registry, state) = rerender_registry(425107, vec![("AXButton", "Save")]);
+        state.lock().unwrap().refusal = Some(code);
+        crate::window_state_view::remember_for_test(
+            "s0000fa13",
+            425107,
+            7,
+            "- [14] AXButton \"Save\"\n",
+        );
+        let result = registry.invoke(super::super::RUN_STEPS_TOOL, json!({
+            "foreground_fallback":true,
+            "steps":[{"tool":"click","args":{"pid":425107,"window_id":7,"element_token":"s0000fa13:14"}}]
+        })).await;
+        assert_eq!(result.is_error, Some(true), "{code}: {}", text(&result));
+        assert_eq!(result.structured_content.as_ref().unwrap()["code"], code);
+        let state = state.lock().unwrap();
+        assert_eq!(state.snapshot, 40, "{code}: no refind reads");
+        assert_eq!(state.click_calls, 1, "{code}: only the refused attempt");
+        assert!(state.clicked.is_empty(), "{code}: no input delivered");
     }
 }
 
@@ -570,6 +650,7 @@ async fn a_stale_element_token_is_found_again_by_its_role_and_label() {
             ("AXButton", "Cinder decision LHP-CINDER"),
         ],
     );
+    state.lock().unwrap().plain_stale = true;
     // The read the model took its token from (snapshot s0000002c, row 14),
     // remembered as get_window_state remembers every read.
     crate::window_state_view::remember_for_test(

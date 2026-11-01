@@ -288,6 +288,12 @@ static RULES: &[Rule] = &[
             .call(c.read_window())
         },
     },
+    Rule {
+        codes: &["process_instance_mismatch", "process_instance_unverified"],
+        build: |c| {
+            RecoveryHint::new("The snapshot's process identity changed or could not be verified. Take a fresh get_window_state before deciding what to do.").call(c.read_window())
+        },
+    },
     // Tokens, snapshots and geometry that went stale.
     Rule {
         codes: &["stale_element_token"],
