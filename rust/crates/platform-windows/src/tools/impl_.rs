@@ -10687,6 +10687,9 @@ impl Tool for BringToFrontTool {
 pub struct KillAppTool;
 static KILL_DEF: std::sync::OnceLock<ToolDef> = std::sync::OnceLock::new();
 
+#[path = "impl_/kill_app_termination.rs"]
+mod kill_app_termination;
+
 #[async_trait]
 impl Tool for KillAppTool {
     fn def(&self) -> &ToolDef {
@@ -10761,59 +10764,42 @@ impl Tool for KillAppTool {
             }
         };
 
+        let expected = match args.get("_protected_process_fingerprint") {
+            Some(value) => {
+                let fingerprint = match serde_json::from_value::<
+                    cua_driver_core::browser::ProcessFingerprint,
+                >(value.clone())
+                {
+                    Ok(fingerprint) if fingerprint.pid == i64::from(pid_v) => fingerprint,
+                    _ => {
+                        return kill_app_stale_process_refusal(
+                            "the process at this pid is not the approved instance".to_owned(),
+                        )
+                    }
+                };
+                match fingerprint.start_time {
+                    Some(start) => Some((start, fingerprint.executable)),
+                    None => {
+                        return kill_app_stale_process_refusal(
+                            "the process at this pid is not the approved instance".to_owned(),
+                        )
+                    }
+                }
+            }
+            None => None,
+        };
+
         // Run the syscalls on a blocking thread — TerminateProcess + the
         // WaitForSingleObject confirmation are both blocking, and we don't
         // want to stall the tokio reactor.
-        let outcome = tokio::task::spawn_blocking(move || -> Result<(), String> {
-            use windows::Win32::Foundation::{CloseHandle, WAIT_OBJECT_0};
-            use windows::Win32::System::Threading::{
-                OpenProcess, TerminateProcess, WaitForSingleObject, PROCESS_SYNCHRONIZE,
-                PROCESS_TERMINATE,
-            };
-
-            // SAFETY: OpenProcess returns a Result<HANDLE> in windows-rs;
-            // PROCESS_TERMINATE | PROCESS_SYNCHRONIZE lets us both kill the
-            // target AND wait for the OS to fully reap it (so the caller's
-            // follow-up list_apps reflects the change immediately).
-            let h = unsafe { OpenProcess(PROCESS_TERMINATE | PROCESS_SYNCHRONIZE, false, pid_v) }
-                .map_err(|e| {
-                format!(
-                    "OpenProcess(pid={pid_v}, PROCESS_TERMINATE|PROCESS_SYNCHRONIZE) failed: {e}. \
-                     The process may not exist, or the daemon lacks the right to terminate it. \
-                     Try listing processes first to confirm the pid is correct."
-                )
-            })?;
-
-            let term_result = unsafe { TerminateProcess(h, 1) };
-
-            // WaitForSingleObject so the caller can assume the process is
-            // really gone on return. 2-second cap — TerminateProcess is
-            // synchronous in practice but the OS still needs a moment to
-            // reap kernel structures. WAIT_TIMEOUT is treated as a soft
-            // success (the kill request landed; the process may take a
-            // little longer to disappear from list_apps).
-            let wait_status = unsafe { WaitForSingleObject(h, 2000) };
-            let _ = unsafe { CloseHandle(h) };
-
-            match (term_result, wait_status) {
-                (Ok(()), s) if s == WAIT_OBJECT_0 => Ok(()),
-                (Ok(()), _) => Ok(()), // killed, wait timed out — caller can re-check
-                (Err(e), _) => Err(format!(
-                    "TerminateProcess(pid={pid_v}) failed: {e}. The handle was opened \
-                     successfully but the kill itself was rejected; this is unusual for \
-                     PROCESS_TERMINATE rights and may indicate a protected-process target \
-                     (PPL, e.g. csrss / system services)."
-                )),
-            }
+        let outcome = tokio::task::spawn_blocking(move || {
+            kill_app_termination::terminate_pid(pid_v, expected)
         })
         .await;
 
         match outcome {
-            Ok(Ok(())) => ToolResult::text(format!("✅ Terminated pid {pid_v}.")),
-            Ok(Err(e)) => ToolResult::error(format!("kill_app: {e}")),
-            Err(join_err) => {
-                ToolResult::error(format!("kill_app: blocking-task join error: {join_err}"))
-            }
+            Ok(result) => kill_app_termination::tool_result(pid_v, result),
+            Err(_) => crate::process_termination::worker_failure_result(),
         }
     }
 }

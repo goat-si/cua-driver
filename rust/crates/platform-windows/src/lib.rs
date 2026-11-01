@@ -79,6 +79,9 @@ pub fn install_pointer_shape_backend() -> bool {
 mod process_selection;
 
 #[cfg(any(target_os = "windows", test))]
+mod process_termination;
+
+#[cfg(any(target_os = "windows", test))]
 mod uia_mutation;
 
 #[cfg(any(target_os = "windows", test))]
