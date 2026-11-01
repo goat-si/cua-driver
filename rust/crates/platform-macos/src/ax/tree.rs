@@ -368,8 +368,9 @@ fn row_label_candidate<'a>(
         .find(|text| !text.is_empty())
 }
 
-pub(super) fn initial_owned_row_label(role: &str) -> Option<Option<String>> {
-    matches!(role, "AXRow" | "AXCell" | "AXOutlineRow").then_some(None)
+pub(super) fn initialize_owned_row_label(node: &mut AXNode) {
+    node.owned_row_label =
+        matches!(node.role.as_str(), "AXRow" | "AXCell" | "AXOutlineRow").then_some(None);
 }
 
 pub(super) fn child_label_path(
@@ -1446,8 +1447,7 @@ unsafe fn walk_element(
 
     if !is_actionable && !has_content && role != "AXWindow" && role != "AXSheet" {
         if exhaustive_nodes() {
-            let node = AXNode {
-                owned_row_label: initial_owned_row_label(&role),
+            let mut node = AXNode {
                 identifier: identifier.clone(),
                 help: help.clone(),
                 ..role_only_node(
@@ -1458,6 +1458,7 @@ unsafe fn walk_element(
                     in_web_content,
                 )
             };
+            initialize_owned_row_label(&mut node);
             lines.push((depth, format_node_line(&node)));
             nodes.push(node);
         }
@@ -1534,14 +1535,14 @@ unsafe fn walk_element(
             control_state.value_state.clone(),
         )
     };
-    let node = if is_actionable {
+    let mut node = if is_actionable {
         let idx = *counter;
         *counter += 1;
         // Retain so the element stays alive in the cache after `copy_children`
         // releases the per-child ref at the end of the caller's loop.
         CFRetain(element as CFTypeRef);
         AXNode {
-            owned_row_label: initial_owned_row_label(&role),
+            owned_row_label: None,
             element_index: Some(idx),
             role: role.clone(),
             title: if visible_title.is_empty() {
@@ -1572,7 +1573,7 @@ unsafe fn walk_element(
         }
     } else {
         AXNode {
-            owned_row_label: initial_owned_row_label(&role),
+            owned_row_label: None,
             element_index: None,
             role: role.clone(),
             title: if visible_title.is_empty() {
@@ -1602,6 +1603,7 @@ unsafe fn walk_element(
             in_web_content,
         }
     };
+    initialize_owned_row_label(&mut node);
 
     // Track this node as the parent for its descendants only when it was
     // assigned an element_index (mirrors what the markdown shows: only
