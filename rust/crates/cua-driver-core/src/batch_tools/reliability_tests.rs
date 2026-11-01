@@ -409,6 +409,7 @@ struct Rerender {
 #[derive(Default)]
 struct RerenderState {
     snapshot: u32,
+    pid: i64,
     /// Labels of the current snapshot, by row.
     rows: Vec<(&'static str, &'static str)>,
     clicked: Vec<String>,
@@ -441,7 +442,7 @@ impl Tool for Rerender {
                     })
                     .collect();
                 ToolResult::text("read").with_structured(json!({
-                    "pid": 42, "window_id": 7, "snapshot_id": snapshot,
+                    "pid": state.pid, "window_id": 7, "snapshot_id": snapshot,
                     "elements": elements, "tree_markdown": "",
                 }))
             }
@@ -464,7 +465,7 @@ impl Tool for Rerender {
                 ToolResult::text(format!("clicked {label}"))
             }
             "list_windows" => ToolResult::text("windows").with_structured(json!({"windows": [{
-                "pid": 42, "window_id": 7, "app_name": "Daymark", "title": "Daymark",
+                "pid": state.pid, "window_id": 7, "app_name": "Daymark", "title": "Daymark",
                 "z_index": 1, "is_on_screen": true,
                 "bounds": {"x": 0.0, "y": 0.0, "width": 800.0, "height": 600.0}
             }]})),
@@ -474,10 +475,12 @@ impl Tool for Rerender {
 }
 
 fn rerender_registry(
+    pid: i64,
     rows: Vec<(&'static str, &'static str)>,
 ) -> (Arc<ToolRegistry>, Arc<Mutex<RerenderState>>) {
     let state = Arc::new(Mutex::new(RerenderState {
         snapshot: 40,
+        pid,
         rows,
         ..Default::default()
     }));
@@ -507,23 +510,26 @@ fn rerender_registry(
 
 #[tokio::test]
 async fn a_stale_element_token_is_found_again_by_its_role_and_label() {
-    let (registry, state) = rerender_registry(vec![
-        ("AXButton", "Update event"),
-        ("AXButton", "Aster kickoff"),
-        ("AXButton", "Cinder decision LHP-CINDER"),
-    ]);
+    let (registry, state) = rerender_registry(
+        425104,
+        vec![
+            ("AXButton", "Update event"),
+            ("AXButton", "Aster kickoff"),
+            ("AXButton", "Cinder decision LHP-CINDER"),
+        ],
+    );
     // The read the model took its token from (snapshot s0000002c, row 14),
     // remembered as get_window_state remembers every read.
     crate::window_state_view::remember_for_test(
         "s0000002c",
-        42,
+        425104,
         7,
         "- [0] AXWindow \"Daymark\"\n  - [14] AXButton \"Cinder decision LHP-CINDER\" [actions=[press]]\n",
     );
     let result = registry
         .invoke(
             super::super::RUN_STEPS_TOOL,
-            json!({"steps": [{"tool": "click", "args": {"pid": 42, "window_id": 7, "element_token": "s0000002c:14"}}]}),
+            json!({"steps": [{"tool": "click", "args": {"pid": 425104, "window_id": 7, "element_token": "s0000002c:14"}}]}),
         )
         .await;
     assert_ne!(result.is_error, Some(true), "{}", text(&result));
@@ -536,10 +542,10 @@ async fn a_stale_element_token_is_found_again_by_its_role_and_label() {
 
 #[tokio::test]
 async fn a_stale_token_is_not_retried_when_its_label_is_ambiguous_or_unknown() {
-    let (registry, state) = rerender_registry(vec![("AXButton", "OK"), ("AXButton", "OK")]);
+    let (registry, state) = rerender_registry(425105, vec![("AXButton", "OK"), ("AXButton", "OK")]);
     crate::window_state_view::remember_for_test(
         "s0000002d",
-        42,
+        425105,
         7,
         "- [3] AXButton \"OK\"\n- [4] AXStaticText = \"no label\"\n",
     );
@@ -547,7 +553,7 @@ async fn a_stale_token_is_not_retried_when_its_label_is_ambiguous_or_unknown() {
         let result = registry
             .invoke(
                 super::super::RUN_STEPS_TOOL,
-                json!({"steps": [{"tool": "click", "args": {"pid": 42, "window_id": 7, "element_token": token}}]}),
+                json!({"steps": [{"tool": "click", "args": {"pid": 425105, "window_id": 7, "element_token": token}}]}),
             )
             .await;
         assert_eq!(result.is_error, Some(true), "{token}");
