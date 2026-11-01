@@ -409,20 +409,22 @@ fn menu_selected_preserves_unknown_and_absent_with_legacy_skip() {
     const CONTENT: &str =
         "AXTitle,AXPlaceholderValue,AXDescription,AXIdentifier,AXHelp,AXSubrole,AXRoleDescription";
     const FRAME: &str = "AXPosition,AXSize";
-    for (selection, expected, skipped) in [
+    for (selection, expected, skipped, walks_children) in [
         (
             Read::Unknown(failure()),
             EvidenceStatus::Unknown(failure()),
             true,
+            false,
         ),
         (
             Read::Unknown(ReadFailure::WrongType),
             EvidenceStatus::Unknown(ReadFailure::WrongType),
             true,
+            false,
         ),
-        (Read::Absent, EvidenceStatus::Absent, true),
-        (Read::Known(false), EvidenceStatus::Known, true),
-        (Read::Known(true), EvidenceStatus::Known, false),
+        (Read::Absent, EvidenceStatus::Absent, true, false),
+        (Read::Known(false), EvidenceStatus::Known, false, false),
+        (Read::Known(true), EvidenceStatus::Known, false, true),
     ] {
         let mut attrs = vec![Slot::Text(AttrStatus::Absent); 7];
         attrs[0] = Slot::Text(AttrStatus::Known("Menu".into()));
@@ -444,7 +446,7 @@ fn menu_selected_preserves_unknown_and_absent_with_legacy_skip() {
             ),
             step("bool 1 AXSelected", Reply::Bool(selection)),
         ];
-        if !skipped {
+        if walks_children {
             steps.push(step("children 1", Reply::Children(Read::Absent)));
         }
         let fake = Fake::new(&[(1, 1, 1, &[])], steps);
