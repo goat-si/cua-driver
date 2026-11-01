@@ -112,6 +112,95 @@ impl ContentReader for ContentScript {
     }
 }
 
+struct ValueScript {
+    value: Option<Result<Option<StringishAttrValue>, AXError>>,
+    expire_after_value: bool,
+    expired: std::cell::Cell<bool>,
+    trace: Vec<&'static str>,
+}
+
+impl ContentReader for ValueScript {
+    fn batch(&mut self) -> Result<[AttrStatus; 7], BatchFailure> {
+        self.trace.push("batch");
+        let mut attrs = std::array::from_fn(|_| AttrStatus::Absent);
+        attrs[0] = AttrStatus::Known("label".into());
+        Ok(attrs)
+    }
+    fn string(&mut self, _: &str) -> AttrStatus {
+        panic!("unexpected single read")
+    }
+    fn value(&mut self) -> Result<Option<StringishAttrValue>, AXError> {
+        self.trace.push("value");
+        if self.expire_after_value {
+            self.expired.set(true);
+        }
+        self.value.take().expect("value read at most once")
+    }
+    fn expired(&self) -> bool {
+        self.expired.get()
+    }
+}
+
+#[test]
+fn content_value_preserves_failure_and_absence() {
+    for (value, expected) in [
+        (
+            Ok(Some(StringishAttrValue {
+                string_value: Some("visible".into()),
+                state_value: "visible".into(),
+            })),
+            EvidenceStatus::Known,
+        ),
+        (Ok(None), EvidenceStatus::Absent),
+        (
+            Err(kAXErrorCannotComplete),
+            EvidenceStatus::Unknown(failure()),
+        ),
+    ] {
+        let mut script = ValueScript {
+            value: Some(value),
+            expire_after_value: false,
+            expired: std::cell::Cell::new(false),
+            trace: vec![],
+        };
+        let observed = crate::ax::content_attrs::read_with_observed(
+            AttrStatus::Known("AXTextField".into()),
+            &mut script,
+            &mut false,
+        );
+        assert!(observed.legacy.is_some());
+        assert_eq!(script.trace, ["batch", "value"]);
+        assert_evidence(&observed.evidence, ReadSite::Content("AXValue"), expected);
+    }
+}
+
+#[test]
+fn abandoned_attribute_read_keeps_deadline_evidence() {
+    let mut script = ValueScript {
+        value: Some(Err(kAXErrorCannotComplete)),
+        expire_after_value: true,
+        expired: std::cell::Cell::new(false),
+        trace: vec![],
+    };
+    let observed = crate::ax::content_attrs::read_with_observed(
+        AttrStatus::Known("AXTextField".into()),
+        &mut script,
+        &mut false,
+    );
+    assert!(observed.legacy.is_none());
+    assert_eq!(script.trace, ["batch", "value"]);
+    assert_evidence(
+        &observed.evidence,
+        ReadSite::Content("AXValue"),
+        EvidenceStatus::Unknown(failure()),
+    );
+    assert_evidence(
+        &observed.evidence,
+        ReadSite::Content("deadline"),
+        EvidenceStatus::DeadlineExpired,
+    );
+}
+
 #[test]
 fn content_observation_preserves_shadowed_failures() {
     let mut attrs = std::array::from_fn(|_| AttrStatus::Absent);
@@ -517,6 +606,62 @@ fn control_singles_preserve_unknown_and_absent_per_field() {
 }
 
 #[test]
+fn recovered_batch_failure_preserves_attempt_history() {
+    let fake = Fake::new(
+        &[(1, 1, 1, &[])],
+        vec![
+            step(
+                &format!("batch 1 {CONTROL}"),
+                Reply::Batch(Err(BatchFailure::WholeCall(kAXErrorCannotComplete))),
+            ),
+            step("bool 1 AXEnabled", Reply::Bool(Read::Known(true))),
+            step("position 1", Reply::Point(Read::Known((1.0, 2.0)))),
+            step("size 1", Reply::Point(Read::Known((3.0, 4.0)))),
+            step(
+                "text 1 AXValueDescription",
+                Reply::Text(Read::Known("value".into())),
+            ),
+            step("number 1 AXMinValue", Reply::Number(Read::Known(0.0))),
+            step("number 1 AXMaxValue", Reply::Number(Read::Known(1.0))),
+            step("bool 1 AXSelected", Reply::Bool(Read::Known(false))),
+        ],
+    );
+    let root = fake.handle(1);
+    let mut batching_disabled = false;
+    let observed = crate::ax::control_attrs::read_control_attrs_observed_with(
+        &fake,
+        &root,
+        &mut WalkBudget::nodes_only(10),
+        &mut batching_disabled,
+        Some(1),
+    );
+    assert_eq!(
+        observed.legacy.as_ref().expect("replayed control").frame,
+        Some([1.0, 2.0, 3.0, 4.0])
+    );
+    assert!(!batching_disabled);
+    fake.assert_consumed();
+    drop(root);
+    fake.assert_lifetimes(&[]);
+    assert!(observed
+        .evidence
+        .iter()
+        .any(|entry| entry.site == ReadSite::Batch("control")
+            && entry.owner == Some(1)
+            && entry.attempt == 0
+            && entry.status == EvidenceStatus::Unknown(failure())));
+    for name in CONTROL_NAMES {
+        assert!(observed
+            .evidence
+            .iter()
+            .any(|entry| entry.site == ReadSite::Control(name)
+                && entry.owner == Some(1)
+                && entry.attempt == 1
+                && entry.status == EvidenceStatus::Known));
+    }
+}
+
+#[test]
 fn scrollbar_owner_preserves_unknown_and_absent() {
     let fake = Fake::new(
         &[(1, 1, 1, &[])],
@@ -579,6 +724,82 @@ fn scrollbar_owner_preserves_unknown_and_absent() {
             case.status(),
         );
         assert!(result.evidence.iter().all(|entry| entry.owner.is_none()));
+    }
+}
+
+#[test]
+fn scrollbar_role_preserves_unknown_and_absent() {
+    for case in CASES {
+        let mut steps = vec![
+            step(
+                "element 1 AXVerticalScrollBar",
+                Reply::Element(Read::Known(2)),
+            ),
+            step(
+                "text 2 AXRole",
+                Reply::Text(case.read("AXScrollBar".into())),
+            ),
+        ];
+        if matches!(case, Case::Known) {
+            steps.push(step("number 2 AXValue", Reply::Number(Read::Known(0.5))));
+        }
+        let fake = Fake::new(&[(1, 1, 1, &[]), (2, 2, 2, &[])], steps);
+        let root = fake.handle(1);
+        let observed = crate::ax::scroll_area::bar_position_observed_with(&fake, &root, "down");
+        assert_eq!(
+            observed.legacy,
+            if matches!(case, Case::Known) {
+                Some(0.5)
+            } else {
+                None
+            }
+        );
+        fake.assert_consumed();
+        drop(root);
+        fake.assert_lifetimes(&[]);
+        assert_evidence(
+            &observed.evidence,
+            ReadSite::Scrollbar("AXRole"),
+            case.status(),
+        );
+    }
+}
+
+#[test]
+fn scrollbar_value_preserves_unknown_and_absent() {
+    for case in CASES {
+        let fake = Fake::new(
+            &[(1, 1, 1, &[]), (2, 2, 2, &[])],
+            vec![
+                step(
+                    "element 1 AXVerticalScrollBar",
+                    Reply::Element(Read::Known(2)),
+                ),
+                step(
+                    "text 2 AXRole",
+                    Reply::Text(Read::Known("AXScrollBar".into())),
+                ),
+                step("number 2 AXValue", Reply::Number(case.read(0.5))),
+            ],
+        );
+        let root = fake.handle(1);
+        let observed = crate::ax::scroll_area::bar_position_observed_with(&fake, &root, "down");
+        assert_eq!(
+            observed.legacy,
+            if matches!(case, Case::Known) {
+                Some(0.5)
+            } else {
+                None
+            }
+        );
+        fake.assert_consumed();
+        drop(root);
+        fake.assert_lifetimes(&[]);
+        assert_evidence(
+            &observed.evidence,
+            ReadSite::Scrollbar("AXValue"),
+            case.status(),
+        );
     }
 }
 
