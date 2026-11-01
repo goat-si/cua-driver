@@ -30,7 +30,7 @@ where
     // reported as unverifiable, so the outcome's own flag decides too.
     let note = match effect.as_deref() {
         _ if verification_withheld => "Return was not posted: the value could not be safely read for verification.".to_owned(),
-        _ if maybe_landed => "Return was not posted: the value write may have landed; read the value before deciding what to do next.".to_owned(),
+        _ if maybe_landed => "Return was not posted: a value or document edit may have landed; read the value before deciding what to do next.".to_owned(),
         _ if write_not_applied => "Return was not posted: the read-back still showed the \
              previous text, so submitting would search for it."
             .to_owned(),

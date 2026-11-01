@@ -15,6 +15,7 @@ use crate::goat::action_latency as latency;
 
 use async_trait::async_trait;
 use cua_driver_core::{
+    mutation::{ChainResult, Postcondition, PriorInput, WriteOutcome},
     protocol::ToolResult,
     tool::{Tool, ToolDef},
 };
@@ -27,8 +28,8 @@ use crate::ax::bindings::{
     kAXErrorSuccess, perform_action, set_number_attr, set_string_attr, AXUIElementRef,
 };
 use crate::ax::write_outcome::{
-    classify_attr_write, query_settable, read_value_if_allowed, AttrWrite, Settable, ValueObs,
-    ValueRead,
+    native_write_outcome, query_settable, read_value_if_allowed, NativeWriteKind, Settable,
+    ValueObs, ValueRead,
 };
 use crate::focus_guard;
 use crate::window_change_detector::WindowChangeDetector;
@@ -42,6 +43,9 @@ mod popup_result_tests;
 #[cfg(test)]
 #[path = "set_value/popup_ownership_tests.rs"]
 mod popup_route_tests;
+#[cfg(test)]
+#[path = "set_value/u32_outcome_tests.rs"]
+mod u32_outcome_tests;
 
 use super::ToolState;
 
@@ -306,11 +310,16 @@ impl Tool for SetValueTool {
         // TOKEN rule (handoff 3.7): after the gate and the rename routes,
         // attempt focus and refuse a text-role element with no editing
         // evidence instead of writing into it.
-        if let Some(refusal) =
-            super::not_editable::token_not_editable_refusal(pid, element_ptr, window_id).await
+        let token_focus = match super::not_editable::token_not_editable_receipt(
+            pid,
+            element_ptr,
+            window_id,
+        )
+        .await
         {
-            return refusal;
-        }
+            Ok(receipt) => receipt,
+            Err(refusal) => return refusal,
+        };
 
         let cursor_key = super::cursor_tools::resolve_cursor_key(&args);
         let center_guard = element_guard.clone();
@@ -382,6 +391,7 @@ impl Tool for SetValueTool {
                                 pid,
                                 window_id,
                                 &value,
+                                token_focus,
                                 document_key,
                             )
                         })
@@ -484,11 +494,22 @@ fn set_value_tool_result(
     pid: i32,
     element_index: usize,
 ) -> ToolResult {
+    set_value_tool_result_with_toolkit(result, ax_echo_surface, suffix, element_index, || {
+        crate::input::pointer_toolkit::detect(pid)
+            == Some(crate::input::pointer_toolkit::PointerReadingToolkit::Vcl)
+    })
+}
+
+fn set_value_tool_result_with_toolkit(
+    result: Result<anyhow::Result<SetValueOutcome>, String>,
+    ax_echo_surface: bool,
+    suffix: String,
+    element_index: usize,
+    is_vcl: impl FnOnce() -> bool,
+) -> ToolResult {
     match result {
         Ok(Ok(outcome)) if outcome.not_applied && !ax_echo_surface => {
-            let vcl = crate::input::pointer_toolkit::detect(pid)
-                == Some(crate::input::pointer_toolkit::PointerReadingToolkit::Vcl);
-            let mut result = not_applied_result(element_index, vcl);
+            let mut result = not_applied_result(element_index, is_vcl());
             // The first text block is the published summary.
             if let Some(cua_driver_core::protocol::Content::Text { text, .. }) =
                 result.content.first_mut()
@@ -527,6 +548,40 @@ fn set_value_tool_result(
         Ok(Err(e)) => {
             if let Some(popup) = e.downcast_ref::<popup_ownership::PopupError>() {
                 popup_ownership::tool_result(&popup.0, &suffix, ax_echo_surface)
+            } else if let Some(write) = e.downcast_ref::<ValueWriteError>() {
+                let effect = if write.chain.no_input() {
+                    "refused"
+                } else {
+                    "unverifiable"
+                };
+                let mut result = ToolResult::error(format!("set_value failed: {e}.{suffix}"))
+                    .with_structured(serde_json::json!({
+                        "path": "ax", "effect": effect, "verified": false,
+                    }));
+                if let Some(disposition) = write
+                    .chain
+                    .error_disposition(Postcondition::Indeterminate, false)
+                {
+                    result = result.with_disposition(disposition);
+                }
+                result
+            } else if let Some(scope) = e.downcast_ref::<KeyScopeFailure>() {
+                let (effect, disposition) = if scope.prior == PriorInput::None {
+                    (
+                        "refused",
+                        cua_driver_contract::ErrorDisposition::NOT_DELIVERED,
+                    )
+                } else {
+                    (
+                        "unverifiable",
+                        cua_driver_contract::ErrorDisposition::SUSPECTED_NOOP,
+                    )
+                };
+                ToolResult::error(format!("set_value failed: {e}.{suffix}"))
+                    .with_structured(
+                        serde_json::json!({ "path": "ax", "effect": effect, "verified": false }),
+                    )
+                    .with_disposition(disposition)
             } else {
                 ToolResult::error(format!("set_value failed: {e}.{suffix}"))
             }
@@ -573,25 +628,31 @@ async fn minimized_set_value(
             Err(error) => {
                 return restore_task_failure(format!(
                     "set_value: restoring the minimized window failed ({error}); it may be left \
-                     restored. Nothing was written."
+                     restored. AXValue was not written."
                 ))
             }
         };
         let finish = |restore: MinimizedRestore<AxMinimizeOps>| async move {
-            latency::spawn_action_blocking(move || restore.finish())
+            latency::spawn_action_blocking(move || restore.finish_with_input())
                 .await
-                .unwrap_or(RestoreReport::ReminimizeNotConfirmed(None))
+                .unwrap_or((
+                    RestoreReport::ReminimizeNotConfirmed(None),
+                    PriorInput::MayHaveDelivered,
+                ))
         };
         let with_note =
             |result: ToolResult, report: RestoreReport| attach_restore_cleanup(result, report, "");
         if let Err(reason) = begun {
-            let report = finish(restore).await;
+            let (report, prior) = finish(restore).await;
             return with_note(
-                super::pre_dispatch_refusal(
-                    cua_driver_core::background_input::refusal_codes::MINIMIZED_OR_HIDDEN,
-                    format!(
+                account_prior_restore(
+                    super::pre_dispatch_refusal(
+                        cua_driver_core::background_input::refusal_codes::MINIMIZED_OR_HIDDEN,
+                        format!(
                         "window {window_id} is minimized and {reason}; AXValue was not written."
                     ),
+                    ),
+                    prior,
                 ),
                 report,
             );
@@ -643,21 +704,21 @@ async fn minimized_set_value(
         let (restore, scope) = match regated {
             Ok((restore, Ok(scope))) => (restore, scope),
             Ok((restore, Err((code, reason)))) => {
-                let report = finish(restore).await;
+                let (report, prior) = finish(restore).await;
                 return with_note(
-                    super::pre_dispatch_refusal(
+                    account_prior_restore(super::pre_dispatch_refusal(
                         code,
                         format!(
                             "window {window_id} was restored, but {reason}; AXValue was not written."
                         ),
-                    ),
+                    ), prior),
                     report,
                 );
             }
             Err(error) => {
                 return restore_task_failure(format!(
                     "set_value: re-checking the restored window failed ({error}); it may be left \
-                     restored. Nothing was written."
+                     restored. AXValue was not written."
                 ))
             }
         };
@@ -671,7 +732,13 @@ async fn minimized_set_value(
                 unsafe { crate::ax::bindings::copy_bool_attr(ptr as AXUIElementRef, "AXFocused") }
                     == Some(true);
             if !already {
-                let _ = crate::input::ax_actions::focus_element(ptr);
+                let settable = unsafe { query_settable(ptr as AXUIElementRef, "AXFocused") };
+                let error = crate::input::ax_actions::focus_element_raw(ptr);
+                let outcome =
+                    native_write_outcome(NativeWriteKind::SetAttribute, true, &settable, error);
+                if outcome != WriteOutcome::Delivered {
+                    return RestoredFocus::WriteFailed { error, outcome };
+                }
             }
             let holds_focus =
                 unsafe { crate::ax::bindings::copy_bool_attr(ptr as AXUIElementRef, "AXFocused") }
@@ -696,6 +763,13 @@ async fn minimized_set_value(
         });
         let token_refusal = match focused {
             RestoredFocus::Editable => None,
+            RestoredFocus::WriteFailed { error, outcome } => {
+                Some(super::not_editable::focus_write_refusal(
+                    outcome,
+                    error,
+                    PriorInput::MayHaveDelivered,
+                ))
+            }
             // A focus write was sent: the receipts say so.
             RestoredFocus::NotFocused { focus_written } => {
                 Some(super::not_editable::not_editable_result(
@@ -728,9 +802,13 @@ async fn minimized_set_value(
             let hand_back = latency::spawn_action_blocking(move || scope.finish())
                 .await
                 .unwrap_or(crate::input::skylight::HandBack::NotConfirmed);
-            let report = finish(restore).await;
+            let (report, prior) = finish(restore).await;
             let disclosure = crate::input::skylight::scope_disclosure(entry, Some(hand_back));
-            return attach_restore_cleanup(refusal, report, &disclosure);
+            return attach_restore_cleanup(
+                account_prior_restore(refusal, prior),
+                report,
+                &disclosure,
+            );
         }
         let ax_echo_surface = super::type_text::target_in_web_area(
             pid,
@@ -774,17 +852,21 @@ async fn minimized_set_value(
                 format!("{changed}; AXValue was not written."),
                 super::not_editable::FocusDispatch::Indeterminate,
             );
-            let report = finish(restore).await;
-            return attach_restore_cleanup(refusal, report, &disclosure);
+            let (report, prior) = finish(restore).await;
+            return attach_restore_cleanup(
+                account_prior_restore(refusal, prior),
+                report,
+                &disclosure,
+            );
         }
-        let report = finish(restore).await;
+        let (report, prior) = finish(restore).await;
         let suffix = [disclosure.clone(), report.describe()]
             .into_iter()
             .filter(|note| !note.is_empty())
             .map(|note| format!(" {note}"))
             .collect::<String>();
         let result = set_value_tool_result(Ok(result), ax_echo_surface, suffix, pid, element_index);
-        attach_restore_cleanup(result, report, &disclosure)
+        attach_restore_cleanup(account_prior_restore(result, prior), report, &disclosure)
     });
     task.await.unwrap_or_else(|error| {
         restore_task_failure(format!(
@@ -797,11 +879,35 @@ async fn minimized_set_value(
 /// A restored-window task that failed: the window may be left restored and
 /// the write may have happened; the whole text is structured too.
 fn restore_task_failure(message: String) -> ToolResult {
-    ToolResult::error(message.clone()).with_structured(serde_json::json!({
-        "effect": "unverifiable",
-        "restore_cleanup": "unknown",
-        "message": message,
-    }))
+    ToolResult::error(message.clone())
+        .with_structured(serde_json::json!({
+            "effect": "unverifiable",
+            "restore_cleanup": "unknown",
+            "message": message,
+        }))
+        .with_disposition(cua_driver_contract::ErrorDisposition::SUSPECTED_NOOP)
+}
+
+fn account_prior_restore(mut result: ToolResult, prior: PriorInput) -> ToolResult {
+    if prior != PriorInput::MayHaveDelivered || result.is_error != Some(true) {
+        return result;
+    }
+    let Some(serde_json::Value::Object(fields)) = result.structured_content.as_mut() else {
+        return result;
+    };
+    if fields.get("effect").and_then(serde_json::Value::as_str) == Some("refused")
+        || result.disposition == Some(cua_driver_contract::ErrorDisposition::NOT_DELIVERED)
+    {
+        fields.insert("effect".into(), serde_json::json!("unverifiable"));
+        fields.remove("dispatched");
+        result.disposition = Some(cua_driver_contract::ErrorDisposition::SUSPECTED_NOOP);
+        if let Some(cua_driver_core::protocol::Content::Text { text, .. }) =
+            result.content.first_mut()
+        {
+            text.push_str(" The window restore or cleanup may have changed state; inspect it before retrying.");
+        }
+    }
+    result
 }
 
 /// Every result of a temporary restore says what became of the window: in
@@ -901,6 +1007,7 @@ unsafe fn window_has_document(element: AXUIElementRef) -> bool {
 /// The restored-window route's own focus step.
 enum RestoredFocus {
     Editable,
+    WriteFailed { error: i32, outcome: WriteOutcome },
     NotFocused { focus_written: bool },
     NotEditable { focus_written: bool },
 }
@@ -1141,6 +1248,7 @@ fn set_value_blocking_with_document(
     pid: i32,
     window_id: u32,
     value: &str,
+    token_focus: super::not_editable::FocusDispatch,
     mark: impl FnOnce() -> crate::document_edit::DocumentEdited,
 ) -> anyhow::Result<SetValueOutcome> {
     set_value_blocking_inner(
@@ -1149,7 +1257,10 @@ fn set_value_blocking_with_document(
         pid,
         window_id,
         value,
-        false,
+        WritePrologue {
+            restored_window: false,
+            prior: prior_for_focus(token_focus),
+        },
         mark,
     )
 }
@@ -1168,7 +1279,10 @@ fn set_value_blocking_with(
         pid,
         window_id,
         value,
-        restored_window,
+        WritePrologue {
+            restored_window,
+            prior: PriorInput::MayHaveDelivered,
+        },
         || unsafe {
             crate::document_edit::ensure_marked_after_ax_write(
                 pid,
@@ -1183,15 +1297,24 @@ fn set_value_blocking_with(
 /// The caller holds the key scope and the temporary restore; the restore
 /// waits for the scope's hand-back before minimizing the window again, and
 /// only a text field is written on this route.
+struct WritePrologue {
+    restored_window: bool,
+    prior: PriorInput,
+}
+
 fn set_value_blocking_inner(
     element_ptr: usize,
     element_index: usize,
     pid: i32,
     window_id: u32,
     value: &str,
-    restored_window: bool,
+    prologue: WritePrologue,
     mark: impl FnOnce() -> crate::document_edit::DocumentEdited,
 ) -> anyhow::Result<SetValueOutcome> {
+    let WritePrologue {
+        restored_window,
+        mut prior,
+    } = prologue;
     let element = element_ptr as AXUIElementRef;
 
     let role = unsafe { copy_string_attr(element, "AXRole") }.unwrap_or_default();
@@ -1230,26 +1353,39 @@ fn set_value_blocking_inner(
         let _key_scope = if text_value_role_requires_exact_focus(&role) && restored_window {
             None
         } else if text_value_role_requires_exact_focus(&role) {
-            Some(
-                super::key_scope(pid, Some(window_id))
-                    .map_err(|reason| anyhow::anyhow!(reason))?
-                    .ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "set_value requires exact-window key priming before an editable text AXValue write, but that transport is unavailable"
-                        )
-                    })?,
-            )
+            Some(set_value_key_scope(pid, window_id, prior)?)
         } else {
             None
         };
+        if let Some(scope) = &_key_scope {
+            prior = prior_for_key_entry(prior, scope.entry());
+        }
         if text_value_role_requires_exact_focus(&role) {
             // A restored window needs no focus write when the field already
             // holds focus.
             let needs_focus =
                 !restored_window || unsafe { copy_bool_attr(element, "AXFocused") } != Some(true);
-            if needs_focus {
-                crate::input::ax_actions::focus_element(element_ptr)?;
-            }
+            let focus_chain = if needs_focus {
+                let settable = unsafe { query_settable(element, "AXFocused") };
+                let error = crate::input::ax_actions::focus_element_raw(element_ptr);
+                let outcome =
+                    native_write_outcome(NativeWriteKind::SetAttribute, true, &settable, error);
+                let chain = ChainResult::from_recorded(vec![outcome], prior)
+                    .expect("one focus write is a valid recorded chain");
+                if outcome != WriteOutcome::Delivered {
+                    return Err(ValueWriteError {
+                        message: format!(
+                            "AXFocused returned error {error}; AXValue was not written"
+                        ),
+                        chain,
+                    }
+                    .into());
+                }
+                prior = PriorInput::MayHaveDelivered;
+                Some(chain)
+            } else {
+                None
+            };
             let own_focus = unsafe { copy_bool_attr(element, "AXFocused") } == Some(true);
             let exact_window =
                 super::type_text::element_in_requested_window(pid, window_id, element_ptr);
@@ -1258,9 +1394,22 @@ fn set_value_blocking_inner(
                 super::type_text::focused_window_matches_element(pid, window_id, element_ptr);
             let focused = own_focus && exact_window && app_focus && key_window;
             if !focused {
-                anyhow::bail!(
-                    "set_value target did not become the application's focused text element in the requested window (AXFocused={own_focus}, exact_window={exact_window}, app_focus={app_focus}, key_window={key_window}); AXValue was not written"
-                )
+                let chain = focus_chain.unwrap_or_else(|| {
+                    ChainResult::from_recorded(
+                        vec![native_write_outcome(
+                            NativeWriteKind::SetAttribute,
+                            false,
+                            &Settable::Yes,
+                            kAXErrorSuccess,
+                        )],
+                        prior,
+                    )
+                    .expect("uncalled focus is a valid recorded chain")
+                });
+                return Err(ValueWriteError {
+                    message: format!("set_value target did not become the application's focused text element in the requested window (AXFocused={own_focus}, exact_window={exact_window}, app_focus={app_focus}, key_window={key_window}); AXValue was not written"),
+                    chain,
+                }.into());
             }
         }
         let subrole = unsafe { copy_string_attr(element, "AXSubrole") };
@@ -1274,7 +1423,7 @@ fn set_value_blocking_inner(
                 .any(|a| a == "AXIncrement" || a == "AXDecrement"),
         };
         let mut ops = LiveAxValueOps { element };
-        let outcome = write_value_ladder(&mut ops, value, &ctx);
+        let outcome = write_value_ladder_with_prior(&mut ops, value, &ctx, prior);
         finish_ladder_with_mark(
             outcome,
             element,
@@ -1285,6 +1434,50 @@ fn set_value_blocking_inner(
             mark,
         )
     }
+}
+
+fn prior_for_focus(focus: super::not_editable::FocusDispatch) -> PriorInput {
+    match focus {
+        super::not_editable::FocusDispatch::None => PriorInput::None,
+        _ => PriorInput::MayHaveDelivered,
+    }
+}
+
+fn prior_for_key_entry(prior: PriorInput, entry: crate::input::skylight::KeyEntry) -> PriorInput {
+    if entry.records_posted > 0 || entry.records_uncertain || entry.ax_write {
+        PriorInput::MayHaveDelivered
+    } else {
+        prior
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("{message}")]
+struct KeyScopeFailure {
+    message: String,
+    prior: PriorInput,
+}
+
+fn set_value_key_scope(
+    pid: i32,
+    window_id: u32,
+    prior: PriorInput,
+) -> anyhow::Result<crate::input::skylight::WindowKeyScope> {
+    use crate::input::skylight;
+    if !skylight::is_available() || !skylight::is_focus_without_raise_available() {
+        return Err(KeyScopeFailure {
+            message: "set_value requires exact-window key priming before an editable text AXValue write, but that transport is unavailable".into(),
+            prior,
+        }.into());
+    }
+    skylight::enter_exact_window_key_inline_detailed(pid, window_id).map_err(|error| {
+        let disclosure = skylight::scope_disclosure(error.entry, error.hand_back);
+        KeyScopeFailure {
+            message: format!("{} {disclosure}", error.reason),
+            prior: prior_for_key_entry(prior, error.entry),
+        }
+        .into()
+    })
 }
 
 trait AxValueOps {
@@ -1340,6 +1533,14 @@ struct LadderOutcome {
     error: Option<i32>,
     reached: bool,
     verification_withheld: bool,
+    chain: Option<ChainResult>,
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("{message}")]
+struct ValueWriteError {
+    message: String,
+    chain: ChainResult,
 }
 impl LadderOutcome {
     fn new() -> Self {
@@ -1354,6 +1555,7 @@ impl LadderOutcome {
             error: None,
             reached: false,
             verification_withheld: false,
+            chain: None,
         }
     }
 }
@@ -1373,14 +1575,26 @@ fn ladder_read(ops: &mut impl AxValueOps, out: &mut LadderOutcome) -> ValueObs {
         }
     }
 }
+#[cfg(test)]
 fn write_value_ladder(
     ops: &mut impl AxValueOps,
     value: &str,
     ctx: &LadderContext,
 ) -> LadderOutcome {
+    write_value_ladder_with_prior(ops, value, ctx, PriorInput::None)
+}
+
+fn write_value_ladder_with_prior(
+    ops: &mut impl AxValueOps,
+    value: &str,
+    ctx: &LadderContext,
+    prior: PriorInput,
+) -> LadderOutcome {
     let mut out = LadderOutcome::new();
     let target = value.trim().parse::<f64>().ok();
-    let text_role = ctx.secure || text_value_role_requires_exact_focus(ctx.role);
+    let text_role = ctx.secure
+        || text_value_role_requires_exact_focus(ctx.role)
+        || crate::ax::editable::is_text_role(ctx.role);
     let numeric_role = matches!(
         ctx.role,
         "AXSlider" | "AXIncrementor" | "AXStepper" | "AXScrollBar"
@@ -1408,18 +1622,36 @@ fn write_value_ladder(
             };
             out.steps_sent += 1;
             let err = ops.perform_step(action);
-            match classify_attr_write(err) {
-                AttrWrite::Applied => out.steps_maybe_landed += 1,
-                AttrWrite::Rejected => {
-                    out.error = Some(err);
-                    break;
-                }
-                AttrWrite::Uncertain => {
+            let outcome = native_write_outcome(NativeWriteKind::Perform, true, &settable, err);
+            let step_prior = if out.steps_maybe_landed > 0 {
+                PriorInput::MayHaveDelivered
+            } else {
+                prior
+            };
+            let skipped_setter = native_write_outcome(
+                NativeWriteKind::SetAttribute,
+                false,
+                &settable,
+                kAXErrorSuccess,
+            );
+            out.chain = Some(
+                ChainResult::from_recorded(vec![skipped_setter, outcome], step_prior)
+                    .expect("skipped setter and one step form a valid chain"),
+            );
+            match outcome {
+                WriteOutcome::Delivered => out.steps_maybe_landed += 1,
+                WriteOutcome::StopUncertain(_) => {
                     out.steps_maybe_landed += 1;
                     out.maybe_landed = true;
                     out.error = Some(err);
                     break;
                 }
+                WriteOutcome::StopNotDelivered(_) | WriteOutcome::FallThrough(_) => {
+                    out.maybe_landed = step_prior == PriorInput::MayHaveDelivered;
+                    out.error = Some(err);
+                    break;
+                }
+                WriteOutcome::RetryAfterUncertain(_) => unreachable!("native step never retries"),
             }
             let next = ladder_read(ops, &mut out);
             if out.verification_withheld {
@@ -1461,35 +1693,46 @@ fn write_value_ladder(
     } else {
         ops.set_string(value)
     };
-    let err = match classify_attr_write(first) {
-        AttrWrite::Applied => first,
-        AttrWrite::Uncertain => {
-            out.maybe_landed = true;
-            first
+    let first_outcome = native_write_outcome(NativeWriteKind::SetAttribute, true, &settable, first);
+    let (err, terminal, outcomes) = if first_number
+        && !text_role
+        && !out.verification_withheld
+        && first == crate::ax::bindings::kAXErrorIllegalArgument
+    {
+        let WriteOutcome::StopUncertain(reason) = first_outcome else {
+            unreachable!("illegal argument is an uncertain native write")
+        };
+        let alternate = ops.set_string(value);
+        let terminal =
+            native_write_outcome(NativeWriteKind::SetAttribute, true, &settable, alternate);
+        (
+            alternate,
+            terminal,
+            vec![WriteOutcome::RetryAfterUncertain(reason), terminal],
+        )
+    } else {
+        (first, first_outcome, vec![first_outcome])
+    };
+    out.chain = Some(
+        ChainResult::from_recorded(outcomes, prior)
+            .expect("single setter or one representation retry forms a valid chain"),
+    );
+    match terminal {
+        WriteOutcome::Delivered => {}
+        WriteOutcome::StopNotDelivered(_) | WriteOutcome::FallThrough(_) => {
+            out.maybe_landed = !out.chain.as_ref().expect("recorded").no_input();
+            out.error = Some(err);
+            return out;
         }
-        AttrWrite::Rejected => {
-            // Only one alternate representation may be attempted.
-            let alternate = if first_number {
-                ops.set_string(value)
-            } else if let Some(number) = target.filter(|_| !text_role) {
-                ops.set_number(number)
-            } else {
-                out.error = Some(first);
+        WriteOutcome::StopUncertain(_) => {
+            out.maybe_landed = true;
+            if err == crate::ax::bindings::kAXErrorIllegalArgument {
+                out.error = Some(err);
                 return out;
-            };
-            match classify_attr_write(alternate) {
-                AttrWrite::Applied => alternate,
-                AttrWrite::Rejected => {
-                    out.error = Some(alternate);
-                    return out;
-                }
-                AttrWrite::Uncertain => {
-                    out.maybe_landed = true;
-                    alternate
-                }
             }
         }
-    };
+        WriteOutcome::RetryAfterUncertain(_) => unreachable!("native setter never retries"),
+    }
     out.error = (err != kAXErrorSuccess).then_some(err);
     if !ctx.secure && !out.verification_withheld {
         let before_s = obs_string(&before);
@@ -1519,6 +1762,17 @@ fn write_value_ladder(
         // that an accepted write had no effect.
         out.not_applied =
             !out.maybe_landed && !numeric && write_not_applied(out.verified, out.changed);
+        if numeric && write_not_applied(out.verified, out.changed) {
+            out.maybe_landed = true;
+        }
+        if out.chain.as_ref().is_some_and(|chain| {
+            matches!(
+                chain.outcomes().first(),
+                Some(WriteOutcome::RetryAfterUncertain(_))
+            ) && out.verified != Some(true)
+        }) {
+            out.maybe_landed = true;
+        }
     }
     out.reached = true;
     out
@@ -1553,16 +1807,49 @@ fn finish_ladder_with_mark(
     restored_window: bool,
     mark: impl FnOnce() -> crate::document_edit::DocumentEdited,
 ) -> anyhow::Result<SetValueOutcome> {
+    finish_ladder_with_document_readers(
+        out,
+        element_index,
+        role,
+        restored_window,
+        mark,
+        || unsafe { window_has_document(element) },
+        || unsafe { crate::document_edit::document_status_without_value(element) },
+    )
+}
+
+fn finish_ladder_with_document_readers(
+    mut out: LadderOutcome,
+    element_index: usize,
+    role: &str,
+    restored_window: bool,
+    mark: impl FnOnce() -> crate::document_edit::DocumentEdited,
+    has_document: impl FnOnce() -> bool,
+    status_without_value: impl FnOnce() -> crate::document_edit::DocumentEdited,
+) -> anyhow::Result<SetValueOutcome> {
     if !out.reached {
         let err = out.error.unwrap_or(kAXErrorSuccess);
-        if out.maybe_landed || out.steps_sent > 0 {
-            anyhow::bail!("AX value operation failed with error {err}; {} step action(s) sent ({} may have landed); the value may have changed. Read it before repeating", out.steps_sent, out.steps_maybe_landed)
+        let message = if out.maybe_landed || out.steps_sent > 0 {
+            format!("AX value operation failed with error {err}; {} step action(s) sent ({} may have landed); the value may have changed. Read it before repeating", out.steps_sent, out.steps_maybe_landed)
+        } else {
+            format!("AXUIElementSetAttributeValue(AXValue) failed with error {err}")
+        };
+        if let Some(chain) = out.chain {
+            return Err(ValueWriteError { message, chain }.into());
         }
-        anyhow::bail!("AXUIElementSetAttributeValue(AXValue) failed with error {err}");
+        anyhow::bail!(message);
+    }
+    if out.verified == Some(true)
+        && out.chain.as_ref().is_some_and(|chain| {
+            chain.effect(Postcondition::Confirmed, true)
+                != cua_driver_contract::ActionEffect::Confirmed
+        })
+    {
+        out.verified = Some(false);
     }
     if out.stepped {
         let document = if out.verification_withheld {
-            unsafe { crate::document_edit::document_status_without_value(element) }
+            status_without_value()
         } else {
             crate::document_edit::DocumentEdited::NotADocument
         };
@@ -1588,8 +1875,8 @@ fn finish_ladder_with_mark(
         &out,
         restored_window,
         mark,
-        || unsafe { window_has_document(element) },
-        || unsafe { crate::document_edit::document_status_without_value(element) },
+        has_document,
+        status_without_value,
     );
     let warning = if out.maybe_landed {
         " The value may have changed; read it before deciding what to do next."
@@ -1605,7 +1892,8 @@ fn finish_ladder_with_mark(
         changed: out.changed,
         not_applied: out.not_applied,
         document_edited: document.structured(),
-        maybe_landed: out.maybe_landed,
+        maybe_landed: out.maybe_landed
+            || document == crate::document_edit::DocumentEdited::NotMarked,
         verification_withheld: out.verification_withheld,
     })
 }
@@ -1696,6 +1984,7 @@ fn not_applied_result(element_index: usize, vcl: bool) -> ToolResult {
         "verified": false,
         "effect": "not_applied",
     }))
+    .with_disposition(cua_driver_contract::ErrorDisposition::SUSPECTED_NOOP)
 }
 
 /// Decide what a post-write AXValue read proves.
@@ -2845,6 +3134,27 @@ mod restore_cleanup_tests {
             "",
         );
         assert_eq!(once.content.len(), 1);
+        for prior in [
+            cua_driver_core::mutation::PriorInput::None,
+            cua_driver_core::mutation::PriorInput::MayHaveDelivered,
+        ] {
+            let refusal = super::account_prior_restore(
+                super::super::pre_dispatch_refusal("window_not_key", "AXValue was not written"),
+                prior,
+            );
+            let fields = refusal.structured_content.as_ref().unwrap();
+            if prior == cua_driver_core::mutation::PriorInput::None {
+                assert_eq!(fields["effect"], "refused");
+                assert_eq!(fields["dispatched"], false);
+            } else {
+                assert_eq!(fields["effect"], "unverifiable");
+                assert!(fields.get("dispatched").is_none());
+                assert_eq!(
+                    refusal.disposition,
+                    Some(cua_driver_contract::ErrorDisposition::SUSPECTED_NOOP)
+                );
+            }
+        }
     }
 }
 
@@ -3025,13 +3335,14 @@ mod ladder_tests {
         assert_eq!(f.writes, ["string"]);
     }
     #[test]
-    fn text_zero_value_rejecting_string_accepts_number() {
+    fn text_zero_value_rejecting_string_never_retries_as_number() {
         let mut f = Fake::new(text("0"))
             .read(text("5"))
             .result(kAXErrorIllegalArgument);
         let out = run(&mut f, "5", false, false);
-        assert_eq!(f.writes, ["string", "number"]);
-        assert_eq!(out.verified, Some(true));
+        assert_eq!(f.writes, ["string"]);
+        assert!(!out.reached);
+        assert!(out.maybe_landed);
     }
     #[test]
     fn text_role_payload_stays_the_exact_string() {
@@ -3147,7 +3458,8 @@ mod ladder_tests {
         let out = run(&mut f, "5", true, false);
         assert_eq!(f.writes, ["step"]);
         assert_eq!(out.steps_sent, 1);
-        assert_eq!(out.steps_maybe_landed, 0);
+        assert_eq!(out.steps_maybe_landed, 1);
+        assert!(out.maybe_landed);
         assert!(!out.reached);
     }
     #[test]
