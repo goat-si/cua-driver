@@ -150,6 +150,9 @@ pub(super) enum Scenario {
     ProviderFailure,
     CachedFailure,
     OptInRejected,
+    ChildrenRecovered,
+    WindowsRecovered,
+    ProviderRecovered,
 }
 
 pub(super) struct Environment {
@@ -213,7 +216,13 @@ impl super::AxWalkEnvironment for Environment {
                 | Scenario::ProviderFailure
                 | Scenario::CachedFailure
                 | Scenario::OptInRejected
-        ) || matches!(self.scenario, Scenario::Launching) && count > 0
+        ) || matches!(
+            self.scenario,
+            Scenario::Launching
+                | Scenario::ChildrenRecovered
+                | Scenario::WindowsRecovered
+                | Scenario::ProviderRecovered
+        ) && count > 0
         {
             vec![2]
         } else {
@@ -225,7 +234,9 @@ impl super::AxWalkEnvironment for Environment {
         crate::ax::evidence::observe_read(
             Some(application),
             ReadSite::Children,
-            if matches!(self.scenario, Scenario::ChildrenFailure) {
+            if matches!(self.scenario, Scenario::ChildrenFailure)
+                || matches!(self.scenario, Scenario::ChildrenRecovered) && count == 0
+            {
                 Read::Unknown(crate::ax::tree_source::ReadFailure::WrongType)
             } else {
                 Read::Known(elements)
@@ -256,7 +267,10 @@ impl super::AxWalkEnvironment for Environment {
             evidence: vec![ReadEvidence {
                 owner: Some(application),
                 site: ReadSite::TopLevelWindows,
-                status: if matches!(self.scenario, Scenario::WindowsFailure) {
+                status: if matches!(self.scenario, Scenario::WindowsFailure)
+                    || matches!(self.scenario, Scenario::WindowsRecovered)
+                        && self.enumerations.get() == 1
+                {
                     EvidenceStatus::Unknown(crate::ax::tree_source::ReadFailure::WrongType)
                 } else {
                     EvidenceStatus::Known
@@ -300,6 +314,9 @@ impl super::AxWalkEnvironment for Environment {
                 | Scenario::ProviderFailure
                 | Scenario::CachedFailure
                 | Scenario::OptInRejected
+                | Scenario::ChildrenRecovered
+                | Scenario::WindowsRecovered
+                | Scenario::ProviderRecovered
         ) {
             Some(99)
         } else {
@@ -311,7 +328,12 @@ impl super::AxWalkEnvironment for Environment {
         self.trace.borrow_mut().push("bounds".into());
         if matches!(
             self.scenario,
-            Scenario::Sheet | Scenario::Launching | Scenario::NeverLaunched
+            Scenario::Sheet
+                | Scenario::Launching
+                | Scenario::NeverLaunched
+                | Scenario::ChildrenRecovered
+                | Scenario::WindowsRecovered
+                | Scenario::ProviderRecovered
         ) {
             None
         } else {
@@ -356,6 +378,7 @@ impl super::AxWalkEnvironment for Environment {
             Scenario::ProviderFailure => Some(ReadSite::ProviderEnablement),
             Scenario::CachedFailure => Some(ReadSite::ProviderCachedEnablement),
             Scenario::OptInRejected => Some(ReadSite::ProviderOptIn),
+            Scenario::ProviderRecovered => Some(ReadSite::ProviderEnablement),
             _ => None,
         };
         if let Some(site) = site {
@@ -364,7 +387,13 @@ impl super::AxWalkEnvironment for Environment {
                 evidence: vec![crate::ax::evidence::ReadEvidence {
                     owner: Some(application),
                     site,
-                    status: EvidenceStatus::Unavailable,
+                    status: if matches!(self.scenario, Scenario::ProviderRecovered)
+                        && self.enumerations.get() > 0
+                    {
+                        EvidenceStatus::Known
+                    } else {
+                        EvidenceStatus::Unavailable
+                    },
                     attempt: 0,
                     listing: None,
                 }],
@@ -417,7 +446,14 @@ impl super::AxWalkEnvironment for Environment {
     fn is_still_launching(&self, pid: i32) -> bool {
         assert_eq!(pid, 42);
         self.trace.borrow_mut().push("launching".into());
-        matches!(self.scenario, Scenario::Launching | Scenario::NeverLaunched)
+        matches!(
+            self.scenario,
+            Scenario::Launching
+                | Scenario::NeverLaunched
+                | Scenario::ChildrenRecovered
+                | Scenario::WindowsRecovered
+                | Scenario::ProviderRecovered
+        )
     }
     fn pause(&self, duration: Duration) {
         self.trace

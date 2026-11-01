@@ -40,6 +40,15 @@ fn application_children_failure_is_not_hidden_by_recovered_window() {
         "provider_failure",
         "child_enumeration_failed"
     ));
+    let (recovered, _, _) = super::orchestration_preservation_tests::run_scenario(
+        Scenario::ChildrenRecovered,
+        Some((2, "AXWindow")),
+    );
+    assert!(!has_reason(
+        &recovered.legacy,
+        "provider_failure",
+        "child_enumeration_failed"
+    ));
 }
 
 #[test]
@@ -52,6 +61,15 @@ fn failed_window_enumeration_reports_enumeration_error() {
     assert_eq!(walk.legacy.window_scope, Some(WindowScope::Matched));
     assert!(has_reason(
         &walk.legacy,
+        "provider_failure",
+        "enumeration_error_unclassified"
+    ));
+    let (recovered, _, _) = super::orchestration_preservation_tests::run_scenario(
+        Scenario::WindowsRecovered,
+        Some((2, "AXWindow")),
+    );
+    assert!(!has_reason(
+        &recovered.legacy,
         "provider_failure",
         "enumeration_error_unclassified"
     ));
@@ -91,6 +109,15 @@ fn chromium_materialization_failure_reports_untrusted_provider() {
     );
     assert!(!has_reason(
         &walk.legacy,
+        "provider_failure",
+        "untrusted_provider"
+    ));
+    let (recovered, _, _) = super::orchestration_preservation_tests::run_scenario(
+        Scenario::ProviderRecovered,
+        Some((2, "AXWindow")),
+    );
+    assert!(!has_reason(
+        &recovered.legacy,
         "provider_failure",
         "untrusted_provider"
     ));
