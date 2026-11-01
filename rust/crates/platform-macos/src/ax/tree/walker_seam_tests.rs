@@ -455,7 +455,7 @@ fn content(title: Option<&str>) -> Batch {
 fn frame_batch() -> Batch {
     Batch(vec![Slot::Point(None), Slot::Size(None)])
 }
-fn control_batch() -> Batch {
+pub(super) fn control_batch() -> Batch {
     Batch(vec![
         Slot::Bool(None),
         Slot::Point(None),

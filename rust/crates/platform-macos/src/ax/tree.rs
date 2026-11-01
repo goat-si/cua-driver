@@ -5293,5 +5293,37 @@ pub(crate) fn evidence_output_fixture(search: bool, shared: bool) -> (TreeWalkRe
 pub(crate) fn evidence_deadline_fixture() -> TreeWalkResult {
     environment_setup_tests::run_menu_deadline_case().0.legacy
 }
+
+#[cfg(test)]
+pub(crate) fn failed_setup_output_fixture() -> TreeWalkResult {
+    environment_setup_tests::run_application_failure().0.legacy
+}
+
+#[cfg(test)]
+pub(crate) fn verify_output_fixture(query: Option<&str>, provider_failure: bool) -> TreeWalkResult {
+    use environment_evidence_tests::Scenario;
+    let scenario = if provider_failure {
+        Scenario::ProviderFailure
+    } else {
+        Scenario::Launching
+    };
+    with_exhaustive_assertion(
+        verify_assertion_requested(true, false, false, query),
+        || {
+            with_exhaustive_nodes(true, || {
+                orchestration_preservation_tests::run_scenario_with_limits(
+                    scenario,
+                    Some((2, "AXWindow")),
+                    10,
+                    100,
+                    false,
+                    query,
+                )
+                .0
+                .legacy
+            })
+        },
+    )
+}
 #[cfg(test)]
 mod walker_test_support;

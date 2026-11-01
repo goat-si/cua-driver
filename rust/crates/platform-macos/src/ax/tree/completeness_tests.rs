@@ -274,6 +274,7 @@ fn clean_verify_with_limits(depth: usize, nodes: usize, empty_children: bool) ->
                 depth,
                 nodes,
                 empty_children,
+                None,
             )
             .0
             .legacy
