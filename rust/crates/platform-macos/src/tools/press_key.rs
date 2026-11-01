@@ -880,18 +880,28 @@ impl Tool for PressKeyTool {
                 super::menu_equivalent::Combo::parse(&modifiers, &key),
             ) {
                 let lookup = combo.clone();
-                let menu_item = super::menu_equivalent::spawn_lookup(move || {
+                let lookup_result = super::menu_equivalent::spawn_lookup(move || {
                     let native = !super::type_text::is_browser_pid(pid)
                         && !crate::browser::electron_js::ElectronJs::is_electron(pid);
-                    if native {
+                    super::menu_equivalent::lookup_native_menu(native, || {
                         super::menu_equivalent::find(pid, &lookup)
-                    } else {
-                        None
-                    }
+                    })
                 })
-                .await
-                .ok()
-                .flatten();
+                .await;
+                let menu_item = match super::menu_equivalent::lookup_worker_result(lookup_result) {
+                    super::menu_equivalent::InitialLookup::Lookup(
+                        super::menu_equivalent::MenuLookup::Found(item),
+                    ) => Some(item),
+                    super::menu_equivalent::InitialLookup::Lookup(
+                        super::menu_equivalent::MenuLookup::Incomplete(_),
+                    ) => {
+                        return super::menu_equivalent::lookup_refusal("press_key");
+                    }
+                    super::menu_equivalent::InitialLookup::Skipped
+                    | super::menu_equivalent::InitialLookup::Lookup(
+                        super::menu_equivalent::MenuLookup::Absent,
+                    ) => None,
+                };
                 if let Some(item) = menu_item {
                     if let Err(refusal) = lease
                         .gate_again(
@@ -1689,6 +1699,31 @@ fn refusal_text(result: &ToolResult) -> String {
         .unwrap_or_else(|| "the keyboard gate refused the window.".to_owned())
 }
 
+fn scoped_menu_result(
+    lookup: super::menu_equivalent::MenuLookup,
+) -> Result<super::menu_equivalent::MenuMatch, &'static str> {
+    match lookup {
+        super::menu_equivalent::MenuLookup::Found(found) => Ok(found),
+        super::menu_equivalent::MenuLookup::Absent => {
+            Err("the app has no menu item for this key equivalent now.")
+        }
+        super::menu_equivalent::MenuLookup::Incomplete(_) => {
+            Err("the app's menu could not be fully read. Retry, or use invoke_menu.")
+        }
+    }
+}
+
+fn scoped_lookup_or_refuse<S, T>(
+    lookup: super::menu_equivalent::MenuLookup,
+    scope: S,
+    refuse: impl FnOnce(&'static str, S) -> T,
+) -> Result<(super::menu_equivalent::MenuMatch, S), T> {
+    match scoped_menu_result(lookup) {
+        Ok(found) => Ok((found, scope)),
+        Err(reason) => Err(refuse(reason, scope)),
+    }
+}
+
 /// The chord's menu route on one blocking thread: hold the target window as
 /// the app's key window, find and validate the item for that window, and
 /// press it only while the window is still the app's focused and main
@@ -1715,13 +1750,20 @@ fn chord_in_scope(pid: i32, wid: u32, combo: super::menu_equivalent::Combo) -> C
             ValidationPost::default(),
         );
     }
-    let Some(found) = super::menu_equivalent::find(pid, &combo) else {
-        return chord_refusal(
-            "background_unavailable",
-            "the app has no menu item for this key equivalent now.",
-            scope,
-            ValidationPost::default(),
-        );
+    let (found, scope) = match scoped_lookup_or_refuse(
+        super::menu_equivalent::find(pid, &combo),
+        scope,
+        |reason, scope| {
+            chord_refusal(
+                "background_unavailable",
+                reason,
+                scope,
+                ValidationPost::default(),
+            )
+        },
+    ) {
+        Ok(found) => found,
+        Err(refusal) => return refusal,
     };
     let Some(item) = resolve_menu_item(pid, &found.path) else {
         return chord_refusal(
@@ -3786,5 +3828,94 @@ mod menu_chord_tests {
         });
         let structured = maybe.structured_content.as_ref().expect("structured");
         assert_eq!(structured["code"], "ax_action_unverified");
+    }
+}
+
+#[cfg(test)]
+mod menu_lookup_tests {
+    use super::super::menu_equivalent::{self, InitialLookup, MenuLookup};
+    #[tokio::test]
+    async fn worker_failure_is_not_absent() {
+        let worker =
+            menu_equivalent::spawn_lookup(|| -> InitialLookup { panic!("fake lookup failure") });
+        let lookup = menu_equivalent::lookup_worker_result(worker.await);
+        assert!(matches!(
+            lookup,
+            InitialLookup::Lookup(MenuLookup::Incomplete(_))
+        ));
+        let result = menu_equivalent::lookup_refusal("press_key");
+        let fields = result.structured_content.unwrap();
+        assert_eq!(fields["effect"], "refused");
+        assert_eq!(fields["dispatched"], false);
+        assert_eq!(fields["keys_sent"], false);
+    }
+    #[test]
+    fn skipped_lookup_keeps_todays_route() {
+        assert!(matches!(
+            menu_equivalent::lookup_native_menu(false, || panic!("must skip")),
+            InitialLookup::Skipped
+        ));
+    }
+    #[test]
+    fn scoped_incomplete_is_refused_before_menu_action() {
+        let hand_backs = std::cell::Cell::new(0);
+        let actions = std::cell::Cell::new(0);
+        let result = super::scoped_lookup_or_refuse(
+            MenuLookup::Incomplete("read failed"),
+            (),
+            |reason, ()| {
+                hand_backs.set(hand_backs.get() + 1);
+                reason
+            },
+        );
+        if result.is_ok() {
+            actions.set(actions.get() + 1);
+        }
+        assert!(result.is_err());
+        assert_eq!(hand_backs.get(), 1);
+        assert_eq!(actions.get(), 0);
+    }
+    #[test]
+    fn scoped_absent_is_not_a_key_fallback() {
+        assert!(super::scoped_menu_result(MenuLookup::Absent).is_err());
+    }
+    #[test]
+    fn confirmed_disabled_lookup_keeps_key_fallback_and_warning() {
+        let found = super::scoped_menu_result(MenuLookup::Found(menu_equivalent::MenuMatch {
+            path: vec!["Edit".into(), "Clear".into()],
+            enabled: false,
+        }))
+        .unwrap();
+        assert!(!found.enabled);
+        assert_eq!(
+            super::not_enabled_route(Some(false)),
+            super::NotEnabledRoute::Keys
+        );
+        let validation = crate::input::skylight::ValidationPost {
+            records: 2,
+            keys: 2,
+            key_attempts: 2,
+            uncertain: false,
+            called: true,
+        };
+        let result = super::chord_result(super::keys_posted_step(
+            crate::input::keyboard::ChordPost::Posted,
+            "Edit > Clear",
+            7,
+            validation,
+            " Key focus went back to the app's previous window.",
+        ));
+        let fields = result.structured_content.unwrap();
+        assert_eq!(fields["effect"], "suspected_noop");
+        assert_eq!(fields["keys_sent"], true);
+        assert_eq!(fields["path"], "keys_under_scope");
+        assert_eq!(fields["warning"], super::DISABLED_KEYS_WARNING);
+        assert!(format!("{:?}", result.content).contains("Key focus went back"));
+    }
+    #[test]
+    fn scoped_worker_failure_remains_unverifiable() {
+        let result = super::task_failure("the menu task failed; it may have run".to_owned());
+        let fields = result.structured_content.unwrap();
+        assert_eq!(fields["effect"], "unverifiable");
     }
 }
