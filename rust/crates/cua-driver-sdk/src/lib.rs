@@ -1873,6 +1873,44 @@ impl ToolResult {
     }
 
     fn window_state_success(mut self) -> Result<WindowStateOutput, DriverError> {
+        if self.is_error {
+            if let Some(structured) = self
+                .structured_json
+                .as_deref()
+                .and_then(|json| serde_json::from_str::<Value>(json).ok())
+            {
+                let expected_code = match structured.get("drilldown_status").and_then(Value::as_str)
+                {
+                    Some("incomplete") => Some("drilldown_incomplete"),
+                    Some("stale_parent") => Some("stale_parent"),
+                    Some("unsupported") => Some("root_unsupported"),
+                    _ => None,
+                };
+                if expected_code.is_some()
+                    && self.error_code.as_deref() == expected_code
+                    && structured.get("pid").and_then(Value::as_u64).is_some()
+                    && structured
+                        .get("window_id")
+                        .and_then(Value::as_u64)
+                        .is_some()
+                {
+                    let output: WindowStateOutput =
+                        serde_json::from_value(structured).map_err(|error| {
+                            DriverError::Protocol {
+                                reason: format!(
+                                "get_window_state returned an invalid drill-down outcome: {error}"
+                            ),
+                            }
+                        })?;
+                    output.validate().map_err(|reason| DriverError::Protocol {
+                        reason: format!(
+                            "get_window_state returned an invalid drill-down outcome: {reason}"
+                        ),
+                    })?;
+                    return Ok(output);
+                }
+            }
+        }
         if !self.is_error {
             // Normalization preserves open-ended results; this typed boundary must
             // not silently discard a malformed image part from a snapshot.

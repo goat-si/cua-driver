@@ -94,11 +94,11 @@ pub enum ScopedWalk<S> {
     Incomplete(Vec<IncompleteReason>),
 }
 
-fn stale_parent() -> ToolResult {
+fn stale_parent(pid: i32, window_id: u64) -> ToolResult {
     ToolResult::error("The parent snapshot changed before drill-down publication.")
         .with_structured(serde_json::json!({
             "status":"refused", "refusal":{"code":"stale_parent","message":"The parent snapshot changed before drill-down publication."},
-            "drilldown_status":"stale_parent"
+            "drilldown_status":"stale_parent", "pid":pid, "window_id":window_id
         }))
 }
 
@@ -148,7 +148,7 @@ impl<S: SnapshotPayload> SnapshotStore<S> {
         let parent = lane
             .iter()
             .find(|entry| entry.id == parent_id && entry.semantic_epoch == parent_epoch)
-            .ok_or_else(stale_parent)?;
+            .ok_or_else(|| stale_parent(pid, window_id))?;
         if !parent.semantic || parent.window_id != window_id || source.window_id != window_id {
             return Err(refusal(
                 "conflicting_element_target",
@@ -220,7 +220,7 @@ impl<S: SnapshotPayload> SnapshotStore<S> {
     ) -> Result<u32, ToolResult> {
         let capture = validated.capture;
         if !Arc::ptr_eq(&self.inner, &capture.state) {
-            return Err(stale_parent());
+            return Err(stale_parent(capture.pid, capture.window_id));
         }
         let (id, evicted) = {
             let mut inner = self.inner.lock().unwrap();
@@ -237,13 +237,13 @@ impl<S: SnapshotPayload> SnapshotStore<S> {
                             && !s.root_session_retired
                     })
                 })
-                .ok_or_else(stale_parent)?;
+                .ok_or_else(|| stale_parent(capture.pid, capture.window_id))?;
             if capture
                 .session
                 .as_deref()
                 .is_some_and(crate::session::is_session_ended)
             {
-                return Err(stale_parent());
+                return Err(stale_parent(capture.pid, capture.window_id));
             }
             if capture.source_id != capture.parent_id
                 && !inner
@@ -255,7 +255,7 @@ impl<S: SnapshotPayload> SnapshotStore<S> {
                             .any(|entry| entry.snapshot.id == capture.source_id)
                     })
             {
-                return Err(stale_parent());
+                return Err(stale_parent(capture.pid, capture.window_id));
             }
             let instance = parent.instance.clone();
             let payload = match walk {
@@ -269,7 +269,8 @@ impl<S: SnapshotPayload> SnapshotStore<S> {
                     }
                     return Err(ToolResult::error("The subtree observation is incomplete.")
                         .with_structured(serde_json::json!({"status":"refused", "refusal":{"code":"drilldown_incomplete","message":"The subtree observation is incomplete."},
-                            "drilldown_status":"incomplete", "observation_complete":false, "drilldown_diagnostics":reasons})));
+                            "drilldown_status":"incomplete", "pid":capture.pid, "window_id":capture.window_id,
+                            "observation_complete":false, "drilldown_diagnostics":reasons})));
                 }
             };
             let id = crate::element_token::mint_snapshot_id();

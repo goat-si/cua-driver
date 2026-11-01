@@ -355,6 +355,9 @@ fn incomplete_walk_is_diagnostics_only_and_never_publishes() {
         .unwrap_err();
     let data = result.structured_content.unwrap();
     assert_eq!(data["drilldown_status"], "incomplete");
+    assert_eq!(data["pid"], 42);
+    assert_eq!(data["window_id"], 7);
+    assert_eq!(data["observation_complete"], false);
     assert_eq!(data["drilldown_diagnostics"][0]["detail"], "node_budget");
     assert!(data.get("snapshot_id").is_none());
     assert_eq!(store.with_latest(42, 7, |id, _| id), Some(parent));
@@ -396,16 +399,22 @@ fn stale_parent_takes_precedence_over_an_incomplete_walk() {
     let error = store
         .commit_scoped_capture(capture, ScopedWalk::Incomplete(vec![]))
         .unwrap_err();
-    assert_eq!(
-        error.structured_content.unwrap()["refusal"]["code"],
-        "stale_parent"
-    );
+    let data = error.structured_content.unwrap();
+    assert_eq!(data["refusal"]["code"], "stale_parent");
+    assert_eq!(data["pid"], 42);
+    assert_eq!(data["window_id"], 7);
 }
 
 #[test]
 fn retired_session_cannot_publish_a_capture_after_same_name_is_reused() {
     let store = SnapshotStore::new();
     let parent = full(&store);
+    let old_scope = commit(
+        &store,
+        root(&store, &token_for(parent, 0)),
+        Payload(vec![9]),
+    )
+    .unwrap();
     // The full snapshot remains because a different session owns its frame.
     store
         .refresh_screenshot_for_session(42, 7, Some("other"), 1.0, None)
@@ -413,6 +422,14 @@ fn retired_session_cannot_publish_a_capture_after_same_name_is_reused() {
     let old = root(&store, &token_for(parent, 0));
     store.retire_session_screenshots("owner");
     assert_eq!(store.with_latest(42, 7, |id, _| id), Some(parent));
+    let args = json!({"element_token":token_for(old_scope, 0), "_session_id":"owner"});
+    let error = store
+        .resolve_for_instance(42, &args, InstanceEvidence::Live(fingerprint(1)))
+        .unwrap_err();
+    assert_eq!(
+        error.structured_content.unwrap()["refusal"]["code"],
+        "stale_element_token"
+    );
     assert!(store
         .begin_scoped_capture(
             42,
