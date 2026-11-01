@@ -292,6 +292,11 @@ async fn step_success_then_timeout_preserves_prior_delivery() {
 
 #[tokio::test]
 async fn withheld_verification_never_compares_or_sends_followup() {
+    let mut withheld_first = Fake::new(ValueRead::Withheld).result(kAXErrorIllegalArgument);
+    let _ = run(&mut withheld_first, "2", "AXSlider", false);
+    assert_eq!(withheld_first.writes, [("number", "2".into())]);
+    assert_eq!(withheld_first.reads_after_withheld, 0);
+
     struct SecureStep {
         reader: crate::ax::label_reader::fake::FakeReader,
         steps: usize,

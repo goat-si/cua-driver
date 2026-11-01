@@ -15,6 +15,7 @@ use crate::goat::action_latency as latency;
 
 use async_trait::async_trait;
 use cua_driver_core::{
+    mutation::{ChainResult, Postcondition, PriorInput, WriteOutcome},
     protocol::ToolResult,
     tool::{Tool, ToolDef},
 };
@@ -27,8 +28,8 @@ use crate::ax::bindings::{
     kAXErrorSuccess, perform_action, set_number_attr, set_string_attr, AXUIElementRef,
 };
 use crate::ax::write_outcome::{
-    classify_attr_write, query_settable, read_value_if_allowed, AttrWrite, Settable, ValueObs,
-    ValueRead,
+    native_write_outcome, query_settable, read_value_if_allowed, NativeWriteKind, Settable,
+    ValueObs, ValueRead,
 };
 use crate::focus_guard;
 use crate::window_change_detector::WindowChangeDetector;
@@ -309,11 +310,16 @@ impl Tool for SetValueTool {
         // TOKEN rule (handoff 3.7): after the gate and the rename routes,
         // attempt focus and refuse a text-role element with no editing
         // evidence instead of writing into it.
-        if let Some(refusal) =
-            super::not_editable::token_not_editable_refusal(pid, element_ptr, window_id).await
+        let token_focus = match super::not_editable::token_not_editable_receipt(
+            pid,
+            element_ptr,
+            window_id,
+        )
+        .await
         {
-            return refusal;
-        }
+            Ok(receipt) => receipt,
+            Err(refusal) => return refusal,
+        };
 
         let cursor_key = super::cursor_tools::resolve_cursor_key(&args);
         let center_guard = element_guard.clone();
@@ -385,6 +391,7 @@ impl Tool for SetValueTool {
                                 pid,
                                 window_id,
                                 &value,
+                                token_focus,
                                 document_key,
                             )
                         })
@@ -541,6 +548,23 @@ fn set_value_tool_result_with_toolkit(
         Ok(Err(e)) => {
             if let Some(popup) = e.downcast_ref::<popup_ownership::PopupError>() {
                 popup_ownership::tool_result(&popup.0, &suffix, ax_echo_surface)
+            } else if let Some(write) = e.downcast_ref::<ValueWriteError>() {
+                let effect = if write.chain.no_input() {
+                    "refused"
+                } else {
+                    "unverifiable"
+                };
+                let mut result = ToolResult::error(format!("set_value failed: {e}.{suffix}"))
+                    .with_structured(serde_json::json!({
+                        "path": "ax", "effect": effect, "verified": false,
+                    }));
+                if let Some(disposition) = write
+                    .chain
+                    .error_disposition(Postcondition::Indeterminate, false)
+                {
+                    result = result.with_disposition(disposition);
+                }
+                result
             } else {
                 ToolResult::error(format!("set_value failed: {e}.{suffix}"))
             }
@@ -1155,6 +1179,7 @@ fn set_value_blocking_with_document(
     pid: i32,
     window_id: u32,
     value: &str,
+    token_focus: super::not_editable::FocusDispatch,
     mark: impl FnOnce() -> crate::document_edit::DocumentEdited,
 ) -> anyhow::Result<SetValueOutcome> {
     set_value_blocking_inner(
@@ -1163,7 +1188,10 @@ fn set_value_blocking_with_document(
         pid,
         window_id,
         value,
-        false,
+        WritePrologue {
+            restored_window: false,
+            prior: prior_for_focus(token_focus),
+        },
         mark,
     )
 }
@@ -1182,7 +1210,10 @@ fn set_value_blocking_with(
         pid,
         window_id,
         value,
-        restored_window,
+        WritePrologue {
+            restored_window,
+            prior: PriorInput::MayHaveDelivered,
+        },
         || unsafe {
             crate::document_edit::ensure_marked_after_ax_write(
                 pid,
@@ -1197,15 +1228,24 @@ fn set_value_blocking_with(
 /// The caller holds the key scope and the temporary restore; the restore
 /// waits for the scope's hand-back before minimizing the window again, and
 /// only a text field is written on this route.
+struct WritePrologue {
+    restored_window: bool,
+    prior: PriorInput,
+}
+
 fn set_value_blocking_inner(
     element_ptr: usize,
     element_index: usize,
     pid: i32,
     window_id: u32,
     value: &str,
-    restored_window: bool,
+    prologue: WritePrologue,
     mark: impl FnOnce() -> crate::document_edit::DocumentEdited,
 ) -> anyhow::Result<SetValueOutcome> {
+    let WritePrologue {
+        restored_window,
+        mut prior,
+    } = prologue;
     let element = element_ptr as AXUIElementRef;
 
     let role = unsafe { copy_string_attr(element, "AXRole") }.unwrap_or_default();
@@ -1263,6 +1303,7 @@ fn set_value_blocking_inner(
                 !restored_window || unsafe { copy_bool_attr(element, "AXFocused") } != Some(true);
             if needs_focus {
                 crate::input::ax_actions::focus_element(element_ptr)?;
+                prior = PriorInput::MayHaveDelivered;
             }
             let own_focus = unsafe { copy_bool_attr(element, "AXFocused") } == Some(true);
             let exact_window =
@@ -1288,7 +1329,7 @@ fn set_value_blocking_inner(
                 .any(|a| a == "AXIncrement" || a == "AXDecrement"),
         };
         let mut ops = LiveAxValueOps { element };
-        let outcome = write_value_ladder(&mut ops, value, &ctx);
+        let outcome = write_value_ladder_with_prior(&mut ops, value, &ctx, prior);
         finish_ladder_with_mark(
             outcome,
             element,
@@ -1298,6 +1339,13 @@ fn set_value_blocking_inner(
             restored_window,
             mark,
         )
+    }
+}
+
+fn prior_for_focus(focus: super::not_editable::FocusDispatch) -> PriorInput {
+    match focus {
+        super::not_editable::FocusDispatch::None => PriorInput::None,
+        _ => PriorInput::MayHaveDelivered,
     }
 }
 
@@ -1354,6 +1402,14 @@ struct LadderOutcome {
     error: Option<i32>,
     reached: bool,
     verification_withheld: bool,
+    chain: Option<ChainResult>,
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("{message}")]
+struct ValueWriteError {
+    message: String,
+    chain: ChainResult,
 }
 impl LadderOutcome {
     fn new() -> Self {
@@ -1368,6 +1424,7 @@ impl LadderOutcome {
             error: None,
             reached: false,
             verification_withheld: false,
+            chain: None,
         }
     }
 }
@@ -1387,10 +1444,20 @@ fn ladder_read(ops: &mut impl AxValueOps, out: &mut LadderOutcome) -> ValueObs {
         }
     }
 }
+#[cfg(test)]
 fn write_value_ladder(
     ops: &mut impl AxValueOps,
     value: &str,
     ctx: &LadderContext,
+) -> LadderOutcome {
+    write_value_ladder_with_prior(ops, value, ctx, PriorInput::None)
+}
+
+fn write_value_ladder_with_prior(
+    ops: &mut impl AxValueOps,
+    value: &str,
+    ctx: &LadderContext,
+    prior: PriorInput,
 ) -> LadderOutcome {
     let mut out = LadderOutcome::new();
     let target = value.trim().parse::<f64>().ok();
@@ -1422,18 +1489,36 @@ fn write_value_ladder(
             };
             out.steps_sent += 1;
             let err = ops.perform_step(action);
-            match classify_attr_write(err) {
-                AttrWrite::Applied => out.steps_maybe_landed += 1,
-                AttrWrite::Rejected => {
-                    out.error = Some(err);
-                    break;
-                }
-                AttrWrite::Uncertain => {
+            let outcome = native_write_outcome(NativeWriteKind::Perform, true, &settable, err);
+            let step_prior = if out.steps_maybe_landed > 0 {
+                PriorInput::MayHaveDelivered
+            } else {
+                prior
+            };
+            let skipped_setter = native_write_outcome(
+                NativeWriteKind::SetAttribute,
+                false,
+                &settable,
+                kAXErrorSuccess,
+            );
+            out.chain = Some(
+                ChainResult::from_recorded(vec![skipped_setter, outcome], step_prior)
+                    .expect("skipped setter and one step form a valid chain"),
+            );
+            match outcome {
+                WriteOutcome::Delivered => out.steps_maybe_landed += 1,
+                WriteOutcome::StopUncertain(_) => {
                     out.steps_maybe_landed += 1;
                     out.maybe_landed = true;
                     out.error = Some(err);
                     break;
                 }
+                WriteOutcome::StopNotDelivered(_) | WriteOutcome::FallThrough(_) => {
+                    out.maybe_landed = step_prior == PriorInput::MayHaveDelivered;
+                    out.error = Some(err);
+                    break;
+                }
+                WriteOutcome::RetryAfterUncertain(_) => unreachable!("native step never retries"),
             }
             let next = ladder_read(ops, &mut out);
             if out.verification_withheld {
@@ -1475,35 +1560,46 @@ fn write_value_ladder(
     } else {
         ops.set_string(value)
     };
-    let err = match classify_attr_write(first) {
-        AttrWrite::Applied => first,
-        AttrWrite::Uncertain => {
-            out.maybe_landed = true;
-            first
+    let first_outcome = native_write_outcome(NativeWriteKind::SetAttribute, true, &settable, first);
+    let (err, terminal, outcomes) = if first_number
+        && !text_role
+        && !out.verification_withheld
+        && first == crate::ax::bindings::kAXErrorIllegalArgument
+    {
+        let WriteOutcome::StopUncertain(reason) = first_outcome else {
+            unreachable!("illegal argument is an uncertain native write")
+        };
+        let alternate = ops.set_string(value);
+        let terminal =
+            native_write_outcome(NativeWriteKind::SetAttribute, true, &settable, alternate);
+        (
+            alternate,
+            terminal,
+            vec![WriteOutcome::RetryAfterUncertain(reason), terminal],
+        )
+    } else {
+        (first, first_outcome, vec![first_outcome])
+    };
+    out.chain = Some(
+        ChainResult::from_recorded(outcomes, prior)
+            .expect("single setter or one representation retry forms a valid chain"),
+    );
+    match terminal {
+        WriteOutcome::Delivered => {}
+        WriteOutcome::StopNotDelivered(_) | WriteOutcome::FallThrough(_) => {
+            out.maybe_landed = !out.chain.as_ref().expect("recorded").no_input();
+            out.error = Some(err);
+            return out;
         }
-        AttrWrite::Rejected => {
-            // Only one alternate representation may be attempted.
-            let alternate = if first_number {
-                ops.set_string(value)
-            } else if let Some(number) = target.filter(|_| !text_role) {
-                ops.set_number(number)
-            } else {
-                out.error = Some(first);
+        WriteOutcome::StopUncertain(_) => {
+            out.maybe_landed = true;
+            if err == crate::ax::bindings::kAXErrorIllegalArgument {
+                out.error = Some(err);
                 return out;
-            };
-            match classify_attr_write(alternate) {
-                AttrWrite::Applied => alternate,
-                AttrWrite::Rejected => {
-                    out.error = Some(alternate);
-                    return out;
-                }
-                AttrWrite::Uncertain => {
-                    out.maybe_landed = true;
-                    alternate
-                }
             }
         }
-    };
+        WriteOutcome::RetryAfterUncertain(_) => unreachable!("native setter never retries"),
+    }
     out.error = (err != kAXErrorSuccess).then_some(err);
     if !ctx.secure && !out.verification_withheld {
         let before_s = obs_string(&before);
@@ -1533,6 +1629,17 @@ fn write_value_ladder(
         // that an accepted write had no effect.
         out.not_applied =
             !out.maybe_landed && !numeric && write_not_applied(out.verified, out.changed);
+        if numeric && write_not_applied(out.verified, out.changed) {
+            out.maybe_landed = true;
+        }
+        if out.chain.as_ref().is_some_and(|chain| {
+            matches!(
+                chain.outcomes().first(),
+                Some(WriteOutcome::RetryAfterUncertain(_))
+            ) && out.verified != Some(true)
+        }) {
+            out.maybe_landed = true;
+        }
     }
     out.reached = true;
     out
@@ -1579,7 +1686,7 @@ fn finish_ladder_with_mark(
 }
 
 fn finish_ladder_with_document_readers(
-    out: LadderOutcome,
+    mut out: LadderOutcome,
     element_index: usize,
     role: &str,
     restored_window: bool,
@@ -1589,10 +1696,23 @@ fn finish_ladder_with_document_readers(
 ) -> anyhow::Result<SetValueOutcome> {
     if !out.reached {
         let err = out.error.unwrap_or(kAXErrorSuccess);
-        if out.maybe_landed || out.steps_sent > 0 {
-            anyhow::bail!("AX value operation failed with error {err}; {} step action(s) sent ({} may have landed); the value may have changed. Read it before repeating", out.steps_sent, out.steps_maybe_landed)
+        let message = if out.maybe_landed || out.steps_sent > 0 {
+            format!("AX value operation failed with error {err}; {} step action(s) sent ({} may have landed); the value may have changed. Read it before repeating", out.steps_sent, out.steps_maybe_landed)
+        } else {
+            format!("AXUIElementSetAttributeValue(AXValue) failed with error {err}")
+        };
+        if let Some(chain) = out.chain {
+            return Err(ValueWriteError { message, chain }.into());
         }
-        anyhow::bail!("AXUIElementSetAttributeValue(AXValue) failed with error {err}");
+        anyhow::bail!(message);
+    }
+    if out.verified == Some(true)
+        && out.chain.as_ref().is_some_and(|chain| {
+            chain.effect(Postcondition::Confirmed, true)
+                != cua_driver_contract::ActionEffect::Confirmed
+        })
+    {
+        out.verified = Some(false);
     }
     if out.stepped {
         let document = if out.verification_withheld {
@@ -1730,6 +1850,7 @@ fn not_applied_result(element_index: usize, vcl: bool) -> ToolResult {
         "verified": false,
         "effect": "not_applied",
     }))
+    .with_disposition(cua_driver_contract::ErrorDisposition::SUSPECTED_NOOP)
 }
 
 /// Decide what a post-write AXValue read proves.
@@ -3059,13 +3180,14 @@ mod ladder_tests {
         assert_eq!(f.writes, ["string"]);
     }
     #[test]
-    fn text_zero_value_rejecting_string_accepts_number() {
+    fn text_zero_value_rejecting_string_never_retries_as_number() {
         let mut f = Fake::new(text("0"))
             .read(text("5"))
             .result(kAXErrorIllegalArgument);
         let out = run(&mut f, "5", false, false);
-        assert_eq!(f.writes, ["string", "number"]);
-        assert_eq!(out.verified, Some(true));
+        assert_eq!(f.writes, ["string"]);
+        assert!(!out.reached);
+        assert!(out.maybe_landed);
     }
     #[test]
     fn text_role_payload_stays_the_exact_string() {
@@ -3181,7 +3303,8 @@ mod ladder_tests {
         let out = run(&mut f, "5", true, false);
         assert_eq!(f.writes, ["step"]);
         assert_eq!(out.steps_sent, 1);
-        assert_eq!(out.steps_maybe_landed, 0);
+        assert_eq!(out.steps_maybe_landed, 1);
+        assert!(out.maybe_landed);
         assert!(!out.reached);
     }
     #[test]

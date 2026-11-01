@@ -57,6 +57,7 @@ pub(crate) fn native_write_outcome(
     }
 }
 
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum AttrWrite {
     Applied,
@@ -68,6 +69,7 @@ pub(crate) enum AttrWrite {
 /// effect occurred. We assume a control rejecting a value can receive the same
 /// value once in another representation. Apple includes values an app does not
 /// recognize in IllegalArgument.
+#[cfg(test)]
 pub(crate) fn classify_attr_write(err: AXError) -> AttrWrite {
     if err == kAXErrorSuccess {
         AttrWrite::Applied
