@@ -670,11 +670,10 @@ fn fold_actionless_text_subtrees_impl<N: CompactableNode>(
                 .description()
                 .map(|s| s.trim().is_empty())
                 .unwrap_or(true)
-            && (!report_folds
-                || nodes[i]
-                    .rendered_text_fields()
-                    .iter()
-                    .all(|(_, text)| text.trim().is_empty()));
+            && nodes[i]
+                .rendered_text_fields()
+                .iter()
+                .all(|(_, text)| text.trim().is_empty());
         if !is_empty_wrapper {
             i += 1;
             continue;
@@ -1610,6 +1609,20 @@ mod tests {
         ];
         nodes[1].extra = Some("wrapper text".into());
         assert!(u20_fold(&mut nodes).is_empty());
+        assert_eq!(nodes.len(), 2);
+    }
+    #[test]
+    fn u20b_revision_b_legacy_wrapper_extra_field_cannot_be_elided() {
+        let mut nodes = vec![
+            u20_node("AXRow", 0, None, None),
+            u20_node("AXGroup", 1, None, None),
+        ];
+        nodes[1].extra = Some("wrapper text".into());
+        let mut lines = nodes
+            .iter()
+            .map(|node| (node.depth(), node.format_line()))
+            .collect();
+        fold_actionless_text_subtrees(&mut lines, &mut nodes);
         assert_eq!(nodes.len(), 2);
     }
     #[test]
