@@ -29,8 +29,10 @@ use core_foundation::{
     string::CFString,
 };
 use cua_driver_contract::{IncompleteReason, IncompleteReasonDetail, IncompleteReasonKind};
+#[cfg(test)]
+use cua_driver_core::snapshot_compaction::fold_actionless_text_subtrees;
 use cua_driver_core::snapshot_compaction::{
-    compact_tab_strip, fold_actionless_text_subtrees, format_omitted_tabs_line,
+    compact_tab_strip, fold_actionless_text_subtrees_with_reasons, format_omitted_tabs_line,
     is_secure_text_field, redact_if_secure, CompactableNode, FieldSecurityMeta, TabChildMeta,
     TabStripCompaction, TAB_STRIP_COMPACTION_THRESHOLD,
 };
@@ -295,6 +297,9 @@ fn role_supports_value_addressing(role: &str) -> bool {
 }
 
 impl CompactableNode for AXNode {
+    fn fold_to_read_level_without_boundary(&self) -> bool {
+        true
+    }
     fn element_index(&self) -> Option<usize> {
         self.element_index
     }
@@ -505,7 +510,10 @@ pub(super) fn apply_owned_label_claims(nodes: &mut [AXNode], claims: Vec<(usize,
     }
 }
 
-fn fold_with_owned_items(lines: &mut Vec<(usize, String)>, nodes: &mut Vec<AXNode>) {
+fn fold_with_owned_items(
+    lines: &mut Vec<(usize, String)>,
+    nodes: &mut Vec<AXNode>,
+) -> Vec<IncompleteReason> {
     // The core folder only sees rendered depth; a missing item wrapper can
     // make unrelated text appear to belong to an unindexed row or cell.
     // Protect those owners during folding so their original children remain.
@@ -520,10 +528,77 @@ fn fold_with_owned_items(lines: &mut Vec<(usize, String)>, nodes: &mut Vec<AXNod
             }
         })
         .collect();
-    fold_actionless_text_subtrees(lines, nodes);
+    let reasons = fold_actionless_text_subtrees_with_reasons(lines, nodes);
     for node in nodes {
         if node.element_index == Some(usize::MAX) && protected.contains(&node.element_ptr) {
             node.element_index = None;
+        }
+    }
+    reasons
+}
+
+fn merge_fold_reasons(
+    budget: &mut WalkBudget,
+    reasons: impl IntoIterator<Item = IncompleteReason>,
+) {
+    for reason in reasons {
+        budget.record_skip(reason);
+    }
+}
+
+#[cfg(test)]
+mod folding_reason_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn folded_boundary_reaches_read_outcome_without_changing_tree_output() {
+        for count in [2, 7] {
+            let mut nodes = vec![role_only_node("AXRow".into(), 1, 0, None, false)];
+            for index in 0..count {
+                let mut child = role_only_node("AXStaticText".into(), index + 2, 1, None, false);
+                child.value = Some(format!("item {index}"));
+                nodes.push(child);
+            }
+            let lines: Vec<_> = nodes
+                .iter()
+                .map(|node| (node.depth, format_node_line(node)))
+                .collect();
+            let mut old_nodes = nodes.clone();
+            let mut old_lines = lines.clone();
+            fold_actionless_text_subtrees(&mut old_lines, &mut old_nodes);
+            let expected_markdown = render_lines(&old_lines);
+            let scope = super::super::evidence::EvidenceScope::start();
+            let (result, _) = finalize_with_deadline_sample(
+                lines,
+                nodes,
+                vec![],
+                None,
+                WalkBudget::nodes_only(100),
+                SkipLedger::start(),
+                None,
+                |_| false,
+            );
+            assert_eq!(result.tree_markdown, expected_markdown);
+            assert_eq!(
+                result
+                    .nodes
+                    .iter()
+                    .map(|node| (&node.role, &node.value, node.depth, node.element_index))
+                    .collect::<Vec<_>>(),
+                old_nodes
+                    .iter()
+                    .map(|node| (&node.role, &node.value, node.depth, node.element_index))
+                    .collect::<Vec<_>>()
+            );
+            let mut output = json!({});
+            result.walk.apply(&mut output);
+            let truncated = output["observation_incomplete_reasons"]
+                .as_array()
+                .unwrap()
+                .contains(&json!({"kind":"policy_omission", "detail":"folded_text_truncated"}));
+            assert_eq!(truncated, count > 6);
+            let _ = scope.finish(());
         }
     }
 }
@@ -1436,8 +1511,8 @@ fn scripted_clock_origin() -> Instant {
 
 #[allow(clippy::too_many_arguments)]
 fn finalize_with_deadline_sample(
-    lines: Vec<(usize, String)>,
-    nodes: Vec<AXNode>,
+    mut lines: Vec<(usize, String)>,
+    mut nodes: Vec<AXNode>,
     offscreen_rows: Vec<dense_rows::OffscreenRows>,
     query: Option<&str>,
     mut budget: WalkBudget,
@@ -1453,6 +1528,10 @@ fn finalize_with_deadline_sample(
             kind: IncompleteReasonKind::Budget,
             detail: IncompleteReasonDetail::TimeBudget,
         });
+    }
+    if !exhaustive_nodes() {
+        let reasons = fold_with_owned_items(&mut lines, &mut nodes);
+        merge_fold_reasons(&mut budget, reasons);
     }
     let walk = budget.outcome();
     let nodes_skipped = ledger.finish();
@@ -1729,11 +1808,6 @@ fn finalize_walk(
     nodes_skipped: bool,
     window_scope: Option<WindowScope>,
 ) -> TreeWalkResult {
-    // Folding merges text rows into their parent; an exhaustive walk keeps
-    // every row it visited.
-    if !exhaustive_nodes() {
-        fold_with_owned_items(&mut lines, &mut nodes);
-    }
     nodes.retain(|n| n.role != "AXTabStripSummary");
     let mut line_nodes = align_line_nodes(&lines, &nodes);
     prune_echo_text_rows(&mut lines, &mut line_nodes, &nodes);
@@ -4753,7 +4827,7 @@ pub(crate) fn test_fold_and_filter(mut nodes: Vec<AXNode>, query: &str) -> (Vec<
         .iter()
         .map(|node| (node.depth, format_node_line(node)))
         .collect();
-    fold_with_owned_items(&mut lines, &mut nodes);
+    let _ = fold_with_owned_items(&mut lines, &mut nodes);
     let mapping = align_line_nodes(&lines, &nodes);
     let rendered = filter_tree_with_original_text(&lines, &mapping, &nodes, query);
     (nodes, rendered)

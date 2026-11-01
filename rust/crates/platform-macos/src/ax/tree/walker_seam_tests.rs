@@ -409,7 +409,7 @@ fn run_fake_inner(
         &mut deferred,
         &mut claims,
     );
-    let (lines, nodes, offscreen) = finish_deferred(
+    let (mut lines, mut nodes, offscreen) = finish_deferred(
         source,
         lines,
         nodes,
@@ -423,6 +423,10 @@ fn run_fake_inner(
         claims,
     );
     record_attribute_failures(&mut budget);
+    if !exhaustive_nodes() {
+        let reasons = fold_with_owned_items(&mut lines, &mut nodes);
+        merge_fold_reasons(&mut budget, reasons);
+    }
     let outcome = budget.outcome();
     finalize_walk(
         lines,
