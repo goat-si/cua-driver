@@ -3580,7 +3580,7 @@ mod timeout_tests {
     fn a_basis_handle_menu_token_is_rerouted_to_invoke_menu() {
         crate::window_state_view::remember_for_test(
             "s7e570003",
-            42,
+            425101,
             7,
             r#"- [27] AXMenuBar
   - [700] AXMenuBarItem "Sheet"
@@ -3591,7 +3591,7 @@ mod timeout_tests {
         let stale = ToolResult::error("element_token is stale")
             .with_structured(json!({"code":"stale_element_token","effect":"refused"}));
         let (menu_args, _) = menu_bar_route(
-            &json!({"pid":42,"element_token":"s7e570003.f2:771"}),
+            &json!({"pid":425101,"element_token":"s7e570003.f2:771"}),
             &stale,
         )
         .expect("rerouted");
@@ -3603,7 +3603,7 @@ mod timeout_tests {
     async fn menu_reroute_does_not_run_after_timeout() {
         crate::window_state_view::remember_for_test(
             "s-menu-timeout",
-            42,
+            425102,
             7,
             r#"- [27] AXMenuBar
   - [700] AXMenuBarItem "Sheet"
@@ -3635,7 +3635,7 @@ mod timeout_tests {
             &json!({
                 "steps":[{
                     "tool":"click",
-                    "args":{"pid":42,"window_id":7,"element_token":"s-menu-timeout:771"}
+                    "args":{"pid":425102,"window_id":7,"element_token":"s-menu-timeout:771"}
                 }]
             }),
         )
@@ -3660,7 +3660,7 @@ mod timeout_tests {
     async fn stale_refind_does_not_run_after_timeout() {
         crate::window_state_view::remember_for_test(
             "s-stale-timeout",
-            42,
+            425103,
             7,
             "- [1] AXStaticText \"Result\"\n",
         );
@@ -3669,11 +3669,11 @@ mod timeout_tests {
         let worker_finished = Arc::new(tokio::sync::Notify::new());
         let calls = Arc::new(Mutex::new(Vec::new()));
         let mut registry = ToolRegistry::new();
-        register_probe(&mut registry, "list_windows", list_windows);
-        register_probe(&mut registry, "list_apps", list_apps);
+        register_probe(&mut registry, "list_windows", || list_windows_for(425103));
+        register_probe(&mut registry, "list_apps", || list_apps_for(425103));
         registry.register(Box::new(WindowReadTool {
             def: tool_def("get_window_state"),
-            pid: 42,
+            pid: 425103,
             calls: Arc::new(Mutex::new(Vec::new())),
             started: Arc::new(tokio::sync::Notify::new()),
             release: Arc::new(tokio::sync::Notify::new()),
@@ -3695,7 +3695,7 @@ mod timeout_tests {
             &json!({
                 "steps":[{
                     "tool":"click",
-                    "args":{"pid":42,"window_id":7,"element_token":"s-stale-timeout:1"}
+                    "args":{"pid":425103,"window_id":7,"element_token":"s-stale-timeout:1"}
                 }]
             }),
         )
