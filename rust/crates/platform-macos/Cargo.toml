@@ -82,6 +82,9 @@ cua-driver-core = { path = "../cua-driver-core", features = ["test-support"] }
 tempfile = "3"
 cua-cursor-motion = { path = "../cua-cursor-motion" }
 tokio = { workspace = true, features = ["test-util"] }
+syn = { version = "2", features = ["full", "visit"] }
+quote = "1"
+proc-macro2 = { version = "1", features = ["span-locations"] }
 
 [[test]]
 name = "embedded_menu_restore"
