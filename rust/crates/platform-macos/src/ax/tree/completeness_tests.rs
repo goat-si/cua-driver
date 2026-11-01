@@ -48,3 +48,49 @@ fn query_with_an_omission_is_false_with_its_typed_reason() {
         .unwrap()
         .contains(&json!({"kind":"policy_omission", "detail":"depth_limit"})));
 }
+
+#[test]
+fn failed_attribute_reports_attribute_read_failed() {
+    let (tree, _) = super::walker_seam_tests::canonical_walk_fixture("u25");
+    let mut output = json!({});
+    tree.walk.apply(&mut output);
+    assert!(output["observation_incomplete_reasons"]
+        .as_array()
+        .unwrap()
+        .contains(&json!({"kind":"provider_failure", "detail":"attribute_read_failed"})));
+}
+
+#[test]
+fn failed_role_reports_attribute_read_failed() {
+    let (tree, _) = super::walker_seam_tests::canonical_walk_fixture("role_failure");
+    let mut output = json!({});
+    tree.walk.apply(&mut output);
+    assert!(output["observation_incomplete_reasons"]
+        .as_array()
+        .unwrap()
+        .contains(&json!({"kind":"provider_failure", "detail":"attribute_read_failed"})));
+}
+
+#[test]
+fn recovered_batch_fallback_is_not_incomplete() {
+    let (tree, trace) = super::walker_seam_tests::canonical_walk_fixture("recovered");
+    assert!(trace.iter().any(|entry| entry == "status 1 AXTitle"));
+    let mut output = json!({});
+    tree.walk.apply(&mut output);
+    assert_eq!(
+        output["observation_incomplete_reasons"],
+        json!([{"kind":"unknown", "detail":"not_asserted"}])
+    );
+}
+
+#[test]
+fn secure_redaction_without_read_failure_is_not_incomplete() {
+    let (tree, trace) = super::walker_seam_tests::canonical_walk_fixture("secure");
+    assert!(!trace.iter().any(|entry| entry == "value 1"));
+    let mut output = json!({});
+    tree.walk.apply(&mut output);
+    assert_eq!(
+        output["observation_incomplete_reasons"],
+        json!([{"kind":"unknown", "detail":"not_asserted"}])
+    );
+}

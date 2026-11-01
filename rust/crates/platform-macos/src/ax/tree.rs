@@ -1414,6 +1414,7 @@ fn finalize_with_deadline_sample(
     sample: impl FnOnce(&WalkBudget) -> bool,
 ) -> (TreeWalkResult, bool) {
     let final_deadline_sample = sample(&budget);
+    record_attribute_failures(&mut budget);
     if final_deadline_sample {
         budget.record_cut(IncompleteReason {
             kind: IncompleteReasonKind::Budget,
@@ -1434,6 +1435,40 @@ fn finalize_with_deadline_sample(
         ),
         final_deadline_sample,
     )
+}
+
+/// Attribute failures are distinct from an unsupported or absent attribute.
+/// Batch-call failures are excluded here: their individual replayed reads
+/// carry the eventual result, and a fully recovered replay is not incomplete.
+fn record_attribute_failures(budget: &mut WalkBudget) {
+    use super::evidence::{current_evidence, EvidenceStatus, ReadSite};
+    let failed = current_evidence().iter().any(|evidence| {
+        let attribute_site = matches!(
+            evidence.site,
+            ReadSite::Role
+                | ReadSite::ActionNames
+                | ReadSite::Content(_)
+                | ReadSite::Control(_)
+                | ReadSite::Frame(_)
+                | ReadSite::Scrollbar(_)
+                | ReadSite::Tab(_)
+                | ReadSite::ValueSettable
+                | ReadSite::SelectedSettable
+                | ReadSite::MenuSelected
+        );
+        attribute_site
+            && (matches!(evidence.status, EvidenceStatus::Unknown(_))
+                || matches!(
+                    (evidence.site, evidence.status),
+                    (ReadSite::Role, EvidenceStatus::Absent)
+                ))
+    });
+    if failed {
+        budget.record_skip(IncompleteReason {
+            kind: IncompleteReasonKind::ProviderFailure,
+            detail: IncompleteReasonDetail::AttributeReadFailed,
+        });
+    }
 }
 
 #[allow(clippy::too_many_arguments)]

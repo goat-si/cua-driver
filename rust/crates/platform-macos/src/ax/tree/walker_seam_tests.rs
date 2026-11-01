@@ -408,6 +408,7 @@ fn run_fake_inner(
         include_web_content,
         claims,
     );
+    record_attribute_failures(&mut budget);
     let outcome = budget.outcome();
     finalize_walk(
         lines,
@@ -2291,7 +2292,7 @@ pub(crate) fn canonical_walk_fixture(case: &str) -> (TreeWalkResult, Vec<String>
         step("timeout 1", Reply::Unit),
         step("text 1 AXRole", Reply::Text(role_reply)),
     ];
-    if case == "u25" {
+    if matches!(case, "u25" | "recovered") {
         steps.push(step(
             &format!("batch 1 {CONTENT}"),
             Reply::Batch(Err(BatchFailure::WholeCall(kAXErrorAttributeUnsupported))),
@@ -2322,7 +2323,7 @@ pub(crate) fn canonical_walk_fixture(case: &str) -> (TreeWalkResult, Vec<String>
         "actions 1",
         Reply::Actions(Read::Known(vec!["AXPress".into()])),
     ));
-    if case == "u25" {
+    if matches!(case, "u25" | "recovered") {
         steps.extend([
             step("bool 1 AXEnabled", Reply::Bool(Read::Absent)),
             step("position 1", Reply::Point(Read::Absent)),

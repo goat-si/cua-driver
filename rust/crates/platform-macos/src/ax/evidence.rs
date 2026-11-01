@@ -52,6 +52,11 @@ pub(crate) fn current_owner() -> Option<usize> {
     WALK_OWNER.with(std::cell::Cell::get)
 }
 
+/// Read the current walk's observations without draining its diagnostic record.
+pub(crate) fn current_evidence() -> Vec<ReadEvidence> {
+    WALK_EVIDENCE.with(|cell| cell.borrow().clone().unwrap_or_default())
+}
+
 pub(crate) struct EvidenceOwner(Option<usize>);
 
 impl EvidenceOwner {
