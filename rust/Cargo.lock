@@ -1283,6 +1283,7 @@ dependencies = [
  "ciborium",
  "coset",
  "cua-driver-contract",
+ "cua-driver-core",
  "fs2",
  "futures-util",
  "getrandom 0.4.2",

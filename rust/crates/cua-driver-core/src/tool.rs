@@ -1246,6 +1246,17 @@ impl ToolRegistry {
         Self::new_with_protected_consent_provider(None)
     }
 
+    /// Construct a registry with a deterministic lease backend for platform tests.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn with_test_lease(
+        backend: Arc<crate::desktop_lease::test_support::TestBackend>,
+        clock: Arc<crate::desktop_lease::test_support::TestClock>,
+    ) -> Self {
+        let mut registry = Self::new();
+        registry.desktop_lease = crate::desktop_lease::LeaseManager::new(backend, clock);
+        registry
+    }
+
     /// Construct a registry with a provider installed by a trusted embedding
     /// host. Public tool calls and transport metadata cannot replace it.
     pub fn new_with_protected_consent_provider(
@@ -2546,11 +2557,12 @@ impl ToolRegistry {
                     | "end_session"
             );
         let private_consent_turn = is_existing_profile_prepare(resolved_name, &args);
-        let file_lease = if requires_desktop_coordination(
-            resolved_name,
-            &args,
-            tool.has_independent_input_lane(&args),
-        ) {
+        let file_lease = if changes_app_or_desktop_state(tool.def(), resolved_name, &args)
+            && requires_desktop_coordination(
+                resolved_name,
+                &args,
+                tool.has_independent_input_lane(&args),
+            ) {
             let owner = runtime_session.clone().unwrap_or_else(|| {
                 crate::desktop_lease::runtime_owner(&context.runtime_scope_key())
             });
@@ -3698,32 +3710,40 @@ fn canonical_proposed_path(raw: &str) -> Result<String, ToolResult> {
     Ok(canonical.to_string_lossy().into_owned())
 }
 
-fn is_physical_desktop_action(tool: &str) -> bool {
-    matches!(
-        tool,
-        "click"
-            | "double_click"
-            | "right_click"
-            | "scroll"
-            | "drag"
-            | "mouse_drag"
-            | "parallel_mouse_drag"
-            | "move_cursor"
-            | "mouse_button_down"
-            | "mouse_button_up"
-            | "type_text"
-            | "press_key"
-            | "hotkey"
-            | "set_value"
-            | "bring_to_front"
-            | "set_window_frame"
-    )
-}
-
-fn requires_desktop_coordination(tool: &str, args: &Value, independent_lane: bool) -> bool {
-    if !is_physical_desktop_action(tool) {
+fn changes_app_or_desktop_state(def: &ToolDef, tool: &str, args: &Value) -> bool {
+    if def.read_only
+        || matches!(
+            tool,
+            "start_session"
+                | "end_session"
+                | "escalate_session"
+                | "start_recording"
+                | "stop_recording"
+                | "get_recording_state"
+                | "install_ffmpeg"
+                | "set_config"
+                | "run_steps"
+                | "run_script"
+                | "set_agent_cursor_enabled"
+                | "set_agent_cursor_motion"
+                | "set_agent_cursor_theme"
+                | "replay_trajectory"
+                | "history_status"
+                | "history_query"
+        )
+    {
         return false;
     }
+    match tool {
+        "menu_bar_extras" => !matches!(args["operation"].as_str(), Some("system" | "list")),
+        "page" => !matches!(args["action"].as_str(), Some("get_text" | "query_dom")),
+        "browser_dialog" => args["action"] != "inspect",
+        "check_permissions" => args["prompt"] == true,
+        _ => true,
+    }
+}
+
+fn requires_desktop_coordination(_tool: &str, args: &Value, independent_lane: bool) -> bool {
     // Only an implementation-attested, exact-window background route can
     // leave the shared lane. Explicit desktop and foreground calls never do.
     let exact_background_window = args["pid"].as_u64().is_some_and(|pid| pid > 0)
@@ -8188,6 +8208,201 @@ resources:
         );
         assert_eq!(hits.load(Ordering::SeqCst), 0);
         assert_eq!(backend.attempts.load(Ordering::SeqCst), 501);
+    }
+
+    #[tokio::test]
+    async fn admission_scope_menu_mutations_and_reads() {
+        use crate::desktop_lease::{
+            test_support::{TestBackend, TestClock},
+            LeaseManager,
+        };
+        let backend = Arc::new(TestBackend::default());
+        backend.hold();
+        let hits = Arc::new(AtomicUsize::new(0));
+        let mut registry = super::ToolRegistry::new();
+        registry.desktop_lease = LeaseManager::new(backend, Arc::new(TestClock::default()));
+        for (name, read_only) in [
+            ("invoke_menu", false),
+            ("menu_bar_extras", false),
+            ("get_window_state", true),
+            ("list_windows", true),
+            ("start_recording", false),
+        ] {
+            registry.register(Box::new(ObservationProbe {
+                hits: hits.clone(),
+                def: super::ToolDef {
+                    name: name.into(),
+                    description: "probe".into(),
+                    input_schema: serde_json::json!({"type":"object"}),
+                    read_only,
+                    destructive: false,
+                    idempotent: false,
+                    open_world: false,
+                },
+            }));
+        }
+        for (name, args) in [
+            ("invoke_menu", serde_json::json!({"pid":42})),
+            (
+                "menu_bar_extras",
+                serde_json::json!({"operation":"click", "pid":42}),
+            ),
+        ] {
+            let result = registry
+                .invoke_with_context(name, args, unrestricted_context())
+                .await;
+            assert_eq!(
+                result.structured_content.unwrap()["code"],
+                "desktop_busy",
+                "{name}"
+            );
+            assert_eq!(hits.load(Ordering::SeqCst), 0, "{name} must not dispatch");
+        }
+        for (name, args) in [
+            ("menu_bar_extras", serde_json::json!({"operation":"list"})),
+            ("get_window_state", serde_json::json!({"pid":42})),
+            ("list_windows", serde_json::json!({})),
+            ("start_recording", serde_json::json!({})),
+        ] {
+            let before = hits.load(Ordering::SeqCst);
+            let result = registry
+                .invoke_with_context(name, args, unrestricted_context())
+                .await;
+            assert_ne!(
+                result.structured_content.as_ref().map(|body| &body["code"]),
+                Some(&serde_json::json!("desktop_busy")),
+                "{name}"
+            );
+            assert_eq!(hits.load(Ordering::SeqCst), before + 1, "{name}");
+        }
+    }
+
+    #[tokio::test]
+    async fn composite_dispatch_acquires_the_lease_only_for_nested_mutations() {
+        use crate::desktop_lease::{
+            test_support::{TestBackend, TestClock},
+            LeaseManager,
+        };
+        let backend = Arc::new(TestBackend::default());
+        let hits = Arc::new(AtomicUsize::new(0));
+        let mut registry = super::ToolRegistry::new();
+        registry.desktop_lease = LeaseManager::new(backend.clone(), Arc::new(TestClock::default()));
+        registry.register(Box::new(ObservationProbe {
+            hits: hits.clone(),
+            def: super::ToolDef {
+                name: "click".into(),
+                description: "probe".into(),
+                input_schema: serde_json::json!({"type":"object"}),
+                read_only: false,
+                destructive: false,
+                idempotent: false,
+                open_world: false,
+            },
+        }));
+        registry.register_session_tools();
+        let registry = Arc::new(registry);
+        registry.init_self_weak();
+        let args = serde_json::json!({"steps":[{"click":{"pid":42}}]});
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            registry.invoke_with_context("run_steps", args.clone(), unrestricted_context()),
+        )
+        .await
+        .expect("composite must not hold the nested action's coordinator");
+        assert_eq!(hits.load(Ordering::SeqCst), 1, "{result:?}");
+        assert_eq!(backend.attempts.load(Ordering::SeqCst), 1);
+        backend.hold();
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            registry.invoke_with_context("run_steps", args, unrestricted_context()),
+        )
+        .await
+        .expect("busy nested action must finish");
+        assert_eq!(hits.load(Ordering::SeqCst), 1, "{result:?}");
+        assert_eq!(backend.attempts.load(Ordering::SeqCst), 502, "{result:?}");
+        assert!(result
+            .structured_content
+            .unwrap()
+            .to_string()
+            .contains("desktop_busy"));
+    }
+
+    #[test]
+    fn mixed_tool_reads_and_overlay_controls_do_not_acquire_the_lease() {
+        let mut def = super::ToolDef {
+            name: "probe".into(),
+            description: "probe".into(),
+            input_schema: serde_json::json!({"type":"object"}),
+            read_only: false,
+            destructive: false,
+            idempotent: false,
+            open_world: false,
+        };
+        for (tool, args, expected) in [
+            (
+                "menu_bar_extras",
+                serde_json::json!({"operation":"system"}),
+                false,
+            ),
+            (
+                "menu_bar_extras",
+                serde_json::json!({"operation":"list"}),
+                false,
+            ),
+            (
+                "menu_bar_extras",
+                serde_json::json!({"operation":"open"}),
+                true,
+            ),
+            (
+                "menu_bar_extras",
+                serde_json::json!({"operation":"click"}),
+                true,
+            ),
+            (
+                "menu_bar_extras",
+                serde_json::json!({"operation":"close"}),
+                true,
+            ),
+            ("page", serde_json::json!({"action":"get_text"}), false),
+            ("page", serde_json::json!({"action":"query_dom"}), false),
+            (
+                "page",
+                serde_json::json!({"action":"execute_javascript"}),
+                true,
+            ),
+            (
+                "browser_dialog",
+                serde_json::json!({"action":"inspect"}),
+                false,
+            ),
+            (
+                "browser_dialog",
+                serde_json::json!({"action":"dismiss"}),
+                true,
+            ),
+            ("check_permissions", serde_json::json!({}), false),
+            (
+                "check_permissions",
+                serde_json::json!({"prompt":true}),
+                true,
+            ),
+            ("set_agent_cursor_enabled", serde_json::json!({}), false),
+            ("set_agent_cursor_motion", serde_json::json!({}), false),
+            ("set_agent_cursor_theme", serde_json::json!({}), false),
+        ] {
+            assert_eq!(
+                super::changes_app_or_desktop_state(&def, tool, &args),
+                expected,
+                "{tool}: {args}"
+            );
+        }
+        def.read_only = true;
+        assert!(!super::changes_app_or_desktop_state(
+            &def,
+            "future_read",
+            &serde_json::json!({})
+        ));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

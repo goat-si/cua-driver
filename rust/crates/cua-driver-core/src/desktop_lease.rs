@@ -1,4 +1,8 @@
 //! Cross-process exclusion for desktop input.
+#![cfg_attr(
+    not(feature = "test-support"),
+    doc = "Without `test-support`, the deterministic fixtures are unavailable:\n\n```compile_fail\nuse cua_driver_core::desktop_lease::test_support::TestBackend;\n```"
+)]
 
 use std::any::Any;
 use std::fs::{self, File, OpenOptions};
@@ -731,7 +735,7 @@ pub async fn acquire_owned(owner: &str) -> Result<OwnedLease, LeaseFailure> {
     })
 }
 
-pub(crate) struct LeaseManager {
+pub struct LeaseManager {
     backend: Arc<dyn LeaseBackend>,
     clock: Arc<dyn LeaseClock>,
 }
@@ -780,13 +784,31 @@ impl LeaseManager {
     }
 }
 
-#[cfg(test)]
-pub(crate) mod test_support {
+/// Deterministic lease fixtures for platform tests. In the platform crate's
+/// `Cargo.toml`, enable `cua-driver-core = { path = "../cua-driver-core",
+/// features = ["test-support"] }` under `[dev-dependencies]`.
+///
+/// ```no_run
+/// use std::sync::Arc;
+/// use cua_driver_core::{desktop_lease::test_support::{TestBackend, TestClock, is_retained}, tool::ToolRegistry};
+/// let backend = Arc::new(TestBackend::default());
+/// backend.hold();
+/// let mut registry = ToolRegistry::with_test_lease(backend, Arc::new(TestClock::default()));
+/// assert!(!is_retained("some-owner"));
+/// # async fn assert_busy(registry: &ToolRegistry) {
+/// // After registering `invoke_menu`, a held backend refuses before dispatch.
+/// let result = registry.invoke("invoke_menu", serde_json::json!({"pid": 42})).await;
+/// assert_eq!(result.structured_content.unwrap()["code"], "desktop_busy");
+/// # }
+/// # let _ = &mut registry;
+/// ```
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_support {
     use super::*;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     #[derive(Default)]
-    pub(crate) struct TestBackend {
+    pub struct TestBackend {
         held: Arc<AtomicBool>,
         pub(crate) attempts: AtomicUsize,
         pub(crate) unavailable: AtomicBool,
@@ -801,7 +823,7 @@ pub(crate) mod test_support {
     }
 
     impl TestBackend {
-        pub(crate) fn hold(&self) {
+        pub fn hold(&self) {
             self.held.store(true, Ordering::SeqCst);
         }
     }
@@ -827,7 +849,7 @@ pub(crate) mod test_support {
         }
     }
     #[derive(Default)]
-    pub(crate) struct TestClock(Mutex<Duration>);
+    pub struct TestClock(Mutex<Duration>);
     #[async_trait::async_trait]
     impl LeaseClock for TestClock {
         fn now(&self) -> Duration {
@@ -837,7 +859,7 @@ pub(crate) mod test_support {
             *self.0.lock().unwrap() += duration;
         }
     }
-    pub(crate) fn manager() -> LeaseManager {
+    pub fn manager() -> LeaseManager {
         LeaseManager::new(
             Arc::new(TestBackend::default()),
             Arc::new(TestClock::default()),
@@ -845,7 +867,7 @@ pub(crate) mod test_support {
     }
 
     /// Whether `owner` currently holds a retained lease.
-    pub(crate) fn is_retained(owner: &str) -> bool {
+    pub fn is_retained(owner: &str) -> bool {
         owners().lock().unwrap().retained.contains_key(owner)
     }
 }
