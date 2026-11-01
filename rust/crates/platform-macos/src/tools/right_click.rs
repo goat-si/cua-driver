@@ -1458,6 +1458,41 @@ fn right_click_result_with_ownership(
 /// An AXShowMenu error that does not prove nothing was sent may have opened
 /// the menu: report that, and never right-click on top of it. Only an error
 /// that proves nothing was sent falls back to the pixel right-click.
+pub(super) enum RightClickAxStage {
+    Completed(ElementRightClick),
+    PixelFallback,
+}
+
+/// Decide whether the semantic actuator completed or a separate pixel stage
+/// is permitted. The pixel operation itself is deliberately outside this
+/// stage so a caller can perform asynchronous checks between the actuators.
+pub(super) fn right_click_ax_stage<T: Copy>(
+    target: T,
+    label: &str,
+    advertises_show_menu: bool,
+    show_menu: impl FnOnce(T) -> crate::ax::bindings::AXError,
+    ax_delivered: impl FnOnce(),
+) -> RightClickAxStage {
+    if advertises_show_menu {
+        let err = show_menu(target);
+        if err == kAXErrorSuccess {
+            ax_delivered();
+            return RightClickAxStage::Completed(ElementRightClick::Ax(format!(
+                "Shown menu for {label} (AXShowMenu)."
+            )));
+        }
+        if !super::click::perform_error_proves_nothing_was_sent(err) {
+            ax_delivered();
+            return RightClickAxStage::Completed(ElementRightClick::Ax(format!(
+                "⚠️ Sent AXShowMenu to {label}, but the app returned AX error {err}, which does \
+                 not mean it failed: the menu may be open. Read the window before repeating it."
+            )));
+        }
+        tracing::debug!("AXShowMenu returned {err} for {label}; falling back to pixel right-click");
+    }
+    RightClickAxStage::PixelFallback
+}
+
 pub(super) fn right_click_element<T: Copy>(
     target: T,
     label: &str,
@@ -1466,24 +1501,10 @@ pub(super) fn right_click_element<T: Copy>(
     ax_delivered: impl FnOnce(),
     pixel: impl FnOnce(T) -> anyhow::Result<String>,
 ) -> anyhow::Result<ElementRightClick> {
-    if advertises_show_menu {
-        let err = show_menu(target);
-        if err == kAXErrorSuccess {
-            ax_delivered();
-            return Ok(ElementRightClick::Ax(format!(
-                "Shown menu for {label} (AXShowMenu)."
-            )));
-        }
-        if !super::click::perform_error_proves_nothing_was_sent(err) {
-            ax_delivered();
-            return Ok(ElementRightClick::Ax(format!(
-                "⚠️ Sent AXShowMenu to {label}, but the app returned AX error {err}, which does \
-                 not mean it failed: the menu may be open. Read the window before repeating it."
-            )));
-        }
-        tracing::debug!("AXShowMenu returned {err} for {label}; falling back to pixel right-click");
+    match right_click_ax_stage(target, label, advertises_show_menu, show_menu, ax_delivered) {
+        RightClickAxStage::Completed(delivery) => Ok(delivery),
+        RightClickAxStage::PixelFallback => pixel(target).map(ElementRightClick::Pixel),
     }
-    pixel(target).map(ElementRightClick::Pixel)
 }
 
 fn ax_show_menu(
@@ -1563,7 +1584,38 @@ mod tests {
         use crate::ax::bindings::{
             kAXErrorActionUnsupported, kAXErrorCannotComplete, kAXErrorIllegalArgument,
         };
+        let attempts = std::cell::Cell::new(0);
+        let stage = right_click_ax_stage(
+            73_u32,
+            "[4]",
+            true,
+            |target| {
+                assert_eq!(target, 73);
+                attempts.set(attempts.get() + 1);
+                kAXErrorIllegalArgument
+            },
+            || panic!("proven-unsent AX action cannot report delivery"),
+        );
+        assert!(matches!(stage, RightClickAxStage::PixelFallback));
+        assert_eq!(attempts.get(), 1);
+        let delivered = std::cell::Cell::new(0);
+        let stage = right_click_ax_stage(
+            73_u32,
+            "[4]",
+            true,
+            |target| {
+                assert_eq!(target, 73);
+                kAXErrorSuccess
+            },
+            || delivered.set(delivered.get() + 1),
+        );
+        assert!(matches!(
+            stage,
+            RightClickAxStage::Completed(ElementRightClick::Ax(_))
+        ));
+        assert_eq!(delivered.get(), 1);
         for err in [kAXErrorCannotComplete, kAXErrorActionUnsupported] {
+            let delivered = std::cell::Cell::new(0);
             let outcome = right_click_element(
                 73_u32,
                 "[4] AXRow \"a\"",
@@ -1572,10 +1624,11 @@ mod tests {
                     assert_eq!(target, 73);
                     err
                 },
-                || {},
+                || delivered.set(delivered.get() + 1),
                 |_| panic!("pixel right-click on top of a menu that may be open"),
             )
             .expect("reported, not failed");
+            assert_eq!(delivered.get(), 1);
             assert!(
                 matches!(&outcome, ElementRightClick::Ax(message) if message.contains("may be open")),
                 "{outcome:?}"
