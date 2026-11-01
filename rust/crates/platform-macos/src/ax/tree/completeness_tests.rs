@@ -17,6 +17,235 @@ fn has_reason(tree: &TreeWalkResult, kind: &str, detail: &str) -> bool {
         .contains(&json!({"kind": kind, "detail": detail}))
 }
 
+fn attribute_failure_after(
+    entries: &[(
+        Option<usize>,
+        crate::ax::evidence::ReadSite,
+        crate::ax::evidence::EvidenceStatus,
+    )],
+) -> bool {
+    let scope = crate::ax::evidence::EvidenceScope::start();
+    for &(owner, site, status) in entries {
+        crate::ax::evidence::record_status(owner, site, status);
+    }
+    let mut budget = WalkBudget::nodes_only(10);
+    record_attribute_failures(&mut budget);
+    let mut output = json!({});
+    budget.outcome().apply(&mut output);
+    let failure = output["observation_incomplete_reasons"]
+        .as_array()
+        .unwrap()
+        .contains(&json!({"kind":"provider_failure", "detail":"attribute_read_failed"}));
+    let _ = scope.finish(());
+    failure
+}
+
+fn assert_attribute_recovery(site: crate::ax::evidence::ReadSite) {
+    use crate::ax::evidence::{EvidenceStatus as Status, ReadSite as Site};
+    use crate::ax::tree_source::ReadFailure;
+    let failed = Status::Unknown(ReadFailure::WrongType);
+    assert!(
+        !attribute_failure_after(&[(Some(1), site, failed), (Some(1), site, Status::Known)]),
+        "same read should recover: {site:?}"
+    );
+    assert!(
+        attribute_failure_after(&[(Some(1), site, failed), (Some(2), site, Status::Known)]),
+        "other owner must not recover: {site:?}"
+    );
+    assert!(
+        attribute_failure_after(&[
+            (Some(1), site, failed),
+            (Some(1), Site::Content("AXHelp"), Status::Known)
+        ]),
+        "different read must not recover: {site:?}"
+    );
+    assert!(
+        attribute_failure_after(&[(Some(1), site, Status::Known), (Some(1), site, failed)]),
+        "earlier success must not recover: {site:?}"
+    );
+    assert!(
+        attribute_failure_after(&[(None, site, failed), (None, site, Status::Known)]),
+        "unknown owner must not recover: {site:?}"
+    );
+    assert!(
+        attribute_failure_after(&[
+            (Some(1), site, failed),
+            (Some(1), site, Status::Known),
+            (Some(1), site, failed)
+        ]),
+        "later failure must remain: {site:?}"
+    );
+}
+
+macro_rules! attribute_recovery_test {
+    ($name:ident, $site:expr) => {
+        #[test]
+        fn $name() {
+            assert_attribute_recovery($site);
+        }
+    };
+}
+attribute_recovery_test!(
+    role_attribute_read_recovers_for_same_owner,
+    crate::ax::evidence::ReadSite::Role
+);
+attribute_recovery_test!(
+    content_attribute_read_recovers_for_same_owner,
+    crate::ax::evidence::ReadSite::Content("AXTitle")
+);
+attribute_recovery_test!(
+    control_attribute_read_recovers_for_same_owner,
+    crate::ax::evidence::ReadSite::Control("AXSelected")
+);
+attribute_recovery_test!(
+    frame_attribute_read_recovers_for_same_owner,
+    crate::ax::evidence::ReadSite::Frame("AXPosition")
+);
+attribute_recovery_test!(
+    scrollbar_attribute_read_recovers_for_same_owner,
+    crate::ax::evidence::ReadSite::Scrollbar("AXValue")
+);
+attribute_recovery_test!(
+    actions_read_recovers_for_same_owner,
+    crate::ax::evidence::ReadSite::ActionNames
+);
+attribute_recovery_test!(
+    value_settable_read_recovers_for_same_owner,
+    crate::ax::evidence::ReadSite::ValueSettable
+);
+attribute_recovery_test!(
+    selected_settable_read_recovers_for_same_owner,
+    crate::ax::evidence::ReadSite::SelectedSettable
+);
+attribute_recovery_test!(
+    menu_selection_read_recovers_for_same_owner,
+    crate::ax::evidence::ReadSite::MenuSelected
+);
+
+#[test]
+fn cross_site_attribute_recovery_preserves_keys() {
+    use crate::ax::evidence::{EvidenceStatus as Status, ReadSite as Site};
+    use crate::ax::tree_source::ReadFailure;
+    let failed = Status::Unknown(ReadFailure::WrongType);
+    for (failed_site, later_site) in [
+        (Site::Scrollbar("AXRole"), Site::Role),
+        (Site::Frame("AXPosition"), Site::Control("AXPosition")),
+        (Site::MenuSelected, Site::Control("AXSelected")),
+        (Site::Content("AXDescription"), Site::Tab("AXDescription")),
+    ] {
+        assert!(
+            !attribute_failure_after(&[
+                (Some(1), failed_site, failed),
+                (Some(1), later_site, Status::Known)
+            ]),
+            "equivalent attribute should recover: {failed_site:?} -> {later_site:?}"
+        );
+    }
+    assert!(attribute_failure_after(&[
+        (Some(1), Site::ValueSettable, failed),
+        (Some(1), Site::Content("AXValue"), Status::Known)
+    ]));
+    assert!(attribute_failure_after(&[
+        (Some(1), Site::Role, failed),
+        (Some(1), Site::Role, Status::Absent)
+    ]));
+    assert!(!attribute_failure_after(&[
+        (Some(1), Site::Content("AXTitle"), failed),
+        (Some(1), Site::Content("AXTitle"), Status::Absent)
+    ]));
+
+    // A composite frame or a settable probe is not a single scalar attribute.
+    assert!(attribute_failure_after(&[
+        (Some(1), Site::Frame("scroll"), failed),
+        (Some(1), Site::Frame("AXPosition"), Status::Known)
+    ]));
+    assert!(attribute_failure_after(&[
+        (Some(1), Site::ValueSettable, failed),
+        (Some(1), Site::SelectedSettable, Status::Known)
+    ]));
+
+    // Reading a literal AXUnknown role through another probe does not recover
+    // the earlier missing role; the actual source result supplies the status.
+    let source = Fake::new(
+        &[(1, 1, 1, &[])],
+        vec![step(
+            "text 1 AXRole",
+            Reply::Text(Read::Known("AXUnknown".into())),
+        )],
+    );
+    let root = source.handle(1);
+    let scope = crate::ax::evidence::EvidenceScope::start();
+    crate::ax::evidence::record_status(Some(1), Site::Role, failed);
+    let wrapped = crate::ax::evidence_source::EvidenceSource::new(
+        &source,
+        crate::ax::evidence_source::Domain::Scrollbar,
+        None,
+    );
+    assert!(matches!(wrapped.text(&root, "AXRole"), Read::Known(_)));
+    wrapped.finish(()).into_walk_legacy();
+    let mut budget = WalkBudget::nodes_only(10);
+    record_attribute_failures(&mut budget);
+    let mut output = json!({});
+    budget.outcome().apply(&mut output);
+    assert!(output["observation_incomplete_reasons"]
+        .as_array()
+        .unwrap()
+        .contains(&json!({"kind":"provider_failure", "detail":"attribute_read_failed"})));
+    let _ = scope.finish(());
+    drop(root);
+    source.assert_consumed();
+    source.assert_lifetimes(&[]);
+}
+
+#[test]
+fn menu_frame_unavailable_reports_attribute_failure_and_scope_mismatch() {
+    use crate::ax::context_menus::MenuOwner;
+    let frame = [0.0, 0.0, 40.0, 40.0];
+    let (walk, _) = super::environment_setup_tests::run_menu_case(
+        Some(vec![frame]),
+        vec![Some((3, None, Some(MenuOwner::Window(99))))],
+    );
+    assert!(has_reason(&walk.legacy, "unknown", "scope_mismatch"));
+    assert!(has_reason(
+        &walk.legacy,
+        "provider_failure",
+        "attribute_read_failed"
+    ));
+}
+
+#[test]
+fn menu_ownership_unavailable_reports_attribute_failure_and_scope_mismatch() {
+    let frame = [0.0, 0.0, 40.0, 40.0];
+    let (walk, _) = super::environment_setup_tests::run_menu_case(
+        Some(vec![frame]),
+        vec![Some((3, Some(frame), None))],
+    );
+    assert!(has_reason(&walk.legacy, "unknown", "scope_mismatch"));
+    assert!(has_reason(
+        &walk.legacy,
+        "provider_failure",
+        "attribute_read_failed"
+    ));
+    let (geometry_only, _) = super::environment_setup_tests::run_menu_case(
+        Some(vec![frame]),
+        vec![Some((
+            3,
+            Some([500.0, 500.0, 40.0, 40.0]),
+            Some(crate::ax::context_menus::MenuOwner::Window(99)),
+        ))],
+    );
+    assert!(has_reason(
+        &geometry_only.legacy,
+        "unknown",
+        "scope_mismatch"
+    ));
+    assert!(!has_reason(
+        &geometry_only.legacy,
+        "provider_failure",
+        "attribute_read_failed"
+    ));
+}
+
 #[test]
 fn missing_application_root_reports_enumeration_error() {
     let (walk, _) = super::environment_setup_tests::run_application_failure();
@@ -81,6 +310,58 @@ fn unresolved_window_reports_scope_mismatch() {
     let (walk, _, _) =
         super::orchestration_preservation_tests::run_scenario(Scenario::NoMatch, None);
     assert!(has_reason(&walk.legacy, "unknown", "scope_mismatch"));
+}
+
+fn assert_scope_probe_failures(walk: &CompletedWalk) {
+    use crate::ax::evidence::{EvidenceStatus, ReadSite};
+    assert!(walk
+        .completion
+        .read_evidence
+        .iter()
+        .any(|entry| entry.owner == Some(3)
+            && entry.site == ReadSite::ScopeCandidate("AXIdentifier")
+            && matches!(entry.status, EvidenceStatus::Unknown(_))));
+    assert!(walk
+        .completion
+        .read_evidence
+        .iter()
+        .any(|entry| entry.owner == Some(3)
+            && entry.site == ReadSite::RecoverySheetRole
+            && matches!(entry.status, EvidenceStatus::Unknown(_))));
+}
+
+#[test]
+fn scope_candidate_failure_after_positive_match_is_not_incomplete() {
+    use super::environment_evidence_tests::Scenario;
+    let (walk, _, _) = super::orchestration_preservation_tests::run_scenario(
+        Scenario::ScopeRecovered,
+        Some((2, "AXWindow")),
+    );
+    assert_eq!(walk.legacy.window_scope, Some(WindowScope::Matched));
+    assert_scope_probe_failures(&walk);
+    assert!(!has_reason(
+        &walk.legacy,
+        "provider_failure",
+        "attribute_read_failed"
+    ));
+}
+
+#[test]
+fn scope_candidate_failure_while_unresolved_reports_attribute_failure() {
+    use super::environment_evidence_tests::Scenario;
+    let (walk, _, _) =
+        super::orchestration_preservation_tests::run_scenario(Scenario::ScopeUnresolved, None);
+    assert!(matches!(
+        walk.legacy.window_scope,
+        Some(WindowScope::AxUnresolved { .. })
+    ));
+    assert_scope_probe_failures(&walk);
+    assert!(has_reason(&walk.legacy, "unknown", "scope_mismatch"));
+    assert!(has_reason(
+        &walk.legacy,
+        "provider_failure",
+        "attribute_read_failed"
+    ));
 }
 
 #[test]

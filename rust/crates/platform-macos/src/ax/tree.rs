@@ -1606,6 +1606,10 @@ fn record_discovery_failures(budget: &mut WalkBudget, scope: Option<&WindowScope
                 ReadSite::ScopeCandidate("AXRole" | "AXSubrole" | "AXIdentifier")
                 | ReadSite::RecoverySheetRole,
                 EvidenceStatus::Unknown(_),
+            ) if unresolved => Some(IncompleteReasonDetail::AttributeReadFailed),
+            (
+                ReadSite::MenuFrame | ReadSite::MenuOwnership,
+                EvidenceStatus::Unavailable | EvidenceStatus::Unknown(_),
             ) => Some(IncompleteReasonDetail::AttributeReadFailed),
             _ => None,
         };
@@ -1640,6 +1644,35 @@ fn record_discovery_failures(budget: &mut WalkBudget, scope: Option<&WindowScope
     }
 }
 
+/// Different probes of the same attribute share a key, while writability and
+/// action probes stay separate from the attributes they may act on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AttributeReadKey {
+    Attribute(&'static str),
+    ActionNames,
+    ValueSettable,
+    SelectedSettable,
+    CombinedFrame,
+}
+
+fn attribute_read_key(site: super::evidence::ReadSite) -> Option<AttributeReadKey> {
+    use super::evidence::ReadSite;
+    match site {
+        ReadSite::Role => Some(AttributeReadKey::Attribute("AXRole")),
+        ReadSite::ActionNames => Some(AttributeReadKey::ActionNames),
+        ReadSite::ValueSettable => Some(AttributeReadKey::ValueSettable),
+        ReadSite::SelectedSettable => Some(AttributeReadKey::SelectedSettable),
+        ReadSite::MenuSelected => Some(AttributeReadKey::Attribute("AXSelected")),
+        ReadSite::Frame("scroll") => Some(AttributeReadKey::CombinedFrame),
+        ReadSite::Content(name)
+        | ReadSite::Control(name)
+        | ReadSite::Frame(name)
+        | ReadSite::Scrollbar(name)
+        | ReadSite::Tab(name) => Some(AttributeReadKey::Attribute(name)),
+        _ => None,
+    }
+}
+
 /// Attribute failures are distinct from an unsupported or absent attribute.
 /// Batch-call failures are excluded here: their individual replayed reads
 /// carry the eventual result, and a fully recovered replay is not incomplete.
@@ -1647,47 +1680,25 @@ fn record_attribute_failures(budget: &mut WalkBudget) {
     use super::evidence::{current_evidence, EvidenceStatus, ReadSite};
     let evidence = current_evidence();
     let failed = evidence.iter().enumerate().any(|(index, entry)| {
-        let attribute_site = matches!(
-            entry.site,
-            ReadSite::Role
-                | ReadSite::ActionNames
-                | ReadSite::Content(_)
-                | ReadSite::Control(_)
-                | ReadSite::Frame(_)
-                | ReadSite::Scrollbar(_)
-                | ReadSite::Tab(_)
-                | ReadSite::ValueSettable
-                | ReadSite::SelectedSettable
-                | ReadSite::MenuSelected
-        );
-        let read_failed = attribute_site
-            && (matches!(entry.status, EvidenceStatus::Unknown(_))
-                || matches!(
-                    (entry.site, entry.status),
-                    (
-                        ReadSite::Role,
-                        EvidenceStatus::Absent | EvidenceStatus::Unavailable
-                    )
-                ));
+        let Some(key) = attribute_read_key(entry.site) else {
+            return false;
+        };
+        let read_failed = matches!(entry.status, EvidenceStatus::Unknown(_))
+            || (key == AttributeReadKey::Attribute("AXRole")
+                && (entry.status == EvidenceStatus::Unavailable
+                    || (entry.site == ReadSite::Role && entry.status == EvidenceStatus::Absent)));
         if !read_failed {
             return false;
         }
-        let recovery_site = match entry.site {
-            ReadSite::Tab("AXRole") => Some(ReadSite::Role),
-            ReadSite::Tab("AXSelected") => Some(ReadSite::Control("AXSelected")),
-            ReadSite::Tab(name @ ("AXTitle" | "AXDescription" | "AXRoleDescription")) => {
-                Some(ReadSite::Content(name))
-            }
-            _ => None,
-        };
-        let Some((owner, site)) = entry.owner.zip(recovery_site) else {
+        let Some(owner) = entry.owner else {
             return true;
         };
         !evidence[index + 1..].iter().any(|later| {
             later.owner == Some(owner)
-                && later.site == site
+                && attribute_read_key(later.site) == Some(key)
                 && (later.status == EvidenceStatus::Known
-                    || (site != ReadSite::Role && later.status == EvidenceStatus::Absent))
+                    || (key != AttributeReadKey::Attribute("AXRole")
+                        && later.status == EvidenceStatus::Absent))
         })
     });
     if failed {

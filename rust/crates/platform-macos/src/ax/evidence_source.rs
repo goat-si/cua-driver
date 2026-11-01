@@ -107,6 +107,9 @@ impl<'a, S: AxTreeSource> EvidenceSource<'a, S> {
         }
     }
     fn record<T>(&self, element: &S::Element, name: &str, result: &Read<T>) {
+        self.record_status(element, name, read_status(result));
+    }
+    fn record_status(&self, element: &S::Element, name: &str, status: EvidenceStatus) {
         if let Some(site) = self.domain.site(name) {
             let owner = self.owner_for(element);
             let mut state = self.state.borrow_mut();
@@ -114,7 +117,7 @@ impl<'a, S: AxTreeSource> EvidenceSource<'a, S> {
             state.evidence.push(ReadEvidence {
                 owner,
                 site,
-                status: read_status(result),
+                status,
                 attempt,
                 listing: None,
             });
@@ -197,6 +200,11 @@ impl<S: AxTreeSource> AxTreeSource for EvidenceSource<'_, S> {
     fn text(&self, e: &Self::Element, name: &str) -> Read<String> {
         let v = self.source.text(e, name);
         self.record(e, name, &v);
+        if name == "AXRole"
+            && matches!(&v, Read::Known(role) if role.trim().is_empty() || role == "AXUnknown")
+        {
+            self.record_status(e, name, EvidenceStatus::Unavailable);
+        }
         v
     }
     fn text_status(&self, e: &Self::Element, name: &str) -> AttrStatus {

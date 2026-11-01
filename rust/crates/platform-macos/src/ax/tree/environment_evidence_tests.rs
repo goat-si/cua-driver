@@ -153,6 +153,8 @@ pub(super) enum Scenario {
     ChildrenRecovered,
     WindowsRecovered,
     ProviderRecovered,
+    ScopeRecovered,
+    ScopeUnresolved,
 }
 
 pub(super) struct Environment {
@@ -208,7 +210,14 @@ impl super::AxWalkEnvironment for Environment {
         self.trace.borrow_mut().push("children".into());
         let count = self.enumerations.get();
         self.enumerations.set(count + 1);
-        let elements = if matches!(
+        let elements = if matches!(self.scenario, Scenario::ScopeRecovered) && count > 0 {
+            vec![2, 3]
+        } else if matches!(
+            self.scenario,
+            Scenario::ScopeRecovered | Scenario::ScopeUnresolved
+        ) {
+            vec![3]
+        } else if matches!(
             self.scenario,
             Scenario::Union
                 | Scenario::Sheet
@@ -303,7 +312,12 @@ impl super::AxWalkEnvironment for Environment {
     }
     fn window_id(&self, element: usize) -> Option<u32> {
         self.trace.borrow_mut().push(format!("id {element}"));
-        if matches!(self.scenario, Scenario::Sheet) {
+        if matches!(
+            self.scenario,
+            Scenario::ScopeRecovered | Scenario::ScopeUnresolved
+        ) {
+            Some(if element == 2 { 99 } else { 8 })
+        } else if matches!(self.scenario, Scenario::Sheet) {
             Some(if element == 2 { 55 } else { 99 })
         } else if matches!(
             self.scenario,
@@ -334,6 +348,8 @@ impl super::AxWalkEnvironment for Environment {
                 | Scenario::ChildrenRecovered
                 | Scenario::WindowsRecovered
                 | Scenario::ProviderRecovered
+                | Scenario::ScopeRecovered
+                | Scenario::ScopeUnresolved
         ) {
             None
         } else {
@@ -407,15 +423,39 @@ impl super::AxWalkEnvironment for Environment {
         element: usize,
     ) -> crate::ax::evidence::Observed<crate::ax::window_scope::TopLevelCandidate> {
         self.trace.borrow_mut().push(format!("candidate {element}"));
-        let id = if matches!(self.scenario, Scenario::Sheet) {
+        let id = if matches!(
+            self.scenario,
+            Scenario::ScopeRecovered | Scenario::ScopeUnresolved
+        ) {
+            if element == 2 {
+                99
+            } else {
+                8
+            }
+        } else if matches!(self.scenario, Scenario::Sheet) {
             55
         } else {
             99
         };
-        crate::ax::evidence::Observed::legacy_only(crate::ax::window_scope::TopLevelCandidate::new(
-            "AXWindow",
-            Some(id),
-        ))
+        let candidate = crate::ax::window_scope::TopLevelCandidate::new("AXWindow", Some(id));
+        if matches!(
+            self.scenario,
+            Scenario::ScopeRecovered | Scenario::ScopeUnresolved
+        ) && element == 3
+        {
+            crate::ax::evidence::Observed {
+                legacy: candidate,
+                evidence: vec![crate::ax::evidence::ReadEvidence {
+                    owner: Some(element),
+                    site: ReadSite::ScopeCandidate("AXIdentifier"),
+                    status: EvidenceStatus::Unknown(crate::ax::tree_source::ReadFailure::WrongType),
+                    attempt: 0,
+                    listing: None,
+                }],
+            }
+        } else {
+            crate::ax::evidence::Observed::legacy_only(candidate)
+        }
     }
     fn window_owner(&self, pid: i32, window_id: u32) -> crate::windows::WindowOwner {
         assert_eq!((pid, window_id), (42, 99));
@@ -426,6 +466,15 @@ impl super::AxWalkEnvironment for Environment {
         self.trace
             .borrow_mut()
             .push(format!("sheet-role {element}"));
+        if matches!(
+            self.scenario,
+            Scenario::ScopeRecovered | Scenario::ScopeUnresolved
+        ) && element == 3
+        {
+            return crate::ax::tree_source::Read::Unknown(
+                crate::ax::tree_source::ReadFailure::WrongType,
+            );
+        }
         crate::ax::tree_source::Read::Known(
             if element == 2 { "AXWindow" } else { "AXSheet" }.into(),
         )
@@ -453,6 +502,7 @@ impl super::AxWalkEnvironment for Environment {
                 | Scenario::ChildrenRecovered
                 | Scenario::WindowsRecovered
                 | Scenario::ProviderRecovered
+                | Scenario::ScopeRecovered
         )
     }
     fn pause(&self, duration: Duration) {
