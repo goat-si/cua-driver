@@ -669,6 +669,27 @@ fn fold_after_elision<N: CompactableNode>(
             let min_snippets = if is_generic_group { 2 } else { 1 };
             if all_plain && raw_snippets.len() >= min_snippets {
                 if let Some(summary) = summarize_static_text_snippets(&raw_snippets) {
+                    // A node can render more than the one field selected for
+                    // the summary, and a platform can decline set_value.
+                    // Keep evidence for all fields actually shown before folding.
+                    let mut visible_text = Vec::new();
+                    if render_loss_marker {
+                        for node in &old_nodes[idx..sub_end] {
+                            let node = node.as_ref().unwrap();
+                            let rendered = sanitize_snippet(&node.format_line(), usize::MAX)
+                                .unwrap_or_default();
+                            for field in [node.title(), node.value(), node.description()]
+                                .into_iter()
+                                .flatten()
+                            {
+                                if let Some(text) = sanitize_snippet(field, usize::MAX) {
+                                    if rendered.contains(&text) && !visible_text.contains(&text) {
+                                        visible_text.push(text);
+                                    }
+                                }
+                            }
+                        }
+                    }
                     let mut parent_node = old_nodes[idx].take().unwrap();
                     let mut distinct = Vec::new();
                     let mut lost_text = false;
@@ -698,7 +719,6 @@ fn fold_after_elision<N: CompactableNode>(
                                 if combined.chars().count() <= MAX_SUMMARY_CHARS {
                                     combined
                                 } else {
-                                    lost_text = true;
                                     summary
                                 }
                             }
@@ -706,6 +726,9 @@ fn fold_after_elision<N: CompactableNode>(
                         };
                         parent_node.set_value(Some(merged_val));
                     }
+                    let mut formatted = parent_node.format_line();
+                    let folded_text = sanitize_snippet(&formatted, usize::MAX).unwrap_or_default();
+                    lost_text |= visible_text.iter().any(|text| !folded_text.contains(text));
                     if lost_text && render_loss_marker {
                         let reason = BoundaryReason {
                             kind: cua_driver_contract::IncompleteReasonKind::PolicyOmission,
@@ -723,7 +746,6 @@ fn fold_after_elision<N: CompactableNode>(
                             read_reasons.sort_unstable();
                         }
                     }
-                    let mut formatted = parent_node.format_line();
                     if lost_text && render_loss_marker {
                         if let Some(boundary) =
                             parent_node.boundary_mut().and_then(|slot| slot.as_ref())
@@ -1093,6 +1115,7 @@ mod tests {
         node: MockNode,
         boundary: Option<NodeBoundary>,
         offscreen: Option<bool>,
+        refuse_value: bool,
     }
     impl CompactableNode for BoundaryNode {
         fn element_index(&self) -> Option<usize> {
@@ -1114,7 +1137,9 @@ mod tests {
             self.node.value.as_deref()
         }
         fn set_value(&mut self, value: Option<String>) {
-            self.node.value = value;
+            if !self.refuse_value {
+                self.node.value = value;
+            }
         }
         fn description(&self) -> Option<&str> {
             self.node.description.as_deref()
@@ -1147,6 +1172,7 @@ mod tests {
             },
             boundary: None,
             offscreen: None,
+            refuse_value: false,
         }
     }
     fn u20_boundary(
@@ -1254,6 +1280,28 @@ mod tests {
             u20_node("AXRow", 0, None, Some(&existing)),
             u20_node("AXStaticText", 1, None, Some(&child)),
         ];
+        assert_eq!(
+            serde_json::to_value(u20_fold(&mut nodes)).unwrap(),
+            serde_json::json!([{"kind":"policy_omission","detail":"folded_text_truncated"}])
+        );
+    }
+    #[test]
+    fn u20b_reports_other_visible_text_lost_during_folding() {
+        let mut nodes = vec![
+            u20_node("AXRow", 0, None, None),
+            u20_node("AXStaticText", 1, None, Some("visible value")),
+        ];
+        nodes[1].node.title = Some("visible title".into());
+        assert_eq!(
+            serde_json::to_value(u20_fold(&mut nodes)).unwrap(),
+            serde_json::json!([{"kind":"policy_omission","detail":"folded_text_truncated"}])
+        );
+
+        let mut nodes = vec![
+            u20_node("AXRow", 0, None, None),
+            u20_node("AXStaticText", 1, None, Some("visible text")),
+        ];
+        nodes[0].refuse_value = true;
         assert_eq!(
             serde_json::to_value(u20_fold(&mut nodes)).unwrap(),
             serde_json::json!([{"kind":"policy_omission","detail":"folded_text_truncated"}])
