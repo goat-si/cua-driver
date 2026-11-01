@@ -86,7 +86,6 @@ impl MoveCursorTool {
             let converted = super::desktop_screenshot_point(x, y);
             return super::dispatch_desktop_points(
                 "move_cursor",
-                [(x, y)],
                 [converted],
                 |[(x, y)]| async move {
                     if let Some(refusal) =
@@ -105,7 +104,7 @@ impl MoveCursorTool {
                         .flatten()
                         .map(|app| inactive_app_note(&app))
                         .unwrap_or_default();
-                    return match result {
+                    match result {
                         Ok(Ok(())) => ToolResult::text(format!(
                             "Moved the real desktop pointer to ({x:.1}, {y:.1}).{note}"
                         ))
@@ -121,7 +120,7 @@ impl MoveCursorTool {
                         Err(error) => {
                             ToolResult::error(format!("desktop pointer task failed: {error}"))
                         }
-                    };
+                    }
                 },
             )
             .await;

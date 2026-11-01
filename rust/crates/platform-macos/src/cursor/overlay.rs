@@ -682,15 +682,12 @@ unsafe fn run_appkit(_cfg: CursorConfig, rx: std::sync::mpsc::Receiver<OverlayMs
     // the AppKit call returns a non-positive value, since downstream paint
     // math divides by this and a 0.0 would zero out the cursor.
     let appkit_scale: f64 = msg_send![main_screen, backingScaleFactor];
-    let backing_scale = if appkit_scale.is_finite() && appkit_scale > 0.0 {
-        appkit_scale
-    } else {
+    let Some(backing_scale) = initial_overlay_scale(appkit_scale, || {
         use core_graphics::display::CGMainDisplayID;
         let display_id = CGMainDisplayID();
-        let Some(scale) = crate::tools::get_screen_size::get_backing_scale(display_id) else {
-            return;
-        };
-        scale
+        crate::tools::get_screen_size::get_backing_scale(display_id)
+    }) else {
+        return;
     };
 
     // ---- NSWindow: single alloc + initWithContentRect:... ----
@@ -1035,9 +1032,27 @@ fn main_display_geometry(applied: Option<SurfaceGeometry>) -> Option<SurfaceGeom
         bounds.size.width,
         bounds.size.height,
     );
+    geometry_from_frame(applied, frame, || {
+        crate::tools::get_screen_size::get_backing_scale(display_id)
+    })
+}
+
+pub(crate) fn initial_overlay_scale(appkit: f64, cg: impl FnOnce() -> Option<f64>) -> Option<f64> {
+    if appkit.is_finite() && appkit > 0.0 {
+        Some(appkit)
+    } else {
+        cg()
+    }
+}
+
+pub(crate) fn geometry_from_frame(
+    applied: Option<SurfaceGeometry>,
+    frame: ScreenFrame,
+    cg: impl FnOnce() -> Option<f64>,
+) -> Option<SurfaceGeometry> {
     let scale = match applied {
         Some(applied) if applied.frame == frame => applied.scale,
-        _ => crate::tools::get_screen_size::get_backing_scale(display_id)?,
+        _ => cg()?,
     };
     Some(SurfaceGeometry::new(frame, scale))
 }

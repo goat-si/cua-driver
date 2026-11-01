@@ -1333,7 +1333,7 @@ impl ClickTool {
                 Err(refusal) => return refusal,
             };
             return super::dispatch_desktop_points(
-                "click", [(sx_shot, sy_shot)], [converted], |[(sx, sy)]| async move {
+                "click", [converted], |[(sx, sy)]| async move {
             let button = match input.button.unwrap_or(ClickButton::Left) {
                 ClickButton::Left => "left",
                 ClickButton::Right => "right",
@@ -1392,7 +1392,7 @@ impl ClickTool {
                 "middle" => "middle-click",
                 _ => "click",
             };
-            return match result {
+            match result {
                 Ok(Ok(hit)) => {
                     let mut structured = serde_json::json!({ "path": "cgevent_hid", "verified": false, "effect": "unverifiable" });
                     if let Some(hit) = hit {
@@ -1407,7 +1407,7 @@ impl ClickTool {
                 }
                 Ok(Err(e)) => ToolResult::error(format!("desktop-scope click failed: {e}")),
                 Err(e) => ToolResult::error(format!("task error: {e}")),
-            };
+            }
                 },
             ).await;
         }

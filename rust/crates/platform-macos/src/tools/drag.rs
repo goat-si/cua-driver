@@ -203,7 +203,6 @@ impl DragTool {
             ];
             return super::dispatch_desktop_points(
                 "drag",
-                [(from_x, from_y), (to_x, to_y)],
                 converted,
                 |[(from_x, from_y), (to_x, to_y)]| async move {
                     let duration_ms = input.duration_ms.unwrap_or(500).min(10_000);
@@ -269,7 +268,7 @@ impl DragTool {
                             .cursor_registry
                             .update_position(&cursor_key, to_x, to_y);
                     }
-                    return match result {
+                    match result {
                         Ok(Ok(())) => ToolResult::text(format!(
                     "Dragged desktop from ({from_x:.1}, {from_y:.1}) to ({to_x:.1}, {to_y:.1})."
                 ))
@@ -284,7 +283,7 @@ impl DragTool {
                         Err(error) => {
                             ToolResult::error(format!("desktop drag task failed: {error}"))
                         }
-                    };
+                    }
                 },
             )
             .await;

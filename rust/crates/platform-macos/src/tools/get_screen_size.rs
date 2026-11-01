@@ -39,17 +39,27 @@ impl Tool for GetScreenSizeTool {
         if let Err(result) = parse_typed_input::<GetScreenSizeInput>("get_screen_size", args) {
             return result;
         }
-        match main_screen_size() {
-            Some((w, h, scale)) => {
-                // Matches Swift text format 1:1.
-                ToolResult::text(format!("✅ Main display: {w}x{h} points @ {scale}x"))
-                    .with_structured(serde_json::json!({
-                        "width": w, "height": h, "scale_factor": scale,
-                    }))
-            }
-            None => ToolResult::error("Main display or its backing scale is unavailable."),
-        }
+        screen_size_result(main_screen_size())
     }
+}
+
+fn screen_size_result(size: Option<(i64, i64, f64)>) -> ToolResult {
+    match size {
+        Some((w, h, scale)) => ToolResult::text(format!(
+            "✅ Main display: {w}x{h} points @ {scale}x"
+        ))
+        .with_structured(serde_json::json!({
+            "width": w, "height": h, "scale_factor": scale,
+        })),
+        None => ToolResult::error("Main display or its backing scale is unavailable."),
+    }
+}
+
+fn size_from_bounds(w: i64, h: i64, scale: Option<f64>) -> Option<(i64, i64, f64)> {
+    if w == 0 || h == 0 {
+        return None;
+    }
+    Some((w, h, scale?))
 }
 
 /// Returns `(width_points, height_points, backing_scale_factor)` from
@@ -69,12 +79,7 @@ pub(crate) fn main_screen_size() -> Option<(i64, i64, f64)> {
     let bounds = unsafe { CGDisplayBounds(display_id) };
     let w = bounds.size.width as i64;
     let h = bounds.size.height as i64;
-    if w == 0 || h == 0 {
-        return None;
-    }
-
-    let scale = get_backing_scale(display_id)?;
-    Some((w, h, scale))
+    size_from_bounds(w, h, get_backing_scale(display_id))
 }
 
 /// Return the current display mode's backing-pixel to point ratio.
@@ -139,7 +144,7 @@ mod tests {
 }
 #[cfg(test)]
 mod scale_tests {
-    use super::backing_scale_from_mode;
+    use super::{backing_scale_from_mode, screen_size_result, size_from_bounds};
 
     #[test]
     fn a_missing_display_mode_is_unknown_scale() {
@@ -158,5 +163,44 @@ mod scale_tests {
         assert_eq!(backing_scale_from_mode(Some((1920, 2880))), Some(1.5));
         assert_eq!(backing_scale_from_mode(Some((1920, 3840))), Some(2.0));
         assert_eq!(backing_scale_from_mode(Some((1000, 1499))), Some(1.5));
+    }
+
+    #[test]
+    fn unknown_scale_produces_a_screen_size_error_and_success_keeps_its_shape() {
+        let unknown = size_from_bounds(1920, 1080, None);
+        assert_eq!(unknown, None);
+        assert_eq!(screen_size_result(unknown).is_error, Some(true));
+        let result = screen_size_result(size_from_bounds(1920, 1080, Some(2.0)));
+        assert_ne!(result.is_error, Some(true));
+        assert_eq!(
+            result.structured_content,
+            Some(serde_json::json!({
+                "width": 1920, "height": 1080, "scale_factor": 2.0
+            }))
+        );
+    }
+
+    #[test]
+    fn overlay_retains_its_last_fit_when_the_new_scale_is_unknown() {
+        use crate::cursor::overlay::{geometry_from_frame, initial_overlay_scale};
+        use cursor_overlay::{ScreenFrame, SurfaceFit, SurfaceGeometry};
+        use std::time::Instant;
+
+        assert_eq!(
+            initial_overlay_scale(2.0, || panic!("AppKit scale wins")),
+            Some(2.0)
+        );
+        assert_eq!(initial_overlay_scale(0.0, || Some(1.5)), Some(1.5));
+        assert_eq!(initial_overlay_scale(f64::NAN, || None), None);
+
+        let initial = SurfaceGeometry::new(ScreenFrame::new(0.0, 0.0, 100.0, 100.0), 2.0);
+        let changed = ScreenFrame::new(0.0, 0.0, 200.0, 100.0);
+        let mut fit = SurfaceFit::new(Some(initial));
+        let unknown = geometry_from_frame(fit.applied(), changed, || None);
+        assert_eq!(fit.observe(Instant::now(), unknown), None);
+        assert_eq!(fit.applied(), Some(initial));
+        let recovered = geometry_from_frame(fit.applied(), changed, || Some(1.5));
+        assert_eq!(fit.observe(Instant::now(), recovered), recovered);
+        assert_eq!(fit.applied(), recovered);
     }
 }

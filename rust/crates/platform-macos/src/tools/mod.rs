@@ -1345,7 +1345,6 @@ where
 
 async fn dispatch_desktop_points<const N: usize, F, Fut>(
     tool: &str,
-    _originals: [(f64, f64); N],
     converted: [Option<(f64, f64)>; N],
     dispatch: F,
 ) -> ToolResult
@@ -2353,7 +2352,7 @@ mod coordinate_scale_tests {
         for tool in ["click", "move_cursor", "drag", "scroll"] {
             let sent = Cell::new(0);
             let counter = &sent;
-            let result = dispatch_desktop_points(tool, [(4.0, 6.0)], [None], |_| async move {
+            let result = dispatch_desktop_points(tool, [None], |_| async move {
                 counter.set(counter.get() + 1);
                 ToolResult::text("sent")
             })
@@ -2367,15 +2366,10 @@ mod coordinate_scale_tests {
         for converted in [[None, Some((3.0, 4.0))], [Some((1.0, 2.0)), None]] {
             let sent = Cell::new(0);
             let counter = &sent;
-            let result = dispatch_desktop_points(
-                "drag",
-                [(2.0, 4.0), (6.0, 8.0)],
-                converted,
-                |_| async move {
-                    counter.set(counter.get() + 1);
-                    ToolResult::text("sent")
-                },
-            )
+            let result = dispatch_desktop_points("drag", converted, |_| async move {
+                counter.set(counter.get() + 1);
+                ToolResult::text("sent")
+            })
             .await;
             assert_eq!(sent.get(), 0);
             let value = result.structured_content.unwrap();
@@ -2389,16 +2383,11 @@ mod coordinate_scale_tests {
         for tool in ["click", "move_cursor", "drag", "scroll"] {
             let sent = Cell::new(0);
             let counter = &sent;
-            let result = dispatch_desktop_points(
-                tool,
-                [(4.0, 6.0)],
-                [Some((2.0, 3.0))],
-                |points| async move {
-                    assert_eq!(points, [(2.0, 3.0)]);
-                    counter.set(counter.get() + 1);
-                    ToolResult::text("sent")
-                },
-            )
+            let result = dispatch_desktop_points(tool, [Some((2.0, 3.0))], |points| async move {
+                assert_eq!(points, [(2.0, 3.0)]);
+                counter.set(counter.get() + 1);
+                ToolResult::text("sent")
+            })
             .await;
             assert_eq!(sent.get(), 1, "{tool}");
             assert_ne!(result.is_error, Some(true), "{tool}");
@@ -2414,7 +2403,7 @@ mod coordinate_scale_tests {
         .unwrap();
         let sent = Cell::new(0);
         let counter = &sent;
-        let result = dispatch_desktop_points("click", [(1.0, 2.0)], [point], |points| async move {
+        let result = dispatch_desktop_points("click", [point], |points| async move {
             assert_eq!(points, [(7.0, 9.0)]);
             counter.set(counter.get() + 1);
             ToolResult::text("sent")

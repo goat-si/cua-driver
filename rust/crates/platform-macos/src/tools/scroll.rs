@@ -164,38 +164,29 @@ impl ScrollTool {
                 ScrollDirection::Left => (0, step),
             };
             let converted = super::desktop_screenshot_point(x, y);
-            return super::dispatch_desktop_points(
-                "scroll",
-                [(x, y)],
-                [converted],
-                |[(x, y)]| async move {
-                    if let Some(refusal) =
-                        super::desktop_pointer_guard::check("scroll", &args, vec![(x, y)]).await
-                    {
-                        return refusal;
-                    }
-                    let result = latency::spawn_action_blocking(move || {
-                        crate::input::mouse::scroll_wheel_desktop(x, y, delta_y, delta_x, amount)
-                    })
-                    .await;
-                    return match result {
-                        Ok(Ok(())) => ToolResult::text(format!(
-                            "Scrolled desktop {direction} by {by} × {amount} at ({x:.1}, {y:.1})."
-                        ))
-                        .with_structured(serde_json::json!({
-                            "scope": "desktop",
-                            "path": "hid",
-                            "effect": "unverifiable"
-                        })),
-                        Ok(Err(error)) => {
-                            ToolResult::error(format!("desktop scroll failed: {error}"))
-                        }
-                        Err(error) => {
-                            ToolResult::error(format!("desktop scroll task failed: {error}"))
-                        }
-                    };
-                },
-            )
+            return super::dispatch_desktop_points("scroll", [converted], |[(x, y)]| async move {
+                if let Some(refusal) =
+                    super::desktop_pointer_guard::check("scroll", &args, vec![(x, y)]).await
+                {
+                    return refusal;
+                }
+                let result = latency::spawn_action_blocking(move || {
+                    crate::input::mouse::scroll_wheel_desktop(x, y, delta_y, delta_x, amount)
+                })
+                .await;
+                match result {
+                    Ok(Ok(())) => ToolResult::text(format!(
+                        "Scrolled desktop {direction} by {by} × {amount} at ({x:.1}, {y:.1})."
+                    ))
+                    .with_structured(serde_json::json!({
+                        "scope": "desktop",
+                        "path": "hid",
+                        "effect": "unverifiable"
+                    })),
+                    Ok(Err(error)) => ToolResult::error(format!("desktop scroll failed: {error}")),
+                    Err(error) => ToolResult::error(format!("desktop scroll task failed: {error}")),
+                }
+            })
             .await;
         }
         let pid = match super::target_pid(&self.state, &args) {
