@@ -606,6 +606,23 @@ fn application_child_refs(children: &[atspi::ObjectRefOwned]) -> (Vec<RawObjectR
     (refs, dropped)
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum ChildEnumeration {
+    Empty,
+    Capped(usize),
+    Fetch,
+    TimedOut,
+}
+
+fn child_enumeration(count: Option<Result<i32, ()>>, cap: usize) -> ChildEnumeration {
+    match count {
+        Some(Ok(count)) if count <= 0 => ChildEnumeration::Empty,
+        Some(Ok(count)) if count as usize > cap => ChildEnumeration::Capped(count as usize),
+        Some(Ok(_)) | Some(Err(())) => ChildEnumeration::Fetch,
+        None => ChildEnumeration::TimedOut,
+    }
+}
+
 /// A toggle's AT-SPI state (goat-si/goat#1261): INDETERMINATE is mixed, CHECKED is on,
 /// and so is PRESSED on a toggle button, which is how GTK 4 reports one. `None` for a role
 /// that does not toggle.
@@ -1720,18 +1737,21 @@ async fn collect_visited_bounded_opts<'a>(
         // Fetch the child list only for real containers within the cap: leaves
         // (the majority of nodes) save a round-trip, and a huge container is
         // never enumerated (see CHILD_ENUMERATION_CAP).
-        let children_r: Option<Result<Vec<RawObjectRef>>> = match count_r {
-            Some(Ok(count)) if count <= 0 => Some(Ok(Vec::new())),
-            Some(Ok(count)) if count as usize > child_cap => {
-                huge_containers.push((count as usize, visited.len()));
-                Some(Ok(Vec::new()))
-            }
-            Some(Ok(_)) => call(raw_children(zconn, &oref)).await,
-            // Count unavailable (older bridges, error): fall back to the
-            // historical unconditional fetch.
-            Some(Err(_)) => call(raw_children(zconn, &oref)).await,
-            None => None,
-        };
+        let count_fact = count_r
+            .as_ref()
+            .map(|result| result.as_ref().copied().map_err(|_| ()));
+        let children_r: Option<Result<Vec<RawObjectRef>>> =
+            match child_enumeration(count_fact, child_cap) {
+                ChildEnumeration::Empty => Some(Ok(Vec::new())),
+                ChildEnumeration::Capped(count) => {
+                    huge_containers.push((count, visited.len()));
+                    Some(Ok(Vec::new()))
+                }
+                // Count unavailable (older bridges, error): fall back to the
+                // historical unconditional fetch.
+                ChildEnumeration::Fetch => call(raw_children(zconn, &oref)).await,
+                ChildEnumeration::TimedOut => None,
+            };
         let role = match role_r {
             Some(Ok(r)) => r,
             _ => String::new(),
@@ -2673,13 +2693,41 @@ fn insert_passive_markers(markdown: &str, markers: &[(usize, String)]) -> String
 #[cfg(test)]
 mod boundary_markdown_tests {
     use super::{
-        application_child_refs, indexed_closed_menu_owners, insert_passive_markers,
-        menu_skip_after_open_evidence, menu_skip_candidate, proven_closed_menu,
+        application_child_refs, child_enumeration, indexed_closed_menu_owners,
+        insert_passive_markers, menu_skip_after_open_evidence, menu_skip_candidate,
+        proven_closed_menu, ChildEnumeration,
     };
     use crate::walk_completeness::{ChildRead, Completeness, NodeOmission};
     use cua_driver_contract::CountEvidence;
     use cua_driver_core::walk_budget::WalkBudget;
     use serde_json::json;
+
+    #[test]
+    fn failed_child_count_fetches_children_and_success_is_complete() {
+        assert_eq!(
+            child_enumeration(Some(Err(())), 100),
+            ChildEnumeration::Fetch
+        );
+        assert_eq!(child_enumeration(Some(Ok(0)), 100), ChildEnumeration::Empty);
+        assert_eq!(
+            child_enumeration(Some(Ok(101)), 100),
+            ChildEnumeration::Capped(101)
+        );
+        assert_eq!(child_enumeration(None, 100), ChildEnumeration::TimedOut);
+        let mut completeness = Completeness::new(true);
+        completeness.node_omission(NodeOmission {
+            in_scope: true,
+            position: 0,
+            child_count: CountEvidence::Unknown,
+            children: ChildRead::Complete,
+            descend: true,
+            skipped_menu: false,
+            excluded_menu: false,
+            peek_read: true,
+        });
+        assert!(completeness.reasons.is_empty());
+        assert!(completeness.boundaries.is_empty());
+    }
 
     #[test]
     fn dropped_application_reference_records_failure_and_keeps_valid_siblings() {
