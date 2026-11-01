@@ -1006,28 +1006,19 @@ fn walk_tree_with_web_content_inner(
                 &super::tree_source::native::NativeSource,
                 child,
                 |source, child| {
-                    let surface = rows_windowed().then_some(source.key(child));
-                    dense_rows::with_visible_clip(surface, || {
-                        walk_element(
-                            source,
-                            child,
-                            child,
-                            0,
-                            None,
-                            None,
-                            LabelPath::Inactive,
-                            false,
-                            &mut nodes,
-                            &mut lines,
-                            &mut index_counter,
-                            &mut budget,
-                            &mut batching_disabled,
-                            max_depth,
-                            include_web_content,
-                            &mut deferred,
-                            &mut label_claims,
-                        )
-                    });
+                    walk_root(
+                        source,
+                        child,
+                        &mut nodes,
+                        &mut lines,
+                        &mut index_counter,
+                        &mut budget,
+                        &mut batching_disabled,
+                        max_depth,
+                        include_web_content,
+                        &mut deferred,
+                        &mut label_claims,
+                    );
                 },
             );
         }
@@ -1156,6 +1147,44 @@ fn walk_tree_with_web_content_inner(
         nodes_skipped,
         window_scope,
     )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn walk_root<S: AxTreeSource>(
+    source: &S,
+    root: &S::Element,
+    nodes: &mut Vec<AXNode>,
+    lines: &mut Vec<(usize, String)>,
+    index_counter: &mut usize,
+    budget: &mut WalkBudget,
+    batching_disabled: &mut bool,
+    max_depth: usize,
+    include_web_content: bool,
+    deferred: &mut Vec<DeferredRow<S::Element>>,
+    label_claims: &mut Vec<(usize, String)>,
+) {
+    let surface = rows_windowed().then_some(source.key(root));
+    dense_rows::with_visible_clip(surface, || {
+        walk_element(
+            source,
+            root,
+            root,
+            0,
+            None,
+            None,
+            LabelPath::Inactive,
+            false,
+            nodes,
+            lines,
+            index_counter,
+            budget,
+            batching_disabled,
+            max_depth,
+            include_web_content,
+            deferred,
+            label_claims,
+        )
+    });
 }
 
 #[allow(clippy::too_many_arguments)]

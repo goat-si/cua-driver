@@ -382,27 +382,19 @@ fn run_fake_inner(
     let mut disabled = false;
     let mut deferred = Vec::new();
     let mut claims = Vec::new();
-    dense_rows::with_visible_clip(rows_windowed().then_some(root.id), || {
-        walk_element(
-            source,
-            root,
-            root,
-            0,
-            None,
-            None,
-            LabelPath::Inactive,
-            false,
-            &mut nodes,
-            &mut lines,
-            &mut counter,
-            &mut budget,
-            &mut disabled,
-            max_depth,
-            include_web_content,
-            &mut deferred,
-            &mut claims,
-        );
-    });
+    walk_root(
+        source,
+        root,
+        &mut nodes,
+        &mut lines,
+        &mut counter,
+        &mut budget,
+        &mut disabled,
+        max_depth,
+        include_web_content,
+        &mut deferred,
+        &mut claims,
+    );
     let (lines, nodes, offscreen) = finish_deferred(
         source,
         lines,
