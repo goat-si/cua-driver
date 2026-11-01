@@ -2750,6 +2750,11 @@ impl ToolRegistry {
         }
         if result.is_error != Some(true) {
             if let Some(structured) = result.structured_content.clone() {
+                let malformed_completeness = (resolved_name == "get_window_state")
+                    .then(|| {
+                        crate::batch_tools::locate::malformed_completeness_details(&structured)
+                    })
+                    .flatten();
                 if let Err(error) =
                     cua_driver_contract::validate_success_output(resolved_name, structured)
                 {
@@ -2762,6 +2767,11 @@ impl ToolRegistry {
                         "tool": resolved_name,
                         "detail": error,
                     }));
+                    if let (Some(details), Some(content)) =
+                        (malformed_completeness, result.structured_content.as_mut())
+                    {
+                        content["malformed_completeness_details"] = serde_json::json!(details);
+                    }
                 }
             }
         }

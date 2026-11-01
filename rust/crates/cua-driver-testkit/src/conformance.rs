@@ -47,6 +47,94 @@ pub trait ConformanceFixture {
     fn start_read_failure(&mut self) -> Result<(), String>;
     /// Restore reads and return the number of injected read errors observed.
     fn finish_read_failure(&mut self) -> Result<u64, String>;
+    fn start_incomplete_observation(&mut self) -> Result<(), String> {
+        Err("incomplete observation injection is not supported".into())
+    }
+    fn finish_incomplete_observation(&mut self) -> Result<u64, String> {
+        Err("incomplete observation injection is not supported".into())
+    }
+    fn absent_element_name(&self) -> Result<&str, String> {
+        Err("an independently absent name is not supplied".into())
+    }
+}
+
+pub fn incomplete_absence(d: &mut dyn Driver, f: &mut dyn ConformanceFixture) -> ContractOutcome {
+    let name = match f.absent_element_name() {
+        Ok(name) if !name.is_empty() => name.to_owned(),
+        Ok(_) => return fail("absent fixture name is empty"),
+        Err(reason) => return ContractOutcome::NotSupported { reason },
+    };
+    let baseline = read(d, f);
+    if baseline.is_error()
+        || baseline.structured()["elements"]
+            .as_array()
+            .is_none_or(|elements| {
+                elements
+                    .iter()
+                    .any(|element| element["label"].as_str() == Some(name.as_str()))
+            })
+    {
+        return fail(format!(
+            "absent-name baseline invalid: {}",
+            describe(&baseline)
+        ));
+    }
+    let before = f.dispatch_count();
+    if let Err(reason) = f.start_incomplete_observation() {
+        return ContractOutcome::NotSupported { reason };
+    }
+    let response = d.call("run_steps", json!({"steps":[{"wait_for":{"pid":f.pid(),"window_id":f.window_id(),"name":name,"gone":true,"timeout_ms":0}}]}));
+    let injected = f.finish_incomplete_observation();
+    let valid = matches!(injected, Ok(count) if count > 0)
+        && check_response(&response, &["incomplete_observation"]);
+    observed_result(response, valid, no_dispatch(before, f.dispatch_count()))
+}
+pub fn incomplete_uniqueness(
+    d: &mut dyn Driver,
+    f: &mut dyn ConformanceFixture,
+) -> ContractOutcome {
+    let name = f.text_field_name().to_owned();
+    if name.is_empty() {
+        return fail("candidate fixture name is empty");
+    }
+    let baseline = read(d, f);
+    let candidates = baseline.structured()["elements"]
+        .as_array()
+        .map(|elements| {
+            elements
+                .iter()
+                .filter(|element| {
+                    element["label"].as_str() == Some(name.as_str())
+                        && element["element_token"]
+                            .as_str()
+                            .is_some_and(|token| !token.is_empty())
+                })
+                .count()
+        });
+    if baseline.is_error() || candidates != Some(1) {
+        return fail(format!(
+            "candidate baseline invalid: {}",
+            describe(&baseline)
+        ));
+    }
+    let before = f.dispatch_count();
+    if let Err(reason) = f.start_incomplete_observation() {
+        return ContractOutcome::NotSupported { reason };
+    }
+    let response = d.call("run_steps", json!({"steps":[{"click":{"pid":f.pid(),"window_id":f.window_id(),"name":name},"timeout_ms":0}]}));
+    let injected = f.finish_incomplete_observation();
+    let valid = matches!(injected, Ok(count) if count > 0)
+        && check_response(&response, &["incomplete_observation"])
+        && response
+            .text()
+            .split_once("observed candidates:")
+            .is_some_and(|(_, candidates)| {
+                candidates
+                    .split("; target by")
+                    .next()
+                    .is_some_and(|list| list.contains(&name))
+            });
+    observed_result(response, valid, no_dispatch(before, f.dispatch_count()))
 }
 
 fn fail(value: impl Into<String>) -> ContractOutcome {

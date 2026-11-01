@@ -413,6 +413,7 @@ struct RerenderState {
     /// Labels of the current snapshot, by row.
     rows: Vec<(&'static str, &'static str)>,
     clicked: Vec<String>,
+    incomplete: bool,
 }
 
 #[async_trait]
@@ -441,10 +442,16 @@ impl Tool for Rerender {
                         })
                     })
                     .collect();
-                ToolResult::text("read").with_structured(json!({
+                let mut read = json!({
                     "pid": state.pid, "window_id": 7, "snapshot_id": snapshot,
                     "elements": elements, "tree_markdown": "",
-                }))
+                });
+                if state.incomplete {
+                    read["observation_complete"] = json!(false);
+                    read["observation_incomplete_reasons"] =
+                        json!([{"kind":"budget","detail":"node_budget"}]);
+                }
+                ToolResult::text("read").with_structured(read)
             }
             "click" => {
                 let token = args["element_token"]
@@ -472,6 +479,51 @@ impl Tool for Rerender {
             _ => ToolResult::text("ok"),
         }
     }
+}
+
+#[derive(Default)]
+struct RefindClock(std::sync::Mutex<std::time::Duration>);
+impl crate::actionability::Clock for RefindClock {
+    fn now(&self) -> std::time::Duration {
+        *self.0.lock().unwrap()
+    }
+    fn sleep(
+        &self,
+        duration: std::time::Duration,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+        Box::pin(async move {
+            *self.0.lock().unwrap() += duration;
+        })
+    }
+}
+
+#[tokio::test]
+async fn stale_refind_does_not_retry_a_single_incomplete_candidate() {
+    let (registry, state) = rerender_registry(425106, vec![("AXButton", "Save")]);
+    state.lock().unwrap().incomplete = true;
+    crate::window_state_view::remember_for_test(
+        "s0000fa12",
+        425106,
+        7,
+        "- [14] AXButton \"Save\"\n",
+    );
+    let clock = Arc::new(RefindClock::default());
+    let locator = super::super::locate::Locator::new(
+        &registry,
+        None,
+        std::time::Instant::now() + std::time::Duration::from_secs(10),
+    )
+    .with_clock(clock, std::time::Duration::from_secs(10));
+    let args = json!({"pid":425106,"window_id":7,"element_token":"s0000fa12:14"});
+    let refused = ToolResult::error("element_token is stale");
+    assert!(super::super::refind_stale_target(&locator, &args, &refused)
+        .await
+        .is_none());
+    assert!(state.lock().unwrap().clicked.is_empty());
+    assert!(
+        state.lock().unwrap().snapshot > 40,
+        "refind must actually read"
+    );
 }
 
 fn rerender_registry(

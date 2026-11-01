@@ -172,7 +172,7 @@ impl Tool for RunScriptTool {
                 takes get_window_state options such as {since:\"latest\"})\n\
                 - app.query({role?, name?, text?}) → matching elements across the app's windows {element_token, \
                 role, label, value, enabled, selected, frame}, then matching static-text rows {role, label, \
-                value, text, display_only}\n\
+                value, text, display_only}; at most 50 observed matches, not proof of absence\n\
                 - app.waitFor({role?, name?, text?, gone?, value?, timeout_ms?}) and app.verify(predicate | \
                 predicates) (verify_state)\n\
                 - app.click(t), doubleClick(t), rightClick(t), typeText(text, t?), pressKey(\"return\" | \
@@ -826,7 +826,8 @@ impl<'a> Api<'a> {
 
     /// Elements matching {role, name, text} across the app's windows
     /// (topmost first): addressable ones with their element_token, then
-    /// matching display-only text rows, whose `value` holds the text.
+    /// matching display-only text rows, whose `value` holds the text. Results
+    /// are observed matches only (at most 50), not proof of absence.
     async fn find(&mut self, mut args: Map<String, Value>) -> Result<Value, HostError> {
         let text = args
             .remove("text")

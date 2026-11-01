@@ -19,6 +19,15 @@ read/act round trip; otherwise set `session_evidence` to an error, producing
 | Actionability | disabled action refused before dispatch | Not wired | Not wired | Not wired |
 | Completeness | observation_complete for adopting platform | Not wired | Not wired | Not wired |
 
+An incomplete tree cannot establish element absence or uniqueness. Batch
+lookups report `incomplete_observation`, while observed ambiguity still
+requires at least two candidates and zero dispatches. Incomplete-tree probes
+need their own injected omissions and independent dispatch evidence; they do
+not replace the ambiguity or read-error contracts. The optional
+`incomplete_absence` and `incomplete_uniqueness` probes require a fixture to
+count injected incomplete reads. The latter also requires exactly one named,
+addressable baseline candidate and checks that the refusal lists it.
+
 Outcomes are `Pass`, `Fail { observed }`, `NotWired { reason }`, and
 `NotSupported { reason }`. Only `Pass` satisfies `assert_required`. Each
 platform job declares its required set in code; removing an unwired item must
