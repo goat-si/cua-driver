@@ -40,10 +40,10 @@ use super::pixel_route::PixelClickRoute;
 use super::ToolState;
 
 pub(super) async fn dispatch_custom_action<C, P, A, F, T>(
-    _clock: &(impl cua_driver_core::actionability::Clock + Sync),
-    _budget: std::time::Duration,
+    clock: &(impl cua_driver_core::actionability::Clock + Sync),
+    budget: std::time::Duration,
     context: C,
-    _probe: P,
+    probe: P,
     perform: A,
 ) -> Result<T, ToolResult>
 where
@@ -51,12 +51,18 @@ where
     P: for<'a> FnMut(
             &'a C,
             std::time::Duration,
-        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = cua_driver_core::actionability::ActionabilityReport> + Send + 'a>>
-        + Send,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = cua_driver_core::actionability::ActionabilityReport,
+                    > + Send
+                    + 'a,
+            >,
+        > + Send,
     A: FnOnce(C) -> F,
     F: std::future::Future<Output = T>,
 {
-    Ok(perform(context).await)
+    super::actionability::dispatch_semantic(clock, budget, context, probe, perform).await
 }
 
 pub struct ClickTool {
@@ -1651,13 +1657,18 @@ impl ClickTool {
                 })
                 .await;
                 match resolved {
-                Ok(Ok(action)) => action,
-                Ok(Err(error)) => {
-                    let code = crate::input::ax_actions::element_action_refusal_code(&error)
-                        .unwrap_or("invalid_arguments");
-                    return super::pre_dispatch_refusal(code, format!("click: {error}"));
-                }
-                Err(error) => return super::pre_dispatch_refusal("action_unavailable", format!("click: action resolution failed ({error}); nothing was sent.")),
+                    Ok(Ok(action)) => action,
+                    Ok(Err(error)) => {
+                        let code = crate::input::ax_actions::element_action_refusal_code(&error)
+                            .unwrap_or("invalid_arguments");
+                        return super::pre_dispatch_refusal(code, format!("click: {error}"));
+                    }
+                    Err(error) => {
+                        return super::pre_dispatch_refusal(
+                            "action_unavailable",
+                            format!("click: action resolution failed ({error}); nothing was sent."),
+                        )
+                    }
                 }
             };
 
@@ -1951,12 +1962,21 @@ impl ClickTool {
                     &clock,
                     cua_driver_core::actionability::DEFAULT_BUDGET,
                     (action_lease, resolved_action),
-                    |(lease, action), _| super::actionability::semantic_probe(
-                        lease.as_ref(), probe_target.clone(), pid, wid,
-                        super::actionability::semantic::SemanticIntent::PerformAction(action.clone()),
-                    ),
+                    |(lease, action), _| {
+                        super::actionability::semantic_probe(
+                            lease.as_ref(),
+                            probe_target.clone(),
+                            pid,
+                            wid,
+                            super::actionability::semantic::SemanticIntent::PerformAction(
+                                action.clone(),
+                            ),
+                        )
+                    },
                     |(lease, _)| perform(lease),
-                ).await {
+                )
+                .await
+                {
                     Ok(result) => result,
                     Err(refusal) => return refusal,
                 }

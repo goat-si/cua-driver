@@ -240,7 +240,8 @@ async fn click_custom_unknown_blocks_action() {
                 count_ref.fetch_add(1, Ordering::SeqCst);
                 success()
             },
-        ).await;
+        )
+        .await;
         assert_eq!(count.load(Ordering::SeqCst), usize::from(known));
         assert_eq!(result.is_ok(), known);
     }
