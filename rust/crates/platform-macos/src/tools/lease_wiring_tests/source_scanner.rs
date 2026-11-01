@@ -426,10 +426,13 @@ pub(super) fn test_only_files(root: &Path, files: &[PathBuf]) -> Result<BTreeSet
         ) {
             base.push(file.file_stem().unwrap());
         }
+        struct ModuleDirs<'a> {
+            base: &'a Path,
+            source: &'a Path,
+        }
         fn modules(
             items: &[syn::Item],
-            base: &Path,
-            source_dir: &Path,
+            dirs: ModuleDirs<'_>,
             root: &Path,
             inherited: bool,
             seen: &mut BTreeSet<(PathBuf, bool)>,
@@ -440,11 +443,13 @@ pub(super) fn test_only_files(root: &Path, files: &[PathBuf]) -> Result<BTreeSet
                 if let syn::Item::Mod(m) = item {
                     let only_test = inherited || test_only(&m.attrs);
                     if let Some((_, nested)) = &m.content {
-                        let nested_base = base.join(m.ident.to_string());
+                        let nested_base = dirs.base.join(m.ident.to_string());
                         modules(
                             nested,
-                            &nested_base,
-                            &nested_base,
+                            ModuleDirs {
+                                base: &nested_base,
+                                source: &nested_base,
+                            },
                             root,
                             only_test,
                             seen,
@@ -465,11 +470,11 @@ pub(super) fn test_only_files(root: &Path, files: &[PathBuf]) -> Result<BTreeSet
                             },
                         );
                         let candidates = if let Some(path) = explicit {
-                            vec![source_dir.join(path)]
+                            vec![dirs.source.join(path)]
                         } else {
                             vec![
-                                base.join(format!("{}.rs", m.ident)),
-                                base.join(m.ident.to_string()).join("mod.rs"),
+                                dirs.base.join(format!("{}.rs", m.ident)),
+                                dirs.base.join(m.ident.to_string()).join("mod.rs"),
                             ]
                         };
                         if let Some(child) = candidates.into_iter().find(|p| root.join(p).is_file())
@@ -483,8 +488,10 @@ pub(super) fn test_only_files(root: &Path, files: &[PathBuf]) -> Result<BTreeSet
         }
         modules(
             &syntax.items,
-            &base,
-            file.parent().unwrap_or(Path::new("")),
+            ModuleDirs {
+                base: &base,
+                source: file.parent().unwrap_or(Path::new("")),
+            },
             root,
             effective_test,
             seen,
