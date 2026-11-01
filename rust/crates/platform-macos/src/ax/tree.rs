@@ -3936,6 +3936,8 @@ mod selectable_row_tests {
 }
 
 #[cfg(test)]
+mod evidence_preservation_tests;
+#[cfg(test)]
 mod walker_seam_tests;
 
 #[cfg(test)]
