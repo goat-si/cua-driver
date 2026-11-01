@@ -2457,6 +2457,36 @@
               "null"
             ]
           },
+          "observation_scope_exclusions": {
+            "items": {
+              "properties": {
+                "element_indices": {
+                  "items": {
+                    "minimum": 0,
+                    "type": "integer"
+                  },
+                  "type": [
+                    "array",
+                    "null"
+                  ]
+                },
+                "kind": {
+                  "enum": [
+                    "closed_menus_not_expanded"
+                  ],
+                  "type": "string"
+                }
+              },
+              "required": [
+                "kind"
+              ],
+              "type": "object"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
           "pid": {
             "minimum": 0,
             "type": "integer"

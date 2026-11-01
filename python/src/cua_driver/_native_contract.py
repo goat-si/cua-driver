@@ -7567,6 +7567,77 @@ class _UniffiFfiConverterTypePressKeyInput(_UniffiConverterRustBuffer):
 
 
 
+class ScopeExclusionKind(enum.Enum):
+    """
+    Scope deliberately not read, distinct from an incomplete requested read.
+"""
+
+    CLOSED_MENUS_NOT_EXPANDED = 0
+
+
+
+class _UniffiFfiConverterTypeScopeExclusionKind(_UniffiConverterRustBuffer):
+    @staticmethod
+    def read(buf):
+        variant = buf.read_i32()
+        if variant == 1:
+            return ScopeExclusionKind.CLOSED_MENUS_NOT_EXPANDED
+        raise InternalError("Raw enum value doesn't match any cases")
+
+    @staticmethod
+    def check_lower(value):
+        if value == ScopeExclusionKind.CLOSED_MENUS_NOT_EXPANDED:
+            return
+        raise ValueError(value)
+
+    @staticmethod
+    def write(value, buf):
+        if value == ScopeExclusionKind.CLOSED_MENUS_NOT_EXPANDED:
+            buf.write_i32(1)
+
+
+
+@dataclass
+class ScopeExclusion:
+    def __init__(self, *, kind:ScopeExclusionKind, element_indices:typing.Optional[typing.List[int]]):
+        self.kind = kind
+        self.element_indices = element_indices
+
+
+
+
+    def __str__(self):
+        return "ScopeExclusion(kind={}, element_indices={})".format(self.kind, self.element_indices)
+    def __eq__(self, other):
+        if self.kind != other.kind:
+            return False
+        if self.element_indices != other.element_indices:
+            return False
+        return True
+
+class _UniffiFfiConverterTypeScopeExclusion(_UniffiConverterRustBuffer):
+    @staticmethod
+    def read(buf):
+        return ScopeExclusion(
+            kind=_UniffiFfiConverterTypeScopeExclusionKind.read(buf),
+            element_indices=_UniffiFfiConverterOptionalSequenceUInt64.read(buf),
+        )
+
+    @staticmethod
+    def check_lower(value):
+        _UniffiFfiConverterTypeScopeExclusionKind.check_lower(value.kind)
+        _UniffiFfiConverterOptionalSequenceUInt64.check_lower(value.element_indices)
+
+    @staticmethod
+    def write(value, buf):
+        _UniffiFfiConverterTypeScopeExclusionKind.write(value.kind, buf)
+        _UniffiFfiConverterOptionalSequenceUInt64.write(value.element_indices, buf)
+
+
+
+
+
+
 class ScrollDirection(enum.Enum):
 
     UP = 0
@@ -10320,6 +10391,54 @@ class _UniffiFfiConverterOptionalSequenceTypeIncompleteReason(_UniffiConverterRu
         else:
             raise InternalError("Unexpected flag byte for optional type")
 
+class _UniffiFfiConverterSequenceTypeScopeExclusion(_UniffiConverterRustBuffer):
+    @classmethod
+    def check_lower(cls, value):
+        for item in value:
+            _UniffiFfiConverterTypeScopeExclusion.check_lower(item)
+
+    @classmethod
+    def write(cls, value, buf):
+        items = len(value)
+        buf.write_i32(items)
+        for item in value:
+            _UniffiFfiConverterTypeScopeExclusion.write(item, buf)
+
+    @classmethod
+    def read(cls, buf):
+        count = buf.read_i32()
+        if count < 0:
+            raise InternalError("Unexpected negative sequence length")
+
+        return [
+            _UniffiFfiConverterTypeScopeExclusion.read(buf) for i in range(count)
+        ]
+
+class _UniffiFfiConverterOptionalSequenceTypeScopeExclusion(_UniffiConverterRustBuffer):
+    @classmethod
+    def check_lower(cls, value):
+        if value is not None:
+            _UniffiFfiConverterSequenceTypeScopeExclusion.check_lower(value)
+
+    @classmethod
+    def write(cls, value, buf):
+        if value is None:
+            buf.write_u8(0)
+            return
+
+        buf.write_u8(1)
+        _UniffiFfiConverterSequenceTypeScopeExclusion.write(value, buf)
+
+    @classmethod
+    def read(cls, buf):
+        flag = buf.read_u8()
+        if flag == 0:
+            return None
+        elif flag == 1:
+            return _UniffiFfiConverterSequenceTypeScopeExclusion.read(buf)
+        else:
+            raise InternalError("Unexpected flag byte for optional type")
+
 class _UniffiFfiConverterOptionalTypeWindowBounds(_UniffiConverterRustBuffer):
     @classmethod
     def check_lower(cls, value):
@@ -10370,7 +10489,7 @@ class _UniffiFfiConverterSequenceTypeSnapshotImage(_UniffiConverterRustBuffer):
 
 @dataclass
 class WindowStateOutput:
-    def __init__(self, *, pid:int, window_id:int, snapshot_id:typing.Optional[str], app_name:typing.Optional[str], window_title:typing.Optional[str], tree_markdown:typing.Optional[str], elements:typing.Optional[typing.List[WindowElement]], element_count:typing.Optional[int], total_element_count:typing.Optional[int], returned_element_count:typing.Optional[int], filtered_element_count:typing.Optional[int], elements_complete:typing.Optional[bool], observation_complete:typing.Optional[bool], observation_incomplete_reasons:typing.Optional[typing.List[IncompleteReason]], degraded:typing.Optional[bool], degraded_reason:typing.Optional[str], truncated:typing.Optional[bool], truncation_reason:typing.Optional[str], truncation_hint:typing.Optional[str], tree_format:typing.Optional[str], since:typing.Optional[str], since_status:typing.Optional[str], tree_diff:typing.Optional[str], screenshot_width:typing.Optional[int], screenshot_height:typing.Optional[int], screenshot_scale:typing.Optional[float], screenshot_mime_type:typing.Optional[str], screenshot_file_path:typing.Optional[str], screenshot_frame_valid:typing.Optional[bool], window_bounds:typing.Optional[WindowBounds], images:typing.List[SnapshotImage]):
+    def __init__(self, *, pid:int, window_id:int, snapshot_id:typing.Optional[str], app_name:typing.Optional[str], window_title:typing.Optional[str], tree_markdown:typing.Optional[str], elements:typing.Optional[typing.List[WindowElement]], element_count:typing.Optional[int], total_element_count:typing.Optional[int], returned_element_count:typing.Optional[int], filtered_element_count:typing.Optional[int], elements_complete:typing.Optional[bool], observation_complete:typing.Optional[bool], observation_incomplete_reasons:typing.Optional[typing.List[IncompleteReason]], observation_scope_exclusions:typing.Optional[typing.List[ScopeExclusion]], degraded:typing.Optional[bool], degraded_reason:typing.Optional[str], truncated:typing.Optional[bool], truncation_reason:typing.Optional[str], truncation_hint:typing.Optional[str], tree_format:typing.Optional[str], since:typing.Optional[str], since_status:typing.Optional[str], tree_diff:typing.Optional[str], screenshot_width:typing.Optional[int], screenshot_height:typing.Optional[int], screenshot_scale:typing.Optional[float], screenshot_mime_type:typing.Optional[str], screenshot_file_path:typing.Optional[str], screenshot_frame_valid:typing.Optional[bool], window_bounds:typing.Optional[WindowBounds], images:typing.List[SnapshotImage]):
         self.pid = pid
         self.window_id = window_id
         self.snapshot_id = snapshot_id
@@ -10385,6 +10504,7 @@ class WindowStateOutput:
         self.elements_complete = elements_complete
         self.observation_complete = observation_complete
         self.observation_incomplete_reasons = observation_incomplete_reasons
+        self.observation_scope_exclusions = observation_scope_exclusions
         self.degraded = degraded
         self.degraded_reason = degraded_reason
         self.truncated = truncated
@@ -10407,7 +10527,7 @@ class WindowStateOutput:
 
 
     def __str__(self):
-        return "WindowStateOutput(pid={}, window_id={}, snapshot_id={}, app_name={}, window_title={}, tree_markdown={}, elements={}, element_count={}, total_element_count={}, returned_element_count={}, filtered_element_count={}, elements_complete={}, observation_complete={}, observation_incomplete_reasons={}, degraded={}, degraded_reason={}, truncated={}, truncation_reason={}, truncation_hint={}, tree_format={}, since={}, since_status={}, tree_diff={}, screenshot_width={}, screenshot_height={}, screenshot_scale={}, screenshot_mime_type={}, screenshot_file_path={}, screenshot_frame_valid={}, window_bounds={}, images={})".format(self.pid, self.window_id, self.snapshot_id, self.app_name, self.window_title, self.tree_markdown, self.elements, self.element_count, self.total_element_count, self.returned_element_count, self.filtered_element_count, self.elements_complete, self.observation_complete, self.observation_incomplete_reasons, self.degraded, self.degraded_reason, self.truncated, self.truncation_reason, self.truncation_hint, self.tree_format, self.since, self.since_status, self.tree_diff, self.screenshot_width, self.screenshot_height, self.screenshot_scale, self.screenshot_mime_type, self.screenshot_file_path, self.screenshot_frame_valid, self.window_bounds, self.images)
+        return "WindowStateOutput(pid={}, window_id={}, snapshot_id={}, app_name={}, window_title={}, tree_markdown={}, elements={}, element_count={}, total_element_count={}, returned_element_count={}, filtered_element_count={}, elements_complete={}, observation_complete={}, observation_incomplete_reasons={}, observation_scope_exclusions={}, degraded={}, degraded_reason={}, truncated={}, truncation_reason={}, truncation_hint={}, tree_format={}, since={}, since_status={}, tree_diff={}, screenshot_width={}, screenshot_height={}, screenshot_scale={}, screenshot_mime_type={}, screenshot_file_path={}, screenshot_frame_valid={}, window_bounds={}, images={})".format(self.pid, self.window_id, self.snapshot_id, self.app_name, self.window_title, self.tree_markdown, self.elements, self.element_count, self.total_element_count, self.returned_element_count, self.filtered_element_count, self.elements_complete, self.observation_complete, self.observation_incomplete_reasons, self.observation_scope_exclusions, self.degraded, self.degraded_reason, self.truncated, self.truncation_reason, self.truncation_hint, self.tree_format, self.since, self.since_status, self.tree_diff, self.screenshot_width, self.screenshot_height, self.screenshot_scale, self.screenshot_mime_type, self.screenshot_file_path, self.screenshot_frame_valid, self.window_bounds, self.images)
     def __eq__(self, other):
         if self.pid != other.pid:
             return False
@@ -10436,6 +10556,8 @@ class WindowStateOutput:
         if self.observation_complete != other.observation_complete:
             return False
         if self.observation_incomplete_reasons != other.observation_incomplete_reasons:
+            return False
+        if self.observation_scope_exclusions != other.observation_scope_exclusions:
             return False
         if self.degraded != other.degraded:
             return False
@@ -10491,6 +10613,7 @@ class _UniffiFfiConverterTypeWindowStateOutput(_UniffiConverterRustBuffer):
             elements_complete=_UniffiFfiConverterOptionalBoolean.read(buf),
             observation_complete=_UniffiFfiConverterOptionalBoolean.read(buf),
             observation_incomplete_reasons=_UniffiFfiConverterOptionalSequenceTypeIncompleteReason.read(buf),
+            observation_scope_exclusions=_UniffiFfiConverterOptionalSequenceTypeScopeExclusion.read(buf),
             degraded=_UniffiFfiConverterOptionalBoolean.read(buf),
             degraded_reason=_UniffiFfiConverterOptionalString.read(buf),
             truncated=_UniffiFfiConverterOptionalBoolean.read(buf),
@@ -10526,6 +10649,7 @@ class _UniffiFfiConverterTypeWindowStateOutput(_UniffiConverterRustBuffer):
         _UniffiFfiConverterOptionalBoolean.check_lower(value.elements_complete)
         _UniffiFfiConverterOptionalBoolean.check_lower(value.observation_complete)
         _UniffiFfiConverterOptionalSequenceTypeIncompleteReason.check_lower(value.observation_incomplete_reasons)
+        _UniffiFfiConverterOptionalSequenceTypeScopeExclusion.check_lower(value.observation_scope_exclusions)
         _UniffiFfiConverterOptionalBoolean.check_lower(value.degraded)
         _UniffiFfiConverterOptionalString.check_lower(value.degraded_reason)
         _UniffiFfiConverterOptionalBoolean.check_lower(value.truncated)
@@ -10560,6 +10684,7 @@ class _UniffiFfiConverterTypeWindowStateOutput(_UniffiConverterRustBuffer):
         _UniffiFfiConverterOptionalBoolean.write(value.elements_complete, buf)
         _UniffiFfiConverterOptionalBoolean.write(value.observation_complete, buf)
         _UniffiFfiConverterOptionalSequenceTypeIncompleteReason.write(value.observation_incomplete_reasons, buf)
+        _UniffiFfiConverterOptionalSequenceTypeScopeExclusion.write(value.observation_scope_exclusions, buf)
         _UniffiFfiConverterOptionalBoolean.write(value.degraded, buf)
         _UniffiFfiConverterOptionalString.write(value.degraded_reason, buf)
         _UniffiFfiConverterOptionalBoolean.write(value.truncated, buf)
@@ -10671,6 +10796,7 @@ __all__ = [
     "VisualActionCoordinateSpace",
     "VerificationStatus",
     "UnknownReason",
+    "ScopeExclusionKind",
     "ScrollDirection",
     "ScrollBy",
     "CaptureScope",
@@ -10746,6 +10872,7 @@ __all__ = [
     "ParseVisualRegionsOutput",
     "PredicateOutcome",
     "PressKeyInput",
+    "ScopeExclusion",
     "ScrollInput",
     "SessionStateOutput",
     "SetAgentCursorEnabledInput",
