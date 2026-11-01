@@ -11,6 +11,7 @@ struct SingleRoot<'a> {
     menu_frames: Option<Option<Vec<[f64; 4]>>>,
     menu_replies: RefCell<std::collections::VecDeque<Option<super::MenuObservation<usize>>>>,
     menu_credits: RefCell<std::collections::HashMap<usize, super::walker_seam_tests::Handle>>,
+    menu_delay: Option<std::time::Duration>,
 }
 
 impl super::AxWalkEnvironment for SingleRoot<'_> {
@@ -162,6 +163,9 @@ impl super::WalkOrchestration<super::walker_seam_tests::Fake> for SingleRoot<'_>
     fn menu_frames(&self, pid: i32) -> crate::ax::evidence::Observed<Option<Vec<[f64; 4]>>> {
         assert_eq!(pid, 42);
         self.trace.borrow_mut().push("menu-list");
+        if let Some(delay) = self.menu_delay {
+            std::thread::sleep(delay);
+        }
         super::menu_list_observed(self.menu_frames.clone().expect("unexpected menu listing"))
     }
     fn menu_in_window(
@@ -198,11 +202,33 @@ pub(super) fn run_menu_case(
     frames: Option<Vec<[f64; 4]>>,
     replies: Vec<Option<super::MenuObservation<usize>>>,
 ) -> (super::CompletedWalk, Vec<&'static str>) {
+    run_menu_case_with_budget(
+        frames,
+        replies,
+        cua_driver_core::walk_budget::WalkBudget::nodes_only(100),
+        None,
+    )
+}
+
+pub(super) fn run_menu_deadline_case() -> (super::CompletedWalk, Vec<&'static str>) {
+    run_menu_case_with_budget(
+        Some(vec![[0.0, 0.0, 40.0, 40.0]]),
+        vec![],
+        cua_driver_core::walk_budget::WalkBudget::new(1000, 100),
+        Some(std::time::Duration::from_millis(1010)),
+    )
+}
+
+fn run_menu_case_with_budget(
+    frames: Option<Vec<[f64; 4]>>,
+    replies: Vec<Option<super::MenuObservation<usize>>>,
+    budget: cua_driver_core::walk_budget::WalkBudget,
+    menu_delay: Option<std::time::Duration>,
+) -> (super::CompletedWalk, Vec<&'static str>) {
     use super::walker_seam_tests::{step, Fake, Reply};
     use super::walker_test_support::{Batch, Slot};
     use crate::ax::content_attrs::AttrStatus;
     use crate::ax::tree_source::Read;
-    use cua_driver_core::walk_budget::WalkBudget;
     let mut attrs = vec![Slot::Text(AttrStatus::Absent); 7];
     attrs[0] = Slot::Text(AttrStatus::Known("Window".into()));
     let source = Fake::new(&[(2, 2, 2, &[]), (3, 3, 3, &[])], vec![
@@ -223,6 +249,7 @@ pub(super) fn run_menu_case(
         menu_frames: Some(frames),
         menu_replies: RefCell::new(replies.into()),
         menu_credits: RefCell::new(Default::default()),
+        menu_delay,
     };
     let observed = super::walk_with_environment(
         &source,
@@ -234,12 +261,12 @@ pub(super) fn run_menu_case(
             max_depth: 10,
             include_web_content: true,
         },
-        WalkBudget::nodes_only(100),
+        budget,
     );
     let expected_markdown = if observed.legacy.truncated {
-        "- AXWindow \"Window\"\n\n⚠️ PARTIAL TREE: the 31536000000 ms timeout_ms budget ran out after 1 node(s) (0 discovered but not visited). Every element listed is real; elements after the cut are missing. If the element you need is absent, retry with a larger timeout_ms (e.g. 5000) or narrow with query / max_depth."
+        format!("- AXWindow \"Window\"\n\n⚠️ PARTIAL TREE: the {} ms timeout_ms budget ran out after 1 node(s) (0 discovered but not visited). Every element listed is real; elements after the cut are missing. If the element you need is absent, retry with a larger timeout_ms (e.g. 5000) or narrow with query / max_depth.", observed.legacy.walk.timeout_ms)
     } else {
-        "- AXWindow \"Window\"\n"
+        "- AXWindow \"Window\"\n".to_string()
     };
     assert_eq!(observed.legacy.tree_markdown, expected_markdown);
     assert!(environment.menu_replies.borrow().is_empty());
@@ -278,6 +305,7 @@ fn shared_entry_walks_fake_root_and_releases_its_credit() {
         menu_frames: None,
         menu_replies: RefCell::new(Default::default()),
         menu_credits: RefCell::new(Default::default()),
+        menu_delay: None,
     };
     let observed = super::walk_with_environment(
         &source,
@@ -344,6 +372,7 @@ fn shared_entry_preserves_application_creation_failure() {
         menu_frames: None,
         menu_replies: RefCell::new(Default::default()),
         menu_credits: RefCell::new(Default::default()),
+        menu_delay: None,
     };
     let observed = super::walk_with_environment(
         &source,

@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 #[test]
 fn menu_discovery_preserves_failure_deadline_and_cap() {
-    use super::environment_setup_tests::run_menu_case;
+    use super::environment_setup_tests::{run_menu_case, run_menu_deadline_case};
     use crate::ax::context_menus::MenuOwner;
     use crate::ax::evidence::EvidenceScope;
     use cua_driver_core::walk_budget::WalkStop;
@@ -32,6 +32,24 @@ fn menu_discovery_preserves_failure_deadline_and_cap() {
         .iter()
         .any(|e| e.site == ReadSite::MenuDiscoveryDeadline
             && e.status == EvidenceStatus::DeadlineExpired));
+
+    // The window was walked before the menu-list operation exceeded the
+    // actual budget. The shared entry must refuse menu resolution and keep
+    // the same timeout projection, not merely test the deadline helper.
+    let (expired, trace) = run_menu_deadline_case();
+    assert_eq!(expired.legacy.walk.stop, Some(WalkStop::Timeout));
+    assert_eq!(expired.legacy.walk.nodes_visited, 1);
+    assert_eq!(expired.legacy.walk.nodes_pending, 0);
+    assert_eq!(expired.completion.final_deadline_sample, Some(true));
+    assert!(expired
+        .completion
+        .read_evidence
+        .iter()
+        .any(|e| e.site == ReadSite::MenuDiscoveryDeadline
+            && e.status == EvidenceStatus::DeadlineExpired));
+    assert!(trace.contains(&"menu-list"));
+    assert!(!trace.contains(&"menu-lookup"));
+    assert_eq!(&trace[trace.len() - 2..], ["release-root", "release-app"]);
 
     let (capped, trace) = run_menu_case(Some(vec![frame; 5]), vec![None, None, None, None]);
     assert_eq!(capped.legacy.walk.stop, Some(WalkStop::Timeout));
