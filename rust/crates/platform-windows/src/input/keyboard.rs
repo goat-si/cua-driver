@@ -31,7 +31,108 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, SetForegroundWindow};
 
+use crate::key_release::{held_after_prefix, KeyId};
 use crate::win32::{foreground_matches_target_or_owned_window, windows::ForegroundTarget};
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct KeyEdge {
+    id: KeyId,
+    source_vk: Option<u16>,
+    up: bool,
+}
+
+fn key_edge(input: &INPUT, source_vk: Option<u16>) -> KeyEdge {
+    let key = unsafe { input.Anonymous.ki };
+    let flags = key.dwFlags.0;
+    let id = if flags & KEYEVENTF_UNICODE.0 != 0 {
+        KeyId::Unicode(key.wScan)
+    } else if flags & KEYEVENTF_SCANCODE.0 != 0 {
+        KeyId::Scan {
+            scan: key.wScan,
+            extended: flags & KEYEVENTF_EXTENDEDKEY.0 != 0,
+        }
+    } else {
+        KeyId::Vk(key.wVk.0)
+    };
+    KeyEdge {
+        id,
+        source_vk,
+        up: flags & KEYEVENTF_KEYUP.0 != 0,
+    }
+}
+
+pub(crate) fn key_name(edge: KeyEdge) -> String {
+    match edge.source_vk {
+        None => "a Unicode text packet (VK_PACKET)".to_string(),
+        Some(vk) => match vk {
+            0x10 => "Shift".to_string(),
+            0x11 => "Ctrl".to_string(),
+            0x12 => "Alt".to_string(),
+            0x5b => "Left Windows".to_string(),
+            0xe8 => "drain sentinel (VK 0xE8)".to_string(),
+            0x30..=0x39 | 0x41..=0x5a => (vk as u8 as char).to_string(),
+            _ => format!("VK 0x{vk:02X}"),
+        },
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct CleanupReport {
+    names: Vec<String>,
+    inserted: usize,
+}
+
+impl std::fmt::Display for CleanupReport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.names.is_empty() {
+            return write!(f, "no corrective key-up events were needed");
+        }
+        if self.inserted == self.names.len() {
+            write!(f, "inserted corrective key-up events for keys this call pressed: {}; whether the target processed them is not observable", self.names.join(", "))
+        } else {
+            write!(f, "corrective key-ups were not all inserted ({} of {}); keys that may still be held: {}; whether the target processed inserted key-ups is not observable; inspect input state before retrying", self.inserted, self.names.len(), self.names.join(", "))
+        }
+    }
+}
+
+pub(crate) struct SendOutcome {
+    pub(crate) sent: usize,
+    pub(crate) cleanup: CleanupReport,
+}
+
+/// Correct only keys this call inserted. A concurrent physical hold of the
+/// same key can be logically released; a later physical press/release restores it.
+pub(crate) fn send_input_releasing(
+    events: &[INPUT],
+    edges: &[KeyEdge],
+    mut send: impl FnMut(&[INPUT]) -> u32,
+) -> SendOutcome {
+    assert_eq!(events.len(), edges.len());
+    let sent = send(events) as usize;
+    let mut cleanup = CleanupReport {
+        names: Vec::new(),
+        inserted: 0,
+    };
+    if sent < events.len() {
+        let simple: Vec<_> = edges.iter().map(|edge| (edge.id, edge.up)).collect();
+        let held = held_after_prefix(&simple, sent);
+        let ups: Vec<_> = held
+            .iter()
+            .map(|&index| {
+                let mut input = events[index];
+                unsafe {
+                    input.Anonymous.ki.dwFlags |= KEYEVENTF_KEYUP;
+                }
+                input
+            })
+            .collect();
+        cleanup.names = held.iter().map(|&index| key_name(edges[index])).collect();
+        if !ups.is_empty() {
+            cleanup.inserted = (send(&ups) as usize).min(ups.len());
+        }
+    }
+    SendOutcome { sent, cleanup }
+}
 
 // ── XAML / UWP host detection ────────────────────────────────────────────────
 //
@@ -471,17 +572,25 @@ pub fn send_key_synthesized_after_focus(
     for mvk in mod_vks.iter().rev() {
         events.push(key_input(*mvk, true));
     }
+    let sources = mod_vks
+        .iter()
+        .map(|vk| Some(vk.0))
+        .chain([Some(key_vk.0), Some(key_vk.0)])
+        .chain(mod_vks.iter().rev().map(|vk| Some(vk.0)));
+    let edges: Vec<_> = events
+        .iter()
+        .zip(sources)
+        .map(|(event, vk)| key_edge(event, vk))
+        .collect();
 
     with_confirmed_foreground(target, "key delivery", focus, |_, _| unsafe {
-        let sent = crate::input::delivery::send_input(&events);
-        if sent as usize != events.len() {
+        let outcome = send_input_releasing(&events, &edges, |inputs| {
+            crate::input::delivery::send_input(inputs)
+        });
+        if outcome.sent != events.len() {
             bail!(
-                "SendInput inserted only {sent} of {} events. Windows blocked the \
-                 rest: the target runs at a higher integrity level than the \
-                 Driver (UIPI), or the input desktop is locked or showing a \
-                 secure prompt. To drive an elevated app, run the Driver \
-                 elevated (the default autostart daemon is).",
-                events.len()
+                "SendInput inserted only {} of {} events; possible causes: UIPI or a locked or secure input desktop. {}",
+                outcome.sent, events.len(), outcome.cleanup
             );
         }
         Ok(())
@@ -543,15 +652,14 @@ pub fn send_text_synthesized_after_focus(
                         remaining = n - k,
                     );
                 }
-                match att.send_and_await_read(&unit_events(unit), Duration::from_secs(2)) {
+                let events = unit_events(unit);
+                let edges = unit_edges(unit, &events);
+                match att.send_and_await_read(&events, &edges, Duration::from_secs(2)) {
                     UnitRead::Read => {}
-                    UnitRead::Short(sent) => bail!(
+                    UnitRead::Short { sent, cleanup } => bail!(
                         "SendInput inserted only {sent} of 4 key events for text unit {} of {n} \
-                         ({k} earlier units were read). Windows blocked the rest: the target \
-                         runs at a higher integrity level than the Driver (UIPI), or the input \
-                         desktop is locked or showing a secure prompt. To drive an elevated \
-                         app, run the Driver elevated (the default autostart daemon is).",
-                        k + 1
+                         ({k} earlier units were read). Possible causes: UIPI or a locked or secure input desktop. {cleanup}",
+                        k + 1,
                     ),
                     UnitRead::Stalled => bail!(
                         "text_delivery_stalled: the target did not read text unit {} of {n} \
@@ -566,18 +674,20 @@ pub fn send_text_synthesized_after_focus(
             return Ok(());
         }
         let mut events = Vec::with_capacity(n * 2);
+        let mut edges = Vec::with_capacity(n * 2);
         for unit in &units {
-            events.extend_from_slice(&unit_events(unit)[..2]);
+            let unit_inputs = unit_events(unit);
+            let unit_keys = unit_edges(unit, &unit_inputs);
+            events.extend_from_slice(&unit_inputs[..2]);
+            edges.extend_from_slice(&unit_keys[..2]);
         }
-        let sent = crate::input::delivery::send_input(&events);
-        if sent as usize != events.len() {
+        let outcome = send_input_releasing(&events, &edges, |inputs| {
+            crate::input::delivery::send_input(inputs)
+        });
+        if outcome.sent != events.len() {
             bail!(
-                "SendInput inserted only {sent} of {} key events. Windows blocked \
-                 the rest: the target runs at a higher integrity level than the \
-                 Driver (UIPI), or the input desktop is locked or showing a \
-                 secure prompt. To drive an elevated app, run the Driver \
-                 elevated (the default autostart daemon is).",
-                events.len()
+                "SendInput inserted only {} of {} key events. Possible causes: UIPI or a locked or secure input desktop. {}",
+                outcome.sent, events.len(), outcome.cleanup
             );
         }
         Ok(())
@@ -693,7 +803,7 @@ const DRAIN_SENTINEL_VK: VIRTUAL_KEY = VIRTUAL_KEY(0xE8);
 
 enum UnitRead {
     Read,
-    Short(u32),
+    Short { sent: usize, cleanup: CleanupReport },
     Stalled,
 }
 
@@ -730,8 +840,19 @@ impl InputQueueAttachment {
         let toggled = || unsafe { GetKeyState(DRAIN_SENTINEL_VK.0 as i32) } & 1;
         let before = toggled();
         let sentinel = [sentinel_key_input(false), sentinel_key_input(true)];
-        let sent = unsafe { crate::input::delivery::send_input(&sentinel) };
-        if sent as usize != sentinel.len() {
+        let edges = sentinel.map(|input| key_edge(&input, Some(DRAIN_SENTINEL_VK.0)));
+        let outcome = send_input_releasing(&sentinel, &edges, |inputs| unsafe {
+            crate::input::delivery::send_input(inputs)
+        });
+        if outcome.sent != sentinel.len() {
+            // This reserved no-name VK has no application meaning; a held
+            // sentinel affects only its own key state.
+            tracing::warn!(
+                "foreground input drain: inserted {} of {} sentinel events; {}",
+                outcome.sent,
+                sentinel.len(),
+                outcome.cleanup
+            );
             sleep(Duration::from_millis(40));
             return false;
         }
@@ -752,12 +873,22 @@ impl InputQueueAttachment {
     }
 
     /// Insert `events`, then yield until the sentinel key-up is read or `timeout`.
-    fn send_and_await_read(&self, events: &[INPUT], timeout: Duration) -> UnitRead {
+    fn send_and_await_read(
+        &self,
+        events: &[INPUT],
+        edges: &[KeyEdge],
+        timeout: Duration,
+    ) -> UnitRead {
         use windows::Win32::UI::Input::KeyboardAndMouse::GetKeyState;
         let before = unsafe { GetKeyState(DRAIN_SENTINEL_VK.0 as i32) } & 1;
-        let sent = unsafe { crate::input::delivery::send_input(events) };
-        if (sent as usize) < events.len() {
-            return UnitRead::Short(sent);
+        let outcome = send_input_releasing(events, edges, |inputs| unsafe {
+            crate::input::delivery::send_input(inputs)
+        });
+        if outcome.sent < events.len() {
+            return UnitRead::Short {
+                sent: outcome.sent,
+                cleanup: outcome.cleanup,
+            };
         }
         let deadline = Instant::now() + timeout;
         loop {
@@ -839,6 +970,20 @@ fn unit_events(unit: &TextUnit) -> [INPUT; 4] {
     [d, u, sentinel_key_input(false), sentinel_key_input(true)]
 }
 
+fn unit_edges(unit: &TextUnit, events: &[INPUT; 4]) -> [KeyEdge; 4] {
+    use windows::Win32::UI::Input::KeyboardAndMouse::VK_RETURN;
+    let source = match unit {
+        TextUnit::Packet(_) => None,
+        TextUnit::Return => Some(VK_RETURN.0),
+    };
+    [
+        key_edge(&events[0], source),
+        key_edge(&events[1], source),
+        key_edge(&events[2], Some(DRAIN_SENTINEL_VK.0)),
+        key_edge(&events[3], Some(DRAIN_SENTINEL_VK.0)),
+    ]
+}
+
 /// Build a single Unicode keyboard INPUT struct for one UTF-16 code unit,
 /// either down (`up = false`) or up (`up = true`). Used by
 /// [`send_text_synthesized`].
@@ -910,10 +1055,22 @@ fn modifier_vk(name: &str) -> Option<VIRTUAL_KEY> {
 /// → two empty vecs (no-op). Lets the mouse SendInput path hold cmd/shift/alt/
 /// ctrl exactly like `send_key_synthesized` does for keystrokes.
 pub fn modifier_hold_inputs(modifiers: &[&str]) -> (Vec<INPUT>, Vec<INPUT>) {
+    let (downs, ups, _) = modifier_hold_inputs_with_edges(modifiers);
+    (downs, ups)
+}
+
+pub(crate) fn modifier_hold_inputs_with_edges(
+    modifiers: &[&str],
+) -> (Vec<INPUT>, Vec<INPUT>, Vec<KeyEdge>) {
     let mod_vks: Vec<VIRTUAL_KEY> = modifiers.iter().filter_map(|m| modifier_vk(m)).collect();
     let downs: Vec<INPUT> = mod_vks.iter().map(|v| key_input(*v, false)).collect();
     let ups: Vec<INPUT> = mod_vks.iter().rev().map(|v| key_input(*v, true)).collect();
-    (downs, ups)
+    let edges = downs
+        .iter()
+        .zip(&mod_vks)
+        .map(|(input, vk)| key_edge(input, Some(vk.0)))
+        .collect();
+    (downs, ups, edges)
 }
 
 fn is_extended(vk: VIRTUAL_KEY) -> bool {
@@ -999,6 +1156,102 @@ fn key_name_to_vk(key: &str) -> Result<VIRTUAL_KEY> {
         }
     };
     Ok(vk)
+}
+
+#[cfg(test)]
+mod release_guard_tests {
+    use super::*;
+    use windows::Win32::UI::Input::KeyboardAndMouse::{VK_CONTROL, VK_RCONTROL, VK_SHIFT};
+
+    #[test]
+    fn maps_real_builders_and_preserves_release_flags() {
+        let inputs = [
+            key_input(VK_RCONTROL, false),
+            unicode_key_input(0xd83d, false),
+        ];
+        let edges = [
+            key_edge(&inputs[0], Some(VK_RCONTROL.0)),
+            key_edge(&inputs[1], None),
+        ];
+        assert!(matches!(edges[1].id, KeyId::Unicode(0xd83d)));
+        assert!(matches!(
+            edges[0].id,
+            KeyId::Scan { extended: true, .. } | KeyId::Vk(_)
+        ));
+        let mut calls = 0;
+        let outcome = send_input_releasing(&inputs, &edges, |batch| {
+            calls += 1;
+            if calls == 1 {
+                1
+            } else {
+                assert_eq!(batch.len(), 1);
+                let original = unsafe { inputs[0].Anonymous.ki };
+                let release = unsafe { batch[0].Anonymous.ki };
+                assert_eq!(release.wScan, original.wScan);
+                assert_eq!(release.dwFlags.0, original.dwFlags.0 | KEYEVENTF_KEYUP.0);
+                assert_ne!(release.dwFlags.0 & KEYEVENTF_EXTENDEDKEY.0, 0);
+                1
+            }
+        });
+        assert_eq!(outcome.cleanup.inserted, 1);
+        let packet = unit_events(&TextUnit::Packet(0xd83d));
+        let packet_edges = unit_edges(&TextUnit::Packet(0xd83d), &packet);
+        assert_eq!(packet_edges[0].id, KeyId::Unicode(0xd83d));
+        let return_inputs = unit_events(&TextUnit::Return);
+        let return_edges = unit_edges(&TextUnit::Return, &return_inputs);
+        assert_eq!(
+            return_edges[0].source_vk,
+            Some(windows::Win32::UI::Input::KeyboardAndMouse::VK_RETURN.0)
+        );
+        assert_eq!(return_edges[2].id, KeyId::Vk(DRAIN_SENTINEL_VK.0));
+        assert!(return_edges[3].up);
+        let mut calls = 0;
+        send_input_releasing(&packet, &packet_edges, |batch| {
+            calls += 1;
+            if calls == 1 {
+                1
+            } else {
+                let flags = unsafe { batch[0].Anonymous.ki.dwFlags };
+                assert_ne!(flags.0 & KEYEVENTF_UNICODE.0, 0);
+                assert_ne!(flags.0 & KEYEVENTF_KEYUP.0, 0);
+                1
+            }
+        });
+        let (downs, _, mod_edges) = modifier_hold_inputs_with_edges(&["ctrl", "shift"]);
+        assert_eq!(mod_edges[0].source_vk, Some(VK_CONTROL.0));
+        assert_eq!(mod_edges[1].source_vk, Some(VK_SHIFT.0));
+        assert_eq!(mod_edges[0].id, key_edge(&downs[0], Some(VK_CONTROL.0)).id);
+    }
+
+    #[test]
+    fn fake_send_full_zero_and_partial_cleanup_outcomes() {
+        let (events, _, edges) = modifier_hold_inputs_with_edges(&["ctrl", "shift", "win"]);
+        for (first, second, expected_calls, expected_fragment) in [
+            (3, 0, 1, "no corrective"),
+            (0, 0, 1, "no corrective"),
+            (2, 2, 2, "inserted corrective key-up events"),
+            (2, 1, 2, "corrective key-ups were not all inserted (1 of 2)"),
+        ] {
+            let mut calls = 0;
+            let outcome = send_input_releasing(&events, &edges, |batch| {
+                calls += 1;
+                if calls == 1 {
+                    first
+                } else {
+                    assert_eq!(batch.len(), 2);
+                    assert_eq!(unsafe { batch[0].Anonymous.ki.wScan }, unsafe {
+                        events[1].Anonymous.ki.wScan
+                    });
+                    second
+                }
+            });
+            assert_eq!(calls, expected_calls);
+            assert!(outcome.cleanup.to_string().contains(expected_fragment));
+            if first == 2 && second == 1 {
+                assert!(outcome.cleanup.to_string().contains("Ctrl"));
+            }
+        }
+    }
 }
 
 #[cfg(test)]
