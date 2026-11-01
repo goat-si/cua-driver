@@ -377,22 +377,21 @@ impl RightClickTool {
             };
 
             let action_guard = element_guard.clone();
-            let advertises_show_menu =
-                match latency::spawn_blocking(move || unsafe {
-                    copy_action_names(action_guard.as_ptr() as AXUIElementRef)
-                        .iter()
-                        .any(|name| name == "AXShowMenu")
-                })
-                .await
-                {
-                    Ok(advertises) => advertises,
-                    Err(error) => return super::pre_dispatch_refusal(
-                        "action_unavailable",
-                        format!(
-                            "right_click: action resolution failed ({error}); nothing was sent."
-                        ),
-                    ),
-                };
+            let advertises_show_menu = match latency::spawn_blocking(move || unsafe {
+                copy_action_names(action_guard.as_ptr() as AXUIElementRef)
+                    .iter()
+                    .any(|name| name == "AXShowMenu")
+            })
+            .await
+            {
+                Ok(advertises) => advertises,
+                Err(error) => {
+                    let message = format!(
+                        "right_click: action resolution failed ({error}); nothing was sent."
+                    );
+                    return super::pre_dispatch_refusal("action_unavailable", message);
+                }
+            };
 
             // The context menu steals key focus from the user's app when the
             // target is in the background; the guard hands it back.
