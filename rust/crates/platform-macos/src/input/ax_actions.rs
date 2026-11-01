@@ -43,6 +43,9 @@ impl SelectionElement {
         std::mem::forget(self);
         ptr
     }
+    pub(crate) fn as_ptr(&self) -> AXUIElementRef {
+        self.0
+    }
 }
 impl Clone for SelectionElement {
     fn clone(&self) -> Self {
@@ -59,7 +62,7 @@ pub(crate) struct LiveSelectionOps;
 impl SelectionOps for LiveSelectionOps {
     type Element = SelectionElement;
     fn role(&mut self, element: &Self::Element) -> Option<String> {
-        unsafe { copy_string_attr(element.0, "AXRole") }
+        unsafe { copy_string_attr(element.as_ptr(), "AXRole") }
     }
     fn parent(&mut self, element: &Self::Element) -> Option<Self::Element> {
         unsafe { copy_element_attr(element.0, "AXParent").map(SelectionElement) }
@@ -128,20 +131,24 @@ pub(crate) enum SelectAttempt {
 }
 
 pub(crate) fn select_with<B: SelectionOps>(ops: &mut B, start: B::Element) -> SelectAttempt {
-    walk_selection(ops, start, |ops, item, role| {
-        if selectable(role) && ops.selected(item).is_some() {
-            let role = role.unwrap().to_owned();
-            let sent = ops.select(item);
-            let result = if sent.is_ok() && ops.selected(item) == Some(true) {
-                SelectAttempt::Confirmed(role)
-            } else {
-                SelectAttempt::WriteSentUnconfirmed(role)
-            };
-            return std::ops::ControlFlow::Break(result);
-        }
-        std::ops::ControlFlow::Continue(())
-    })
-    .unwrap_or(SelectAttempt::NotAttempted)
+    match selection_target_with(ops, start) {
+        Some((role, item)) => select_target_with(ops, &item, role),
+        None => SelectAttempt::NotAttempted,
+    }
+}
+
+/// Write only to the retained item selected by `selection_target_with`.
+pub(crate) fn select_target_with<B: SelectionOps>(
+    ops: &mut B,
+    item: &B::Element,
+    role: String,
+) -> SelectAttempt {
+    let sent = ops.select(item);
+    if sent.is_ok() && ops.selected(item) == Some(true) {
+        SelectAttempt::Confirmed(role)
+    } else {
+        SelectAttempt::WriteSentUnconfirmed(role)
+    }
 }
 
 pub(crate) fn selection_state_with<B: SelectionOps>(
@@ -1190,6 +1197,15 @@ mod selection_boundary_tests {
             select_with(&mut ops, 0),
             SelectAttempt::Confirmed("AXRow".into())
         );
+        let mut ops = fake(&[Some("AXStaticText"), Some("AXRow")], &[None, Some(false)]);
+        let (role, item) = selection_target_with(&mut ops, 0).expect("selection target");
+        assert_eq!(item, 1);
+        assert!(ops.writes.is_empty());
+        assert_eq!(
+            select_target_with(&mut ops, &item, role),
+            SelectAttempt::Confirmed("AXRow".into())
+        );
+        assert_eq!(ops.writes, [1]);
     }
 
     #[test]
