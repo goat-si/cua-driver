@@ -2923,6 +2923,22 @@ fn unconfirmed_selection_write(
     )
 }
 
+#[cfg(test)]
+mod selection_write_outcome_tests {
+    use super::{ax_click_structured, unconfirmed_selection_write};
+
+    #[test]
+    fn a_sent_unconfirmed_write_has_existing_unverifiable_fields() {
+        let (_, suspected_noop, evidence, via_pixel) =
+            unconfirmed_selection_write("AXCell", (1, "AXStaticText", "label"));
+        let fields = ax_click_structured(via_pixel, false, evidence, suspected_noop);
+        assert_eq!(
+            fields,
+            serde_json::json!({"path": "ax", "verified": false, "effect": "unverifiable"})
+        );
+    }
+}
+
 /// Whether a non-success `AXUIElementPerformAction` return proves the app
 /// never received the action. Only the accessibility client's own refusals
 /// do: a bad argument, a dead element reference, or accessibility turned off.

@@ -283,6 +283,13 @@ impl CompactableNode for AXNode {
         self.value.as_deref()
     }
     fn set_value(&mut self, value: Option<String>) {
+        // Compaction sees rendered depth after omitted wrappers. Only copy a
+        // summary onto an item when the walk independently proved ownership.
+        if let Some(owned) = &self.owned_row_label {
+            if self.value.is_some() || value.as_deref() != owned.as_deref() {
+                return;
+            }
+        }
         self.value = value;
     }
     fn description(&self) -> Option<&str> {
