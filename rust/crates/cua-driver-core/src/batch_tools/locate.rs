@@ -484,6 +484,11 @@ impl Read {
         let Some(wanted_role) = spec.role.as_deref() else {
             return false;
         };
+        if !crate::snapshot_compaction::absorbed_role_tokens()
+            .any(|role| role_matches(wanted_role, role))
+        {
+            return false;
+        }
         let text_matches_spec = |text: &str| {
             let text = fold(text);
             spec.name
@@ -494,63 +499,66 @@ impl Read {
                     .as_ref()
                     .is_some_and(|needle| text.contains(&fold(needle)))
         };
-        let markdown_match =
-            self.markdown
-                .lines()
-                .filter_map(folded_children_row)
-                .any(|(role, text)| {
-                    if spec.name.is_none() && spec.text.is_none() {
-                        return true;
-                    }
-                    if role_matches(wanted_role, role) {
-                        return false;
-                    }
-                    text_matches_spec(text)
+        if self.elements.iter().any(|element| {
+            if !has_folded_children_boundary(element) {
+                return false;
+            }
+            if spec.name.is_none() && spec.text.is_none() {
+                return true;
+            }
+            if element_role_matches(wanted_role, element) {
+                return false;
+            }
+            let fields = [
+                element.get("label").and_then(Value::as_str),
+                element.get("value").and_then(Value::as_str),
+            ];
+            if fields.iter().flatten().any(|text| text_matches_spec(text)) {
+                return true;
+            }
+            if fields.iter().flatten().any(|text| !text.trim().is_empty()) {
+                return false;
+            }
+            // If the structured row has no text, a corresponding marked
+            // markdown row can still establish what it displayed.
+            let represented = element
+                .get("element_index")
+                .and_then(Value::as_u64)
+                .is_some_and(|index| {
+                    let prefix = format!("- [{index}] ");
+                    self.markdown.lines().map(str::trim).any(|line| {
+                        line.starts_with(&prefix) && folded_children_row(line).is_some()
+                    })
                 });
-        markdown_match
-            || self.elements.iter().any(|element| {
-                let folded = element
-                    .get("boundary")
-                    .and_then(|boundary| boundary.get("reasons"))
-                    .and_then(Value::as_array)
-                    .is_some_and(|reasons| {
-                        reasons.iter().any(|reason| {
-                            reason.get("kind").and_then(Value::as_str) == Some("policy_omission")
-                                && reason.get("detail").and_then(Value::as_str)
-                                    == Some("folded_children")
-                        })
-                    });
-                if !folded {
-                    return false;
-                }
+            !represented
+        }) {
+            return true;
+        }
+        self.markdown
+            .lines()
+            .filter_map(|line| {
+                let row = folded_children_row(line)?;
+                // Both fields together supply the structured row's label and
+                // folded value; otherwise markdown remains necessary evidence.
+                let complete_structured = markdown_row_index(line).is_some_and(|index| {
+                    self.elements.iter().any(|element| {
+                        element.get("element_index").and_then(Value::as_u64) == Some(index)
+                            && has_folded_children_boundary(element)
+                            && ["label", "value"].into_iter().all(|key| {
+                                element
+                                    .get(key)
+                                    .and_then(Value::as_str)
+                                    .is_some_and(|text| !text.trim().is_empty())
+                            })
+                    })
+                });
+                (!complete_structured).then_some(row)
+            })
+            .any(|(role, text)| {
                 if spec.name.is_none() && spec.text.is_none() {
                     return true;
                 }
-                if element_role_matches(wanted_role, element) {
-                    return false;
-                }
-                let fields = [
-                    element.get("label").and_then(Value::as_str),
-                    element.get("value").and_then(Value::as_str),
-                ];
-                if fields.iter().flatten().any(|text| text_matches_spec(text)) {
-                    return true;
-                }
-                if fields.iter().flatten().any(|text| !text.trim().is_empty()) {
-                    return false;
-                }
-                // If the structured row has no text, a corresponding marked
-                // markdown row can still establish what it displayed.
-                let represented = element
-                    .get("element_index")
-                    .and_then(Value::as_u64)
-                    .is_some_and(|index| {
-                        let prefix = format!("- [{index}] ");
-                        self.markdown.lines().map(str::trim).any(|line| {
-                            line.starts_with(&prefix) && folded_children_row(line).is_some()
-                        })
-                    });
-                !represented
+                !role_matches(wanted_role, role) && text_matches_spec(text)
             })
     }
 
@@ -573,6 +581,28 @@ impl Read {
     }
 }
 
+fn has_folded_children_boundary(element: &Value) -> bool {
+    element
+        .get("boundary")
+        .and_then(|boundary| boundary.get("reasons"))
+        .and_then(Value::as_array)
+        .is_some_and(|reasons| {
+            reasons.iter().any(|reason| {
+                reason.get("kind").and_then(Value::as_str) == Some("policy_omission")
+                    && reason.get("detail").and_then(Value::as_str) == Some("folded_children")
+            })
+        })
+}
+
+fn markdown_row_index(line: &str) -> Option<u64> {
+    line.trim()
+        .strip_prefix("- [")?
+        .split_once(']')?
+        .0
+        .parse()
+        .ok()
+}
+
 /// Identify a folded row and exclude its rendered boundary metadata.
 fn strip_folded_children_marker(line: &str) -> Option<&str> {
     let (before_kinds, kinds) = line.trim().rsplit_once(" [reason kinds: ")?;
@@ -585,7 +615,41 @@ fn strip_folded_children_marker(line: &str) -> Option<&str> {
     }
     let boundary = before_kinds
         .rfind(" [more: ")
-        .or_else(|| before_kinds.rfind(" [+"))?;
+        .max(before_kinds.rfind(" [+"))?;
+    let marker = before_kinds[boundary + 1..].strip_suffix(']')?;
+    let rest = if let Some(rest) = marker.strip_prefix("[more: unknown") {
+        rest
+    } else {
+        let (count, rest) = marker.strip_prefix("[+")?.split_once(" more")?;
+        if count.is_empty() || !count.bytes().all(|byte| byte.is_ascii_digit()) {
+            return None;
+        }
+        rest
+    };
+    let (reason_part, descendant_part) = rest
+        .split_once(';')
+        .map_or((rest, None), |(reasons, descendants)| {
+            (reasons, Some(descendants))
+        });
+    if !matches!(
+        descendant_part,
+        None | Some(" descendants omitted") | Some(" descendants not omitted")
+    ) {
+        return None;
+    }
+    let reasons = reason_part.strip_prefix(": ")?;
+    if !reasons
+        .split(", ")
+        .any(|reason| reason == "folded_children")
+        || !reasons.split(", ").all(|reason| {
+            !reason.is_empty()
+                && reason
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
+        })
+    {
+        return None;
+    }
     Some(&before_kinds[..boundary])
 }
 
@@ -2835,6 +2899,137 @@ mod tests {
     }
 
     #[test]
+    fn u20b_review_guard_only_covers_matchable_absorbed_roles() {
+        let markdown = "- AXRow = \"Foo\" [+1 more: folded_children; descendants not omitted] [reason kinds: folded_children=policy_omission]";
+        let mut observed = read(vec![], markdown);
+        observed.completeness = Completeness::Complete;
+        let check = |raw: Value| Check::parse(&raw, 0).unwrap();
+        assert!(evaluate(&check(json!({"role":"button","gone":true})), &observed).is_ok());
+        assert!(evaluate(
+            &check(json!({"role":"button","name":"Foo","gone":true})),
+            &observed
+        )
+        .is_ok());
+        let roles: Vec<_> = crate::snapshot_compaction::absorbed_role_tokens().collect();
+        for &role in &roles {
+            assert!(
+                crate::snapshot_compaction::is_plain_text_subtree_role(role)
+                    || crate::snapshot_compaction::is_elidable_wrapper_role(role)
+            );
+            let guarded = roles.iter().any(|candidate| role_matches(role, candidate));
+            let result = evaluate(&check(json!({"role":role,"gone":true})), &observed);
+            assert_eq!(
+                result
+                    .as_ref()
+                    .err()
+                    .is_some_and(|miss| miss.code == "incomplete_observation"),
+                guarded,
+                "{role}"
+            );
+        }
+        assert!(role_matches("textfield", "text"));
+        assert!(role_matches("text", "textfield"));
+        assert!(role_matches("textfield", "AXTextField"));
+        assert!(!role_matches("button", "text"));
+        assert_eq!(
+            evaluate(&check(json!({"role":"textfield","gone":true})), &observed)
+                .unwrap_err()
+                .code,
+            "incomplete_observation"
+        );
+        assert_eq!(
+            evaluate(
+                &check(json!({"role":"textfield","name":"Foo","gone":true})),
+                &observed
+            )
+            .unwrap_err()
+            .code,
+            "incomplete_observation"
+        );
+        let mut row = element(4, "AXRow", "Foo");
+        row["boundary"] = json!({"reasons":[{"kind":"policy_omission","detail":"folded_children"}],"children_skipped":{"known":1},"descendants_omitted":false});
+        let observed = read(vec![row], "");
+        assert!(evaluate(&check(json!({"role":"button","gone":true})), &observed).is_ok());
+        assert_eq!(
+            evaluate(&check(json!({"role":"textfield","gone":true})), &observed)
+                .unwrap_err()
+                .code,
+            "incomplete_observation"
+        );
+    }
+
+    #[test]
+    fn u20b_review_marker_parser_does_not_truncate_page_text() {
+        let markdown = "- AXRow = \"Foo [more: decoy [+ other] target\" [+1 more: folded_children; descendants not omitted] [reason kinds: folded_children=policy_omission]";
+        let observed = read(vec![], markdown);
+        let check =
+            Check::parse(&json!({"role":"statictext","name":"target","gone":true}), 0).unwrap();
+        assert_eq!(
+            evaluate(&check, &observed).unwrap_err().code,
+            "incomplete_observation"
+        );
+        assert!(strip_folded_children_marker(
+            "- AXRow [+x more: folded_children] [reason kinds: folded_children=policy_omission]"
+        )
+        .is_none());
+        assert!(strip_folded_children_marker(markdown)
+            .unwrap()
+            .contains("target"));
+        let unknown = "- AXRow = \"Foo [+8 more: decoy] [more: decoy] target\" [more: unknown: folded_children; descendants not omitted] [reason kinds: folded_children=policy_omission]";
+        assert!(strip_folded_children_marker(unknown)
+            .unwrap()
+            .contains("target"));
+        let observed = read(vec![], unknown);
+        assert_eq!(
+            evaluate(&check, &observed).unwrap_err().code,
+            "incomplete_observation"
+        );
+    }
+
+    #[test]
+    fn u20b_review_structured_fold_text_precedes_markdown_fallback() {
+        let mut row = element(4, "AXRow", "Foo");
+        row["value"] = json!("summary");
+        row["boundary"] = json!({"reasons":[{"kind":"policy_omission","detail":"folded_children"}],"children_skipped":{"known":1},"descendants_omitted":false});
+        let markdown = "- [4] AXRow \"Foo [more: decoy [+ fake] target\" [+1 more: folded_children; descendants not omitted] [reason kinds: folded_children=policy_omission]";
+        let check =
+            Check::parse(&json!({"role":"statictext","name":"target","gone":true}), 0).unwrap();
+        assert!(evaluate(&check, &read(vec![row.clone()], markdown)).is_ok());
+        row.as_object_mut().unwrap().remove("value");
+        assert_eq!(
+            evaluate(&check, &read(vec![row], markdown))
+                .unwrap_err()
+                .code,
+            "incomplete_observation"
+        );
+    }
+
+    #[test]
+    fn u20b_review_structured_text_matches_rendered_rows_and_exposes_extra_fields() {
+        let mut candidate = element(1, "AXButton", "Foo");
+        candidate["value"] = json!("Bar");
+        candidate["identifier"] = json!("beta");
+        candidate["description"] = json!("not-rendered");
+        let markdown = "- [1] AXButton \"Foo\" [value=\"Bar\" id=beta]";
+        let observed = read(vec![candidate], markdown);
+        for text in ["foo", "BAR", "beta", "no-match"] {
+            let spec = Check::parse(&json!({"role":"button","text":text}), 0)
+                .unwrap()
+                .element;
+            assert_eq!(
+                !matches(&observed, &spec).is_empty(),
+                row_matches(markdown, &spec),
+                "{text}"
+            );
+        }
+        let spec = Check::parse(&json!({"role":"button","text":"not-rendered"}), 0)
+            .unwrap()
+            .element;
+        assert!(!matches(&observed, &spec).is_empty());
+        assert!(!row_matches(markdown, &spec));
+    }
+
+    #[test]
     fn u20b_a_structured_only_folded_rows_guard_roles() {
         let mut folded = element(3, "AXRow", "Foo");
         folded["boundary"] = json!({"reasons":[{"kind":"policy_omission","detail":"folded_children"}],"children_skipped":{"known":1},"descendants_omitted":false});
@@ -2861,7 +3056,8 @@ mod tests {
             .is_ok());
         }
         folded.as_object_mut().unwrap().remove("label");
-        let check = Check::parse(&json!({"role":"button","name":"Bar","gone":true}), 0).unwrap();
+        let check =
+            Check::parse(&json!({"role":"statictext","name":"Bar","gone":true}), 0).unwrap();
         let observed = read(vec![folded.clone()], "");
         assert_eq!(
             evaluate(&check, &observed).unwrap_err().code,

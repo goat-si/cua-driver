@@ -62,8 +62,8 @@ For text-folding completeness, Windows must use
 every returned reason into the corresponding walk budget via `record_skip`,
 implement `CompactableNode::offscreen` from observed UIA visibility, and
 implement `CompactableNode::boundary_mut` and retain node boundaries in output.
-macOS and Linux must do the same wherever
-they fold before asserting observation completeness. A truncated folded
+macOS must do the same wherever it folds before asserting observation
+completeness; Linux must do so if it adds folding. A truncated folded
 snippet makes the read incomplete even if the native walk was exhaustive.
 The reason-aware path marks absorbed rows with `folded_children`, including
 lossless folds; that marker does not make the read incomplete by itself.

@@ -453,35 +453,50 @@ pub fn is_summarizable_container_or_row_role(role: &str) -> bool {
     )
 }
 
+const ELIDABLE_WRAPPER_ROLES: &[&str] = &[
+    "axgroup",
+    "axunknown",
+    "group",
+    "custom",
+    "pane",
+    "panel",
+    "section",
+];
+const PLAIN_TEXT_SUBTREE_ROLES: &[&str] = &[
+    "axstatictext",
+    "axlink",
+    "aximage",
+    "axgroup",
+    "axunknown",
+    "text",
+    "statictext",
+    "hyperlink",
+    "image",
+    "group",
+    "custom",
+    "label",
+    "static",
+    "link",
+    "panel",
+    "section",
+];
+
+/// The role vocabulary that folding or wrapper elision can absorb.
+pub(crate) fn absorbed_role_tokens() -> impl Iterator<Item = &'static str> {
+    PLAIN_TEXT_SUBTREE_ROLES
+        .iter()
+        .chain(ELIDABLE_WRAPPER_ROLES)
+        .copied()
+}
+
 /// Roles that are pure layout/generic wrappers which can be elided when actionless and unlabelled.
 pub fn is_elidable_wrapper_role(role: &str) -> bool {
-    matches!(
-        role.trim().to_ascii_lowercase().as_str(),
-        "axgroup" | "axunknown" | "group" | "custom" | "pane" | "panel" | "section"
-    )
+    ELIDABLE_WRAPPER_ROLES.contains(&role.trim().to_ascii_lowercase().as_str())
 }
 
 /// Roles allowed inside an actionless static-text subtree.
 pub fn is_plain_text_subtree_role(role: &str) -> bool {
-    matches!(
-        role.trim().to_ascii_lowercase().as_str(),
-        "axstatictext"
-            | "axlink"
-            | "aximage"
-            | "axgroup"
-            | "axunknown"
-            | "text"
-            | "statictext"
-            | "hyperlink"
-            | "image"
-            | "group"
-            | "custom"
-            | "label"
-            | "static"
-            | "link"
-            | "panel"
-            | "section"
-    )
+    PLAIN_TEXT_SUBTREE_ROLES.contains(&role.trim().to_ascii_lowercase().as_str())
 }
 
 /// Roles that contribute text snippets during static-text subtree folding.
@@ -511,7 +526,7 @@ pub trait CompactableNode {
     fn description(&self) -> Option<&str>;
     fn format_line(&self) -> String;
     /// Return observed visibility when available. Completeness-asserting
-    /// platforms should implement this to keep differing visibility separate.
+    /// platforms should report `Some` for rows so differing visibility stays separate.
     fn offscreen(&self) -> Option<bool> {
         None
     }
@@ -621,12 +636,25 @@ fn fold_actionless_text_subtrees_impl<N: CompactableNode>(
         if let Some(visibility) = nodes[i].offscreen() {
             let mut ancestor_depth = wrapper_depth;
             let mut conflict = false;
-            for ancestor in nodes[..i].iter().rev() {
+            for (ancestor_index, ancestor) in nodes[..i].iter().enumerate().rev() {
                 if ancestor.depth() < ancestor_depth {
                     ancestor_depth = ancestor.depth();
                     if ancestor.offscreen().is_some_and(|v| v != visibility) {
                         conflict = true;
                         break;
+                    }
+                    if ancestor.offscreen().is_none() {
+                        let mut end = ancestor_index + 1;
+                        while end < nodes.len() && nodes[end].depth() > ancestor.depth() {
+                            end += 1;
+                        }
+                        if nodes[(ancestor_index + 1)..end]
+                            .iter()
+                            .any(|node| node.offscreen().is_some_and(|v| v != visibility))
+                        {
+                            conflict = true;
+                            break;
+                        }
                     }
                 }
             }
@@ -748,14 +776,23 @@ fn fold_after_elision<N: CompactableNode>(
             };
             let mut all_plain = true;
             let mut raw_snippets: Vec<String> = Vec::new();
+            let mut known_visibility = node_ref.offscreen();
 
             for desc_opt in &old_nodes[(idx + 1)..sub_end] {
                 let desc = desc_opt.as_ref().unwrap();
                 let rel_depth = desc.depth().saturating_sub(base_depth);
+                let visibility_conflict = desc.offscreen().is_some_and(|visibility| {
+                    if let Some(previous) = known_visibility {
+                        previous != visibility
+                    } else {
+                        known_visibility = Some(visibility);
+                        false
+                    }
+                });
                 if desc.element_index().is_some()
                     || rel_depth > max_allowed_rel_depth
                     || !is_plain_text_subtree_role(desc.role())
-                    || matches!((node_ref.offscreen(), desc.offscreen()), (Some(a), Some(b)) if a != b)
+                    || visibility_conflict
                 {
                     all_plain = false;
                     break;
@@ -1557,6 +1594,41 @@ mod tests {
             assert!(u20_fold(&mut nodes).is_empty());
             assert_eq!(nodes.len(), expected, "{parent:?}, {child:?}");
         }
+    }
+
+    #[test]
+    fn u20b_review_unknown_parent_preserves_mixed_descendant_visibility() {
+        let mut nodes = vec![
+            u20_node("AXRow", 0, None, None),
+            u20_node("AXStaticText", 1, None, Some("visible")),
+            u20_node("AXStaticText", 1, None, Some("offscreen")),
+        ];
+        nodes[1].offscreen = Some(false);
+        nodes[2].offscreen = Some(true);
+        assert!(u20_fold(&mut nodes).is_empty());
+        assert_eq!(nodes.len(), 3);
+        assert_eq!(nodes[1].offscreen, Some(false));
+        assert_eq!(nodes[2].offscreen, Some(true));
+        let mut nodes = vec![
+            u20_node("AXRow", 0, None, None),
+            u20_node("AXStaticText", 1, None, Some("one")),
+            u20_node("AXStaticText", 1, None, Some("two")),
+        ];
+        nodes[1].offscreen = Some(true);
+        nodes[2].offscreen = Some(true);
+        assert!(u20_fold(&mut nodes).is_empty());
+        assert_eq!(nodes.len(), 1);
+        let mut nodes = vec![
+            u20_node("AXRow", 0, None, None),
+            u20_node("AXGroup", 1, None, None),
+            u20_node("AXStaticText", 1, None, Some("offscreen")),
+        ];
+        nodes[1].offscreen = Some(false);
+        nodes[2].offscreen = Some(true);
+        assert!(u20_fold(&mut nodes).is_empty());
+        assert_eq!(nodes.len(), 3);
+        assert_eq!(nodes[1].offscreen, Some(false));
+        assert_eq!(nodes[2].offscreen, Some(true));
     }
     #[test]
     fn u20b_visibility_boundary_survives_empty_wrapper_elision() {
