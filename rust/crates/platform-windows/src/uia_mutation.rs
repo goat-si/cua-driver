@@ -149,51 +149,33 @@ pub(crate) enum ChainOutcome {
     },
 }
 pub(crate) fn run_rungs(rungs: Vec<Box<dyn FnOnce() -> RungOutcome + '_>>) -> ChainOutcome {
-    let mut not_supported_calls = Vec::new();
-    for (rung, call) in rungs.into_iter().enumerate() {
-        let hresult = match call() {
-            RungOutcome::Absent => continue,
-            RungOutcome::AcquireFailed(hresult) => {
-                return ChainOutcome::Refused {
-                    rung,
-                    kind: match classify_acquisition(hresult) {
-                        AcquireVerdict::Absent => continue,
-                        AcquireVerdict::NotDelivered(kind) => kind,
-                    },
-                    hresult,
-                    not_supported_calls,
-                }
+    use cua_driver_core::mutation::{WriteChain, WriteOutcome};
+    let mut last = None;
+    let chain = WriteChain::run(
+        rungs.into_iter().enumerate().map(|(index, call)| {
+            let outcome = call();
+            last = Some((index, outcome));
+            match outcome {
+                RungOutcome::Absent => AcquireVerdict::Absent.to_core(),
+                RungOutcome::AcquireFailed(hr) => classify_acquisition(hr).to_core(),
+                RungOutcome::Called(hr) => classify_sent_call(hr).to_core(),
             }
-            RungOutcome::Called(hresult) => hresult,
-        };
-        match classify_write_hresult(hresult) {
-            WriteVerdict::Delivered => {
-                return ChainOutcome::Delivered {
-                    rung,
-                    not_supported_calls,
-                }
-            }
-            WriteVerdict::AffordanceAbsent => not_supported_calls.push(rung),
-            WriteVerdict::Refused(kind) => {
-                return ChainOutcome::Refused {
-                    rung,
-                    kind,
-                    hresult,
-                    not_supported_calls,
-                }
-            }
-            WriteVerdict::Uncertain(kind) => {
-                return ChainOutcome::Uncertain {
-                    rung,
-                    kind,
-                    hresult,
-                    not_supported_calls,
-                }
-            }
+        }),
+        false,
+    );
+    let not_supported_calls = Vec::new();
+    match (chain.outcomes().last(), last) {
+        (Some(WriteOutcome::Delivered), Some((rung, _))) => ChainOutcome::Delivered { rung, not_supported_calls },
+        (Some(WriteOutcome::StopNotDelivered(_)), Some((rung, RungOutcome::AcquireFailed(hresult)))) => {
+            let AcquireVerdict::NotDelivered(kind) = classify_acquisition(hresult) else { unreachable!() };
+            ChainOutcome::Refused { rung, kind, hresult, not_supported_calls }
         }
-    }
-    ChainOutcome::NoAffordance {
-        not_supported_calls,
+        (Some(WriteOutcome::StopUncertain(_)), Some((rung, RungOutcome::Called(hresult)))) => {
+            let SentVerdict::Uncertain(kind) = classify_sent_call(hresult) else { unreachable!() };
+            ChainOutcome::Uncertain { rung, kind, hresult, not_supported_calls }
+        }
+        (None | Some(WriteOutcome::FallThrough(_)), _) => ChainOutcome::NoAffordance { not_supported_calls },
+        _ => unreachable!("rung outcome and core result disagree"),
     }
 }
 #[derive(Debug, PartialEq, Eq)]
