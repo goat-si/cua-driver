@@ -806,6 +806,19 @@ fn build_element_entry(
     Some(entry)
 }
 
+fn build_bounded_element_entry(
+    n: &crate::atspi::AtspiNode,
+    snapshot_id: Option<u32>,
+    bounds: Option<(i32, i32, u32, u32)>,
+    boundary: Option<&cua_driver_contract::NodeBoundary>,
+) -> Option<serde_json::Value> {
+    let mut entry = build_element_entry(n, snapshot_id, bounds)?;
+    if let Some(boundary) = boundary {
+        entry["boundary"] = json!(boundary);
+    }
+    Some(entry)
+}
+
 /// Roles a popup's rows carry: menu entries, and the list / tree / table
 /// rows of a combo list, a completer or a chooser popover.
 fn popup_item_role(role: &str) -> bool {
@@ -1709,15 +1722,12 @@ impl Tool for GetWindowStateTool {
                         .nodes
                         .iter()
                         .filter_map(|n| {
-                            let mut element = build_element_entry(
+                            build_bounded_element_entry(
                                 n,
                                 snapshot_id,
                                 bounds_by_idx.get(&n.element_index?).copied(),
-                            )?;
-                            if let Some(boundary) = tr.boundaries.get(&n.element_index?) {
-                                element["boundary"] = json!(boundary);
-                            }
-                            Some(element)
+                                tr.boundaries.get(&n.element_index?),
+                            )
                         })
                         .collect();
                     let elements = cua_driver_core::element_query::project_elements_for_query(

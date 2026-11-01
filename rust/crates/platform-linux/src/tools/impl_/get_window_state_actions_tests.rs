@@ -122,6 +122,44 @@ fn get_window_state_completeness_adapter_preserves_legacy_fields_and_schema() {
 }
 
 #[test]
+fn get_window_state_serializes_real_boundary_and_completeness_through_mcp_schema() {
+    use crate::walk_completeness::{ChildRead, NodeOmission};
+    use cua_driver_contract::CountEvidence;
+
+    let mut tree = tree_for_completeness();
+    tree.nodes.push(node(vec!["press".into()]));
+    tree.completeness.node_omission(NodeOmission {
+        in_scope: true,
+        position: 0,
+        child_count: CountEvidence::Known(3),
+        children: ChildRead::Failed,
+        descend: true,
+        skipped_menu: false,
+        excluded_menu: false,
+        peek_read: true,
+    });
+    tree.boundaries
+        .insert(1, tree.completeness.boundaries[&0].clone());
+    let mut structured = json!({"pid": 7, "window_id": 9});
+    apply_linux_walk_completeness(&mut structured, &tree, 500);
+    let entry =
+        build_bounded_element_entry(&tree.nodes[0], None, None, tree.boundaries.get(&1)).unwrap();
+    structured["elements"] = json!([entry]);
+    let result = ToolResult::text("tree").with_structured(structured);
+    let wire = serde_json::to_value(result).unwrap();
+    assert_eq!(wire["structuredContent"]["observation_complete"], false);
+    assert_eq!(wire["structuredContent"]["elements_complete"], false);
+    assert_eq!(
+        wire["structuredContent"]["elements"][0]["boundary"]["children_skipped"],
+        json!({"known":3})
+    );
+    assert_eq!(
+        cua_driver_core::mcp_result::conforming_tool_result("get_window_state", wire.clone()),
+        wire
+    );
+}
+
+#[test]
 fn sibling_only_stop_keeps_the_legacy_truncation_and_complete_observation() {
     let mut tree = tree_for_completeness();
     tree.truncated = true;
