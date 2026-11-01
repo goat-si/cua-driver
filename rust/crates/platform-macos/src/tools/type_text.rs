@@ -3643,6 +3643,84 @@ mod u32_outcome_tests {
     use cua_driver_core::mutation::PriorInput;
     use std::cell::Cell;
 
+    fn replacement_unconfirmed_sends_no_document_keys(attribute: &str) {
+        use cua_driver_core::mutation::{ChainResult, Postcondition, WriteOutcome};
+        for after in [Some("old"), None, Some("unexpected")] {
+            let keys = Cell::new(0);
+            let (verified, delivered, _) = replace_ax_with(
+                attribute,
+                "old",
+                "new",
+                TextWriteContext {
+                    settable: Settable::Yes,
+                    prior: PriorInput::MayHaveDelivered,
+                },
+                || kAXErrorSuccess,
+                || {
+                    keys.set(keys.get() + 2);
+                    DocumentEdited::Marked
+                },
+                || {
+                    await_replacement_delivery_with(
+                        "new",
+                        || after.map(str::to_owned),
+                        || true,
+                        || panic!("deadline has expired"),
+                    )
+                },
+            )
+            .unwrap();
+            assert_eq!(
+                keys.get(),
+                0,
+                "{attribute}: unconfirmed readback {after:?} must not send document keys"
+            );
+            assert!(!verified);
+            assert_eq!(delivered, None);
+            let result = type_text_outcome_result(
+                TypeTextOutcome {
+                    detail: String::new(),
+                    path: PATH_AX,
+                    verified,
+                    delivered_chars: delivered,
+                    web_area: WebAreaClassification::NonWebContent,
+                },
+                3,
+                false,
+                false,
+                "",
+            );
+            assert_eq!(
+                result.structured_content.as_ref().unwrap()["effect"],
+                "unverifiable"
+            );
+            assert_ne!(result.is_error, Some(true));
+            let native = crate::ax::write_outcome::native_write_outcome(
+                crate::ax::write_outcome::NativeWriteKind::SetAttribute,
+                true,
+                &Settable::Yes,
+                kAXErrorSuccess,
+            );
+            assert_eq!(native, WriteOutcome::Delivered);
+            let chain =
+                ChainResult::from_recorded(vec![native], PriorInput::MayHaveDelivered).unwrap();
+            assert_eq!(
+                chain.error_disposition(Postcondition::Indeterminate, false),
+                Some(cua_driver_contract::ErrorDisposition::DELIVERED)
+            );
+        }
+    }
+
+    #[test]
+    fn replace_axvalue_unconfirmed_readback_never_marks_document() {
+        replacement_unconfirmed_sends_no_document_keys("AXValue");
+    }
+
+    #[test]
+    fn replace_selected_text_unconfirmed_readback_never_marks_document() {
+        replacement_unconfirmed_sends_no_document_keys("AXSelectedText");
+    }
+
     #[test]
     fn replace_axvalue_timeout_with_matching_readback_sends_no_document_keys() {
         let marks = Cell::new(0);
