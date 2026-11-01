@@ -631,6 +631,10 @@ async fn malformed_registry_output_reaches_locator_as_incomplete_for_gone_and_un
             )
             .await;
         assert_eq!(direct.is_error, Some(true));
+        assert_eq!(
+            direct.structured_content.as_ref().unwrap()["code"],
+            "typed_output_mismatch"
+        );
         let details =
             &direct.structured_content.as_ref().unwrap()["malformed_completeness_details"];
         assert!(
