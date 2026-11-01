@@ -27,6 +27,7 @@ pub trait SnapshotPayload: Send + Sync + 'static {
 struct Snapshot<S> {
     id: u32,
     window_id: u64,
+    publisher: Option<String>,
     screenshot_owner: Option<String>,
     screenshot_scale: Option<f64>,
     /// Window size in points when the screenshot was taken. A tree-only read
@@ -516,6 +517,7 @@ impl<S: SnapshotPayload> SnapshotStore<S> {
             lane.push(Snapshot {
                 id,
                 window_id,
+                publisher: session.map(str::to_owned),
                 screenshot_owner: session.map(str::to_owned),
                 screenshot_scale: scale,
                 screenshot_window_size: frame_size,
@@ -762,11 +764,16 @@ impl<S: SnapshotPayload> SnapshotStore<S> {
     pub fn pid_for_token(&self, args: &serde_json::Value) -> Option<i32> {
         let token = args.get("element_token")?.as_str()?;
         let (snapshot_id, _) = parse_token(token)?;
+        let session = args.get("_session_id").and_then(serde_json::Value::as_str);
         self.inner
             .lock()
             .unwrap()
             .iter()
-            .find(|(_, lane)| lane.iter().any(|snapshot| snapshot.id == snapshot_id))
+            .find(|(_, lane)| {
+                lane.iter().any(|snapshot| {
+                    snapshot.id == snapshot_id && snapshot.publisher.as_deref() == session
+                })
+            })
             .map(|(pid, _)| *pid)
     }
 
@@ -805,10 +812,24 @@ impl<S: SnapshotPayload> SnapshotStore<S> {
                 "element_token conflicts with window_id".into(),
             ));
         }
+        // Membership comes from the payload itself: some platforms key rows
+        // by sparse member indices, so len() is not an index bound. Retaining
+        // first keeps out-of-range ahead of the ownership refusal; a foreign
+        // caller's retained element is dropped (released) before refusing.
         let element = snapshot
             .payload
             .retain(element_index)
             .ok_or_else(|| out_of_range_refusal(snapshot, element_index))?;
+        // Both absent is compatible with sessionless embedders; registry
+        // dispatch installs a namespaced session for session-requiring tools.
+        let session = args.get("_session_id").and_then(serde_json::Value::as_str);
+        if snapshot.publisher.as_deref() != session {
+            drop(element);
+            return Err(refusal(
+                "stale_element_token",
+                "snapshot belongs to another session; call get_window_state in this session".into(),
+            ));
+        }
         Ok(ResolvedElement::Element {
             window_id: snapshot.window_id,
             element_index,
@@ -1001,6 +1022,120 @@ mod tests {
         assert_eq!(cache.pid_for_token(&serde_json::json!({})), None);
         let unknown = serde_json::json!({ "element_token": token_for(id + 1000, 0) });
         assert_eq!(cache.pid_for_token(&unknown), None);
+    }
+
+    /// A payload whose element indices are sparse members (as on Linux),
+    /// not dense offsets below len().
+    struct SparsePayload(std::collections::BTreeMap<usize, usize>);
+
+    impl SnapshotPayload for SparsePayload {
+        type Element = usize;
+        fn len(&self) -> usize {
+            self.0.len()
+        }
+        fn retain(&self, index: usize) -> Option<usize> {
+            self.0.get(&index).copied()
+        }
+    }
+
+    #[test]
+    fn sparse_member_index_resolves_and_still_checks_ownership() {
+        let cache = SnapshotStore::new();
+        let id = cache
+            .publish_for_session(
+                42,
+                7,
+                SparsePayload([(7, 70)].into_iter().collect()),
+                Some("runtime:a"),
+                None,
+            )
+            .unwrap()
+            .0;
+        let owner =
+            serde_json::json!({"element_token": token_for(id, 7), "_session_id": "runtime:a"});
+        assert!(matches!(
+            cache.resolve(42, &owner),
+            Ok(ResolvedElement::Element { element: 70, .. })
+        ));
+        let foreign =
+            serde_json::json!({"element_token": token_for(id, 7), "_session_id": "runtime:b"});
+        let err = cache.resolve(42, &foreign).unwrap_err();
+        assert_eq!(
+            err.structured_content.unwrap()["refusal"]["code"],
+            "stale_element_token"
+        );
+        let missing =
+            serde_json::json!({"element_token": token_for(id, 1), "_session_id": "runtime:b"});
+        let err = cache.resolve(42, &missing).unwrap_err();
+        assert_eq!(
+            err.structured_content.unwrap()["refusal"]["code"],
+            "invalid_element_token"
+        );
+    }
+
+    #[test]
+    fn session_ownership_and_refusal_precedence() {
+        let cache = SnapshotStore::new();
+        let id = cache
+            .publish_for_session(42, 7, Payload(vec![10]), Some("runtime:a"), None)
+            .unwrap()
+            .0;
+        let token = token_for(id, 0);
+        let owner = serde_json::json!({"element_token": token, "_session_id": "runtime:a"});
+        assert!(cache.resolve(42, &owner).is_ok());
+        assert_eq!(cache.pid_for_token(&owner), Some(42));
+        for foreign in [
+            serde_json::json!({"element_token": token, "_session_id": "runtime:b"}),
+            serde_json::json!({"element_token": "0", "_session_id": "runtime:b"}),
+            serde_json::json!({"element_token": token}),
+        ] {
+            let err = cache.resolve(42, &foreign).unwrap_err();
+            let content = err.structured_content.unwrap();
+            assert_eq!(content["refusal"]["code"], "stale_element_token");
+            assert!(format!("{content}").contains("snapshot belongs to another session"));
+        }
+        assert_eq!(
+            cache.pid_for_token(
+                &serde_json::json!({"element_token": token, "_session_id": "runtime:b"})
+            ),
+            None
+        );
+        let conflict = cache.resolve(42, &serde_json::json!({"element_token": token, "window_id": 8, "_session_id": "runtime:b"})).unwrap_err();
+        assert_eq!(
+            conflict.structured_content.unwrap()["refusal"]["code"],
+            "conflicting_element_target"
+        );
+        let range = cache
+            .resolve(
+                42,
+                &serde_json::json!({"element_token": token_for(id, 1), "_session_id": "runtime:b"}),
+            )
+            .unwrap_err();
+        assert_eq!(
+            range.structured_content.unwrap()["refusal"]["code"],
+            "invalid_element_token"
+        );
+        cache
+            .refresh_screenshot_for_session(42, 7, Some("runtime:b"), 1.0, None)
+            .unwrap();
+        assert!(cache.resolve(42, &owner).is_ok());
+        assert!(cache
+            .resolve(
+                42,
+                &serde_json::json!({"element_token": token, "_session_id": "runtime:b"})
+            )
+            .is_err());
+        let anonymous = cache.publish(43, 8, Payload(vec![1]));
+        let anon_token = token_for(anonymous, 0);
+        assert!(cache
+            .resolve(43, &serde_json::json!({"element_token": anon_token}))
+            .is_ok());
+        assert!(cache
+            .resolve(
+                43,
+                &serde_json::json!({"element_token": anon_token, "_session_id": "runtime:a"})
+            )
+            .is_err());
     }
 
     /// A token built on a window-basis id addresses the same snapshot (#130).
@@ -1382,7 +1517,7 @@ mod tests {
             Some(id)
         );
         assert_eq!(scale(&cache, 20, "a"), Some(2.0));
-        let token = serde_json::json!({ "element_token": token_for(id, 2) });
+        let token = serde_json::json!({ "element_token": token_for(id, 2), "_session_id": "a" });
         assert!(matches!(
             cache.resolve(10, &token).unwrap(),
             ResolvedElement::Element { element: 7, .. }
@@ -1577,8 +1712,12 @@ mod tests {
                 SessionClientKind::Mcp,
             )
         };
-        let resolve =
-            |token: &str| cache.resolve(10, &serde_json::json!({ "element_token": token }));
+        let resolve = |token: &str| {
+            cache.resolve(
+                10,
+                &serde_json::json!({ "element_token": token, "_session_id": session }),
+            )
+        };
 
         let guard = begin().expect("first unnamed call starts the session");
         let (snapshot, _) = cache

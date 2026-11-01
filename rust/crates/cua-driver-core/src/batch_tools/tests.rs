@@ -883,6 +883,11 @@ async fn later_denied_action_refuses_before_any_step_runs() {
             context(Some(manifest)),
         )
         .await;
+    assert_eq!(
+        result.disposition,
+        Some(cua_driver_contract::ErrorDisposition::NOT_DELIVERED),
+        "a batch refused before step 1 sent nothing"
+    );
     let structured = result.structured_content.unwrap();
     assert_eq!(
         harness.hits("click"),

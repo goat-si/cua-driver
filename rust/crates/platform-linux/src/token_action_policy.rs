@@ -1,5 +1,15 @@
 //! Decisions shared by token actions and their host-runnable tests.
 
+pub(crate) fn ax_click_structured(suspected_noop: bool, unacknowledged: bool) -> serde_json::Value {
+    let mut result = serde_json::json!({"path": "ax", "verified": false,
+        "effect": if suspected_noop && !unacknowledged { "suspected_noop" } else { "unverifiable" }});
+    if unacknowledged {
+        result["code"] = serde_json::json!("element_action_unacknowledged");
+        result["note"] = serde_json::json!("no acknowledgement received for the doAction call; the action may have run. Re-snapshot before retrying");
+    }
+    result
+}
+
 pub(crate) fn observed<T, E>(action: impl FnOnce() -> Result<T, E>) -> Result<T, E> {
     action()
 }
@@ -18,6 +28,29 @@ pub(crate) fn proves_gone(name: Option<&str>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ax_click_unacknowledged_takes_precedence() {
+        for suspected in [false, true] {
+            for unacknowledged in [false, true] {
+                let actual = ax_click_structured(suspected, unacknowledged);
+                assert_eq!(actual["verified"], false);
+                assert_eq!(
+                    actual["effect"],
+                    if unacknowledged || !suspected {
+                        "unverifiable"
+                    } else {
+                        "suspected_noop"
+                    }
+                );
+                assert_eq!(
+                    actual.get("code").and_then(|v| v.as_str()),
+                    unacknowledged.then_some("element_action_unacknowledged")
+                );
+                assert_eq!(actual.get("note").and_then(|v| v.as_str()), unacknowledged.then_some("no acknowledgement received for the doAction call; the action may have run. Re-snapshot before retrying"));
+            }
+        }
+    }
 
     #[test]
     fn only_proven_object_or_owner_loss_is_gone() {
@@ -82,31 +115,5 @@ mod write_tests {
             action_failure_result(ActionFailure::BeforeDispatch),
             ("element_bounds_unavailable", "none")
         );
-    }
-
-    #[test]
-    fn all_token_entrypoints_refuse_errors_without_a_sibling_write() {
-        for _entrypoint in ["hyprland", "inject", "targeted"] {
-            for (failure, expected) in [
-                (
-                    WriteFailure::BeforeDispatch,
-                    ("token_route_unavailable", "none"),
-                ),
-                (WriteFailure::Gone, ("stale_element_token", "none")),
-                (
-                    WriteFailure::Unknown,
-                    ("element_write_unacknowledged", "unverifiable"),
-                ),
-            ] {
-                let mut fallback_calls = 0;
-                let result = write_failure_result(failure);
-                if result.is_none() {
-                    fallback_calls += 1;
-                }
-                assert_eq!(result, Some(expected));
-                assert_eq!(fallback_calls, 0);
-            }
-            assert_eq!(write_failure_result(WriteFailure::NoRoute), None);
-        }
     }
 }

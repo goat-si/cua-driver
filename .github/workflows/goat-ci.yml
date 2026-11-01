@@ -865,6 +865,14 @@ jobs:
           # clipboard round trip that would clobber a developer's clipboard.
           CUA_TEST_ALLOW_CLIPBOARD: "1"
         run: cargo test --locked -p platform-macos --lib
+      # Live AppKit tests, one at a time and by exact name, so they never share the
+      # parallel lib run with other tests (goat-si/cua-driver#151).
+      - name: Run the live AppKit unit tests on macOS, one at a time
+        working-directory: rust
+        run: |
+          cargo test --locked -p platform-macos --lib cursor::shape::tests::probe_degrades_to_unknown_without_appkit -- --ignored --exact --test-threads=1
+          cargo test --locked -p platform-macos --lib focus_guard::tests::the_next_action_ends_a_detached_hold -- --ignored --exact --test-threads=1
+          cargo test --locked -p platform-macos --lib focus_guard::tests::a_key_hand_back_keeps_the_actions_hold -- --ignored --exact --test-threads=1
       - name: Run cua-driver-core unit tests on macOS
         working-directory: rust
         run: cargo test --locked -p cua-driver-core --lib

@@ -31,17 +31,14 @@ use windows::Win32::Foundation::{HWND, RECT};
 use windows::Win32::Graphics::Dwm::{
     DwmGetWindowAttribute, DWMWA_CLOAKED, DWMWA_EXTENDED_FRAME_BOUNDS,
 };
-use windows::Win32::System::Com::{
-    CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED,
-};
+use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_MULTITHREADED};
 use windows::Win32::UI::Accessibility::{
-    CUIAutomation, IUIAutomation, IUIAutomationElement, IUIAutomationInvokePattern,
-    IUIAutomationTogglePattern, TreeScope_Children, TreeScope_Subtree,
-    UIA_AcceleratorKeyPropertyId, UIA_ButtonControlTypeId, UIA_CheckBoxControlTypeId,
-    UIA_HyperlinkControlTypeId, UIA_InvokePatternId, UIA_ListItemControlTypeId,
-    UIA_MenuItemControlTypeId, UIA_RadioButtonControlTypeId, UIA_SplitButtonControlTypeId,
-    UIA_TabItemControlTypeId, UIA_TogglePatternId, UIA_TreeItemControlTypeId, UIA_CONTROLTYPE_ID,
-    UIA_PROPERTY_ID,
+    IUIAutomation, IUIAutomationElement, IUIAutomationInvokePattern, IUIAutomationTogglePattern,
+    TreeScope_Children, TreeScope_Subtree, UIA_AcceleratorKeyPropertyId, UIA_ButtonControlTypeId,
+    UIA_CheckBoxControlTypeId, UIA_HyperlinkControlTypeId, UIA_InvokePatternId,
+    UIA_ListItemControlTypeId, UIA_MenuItemControlTypeId, UIA_RadioButtonControlTypeId,
+    UIA_SplitButtonControlTypeId, UIA_TabItemControlTypeId, UIA_TogglePatternId,
+    UIA_TreeItemControlTypeId, UIA_CONTROLTYPE_ID, UIA_PROPERTY_ID,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     GetAncestor, GetWindowRect, GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId,
@@ -205,7 +202,7 @@ impl Drop for ComInit {
 
 /// Build an IUIAutomation instance after COM is initialized.
 fn get_uia() -> Option<IUIAutomation> {
-    match unsafe { CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER) } {
+    match super::client::new_uia_client() {
         Ok(a) => Some(a),
         Err(e) => {
             tracing::warn!(target: "uia_windows_enum", "CoCreateInstance(CUIAutomation) failed: {e}");
@@ -419,6 +416,8 @@ pub(crate) enum PointInvokeOutcome {
     Busy,
     Timeout,
     Unavailable,
+    NotResponding,
+    WindowGone,
 }
 
 impl PointInvokeOutcome {
@@ -457,6 +456,11 @@ fn try_invoke_in_window_at_point_unbounded(
         Some(u) => u,
         None => return Unavailable,
     };
+    match super::client::probe_root(HWND(hwnd as *mut _)) {
+        crate::uia_root::RootVerdict::Ok => {}
+        crate::uia_root::RootVerdict::WindowGone => return PointInvokeOutcome::WindowGone,
+        crate::uia_root::RootVerdict::NoAnswer => return PointInvokeOutcome::NotResponding,
+    }
     unsafe {
         let root = match uia.ElementFromHandle(HWND(hwnd as *mut _)) {
             Ok(r) => r,
@@ -679,6 +683,16 @@ fn try_invoke_accelerator_in_window_unbounded(
     let target = canonical_accelerator(combo)
         .ok_or_else(|| anyhow::anyhow!("invalid accelerator combo `{combo}`"))?;
     let uia = get_uia().ok_or_else(|| anyhow::anyhow!("UI Automation is unavailable"))?;
+
+    match super::client::probe_root(HWND(hwnd as *mut _)) {
+        crate::uia_root::RootVerdict::Ok => {}
+        crate::uia_root::RootVerdict::WindowGone => {
+            bail!("window no longer exists; the shortcut was not sent")
+        }
+        crate::uia_root::RootVerdict::NoAnswer => {
+            bail!("the app did not answer a no-op message; the shortcut was not sent")
+        }
+    }
 
     unsafe {
         let root = uia

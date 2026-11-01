@@ -399,6 +399,8 @@ struct State {
     output_h: u32,
     output_mode: (u32, u32),
     output_transform: u32,
+    #[cfg(feature = "portal-input")]
+    first_output_origin: Option<(i32, i32)>,
     // Native screencopy capture state.
     scrcopy_manager: Option<ZwlrScreencopyManagerV1>,
     shm: Option<WlShm>,
@@ -473,7 +475,7 @@ impl Dispatch<WlSeat, ()> for State {
 impl Dispatch<WlOutput, ()> for State {
     fn event(
         state: &mut Self,
-        _: &WlOutput,
+        output: &WlOutput,
         event: wl_output::Event,
         _: &(),
         _: &Connection,
@@ -488,8 +490,16 @@ impl Dispatch<WlOutput, ()> for State {
             }
             wl_output::Event::Geometry {
                 transform: WEnum::Value(transform),
+                x,
+                y,
                 ..
             } => {
+                #[cfg(feature = "portal-input")]
+                if state.output.as_ref() == Some(output) {
+                    state.first_output_origin = Some((x, y));
+                }
+                #[cfg(not(feature = "portal-input"))]
+                let _ = (output, x, y);
                 state.output_transform = transform as u32;
             }
             _ => return,
@@ -1704,6 +1714,17 @@ pub fn with_target_foreground<T>(
 /// identically. Falls back to `(1, 1)` when no output reports a mode.
 #[cfg(feature = "portal-input")]
 fn output_dimensions() -> anyhow::Result<(u32, u32)> {
+    Ok(output_details()?.dimensions)
+}
+
+#[cfg(feature = "portal-input")]
+struct OutputDetails {
+    dimensions: (u32, u32),
+    current_origin: Option<(f32, f32)>,
+}
+
+#[cfg(feature = "portal-input")]
+fn output_details() -> anyhow::Result<OutputDetails> {
     let conn = Connection::connect_to_env()?;
     let mut queue = conn.new_event_queue::<State>();
     let qh = queue.handle();
@@ -1713,24 +1734,32 @@ fn output_dimensions() -> anyhow::Result<(u32, u32)> {
     for _ in 0..4 {
         queue.roundtrip(&mut state)?;
     }
-    Ok((state.output_w.max(1), state.output_h.max(1)))
+    Ok(OutputDetails {
+        dimensions: (state.output_w.max(1), state.output_h.max(1)),
+        current_origin: state.first_output_origin.map(|(x, y)| (x as f32, y as f32)),
+    })
 }
 
 /// Reproduce the wlroots vptr path's coordinate handling for the libei
-/// fallback: `(0, 0)` defaults to the output centre, and any value is clamped
-/// to `[0, dim-1]`. Keeps `click(.., 0, 0, ..)` landing on centre rather than
-/// the top-left corner across both backends.
+/// fallback: `(0, 0)` is the coordinate-free sentinel, resolved through EIS
+/// regions in logical space. Explicit coordinates retain the existing clamp;
+/// distinguishing an explicit `(0, 0)` remains future work.
 #[cfg(feature = "portal-input")]
-fn normalize_click_xy(x: i32, y: i32, w: u32, h: u32) -> (i32, i32) {
-    let (px, py) = if x == 0 && y == 0 {
-        ((w / 2) as i32, (h / 2) as i32)
-    } else {
-        (x, y)
-    };
-    (
-        px.clamp(0, (w as i32).saturating_sub(1)),
-        py.clamp(0, (h as i32).saturating_sub(1)),
-    )
+fn normalize_click_xy(
+    x: i32,
+    y: i32,
+    w: u32,
+    h: u32,
+    centre: impl FnOnce() -> anyhow::Result<(f32, f32)>,
+) -> anyhow::Result<(f64, f64)> {
+    if x == 0 && y == 0 {
+        let (x, y) = centre()?;
+        return Ok((x.into(), y.into()));
+    }
+    Ok((
+        x.clamp(0, (w as i32).saturating_sub(1)) as f64,
+        y.clamp(0, (h as i32).saturating_sub(1)) as f64,
+    ))
 }
 
 /// Map a cua/X11 pointer button (1=left / 2=middle / 3=right) to its evdev
@@ -2273,6 +2302,69 @@ pub fn type_text(window_id: u64, text: &str) -> anyhow::Result<()> {
     }
 }
 
+/// Preserve per-character backend selection while admitting the complete
+/// string before the first EIS keyboard-fallback key.
+pub fn type_text_chars(window_id: u64, text: &str, delay_ms: u64) -> anyhow::Result<()> {
+    type_chars_dispatch(
+        text,
+        delay_ms,
+        |index, character| {
+            #[cfg(feature = "portal-input")]
+            {
+                activate_window_for_input(window_id)?;
+                let result = std::process::Command::new("wtype")
+                    .args(["-k", "Shift_L", "--"])
+                    .arg(character)
+                    .output();
+                let mut admitted_all = false;
+                match result {
+                    Ok(out) if out.status.success() => {}
+                    other => with_wtype_libei_fallback(
+                        || {
+                            libei_wait_keyboard_ready()?;
+                            activate_window_for_input(window_id)?;
+                            if libei::has_text_interface()? {
+                                libei_type_text(character)
+                            } else {
+                                libei::type_keyboard_text_with_delay(text, delay_ms, index)?;
+                                admitted_all = true;
+                                Ok(())
+                            }
+                        },
+                        other.map(|o| String::from_utf8_lossy(&o.stderr).into_owned()),
+                    )?,
+                }
+                Ok(admitted_all)
+            }
+            #[cfg(not(feature = "portal-input"))]
+            {
+                let _ = index;
+                type_text(window_id, character)?;
+                Ok(false)
+            }
+        },
+        |delay| std::thread::sleep(std::time::Duration::from_millis(delay)),
+    )
+}
+
+fn type_chars_dispatch(
+    text: &str,
+    delay_ms: u64,
+    mut send: impl FnMut(usize, &str) -> anyhow::Result<bool>,
+    mut delay: impl FnMut(u64),
+) -> anyhow::Result<()> {
+    for (index, ch) in text.chars().enumerate() {
+        let mut buf = [0; 4];
+        if send(index, ch.encode_utf8(&mut buf))? {
+            return Ok(());
+        }
+        if delay_ms > 0 {
+            delay(delay_ms);
+        }
+    }
+    Ok(())
+}
+
 /// Type into a surface whose exact Sway container is already held focused by
 /// the caller. This avoids re-resolving a title that can change mid-sequence
 /// (for example after opening a Chromium tab).
@@ -2638,16 +2730,19 @@ fn libei_wait_keyboard_ready() -> anyhow::Result<()> {
 #[cfg(feature = "portal-input")]
 fn libei_click(x: i32, y: i32, count: u32, button: u8) -> anyhow::Result<()> {
     let btn = cua_button_to_libei(button);
-    let (w, h) = output_dimensions()?;
-    let (px, py) = normalize_click_xy(x, y, w, h);
-    libei::move_absolute(px as f64, py as f64)?;
+    let output = output_details()?;
+    let (w, h) = output.dimensions;
+    let (px, py) = normalize_click_xy(x, y, w, h, || {
+        libei::coordinate_free_centre(output.current_origin)
+    })?;
+    libei::move_absolute(px, py)?;
     for i in 0..count.max(1) {
         if i > 0 {
             std::thread::sleep(std::time::Duration::from_millis(80));
         }
-        libei::click(px as f64, py as f64, btn)?;
+        libei::click(px, py, btn)?;
     }
-    record_synth_cursor(px, py);
+    record_synth_cursor(px as i32, py as i32);
     Ok(())
 }
 
@@ -3864,6 +3959,47 @@ mod output_transform_tests {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn type_chars_dispatch_preserves_per_character_delays() {
+        let events = std::cell::RefCell::new(Vec::new());
+        super::type_chars_dispatch(
+            "ab",
+            30,
+            |_, ch| {
+                events.borrow_mut().push(format!("key:{ch}"));
+                Ok(false)
+            },
+            |ms| events.borrow_mut().push(format!("delay:{ms}")),
+        )
+        .unwrap();
+        assert_eq!(*events.borrow(), ["key:a", "delay:30", "key:b", "delay:30"]);
+    }
+
+    #[cfg(feature = "portal-input")]
+    #[test]
+    fn coordinate_free_click_uses_logical_region_centre() {
+        let regions = [crate::libei_route::Region {
+            x: 0.0,
+            y: 0.0,
+            width: 1920.0,
+            height: 1080.0,
+        }];
+        let centre = || {
+            crate::libei_route::coordinate_free_centre(&regions, None)
+                .ok_or_else(|| anyhow::anyhow!("no centre"))
+        };
+        assert_eq!(
+            super::normalize_click_xy(0, 0, 3840, 2160, centre).unwrap(),
+            (960.0, 540.0)
+        );
+        assert_eq!(
+            super::normalize_click_xy(4000, 10, 3840, 2160, || panic!(
+                "explicit point must not query centre"
+            ))
+            .unwrap(),
+            (3839.0, 10.0)
+        );
+    }
     /// The pointer always moves before a desktop click or scroll, even when
     /// it already sits on the target pixel (corners and 1-pixel outputs too).
     #[test]

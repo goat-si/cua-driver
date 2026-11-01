@@ -272,7 +272,12 @@ mod tests {
     /// This test is meaningful precisely because AppKit is unavailable: the
     /// first implementation used objc2's generated accessors, which `expect()`
     /// a non-NULL result, and this exact call aborted the process.
+    ///
+    /// It reads live AppKit and Window Server state, so it is ignored in the
+    /// parallel lib run and run alone, by exact name, in the macOS slow lane
+    /// (goat-si/cua-driver#151).
     #[test]
+    #[ignore = "reads live AppKit/Window Server state; the macOS slow lane runs it alone"]
     fn probe_degrades_to_unknown_without_appkit() {
         if appkit_cursors_available() {
             // An AppKit-hosted runner: then the probe must return a real

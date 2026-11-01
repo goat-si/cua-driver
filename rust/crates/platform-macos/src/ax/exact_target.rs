@@ -709,6 +709,106 @@ fn count_competing_keyboard_destinations(
         .count()
 }
 
+struct SheetParentOnce<F> {
+    lookup: F,
+    sample: Option<Option<u32>>,
+}
+
+impl<F: FnMut() -> Option<u32>> SheetParentOnce<F> {
+    fn new(lookup: F) -> Self {
+        Self {
+            lookup,
+            sample: None,
+        }
+    }
+
+    fn get(&mut self) -> Option<u32> {
+        *self.sample.get_or_insert_with(&mut self.lookup)
+    }
+}
+
+#[cfg(test)]
+mod sheet_enumeration_tests {
+    use super::SheetParentOnce;
+    use std::cell::{Cell, RefCell};
+
+    #[test]
+    fn the_gate_looks_up_the_sheet_parent_once() {
+        let calls = Cell::new(0);
+        let mut parent = SheetParentOnce::new(|| {
+            calls.set(calls.get() + 1);
+            Some(700)
+        });
+        assert_eq!(parent.get(), Some(700));
+        assert_eq!(parent.get(), Some(700));
+        assert_eq!(calls.get(), 1);
+    }
+
+    #[test]
+    fn a_missing_parent_is_remembered_as_missing() {
+        let calls = Cell::new(0);
+        let mut parent = SheetParentOnce::new(|| {
+            calls.set(calls.get() + 1);
+            None
+        });
+        assert_eq!(parent.get(), None);
+        assert_eq!(parent.get(), None);
+        assert_eq!(calls.get(), 1);
+    }
+
+    #[test]
+    fn a_changing_relationship_uses_the_first_sample() {
+        let calls = Cell::new(0);
+        let mut samples = [Some(700), None].into_iter();
+        let mut parent = SheetParentOnce::new(|| {
+            calls.set(calls.get() + 1);
+            samples.next().unwrap()
+        });
+        let requested_parent = parent.get();
+        let facts_parent = parent.get();
+        assert_eq!((requested_parent, facts_parent), (Some(700), Some(700)));
+        assert_eq!(calls.get(), 1);
+    }
+
+    #[test]
+    fn a_failed_first_lookup_is_used_for_both() {
+        let calls = Cell::new(0);
+        let mut samples = [None, Some(700)].into_iter();
+        let mut parent = SheetParentOnce::new(|| {
+            calls.set(calls.get() + 1);
+            samples.next().unwrap()
+        });
+        let requested_parent = parent.get();
+        let facts_parent = parent.get();
+        assert_eq!((requested_parent, facts_parent), (None, None));
+        assert_eq!(calls.get(), 1);
+    }
+
+    #[test]
+    fn the_first_lookup_happens_where_it_did() {
+        for has_element in [false, true] {
+            let events = RefCell::new(Vec::new());
+            let mut parent = SheetParentOnce::new(|| {
+                events.borrow_mut().push("lookup");
+                Some(700)
+            });
+            events.borrow_mut().push("constructed");
+            if has_element {
+                events.borrow_mut().push("element");
+                assert_eq!(parent.get(), Some(700));
+            }
+            events.borrow_mut().push("focused-window");
+            assert_eq!(parent.get(), Some(700));
+            let expected = if has_element {
+                vec!["constructed", "element", "lookup", "focused-window"]
+            } else {
+                vec!["constructed", "focused-window", "lookup"]
+            };
+            assert_eq!(*events.borrow(), expected);
+        }
+    }
+}
+
 /// Gather fresh background-input facts for one `(pid, window_id)` target.
 ///
 /// `element_ptr` is an optional retained `AXUIElementRef` (as `usize`) for an
@@ -748,6 +848,8 @@ pub fn gather_background_facts(
             super::enablement::ensure_chromium_ax_enabled(pid, app);
             let records = ax_window_records(app, pid, window_id);
             let app_hidden = copy_bool_attr(app, "AXHidden");
+            let mut sheet_parent =
+                SheetParentOnce::new(|| sheet_parent_window_id(app, pid, window_id));
             let element = element_ptr.map(|ptr| {
                 let element = ptr as AXUIElementRef;
                 let window = element_window_id(element);
@@ -756,7 +858,7 @@ pub fn gather_background_facts(
                 let in_menu_bar = window.is_none() && element_in_app_menu_bar(app, element);
                 let in_recorded_menu = window.is_none()
                     && element_in_recorded_top_level_menu(app, element, pid, window_id);
-                let requested = match sheet_parent_window_id(app, pid, window_id) {
+                let requested = match sheet_parent.get() {
                     Some(parent) if element_in_requested_sheet(element, window_id) => parent,
                     _ => window_id,
                 };
@@ -777,7 +879,7 @@ pub fn gather_background_facts(
                 CFRelease(window as CFTypeRef);
                 window_id
             });
-            let sheet_parent = sheet_parent_window_id(app, pid, window_id);
+            let sheet_parent = sheet_parent.get();
             CFRelease(app as CFTypeRef);
             (
                 records,

@@ -212,6 +212,22 @@ where
 pub struct MacOsBrowserPlatform {
     cursor_registry: Arc<crate::cursor::CursorRegistry>,
     browser_cursors: Arc<Mutex<BrowserCursorTracker>>,
+    /// Who a pid is: the running-app record, process name and bundle id
+    /// (live AppKit reads; tests pass a fake, goat-si/cua-driver#151).
+    app_identity: fn(i64) -> AppIdentity,
+}
+
+/// The running-app record, process name and bundle id of one pid.
+type AppIdentity = (Option<crate::apps::AppInfo>, Option<String>, Option<String>);
+
+/// [`AppIdentity`] from the live process and AppKit state.
+fn live_app_identity(pid: i64) -> AppIdentity {
+    let app = crate::apps::list_running_apps()
+        .into_iter()
+        .find(|app| i64::from(app.pid) == pid);
+    let fallback_name = crate::apps::get_app_name_for_pid(pid as i32);
+    let fallback_bundle_id = crate::apps::bundle_id_for_pid(pid as i32);
+    (app, fallback_name, fallback_bundle_id)
 }
 
 impl MacOsBrowserPlatform {
@@ -219,7 +235,16 @@ impl MacOsBrowserPlatform {
         Self {
             cursor_registry,
             browser_cursors: Arc::new(Mutex::new(BrowserCursorTracker::default())),
+            app_identity: live_app_identity,
         }
+    }
+
+    /// The same platform with another app-identity source, so a unit test
+    /// never reads live AppKit or WindowServer state.
+    #[cfg(test)]
+    fn with_app_identity(mut self, app_identity: fn(i64) -> AppIdentity) -> Self {
+        self.app_identity = app_identity;
+        self
     }
 
     async fn discover_endpoint(
@@ -996,16 +1021,11 @@ impl BrowserPlatform for MacOsBrowserPlatform {
     }
 
     async fn classify_browser(&self, pid: i64) -> Result<BrowserClassification, BrowserRefusal> {
-        let (app, fallback_name, fallback_bundle_id) = tokio::task::spawn_blocking(move || {
-            let app = crate::apps::list_running_apps()
-                .into_iter()
-                .find(|app| i64::from(app.pid) == pid);
-            let fallback_name = crate::apps::get_app_name_for_pid(pid as i32);
-            let fallback_bundle_id = crate::apps::bundle_id_for_pid(pid as i32);
-            (app, fallback_name, fallback_bundle_id)
-        })
-        .await
-        .unwrap_or((None, None, None));
+        let app_identity = self.app_identity;
+        let (app, fallback_name, fallback_bundle_id) =
+            tokio::task::spawn_blocking(move || app_identity(pid))
+                .await
+                .unwrap_or((None, None, None));
         let name = app
             .as_ref()
             .map(|app| app.name.as_str())
@@ -1888,6 +1908,22 @@ mod tests {
         assert_eq!(parse_loopback_lsof_ports(input), vec![9222, 9444]);
     }
 
+    /// The pids [`fixture_app_identity`] was asked about. Each case spawns
+    /// its own fixture process, so its pid identifies the case even while
+    /// other cases run in parallel.
+    static FIXTURE_IDENTITY_PIDS: Mutex<Vec<i64>> = Mutex::new(Vec::new());
+
+    /// What the live lookup reports for the unbundled /bin/sh endpoint
+    /// fixture: no running-app record, process name "sh", no bundle id. A
+    /// live lookup would read AppKit and WindowServer state (#151).
+    fn fixture_app_identity(pid: i64) -> AppIdentity {
+        FIXTURE_IDENTITY_PIDS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(pid);
+        (None, Some("sh".to_owned()), None)
+    }
+
     async fn assert_owned_discovery_profile_case(case: &str) {
         use std::os::fd::AsRawFd;
         use std::os::unix::process::CommandExt;
@@ -2036,8 +2072,21 @@ mod tests {
         }
         let take_counts =
             || std::array::from_fn::<_, 3, _>(|index| counts[index].swap(0, Ordering::SeqCst));
-        let platform = MacOsBrowserPlatform::new(Arc::new(crate::cursor::CursorRegistry::new()));
+        let platform = MacOsBrowserPlatform::new(Arc::new(crate::cursor::CursorRegistry::new()))
+            .with_app_identity(fixture_app_identity);
+        // A pid reused from an earlier case must not satisfy the check below.
+        FIXTURE_IDENTITY_PIDS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|seen| *seen != pid);
         let endpoint = platform.discover_owned_endpoint(pid).await;
+        assert!(
+            FIXTURE_IDENTITY_PIDS
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains(&pid),
+            "discovery classified this case's fixture through the injected lookup: {case}"
+        );
         let expected_counts = match case {
             "absolute" | "conflicting" | "malformed" | "unreadable" => [0, 0, 0],
             "non_loopback" | "wrong_port" | "no_valid" => [1, 1, 1],

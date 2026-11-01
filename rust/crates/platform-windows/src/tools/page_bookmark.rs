@@ -302,6 +302,8 @@ unsafe fn init_uia() -> Result<IUIAutomation> {
     }
     let automation: IUIAutomation = CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER)
         .map_err(|e| anyhow!("CoCreateInstance(CUIAutomation) failed: {e}"))?;
+    crate::uia::client::warm_up(&automation)
+        .map_err(|e| anyhow!("CoCreateInstance(CUIAutomation) failed: {e}"))?;
     Ok(automation)
 }
 
@@ -322,6 +324,15 @@ unsafe fn root_for_window(
     let _ = GetWindowThreadProcessId(hwnd, Some(&mut actual_pid));
     if actual_pid as i32 != expected_pid {
         bail!("hwnd 0x{hwnd_raw:x} belongs to pid {actual_pid}, not the expected {expected_pid}");
+    }
+    match crate::uia::client::probe_root(hwnd) {
+        crate::uia_root::RootVerdict::Ok => {}
+        crate::uia_root::RootVerdict::WindowGone => {
+            bail!("window 0x{hwnd_raw:x} no longer exists; the bookmark was not invoked")
+        }
+        crate::uia_root::RootVerdict::NoAnswer => bail!(
+            "window 0x{hwnd_raw:x} did not answer a no-op message within 1 s (the app may be hung); the bookmark was not invoked"
+        ),
     }
     automation
         .ElementFromHandle(hwnd)

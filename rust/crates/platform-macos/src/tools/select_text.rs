@@ -122,10 +122,9 @@ unsafe fn optional_string_attr_once(
 /// TextEdit's document text view (its AXDescription fails with
 /// kAXErrorFailure on every read): an AXTextArea whose role, subrole, role
 /// description and other four hints read cleanly with no security marking
-/// may have exactly one hint that fails that way. Such an element's value is
-/// already published unredacted by get_window_state, which reads a failed
-/// hint as absent under the same classifier. A field whose only protection
-/// signal sits in that one failing hint would be admitted.
+/// may have a failing description only when it has the document body shape.
+/// This is a compatibility exception, not a security proof: a custom field
+/// with the same shape and a secret marker only in that description is admitted.
 fn selection_exposure_allowed(attributes: &[OptionalStringAttr; 8]) -> bool {
     if !matches!(attributes[0], OptionalStringAttr::Value(_))
         || !matches!(attributes[1], OptionalStringAttr::Value(_))
@@ -186,6 +185,31 @@ fn selection_exposure_allowed(attributes: &[OptionalStringAttr; 8]) -> bool {
             is_password_flag: false,
         },
     )
+}
+
+#[derive(Clone, Copy)]
+struct DocumentShape<'a> {
+    parent_role: Option<&'a str>,
+    window_subrole: Option<&'a str>,
+}
+
+fn selection_exposure_with_shape(
+    attributes: &[OptionalStringAttr; 8],
+    shape: DocumentShape<'_>,
+) -> bool {
+    let failed_hints = attributes[2..7]
+        .iter()
+        .filter(|a| matches!(a, OptionalStringAttr::StableFailure))
+        .count();
+    if failed_hints > 0
+        && (failed_hints != 1
+            || !matches!(attributes[3], OptionalStringAttr::StableFailure)
+            || shape.parent_role != Some("AXScrollArea")
+            || shape.window_subrole != Some("AXStandardWindow"))
+    {
+        return false;
+    }
+    selection_exposure_allowed(attributes)
 }
 
 fn find_occurrences(value: &str, needle: &str) -> Vec<(usize, usize)> {
@@ -286,17 +310,30 @@ unsafe fn select_text_blocking(
     suffix: Option<&str>,
     selection: &str,
 ) -> Result<(String, SelectedTextRange, usize, usize), SelectError> {
-    let attributes = [
-        optional_string_attr(element, "AXRole"),
-        optional_string_attr(element, "AXSubrole"),
-        optional_string_attr(element, "AXTitle"),
-        optional_string_attr(element, "AXDescription"),
-        optional_string_attr(element, "AXPlaceholderValue"),
-        optional_string_attr(element, "AXIdentifier"),
-        optional_string_attr(element, "AXHelp"),
-        optional_string_attr(element, "AXRoleDescription"),
-    ];
-    if !selection_exposure_allowed(&attributes) {
+    let attributes = selection_attributes_with(|name| optional_string_attr(element, name));
+    let (parent_role, window_subrole) =
+        if matches!(attributes[3], OptionalStringAttr::StableFailure) {
+            let read_related = |name: &str, attr: &str| {
+                copy_element_attr(element, name).and_then(|related| {
+                    let value = copy_string_attr(related, attr);
+                    CFRelease(related as CFTypeRef);
+                    value
+                })
+            };
+            (
+                read_related("AXParent", "AXRole"),
+                read_related("AXWindow", "AXSubrole"),
+            )
+        } else {
+            (None, None)
+        };
+    if !selection_exposure_with_shape(
+        &attributes,
+        DocumentShape {
+            parent_role: parent_role.as_deref(),
+            window_subrole: window_subrole.as_deref(),
+        },
+    ) {
         return Err(
             "select_text refuses secure fields, and fields whose security attributes could not be read"
                 .into(),
@@ -370,6 +407,22 @@ unsafe fn select_text_blocking(
         ));
     }
     Ok((selected_text, range, occurrence, match_count))
+}
+
+fn selection_attributes_with(
+    mut read: impl FnMut(&str) -> OptionalStringAttr,
+) -> [OptionalStringAttr; 8] {
+    [
+        "AXRole",
+        "AXSubrole",
+        "AXTitle",
+        "AXDescription",
+        "AXPlaceholderValue",
+        "AXIdentifier",
+        "AXHelp",
+        "AXRoleDescription",
+    ]
+    .map(&mut read)
 }
 
 #[async_trait]
@@ -493,6 +546,28 @@ mod tests {
     use super::*;
 
     #[test]
+    fn selection_reader_requests_the_existing_attribute_order() {
+        let mut trace = Vec::new();
+        let _ = selection_attributes_with(|name| {
+            trace.push(name.to_owned());
+            OptionalStringAttr::Value(None)
+        });
+        assert_eq!(
+            trace,
+            [
+                "AXRole",
+                "AXSubrole",
+                "AXTitle",
+                "AXDescription",
+                "AXPlaceholderValue",
+                "AXIdentifier",
+                "AXHelp",
+                "AXRoleDescription"
+            ]
+        );
+    }
+
+    #[test]
     fn occurrences_overlap_on_scalar_boundaries() {
         assert_eq!(find_occurrences("aaa", "aa"), vec![(0, 2), (1, 3)]);
         assert_eq!(find_occurrences("a😀a😀", "😀"), vec![(1, 5), (6, 10)]);
@@ -553,6 +628,65 @@ mod tests {
             OptionalStringAttr::Value(None),
             OptionalStringAttr::Value(Some("text entry area".into())),
         ]
+    }
+
+    fn body_shape() -> DocumentShape<'static> {
+        DocumentShape {
+            parent_role: Some("AXScrollArea"),
+            window_subrole: Some("AXStandardWindow"),
+        }
+    }
+
+    #[test]
+    fn select_text_exception_requires_the_document_body_shape() {
+        let attrs = textedit_text_area();
+        for shape in [
+            DocumentShape {
+                parent_role: None,
+                window_subrole: Some("AXStandardWindow"),
+            },
+            DocumentShape {
+                parent_role: Some("AXGroup"),
+                window_subrole: Some("AXStandardWindow"),
+            },
+            DocumentShape {
+                parent_role: Some("AXScrollArea"),
+                window_subrole: None,
+            },
+        ] {
+            assert!(!selection_exposure_with_shape(&attrs, shape));
+        }
+        let mut other_hint = attrs;
+        other_hint[3] = OptionalStringAttr::Value(None);
+        other_hint[2] = OptionalStringAttr::StableFailure;
+        assert!(!selection_exposure_with_shape(&other_hint, body_shape()));
+    }
+
+    #[test]
+    fn a_non_body_custom_field_with_a_failing_hint_is_refused() {
+        assert!(!selection_exposure_with_shape(
+            &textedit_text_area(),
+            DocumentShape {
+                parent_role: Some("AXGroup"),
+                window_subrole: Some("AXStandardWindow")
+            }
+        ));
+    }
+
+    #[test]
+    fn textedit_body_shape_is_still_allowed() {
+        assert!(selection_exposure_with_shape(
+            &textedit_text_area(),
+            body_shape()
+        ));
+    }
+
+    #[test]
+    fn same_shape_custom_field_is_admitted_by_the_exception() {
+        assert!(selection_exposure_with_shape(
+            &textedit_text_area(),
+            body_shape()
+        ));
     }
 
     #[test]

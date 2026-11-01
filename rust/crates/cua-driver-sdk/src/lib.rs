@@ -1953,6 +1953,7 @@ fn parse_arguments(tool: &str, arguments_json: &str) -> Result<Value, DriverErro
 }
 
 fn normalize_result(tool: &str, raw: Value) -> Result<ToolResult, DriverError> {
+    let raw = cua_driver_core::mcp_result::finalize_error_disposition(tool, raw);
     let object = raw.as_object().ok_or_else(|| DriverError::Protocol {
         reason: "tool result must be a JSON object".into(),
     })?;
@@ -2082,6 +2083,24 @@ mod tests {
     use std::io::{BufRead, BufReader, Write};
     #[cfg(unix)]
     use std::os::unix::net::UnixListener;
+
+    #[test]
+    fn sdk_error_has_unknown_disposition_without_evidence() {
+        let result = normalize_result(
+            "click",
+            serde_json::json!({
+                "content": [{"type":"text", "text":"failure"}], "isError":true,
+                "structuredContent":{"code":"tool_failure"}
+            }),
+        )
+        .unwrap();
+        let structured: Value =
+            serde_json::from_str(result.structured_json.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            structured["disposition"],
+            serde_json::json!({"delivery":"unknown", "retry":"unknown"})
+        );
+    }
 
     #[test]
     fn exported_typed_methods_cover_every_published_contract() {

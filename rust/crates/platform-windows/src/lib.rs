@@ -82,6 +82,9 @@ mod process_selection;
 mod uia_mutation;
 
 #[cfg(any(target_os = "windows", test))]
+mod uia_root;
+
+#[cfg(any(target_os = "windows", test))]
 mod value_append;
 
 #[cfg(any(target_os = "windows", test))]
