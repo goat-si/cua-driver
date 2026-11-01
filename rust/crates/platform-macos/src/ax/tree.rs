@@ -734,15 +734,40 @@ pub(crate) fn walk_tree_with_web_content_observed(
     budget: WalkBudget,
     include_web_content: bool,
 ) -> super::evidence::Observed<TreeWalkResult> {
-    let scope = super::evidence::EvidenceScope::start();
-    let result = walk_tree_with_web_content_inner(
-        pid,
-        window_id,
-        query,
-        max_depth,
+    walk_with_environment(
+        &super::tree_source::native::NativeSource,
+        &NativeWalkEnvironment,
+        WalkRequest {
+            pid,
+            window_id,
+            query,
+            max_depth,
+            include_web_content,
+        },
         budget,
-        include_web_content,
-    );
+    )
+}
+
+struct WalkRequest<'a> {
+    pid: i32,
+    window_id: Option<u32>,
+    query: Option<&'a str>,
+    max_depth: usize,
+    include_web_content: bool,
+}
+
+fn walk_with_environment<S, E>(
+    source: &S,
+    environment: &E,
+    request: WalkRequest<'_>,
+    budget: WalkBudget,
+) -> super::evidence::Observed<TreeWalkResult>
+where
+    S: AxTreeSource,
+    E: WalkOrchestration<S>,
+{
+    let scope = super::evidence::EvidenceScope::start();
+    let result = walk_tree_with_web_content_inner(source, environment, request, budget);
     scope.finish(result)
 }
 
@@ -802,6 +827,39 @@ trait WalkElementBorrow<S: AxTreeSource> {
         raw: Self::Raw,
         f: impl FnOnce(&S, &S::Element) -> R,
     ) -> R;
+}
+
+type MenuObservation<E> = (E, Option<[f64; 4]>, Option<super::context_menus::MenuOwner>);
+
+/// Operations whose raw results are used by the shared walk orchestration.
+trait WalkOrchestration<S: AxTreeSource>:
+    AxWalkEnvironment + WalkElementBorrow<S, Raw = <Self as AxWalkEnvironment>::Element>
+{
+    fn release_application(&self, application: Self::Application);
+    fn menu_frames(&self, pid: i32) -> Option<Vec<[f64; 4]>>;
+    fn menu_in_window(
+        &self,
+        pid: i32,
+        frame: [f64; 4],
+        deadline: Instant,
+    ) -> Option<MenuObservation<Self::Element>>;
+}
+
+impl WalkOrchestration<super::tree_source::native::NativeSource> for NativeWalkEnvironment {
+    fn release_application(&self, application: Self::Application) {
+        unsafe { CFRelease(application as CFTypeRef) }
+    }
+    fn menu_frames(&self, pid: i32) -> Option<Vec<[f64; 4]>> {
+        super::context_menus::open_menu_window_frames(pid)
+    }
+    fn menu_in_window(
+        &self,
+        pid: i32,
+        frame: [f64; 4],
+        deadline: Instant,
+    ) -> Option<MenuObservation<Self::Element>> {
+        unsafe { super::context_menus::menu_in_window(pid, frame, deadline) }
+    }
 }
 
 impl WalkElementBorrow<super::tree_source::native::NativeSource> for NativeWalkEnvironment {
@@ -953,14 +1011,23 @@ fn create_application_with<E: AxWalkEnvironment>(
     }
 }
 
-fn walk_tree_with_web_content_inner(
-    pid: i32,
-    window_id: Option<u32>,
-    query: Option<&str>,
-    max_depth: usize,
+fn walk_tree_with_web_content_inner<S, E>(
+    source: &S,
+    environment: &E,
+    request: WalkRequest<'_>,
     mut budget: WalkBudget,
-    include_web_content: bool,
-) -> TreeWalkResult {
+) -> TreeWalkResult
+where
+    S: AxTreeSource,
+    E: WalkOrchestration<S>,
+{
+    let WalkRequest {
+        pid,
+        window_id,
+        query,
+        max_depth,
+        include_web_content,
+    } = request;
     let ledger = SkipLedger::start();
     let mut nodes: Vec<AXNode> = Vec::new();
     let mut lines: Vec<(usize, String)> = Vec::new(); // (depth, line)
@@ -970,10 +1037,8 @@ fn walk_tree_with_web_content_inner(
     let mut batching_disabled = false;
     let window_scope;
 
-    unsafe {
-        let Some(app_elem) =
-            create_application_with(&NativeWalkEnvironment, pid).into_walk_legacy()
-        else {
+    {
+        let Some(app_elem) = create_application_with(environment, pid).into_walk_legacy() else {
             return TreeWalkResult {
                 offscreen_rows: Vec::new(),
                 tree_markdown: String::new(),
@@ -987,13 +1052,8 @@ fn walk_tree_with_web_content_inner(
             };
         };
 
-        let (mut top_level, walk_these, resolved_scope) = resolve_top_level_with(
-            &NativeWalkEnvironment,
-            app_elem,
-            pid,
-            window_id,
-            &mut budget,
-        );
+        let (mut top_level, walk_these, resolved_scope) =
+            resolve_top_level_with(environment, app_elem, pid, window_id, &mut budget);
         window_scope = resolved_scope;
 
         let mut label_claims = Vec::new();
@@ -1002,25 +1062,21 @@ fn walk_tree_with_web_content_inner(
         // a large container needs it, bounds what is on screen for children
         // whose app does not list the visible ones.
         for child in walk_these {
-            NativeWalkEnvironment.with_walk_element(
-                &super::tree_source::native::NativeSource,
-                child,
-                |source, child| {
-                    walk_root(
-                        source,
-                        child,
-                        &mut nodes,
-                        &mut lines,
-                        &mut index_counter,
-                        &mut budget,
-                        &mut batching_disabled,
-                        max_depth,
-                        include_web_content,
-                        &mut deferred,
-                        &mut label_claims,
-                    );
-                },
-            );
+            environment.with_walk_element(source, child, |source, child| {
+                walk_root(
+                    source,
+                    child,
+                    &mut nodes,
+                    &mut lines,
+                    &mut index_counter,
+                    &mut budget,
+                    &mut batching_disabled,
+                    max_depth,
+                    include_web_content,
+                    &mut deferred,
+                    &mut label_claims,
+                );
+            });
         }
 
         // An open context menu of the walked window hangs off a view that
@@ -1031,11 +1087,10 @@ fn walk_tree_with_web_content_inner(
         // A WindowServer list that could not be read leaves open menus
         // unknown: partial.
         let menu_frames = match window_id {
-            Some(_) if !nodes.is_empty() => super::context_menus::open_menu_window_frames(pid)
-                .unwrap_or_else(|| {
-                    budget.stop_for_timeout();
-                    Vec::new()
-                }),
+            Some(_) if !nodes.is_empty() => environment.menu_frames(pid).unwrap_or_else(|| {
+                budget.stop_for_timeout();
+                Vec::new()
+            }),
             _ => Vec::new(),
         };
         let discovery = (!menu_frames.is_empty())
@@ -1062,7 +1117,7 @@ fn walk_tree_with_web_content_inner(
                 .take(super::context_menus::MAX_MENU_WINDOWS)
             {
                 let Some((menu, menu_frame, owner)) =
-                    super::context_menus::menu_in_window(pid, frame, deadline)
+                    environment.menu_in_window(pid, frame, deadline)
                 else {
                     // Nothing readable reached a menu in this menu window.
                     incomplete = true;
@@ -1085,31 +1140,27 @@ fn walk_tree_with_web_content_inner(
                     }
                 }
                 walked_menus.extend(menu_frame);
-                NativeWalkEnvironment.with_walk_element(
-                    &super::tree_source::native::NativeSource,
-                    menu,
-                    |source, menu| {
-                        walk_element(
-                            source,
-                            menu,
-                            menu,
-                            0,
-                            None,
-                            None,
-                            LabelPath::Inactive,
-                            false,
-                            &mut nodes,
-                            &mut lines,
-                            &mut index_counter,
-                            &mut budget,
-                            &mut batching_disabled,
-                            max_depth,
-                            include_web_content,
-                            &mut deferred,
-                            &mut label_claims,
-                        )
-                    },
-                );
+                environment.with_walk_element(source, menu, |source, menu| {
+                    walk_element(
+                        source,
+                        menu,
+                        menu,
+                        0,
+                        None,
+                        None,
+                        LabelPath::Inactive,
+                        false,
+                        &mut nodes,
+                        &mut lines,
+                        &mut index_counter,
+                        &mut budget,
+                        &mut batching_disabled,
+                        max_depth,
+                        include_web_content,
+                        &mut deferred,
+                        &mut label_claims,
+                    )
+                });
             }
             if incomplete {
                 budget.stop_for_timeout();
@@ -1117,7 +1168,7 @@ fn walk_tree_with_web_content_inner(
         }
 
         (lines, nodes, offscreen_rows) = finish_deferred(
-            &super::tree_source::native::NativeSource,
+            source,
             lines,
             nodes,
             deferred,
@@ -1131,9 +1182,9 @@ fn walk_tree_with_web_content_inner(
         );
 
         // Release all top-level elements (copy_children / copy_ax_windows both retain).
-        release_all(top_level);
+        release_environment(environment, top_level);
 
-        CFRelease(app_elem as CFTypeRef);
+        environment.release_application(app_elem);
     }
 
     let walk = budget.outcome();
@@ -1348,7 +1399,7 @@ fn resolve_top_level_with<E: AxWalkEnvironment>(
 /// `AXChildren` omits windows when the app isn't frontmost (AppKit
 /// limitation); `AXWindows` returns the window list regardless of activation
 /// state, so the union is the only way to see background windows. Every
-/// returned element is retained; release them with [`release_all`].
+/// returned element is retained; release them with [`release_environment`].
 fn top_level_with<E: AxWalkEnvironment>(
     environment: &E,
     app_elem: E::Application,
@@ -1703,13 +1754,6 @@ fn recovery_window_id_with<E: AxWalkEnvironment>(
         },
     );
     id
-}
-
-/// Release retained top-level elements.
-unsafe fn release_all(elements: Vec<AXUIElementRef>) {
-    for element in elements {
-        CFRelease(element as CFTypeRef);
-    }
 }
 
 fn known<T>(read: Read<T>) -> Option<T> {
