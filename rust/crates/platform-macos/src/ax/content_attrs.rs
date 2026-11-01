@@ -470,19 +470,7 @@ unsafe fn attribute_listed(element: AXUIElementRef, name: &str) -> Option<bool> 
     Some(names.iter().any(|listed| listed.to_string() == name))
 }
 
-/// A timeout returns no content, so the walker emits only the role already read.
-pub(crate) unsafe fn read_content_attrs(
-    element: AXUIElementRef,
-    role: &str,
-    budget: &mut WalkBudget,
-    batching_disabled: &mut bool,
-) -> Option<ContentAttrs> {
-    super::tree_source::native::with_borrowed(element, |source, element| {
-        read_content_attrs_with(source, element, role, budget, batching_disabled)
-    })
-}
-
-fn read_content_attrs_with<S: AxTreeSource>(
+pub(crate) fn read_content_attrs_with<S: AxTreeSource>(
     source: &S,
     element: &S::Element,
     role: &str,
