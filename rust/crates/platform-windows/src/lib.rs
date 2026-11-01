@@ -41,6 +41,9 @@ pub mod virtualdesk;
 mod actionability;
 
 #[cfg(any(target_os = "windows", test))]
+mod keyboard_dispatch;
+
+#[cfg(any(target_os = "windows", test))]
 mod keycodes;
 
 #[cfg(any(target_os = "windows", test))]
@@ -80,6 +83,9 @@ pub fn install_pointer_shape_backend() -> bool {
         false
     }
 }
+
+#[cfg(any(target_os = "windows", test))]
+mod page_dispatch;
 
 #[cfg(any(target_os = "windows", test))]
 mod process_selection;

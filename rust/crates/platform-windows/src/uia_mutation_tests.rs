@@ -586,3 +586,29 @@ fn point_failures_finalize_with_truthful_dispositions() {
         );
     }
 }
+
+#[test]
+fn accelerator_without_hresult_finalizes_uncertain() {
+    use cua_driver_core::mutation::{Reason, WriteOutcome};
+    for kind in [UncertainKind::Timeout, UncertainKind::Unclassified] {
+        let text = uncertain_text_without_hresult(kind);
+        assert!(!text.contains("HRESULT"));
+        let result = chain_error(
+            text,
+            serde_json::json!({"path":"uia", "verified":false}),
+            [WriteOutcome::StopUncertain(Reason::Unknown)],
+            false,
+        );
+        let wire = cua_driver_core::mcp_result::conforming_tool_result(
+            "hotkey",
+            serde_json::to_value(result).unwrap(),
+        );
+        assert_eq!(
+            serde_json::from_value::<cua_driver_contract::ErrorDisposition>(
+                wire["structuredContent"]["disposition"].clone()
+            )
+            .unwrap(),
+            cua_driver_contract::ErrorDisposition::SUSPECTED_NOOP
+        );
+    }
+}

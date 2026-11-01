@@ -468,43 +468,37 @@ pub fn post_key(hwnd: u64, key: &str, modifiers: &[&str]) -> Result<()> {
 
     let mod_vks: Vec<VIRTUAL_KEY> = modifiers.iter().filter_map(|m| modifier_vk(m)).collect();
 
-    unsafe {
-        // Press modifiers.
-        for mvk in &mod_vks {
-            let ms = MapVirtualKeyW(mvk.0 as u32, MAPVK_VK_TO_VSC);
-            PostMessageW(
-                target,
-                down_msg,
-                WPARAM(mvk.0 as usize),
-                repeat_lp(ms, false, false),
-            )?;
-        }
-        // Press key.
-        PostMessageW(
-            target,
+    let mut messages = Vec::new();
+    for mvk in &mod_vks {
+        let ms = unsafe { MapVirtualKeyW(mvk.0 as u32, MAPVK_VK_TO_VSC) };
+        messages.push((
             down_msg,
-            WPARAM(vk.0 as usize),
-            repeat_lp(scan, is_extended(vk), false),
-        )?;
-        sleep(Duration::from_millis(KEY_DELAY_MS));
-        // Release key.
-        PostMessageW(
-            target,
-            up_msg,
-            WPARAM(vk.0 as usize),
-            repeat_lp(scan, is_extended(vk), true),
-        )?;
-        // Release modifiers (reverse order).
-        for mvk in mod_vks.iter().rev() {
-            let ms = MapVirtualKeyW(mvk.0 as u32, MAPVK_VK_TO_VSC);
-            PostMessageW(
-                target,
-                up_msg,
-                WPARAM(mvk.0 as usize),
-                repeat_lp(ms, false, true),
-            )?;
-        }
+            WPARAM(mvk.0 as usize),
+            repeat_lp(ms, false, false),
+        ));
     }
+    messages.push((
+        down_msg,
+        WPARAM(vk.0 as usize),
+        repeat_lp(scan, is_extended(vk), false),
+    ));
+    messages.push((
+        up_msg,
+        WPARAM(vk.0 as usize),
+        repeat_lp(scan, is_extended(vk), true),
+    ));
+    for mvk in mod_vks.iter().rev() {
+        let ms = unsafe { MapVirtualKeyW(mvk.0 as u32, MAPVK_VK_TO_VSC) };
+        messages.push((up_msg, WPARAM(mvk.0 as usize), repeat_lp(ms, false, true)));
+    }
+    let mut index = 0;
+    crate::keyboard_dispatch::post_sequence(&messages, |(msg, wp, lp)| {
+        if index == mod_vks.len() + 1 {
+            sleep(Duration::from_millis(KEY_DELAY_MS));
+        }
+        index += 1;
+        unsafe { PostMessageW(target, *msg, *wp, *lp) }.map_err(anyhow::Error::from)
+    })?;
     Ok(())
 }
 
@@ -588,10 +582,12 @@ pub fn send_key_synthesized_after_focus(
             crate::input::delivery::send_input(inputs)
         });
         if outcome.sent != events.len() {
-            bail!(
-                "SendInput inserted only {} of {} events; possible causes: UIPI or a locked or secure input desktop. {}",
-                outcome.sent, events.len(), outcome.cleanup
-            );
+            return Err(crate::keyboard_dispatch::key_batch_failure(
+                outcome.sent,
+                events.len(),
+                &outcome.cleanup,
+            )
+            .into());
         }
         Ok(())
     })
@@ -644,31 +640,38 @@ pub fn send_text_synthesized_after_focus(
             for (k, unit) in units.iter().enumerate() {
                 let actual = GetForegroundWindow();
                 if !foreground_matches_target_or_owned_window(ft, actual.0 as usize as u64) {
-                    bail!(
-                        "foreground_lost: foreground moved to HWND {h:?} after {k} of {n} \
-                         text units were read; the remaining {remaining} were not sent. \
-                         Nothing was retried; inspect the target before sending the rest.",
-                        h = actual.0,
-                        remaining = n - k,
-                    );
+                    return Err(crate::keyboard_dispatch::text_unit_failure(
+                        k,
+                        n,
+                        crate::keyboard_dispatch::UnitFailure::ForegroundLost {
+                            hwnd: format!("{:?}", actual.0),
+                        },
+                    )
+                    .into());
                 }
                 let events = unit_events(unit);
                 let edges = unit_edges(unit, &events);
                 match att.send_and_await_read(&events, &edges, Duration::from_secs(2)) {
                     UnitRead::Read => {}
-                    UnitRead::Short { sent, cleanup } => bail!(
-                        "SendInput inserted only {sent} of 4 key events for text unit {} of {n} \
-                         ({k} earlier units were read). Possible causes: UIPI or a locked or secure input desktop. {cleanup}",
-                        k + 1,
-                    ),
-                    UnitRead::Stalled => bail!(
-                        "text_delivery_stalled: the target did not read text unit {} of {n} \
-                         within 2000 ms; {k} earlier units were read. Unit {} was inserted \
-                         and may still appear, possibly in the previously foreground window. \
-                         Nothing was retried; inspect the target before sending the rest.",
-                        k + 1,
-                        k + 1
-                    ),
+                    UnitRead::Short { sent, cleanup } => {
+                        return Err(crate::keyboard_dispatch::text_unit_failure(
+                            k,
+                            n,
+                            crate::keyboard_dispatch::UnitFailure::Short {
+                                sent,
+                                cleanup: cleanup.to_string(),
+                            },
+                        )
+                        .into())
+                    }
+                    UnitRead::Stalled => {
+                        return Err(crate::keyboard_dispatch::text_unit_failure(
+                            k,
+                            n,
+                            crate::keyboard_dispatch::UnitFailure::Stalled,
+                        )
+                        .into())
+                    }
                 }
             }
             return Ok(());
@@ -685,10 +688,13 @@ pub fn send_text_synthesized_after_focus(
             crate::input::delivery::send_input(inputs)
         });
         if outcome.sent != events.len() {
-            bail!(
-                "SendInput inserted only {} of {} key events. Possible causes: UIPI or a locked or secure input desktop. {}",
-                outcome.sent, events.len(), outcome.cleanup
+            let mut failure = crate::keyboard_dispatch::key_batch_failure(
+                outcome.sent,
+                events.len(),
+                &outcome.cleanup,
             );
+            failure.message = format!("SendInput inserted only {} of {} key events. Possible causes: UIPI or a locked or secure input desktop. {}", outcome.sent, events.len(), outcome.cleanup);
+            return Err(failure.into());
         }
         Ok(())
     })
@@ -1194,6 +1200,18 @@ mod release_guard_tests {
             }
         });
         assert_eq!(outcome.cleanup.inserted, 1);
+        let failure: anyhow::Error = crate::keyboard_dispatch::key_batch_failure(
+            outcome.sent,
+            inputs.len(),
+            &outcome.cleanup,
+        )
+        .into();
+        assert!(
+            failure
+                .downcast_ref::<crate::keyboard_dispatch::InputDispatchFailure>()
+                .unwrap()
+                .inserted_any
+        );
         let packet = unit_events(&TextUnit::Packet(0xd83d));
         let packet_edges = unit_edges(&TextUnit::Packet(0xd83d), &packet);
         assert_eq!(packet_edges[0].id, KeyId::Unicode(0xd83d));
@@ -1246,6 +1264,21 @@ mod release_guard_tests {
                 }
             });
             assert_eq!(calls, expected_calls);
+            if (first as usize) < events.len() {
+                let failure: anyhow::Error = crate::keyboard_dispatch::key_batch_failure(
+                    outcome.sent,
+                    events.len(),
+                    &outcome.cleanup,
+                )
+                .into();
+                assert_eq!(
+                    failure
+                        .downcast_ref::<crate::keyboard_dispatch::InputDispatchFailure>()
+                        .unwrap()
+                        .inserted_any,
+                    first > 0
+                );
+            }
             assert!(outcome.cleanup.to_string().contains(expected_fragment));
             if first == 2 && second == 1 {
                 assert!(outcome.cleanup.to_string().contains("Ctrl"));
