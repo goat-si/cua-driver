@@ -17,18 +17,33 @@ pub fn retain_boundary(
     ancestor: Option<&mut Option<NodeBoundary>>,
     read_reasons: &mut Vec<BoundaryReason>,
 ) {
+    let ancestor_supported = ancestor.is_some();
+    let marker_only = dropped.descendants_omitted == Some(false)
+        && !dropped.reasons.is_empty()
+        && dropped.reasons.iter().all(|reason| {
+            reason.kind == cua_driver_contract::IncompleteReasonKind::PolicyOmission
+                && reason.detail == cua_driver_contract::IncompleteReasonDetail::FoldedChildren
+        });
     let reasons = if let Some(slot) = ancestor {
         let target = slot.get_or_insert_with(|| NodeBoundary {
             reasons: Vec::new(),
             children_skipped: CountEvidence::Unknown,
             descendants_omitted: None,
         });
-        target.descendants_omitted = Some(true);
+        if !marker_only {
+            target.descendants_omitted = Some(true);
+        } else if target.reasons.is_empty() && target.descendants_omitted.is_none() {
+            target.descendants_omitted = Some(false);
+        }
         &mut target.reasons
     } else {
         read_reasons
     };
-    reasons.extend(dropped.reasons.iter().copied());
+    reasons.extend(dropped.reasons.iter().copied().filter(|reason| {
+        ancestor_supported
+            || !(reason.kind == cua_driver_contract::IncompleteReasonKind::PolicyOmission
+                && reason.detail == cua_driver_contract::IncompleteReasonDetail::FoldedChildren)
+    }));
     reasons.sort_unstable();
     reasons.dedup();
 }
@@ -75,5 +90,24 @@ mod tests {
         retain_boundary(&root, None, &mut reasons);
         retain_boundary(&root, None, &mut reasons);
         assert_eq!(reasons, root.reasons);
+    }
+    #[test]
+    fn folded_children_alone_never_becomes_a_read_level_omission() {
+        let folded = NodeBoundary {
+            reasons: vec![BoundaryReason {
+                kind: Kind::PolicyOmission,
+                detail: Detail::FoldedChildren,
+            }],
+            children_skipped: CountEvidence::Known(1),
+            descendants_omitted: Some(false),
+        };
+        let mut read = vec![];
+        retain_boundary(&folded, None, &mut read);
+        assert!(read.is_empty());
+        let mut ancestor = None;
+        retain_boundary(&folded, Some(&mut ancestor), &mut read);
+        let ancestor = ancestor.unwrap();
+        assert_eq!(ancestor.reasons, folded.reasons);
+        assert_eq!(ancestor.descendants_omitted, Some(false));
     }
 }

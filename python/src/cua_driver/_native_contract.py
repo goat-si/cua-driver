@@ -5596,6 +5596,10 @@ class IncompleteReasonDetail(enum.Enum):
 
     EXCLUDED_CONTENT_UNCLASSIFIED = 14
 
+    FOLDED_TEXT_TRUNCATED = 15
+
+    FOLDED_CHILDREN = 16
+
 
 
 class _UniffiFfiConverterTypeIncompleteReasonDetail(_UniffiConverterRustBuffer):
@@ -5632,6 +5636,10 @@ class _UniffiFfiConverterTypeIncompleteReasonDetail(_UniffiConverterRustBuffer):
             return IncompleteReasonDetail.NOT_ASSERTED
         if variant == 15:
             return IncompleteReasonDetail.EXCLUDED_CONTENT_UNCLASSIFIED
+        if variant == 16:
+            return IncompleteReasonDetail.FOLDED_TEXT_TRUNCATED
+        if variant == 17:
+            return IncompleteReasonDetail.FOLDED_CHILDREN
         raise InternalError("Raw enum value doesn't match any cases")
 
     @staticmethod
@@ -5665,6 +5673,10 @@ class _UniffiFfiConverterTypeIncompleteReasonDetail(_UniffiConverterRustBuffer):
         if value == IncompleteReasonDetail.NOT_ASSERTED:
             return
         if value == IncompleteReasonDetail.EXCLUDED_CONTENT_UNCLASSIFIED:
+            return
+        if value == IncompleteReasonDetail.FOLDED_TEXT_TRUNCATED:
+            return
+        if value == IncompleteReasonDetail.FOLDED_CHILDREN:
             return
         raise ValueError(value)
 
@@ -5700,6 +5712,10 @@ class _UniffiFfiConverterTypeIncompleteReasonDetail(_UniffiConverterRustBuffer):
             buf.write_i32(14)
         if value == IncompleteReasonDetail.EXCLUDED_CONTENT_UNCLASSIFIED:
             buf.write_i32(15)
+        if value == IncompleteReasonDetail.FOLDED_TEXT_TRUNCATED:
+            buf.write_i32(16)
+        if value == IncompleteReasonDetail.FOLDED_CHILDREN:
+            buf.write_i32(17)
 
 
 

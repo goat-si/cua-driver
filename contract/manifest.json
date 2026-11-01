@@ -2278,7 +2278,9 @@
                     "untrusted_provider",
                     "scope_mismatch",
                     "not_asserted",
-                    "excluded_content_unclassified"
+                    "excluded_content_unclassified",
+                    "folded_text_truncated",
+                    "folded_children"
                   ],
                   "type": "string"
                 },
@@ -2381,7 +2383,9 @@
                               "untrusted_provider",
                               "scope_mismatch",
                               "not_asserted",
-                              "excluded_content_unclassified"
+                              "excluded_content_unclassified",
+                              "folded_text_truncated",
+                              "folded_children"
                             ],
                             "type": "string"
                           },
@@ -2687,7 +2691,9 @@
                     "untrusted_provider",
                     "scope_mismatch",
                     "not_asserted",
-                    "excluded_content_unclassified"
+                    "excluded_content_unclassified",
+                    "folded_text_truncated",
+                    "folded_children"
                   ],
                   "type": "string"
                 },

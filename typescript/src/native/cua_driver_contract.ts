@@ -3859,7 +3859,9 @@ export enum IncompleteReasonDetail {
     UntrustedProvider,
     ScopeMismatch,
     NotAsserted,
-    ExcludedContentUnclassified
+    ExcludedContentUnclassified,
+    FoldedTextTruncated,
+    FoldedChildren
 }
 
 const FfiConverterTypeIncompleteReasonDetail = (() => {
@@ -3883,6 +3885,8 @@ const FfiConverterTypeIncompleteReasonDetail = (() => {
                 case 13: return IncompleteReasonDetail.ScopeMismatch;
                 case 14: return IncompleteReasonDetail.NotAsserted;
                 case 15: return IncompleteReasonDetail.ExcludedContentUnclassified;
+                case 16: return IncompleteReasonDetail.FoldedTextTruncated;
+                case 17: return IncompleteReasonDetail.FoldedChildren;
                 default: throw new UniffiInternalError.UnexpectedEnumCase();
             }
         }
@@ -3903,6 +3907,8 @@ const FfiConverterTypeIncompleteReasonDetail = (() => {
                 case IncompleteReasonDetail.ScopeMismatch: return ordinalConverter.write(13, into);
                 case IncompleteReasonDetail.NotAsserted: return ordinalConverter.write(14, into);
                 case IncompleteReasonDetail.ExcludedContentUnclassified: return ordinalConverter.write(15, into);
+                case IncompleteReasonDetail.FoldedTextTruncated: return ordinalConverter.write(16, into);
+                case IncompleteReasonDetail.FoldedChildren: return ordinalConverter.write(17, into);
             }
         }
         allocationSize(value: TypeName): number {
