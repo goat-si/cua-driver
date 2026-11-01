@@ -76,9 +76,16 @@ fn deliver_menu_with<E>(
     if cancelled() {
         return keyboard::ChordPost::NotPosted("key delivery cancelled".into());
     }
-    post(&down);
-    let interrupted = wait();
+    // A poster may panic after sending the down event, so arm cleanup first.
+    let delivery = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        post(&down);
+        wait()
+    }));
     post(&up);
+    let interrupted = match delivery {
+        Ok(interrupted) => interrupted,
+        Err(panic) => std::panic::resume_unwind(panic),
+    };
     if interrupted {
         keyboard::ChordPost::Uncertain("key delivery cancelled after posting".into())
     } else {
@@ -180,28 +187,30 @@ fn deliver_with_pacing(
     let mut flags = CGEventFlags::CGEventFlagNull;
     let mut base_attempted = false;
     let mut result: anyhow::Result<()> = Ok(());
-    for (code, flag) in keys {
-        if cancelled() {
-            break;
+    let delivery = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        for (code, flag) in keys {
+            if cancelled() {
+                break;
+            }
+            flags |= flag;
+            pressed.push((code, flag));
+            if let Err(error) = post(code, true, flags) {
+                result = Err(error);
+                break;
+            }
+            if pace_modifiers && wait(keyboard::key_gap()) {
+                break;
+            }
         }
-        flags |= flag;
-        pressed.push((code, flag));
-        if let Err(error) = post(code, true, flags) {
-            result = Err(error);
-            break;
+        if result.is_ok() && !cancelled() {
+            base_attempted = true;
+            if let Err(error) = post(base, true, flags) {
+                result = Err(error);
+            } else if wait(duration) {
+                result = Err(anyhow::anyhow!("key delivery cancelled"));
+            }
         }
-        if pace_modifiers && wait(keyboard::key_gap()) {
-            break;
-        }
-    }
-    if result.is_ok() && !cancelled() {
-        base_attempted = true;
-        if let Err(error) = post(base, true, flags) {
-            result = Err(error);
-        } else if wait(duration) {
-            result = Err(anyhow::anyhow!("key delivery cancelled"));
-        }
-    }
+    }));
     if base_attempted {
         if let Err(error) = post(base, false, flags) {
             let _ = post(base, false, flags);
@@ -225,10 +234,100 @@ fn deliver_with_pacing(
             wait(keyboard::key_gap());
         }
     }
+    if let Err(panic) = delivery {
+        std::panic::resume_unwind(panic);
+    }
     if result.is_ok() && cancelled() {
         return Err(anyhow::anyhow!("key delivery cancelled"));
     }
     result
+}
+
+#[cfg(test)]
+mod u29b_cleanup_tests {
+    use super::*;
+    use std::cell::RefCell;
+    use std::panic::{catch_unwind, AssertUnwindSafe};
+
+    #[test]
+    fn poster_panic_after_base_down_releases_before_unwind() {
+        let events = RefCell::new(Vec::new());
+        let outcome = catch_unwind(AssertUnwindSafe(|| {
+            deliver_with(
+                "a",
+                &["cmd", "shift"],
+                Duration::ZERO,
+                |code, down, _| {
+                    events.borrow_mut().push((code, down));
+                    if code == 0 && down {
+                        panic!("poster panic after down");
+                    }
+                    Ok(())
+                },
+                || false,
+                |_| false,
+            )
+        }));
+        assert!(outcome.is_err());
+        assert_eq!(
+            *events.borrow(),
+            vec![
+                (55, true),
+                (56, true),
+                (0, true),
+                (0, false),
+                (56, false),
+                (55, false)
+            ]
+        );
+    }
+
+    #[test]
+    fn menu_wait_panic_still_posts_up() {
+        let events = RefCell::new(Vec::new());
+        let outcome = catch_unwind(AssertUnwindSafe(|| {
+            deliver_menu_with(
+                Ok((1, 2)),
+                |event| events.borrow_mut().push(*event),
+                || false,
+                || panic!("wait panic"),
+            )
+        }));
+        assert!(outcome.is_err());
+        assert_eq!(*events.borrow(), vec![1, 2]);
+    }
+
+    #[test]
+    fn failed_key_up_remains_an_error_after_modifier_cleanup() {
+        let events = RefCell::new(Vec::new());
+        let result = deliver_with(
+            "a",
+            &["cmd", "shift"],
+            Duration::ZERO,
+            |code, down, _| {
+                events.borrow_mut().push((code, down));
+                if code == 0 && !down {
+                    anyhow::bail!("base up failed");
+                }
+                Ok(())
+            },
+            || false,
+            |_| false,
+        );
+        assert_eq!(result.unwrap_err().to_string(), "base up failed");
+        assert_eq!(
+            *events.borrow(),
+            vec![
+                (55, true),
+                (56, true),
+                (0, true),
+                (0, false),
+                (0, false),
+                (56, false),
+                (55, false)
+            ]
+        );
+    }
 }
 
 #[cfg(test)]
