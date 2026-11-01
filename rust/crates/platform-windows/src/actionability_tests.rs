@@ -276,7 +276,7 @@ async fn admission_and_route_changes() {
     let a = Admission {
         route: AdmittedRoute::UiaWrite,
         value: PatternAdmission::Present {
-            read_only: Some(false),
+            read_only: LiveRead::Value(false),
         },
         range: PatternAdmission::Absent,
     };
@@ -372,11 +372,11 @@ fn value_notsupported_only_calls_admitted_range() {
         let admission = Admission {
             route: AdmittedRoute::UiaWrite,
             value: PatternAdmission::Present {
-                read_only: Some(false),
+                read_only: LiveRead::Value(false),
             },
             range: if range_allowed {
                 PatternAdmission::Present {
-                    read_only: Some(false),
+                    read_only: LiveRead::Value(false),
                 }
             } else {
                 PatternAdmission::Absent
@@ -437,7 +437,7 @@ fn changed_patterns_never_call_an_unadmitted_rung() {
             Admission {
                 route: AdmittedRoute::UiaWrite,
                 value: PatternAdmission::Present {
-                    read_only: Some(false),
+                    read_only: LiveRead::Value(false),
                 },
                 range: PatternAdmission::Absent,
             },
@@ -450,7 +450,7 @@ fn changed_patterns_never_call_an_unadmitted_rung() {
                 route: AdmittedRoute::UiaWrite,
                 value: PatternAdmission::Absent,
                 range: PatternAdmission::Present {
-                    read_only: Some(false),
+                    read_only: LiveRead::Value(false),
                 },
             },
             true,
@@ -461,10 +461,10 @@ fn changed_patterns_never_call_an_unadmitted_rung() {
             Admission {
                 route: AdmittedRoute::UiaWrite,
                 value: PatternAdmission::Present {
-                    read_only: Some(false),
+                    read_only: LiveRead::Value(false),
                 },
                 range: PatternAdmission::Present {
-                    read_only: Some(false),
+                    read_only: LiveRead::Value(false),
                 },
             },
             true,

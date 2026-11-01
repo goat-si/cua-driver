@@ -9,7 +9,7 @@ use std::{
     time::Duration,
 };
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum LiveRead<T> {
     Value(T),
     NotSupported,
@@ -183,16 +183,16 @@ pub(crate) enum AdmittedRoute {
     UiaWrite,
     NativeCombo,
 }
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Admission {
     pub route: AdmittedRoute,
     pub value: PatternAdmission,
     pub range: PatternAdmission,
 }
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum PatternAdmission {
     Absent,
-    Present { read_only: Option<bool> },
+    Present { read_only: LiveRead<bool> },
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Rung {
@@ -203,15 +203,15 @@ pub(crate) fn may_write(rung: Rung, a: &Admission) -> bool {
     a.route == AdmittedRoute::UiaWrite
         && match rung {
             Rung::Value => matches!(
-                a.value,
+                &a.value,
                 PatternAdmission::Present {
-                    read_only: Some(false)
+                    read_only: LiveRead::Value(false)
                 }
             ),
             Rung::RangeValue => matches!(
-                a.range,
+                &a.range,
                 PatternAdmission::Present {
-                    read_only: Some(false)
+                    read_only: LiveRead::Value(false)
                 }
             ),
         }
@@ -231,12 +231,7 @@ impl Probe {
 fn admission(raw: &RawLiveFacts) -> Admission {
     let rung = |kind, read: &LiveRead<bool>| {
         if matches!(&raw.patterns, LiveRead::Value(patterns) if patterns.contains(&kind)) {
-            PatternAdmission::Present {
-                read_only: match read {
-                    LiveRead::Value(v) => Some(*v),
-                    _ => None,
-                },
-            }
+            PatternAdmission::Present { read_only: read.clone() }
         } else {
             PatternAdmission::Absent
         }
@@ -312,6 +307,7 @@ where
         let admission = admitted
             .lock()
             .expect("admission lock")
+            .take()
             .expect("passing probe records admission");
         Ok(write(admission).await)
     } else {

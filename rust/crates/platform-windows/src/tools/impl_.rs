@@ -6866,7 +6866,7 @@ impl Tool for SetValueTool {
                             UIA_ValuePatternId,
                         ) {
                             Ok(Some(vp)) => {
-                                if matches!(admission.value, crate::actionability::PatternAdmission::Absent) {
+                                if matches!(&admission.value, crate::actionability::PatternAdmission::Absent) {
                                     return Ok(SetValueRoute::AdmissionRefused {
                                         reason: "ValuePattern appeared since the actionability check",
                                     });
