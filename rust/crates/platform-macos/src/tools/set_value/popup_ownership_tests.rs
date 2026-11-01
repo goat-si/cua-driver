@@ -12,6 +12,7 @@ struct Fake {
     result: PressReturn,
     cancel_result: i32,
     press_result: i32,
+    panic_on_options: bool,
     effects: Vec<&'static str>,
     time: Duration,
 }
@@ -28,6 +29,7 @@ impl Fake {
             result: PressReturn::Success,
             cancel_result: 0,
             press_result: 0,
+            panic_on_options: false,
             effects: vec![],
             time: Duration::ZERO,
         }
@@ -46,6 +48,7 @@ impl PopupEnv for Fake {
         self.last_menu.clone()
     }
     fn options(&mut self, _: &u32) -> ListRead<u32> {
+        assert!(!self.panic_on_options, "injected option read failure");
         if let Some(list) = self.lists.pop_front() {
             self.last_list = list;
         }
@@ -439,6 +442,23 @@ fn item_press_failure_preserves_delivery_uncertainty_and_cleans_up() {
         }
     ));
     assert_eq!(f.effects, ["open", "press", "cancel", "join"]);
+}
+
+#[test]
+fn owned_menu_is_cleaned_up_if_option_read_panics() {
+    let mut f = Fake::new(
+        vec![
+            MenuState::ClosedOrEmpty,
+            MenuState::Open(1),
+            MenuState::Open(1),
+            MenuState::Open(1),
+        ],
+        list(&[]),
+    );
+    f.panic_on_options = true;
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| select(&mut f, "x")));
+    assert!(result.is_err());
+    assert_eq!(f.effects, ["open", "cancel", "join"]);
 }
 
 #[test]
