@@ -349,6 +349,16 @@ pub(super) fn click_probe<'a>(
     pid: i32,
     window_id: u32,
 ) -> std::pin::Pin<Box<dyn Future<Output = ActionabilityReport> + Send + 'a>> {
+    semantic_probe(lease.as_ref(), target, pid, window_id, semantic::SemanticIntent::Click)
+}
+
+pub(super) fn semantic_probe<'a>(
+    lease: Option<&'a crate::tools::BackgroundMutationLease>,
+    target: crate::ax::snapshot::RetainedElement,
+    pid: i32,
+    window_id: u32,
+    intent: semantic::SemanticIntent,
+) -> std::pin::Pin<Box<dyn Future<Output = ActionabilityReport> + Send + 'a>> {
     Box::pin(async move {
         let bound = if let Some(lease) = lease {
             semantic::bind_exact_after_lease(lease, target, window_id).await
@@ -356,7 +366,7 @@ pub(super) fn click_probe<'a>(
             semantic::bind_exact_after_admission(pid, target, window_id).await
         };
         match bound {
-            Evidence::Known(probe) => probe.sample(semantic::SemanticIntent::Click).await,
+            Evidence::Known(probe) => probe.sample(intent).await,
             Evidence::Unknown(reason) => semantic::unavailable(reason),
             Evidence::Absent => semantic::unavailable("target binding absent".into()),
         }

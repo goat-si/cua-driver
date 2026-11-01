@@ -90,7 +90,7 @@ pub(super) fn bind_exact_with<R: WindowReader>(
 
 /// Owned intent names cross worker boundaries without sending a raw AX pointer.
 #[derive(Clone)]
-pub(super) enum SemanticIntent {
+pub(crate) enum SemanticIntent {
     Click,
     Open,
     RightClick,

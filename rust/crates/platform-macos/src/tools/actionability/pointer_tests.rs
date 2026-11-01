@@ -172,3 +172,38 @@ async fn click_axpress_refusal_forwards_core_result_unchanged() {
     .unwrap();
     assert_same(&result, &success());
 }
+
+#[tokio::test]
+async fn right_click_owned_cancel_checks_recorded_menu() {
+    let clock = FakeClock::default();
+    for allowed in [false, true] {
+        let sent = AtomicUsize::new(0);
+        let sampled = AtomicUsize::new(0);
+        let sent_ref = &sent;
+        let result = super::super::right_click::dispatch_owned_cancel(
+            &clock,
+            Duration::ZERO,
+            41usize, // recorded menu; the original opener is a different object
+            |menu, _| {
+                assert_eq!(*menu, 41);
+                sampled.fetch_add(1, Ordering::SeqCst);
+                let mut f = facts();
+                f.advertised_actions = Evidence::Known(if allowed {
+                    vec!["AXCancel".into()]
+                } else {
+                    vec![]
+                });
+                let report = evaluate(Intent::PerformAction { name: "AXCancel" }, Policy::headless(), &f);
+                Box::pin(async move { report })
+            },
+            |menu| async move {
+                assert_eq!(menu, 41);
+                sent_ref.fetch_add(1, Ordering::SeqCst);
+                success()
+            },
+        ).await;
+        assert!(sampled.load(Ordering::SeqCst) > 0);
+        assert_eq!(sent.load(Ordering::SeqCst), usize::from(allowed));
+        assert_eq!(result.is_ok(), allowed);
+    }
+}
