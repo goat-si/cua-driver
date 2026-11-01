@@ -234,15 +234,16 @@ fn ax_double_click_result(message: &str, suffix: &str) -> ToolResult {
 /// never send a pixel double-click after it, which would land in whatever
 /// opened. Only an error that proves nothing was sent falls back to pixels,
 /// and only in the foreground.
-pub(super) fn double_click_element<P>(
+pub(super) fn double_click_element<P, T: Copy>(
+    target: T,
     idx: usize,
     has_ax_open: bool,
     foreground: bool,
-    open: impl FnOnce() -> crate::ax::bindings::AXError,
-    pixel: impl FnOnce() -> anyhow::Result<P>,
+    open: impl FnOnce(T) -> crate::ax::bindings::AXError,
+    pixel: impl FnOnce(T) -> anyhow::Result<P>,
 ) -> anyhow::Result<ElementDoubleClick<P>> {
     if has_ax_open {
-        let err = open();
+        let err = open(target);
         if err == kAXErrorSuccess {
             return Ok(ElementDoubleClick::Ax(format!(
                 "AXOpen performed on element [{idx}]."
@@ -265,7 +266,7 @@ pub(super) fn double_click_element<P>(
             "AXOpen returned {err} for element [{idx}], falling back to pixel double-click"
         );
     }
-    pixel().map(ElementDoubleClick::Pixel)
+    pixel(target).map(ElementDoubleClick::Pixel)
 }
 
 fn ax_double_click(
@@ -279,11 +280,12 @@ fn ax_double_click(
 ) -> anyhow::Result<ElementDoubleClick> {
     let element = element_ptr as AXUIElementRef;
     double_click_element(
+        element,
         idx,
         has_ax_open,
         foreground,
-        || unsafe { perform_action(element, "AXOpen") },
-        || pixel_double_click(pid, wid, element, idx, cursor_key, foreground),
+        |target| unsafe { perform_action(target, "AXOpen") },
+        |target| pixel_double_click(pid, wid, target, idx, cursor_key, foreground),
     )
 }
 
@@ -348,12 +350,16 @@ mod tests {
         };
         for err in [kAXErrorCannotComplete, kAXErrorAttributeUnsupported] {
             for foreground in [false, true] {
-                let outcome = double_click_element::<String>(
+                let outcome = double_click_element::<String, _>(
+                    73_u32,
                     3,
                     true,
                     foreground,
-                    || err,
-                    || panic!("pixel double-click after an AXOpen that may have opened"),
+                    |target| {
+                        assert_eq!(target, 73);
+                        err
+                    },
+                    |_| panic!("pixel double-click after an AXOpen that may have opened"),
                 )
                 .expect("reported, not failed");
                 assert!(
@@ -364,21 +370,30 @@ mod tests {
         }
         // An error that proves nothing was sent: background fails, foreground
         // falls back to one pixel double-click.
-        assert!(double_click_element::<String>(
+        assert!(double_click_element::<String, _>(
+            73_u32,
             3,
             true,
             false,
-            || kAXErrorIllegalArgument,
-            || { panic!("no pointer fallback in the background") }
+            |target| {
+                assert_eq!(target, 73);
+                kAXErrorIllegalArgument
+            },
+            |_| { panic!("no pointer fallback in the background") }
         )
         .is_err());
         let pixels = std::cell::Cell::new(0);
-        let outcome = double_click_element::<String>(
+        let outcome = double_click_element::<String, _>(
+            73_u32,
             3,
             true,
             true,
-            || kAXErrorIllegalArgument,
-            || {
+            |target| {
+                assert_eq!(target, 73);
+                kAXErrorIllegalArgument
+            },
+            |target| {
+                assert_eq!(target, 73);
                 pixels.set(pixels.get() + 1);
                 Ok(String::from("pixel"))
             },

@@ -578,7 +578,7 @@ impl RightClickTool {
 
 /// How an element right-click was delivered.
 #[derive(Debug, PartialEq, Eq)]
-enum ElementRightClick {
+pub(super) enum ElementRightClick {
     /// AXShowMenu was sent; the message says whether the app reported an error.
     Ax(String),
     /// A pixel right-click at the element's center.
@@ -1458,15 +1458,16 @@ fn right_click_result_with_ownership(
 /// An AXShowMenu error that does not prove nothing was sent may have opened
 /// the menu: report that, and never right-click on top of it. Only an error
 /// that proves nothing was sent falls back to the pixel right-click.
-fn right_click_element(
+pub(super) fn right_click_element<T: Copy>(
+    target: T,
     label: &str,
     advertises_show_menu: bool,
-    show_menu: impl FnOnce() -> crate::ax::bindings::AXError,
+    show_menu: impl FnOnce(T) -> crate::ax::bindings::AXError,
     ax_delivered: impl FnOnce(),
-    pixel: impl FnOnce() -> anyhow::Result<String>,
+    pixel: impl FnOnce(T) -> anyhow::Result<String>,
 ) -> anyhow::Result<ElementRightClick> {
     if advertises_show_menu {
-        let err = show_menu();
+        let err = show_menu(target);
         if err == kAXErrorSuccess {
             ax_delivered();
             return Ok(ElementRightClick::Ax(format!(
@@ -1482,7 +1483,7 @@ fn right_click_element(
         }
         tracing::debug!("AXShowMenu returned {err} for {label}; falling back to pixel right-click");
     }
-    pixel().map(ElementRightClick::Pixel)
+    pixel(target).map(ElementRightClick::Pixel)
 }
 
 fn ax_show_menu(
@@ -1510,18 +1511,19 @@ fn ax_show_menu(
     // just ones with a native context-menu AX action.
     let ax_dispatch = dispatch.clone();
     right_click_element(
+        element,
         &format!("[{idx}] {role} \"{title}\""),
         advertised.iter().any(|a| a == "AXShowMenu"),
-        || {
+        |target| {
             let _ = ax_dispatch.send(ActionEvent::Dispatching(Instant::now()));
-            unsafe { perform_action(element, "AXShowMenu") }
+            unsafe { perform_action(target, "AXShowMenu") }
         },
         || {
             let _ = ax_dispatch.send(ActionEvent::Sent(Instant::now()));
         },
-        || {
+        |target| {
             let _ = dispatch.send(ActionEvent::Dispatching(Instant::now()));
-            pixel_right_click(element, idx, &role, &title, pid, wid)
+            pixel_right_click(target, idx, &role, &title, pid, wid)
         },
     )
 }
@@ -1563,11 +1565,15 @@ mod tests {
         };
         for err in [kAXErrorCannotComplete, kAXErrorActionUnsupported] {
             let outcome = right_click_element(
+                73_u32,
                 "[4] AXRow \"a\"",
                 true,
-                || err,
+                |target| {
+                    assert_eq!(target, 73);
+                    err
+                },
                 || {},
-                || panic!("pixel right-click on top of a menu that may be open"),
+                |_| panic!("pixel right-click on top of a menu that may be open"),
             )
             .expect("reported, not failed");
             assert!(
@@ -1580,11 +1586,16 @@ mod tests {
             let pixels = std::cell::Cell::new(0);
             let ax_delivered = std::cell::Cell::new(0);
             let outcome = right_click_element(
+                73_u32,
                 "[4]",
                 advertised,
-                || err,
+                |target| {
+                    assert_eq!(target, 73);
+                    err
+                },
                 || ax_delivered.set(ax_delivered.get() + 1),
-                || {
+                |target| {
+                    assert_eq!(target, 73);
                     pixels.set(pixels.get() + 1);
                     Ok("pixel".into())
                 },
@@ -2026,13 +2037,18 @@ mod tests {
         let (sent_tx, sent_rx) = std::sync::mpsc::channel();
         let ax_tx = sent_tx.clone();
         let outcome = right_click_element(
+            73_u32,
             "[4]",
             true,
-            || kAXErrorIllegalArgument,
+            |target| {
+                assert_eq!(target, 73);
+                kAXErrorIllegalArgument
+            },
             move || {
                 let _ = ax_tx.send("ax");
             },
-            move || {
+            move |target| {
+                assert_eq!(target, 73);
                 let _ = sent_tx.send("pixel");
                 Ok("pixel".into())
             },

@@ -1220,7 +1220,7 @@ impl Tool for ClickTool {
             .and_then(Value::as_f64)
             .zip(args.get("y").and_then(Value::as_f64));
         let result =
-            super::window_points::annotate(self.invoke_in(args, space, false).await, space, point);
+            super::window_points::annotate(self.invoke_in(args, space, None).await, space, point);
         with_screenshot_point(result, space, point)
     }
 }
@@ -1256,9 +1256,11 @@ impl ClickTool {
         &self,
         args: Value,
         space: super::window_points::PointSpace,
-        simulated: bool,
+        simulated_target: Option<&crate::ax::snapshot::RetainedElement>,
     ) -> ToolResult {
         use cua_driver_core::tool_args::ArgsExt;
+
+        let simulated = simulated_target.is_some();
 
         if let Err(refusal) = super::element_simulate::validate(&args) {
             return refusal;
@@ -1513,13 +1515,20 @@ impl ClickTool {
                     "click: the element frame could not be read; nothing was sent.",
                 )),
             };
-            return super::element_simulate::dispatch(prepared, |pixel_args| async move {
-                let pixel_space = match super::window_points::point_space(&pixel_args) {
-                    Ok(value) => value,
-                    Err(refusal) => return refusal,
-                };
-                Box::pin(self.invoke_in(pixel_args, pixel_space, true)).await
-            })
+            return super::element_simulate::dispatch(
+                prepared,
+                element.clone(),
+                |pixel_args, retained| async move {
+                    let pixel_space = match super::window_points::point_space(&pixel_args) {
+                        Ok(value) => value,
+                        Err(refusal) => return refusal,
+                    };
+                    let result =
+                        Box::pin(self.invoke_in(pixel_args, pixel_space, Some(&retained))).await;
+                    drop(retained);
+                    result
+                },
+            )
             .await;
         }
 
