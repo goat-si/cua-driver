@@ -523,6 +523,40 @@ fn raw_primitive_renames_and_reexports_are_inventory_sites() {
 }
 
 #[test]
+fn shadowed_roots_and_production_includes_fail_closed() {
+    let shadow = scan(
+        "shadow.rs",
+        r#"
+        use crate::input::worker_context::wrap_blocking as wrap;
+        mod std { pub mod thread { pub type Builder = ::std::thread::Builder; } }
+        fn f() { std::thread::Builder::new().spawn(wrap(work)); }
+    "#,
+    )
+    .unwrap();
+    let fixture = tempfile::tempdir().unwrap();
+    let root = fixture.path();
+    let source = "#[cfg(test)] #[path = \"shared.rs\"] mod shared; include!(\"shared.rs\");";
+    fs::write(root.join("lib.rs"), source).unwrap();
+    fs::write(
+        root.join("shared.rs"),
+        "fn native() { std::thread::spawn(work); }",
+    )
+    .unwrap();
+    let tests = test_only_files(root, &rust_sources(root).unwrap()).unwrap();
+    let includes = scan("lib.rs", source).unwrap();
+    assert!(
+        shadow
+            .iter()
+            .any(|site| site.primitive == "forbidden-path-root:std")
+            && includes
+                .iter()
+                .any(|site| site.primitive == "forbidden-include")
+            && !tests.contains(&PathBuf::from("shared.rs")),
+        "guard holes: shadow={shadow:#?}; include={includes:#?}; test_only={tests:#?}"
+    );
+}
+
+#[test]
 fn trait_method_parameter_shadow_rejects_wrapped_builder() {
     let sites = scan(
         "trait_shadow.rs",
