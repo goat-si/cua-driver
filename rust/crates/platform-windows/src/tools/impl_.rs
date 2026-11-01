@@ -5042,10 +5042,7 @@ fn focus_cached_element_for_foreground(
     // which would make the enclosing verify-before-SendInput transaction
     // fail closed. The foreground route has already activated the exact HWND,
     // so focus the cached element directly and verify it below.
-    if let Some(element) = admitted.as_ref().filter(|element| element.is_uia()) {
-        let hr = element
-            .focus_hresult()
-            .expect("UIA element has a focus route");
+    if let Some(hr) = admitted.as_ref().and_then(|element| element.focus_hresult()) {
         let confirmed = crate::uia_mutation::after_sent_call(hr, || {
             wait_for_cached_element_keyboard_focus(admitted, std::time::Duration::from_millis(350))
         });

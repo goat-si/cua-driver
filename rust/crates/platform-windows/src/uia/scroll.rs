@@ -118,7 +118,8 @@ pub(crate) unsafe fn scroll_into_view_and_recenter(
 
     let mut writes_sent = false;
     match scroll_item_into_view(host_hwnd, &elem) {
-        Err(()) => return RevealOutcome::Uncertain,
+        Err(RevealFailure::Sent) => return RevealOutcome::Uncertain,
+        Err(RevealFailure::PreSend) => return RevealOutcome::NotRevealed { writes_sent: false },
         Ok((point, sent)) => {
             writes_sent |= sent;
             if let Some(point) = point.and_then(actionable) {
@@ -207,17 +208,18 @@ pub(crate) unsafe fn scroll_element(
     Ok(outcome)
 }
 
+enum RevealFailure { PreSend, Sent }
+
 /// Strategy 1: `ScrollItemPattern::ScrollIntoView` on the element itself.
 unsafe fn scroll_item_into_view(
     host_hwnd: u64,
     elem: &IUIAutomationElement,
-) -> Result<(Option<(i32, i32)>, bool), ()> {
-    let Some(scroll_item) = elem
-        .GetCurrentPattern(UIA_ScrollItemPatternId)
-        .ok()
-        .and_then(|pattern| pattern.cast::<IUIAutomationScrollItemPattern>().ok())
-    else {
-        return Ok((None, false));
+) -> Result<(Option<(i32, i32)>, bool), RevealFailure> {
+    let scroll_item = match elem.GetCurrentPattern(UIA_ScrollItemPatternId)
+        .and_then(|pattern| pattern.cast::<IUIAutomationScrollItemPattern>()) {
+        Ok(pattern) => pattern,
+        Err(error) if crate::uia_mutation::pattern_absent(error.code().0) => return Ok((None, false)),
+        Err(_) => return Err(RevealFailure::PreSend),
     };
     let hr = crate::uia::fg_bypass::run_with_uwp_bypass(host_hwnd as isize, || {
         super::sent_call::scroll_into_view(&scroll_item)
@@ -227,7 +229,7 @@ unsafe fn scroll_item_into_view(
             .ok()
             .map(|rect| ((rect.left + rect.right) / 2, (rect.top + rect.bottom) / 2))
     })
-    .map_err(|_| ())?;
+    .map_err(|_| RevealFailure::Sent)?;
     Ok((point, true))
 }
 
@@ -253,16 +255,14 @@ unsafe fn scroll_ancestors_into_view(
         let mut containers: Vec<(IUIAutomationElement, IUIAutomationScrollPattern)> = Vec::new();
         let mut cur = walker.GetParentElement(elem).ok()?;
         for _ in 0..16 {
-            if let Ok(p) = cur.GetCurrentPattern(UIA_ScrollPatternId) {
-                if let Ok(sp) = p.cast::<IUIAutomationScrollPattern>() {
-                    let scrollable = sp
-                        .CurrentVerticallyScrollable()
-                        .map(|b| b.as_bool())
-                        .unwrap_or(false);
-                    if scrollable {
-                        containers.push((cur.clone(), sp));
-                    }
+            match cur.GetCurrentPattern(UIA_ScrollPatternId)
+                .and_then(|p| p.cast::<IUIAutomationScrollPattern>()) {
+                Ok(sp) => {
+                    let scrollable = sp.CurrentVerticallyScrollable().ok()?.as_bool();
+                    if scrollable { containers.push((cur.clone(), sp)); }
                 }
+                Err(error) if crate::uia_mutation::pattern_absent(error.code().0) => {}
+                Err(_) => return None,
             }
             match walker.GetParentElement(&cur) {
                 Ok(parent) => cur = parent,
@@ -295,7 +295,7 @@ unsafe fn scroll_ancestors_into_view(
                         super::sent_call::scroll(&sp, ScrollAmount_NoAmount, amount)
                     });
                 writes_sent = true;
-                if scrolled != 0 {
+                if crate::uia_mutation::after_sent_call(scrolled, || ()).is_err() {
                     uncertain = true;
                     return None;
                 }

@@ -43,7 +43,7 @@ impl RetainedElement {
     }
 
     pub fn focus_hresult(&self) -> Option<i32> {
-        if !self.is_uia() {
+        if !self.is_uia() || self.ptr == 0 {
             return None;
         }
         let element = std::mem::ManuallyDrop::new(unsafe {
