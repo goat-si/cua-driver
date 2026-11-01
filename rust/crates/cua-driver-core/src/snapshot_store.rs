@@ -1,4 +1,5 @@
 mod basis;
+mod scoped;
 use crate::browser::types::ProcessFingerprint;
 use crate::element_token::{
     format_snapshot_id, parse_token, refusal, token_for, ResolvedElement, LRU_CAP_PER_PID,
@@ -6,6 +7,7 @@ use crate::element_token::{
 };
 use crate::protocol::ToolResult;
 pub use basis::CaptureTicket;
+pub use scoped::{ScopedCapture, ScopedWalk, ValidatedScopedCapture, SCOPED_CAP_PER_PARENT};
 use std::any::Any;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock, Weak};
@@ -41,12 +43,22 @@ pub trait SnapshotPayload: Send + Sync + 'static {
         self.len() == 0
     }
     fn retain(&self, index: usize) -> Option<Self::Element>;
+    /// Structural child indices from this payload's root to `index`.
+    /// Existing payloads fail closed for rooted reads until their platform
+    /// supplies paths suitable for fresh native traversal.
+    fn structural_path(&self, _index: usize) -> Option<Vec<usize>> {
+        None
+    }
 }
 
 struct Snapshot<S> {
     id: u32,
+    semantic_epoch: u64,
     window_id: u64,
     publisher: Option<String>,
+    /// A publisher session that ended may not authorize new rooted reads,
+    /// even if another session's screenshot keeps this full snapshot alive.
+    root_session_retired: bool,
     // None is the explicitly unprotected rollout mode of the legacy publishers.
     instance: Option<InstanceCapture>,
     screenshot_owner: Option<String>,
@@ -299,6 +311,8 @@ struct TicketState {
 }
 struct StoreState<S> {
     snapshots: HashMap<i32, Vec<Snapshot<S>>>,
+    scoped: HashMap<(i32, u32), Vec<scoped::ScopedEntry<S>>>,
+    last_semantic_epoch: u64,
     tickets: HashMap<(i32, u64), TicketState>,
     /// Store-wide ticket counter. It never restarts, even when `tickets`
     /// entries are dropped, so an old ticket can never match a newer entry.
@@ -459,6 +473,8 @@ impl<S: SnapshotPayload> SnapshotStore<S> {
             runtime_scope: current_runtime_scope(),
             inner: Arc::new(Mutex::new(StoreState {
                 snapshots: HashMap::new(),
+                scoped: HashMap::new(),
+                last_semantic_epoch: 0,
                 tickets: HashMap::new(),
                 last_ticket: 0,
             })),
@@ -636,7 +652,7 @@ impl<S: SnapshotPayload> SnapshotStore<S> {
             }
             capture => capture,
         });
-        let (id, retired, stored) = {
+        let (id, retired, scoped_retired, stored) = {
             let mut inner = self.lock_for_tickets();
             if session.is_some_and(crate::session::is_session_ended) {
                 // No publication can use this capture's ticket any more.
@@ -645,6 +661,7 @@ impl<S: SnapshotPayload> SnapshotStore<S> {
                 }
                 return None;
             }
+            let epoch = inner.last_semantic_epoch.checked_add(1)?;
             let (basis, ticket_floor) = if let Some((ticket, basis)) = basis_ticket {
                 if basis
                     .as_ref()
@@ -664,6 +681,7 @@ impl<S: SnapshotPayload> SnapshotStore<S> {
                 inner.supersede_captures(pid, window_id);
                 (None, inner.last_ticket)
             };
+            inner.last_semantic_epoch = epoch;
             let lane = inner.entry(pid).or_default();
             let mut retired = Vec::new();
             if let Some(position) = lane.iter().position(|entry| entry.window_id == window_id) {
@@ -694,8 +712,10 @@ impl<S: SnapshotPayload> SnapshotStore<S> {
             });
             lane.push(Snapshot {
                 id,
+                semantic_epoch: epoch,
                 window_id,
                 publisher: session.map(str::to_owned),
+                root_session_retired: false,
                 instance,
                 screenshot_owner: session.map(str::to_owned),
                 screenshot_scale: scale,
@@ -713,10 +733,15 @@ impl<S: SnapshotPayload> SnapshotStore<S> {
                     inner.tickets.remove(&(pid, snapshot.window_id));
                 }
             }
-            (id, retired, stored)
+            let scoped_retired: Vec<_> = retired
+                .iter()
+                .flat_map(|snapshot| inner.scoped.remove(&(pid, snapshot.id)).unwrap_or_default())
+                .collect();
+            (id, retired, scoped_retired, stored)
         };
         let invalidated = retired.iter().map(|snapshot| snapshot.id).collect();
         drop(retired);
+        drop(scoped_retired);
         Some((id, invalidated, stored))
     }
 
@@ -864,11 +889,18 @@ impl<S: SnapshotPayload> SnapshotStore<S> {
     }
 
     pub fn retire_session_screenshots(&self, session: &str) -> usize {
-        let retired = {
+        let (retired, scoped_retired) = {
             let mut inner = self.inner.lock().unwrap();
             let mut retired = Vec::new();
             let mut retired_keys = Vec::new();
+            let mut retired_parents = Vec::new();
             for (&pid, lane) in inner.snapshots.iter_mut() {
+                for snapshot in lane
+                    .iter_mut()
+                    .filter(|snapshot| snapshot.publisher.as_deref() == Some(session))
+                {
+                    snapshot.root_session_retired = true;
+                }
                 let (owned, kept) = std::mem::take(lane)
                     .into_iter()
                     .partition(|snapshot| snapshot.screenshot_owner.as_deref() == Some(session));
@@ -878,27 +910,53 @@ impl<S: SnapshotPayload> SnapshotStore<S> {
                         .iter()
                         .map(|snapshot: &Snapshot<S>| (pid, snapshot.window_id)),
                 );
+                retired_parents.extend(
+                    owned
+                        .iter()
+                        .map(|snapshot: &Snapshot<S>| (pid, snapshot.id)),
+                );
                 retired.extend::<Vec<_>>(owned);
             }
             for key in retired_keys {
                 inner.tickets.remove(&key);
             }
             inner.retain(|_, lane| !lane.is_empty());
-            retired
+            let mut scoped_retired = Vec::new();
+            for (key, entries) in std::mem::take(&mut inner.scoped) {
+                if retired_parents.contains(&key)
+                    || entries
+                        .first()
+                        .is_some_and(|entry| entry.snapshot.publisher.as_deref() == Some(session))
+                {
+                    scoped_retired.extend(entries);
+                } else {
+                    inner.scoped.insert(key, entries);
+                }
+            }
+            (retired, scoped_retired)
         };
         let count = retired.len();
         drop(retired);
+        drop(scoped_retired);
         count
     }
 
     pub fn window_for_snapshot(&self, pid: i32, snapshot_id: u32) -> Option<u64> {
-        self.inner
-            .lock()
-            .unwrap()
-            .get(&pid)?
-            .iter()
-            .find(|entry| entry.id == snapshot_id)
+        let inner = self.inner.lock().unwrap();
+        inner
+            .snapshots
+            .get(&pid)
+            .and_then(|lane| lane.iter().find(|entry| entry.id == snapshot_id))
             .map(|entry| entry.window_id)
+            .or_else(|| {
+                inner
+                    .scoped
+                    .iter()
+                    .filter(|((owner, _), _)| *owner == pid)
+                    .flat_map(|(_, entries)| entries.iter())
+                    .find(|entry| entry.snapshot.id == snapshot_id)
+                    .map(|entry| entry.snapshot.window_id)
+            })
     }
 
     /// Visit the latest published snapshot for a window, if one exists.
@@ -944,9 +1002,9 @@ impl<S: SnapshotPayload> SnapshotStore<S> {
         let token = args.get("element_token")?.as_str()?;
         let (snapshot_id, _) = parse_token(token)?;
         let session = args.get("_session_id").and_then(serde_json::Value::as_str);
-        self.inner
-            .lock()
-            .unwrap()
+        let inner = self.inner.lock().unwrap();
+        inner
+            .snapshots
             .iter()
             .find(|(_, lane)| {
                 lane.iter().any(|snapshot| {
@@ -954,6 +1012,18 @@ impl<S: SnapshotPayload> SnapshotStore<S> {
                 })
             })
             .map(|(pid, _)| *pid)
+            .or_else(|| {
+                inner
+                    .scoped
+                    .iter()
+                    .find(|(_, entries)| {
+                        entries.iter().any(|entry| {
+                            entry.snapshot.id == snapshot_id
+                                && entry.snapshot.publisher.as_deref() == session
+                        })
+                    })
+                    .map(|((pid, _), _)| *pid)
+            })
     }
 
     pub fn resolve(
@@ -984,7 +1054,19 @@ impl<S: SnapshotPayload> SnapshotStore<S> {
         let lane = inner.get(&pid).map(Vec::as_slice).unwrap_or_default();
         let (snapshot, element_index) = match parse_token(token) {
             Some((snapshot_id, element_index)) => {
-                let Some(snapshot) = lane.iter().find(|snapshot| snapshot.id == snapshot_id) else {
+                let Some(snapshot) = lane
+                    .iter()
+                    .find(|snapshot| snapshot.id == snapshot_id)
+                    .or_else(|| {
+                        inner
+                            .scoped
+                            .iter()
+                            .filter(|((owner, _), _)| *owner == pid)
+                            .flat_map(|(_, entries)| entries.iter())
+                            .find(|entry| entry.snapshot.id == snapshot_id)
+                            .map(|entry| &entry.snapshot)
+                    })
+                else {
                     return Err(stale_token_refusal(pid, lane));
                 };
                 (snapshot, element_index)
@@ -1042,14 +1124,19 @@ impl<S: SnapshotPayload> SnapshotStore<S> {
     }
 
     pub fn remove(&self, pid: i32, window_id: u64) -> Option<u32> {
-        let retired = {
+        let (retired, scoped_retired) = {
             let mut inner = self.inner.lock().unwrap();
             inner.supersede_captures(pid, window_id);
-            inner.get_mut(&pid).and_then(|lane| {
+            let retired = inner.get_mut(&pid).and_then(|lane| {
                 let position = lane.iter().position(|entry| entry.window_id == window_id)?;
                 Some(lane.remove(position))
-            })
+            });
+            let scoped_retired = retired
+                .as_ref()
+                .and_then(|s| inner.scoped.remove(&(pid, s.id)));
+            (retired, scoped_retired)
         };
+        drop(scoped_retired);
         retired.map(|snapshot| snapshot.id)
     }
 
@@ -1065,29 +1152,38 @@ impl<S: SnapshotPayload> SnapshotStore<S> {
             return None;
         }
         let ticket = ticket.ticket();
-        let retired = {
+        let (retired, scoped_retired) = {
             let mut inner = self.lock_for_tickets();
             if !inner.ticket_current(pid, window_id, ticket) {
                 return None;
             }
             let state = inner.tickets.get_mut(&(pid, window_id)).unwrap();
             state.applied = state.applied.max(ticket - 1);
-            inner.get_mut(&pid).and_then(|lane| {
+            let retired = inner.get_mut(&pid).and_then(|lane| {
                 let position = lane.iter().position(|entry| entry.window_id == window_id)?;
                 Some(lane.remove(position))
-            })
+            });
+            let scoped_retired = retired
+                .as_ref()
+                .and_then(|s| inner.scoped.remove(&(pid, s.id)));
+            (retired, scoped_retired)
         };
+        drop(scoped_retired);
         retired.map(|snapshot| snapshot.id)
     }
 
     pub fn clear(&self) -> usize {
-        let retired = {
+        let (retired, scoped_retired) = {
             let mut inner = self.inner.lock().unwrap();
             inner.tickets.clear();
-            std::mem::take(&mut inner.snapshots)
+            (
+                std::mem::take(&mut inner.snapshots),
+                std::mem::take(&mut inner.scoped),
+            )
         };
         let count = retired.len();
         drop(retired);
+        drop(scoped_retired);
         count
     }
 }
