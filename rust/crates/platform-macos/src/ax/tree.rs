@@ -317,7 +317,7 @@ pub(crate) enum LabelPath {
     Blocked,
 }
 
-fn next_label_path(
+pub(super) fn next_label_path(
     parent: LabelPath,
     parent_role: Option<&str>,
     child_role: Option<&str>,
@@ -351,11 +351,16 @@ fn row_label_candidate<'a>(
         .find(|text| !text.is_empty())
 }
 
-fn initial_owned_row_label(selectable_row: bool) -> Option<Option<String>> {
+pub(super) fn initial_owned_row_label(selectable_row: bool) -> Option<Option<String>> {
     selectable_row.then_some(None)
 }
 
-fn child_label_path(path: LabelPath, selectable_row: bool, indexed: bool, ptr: usize) -> LabelPath {
+pub(super) fn child_label_path(
+    path: LabelPath,
+    selectable_row: bool,
+    indexed: bool,
+    ptr: usize,
+) -> LabelPath {
     if selectable_row && indexed {
         LabelPath::Open(ptr)
     } else {
@@ -363,7 +368,7 @@ fn child_label_path(path: LabelPath, selectable_row: bool, indexed: bool, ptr: u
     }
 }
 
-fn collect_label_claim(
+pub(super) fn collect_label_claim(
     claims: &mut Vec<(usize, String)>,
     path: LabelPath,
     role: &str,
@@ -401,7 +406,7 @@ fn selected_probe_before_deadline(
     }
 }
 
-fn apply_owned_label_claims(nodes: &mut [AXNode], claims: Vec<(usize, String)>) {
+pub(super) fn apply_owned_label_claims(nodes: &mut [AXNode], claims: Vec<(usize, String)>) {
     for (owner, label) in claims {
         if let Some(node) = nodes
             .iter_mut()
