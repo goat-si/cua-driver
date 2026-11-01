@@ -1,5 +1,6 @@
 use cua_driver_core::actionability::{
-    auto_wait, evaluate, Affordance, Clock, ElementFacts, Evidence, Intent, Policy, Rect, Verdict,
+    auto_wait, evaluate, ActionabilityReport, Affordance, Clock, ElementFacts, Evidence, Intent,
+    Policy, Rect, Verdict,
 };
 use cua_driver_core::protocol::ToolResult;
 use std::{
@@ -224,21 +225,44 @@ where
         async move {
             let (facts, admission) = match probe.await {
                 Probe::NativeCombo => {
-                    let a = Admission { route: AdmittedRoute::NativeCombo, value_admitted: false, range_admitted: false };
-                    let raw = RawLiveFacts { is_offscreen: LiveRead::Value(false), is_enabled: LiveRead::Value(true), bounds: LiveRead::Value(Rect { x: 0., y: 0., width: 1., height: 1. }), window_visible: LiveRead::Value(true), window_minimized: LiveRead::Value(false), window_cloaked: LiveRead::Value(false), control_type: LiveRead::Value("Edit".into()), patterns: LiveRead::Value(vec![PatternKind::Value]), value_read_only: LiveRead::Value(false), range_read_only: LiveRead::NotSupported };
-                    (element_facts(&raw, ValueWrite::Value), a)
+                    // PR 1 does not gate native Win32 combo selection (PR 3 gates it
+                    // as Select). Pass without facts rather than inventing evidence.
+                    *admitted.lock().expect("admission lock") = Some(Admission {
+                        route: AdmittedRoute::NativeCombo,
+                        value_admitted: false,
+                        range_admitted: false,
+                    });
+                    return ActionabilityReport {
+                        verdict: Verdict::Pass,
+                        checks: Vec::new(),
+                        waited_ms: 0,
+                        samples: 1,
+                        last_facts: None,
+                        disposition: None,
+                    };
                 }
                 Probe::Uia(raw) => {
                     let a = admission(&raw);
-                    let first = if matches!(&raw.patterns, LiveRead::Value(v) if v.contains(&PatternKind::Value)) { ValueWrite::Value } else { ValueWrite::RangeValue };
+                    let value_present = matches!(
+                        &raw.patterns,
+                        LiveRead::Value(v) if v.contains(&PatternKind::Value)
+                    );
+                    let first = if value_present {
+                        ValueWrite::Value
+                    } else {
+                        ValueWrite::RangeValue
+                    };
                     (element_facts(&raw, first), a)
                 }
             };
             let report = evaluate(Intent::SetValue, &facts, Policy::headless());
-            if matches!(report.verdict, Verdict::Pass) { *admitted.lock().expect("admission lock") = Some(admission); }
+            if matches!(report.verdict, Verdict::Pass) {
+                *admitted.lock().expect("admission lock") = Some(admission);
+            }
             report
         }
-    }).await;
+    })
+    .await;
     if matches!(report.verdict, Verdict::Pass) {
         let admission = admitted
             .lock()
