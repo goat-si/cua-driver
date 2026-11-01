@@ -102,7 +102,10 @@ fn duplicate_titles_refuse_without_pressing() {
         vec![MenuState::Open(1)],
         list(&[(2, "Choice", "a"), (3, "Choice", "b")]),
     );
-    assert!(matches!(select(&mut f, "Choice"), PopupOutcome::Refused(_)));
+    assert!(matches!(
+        select(&mut f, "Choice"),
+        PopupOutcome::Refused { .. }
+    ));
     assert!(f.effects.is_empty());
 }
 
@@ -122,7 +125,7 @@ fn a_unique_title_still_selects() {
 #[test]
 fn unknown_initial_menu_refuses_without_mutation() {
     let mut f = Fake::new(vec![MenuState::Unknown], list(&[]));
-    assert!(matches!(select(&mut f, "x"), PopupOutcome::Refused(_)));
+    assert!(matches!(select(&mut f, "x"), PopupOutcome::Refused { .. }));
     assert!(f.effects.is_empty());
 }
 
@@ -147,8 +150,20 @@ fn a_preexisting_menu_is_not_closed_by_this_call() {
     let mut f = Fake::new(vec![MenuState::Open(1)], list(&[(2, "Other", "a")]));
     assert!(matches!(
         select(&mut f, "Missing"),
-        PopupOutcome::Refused(_)
+        PopupOutcome::Refused { .. }
     ));
+    assert!(f.effects.is_empty());
+}
+
+#[test]
+fn refusal_on_preexisting_menu_reports_its_ownership() {
+    let mut f = Fake::new(vec![MenuState::Open(1)], list(&[(2, "Other", "a")]));
+    let outcome = select(&mut f, "Missing");
+    let result = tool_result(&outcome, "", false);
+    assert!(result.structured_content.unwrap()["note"]
+        .as_str()
+        .unwrap_or("")
+        .contains("previously open"));
     assert!(f.effects.is_empty());
 }
 
@@ -345,7 +360,7 @@ fn delayed_duplicate_is_not_pressed() {
         list(&[(2, "x", "a"), (3, "x", "b")]),
     ]
     .into();
-    assert!(matches!(select(&mut f, "x"), PopupOutcome::Refused(_)));
+    assert!(matches!(select(&mut f, "x"), PopupOutcome::Refused { .. }));
     assert!(f.effects.is_empty());
 }
 
@@ -358,14 +373,14 @@ fn replacement_item_with_same_title_is_not_pressed() {
         list(&[(3, "x", "a")]),
     ]
     .into();
-    assert!(matches!(select(&mut f, "x"), PopupOutcome::Refused(_)));
+    assert!(matches!(select(&mut f, "x"), PopupOutcome::Refused { .. }));
     assert!(f.effects.is_empty());
 }
 
 #[test]
 fn incomplete_list_never_selects() {
     let mut f = Fake::new(vec![MenuState::Open(1)], ListRead::Incomplete);
-    assert!(matches!(select(&mut f, "x"), PopupOutcome::Refused(_)));
+    assert!(matches!(select(&mut f, "x"), PopupOutcome::Refused { .. }));
     assert!(f.effects.is_empty());
 }
 

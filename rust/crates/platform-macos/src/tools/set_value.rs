@@ -2085,13 +2085,14 @@ fn select_popup_option(
         let mut env = unsafe { popup_ownership::NativePopupEnv::new(element) };
         let outcome = popup_ownership::select(&mut env, value);
         let outcome = match outcome {
-            popup_ownership::PopupOutcome::Refused(reason) if prior_input => {
-                popup_ownership::PopupOutcome::SentUnverified {
-                    reason,
-                    preexisting: false,
-                    close: None,
-                }
-            }
+            popup_ownership::PopupOutcome::Refused {
+                reason,
+                preexisting,
+            } if prior_input => popup_ownership::PopupOutcome::SentUnverified {
+                reason,
+                preexisting,
+                close: None,
+            },
             other => other,
         };
         Err(popup_ownership::PopupError(outcome).into())

@@ -2,7 +2,14 @@ use super::popup_ownership::{tool_result, CloseStatus, PopupOutcome};
 
 #[test]
 fn refusal_has_no_dispatch() {
-    let result = tool_result(&PopupOutcome::Refused("ambiguous".into()), "", false);
+    let result = tool_result(
+        &PopupOutcome::Refused {
+            reason: "ambiguous".into(),
+            preexisting: false,
+        },
+        "",
+        false,
+    );
     assert_eq!(result.is_error, Some(true));
     let data = result.structured_content.unwrap();
     assert_eq!(data["dispatched"], false);
