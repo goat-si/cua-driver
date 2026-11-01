@@ -10200,19 +10200,17 @@ impl Tool for SetValueTool {
             &[key_dispatch],
             value.len(),
             move || -> anyhow::Result<Option<crate::input::FocusGuardReport>> {
-                use crate::atspi::native::gated_route;
                 let (win, lx, ly) = resolve_element_local_coords(pid, &target, xid_opt)?;
                 if is_combo {
-                    return gated_route(&key_gate, || {
-                        pick_from_popup(
-                            &cursor_id,
-                            pid,
-                            &target,
-                            (win, lx, ly),
-                            &value_for_keys,
-                            foreground_route,
-                        )
-                    });
+                    return pick_from_popup(
+                        &cursor_id,
+                        pid,
+                        &target,
+                        (win, lx, ly),
+                        &value_for_keys,
+                        foreground_route,
+                        &key_gate,
+                    );
                 }
                 if foreground_route {
                     let (sx, sy) = window_local_to_screen(win, lx, ly)?;
@@ -10220,33 +10218,54 @@ impl Tool for SetValueTool {
                         win,
                         crate::input::ForegroundOptions::pointer(),
                         || {
-                            gated_route(&key_gate, || {
-                                crate::input::send_click_xtest_desktop(
-                                    sx.round() as i32,
-                                    sy.round() as i32,
-                                    1,
-                                    1,
-                                )?;
-                                std::thread::sleep(std::time::Duration::from_millis(80));
-                                crate::input::send_key_xtest("a", &["ctrl"])?;
-                                crate::input::send_type_text_xtest(&value_for_keys)?;
-                                crate::input::send_key_xtest("Tab", &[])
-                            })
+                            gated_steps(
+                                &key_gate,
+                                vec![
+                                    Box::new(|| {
+                                        crate::input::send_click_xtest_desktop(
+                                            sx.round() as i32,
+                                            sy.round() as i32,
+                                            1,
+                                            1,
+                                        )?;
+                                        std::thread::sleep(std::time::Duration::from_millis(80));
+                                        Ok(())
+                                    }),
+                                    Box::new(|| crate::input::send_key_xtest("a", &["ctrl"])),
+                                    Box::new(|| {
+                                        crate::input::send_type_text_xtest(&value_for_keys)
+                                    }),
+                                    Box::new(|| crate::input::send_key_xtest("Tab", &[])),
+                                ],
+                            )
                         },
                     )?;
                     return Ok(None);
                 }
                 let (_, guard) = crate::input::focus_guard::guarded(Some(pid), || {
-                    gated_route(&key_gate, || {
-                        x11_pixel_click_no_focus_steal(
-                            &cursor_id, win, lx as i32, ly as i32, 1, 1,
-                        )?;
-                        std::thread::sleep(std::time::Duration::from_millis(80));
-                        background_virtual_key(&cursor_id, pid, win, "a", &["ctrl"])?;
-                        background_virtual_text(&cursor_id, pid, win, &value_for_keys)?;
-                        background_virtual_key(&cursor_id, pid, win, "Tab", &[])?;
-                        Ok(())
-                    })
+                    gated_steps(
+                        &key_gate,
+                        vec![
+                            Box::new(|| {
+                                x11_pixel_click_no_focus_steal(
+                                    &cursor_id, win, lx as i32, ly as i32, 1, 1,
+                                )?;
+                                std::thread::sleep(std::time::Duration::from_millis(80));
+                                Ok(())
+                            }),
+                            Box::new(|| {
+                                background_virtual_key(&cursor_id, pid, win, "a", &["ctrl"])
+                                    .map(|_| ())
+                            }),
+                            Box::new(|| {
+                                background_virtual_text(&cursor_id, pid, win, &value_for_keys)
+                                    .map(|_| ())
+                            }),
+                            Box::new(|| {
+                                background_virtual_key(&cursor_id, pid, win, "Tab", &[]).map(|_| ())
+                            }),
+                        ],
+                    )
                 })?;
                 Ok(guard)
             },
@@ -10322,7 +10341,12 @@ fn pick_from_popup(
     (win, lx, ly): (u64, f64, f64),
     value: &str,
     foreground: bool,
+    gate: &crate::atspi::native::TextWriteDispatch,
 ) -> anyhow::Result<Option<crate::input::FocusGuardReport>> {
+    use crate::atspi::native::gated_route;
+    // Reads (popup state, coordinates) stay outside the gate; every write
+    // (open click, option activation, Escape) checks it, so a timeout stops
+    // the next one.
     let close_popup = || -> anyhow::Result<()> {
         if !crate::atspi::options_showing_token(token) {
             return Ok(());
@@ -10331,17 +10355,19 @@ fn pick_from_popup(
             crate::input::with_x11_foreground_opts(
                 win,
                 crate::input::ForegroundOptions::keyboard(),
-                || crate::input::send_key_xtest("Escape", &[]),
+                || gated_route(gate, || crate::input::send_key_xtest("Escape", &[])),
             )
             .map(|_| ())
         } else {
-            background_virtual_key(cursor_id, pid, win, "Escape", &[]).map(|_| ())
+            gated_route(gate, || {
+                background_virtual_key(cursor_id, pid, win, "Escape", &[]).map(|_| ())
+            })
         }
     };
     let pick = || -> anyhow::Result<String> {
         let deadline = std::time::Instant::now() + POPUP_OPTIONS_WAIT;
         loop {
-            match crate::atspi::activate_option_token(token, value) {
+            match gated_route(gate, || crate::atspi::activate_option_token(token, value)) {
                 Ok(Some(name)) => return Ok(name),
                 Ok(None) if std::time::Instant::now() < deadline => {
                     std::thread::sleep(std::time::Duration::from_millis(100));
@@ -10364,16 +10390,41 @@ fn pick_from_popup(
         crate::input::with_x11_foreground_opts(
             win,
             crate::input::ForegroundOptions::pointer(),
-            || crate::input::send_click_xtest_desktop(sx.round() as i32, sy.round() as i32, 1, 1),
+            || {
+                gated_route(gate, || {
+                    crate::input::send_click_xtest_desktop(
+                        sx.round() as i32,
+                        sy.round() as i32,
+                        1,
+                        1,
+                    )
+                })
+            },
         )?;
         open_and_pick()?;
         return Ok(None);
     }
     let (_, guard) = crate::input::focus_guard::guarded(Some(pid), || {
-        x11_pixel_click_no_focus_steal(cursor_id, win, lx as i32, ly as i32, 1, 1)?;
+        gated_route(gate, || {
+            x11_pixel_click_no_focus_steal(cursor_id, win, lx as i32, ly as i32, 1, 1)
+        })?;
         open_and_pick()
     })?;
     Ok(guard)
+}
+
+/// Run a sequence of writes (click, select-all, type, commit) with the gate
+/// checked before each one: once the caller timed out and closed it, no
+/// further step runs. A step already in flight still finishes; the caller
+/// reported that as unverifiable.
+fn gated_steps<'a>(
+    gate: &crate::atspi::native::TextWriteDispatch,
+    steps: Vec<Box<dyn FnOnce() -> anyhow::Result<()> + 'a>>,
+) -> anyhow::Result<()> {
+    for step in steps {
+        crate::atspi::native::gated_route(gate, step)?;
+    }
+    Ok(())
 }
 
 /// Numeric-aware equality for the `set_value` read-back ("40" == "40.0").

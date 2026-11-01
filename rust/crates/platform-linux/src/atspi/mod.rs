@@ -493,9 +493,11 @@ fn select_option(object_ref: &native::ObjectRef, value: &str) -> Option<Result<(
     }
 }
 
-fn no_such_option(value: &str, options: &[String]) -> anyhow::Error {
+/// The requested value never goes into the error: only the options the
+/// control lists.
+fn no_such_option(_value: &str, options: &[String]) -> anyhow::Error {
     anyhow::anyhow!(
-        "{}: no option {value:?}; options: {options:?}",
+        "{}: no option matching the requested value; options: {options:?}",
         native::NO_SUCH_OPTION
     )
 }
@@ -1111,5 +1113,18 @@ mod token_dispatch_tests {
                 "/window_b/text"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod option_error_tests {
+    use super::*;
+
+    #[test]
+    fn option_error_never_echoes_the_requested_value() {
+        let error = no_such_option("hunter2", &["Small".into(), "Large".into()]);
+        assert!(native::is_no_such_option(&error));
+        assert!(!error.to_string().contains("hunter2"));
+        assert!(error.to_string().contains("Large"));
     }
 }

@@ -4876,12 +4876,14 @@ pub fn tk_send_text(text: &str) -> TkSend {
         r#"set ::done 0
 set ::rc 0
 after 5000 {{ set ::rc 2; set ::done 1 }}
+puts {TK_ATTEMPT_MARKER}
+flush stdout
 if {{[catch {{send -async cua-tk-target {{.entry insert insert {{{}}}}}}} err]}} {{
+    puts {TK_NOT_QUEUED_MARKER}
+    flush stdout
     puts stderr "tk send failed: $err"
     exit 1
 }}
-puts {TK_QUEUED_MARKER}
-flush stdout
 after 500 {{ set ::done 1 }}
 vwait ::done
 if {{$::rc == 2}} {{
@@ -4890,7 +4892,8 @@ if {{$::rc == 2}} {{
 }}
 exit 0"#,
         tcl_text,
-        TK_QUEUED_MARKER = TK_QUEUED_MARKER,
+        TK_ATTEMPT_MARKER = TK_ATTEMPT_MARKER,
+        TK_NOT_QUEUED_MARKER = TK_NOT_QUEUED_MARKER,
     );
 
     // Try to spawn wish (Tk's shell). If it's not available, this isn't a
@@ -4929,11 +4932,12 @@ exit 0"#,
             }
         }
     };
-    let mut stdout = String::new();
-    if let Some(mut out) = child.stdout.take() {
+    // A failed read leaves no evidence either way: `None`.
+    let stdout = child.stdout.take().and_then(|mut out| {
         use std::io::Read;
-        let _ = out.read_to_string(&mut stdout);
-    }
+        let mut read = String::new();
+        out.read_to_string(&mut read).ok().map(|_| read)
+    });
     if exited_ok != Some(true) {
         let mut stderr = String::new();
         if let Some(mut err) = child.stderr.take() {
@@ -4942,33 +4946,41 @@ exit 0"#,
         }
         tracing::debug!(exited_ok = ?exited_ok, "wish send did not complete: {}", stderr.trim());
     }
-    classify_tk_send(
-        exited_ok,
-        stdout.lines().any(|line| line == TK_QUEUED_MARKER),
-    )
+    classify_tk_send(exited_ok, stdout.as_deref())
 }
 
-/// Printed by the `wish` script right after `send -async` queued the insert.
-const TK_QUEUED_MARKER: &str = "cua-tk-send-queued";
+/// Printed (and flushed) by the `wish` script just before it calls `send`.
+const TK_ATTEMPT_MARKER: &str = "cua-tk-send-attempt";
+/// Printed when `send` raised before queueing anything.
+const TK_NOT_QUEUED_MARKER: &str = "cua-tk-send-not-queued";
 
 /// What a Tk `send` attempt delivered.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TkSend {
     /// `wish` queued the insert and exited cleanly.
     Sent,
-    /// Nothing left `wish`: the next route may run.
+    /// Evidence that nothing left `wish`: the next route may run.
     NotSent,
-    /// The insert was queued, then `wish` failed or overran: it may have run.
+    /// `wish` reached the send and then failed, overran or left no readable
+    /// evidence: the insert may have run.
     MaybeSent,
 }
 
-/// `exited_ok`: `Some(success)` when `wish` exited, `None` when it was killed.
-fn classify_tk_send(exited_ok: Option<bool>, queued: bool) -> TkSend {
-    match (exited_ok, queued) {
-        // A clean exit means the script ran past the queued send.
-        (Some(true), _) => TkSend::Sent,
-        (_, false) => TkSend::NotSent,
-        (_, true) => TkSend::MaybeSent,
+/// `exited_ok`: `Some(success)` when `wish` exited, `None` when it was
+/// killed. `stdout`: what it printed, `None` when that could not be read.
+fn classify_tk_send(exited_ok: Option<bool>, stdout: Option<&str>) -> TkSend {
+    // A clean exit means the script ran past the queued send.
+    if exited_ok == Some(true) {
+        return TkSend::Sent;
+    }
+    let Some(stdout) = stdout else {
+        return TkSend::MaybeSent;
+    };
+    let printed = |marker: &str| stdout.lines().any(|line| line == marker);
+    if !printed(TK_ATTEMPT_MARKER) || printed(TK_NOT_QUEUED_MARKER) {
+        TkSend::NotSent
+    } else {
+        TkSend::MaybeSent
     }
 }
 
@@ -4977,15 +4989,27 @@ mod tk_send_tests {
     use super::*;
 
     #[test]
-    fn tk_send_is_uncertain_only_after_the_insert_was_queued() {
-        assert_eq!(classify_tk_send(Some(true), true), TkSend::Sent);
-        assert_eq!(classify_tk_send(Some(true), false), TkSend::Sent);
-        // Not registered / send error before queueing: nothing left wish.
-        assert_eq!(classify_tk_send(Some(false), false), TkSend::NotSent);
-        assert_eq!(classify_tk_send(None, false), TkSend::NotSent);
-        // Queued, then wish failed or was killed: the insert may have run.
-        assert_eq!(classify_tk_send(Some(false), true), TkSend::MaybeSent);
-        assert_eq!(classify_tk_send(None, true), TkSend::MaybeSent);
+    fn tk_send_is_not_sent_only_with_evidence() {
+        let attempt = format!("{TK_ATTEMPT_MARKER}\n");
+        let refused = format!("{TK_ATTEMPT_MARKER}\n{TK_NOT_QUEUED_MARKER}\n");
+        for stdout in [
+            None,
+            Some(""),
+            Some(attempt.as_str()),
+            Some(refused.as_str()),
+        ] {
+            assert_eq!(classify_tk_send(Some(true), stdout), TkSend::Sent);
+        }
+        // The script never reached send, or send raised before queueing.
+        for exited in [Some(false), None] {
+            assert_eq!(classify_tk_send(exited, Some("")), TkSend::NotSent);
+            assert_eq!(classify_tk_send(exited, Some(&refused)), TkSend::NotSent);
+            // Reached send, then failed or was killed before (or after)
+            // queueing: no proof either way.
+            assert_eq!(classify_tk_send(exited, Some(&attempt)), TkSend::MaybeSent);
+            // Unreadable stdout is no evidence.
+            assert_eq!(classify_tk_send(exited, None), TkSend::MaybeSent);
+        }
     }
 }
 

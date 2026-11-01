@@ -256,3 +256,49 @@ async fn completed_write_passes_through() {
     .await;
     assert_eq!(result.unwrap().unwrap(), 7);
 }
+
+#[test]
+fn gated_steps_stop_once_the_caller_closed_the_gate() {
+    let gate = TextWriteDispatch::default();
+    let ran = std::cell::RefCell::new(Vec::new());
+    let result = gated_steps(
+        &gate,
+        vec![
+            Box::new(|| {
+                ran.borrow_mut().push("click");
+                // The caller times out while the click is in flight.
+                assert!(text_write_timeout_error(&gate, 5).is_some());
+                Ok(())
+            }),
+            Box::new(|| {
+                ran.borrow_mut().push("select_all");
+                Ok(())
+            }),
+            Box::new(|| {
+                ran.borrow_mut().push("type");
+                Ok(())
+            }),
+            Box::new(|| {
+                ran.borrow_mut().push("tab");
+                Ok(())
+            }),
+        ],
+    );
+    assert_eq!(*ran.borrow(), vec!["click"]);
+    assert_eq!(
+        text_write_stop(&result.unwrap_err()),
+        Some(TextWriteStop::Closed)
+    );
+}
+
+#[test]
+fn gated_steps_run_every_step_while_open() {
+    let gate = TextWriteDispatch::default();
+    let ran = std::cell::RefCell::new(0);
+    let step = || -> anyhow::Result<()> {
+        *ran.borrow_mut() += 1;
+        Ok(())
+    };
+    gated_steps(&gate, vec![Box::new(step), Box::new(step), Box::new(step)]).unwrap();
+    assert_eq!(*ran.borrow(), 3);
+}
