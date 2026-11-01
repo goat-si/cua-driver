@@ -884,6 +884,14 @@ trait AxWalkEnvironment {
     fn hit(&self, pid: i32, x: f64, y: f64) -> super::evidence::Observed<Option<Self::Element>>;
     fn parent(&self, element: Self::Element) -> Option<Self::Element>;
     fn now(&self) -> Instant;
+    /// Observe the same walk budget used by the native walker. Fake
+    /// environments can couple these observations to their controlled clock.
+    fn budget_remaining(&self, budget: &WalkBudget) -> Option<std::time::Duration> {
+        budget.remaining()
+    }
+    fn budget_expired(&self, budget: &WalkBudget) -> bool {
+        budget.expired()
+    }
     fn enable(&self, pid: i32, application: Self::Application) -> super::evidence::Observed<()>;
     fn scope_candidate(
         &self,
@@ -1273,9 +1281,9 @@ where
         let discovery = (!menu_frames.is_empty())
             .then(|| {
                 menu_discovery_deadline(
-                    Instant::now(),
+                    environment.now(),
                     budget.outcome().truncated(),
-                    budget.remaining(),
+                    environment.budget_remaining(&budget),
                 )
             })
             .flatten();
@@ -1380,9 +1388,17 @@ where
         budget,
         ledger,
         window_scope,
-        WalkBudget::expired,
+        |budget| environment.budget_expired(budget),
     );
     (result, Some(sample))
+}
+
+/// `Instant` has no public fixed epoch. Seed a single origin for the scripted
+/// clock; tests advance from it and never compare it with the running clock.
+#[cfg(test)]
+fn scripted_clock_origin() -> Instant {
+    static ORIGIN: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    *ORIGIN.get_or_init(Instant::now)
 }
 
 #[allow(clippy::too_many_arguments)]

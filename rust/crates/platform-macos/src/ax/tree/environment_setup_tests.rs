@@ -1,6 +1,6 @@
 use super::{create_application_with, AxWalkEnvironment};
 use crate::ax::evidence::{EvidenceStatus, ReadSite};
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 
 struct SingleRoot<'a> {
     source: &'a super::walker_seam_tests::Fake,
@@ -12,7 +12,8 @@ struct SingleRoot<'a> {
     menu_frames: Option<Option<Vec<[f64; 4]>>>,
     menu_replies: RefCell<std::collections::VecDeque<Option<super::MenuObservation<usize>>>>,
     menu_credits: RefCell<std::collections::HashMap<usize, super::walker_seam_tests::Handle>>,
-    menu_delay: Option<std::time::Duration>,
+    clock: Cell<std::time::Instant>,
+    menu_advance: Option<std::time::Duration>,
 }
 
 impl super::AxWalkEnvironment for SingleRoot<'_> {
@@ -102,7 +103,27 @@ impl super::AxWalkEnvironment for SingleRoot<'_> {
     }
     fn now(&self) -> std::time::Instant {
         self.trace.borrow_mut().push("now");
-        std::time::Instant::now()
+        self.clock.get()
+    }
+    fn budget_remaining(
+        &self,
+        budget: &cua_driver_core::walk_budget::WalkBudget,
+    ) -> Option<std::time::Duration> {
+        budget.time_limit().map(|limit| {
+            limit.saturating_sub(
+                self.clock
+                    .get()
+                    .duration_since(super::scripted_clock_origin()),
+            )
+        })
+    }
+    fn budget_expired(&self, budget: &cua_driver_core::walk_budget::WalkBudget) -> bool {
+        budget.time_limit().is_some_and(|limit| {
+            self.clock
+                .get()
+                .duration_since(super::scripted_clock_origin())
+                >= limit
+        })
     }
     fn enable(&self, pid: i32, application: usize) -> crate::ax::evidence::Observed<()> {
         assert_eq!((pid, application), (42, 1));
@@ -164,8 +185,8 @@ impl super::WalkOrchestration<super::walker_seam_tests::Fake> for SingleRoot<'_>
     fn menu_frames(&self, pid: i32) -> crate::ax::evidence::Observed<Option<Vec<[f64; 4]>>> {
         assert_eq!(pid, 42);
         self.trace.borrow_mut().push("menu-list");
-        if let Some(delay) = self.menu_delay {
-            std::thread::sleep(delay);
+        if let Some(advance) = self.menu_advance {
+            self.clock.set(self.clock.get() + advance);
         }
         super::menu_list_observed(self.menu_frames.clone().expect("unexpected menu listing"))
     }
@@ -173,7 +194,7 @@ impl super::WalkOrchestration<super::walker_seam_tests::Fake> for SingleRoot<'_>
         &self,
         pid: i32,
         _: [f64; 4],
-        _: std::time::Instant,
+        deadline: std::time::Instant,
     ) -> crate::ax::evidence::Observed<
         Option<(
             usize,
@@ -182,6 +203,10 @@ impl super::WalkOrchestration<super::walker_seam_tests::Fake> for SingleRoot<'_>
         )>,
     > {
         assert_eq!(pid, 42);
+        assert_eq!(
+            deadline,
+            self.clock.get() + std::time::Duration::from_millis(250)
+        );
         self.trace.borrow_mut().push("menu-lookup");
         let result = self
             .menu_replies
@@ -234,7 +259,8 @@ pub(super) fn run_application_failure() -> (super::CompletedWalk, Vec<&'static s
         menu_frames: None,
         menu_replies: RefCell::new(Default::default()),
         menu_credits: RefCell::new(Default::default()),
-        menu_delay: None,
+        clock: Cell::new(super::scripted_clock_origin()),
+        menu_advance: None,
     };
     let result = super::walk_with_environment(
         &source,
@@ -270,7 +296,8 @@ pub(super) fn run_unscoped_source(
         menu_frames: None,
         menu_replies: RefCell::new(Default::default()),
         menu_credits: RefCell::new(Default::default()),
-        menu_delay: None,
+        clock: Cell::new(super::scripted_clock_origin()),
+        menu_advance: None,
     };
     let result = super::walk_with_environment(
         source,
@@ -378,7 +405,8 @@ fn run_published_menu_case_inner(
             .into(),
         ),
         menu_credits: RefCell::new(Default::default()),
-        menu_delay: None,
+        clock: Cell::new(super::scripted_clock_origin()),
+        menu_advance: None,
     };
     let observed = super::walk_with_environment(
         &source,
@@ -406,7 +434,7 @@ fn run_menu_case_with_budget(
     frames: Option<Vec<[f64; 4]>>,
     replies: Vec<Option<super::MenuObservation<usize>>>,
     budget: cua_driver_core::walk_budget::WalkBudget,
-    menu_delay: Option<std::time::Duration>,
+    menu_advance: Option<std::time::Duration>,
 ) -> (super::CompletedWalk, Vec<&'static str>) {
     use super::walker_seam_tests::{step, Fake, Reply};
     use super::walker_test_support::{Batch, Slot};
@@ -433,7 +461,8 @@ fn run_menu_case_with_budget(
         menu_frames: Some(frames),
         menu_replies: RefCell::new(replies.into()),
         menu_credits: RefCell::new(Default::default()),
-        menu_delay,
+        clock: Cell::new(super::scripted_clock_origin()),
+        menu_advance,
     };
     let observed = super::walk_with_environment(
         &source,
@@ -453,6 +482,15 @@ fn run_menu_case_with_budget(
         "- AXWindow \"Window\"\n".to_string()
     };
     assert_eq!(observed.legacy.tree_markdown, expected_markdown);
+    if let Some(advance) = menu_advance {
+        assert_eq!(
+            environment
+                .clock
+                .get()
+                .duration_since(super::scripted_clock_origin()),
+            advance
+        );
+    }
     assert!(environment.menu_replies.borrow().is_empty());
     assert!(environment.menu_credits.borrow().is_empty());
     assert!(environment.root.borrow().is_none());
@@ -490,7 +528,8 @@ fn shared_entry_walks_fake_root_and_releases_its_credit() {
         menu_frames: None,
         menu_replies: RefCell::new(Default::default()),
         menu_credits: RefCell::new(Default::default()),
-        menu_delay: None,
+        clock: Cell::new(super::scripted_clock_origin()),
+        menu_advance: None,
     };
     let observed = super::walk_with_environment(
         &source,
@@ -558,7 +597,8 @@ fn shared_entry_preserves_application_creation_failure() {
         menu_frames: None,
         menu_replies: RefCell::new(Default::default()),
         menu_credits: RefCell::new(Default::default()),
-        menu_delay: None,
+        clock: Cell::new(super::scripted_clock_origin()),
+        menu_advance: None,
     };
     let observed = super::walk_with_environment(
         &source,

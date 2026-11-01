@@ -116,6 +116,16 @@ impl AxWalkEnvironment for ScenarioWalk<'_> {
     fn now(&self) -> Instant {
         self.environment.now()
     }
+    fn budget_remaining(&self, budget: &WalkBudget) -> Option<std::time::Duration> {
+        budget
+            .time_limit()
+            .map(|limit| limit.saturating_sub(self.environment.simulated_elapsed()))
+    }
+    fn budget_expired(&self, budget: &WalkBudget) -> bool {
+        budget
+            .time_limit()
+            .is_some_and(|limit| self.environment.simulated_elapsed() >= limit)
+    }
     fn enable(&self, pid: i32, application: usize) -> super::super::evidence::Observed<()> {
         self.environment.enable(pid, application)
     }
@@ -573,7 +583,8 @@ fn production_deferred_pass_keeps_order_and_ownership() {
         shared.walk.apply(&mut new_fields);
         let old_elapsed = old_fields["walk_elapsed_ms"].as_u64().unwrap();
         let new_elapsed = new_fields["walk_elapsed_ms"].as_u64().unwrap();
-        assert!(old_elapsed < 2000 && new_elapsed < 2000);
+        assert_eq!(old_elapsed, baseline.walk.elapsed_ms);
+        assert_eq!(new_elapsed, shared.walk.elapsed_ms);
         old_fields["walk_elapsed_ms"] = json!(new_elapsed);
         assert_eq!(new_fields, old_fields);
     }

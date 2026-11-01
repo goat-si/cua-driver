@@ -36,6 +36,10 @@ fn project(search: bool, shared: bool, verify: bool) -> (Value, Vec<Content>, Ve
         42,
         None,
     );
+    assert_eq!(
+        structured["walk_elapsed_ms"].as_u64(),
+        Some(tree.walk.elapsed_ms)
+    );
     let content = response_content(99, 42, Some(&tree), None, false);
     (structured, content, trace)
 }
@@ -47,7 +51,8 @@ fn assert_same_projection(mut baseline: Value, current: Value) {
     let current_elapsed = current["walk_elapsed_ms"]
         .as_u64()
         .expect("current elapsed time");
-    assert!(baseline_elapsed < 2000 && current_elapsed < 2000);
+    assert_eq!(baseline["walk_elapsed_ms"], json!(baseline_elapsed));
+    assert_eq!(current["walk_elapsed_ms"], json!(current_elapsed));
     baseline["walk_elapsed_ms"] = json!(current_elapsed);
     assert_eq!(baseline, current);
     let encoded = serde_json::to_string(&current).unwrap();
@@ -241,7 +246,10 @@ fn scope_discovery_and_budget_outputs_are_unchanged_by_evidence_refactor() {
     assert_eq!(payload["nodes_visited"], 1);
     assert_eq!(payload["nodes_pending"], 0);
     assert_eq!(payload["timeout_ms"], 1000);
-    assert!(payload["walk_elapsed_ms"].as_u64().unwrap() >= 1000);
+    assert_eq!(
+        payload["walk_elapsed_ms"].as_u64(),
+        Some(tree.walk.elapsed_ms)
+    );
     assert_eq!(payload["observation_complete"], false);
     assert!(payload.get("snapshot_id").is_none());
     assert!(payload.get("observation_scope_exclusions").is_none());

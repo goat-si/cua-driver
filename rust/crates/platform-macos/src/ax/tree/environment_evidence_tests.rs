@@ -21,11 +21,24 @@ fn menu_discovery_preserves_failure_deadline_and_cap() {
         .any(|e| e.site == ReadSite::MenuWindowList && e.status == EvidenceStatus::Unavailable));
     assert!(!trace.contains(&"menu-lookup"));
 
-    let scope = EvidenceScope::start();
-    assert!(
-        super::menu_discovery_deadline(Instant::now(), false, Some(Duration::from_millis(1)))
-            .is_none()
+    let (_, clock_trace) = run_menu_case(Some(vec![frame]), vec![None]);
+    let listing = clock_trace
+        .iter()
+        .position(|item| *item == "menu-list")
+        .unwrap();
+    assert_eq!(
+        clock_trace.get(listing + 1),
+        Some(&"now"),
+        "menu discovery must sample the environment clock after listing"
     );
+
+    let scope = EvidenceScope::start();
+    assert!(super::menu_discovery_deadline(
+        super::scripted_clock_origin(),
+        false,
+        Some(Duration::from_millis(1))
+    )
+    .is_none());
     let deadline = scope.finish(());
     assert!(deadline
         .evidence
@@ -34,9 +47,15 @@ fn menu_discovery_preserves_failure_deadline_and_cap() {
             && e.status == EvidenceStatus::DeadlineExpired));
 
     // The window was walked before the menu-list operation exceeded the
-    // actual budget. The shared entry must refuse menu resolution and keep
+    // simulated budget. The shared entry must refuse menu resolution and keep
     // the same timeout projection, not merely test the deadline helper.
     let (expired, trace) = run_menu_deadline_case();
+    let listing = trace.iter().position(|item| *item == "menu-list").unwrap();
+    assert_eq!(
+        trace.get(listing + 1),
+        Some(&"now"),
+        "menu discovery must sample the environment clock after listing"
+    );
     assert_eq!(expired.legacy.walk.stop, Some(WalkStop::Timeout));
     assert_eq!(expired.legacy.walk.nodes_visited, 1);
     assert_eq!(expired.legacy.walk.nodes_pending, 0);
@@ -141,7 +160,7 @@ impl Environment {
             scenario,
             trace: RefCell::new(Vec::new()),
             credits: RefCell::new(std::collections::HashMap::new()),
-            now: Cell::new(Instant::now()),
+            now: Cell::new(super::scripted_clock_origin()),
             enumerations: Cell::new(0),
         }
     }
@@ -151,6 +170,11 @@ impl Environment {
     }
     pub(super) fn assert_released(&self) {
         assert!(self.credits.borrow().values().all(|credits| *credits == 0));
+    }
+    pub(super) fn simulated_elapsed(&self) -> Duration {
+        self.now
+            .get()
+            .duration_since(super::scripted_clock_origin())
     }
 }
 
@@ -570,7 +594,7 @@ fn recovery_probe_preserves_failure_and_no_match() {
         .evidence
         .iter()
         .any(|entry| entry.site == ReadSite::RecoveryHit && entry.status == EvidenceStatus::Known));
-    let now = Instant::now();
+    let now = super::scripted_clock_origin();
     let scope = crate::ax::evidence::EvidenceScope::start();
     let skipped: Option<()> =
         super::window_center_hit_if_live(Some(now), now, || panic!("no hit after deadline"));
@@ -749,7 +773,7 @@ fn scope_candidate_reads_preserve_unknown_and_absent() {
 #[test]
 fn provider_enablement_preserves_failed_and_cached_outcomes() {
     let stamp = (10, 20);
-    let now = Instant::now();
+    let now = super::scripted_clock_origin();
     let stored = Cell::new(None);
     let trace = RefCell::new(Vec::new());
     let failed = ensure_with(

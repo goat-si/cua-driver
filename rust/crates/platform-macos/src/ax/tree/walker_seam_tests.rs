@@ -2228,7 +2228,7 @@ pub(crate) fn canonical_metadata_fixture(
     }
     let source = Fake::new(&[(1, 1, 1, &[])], steps);
     let root = source.handle(1);
-    let start = std::time::Instant::now();
+    let start = super::scripted_clock_origin();
     let deadline = start + std::time::Duration::from_secs(1);
     let mut calls = 0;
     let mut evidence = CanonicalEvidence::default();
@@ -2372,7 +2372,7 @@ pub(crate) fn canonical_walk_and_collect() -> (AXNode, Vec<String>) {
         ],
     );
     let root = source.handle(1);
-    let start = std::time::Instant::now();
+    let start = super::scripted_clock_origin();
     super::super::vocabulary::collect_node_state_evidence(
         &source,
         &root,
