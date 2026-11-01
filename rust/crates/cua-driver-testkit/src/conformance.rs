@@ -125,7 +125,15 @@ pub fn incomplete_uniqueness(
     let injected = f.finish_incomplete_observation();
     let valid = matches!(injected, Ok(count) if count > 0)
         && check_response(&response, &["incomplete_observation"])
-        && response.text().contains(&name);
+        && response
+            .text()
+            .split_once("observed candidates:")
+            .is_some_and(|(_, candidates)| {
+                candidates
+                    .split("; target by")
+                    .next()
+                    .is_some_and(|list| list.contains(&name))
+            });
     observed_result(response, valid, no_dispatch(before, f.dispatch_count()))
 }
 

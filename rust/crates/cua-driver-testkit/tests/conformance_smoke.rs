@@ -16,6 +16,8 @@ struct State {
     incomplete_reads: bool,
     incomplete_count: u64,
     incomplete_violation: bool,
+    missing_candidate: bool,
+    dispatch_incomplete: bool,
 }
 struct Fixture(Rc<RefCell<State>>);
 impl ConformanceFixture for Fixture {
@@ -142,13 +144,13 @@ impl Driver for Fake {
             "run_steps" => {
                 if s.incomplete_reads {
                     s.incomplete_count += 1;
-                    if s.incomplete_violation {
+                    if s.incomplete_violation || s.dispatch_incomplete {
                         s.dispatched.push("click".into());
                     }
-                    let text = if s.incomplete_violation {
-                        "no candidates"
+                    let text = if s.incomplete_violation || s.missing_candidate {
+                        "Text is uncertain; observed candidates:"
                     } else {
-                        "candidate: Text"
+                        "observed candidates: [3] AXTextField \"Text\""
                     };
                     return response(
                         json!({"steps":[{"code":"incomplete_observation"}]}),
@@ -194,6 +196,23 @@ fn incomplete_tree_probes_require_injection_candidates_and_zero_dispatch() {
                 "{outcome:?}"
             );
         }
+    }
+    for (missing_candidate, dispatch_incomplete) in [(true, false), (false, true)] {
+        let state = Rc::new(RefCell::new(State {
+            missing_candidate,
+            dispatch_incomplete,
+            ..Default::default()
+        }));
+        let mut fixture = Fixture(state.clone());
+        let mut driver = Fake {
+            state,
+            session: "a",
+            violation: None,
+        };
+        assert!(matches!(
+            conformance::incomplete_uniqueness(&mut driver, &mut fixture),
+            ContractOutcome::Fail { .. }
+        ));
     }
 }
 fn run(c: Contract, violation: Option<Contract>) -> ContractOutcome {
