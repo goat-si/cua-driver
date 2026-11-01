@@ -2114,6 +2114,59 @@ mod hand_back_order_tests {
     }
 }
 
+// Keep popup I/O behind one boundary so the menu route can be exercised with
+// synthetic AX observations and input without touching the user's desktop.
+trait PopupEnv {
+    fn options(&mut self) -> Vec<PopupOption>;
+    fn menu_is_open(&mut self) -> bool;
+    fn open(&mut self) -> std::thread::JoinHandle<()>;
+    fn press(&mut self, element: AXUIElementRef) -> i32;
+    fn dismiss(&mut self);
+    fn now(&mut self) -> std::time::Instant;
+    fn pause(&mut self);
+}
+
+struct NativePopupEnv {
+    element: AXUIElementRef,
+    pid: i32,
+}
+
+impl PopupEnv for NativePopupEnv {
+    fn options(&mut self) -> Vec<PopupOption> {
+        popup_options(self.element)
+    }
+
+    fn menu_is_open(&mut self) -> bool {
+        popup_menu_is_open(self.element)
+    }
+
+    fn open(&mut self) -> std::thread::JoinHandle<()> {
+        let popup_address = self.element as usize;
+        std::thread::spawn(move || unsafe {
+            let popup = popup_address as AXUIElementRef;
+            crate::ax::bindings::AXUIElementSetMessagingTimeout(popup, POPUP_PRESS_TIMEOUT_SECONDS);
+            let _ = perform_action(popup, "AXPress");
+            crate::ax::bindings::AXUIElementSetMessagingTimeout(popup, 0.0);
+        })
+    }
+
+    fn press(&mut self, element: AXUIElementRef) -> i32 {
+        unsafe { perform_action(element, "AXPress") }
+    }
+
+    fn dismiss(&mut self) {
+        dismiss_popup_menu(self.element, self.pid);
+    }
+
+    fn now(&mut self) -> std::time::Instant {
+        std::time::Instant::now()
+    }
+
+    fn pause(&mut self) {
+        std::thread::sleep(POPUP_POLL_INTERVAL);
+    }
+}
+
 fn select_popup_option(
     element: AXUIElementRef,
     element_index: usize,
@@ -2142,7 +2195,18 @@ fn select_popup_option_after_typeahead(
     value: &str,
     element_title: &str,
 ) -> anyhow::Result<String> {
-    let mut options = popup_options(element);
+    let mut env = NativePopupEnv { element, pid };
+    select_popup_option_with_env(&mut env, element_index, pid, value, element_title)
+}
+
+fn select_popup_option_with_env(
+    env: &mut impl PopupEnv,
+    element_index: usize,
+    pid: i32,
+    value: &str,
+    element_title: &str,
+) -> anyhow::Result<String> {
+    let mut options = env.options();
     let mut opened_menu = false;
     let mut press_thread = None;
 
@@ -2166,7 +2230,7 @@ fn select_popup_option_after_typeahead(
         // the messaging timeout fires), so run it on its own thread and read
         // the items as soon as they appear: the menu, and with it the key
         // focus it holds, stays open for the shortest time.
-        let already_open = popup_menu_is_open(element);
+        let already_open = env.menu_is_open();
         let closed_titles = if already_open {
             Vec::new()
         } else {
@@ -2177,22 +2241,13 @@ fn select_popup_option_after_typeahead(
         // A menu left open by an earlier click is already showing its items;
         // pressing again would close it.
         if !already_open {
-            let popup_address = element as usize;
-            press_thread = Some(std::thread::spawn(move || unsafe {
-                let popup = popup_address as AXUIElementRef;
-                crate::ax::bindings::AXUIElementSetMessagingTimeout(
-                    popup,
-                    POPUP_PRESS_TIMEOUT_SECONDS,
-                );
-                let _ = perform_action(popup, "AXPress");
-                crate::ax::bindings::AXUIElementSetMessagingTimeout(popup, 0.0);
-            }));
+            press_thread = Some(env.open());
         }
-        let deadline = std::time::Instant::now() + POPUP_OPEN_TIMEOUT;
+        let deadline = env.now() + POPUP_OPEN_TIMEOUT;
         let mut last_seen: Vec<(String, String)> = Vec::new();
         let mut stable_polls = 0;
         loop {
-            options = popup_options(element);
+            options = env.options();
             let seen = option_pairs(&options);
             if matching_option(&seen, value).is_some() {
                 break;
@@ -2210,14 +2265,14 @@ fn select_popup_option_after_typeahead(
                 }
             }
             last_seen = seen;
-            if std::time::Instant::now() >= deadline {
+            if env.now() >= deadline {
                 break;
             }
             release_options(&options);
-            std::thread::sleep(POPUP_POLL_INTERVAL);
+            env.pause();
         }
         if options.is_empty() {
-            dismiss_popup_menu(element, pid);
+            env.dismiss();
             if let Some(press) = press_thread.take() {
                 let _ = press.join();
             }
@@ -2232,7 +2287,7 @@ fn select_popup_option_after_typeahead(
     let result = match matching_option(&option_pairs(&options), value) {
         Some(i) => {
             let option = &options[i];
-            let err = unsafe { perform_action(option.element, "AXPress") };
+            let err = env.press(option.element);
             if err == kAXErrorSuccess {
                 let label = if option.title.is_empty() {
                     &option.value
@@ -2250,7 +2305,7 @@ fn select_popup_option_after_typeahead(
                 ))
             } else {
                 if opened_menu {
-                    dismiss_popup_menu(element, pid);
+                    env.dismiss();
                 }
                 Err(anyhow::anyhow!(
                     "AXPress on menu item failed with error {err}"
@@ -2259,7 +2314,7 @@ fn select_popup_option_after_typeahead(
         }
         None => {
             if opened_menu {
-                dismiss_popup_menu(element, pid);
+                env.dismiss();
             }
             Err(anyhow::anyhow!(
                 "No option matching '{value}' in AXPopUpButton [{element_index}] \
