@@ -340,6 +340,16 @@ async fn uncertain_delayed_match_stays_unverifiable_and_blocks_document_and_retu
         false
     );
     assert_eq!((mark.get(), returns.get()), (0, 0));
+    let mut mismatched = Fake::new(text("old")).read(text("different"));
+    let out = run(&mut mismatched, "new", "AXTextField", false);
+    assert_eq!(out.verified, Some(false));
+    assert_eq!(out.changed, Some(true));
+    let (_, _, _, _) = project(out, "AXTextField", &mark);
+    assert_eq!(
+        mark.get(),
+        0,
+        "a changed but unconfirmed value must not send document keys"
+    );
     let mut retry = Fake::new(num(0.0))
         .read(num(5.0))
         .result(kAXErrorIllegalArgument);
