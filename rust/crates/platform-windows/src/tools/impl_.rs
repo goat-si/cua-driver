@@ -1504,8 +1504,12 @@ impl Tool for GetWindowStateTool {
                 let mut budget =
                     cua_driver_core::walk_budget::WalkBudget::new(timeout_ms, max_elements);
                 let iconic_before = crate::input::window_is_iconic(hwnd);
+                // Bracket the walk with process/window identity reads so the
+                // published snapshot is bound to the instance it was read from.
+                let identity_before = crate::process_instance::probe(pid, hwnd);
                 let tree =
                     crate::uia::walk_tree_budgeted(hwnd, q.as_deref(), max_depth, &mut budget);
+                let identity_after = crate::process_instance::probe(pid, hwnd);
                 let kind = if tree.nodes.iter().any(|node| node.msaa_role.is_some()) {
                     crate::uia::snapshot::SnapshotKind::Msaa
                 } else {
@@ -1515,7 +1519,9 @@ impl Tool for GetWindowStateTool {
                     .with_read_while_minimized(
                         iconic_before || crate::input::window_is_iconic(hwnd),
                     );
-                (tree, payload, budget.outcome())
+                let capture =
+                    crate::process_instance::instance_capture(pid, identity_before, identity_after);
+                (tree, payload, budget.outcome(), capture)
             });
             let started = std::time::Instant::now();
             let deadline = std::time::Duration::from_millis(timeout_ms) + UIA_WALK_BACKSTOP_GRACE;
@@ -1541,7 +1547,12 @@ impl Tool for GetWindowStateTool {
                         &[],
                         crate::uia::snapshot::SnapshotKind::Uia,
                     );
-                    Some((tree, payload, walk))
+                    Some((
+                        tree,
+                        payload,
+                        walk,
+                        crate::process_instance::walk_timed_out_capture(),
+                    ))
                 }
             }
         } else {
@@ -1560,10 +1571,18 @@ impl Tool for GetWindowStateTool {
             // to call `bring_to_front` instead of retrying).
             // The previous `Err(_) => None` silently dropped the error and
             // upstream agents saw an empty response with no signal.
+            let mut shot_capture = None;
             let (screenshot, screenshot_err) = if do_shot {
+                let identity_before = crate::process_instance::probe(pid, hwnd);
                 let pre = crate::capture::read_live_frame(hwnd).ok();
                 let capture = crate::capture::screenshot_window_with_geometry(hwnd);
                 let post = crate::capture::read_live_frame(hwnd).ok();
+                let identity_after = crate::process_instance::probe(pid, hwnd);
+                shot_capture = Some(crate::process_instance::instance_capture(
+                    pid,
+                    identity_before,
+                    identity_after,
+                ));
                 let captured_at_ms = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
@@ -1606,7 +1625,7 @@ impl Tool for GetWindowStateTool {
             } else {
                 (None, None)
             };
-            Ok((screenshot, screenshot_err, basis_result))
+            Ok((screenshot, screenshot_err, basis_result, shot_capture))
         });
         let result: anyhow::Result<_> =
             match tokio::time::timeout(UIA_SCREENSHOT_TIMEOUT, blocking).await {
@@ -1620,14 +1639,15 @@ impl Tool for GetWindowStateTool {
                         UIA_SCREENSHOT_TIMEOUT.as_secs()
                     )),
                     None,
+                    None,
                 )),
             };
-        let result = result.map(|(screenshot, screenshot_err, basis)| {
-            (tree_result, screenshot, screenshot_err, basis)
+        let result = result.map(|(screenshot, screenshot_err, basis, shot_capture)| {
+            (tree_result, screenshot, screenshot_err, basis, shot_capture)
         });
 
         match result {
-            Ok((tree_opt, screenshot_opt, screenshot_err, basis_result)) => {
+            Ok((tree_opt, screenshot_opt, screenshot_err, basis_result, shot_capture)) => {
                 let candidate_basis = basis_result
                     .as_ref()
                     .and_then(|decision| decision.as_ref().ok().cloned());
@@ -1642,7 +1662,7 @@ impl Tool for GetWindowStateTool {
                 let mut published_snapshot = false;
                 let mut invalidated = Vec::new();
 
-                if let Some((tr, payload, walk)) = tree_opt {
+                if let Some((tr, payload, walk, instance_capture)) = tree_opt {
                     let is_msaa = tr.nodes.iter().any(|node| node.msaa_role.is_some());
                     let count = tr
                         .nodes
@@ -1670,7 +1690,8 @@ impl Tool for GetWindowStateTool {
                     let publication = if observation_only {
                         None
                     } else if let Some(ticket) = ticket.as_ref() {
-                        state.snapshots.publish_basis_for_session(
+                        crate::process_instance::publish_window_snapshot_with_basis(
+                            &state.snapshots,
                             pid as i32,
                             hwnd,
                             payload,
@@ -1678,18 +1699,19 @@ impl Tool for GetWindowStateTool {
                             screenshot_scale,
                             candidate_basis.clone(),
                             ticket,
+                            instance_capture,
                         )
                     } else {
-                        state
-                            .snapshots
-                            .publish_for_session(
-                                pid as i32,
-                                hwnd,
-                                payload,
-                                session_id.as_deref(),
-                                screenshot_scale,
-                            )
-                            .map(|(id, replaced)| (id, replaced, None))
+                        crate::process_instance::publish_window_snapshot(
+                            &state.snapshots,
+                            pid as i32,
+                            hwnd,
+                            payload,
+                            session_id.as_deref(),
+                            screenshot_scale,
+                            instance_capture,
+                        )
+                        .map(|(id, replaced)| (id, replaced, None))
                     };
                     let (snapshot_id, replaced) = match publication {
                         Some((id, replaced, basis)) => {
@@ -1810,8 +1832,16 @@ impl Tool for GetWindowStateTool {
                             &[],
                             crate::uia::snapshot::SnapshotKind::Uia,
                         );
+                        // A screenshot-only read binds its new empty snapshot to
+                        // the identity reads taken around this capture.
+                        let capture = shot_capture.clone().unwrap_or_else(|| {
+                            cua_driver_core::snapshot_store::InstanceCapture::Failed(
+                                "process identity was not read around the capture".into(),
+                            )
+                        });
                         if let Some((id, replaced, basis)) =
-                            state.snapshots.publish_capture_basis_for_session(
+                            crate::process_instance::publish_capture_snapshot_with_basis(
+                                &state.snapshots,
                                 pid as i32,
                                 hwnd,
                                 payload,
@@ -1819,6 +1849,7 @@ impl Tool for GetWindowStateTool {
                                 screenshot_scale,
                                 candidate_basis.clone(),
                                 ticket,
+                                capture,
                             )
                         {
                             invalidated.extend(replaced);
@@ -3940,10 +3971,13 @@ impl Tool for ClickTool {
             Ok(v) => v,
             Err(e) => return e,
         };
-        let resolved = match self.state.snapshots.resolve(pid as i32, &args) {
-            Ok(r) => r,
-            Err(e) => return e,
-        };
+        let resolved =
+            match crate::process_instance::resolve_live(&self.state.snapshots, pid as i32, &args)
+                .await
+            {
+                Ok(r) => r,
+                Err(e) => return e,
+            };
         let (elem_idx, hwnd_opt, admitted) = resolved.into_parts(args.opt_u64("window_id"));
         let x = args.opt_f64("x");
         let y = args.opt_f64("y");
@@ -5225,10 +5259,13 @@ impl Tool for TypeTextTool {
             Err(e) => return e,
         };
         let pid = raw_pid as u32;
-        let resolved = match self.state.snapshots.resolve(pid as i32, &args) {
-            Ok(r) => r,
-            Err(e) => return e,
-        };
+        let resolved =
+            match crate::process_instance::resolve_live(&self.state.snapshots, pid as i32, &args)
+                .await
+            {
+                Ok(r) => r,
+                Err(e) => return e,
+            };
         let (elem_idx, hwnd_opt, admitted) = resolved.into_parts(args.opt_u64("window_id"));
         let delivery = DeliveryMode::from_args(&args);
 
@@ -6121,10 +6158,13 @@ impl Tool for PressKeyTool {
             Err(e) => return e,
         };
         let pid = raw_pid as u32;
-        let resolved = match self.state.snapshots.resolve(pid as i32, &args) {
-            Ok(r) => r,
-            Err(e) => return e,
-        };
+        let resolved =
+            match crate::process_instance::resolve_live(&self.state.snapshots, pid as i32, &args)
+                .await
+            {
+                Ok(r) => r,
+                Err(e) => return e,
+            };
         let (elem_idx, hwnd_opt, admitted) = resolved.into_parts(args.opt_u64("window_id"));
         let delivery = DeliveryMode::from_args(&args);
         // Swift requires window_id when element_index is supplied — ports the
@@ -6544,10 +6584,13 @@ impl Tool for HotkeyTool {
             Err(e) => return e,
         };
         let pid = raw_pid as u32;
-        let resolved = match self.state.snapshots.resolve(pid as i32, &args) {
-            Ok(resolved) => resolved,
-            Err(error) => return error,
-        };
+        let resolved =
+            match crate::process_instance::resolve_live(&self.state.snapshots, pid as i32, &args)
+                .await
+            {
+                Ok(resolved) => resolved,
+                Err(error) => return error,
+            };
         let (elem_idx, hwnd_opt, admitted) = resolved.into_parts(args.opt_u64("window_id"));
         let delivery = DeliveryMode::from_args(&args);
 
@@ -6839,10 +6882,13 @@ impl Tool for SetValueTool {
             Some(v) => v.to_owned(),
             None => return ToolResult::error("Missing required string field value."),
         };
-        let resolved = match self.state.snapshots.resolve(pid as i32, &args) {
-            Ok(r) => r,
-            Err(e) => return e,
-        };
+        let resolved =
+            match crate::process_instance::resolve_live(&self.state.snapshots, pid as i32, &args)
+                .await
+            {
+                Ok(r) => r,
+                Err(e) => return e,
+            };
         let (index, window_id, admitted) = resolved.into_parts(None);
         let (Some(hwnd), Some(idx), Some(admitted)) = (window_id, index, admitted) else {
             return ToolResult::error("set_value requires an admitted element target.");
@@ -7290,10 +7336,13 @@ impl Tool for ScrollTool {
         let by = args.str_or("by", "line");
         let direction_display = direction.clone();
         let by_display = by.clone();
-        let resolved = match self.state.snapshots.resolve(pid as i32, &args) {
-            Ok(r) => r,
-            Err(e) => return e,
-        };
+        let resolved =
+            match crate::process_instance::resolve_live(&self.state.snapshots, pid as i32, &args)
+                .await
+            {
+                Ok(r) => r,
+                Err(e) => return e,
+            };
         let (elem_idx, hwnd_opt, admitted) = resolved.into_parts(args.opt_u64("window_id"));
 
         // Resolve HWND: use window_id if given, else first window for pid.
@@ -7870,10 +7919,13 @@ impl Tool for DoubleClickTool {
         };
         let pid = raw_pid as u32;
         use cua_driver_core::tool_args::ArgsExt;
-        let resolved = match self.state.snapshots.resolve(pid as i32, &args) {
-            Ok(r) => r,
-            Err(e) => return e,
-        };
+        let resolved =
+            match crate::process_instance::resolve_live(&self.state.snapshots, pid as i32, &args)
+                .await
+            {
+                Ok(r) => r,
+                Err(e) => return e,
+            };
         let (elem_idx, hwnd_opt, admitted) = resolved.into_parts(args.opt_u64("window_id"));
         let x = args.opt_f64("x");
         let y = args.opt_f64("y");
@@ -8241,10 +8293,13 @@ impl Tool for RightClickTool {
         };
         let pid = raw_pid as u32;
         use cua_driver_core::tool_args::ArgsExt;
-        let resolved = match self.state.snapshots.resolve(pid as i32, &args) {
-            Ok(r) => r,
-            Err(e) => return e,
-        };
+        let resolved =
+            match crate::process_instance::resolve_live(&self.state.snapshots, pid as i32, &args)
+                .await
+            {
+                Ok(r) => r,
+                Err(e) => return e,
+            };
         let (elem_idx, hwnd_opt, admitted) = resolved.into_parts(args.opt_u64("window_id"));
         let x = args.opt_f64("x");
         let y = args.opt_f64("y");

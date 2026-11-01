@@ -586,8 +586,12 @@ pub fn resolve_element_action<'a>(
 }
 
 /// Set AXFocused=true on an element (for pre-focusing before key press).
+pub(crate) fn focus_element_raw(element_ptr: usize) -> i32 {
+    unsafe { set_bool_attr_true(element_ptr as AXUIElementRef, "AXFocused") }
+}
+
 pub fn focus_element(element_ptr: usize) -> anyhow::Result<()> {
-    let err = unsafe { set_bool_attr_true(element_ptr as AXUIElementRef, "AXFocused") };
+    let err = focus_element_raw(element_ptr);
     if err == kAXErrorSuccess {
         Ok(())
     } else {

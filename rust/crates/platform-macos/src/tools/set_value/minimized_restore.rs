@@ -3,10 +3,13 @@
 //! window temporarily, since minimizing it again cannot be ordered after a
 //! posted key (goat-si/cua-driver#125).
 
+use crate::ax::write_outcome::{native_write_outcome, NativeWriteKind, Settable};
 use core_foundation::base::CFRelease;
+use cua_driver_core::mutation::{ChainResult, PriorInput, WriteOutcome};
 
 /// The live reads and writes of a temporary restore (fakes in tests).
 pub(super) trait MinimizeOps {
+    fn query_settable(&self) -> Settable;
     /// Write AXMinimized; `Err` carries the AX error code.
     fn set_minimized(&self, minimized: bool) -> Result<(), i32>;
     fn read_minimized(&self) -> Option<bool>;
@@ -78,6 +81,7 @@ impl RestoreReport {
 pub(super) struct MinimizedRestore<O: MinimizeOps> {
     ops: O,
     state: RestoreState,
+    prior: PriorInput,
 }
 
 const RESTORE_POLLS: usize = 60;
@@ -91,6 +95,7 @@ impl<O: MinimizeOps> MinimizedRestore<O> {
         Self {
             ops,
             state: RestoreState::Untouched,
+            prior: PriorInput::None,
         }
     }
 
@@ -98,7 +103,11 @@ impl<O: MinimizeOps> MinimizedRestore<O> {
     /// input may follow then.
     pub(super) fn begin(&mut self, mut pause: impl FnMut()) -> Result<(), String> {
         self.state = RestoreState::MaybeUnminimized;
-        if let Err(code) = self.ops.set_minimized(false) {
+        let (outcome, code) = self.write(false);
+        if outcome != WriteOutcome::Delivered {
+            if self.prior == PriorInput::None {
+                self.state = RestoreState::Untouched;
+            }
             return Err(format!(
                 "restoring the minimized window returned AX error {code}"
             ));
@@ -116,8 +125,26 @@ impl<O: MinimizeOps> MinimizedRestore<O> {
         Ok(())
     }
 
-    pub(super) fn finish(mut self) -> RestoreReport {
-        self.cleanup(|| std::thread::sleep(RESTORE_POLL))
+    #[cfg(test)]
+    fn finish(self) -> RestoreReport {
+        self.finish_with_input().0
+    }
+
+    pub(super) fn finish_with_input(mut self) -> (RestoreReport, PriorInput) {
+        let report = self.cleanup(|| std::thread::sleep(RESTORE_POLL));
+        (report, self.prior)
+    }
+
+    fn write(&mut self, minimized: bool) -> (WriteOutcome, i32) {
+        let settable = self.ops.query_settable();
+        let error = self.ops.set_minimized(minimized).err().unwrap_or(0);
+        let outcome = native_write_outcome(NativeWriteKind::SetAttribute, true, &settable, error);
+        let chain = ChainResult::from_recorded(vec![outcome], self.prior)
+            .expect("one restore write is a valid recorded chain");
+        if !chain.no_input() {
+            self.prior = PriorInput::MayHaveDelivered;
+        }
+        (outcome, error)
     }
 
     fn cleanup(&mut self, mut pause: impl FnMut()) -> RestoreReport {
@@ -132,12 +159,15 @@ impl<O: MinimizeOps> MinimizedRestore<O> {
         if !self.ops.await_hand_backs() {
             return RestoreReport::LeftRestored;
         }
-        let _ = self.ops.set_minimized(true);
+        let (outcome, _) = self.write(true);
         let mut read = None;
         for _ in 0..RESTORE_POLLS {
             read = self.ops.read_minimized();
-            if read == Some(true) {
+            if read == Some(true) && outcome == WriteOutcome::Delivered {
                 return RestoreReport::Reminimized;
+            }
+            if read == Some(true) {
+                return RestoreReport::ReminimizeNotConfirmed(read);
             }
             pause();
         }
@@ -192,6 +222,14 @@ impl AxMinimizeOps {
 }
 
 impl MinimizeOps for AxMinimizeOps {
+    fn query_settable(&self) -> Settable {
+        unsafe {
+            crate::ax::write_outcome::query_settable(
+                self.window.as_ptr() as crate::ax::bindings::AXUIElementRef,
+                "AXMinimized",
+            )
+        }
+    }
     fn set_minimized(&self, minimized: bool) -> Result<(), i32> {
         use core_foundation::{base::TCFType, boolean::CFBoolean, string::CFString};
         let attr = CFString::new("AXMinimized");
@@ -240,6 +278,7 @@ mod tests {
     struct Fake {
         writes: RefCell<Vec<bool>>,
         write_error_on: Option<bool>,
+        write_error_code: i32,
         reads: RefCell<Vec<Option<bool>>>,
         /// What `await_hand_backs` answers.
         hand_backs_done: bool,
@@ -252,6 +291,7 @@ mod tests {
             Self {
                 writes: RefCell::new(Vec::new()),
                 write_error_on: None,
+                write_error_code: crate::ax::bindings::kAXErrorFailure,
                 reads: RefCell::new(reads),
                 hand_backs_done: true,
                 log: RefCell::new(Vec::new()),
@@ -269,11 +309,14 @@ mod tests {
     }
 
     impl MinimizeOps for &Fake {
+        fn query_settable(&self) -> Settable {
+            Settable::Yes
+        }
         fn set_minimized(&self, minimized: bool) -> Result<(), i32> {
             self.writes.borrow_mut().push(minimized);
             self.log.borrow_mut().push(format!("min:{minimized}"));
             if self.write_error_on == Some(minimized) {
-                Err(-25200)
+                Err(self.write_error_code)
             } else {
                 Ok(())
             }
@@ -317,6 +360,30 @@ mod tests {
         assert!(restore.begin(|| {}).is_err());
         assert_eq!(restore.finish(), RestoreReport::Reminimized);
         assert_eq!(*fake.writes.borrow(), vec![false, true]);
+
+        let mut denied = Fake::new(vec![Some(true)]);
+        denied.write_error_on = Some(false);
+        denied.write_error_code = crate::ax::bindings::kAXErrorAPIDisabled;
+        let mut restore = MinimizedRestore::new(&denied);
+        assert!(restore.begin(|| {}).is_err());
+        assert_eq!(
+            restore.finish_with_input(),
+            (RestoreReport::NotTouched, PriorInput::None)
+        );
+        assert_eq!(*denied.writes.borrow(), vec![false]);
+
+        let mut uncertain_cleanup = Fake::new(vec![Some(false), Some(true)]);
+        uncertain_cleanup.write_error_on = Some(true);
+        let mut restore = MinimizedRestore::new(&uncertain_cleanup);
+        restore.begin(|| {}).unwrap();
+        assert_eq!(
+            restore.finish_with_input(),
+            (
+                RestoreReport::ReminimizeNotConfirmed(Some(true)),
+                PriorInput::MayHaveDelivered
+            )
+        );
+        assert_eq!(*uncertain_cleanup.writes.borrow(), vec![false, true]);
     }
 
     #[test]
