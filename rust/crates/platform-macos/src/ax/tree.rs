@@ -1533,6 +1533,21 @@ fn finalize_with_deadline_sample(
         let reasons = fold_with_owned_items(&mut lines, &mut nodes);
         merge_fold_reasons(&mut budget, reasons);
     }
+    // Only the internal verify request can opt in. Require positive window
+    // scope and a clean, reconciled budget after the terminal deadline sample.
+    let mut completeness = serde_json::json!({});
+    budget.outcome().apply(&mut completeness);
+    if EXHAUSTIVE_ASSERTION.with(std::cell::Cell::get)
+        && exhaustive_nodes()
+        && query.is_none()
+        && !MENUS_COLLAPSED.with(std::cell::Cell::get)
+        && window_scope.as_ref().is_some_and(WindowScope::is_matched)
+        && !final_deadline_sample
+        && completeness["observation_incomplete_reasons"]
+            == serde_json::json!([{"kind":"unknown", "detail":"not_asserted"}])
+    {
+        budget.assert_exhaustive();
+    }
     let walk = budget.outcome();
     let nodes_skipped = ledger.finish();
     (
@@ -3780,6 +3795,19 @@ thread_local! {
     static MENUS_COLLAPSED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static WALK_SKIPPED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static EXHAUSTIVE_NODES: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static EXHAUSTIVE_ASSERTION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Enable completeness assertion only for a trusted internal verify read.
+pub fn with_exhaustive_assertion<T>(enabled: bool, walk: impl FnOnce() -> T) -> T {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            EXHAUSTIVE_ASSERTION.with(|flag| flag.set(self.0));
+        }
+    }
+    let _restore = Restore(EXHAUSTIVE_ASSERTION.with(|flag| flag.replace(enabled)));
+    walk()
 }
 
 /// Run `walk` keeping every visited node in `nodes` (or not) on this thread:

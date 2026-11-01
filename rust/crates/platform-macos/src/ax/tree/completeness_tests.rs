@@ -247,6 +247,61 @@ fn menu_ownership_unavailable_reports_attribute_failure_and_scope_mismatch() {
 }
 
 #[test]
+fn verify_read_with_no_omission_is_complete() {
+    use super::environment_evidence_tests::Scenario;
+    let (walk, _, _) = with_exhaustive_assertion(true, || {
+        with_exhaustive_nodes(true, || {
+            super::orchestration_preservation_tests::run_scenario(
+                Scenario::Launching,
+                Some((2, "AXWindow")),
+            )
+        })
+    });
+    assert_eq!(walk.legacy.window_scope, Some(WindowScope::Matched));
+    let mut output = json!({});
+    walk.legacy.walk.apply(&mut output);
+    assert_eq!(output["observation_complete"], true, "{output}");
+    assert_eq!(output["observation_incomplete_reasons"], json!([]));
+}
+
+#[test]
+fn ordinary_read_is_not_asserted() {
+    use super::environment_evidence_tests::Scenario;
+    let (walk, _, _) = super::orchestration_preservation_tests::run_scenario(
+        Scenario::Launching,
+        Some((2, "AXWindow")),
+    );
+    assert_eq!(
+        reasons(&walk.legacy),
+        json!([{"kind":"unknown", "detail":"not_asserted"}])
+    );
+}
+
+#[test]
+fn window_recovery_failure_never_asserts_complete() {
+    use super::environment_evidence_tests::Scenario;
+    for (scenario, root) in [
+        (Scenario::NoMatch, None),
+        (Scenario::ProviderFailure, Some((2, "AXWindow"))),
+        (Scenario::CachedFailure, Some((2, "AXWindow"))),
+    ] {
+        let (walk, _, _) = with_exhaustive_assertion(true, || {
+            with_exhaustive_nodes(true, || {
+                super::orchestration_preservation_tests::run_scenario(scenario, root)
+            })
+        });
+        let mut output = json!({});
+        walk.legacy.walk.apply(&mut output);
+        assert_eq!(output["observation_complete"], false, "{output}");
+        assert!(output["observation_incomplete_reasons"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|reason| reason != &json!({"kind":"unknown", "detail":"not_asserted"})));
+    }
+}
+
+#[test]
 fn missing_application_root_reports_enumeration_error() {
     let (walk, _) = super::environment_setup_tests::run_application_failure();
     assert!(has_reason(

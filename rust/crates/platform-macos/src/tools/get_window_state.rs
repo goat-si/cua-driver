@@ -585,6 +585,8 @@ impl Tool for GetWindowStateTool {
         let collapse_menus = query.as_deref().is_none_or(|q| q.trim().is_empty())
             && !view.full_output
             && !observation_only;
+        let assert_exhaustive =
+            verify_read && !display_only && !view.full_output && query.is_none();
         let window_dense_rows = !view.full_output && !observation_only;
         // Start the screenshot grab before the tree walk so the two overlap:
         // ScreenCaptureKit and the accessibility walk use independent system
@@ -629,14 +631,16 @@ impl Tool for GetWindowStateTool {
                 }
                 let mut tree = crate::ax::tree::with_menus_collapsed(collapse_menus, || {
                     crate::ax::dense_rows::with_dense_rows_windowed(window_dense_rows, || {
-                        crate::ax::tree::with_exhaustive_nodes(verify_read, || {
-                            crate::ax::tree::walk_tree_budgeted(
-                                pid,
-                                Some(window_id),
-                                q.as_deref(),
-                                max_depth,
-                                budget,
-                            )
+                        crate::ax::tree::with_exhaustive_assertion(assert_exhaustive, || {
+                            crate::ax::tree::with_exhaustive_nodes(verify_read, || {
+                                crate::ax::tree::walk_tree_budgeted(
+                                    pid,
+                                    Some(window_id),
+                                    q.as_deref(),
+                                    max_depth,
+                                    budget,
+                                )
+                            })
                         })
                     })
                 });
