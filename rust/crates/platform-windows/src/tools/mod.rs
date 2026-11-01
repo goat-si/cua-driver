@@ -6,6 +6,8 @@
 use cua_driver_core::tool::ToolRegistry;
 
 #[cfg(target_os = "windows")]
+mod actionability;
+#[cfg(target_os = "windows")]
 mod impl_;
 #[cfg(target_os = "windows")]
 pub(crate) mod page;

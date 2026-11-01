@@ -416,3 +416,67 @@ fn all_uia_patterns_map_to_expected_affordances() {
         ])
     );
 }
+
+#[test]
+fn changed_patterns_never_call_an_unadmitted_rung() {
+    use crate::uia_mutation::{set_value_route, RungOutcome, SetValueDecision};
+
+    for (admission, worker_value, expected_value, expected_range) in [
+        (
+            Admission {
+                route: AdmittedRoute::UiaWrite,
+                value_admitted: true,
+                range_admitted: false,
+            },
+            false,
+            0,
+            0,
+        ),
+        (
+            Admission {
+                route: AdmittedRoute::UiaWrite,
+                value_admitted: false,
+                range_admitted: true,
+            },
+            true,
+            0,
+            0,
+        ),
+        (
+            Admission {
+                route: AdmittedRoute::UiaWrite,
+                value_admitted: true,
+                range_admitted: true,
+            },
+            true,
+            1,
+            1,
+        ),
+    ] {
+        let values = AtomicUsize::new(0);
+        let ranges = AtomicUsize::new(0);
+        if worker_value && !may_write(Rung::Value, &admission) {
+            assert_eq!(values.load(Ordering::SeqCst), expected_value);
+            assert_eq!(ranges.load(Ordering::SeqCst), expected_range);
+            continue;
+        }
+        let value = if worker_value {
+            values.fetch_add(1, Ordering::SeqCst);
+            RungOutcome::Called(0x80040204u32 as i32)
+        } else {
+            RungOutcome::Absent
+        };
+        let result = set_value_route(value, || {
+            if !may_write(Rung::RangeValue, &admission) {
+                return RungOutcome::Absent;
+            }
+            ranges.fetch_add(1, Ordering::SeqCst);
+            RungOutcome::Called(0)
+        });
+        assert_eq!(values.load(Ordering::SeqCst), expected_value);
+        assert_eq!(ranges.load(Ordering::SeqCst), expected_range);
+        if expected_range == 1 {
+            assert_eq!(result, SetValueDecision::Delivered { rung: 1 });
+        }
+    }
+}

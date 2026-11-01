@@ -41,6 +41,7 @@ use windows::Win32::UI::Accessibility::{
     UIA_ToggleToggleStatePropertyId, UIA_ValuePatternId, UIA_ValueValuePropertyId,
 };
 
+pub(crate) mod actionability;
 pub(crate) mod client;
 pub mod fg_bypass;
 pub(crate) mod focused_document;

@@ -6740,173 +6740,217 @@ impl Tool for SetValueTool {
             );
         }
 
-        // No-raise guard: a WPF/XAML automation peer calls UIElement.Focus() →
-        // SetForegroundWindow during ValuePattern.SetValue. WS_EX_NOACTIVATE on
-        // the target makes that a no-op while the value is still set, so a
-        // background SetValue can't steal the user's foreground. Held across the
-        // whole write. (No-op for delivery_mode:"foreground".)
-        let _noact = if crate::input::delivery::DeliveryMode::from_args(&args)
-            != crate::input::delivery::DeliveryMode::Foreground
-        {
-            match crate::input::NoActivateGuard::arm(windows::Win32::Foundation::HWND(
-                hwnd as *mut _,
-            )) {
-                Ok(guard) => Some(guard),
-                Err(error) => return ToolResult::error(error.to_string()),
-            }
-        } else {
-            None
-        };
+        let clock = super::actionability::TokioClock::new();
+        let probe_target = admitted.clone();
+        let probe_target_ref = &probe_target;
+        match crate::actionability::gate_then_write(
+            &clock,
+            cua_driver_core::actionability::DEFAULT_BUDGET,
+            move |_| super::actionability::probe(probe_target_ref, hwnd as isize),
+            |admission| async move {
+                // No-raise guard: a WPF/XAML automation peer calls UIElement.Focus() →
+                // SetForegroundWindow during ValuePattern.SetValue. WS_EX_NOACTIVATE on
+                // the target makes that a no-op while the value is still set, so a
+                // background SetValue can't steal the user's foreground. Held across the
+                // whole write. (No-op for delivery_mode:"foreground".)
+                let _noact = if crate::input::delivery::DeliveryMode::from_args(&args)
+                    != crate::input::delivery::DeliveryMode::Foreground
+                {
+                    match crate::input::NoActivateGuard::arm(windows::Win32::Foundation::HWND(
+                        hwnd as *mut _,
+                    )) {
+                        Ok(guard) => Some(guard),
+                        Err(error) => return ToolResult::error(error.to_string()),
+                    }
+                } else {
+                    None
+                };
 
-        // Glide the agent cursor onto the target element before writing its
-        // value, so a value write gets the same visual feedback as a click —
-        // the viewer can see *where* the agent is acting. No-op when the
-        // overlay is disabled or the element has no cached center.
-        {
-            let (cx, cy) = admitted.center;
-            pin_overlay_above(&cursor_key, hwnd);
-            overlay_glide_to_target(
-                &cursor_key,
-                cx as f64,
-                cy as f64,
-                element_target_rect(Some(&admitted), (0, 0)),
-            )
-            .await;
-            crate::overlay::send_command(
-                cursor_key.clone(),
-                cursor_overlay::OverlayCommand::ClickPulse {
-                    x: cx as f64,
-                    y: cy as f64,
-                },
-            );
-        }
-
-        let value_for_task = value.clone();
-        let result = tokio::task::spawn_blocking({
-            move || -> anyhow::Result<SetValueRoute> {
-                let value = value_for_task;
-                let _noact = _noact;
-                let ptr = admitted.as_ptr();
-                use windows::core::{Interface, BSTR};
-                use windows::Win32::UI::Accessibility::{
-                    IUIAutomationElement, IUIAutomationValuePattern, UIA_ComboBoxControlTypeId,
-                    UIA_ValuePatternId,
-                };
-                let elem = std::mem::ManuallyDrop::new(unsafe {
-                    IUIAutomationElement::from_raw(ptr as *mut _)
-                });
-                // A native Win32 combo box (or its edit field): select the
-                // option and notify the app the way the control does. A UIA
-                // value write would only change the displayed text.
-                let native = unsafe { elem.CurrentNativeWindowHandle() }
-                    .ok()
-                    .and_then(|h| crate::win32::combo::combo_for_window(h.0 as isize));
-                if let Some(combo) = native {
-                    let write = crate::win32::combo::set_value(combo, &value)?;
-                    return Ok(SetValueRoute::Win32Combo { combo, write });
-                }
-                let is_combo = unsafe { elem.CurrentControlType() }
-                    .is_ok_and(|control_type| control_type == UIA_ComboBoxControlTypeId);
-                use crate::uia_mutation::{set_value_route, RungOutcome, SetValueDecision};
-                use windows::Win32::UI::Accessibility::{
-                    IUIAutomationRangeValuePattern, UIA_RangeValuePatternId,
-                };
-                let value_rung = match acquire_uia_pattern::<IUIAutomationValuePattern>(
-                    &elem,
-                    UIA_ValuePatternId,
-                ) {
-                    Ok(Some(vp)) => RungOutcome::Called(
-                        crate::uia::fg_bypass::run_with_uwp_bypass(hwnd as isize, || unsafe {
-                            vp.SetValue(&BSTR::from(value.as_str()))
-                        })
-                        .map_or_else(|error| error.code().0, |_| 0),
-                    ),
-                    Ok(None) => RungOutcome::Absent,
-                    Err(hresult) => RungOutcome::AcquireFailed(hresult),
-                };
-                let mut parse_error = None;
-                let decision = set_value_route(value_rung, || {
-                    let rv = match acquire_uia_pattern::<IUIAutomationRangeValuePattern>(
-                        &elem,
-                        UIA_RangeValuePatternId,
-                    ) {
-                        Ok(Some(rv)) => rv,
-                        Ok(None) => return RungOutcome::Absent,
-                        Err(hresult) => return RungOutcome::AcquireFailed(hresult),
-                    };
-                    let parsed: f64 = match value.parse() {
-                        Ok(parsed) => parsed,
-                        Err(_) => {
-                            parse_error = Some(anyhow::anyhow!(
-                                "set_value: target element exposes RangeValuePattern (Slider / \
-                         ProgressBar / numeric range). `value` must be a parseable f64; \
-                         got {value:?}."
-                            ));
-                            return RungOutcome::Absent;
-                        }
-                    };
-                    RungOutcome::Called(
-                        crate::uia::fg_bypass::run_with_uwp_bypass(hwnd as isize, || unsafe {
-                            rv.SetValue(parsed)
-                        })
-                        .map_or_else(|error| error.code().0, |_| 0),
+                // Glide the agent cursor onto the target element before writing its
+                // value, so a value write gets the same visual feedback as a click —
+                // the viewer can see *where* the agent is acting. No-op when the
+                // overlay is disabled or the element has no cached center.
+                {
+                    let (cx, cy) = admitted.center;
+                    pin_overlay_above(&cursor_key, hwnd);
+                    overlay_glide_to_target(
+                        &cursor_key,
+                        cx as f64,
+                        cy as f64,
+                        element_target_rect(Some(&admitted), (0, 0)),
                     )
-                });
-                if let Some(error) = parse_error {
-                    return Err(error);
+                    .await;
+                    crate::overlay::send_command(
+                        cursor_key.clone(),
+                        cursor_overlay::OverlayCommand::ClickPulse {
+                            x: cx as f64,
+                            y: cy as f64,
+                        },
+                    );
                 }
-                match decision {
-                    SetValueDecision::Delivered { rung: 0 } => {
-                        return Ok(if is_combo {
-                            SetValueRoute::ComboValuePattern
-                        } else {
-                            SetValueRoute::Pattern("ValuePattern")
-                        })
+
+                let value_for_task = value.clone();
+                let result = tokio::task::spawn_blocking({
+                    move || -> anyhow::Result<SetValueRoute> {
+                        let value = value_for_task;
+                        let _noact = _noact;
+                        let ptr = admitted.as_ptr();
+                        use windows::core::{Interface, BSTR};
+                        use windows::Win32::UI::Accessibility::{
+                            IUIAutomationElement, IUIAutomationValuePattern, UIA_ComboBoxControlTypeId,
+                            UIA_ValuePatternId,
+                        };
+                        let elem = std::mem::ManuallyDrop::new(unsafe {
+                            IUIAutomationElement::from_raw(ptr as *mut _)
+                        });
+                        // A native Win32 combo box (or its edit field): select the
+                        // option and notify the app the way the control does. A UIA
+                        // value write would only change the displayed text.
+                        let native = match unsafe { elem.CurrentNativeWindowHandle() } {
+                            Ok(h) => crate::win32::combo::combo_for_window(h.0 as isize),
+                            Err(_) => return Ok(SetValueRoute::AdmissionRefused {
+                                reason: "target changed since the actionability check",
+                            }),
+                        };
+                        if !crate::actionability::route_agrees(admission.route, native.is_some()) {
+                            return Ok(SetValueRoute::AdmissionRefused {
+                                reason: "target changed since the actionability check",
+                            });
+                        }
+                        if let Some(combo) = native {
+                            let write = crate::win32::combo::set_value(combo, &value)?;
+                            return Ok(SetValueRoute::Win32Combo { combo, write });
+                        }
+                        let is_combo = unsafe { elem.CurrentControlType() }
+                            .is_ok_and(|control_type| control_type == UIA_ComboBoxControlTypeId);
+                        use crate::uia_mutation::{set_value_route, RungOutcome, SetValueDecision};
+                        use windows::Win32::UI::Accessibility::{
+                            IUIAutomationRangeValuePattern, UIA_RangeValuePatternId,
+                        };
+                        let value_rung = match acquire_uia_pattern::<IUIAutomationValuePattern>(
+                            &elem,
+                            UIA_ValuePatternId,
+                        ) {
+                            Ok(Some(vp)) => {
+                                if !crate::actionability::may_write(crate::actionability::Rung::Value, &admission) {
+                                    return Ok(SetValueRoute::AdmissionRefused {
+                                        reason: "ValuePattern write not admitted by the actionability check",
+                                    });
+                                }
+                                RungOutcome::Called(
+                                    crate::uia::fg_bypass::run_with_uwp_bypass(hwnd as isize, || unsafe {
+                                        vp.SetValue(&BSTR::from(value.as_str()))
+                                    })
+                                    .map_or_else(|error| error.code().0, |_| 0),
+                                )
+                            },
+                            Ok(None) => RungOutcome::Absent,
+                            Err(hresult) => RungOutcome::AcquireFailed(hresult),
+                        };
+                        let mut parse_error = None;
+                        let mut range_refused = false;
+                        let decision = set_value_route(value_rung, || {
+                            if !crate::actionability::may_write(crate::actionability::Rung::RangeValue, &admission) {
+                                range_refused = true;
+                                return RungOutcome::Absent;
+                            }
+                            let rv = match acquire_uia_pattern::<IUIAutomationRangeValuePattern>(
+                                &elem,
+                                UIA_RangeValuePatternId,
+                            ) {
+                                Ok(Some(rv)) => rv,
+                                Ok(None) => return RungOutcome::Absent,
+                                Err(hresult) => return RungOutcome::AcquireFailed(hresult),
+                            };
+                            let parsed: f64 = match value.parse() {
+                                Ok(parsed) => parsed,
+                                Err(_) => {
+                                    parse_error = Some(anyhow::anyhow!(
+                                        "set_value: target element exposes RangeValuePattern (Slider / \
+                                 ProgressBar / numeric range). `value` must be a parseable f64; \
+                                 got {value:?}."
+                                    ));
+                                    return RungOutcome::Absent;
+                                }
+                            };
+                            RungOutcome::Called(
+                                crate::uia::fg_bypass::run_with_uwp_bypass(hwnd as isize, || unsafe {
+                                    rv.SetValue(parsed)
+                                })
+                                .map_or_else(|error| error.code().0, |_| 0),
+                            )
+                        });
+                        if range_refused {
+                            return Ok(SetValueRoute::AdmissionRefused {
+                                reason: "RangeValue fallback not admitted by the actionability check",
+                            });
+                        }
+                        if let Some(error) = parse_error {
+                            return Err(error);
+                        }
+                        match decision {
+                            SetValueDecision::Delivered { rung: 0 } => {
+                                return Ok(if is_combo {
+                                    SetValueRoute::ComboValuePattern
+                                } else {
+                                    SetValueRoute::Pattern("ValuePattern")
+                                })
+                            }
+                            SetValueDecision::Delivered { rung: 1 } => {
+                                return Ok(SetValueRoute::Pattern("RangeValuePattern"))
+                            }
+                            failure @ (SetValueDecision::Refused { .. }
+                            | SetValueDecision::Uncertain { .. }) => {
+                                return Ok(SetValueRoute::WriteFailure(failure))
+                            }
+                            SetValueDecision::NoAffordance => {}
+                            SetValueDecision::Delivered { .. } => unreachable!("only two value rungs"),
+                        }
+                        anyhow::bail!(
+                            "set_value: element [{idx}] does not implement ValuePattern or \
+                         RangeValuePattern. For controls with TogglePattern (CheckBox) or \
+                         SelectionItemPattern (RadioButton / ComboBoxItem), use the `click` \
+                         tool instead."
+                        );
                     }
-                    SetValueDecision::Delivered { rung: 1 } => {
-                        return Ok(SetValueRoute::Pattern("RangeValuePattern"))
+                })
+                .await;
+                match result {
+                    Ok(Ok(SetValueRoute::Pattern(pattern_name))) => {
+                        ToolResult::text(format!("✅ Set AXValue on [{idx}] (UIA {pattern_name})."))
                     }
-                    failure @ (SetValueDecision::Refused { .. }
-                    | SetValueDecision::Uncertain { .. }) => {
-                        return Ok(SetValueRoute::WriteFailure(failure))
+                    Ok(Ok(SetValueRoute::ComboValuePattern)) => ToolResult::text(format!(
+                        "Set the UIA value of combo box [{idx}] to '{value}'. This combo box is not a \
+                         native Win32 one, and a UIA value write may change the shown text without \
+                         the app treating it as a selection. Check with get_window_state; if the app \
+                         did not react, click the combo box and then the option."
+                    ))
+                    .with_structured(json!({ "path": "ax", "verified": false, "effect": "unverifiable" })),
+                    Ok(Ok(SetValueRoute::WriteFailure(failure))) => {
+                        set_value_write_failure_result(failure, &args)
                     }
-                    SetValueDecision::NoAffordance => {}
-                    SetValueDecision::Delivered { .. } => unreachable!("only two value rungs"),
+                    Ok(Ok(SetValueRoute::AdmissionRefused { reason })) => {
+                        crate::actionability::admission_refusal(reason)
+                    }
+                    Ok(Ok(SetValueRoute::Win32Combo { combo, write })) => {
+                        win32_combo_set_value_result(idx, &value, combo, write, &args)
+                    }
+                    Ok(Err(e)) => ToolResult::error(e.to_string()),
+                    Err(e) => ToolResult::error(format!("Task error: {e}")),
                 }
-                anyhow::bail!(
-                    "set_value: element [{idx}] does not implement ValuePattern or \
-                 RangeValuePattern. For controls with TogglePattern (CheckBox) or \
-                 SelectionItemPattern (RadioButton / ComboBoxItem), use the `click` \
-                 tool instead."
-                );
-            }
-        })
-        .await;
-        match result {
-            Ok(Ok(SetValueRoute::Pattern(pattern_name))) => {
-                ToolResult::text(format!("✅ Set AXValue on [{idx}] (UIA {pattern_name})."))
-            }
-            Ok(Ok(SetValueRoute::ComboValuePattern)) => ToolResult::text(format!(
-                "Set the UIA value of combo box [{idx}] to '{value}'. This combo box is not a \
-                 native Win32 one, and a UIA value write may change the shown text without \
-                 the app treating it as a selection. Check with get_window_state; if the app \
-                 did not react, click the combo box and then the option."
-            ))
-            .with_structured(json!({ "path": "ax", "verified": false, "effect": "unverifiable" })),
-            Ok(Ok(SetValueRoute::WriteFailure(failure))) => {
-                set_value_write_failure_result(failure, &args)
-            }
-            Ok(Ok(SetValueRoute::Win32Combo { combo, write })) => {
-                win32_combo_set_value_result(idx, &value, combo, write, &args)
-            }
-            Ok(Err(e)) => ToolResult::error(e.to_string()),
-            Err(e) => ToolResult::error(format!("Task error: {e}")),
+            },
+        ).await {
+            Ok(result) => result,
+            Err(refusal) => refusal,
         }
     }
 }
 
 /// How `set_value` wrote the value.
 enum SetValueRoute {
+    AdmissionRefused {
+        reason: &'static str,
+    },
     WriteFailure(crate::uia_mutation::SetValueDecision),
     /// A UIA pattern on a non-combo element (`ValuePattern`, `RangeValuePattern`).
     Pattern(&'static str),
