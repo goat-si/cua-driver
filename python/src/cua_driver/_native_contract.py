@@ -5594,6 +5594,8 @@ class IncompleteReasonDetail(enum.Enum):
 
     NOT_ASSERTED = 13
 
+    EXCLUDED_CONTENT_UNCLASSIFIED = 14
+
 
 
 class _UniffiFfiConverterTypeIncompleteReasonDetail(_UniffiConverterRustBuffer):
@@ -5628,6 +5630,8 @@ class _UniffiFfiConverterTypeIncompleteReasonDetail(_UniffiConverterRustBuffer):
             return IncompleteReasonDetail.SCOPE_MISMATCH
         if variant == 14:
             return IncompleteReasonDetail.NOT_ASSERTED
+        if variant == 15:
+            return IncompleteReasonDetail.EXCLUDED_CONTENT_UNCLASSIFIED
         raise InternalError("Raw enum value doesn't match any cases")
 
     @staticmethod
@@ -5659,6 +5663,8 @@ class _UniffiFfiConverterTypeIncompleteReasonDetail(_UniffiConverterRustBuffer):
         if value == IncompleteReasonDetail.SCOPE_MISMATCH:
             return
         if value == IncompleteReasonDetail.NOT_ASSERTED:
+            return
+        if value == IncompleteReasonDetail.EXCLUDED_CONTENT_UNCLASSIFIED:
             return
         raise ValueError(value)
 
@@ -5692,6 +5698,8 @@ class _UniffiFfiConverterTypeIncompleteReasonDetail(_UniffiConverterRustBuffer):
             buf.write_i32(13)
         if value == IncompleteReasonDetail.NOT_ASSERTED:
             buf.write_i32(14)
+        if value == IncompleteReasonDetail.EXCLUDED_CONTENT_UNCLASSIFIED:
+            buf.write_i32(15)
 
 
 
@@ -8035,6 +8043,8 @@ class ScopeExclusionKind(enum.Enum):
 
     CLOSED_MENUS_NOT_EXPANDED = 0
 
+    COLLAPSED_LISTS_NOT_EXPANDED = 1
+
 
 
 class _UniffiFfiConverterTypeScopeExclusionKind(_UniffiConverterRustBuffer):
@@ -8043,11 +8053,15 @@ class _UniffiFfiConverterTypeScopeExclusionKind(_UniffiConverterRustBuffer):
         variant = buf.read_i32()
         if variant == 1:
             return ScopeExclusionKind.CLOSED_MENUS_NOT_EXPANDED
+        if variant == 2:
+            return ScopeExclusionKind.COLLAPSED_LISTS_NOT_EXPANDED
         raise InternalError("Raw enum value doesn't match any cases")
 
     @staticmethod
     def check_lower(value):
         if value == ScopeExclusionKind.CLOSED_MENUS_NOT_EXPANDED:
+            return
+        if value == ScopeExclusionKind.COLLAPSED_LISTS_NOT_EXPANDED:
             return
         raise ValueError(value)
 
@@ -8055,6 +8069,8 @@ class _UniffiFfiConverterTypeScopeExclusionKind(_UniffiConverterRustBuffer):
     def write(value, buf):
         if value == ScopeExclusionKind.CLOSED_MENUS_NOT_EXPANDED:
             buf.write_i32(1)
+        if value == ScopeExclusionKind.COLLAPSED_LISTS_NOT_EXPANDED:
+            buf.write_i32(2)
 
 
 

@@ -177,10 +177,26 @@ impl WalkBudget {
         self.record_skip(reason);
     }
 
-    /// Record intentionally excluded scope without affecting completeness.
+    /// Record excluded scope whose content has not been verified. It may
+    /// contain any role, so the entire observation is incomplete.
     /// `owner` is a walk-local identity, not a returned element index. Use a
     /// separate node boundary for a closed-menu row; do not call `record_cut`.
     pub fn record_scope_exclusion(&mut self, kind: ScopeExclusionKind, owner: Option<u64>) {
+        self.record_skip(IncompleteReason {
+            kind: Kind::Unknown,
+            detail: Detail::ExcludedContentUnclassified,
+        });
+        self.record_verified_scope_exclusion(kind, owner);
+    }
+
+    /// Record excluded scope only after proving its contents belong to the
+    /// kind's guarded families without expanding the UI. Any uncertainty or
+    /// non-family control requires `record_scope_exclusion` instead.
+    pub fn record_verified_scope_exclusion(
+        &mut self,
+        kind: ScopeExclusionKind,
+        owner: Option<u64>,
+    ) {
         self.scope_exclusions.push((kind, owner));
     }
 
@@ -499,12 +515,38 @@ mod tests {
     use super::*;
 
     #[test]
+    fn unverified_exclusion_marks_the_read_incomplete() {
+        let mut budget = WalkBudget::nodes_only(10);
+        budget.assert_exhaustive();
+        for kind in [
+            ScopeExclusionKind::ClosedMenusNotExpanded,
+            ScopeExclusionKind::CollapsedListsNotExpanded,
+        ] {
+            budget.record_scope_exclusion(kind, None);
+        }
+        let mut out = json!({});
+        budget.outcome().apply(&mut out);
+        assert_eq!(out["observation_complete"], false);
+        assert_eq!(
+            out["observation_incomplete_reasons"],
+            json!([{"kind":"unknown","detail":"excluded_content_unclassified"}])
+        );
+        assert_eq!(
+            out["observation_scope_exclusions"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+    }
+
+    #[test]
     fn scope_exclusions_are_localized_conservatively_without_affecting_completeness() {
         let kind = ScopeExclusionKind::ClosedMenusNotExpanded;
         let mut budget = WalkBudget::nodes_only(10);
         budget.assert_exhaustive();
         for owner in [Some(7), Some(3), Some(7)] {
-            budget.record_scope_exclusion(kind, owner);
+            budget.record_verified_scope_exclusion(kind, owner);
         }
         let mut out = json!({"elements":[{"element_index":9,"boundary":{
             "reasons":[{"kind":"policy_omission","detail":"collapsed_menu"}],
@@ -548,7 +590,7 @@ mod tests {
         for is_cut in [true, false] {
             let mut other = WalkBudget::nodes_only(10);
             other.assert_exhaustive();
-            other.record_scope_exclusion(kind, None);
+            other.record_verified_scope_exclusion(kind, None);
             let reason = IncompleteReason {
                 kind: Kind::Unknown,
                 detail: Detail::UntrustedProvider,
@@ -564,7 +606,7 @@ mod tests {
         }
         let mut timed = WalkBudget::nodes_only(10);
         timed.assert_exhaustive();
-        timed.record_scope_exclusion(kind, None);
+        timed.record_verified_scope_exclusion(kind, None);
         timed.stop_for_timeout();
         timed.outcome().apply(&mut out);
         assert_eq!(out["observation_complete"], false);

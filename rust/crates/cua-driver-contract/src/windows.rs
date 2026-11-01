@@ -400,6 +400,7 @@ pub enum IncompleteReasonDetail {
     UntrustedProvider,
     ScopeMismatch,
     NotAsserted,
+    ExcludedContentUnclassified,
 }
 
 #[derive(
@@ -440,6 +441,7 @@ pub type BoundaryReason = IncompleteReason;
 #[serde(rename_all = "snake_case")]
 pub enum ScopeExclusionKind {
     ClosedMenusNotExpanded,
+    CollapsedListsNotExpanded,
 }
 
 #[derive(
@@ -861,13 +863,17 @@ mod tests {
         assert_eq!(serde_json::to_value(parsed).unwrap(), old);
         let new = json!({"pid":7,"window_id":9,"observation_scope_exclusions":[
             {"kind":"closed_menus_not_expanded","element_indices":[1,2]},
-            {"kind":"closed_menus_not_expanded"}
+            {"kind":"collapsed_lists_not_expanded"}
         ]});
         let parsed: WindowStateOutput = serde_json::from_value(new.clone()).unwrap();
         assert_eq!(serde_json::to_value(parsed).unwrap(), new);
         let mut invalid = new;
         invalid["observation_scope_exclusions"][0]["kind"] = json!("unknown_kind");
         assert!(serde_json::from_value::<WindowStateOutput>(invalid).is_err());
+        let reason = json!({"pid":7,"window_id":9,"observation_complete":false,
+            "observation_incomplete_reasons":[{"kind":"unknown","detail":"excluded_content_unclassified"}]});
+        let parsed: WindowStateOutput = serde_json::from_value(reason.clone()).unwrap();
+        assert_eq!(serde_json::to_value(parsed).unwrap(), reason);
     }
 
     #[test]

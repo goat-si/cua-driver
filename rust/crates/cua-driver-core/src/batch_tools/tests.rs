@@ -397,6 +397,158 @@ async fn excluded_menu_scope_never_proves_absence() {
 }
 
 #[tokio::test]
+async fn collapsed_list_scope_never_proves_gone_unique_or_nth() {
+    for role in [
+        "listitem",
+        "option",
+        "row",
+        "cell",
+        "DataItem",
+        "AXRow",
+        "AXCell",
+        "table cell",
+    ] {
+        for mode in ["gone", "unique", "nth"] {
+            let harness = Harness::new();
+            let mut state = if mode == "gone" {
+                empty_state()
+            } else {
+                save_state()
+            };
+            if mode != "gone" {
+                state["elements"][0]["role"] = json!(role);
+            }
+            state["observation_complete"] = json!(true);
+            state["observation_scope_exclusions"] =
+                json!([{"kind":"collapsed_lists_not_expanded"}]);
+            harness.respond("get_window_state", state);
+            let mut target = json!({"pid":42,"window_id":9,"role":role,"name":"Save"});
+            let step = if mode == "gone" {
+                target["gone"] = json!(true);
+                target["timeout_ms"] = json!(0);
+                json!({"expect":target})
+            } else {
+                if mode == "nth" {
+                    target["nth"] = json!(0);
+                }
+                json!({"click":target,"timeout_ms":0})
+            };
+            let result = harness
+                .run(json!({"steps":[step]}))
+                .await
+                .structured_content
+                .unwrap();
+            assert_eq!(
+                result["steps"][0]["code"], "incomplete_observation",
+                "{role} {mode}: {result}"
+            );
+            assert_eq!(harness.hits("click"), 0);
+        }
+    }
+}
+
+#[tokio::test]
+async fn exclusion_content_roles_and_unverified_content_are_guarded() {
+    for kind in ["closed_menus_not_expanded", "collapsed_lists_not_expanded"] {
+        for role in [
+            "statictext",
+            "static_text",
+            "AXStaticText",
+            "label",
+            "text",
+            "heading",
+            "paragraph",
+            "image",
+            "hyperlink",
+        ] {
+            let harness = Harness::new();
+            let mut state = empty_state();
+            state["observation_complete"] = json!(true);
+            state["observation_scope_exclusions"] = json!([{"kind":kind}]);
+            harness.respond("get_window_state", state);
+            let result = harness.run(json!({"steps":[{"expect":{"pid":42,"window_id":9,"role":role,"name":"Save","gone":true,"timeout_ms":0}}]})).await.structured_content.unwrap();
+            assert_eq!(
+                result["steps"][0]["code"], "incomplete_observation",
+                "{kind} {role}: {result}"
+            );
+        }
+        for role in ["button", "checkbox", "textfield", "slider"] {
+            for verified in [true, false] {
+                let harness = Harness::new();
+                let mut state = empty_state();
+                let mut budget = crate::walk_budget::WalkBudget::nodes_only(10);
+                budget.assert_exhaustive();
+                let kind_value = if kind == "closed_menus_not_expanded" {
+                    cua_driver_contract::ScopeExclusionKind::ClosedMenusNotExpanded
+                } else {
+                    cua_driver_contract::ScopeExclusionKind::CollapsedListsNotExpanded
+                };
+                if verified {
+                    budget.record_verified_scope_exclusion(kind_value, None);
+                } else {
+                    budget.record_scope_exclusion(kind_value, None);
+                }
+                budget.outcome().apply(&mut state);
+                harness.respond("get_window_state", state);
+                let result = harness.run(json!({"steps":[{"expect":{"pid":42,"window_id":9,"role":role,"name":"Save","gone":true,"timeout_ms":0}}]})).await.structured_content.unwrap();
+                assert_eq!(
+                    result["steps"][0]["code"] == "incomplete_observation",
+                    !verified,
+                    "{kind} {role} verified={verified}: {result}"
+                );
+                if verified {
+                    assert_eq!(result["steps"][0]["ok"], true, "{result}");
+                }
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn unknown_scope_exclusion_fails_closed_for_all_selectors() {
+    for role in ["button", "menu", "row", "statictext"] {
+        for mode in ["gone", "unique", "nth"] {
+            let harness = Harness::new();
+            let mut state = if mode == "gone" {
+                empty_state()
+            } else {
+                save_state()
+            };
+            state["elements"]
+                .as_array_mut()
+                .unwrap()
+                .iter_mut()
+                .for_each(|item| item["role"] = json!(role));
+            state["observation_complete"] = json!(true);
+            state["observation_scope_exclusions"] = json!([{"kind":"future_kind"}]);
+            harness.respond("get_window_state", state);
+            let mut target = json!({"pid":42,"window_id":9,"role":role,"name":"Save"});
+            let step = if mode == "gone" {
+                target["gone"] = json!(true);
+                target["timeout_ms"] = json!(0);
+                json!({"expect":target})
+            } else {
+                if mode == "nth" {
+                    target["nth"] = json!(0);
+                }
+                json!({"click":target,"timeout_ms":0})
+            };
+            let result = harness
+                .run(json!({"steps":[step]}))
+                .await
+                .structured_content
+                .unwrap();
+            assert_eq!(
+                result["steps"][0]["code"], "incomplete_observation",
+                "{role} {mode}: {result}"
+            );
+            assert_eq!(harness.hits("click"), 0);
+            assert!(!result.to_string().contains("future_kind"));
+        }
+    }
+}
+
+#[tokio::test]
 async fn completeness_metadata_truth_table_for_gone() {
     let cases = [
         (json!({"observation_complete":true}), false),
