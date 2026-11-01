@@ -17,8 +17,47 @@ use proc_macro2::{TokenStream, TokenTree};
 use quote::ToTokens;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
+use syn::ext::IdentExt;
 use syn::visit::{self, Visit};
 use syn::{Attribute, Expr, ItemMod, Meta, UseTree};
+
+// Rust raw identifiers denote the same name as their unprefixed spelling.
+fn normalized_ident(ident: &syn::Ident) -> syn::Ident {
+    ident.unraw()
+}
+
+fn ident_text(ident: &syn::Ident) -> String {
+    normalized_ident(ident).to_string()
+}
+
+fn path_is_ident(path: &syn::Path, expected: &str) -> bool {
+    path.get_ident()
+        .is_some_and(|ident| ident_text(ident) == expected)
+}
+
+fn normalized_tokens(tokens: TokenStream) -> TokenStream {
+    tokens
+        .into_iter()
+        .map(|token| match token {
+            TokenTree::Ident(ident) => TokenTree::Ident(normalized_ident(&ident)),
+            TokenTree::Group(group) => {
+                let mut normalized =
+                    proc_macro2::Group::new(group.delimiter(), normalized_tokens(group.stream()));
+                normalized.set_span(group.span());
+                TokenTree::Group(normalized)
+            }
+            other => other,
+        })
+        .collect()
+}
+
+fn contains_ident(tokens: TokenStream, expected: &str) -> bool {
+    tokens.into_iter().any(|token| match token {
+        TokenTree::Ident(ident) => ident_text(&ident) == expected,
+        TokenTree::Group(group) => contains_ident(group.stream(), expected),
+        _ => false,
+    })
+}
 
 #[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd)]
 pub(super) struct Site {
@@ -33,14 +72,16 @@ pub(super) struct Site {
 
 fn cfg_value(meta: &Meta) -> Option<bool> {
     match meta {
-        Meta::Path(path) if path.is_ident("test") => Some(false),
-        Meta::List(list) if list.path.is_ident("all") || list.path.is_ident("any") => {
+        Meta::Path(path) if path_is_ident(path, "test") => Some(false),
+        Meta::List(list)
+            if path_is_ident(&list.path, "all") || path_is_ident(&list.path, "any") =>
+        {
             use syn::parse::Parser;
             let args = syn::punctuated::Punctuated::<Meta, syn::Token![,]>::parse_terminated
                 .parse2(list.tokens.clone())
                 .ok()?;
             let values: Vec<_> = args.iter().map(cfg_value).collect();
-            if list.path.is_ident("all") {
+            if path_is_ident(&list.path, "all") {
                 if values.contains(&Some(false)) {
                     Some(false)
                 } else if values.iter().all(|v| *v == Some(true)) {
@@ -56,17 +97,19 @@ fn cfg_value(meta: &Meta) -> Option<bool> {
                 None
             }
         }
-        Meta::List(list) if list.path.is_ident("not") => syn::parse2::<Meta>(list.tokens.clone())
-            .ok()
-            .and_then(|m| cfg_value(&m))
-            .map(|v| !v),
+        Meta::List(list) if path_is_ident(&list.path, "not") => {
+            syn::parse2::<Meta>(list.tokens.clone())
+                .ok()
+                .and_then(|m| cfg_value(&m))
+                .map(|v| !v)
+        }
         _ => None,
     }
 }
 
 fn test_only(attrs: &[Attribute]) -> bool {
     attrs.iter().any(|a| {
-        a.path().is_ident("cfg")
+        path_is_ident(a.path(), "cfg")
             && a.parse_args::<Meta>().ok().and_then(|m| cfg_value(&m)) == Some(false)
     })
 }
@@ -84,12 +127,12 @@ fn fingerprint(tokens: TokenStream) -> u64 {
 fn imports(tree: &UseTree, prefix: &mut Vec<String>, out: &mut BTreeMap<String, BTreeSet<String>>) {
     match tree {
         UseTree::Path(p) => {
-            prefix.push(p.ident.to_string());
+            prefix.push(ident_text(&p.ident));
             imports(&p.tree, prefix, out);
             prefix.pop();
         }
         UseTree::Name(n) => {
-            let ident = n.ident.to_string();
+            let ident = ident_text(&n.ident);
             let mut path = prefix.clone();
             let name = if ident == "self" {
                 match prefix.last() {
@@ -104,8 +147,8 @@ fn imports(tree: &UseTree, prefix: &mut Vec<String>, out: &mut BTreeMap<String, 
         }
         UseTree::Rename(n) => {
             let mut path = prefix.clone();
-            path.push(n.ident.to_string());
-            out.entry(n.rename.to_string())
+            path.push(ident_text(&n.ident));
+            out.entry(ident_text(&n.rename))
                 .or_default()
                 .insert(path.join("::"));
         }
@@ -128,7 +171,7 @@ fn bind_pattern(aliases: &mut Aliases, pattern: &syn::Pat) {
     impl<'ast> Visit<'ast> for Bindings<'_> {
         fn visit_pat_ident(&mut self, pattern: &'ast syn::PatIdent) {
             self.0
-                .entry(pattern.ident.to_string())
+                .entry(ident_text(&pattern.ident))
                 .or_default()
                 .insert(LOCAL_BINDING.into());
             visit::visit_pat_ident(self, pattern);
@@ -149,7 +192,7 @@ fn parameters(sig: &syn::Signature) -> Aliases {
 
 fn bind_name(aliases: &mut Aliases, name: &syn::Ident) {
     aliases
-        .entry(name.to_string())
+        .entry(ident_text(name))
         .or_default()
         .insert(LOCAL_BINDING.into());
 }
@@ -259,9 +302,8 @@ fn has_glob(tree: &UseTree) -> bool {
 }
 
 fn reserved_path_root(name: &syn::Ident) -> Option<String> {
-    let spelling = name.to_string();
-    let spelling = spelling.strip_prefix("r#").unwrap_or(&spelling);
-    matches!(spelling, "std" | "core" | "alloc" | "tokio").then(|| spelling.to_owned())
+    let spelling = ident_text(name);
+    matches!(spelling.as_str(), "std" | "core" | "alloc" | "tokio").then_some(spelling)
 }
 
 fn use_path_roots(tree: &UseTree, prefix: &mut Vec<syn::Ident>, out: &mut Vec<(String, usize)>) {
@@ -272,7 +314,7 @@ fn use_path_roots(tree: &UseTree, prefix: &mut Vec<syn::Ident>, out: &mut Vec<(S
             prefix.pop();
         }
         UseTree::Name(name) => {
-            let binding = if name.ident == "self" {
+            let binding = if ident_text(&name.ident) == "self" {
                 prefix.last()
             } else {
                 Some(&name.ident)
@@ -357,7 +399,7 @@ fn contains_forbidden_include(tokens: TokenStream) -> bool {
             tokens.get(index + 1),
             tokens.get(index + 2),
         ) {
-            if bang.as_char() == '!' && forbidden_include(&name.to_string(), args.stream()) {
+            if bang.as_char() == '!' && forbidden_include(&ident_text(name), args.stream()) {
                 return true;
             }
         }
@@ -376,7 +418,7 @@ fn raw_primitive_imports(
 ) {
     match tree {
         UseTree::Path(path) => {
-            prefix.push(path.ident.to_string());
+            prefix.push(ident_text(&path.ident));
             raw_primitive_imports(&path.tree, prefix, exported, out);
             prefix.pop();
         }
@@ -387,8 +429,8 @@ fn raw_primitive_imports(
         }
         UseTree::Name(name) => {
             let mut path = prefix.clone();
-            if name.ident != "self" {
-                path.push(name.ident.to_string());
+            if ident_text(&name.ident) != "self" {
+                path.push(ident_text(&name.ident));
             }
             if exported && potential_raw_primitive(&path) {
                 out.push((path.join("::"), name.ident.span().start().line));
@@ -396,12 +438,12 @@ fn raw_primitive_imports(
         }
         UseTree::Rename(rename) => {
             let mut path = prefix.clone();
-            if rename.ident != "self" {
-                path.push(rename.ident.to_string());
+            if ident_text(&rename.ident) != "self" {
+                path.push(ident_text(&rename.ident));
             }
             let renamed = path
                 .last()
-                .is_none_or(|original| rename.rename != original.as_str());
+                .is_none_or(|original| ident_text(&rename.rename) != *original);
             if (exported || renamed) && potential_raw_primitive(&path) {
                 out.push((path.join("::"), rename.ident.span().start().line));
             }
@@ -512,16 +554,16 @@ struct BodyBindings {
 
 impl<'ast> Visit<'ast> for BodyBindings {
     fn visit_pat_ident(&mut self, pattern: &'ast syn::PatIdent) {
-        self.names.insert(pattern.ident.to_string());
+        self.names.insert(ident_text(&pattern.ident));
         visit::visit_pat_ident(self, pattern);
     }
     fn visit_generic_param(&mut self, param: &'ast syn::GenericParam) {
         match param {
             syn::GenericParam::Type(item) => {
-                self.names.insert(item.ident.to_string());
+                self.names.insert(ident_text(&item.ident));
             }
             syn::GenericParam::Const(item) => {
-                self.names.insert(item.ident.to_string());
+                self.names.insert(ident_text(&item.ident));
             }
             syn::GenericParam::Lifetime(_) => {}
         }
@@ -556,13 +598,13 @@ impl<'ast> Visit<'ast> for BodyBindings {
         if !test_only(trait_item_attrs(item)) {
             match item {
                 syn::TraitItem::Fn(item) => {
-                    self.names.insert(item.sig.ident.to_string());
+                    self.names.insert(ident_text(&item.sig.ident));
                 }
                 syn::TraitItem::Const(item) => {
-                    self.names.insert(item.ident.to_string());
+                    self.names.insert(ident_text(&item.ident));
                 }
                 syn::TraitItem::Type(item) => {
-                    self.names.insert(item.ident.to_string());
+                    self.names.insert(ident_text(&item.ident));
                 }
                 _ => {}
             }
@@ -573,13 +615,13 @@ impl<'ast> Visit<'ast> for BodyBindings {
         if !test_only(impl_item_attrs(item)) {
             match item {
                 syn::ImplItem::Fn(item) => {
-                    self.names.insert(item.sig.ident.to_string());
+                    self.names.insert(ident_text(&item.sig.ident));
                 }
                 syn::ImplItem::Const(item) => {
-                    self.names.insert(item.ident.to_string());
+                    self.names.insert(ident_text(&item.ident));
                 }
                 syn::ImplItem::Type(item) => {
-                    self.names.insert(item.ident.to_string());
+                    self.names.insert(ident_text(&item.ident));
                 }
                 _ => {}
             }
@@ -609,7 +651,7 @@ impl Scanner {
         let Some(first) = path.segments.first() else {
             return false;
         };
-        let name = first.ident.to_string();
+        let name = ident_text(&first.ident);
         !self.body_bindings.iter().any(|scope| {
             scope.names.contains(&name)
                 || scope.imports.get(&name).is_some_and(|imports| {
@@ -634,7 +676,10 @@ impl Scanner {
                 _ => false,
             }
         }
-        if call.method != "spawn" || call.args.len() != 1 || !builder(self, &call.receiver) {
+        if ident_text(&call.method) != "spawn"
+            || call.args.len() != 1
+            || !builder(self, &call.receiver)
+        {
             return false;
         }
         match call.args.first() {
@@ -678,7 +723,7 @@ impl Scanner {
         self.item.pop();
     }
     fn resolve(&self, path: &syn::Path) -> Vec<String> {
-        let pieces: Vec<_> = path.segments.iter().map(|s| s.ident.to_string()).collect();
+        let pieces: Vec<_> = path.segments.iter().map(|s| ident_text(&s.ident)).collect();
         if pieces.is_empty() {
             return Vec::new();
         }
@@ -881,8 +926,8 @@ impl<'ast> Visit<'ast> for Scanner {
             let previous = self.module_scope;
             self.module_scope = self.scopes.len();
             self.scopes.push(item_imports(items.iter()));
-            self.modules.push(i.ident.to_string());
-            self.with_item(i.ident.to_string(), |s| visit::visit_item_mod(s, i));
+            self.modules.push(ident_text(&i.ident));
+            self.with_item(ident_text(&i.ident), |s| visit::visit_item_mod(s, i));
             self.modules.pop();
             self.scopes.pop();
             self.module_scope = previous;
@@ -913,38 +958,40 @@ impl<'ast> Visit<'ast> for Scanner {
         if !test_only(&i.attrs) {
             let mut body = BodyBindings::default();
             body.visit_signature(&i.sig);
-            body.names.insert(i.sig.ident.to_string());
+            body.names.insert(ident_text(&i.sig.ident));
             self.body_bindings.push(body);
             self.scopes.push(parameters(&i.sig));
-            self.with_item(i.sig.ident.to_string(), |s| visit::visit_item_fn(s, i));
+            self.with_item(ident_text(&i.sig.ident), |s| visit::visit_item_fn(s, i));
             self.scopes.pop();
             self.body_bindings.pop();
         }
     }
     fn visit_item_const(&mut self, i: &'ast syn::ItemConst) {
         self.body_bindings.push(BodyBindings {
-            names: [i.ident.to_string()].into_iter().collect(),
+            names: [ident_text(&i.ident)].into_iter().collect(),
             ..Default::default()
         });
-        self.with_item(i.ident.to_string(), |s| visit::visit_item_const(s, i));
+        self.with_item(ident_text(&i.ident), |s| visit::visit_item_const(s, i));
         self.body_bindings.pop();
     }
     fn visit_item_static(&mut self, i: &'ast syn::ItemStatic) {
         self.body_bindings.push(BodyBindings {
-            names: [i.ident.to_string()].into_iter().collect(),
+            names: [ident_text(&i.ident)].into_iter().collect(),
             ..Default::default()
         });
-        self.with_item(i.ident.to_string(), |s| visit::visit_item_static(s, i));
+        self.with_item(ident_text(&i.ident), |s| visit::visit_item_static(s, i));
         self.body_bindings.pop();
     }
     fn visit_impl_item_fn(&mut self, i: &'ast syn::ImplItemFn) {
         if !test_only(&i.attrs) {
             let mut body = BodyBindings::default();
             body.visit_signature(&i.sig);
-            body.names.insert(i.sig.ident.to_string());
+            body.names.insert(ident_text(&i.sig.ident));
             self.body_bindings.push(body);
             self.scopes.push(parameters(&i.sig));
-            self.with_item(i.sig.ident.to_string(), |s| visit::visit_impl_item_fn(s, i));
+            self.with_item(ident_text(&i.sig.ident), |s| {
+                visit::visit_impl_item_fn(s, i)
+            });
             self.scopes.pop();
             self.body_bindings.pop();
         }
@@ -953,10 +1000,10 @@ impl<'ast> Visit<'ast> for Scanner {
         if !test_only(&i.attrs) {
             let mut body = BodyBindings::default();
             body.visit_signature(&i.sig);
-            body.names.insert(i.sig.ident.to_string());
+            body.names.insert(ident_text(&i.sig.ident));
             self.body_bindings.push(body);
             self.scopes.push(parameters(&i.sig));
-            self.with_item(i.sig.ident.to_string(), |s| {
+            self.with_item(ident_text(&i.sig.ident), |s| {
                 visit::visit_trait_item_fn(s, i)
             });
             self.scopes.pop();
@@ -966,20 +1013,22 @@ impl<'ast> Visit<'ast> for Scanner {
     fn visit_trait_item_const(&mut self, i: &'ast syn::TraitItemConst) {
         if !test_only(&i.attrs) {
             self.body_bindings.push(BodyBindings {
-                names: [i.ident.to_string()].into_iter().collect(),
+                names: [ident_text(&i.ident)].into_iter().collect(),
                 ..Default::default()
             });
-            self.with_item(i.ident.to_string(), |s| visit::visit_trait_item_const(s, i));
+            self.with_item(ident_text(&i.ident), |s| {
+                visit::visit_trait_item_const(s, i)
+            });
             self.body_bindings.pop();
         }
     }
     fn visit_impl_item_const(&mut self, i: &'ast syn::ImplItemConst) {
         if !test_only(&i.attrs) {
             self.body_bindings.push(BodyBindings {
-                names: [i.ident.to_string()].into_iter().collect(),
+                names: [ident_text(&i.ident)].into_iter().collect(),
                 ..Default::default()
             });
-            self.with_item(i.ident.to_string(), |s| visit::visit_impl_item_const(s, i));
+            self.with_item(ident_text(&i.ident), |s| visit::visit_impl_item_const(s, i));
             self.body_bindings.pop();
         }
     }
@@ -991,7 +1040,7 @@ impl<'ast> Visit<'ast> for Scanner {
                 ..Default::default()
             });
             self.scopes.push(names);
-            self.with_item(i.ident.to_string(), |s| visit::visit_item_trait(s, i));
+            self.with_item(ident_text(&i.ident), |s| visit::visit_item_trait(s, i));
             self.scopes.pop();
             self.body_bindings.pop();
         }
@@ -1004,9 +1053,10 @@ impl<'ast> Visit<'ast> for Scanner {
                 ..Default::default()
             });
             self.scopes.push(names);
-            self.with_item(i.self_ty.to_token_stream().to_string(), |s| {
-                visit::visit_item_impl(s, i)
-            });
+            self.with_item(
+                normalized_tokens(i.self_ty.to_token_stream()).to_string(),
+                |s| visit::visit_item_impl(s, i),
+            );
             self.scopes.pop();
             self.body_bindings.pop();
         }
@@ -1087,11 +1137,13 @@ impl<'ast> Visit<'ast> for Scanner {
         visit::visit_expr_path(self, p);
     }
     fn visit_expr_method_call(&mut self, i: &'ast syn::ExprMethodCall) {
-        if (i.method == "spawn" || i.method == "spawn_blocking" || i.method == "spawn_local")
-            && !self.wrapped_thread_builder(i)
+        if matches!(
+            ident_text(&i.method).as_str(),
+            "spawn" | "spawn_blocking" | "spawn_local"
+        ) && !self.wrapped_thread_builder(i)
         {
             self.record(
-                format!(".{}", i.method),
+                format!(".{}", ident_text(&i.method)),
                 i.to_token_stream(),
                 i.method.span().start().line,
             );
@@ -1099,13 +1151,7 @@ impl<'ast> Visit<'ast> for Scanner {
         visit::visit_expr_method_call(self, i);
     }
     fn visit_macro(&mut self, m: &'ast syn::Macro) {
-        let name = m
-            .path
-            .segments
-            .last()
-            .expect("macro path")
-            .ident
-            .to_string();
+        let name = ident_text(&m.path.segments.last().expect("macro path").ident);
         if forbidden_include(&name, m.tokens.clone())
             || contains_forbidden_include(m.tokens.clone())
         {
@@ -1121,7 +1167,7 @@ impl<'ast> Visit<'ast> for Scanner {
             stream.into_iter().any(|t| match t {
                 TokenTree::Group(g) => has_spawn(scanner, g.stream()),
                 TokenTree::Ident(i) => {
-                    let ident = i.to_string();
+                    let ident = ident_text(&i);
                     matches!(ident.as_str(), "spawn" | "spawn_blocking" | "spawn_local")
                         || scanner.scopes[scanner.module_scope..]
                             .iter()
@@ -1248,12 +1294,8 @@ pub(super) fn test_only_files(root: &Path, files: &[PathBuf]) -> Result<BTreeSet
                 self.uncertain = true;
             }
             if item.attrs.iter().any(|attr| {
-                attr.path().is_ident("cfg_attr")
-                    && attr
-                        .to_token_stream()
-                        .to_string()
-                        .split_whitespace()
-                        .any(|token| token == "path")
+                path_is_ident(attr.path(), "cfg_attr")
+                    && contains_ident(attr.to_token_stream(), "path")
             }) {
                 self.uncertain = true;
             }
@@ -1263,7 +1305,7 @@ pub(super) fn test_only_files(root: &Path, files: &[PathBuf]) -> Result<BTreeSet
             fn nested_mod(tokens: TokenStream) -> bool {
                 let tokens: Vec<_> = tokens.into_iter().collect();
                 (0..tokens.len()).any(|index| {
-                    matches!(tokens.get(index), Some(TokenTree::Ident(ident)) if ident == "mod")
+                    matches!(tokens.get(index), Some(TokenTree::Ident(ident)) if ident_text(ident) == "mod")
                         && matches!(tokens.get(index + 1), Some(TokenTree::Ident(_)))
                         && matches!(tokens.get(index + 2), Some(TokenTree::Punct(punct)) if punct.as_char() == ';')
                         || matches!(tokens.get(index), Some(TokenTree::Group(group)) if nested_mod(group.stream()))
@@ -1318,7 +1360,7 @@ pub(super) fn test_only_files(root: &Path, files: &[PathBuf]) -> Result<BTreeSet
                 if let syn::Item::Mod(m) = item {
                     let only_test = inherited || test_only(&m.attrs);
                     if let Some((_, nested)) = &m.content {
-                        let nested_base = dirs.base.join(m.ident.to_string());
+                        let nested_base = dirs.base.join(ident_text(&m.ident));
                         modules(
                             nested,
                             ModuleDirs {
@@ -1332,8 +1374,11 @@ pub(super) fn test_only_files(root: &Path, files: &[PathBuf]) -> Result<BTreeSet
                             production,
                         )?;
                     } else {
-                        let explicit = m.attrs.iter().find(|a| a.path().is_ident("path")).and_then(
-                            |a| match &a.meta {
+                        let explicit = m
+                            .attrs
+                            .iter()
+                            .find(|a| path_is_ident(a.path(), "path"))
+                            .and_then(|a| match &a.meta {
                                 Meta::NameValue(v) => match &v.value {
                                     Expr::Lit(l) => match &l.lit {
                                         syn::Lit::Str(s) => Some(s.value()),
@@ -1342,14 +1387,13 @@ pub(super) fn test_only_files(root: &Path, files: &[PathBuf]) -> Result<BTreeSet
                                     _ => None,
                                 },
                                 _ => None,
-                            },
-                        );
+                            });
                         let candidates = if let Some(path) = explicit {
                             vec![dirs.source.join(path)]
                         } else {
                             vec![
-                                dirs.base.join(format!("{}.rs", m.ident)),
-                                dirs.base.join(m.ident.to_string()).join("mod.rs"),
+                                dirs.base.join(format!("{}.rs", ident_text(&m.ident))),
+                                dirs.base.join(ident_text(&m.ident)).join("mod.rs"),
                             ]
                         };
                         if let Some(child) = candidates.into_iter().find(|p| root.join(p).is_file())

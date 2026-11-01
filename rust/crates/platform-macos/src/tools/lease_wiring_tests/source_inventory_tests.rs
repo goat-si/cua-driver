@@ -515,6 +515,24 @@ fn raw_identifiers_are_normalized_for_inventory() {
             "macro-spawn",
             false,
         ),
+        (
+            "raw nested include",
+            "outer! { r#include!(\"shared.rs\") }",
+            "forbidden-include",
+            false,
+        ),
+        (
+            "raw binding shadows wrapper",
+            "use crate::input::worker_context::wrap_blocking as wrap; fn f(r#wrap: fn(fn()) -> fn()) { std::thread::Builder::new().spawn(wrap(work)); }",
+            ".spawn",
+            false,
+        ),
+        (
+            "raw imported alias",
+            "use tokio::task::spawn_blocking; fn f() { r#spawn_blocking(work); }",
+            "tokio::task::spawn_blocking",
+            false,
+        ),
     ];
     let mut missing = Vec::new();
     for (label, source, primitive, raw_import) in fixtures {
@@ -530,6 +548,29 @@ fn raw_identifiers_are_normalized_for_inventory() {
         missing.is_empty(),
         "raw identifier guard holes:\n{}",
         missing.join("\n")
+    );
+    let wrapped = scan("wrapped.rs", "use crate::input::worker_context::wrap_blocking as r#wrap; fn f() { std::thread::Builder::new().r#spawn(wrap(work)); }").unwrap();
+    assert!(
+        wrapped.is_empty(),
+        "raw helper alias should resolve uniquely: {wrapped:#?}"
+    );
+
+    let fixture = tempfile::tempdir().unwrap();
+    let root = fixture.path();
+    fs::write(
+        root.join("lib.rs"),
+        "#[cfg(test)] #[path=\"shared.rs\"] mod test; r#include!(\"shared.rs\");",
+    )
+    .unwrap();
+    fs::write(
+        root.join("shared.rs"),
+        "fn f() { std::thread::spawn(work); }",
+    )
+    .unwrap();
+    let tests = test_only_files(root, &rust_sources(root).unwrap()).unwrap();
+    assert!(
+        !tests.contains(&PathBuf::from("shared.rs")),
+        "raw include must keep shared production source scanned: {tests:#?}"
     );
 }
 
