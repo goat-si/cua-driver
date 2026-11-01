@@ -2174,7 +2174,14 @@ mod popup_match_tests {
 
 #[cfg(test)]
 mod popup_option_tests {
-    use super::popup_ownership::{match_option, OptionEntry, OptionMatch};
+    use super::popup_ownership::{match_option, option_role, OptionEntry, OptionMatch};
+
+    #[test]
+    fn unknown_item_roles_do_not_prove_a_complete_list() {
+        assert_eq!(option_role("AXMenuItem"), Some(true));
+        assert_eq!(option_role("AXSeparator"), Some(false));
+        assert_eq!(option_role("AXGroup"), None);
+    }
 
     fn pairs(titles: &[&str]) -> Vec<OptionEntry<usize>> {
         titles
