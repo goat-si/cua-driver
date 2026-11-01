@@ -61,7 +61,8 @@ For text-folding completeness, Windows must use
 `fold_actionless_text_subtrees_with_reasons` at both UIA folding sites, merge
 every returned reason into the corresponding walk budget via `record_skip`,
 implement `CompactableNode::offscreen` from observed UIA visibility, and
-retain node boundaries in output. macOS and Linux must do the same wherever
+implement `CompactableNode::boundary_mut` and retain node boundaries in output.
+macOS and Linux must do the same wherever
 they fold before asserting observation completeness. A truncated folded
 snippet makes the read incomplete even if the native walk was exhaustive.
 

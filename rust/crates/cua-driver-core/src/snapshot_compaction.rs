@@ -565,14 +565,34 @@ fn fold_actionless_text_subtrees_impl<N: CompactableNode>(
             continue;
         }
         let wrapper_depth = nodes[i].depth();
+        let mut sub_end = i + 1;
+        while sub_end < nodes.len() && nodes[sub_end].depth() > wrapper_depth {
+            sub_end += 1;
+        }
+        if let Some(visibility) = nodes[i].offscreen() {
+            let mut ancestor_depth = wrapper_depth;
+            let mut conflict = false;
+            for ancestor in nodes[..i].iter().rev() {
+                if ancestor.depth() < ancestor_depth {
+                    ancestor_depth = ancestor.depth();
+                    if ancestor.offscreen().is_some_and(|v| v != visibility) {
+                        conflict = true;
+                        break;
+                    }
+                }
+            }
+            conflict |= nodes[(i + 1)..sub_end]
+                .iter()
+                .any(|node| node.offscreen().is_some_and(|v| v != visibility));
+            if conflict {
+                i += 1;
+                continue;
+            }
+        }
         if let Some(boundary) = nodes[i].boundary_mut().and_then(Option::take) {
             let ancestor = (0..i).rev().find(|&j| nodes[j].depth() < wrapper_depth);
             let slot = ancestor.and_then(|j| nodes[j].boundary_mut());
             retain_boundary(&boundary, slot, &mut read_reasons);
-        }
-        let mut sub_end = i + 1;
-        while sub_end < nodes.len() && nodes[sub_end].depth() > wrapper_depth {
-            sub_end += 1;
         }
         for j in (i + 1)..sub_end {
             let new_d = nodes[j].depth().saturating_sub(1);
@@ -672,20 +692,21 @@ fn fold_after_elision<N: CompactableNode>(
                     // A node can render more than the one field selected for
                     // the summary, and a platform can decline set_value.
                     // Keep evidence for all fields actually shown before folding.
-                    let mut visible_text = Vec::new();
+                    let mut visible_text: Vec<String> = Vec::new();
                     if render_loss_marker {
                         for node in &old_nodes[idx..sub_end] {
                             let node = node.as_ref().unwrap();
-                            let rendered = sanitize_snippet(&node.format_line(), usize::MAX)
-                                .unwrap_or_default();
+                            let rendered = node.format_line();
                             for field in [node.title(), node.value(), node.description()]
                                 .into_iter()
                                 .flatten()
                             {
-                                if let Some(text) = sanitize_snippet(field, usize::MAX) {
-                                    if rendered.contains(&text) && !visible_text.contains(&text) {
-                                        visible_text.push(text);
-                                    }
+                                let text = field.trim();
+                                if !text.is_empty()
+                                    && rendered.contains(text)
+                                    && !visible_text.iter().any(|seen| seen == text)
+                                {
+                                    visible_text.push(text.to_owned());
                                 }
                             }
                         }
@@ -727,8 +748,7 @@ fn fold_after_elision<N: CompactableNode>(
                         parent_node.set_value(Some(merged_val));
                     }
                     let mut formatted = parent_node.format_line();
-                    let folded_text = sanitize_snippet(&formatted, usize::MAX).unwrap_or_default();
-                    lost_text |= visible_text.iter().any(|text| !folded_text.contains(text));
+                    lost_text |= visible_text.iter().any(|text| !formatted.contains(text));
                     if lost_text && render_loss_marker {
                         let reason = BoundaryReason {
                             kind: cua_driver_contract::IncompleteReasonKind::PolicyOmission,
@@ -1236,6 +1256,9 @@ mod tests {
             serde_json::to_value(reasons).unwrap(),
             serde_json::json!([{"kind":"policy_omission","detail":"folded_text_truncated"}])
         );
+        let truncated = nodes[0].value().unwrap();
+        assert_eq!(truncated.chars().count(), MAX_SNIPPET_CHARS);
+        assert!(truncated.ends_with('…'));
         let mut nodes = vec![u20_node("AXRow", 0, None, None)];
         for n in 0..6 {
             nodes.push(u20_node(
@@ -1266,6 +1289,38 @@ mod tests {
             assert!(u20_fold(&mut nodes).is_empty());
             assert_eq!(nodes.len(), expected, "{parent:?}, {child:?}");
         }
+    }
+    #[test]
+    fn u20b_visibility_boundary_survives_empty_wrapper_elision() {
+        let mut nodes = vec![
+            u20_node("AXRow", 0, None, None),
+            u20_node("AXGroup", 1, None, None),
+            u20_node("AXStaticText", 2, None, Some("child")),
+        ];
+        nodes[0].offscreen = Some(false);
+        nodes[1].offscreen = Some(true);
+        assert!(u20_fold(&mut nodes).is_empty());
+        assert_eq!(nodes.len(), 3);
+        assert_eq!(nodes[1].offscreen, Some(true));
+        assert_eq!(nodes[2].value(), Some("child"));
+        let mut unknown = vec![
+            u20_node("AXRow", 0, None, None),
+            u20_node("AXGroup", 1, None, None),
+            u20_node("AXStaticText", 2, None, Some("child")),
+        ];
+        assert!(u20_fold(&mut unknown).is_empty());
+        assert_eq!(unknown.len(), 1);
+    }
+    #[test]
+    fn u20b_reports_lost_visible_whitespace() {
+        let mut nodes = vec![
+            u20_node("AXRow", 0, None, None),
+            u20_node("AXStaticText", 1, None, Some("two  spaces")),
+        ];
+        assert_eq!(
+            serde_json::to_value(u20_fold(&mut nodes)).unwrap(),
+            serde_json::json!([{"kind":"policy_omission","detail":"folded_text_truncated"}])
+        );
     }
     #[test]
     fn u20b_duplicate_snippets_are_not_loss_and_oversize_parent_merge_is() {

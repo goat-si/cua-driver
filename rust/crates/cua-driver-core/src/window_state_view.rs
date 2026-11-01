@@ -2122,6 +2122,30 @@ mod tests {
     }
 
     #[test]
+    fn u20b_unindexed_fold_marker_change_is_a_diff() {
+        let (mut content, mut first) = payload("s0000ab11", OLD);
+        first["observation_complete"] = json!(false);
+        first["observation_incomplete_reasons"] =
+            json!([{"kind":"policy_omission","detail":"folded_text_truncated"}]);
+        apply(&opts(json!({})), &ctx(88018), &mut content, &mut first);
+        let marked = OLD.replace("AXStaticText = \"hello\"", "AXStaticText = \"hello\" [more: unknown: folded_text_truncated; descendants omitted] [reason kinds: folded_text_truncated=policy_omission]");
+        let (mut content, mut second) = payload("s0000ab12", &marked);
+        second["observation_complete"] = json!(false);
+        second["observation_incomplete_reasons"] = first["observation_incomplete_reasons"].clone();
+        apply(
+            &opts(json!({"since":"s0000ab11"})),
+            &ctx(88018),
+            &mut content,
+            &mut second,
+        );
+        assert_eq!(second["since_status"], "diff");
+        assert!(second["tree_diff"]
+            .as_str()
+            .unwrap()
+            .contains("folded_text_truncated"));
+    }
+
+    #[test]
     fn u20_descendants_only_boundary_change_is_a_changed_row() {
         let (mut content, mut first) = payload("s0000ad01", OLD);
         first["elements"][0]["boundary"] = json!({"reasons":[{"kind":"budget","detail":"node_budget"}],"children_skipped":"unknown"});
