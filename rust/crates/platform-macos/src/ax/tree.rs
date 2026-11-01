@@ -4868,4 +4868,6 @@ mod environment_evidence_tests;
 #[cfg(test)]
 mod environment_setup_tests;
 #[cfg(test)]
+mod orchestration_preservation_tests;
+#[cfg(test)]
 mod walker_test_support;

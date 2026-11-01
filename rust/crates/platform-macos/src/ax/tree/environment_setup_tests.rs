@@ -7,6 +7,7 @@ struct SingleRoot<'a> {
     root: RefCell<Option<super::walker_seam_tests::Handle>>,
     trace: RefCell<Vec<&'static str>>,
     create: bool,
+    root_id: usize,
     scoped: bool,
     menu_frames: Option<Option<Vec<[f64; 4]>>>,
     menu_replies: RefCell<std::collections::VecDeque<Option<super::MenuObservation<usize>>>>,
@@ -38,12 +39,12 @@ impl super::AxWalkEnvironment for SingleRoot<'_> {
         assert!(self
             .root
             .borrow_mut()
-            .replace(self.source.handle(2))
+            .replace(self.source.handle(self.root_id))
             .is_none());
         crate::ax::evidence::observe_read(
             Some(1),
             ReadSite::Children,
-            crate::ax::tree_source::Read::Known(vec![2]),
+            crate::ax::tree_source::Read::Known(vec![self.root_id]),
         )
     }
     fn windows(
@@ -60,7 +61,7 @@ impl super::AxWalkEnvironment for SingleRoot<'_> {
         panic!("unexpected identity check")
     }
     fn release(&self, element: usize) {
-        if element == 2 {
+        if element == self.root_id {
             self.trace.borrow_mut().push("release-root");
             drop(self.root.borrow_mut().take().expect("root credit"));
         } else {
@@ -81,12 +82,12 @@ impl super::AxWalkEnvironment for SingleRoot<'_> {
     }
     fn set_element_timeout(&self, element: usize) {
         assert!(self.scoped);
-        assert_eq!(element, 2);
+        assert_eq!(element, self.root_id);
         self.trace.borrow_mut().push("element-timeout");
     }
     fn window_id(&self, element: usize) -> Option<u32> {
         assert!(self.scoped);
-        assert_eq!(element, 2);
+        assert_eq!(element, self.root_id);
         self.trace.borrow_mut().push("window-id");
         Some(99)
     }
@@ -113,7 +114,7 @@ impl super::AxWalkEnvironment for SingleRoot<'_> {
         element: usize,
     ) -> crate::ax::evidence::Observed<crate::ax::window_scope::TopLevelCandidate> {
         assert!(self.scoped);
-        assert_eq!(element, 2);
+        assert_eq!(element, self.root_id);
         self.trace.borrow_mut().push("candidate");
         crate::ax::evidence::Observed::legacy_only(crate::ax::window_scope::TopLevelCandidate::new(
             "AXWindow",
@@ -219,6 +220,188 @@ pub(super) fn run_menu_deadline_case() -> (super::CompletedWalk, Vec<&'static st
     )
 }
 
+pub(super) fn run_application_failure() -> (super::CompletedWalk, Vec<&'static str>) {
+    use super::walker_seam_tests::Fake;
+    use cua_driver_core::walk_budget::WalkBudget;
+    let source = Fake::new(&[], vec![]);
+    let environment = SingleRoot {
+        source: &source,
+        root: RefCell::new(None),
+        trace: RefCell::new(vec![]),
+        create: false,
+        root_id: 2,
+        scoped: false,
+        menu_frames: None,
+        menu_replies: RefCell::new(Default::default()),
+        menu_credits: RefCell::new(Default::default()),
+        menu_delay: None,
+    };
+    let result = super::walk_with_environment(
+        &source,
+        &environment,
+        super::WalkRequest {
+            pid: 42,
+            window_id: Some(99),
+            query: None,
+            max_depth: 10,
+            include_web_content: true,
+        },
+        WalkBudget::nodes_only(100),
+    );
+    source.assert_consumed();
+    source.assert_lifetimes(&[]);
+    let trace = environment.trace.borrow().clone();
+    (result, trace)
+}
+
+pub(super) fn run_unscoped_source(
+    source: &super::walker_seam_tests::Fake,
+    root_id: usize,
+    query: Option<&str>,
+) -> super::CompletedWalk {
+    use cua_driver_core::walk_budget::WalkBudget;
+    let environment = SingleRoot {
+        source,
+        root: RefCell::new(None),
+        trace: RefCell::new(vec![]),
+        create: true,
+        root_id,
+        scoped: false,
+        menu_frames: None,
+        menu_replies: RefCell::new(Default::default()),
+        menu_credits: RefCell::new(Default::default()),
+        menu_delay: None,
+    };
+    let result = super::walk_with_environment(
+        source,
+        &environment,
+        super::WalkRequest {
+            pid: 42,
+            window_id: None,
+            query,
+            max_depth: 10,
+            include_web_content: true,
+        },
+        WalkBudget::nodes_only(100),
+    );
+    assert!(environment.root.borrow().is_none());
+    assert_eq!(
+        *environment.trace.borrow(),
+        [
+            "create",
+            "app-timeout",
+            "now",
+            "enable",
+            "children",
+            "windows",
+            "release-root",
+            "release-app"
+        ]
+    );
+    result
+}
+
+pub(super) fn run_published_menu_case() -> (super::CompletedWalk, Vec<&'static str>, Vec<String>) {
+    run_published_menu_case_inner(false)
+}
+
+pub(super) fn run_nested_menu_case() -> (super::CompletedWalk, Vec<&'static str>, Vec<String>) {
+    run_published_menu_case_inner(true)
+}
+
+fn run_published_menu_case_inner(
+    nested: bool,
+) -> (super::CompletedWalk, Vec<&'static str>, Vec<String>) {
+    use super::super::context_menus::MenuOwner;
+    use super::walker_seam_tests::{step, Fake, Reply};
+    use super::walker_test_support::{Batch, Slot};
+    use crate::ax::content_attrs::AttrStatus;
+    use crate::ax::tree_source::Read;
+    use cua_driver_core::walk_budget::WalkBudget;
+    fn content(title: &str) -> Batch {
+        let mut attrs = vec![Slot::Text(AttrStatus::Absent); 7];
+        attrs[0] = Slot::Text(AttrStatus::Known(title.into()));
+        Batch(attrs)
+    }
+    let mut steps = Vec::new();
+    for (id, role, title) in [(2, "AXWindow", "Window"), (3, "AXMenu", "Menu")] {
+        steps.push(step(&format!("timeout {id}"), Reply::Unit));
+        if nested && id == 2 {
+            steps.push(step(
+                &format!("text {id} AXRole"),
+                Reply::Nested(Box::new(|| {
+                    let (inner, trace) = run_application_failure();
+                    assert_eq!(trace, ["create"]);
+                    assert!(inner.legacy.nodes_skipped);
+                    assert_eq!(inner.completion.read_evidence.len(), 1);
+                    assert_eq!(
+                        inner.completion.read_evidence[0].status,
+                        EvidenceStatus::Unavailable
+                    );
+                })),
+            ));
+        }
+        steps.extend([
+            step(&format!("text {id} AXRole"), Reply::Text(Read::Known(role.into()))),
+            step(&format!("batch {id} AXTitle,AXPlaceholderValue,AXDescription,AXIdentifier,AXHelp,AXSubrole,AXRoleDescription"), Reply::Batch(Ok(content(title)))),
+            step(&format!("value {id}"), Reply::Value(Ok(None))),
+            step(&format!("actions {id}"), Reply::Actions(Read::Known(vec![]))),
+            step(&format!("batch {id} AXPosition,AXSize"), Reply::Batch(Ok(Batch(vec![Slot::Point(None), Slot::Size(None)])))),
+            step(&format!("children {id}"), Reply::Children(Read::Absent)),
+        ]);
+    }
+    let source = Fake::new(
+        &[
+            (2, 2, 2, &[]),
+            (3, 3, 3, &[]),
+            (4, 4, 4, &[]),
+            (5, 5, 5, &[]),
+        ],
+        steps,
+    );
+    let a = [0.0, 0.0, 40.0, 40.0];
+    let b = [100.0, 100.0, 40.0, 40.0];
+    let environment = SingleRoot {
+        source: &source,
+        root: RefCell::new(None),
+        trace: RefCell::new(vec![]),
+        create: true,
+        root_id: 2,
+        scoped: true,
+        menu_frames: Some(Some(vec![a, a, b])),
+        menu_replies: RefCell::new(
+            vec![
+                Some((3, Some(a), Some(MenuOwner::Window(99)))),
+                Some((4, Some(a), Some(MenuOwner::Window(99)))),
+                Some((5, Some(b), Some(MenuOwner::Window(123)))),
+            ]
+            .into(),
+        ),
+        menu_credits: RefCell::new(Default::default()),
+        menu_delay: None,
+    };
+    let observed = super::walk_with_environment(
+        &source,
+        &environment,
+        super::WalkRequest {
+            pid: 42,
+            window_id: Some(99),
+            query: None,
+            max_depth: 10,
+            include_web_content: true,
+        },
+        WalkBudget::nodes_only(100),
+    );
+    assert!(environment.menu_replies.borrow().is_empty());
+    assert!(environment.menu_credits.borrow().is_empty());
+    assert!(environment.root.borrow().is_none());
+    source.assert_consumed();
+    source.assert_lifetimes(&[]);
+    let trace = environment.trace.borrow().clone();
+    let source_trace = source.trace();
+    (observed, trace, source_trace)
+}
+
 fn run_menu_case_with_budget(
     frames: Option<Vec<[f64; 4]>>,
     replies: Vec<Option<super::MenuObservation<usize>>>,
@@ -245,6 +428,7 @@ fn run_menu_case_with_budget(
         root: RefCell::new(None),
         trace: RefCell::new(vec![]),
         create: true,
+        root_id: 2,
         scoped: true,
         menu_frames: Some(frames),
         menu_replies: RefCell::new(replies.into()),
@@ -301,6 +485,7 @@ fn shared_entry_walks_fake_root_and_releases_its_credit() {
         root: RefCell::new(None),
         trace: RefCell::new(vec![]),
         create: true,
+        root_id: 2,
         scoped: false,
         menu_frames: None,
         menu_replies: RefCell::new(Default::default()),
@@ -368,6 +553,7 @@ fn shared_entry_preserves_application_creation_failure() {
         root: RefCell::new(None),
         trace: RefCell::new(vec![]),
         create: false,
+        root_id: 2,
         scoped: false,
         menu_frames: None,
         menu_replies: RefCell::new(Default::default()),

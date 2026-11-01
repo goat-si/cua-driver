@@ -1367,6 +1367,14 @@ fn decode_failure_replays_without_disabling_batching() {
     assert_eq!(source.trace(), ["adopt 1", "timeout 1", "text 1 AXRole", "batch 1 AXTitle,AXPlaceholderValue,AXDescription,AXIdentifier,AXHelp,AXSubrole,AXRoleDescription", "status 1 AXTitle", "status 1 AXPlaceholderValue", "status 1 AXDescription", "status 1 AXIdentifier", "status 1 AXHelp", "status 1 AXSubrole", "status 1 AXRoleDescription", "value 1", "actions 1", "batch 1 AXPosition,AXSize", "children 1", "release 1"]);
 }
 fn dense_case(search: bool, alias: bool) -> (TreeWalkResult, Vec<String>) {
+    dense_case_with_entry(search, alias, false)
+}
+
+pub(super) fn dense_case_with_entry(
+    search: bool,
+    alias: bool,
+    full_walk: bool,
+) -> (TreeWalkResult, Vec<String>) {
     let rows = if alias { vec![20, 40] } else { vec![2, 4] };
     let visible = if alias { vec![20] } else { vec![2] };
     let mut script = vec![
@@ -1480,18 +1488,26 @@ fn dense_case(search: bool, alias: bool) -> (TreeWalkResult, Vec<String>) {
         ],
         script,
     );
-    let root = source.handle(1);
     let result = with_dense_rows_windowed(true, || {
-        run_fake(
-            &source,
-            &root,
-            search.then_some("Beta"),
-            10,
-            WalkBudget::nodes_only(100),
-            true,
-        )
+        if full_walk {
+            super::environment_setup_tests::run_unscoped_source(
+                &source,
+                1,
+                search.then_some("Beta"),
+            )
+            .legacy
+        } else {
+            let root = source.handle(1);
+            run_fake(
+                &source,
+                &root,
+                search.then_some("Beta"),
+                10,
+                WalkBudget::nodes_only(100),
+                true,
+            )
+        }
     });
-    drop(root);
     source.assert_consumed();
     if search {
         source.assert_lifetimes(&[(1, 1), (2, 1), (3, 1), (4, 1)]);
