@@ -37,6 +37,14 @@ use std::thread;
 use crossbeam_channel::{bounded, Receiver, Sender};
 use xkbcommon::xkb;
 
+#[derive(Debug, thiserror::Error)]
+enum LibeiRefusal {
+    #[error(transparent)]
+    Route(#[from] crate::libei_route::RouteRefusal),
+    #[error(transparent)]
+    Key(#[from] crate::libei_route::KeyRefusal),
+}
+
 /// Buttons the public API exposes. Mapped to evdev codes in the worker
 /// thread so the libei surface only sees evdev integers.
 #[derive(Debug, Clone, Copy)]
@@ -102,6 +110,13 @@ enum Cmd {
         interface: &'static str,
         reply: Sender<anyhow::Result<()>>,
     },
+    Centre {
+        current: Option<(f32, f32)>,
+        reply: Sender<anyhow::Result<(f32, f32)>>,
+    },
+    HasText {
+        reply: Sender<anyhow::Result<bool>>,
+    },
     Click {
         x: f64,
         y: f64,
@@ -120,6 +135,12 @@ enum Cmd {
     },
     TypeText {
         text: String,
+        reply: Sender<anyhow::Result<()>>,
+    },
+    KeyboardText {
+        text: String,
+        delay_ms: u64,
+        skip: usize,
         reply: Sender<anyhow::Result<()>>,
     },
     PressKey {
@@ -151,7 +172,14 @@ fn tx() -> anyhow::Result<&'static Sender<Cmd>> {
 }
 
 fn wait_for_reply(rx: Receiver<anyhow::Result<()>>) -> anyhow::Result<()> {
-    rx.recv_timeout(std::time::Duration::from_secs(20))
+    wait_for_reply_timeout(rx, std::time::Duration::from_secs(20))
+}
+
+fn wait_for_reply_timeout(
+    rx: Receiver<anyhow::Result<()>>,
+    timeout: std::time::Duration,
+) -> anyhow::Result<()> {
+    rx.recv_timeout(timeout)
         .map_err(|error| match error {
             crossbeam_channel::RecvTimeoutError::Timeout => anyhow::anyhow!(
                 "libei input backend did not become ready within 20s; the desktop portal may be waiting for Remote Desktop consent or its EIS session may be wedged"
@@ -253,6 +281,45 @@ pub fn wait_scroll_ready() -> anyhow::Result<()> {
 /// Negotiate a resumed keyboard device without emitting input.
 pub fn wait_keyboard_ready() -> anyhow::Result<()> {
     wait_until_ready("ei_keyboard")
+}
+
+/// Query the logical centre of the current EIS output without emitting input.
+pub fn coordinate_free_centre(current: Option<(f32, f32)>) -> anyhow::Result<(f32, f32)> {
+    ensure_started()?;
+    let (reply, rx) = bounded(1);
+    tx()?
+        .send(Cmd::Centre { current, reply })
+        .map_err(|e| anyhow::anyhow!("libei worker channel closed: {e}"))?;
+    rx.recv_timeout(std::time::Duration::from_secs(20))
+        .map_err(|e| anyhow::anyhow!("libei centre query failed: {e}"))?
+}
+
+pub fn has_text_interface() -> anyhow::Result<bool> {
+    ensure_started()?;
+    let (reply, rx) = bounded(1);
+    tx()?
+        .send(Cmd::HasText { reply })
+        .map_err(|e| anyhow::anyhow!("libei worker channel closed: {e}"))?;
+    rx.recv_timeout(std::time::Duration::from_secs(20))
+        .map_err(|e| anyhow::anyhow!("libei text capability query failed: {e}"))?
+}
+
+pub fn type_keyboard_text_with_delay(text: &str, delay_ms: u64, skip: usize) -> anyhow::Result<()> {
+    ensure_started()?;
+    let (reply, rx) = bounded(1);
+    tx()?
+        .send(Cmd::KeyboardText {
+            text: text.to_owned(),
+            delay_ms,
+            skip,
+            reply,
+        })
+        .map_err(|e| anyhow::anyhow!("libei worker channel closed: {e}"))?;
+    let delay = delay_ms.saturating_mul(text.chars().count() as u64);
+    wait_for_reply_timeout(
+        rx,
+        std::time::Duration::from_secs(20).saturating_add(std::time::Duration::from_millis(delay)),
+    )
 }
 
 // ── Public API ───────────────────────────────────────────────────────────
@@ -626,6 +693,165 @@ fn run_calloop(context: reis::ei::Context, rx: Receiver<Cmd>) -> anyhow::Result<
     Ok(())
 }
 
+trait EmissionSink {
+    fn motion_absolute(&mut self, x: f32, y: f32);
+    fn button(&mut self, code: u32, pressed: bool);
+    fn key(&mut self, code: u32, pressed: bool);
+    fn frame(&mut self);
+    fn flush(&mut self) -> anyhow::Result<()>;
+    fn delay(&mut self, duration: std::time::Duration);
+}
+
+struct ReisSink<'a> {
+    device: reis::ei::Device,
+    pointer: Option<reis::ei::PointerAbsolute>,
+    button: Option<reis::ei::Button>,
+    keyboard: Option<reis::ei::Keyboard>,
+    serial: u32,
+    context: Option<&'a reis::ei::Context>,
+}
+
+impl EmissionSink for ReisSink<'_> {
+    fn motion_absolute(&mut self, x: f32, y: f32) {
+        self.pointer
+            .as_ref()
+            .expect("pointer sink")
+            .motion_absolute(x, y);
+    }
+    fn button(&mut self, code: u32, pressed: bool) {
+        use reis::ei::button::ButtonState;
+        self.button.as_ref().expect("button sink").button(
+            code,
+            if pressed {
+                ButtonState::Press
+            } else {
+                ButtonState::Released
+            },
+        );
+    }
+    fn key(&mut self, code: u32, pressed: bool) {
+        use reis::ei::keyboard::KeyState;
+        self.keyboard.as_ref().expect("keyboard sink").key(
+            code,
+            if pressed {
+                KeyState::Press
+            } else {
+                KeyState::Released
+            },
+        );
+    }
+    fn frame(&mut self) {
+        self.device.frame(self.serial, event_time_us());
+    }
+    fn flush(&mut self) -> anyhow::Result<()> {
+        self.context
+            .ok_or_else(|| anyhow::anyhow!("EIS context unavailable for input flush"))?
+            .flush()?;
+        Ok(())
+    }
+    fn delay(&mut self, duration: std::time::Duration) {
+        if !duration.is_zero() {
+            std::thread::sleep(duration);
+        }
+    }
+}
+
+fn perform_click<S: EmissionSink>(
+    devices: &[crate::libei_route::Device],
+    x: f64,
+    y: f64,
+    button: u32,
+    make: impl FnOnce(usize) -> anyhow::Result<S>,
+) -> anyhow::Result<()> {
+    let (key, x, y) =
+        crate::libei_route::route_absolute(devices, x, y).map_err(LibeiRefusal::from)?;
+    let mut sink = make(key)?;
+    sink.motion_absolute(x, y);
+    sink.button(button, true);
+    sink.frame();
+    sink.button(button, false);
+    sink.frame();
+    Ok(())
+}
+
+fn perform_move<S: EmissionSink>(
+    devices: &[crate::libei_route::Device],
+    x: f64,
+    y: f64,
+    make: impl FnOnce(usize) -> anyhow::Result<S>,
+) -> anyhow::Result<()> {
+    let (key, x, y) =
+        crate::libei_route::route_absolute(devices, x, y).map_err(LibeiRefusal::from)?;
+    let mut sink = make(key)?;
+    sink.motion_absolute(x, y);
+    sink.frame();
+    Ok(())
+}
+
+fn perform_drag<S: EmissionSink>(
+    devices: &[crate::libei_route::Device],
+    from: (f64, f64),
+    to: (f64, f64),
+    steps: u32,
+    duration_ms: u64,
+    button: u32,
+    make: impl FnOnce(usize) -> anyhow::Result<S>,
+) -> anyhow::Result<()> {
+    let (key, points) =
+        crate::libei_route::plan_drag(devices, from, to, steps).map_err(LibeiRefusal::from)?;
+    let mut sink = make(key)?;
+    sink.motion_absolute(points[0].0, points[0].1);
+    sink.frame();
+    sink.button(button, true);
+    sink.frame();
+    let _ = sink.flush();
+    let delay = drag_step_delay(duration_ms, points.len() as u32 - 1);
+    for &(x, y) in &points[1..] {
+        sink.motion_absolute(x, y);
+        sink.frame();
+        let _ = sink.flush();
+        sink.delay(delay);
+    }
+    sink.button(button, false);
+    sink.frame();
+    Ok(())
+}
+
+fn perform_keycodes<S: EmissionSink>(
+    text: &str,
+    keymap: Option<&crate::libei_route::KeymapChars>,
+    shift: Option<u32>,
+    delay: std::time::Duration,
+    skip: usize,
+    make: impl FnOnce() -> anyhow::Result<S>,
+) -> anyhow::Result<()> {
+    // Admit only what is still untyped: an earlier backend may already have
+    // typed the first skip characters.
+    let remainder: String = text.chars().skip(skip).collect();
+    let strokes =
+        crate::libei_route::plan_keycodes(&remainder, keymap, shift).map_err(LibeiRefusal::from)?;
+    let mut sink = make()?;
+    for stroke in strokes {
+        if let Some(shift) = stroke.shift {
+            sink.key(shift, true);
+            sink.frame();
+        }
+        sink.key(stroke.code, true);
+        sink.frame();
+        sink.key(stroke.code, false);
+        sink.frame();
+        if let Some(shift) = stroke.shift {
+            sink.key(shift, false);
+            sink.frame();
+        }
+        if !delay.is_zero() {
+            sink.flush()?;
+            sink.delay(delay);
+        }
+    }
+    Ok(())
+}
+
 #[derive(Default)]
 struct EisState {
     context: Option<reis::ei::Context>,
@@ -645,9 +871,10 @@ struct EisState {
     /// `char -> (evdev keycode, needs_shift)` built from the compositor's active
     /// xkb keymap (delivered by the `ei_keyboard` device). Lets keycode typing
     /// follow the user's real layout instead of assuming US. Empty until the
-    /// `Keymap` event arrives; typing then falls back to [`char_to_evdev`].
-    keymap_chars: HashMap<char, (u32, bool)>,
-    /// evdev keycode that produces `Shift_L` in the active keymap (else 42).
+    /// `Keymap` event arrives; typing then falls back to the US table. This
+    /// state is global and is not cleared when a keyboard device is removed.
+    keymap_chars: Option<crate::libei_route::KeymapChars>,
+    /// evdev keycode that produces `Shift_L` in the active keymap.
     keymap_shift: Option<u32>,
 }
 
@@ -668,17 +895,6 @@ struct RegionRect {
     height: f32,
 }
 
-impl RegionRect {
-    fn contains(&self, x: f64, y: f64) -> bool {
-        let xf = x as f32;
-        let yf = y as f32;
-        xf >= self.offset_x
-            && xf < self.offset_x + self.width
-            && yf >= self.offset_y
-            && yf < self.offset_y + self.height
-    }
-}
-
 #[derive(Default)]
 struct DeviceData {
     device_type: Option<reis::ei::device::DeviceType>,
@@ -692,6 +908,36 @@ struct DeviceData {
 }
 
 impl EisState {
+    fn pointer_sink(
+        &self,
+        device: &reis::ei::Device,
+        button: bool,
+    ) -> anyhow::Result<ReisSink<'_>> {
+        Ok(ReisSink {
+            device: device.clone(),
+            pointer: Some(require_device_interface(&self.devices, device)?),
+            button: if button {
+                Some(require_device_interface(&self.devices, device)?)
+            } else {
+                None
+            },
+            keyboard: None,
+            serial: self.last_serial,
+            context: self.context.as_ref(),
+        })
+    }
+
+    fn keyboard_sink(&self, device: &reis::ei::Device) -> anyhow::Result<ReisSink<'_>> {
+        Ok(ReisSink {
+            device: device.clone(),
+            pointer: None,
+            button: None,
+            keyboard: Some(require_device_interface(&self.devices, device)?),
+            serial: self.last_serial,
+            context: self.context.as_ref(),
+        })
+    }
+
     fn handle_eis_readable(
         &mut self,
         context: &mut reis::ei::Context,
@@ -875,7 +1121,7 @@ impl EisState {
     /// into a `char -> (evdev keycode, shift)` table + the Shift keycode, so
     /// keycode typing follows the user's real layout instead of assuming US.
     /// Best-effort: on any failure the table stays empty and typing falls back
-    /// to [`char_to_evdev`].
+    /// to the US keycode table.
     fn load_xkb_keymap(&mut self, fd: std::os::unix::io::OwnedFd, size: u32) {
         use std::io::{Read, Seek, SeekFrom};
         const XKB_EVDEV_OFFSET: u32 = 8;
@@ -927,7 +1173,7 @@ impl EisState {
                 }
             }
         }
-        self.keymap_chars = chars;
+        self.keymap_chars = Some(chars);
         self.keymap_shift = shift;
     }
 
@@ -947,6 +1193,10 @@ impl EisState {
         }
         match cmd {
             Cmd::WaitReady { interface, .. } => self.device_with_interface(interface).is_some(),
+            Cmd::Centre { .. } => self.device_with_interface("ei_pointer_absolute").is_some(),
+            Cmd::HasText { .. } | Cmd::KeyboardText { .. } => {
+                self.device_with_interface("ei_keyboard").is_some()
+            }
             Cmd::Click { .. } | Cmd::MoveAbsolute { .. } | Cmd::Drag { .. } => {
                 self.device_with_interface("ei_pointer_absolute").is_some()
             }
@@ -963,6 +1213,36 @@ impl EisState {
     }
 
     fn handle_command(&mut self, cmd: Cmd) {
+        if let Cmd::Centre { current, reply } = cmd {
+            let (_, devices) = self.routing_devices();
+            let mut regions = Vec::new();
+            for device in devices.iter().filter(|d| d.resumed && d.absolute) {
+                for region in &device.regions {
+                    if !regions.contains(region) {
+                        regions.push(*region);
+                    }
+                }
+            }
+            let centre =
+                crate::libei_route::coordinate_free_centre(&regions, current).ok_or_else(|| {
+                    let refusal = if regions.is_empty()
+                        && devices
+                            .iter()
+                            .any(|d| d.resumed && d.absolute && d.regions.is_empty())
+                    {
+                        crate::libei_route::RouteRefusal::NoRegions
+                    } else {
+                        crate::libei_route::RouteRefusal::OutsideRegions
+                    };
+                    anyhow::anyhow!(LibeiRefusal::Route(refusal))
+                });
+            let _ = reply.send(centre);
+            return;
+        }
+        if let Cmd::HasText { reply } = cmd {
+            let _ = reply.send(Ok(self.device_with_interface("ei_text").is_some()));
+            return;
+        }
         let result = self.run_command(&cmd);
         let needs_sync = !matches!(cmd, Cmd::WaitReady { .. });
         let reply = match cmd {
@@ -971,9 +1251,12 @@ impl EisState {
             | Cmd::MoveAbsolute { reply, .. }
             | Cmd::Scroll { reply, .. }
             | Cmd::TypeText { reply, .. }
+            | Cmd::KeyboardText { reply, .. }
             | Cmd::PressKey { reply, .. }
             | Cmd::KeySequence { reply, .. }
             | Cmd::Drag { reply, .. } => reply,
+            Cmd::Centre { .. } => unreachable!("centre handled above"),
+            Cmd::HasText { .. } => unreachable!("capability query handled above"),
             Cmd::Shutdown => return,
         };
         if result.is_ok() && needs_sync {
@@ -1004,18 +1287,13 @@ impl EisState {
                     anyhow::anyhow!("no resumed EIS {interface} device negotiated within 20s")
                 })?;
             }
+            Cmd::Centre { .. } => unreachable!("centre handled above"),
+            Cmd::HasText { .. } => unreachable!("capability query handled above"),
             Cmd::Click { x, y, button, .. } => {
-                let (device, rel_x, rel_y) = self.pointer_device_for(*x, *y)?;
-                let serial = self.last_serial;
-                let ptr_abs =
-                    require_device_interface::<reis::ei::PointerAbsolute>(&self.devices, &device)?;
-                let btn = require_device_interface::<reis::ei::Button>(&self.devices, &device)?;
-
-                ptr_abs.motion_absolute(rel_x, rel_y);
-                btn.button(button.to_evdev(), reis::ei::button::ButtonState::Press);
-                device.frame(serial, event_time_us());
-                btn.button(button.to_evdev(), reis::ei::button::ButtonState::Released);
-                device.frame(serial, event_time_us());
+                let (handles, devices) = self.routing_devices();
+                perform_click(&devices, *x, *y, button.to_evdev(), |key| {
+                    self.pointer_sink(&handles[key], true)
+                })?;
             }
             Cmd::Drag {
                 from_x,
@@ -1027,61 +1305,22 @@ impl EisState {
                 button,
                 ..
             } => {
-                let (device, from_rx, from_ry) = self.pointer_device_for(*from_x, *from_y)?;
-                let serial = self.last_serial;
-                let ptr_abs =
-                    require_device_interface::<reis::ei::PointerAbsolute>(&self.devices, &device)?;
-                let btn = require_device_interface::<reis::ei::Button>(&self.devices, &device)?;
-                // Map the drag end into the SAME device's region (a single EIS
-                // emulation session can't span devices). Fall back to the start
-                // region's offset when no region of this device contains the end
-                // (single-region device, or a point just off-screen) — this is
-                // correct only within one region, but avoids the cross-monitor
-                // mis-mapping of blindly reusing the start offset.
-                let (to_rx, to_ry) =
-                    self.region_local_on(&device, *to_x, *to_y)
-                        .unwrap_or_else(|| {
-                            let off_x = *from_x as f32 - from_rx;
-                            let off_y = *from_y as f32 - from_ry;
-                            (*to_x as f32 - off_x, *to_y as f32 - off_y)
-                        });
-
-                ptr_abs.motion_absolute(from_rx, from_ry);
-                device.frame(serial, event_time_us());
-                btn.button(button.to_evdev(), reis::ei::button::ButtonState::Press);
-                device.frame(serial, event_time_us());
-                if let Some(context) = self.context.as_ref() {
-                    let _ = context.flush();
-                }
-                // Bound the interpolation: run_command executes synchronously in
-                // the worker loop, so a huge step count would block EIS event
-                // processing (incl. Ping) and balloon the unflushed request queue.
-                let n = (*steps).max(1).min(500);
-                let delay = drag_step_delay(*duration_ms, n);
-                for s in 1..=n {
-                    let t = s as f32 / n as f32;
-                    let ix = from_rx + (to_rx - from_rx) * t;
-                    let iy = from_ry + (to_ry - from_ry) * t;
-                    ptr_abs.motion_absolute(ix, iy);
-                    device.frame(serial, event_time_us());
-                    if let Some(context) = self.context.as_ref() {
-                        let _ = context.flush();
-                    }
-                    if !delay.is_zero() {
-                        std::thread::sleep(delay);
-                    }
-                }
-                btn.button(button.to_evdev(), reis::ei::button::ButtonState::Released);
-                device.frame(serial, event_time_us());
+                let (handles, devices) = self.routing_devices();
+                perform_drag(
+                    &devices,
+                    (*from_x, *from_y),
+                    (*to_x, *to_y),
+                    *steps,
+                    *duration_ms,
+                    button.to_evdev(),
+                    |key| self.pointer_sink(&handles[key], true),
+                )?;
             }
             Cmd::MoveAbsolute { x, y, .. } => {
-                let (device, rel_x, rel_y) = self.pointer_device_for(*x, *y)?;
-                let serial = self.last_serial;
-                let ptr_abs =
-                    require_device_interface::<reis::ei::PointerAbsolute>(&self.devices, &device)?;
-
-                ptr_abs.motion_absolute(rel_x, rel_y);
-                device.frame(serial, event_time_us());
+                let (handles, devices) = self.routing_devices();
+                perform_move(&devices, *x, *y, |key| {
+                    self.pointer_sink(&handles[key], false)
+                })?;
             }
             Cmd::Scroll { dx, dy, .. } => {
                 let device = self.device_with_interface("ei_scroll").ok_or_else(|| {
@@ -1095,11 +1334,8 @@ impl EisState {
             }
             Cmd::TypeText { text, .. } => {
                 // Prefer ei_text (libei 1.6+ — a UTF-8 string, layout-correct).
-                // Mutter does NOT advertise ei_text, so fall back to keycode
-                // typing via ei_keyboard: map each char to a US-layout evdev
-                // keycode + shift and emit press/release. Chars with no US-layout
-                // keycode are skipped (a documented limitation — full layout
-                // support needs an xkb keymap, like reis's type-text example).
+                // When ei_text is unavailable, admit the entire string against
+                // the loaded keymap (or the US table if none was loaded).
                 if let Some(device) = self.device_with_interface("ei_text") {
                     let serial = self.last_serial;
                     let text_iface =
@@ -1107,53 +1343,41 @@ impl EisState {
                     text_iface.utf8(text);
                     device.frame(serial, event_time_us());
                 } else {
-                    use reis::ei::keyboard::KeyState;
                     let device = self.device_with_interface("ei_keyboard").ok_or_else(|| {
                         anyhow::anyhow!(
                             "no EIS keyboard device negotiated yet — wait for handshake"
                         )
                     })?;
-                    let serial = self.last_serial;
-                    let kb =
-                        require_device_interface::<reis::ei::Keyboard>(&self.devices, &device)?;
-                    let shift_code = self.keymap_shift.unwrap_or(42);
-                    let mut skipped = 0usize;
-                    for ch in text.chars() {
-                        // Prefer the compositor's actual keymap (layout-correct);
-                        // fall back to the US-layout table if no keymap arrived.
-                        let mapped = self
-                            .keymap_chars
-                            .get(&ch)
-                            .copied()
-                            .or_else(|| char_to_evdev(ch));
-                        let Some((code, shift)) = mapped else {
-                            // No keycode for this char in the keymap/US table
-                            // (e.g. CJK/emoji via the keycode path). Skip it, but
-                            // don't pretend the whole string was typed.
-                            skipped += 1;
-                            continue;
-                        };
-                        if shift {
-                            kb.key(shift_code, KeyState::Press);
-                            device.frame(serial, event_time_us());
-                        }
-                        kb.key(code, KeyState::Press);
-                        device.frame(serial, event_time_us());
-                        kb.key(code, KeyState::Released);
-                        device.frame(serial, event_time_us());
-                        if shift {
-                            kb.key(shift_code, KeyState::Released);
-                            device.frame(serial, event_time_us());
-                        }
-                    }
-                    if skipped > 0 {
-                        tracing::warn!(
-                            "libei keycode typing skipped {skipped} char(s) with no \
-                             keycode in the active keymap (e.g. non-Latin/emoji) — \
-                             the ei_text path (libei 1.6+) would type these verbatim"
-                        );
-                    }
+                    perform_keycodes(
+                        text,
+                        self.keymap_chars.as_ref(),
+                        self.keymap_shift,
+                        std::time::Duration::ZERO,
+                        0,
+                        || self.keyboard_sink(&device),
+                    )?;
                 }
+            }
+            Cmd::KeyboardText {
+                text,
+                delay_ms,
+                skip,
+                ..
+            } => {
+                if self.device_with_interface("ei_text").is_some() {
+                    anyhow::bail!("EIS text interface changed while preparing delayed typing");
+                }
+                let device = self.device_with_interface("ei_keyboard").ok_or_else(|| {
+                    anyhow::anyhow!("no EIS keyboard device negotiated yet — wait for handshake")
+                })?;
+                perform_keycodes(
+                    text,
+                    self.keymap_chars.as_ref(),
+                    self.keymap_shift,
+                    std::time::Duration::from_millis(*delay_ms),
+                    *skip,
+                    || self.keyboard_sink(&device),
+                )?;
             }
             Cmd::PressKey { keycode, .. } => {
                 let device = self.device_with_interface("ei_keyboard").ok_or_else(|| {
@@ -1195,55 +1419,29 @@ impl EisState {
         Ok(())
     }
 
-    /// Pick a pointer device whose announced Region contains `(x, y)`,
-    /// and translate the absolute screen coordinates into the device's
-    /// region-local pixel coordinates.
-    ///
-    /// Multi-monitor seats announce one Region per output; routing each
-    /// (x, y) by containment is what lets a click on monitor #2 actually
-    /// land on monitor #2. When no device's region contains the point —
-    /// e.g. coords just past the edge of an output, or a session with
-    /// a single device that hasn't announced any regions yet — we fall
-    /// back to the first pointer device with the raw coordinates, which
-    /// matches the pre-multi-monitor behaviour.
-    fn pointer_device_for(&self, x: f64, y: f64) -> anyhow::Result<(reis::ei::Device, f32, f32)> {
-        // Absolute motion needs the device that actually carries
-        // ei_pointer_absolute — Mutter/KWin split the relative and absolute
-        // pointers onto separate devices, and only one of them accepts an
-        // absolute warp.
-        for (device, data) in self.devices.iter() {
-            if !data.resumed || !data.interfaces.contains_key("ei_pointer_absolute") {
-                continue;
-            }
-            for region in &data.regions {
-                if region.contains(x, y) {
-                    let rel_x = x as f32 - region.offset_x;
-                    let rel_y = y as f32 - region.offset_y;
-                    return Ok((device.clone(), rel_x, rel_y));
-                }
-            }
+    fn routing_devices(&self) -> (Vec<reis::ei::Device>, Vec<crate::libei_route::Device>) {
+        let mut handles = Vec::with_capacity(self.devices.len());
+        let mut devices = Vec::with_capacity(self.devices.len());
+        for (device, data) in &self.devices {
+            let key = handles.len();
+            handles.push(device.clone());
+            devices.push(crate::libei_route::Device {
+                key,
+                resumed: data.resumed,
+                absolute: data.interfaces.contains_key("ei_pointer_absolute"),
+                regions: data
+                    .regions
+                    .iter()
+                    .map(|r| crate::libei_route::Region {
+                        x: r.offset_x,
+                        y: r.offset_y,
+                        width: r.width,
+                        height: r.height,
+                    })
+                    .collect(),
+            });
         }
-        // Fallback: first absolute-pointer device, raw coords (single-region).
-        let device = self
-            .device_with_interface("ei_pointer_absolute")
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "no EIS absolute-pointer device negotiated yet — wait for handshake"
-                )
-            })?;
-        Ok((device, x as f32, y as f32))
-    }
-
-    /// Region-local coordinates for absolute `(x, y)` within one of `device`'s
-    /// announced regions, or `None` when no region of that device contains the
-    /// point. Used to map a drag endpoint into the same device the drag start
-    /// resolved to (a single EIS emulation session can't span devices).
-    fn region_local_on(&self, device: &reis::ei::Device, x: f64, y: f64) -> Option<(f32, f32)> {
-        let data = self.devices.get(device)?;
-        data.regions
-            .iter()
-            .find(|r| r.contains(x, y))
-            .map(|r| (x as f32 - r.offset_x, y as f32 - r.offset_y))
+        (handles, devices)
     }
 
     /// The negotiated device that exposes `iface` (e.g. `ei_pointer_absolute`,
@@ -1259,99 +1457,6 @@ impl EisState {
             .max_by_key(|(_, data)| data.resumed_serial.unwrap_or(0))
             .map(|(d, _)| d.clone())
     }
-}
-
-/// Map a character to a US-layout evdev keycode + whether Shift is needed.
-/// Used by the keyboard-typing fallback when the compositor's EIS exposes no
-/// `ei_text` interface (e.g. Mutter). Returns `None` for characters outside the
-/// US-ASCII printable set — those are skipped rather than mistyped. Full
-/// layout-correct typing would need an xkb keymap (see reis `type-text` example).
-fn char_to_evdev(c: char) -> Option<(u32, bool)> {
-    // Letter codes follow the QWERTY scancode layout (input-event-codes.h).
-    fn letter(c: char) -> u32 {
-        // KEY_A..KEY_Z follow the QWERTY scancode layout, not the alphabet.
-        match c {
-            'a' => 30,
-            'b' => 48,
-            'c' => 46,
-            'd' => 32,
-            'e' => 18,
-            'f' => 33,
-            'g' => 34,
-            'h' => 35,
-            'i' => 23,
-            'j' => 36,
-            'k' => 37,
-            'l' => 38,
-            'm' => 50,
-            'n' => 49,
-            'o' => 24,
-            'p' => 25,
-            'q' => 16,
-            'r' => 19,
-            's' => 31,
-            't' => 20,
-            'u' => 22,
-            'v' => 47,
-            'w' => 17,
-            'x' => 45,
-            'y' => 21,
-            'z' => 44,
-            _ => 0,
-        }
-    }
-    // (keycode, needs_shift). Digit/symbol codes and their shifted variants
-    // follow the US QWERTY row (input-event-codes.h).
-    Some(match c {
-        'a'..='z' => (letter(c), false),
-        'A'..='Z' => (letter(c.to_ascii_lowercase()), true),
-        '1' => (2, false),
-        '2' => (3, false),
-        '3' => (4, false),
-        '4' => (5, false),
-        '5' => (6, false),
-        '6' => (7, false),
-        '7' => (8, false),
-        '8' => (9, false),
-        '9' => (10, false),
-        '0' => (11, false),
-        '!' => (2, true),
-        '@' => (3, true),
-        '#' => (4, true),
-        '$' => (5, true),
-        '%' => (6, true),
-        '^' => (7, true),
-        '&' => (8, true),
-        '*' => (9, true),
-        '(' => (10, true),
-        ')' => (11, true),
-        ' ' => (57, false),
-        '\n' => (28, false),
-        '\t' => (15, false),
-        '-' => (12, false),
-        '_' => (12, true),
-        '=' => (13, false),
-        '+' => (13, true),
-        '[' => (26, false),
-        '{' => (26, true),
-        ']' => (27, false),
-        '}' => (27, true),
-        '\\' => (43, false),
-        '|' => (43, true),
-        ';' => (39, false),
-        ':' => (39, true),
-        '\'' => (40, false),
-        '"' => (40, true),
-        '`' => (41, false),
-        '~' => (41, true),
-        ',' => (51, false),
-        '<' => (51, true),
-        '.' => (52, false),
-        '>' => (52, true),
-        '/' => (53, false),
-        '?' => (53, true),
-        _ => return None,
-    })
 }
 
 fn require_device_interface<T: reis::Interface>(
@@ -1388,6 +1493,250 @@ fn drag_step_delay(duration_ms: u64, steps: u32) -> std::time::Duration {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Debug, PartialEq)]
+    enum Emitted {
+        Motion(f32, f32),
+        Button(u32, bool),
+        Key(u32, bool),
+        Frame,
+        Flush,
+        Delay(std::time::Duration),
+    }
+    #[derive(Clone, Default)]
+    struct FakeSink(std::rc::Rc<std::cell::RefCell<Vec<Emitted>>>);
+    impl EmissionSink for FakeSink {
+        fn motion_absolute(&mut self, x: f32, y: f32) {
+            self.0.borrow_mut().push(Emitted::Motion(x, y));
+        }
+        fn button(&mut self, code: u32, pressed: bool) {
+            self.0.borrow_mut().push(Emitted::Button(code, pressed));
+        }
+        fn key(&mut self, code: u32, pressed: bool) {
+            self.0.borrow_mut().push(Emitted::Key(code, pressed));
+        }
+        fn frame(&mut self) {
+            self.0.borrow_mut().push(Emitted::Frame);
+        }
+        fn flush(&mut self) -> anyhow::Result<()> {
+            self.0.borrow_mut().push(Emitted::Flush);
+            Ok(())
+        }
+        fn delay(&mut self, duration: std::time::Duration) {
+            self.0.borrow_mut().push(Emitted::Delay(duration));
+        }
+    }
+    fn test_devices() -> Vec<crate::libei_route::Device> {
+        vec![crate::libei_route::Device {
+            key: 0,
+            resumed: true,
+            absolute: true,
+            regions: vec![crate::libei_route::Region {
+                x: 1920.0,
+                y: 0.0,
+                width: 100.0,
+                height: 100.0,
+            }],
+        }]
+    }
+
+    #[test]
+    fn routing_refusals_emit_nothing_and_success_emits_exactly() {
+        let devices = test_devices();
+        let sink = FakeSink::default();
+        let mut no_regions = test_devices();
+        no_regions[0].regions.clear();
+        for (input, x, y) in [
+            (&devices, 0.0, 0.0),
+            (&devices, f64::NAN, 0.0),
+            (&no_regions, 0.0, 0.0),
+        ] {
+            let click = perform_click(input, x, y, 272, |_| Ok(sink.clone())).unwrap_err();
+            assert!(click.downcast_ref::<LibeiRefusal>().is_some());
+            let movement = perform_move(input, x, y, |_| Ok(sink.clone())).unwrap_err();
+            assert!(movement.downcast_ref::<LibeiRefusal>().is_some());
+            let drag =
+                perform_drag(input, (x, y), (x, y), 2, 10, 272, |_| Ok(sink.clone())).unwrap_err();
+            assert!(drag.downcast_ref::<LibeiRefusal>().is_some());
+        }
+        let mut separate = test_devices();
+        separate[0].regions.push(crate::libei_route::Region {
+            x: 2100.0,
+            y: 0.0,
+            width: 100.0,
+            height: 100.0,
+        });
+        assert!(
+            perform_drag(&separate, (1921.0, 1.0), (2101.0, 1.0), 2, 10, 272, |_| Ok(
+                sink.clone()
+            ))
+            .is_err()
+        );
+        assert!(
+            perform_drag(&devices, (1921.0, 1.0), (2050.0, 1.0), 2, 10, 272, |_| Ok(
+                sink.clone()
+            ))
+            .is_err()
+        );
+        assert!(sink.0.borrow().is_empty());
+        perform_click(&devices, 2000.0, 10.0, 272, |_| Ok(sink.clone())).unwrap();
+        assert_eq!(
+            *sink.0.borrow(),
+            vec![
+                Emitted::Motion(2000.0, 10.0),
+                Emitted::Button(272, true),
+                Emitted::Frame,
+                Emitted::Button(272, false),
+                Emitted::Frame
+            ]
+        );
+        sink.0.borrow_mut().clear();
+        perform_move(&devices, 2000.0, 10.0, |_| Ok(sink.clone())).unwrap();
+        assert_eq!(
+            *sink.0.borrow(),
+            vec![Emitted::Motion(2000.0, 10.0), Emitted::Frame]
+        );
+        sink.0.borrow_mut().clear();
+        perform_drag(&devices, (1921.0, 1.0), (1923.0, 1.0), 2, 10, 272, |_| {
+            Ok(sink.clone())
+        })
+        .unwrap();
+        let delay = std::time::Duration::from_millis(5);
+        assert_eq!(
+            *sink.0.borrow(),
+            vec![
+                Emitted::Motion(1921.0, 1.0),
+                Emitted::Frame,
+                Emitted::Button(272, true),
+                Emitted::Frame,
+                Emitted::Flush,
+                Emitted::Motion(1922.0, 1.0),
+                Emitted::Frame,
+                Emitted::Flush,
+                Emitted::Delay(delay),
+                Emitted::Motion(1923.0, 1.0),
+                Emitted::Frame,
+                Emitted::Flush,
+                Emitted::Delay(delay),
+                Emitted::Button(272, false),
+                Emitted::Frame
+            ]
+        );
+    }
+
+    #[test]
+    fn keycode_admission_refuses_before_emitting_and_preserves_delay() {
+        let sink = FakeSink::default();
+        let delay = std::time::Duration::from_millis(30);
+        let refusal =
+            perform_keycodes("a€b", None, None, delay, 0, || Ok(sink.clone())).unwrap_err();
+        assert!(refusal.downcast_ref::<LibeiRefusal>().is_some());
+        let mut map = crate::libei_route::KeymapChars::new();
+        map.insert('A', (30, true));
+        assert!(perform_keycodes("A", Some(&map), None, delay, 0, || Ok(sink.clone())).is_err());
+        assert!(sink.0.borrow().is_empty());
+        perform_keycodes("aB", None, None, delay, 0, || Ok(sink.clone())).unwrap();
+        assert_eq!(
+            *sink.0.borrow(),
+            vec![
+                Emitted::Key(30, true),
+                Emitted::Frame,
+                Emitted::Key(30, false),
+                Emitted::Frame,
+                Emitted::Flush,
+                Emitted::Delay(delay),
+                Emitted::Key(42, true),
+                Emitted::Frame,
+                Emitted::Key(48, true),
+                Emitted::Frame,
+                Emitted::Key(48, false),
+                Emitted::Frame,
+                Emitted::Key(42, false),
+                Emitted::Frame,
+                Emitted::Flush,
+                Emitted::Delay(delay)
+            ]
+        );
+    }
+
+    #[test]
+    fn keycode_admission_plans_only_the_untyped_remainder() {
+        // An earlier backend typed the first character; the loaded keymap maps
+        // the remainder but not that character, so the remainder is typed.
+        let sink = FakeSink::default();
+        let mut map = crate::libei_route::KeymapChars::new();
+        map.insert('a', (30, false));
+        map.insert('b', (48, false));
+        let none = std::time::Duration::ZERO;
+        perform_keycodes("\u{20ac}ab", Some(&map), None, none, 1, || Ok(sink.clone())).unwrap();
+        assert_eq!(
+            *sink.0.borrow(),
+            vec![
+                Emitted::Key(30, true),
+                Emitted::Frame,
+                Emitted::Key(30, false),
+                Emitted::Frame,
+                Emitted::Key(48, true),
+                Emitted::Frame,
+                Emitted::Key(48, false),
+                Emitted::Frame,
+            ]
+        );
+        // An unmappable character in the remainder still refuses with nothing sent.
+        let refused = FakeSink::default();
+        assert!(
+            perform_keycodes("a\u{20ac}b", Some(&map), None, none, 1, || Ok(
+                refused.clone()
+            ))
+            .is_err()
+        );
+        assert!(refused.0.borrow().is_empty());
+    }
+
+    #[test]
+    fn type_chars_dispatch_admits_whole_string_before_keyboard_output() {
+        let sink = FakeSink::default();
+        let delay = std::time::Duration::from_millis(30);
+        let result = super::super::type_chars_dispatch(
+            "a€b",
+            30,
+            |index, _| {
+                perform_keycodes("a€b", None, None, delay, index, || Ok(sink.clone()))?;
+                Ok(true)
+            },
+            |_| panic!("caller delay must not run on an atomic refusal"),
+        );
+        assert!(result.is_err());
+        assert!(sink.0.borrow().is_empty());
+
+        super::super::type_chars_dispatch(
+            "ab",
+            30,
+            |index, _| {
+                perform_keycodes("ab", None, None, delay, index, || Ok(sink.clone()))?;
+                Ok(true)
+            },
+            |_| panic!("worker owns the delays"),
+        )
+        .unwrap();
+        assert_eq!(
+            *sink.0.borrow(),
+            vec![
+                Emitted::Key(30, true),
+                Emitted::Frame,
+                Emitted::Key(30, false),
+                Emitted::Frame,
+                Emitted::Flush,
+                Emitted::Delay(delay),
+                Emitted::Key(48, true),
+                Emitted::Frame,
+                Emitted::Key(48, false),
+                Emitted::Frame,
+                Emitted::Flush,
+                Emitted::Delay(delay),
+            ]
+        );
+    }
 
     #[test]
     fn key_sequence_accepts_empty_and_maximum_length_requests() {
