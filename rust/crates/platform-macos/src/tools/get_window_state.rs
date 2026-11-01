@@ -854,39 +854,17 @@ impl Tool for GetWindowStateTool {
             .map(|(_, _, _, _, _, _, bounds, scale)| (bounds.clone(), *scale));
 
         // Build response.
-        let mut content: Vec<Content> = Vec::new();
-
-        if let Some((png, ref file_path, w, h, _, _, _, _)) = screenshot.as_ref() {
-            if file_path.is_none() {
-                use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
-                content.push(if jpeg {
-                    Content::image_jpeg(BASE64.encode(png))
-                } else {
-                    Content::image_png(BASE64.encode(png))
-                });
-            }
-
-            // Summary text line (matching Swift reference format).
-            let element_count = tree_result
+        let mut content = response_content(
+            window_id,
+            pid,
+            tree_result.as_ref(),
+            screenshot
                 .as_ref()
-                .map(|r| r.nodes.iter().filter(|n| n.element_index.is_some()).count())
-                .unwrap_or(0);
-            let summary = if let Some(ref r) = tree_result {
-                format!(
-                    "window_id={window_id} pid={pid} size={}x{} elements={element_count}\n\n{}",
-                    w, h, r.tree_markdown
-                )
-            } else {
-                format!("window_id={window_id} pid={pid} size={}x{}", w, h)
-            };
-            content.push(Content::text(summary));
-        } else if let Some(ref r) = tree_result {
-            let element_count = r.nodes.iter().filter(|n| n.element_index.is_some()).count();
-            content.push(Content::text(format!(
-                "window_id={window_id} pid={pid} elements={element_count}\n\n{}",
-                r.tree_markdown
-            )));
-        }
+                .map(|(bytes, file_path, width, height, _, _, _, _)| {
+                    (bytes.as_slice(), file_path.is_some(), *width, *height)
+                }),
+            jpeg,
+        );
 
         if content.is_empty() {
             return ToolResult::error(
@@ -1030,41 +1008,25 @@ impl Tool for GetWindowStateTool {
         let filtered_element_count = elements_json.len();
         let elements_complete = elements_complete(tree_result.as_ref(), scope_matched, verify_read);
 
-        let mut structured = serde_json::json!({
-            "window_id": window_id,
-            "pid": pid,
-            "element_count": element_count,
-            "total_element_count": element_count,
-            "returned_element_count": filtered_element_count,
-            "elements_complete": elements_complete,
-            "tree_markdown": tree_md,
-            "elements": elements_json,
-            "_note": "Prefer `elements` — `tree_markdown` will continue to work \
-                but new fields will only be added to the structured side. \
-                Issue #22865: use `max_elements` / `max_depth` to bound the \
-                AX walk on apps with very large trees."
-        });
-        if let Some(attestation) = external_panel {
-            structured["requested_pid"] = serde_json::json!(requested_pid);
-            structured["ax_pid"] = serde_json::json!(attestation.owner_pid);
-            structured["external_panel_service"] = serde_json::json!(OPEN_SAVE_PANEL_SERVICE);
-        }
-        if query.is_some() {
-            structured["filtered_element_count"] = serde_json::json!(filtered_element_count);
-        }
-        if let Some(r) = tree_result.as_ref() {
-            r.walk.apply(&mut structured);
-            apply_offscreen_rows(&mut structured, &r.offscreen_rows);
-        }
+        let mut structured = tree_output_fields(
+            window_id,
+            pid,
+            element_count,
+            filtered_element_count,
+            elements_complete,
+            tree_md,
+            elements_json,
+            query.is_some(),
+            tree_result.as_ref(),
+            snapshot_id,
+            requested_pid,
+            external_panel,
+        );
         // Surface 6: an opaque snapshot identifier consumers can log
         // alongside the per-element tokens for debug correlation. Same value
         // embedded in every `element_token` emitted in `elements[]` above.
         // Additive — old consumers ignore it. Absent when no snapshot was
         // registered (unresolved window scope).
-        if let Some(sid) = snapshot_id {
-            structured["snapshot_id"] =
-                serde_json::json!(cua_driver_core::element_token::format_snapshot_id(sid));
-        }
         let invalidated: Vec<String> = removed
             .into_iter()
             .chain(replaced.into_iter().flatten())
@@ -1217,17 +1179,7 @@ impl Tool for GetWindowStateTool {
                 structured["background_input"] = report;
             }
         }
-        if let Some((sw, sh)) = screenshot_dims {
-            structured["screenshot_width"] = serde_json::json!(sw);
-            structured["screenshot_height"] = serde_json::json!(sh);
-            // Surface 7: emit an explicit `screenshot_mime_type` on the
-            // structured payload so consumers don't have to sniff the magic
-            // bytes off the base64 PNG (`iVBOR` = PNG, `/9j/` = JPEG) to
-            // know what they're holding. `Content::image_png` already carries
-            // `mimeType` on the protocol image part — this mirrors it onto
-            // the structured side. Additive: keeps every existing field.
-            structured["screenshot_mime_type"] = serde_json::json!(encoding.mime_type());
-        }
+        apply_screenshot_dimensions(&mut structured, screenshot_dims, encoding.mime_type());
         if let Some((bounds, scale)) = screenshot_frame {
             structured["window_bounds"] = serde_json::json!({
                 "x": bounds.x,
@@ -1536,6 +1488,110 @@ fn wants_tree(args: &Value) -> bool {
     args.get("include_accessibility_tree")
         .and_then(|v| v.as_bool())
         != Some(false)
+}
+
+fn response_content(
+    window_id: u32,
+    pid: i32,
+    tree: Option<&crate::ax::tree::TreeWalkResult>,
+    screenshot: Option<(&[u8], bool, u32, u32)>,
+    jpeg: bool,
+) -> Vec<Content> {
+    let mut content = Vec::new();
+    if let Some((bytes, has_file, width, height)) = screenshot {
+        if !has_file {
+            use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
+            content.push(if jpeg {
+                Content::image_jpeg(BASE64.encode(bytes))
+            } else {
+                Content::image_png(BASE64.encode(bytes))
+            });
+        }
+        let element_count = tree.map_or(0, |result| {
+            result
+                .nodes
+                .iter()
+                .filter(|node| node.element_index.is_some())
+                .count()
+        });
+        let summary = if let Some(result) = tree {
+            format!("window_id={window_id} pid={pid} size={width}x{height} elements={element_count}\n\n{}", result.tree_markdown)
+        } else {
+            format!("window_id={window_id} pid={pid} size={width}x{height}")
+        };
+        content.push(Content::text(summary));
+    } else if let Some(result) = tree {
+        let element_count = result
+            .nodes
+            .iter()
+            .filter(|node| node.element_index.is_some())
+            .count();
+        content.push(Content::text(format!(
+            "window_id={window_id} pid={pid} elements={element_count}\n\n{}",
+            result.tree_markdown
+        )));
+    }
+    content
+}
+
+fn apply_screenshot_dimensions(
+    structured: &mut Value,
+    dimensions: Option<(u32, u32)>,
+    mime_type: &str,
+) {
+    if let Some((width, height)) = dimensions {
+        structured["screenshot_width"] = serde_json::json!(width);
+        structured["screenshot_height"] = serde_json::json!(height);
+        structured["screenshot_mime_type"] = serde_json::json!(mime_type);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn tree_output_fields(
+    window_id: u32,
+    pid: i32,
+    element_count: usize,
+    filtered_element_count: usize,
+    elements_complete: bool,
+    tree_md: String,
+    elements_json: Vec<Value>,
+    queried: bool,
+    tree: Option<&crate::ax::tree::TreeWalkResult>,
+    snapshot_id: Option<u32>,
+    requested_pid: i32,
+    external_panel: Option<PanelAttestation>,
+) -> Value {
+    let mut structured = serde_json::json!({
+        "window_id": window_id,
+        "pid": pid,
+        "element_count": element_count,
+        "total_element_count": element_count,
+        "returned_element_count": filtered_element_count,
+        "elements_complete": elements_complete,
+        "tree_markdown": tree_md,
+        "elements": elements_json,
+        "_note": "Prefer `elements` — `tree_markdown` will continue to work \
+            but new fields will only be added to the structured side. \
+            Issue #22865: use `max_elements` / `max_depth` to bound the \
+            AX walk on apps with very large trees."
+    });
+    if let Some(attestation) = external_panel {
+        structured["requested_pid"] = serde_json::json!(requested_pid);
+        structured["ax_pid"] = serde_json::json!(attestation.owner_pid);
+        structured["external_panel_service"] = serde_json::json!(OPEN_SAVE_PANEL_SERVICE);
+    }
+    if queried {
+        structured["filtered_element_count"] = serde_json::json!(filtered_element_count);
+    }
+    if let Some(tree) = tree {
+        tree.walk.apply(&mut structured);
+        apply_offscreen_rows(&mut structured, &tree.offscreen_rows);
+    }
+    if let Some(sid) = snapshot_id {
+        structured["snapshot_id"] =
+            serde_json::json!(cua_driver_core::element_token::format_snapshot_id(sid));
+    }
+    structured
 }
 
 /// A read that left offscreen list rows unwalked says so: `partial_walk`, and
@@ -3074,6 +3130,9 @@ mod row_label_tests {
         assert_eq!(entries[0]["label"], "Applications");
     }
 }
+
+#[cfg(test)]
+mod evidence_refactor_output_tests;
 
 #[cfg(test)]
 mod canonical_output_tests {

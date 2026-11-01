@@ -121,16 +121,63 @@ extern "C" {
 ///
 /// The caller must release any returned element exactly once with `CFRelease`.
 pub unsafe fn element_at_screen_position(pid: i32, x: f64, y: f64) -> Option<AXUIElementRef> {
+    element_at_screen_position_observed(pid, x, y).legacy
+}
+
+pub(crate) unsafe fn element_at_screen_position_observed(
+    pid: i32,
+    x: f64,
+    y: f64,
+) -> super::evidence::Observed<Option<AXUIElementRef>> {
     // The unbounded default keeps Electron reveal's existing AX timeout
     // behavior; U4's guard uses the bounded variant explicitly.
     let application = AXUIElementCreateApplication(pid);
     if application.is_null() {
-        return None;
+        use super::evidence::{EvidenceStatus, Observed, ReadEvidence, ReadSite};
+        return Observed {
+            legacy: None,
+            evidence: vec![ReadEvidence {
+                owner: None,
+                site: ReadSite::RecoveryHit,
+                status: EvidenceStatus::Unavailable,
+                attempt: 0,
+                listing: None,
+            }],
+        };
     }
     let mut element = std::ptr::null_mut();
     let error = AXUIElementCopyElementAtPosition(application, x as f32, y as f32, &mut element);
     CFRelease(application as CFTypeRef);
-    (error == kAXErrorSuccess && !element.is_null()).then_some(element)
+    let owner = (!element.is_null() && error == kAXErrorSuccess).then_some(element as usize);
+    recovery_hit_outcome(error, (!element.is_null()).then_some(element), owner)
+}
+
+/// Project an already completed hit test without repeating the AX request.
+pub(crate) fn recovery_hit_outcome<T>(
+    error: AXError,
+    hit: Option<T>,
+    owner: Option<usize>,
+) -> super::evidence::Observed<Option<T>> {
+    use super::evidence::{EvidenceStatus, Observed, ReadEvidence, ReadSite};
+    use super::tree_source::ReadFailure;
+    let status = if error != kAXErrorSuccess {
+        EvidenceStatus::Unknown(ReadFailure::Ax(error))
+    } else if hit.is_some() {
+        EvidenceStatus::Known
+    } else {
+        EvidenceStatus::Absent
+    };
+    let legacy = if error == kAXErrorSuccess { hit } else { None };
+    Observed {
+        legacy,
+        evidence: vec![ReadEvidence {
+            owner,
+            site: ReadSite::RecoveryHit,
+            status,
+            attempt: 0,
+            listing: None,
+        }],
+    }
 }
 
 /// element_at_screen_position with an explicit messaging timeout on the
@@ -1005,30 +1052,107 @@ pub unsafe fn ax_get_window_id(element: AXUIElementRef) -> Option<u32> {
 ///
 /// `element` must be valid, and the caller must release every returned element.
 pub unsafe fn copy_ax_windows(element: AXUIElementRef) -> Vec<AXUIElementRef> {
+    copy_ax_windows_observed(element).legacy
+}
+
+pub(crate) fn window_list_status(
+    error: AXError,
+    present: bool,
+    array_type: bool,
+) -> super::evidence::EvidenceStatus {
+    use super::evidence::EvidenceStatus;
+    use super::tree_source::ReadFailure;
+    if [kAXErrorNoValue, kAXErrorAttributeUnsupported].contains(&error) {
+        EvidenceStatus::Absent
+    } else if error != kAXErrorSuccess {
+        EvidenceStatus::Unknown(ReadFailure::Ax(error))
+    } else if !present {
+        EvidenceStatus::Absent
+    } else if !array_type {
+        EvidenceStatus::Unknown(ReadFailure::WrongType)
+    } else {
+        EvidenceStatus::Known
+    }
+}
+
+pub(crate) unsafe fn copy_ax_windows_observed(
+    element: AXUIElementRef,
+) -> super::evidence::Observed<Vec<AXUIElementRef>> {
+    use super::evidence::{Observed, ReadEvidence, ReadSite};
     let attr = CFStr::new("AXWindows");
     let mut value: CFTypeRef = std::ptr::null();
     let err = AXUIElementCopyAttributeValue(element, attr.as_concrete_TypeRef(), &mut value);
+    let owner = Some(element as usize);
+    let mut evidence = Vec::new();
     if err != kAXErrorSuccess || value.is_null() {
-        return vec![];
+        evidence.push(ReadEvidence {
+            owner,
+            site: ReadSite::TopLevelWindows,
+            status: window_list_status(err, !value.is_null(), false),
+            attempt: 0,
+            listing: None,
+        });
+        return Observed {
+            legacy: Vec::new(),
+            evidence,
+        };
     }
     let cf_array_type_id = CFArray::<CFTypeRef>::type_id();
     if core_foundation::base::CFGetTypeID(value) != cf_array_type_id {
         CFRelease(value);
-        return vec![];
+        evidence.push(ReadEvidence {
+            owner,
+            site: ReadSite::TopLevelWindows,
+            status: window_list_status(err, true, false),
+            attempt: 0,
+            listing: None,
+        });
+        return Observed {
+            legacy: Vec::new(),
+            evidence,
+        };
     }
+    evidence.push(ReadEvidence {
+        owner,
+        site: ReadSite::TopLevelWindows,
+        status: window_list_status(err, true, true),
+        attempt: 0,
+        listing: None,
+    });
     let arr = CFArray::<CFTypeRef>::wrap_under_create_rule(value as _);
     let ax_type_id = AXUIElementGetTypeID();
-    (0..arr.len())
+    let legacy = (0..arr.len())
         .filter_map(|i| {
-            let item = *arr.get(i)?;
+            let Some(item) = arr.get(i).map(|item| *item) else {
+                evidence.push(ReadEvidence {
+                    owner,
+                    site: ReadSite::TopLevelWindowsMember,
+                    status: super::evidence::EvidenceStatus::Unknown(
+                        super::tree_source::ReadFailure::WrongType,
+                    ),
+                    attempt: 0,
+                    listing: None,
+                });
+                return None;
+            };
             if core_foundation::base::CFGetTypeID(item) == ax_type_id {
                 CFRetain(item);
                 Some(item as AXUIElementRef)
             } else {
+                evidence.push(ReadEvidence {
+                    owner,
+                    site: ReadSite::TopLevelWindowsMember,
+                    status: super::evidence::EvidenceStatus::Unknown(
+                        super::tree_source::ReadFailure::WrongType,
+                    ),
+                    attempt: 0,
+                    listing: None,
+                });
                 None
             }
         })
-        .collect()
+        .collect();
+    Observed { legacy, evidence }
 }
 
 /// CGWindowIDs of `pid`'s `AXWindows`, or `None` when that list cannot be
@@ -1175,16 +1299,38 @@ pub unsafe fn copy_ax_windows_including(
     pid: i32,
     window_id: u32,
 ) -> Vec<AXUIElementRef> {
-    let mut windows = copy_ax_windows(app);
+    copy_ax_windows_including_observed(app, pid, window_id).legacy
+}
+
+pub(crate) unsafe fn copy_ax_windows_including_observed(
+    app: AXUIElementRef,
+    pid: i32,
+    window_id: u32,
+) -> super::evidence::Observed<Vec<AXUIElementRef>> {
+    use super::evidence::{EvidenceStatus, ReadEvidence, ReadSite};
+    let mut observed = copy_ax_windows_observed(app);
+    let windows = &mut observed.legacy;
     let listed = windows
         .iter()
         .any(|&window| ax_get_window_id(window) == Some(window_id));
     if should_probe_off_space_window(listed, || {
         crate::windows::window_space_view_by_id(window_id)
     }) {
-        windows.extend(copy_ax_window_by_remote_token(pid, window_id));
+        let remote = copy_ax_window_by_remote_token(pid, window_id);
+        observed.evidence.push(ReadEvidence {
+            owner: Some(app as usize),
+            site: ReadSite::TopLevelRemoteWindow,
+            status: if remote.is_none() {
+                EvidenceStatus::Unavailable
+            } else {
+                EvidenceStatus::Known
+            },
+            attempt: 0,
+            listing: None,
+        });
+        windows.extend(remote);
     }
-    windows
+    observed
 }
 
 #[cfg(test)]
