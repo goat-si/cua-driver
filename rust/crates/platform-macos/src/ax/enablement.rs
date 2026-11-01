@@ -66,23 +66,30 @@ enum Attempt {
 /// Kernel start time of a process: `(pbi_start_tvsec, pbi_start_tvusec)`.
 /// `None` when the process is gone or proc info is unreadable.
 pub(crate) fn process_start_stamp(pid: i32) -> Option<ProcessStartStamp> {
-    // SAFETY: proc_pidinfo writes at most `size` bytes into `info` and returns
-    // the number of bytes filled (<= size) or <= 0 on failure.
+    process_start_stamp_with(pid, read_process_info)
+}
+
+pub(crate) fn read_process_info(pid: i32, info: &mut libc::proc_bsdinfo) -> libc::c_int {
+    // SAFETY: `info` is a writable proc_bsdinfo buffer of the supplied size.
     unsafe {
-        let mut info: libc::proc_bsdinfo = std::mem::zeroed();
-        let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
-        let filled = libc::proc_pidinfo(
+        libc::proc_pidinfo(
             pid,
             libc::PROC_PIDTBSDINFO,
             0,
-            &mut info as *mut _ as *mut libc::c_void,
-            size,
-        );
-        if filled != size {
-            return None;
-        }
-        Some((info.pbi_start_tvsec, info.pbi_start_tvusec))
+            info as *mut _ as *mut libc::c_void,
+            std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int,
+        )
     }
+}
+
+pub(crate) fn process_start_stamp_with(
+    pid: i32,
+    read: impl FnOnce(i32, &mut libc::proc_bsdinfo) -> libc::c_int,
+) -> Option<ProcessStartStamp> {
+    // SAFETY: proc_bsdinfo is a plain C data structure and zero is valid for its fields.
+    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+    (read(pid, &mut info) == size).then_some((info.pbi_start_tvsec, info.pbi_start_tvusec))
 }
 
 static ENABLEMENT_STATE: LazyLock<Mutex<HashMap<i32, ProcessEnablement>>> =
