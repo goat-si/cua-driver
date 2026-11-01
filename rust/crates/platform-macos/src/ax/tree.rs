@@ -4869,5 +4869,15 @@ mod environment_evidence_tests;
 mod environment_setup_tests;
 #[cfg(test)]
 mod orchestration_preservation_tests;
+
+#[cfg(test)]
+pub(crate) fn evidence_output_fixture(search: bool, shared: bool) -> (TreeWalkResult, Vec<String>) {
+    walker_seam_tests::dense_case_with_entry(search, false, shared)
+}
+
+#[cfg(test)]
+pub(crate) fn evidence_deadline_fixture() -> TreeWalkResult {
+    environment_setup_tests::run_menu_deadline_case().0.legacy
+}
 #[cfg(test)]
 mod walker_test_support;
