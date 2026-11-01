@@ -3126,6 +3126,8 @@ async fn editable_toolkit(acc: &AccessibleProxy<'_>) -> crate::text_write_policy
     };
     let Ok(builder) =
         atspi::proxy::application::ApplicationProxy::builder(acc.inner().connection())
+            // Read directly: the cached proxy failed to obtain GTK3's toolkit name.
+            .cache_properties(zbus::proxy::CacheProperties::No)
             .destination(name)
     else {
         return Toolkit::Unknown;
