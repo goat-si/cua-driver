@@ -1905,9 +1905,13 @@ fn document_after_ladder(
     has_document: impl FnOnce() -> bool,
     status_without_value: impl FnOnce() -> crate::document_edit::DocumentEdited,
 ) -> crate::document_edit::DocumentEdited {
-    if out.verification_withheld {
+    if out.verification_withheld || (out.changed == Some(true) && out.verified != Some(true)) {
         status_without_value()
-    } else if !out.maybe_landed && out.changed == Some(true) && !restored_window {
+    } else if !out.maybe_landed
+        && out.verified == Some(true)
+        && out.changed == Some(true)
+        && !restored_window
+    {
         mark()
     } else if restored_window && out.changed != Some(false) && has_document() {
         crate::document_edit::DocumentEdited::NotMarked

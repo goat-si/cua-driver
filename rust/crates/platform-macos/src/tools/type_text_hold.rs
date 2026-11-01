@@ -18,9 +18,10 @@ use cua_driver_core::protocol::ToolResult;
 
 #[cfg(test)]
 use crate::ax::write_outcome::ValueObs;
-use crate::ax::write_outcome::ValueRead;
+use crate::ax::write_outcome::{native_write_outcome, NativeWriteKind, Settable, ValueRead};
 use crate::document_edit::HeldMark;
 use crate::input::skylight::{scope_disclosure, HandBack, KeyEntry, ScopeEntryError};
+use cua_driver_core::mutation::{ChainResult, Postcondition, PriorInput, WriteOutcome};
 
 /// Whether an untargeted insert needs the inline hold: a window-addressed
 /// background request (keyboard policy allowed, no-raise SPIs present) whose
@@ -152,8 +153,10 @@ pub(super) enum HoldOutcome {
     BeforeUnreadable,
     /// A pre-write check failed: nothing was written.
     Stopped(Dispatch),
+    NotSettable,
     /// The write was sent; the document mark ran only after a confirmed one.
     Inserted {
+        native: WriteOutcome,
         readback: Readback,
         mark: Option<HeldMark>,
         detail: String,
@@ -181,6 +184,7 @@ pub(super) trait HoldOps {
     fn before(&mut self, element: &Self::Element) -> Option<Before>;
     /// The last check, with nothing between it and the next post.
     fn can_dispatch(&mut self, element: &Self::Element) -> Dispatch;
+    fn settable(&mut self, element: &Self::Element) -> Settable;
     /// The one AXSelectedText write; the AX error (0 on success).
     fn write(&mut self, element: &Self::Element, text: &str) -> i32;
     fn read_value(&mut self, element: &Self::Element) -> ValueRead;
@@ -228,14 +232,24 @@ fn held<O: HoldOps>(ops: &mut O, text: &str) -> HoldOutcome {
         Dispatch::Ok => {}
         stopped => return HoldOutcome::Stopped(stopped),
     }
+    let settable = ops.settable(&element);
+    if settable == Settable::No {
+        let outcome = native_write_outcome(NativeWriteKind::SetAttribute, false, &settable, 0);
+        debug_assert!(matches!(outcome, WriteOutcome::FallThrough(_)));
+        return HoldOutcome::NotSettable;
+    }
     let ax_error = ops.write(&element, text);
+    let native = native_write_outcome(NativeWriteKind::SetAttribute, true, &settable, ax_error);
     let after = ops.read_value(&element);
-    let readback = match after {
-        ValueRead::Withheld => Readback::Unverifiable,
-        value => judge(&before, text, ax_error, value.text().as_deref()),
+    let readback = match (native, after) {
+        (WriteOutcome::Delivered, ValueRead::Withheld) => Readback::Unverifiable,
+        (WriteOutcome::Delivered, value) => judge(&before, text, ax_error, value.text().as_deref()),
+        (_, _) => Readback::AxError(ax_error),
     };
-    let mark = (readback == Readback::Confirmed).then(|| ops.mark(&element));
+    let mark = (native == WriteOutcome::Delivered && readback == Readback::Confirmed)
+        .then(|| ops.mark(&element));
     HoldOutcome::Inserted {
+        native,
         readback,
         mark,
         detail: ops.describe(&element),
@@ -297,17 +311,40 @@ pub(super) fn hold_result(step: HoldStep, pid: i32, wid: u32, char_count: usize)
         }
     };
     let key_hold = key_hold_json(wid, entry, hand_back);
-    let nothing = if entry_touched(entry) {
+    let prior = if entry_touched(entry) || hand_back.is_some_and(|h| h != HandBack::NotMoved) {
+        PriorInput::MayHaveDelivered
+    } else {
+        PriorInput::None
+    };
+    let recorded = match &outcome {
+        HoldOutcome::Inserted { native, .. } => {
+            Some(ChainResult::from_recorded(vec![*native], prior).expect("one held insert setter"))
+        }
+        HoldOutcome::NotSettable => Some(
+            ChainResult::from_recorded(
+                vec![native_write_outcome(
+                    NativeWriteKind::SetAttribute,
+                    false,
+                    &Settable::No,
+                    0,
+                )],
+                prior,
+            )
+            .expect("one skipped held insert setter"),
+        ),
+        _ => None,
+    };
+    let nothing = if prior != PriorInput::None {
         "No text was typed."
     } else {
         "Nothing was sent."
     };
     let refused = |code: &str, reason: String| {
         let message = with_note(format!("{reason} {nothing} {TOKEN_ADVICE}"));
-        ToolResult::error(format!("type_text refused ({code}): {message}")).with_structured(
-            serde_json::json!({
+        ToolResult::error(format!("type_text stopped ({code}): {message}"))
+            .with_structured(serde_json::json!({
                 "code": code,
-                "effect": "refused",
+                "effect": if prior == PriorInput::None { "refused" } else { "unverifiable" },
                 "pid": pid,
                 "window_id": wid,
                 "keys_sent": false,
@@ -315,8 +352,12 @@ pub(super) fn hold_result(step: HoldStep, pid: i32, wid: u32, char_count: usize)
                 "message": message,
                 "key_hold": key_hold.clone(),
                 "escalation": { "recommended": "element_token", "reason": TOKEN_ADVICE },
-            }),
-        )
+            }))
+            .with_disposition(if prior == PriorInput::None {
+                cua_driver_contract::ErrorDisposition::NOT_DELIVERED
+            } else {
+                cua_driver_contract::ErrorDisposition::SUSPECTED_NOOP
+            })
     };
     let unverifiable = |message: String, extra: serde_json::Value| {
         let message = with_note(message);
@@ -377,10 +418,12 @@ pub(super) fn hold_result(step: HoldStep, pid: i32, wid: u32, char_count: usize)
             "focus left the element, or the window stopped taking keys, right before the insert, so it was not written."
                 .to_owned(),
         ),
+        HoldOutcome::NotSettable => refused("no_focused_text_input", "the focused element does not support AXSelectedText.".into()),
         HoldOutcome::Inserted {
             readback: Readback::Confirmed,
             mark,
             detail,
+            ..
         } => {
             let mark = mark.unwrap_or(HeldMark::NothingSent);
             let clean = matches!(mark, HeldMark::Marked | HeldMark::NotADocument);
@@ -416,12 +459,18 @@ pub(super) fn hold_result(step: HoldStep, pid: i32, wid: u32, char_count: usize)
             readback: Readback::AxError(error),
             detail,
             ..
-        } => unverifiable(
-            format!(
-                "{char_count} char(s) as one accessibility write into {detail}, which returned AX error {error}; it may still have changed the text, so read the window before sending it again."
-            ),
-            serde_json::json!({ "readback": "ax_error", "ax_error": error }),
-        ),
+        } => {
+            let chain = recorded.expect("insert has a recorded native outcome");
+            let message = with_note(format!("AXSelectedText into {detail} returned error {error}; read the window before retrying."));
+            let mut result = ToolResult::error(message.clone()).with_structured(serde_json::json!({
+                "code": "type_text_unverified", "path": "ax", "verified": false,
+                "effect": if chain.no_input() { "refused" } else { "unverifiable" },
+                "pid": pid, "window_id": wid, "message": message, "key_hold": key_hold,
+                "readback": "ax_error", "ax_error": error,
+            }));
+            if let Some(disposition) = chain.error_disposition(Postcondition::Indeterminate, false) { result = result.with_disposition(disposition); }
+            result
+        },
         HoldOutcome::Inserted { detail, .. } => unverifiable(
             format!(
                 "{char_count} char(s) as one accessibility write into {detail}; the value could not be read back as the expected insert, so read the window before sending it again."
@@ -479,13 +528,15 @@ pub(super) async fn held_window_insert(
                  inserted into window {wid}, and key may have been handed back during unwinding \
                  or left on it; read the window before sending it again."
             );
-            ToolResult::error(message.clone()).with_structured(serde_json::json!({
-                "code": "type_text_unverified",
-                "effect": "unverifiable",
-                "pid": pid,
-                "window_id": wid,
-                "message": message,
-            }))
+            ToolResult::error(message.clone())
+                .with_structured(serde_json::json!({
+                    "code": "type_text_unverified",
+                    "effect": "unverifiable",
+                    "pid": pid,
+                    "window_id": wid,
+                    "message": message,
+                }))
+                .with_disposition(cua_driver_contract::ErrorDisposition::SUSPECTED_NOOP)
         }
     }
 }
@@ -591,6 +642,10 @@ impl HoldOps for LiveHoldOps {
         Dispatch::Ok
     }
 
+    fn settable(&mut self, element: &Self::Element) -> Settable {
+        unsafe { crate::ax::write_outcome::query_settable(element.as_ptr() as _, "AXSelectedText") }
+    }
+
     fn write(&mut self, element: &Self::Element, text: &str) -> i32 {
         unsafe {
             crate::ax::bindings::set_string_attr(
@@ -641,8 +696,13 @@ mod secure_read_tests {
         let (_, result) = run(&mut fake);
         assert!(!fake.log.contains(&"write"));
         let data = result.structured_content.unwrap();
-        assert_eq!(data["effect"], "refused");
+        assert_eq!(data["effect"], "unverifiable");
         assert_eq!(data["text_sent"], false);
+        assert!(!fake.log.contains(&"mark"));
+        assert_eq!(
+            fake.log.iter().filter(|event| **event == "finish").count(),
+            1
+        );
     }
 
     #[test]
@@ -658,7 +718,8 @@ mod secure_read_tests {
         assert!(!fake.log.contains(&"mark"));
         let data = result.structured_content.unwrap();
         assert_eq!(data["effect"], "unverifiable");
-        assert_eq!(data["readback"], "unverifiable");
+        assert_eq!(data["readback"], "ax_error");
+        assert_eq!(data["ax_error"], -25204);
     }
 }
 
@@ -676,8 +737,9 @@ mod tests {
         pub(super) before: Option<Before>,
         dispatch: Dispatch,
         pub(super) ax_error: i32,
-        after: Option<String>,
+        pub(super) after: Option<String>,
         pub(super) after_withheld: bool,
+        pub(super) settable: Settable,
         mark: HeldMark,
         pub(super) log: Vec<&'static str>,
     }
@@ -702,6 +764,7 @@ mod tests {
                 ax_error: 0,
                 after: Some(" TOKhello alpha".into()),
                 after_withheld: false,
+                settable: Settable::Yes,
                 mark: HeldMark::Marked,
                 log: Vec::new(),
             }
@@ -741,6 +804,9 @@ mod tests {
         fn can_dispatch(&mut self, _: &()) -> Dispatch {
             self.log.push("can_dispatch");
             self.dispatch
+        }
+        fn settable(&mut self, _: &()) -> Settable {
+            self.settable
         }
         fn write(&mut self, _: &(), _: &str) -> i32 {
             self.log.push("write");
@@ -913,12 +979,22 @@ mod tests {
             assert_eq!(fake.log.last(), Some(&"finish"), "{code}");
             let data = structured(&result);
             assert_eq!(data["code"], code);
-            assert_eq!(data["effect"], "refused");
+            assert_eq!(data["effect"], "unverifiable");
             assert_eq!(data["text_sent"], false);
             let text = text_of(&result);
             assert!(text.contains("No text was typed."), "{code}: {text}");
             assert!(text.contains("element_token"), "{code}: {text}");
         }
+        let mut zero = Fake::ok();
+        zero.entry = KeyEntry::default();
+        zero.hand_back = HandBack::NotMoved;
+        zero.before = None;
+        let (_, result) = run(&mut zero);
+        assert_eq!(structured(&result)["effect"], "refused");
+        assert_eq!(structured(&result)["text_sent"], false);
+        assert!(!zero.log.contains(&"write"));
+        assert!(!zero.log.contains(&"mark"));
+        assert_eq!(zero.log.iter().filter(|c| **c == "finish").count(), 1);
     }
 
     #[test]
@@ -986,7 +1062,7 @@ mod tests {
             let data = structured(&result);
             assert_eq!(data["effect"], "unverifiable", "{readback}");
             assert_eq!(data["readback"], readback);
-            assert_ne!(result.is_error, Some(true));
+            assert_eq!(result.is_error == Some(true), ax_error != 0);
         }
     }
 
@@ -1009,5 +1085,69 @@ mod tests {
         let mut fake = Fake::ok();
         fake.mark = HeldMark::NotADocument;
         assert_eq!(structured(&run(&mut fake).1)["effect"], "confirmed");
+    }
+}
+
+#[cfg(test)]
+mod u32_outcome_tests {
+    use super::tests::{run, Fake};
+    use super::*;
+
+    #[test]
+    fn unchanged_splice_keeps_existing_unverified_contract() {
+        let mut fake = Fake::ok();
+        fake.before = Some(Before {
+            value: "same".into(),
+            range: (0, 4),
+        });
+        fake.after = Some("same".into());
+        let step = run_hold(&mut fake, "same");
+        let result = hold_result(step, 42, 7, 4);
+        let data = result.structured_content.unwrap();
+        assert_eq!(data["effect"], "unverifiable");
+        assert_eq!(data["readback"], "unchanged");
+        assert!(!fake.log.contains(&"mark"));
+        assert_eq!(
+            fake.log.iter().filter(|event| **event == "write").count(),
+            1
+        );
+        assert_eq!(
+            fake.log.iter().filter(|event| **event == "finish").count(),
+            1
+        );
+    }
+
+    #[test]
+    fn withheld_after_write_keeps_handback_and_suppresses_mark() {
+        let mut fake = Fake::ok();
+        fake.after_withheld = true;
+        fake.ax_error = crate::ax::bindings::kAXErrorCannotComplete;
+        let (_, result) = run(&mut fake);
+        let data = result.structured_content.unwrap();
+        assert_eq!(data["effect"], "unverifiable");
+        assert_eq!(
+            data["ax_error"],
+            crate::ax::bindings::kAXErrorCannotComplete
+        );
+        assert_eq!(data["key_hold"]["hand_back"], "restored");
+        assert_eq!(
+            result.disposition,
+            Some(cua_driver_contract::ErrorDisposition::SUSPECTED_NOOP)
+        );
+        assert!(!fake.log.contains(&"mark"));
+        assert_eq!(
+            fake.log.iter().filter(|event| **event == "write").count(),
+            1
+        );
+        assert_eq!(
+            fake.log.iter().filter(|event| **event == "finish").count(),
+            1
+        );
+        let mut unsupported = Fake::ok();
+        unsupported.settable = Settable::No;
+        let (_, result) = run(&mut unsupported);
+        assert_eq!(result.structured_content.unwrap()["text_sent"], false);
+        assert!(!unsupported.log.contains(&"write"));
+        assert!(!unsupported.log.contains(&"mark"));
     }
 }
