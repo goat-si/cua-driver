@@ -720,7 +720,7 @@ impl<S: AxTreeSource> ContentReader for SourceContentReader<'_, S> {
     }
 
     fn expired(&self) -> bool {
-        self.budget.expired()
+        self.source.budget_expired(self.budget)
     }
 }
 

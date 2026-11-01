@@ -182,6 +182,9 @@ impl<S: AxTreeSource> AxTreeSource for EvidenceSource<'_, S> {
     type Element = S::Element;
     type Batch = EvidenceBatch<S::Batch>;
     type ElementSet = S::ElementSet;
+    fn budget_expired(&self, budget: &cua_driver_core::walk_budget::WalkBudget) -> bool {
+        self.source.budget_expired(budget)
+    }
     fn key(&self, e: &Self::Element) -> usize {
         self.source.key(e)
     }

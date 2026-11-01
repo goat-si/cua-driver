@@ -553,6 +553,119 @@ fn late_final_child_enumeration_reports_time_budget() {
     assert_eq!(walk.legacy.walk.nodes_visited, 1);
 }
 
+fn assert_mid_read_timeout(stage: &str) {
+    use std::cell::Cell;
+    use std::rc::Rc;
+    let clock = Rc::new(Cell::new(super::scripted_clock_origin()));
+    let expire_clock = clock.clone();
+    let content = "batch 2 AXTitle,AXPlaceholderValue,AXDescription,AXIdentifier,AXHelp,AXSubrole,AXRoleDescription";
+    let control =
+        "batch 2 AXEnabled,AXPosition,AXSize,AXValueDescription,AXMinValue,AXMaxValue,AXSelected";
+    let frame = "batch 2 AXPosition,AXSize";
+    let target = match stage {
+        "content" => content,
+        "control" => control,
+        "frame" => frame,
+        _ => panic!("unknown stage"),
+    };
+    let mut script = vec![
+        step("timeout 2", Reply::Unit),
+        step(
+            "text 2 AXRole",
+            Reply::Text(Read::Known(
+                if stage == "control" {
+                    "AXButton"
+                } else {
+                    "AXWindow"
+                }
+                .into(),
+            )),
+        ),
+    ];
+    let expire = step(
+        target,
+        Reply::Nested(Box::new(move || {
+            expire_clock
+                .set(super::scripted_clock_origin() + std::time::Duration::from_millis(2_000_000));
+        })),
+    );
+    let mut expire = Some(expire);
+    if stage == "content" {
+        script.push(expire.take().unwrap());
+    }
+    script.push(step(
+        content,
+        Reply::Batch(Ok(Batch(vec![Slot::Text(AttrStatus::Absent); 7]))),
+    ));
+    script.push(step("value 2", Reply::Value(Ok(None))));
+    script.push(step(
+        "actions 2",
+        Reply::Actions(Read::Known(if stage == "control" {
+            vec!["AXPress".into()]
+        } else {
+            vec![]
+        })),
+    ));
+    if stage == "control" {
+        script.push(expire.take().unwrap());
+        script.push(step(
+            control,
+            Reply::Batch(Ok(Batch(vec![
+                Slot::Bool(None),
+                Slot::Point(None),
+                Slot::Size(None),
+                Slot::Text(AttrStatus::Absent),
+                Slot::Number(None),
+                Slot::Number(None),
+                Slot::Bool(None),
+            ]))),
+        ));
+        script.push(step("snapshot 2", Reply::Unit));
+    } else {
+        if stage == "frame" {
+            script.push(expire.take().unwrap());
+        }
+        script.push(step(
+            frame,
+            Reply::Batch(Ok(Batch(vec![Slot::Point(None), Slot::Size(None)]))),
+        ));
+    }
+    script.push(step("children 2", Reply::Children(Read::Absent)));
+    let source = Fake::new(&[(2, 2, 2, &[])], script);
+    let walk = super::environment_setup_tests::run_timed_source(&source, clock);
+    assert_eq!(
+        walk.legacy.walk.stop,
+        Some(cua_driver_core::walk_budget::WalkStop::Timeout),
+        "stage={stage}"
+    );
+    assert!(has_reason(&walk.legacy, "budget", "time_budget"));
+    assert_eq!(walk.legacy.nodes.len(), 1);
+    assert!(walk.legacy.nodes[0].element_index.is_none());
+    let trace = source.trace();
+    assert!(trace.iter().any(|operation| operation == target));
+    assert!(!trace.iter().any(|operation| operation == "children 2"));
+    assert!(!trace.iter().any(|operation| operation == "snapshot 2"));
+    if stage == "content" {
+        assert!(!trace.iter().any(|operation| operation == "value 2"));
+    }
+    source.assert_lifetimes(&[]);
+}
+
+#[test]
+fn content_timeout_reports_time_budget() {
+    assert_mid_read_timeout("content");
+}
+
+#[test]
+fn control_timeout_reports_time_budget() {
+    assert_mid_read_timeout("control");
+}
+
+#[test]
+fn frame_timeout_reports_time_budget() {
+    assert_mid_read_timeout("frame");
+}
+
 #[test]
 fn query_with_an_omission_is_false_with_its_typed_reason() {
     let output = depth_limited_walk(Some("missing"));

@@ -18,6 +18,7 @@ struct State {
     children: HashMap<usize, Vec<usize>>,
     handles: HashMap<usize, usize>,
     snapshot_credits: HashMap<usize, usize>,
+    scripted_clock: Option<Rc<std::cell::Cell<std::time::Instant>>>,
 }
 
 pub(super) struct Handle {
@@ -140,6 +141,15 @@ impl AxTreeSource for Fake {
     type Element = Handle;
     type Batch = Batch;
     type ElementSet = Vec<usize>;
+    fn budget_expired(&self, budget: &WalkBudget) -> bool {
+        let state = self.state.borrow();
+        match &state.scripted_clock {
+            Some(clock) => budget.time_limit().is_some_and(|limit| {
+                clock.get().duration_since(super::scripted_clock_origin()) >= limit
+            }),
+            None => budget.expired(),
+        }
+    }
     fn key(&self, e: &Handle) -> usize {
         e.id
     }
@@ -324,11 +334,15 @@ impl Fake {
                 children,
                 handles: HashMap::new(),
                 snapshot_credits: HashMap::new(),
+                scripted_clock: None,
             })),
         }
     }
     pub(super) fn trace(&self) -> Vec<String> {
         self.state.borrow().trace.clone()
+    }
+    pub(super) fn set_scripted_clock(&self, clock: Rc<std::cell::Cell<std::time::Instant>>) {
+        self.state.borrow_mut().scripted_clock = Some(clock);
     }
     pub(super) fn assert_lifetimes(&self, snapshot_credits: &[(usize, usize)]) {
         let state = self.state.borrow();

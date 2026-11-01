@@ -329,6 +329,40 @@ pub(super) fn run_unscoped_source(
     result
 }
 
+pub(super) fn run_timed_source(
+    source: &super::walker_seam_tests::Fake,
+    clock: Rc<Cell<std::time::Instant>>,
+) -> super::CompletedWalk {
+    source.set_scripted_clock(clock.clone());
+    let environment = SingleRoot {
+        source,
+        root: RefCell::new(None),
+        trace: RefCell::new(vec![]),
+        create: true,
+        root_id: 2,
+        scoped: false,
+        menu_frames: None,
+        menu_replies: RefCell::new(Default::default()),
+        menu_credits: RefCell::new(Default::default()),
+        clock,
+        menu_advance: None,
+    };
+    let result = super::walk_with_environment(
+        source,
+        &environment,
+        super::WalkRequest {
+            pid: 42,
+            window_id: None,
+            query: None,
+            max_depth: 10,
+            include_web_content: true,
+        },
+        cua_driver_core::walk_budget::WalkBudget::new(1_000_000, 10),
+    );
+    assert!(environment.root.borrow().is_none());
+    result
+}
+
 pub(super) fn run_late_final_enumeration() -> super::CompletedWalk {
     use super::walker_seam_tests::{step, Fake, Reply};
     use super::walker_test_support::{Batch, Slot};
