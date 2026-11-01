@@ -45,6 +45,41 @@ where
     Observed { legacy, evidence }
 }
 
+pub(crate) fn decode_element_set_members<I, T>(
+    items: I,
+    owner: Option<usize>,
+    name: &'static str,
+    decode: impl FnMut(I::Item) -> Option<T>,
+) -> crate::ax::evidence::Observed<Vec<T>>
+where
+    I: IntoIterator,
+{
+    let mut observed = decode_child_members(items, decode);
+    for entry in &mut observed.evidence {
+        entry.owner = owner;
+        entry.site = crate::ax::evidence::ReadSite::ElementSet(name);
+    }
+    observed
+}
+
+pub(crate) fn scalar_outcome<T>(
+    error: AXError,
+    is_null: bool,
+    decode: impl FnOnce() -> Option<T>,
+) -> Read<T> {
+    if error != kAXErrorSuccess {
+        return if [kAXErrorNoValue, kAXErrorAttributeUnsupported].contains(&error) {
+            Read::Absent
+        } else {
+            Read::Unknown(ReadFailure::Ax(error))
+        };
+    }
+    if is_null {
+        return Read::Absent;
+    }
+    decode().map_or(Read::Unknown(ReadFailure::WrongType), Read::Known)
+}
+
 pub(crate) fn observed_children_read<T>(
     owner: usize,
     legacy: Read<Vec<T>>,
@@ -75,19 +110,11 @@ unsafe fn scalar<T>(
     let attr = CFString::new(name);
     let mut value = std::ptr::null();
     let error = AXUIElementCopyAttributeValue(element, attr.as_concrete_TypeRef(), &mut value);
-    if error != kAXErrorSuccess {
-        return if [kAXErrorNoValue, kAXErrorAttributeUnsupported].contains(&error) {
-            Read::Absent
-        } else {
-            Read::Unknown(ReadFailure::Ax(error))
-        };
+    let result = scalar_outcome(error, value.is_null(), || decode(value));
+    if error == kAXErrorSuccess && !value.is_null() {
+        CFRelease(value);
     }
-    if value.is_null() {
-        return Read::Absent;
-    }
-    let decoded = decode(value);
-    CFRelease(value);
-    decoded.map_or(Read::Unknown(ReadFailure::WrongType), Read::Known)
+    result
 }
 
 impl AxTreeSource for NativeSource {
@@ -237,11 +264,22 @@ impl AxTreeSource for NativeSource {
                 return Read::Unknown(ReadFailure::WrongType);
             }
             let array = CFArray::<CFTypeRef>::wrap_under_create_rule(value as _);
+            let site = match name {
+                "AXRows" => "AXRows",
+                "AXVisibleRows" => "AXVisibleRows",
+                "AXVisibleChildren" => "AXVisibleChildren",
+                _ => "other",
+            };
+            let members = decode_element_set_members(
+                array.iter().map(|item| *item),
+                Some(self.key(element)),
+                site,
+                |item| (CFGetTypeID(item) == AXUIElementGetTypeID()).then_some(item),
+            )
+            .into_walk_legacy();
             let mut buckets: HashMap<usize, Vec<CFTypeRef>> = HashMap::new();
-            for item in array.iter() {
-                if CFGetTypeID(*item) == AXUIElementGetTypeID() {
-                    buckets.entry(CFHash(*item)).or_default().push(*item);
-                }
+            for item in members {
+                buckets.entry(CFHash(item)).or_default().push(item);
             }
             if buckets.is_empty() {
                 Read::Absent

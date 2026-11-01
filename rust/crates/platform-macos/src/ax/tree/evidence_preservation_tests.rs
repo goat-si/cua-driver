@@ -1230,6 +1230,61 @@ fn tab_content_preserves_shadowed_failures() {
 }
 
 #[test]
+fn native_decoders_preserve_raw_errors_without_new_requests() {
+    let calls = std::cell::Cell::new(0);
+    let unknown =
+        crate::ax::tree_source::native::scalar_outcome(kAXErrorCannotComplete, false, || {
+            calls.set(calls.get() + 1);
+            Some(7)
+        });
+    assert!(
+        matches!(unknown, Read::Unknown(ReadFailure::Ax(code)) if code == kAXErrorCannotComplete)
+    );
+    assert_eq!(calls.get(), 0);
+    let absent = crate::ax::tree_source::native::scalar_outcome(kAXErrorNoValue, false, || Some(7));
+    assert!(matches!(absent, Read::Absent));
+    let wrong =
+        crate::ax::tree_source::native::scalar_outcome::<i32>(kAXErrorSuccess, false, || None);
+    assert!(matches!(wrong, Read::Unknown(ReadFailure::WrongType)));
+    let known = crate::ax::tree_source::native::scalar_outcome(kAXErrorSuccess, false, || Some(7));
+    assert!(matches!(known, Read::Known(7)));
+    let observed = crate::ax::tree_source::native::decode_element_set_members(
+        [Some(11), None, Some(33)],
+        Some(7),
+        "AXVisibleRows",
+        |item| {
+            calls.set(calls.get() + 1);
+            item
+        },
+    );
+    assert_eq!(observed.legacy, [11, 33]);
+    assert_eq!(calls.get(), 3);
+    assert_evidence(
+        &observed.evidence,
+        ReadSite::ElementSet("AXVisibleRows"),
+        EvidenceStatus::Unknown(ReadFailure::WrongType),
+    );
+    assert!(observed.evidence.iter().all(|entry| entry.owner == Some(7)));
+    for (input, valid, invalid) in [
+        (vec![Some(1), Some(2)], vec![1, 2], 0),
+        (vec![None, None], vec![], 2),
+        (vec![], vec![], 0),
+    ] {
+        let decoded = crate::ax::tree_source::native::decode_element_set_members(
+            input,
+            Some(7),
+            "AXRows",
+            |item| item,
+        );
+        assert_eq!(decoded.legacy, valid);
+        assert_eq!(decoded.evidence.len(), invalid);
+        assert!(decoded.evidence.iter().all(|entry| entry.owner == Some(7)
+            && entry.site == ReadSite::ElementSet("AXRows")
+            && entry.status == EvidenceStatus::Unknown(ReadFailure::WrongType)));
+    }
+}
+
+#[test]
 fn dense_visibility_sets_preserve_unknown_and_absent() {
     let fake = Fake::new(
         &[(1, 1, 1, &[])],
