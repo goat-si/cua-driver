@@ -3532,6 +3532,7 @@ mod primed_key_tests {
     /// The release takes the app's mutation lease itself, so an action that
     /// holds it (or starts while the release runs) is never cut short.
     #[test]
+    #[ignore = "live: reads HID idle time, SkyLight; runs alone in the macOS live lane"]
     fn a_release_waits_while_an_action_holds_the_apps_lease() {
         let _serial = serial();
         let ours = |pid: i32| primed_keys_for_test().iter().any(|k| k.pid == pid);
@@ -3549,6 +3550,7 @@ mod primed_key_tests {
     /// declaration order): from its creation until its hand-back has run, a
     /// release waits as for an action.
     #[test]
+    #[ignore = "live: reads HID idle time, SkyLight; runs alone in the macOS live lane"]
     fn a_live_key_scope_counts_as_an_action_in_flight() {
         let _serial = serial();
         let ours = |pid: i32| primed_keys_for_test().iter().any(|k| k.pid == pid);
@@ -3565,6 +3567,7 @@ mod primed_key_tests {
     }
 
     #[test]
+    #[ignore = "live: reads HID idle time, SkyLight; runs alone in the macOS live lane"]
     fn a_new_priming_replaces_its_apps_entry_and_lets_other_apps_go() {
         let _serial = serial();
         // No such processes: WindowServer cannot say who is front, so the

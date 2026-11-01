@@ -1176,6 +1176,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "live: reads NSWorkspace; runs alone in the macOS live lane"]
     fn locate_by_name_accepts_absolute_app_bundle_path() {
         let dir = tempfile::tempdir().unwrap();
         let bundle = dir.path().join("Zz Path Only Fixture.app");
@@ -1301,6 +1302,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "live: reads NSWorkspace; runs alone in the macOS live lane"]
     fn finder_is_located_by_name_outside_the_app_roots() {
         let (_, bundle_id) = super::locate_by_name("Finder")
             .expect("Finder ships with every macOS")

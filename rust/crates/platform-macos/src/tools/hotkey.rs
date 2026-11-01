@@ -878,6 +878,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "live: reads NSWorkspace; runs alone in the macOS live lane"]
     async fn desktop_hotkey_cancellation_releases_real_dispatch_transitions() {
         cancel_real_desktop_hotkey(false).await;
         cancel_real_desktop_hotkey(true).await;

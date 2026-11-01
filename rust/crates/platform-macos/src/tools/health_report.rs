@@ -658,6 +658,7 @@ mod tests {
     // name appears in the response and the response shape matches the
     // documented contract.
     #[tokio::test]
+    #[ignore = "live: reads accessibility trust, screen-capture grant; runs alone in the macOS live lane"]
     async fn invoke_full_run_produces_macos_check_set() {
         let provider = Arc::new(MacosHealthProvider);
         let tool = HealthReportTool::new(provider);
