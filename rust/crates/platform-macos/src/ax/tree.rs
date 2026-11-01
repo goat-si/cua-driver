@@ -748,17 +748,39 @@ pub(crate) fn walk_tree_with_web_content_observed(
 
 /// Supplies native setup observations to shared walk code.
 trait AxWalkEnvironment {
-    type Application;
+    type Application: Copy;
+    type Element: Copy;
 
     fn create_application(&self, pid: i32) -> Option<Self::Application>;
     fn set_application_timeout(&self, application: &Self::Application);
     fn application_key(&self, application: &Self::Application) -> usize;
+    fn children(
+        &self,
+        application: Self::Application,
+    ) -> super::evidence::Observed<Read<Vec<Self::Element>>>;
+    fn windows(
+        &self,
+        application: Self::Application,
+        pid: i32,
+        window_id: Option<u32>,
+    ) -> super::evidence::Observed<Vec<Self::Element>>;
+    fn same(&self, left: Self::Element, right: Self::Element) -> bool;
+    fn release(&self, element: Self::Element);
+    fn retain(&self, element: Self::Element);
+    fn element_key(&self, element: Self::Element) -> usize;
+    fn set_element_timeout(&self, element: Self::Element);
+    fn window_id(&self, element: Self::Element) -> Option<u32>;
+    fn window_bounds(&self, window_id: u32) -> Option<[f64; 4]>;
+    fn hit(&self, pid: i32, x: f64, y: f64) -> super::evidence::Observed<Option<Self::Element>>;
+    fn parent(&self, element: Self::Element) -> Option<Self::Element>;
+    fn now(&self) -> Instant;
 }
 
 struct NativeWalkEnvironment;
 
 impl AxWalkEnvironment for NativeWalkEnvironment {
     type Application = AXUIElementRef;
+    type Element = AXUIElementRef;
 
     fn create_application(&self, pid: i32) -> Option<Self::Application> {
         let application = unsafe { AXUIElementCreateApplication(pid) };
@@ -769,6 +791,58 @@ impl AxWalkEnvironment for NativeWalkEnvironment {
     }
     fn application_key(&self, application: &Self::Application) -> usize {
         *application as usize
+    }
+    fn children(
+        &self,
+        application: Self::Application,
+    ) -> super::evidence::Observed<Read<Vec<Self::Element>>> {
+        unsafe { super::tree_source::native::children_observed_raw(application) }
+    }
+    fn windows(
+        &self,
+        application: Self::Application,
+        pid: i32,
+        window_id: Option<u32>,
+    ) -> super::evidence::Observed<Vec<Self::Element>> {
+        unsafe {
+            match window_id {
+                Some(wid) => copy_ax_windows_including_observed(application, pid, wid),
+                None => copy_ax_windows_observed(application),
+            }
+        }
+    }
+    fn same(&self, left: Self::Element, right: Self::Element) -> bool {
+        unsafe { CFEqual(left as CFTypeRef, right as CFTypeRef) != 0 }
+    }
+    fn release(&self, element: Self::Element) {
+        unsafe { CFRelease(element as CFTypeRef) }
+    }
+    fn retain(&self, element: Self::Element) {
+        unsafe {
+            CFRetain(element as CFTypeRef);
+        }
+    }
+    fn element_key(&self, element: Self::Element) -> usize {
+        element as usize
+    }
+    fn set_element_timeout(&self, element: Self::Element) {
+        unsafe { set_messaging_timeout(element) }
+    }
+    fn window_id(&self, element: Self::Element) -> Option<u32> {
+        unsafe { ax_get_window_id(element) }
+    }
+    fn window_bounds(&self, window_id: u32) -> Option<[f64; 4]> {
+        crate::windows::window_bounds_by_id(window_id)
+            .map(|bounds| [bounds.x, bounds.y, bounds.width, bounds.height])
+    }
+    fn hit(&self, pid: i32, x: f64, y: f64) -> super::evidence::Observed<Option<Self::Element>> {
+        unsafe { element_at_screen_position_observed(pid, x, y) }
+    }
+    fn parent(&self, element: Self::Element) -> Option<Self::Element> {
+        unsafe { copy_element_attr(element, "AXParent") }
+    }
+    fn now(&self) -> Instant {
+        Instant::now()
     }
 }
 
@@ -1163,48 +1237,58 @@ fn finalize_walk(
 /// limitation); `AXWindows` returns the window list regardless of activation
 /// state, so the union is the only way to see background windows. Every
 /// returned element is retained; release them with [`release_all`].
-unsafe fn copy_top_level(
+fn copy_top_level(
     app_elem: AXUIElementRef,
     pid: i32,
     window_id: Option<u32>,
     recovery_deadline: Option<Instant>,
 ) -> Vec<AXUIElementRef> {
-    let children = super::tree_source::native::children_observed_raw(app_elem);
+    top_level_with(
+        &NativeWalkEnvironment,
+        app_elem,
+        pid,
+        window_id,
+        recovery_deadline,
+    )
+}
+
+fn top_level_with<E: AxWalkEnvironment>(
+    environment: &E,
+    app_elem: E::Application,
+    pid: i32,
+    window_id: Option<u32>,
+    recovery_deadline: Option<Instant>,
+) -> Vec<E::Element> {
+    let children = environment.children(app_elem);
     // A requested window on another Space is absent from AXWindows; the
     // `_including` variant recovers it by exact CGWindowID.
     let mut top_level = top_level_union_with(
         children,
-        || match window_id {
-            Some(wid) => copy_ax_windows_including_observed(app_elem, pid, wid),
-            None => copy_ax_windows_observed(app_elem),
-        },
-        |existing, candidate| CFEqual(*existing as CFTypeRef, *candidate as CFTypeRef) != 0,
-        |duplicate| CFRelease(duplicate as CFTypeRef),
+        || environment.windows(app_elem, pid, window_id),
+        |existing, candidate| environment.same(*existing, *candidate),
+        |duplicate| environment.release(duplicate),
     );
 
     if let Some(wid) = window_id {
         let already_present = top_level.iter().any(|&element| {
-            set_messaging_timeout(element);
-            ax_get_window_id(element) == Some(wid)
+            environment.set_element_timeout(element);
+            environment.window_id(element) == Some(wid)
         });
-        if !already_present && !recovery_deadline_reached(recovery_deadline, Instant::now()) {
-            if let Some(bounds) = crate::windows::window_bounds_by_id(wid) {
-                let hit = window_center_hit_if_live(recovery_deadline, Instant::now(), || {
-                    element_at_screen_position_observed(
-                        pid,
-                        bounds.x + bounds.width * 0.5,
-                        bounds.y + bounds.height * 0.5,
-                    )
-                    .into_walk_legacy()
+        if !already_present && !recovery_deadline_reached(recovery_deadline, environment.now()) {
+            if let Some([x, y, width, height]) = environment.window_bounds(wid) {
+                let hit = window_center_hit_if_live(recovery_deadline, environment.now(), || {
+                    environment
+                        .hit(pid, x + width * 0.5, y + height * 0.5)
+                        .into_walk_legacy()
                 });
                 if let Some(root) = hit.flatten().and_then(|element| {
-                    recover_window_root_at_center(element, wid, recovery_deadline)
+                    recover_window_root_with(environment, element, wid, recovery_deadline)
                 }) {
                     if top_level
                         .iter()
-                        .any(|&element| CFEqual(element as CFTypeRef, root as CFTypeRef) != 0)
+                        .any(|&element| environment.same(element, root))
                     {
-                        CFRelease(root as CFTypeRef);
+                        environment.release(root);
                     } else {
                         top_level.push(root);
                     }
@@ -1298,22 +1382,23 @@ fn recovery_root_outcome(
 
 /// Recover the highest matching ancestor of a center-hit element. The hit and
 /// every parent are retained; keep only one extra retain on the returned root.
-unsafe fn recover_window_root_at_center(
-    hit: AXUIElementRef,
+fn recover_window_root_with<E: AxWalkEnvironment>(
+    environment: &E,
+    hit: E::Element,
     requested: u32,
     deadline: Option<Instant>,
-) -> Option<AXUIElementRef> {
+) -> Option<E::Element> {
     let mut ancestors = vec![hit];
     for _ in 1..MAX_WINDOW_RECOVERY_ANCESTORS {
-        if recovery_deadline_reached(deadline, Instant::now()) {
-            release_all(ancestors);
+        if recovery_deadline_reached(deadline, environment.now()) {
+            release_environment(environment, ancestors);
             return None;
         }
         let current = *ancestors.last().expect("the hit is always present");
-        set_messaging_timeout(current);
-        let parent = copy_element_attr(current, "AXParent");
+        environment.set_element_timeout(current);
+        let parent = environment.parent(current);
         super::evidence::record_status(
-            Some(current as usize),
+            Some(environment.element_key(current)),
             super::evidence::ReadSite::RecoveryParent,
             if parent.is_some() {
                 super::evidence::EvidenceStatus::Known
@@ -1325,22 +1410,22 @@ unsafe fn recover_window_root_at_center(
             break;
         };
         ancestors.push(parent);
-        if recovery_deadline_reached(deadline, Instant::now()) {
-            release_all(ancestors);
+        if recovery_deadline_reached(deadline, environment.now()) {
+            release_environment(environment, ancestors);
             return None;
         }
     }
 
     let mut window_ids = Vec::with_capacity(ancestors.len());
     for &element in &ancestors {
-        if recovery_deadline_reached(deadline, Instant::now()) {
-            release_all(ancestors);
+        if recovery_deadline_reached(deadline, environment.now()) {
+            release_environment(environment, ancestors);
             return None;
         }
-        set_messaging_timeout(element);
-        let id = ax_get_window_id(element);
+        environment.set_element_timeout(element);
+        let id = environment.window_id(element);
         super::evidence::record_status(
-            Some(element as usize),
+            Some(environment.element_key(element)),
             super::evidence::ReadSite::RecoveryWindowId,
             if id.is_some() {
                 super::evidence::EvidenceStatus::Known
@@ -1349,21 +1434,27 @@ unsafe fn recover_window_root_at_center(
             },
         );
         window_ids.push(id);
-        if recovery_deadline_reached(deadline, Instant::now()) {
-            release_all(ancestors);
+        if recovery_deadline_reached(deadline, environment.now()) {
+            release_environment(environment, ancestors);
             return None;
         }
     }
     let mut observed = recovery_root_outcome(&window_ids, requested);
     if let Some(index) = observed.legacy {
-        observed.evidence[0].owner = Some(ancestors[index] as usize);
+        observed.evidence[0].owner = Some(environment.element_key(ancestors[index]));
     }
     let root = observed.into_walk_legacy().map(|index| {
-        CFRetain(ancestors[index] as CFTypeRef);
+        environment.retain(ancestors[index]);
         ancestors[index]
     });
-    release_all(ancestors);
+    release_environment(environment, ancestors);
     root
+}
+
+fn release_environment<E: AxWalkEnvironment>(environment: &E, elements: Vec<E::Element>) {
+    for element in elements {
+        environment.release(element);
+    }
 }
 
 /// The children a checked `AXChildren` read found; a failed read records

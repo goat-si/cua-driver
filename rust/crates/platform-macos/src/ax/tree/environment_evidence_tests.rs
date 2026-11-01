@@ -4,6 +4,167 @@ use crate::ax::evidence::{EvidenceStatus, ReadSite};
 use std::cell::{Cell, RefCell};
 use std::time::{Duration, Instant};
 
+#[derive(Clone, Copy)]
+enum Scenario {
+    Union,
+    Recovered,
+    NoMatch,
+    FailedHit,
+}
+
+struct Environment {
+    scenario: Scenario,
+    trace: RefCell<Vec<String>>,
+    credits: RefCell<std::collections::HashMap<usize, usize>>,
+    now: Instant,
+}
+
+impl Environment {
+    fn new(scenario: Scenario) -> Self {
+        Self {
+            scenario,
+            trace: RefCell::new(Vec::new()),
+            credits: RefCell::new(std::collections::HashMap::new()),
+            now: Instant::now(),
+        }
+    }
+    fn adopt(&self, id: usize) {
+        *self.credits.borrow_mut().entry(id).or_default() += 1;
+        self.trace.borrow_mut().push(format!("adopt {id}"));
+    }
+    fn assert_released(&self) {
+        assert!(self.credits.borrow().values().all(|credits| *credits == 0));
+    }
+}
+
+impl super::AxWalkEnvironment for Environment {
+    type Application = usize;
+    type Element = usize;
+    fn create_application(&self, _: i32) -> Option<usize> {
+        panic!("unexpected application creation")
+    }
+    fn set_application_timeout(&self, _: &usize) {
+        panic!("unexpected application timeout")
+    }
+    fn application_key(&self, application: &usize) -> usize {
+        *application
+    }
+    fn children(
+        &self,
+        application: usize,
+    ) -> crate::ax::evidence::Observed<crate::ax::tree_source::Read<Vec<usize>>> {
+        use crate::ax::tree_source::Read;
+        assert_eq!(application, 1);
+        self.trace.borrow_mut().push("children".into());
+        let elements = if matches!(self.scenario, Scenario::Union) {
+            vec![2]
+        } else {
+            vec![]
+        };
+        for &element in &elements {
+            self.adopt(element);
+        }
+        crate::ax::evidence::observe_read(
+            Some(application),
+            ReadSite::Children,
+            Read::Known(elements),
+        )
+    }
+    fn windows(
+        &self,
+        application: usize,
+        pid: i32,
+        _: Option<u32>,
+    ) -> crate::ax::evidence::Observed<Vec<usize>> {
+        use crate::ax::evidence::{Observed, ReadEvidence};
+        assert_eq!((application, pid), (1, 42));
+        self.trace.borrow_mut().push("windows".into());
+        let elements = if matches!(self.scenario, Scenario::Union) {
+            vec![2, 3]
+        } else {
+            vec![]
+        };
+        for &element in &elements {
+            self.adopt(element);
+        }
+        Observed {
+            legacy: elements,
+            evidence: vec![ReadEvidence {
+                owner: Some(application),
+                site: ReadSite::TopLevelWindows,
+                status: EvidenceStatus::Known,
+                attempt: 0,
+                listing: None,
+            }],
+        }
+    }
+    fn same(&self, left: usize, right: usize) -> bool {
+        self.trace.borrow_mut().push(format!("same {left} {right}"));
+        left == right
+    }
+    fn release(&self, element: usize) {
+        let mut credits = self.credits.borrow_mut();
+        let count = credits.get_mut(&element).expect("known retained element");
+        assert!(*count > 0);
+        *count -= 1;
+        self.trace.borrow_mut().push(format!("release {element}"));
+    }
+    fn retain(&self, element: usize) {
+        self.adopt(element);
+        self.trace.borrow_mut().push(format!("retain {element}"));
+    }
+    fn element_key(&self, element: usize) -> usize {
+        element
+    }
+    fn set_element_timeout(&self, element: usize) {
+        self.trace.borrow_mut().push(format!("timeout {element}"));
+    }
+    fn window_id(&self, element: usize) -> Option<u32> {
+        self.trace.borrow_mut().push(format!("id {element}"));
+        if matches!(self.scenario, Scenario::Recovered) {
+            Some(99)
+        } else {
+            Some(8)
+        }
+    }
+    fn window_bounds(&self, id: u32) -> Option<[f64; 4]> {
+        assert_eq!(id, 99);
+        self.trace.borrow_mut().push("bounds".into());
+        Some([10.0, 20.0, 40.0, 60.0])
+    }
+    fn hit(&self, pid: i32, x: f64, y: f64) -> crate::ax::evidence::Observed<Option<usize>> {
+        assert_eq!((pid, x, y), (42, 30.0, 50.0));
+        self.trace.borrow_mut().push("hit".into());
+        if matches!(self.scenario, Scenario::FailedHit) {
+            crate::ax::bindings::recovery_hit_outcome::<usize>(
+                crate::ax::bindings::kAXErrorCannotComplete,
+                None,
+                None,
+            )
+        } else {
+            self.adopt(10);
+            crate::ax::bindings::recovery_hit_outcome(
+                crate::ax::bindings::kAXErrorSuccess,
+                Some(10),
+                Some(10),
+            )
+        }
+    }
+    fn parent(&self, element: usize) -> Option<usize> {
+        self.trace.borrow_mut().push(format!("parent {element}"));
+        if element == 10 {
+            self.adopt(11);
+            Some(11)
+        } else {
+            None
+        }
+    }
+    fn now(&self) -> Instant {
+        self.trace.borrow_mut().push("now".into());
+        self.now
+    }
+}
+
 #[test]
 fn top_level_enumeration_preserves_unknown_and_empty() {
     use super::walker_seam_tests::{step, Fake, Reply};
@@ -159,6 +320,40 @@ fn top_level_enumeration_preserves_unknown_and_empty() {
     drop(union);
     drop(root);
     fake.assert_lifetimes(&[]);
+
+    let environment = Environment::new(Scenario::Union);
+    let scope = EvidenceScope::start();
+    let ledger = super::SkipLedger::start();
+    let roots = super::top_level_with(&environment, 1, 42, None, None);
+    assert_eq!(roots, [2, 3]);
+    assert!(!ledger.finish());
+    let observed = scope.finish(roots);
+    assert!(observed
+        .evidence
+        .iter()
+        .any(|entry| entry.site == ReadSite::Children && entry.status == EvidenceStatus::Known));
+    assert!(observed
+        .evidence
+        .iter()
+        .any(|entry| entry.site == ReadSite::TopLevelWindows
+            && entry.status == EvidenceStatus::Known));
+    super::release_environment(&environment, observed.legacy);
+    environment.assert_released();
+    assert_eq!(
+        *environment.trace.borrow(),
+        [
+            "children",
+            "adopt 2",
+            "windows",
+            "adopt 2",
+            "adopt 3",
+            "same 2 2",
+            "release 2",
+            "same 2 3",
+            "release 2",
+            "release 3"
+        ]
+    );
 }
 
 #[test]
@@ -217,6 +412,59 @@ fn recovery_probe_preserves_failure_and_no_match() {
             .evidence
             .iter()
             .any(|entry| entry.site == ReadSite::RecoveryRoot && entry.status == status));
+    }
+
+    for (scenario, expected_roots, expected_site, expected_status) in [
+        (
+            Scenario::Recovered,
+            vec![11],
+            ReadSite::RecoveryRoot,
+            EvidenceStatus::Known,
+        ),
+        (
+            Scenario::NoMatch,
+            vec![],
+            ReadSite::RecoveryRoot,
+            EvidenceStatus::Absent,
+        ),
+        (
+            Scenario::FailedHit,
+            vec![],
+            ReadSite::RecoveryHit,
+            EvidenceStatus::Unknown(ReadFailure::Ax(kAXErrorCannotComplete)),
+        ),
+    ] {
+        let environment = Environment::new(scenario);
+        let scope = crate::ax::evidence::EvidenceScope::start();
+        let roots = super::top_level_with(&environment, 1, 42, Some(99), None);
+        assert_eq!(roots, expected_roots);
+        let observed = scope.finish(roots);
+        assert!(observed
+            .evidence
+            .iter()
+            .any(|entry| entry.site == expected_site && entry.status == expected_status));
+        super::release_environment(&environment, observed.legacy);
+        environment.assert_released();
+        let trace = environment.trace.borrow();
+        assert!(
+            trace.iter().position(|event| event == "bounds")
+                < trace.iter().position(|event| event == "hit")
+        );
+        if matches!(scenario, Scenario::FailedHit) {
+            assert!(!trace.iter().any(|event| event.starts_with("parent ")));
+        } else {
+            assert!(
+                trace.iter().position(|event| event == "parent 10")
+                    < trace.iter().position(|event| event == "id 10")
+            );
+            assert_eq!(
+                trace
+                    .iter()
+                    .filter(|event| event.as_str() == "retain 11")
+                    .count(),
+                usize::from(matches!(scenario, Scenario::Recovered))
+            );
+        }
     }
 }
 
