@@ -133,6 +133,30 @@ fn assert_unsafe(result: &ToolResult) {
 
 #[test]
 fn setter_illegal_argument_after_change_is_never_not_delivered() {
+    use crate::input::skylight::KeyEntry;
+    for entry in [
+        KeyEntry {
+            records_posted: 1,
+            ..KeyEntry::default()
+        },
+        KeyEntry {
+            records_uncertain: true,
+            ..KeyEntry::default()
+        },
+        KeyEntry {
+            ax_write: true,
+            ..KeyEntry::default()
+        },
+    ] {
+        assert_eq!(
+            prior_for_key_entry(PriorInput::None, entry),
+            PriorInput::MayHaveDelivered
+        );
+    }
+    assert_eq!(
+        prior_for_key_entry(PriorInput::None, KeyEntry::default()),
+        PriorInput::None
+    );
     let mut fake = Fake::new(text("old"))
         .read(text("new"))
         .result(kAXErrorIllegalArgument);

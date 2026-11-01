@@ -1348,6 +1348,9 @@ fn set_value_blocking_inner(
         } else {
             None
         };
+        if let Some(scope) = &_key_scope {
+            prior = prior_for_key_entry(prior, scope.entry());
+        }
         if text_value_role_requires_exact_focus(&role) {
             // A restored window needs no focus write when the field already
             // holds focus.
@@ -1428,6 +1431,14 @@ fn prior_for_focus(focus: super::not_editable::FocusDispatch) -> PriorInput {
     match focus {
         super::not_editable::FocusDispatch::None => PriorInput::None,
         _ => PriorInput::MayHaveDelivered,
+    }
+}
+
+fn prior_for_key_entry(prior: PriorInput, entry: crate::input::skylight::KeyEntry) -> PriorInput {
+    if entry.records_posted > 0 || entry.records_uncertain || entry.ax_write {
+        PriorInput::MayHaveDelivered
+    } else {
+        prior
     }
 }
 
