@@ -1,4 +1,6 @@
+use crate::ax::write_outcome::Settable;
 use async_trait::async_trait;
+use cua_driver_core::mutation::PriorInput;
 use cua_driver_core::{
     protocol::ToolResult,
     tool::{Tool, ToolDef},
@@ -66,6 +68,33 @@ fn type_chars_outcome(
     }
 }
 
+enum FocusAttempt {
+    Native(Settable, i32),
+    WorkerFailed(String),
+}
+
+fn prior_for_key_entry(entry: crate::input::skylight::KeyEntry) -> PriorInput {
+    if entry.records_posted > 0 || entry.records_uncertain || entry.ax_write {
+        PriorInput::MayHaveDelivered
+    } else {
+        PriorInput::None
+    }
+}
+
+// This boundary also lets the character sender share the focus decision with
+// tests without posting native events.
+fn focus_failure(attempt: FocusAttempt, prior: PriorInput) -> Option<ToolResult> {
+    match attempt {
+        FocusAttempt::Native(settable, error) => {
+            let _ = (settable, error, prior);
+        }
+        FocusAttempt::WorkerFailed(error) => {
+            let _ = (error, prior);
+        }
+    }
+    None
+}
+
 #[async_trait]
 impl Tool for TypeTextCharsTool {
     fn def(&self) -> &ToolDef {
@@ -124,7 +153,7 @@ impl Tool for TypeTextCharsTool {
             None
         };
 
-        let _key_scope = match super::acquire_key_scope(pid, window_id, false).await {
+        let key_scope = match super::acquire_key_scope(pid, window_id, false).await {
             Ok(scope) => scope,
             Err(refusal) => return refusal,
         };
@@ -132,22 +161,79 @@ impl Tool for TypeTextCharsTool {
         // Pre-focus element if requested.
         if !type_chars_only {
             if let Some(guard) = element_guard.as_ref().cloned() {
-                let _ = tokio::task::spawn_blocking(move || {
-                    crate::input::ax_actions::focus_element(guard.as_ptr())
+                let attempt = crate::goat::action_latency::spawn_blocking(move || {
+                    let settable = unsafe {
+                        crate::ax::write_outcome::query_settable(guard.as_ptr() as _, "AXFocused")
+                    };
+                    let error = crate::input::ax_actions::focus_element_raw(guard.as_ptr());
+                    FocusAttempt::Native(settable, error)
                 })
                 .await;
+                let attempt =
+                    attempt.unwrap_or_else(|error| FocusAttempt::WorkerFailed(error.to_string()));
+                let prior = key_scope
+                    .as_ref()
+                    .map(|scope| prior_for_key_entry(scope.entry()))
+                    .unwrap_or(PriorInput::None);
+                if let Some(failure) = focus_failure(attempt, prior) {
+                    return failure;
+                }
                 tokio::time::sleep(std::time::Duration::from_millis(50)).await;
             }
         }
         drop(element_guard);
 
         let text_len = text.chars().count();
-        let result = tokio::task::spawn_blocking(move || {
+        let result = crate::goat::action_latency::spawn_blocking(move || {
             crate::input::keyboard::type_text_with_delay(pid, &text, delay_ms)
         })
         .await;
 
         type_chars_outcome(result, text_len, delay_ms)
+    }
+}
+
+#[cfg(test)]
+mod u32_outcome_tests {
+    use super::*;
+    use crate::ax::bindings::{kAXErrorAPIDisabled, kAXErrorCannotComplete};
+
+    #[test]
+    fn uncertain_focus_prevents_all_character_posts() {
+        let mut posts = 0;
+        let failure = focus_failure(
+            FocusAttempt::Native(Settable::Yes, kAXErrorCannotComplete),
+            PriorInput::None,
+        );
+        if failure.is_none() {
+            posts += 1;
+        }
+        assert_eq!(posts, 0, "uncertain focus must prevent all character posts");
+        assert_eq!(
+            failure.unwrap().structured_content.unwrap()["effect"],
+            "unverifiable"
+        );
+    }
+
+    #[test]
+    fn focus_denied_after_key_entry_preserves_prior_input() {
+        let mut posts = 0;
+        let prior = prior_for_key_entry(crate::input::skylight::KeyEntry {
+            records_posted: 1,
+            ..Default::default()
+        });
+        let failure = focus_failure(
+            FocusAttempt::Native(Settable::Yes, kAXErrorAPIDisabled),
+            prior,
+        );
+        if failure.is_none() {
+            posts += 1;
+        }
+        assert_eq!(posts, 0, "denied focus must prevent all character posts");
+        assert_eq!(
+            failure.unwrap().structured_content.unwrap()["effect"],
+            "unverifiable"
+        );
     }
 }
 
