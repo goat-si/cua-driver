@@ -429,7 +429,7 @@ pub(crate) async fn token_not_editable_refusal(
     element: usize,
     window_id: u32,
 ) -> Option<ToolResult> {
-    token_not_editable_receipt(pid, element, window_id)
+    token_not_editable_with_policy(pid, element, window_id, false)
         .await
         .err()
 }
@@ -440,6 +440,15 @@ pub(crate) async fn token_not_editable_receipt(
     element: usize,
     window_id: u32,
 ) -> Result<FocusDispatch, ToolResult> {
+    token_not_editable_with_policy(pid, element, window_id, true).await
+}
+
+async fn token_not_editable_with_policy(
+    pid: i32,
+    element: usize,
+    window_id: u32,
+    strict: bool,
+) -> Result<FocusDispatch, ToolResult> {
     match latency::spawn_action_blocking(move || unsafe {
         let element = element as AXUIElementRef;
         let deadline = std::time::Instant::now() + std::time::Duration::from_millis(800);
@@ -447,8 +456,27 @@ pub(crate) async fn token_not_editable_receipt(
         token_guard_with(
             || facts_for_element_with_deadline(element, deadline),
             || {
-                let _ = crate::input::ax_actions::focus_element(element as usize);
+                if !strict {
+                    let _ = crate::input::ax_actions::focus_element(element as usize);
+                    return Ok(());
+                }
+                let settable = crate::ax::write_outcome::query_settable(element, "AXFocused");
+                let error = crate::input::ax_actions::focus_element_raw(element as usize);
+                match crate::ax::write_outcome::native_write_outcome(
+                    crate::ax::write_outcome::NativeWriteKind::SetAttribute,
+                    true,
+                    &settable,
+                    error,
+                ) {
+                    cua_driver_core::mutation::WriteOutcome::Delivered => Ok(()),
+                    outcome => Err(focus_write_refusal(
+                        outcome,
+                        error,
+                        cua_driver_core::mutation::PriorInput::None,
+                    )),
+                }
             },
+            strict,
         )
     })
     .await
@@ -463,9 +491,34 @@ pub(crate) async fn token_not_editable_receipt(
     }
 }
 
+pub(super) fn focus_write_refusal(
+    outcome: cua_driver_core::mutation::WriteOutcome,
+    error: i32,
+    prior: cua_driver_core::mutation::PriorInput,
+) -> ToolResult {
+    use cua_driver_core::mutation::{ChainResult, Postcondition};
+    let chain = ChainResult::from_recorded(vec![outcome], prior)
+        .expect("one focus write is a valid recorded chain");
+    let effect = if chain.no_input() {
+        "refused"
+    } else {
+        "unverifiable"
+    };
+    let mut result = ToolResult::error(format!(
+        "AXFocused returned error {error}; no value or keys were sent. Read fresh state before retrying."
+    )).with_structured(serde_json::json!({
+        "code": "not_editable", "effect": effect, "keys_sent": false,
+    }));
+    if let Some(disposition) = chain.error_disposition(Postcondition::Indeterminate, false) {
+        result = result.with_disposition(disposition);
+    }
+    result
+}
+
 fn token_guard_with(
     mut read: impl FnMut() -> Option<ElementFacts>,
-    focus_element: impl FnOnce(),
+    focus_element: impl FnOnce() -> Result<(), ToolResult>,
+    require_focus: bool,
 ) -> Result<FocusDispatch, ToolResult> {
     let Some(initial) = read() else {
         return Err(not_editable_result(
@@ -484,7 +537,7 @@ fn token_guard_with(
     }
     let mut focus = FocusDispatch::None;
     if initial.focused != Some(true) {
-        focus_element();
+        focus_element()?;
         focus = FocusDispatch::Indeterminate;
     }
     let Some(facts) = read() else {
@@ -503,6 +556,12 @@ fn token_guard_with(
     if matches!(focus, FocusDispatch::Indeterminate) && facts.focused == Some(true) {
         // The read-back proves the focus action landed.
         focus = FocusDispatch::SentAx;
+    }
+    if require_focus && matches!(focus, FocusDispatch::Indeterminate) {
+        return Err(not_editable_result(
+            "the focus action was not confirmed; no value or keys were sent.".into(),
+            focus,
+        ));
     }
     if token_refused(&facts) {
         return Err(not_editable_result(
@@ -561,7 +620,11 @@ mod tests {
             let focus_calls = Cell::new(0);
             let receipt = token_guard_with(
                 || reads.pop_front().expect("unexpected read"),
-                || focus_calls.set(focus_calls.get() + 1),
+                || {
+                    focus_calls.set(focus_calls.get() + 1);
+                    Ok(())
+                },
+                false,
             )
             .expect("editable");
             assert_eq!(receipt, expected);
@@ -579,8 +642,60 @@ mod tests {
             }),
             None,
         ]);
-        let result = token_guard_with(|| reads.pop_front().unwrap(), || {}).unwrap_err();
+        let result = token_guard_with(|| reads.pop_front().unwrap(), || Ok(()), false).unwrap_err();
         assert_eq!(result.structured_content.unwrap()["effect"], "unverifiable");
+    }
+
+    #[test]
+    fn strict_token_guard_stops_after_raw_focus_failure() {
+        use crate::ax::bindings::{kAXErrorAPIDisabled, kAXErrorCannotComplete};
+        use crate::ax::write_outcome::{native_write_outcome, NativeWriteKind, Settable};
+        use cua_driver_contract::ErrorDisposition;
+        for (error, effect, disposition) in [
+            (
+                kAXErrorCannotComplete,
+                "unverifiable",
+                ErrorDisposition::SUSPECTED_NOOP,
+            ),
+            (
+                kAXErrorAPIDisabled,
+                "refused",
+                ErrorDisposition::NOT_DELIVERED,
+            ),
+        ] {
+            let mut reads = 0;
+            let result = token_guard_with(
+                || {
+                    reads += 1;
+                    Some(ElementFacts {
+                        role: Some("AXTextField".into()),
+                        focused: Some(false),
+                        ..ElementFacts::default()
+                    })
+                },
+                || {
+                    let outcome = native_write_outcome(
+                        NativeWriteKind::SetAttribute,
+                        true,
+                        &Settable::Yes,
+                        error,
+                    );
+                    Err(focus_write_refusal(
+                        outcome,
+                        error,
+                        cua_driver_core::mutation::PriorInput::None,
+                    ))
+                },
+                true,
+            )
+            .unwrap_err();
+            assert_eq!(reads, 1);
+            assert_eq!(
+                result.structured_content.as_ref().unwrap()["effect"],
+                effect
+            );
+            assert_eq!(result.disposition, Some(disposition));
+        }
     }
 
     fn text_of(result: &ToolResult) -> String {

@@ -709,7 +709,13 @@ async fn minimized_set_value(
                 unsafe { crate::ax::bindings::copy_bool_attr(ptr as AXUIElementRef, "AXFocused") }
                     == Some(true);
             if !already {
-                let _ = crate::input::ax_actions::focus_element(ptr);
+                let settable = unsafe { query_settable(ptr as AXUIElementRef, "AXFocused") };
+                let error = crate::input::ax_actions::focus_element_raw(ptr);
+                let outcome =
+                    native_write_outcome(NativeWriteKind::SetAttribute, true, &settable, error);
+                if outcome != WriteOutcome::Delivered {
+                    return RestoredFocus::WriteFailed { error, outcome };
+                }
             }
             let holds_focus =
                 unsafe { crate::ax::bindings::copy_bool_attr(ptr as AXUIElementRef, "AXFocused") }
@@ -734,6 +740,13 @@ async fn minimized_set_value(
         });
         let token_refusal = match focused {
             RestoredFocus::Editable => None,
+            RestoredFocus::WriteFailed { error, outcome } => {
+                Some(super::not_editable::focus_write_refusal(
+                    outcome,
+                    error,
+                    PriorInput::MayHaveDelivered,
+                ))
+            }
             // A focus write was sent: the receipts say so.
             RestoredFocus::NotFocused { focus_written } => {
                 Some(super::not_editable::not_editable_result(
@@ -939,6 +952,7 @@ unsafe fn window_has_document(element: AXUIElementRef) -> bool {
 /// The restored-window route's own focus step.
 enum RestoredFocus {
     Editable,
+    WriteFailed { error: i32, outcome: WriteOutcome },
     NotFocused { focus_written: bool },
     NotEditable { focus_written: bool },
 }
@@ -1301,10 +1315,27 @@ fn set_value_blocking_inner(
             // holds focus.
             let needs_focus =
                 !restored_window || unsafe { copy_bool_attr(element, "AXFocused") } != Some(true);
-            if needs_focus {
-                crate::input::ax_actions::focus_element(element_ptr)?;
+            let focus_chain = if needs_focus {
+                let settable = unsafe { query_settable(element, "AXFocused") };
+                let error = crate::input::ax_actions::focus_element_raw(element_ptr);
+                let outcome =
+                    native_write_outcome(NativeWriteKind::SetAttribute, true, &settable, error);
+                let chain = ChainResult::from_recorded(vec![outcome], prior)
+                    .expect("one focus write is a valid recorded chain");
+                if outcome != WriteOutcome::Delivered {
+                    return Err(ValueWriteError {
+                        message: format!(
+                            "AXFocused returned error {error}; AXValue was not written"
+                        ),
+                        chain,
+                    }
+                    .into());
+                }
                 prior = PriorInput::MayHaveDelivered;
-            }
+                Some(chain)
+            } else {
+                None
+            };
             let own_focus = unsafe { copy_bool_attr(element, "AXFocused") } == Some(true);
             let exact_window =
                 super::type_text::element_in_requested_window(pid, window_id, element_ptr);
@@ -1313,9 +1344,22 @@ fn set_value_blocking_inner(
                 super::type_text::focused_window_matches_element(pid, window_id, element_ptr);
             let focused = own_focus && exact_window && app_focus && key_window;
             if !focused {
-                anyhow::bail!(
-                    "set_value target did not become the application's focused text element in the requested window (AXFocused={own_focus}, exact_window={exact_window}, app_focus={app_focus}, key_window={key_window}); AXValue was not written"
-                )
+                let chain = focus_chain.unwrap_or_else(|| {
+                    ChainResult::from_recorded(
+                        vec![native_write_outcome(
+                            NativeWriteKind::SetAttribute,
+                            false,
+                            &Settable::Yes,
+                            kAXErrorSuccess,
+                        )],
+                        prior,
+                    )
+                    .expect("uncalled focus is a valid recorded chain")
+                });
+                return Err(ValueWriteError {
+                    message: format!("set_value target did not become the application's focused text element in the requested window (AXFocused={own_focus}, exact_window={exact_window}, app_focus={app_focus}, key_window={key_window}); AXValue was not written"),
+                    chain,
+                }.into());
             }
         }
         let subrole = unsafe { copy_string_attr(element, "AXSubrole") };
