@@ -182,4 +182,29 @@ fn popup_refusal_after_prior_typeahead_is_not_clean_refusal() {
         Some(cua_driver_contract::ErrorDisposition::SUSPECTED_NOOP)
     );
     assert_eq!((prior.presses, prior.cancels), (1, 0));
+    for error in [
+        crate::ax::bindings::kAXErrorCannotComplete,
+        crate::ax::bindings::kAXErrorFailure,
+    ] {
+        let decision = super::popup_typeahead_input(
+            super::Settable::Yes,
+            || error,
+            || panic!("read after uncertain focus"),
+            || panic!("key after uncertain focus"),
+        )
+        .unwrap();
+        assert!(matches!(decision, super::TypeaheadResult::SentUnverified));
+        let output =
+            super::popup_route(decision, |_| panic!("fallback after uncertain focus")).unwrap();
+        assert!(output.contains("verify before repeating"));
+    }
+    let decision = super::popup_typeahead_input(
+        super::Settable::Yes,
+        || crate::ax::bindings::kAXErrorSuccess,
+        || true,
+        || false,
+    )
+    .unwrap();
+    assert!(matches!(decision, super::TypeaheadResult::SentUnverified));
+    let _ = super::popup_route(decision, |_| panic!("fallback after uncertain key"));
 }
