@@ -46,6 +46,9 @@ mod popup_route_tests;
 #[cfg(test)]
 #[path = "set_value/u32_outcome_tests.rs"]
 mod u32_outcome_tests;
+#[cfg(test)]
+#[path = "set_value/u32_popup_outcome_tests.rs"]
+mod u32_popup_outcome_tests;
 
 use super::ToolState;
 
@@ -2225,6 +2228,28 @@ enum TypeaheadResult {
     SentUnverified,
 }
 
+fn popup_typeahead_input(
+    settable: Settable,
+    focus: impl FnOnce() -> i32,
+    focused: impl FnOnce() -> bool,
+    keys: impl FnOnce() -> bool,
+) -> Option<TypeaheadResult> {
+    let outcome = native_write_outcome(NativeWriteKind::SetAttribute, true, &settable, focus());
+    let chain = ChainResult::from_recorded(vec![outcome], PriorInput::None)
+        .expect("one focus write is a valid recorded chain");
+    if outcome != WriteOutcome::Delivered {
+        return Some(if chain.no_input() {
+            TypeaheadResult::NotAttempted
+        } else {
+            TypeaheadResult::SentUnverified
+        });
+    }
+    if !focused() || !keys() {
+        return Some(TypeaheadResult::SentUnverified);
+    }
+    None
+}
+
 fn select_chromium_popup_by_typeahead(
     popup: AXUIElementRef,
     element_index: usize,
@@ -2254,18 +2279,23 @@ fn select_chromium_popup_by_typeahead(
         return TypeaheadResult::PostUnavailable;
     }
     // Focus moves inside the page only: no activation, no window order change.
-    unsafe { crate::ax::bindings::set_bool_attr_true(popup, "AXFocused") };
-    std::thread::sleep(POPUP_POLL_INTERVAL);
-    if unsafe { copy_bool_attr(popup, "AXFocused") } != Some(true) {
-        return TypeaheadResult::FallbackAfterInput;
-    }
-    // Keys go to the window's focused element, so the window must be the
-    // app's key window (in-app records only; the app is not activated).
-    let Ok(_scope) = super::key_scope(pid, Some(window_id)) else {
-        return TypeaheadResult::FallbackAfterInput;
-    };
-    if crate::input::keyboard::type_text(pid, wanted).is_err() {
-        return TypeaheadResult::FallbackAfterInput;
+    let settable = unsafe { query_settable(popup, "AXFocused") };
+    if let Some(result) = popup_typeahead_input(
+        settable,
+        || crate::input::ax_actions::focus_element_raw(popup as usize),
+        || {
+            std::thread::sleep(POPUP_POLL_INTERVAL);
+            (unsafe { copy_bool_attr(popup, "AXFocused") }) == Some(true)
+        },
+        || {
+            // The key scope stays alive through the entire key operation.
+            let Ok(_scope) = super::key_scope(pid, Some(window_id)) else {
+                return false;
+            };
+            crate::input::keyboard::type_text(pid, wanted).is_ok()
+        },
+    ) {
+        return result;
     }
     let deadline = std::time::Instant::now() + TYPEAHEAD_SETTLE;
     let confirmation = wait_typeahead_confirmation(
@@ -2414,20 +2444,33 @@ fn select_popup_option(
             return set_select_via_js(element_index, element_title, value);
         }
         let mut env = unsafe { popup_ownership::NativePopupEnv::new(element) };
-        let outcome = popup_ownership::select(&mut env, value);
-        let outcome = match outcome {
-            popup_ownership::PopupOutcome::Refused {
-                reason,
-                preexisting,
-            } if prior_input => popup_ownership::PopupOutcome::SentUnverified {
-                reason,
-                preexisting,
-                close: None,
-            },
-            other => other,
+        let prior = if prior_input {
+            PriorInput::MayHaveDelivered
+        } else {
+            PriorInput::None
         };
+        let outcome = popup_ownership::select_with_prior(&mut env, value, prior);
+        let outcome = popup_after_prior(outcome, prior_input);
         Err(popup_ownership::PopupError(outcome).into())
     })
+}
+
+fn popup_after_prior(
+    outcome: popup_ownership::PopupOutcome,
+    prior_input: bool,
+) -> popup_ownership::PopupOutcome {
+    match outcome {
+        popup_ownership::PopupOutcome::Refused {
+            reason,
+            preexisting,
+        } if prior_input => popup_ownership::PopupOutcome::SentUnverified {
+            reason,
+            preexisting,
+            close: None,
+            disposition: cua_driver_contract::ErrorDisposition::SUSPECTED_NOOP,
+        },
+        other => other,
+    }
 }
 
 #[cfg(test)]

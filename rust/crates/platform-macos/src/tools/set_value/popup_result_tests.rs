@@ -23,6 +23,7 @@ fn stopped_after_open_preserves_uncertainty_and_close_note() {
         &PopupOutcome::StoppedAfterOpen {
             reason: "ambiguous".into(),
             close: CloseStatus::Unconfirmed,
+            disposition: cua_driver_contract::ErrorDisposition::SUSPECTED_NOOP,
         },
         "",
         false,
@@ -76,6 +77,7 @@ fn sent_unverified_never_claims_refusal() {
             reason: "press failed".into(),
             preexisting: true,
             close: None,
+            disposition: cua_driver_contract::ErrorDisposition::SUSPECTED_NOOP,
         },
         "",
         false,
