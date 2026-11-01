@@ -1510,6 +1510,17 @@ fn ax_insert_progress(
     }
 }
 
+fn document_after_ax_insert(
+    progress: TypedProgress,
+    mark: impl FnOnce() -> crate::document_edit::DocumentEdited,
+) -> crate::document_edit::DocumentEdited {
+    if progress == TypedProgress::Complete {
+        mark()
+    } else {
+        crate::document_edit::DocumentEdited::NotADocument
+    }
+}
+
 /// Read the focused/target field's `AXValue`, for before/after read-back.
 /// Re-fetches the focused element each call when no explicit element is given
 /// (cheap, and focus is stable across our own keystrokes).
@@ -3249,13 +3260,9 @@ fn type_text_in_key_window(
                 };
                 // An AX insert bypasses NSTextView's edit model, so a document is
                 // not marked edited and would never save the new text (DS-07).
-                let document = if ax_progress == TypedProgress::Complete {
-                    unsafe {
-                        crate::document_edit::ensure_marked_after_ax_write(pid, element, false)
-                    }
-                } else {
-                    crate::document_edit::DocumentEdited::NotADocument
-                };
+                let document = document_after_ax_insert(ax_progress, || unsafe {
+                    crate::document_edit::ensure_marked_after_ax_write(pid, element, false)
+                });
                 if owns {
                     unsafe {
                         CFRelease(element as _);
@@ -3988,6 +3995,18 @@ mod u32_outcome_tests {
             ax_insert_progress(Some("😀old"), Some("😀new"), "new", None, true),
             TypedProgress::Unverifiable
         );
+        let progress = ax_insert_progress(Some("a😀"), Some("a😀"), "😀", Some((1, 2)), true);
+        let keys = Cell::new(0);
+        let _document = document_after_ax_insert(progress, || {
+            keys.set(keys.get() + 2);
+            DocumentEdited::Marked
+        });
+        assert_eq!(
+            keys.get(),
+            0,
+            "an unchanged selected splice must not send document keys"
+        );
+        assert_eq!(progress, TypedProgress::Unchanged);
     }
 }
 
