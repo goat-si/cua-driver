@@ -33,12 +33,46 @@ fn fingerprint() -> ProcessFingerprint {
     }
 }
 
+#[derive(Clone)]
+struct FakeRoot {
+    element: usize,
+    path: Vec<usize>,
+    window: u64,
+    start_time: Option<u64>,
+}
+
+fn revalidate_live(
+    live: &Mutex<Option<FakeRoot>>,
+    old: &usize,
+    path: &[usize],
+    window: u64,
+    process: &ProcessFingerprint,
+) -> Result<usize, cua_driver_core::snapshot_store::RootValidationError> {
+    live.lock()
+        .unwrap()
+        .as_ref()
+        .filter(|entry| {
+            entry.element == *old
+                && entry.path == path
+                && entry.window == window
+                && entry.start_time == process.start_time
+        })
+        .map(|entry| entry.element)
+        .ok_or_else(|| {
+            cua_driver_core::snapshot_store::RootValidationError::new(
+                "stale_element_token",
+                "fake element is no longer live",
+            )
+        })
+}
+
 struct FakePlatform {
     def: ToolDef,
     store: Arc<SnapshotStore<Payload>>,
     full_walks: Arc<AtomicUsize>,
     root_walks: Arc<AtomicUsize>,
     session: Arc<Mutex<Option<String>>>,
+    live_root: Arc<Mutex<Option<FakeRoot>>>,
 }
 
 #[async_trait::async_trait]
@@ -73,14 +107,7 @@ impl Tool for FakePlatform {
                 Err(error) => return error,
             };
             let selected = match selected.validate_root(|old, path, window, process| {
-                if *old == 11 && path == [1] && window == 7 && process.start_time == Some(1) {
-                    Ok(11)
-                } else {
-                    Err(cua_driver_core::snapshot_store::RootValidationError::new(
-                        "stale_element_token",
-                        "fake root is no longer live",
-                    ))
-                }
+                revalidate_live(&self.live_root, old, path, window, process)
             }) {
                 Ok(value) => value,
                 Err(error) => return error,
@@ -176,17 +203,90 @@ impl Tool for FakePlatform {
     }
 }
 
+struct FakeAction {
+    def: ToolDef,
+    store: Arc<SnapshotStore<Payload>>,
+    live: Arc<Mutex<Option<FakeRoot>>>,
+    sends: Arc<AtomicUsize>,
+}
+
+#[async_trait::async_trait]
+impl Tool for FakeAction {
+    fn def(&self) -> &ToolDef {
+        &self.def
+    }
+    async fn protected_resource_ownership(
+        &self,
+        _adapter: &str,
+        _args: &Value,
+    ) -> ProtectedResourceOwnership {
+        ProtectedResourceOwnership::DriverOwned
+    }
+    async fn invoke(&self, args: Value) -> ToolResult {
+        let Some(token) = args.get("element_token").and_then(Value::as_str) else {
+            return ToolResult::error("missing element token");
+        };
+        let session = args.get("_session_id").and_then(Value::as_str);
+        let selected = match self.store.begin_scoped_capture(
+            42,
+            7,
+            token,
+            session,
+            InstanceEvidence::Live(fingerprint()),
+        ) {
+            Ok(value) => value,
+            Err(error) => return error,
+        };
+        if let Err(error) = selected.validate_root(|old, path, window, process| {
+            revalidate_live(&self.live, old, path, window, process)
+        }) {
+            return error;
+        }
+        self.sends.fetch_add(1, Ordering::SeqCst);
+        use cua_driver_core::action_record::{
+            ActionEffect, ActionExecutionRecord, ActionTransport, ActualDelivery, RequestedDelivery,
+        };
+        let record = ActionExecutionRecord::builder(
+            ActionEffect::Unverifiable,
+            ActionTransport::WindowsUiaInvoke,
+            RequestedDelivery::Background,
+        )
+        .actual_delivery(ActualDelivery::Background)
+        .build()
+        .unwrap();
+        ToolResult::text("fake action sent").with_action_record(record)
+    }
+}
+
 #[tokio::test]
 async fn registry_fake_platform_drills_without_replacing_the_full_snapshot() {
     let store = Arc::new(SnapshotStore::new());
     let full_walks = Arc::new(AtomicUsize::new(0));
     let root_walks = Arc::new(AtomicUsize::new(0));
     let session = Arc::new(Mutex::new(None));
+    let live_root = Arc::new(Mutex::new(Some(FakeRoot {
+        element: 11,
+        path: vec![1],
+        window: 7,
+        start_time: Some(1),
+    })));
+    let live_action = Arc::new(Mutex::new(Some(FakeRoot {
+        element: 12,
+        path: vec![1, 1],
+        window: 7,
+        start_time: Some(1),
+    })));
+    let sends = Arc::new(AtomicUsize::new(0));
     let mut registry = ToolRegistry::new();
-    registry.register(Box::new(FakePlatform { store: store.clone(), full_walks: full_walks.clone(), root_walks: root_walks.clone(), session: session.clone(),
+    registry.register(Box::new(FakePlatform { store: store.clone(), full_walks: full_walks.clone(), root_walks: root_walks.clone(), session: session.clone(), live_root:live_root.clone(),
         def: ToolDef { name:"get_window_state".into(), description:"fake".into(), input_schema:window_state_view::extend_input_schema(json!({"type":"object","additionalProperties":false,
             "properties":{"pid":{"type":"integer"},"window_id":{"type":"integer"},"query":{"type":"string"},"max_depth":{"type":"integer"},"include_accessibility_tree":{"type":"boolean"}}})),
             read_only:true, destructive:false, idempotent:false, open_world:false } }));
+    registry.register(Box::new(FakeAction { store:store.clone(), live:live_action.clone(), sends:sends.clone(),
+        def:ToolDef { name:"click".into(), description:"fake action".into(),
+            input_schema:json!({"type":"object","additionalProperties":false,"properties":{
+                "pid":{"type":"integer"},"window_id":{"type":"integer"},"element_token":{"type":"string"}}}),
+            read_only:false, destructive:false, idempotent:false, open_world:false } }));
     let full = registry
         .invoke("get_window_state", json!({"pid":42,"window_id":7}))
         .await;
@@ -196,6 +296,7 @@ async fn registry_fake_platform_drills_without_replacing_the_full_snapshot() {
         .unwrap()
         .to_owned();
     let root = format!("{parent}:1");
+    let mut action_token = None;
     for format in ["markdown", "elements", "both"] {
         let result = registry.invoke("get_window_state", json!({"pid":42,"window_id":7,"root_element_token":root,"tree_format":format,"query":"Save"})).await;
         assert_ne!(result.is_error, Some(true), "{result:?}");
@@ -214,6 +315,18 @@ async fn registry_fake_platform_drills_without_replacing_the_full_snapshot() {
         if format != "markdown" {
             assert_eq!(output["elements"].as_array().unwrap().len(), 1);
             let token = output["elements"][0]["element_token"].as_str().unwrap();
+            let action = registry
+                .invoke(
+                    "click",
+                    json!({"pid":42,"window_id":7,"element_token":token}),
+                )
+                .await;
+            assert_ne!(action.is_error, Some(true), "{action:?}");
+            assert_eq!(
+                action.structured_content.as_ref().unwrap()["effect"],
+                "unverifiable"
+            );
+            action_token = Some(token.to_owned());
             let args = json!({"element_token":token,"_session_id":session.lock().unwrap().clone()});
             assert!(store
                 .resolve_for_instance(42, &args, InstanceEvidence::Live(fingerprint()))
@@ -243,6 +356,19 @@ async fn registry_fake_platform_drills_without_replacing_the_full_snapshot() {
             Some(parent.as_str())
         );
     }
+    *live_action.lock().unwrap() = None;
+    let refused_action = registry
+        .invoke(
+            "click",
+            json!({"pid":42,"window_id":7,"element_token":action_token.unwrap()}),
+        )
+        .await;
+    assert_eq!(refused_action.is_error, Some(true));
+    assert_eq!(
+        refused_action.structured_content.unwrap()["refusal"]["code"],
+        "stale_element_token"
+    );
+    assert_eq!(sends.load(Ordering::SeqCst), 2);
     let full_output = registry
         .invoke(
             "get_window_state",
@@ -301,6 +427,46 @@ async fn registry_fake_platform_drills_without_replacing_the_full_snapshot() {
         malformed.structured_content.unwrap()["refusal"]["code"],
         "invalid_element_token"
     );
+    for live in [
+        Some(FakeRoot {
+            element: 11,
+            path: vec![2],
+            window: 7,
+            start_time: Some(1),
+        }),
+        None,
+        Some(FakeRoot {
+            element: 11,
+            path: vec![1],
+            window: 8,
+            start_time: Some(1),
+        }),
+        Some(FakeRoot {
+            element: 11,
+            path: vec![1],
+            window: 7,
+            start_time: Some(2),
+        }),
+        Some(FakeRoot {
+            element: 99,
+            path: vec![1],
+            window: 7,
+            start_time: Some(1),
+        }),
+    ] {
+        *live_root.lock().unwrap() = live;
+        let refused = registry
+            .invoke(
+                "get_window_state",
+                json!({"pid":42,"window_id":7,"root_element_token":root}),
+            )
+            .await;
+        assert_eq!(refused.is_error, Some(true), "{refused:?}");
+        assert_eq!(
+            refused.structured_content.unwrap()["refusal"]["code"],
+            "stale_element_token"
+        );
+    }
     assert_eq!(full_walks.load(Ordering::SeqCst), 1);
     assert_eq!(root_walks.load(Ordering::SeqCst), 5);
 }
