@@ -125,6 +125,62 @@ fn failed_role_reports_attribute_read_failed() {
 }
 
 #[test]
+fn failed_actions_report_attribute_read_failed() {
+    use crate::ax::tree_source::ReadFailure;
+    let source = Fake::new(
+        &[(1, 1, 1, &[])],
+        vec![
+            step("timeout 1", Reply::Unit),
+            step("text 1 AXRole", Reply::Text(Read::Known("AXWindow".into()))),
+            step("batch 1 AXTitle,AXPlaceholderValue,AXDescription,AXIdentifier,AXHelp,AXSubrole,AXRoleDescription", Reply::Batch(Ok(Batch(vec![Slot::Text(AttrStatus::Absent); 7])))),
+            step("value 1", Reply::Value(Ok(None))),
+            step("actions 1", Reply::Actions(Read::Unknown(ReadFailure::WrongType))),
+            step("batch 1 AXPosition,AXSize", Reply::Batch(Ok(Batch(vec![Slot::Point(None), Slot::Size(None)])))),
+            step("children 1", Reply::Children(Read::Absent)),
+        ],
+    );
+    let root = source.handle(1);
+    let tree = run_fake_observed(&source, &root, None, 10, WalkBudget::nodes_only(10), true).legacy;
+    drop(root);
+    source.assert_consumed();
+    source.assert_lifetimes(&[]);
+    let mut output = json!({});
+    tree.walk.apply(&mut output);
+    assert!(output["observation_incomplete_reasons"]
+        .as_array()
+        .unwrap()
+        .contains(&json!({"kind":"provider_failure", "detail":"attribute_read_failed"})));
+}
+
+#[test]
+fn failed_scrollbar_probe_reports_attribute_read_failed() {
+    use crate::ax::tree_source::ReadFailure;
+    let source = Fake::new(
+        &[(1, 1, 1, &[])],
+        vec![
+            step("timeout 1", Reply::Unit),
+            step("text 1 AXRole", Reply::Text(Read::Known("AXScrollArea".into()))),
+            step("batch 1 AXTitle,AXPlaceholderValue,AXDescription,AXIdentifier,AXHelp,AXSubrole,AXRoleDescription", Reply::Batch(Ok(Batch(vec![Slot::Text(AttrStatus::Absent); 7])))),
+            step("value 1", Reply::Value(Ok(None))),
+            step("element 1 AXVerticalScrollBar", Reply::Element(Read::Unknown(ReadFailure::WrongType))),
+            step("element 1 AXHorizontalScrollBar", Reply::Element(Read::Absent)),
+            step("children 1", Reply::Children(Read::Absent)),
+        ],
+    );
+    let root = source.handle(1);
+    let tree = run_fake_observed(&source, &root, None, 10, WalkBudget::nodes_only(10), true).legacy;
+    drop(root);
+    source.assert_consumed();
+    source.assert_lifetimes(&[]);
+    let mut output = json!({});
+    tree.walk.apply(&mut output);
+    assert!(output["observation_incomplete_reasons"]
+        .as_array()
+        .unwrap()
+        .contains(&json!({"kind":"provider_failure", "detail":"attribute_read_failed"})));
+}
+
+#[test]
 fn recovered_batch_fallback_is_not_incomplete() {
     let (tree, trace) = super::walker_seam_tests::canonical_walk_fixture("recovered");
     assert!(trace.iter().any(|entry| entry == "status 1 AXTitle"));
