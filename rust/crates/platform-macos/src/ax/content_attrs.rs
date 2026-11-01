@@ -395,7 +395,7 @@ fn label_hidden(slots: &[LabelSlot]) -> bool {
 ///
 /// # Safety
 /// `element` must be a live `AXUIElementRef`.
-unsafe fn single_read<T>(
+pub(super) unsafe fn single_read<T>(
     element: AXUIElementRef,
     name: &str,
     decode: impl FnOnce(core_foundation::base::CFTypeRef) -> Option<T>,

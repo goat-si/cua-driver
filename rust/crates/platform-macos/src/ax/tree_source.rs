@@ -13,6 +13,8 @@ use super::write_outcome::Settable;
 use core_foundation::base::{CFRelease, CFRetain, CFTypeRef};
 use std::ptr::NonNull;
 
+pub(super) mod native;
+
 pub(crate) enum Read<T> {
     Known(T),
     Absent,
@@ -33,7 +35,7 @@ pub(crate) trait TreeBatch {
 }
 
 /// The copied batch array owns all slots until decoding is complete.
-pub(crate) struct NativeBatch(BatchSlots);
+pub(crate) struct NativeBatch(pub(super) BatchSlots);
 
 impl NativeBatch {
     fn decode<T>(&self, slot: usize, f: unsafe fn(CFTypeRef) -> Option<T>) -> Read<T> {
