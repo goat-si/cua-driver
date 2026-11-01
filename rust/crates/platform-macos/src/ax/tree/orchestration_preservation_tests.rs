@@ -199,7 +199,7 @@ impl WalkOrchestration<super::walker_seam_tests::Fake> for ScenarioWalk<'_> {
     }
 }
 
-fn run_scenario(
+pub(super) fn run_scenario(
     scenario: super::environment_evidence_tests::Scenario,
     root: Option<(usize, &str)>,
 ) -> (CompletedWalk, Vec<String>, Vec<String>) {

@@ -28,6 +28,75 @@ fn missing_application_root_reports_enumeration_error() {
 }
 
 #[test]
+fn application_children_failure_is_not_hidden_by_recovered_window() {
+    use super::environment_evidence_tests::Scenario;
+    let (walk, _, _) = super::orchestration_preservation_tests::run_scenario(
+        Scenario::ChildrenFailure,
+        Some((2, "AXWindow")),
+    );
+    assert_eq!(walk.legacy.window_scope, Some(WindowScope::Matched));
+    assert!(has_reason(
+        &walk.legacy,
+        "provider_failure",
+        "child_enumeration_failed"
+    ));
+}
+
+#[test]
+fn failed_window_enumeration_reports_enumeration_error() {
+    use super::environment_evidence_tests::Scenario;
+    let (walk, _, _) = super::orchestration_preservation_tests::run_scenario(
+        Scenario::WindowsFailure,
+        Some((2, "AXWindow")),
+    );
+    assert_eq!(walk.legacy.window_scope, Some(WindowScope::Matched));
+    assert!(has_reason(
+        &walk.legacy,
+        "provider_failure",
+        "enumeration_error_unclassified"
+    ));
+}
+
+#[test]
+fn unresolved_window_reports_scope_mismatch() {
+    use super::environment_evidence_tests::Scenario;
+    let (walk, _, _) =
+        super::orchestration_preservation_tests::run_scenario(Scenario::NoMatch, None);
+    assert!(has_reason(&walk.legacy, "unknown", "scope_mismatch"));
+}
+
+#[test]
+fn launch_timeout_reports_time_budget() {
+    use super::environment_evidence_tests::Scenario;
+    let (walk, _, _) =
+        super::orchestration_preservation_tests::run_scenario(Scenario::NeverLaunched, None);
+    assert!(has_reason(&walk.legacy, "budget", "time_budget"));
+}
+
+#[test]
+fn chromium_materialization_failure_reports_untrusted_provider() {
+    use super::environment_evidence_tests::Scenario;
+    for scenario in [Scenario::ProviderFailure, Scenario::CachedFailure] {
+        let (walk, _, _) =
+            super::orchestration_preservation_tests::run_scenario(scenario, Some((2, "AXWindow")));
+        assert!(has_reason(
+            &walk.legacy,
+            "provider_failure",
+            "untrusted_provider"
+        ));
+    }
+    let (walk, _, _) = super::orchestration_preservation_tests::run_scenario(
+        Scenario::OptInRejected,
+        Some((2, "AXWindow")),
+    );
+    assert!(!has_reason(
+        &walk.legacy,
+        "provider_failure",
+        "untrusted_provider"
+    ));
+}
+
+#[test]
 fn menu_window_list_failure_reports_enumeration_error() {
     let (walk, _) = super::environment_setup_tests::run_menu_case(None, vec![]);
     assert!(has_reason(

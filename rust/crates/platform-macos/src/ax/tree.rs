@@ -1447,6 +1447,7 @@ fn finalize_with_deadline_sample(
 ) -> (TreeWalkResult, bool) {
     let final_deadline_sample = sample(&budget);
     record_attribute_failures(&mut budget);
+    record_discovery_failures(&mut budget, window_scope.as_ref());
     if final_deadline_sample {
         budget.record_cut(IncompleteReason {
             kind: IncompleteReasonKind::Budget,
@@ -1467,6 +1468,97 @@ fn finalize_with_deadline_sample(
         ),
         final_deadline_sample,
     )
+}
+
+fn record_discovery_failures(budget: &mut WalkBudget, scope: Option<&WindowScope>) {
+    use super::evidence::{current_evidence, EvidenceStatus, ReadSite};
+    let evidence = current_evidence();
+    let application = evidence.iter().find_map(|entry| {
+        (entry.site == ReadSite::ApplicationRoot && entry.status == EvidenceStatus::Known)
+            .then_some(entry.owner)
+            .flatten()
+    });
+    let unresolved = scope.is_some_and(|scope| !scope.is_matched());
+    if unresolved {
+        budget.record_untrusted(IncompleteReason {
+            kind: IncompleteReasonKind::Unknown,
+            detail: IncompleteReasonDetail::ScopeMismatch,
+        });
+    }
+    if evidence
+        .iter()
+        .rev()
+        .find(|entry| {
+            matches!(
+                entry.site,
+                ReadSite::ProviderEnablement | ReadSite::ProviderCachedEnablement
+            )
+        })
+        .is_some_and(|entry| {
+            matches!(
+                entry.status,
+                EvidenceStatus::Unavailable | EvidenceStatus::Unknown(_)
+            )
+        })
+    {
+        budget.record_untrusted(IncompleteReason {
+            kind: IncompleteReasonKind::ProviderFailure,
+            detail: IncompleteReasonDetail::UntrustedProvider,
+        });
+    }
+    for (index, entry) in evidence.iter().enumerate() {
+        let detail = match (entry.site, entry.status) {
+            (ReadSite::Children, EvidenceStatus::Unknown(_))
+                if entry.owner == application && application.is_some() =>
+            {
+                Some(IncompleteReasonDetail::ChildEnumerationFailed)
+            }
+            (
+                ReadSite::TopLevelWindows | ReadSite::TopLevelWindowsMember,
+                EvidenceStatus::Unknown(_),
+            ) => Some(IncompleteReasonDetail::EnumerationErrorUnclassified),
+            (ReadSite::TopLevelRemoteWindow, EvidenceStatus::Unavailable) if unresolved => {
+                Some(IncompleteReasonDetail::EnumerationErrorUnclassified)
+            }
+            (ReadSite::RecoveryHit, EvidenceStatus::Unknown(_)) if unresolved => {
+                Some(IncompleteReasonDetail::EnumerationErrorUnclassified)
+            }
+            (
+                ReadSite::ScopeCandidate("AXRole" | "AXSubrole" | "AXIdentifier")
+                | ReadSite::RecoverySheetRole,
+                EvidenceStatus::Unknown(_),
+            ) => Some(IncompleteReasonDetail::AttributeReadFailed),
+            _ => None,
+        };
+        let Some(detail) = detail else { continue };
+        let retry_site = if entry.site == ReadSite::TopLevelWindowsMember {
+            ReadSite::TopLevelWindows
+        } else {
+            entry.site
+        };
+        let recovered = evidence[index + 1..].iter().any(|later| {
+            later.owner == entry.owner
+                && later.site == retry_site
+                && matches!(later.status, EvidenceStatus::Known | EvidenceStatus::Absent)
+        });
+        if !recovered {
+            budget.record_skip(IncompleteReason {
+                kind: IncompleteReasonKind::ProviderFailure,
+                detail,
+            });
+        }
+    }
+    if unresolved
+        && evidence.iter().any(|entry| {
+            entry.site == ReadSite::RecoveryDeadline
+                && entry.status == EvidenceStatus::DeadlineExpired
+        })
+    {
+        budget.record_cut(IncompleteReason {
+            kind: IncompleteReasonKind::Budget,
+            detail: IncompleteReasonDetail::TimeBudget,
+        });
+    }
 }
 
 /// Attribute failures are distinct from an unsupported or absent attribute.
