@@ -5,6 +5,100 @@ use std::cell::{Cell, RefCell};
 use std::time::{Duration, Instant};
 
 #[test]
+fn scope_candidate_reads_preserve_unknown_and_absent() {
+    use super::scope_candidate_with;
+    use super::walker_seam_tests::{step, Fake, Reply};
+    use crate::ax::tree_source::{Read, ReadFailure};
+    use crate::ax::window_scope::{decide_window_scope, WindowScope};
+    use crate::windows::WindowOwner;
+
+    for name in ["AXRole", "AXSubrole", "AXIdentifier"] {
+        for case in 0..4 {
+            let make_read = |target: &str, known: &str| {
+                if target != name {
+                    return Read::Known(known.to_owned());
+                }
+                match case {
+                    0 => {
+                        Read::Unknown(ReadFailure::Ax(crate::ax::bindings::kAXErrorCannotComplete))
+                    }
+                    1 => Read::Known(known.to_owned()),
+                    2 => Read::Absent,
+                    _ => Read::Unknown(ReadFailure::WrongType),
+                }
+            };
+            let fake = Fake::new(
+                &[(1, 1, 1, &[])],
+                vec![
+                    step("timeout 1", Reply::Unit),
+                    step(
+                        "text 1 AXRole",
+                        Reply::Text(make_read("AXRole", "AXWindow")),
+                    ),
+                    step(
+                        "text 1 AXSubrole",
+                        Reply::Text(make_read("AXSubrole", "ordinary")),
+                    ),
+                    step(
+                        "text 1 AXIdentifier",
+                        Reply::Text(make_read("AXIdentifier", "ordinary")),
+                    ),
+                ],
+            );
+            let element = fake.handle(1);
+            let id_calls = Cell::new(0);
+            let observed = scope_candidate_with(&fake, &element, || {
+                id_calls.set(id_calls.get() + 1);
+                Some(42)
+            });
+            let role_present = name != "AXRole" || case == 1;
+            assert_eq!(id_calls.get(), usize::from(role_present));
+            let decision = decide_window_scope(&[observed.legacy], 42, || WindowOwner::SamePid);
+            if role_present {
+                assert_eq!(decision.scope, WindowScope::Matched);
+            } else {
+                assert!(decision.walk.is_empty());
+            }
+            fake.assert_consumed();
+            drop(element);
+            fake.assert_lifetimes(&[]);
+            let status = match case {
+                0 => EvidenceStatus::Unknown(ReadFailure::Ax(
+                    crate::ax::bindings::kAXErrorCannotComplete,
+                )),
+                1 => EvidenceStatus::Known,
+                2 => EvidenceStatus::Absent,
+                _ => EvidenceStatus::Unknown(ReadFailure::WrongType),
+            };
+            assert!(
+                observed.evidence.iter().any(|entry| entry.owner == Some(1)
+                    && entry.site == ReadSite::ScopeCandidate(name)
+                    && entry.status == status),
+                "missing candidate evidence for {name}"
+            );
+        }
+    }
+    let fake = Fake::new(
+        &[(1, 1, 1, &[])],
+        vec![
+            step("timeout 1", Reply::Unit),
+            step("text 1 AXRole", Reply::Text(Read::Known("AXWindow".into()))),
+            step("text 1 AXSubrole", Reply::Text(Read::Absent)),
+            step("text 1 AXIdentifier", Reply::Text(Read::Absent)),
+        ],
+    );
+    let element = fake.handle(1);
+    let observed = scope_candidate_with(&fake, &element, || None);
+    assert_eq!(observed.legacy.ax_window_id, None);
+    fake.assert_consumed();
+    drop(element);
+    fake.assert_lifetimes(&[]);
+    assert!(observed.evidence.iter().any(|entry| entry.owner == Some(1)
+        && entry.site == ReadSite::ScopeCandidate("AXWindowId")
+        && entry.status == EvidenceStatus::Unavailable));
+}
+
+#[test]
 fn provider_enablement_preserves_failed_and_cached_outcomes() {
     let stamp = (10, 20);
     let now = Instant::now();

@@ -1250,28 +1250,74 @@ unsafe fn scope_top_level(top_level: &[AXUIElementRef], pid: i32, wid: u32) -> S
     let candidates: Vec<TopLevelCandidate> = top_level
         .iter()
         .map(|&child| {
-            set_messaging_timeout(child);
-            let role = copy_string_attr(child, "AXRole").unwrap_or_default();
-            let subrole = copy_string_attr(child, "AXSubrole");
-            let identifier = copy_string_attr(child, "AXIdentifier");
-            // Match AX window element → CGWindowID via private SPI.
-            // Only windows carry one, so skip the round-trip elsewhere.
-            let ax_window_id = if is_window_like_role(&role) {
-                ax_get_window_id(child)
-            } else {
-                None
-            };
-            TopLevelCandidate {
-                role,
-                subrole,
-                identifier,
-                ax_window_id,
-            }
+            super::tree_source::native::with_borrowed(child, |source, element| {
+                scope_candidate_with(source, element, || ax_get_window_id(child)).into_walk_legacy()
+            })
         })
         .collect();
     decide_window_scope(&candidates, wid, || {
         crate::windows::resolve_window_owner(pid, wid)
     })
+}
+
+fn scope_candidate_with<S: AxTreeSource>(
+    source: &S,
+    element: &S::Element,
+    window_id: impl FnOnce() -> Option<u32>,
+) -> super::evidence::Observed<TopLevelCandidate> {
+    use super::evidence::{read_status, EvidenceStatus, Observed, ReadEvidence, ReadSite};
+    source.set_messaging_timeout(element);
+    let role_read = source.text(element, "AXRole");
+    let role_status = read_status(&role_read);
+    let role = known(role_read).unwrap_or_default();
+    let subrole_read = source.text(element, "AXSubrole");
+    let subrole_status = read_status(&subrole_read);
+    let subrole = known(subrole_read);
+    let identifier_read = source.text(element, "AXIdentifier");
+    let identifier_status = read_status(&identifier_read);
+    let identifier = known(identifier_read);
+    let window_read = if is_window_like_role(&role) {
+        Some(window_id())
+    } else {
+        None
+    };
+    let owner = Some(source.key(element));
+    let mut evidence = [
+        ("AXRole", role_status),
+        ("AXSubrole", subrole_status),
+        ("AXIdentifier", identifier_status),
+    ]
+    .into_iter()
+    .map(|(name, status)| ReadEvidence {
+        owner,
+        site: ReadSite::ScopeCandidate(name),
+        status,
+        attempt: 0,
+        listing: None,
+    })
+    .collect::<Vec<_>>();
+    if let Some(result) = window_read {
+        evidence.push(ReadEvidence {
+            owner,
+            site: ReadSite::ScopeCandidate("AXWindowId"),
+            status: if result.is_some() {
+                EvidenceStatus::Known
+            } else {
+                EvidenceStatus::Unavailable
+            },
+            attempt: 0,
+            listing: None,
+        });
+    }
+    Observed {
+        legacy: TopLevelCandidate {
+            role,
+            subrole,
+            identifier,
+            ax_window_id: window_read.flatten(),
+        },
+        evidence,
+    }
 }
 
 /// The CGWindowID of the app window holding an `AXSheet` whose own

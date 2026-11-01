@@ -112,6 +112,7 @@ pub(crate) enum ReadSite {
     ProviderEnablement,
     ProviderCachedEnablement,
     ProviderOptIn,
+    ScopeCandidate(&'static str),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
