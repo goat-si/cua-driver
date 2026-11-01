@@ -5,6 +5,163 @@ use std::cell::{Cell, RefCell};
 use std::time::{Duration, Instant};
 
 #[test]
+fn top_level_enumeration_preserves_unknown_and_empty() {
+    use super::walker_seam_tests::{step, Fake, Reply};
+    use crate::ax::bindings::{
+        kAXErrorCannotComplete, kAXErrorNoValue, kAXErrorSuccess, window_list_status,
+    };
+    use crate::ax::evidence::{EvidenceScope, Observed, ReadEvidence};
+    use crate::ax::tree_source::{AxTreeSource, Read, ReadFailure};
+
+    assert_eq!(
+        window_list_status(kAXErrorCannotComplete, false, false),
+        EvidenceStatus::Unknown(ReadFailure::Ax(kAXErrorCannotComplete))
+    );
+    assert_eq!(
+        window_list_status(kAXErrorNoValue, false, false),
+        EvidenceStatus::Absent
+    );
+    assert_eq!(
+        window_list_status(kAXErrorSuccess, false, false),
+        EvidenceStatus::Absent
+    );
+    assert_eq!(
+        window_list_status(kAXErrorSuccess, true, false),
+        EvidenceStatus::Unknown(ReadFailure::WrongType)
+    );
+    assert_eq!(
+        window_list_status(kAXErrorSuccess, true, true),
+        EvidenceStatus::Known
+    );
+
+    for child_failure in [false, true] {
+        let child_reply = if child_failure {
+            Read::Unknown(ReadFailure::Ax(kAXErrorCannotComplete))
+        } else {
+            Read::Known(vec![])
+        };
+        let fake = Fake::new(
+            &[(1, 1, 1, &[])],
+            vec![step("children 1", Reply::Children(child_reply))],
+        );
+        let root = fake.handle(1);
+        let scope = EvidenceScope::start();
+        let ledger = super::SkipLedger::start();
+        let children = fake.observed_children(&root);
+        let union = super::top_level_union_with(
+            children,
+            || {
+                assert_eq!(
+                    super::WALK_SKIPPED.with(std::cell::Cell::get),
+                    child_failure
+                );
+                Observed {
+                    legacy: Vec::new(),
+                    evidence: vec![ReadEvidence {
+                        owner: Some(1),
+                        site: ReadSite::TopLevelWindows,
+                        status: EvidenceStatus::Known,
+                        attempt: 0,
+                        listing: None,
+                    }],
+                }
+            },
+            |_, _| panic!("no windows"),
+            |_| panic!("no duplicate"),
+        );
+        assert!(union.is_empty());
+        assert_eq!(ledger.finish(), child_failure);
+        let observed = scope.finish(union);
+        assert!(observed
+            .evidence
+            .iter()
+            .any(|entry| entry.site == ReadSite::Children
+                && entry.owner == Some(1)
+                && entry.status
+                    == if child_failure {
+                        EvidenceStatus::Unknown(ReadFailure::Ax(kAXErrorCannotComplete))
+                    } else {
+                        EvidenceStatus::Known
+                    }));
+        assert!(observed
+            .evidence
+            .iter()
+            .any(|entry| entry.site == ReadSite::TopLevelWindows
+                && entry.status == EvidenceStatus::Known));
+        fake.assert_consumed();
+        drop(root);
+        fake.assert_lifetimes(&[]);
+    }
+
+    for window_failure in [false, true] {
+        let fake = Fake::new(
+            &[(1, 1, 1, &[])],
+            vec![step("children 1", Reply::Children(Read::Absent))],
+        );
+        let root = fake.handle(1);
+        let scope = EvidenceScope::start();
+        let ledger = super::SkipLedger::start();
+        let children = fake.observed_children(&root);
+        let status = if window_failure {
+            EvidenceStatus::Unknown(ReadFailure::Ax(kAXErrorCannotComplete))
+        } else {
+            EvidenceStatus::Known
+        };
+        let union = super::top_level_union_with(
+            children,
+            || Observed {
+                legacy: Vec::new(),
+                evidence: vec![ReadEvidence {
+                    owner: Some(1),
+                    site: ReadSite::TopLevelWindows,
+                    status,
+                    attempt: 0,
+                    listing: None,
+                }],
+            },
+            |_, _| panic!("no windows"),
+            |_| panic!("no duplicate"),
+        );
+        assert!(union.is_empty());
+        assert!(!ledger.finish());
+        let observed = scope.finish(union);
+        assert!(observed
+            .evidence
+            .iter()
+            .any(|entry| entry.site == ReadSite::TopLevelWindows
+                && entry.owner == Some(1)
+                && entry.status == status));
+        fake.assert_consumed();
+        drop(root);
+        fake.assert_lifetimes(&[]);
+    }
+
+    let fake = Fake::new(
+        &[(1, 1, 1, &[2]), (2, 2, 2, &[]), (3, 3, 3, &[])],
+        vec![step("children 1", Reply::Children(Read::Known(vec![2])))],
+    );
+    let root = fake.handle(1);
+    let children = fake.observed_children(&root);
+    let duplicate = fake.handle(2);
+    let extra = fake.handle(3);
+    let windows = || Observed::legacy_only(vec![duplicate, extra]);
+    let union = super::top_level_union_with(
+        children,
+        windows,
+        |left, right| fake.key(left) == fake.key(right),
+        drop,
+    );
+    assert_eq!(
+        union.iter().map(|item| fake.key(item)).collect::<Vec<_>>(),
+        [2, 3]
+    );
+    fake.assert_consumed();
+    drop(union);
+    drop(root);
+    fake.assert_lifetimes(&[]);
+}
+
+#[test]
 fn recovery_probe_preserves_failure_and_no_match() {
     use crate::ax::bindings::{kAXErrorCannotComplete, kAXErrorSuccess, recovery_hit_outcome};
     use crate::ax::tree_source::ReadFailure;

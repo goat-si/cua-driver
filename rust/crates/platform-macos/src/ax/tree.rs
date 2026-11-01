@@ -1114,28 +1114,18 @@ unsafe fn copy_top_level(
     window_id: Option<u32>,
     recovery_deadline: Option<Instant>,
 ) -> Vec<AXUIElementRef> {
-    let mut top_level = children_or_skipped(copy_children_checked(app_elem));
+    let children = super::tree_source::native::children_observed_raw(app_elem);
     // A requested window on another Space is absent from AXWindows; the
     // `_including` variant recovers it by exact CGWindowID.
-    let from_windows = match window_id {
-        Some(wid) => copy_ax_windows_including(app_elem, pid, wid),
-        None => copy_ax_windows(app_elem),
-    };
-    for w in from_windows {
-        // AXChildren and AXWindows can return different proxy pointers for
-        // the same native window. CFEqual compares their AX identity;
-        // pointer equality alone duplicates the whole subtree and can turn
-        // one exact dialog action into a false ambiguity.
-        if !top_level
-            .iter()
-            .any(|&e| CFEqual(e as CFTypeRef, w as CFTypeRef) != 0)
-        {
-            top_level.push(w);
-        } else {
-            // Already present — release the extra retain from copy_ax_windows.
-            CFRelease(w as CFTypeRef);
-        }
-    }
+    let mut top_level = top_level_union_with(
+        children,
+        || match window_id {
+            Some(wid) => copy_ax_windows_including_observed(app_elem, pid, wid),
+            None => copy_ax_windows_observed(app_elem),
+        },
+        |existing, candidate| CFEqual(*existing as CFTypeRef, *candidate as CFTypeRef) != 0,
+        |duplicate| CFRelease(duplicate as CFTypeRef),
+    );
 
     if let Some(wid) = window_id {
         let already_present = top_level.iter().any(|&element| {
@@ -1165,6 +1155,30 @@ unsafe fn copy_top_level(
                     }
                 }
             }
+        }
+    }
+    top_level
+}
+
+/// Union retained observations by identity; duplicates surrender their own
+/// retain credit exactly once. Failed children retain the legacy skip mark.
+fn top_level_union_with<T>(
+    children: super::evidence::Observed<Read<Vec<T>>>,
+    windows: impl FnOnce() -> super::evidence::Observed<Vec<T>>,
+    same: impl Fn(&T, &T) -> bool,
+    mut release: impl FnMut(T),
+) -> Vec<T> {
+    let children = match children.into_walk_legacy() {
+        Read::Known(children) => Some(children),
+        Read::Absent => Some(Vec::new()),
+        Read::Unknown(_) => None,
+    };
+    let mut top_level = children_or_skipped(children);
+    for window in windows().into_walk_legacy() {
+        if top_level.iter().any(|item| same(item, &window)) {
+            release(window);
+        } else {
+            top_level.push(window);
         }
     }
     top_level

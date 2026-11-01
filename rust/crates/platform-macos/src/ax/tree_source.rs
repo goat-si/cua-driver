@@ -99,7 +99,12 @@ pub(crate) trait AxTreeSource {
         &self,
         element: &Self::Element,
     ) -> super::evidence::Observed<Read<Vec<Self::Element>>> {
-        super::evidence::Observed::legacy_only(self.children(element))
+        let legacy = self.children(element);
+        super::evidence::observe_read(
+            Some(self.key(element)),
+            super::evidence::ReadSite::Children,
+            legacy,
+        )
     }
     fn element_attribute(&self, element: &Self::Element, name: &str) -> Read<Self::Element>;
     fn element_set(&self, element: &Self::Element, name: &str) -> Read<Self::ElementSet>;

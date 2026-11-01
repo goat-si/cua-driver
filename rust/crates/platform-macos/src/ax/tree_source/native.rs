@@ -361,3 +361,23 @@ pub(crate) unsafe fn with_borrowed<R>(
     let borrowed = std::mem::ManuallyDrop::new(NativeElement::from_owned(raw));
     f(&NativeSource, &borrowed)
 }
+
+/// Transfer the existing child retain credits to the raw orchestration caller.
+pub(crate) unsafe fn children_observed_raw(
+    raw: AXUIElementRef,
+) -> crate::ax::evidence::Observed<Read<Vec<AXUIElementRef>>> {
+    with_borrowed(raw, |source, element| {
+        let observed = source.observed_children(element);
+        let legacy = match observed.legacy {
+            Read::Known(children) => {
+                Read::Known(children.into_iter().map(NativeElement::into_raw).collect())
+            }
+            Read::Absent => Read::Absent,
+            Read::Unknown(error) => Read::Unknown(error),
+        };
+        crate::ax::evidence::Observed {
+            legacy,
+            evidence: observed.evidence,
+        }
+    })
+}

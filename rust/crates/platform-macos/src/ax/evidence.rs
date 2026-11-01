@@ -118,6 +118,9 @@ pub(crate) enum ReadSite {
     RecoveryParent,
     RecoveryWindowId,
     RecoveryRoot,
+    TopLevelWindows,
+    TopLevelWindowsMember,
+    TopLevelRemoteWindow,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
