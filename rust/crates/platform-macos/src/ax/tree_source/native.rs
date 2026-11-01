@@ -45,7 +45,7 @@ where
     Observed { legacy, evidence }
 }
 
-fn observed_children_read<T>(
+pub(crate) fn observed_children_read<T>(
     owner: usize,
     legacy: Read<Vec<T>>,
 ) -> crate::ax::evidence::Observed<Read<Vec<T>>> {
