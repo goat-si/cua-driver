@@ -1264,7 +1264,7 @@ mod release_guard_tests {
                 }
             });
             assert_eq!(calls, expected_calls);
-            if first < events.len() {
+            if (first as usize) < events.len() {
                 let failure: anyhow::Error = crate::keyboard_dispatch::key_batch_failure(
                     outcome.sent,
                     events.len(),
