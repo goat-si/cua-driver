@@ -74,9 +74,11 @@ pub(super) async fn post_return(
     element: crate::ax::snapshot::RetainedElement,
     key: &'static str,
 ) -> Result<bool, String> {
-    tokio::spawn(async move { post_return_inner(lease, window_id, element, key).await })
-        .await
-        .unwrap_or(Ok(false))
+    crate::input::worker_context::spawn_async(async move {
+        post_return_inner(lease, window_id, element, key).await
+    })
+    .await
+    .unwrap_or(Ok(false))
 }
 
 async fn post_return_inner(

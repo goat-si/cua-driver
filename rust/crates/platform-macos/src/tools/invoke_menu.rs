@@ -1151,7 +1151,7 @@ pub(super) async fn run_in_background(
     // the route short or release the lease before the hand-back.
     let shown = path.clone();
     let preface = request.preface(&path);
-    tokio::spawn(async move {
+    crate::input::worker_context::spawn_async(async move {
         let mutation = super::acquire_background_mutation(pid).await;
         run_in_background_with_lease(&mutation, window_id, path, request, KeyOwner::Direct).await
     })

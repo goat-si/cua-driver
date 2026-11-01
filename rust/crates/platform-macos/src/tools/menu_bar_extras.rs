@@ -396,7 +396,7 @@ impl Tool for MenuBarExtrasTool {
                     };
                     let press_item = item_element.clone();
                     let (tx, rx) = std::sync::mpsc::channel();
-                    std::thread::spawn(move || {
+                    crate::input::worker_context::spawn_thread(move || {
                         let result = unsafe {
                             AXUIElementSetMessagingTimeout(press_item.0 as AXUIElementRef, 0.5);
                             perform_action(press_item.0 as AXUIElementRef, "AXPress")

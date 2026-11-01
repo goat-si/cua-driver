@@ -94,7 +94,7 @@ impl MoveCursorTool {
                     {
                         return refusal;
                     }
-                    let result = tokio::task::spawn_blocking(move || {
+                    let result = crate::goat::action_latency::spawn_blocking(move || {
                         crate::input::mouse::move_cursor_desktop(x, y)
                     })
                     .await;
@@ -243,7 +243,7 @@ impl MoveCursorTool {
         })
         .await
         .unwrap_or(false);
-        let ax = tokio::task::spawn_blocking(move || {
+        let ax = crate::goat::action_latency::spawn_blocking(move || {
             crate::input::hover::reveal_alternate_ui(pid, wid, screen_x, screen_y)
         })
         .await

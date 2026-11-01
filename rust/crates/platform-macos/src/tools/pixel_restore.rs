@@ -685,7 +685,7 @@ fn spawn_restore_with_window<F, Fut, V>(
     let mut epochs = fence.epochs.subscribe();
     fence.notify_epoch_change();
     let deadline_at = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
-    tokio::spawn(async move {
+    crate::input::worker_context::spawn_async(async move {
         let _pending = pending;
         let deadline = tokio::time::sleep_until(deadline_at);
         tokio::pin!(deadline);

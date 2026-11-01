@@ -550,7 +550,7 @@ impl PopupEnv for NativePopupEnv {
     }
     fn open(&mut self) {
         let popup = self.popup.clone();
-        self.opener = Some(std::thread::spawn(move || unsafe {
+        self.opener = Some(crate::input::worker_context::spawn_thread(move || unsafe {
             let ptr = popup.as_ptr() as crate::ax::bindings::AXUIElementRef;
             crate::ax::bindings::AXUIElementSetMessagingTimeout(
                 ptr,

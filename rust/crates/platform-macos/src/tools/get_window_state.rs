@@ -719,12 +719,12 @@ impl Tool for GetWindowStateTool {
             let out_file = screenshot_out_file.clone();
             let panel_args = args.clone();
             let side_facts = !want_tree && !display_only;
-            let res = tokio::task::spawn_blocking(move || {
+            let res = latency::spawn_blocking(move || {
                 std::thread::scope(|scope| {
                 let side = side_facts.then(|| {
-                    scope.spawn(move || {
+                    scope.spawn(crate::input::worker_context::wrap_blocking(move || {
                         crate::ax::exact_target::gather_background_facts(pid, window_id, None)
-                    })
+                    }))
                 });
                 let captured = (move || -> Result<
                 (
@@ -1164,7 +1164,7 @@ impl Tool for GetWindowStateTool {
         if !display_only {
             let capture_available = screenshot_dims.is_some();
             let prefetched = prefetched_facts;
-            let report = tokio::task::spawn_blocking(move || {
+            let report = latency::spawn_blocking(move || {
                 let facts = prefetched.unwrap_or_else(|| {
                     crate::ax::exact_target::gather_background_facts(pid, window_id, None)
                 });

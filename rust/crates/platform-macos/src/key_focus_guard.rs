@@ -263,7 +263,7 @@ fn watch_order_after_action(target: i32, front: i32, order: bool, epoch: u64) {
     }
     let spawned = std::thread::Builder::new()
         .name("cua-order-watch".into())
-        .spawn(move || {
+        .spawn(crate::input::worker_context::wrap_blocking(move || {
             // Some apps re-raise right after each restore (a Chromium popup
             // that stays open); cap the restores so the user's app is not
             // re-activated in a loop.
@@ -302,7 +302,7 @@ fn watch_order_after_action(target: i32, front: i32, order: bool, epoch: u64) {
                     return;
                 }
             }
-        });
+        }));
     if spawned.is_err() {
         watching
             .lock()

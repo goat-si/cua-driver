@@ -770,7 +770,7 @@ pub(super) async fn click_element(state: &ToolState, request: ElementClick) -> T
     // A background pointer gesture lets the target become AppKit-active
     // without raising (the pixel-click prologue); AXOpen keeps it suppressed.
     let background_pointer = !foreground && !use_ax_open;
-    let action = tokio::spawn(async move {
+    let action = crate::input::worker_context::spawn_async(async move {
         use crate::window_change_detector::WindowChangeDetector;
         let prior_front = crate::apps::frontmost_pid();
         let snapshot = if foreground {

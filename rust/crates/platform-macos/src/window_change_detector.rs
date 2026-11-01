@@ -699,7 +699,7 @@ impl Snapshot {
         let still_mine = move || lock(&TAIL).as_ref().is_some_and(|tail| tail.id == id);
         let spawned = std::thread::Builder::new()
             .name("cua-window-watch".into())
-            .spawn(move || {
+            .spawn(crate::input::worker_context::wrap_blocking(move || {
                 loop {
                     std::thread::sleep(poll_interval);
                     if !still_mine() {
@@ -739,7 +739,7 @@ impl Snapshot {
                 if tail.as_ref().is_some_and(|tail| tail.id == id) {
                     tail.take();
                 }
-            });
+            }));
         latency::tail_spawned(spawned.is_ok());
         if spawned.is_err() {
             // No thread: release the lease now rather than holding it forever.

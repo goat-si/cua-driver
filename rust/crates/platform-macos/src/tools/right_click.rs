@@ -1164,7 +1164,7 @@ fn observe_right_click_action_with<T: Send + 'static>(
     let (event_tx, event_rx) = std::sync::mpsc::channel();
     let (result_tx, result_rx) = std::sync::mpsc::channel();
     let action_tx = event_tx.clone();
-    std::thread::spawn(move || {
+    crate::input::worker_context::spawn_thread(move || {
         let result = action(action_tx);
         let _ = result_tx.send(result);
         let _ = event_tx.send(ActionEvent::Done);

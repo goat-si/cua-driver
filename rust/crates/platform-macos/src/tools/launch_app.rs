@@ -209,7 +209,7 @@ impl Tool for LaunchAppTool {
         // blocking task returns (pid, app_info, windows). Suppression
         // upgrade happens AFTER the blocking call returns (back on the
         // async runtime), then we sleep holding the targeted lease.
-        let launch_result = tokio::task::spawn_blocking(move || {
+        let launch_result = crate::goat::action_latency::spawn_blocking(move || {
             // Finder's windows before a folder launch: only a window the
             // launch adds can show the requested folder. Folder launches run
             // one at a time from snapshot to match, so two launches never
@@ -425,7 +425,7 @@ impl Tool for LaunchAppTool {
                     if slow_launch_path {
                         let launched_pid = *pid;
                         let prior_pid = prior;
-                        tokio::spawn(async move {
+                        crate::input::worker_context::spawn_async(async move {
                             let _lease = crate::focus_steal::FocusStealPreventer::begin_suppression(
                                 Some(launched_pid),
                                 prior_pid,

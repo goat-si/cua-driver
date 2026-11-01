@@ -333,7 +333,7 @@ impl SelfActivationGuard {
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let flag = stop.clone();
         let user_front = crate::apps::frontmost_pid().filter(|front| *front != pid);
-        std::thread::spawn(move || {
+        crate::input::worker_context::spawn_thread(move || {
             if let Some(front) = user_front {
                 watch_self_activation(pid, front, &flag);
             }
@@ -1289,17 +1289,19 @@ impl BrowserPlatform for MacOsBrowserPlatform {
         })?;
         let listeners_before = loopback_ports_for_pid(request.pid).await?;
         let run_setup = move || async move {
-            tokio::task::spawn_blocking(move || super::setup_ui::enable(pid, window_id, descriptor))
-                .await
-                .map_err(|error| {
-                    BrowserRefusal::new(
-                        BrowserRefusalCode::BrowserRouteUnavailable,
-                        format!(
-                            "could not inspect {}'s remote-debugging setup UI: {error}",
-                            descriptor.product_name
-                        ),
-                    )
-                })?
+            crate::goat::action_latency::spawn_blocking(move || {
+                super::setup_ui::enable(pid, window_id, descriptor)
+            })
+            .await
+            .map_err(|error| {
+                BrowserRefusal::new(
+                    BrowserRefusalCode::BrowserRouteUnavailable,
+                    format!(
+                        "could not inspect {}'s remote-debugging setup UI: {error}",
+                        descriptor.product_name
+                    ),
+                )
+            })?
         };
         // Under the self-activation guard, the setup's background key turns make
         // Chrome's window key on purpose; the generic focus-steal lease would
@@ -1401,15 +1403,16 @@ impl BrowserPlatform for MacOsBrowserPlatform {
         let endpoint = match endpoint_result {
             Ok(endpoint) => endpoint,
             Err(error) => {
-                let error =
-                    tokio::task::spawn_blocking(move || handle.abort(pid, window_id, error))
-                        .await
-                        .map_err(|join_error| {
-                            BrowserRefusal::new(
-                                BrowserRefusalCode::BrowserRouteUnavailable,
-                                format!("could not roll back browser setup: {join_error}"),
-                            )
-                        })?;
+                let error = crate::goat::action_latency::spawn_blocking(move || {
+                    handle.abort(pid, window_id, error)
+                })
+                .await
+                .map_err(|join_error| {
+                    BrowserRefusal::new(
+                        BrowserRefusalCode::BrowserRouteUnavailable,
+                        format!("could not roll back browser setup: {join_error}"),
+                    )
+                })?;
                 return Err(error);
             }
         };
@@ -1443,14 +1446,16 @@ impl BrowserPlatform for MacOsBrowserPlatform {
                 "the approved browser window is outside the macOS window-id range",
             )
         })?;
-        tokio::task::spawn_blocking(move || super::setup_ui::commit_pending(pid, window_id))
-            .await
-            .map_err(|error| {
-                BrowserRefusal::new(
-                    BrowserRefusalCode::BrowserRouteUnavailable,
-                    format!("could not commit exact browser setup cleanup: {error}"),
-                )
-            })?
+        crate::goat::action_latency::spawn_blocking(move || {
+            super::setup_ui::commit_pending(pid, window_id)
+        })
+        .await
+        .map_err(|error| {
+            BrowserRefusal::new(
+                BrowserRefusalCode::BrowserRouteUnavailable,
+                format!("could not commit exact browser setup cleanup: {error}"),
+            )
+        })?
     }
 
     fn cleanup_existing_profile_setup(
@@ -1512,7 +1517,7 @@ impl BrowserPlatform for MacOsBrowserPlatform {
         let Ok(window_id) = u32::try_from(request.window_id) else {
             return error;
         };
-        tokio::task::spawn_blocking(move || {
+        crate::goat::action_latency::spawn_blocking(move || {
             run_failed_prepare_consent_cleanup(
                 error,
                 CONSENT_CLEANUP_PASSES,
