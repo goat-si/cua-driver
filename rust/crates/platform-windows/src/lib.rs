@@ -82,6 +82,9 @@ pub fn install_pointer_shape_backend() -> bool {
 }
 
 #[cfg(any(target_os = "windows", test))]
+mod page_dispatch;
+
+#[cfg(any(target_os = "windows", test))]
 mod process_selection;
 
 #[cfg(any(target_os = "windows", test))]
