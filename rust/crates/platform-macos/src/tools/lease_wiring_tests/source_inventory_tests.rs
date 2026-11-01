@@ -64,7 +64,7 @@ fn inventory() -> Vec<Site> {
 // a pinned source fingerprint; the remaining reviewed globs target enums.
 fn check_reviewed_glob_targets(root: &Path) {
     for (path, expected) in [
-        (root.join("ax/bindings.rs"), 14739359237517523625_u64),
+        (root.join("ax/bindings.rs"), 8298848675715171104_u64),
         (
             root.join("../../cua-driver-contract/src/vocabulary.rs"),
             7383688377390068226_u64,
@@ -131,6 +131,28 @@ fn all_in_scope_mutating_spawns_propagate_worker_context() {
     assert!(
         unclassified.is_empty() && errors.is_empty(),
         "unclassified spawn sites: {unclassified:#?}; exemption errors: {errors:#?}"
+    );
+    // These workers call gather_background_facts, which can write Chromium AX
+    // provider opt-in attributes; they must not remain raw read exemptions.
+    let provider_opt_in_workers: Vec<_> = sites
+        .iter()
+        .filter(|site| {
+            (site.file == "tools/get_window_state.rs"
+                && site.item == "GetWindowStateTool::invoke"
+                && [
+                    13541990699142757200_u64,
+                    17523493639179371745,
+                    9260217390489031091,
+                ]
+                .contains(&site.fingerprint))
+                || (site.file == "tools/mod.rs"
+                    && site.item == "decide_background_window_action"
+                    && site.fingerprint == 3789158294029726889)
+        })
+        .collect();
+    assert!(
+        provider_opt_in_workers.is_empty(),
+        "provider opt-in workers lack context propagation: {provider_opt_in_workers:#?}"
     );
 }
 

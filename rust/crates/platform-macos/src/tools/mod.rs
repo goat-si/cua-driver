@@ -707,7 +707,7 @@ async fn decide_background_window_action(
     };
     let element_guard =
         element_ptr.map(|ptr| unsafe { crate::ax::snapshot::RetainedElement::retain(ptr) });
-    let facts = match tokio::task::spawn_blocking(move || {
+    let facts = match crate::goat::action_latency::spawn_blocking(move || {
         let element_ptr = element_guard.as_ref().map(|guard| guard.as_ptr());
         crate::ax::exact_target::gather_background_facts(pid, window_id, element_ptr)
     })
