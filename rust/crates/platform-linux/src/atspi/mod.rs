@@ -619,6 +619,26 @@ pub fn set_value_token(_pid: u32, token: &TokenElement, value: &str) -> Result<(
     })
 }
 
+/// [`set_value_token`] sharing the caller's dispatch gate: the selection
+/// pick runs behind it too, so a caller timeout covers every write.
+pub fn set_value_token_with_dispatch(
+    _pid: u32,
+    token: &TokenElement,
+    value: &str,
+    dispatch: std::sync::Arc<native::TextWriteDispatch>,
+) -> Result<()> {
+    token.act(
+        |object| match native::set_value_ref_with_dispatch(object, value, dispatch.clone()) {
+            Err(error) if native::is_no_value_route(&error) => {
+                native::gated_route(&dispatch, || {
+                    select_option(object, value).unwrap_or(Err(error))
+                })
+            }
+            done => done,
+        },
+    )
+}
+
 /// The open popup of the token's combo box: activate the option `value`
 /// names. `Ok(None)` when the popup lists no options yet.
 pub fn activate_option_token(token: &TokenElement, value: &str) -> Result<Option<String>> {

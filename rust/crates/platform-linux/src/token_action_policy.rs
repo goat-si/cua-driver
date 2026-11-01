@@ -115,7 +115,9 @@ pub(crate) enum TextWriteStop {
 }
 
 /// (code, effect, note) for a stopped text write.
-pub(crate) fn text_write_stop_result(stop: TextWriteStop) -> (&'static str, &'static str, &'static str) {
+pub(crate) fn text_write_stop_result(
+    stop: TextWriteStop,
+) -> (&'static str, &'static str, &'static str) {
     match stop {
         TextWriteStop::Partial => (
             "element_write_partial",
@@ -209,7 +211,11 @@ mod write_tests {
             write_failure_result(WriteFailure::Partial),
             Some(("element_write_partial", "unverifiable"))
         );
-        for stop in [TextWriteStop::Uncertain, TextWriteStop::Partial, TextWriteStop::Closed] {
+        for stop in [
+            TextWriteStop::Uncertain,
+            TextWriteStop::Partial,
+            TextWriteStop::Closed,
+        ] {
             let (code, effect, note) = text_write_stop_result(stop);
             assert_eq!(effect, "unverifiable");
             assert_eq!(
@@ -226,14 +232,25 @@ mod write_tests {
 
     #[test]
     fn untargeted_stages_stop_after_a_possible_write() {
-        for stop in [TextWriteStop::Uncertain, TextWriteStop::Partial, TextWriteStop::Closed] {
+        for stop in [
+            TextWriteStop::Uncertain,
+            TextWriteStop::Partial,
+            TextWriteStop::Closed,
+        ] {
             let mut qt5_calls = 0;
-            let outcome = untargeted_ax_stages(classify, || Err(E::Stop(stop)), || {
-                qt5_calls += 1;
-                Ok(())
-            });
+            let outcome = untargeted_ax_stages(
+                classify,
+                || Err(E::Stop(stop)),
+                || {
+                    qt5_calls += 1;
+                    Ok(())
+                },
+            );
             assert!(matches!(outcome, UntargetedAx::Stopped(E::Stop(s)) if s == stop));
-            assert_eq!(qt5_calls, 0, "{stop:?}: Qt5 stage wrote after a possible write");
+            assert_eq!(
+                qt5_calls, 0,
+                "{stop:?}: Qt5 stage wrote after a possible write"
+            );
 
             let outcome = untargeted_ax_stages(classify, || Err(E::Plain), || Err(E::Stop(stop)));
             assert!(matches!(outcome, UntargetedAx::Stopped(E::Stop(s)) if s == stop));
@@ -243,10 +260,14 @@ mod write_tests {
     #[test]
     fn untargeted_stages_continue_only_when_nothing_changed() {
         let mut qt5_calls = 0;
-        let outcome = untargeted_ax_stages(classify, || Ok(()), || {
-            qt5_calls += 1;
-            Ok(())
-        });
+        let outcome = untargeted_ax_stages(
+            classify,
+            || Ok(()),
+            || {
+                qt5_calls += 1;
+                Ok(())
+            },
+        );
         assert!(matches!(outcome, UntargetedAx::Written("via AT-SPI")));
         assert_eq!(qt5_calls, 0);
         let outcome = untargeted_ax_stages(classify, || Err(E::Plain), || Ok(()));
@@ -268,7 +289,10 @@ mod write_tests {
             qt5_restore_outcome(Err(stop), Err(E::Plain), classify),
             Err(E::Stop(TextWriteStop::Uncertain))
         );
-        assert_eq!(qt5_restore_outcome(Err(E::Plain), Ok(()), classify), Err(E::Plain));
+        assert_eq!(
+            qt5_restore_outcome(Err(E::Plain), Ok(()), classify),
+            Err(E::Plain)
+        );
         assert_eq!(qt5_restore_outcome::<E>(Ok(()), Ok(()), classify), Ok(()));
     }
 
@@ -277,8 +301,15 @@ mod write_tests {
         assert_eq!(final_insert_step::<E>(Ok(true), classify), Ok(true));
         assert_eq!(final_insert_step::<E>(Ok(false), classify), Ok(false));
         assert_eq!(final_insert_step(Err(E::Plain), classify), Ok(false));
-        for stop in [TextWriteStop::Uncertain, TextWriteStop::Partial, TextWriteStop::Closed] {
-            assert_eq!(final_insert_step(Err(E::Stop(stop)), classify), Err(E::Stop(stop)));
+        for stop in [
+            TextWriteStop::Uncertain,
+            TextWriteStop::Partial,
+            TextWriteStop::Closed,
+        ] {
+            assert_eq!(
+                final_insert_step(Err(E::Stop(stop)), classify),
+                Err(E::Stop(stop))
+            );
         }
     }
 

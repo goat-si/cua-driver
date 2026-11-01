@@ -125,6 +125,42 @@ pub fn text_write_timeout_error(
     write_timeout_result(dispatch, bytes, || Ok(())).err()
 }
 
+/// Whether `error` ends a text-writing tool call: a mutator may have run
+/// (uncertain), the field was partly changed, or the caller had already
+/// closed the dispatch gate.
+pub(crate) fn text_write_stop(
+    error: &anyhow::Error,
+) -> Option<crate::token_action_policy::TextWriteStop> {
+    use crate::token_action_policy::TextWriteStop;
+    if error.is::<WritePartial>() {
+        Some(TextWriteStop::Partial)
+    } else if error.is::<WriteUncertain>() {
+        Some(TextWriteStop::Uncertain)
+    } else if error.is::<WriteDispatchClosed>() {
+        Some(TextWriteStop::Closed)
+    } else {
+        None
+    }
+}
+
+/// Run a non-AT-SPI input route (pty, Tk send, key events, a selection pick)
+/// behind the caller's dispatch gate, so a caller that already timed out and
+/// reported `effect:"none"` can never see it run afterwards, and a timeout
+/// while it runs reports that it may have run.
+pub fn gated_route<T>(
+    dispatch: &TextWriteDispatch,
+    route: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    dispatch
+        .gate
+        .enter_mutator()
+        .map_err(|_| WriteDispatchClosed)?;
+    dispatch.ledger.record_sent();
+    let result = route();
+    dispatch.gate.finish_mutator();
+    result
+}
+
 fn gated_input_action(
     dispatch: &TextWriteDispatch,
     bytes: usize,

@@ -2826,12 +2826,98 @@ async fn spawn_blocking_bounded<T: Send + 'static>(
 ) -> Result<anyhow::Result<T>, tokio::task::JoinError> {
     match tokio::time::timeout(budget, tokio::task::spawn_blocking(f)).await {
         Ok(joined) => joined,
-        Err(_elapsed) => Ok(Err(anyhow::anyhow!(
-            "{}: {label} did not complete within {budget:?}; the X server or the target \
-             application may be wedged. Take a screenshot before retrying",
-            crate::input::foreground::CODE_TIMEOUT
-        ))),
+        Err(_elapsed) => Ok(Err(foreground_timeout_error(label, budget))),
     }
+}
+
+fn foreground_timeout_error(label: &'static str, budget: std::time::Duration) -> anyhow::Error {
+    anyhow::anyhow!(
+        "{}: {label} did not complete within {budget:?}; the X server or the target \
+         application may be wedged. Take a screenshot before retrying",
+        crate::input::foreground::CODE_TIMEOUT
+    )
+}
+
+/// [`spawn_blocking_bounded`] for a transaction that writes text. Every write
+/// the worker makes runs behind one of `dispatches`; when the caller stops
+/// waiting (deadline or a panicked worker) it closes them all. If no write had
+/// begun, none can begin later and the old `foreground_timeout`
+/// (`effect:"none"`) stays true; otherwise the result is a stopped write
+/// (`effect:"unverifiable"`).
+async fn spawn_text_write_bounded<T: Send + 'static>(
+    label: &'static str,
+    budget: std::time::Duration,
+    dispatches: &[Arc<crate::atspi::native::TextWriteDispatch>],
+    bytes: usize,
+    f: impl FnOnce() -> anyhow::Result<T> + Send + 'static,
+) -> Result<anyhow::Result<T>, tokio::task::JoinError> {
+    spawn_text_write_until(
+        label,
+        budget,
+        tokio::time::sleep(budget),
+        dispatches,
+        bytes,
+        f,
+    )
+    .await
+}
+
+/// [`spawn_text_write_bounded`] with the deadline as a future, so tests drive
+/// it without wall-clock time.
+async fn spawn_text_write_until<T: Send + 'static>(
+    label: &'static str,
+    budget: std::time::Duration,
+    deadline: impl std::future::Future<Output = ()>,
+    dispatches: &[Arc<crate::atspi::native::TextWriteDispatch>],
+    bytes: usize,
+    f: impl FnOnce() -> anyhow::Result<T> + Send + 'static,
+) -> Result<anyhow::Result<T>, tokio::task::JoinError> {
+    let mut worker = tokio::task::spawn_blocking(f);
+    let failure = tokio::select! {
+        joined = &mut worker => match joined {
+            Ok(result) => return Ok(result),
+            Err(join) => Err(join),
+        },
+        () = deadline => Ok(()),
+    };
+    // Close every gate before judging: none may stay open for a late write.
+    let entered: Vec<anyhow::Error> = dispatches
+        .iter()
+        .filter_map(|dispatch| crate::atspi::native::text_write_timeout_error(dispatch, bytes))
+        .collect();
+    match (entered.into_iter().next(), failure) {
+        (Some(error), Ok(())) => Ok(Err(
+            error.context(format!("{label} did not complete within {budget:?}"))
+        )),
+        (Some(error), Err(join)) => Ok(Err(error.context(format!("{label} task failed: {join}")))),
+        (None, Ok(())) => Ok(Err(foreground_timeout_error(label, budget))),
+        (None, Err(join)) => Err(join),
+    }
+}
+
+/// A text write that may have changed the field ends the call as
+/// `effect:"unverifiable"`: `element_write_partial` when the field was
+/// cleared before the new text was confirmed, else
+/// `element_write_unacknowledged`. `None` for any other error.
+fn text_write_stop_result(
+    tool: &str,
+    element_index: Option<usize>,
+    error: &anyhow::Error,
+) -> Option<ToolResult> {
+    let stop = crate::atspi::native::text_write_stop(error)?;
+    let (code, effect, note) = crate::token_action_policy::text_write_stop_result(stop);
+    let mut structured = json!({
+        "code": code,
+        "effect": effect,
+        "verified": false,
+        "note": note,
+    });
+    if let Some(idx) = element_index {
+        structured["element_index"] = json!(idx);
+    }
+    Some(
+        ToolResult::error(format!("{tool}: {code}: {error:#}; {note}")).with_structured(structured),
+    )
 }
 
 /// Map an input-path error to a tool error, attaching the structured
@@ -3079,6 +3165,8 @@ fn token_write_failure_result(idx: usize, error: &anyhow::Error) -> Option<ToolR
         WriteFailure::Gone
     } else if error.is::<crate::atspi::native::TokenRouteUnavailable>() {
         WriteFailure::BeforeDispatch
+    } else if error.is::<crate::atspi::native::WritePartial>() {
+        WriteFailure::Partial
     } else {
         WriteFailure::Unknown
     };
@@ -3332,6 +3420,36 @@ fn is_qt5_process(pid: u32) -> bool {
     fs::read_to_string(format!("/proc/{pid}/maps"))
         .map(|maps| maps.contains("libQt5Gui") || maps.contains("libQt5Widgets"))
         .unwrap_or(false)
+}
+
+/// Qt5 workaround: a synthetic FocusIn makes Qt5's AT-SPI bridge expose the
+/// widget tree, the write goes through AT-SPI, then FocusOut restores the
+/// state. The X11 active window never changes. FocusOut is always attempted;
+/// its failure never hides a write that was acknowledged or may have run.
+fn qt5_focus_workaround_write(
+    pid: u32,
+    xid: u64,
+    text: &str,
+    dispatch: Arc<crate::atspi::native::TextWriteDispatch>,
+) -> anyhow::Result<()> {
+    if !is_qt5_process(pid) {
+        anyhow::bail!("not a Qt5 process; synthetic-FocusIn bridge workaround skipped");
+    }
+    crate::input::send_focus_in(xid)?;
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    let write = crate::atspi::native::type_into_editable_with_dispatch(pid, text, dispatch);
+    let restore = crate::input::send_focus_out(xid);
+    if let (Ok(()), Err(error)) = (&write, &restore) {
+        tracing::warn!(
+            pid,
+            "Qt5 FocusOut after an acknowledged AT-SPI write failed: {error}"
+        );
+    }
+    crate::token_action_policy::qt5_restore_outcome(
+        write,
+        restore,
+        crate::atspi::native::text_write_stop,
+    )
 }
 
 fn is_gtk_process(pid: u32) -> bool {
@@ -6245,18 +6363,20 @@ fn is_enter_key(key: &str) -> bool {
 /// `crate::tty`). Returns `Ok(false)` when the target isn't a terminal we can
 /// reach this way so the caller falls back to the generic XSendEvent path.
 fn inject_terminal_input(pid: u32, xid: u64, text: &str) -> anyhow::Result<bool> {
-    let Some(tty) = terminal_tty_for_window(pid, xid) else {
-        return Ok(false);
-    };
+    match terminal_pty_number(pid, xid) {
+        Some(ptn) => crate::tty::inject_via_master(pid, ptn, text),
+        None => Ok(false),
+    }
+}
+
+/// The pty number of the terminal window's shell, when `xid` is a terminal
+/// whose pty can be resolved. Reads only; writes nothing.
+fn terminal_pty_number(pid: u32, xid: u64) -> Option<u32> {
+    let tty = terminal_tty_for_window(pid, xid)?;
     // tty is `/dev/pts/<N>`; the emulator (pid) holds the master for the same N.
-    let Some(ptn) = tty
-        .file_name()
+    tty.file_name()
         .and_then(|s| s.to_str())
         .and_then(|s| s.parse::<u32>().ok())
-    else {
-        return Ok(false);
-    };
-    crate::tty::inject_via_master(pid, ptn, text)
 }
 
 // ── click ─────────────────────────────────────────────────────────────────────
@@ -7752,6 +7872,7 @@ enum TypeTextTestOutcome {
     Unavailable,
     Gone,
     Unknown,
+    Partial,
     Panic,
     Ok,
     NoRoute,
@@ -7805,6 +7926,14 @@ impl TypeTextTool {
                     Err(crate::atspi::native::CachedElementGone("test".into()).into())
                 }
                 TypeTextTestOutcome::Unknown => Err(anyhow::anyhow!("test write error")),
+                TypeTextTestOutcome::Partial => Err(crate::atspi::native::WritePartial {
+                    step: crate::text_write_policy::WriteStep {
+                        step: crate::text_write_policy::Step::InsertText,
+                        bytes: text.len(),
+                        units: None,
+                    },
+                }
+                .into()),
                 TypeTextTestOutcome::Panic => panic!("test task panic"),
                 TypeTextTestOutcome::Ok => Ok(()),
                 TypeTextTestOutcome::NoRoute => Err(anyhow::anyhow!("no_value_route: test")),
@@ -7873,6 +8002,9 @@ macro_rules! type_text_token {
     };
 }
 
+#[cfg(test)]
+#[path = "impl_/text_write_stop_tests.rs"]
+mod text_write_stop_tests;
 #[cfg(test)]
 #[path = "impl_/type_text_token_routing_tests.rs"]
 mod type_text_token_routing_tests;
@@ -8614,53 +8746,56 @@ impl Tool for TypeTextTool {
             };
         }
 
-        // Try AT-SPI EditableText first (focus-free, works for Qt6/GTK4).
-        let text_clone = text.clone();
-        let atspi_result =
-            tokio::task::spawn_blocking(move || crate::atspi::type_into_editable(pid, &text_clone))
-                .await;
-
-        match atspi_result {
-            Ok(Ok(())) => {
-                // AT-SPI succeeded — focus-free typing worked (Qt6, GTK4, etc.)!
-                // Electron/Chromium can echo this write without the renderer
-                // observing it, so the confirm is suppressed there (mirrors macOS).
-                return type_text_ax_result(pid, text_len, "via AT-SPI");
+        // Focus-free AT-SPI EditableText first (Qt6, GTK4), then the Qt5
+        // synthetic-FocusIn workaround (Qt5 exposes no widgets while
+        // unfocused). A stage that may have changed the field ends the call;
+        // only a stage that changed nothing lets the next route run. Each
+        // stage has its own dispatch: a native lookup timeout closes its
+        // stage's gate even when nothing was sent.
+        let first_dispatch = Arc::new(crate::atspi::native::TextWriteDispatch::default());
+        let qt5_dispatch = Arc::new(crate::atspi::native::TextWriteDispatch::default());
+        let stages = {
+            let (first_dispatch, qt5_dispatch) = (first_dispatch.clone(), qt5_dispatch.clone());
+            let text = text.clone();
+            tokio::task::spawn_blocking(move || {
+                crate::token_action_policy::untargeted_ax_stages(
+                    crate::atspi::native::text_write_stop,
+                    || {
+                        crate::atspi::native::type_into_editable_with_dispatch(
+                            pid,
+                            &text,
+                            first_dispatch,
+                        )
+                    },
+                    || qt5_focus_workaround_write(pid, xid, &text, qt5_dispatch),
+                )
+            })
+            .await
+        };
+        match stages {
+            // Electron/Chromium can echo this write without the renderer
+            // observing it, so the confirm is suppressed there (mirrors macOS).
+            Ok(crate::token_action_policy::UntargetedAx::Written(route)) => {
+                return type_text_ax_result(pid, text_len, route);
             }
-            _ => {
-                // AT-SPI failed (no editable exposed). Qt5 doesn't expose widgets
-                // when unfocused, so try the synthetic-focus workaround.
+            Ok(crate::token_action_policy::UntargetedAx::Stopped(error)) => {
+                return text_write_stop_result("type_text", None, &error)
+                    .unwrap_or_else(|| input_error_result(error));
             }
-        }
-
-        // Qt5 workaround: send synthetic FocusIn to make Qt5's AT-SPI bridge
-        // expose the widget tree, type via AT-SPI, then send FocusOut.
-        // This doesn't change the X11 active window, so the test's focus check passes.
-        let text_clone2 = text.clone();
-        let qt5_result = tokio::task::spawn_blocking(move || {
-            if !is_qt5_process(pid) {
-                anyhow::bail!("not a Qt5 process; synthetic-FocusIn bridge workaround skipped");
-            }
-            // Send FocusIn to trigger Qt5's bridge
-            crate::input::send_focus_in(xid)?;
-            std::thread::sleep(std::time::Duration::from_millis(100));
-
-            // Try AT-SPI again now that widgets should be exposed
-            let result = crate::atspi::type_into_editable(pid, &text_clone2);
-
-            // Restore state with FocusOut
-            crate::input::send_focus_out(xid)?;
-
-            result
-        })
-        .await;
-
-        match qt5_result {
-            Ok(Ok(())) => {
-                return type_text_ax_result(pid, text_len, "via AT-SPI with focus workaround");
-            }
-            _ => {
-                // AT-SPI still didn't work. Fall back to X11 XSendEvent.
+            Ok(crate::token_action_policy::UntargetedAx::NotWritten) => {}
+            Err(join) => {
+                // A panicked stage may already have sent its write.
+                let entered: Vec<anyhow::Error> = [&first_dispatch, &qt5_dispatch]
+                    .into_iter()
+                    .filter_map(|dispatch| {
+                        crate::atspi::native::text_write_timeout_error(dispatch, text.len())
+                    })
+                    .collect();
+                if let Some(error) = entered.into_iter().next() {
+                    let error = error.context(format!("type_text task failed: {join}"));
+                    return text_write_stop_result("type_text", None, &error)
+                        .unwrap_or_else(|| input_error_result(error));
+                }
             }
         }
 
@@ -8673,35 +8808,55 @@ impl Tool for TypeTextTool {
         // events to it via XTest — the escalation when background didn't land
         // (e.g. a GTK dialog whose widget ignores synthetic XSendEvent keys).
         let cursor_id = resolve_cursor_key(&args);
-        let result = spawn_blocking_bounded(
+        // The AT-SPI insert and the key routes each run behind a dispatch gate
+        // the caller closes on timeout, so a late worker never writes after
+        // the call has returned.
+        let ax_dispatch = Arc::new(crate::atspi::native::TextWriteDispatch::default());
+        let key_dispatch = Arc::new(crate::atspi::native::TextWriteDispatch::default());
+        let text_bytes = text.len();
+        let (ax_gate, key_gate) = (ax_dispatch.clone(), key_dispatch.clone());
+        let result = spawn_text_write_bounded(
             "type_text",
             foreground_budget(text_len),
+            &[ax_dispatch, key_dispatch],
+            text_bytes,
             move || -> anyhow::Result<(&'static str, Option<crate::input::KeyboardDeliveryReport>)> {
+            use crate::atspi::native::gated_route;
             // Terminals: write to the pty master (focus-free, below the toolkit).
-            if inject_terminal_input(pid, xid, &text)? {
-                return Ok(("key_events", None));
+            // Detection reads only, so only the pty write enters the gate.
+            if let Some(ptn) = terminal_pty_number(pid, xid) {
+                if gated_route(&key_gate, || crate::tty::inject_via_master(pid, ptn, &text))? {
+                    return Ok(("key_events", None));
+                }
             }
             // GUI apps: X11 only routes keystrokes to the *focused* toplevel's
             // focused widget, so background XSendEvent typing doesn't land. Fill
             // the editable field via AT-SPI instead — focus-free and toolkit-
             // agnostic. Fall back to Tk send or XSendEvent when no a11y field is exposed.
-            if crate::atspi::insert_text(pid, &text).unwrap_or(false) {
+            // An insert that may have run ends here; one that changed nothing
+            // lets the key routes below run.
+            if crate::token_action_policy::final_insert_step(
+                crate::atspi::native::insert_text_with_dispatch(pid, &text, ax_gate),
+                crate::atspi::native::text_write_stop,
+            )? {
                 return Ok(("ax", None));
             }
             // Tk apps: use Tk's `send` command (no AT-SPI bridge, so AT-SPI above
             // returned false). This is the Tk-specific override, like CDP for Chromium.
-            if crate::input::inject_tk_send(&text).unwrap_or(false) {
+            if gated_route(&key_gate, || Ok(crate::input::inject_tk_send(&text).unwrap_or(false)))? {
                 return Ok(("key_events", None));
             }
             if delivery.is_foreground() {
-                crate::input::with_x11_foreground(xid, 80, || {
-                    crate::input::send_type_text_xtest(&text)
+                gated_route(&key_gate, || {
+                    crate::input::with_x11_foreground(xid, 80, || {
+                        crate::input::send_type_text_xtest(&text)
+                    })
                 })?;
                 return Ok(("key_events_fg", None));
             }
             // No a11y editable, no pty: real key events through the XI2 virtual
             // master keyboard are the last focus-free route.
-            match background_text_route(&cursor_id, pid, xid, &text)? {
+            match gated_route(&key_gate, || background_text_route(&cursor_id, pid, xid, &text))? {
                 Some(KeyRoute::Mpx(report)) => Ok((crate::input::MPX_UINPUT_PATH, Some(report))),
                 _ => Ok(("background_unavailable", None)),
             }
@@ -8727,7 +8882,8 @@ impl Tool for TypeTextTool {
                 "Typed {text_len} character(s) (via X11, delivery_mode={mode_label})."
             ))
             .with_structured(type_text_structured(path, text_len, false)),
-            Ok(Err(e)) => input_error_result(e),
+            Ok(Err(e)) => text_write_stop_result("type_text", None, &e)
+                .unwrap_or_else(|| input_error_result(e)),
             Err(e) => ToolResult::error(format!("Task error: {e}")),
         }
     }
@@ -9734,6 +9890,94 @@ impl Tool for HotkeyTool {
 
 pub struct SetValueTool {
     state: Arc<ToolState>,
+    #[cfg(test)]
+    test_hooks: Option<Arc<SetValueTestHooks>>,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SetValueTestOutcome {
+    Uncertain,
+    Partial,
+    UncertainAfterTimeout,
+    NoRoute,
+}
+
+#[cfg(test)]
+struct SetValueTestHooks {
+    ax: SetValueTestOutcome,
+    keyboard_fallbacks: std::sync::atomic::AtomicUsize,
+}
+
+impl SetValueTool {
+    /// The focus-free accessibility write on the token's object. Every write
+    /// it makes (EditableText, Value, a selection pick) shares one dispatch
+    /// gate, closed if the call stops waiting.
+    async fn ax_write(
+        &self,
+        pid: u32,
+        target: crate::atspi::TokenElement,
+        value: String,
+    ) -> Result<anyhow::Result<()>, tokio::task::JoinError> {
+        #[cfg(test)]
+        if let Some(hooks) = &self.test_hooks {
+            use crate::text_write_policy::{Step, WriteStep};
+            let step = WriteStep {
+                step: Step::SetText,
+                bytes: value.len(),
+                units: None,
+            };
+            return Ok(Err(match hooks.ax {
+                SetValueTestOutcome::Uncertain => {
+                    crate::atspi::native::WriteUncertain { step }.into()
+                }
+                SetValueTestOutcome::Partial => crate::atspi::native::WritePartial { step }.into(),
+                SetValueTestOutcome::UncertainAfterTimeout => {
+                    anyhow::Error::from(crate::atspi::native::WriteUncertain { step })
+                        .context("set_value did not complete within 12s")
+                }
+                SetValueTestOutcome::NoRoute => {
+                    anyhow::anyhow!("{}: test", crate::atspi::native::NO_VALUE_ROUTE)
+                }
+            }));
+        }
+        let dispatch = Arc::new(crate::atspi::native::TextWriteDispatch::default());
+        let task_dispatch = dispatch.clone();
+        let bytes = value.len();
+        spawn_text_write_bounded(
+            "set_value",
+            foreground_budget(0),
+            &[dispatch],
+            bytes,
+            move || {
+                crate::atspi::set_value_token_with_dispatch(pid, &target, &value, task_dispatch)
+            },
+        )
+        .await
+    }
+
+    /// Test seam: counts entries into the keyboard fallback and stops there.
+    fn keyboard_fallback_entered(&self) -> Option<ToolResult> {
+        #[cfg(test)]
+        if let Some(hooks) = &self.test_hooks {
+            hooks
+                .keyboard_fallbacks
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            return Some(
+                ToolResult::text("test fallthrough")
+                    .with_structured(json!({"test_fallthrough": true})),
+            );
+        }
+        None
+    }
+
+    fn positions_cursor(&self) -> bool {
+        #[cfg(test)]
+        if self.test_hooks.is_some() {
+            return false;
+        }
+        true
+    }
 }
 static SV_DEF: std::sync::OnceLock<ToolDef> = std::sync::OnceLock::new();
 
@@ -9802,22 +10046,20 @@ impl Tool for SetValueTool {
         let xid_opt = Some(xid);
         let delivery = crate::input::delivery::DeliveryMode::from_args(&args);
         let cursor_id = resolve_cursor_key(&args);
-        position_named_session_keyboard_cursor(
-            &self.state,
-            &args,
-            pid,
-            xid,
-            Some(token.clone()),
-            None,
-            true,
-        )
-        .await;
+        if self.positions_cursor() {
+            position_named_session_keyboard_cursor(
+                &self.state,
+                &args,
+                pid,
+                xid,
+                Some(token.clone()),
+                None,
+                true,
+            )
+            .await;
+        }
         // 1. Focus-free accessibility write on the exact snapshot object.
-        let target = token.clone();
-        let ax = spawn_blocking_bounded("set_value", foreground_budget(0), move || {
-            crate::atspi::set_value_token(pid, &target, &value_for_task)
-        })
-        .await;
+        let ax = self.ax_write(pid, token.clone(), value_for_task).await;
         let ax_error = match ax {
             Ok(Ok(())) => {
                 let target = token.clone();
@@ -9827,6 +10069,12 @@ impl Tool for SetValueTool {
                         .ok()
                         .flatten();
                 return set_value_result(idx, &value, "ax", readback, None, secret);
+            }
+            // The write may have run, or the field is partly changed: no
+            // further route (keys, selection, pointer) may write again.
+            Ok(Err(error)) if crate::atspi::native::text_write_stop(&error).is_some() => {
+                return text_write_stop_result("set_value", Some(idx), &error)
+                    .unwrap_or_else(|| input_error_result(error))
             }
             Ok(Err(error)) if crate::atspi::native::is_no_value_route(&error) => error,
             Ok(Err(error)) if crate::atspi::native::is_no_such_option(&error) => {
@@ -9838,6 +10086,9 @@ impl Tool for SetValueTool {
             }
             Err(error) => return ToolResult::error(format!("Task error: {error}")),
         };
+        if let Some(entered) = self.keyboard_fallback_entered() {
+            return entered;
+        }
         // 2. No accessibility write route. A combo box is opened with a click
         //    and the option picked from its popup (whose items only exist and
         //    act while it is open), then the popup is closed. Anything else is
@@ -15183,6 +15434,8 @@ pub fn build_registry_with_provider(
     r.register(pid_window_guarded(
         SetValueTool {
             state: state.clone(),
+            #[cfg(test)]
+            test_hooks: None,
         },
         &pid_window_candidates,
     ));
