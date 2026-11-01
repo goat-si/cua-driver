@@ -1,5 +1,6 @@
 //! Recording artifact storage. POSIX mode-bit checks do not inspect ACLs;
 //! inherited or existing ACL grants can expose or redirect artifacts.
+//! On Windows, `verify` only reopens the path and does not compare identity.
 
 #[cfg(unix)]
 mod platform {
@@ -124,6 +125,10 @@ mod platform {
     impl PrivateDir {
         pub(crate) fn open(path: &Path) -> io::Result<Self> {
             Self::open_inner(path, true)
+        }
+
+        pub(crate) fn open_existing(path: &Path) -> io::Result<Self> {
+            Self::open_inner(path, false)
         }
 
         fn open_inner(path: &Path, create: bool) -> io::Result<Self> {
@@ -289,6 +294,20 @@ mod platform {
             Ok(file)
         }
 
+        pub(crate) fn remove(&self, target: &OsStr) -> io::Result<()> {
+            let target = name(target)?;
+            let stat = stat_at(self.file.as_raw_fd(), &target)?;
+            if stat.st_mode & libc::S_IFMT != libc::S_IFREG
+                || stat.st_uid != unsafe { libc::geteuid() }
+            {
+                return Err(fail("unsafe recording artifact"));
+            }
+            if unsafe { libc::unlinkat(self.file.as_raw_fd(), target.as_ptr(), 0) } != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        }
+
         pub(crate) fn verify(&self) -> io::Result<()> {
             let fresh = Self::open_inner(&self.path, false)?;
             if (fresh.dev, fresh.ino) != (self.dev, self.ino) {
@@ -348,6 +367,10 @@ mod windows_platform {
     impl PrivateDir {
         pub(crate) fn open(path: &Path) -> io::Result<Self> {
             Self::open_inner(path, true)
+        }
+
+        pub(crate) fn open_existing(path: &Path) -> io::Result<Self> {
+            Self::open_inner(path, false)
         }
 
         fn open_inner(path: &Path, create: bool) -> io::Result<Self> {
@@ -441,6 +464,19 @@ mod windows_platform {
             Ok(file)
         }
 
+        pub(crate) fn remove(&self, name: &OsStr) -> io::Result<()> {
+            component(name)?;
+            let target = self.path.join(name);
+            let meta = std::fs::symlink_metadata(&target)?;
+            if meta.file_attributes() & REPARSE_ATTRIBUTE != 0 || !meta.is_file() {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "unsafe recording artifact",
+                ));
+            }
+            std::fs::remove_file(target)
+        }
+
         pub(crate) fn verify(&self) -> io::Result<()> {
             Self::open_inner(&self.path, false).map(|_| ())
         }
@@ -458,6 +494,45 @@ mod tests {
     use super::PrivateDir;
     use std::ffi::OsStr;
     use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
+
+    #[test]
+    fn open_existing_does_not_create_and_rejects_unsafe_paths() {
+        let root = tempfile::tempdir().unwrap();
+        let absent = root.path().join("absent");
+        assert!(PrivateDir::open_existing(&absent).is_err());
+        assert!(!absent.exists());
+        let link = root.path().join("link");
+        symlink(root.path(), &link).unwrap();
+        assert!(PrivateDir::open_existing(&link).is_err());
+        assert!(PrivateDir::open_existing(root.path()).is_ok());
+    }
+
+    #[test]
+    fn remove_refuses_links_and_directories_and_uses_held_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("recording");
+        let dir = PrivateDir::open(&path).unwrap();
+        let target = root.path().join("target");
+        std::fs::write(&target, b"untouched").unwrap();
+        symlink(&target, path.join("link")).unwrap();
+        std::fs::create_dir(path.join("directory")).unwrap();
+        assert!(dir.remove(OsStr::new("link")).is_err());
+        assert!(dir.remove(OsStr::new("directory")).is_err());
+        assert_eq!(std::fs::read(&target).unwrap(), b"untouched");
+        assert!(std::fs::symlink_metadata(path.join("link"))
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert!(path.join("directory").is_dir());
+        dir.create(OsStr::new("video"), b"data").unwrap();
+        let moved = root.path().join("moved");
+        std::fs::rename(&path, &moved).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        std::fs::write(path.join("video"), b"replacement").unwrap();
+        dir.remove(OsStr::new("video")).unwrap();
+        assert!(!moved.join("video").exists());
+        assert_eq!(std::fs::read(path.join("video")).unwrap(), b"replacement");
+    }
 
     #[test]
     fn owned_symlink_ancestor_is_allowed_but_destination_link_is_not() {

@@ -687,6 +687,12 @@ impl RecordingSession {
                     video_present = true;
                 }
                 Err(e) => {
+                    #[cfg(any(unix, windows))]
+                    private_dir
+                        .remove(std::ffi::OsStr::new("recording.mp4"))
+                        .map_err(|cleanup| anyhow::anyhow!(
+                            "video capture failed to start: {e}; removing precreated video failed: {cleanup}"
+                        ))?;
                     video_error = Some(e.to_string());
                     tracing::warn!(target: "recording",
                         "Video capture failed to start; per-turn recording will \

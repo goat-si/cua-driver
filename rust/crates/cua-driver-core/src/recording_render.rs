@@ -127,11 +127,21 @@ pub fn render(
             video_h,
             traj.metadata.display_scale_factor,
         );
-        let expr_dump = input_dir.join("render.expression.txt");
-        let _ = std::fs::write(
-            &expr_dump,
-            format!("z:\n{zoom_expr}\n\nx:\n{x_expr}\n\ny:\n{y_expr}\n"),
-        );
+        let dump = format!("z:\n{zoom_expr}\n\nx:\n{x_expr}\n\ny:\n{y_expr}\n");
+        #[cfg(any(unix, windows))]
+        let dump_result = crate::private_artifact::PrivateDir::open_existing(input_dir)
+            .and_then(|dir| {
+                dir.create(
+                    std::ffi::OsStr::new("render.expression.txt"),
+                    dump.as_bytes(),
+                )
+            })
+            .map(|_| ());
+        #[cfg(not(any(unix, windows)))]
+        let dump_result = std::fs::write(input_dir.join("render.expression.txt"), dump);
+        if let Err(error) = dump_result {
+            tracing::debug!(target: "recording", %error, "skipping render expression diagnostic");
+        }
         format!(
             "zoompan=z='{z}':x='{x}':y='{y}':d=1:s={w}x{h}:fps=30,\
              pad=ceil(iw/2)*2:ceil(ih/2)*2,format=yuv420p",
