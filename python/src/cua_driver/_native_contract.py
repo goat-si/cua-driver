@@ -2073,6 +2073,413 @@ class _UniffiFfiConverterOptionalSequenceString(_UniffiConverterRustBuffer):
         else:
             raise InternalError("Unexpected flag byte for optional type")
 
+
+
+
+
+
+class OpenedSurfaceKind(enum.Enum):
+
+    MENU = 0
+
+    POPOVER = 1
+
+    ALERT = 2
+
+    SHEET = 3
+
+    UNKNOWN = 4
+
+
+
+class _UniffiFfiConverterTypeOpenedSurfaceKind(_UniffiConverterRustBuffer):
+    @staticmethod
+    def read(buf):
+        variant = buf.read_i32()
+        if variant == 1:
+            return OpenedSurfaceKind.MENU
+        if variant == 2:
+            return OpenedSurfaceKind.POPOVER
+        if variant == 3:
+            return OpenedSurfaceKind.ALERT
+        if variant == 4:
+            return OpenedSurfaceKind.SHEET
+        if variant == 5:
+            return OpenedSurfaceKind.UNKNOWN
+        raise InternalError("Raw enum value doesn't match any cases")
+
+    @staticmethod
+    def check_lower(value):
+        if value == OpenedSurfaceKind.MENU:
+            return
+        if value == OpenedSurfaceKind.POPOVER:
+            return
+        if value == OpenedSurfaceKind.ALERT:
+            return
+        if value == OpenedSurfaceKind.SHEET:
+            return
+        if value == OpenedSurfaceKind.UNKNOWN:
+            return
+        raise ValueError(value)
+
+    @staticmethod
+    def write(value, buf):
+        if value == OpenedSurfaceKind.MENU:
+            buf.write_i32(1)
+        if value == OpenedSurfaceKind.POPOVER:
+            buf.write_i32(2)
+        if value == OpenedSurfaceKind.ALERT:
+            buf.write_i32(3)
+        if value == OpenedSurfaceKind.SHEET:
+            buf.write_i32(4)
+        if value == OpenedSurfaceKind.UNKNOWN:
+            buf.write_i32(5)
+
+
+
+@dataclass
+class OpenedSurfaceTarget:
+    """
+    A target addressable by `get_window_state`.
+"""
+    def __init__(self, *, pid:int, window_id:int):
+        self.pid = pid
+        self.window_id = window_id
+
+
+
+
+    def __str__(self):
+        return "OpenedSurfaceTarget(pid={}, window_id={})".format(self.pid, self.window_id)
+    def __eq__(self, other):
+        if self.pid != other.pid:
+            return False
+        if self.window_id != other.window_id:
+            return False
+        return True
+
+class _UniffiFfiConverterTypeOpenedSurfaceTarget(_UniffiConverterRustBuffer):
+    @staticmethod
+    def read(buf):
+        return OpenedSurfaceTarget(
+            pid=_UniffiFfiConverterUInt32.read(buf),
+            window_id=_UniffiFfiConverterUInt64.read(buf),
+        )
+
+    @staticmethod
+    def check_lower(value):
+        _UniffiFfiConverterUInt32.check_lower(value.pid)
+        _UniffiFfiConverterUInt64.check_lower(value.window_id)
+
+    @staticmethod
+    def write(value, buf):
+        _UniffiFfiConverterUInt32.write(value.pid, buf)
+        _UniffiFfiConverterUInt64.write(value.window_id, buf)
+
+class _UniffiFfiConverterOptionalTypeOpenedSurfaceTarget(_UniffiConverterRustBuffer):
+    @classmethod
+    def check_lower(cls, value):
+        if value is not None:
+            _UniffiFfiConverterTypeOpenedSurfaceTarget.check_lower(value)
+
+    @classmethod
+    def write(cls, value, buf):
+        if value is None:
+            buf.write_u8(0)
+            return
+
+        buf.write_u8(1)
+        _UniffiFfiConverterTypeOpenedSurfaceTarget.write(value, buf)
+
+    @classmethod
+    def read(cls, buf):
+        flag = buf.read_u8()
+        if flag == 0:
+            return None
+        elif flag == 1:
+            return _UniffiFfiConverterTypeOpenedSurfaceTarget.read(buf)
+        else:
+            raise InternalError("Unexpected flag byte for optional type")
+
+@dataclass
+class WindowBounds:
+    def __init__(self, *, x:float, y:float, width:float, height:float):
+        self.x = x
+        self.y = y
+        self.width = width
+        self.height = height
+
+
+
+
+    def __str__(self):
+        return "WindowBounds(x={}, y={}, width={}, height={})".format(self.x, self.y, self.width, self.height)
+    def __eq__(self, other):
+        if self.x != other.x:
+            return False
+        if self.y != other.y:
+            return False
+        if self.width != other.width:
+            return False
+        if self.height != other.height:
+            return False
+        return True
+
+class _UniffiFfiConverterTypeWindowBounds(_UniffiConverterRustBuffer):
+    @staticmethod
+    def read(buf):
+        return WindowBounds(
+            x=_UniffiFfiConverterFloat64.read(buf),
+            y=_UniffiFfiConverterFloat64.read(buf),
+            width=_UniffiFfiConverterFloat64.read(buf),
+            height=_UniffiFfiConverterFloat64.read(buf),
+        )
+
+    @staticmethod
+    def check_lower(value):
+        _UniffiFfiConverterFloat64.check_lower(value.x)
+        _UniffiFfiConverterFloat64.check_lower(value.y)
+        _UniffiFfiConverterFloat64.check_lower(value.width)
+        _UniffiFfiConverterFloat64.check_lower(value.height)
+
+    @staticmethod
+    def write(value, buf):
+        _UniffiFfiConverterFloat64.write(value.x, buf)
+        _UniffiFfiConverterFloat64.write(value.y, buf)
+        _UniffiFfiConverterFloat64.write(value.width, buf)
+        _UniffiFfiConverterFloat64.write(value.height, buf)
+
+class _UniffiFfiConverterOptionalTypeWindowBounds(_UniffiConverterRustBuffer):
+    @classmethod
+    def check_lower(cls, value):
+        if value is not None:
+            _UniffiFfiConverterTypeWindowBounds.check_lower(value)
+
+    @classmethod
+    def write(cls, value, buf):
+        if value is None:
+            buf.write_u8(0)
+            return
+
+        buf.write_u8(1)
+        _UniffiFfiConverterTypeWindowBounds.write(value, buf)
+
+    @classmethod
+    def read(cls, buf):
+        flag = buf.read_u8()
+        if flag == 0:
+            return None
+        elif flag == 1:
+            return _UniffiFfiConverterTypeWindowBounds.read(buf)
+        else:
+            raise InternalError("Unexpected flag byte for optional type")
+
+@dataclass
+class OpenedSurface:
+    """
+    A surface that appeared after dispatch, established by before/after comparison
+    or an open notification tied to the input. Embedded AX/UIA surfaces may
+    have no independently addressable target.
+"""
+    def __init__(self, *, kind:OpenedSurfaceKind, owner_pid:typing.Optional[int], window_id:typing.Optional[int], target:typing.Optional[OpenedSurfaceTarget], bounds:typing.Optional[WindowBounds], title:typing.Optional[str]):
+        self.kind = kind
+        self.owner_pid = owner_pid
+        self.window_id = window_id
+        self.target = target
+        self.bounds = bounds
+        self.title = title
+
+
+
+
+    def __str__(self):
+        return "OpenedSurface(kind={}, owner_pid={}, window_id={}, target={}, bounds={}, title={})".format(self.kind, self.owner_pid, self.window_id, self.target, self.bounds, self.title)
+    def __eq__(self, other):
+        if self.kind != other.kind:
+            return False
+        if self.owner_pid != other.owner_pid:
+            return False
+        if self.window_id != other.window_id:
+            return False
+        if self.target != other.target:
+            return False
+        if self.bounds != other.bounds:
+            return False
+        if self.title != other.title:
+            return False
+        return True
+
+class _UniffiFfiConverterTypeOpenedSurface(_UniffiConverterRustBuffer):
+    @staticmethod
+    def read(buf):
+        return OpenedSurface(
+            kind=_UniffiFfiConverterTypeOpenedSurfaceKind.read(buf),
+            owner_pid=_UniffiFfiConverterOptionalUInt32.read(buf),
+            window_id=_UniffiFfiConverterOptionalUInt64.read(buf),
+            target=_UniffiFfiConverterOptionalTypeOpenedSurfaceTarget.read(buf),
+            bounds=_UniffiFfiConverterOptionalTypeWindowBounds.read(buf),
+            title=_UniffiFfiConverterOptionalString.read(buf),
+        )
+
+    @staticmethod
+    def check_lower(value):
+        _UniffiFfiConverterTypeOpenedSurfaceKind.check_lower(value.kind)
+        _UniffiFfiConverterOptionalUInt32.check_lower(value.owner_pid)
+        _UniffiFfiConverterOptionalUInt64.check_lower(value.window_id)
+        _UniffiFfiConverterOptionalTypeOpenedSurfaceTarget.check_lower(value.target)
+        _UniffiFfiConverterOptionalTypeWindowBounds.check_lower(value.bounds)
+        _UniffiFfiConverterOptionalString.check_lower(value.title)
+
+    @staticmethod
+    def write(value, buf):
+        _UniffiFfiConverterTypeOpenedSurfaceKind.write(value.kind, buf)
+        _UniffiFfiConverterOptionalUInt32.write(value.owner_pid, buf)
+        _UniffiFfiConverterOptionalUInt64.write(value.window_id, buf)
+        _UniffiFfiConverterOptionalTypeOpenedSurfaceTarget.write(value.target, buf)
+        _UniffiFfiConverterOptionalTypeWindowBounds.write(value.bounds, buf)
+        _UniffiFfiConverterOptionalString.write(value.title, buf)
+
+class _UniffiFfiConverterSequenceTypeOpenedSurface(_UniffiConverterRustBuffer):
+    @classmethod
+    def check_lower(cls, value):
+        for item in value:
+            _UniffiFfiConverterTypeOpenedSurface.check_lower(item)
+
+    @classmethod
+    def write(cls, value, buf):
+        items = len(value)
+        buf.write_i32(items)
+        for item in value:
+            _UniffiFfiConverterTypeOpenedSurface.write(item, buf)
+
+    @classmethod
+    def read(cls, buf):
+        count = buf.read_i32()
+        if count < 0:
+            raise InternalError("Unexpected negative sequence length")
+
+        return [
+            _UniffiFfiConverterTypeOpenedSurface.read(buf) for i in range(count)
+        ]
+
+class _UniffiFfiConverterOptionalSequenceTypeOpenedSurface(_UniffiConverterRustBuffer):
+    @classmethod
+    def check_lower(cls, value):
+        if value is not None:
+            _UniffiFfiConverterSequenceTypeOpenedSurface.check_lower(value)
+
+    @classmethod
+    def write(cls, value, buf):
+        if value is None:
+            buf.write_u8(0)
+            return
+
+        buf.write_u8(1)
+        _UniffiFfiConverterSequenceTypeOpenedSurface.write(value, buf)
+
+    @classmethod
+    def read(cls, buf):
+        flag = buf.read_u8()
+        if flag == 0:
+            return None
+        elif flag == 1:
+            return _UniffiFfiConverterSequenceTypeOpenedSurface.read(buf)
+        else:
+            raise InternalError("Unexpected flag byte for optional type")
+
+
+
+
+
+
+class OpenedSurfacesStatus(enum.Enum):
+    """
+    Completeness of the observation performed after an input was dispatched.
+"""
+
+    OBSERVED = 0
+    """
+    Complete before/after observation; an empty list means none opened.
+"""
+
+    PARTIAL = 1
+    """
+    Some surfaces were seen, but absence of others remains unknown.
+"""
+
+    UNAVAILABLE = 2
+    """
+    Observation could not be completed.
+"""
+
+    NOT_CHECKED = 3
+
+
+
+class _UniffiFfiConverterTypeOpenedSurfacesStatus(_UniffiConverterRustBuffer):
+    @staticmethod
+    def read(buf):
+        variant = buf.read_i32()
+        if variant == 1:
+            return OpenedSurfacesStatus.OBSERVED
+        if variant == 2:
+            return OpenedSurfacesStatus.PARTIAL
+        if variant == 3:
+            return OpenedSurfacesStatus.UNAVAILABLE
+        if variant == 4:
+            return OpenedSurfacesStatus.NOT_CHECKED
+        raise InternalError("Raw enum value doesn't match any cases")
+
+    @staticmethod
+    def check_lower(value):
+        if value == OpenedSurfacesStatus.OBSERVED:
+            return
+        if value == OpenedSurfacesStatus.PARTIAL:
+            return
+        if value == OpenedSurfacesStatus.UNAVAILABLE:
+            return
+        if value == OpenedSurfacesStatus.NOT_CHECKED:
+            return
+        raise ValueError(value)
+
+    @staticmethod
+    def write(value, buf):
+        if value == OpenedSurfacesStatus.OBSERVED:
+            buf.write_i32(1)
+        if value == OpenedSurfacesStatus.PARTIAL:
+            buf.write_i32(2)
+        if value == OpenedSurfacesStatus.UNAVAILABLE:
+            buf.write_i32(3)
+        if value == OpenedSurfacesStatus.NOT_CHECKED:
+            buf.write_i32(4)
+
+
+
+class _UniffiFfiConverterOptionalTypeOpenedSurfacesStatus(_UniffiConverterRustBuffer):
+    @classmethod
+    def check_lower(cls, value):
+        if value is not None:
+            _UniffiFfiConverterTypeOpenedSurfacesStatus.check_lower(value)
+
+    @classmethod
+    def write(cls, value, buf):
+        if value is None:
+            buf.write_u8(0)
+            return
+
+        buf.write_u8(1)
+        _UniffiFfiConverterTypeOpenedSurfacesStatus.write(value, buf)
+
+    @classmethod
+    def read(cls, buf):
+        flag = buf.read_u8()
+        if flag == 0:
+            return None
+        elif flag == 1:
+            return _UniffiFfiConverterTypeOpenedSurfacesStatus.read(buf)
+        else:
+            raise InternalError("Unexpected flag byte for optional type")
+
 class _UniffiFfiConverterOptionalTypeActionPoint(_UniffiConverterRustBuffer):
     @classmethod
     def check_lower(cls, value):
@@ -2125,7 +2532,7 @@ class _UniffiFfiConverterOptionalTypeActionHit(_UniffiConverterRustBuffer):
 
 @dataclass
 class ActionResult:
-    def __init__(self, *, effect:ActionEffect, route:ActionRoute, delivery:typing.Optional[ActionDelivery], evidence:typing.Optional[typing.List[ActionEvidence]], escalation:typing.Optional[ActionEscalation], summary:typing.Optional[str], note:typing.Optional[str], warning:typing.Optional[str], focus_restoration:typing.Optional[ActionFocusRestoration], error:typing.Optional[ActionError], hint:typing.Optional[str], next_call:typing.Optional[ActionNextCall], verified:typing.Optional[bool], selection_changed:typing.Optional[bool], selected_text_range:typing.Optional[ActionSelectedTextRange], selected_text:typing.Optional[str], menu_opened:typing.Optional[bool], menu_items:typing.Optional[typing.List[str]], point:typing.Optional[ActionPoint], hit:typing.Optional[ActionHit]):
+    def __init__(self, *, effect:ActionEffect, route:ActionRoute, delivery:typing.Optional[ActionDelivery], evidence:typing.Optional[typing.List[ActionEvidence]], escalation:typing.Optional[ActionEscalation], summary:typing.Optional[str], note:typing.Optional[str], warning:typing.Optional[str], focus_restoration:typing.Optional[ActionFocusRestoration], error:typing.Optional[ActionError], hint:typing.Optional[str], next_call:typing.Optional[ActionNextCall], verified:typing.Optional[bool], selection_changed:typing.Optional[bool], selected_text_range:typing.Optional[ActionSelectedTextRange], selected_text:typing.Optional[str], menu_opened:typing.Optional[bool], menu_items:typing.Optional[typing.List[str]], opened_surfaces:typing.Optional[typing.List[OpenedSurface]], opened_surfaces_status:typing.Optional[OpenedSurfacesStatus], point:typing.Optional[ActionPoint], hit:typing.Optional[ActionHit]):
         self.effect = effect
         self.route = route
         self.delivery = delivery
@@ -2144,6 +2551,8 @@ class ActionResult:
         self.selected_text = selected_text
         self.menu_opened = menu_opened
         self.menu_items = menu_items
+        self.opened_surfaces = opened_surfaces
+        self.opened_surfaces_status = opened_surfaces_status
         self.point = point
         self.hit = hit
 
@@ -2151,7 +2560,7 @@ class ActionResult:
 
 
     def __str__(self):
-        return "ActionResult(effect={}, route={}, delivery={}, evidence={}, escalation={}, summary={}, note={}, warning={}, focus_restoration={}, error={}, hint={}, next_call={}, verified={}, selection_changed={}, selected_text_range={}, selected_text={}, menu_opened={}, menu_items={}, point={}, hit={})".format(self.effect, self.route, self.delivery, self.evidence, self.escalation, self.summary, self.note, self.warning, self.focus_restoration, self.error, self.hint, self.next_call, self.verified, self.selection_changed, self.selected_text_range, self.selected_text, self.menu_opened, self.menu_items, self.point, self.hit)
+        return "ActionResult(effect={}, route={}, delivery={}, evidence={}, escalation={}, summary={}, note={}, warning={}, focus_restoration={}, error={}, hint={}, next_call={}, verified={}, selection_changed={}, selected_text_range={}, selected_text={}, menu_opened={}, menu_items={}, opened_surfaces={}, opened_surfaces_status={}, point={}, hit={})".format(self.effect, self.route, self.delivery, self.evidence, self.escalation, self.summary, self.note, self.warning, self.focus_restoration, self.error, self.hint, self.next_call, self.verified, self.selection_changed, self.selected_text_range, self.selected_text, self.menu_opened, self.menu_items, self.opened_surfaces, self.opened_surfaces_status, self.point, self.hit)
     def __eq__(self, other):
         if self.effect != other.effect:
             return False
@@ -2189,6 +2598,10 @@ class ActionResult:
             return False
         if self.menu_items != other.menu_items:
             return False
+        if self.opened_surfaces != other.opened_surfaces:
+            return False
+        if self.opened_surfaces_status != other.opened_surfaces_status:
+            return False
         if self.point != other.point:
             return False
         if self.hit != other.hit:
@@ -2217,6 +2630,8 @@ class _UniffiFfiConverterTypeActionResult(_UniffiConverterRustBuffer):
             selected_text=_UniffiFfiConverterOptionalString.read(buf),
             menu_opened=_UniffiFfiConverterOptionalBoolean.read(buf),
             menu_items=_UniffiFfiConverterOptionalSequenceString.read(buf),
+            opened_surfaces=_UniffiFfiConverterOptionalSequenceTypeOpenedSurface.read(buf),
+            opened_surfaces_status=_UniffiFfiConverterOptionalTypeOpenedSurfacesStatus.read(buf),
             point=_UniffiFfiConverterOptionalTypeActionPoint.read(buf),
             hit=_UniffiFfiConverterOptionalTypeActionHit.read(buf),
         )
@@ -2241,6 +2656,8 @@ class _UniffiFfiConverterTypeActionResult(_UniffiConverterRustBuffer):
         _UniffiFfiConverterOptionalString.check_lower(value.selected_text)
         _UniffiFfiConverterOptionalBoolean.check_lower(value.menu_opened)
         _UniffiFfiConverterOptionalSequenceString.check_lower(value.menu_items)
+        _UniffiFfiConverterOptionalSequenceTypeOpenedSurface.check_lower(value.opened_surfaces)
+        _UniffiFfiConverterOptionalTypeOpenedSurfacesStatus.check_lower(value.opened_surfaces_status)
         _UniffiFfiConverterOptionalTypeActionPoint.check_lower(value.point)
         _UniffiFfiConverterOptionalTypeActionHit.check_lower(value.hit)
 
@@ -2264,6 +2681,8 @@ class _UniffiFfiConverterTypeActionResult(_UniffiConverterRustBuffer):
         _UniffiFfiConverterOptionalString.write(value.selected_text, buf)
         _UniffiFfiConverterOptionalBoolean.write(value.menu_opened, buf)
         _UniffiFfiConverterOptionalSequenceString.write(value.menu_items, buf)
+        _UniffiFfiConverterOptionalSequenceTypeOpenedSurface.write(value.opened_surfaces, buf)
+        _UniffiFfiConverterOptionalTypeOpenedSurfacesStatus.write(value.opened_surfaces_status, buf)
         _UniffiFfiConverterOptionalTypeActionPoint.write(value.point, buf)
         _UniffiFfiConverterOptionalTypeActionHit.write(value.hit, buf)
 
@@ -5775,54 +6194,6 @@ class _UniffiFfiConverterTypeListWindowsInput(_UniffiConverterRustBuffer):
     def write(value, buf):
         _UniffiFfiConverterOptionalUInt32.write(value.pid, buf)
         _UniffiFfiConverterOptionalBoolean.write(value.on_screen_only, buf)
-
-@dataclass
-class WindowBounds:
-    def __init__(self, *, x:float, y:float, width:float, height:float):
-        self.x = x
-        self.y = y
-        self.width = width
-        self.height = height
-
-
-
-
-    def __str__(self):
-        return "WindowBounds(x={}, y={}, width={}, height={})".format(self.x, self.y, self.width, self.height)
-    def __eq__(self, other):
-        if self.x != other.x:
-            return False
-        if self.y != other.y:
-            return False
-        if self.width != other.width:
-            return False
-        if self.height != other.height:
-            return False
-        return True
-
-class _UniffiFfiConverterTypeWindowBounds(_UniffiConverterRustBuffer):
-    @staticmethod
-    def read(buf):
-        return WindowBounds(
-            x=_UniffiFfiConverterFloat64.read(buf),
-            y=_UniffiFfiConverterFloat64.read(buf),
-            width=_UniffiFfiConverterFloat64.read(buf),
-            height=_UniffiFfiConverterFloat64.read(buf),
-        )
-
-    @staticmethod
-    def check_lower(value):
-        _UniffiFfiConverterFloat64.check_lower(value.x)
-        _UniffiFfiConverterFloat64.check_lower(value.y)
-        _UniffiFfiConverterFloat64.check_lower(value.width)
-        _UniffiFfiConverterFloat64.check_lower(value.height)
-
-    @staticmethod
-    def write(value, buf):
-        _UniffiFfiConverterFloat64.write(value.x, buf)
-        _UniffiFfiConverterFloat64.write(value.y, buf)
-        _UniffiFfiConverterFloat64.write(value.width, buf)
-        _UniffiFfiConverterFloat64.write(value.height, buf)
 
 class _UniffiFfiConverterInt64(_UniffiConverterPrimitiveInt):
     CLASS_NAME = "i64"
@@ -10320,31 +10691,6 @@ class _UniffiFfiConverterOptionalSequenceTypeIncompleteReason(_UniffiConverterRu
         else:
             raise InternalError("Unexpected flag byte for optional type")
 
-class _UniffiFfiConverterOptionalTypeWindowBounds(_UniffiConverterRustBuffer):
-    @classmethod
-    def check_lower(cls, value):
-        if value is not None:
-            _UniffiFfiConverterTypeWindowBounds.check_lower(value)
-
-    @classmethod
-    def write(cls, value, buf):
-        if value is None:
-            buf.write_u8(0)
-            return
-
-        buf.write_u8(1)
-        _UniffiFfiConverterTypeWindowBounds.write(value, buf)
-
-    @classmethod
-    def read(cls, buf):
-        flag = buf.read_u8()
-        if flag == 0:
-            return None
-        elif flag == 1:
-            return _UniffiFfiConverterTypeWindowBounds.read(buf)
-        else:
-            raise InternalError("Unexpected flag byte for optional type")
-
 class _UniffiFfiConverterSequenceTypeSnapshotImage(_UniffiConverterRustBuffer):
     @classmethod
     def check_lower(cls, value):
@@ -10649,6 +10995,8 @@ __all__ = [
     "ActionFocusRestorationReason",
     "ActionEffect",
     "ActionRoute",
+    "OpenedSurfaceKind",
+    "OpenedSurfacesStatus",
     "ActionTarget",
     "ClickPosition",
     "InputDeliveryMode",
@@ -10689,6 +11037,9 @@ __all__ = [
     "ActionNextCall",
     "ActionPoint",
     "ActionSelectedTextRange",
+    "OpenedSurfaceTarget",
+    "WindowBounds",
+    "OpenedSurface",
     "ActionResult",
     "AppInfo",
     "BoundsExpectation",
@@ -10729,7 +11080,6 @@ __all__ = [
     "SessionOutput",
     "ListSessionsOutput",
     "ListWindowsInput",
-    "WindowBounds",
     "WindowInfo",
     "ListWindowsOutput",
     "MoveCursorInput",

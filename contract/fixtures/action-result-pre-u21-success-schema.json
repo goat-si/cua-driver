@@ -1,0 +1,337 @@
+{
+  "additionalProperties": false,
+  "properties": {
+    "delivery": {
+      "additionalProperties": false,
+      "properties": {
+        "delivered_count": {
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "mode": {
+          "enum": [
+            "background",
+            "foreground",
+            "not_applicable",
+            "unknown"
+          ],
+          "type": "string"
+        }
+      },
+      "required": [
+        "mode"
+      ],
+      "type": [
+        "object",
+        "null"
+      ]
+    },
+    "effect": {
+      "enum": [
+        "confirmed",
+        "partial",
+        "unverifiable",
+        "suspected_noop",
+        "refused"
+      ],
+      "type": "string"
+    },
+    "error": {
+      "additionalProperties": false,
+      "properties": {
+        "code": {
+          "type": "string"
+        },
+        "hint": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "code"
+      ],
+      "type": [
+        "object",
+        "null"
+      ]
+    },
+    "escalation": {
+      "additionalProperties": false,
+      "properties": {
+        "reason": {
+          "enum": [
+            "route_unavailable",
+            "delivery_failed",
+            "effect_unconfirmed",
+            "suspected_noop",
+            "permission_required"
+          ],
+          "type": "string"
+        },
+        "target": {
+          "enum": [
+            "pixel",
+            "foreground",
+            "page",
+            "session"
+          ],
+          "type": "string"
+        }
+      },
+      "required": [
+        "target",
+        "reason"
+      ],
+      "type": [
+        "object",
+        "null"
+      ]
+    },
+    "evidence": {
+      "items": {
+        "additionalProperties": false,
+        "properties": {
+          "detail": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "kind": {
+            "enum": [
+              "value_readback",
+              "window_change"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "kind"
+        ],
+        "type": "object"
+      },
+      "type": [
+        "array",
+        "null"
+      ]
+    },
+    "focus_restoration": {
+      "additionalProperties": false,
+      "properties": {
+        "prior_pid": {
+          "format": "int32",
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "reason": {
+          "enum": [
+            "user_input",
+            "third_app",
+            "timeout",
+            "panic",
+            "unconfirmed"
+          ],
+          "type": "string"
+        },
+        "status": {
+          "enum": [
+            "restored",
+            "abandoned"
+          ],
+          "type": "string"
+        }
+      },
+      "required": [
+        "status",
+        "prior_pid"
+      ],
+      "type": [
+        "object",
+        "null"
+      ]
+    },
+    "hint": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "hit": {
+      "additionalProperties": false,
+      "properties": {
+        "identifier": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "index": {
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "label": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "role": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": [
+        "object",
+        "null"
+      ]
+    },
+    "menu_items": {
+      "items": {
+        "type": "string"
+      },
+      "type": [
+        "array",
+        "null"
+      ]
+    },
+    "menu_opened": {
+      "type": [
+        "boolean",
+        "null"
+      ]
+    },
+    "next_call": {
+      "additionalProperties": false,
+      "properties": {
+        "arguments": {
+          "type": "object"
+        },
+        "tool": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "tool",
+        "arguments"
+      ],
+      "type": [
+        "object",
+        "null"
+      ]
+    },
+    "note": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "point": {
+      "additionalProperties": false,
+      "properties": {
+        "coordinate_space": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "x": {
+          "type": "number"
+        },
+        "y": {
+          "type": "number"
+        }
+      },
+      "required": [
+        "x",
+        "y"
+      ],
+      "type": [
+        "object",
+        "null"
+      ]
+    },
+    "route": {
+      "enum": [
+        "accessibility",
+        "synthetic_events",
+        "global_input",
+        "system_api",
+        "dom",
+        "trusted_input"
+      ],
+      "type": "string"
+    },
+    "selected_text": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "selected_text_range": {
+      "additionalProperties": false,
+      "properties": {
+        "length": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "location": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "units": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "location",
+        "length",
+        "units"
+      ],
+      "type": [
+        "object",
+        "null"
+      ]
+    },
+    "selection_changed": {
+      "type": [
+        "boolean",
+        "null"
+      ]
+    },
+    "summary": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "verified": {
+      "type": [
+        "boolean",
+        "null"
+      ]
+    },
+    "warning": {
+      "type": [
+        "string",
+        "null"
+      ]
+    }
+  },
+  "required": [
+    "effect",
+    "route"
+  ],
+  "type": "object"
+}

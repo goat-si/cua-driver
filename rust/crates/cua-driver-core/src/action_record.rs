@@ -256,7 +256,7 @@ pub struct ActionRefusal {
 }
 
 /// Complete internal accounting for one action execution.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct ActionExecutionRecord {
     pub effect: ActionEffect,
     pub transport: ActionTransport,
@@ -269,6 +269,8 @@ pub struct ActionExecutionRecord {
     pub delivered_count: Option<u32>,
     pub detail: Option<String>,
     pub refusal: Option<ActionRefusal>,
+    pub opened_surfaces: Option<Vec<cua_driver_contract::OpenedSurface>>,
+    pub opened_surfaces_status: Option<cua_driver_contract::OpenedSurfacesStatus>,
 }
 
 impl ActionExecutionRecord {
@@ -289,6 +291,8 @@ impl ActionExecutionRecord {
             delivered_count: None,
             detail: None,
             refusal: None,
+            opened_surfaces: None,
+            opened_surfaces_status: None,
         }
     }
 
@@ -469,6 +473,8 @@ impl ActionExecutionRecord {
             selected_text: None,
             menu_opened: None,
             menu_items: None,
+            opened_surfaces: self.opened_surfaces.clone(),
+            opened_surfaces_status: self.opened_surfaces_status,
             point: None,
             hit: None,
         })

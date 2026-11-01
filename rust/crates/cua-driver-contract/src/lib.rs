@@ -71,11 +71,11 @@ pub use outputs::{
     ActionRoute, AgentOverlayCapture, AgentOverlayCaptureStatus, ClipboardReadOutput,
     ClipboardWriteOutput, CursorMotionOutput, CursorPointOutput, CursorPositionOutput,
     CursorThemeOutput, CursorVisualOutput, DesktopStateOutput, EffectiveScope, EndSessionOutput,
-    ErrorDisposition, GetAgentCursorStateOutput, InputDelivery, ListSessionsOutput, RetrySafety,
-    ScreenSizeOutput, SessionClientKindOutput, SessionLifecycleState, SessionOutput,
-    SessionStateOutput, SessionTransportOutput, SetAgentCursorEnabledOutput,
-    SetAgentCursorMotionOutput, SetAgentCursorThemeOutput, StartSessionOutput, ToolOutput,
-    TOOL_INVOCATION_FAILED_CODE,
+    ErrorDisposition, GetAgentCursorStateOutput, InputDelivery, ListSessionsOutput, OpenedSurface,
+    OpenedSurfaceKind, OpenedSurfaceTarget, OpenedSurfacesStatus, RetrySafety, ScreenSizeOutput,
+    SessionClientKindOutput, SessionLifecycleState, SessionOutput, SessionStateOutput,
+    SessionTransportOutput, SetAgentCursorEnabledOutput, SetAgentCursorMotionOutput,
+    SetAgentCursorThemeOutput, StartSessionOutput, ToolOutput, TOOL_INVOCATION_FAILED_CODE,
 };
 pub use verification::{
     BoundsExpectation, ElementPredicate, ElementSelector, PredicateOutcome, StatePredicate,

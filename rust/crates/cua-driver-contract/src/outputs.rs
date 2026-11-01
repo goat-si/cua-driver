@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Cua AI, Inc.
 
-use crate::{schema_settings, ActionHit, ActionPoint, CaptureScope, EscalationReason, Platform};
+use crate::{
+    schema_settings, ActionHit, ActionPoint, CaptureScope, EscalationReason, Platform, WindowBounds,
+};
 use schemars::JsonSchema;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -866,6 +868,56 @@ fn deserialize_prior_pid<'de, D: serde::Deserializer<'de>>(
     Option::<i32>::deserialize(deserializer)
 }
 
+/// Completeness of the observation performed after an input was dispatched.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq, uniffi::Enum)]
+#[serde(rename_all = "snake_case")]
+pub enum OpenedSurfacesStatus {
+    /// Complete before/after observation; an empty list means none opened.
+    Observed,
+    /// Some surfaces were seen, but absence of others remains unknown.
+    Partial,
+    /// Observation could not be completed.
+    Unavailable,
+    NotChecked,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq, uniffi::Enum)]
+#[serde(rename_all = "snake_case")]
+pub enum OpenedSurfaceKind {
+    Menu,
+    Popover,
+    Alert,
+    Sheet,
+    Unknown,
+}
+
+/// A target addressable by `get_window_state`.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq, uniffi::Record)]
+#[serde(deny_unknown_fields)]
+pub struct OpenedSurfaceTarget {
+    pub pid: u32,
+    pub window_id: u64,
+}
+
+/// A surface that appeared after dispatch, established by before/after comparison
+/// or an open notification tied to the input. Embedded AX/UIA surfaces may
+/// have no independently addressable target.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, uniffi::Record)]
+#[serde(deny_unknown_fields)]
+pub struct OpenedSurface {
+    pub kind: OpenedSurfaceKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_pid: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub window_id: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<OpenedSurfaceTarget>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bounds: Option<WindowBounds>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+}
+
 // `PartialEq` only: `point` carries floating-point coordinates.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, uniffi::Record)]
 #[serde(deny_unknown_fields)]
@@ -914,9 +966,18 @@ pub struct ActionResult {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub selected_text: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Legacy macOS readback; false means unconfirmed, not proven absent.
+    /// See `opened_surfaces` for the cross-platform observation.
     pub menu_opened: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub menu_items: Option<Vec<String>>,
+    /// Surfaces appearing after this input was dispatched. Status absent means
+    /// unknown; only observed with an empty list proves none opened.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub opened_surfaces: Option<Vec<OpenedSurface>>,
+    /// A failed or deadline-limited observation cannot be `observed`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub opened_surfaces_status: Option<OpenedSurfacesStatus>,
     /// The point a pointer action (click, double_click, right_click,
     /// move_cursor, scroll, drag) aimed at, in `coordinate_space`, as its
     /// producer reports it; for drag, the end point. It says where the input
@@ -990,6 +1051,8 @@ pub enum ActionResultValidationError {
     ReadbackEffectMismatch,
     PointNotFinite,
     FocusRestorationReasonRequiresAbandoned,
+    OpenedSurfacesRequireList,
+    OpenedSurfacesForbidden,
 }
 
 impl std::fmt::Display for ActionResultValidationError {
@@ -1008,6 +1071,10 @@ impl std::fmt::Display for ActionResultValidationError {
             Self::FocusRestorationReasonRequiresAbandoned => {
                 "focus restoration reason requires abandoned status"
             }
+            Self::OpenedSurfacesRequireList => "observed or partial surfaces require a list",
+            Self::OpenedSurfacesForbidden => {
+                "unavailable or not checked surfaces cannot have a non-empty list"
+            }
         })
     }
 }
@@ -1016,6 +1083,22 @@ impl std::error::Error for ActionResultValidationError {}
 
 impl ActionResult {
     pub fn validate_invariants(&self) -> Result<(), ActionResultValidationError> {
+        match self.opened_surfaces_status {
+            Some(OpenedSurfacesStatus::Observed | OpenedSurfacesStatus::Partial)
+                if self.opened_surfaces.is_none() =>
+            {
+                return Err(ActionResultValidationError::OpenedSurfacesRequireList)
+            }
+            Some(OpenedSurfacesStatus::Unavailable | OpenedSurfacesStatus::NotChecked)
+                if self
+                    .opened_surfaces
+                    .as_ref()
+                    .is_some_and(|surfaces| !surfaces.is_empty()) =>
+            {
+                return Err(ActionResultValidationError::OpenedSurfacesForbidden)
+            }
+            _ => {}
+        }
         if self
             .point
             .as_ref()
@@ -1183,9 +1266,62 @@ mod tests {
             selected_text: None,
             menu_opened: None,
             menu_items: None,
+            opened_surfaces: None,
+            opened_surfaces_status: None,
             point: None,
             hit: None,
         }
+    }
+
+    #[test]
+    fn opened_surfaces_observation_contract() {
+        let base = serde_json::to_value(confirmed_result()).unwrap();
+        let surface = json!({"kind":"menu", "owner_pid":7, "window_id":9,
+            "target":{"pid":7,"window_id":9},
+            "bounds":{"x":1.0,"y":2.0,"width":3.0,"height":4.0}, "title":"Menu"});
+        for (status, list, valid) in [
+            (Some("observed"), Some(vec![surface.clone()]), true),
+            (Some("observed"), Some(vec![]), true),
+            (Some("partial"), Some(vec![]), true),
+            (Some("observed"), None, false),
+            (Some("partial"), None, false),
+            (Some("unavailable"), None, true),
+            (Some("unavailable"), Some(vec![]), true),
+            (Some("not_checked"), None, true),
+            (Some("not_checked"), Some(vec![]), true),
+            (Some("unavailable"), Some(vec![surface.clone()]), false),
+            (Some("not_checked"), Some(vec![surface.clone()]), false),
+            (None, None, true),
+            (None, Some(vec![surface.clone()]), true),
+        ] {
+            let mut value = base.clone();
+            if let Some(status) = status {
+                value["opened_surfaces_status"] = json!(status);
+            }
+            if let Some(list) = list {
+                value["opened_surfaces"] = json!(list);
+            }
+            let result: ActionResult = serde_json::from_value(value.clone()).unwrap();
+            assert_eq!(result.validate_invariants().is_ok(), valid, "{value}");
+            assert_eq!(serde_json::to_value(result).unwrap(), value);
+        }
+    }
+
+    #[test]
+    fn opened_surface_kinds_and_embedded_targets_round_trip() {
+        for kind in ["menu", "popover", "alert", "sheet", "unknown"] {
+            let surface: OpenedSurface = serde_json::from_value(json!({"kind": kind})).unwrap();
+            assert!(surface.target.is_none());
+            assert_eq!(
+                serde_json::to_value(surface).unwrap(),
+                json!({"kind": kind})
+            );
+        }
+        assert!(serde_json::from_value::<OpenedSurface>(json!({"kind":"dialog"})).is_err());
+        assert!(serde_json::from_value::<OpenedSurface>(
+            json!({"kind":"menu", "target":{"pid":7}})
+        )
+        .is_err());
     }
 
     #[test]
@@ -1279,6 +1415,8 @@ mod tests {
                 "menu_opened",
                 "next_call",
                 "note",
+                "opened_surfaces",
+                "opened_surfaces_status",
                 "point",
                 "route",
                 "selected_text",

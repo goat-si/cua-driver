@@ -350,6 +350,127 @@
               "null"
             ]
           },
+          "opened_surfaces": {
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "bounds": {
+                  "properties": {
+                    "height": {
+                      "type": "number"
+                    },
+                    "width": {
+                      "type": "number"
+                    },
+                    "x": {
+                      "type": "number"
+                    },
+                    "y": {
+                      "type": "number"
+                    }
+                  },
+                  "required": [
+                    "x",
+                    "y",
+                    "width",
+                    "height"
+                  ],
+                  "type": [
+                    "object",
+                    "null"
+                  ]
+                },
+                "kind": {
+                  "enum": [
+                    "menu",
+                    "popover",
+                    "alert",
+                    "sheet",
+                    "unknown"
+                  ],
+                  "type": "string"
+                },
+                "owner_pid": {
+                  "minimum": 0,
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
+                },
+                "target": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "pid": {
+                      "minimum": 0,
+                      "type": "integer"
+                    },
+                    "window_id": {
+                      "minimum": 0,
+                      "type": "integer"
+                    }
+                  },
+                  "required": [
+                    "pid",
+                    "window_id"
+                  ],
+                  "type": [
+                    "object",
+                    "null"
+                  ]
+                },
+                "title": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "window_id": {
+                  "minimum": 0,
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
+                }
+              },
+              "required": [
+                "kind"
+              ],
+              "type": "object"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "opened_surfaces_status": {
+            "anyOf": [
+              {
+                "oneOf": [
+                  {
+                    "enum": [
+                      "not_checked"
+                    ],
+                    "type": "string"
+                  },
+                  {
+                    "const": "observed",
+                    "type": "string"
+                  },
+                  {
+                    "const": "partial",
+                    "type": "string"
+                  },
+                  {
+                    "const": "unavailable",
+                    "type": "string"
+                  }
+                ]
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "point": {
             "additionalProperties": false,
             "properties": {
@@ -955,6 +1076,127 @@
             "type": [
               "string",
               "null"
+            ]
+          },
+          "opened_surfaces": {
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "bounds": {
+                  "properties": {
+                    "height": {
+                      "type": "number"
+                    },
+                    "width": {
+                      "type": "number"
+                    },
+                    "x": {
+                      "type": "number"
+                    },
+                    "y": {
+                      "type": "number"
+                    }
+                  },
+                  "required": [
+                    "x",
+                    "y",
+                    "width",
+                    "height"
+                  ],
+                  "type": [
+                    "object",
+                    "null"
+                  ]
+                },
+                "kind": {
+                  "enum": [
+                    "menu",
+                    "popover",
+                    "alert",
+                    "sheet",
+                    "unknown"
+                  ],
+                  "type": "string"
+                },
+                "owner_pid": {
+                  "minimum": 0,
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
+                },
+                "target": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "pid": {
+                      "minimum": 0,
+                      "type": "integer"
+                    },
+                    "window_id": {
+                      "minimum": 0,
+                      "type": "integer"
+                    }
+                  },
+                  "required": [
+                    "pid",
+                    "window_id"
+                  ],
+                  "type": [
+                    "object",
+                    "null"
+                  ]
+                },
+                "title": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "window_id": {
+                  "minimum": 0,
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
+                }
+              },
+              "required": [
+                "kind"
+              ],
+              "type": "object"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "opened_surfaces_status": {
+            "anyOf": [
+              {
+                "oneOf": [
+                  {
+                    "enum": [
+                      "not_checked"
+                    ],
+                    "type": "string"
+                  },
+                  {
+                    "const": "observed",
+                    "type": "string"
+                  },
+                  {
+                    "const": "partial",
+                    "type": "string"
+                  },
+                  {
+                    "const": "unavailable",
+                    "type": "string"
+                  }
+                ]
+              },
+              {
+                "type": "null"
+              }
             ]
           },
           "point": {
@@ -2930,6 +3172,127 @@
               "null"
             ]
           },
+          "opened_surfaces": {
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "bounds": {
+                  "properties": {
+                    "height": {
+                      "type": "number"
+                    },
+                    "width": {
+                      "type": "number"
+                    },
+                    "x": {
+                      "type": "number"
+                    },
+                    "y": {
+                      "type": "number"
+                    }
+                  },
+                  "required": [
+                    "x",
+                    "y",
+                    "width",
+                    "height"
+                  ],
+                  "type": [
+                    "object",
+                    "null"
+                  ]
+                },
+                "kind": {
+                  "enum": [
+                    "menu",
+                    "popover",
+                    "alert",
+                    "sheet",
+                    "unknown"
+                  ],
+                  "type": "string"
+                },
+                "owner_pid": {
+                  "minimum": 0,
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
+                },
+                "target": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "pid": {
+                      "minimum": 0,
+                      "type": "integer"
+                    },
+                    "window_id": {
+                      "minimum": 0,
+                      "type": "integer"
+                    }
+                  },
+                  "required": [
+                    "pid",
+                    "window_id"
+                  ],
+                  "type": [
+                    "object",
+                    "null"
+                  ]
+                },
+                "title": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "window_id": {
+                  "minimum": 0,
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
+                }
+              },
+              "required": [
+                "kind"
+              ],
+              "type": "object"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "opened_surfaces_status": {
+            "anyOf": [
+              {
+                "oneOf": [
+                  {
+                    "enum": [
+                      "not_checked"
+                    ],
+                    "type": "string"
+                  },
+                  {
+                    "const": "observed",
+                    "type": "string"
+                  },
+                  {
+                    "const": "partial",
+                    "type": "string"
+                  },
+                  {
+                    "const": "unavailable",
+                    "type": "string"
+                  }
+                ]
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "point": {
             "additionalProperties": false,
             "properties": {
@@ -3325,6 +3688,127 @@
             "type": [
               "string",
               "null"
+            ]
+          },
+          "opened_surfaces": {
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "bounds": {
+                  "properties": {
+                    "height": {
+                      "type": "number"
+                    },
+                    "width": {
+                      "type": "number"
+                    },
+                    "x": {
+                      "type": "number"
+                    },
+                    "y": {
+                      "type": "number"
+                    }
+                  },
+                  "required": [
+                    "x",
+                    "y",
+                    "width",
+                    "height"
+                  ],
+                  "type": [
+                    "object",
+                    "null"
+                  ]
+                },
+                "kind": {
+                  "enum": [
+                    "menu",
+                    "popover",
+                    "alert",
+                    "sheet",
+                    "unknown"
+                  ],
+                  "type": "string"
+                },
+                "owner_pid": {
+                  "minimum": 0,
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
+                },
+                "target": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "pid": {
+                      "minimum": 0,
+                      "type": "integer"
+                    },
+                    "window_id": {
+                      "minimum": 0,
+                      "type": "integer"
+                    }
+                  },
+                  "required": [
+                    "pid",
+                    "window_id"
+                  ],
+                  "type": [
+                    "object",
+                    "null"
+                  ]
+                },
+                "title": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "window_id": {
+                  "minimum": 0,
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
+                }
+              },
+              "required": [
+                "kind"
+              ],
+              "type": "object"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "opened_surfaces_status": {
+            "anyOf": [
+              {
+                "oneOf": [
+                  {
+                    "enum": [
+                      "not_checked"
+                    ],
+                    "type": "string"
+                  },
+                  {
+                    "const": "observed",
+                    "type": "string"
+                  },
+                  {
+                    "const": "partial",
+                    "type": "string"
+                  },
+                  {
+                    "const": "unavailable",
+                    "type": "string"
+                  }
+                ]
+              },
+              {
+                "type": "null"
+              }
             ]
           },
           "point": {
@@ -4133,6 +4617,127 @@
             "type": [
               "string",
               "null"
+            ]
+          },
+          "opened_surfaces": {
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "bounds": {
+                  "properties": {
+                    "height": {
+                      "type": "number"
+                    },
+                    "width": {
+                      "type": "number"
+                    },
+                    "x": {
+                      "type": "number"
+                    },
+                    "y": {
+                      "type": "number"
+                    }
+                  },
+                  "required": [
+                    "x",
+                    "y",
+                    "width",
+                    "height"
+                  ],
+                  "type": [
+                    "object",
+                    "null"
+                  ]
+                },
+                "kind": {
+                  "enum": [
+                    "menu",
+                    "popover",
+                    "alert",
+                    "sheet",
+                    "unknown"
+                  ],
+                  "type": "string"
+                },
+                "owner_pid": {
+                  "minimum": 0,
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
+                },
+                "target": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "pid": {
+                      "minimum": 0,
+                      "type": "integer"
+                    },
+                    "window_id": {
+                      "minimum": 0,
+                      "type": "integer"
+                    }
+                  },
+                  "required": [
+                    "pid",
+                    "window_id"
+                  ],
+                  "type": [
+                    "object",
+                    "null"
+                  ]
+                },
+                "title": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "window_id": {
+                  "minimum": 0,
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
+                }
+              },
+              "required": [
+                "kind"
+              ],
+              "type": "object"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "opened_surfaces_status": {
+            "anyOf": [
+              {
+                "oneOf": [
+                  {
+                    "enum": [
+                      "not_checked"
+                    ],
+                    "type": "string"
+                  },
+                  {
+                    "const": "observed",
+                    "type": "string"
+                  },
+                  {
+                    "const": "partial",
+                    "type": "string"
+                  },
+                  {
+                    "const": "unavailable",
+                    "type": "string"
+                  }
+                ]
+              },
+              {
+                "type": "null"
+              }
             ]
           },
           "point": {
@@ -5044,6 +5649,127 @@
               "null"
             ]
           },
+          "opened_surfaces": {
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "bounds": {
+                  "properties": {
+                    "height": {
+                      "type": "number"
+                    },
+                    "width": {
+                      "type": "number"
+                    },
+                    "x": {
+                      "type": "number"
+                    },
+                    "y": {
+                      "type": "number"
+                    }
+                  },
+                  "required": [
+                    "x",
+                    "y",
+                    "width",
+                    "height"
+                  ],
+                  "type": [
+                    "object",
+                    "null"
+                  ]
+                },
+                "kind": {
+                  "enum": [
+                    "menu",
+                    "popover",
+                    "alert",
+                    "sheet",
+                    "unknown"
+                  ],
+                  "type": "string"
+                },
+                "owner_pid": {
+                  "minimum": 0,
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
+                },
+                "target": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "pid": {
+                      "minimum": 0,
+                      "type": "integer"
+                    },
+                    "window_id": {
+                      "minimum": 0,
+                      "type": "integer"
+                    }
+                  },
+                  "required": [
+                    "pid",
+                    "window_id"
+                  ],
+                  "type": [
+                    "object",
+                    "null"
+                  ]
+                },
+                "title": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "window_id": {
+                  "minimum": 0,
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
+                }
+              },
+              "required": [
+                "kind"
+              ],
+              "type": "object"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "opened_surfaces_status": {
+            "anyOf": [
+              {
+                "oneOf": [
+                  {
+                    "enum": [
+                      "not_checked"
+                    ],
+                    "type": "string"
+                  },
+                  {
+                    "const": "observed",
+                    "type": "string"
+                  },
+                  {
+                    "const": "partial",
+                    "type": "string"
+                  },
+                  {
+                    "const": "unavailable",
+                    "type": "string"
+                  }
+                ]
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "point": {
             "additionalProperties": false,
             "properties": {
@@ -5483,6 +6209,127 @@
             "type": [
               "string",
               "null"
+            ]
+          },
+          "opened_surfaces": {
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "bounds": {
+                  "properties": {
+                    "height": {
+                      "type": "number"
+                    },
+                    "width": {
+                      "type": "number"
+                    },
+                    "x": {
+                      "type": "number"
+                    },
+                    "y": {
+                      "type": "number"
+                    }
+                  },
+                  "required": [
+                    "x",
+                    "y",
+                    "width",
+                    "height"
+                  ],
+                  "type": [
+                    "object",
+                    "null"
+                  ]
+                },
+                "kind": {
+                  "enum": [
+                    "menu",
+                    "popover",
+                    "alert",
+                    "sheet",
+                    "unknown"
+                  ],
+                  "type": "string"
+                },
+                "owner_pid": {
+                  "minimum": 0,
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
+                },
+                "target": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "pid": {
+                      "minimum": 0,
+                      "type": "integer"
+                    },
+                    "window_id": {
+                      "minimum": 0,
+                      "type": "integer"
+                    }
+                  },
+                  "required": [
+                    "pid",
+                    "window_id"
+                  ],
+                  "type": [
+                    "object",
+                    "null"
+                  ]
+                },
+                "title": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "window_id": {
+                  "minimum": 0,
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
+                }
+              },
+              "required": [
+                "kind"
+              ],
+              "type": "object"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "opened_surfaces_status": {
+            "anyOf": [
+              {
+                "oneOf": [
+                  {
+                    "enum": [
+                      "not_checked"
+                    ],
+                    "type": "string"
+                  },
+                  {
+                    "const": "observed",
+                    "type": "string"
+                  },
+                  {
+                    "const": "partial",
+                    "type": "string"
+                  },
+                  {
+                    "const": "unavailable",
+                    "type": "string"
+                  }
+                ]
+              },
+              {
+                "type": "null"
+              }
             ]
           },
           "point": {
@@ -6299,6 +7146,127 @@
               "null"
             ]
           },
+          "opened_surfaces": {
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "bounds": {
+                  "properties": {
+                    "height": {
+                      "type": "number"
+                    },
+                    "width": {
+                      "type": "number"
+                    },
+                    "x": {
+                      "type": "number"
+                    },
+                    "y": {
+                      "type": "number"
+                    }
+                  },
+                  "required": [
+                    "x",
+                    "y",
+                    "width",
+                    "height"
+                  ],
+                  "type": [
+                    "object",
+                    "null"
+                  ]
+                },
+                "kind": {
+                  "enum": [
+                    "menu",
+                    "popover",
+                    "alert",
+                    "sheet",
+                    "unknown"
+                  ],
+                  "type": "string"
+                },
+                "owner_pid": {
+                  "minimum": 0,
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
+                },
+                "target": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "pid": {
+                      "minimum": 0,
+                      "type": "integer"
+                    },
+                    "window_id": {
+                      "minimum": 0,
+                      "type": "integer"
+                    }
+                  },
+                  "required": [
+                    "pid",
+                    "window_id"
+                  ],
+                  "type": [
+                    "object",
+                    "null"
+                  ]
+                },
+                "title": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "window_id": {
+                  "minimum": 0,
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
+                }
+              },
+              "required": [
+                "kind"
+              ],
+              "type": "object"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "opened_surfaces_status": {
+            "anyOf": [
+              {
+                "oneOf": [
+                  {
+                    "enum": [
+                      "not_checked"
+                    ],
+                    "type": "string"
+                  },
+                  {
+                    "const": "observed",
+                    "type": "string"
+                  },
+                  {
+                    "const": "partial",
+                    "type": "string"
+                  },
+                  {
+                    "const": "unavailable",
+                    "type": "string"
+                  }
+                ]
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "point": {
             "additionalProperties": false,
             "properties": {
@@ -7109,6 +8077,127 @@
             "type": [
               "string",
               "null"
+            ]
+          },
+          "opened_surfaces": {
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "bounds": {
+                  "properties": {
+                    "height": {
+                      "type": "number"
+                    },
+                    "width": {
+                      "type": "number"
+                    },
+                    "x": {
+                      "type": "number"
+                    },
+                    "y": {
+                      "type": "number"
+                    }
+                  },
+                  "required": [
+                    "x",
+                    "y",
+                    "width",
+                    "height"
+                  ],
+                  "type": [
+                    "object",
+                    "null"
+                  ]
+                },
+                "kind": {
+                  "enum": [
+                    "menu",
+                    "popover",
+                    "alert",
+                    "sheet",
+                    "unknown"
+                  ],
+                  "type": "string"
+                },
+                "owner_pid": {
+                  "minimum": 0,
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
+                },
+                "target": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "pid": {
+                      "minimum": 0,
+                      "type": "integer"
+                    },
+                    "window_id": {
+                      "minimum": 0,
+                      "type": "integer"
+                    }
+                  },
+                  "required": [
+                    "pid",
+                    "window_id"
+                  ],
+                  "type": [
+                    "object",
+                    "null"
+                  ]
+                },
+                "title": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "window_id": {
+                  "minimum": 0,
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
+                }
+              },
+              "required": [
+                "kind"
+              ],
+              "type": "object"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "opened_surfaces_status": {
+            "anyOf": [
+              {
+                "oneOf": [
+                  {
+                    "enum": [
+                      "not_checked"
+                    ],
+                    "type": "string"
+                  },
+                  {
+                    "const": "observed",
+                    "type": "string"
+                  },
+                  {
+                    "const": "partial",
+                    "type": "string"
+                  },
+                  {
+                    "const": "unavailable",
+                    "type": "string"
+                  }
+                ]
+              },
+              {
+                "type": "null"
+              }
             ]
           },
           "point": {

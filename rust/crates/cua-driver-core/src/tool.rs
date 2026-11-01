@@ -4264,6 +4264,86 @@ mod runtime_isolation_tests {
         hits: Arc<AtomicUsize>,
     }
 
+    struct OpenedSurfaceProbe {
+        def: super::ToolDef,
+    }
+
+    #[async_trait::async_trait]
+    impl super::Tool for OpenedSurfaceProbe {
+        fn def(&self) -> &super::ToolDef {
+            &self.def
+        }
+        async fn invoke(&self, args: serde_json::Value) -> ToolResult {
+            use crate::action_record::{
+                ActionEffect, ActionExecutionRecord, ActionTransport, RequestedDelivery,
+            };
+            let mut record = ActionExecutionRecord::new(
+                ActionEffect::Unverifiable,
+                ActionTransport::MacosAxAction,
+                RequestedDelivery::Background,
+            );
+            record.opened_surfaces_status = args
+                .get("status")
+                .map(|v| serde_json::from_value(v.clone()).unwrap());
+            record.opened_surfaces = args
+                .get("surfaces")
+                .map(|v| serde_json::from_value(v.clone()).unwrap());
+            ToolResult::text("test").with_action_record(record)
+        }
+    }
+
+    #[tokio::test]
+    async fn opened_surfaces_reach_mcp_from_registry() {
+        use serde_json::json;
+        let mut registry = super::ToolRegistry::new();
+        registry.register(Box::new(OpenedSurfaceProbe {
+            def: super::ToolDef {
+                name: "click".into(),
+                description: "test".into(),
+                input_schema: json!({"type":"object"}),
+                read_only: false,
+                destructive: false,
+                idempotent: false,
+                open_world: false,
+            },
+        }));
+        for input in [
+            json!({"status":"observed", "surfaces":[{"kind":"menu", "owner_pid":7}]}),
+            json!({"status":"observed", "surfaces":[]}),
+            json!({"status":"unavailable"}),
+            json!({}),
+        ] {
+            let result = registry
+                .invoke_with_context("click", input.clone(), unrestricted_context())
+                .await;
+            let wire = crate::mcp_result::conforming_tool_result(
+                "click",
+                serde_json::to_value(result).unwrap(),
+            );
+            assert_ne!(wire["isError"], true, "{wire}");
+            let structured = &wire["structuredContent"];
+            assert_eq!(
+                structured.get("opened_surfaces_status"),
+                input.get("status"),
+                "{wire}"
+            );
+            assert_eq!(
+                structured.get("opened_surfaces"),
+                input.get("surfaces"),
+                "{wire}"
+            );
+        }
+        for input in [
+            json!({"status":"observed"}),
+            json!({"status":"unavailable", "surfaces":[{"kind":"menu"}]}),
+        ] {
+            let result = registry
+                .invoke_with_context("click", input, unrestricted_context())
+                .await;
+            assert_eq!(result.is_error, Some(true));
+        }
+    }
+
     #[async_trait::async_trait]
     impl super::Tool for DispositionProbe {
         fn def(&self) -> &super::ToolDef {
