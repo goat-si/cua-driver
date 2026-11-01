@@ -99,6 +99,13 @@ def main():
                     failures.append(f"live call during {current}: {match.group(2).strip()}")
     if failures:
         print("FAILED:\n" + "\n".join(failures))
+        if args.mode == "default":
+            # What libtest said, without the probe's lines: the failing tests
+            # and their panics, or the tail when the binary died early.
+            text = re.sub(r"LIVECALL [^\n]*", "", result.stdout)
+            start = text.find("\nfailures:\n")
+            print("--- libtest output ---")
+            print(text[start:] if start >= 0 else text[-6000:])
         sys.exit(1)
     print("ok")
 
