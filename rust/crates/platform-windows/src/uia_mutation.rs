@@ -23,16 +23,10 @@ pub(crate) enum WriteVerdict {
 }
 
 pub(crate) fn classify_write_hresult(hresult: i32) -> WriteVerdict {
-    use RefusalKind::*;
     use UncertainKind::*;
     use WriteVerdict::*;
     match hresult as u32 {
         0 => Delivered,
-        0x8004_0204 => AffordanceAbsent,
-        0x8007_0005 => Refused(AccessDenied),
-        0x8004_0201 => Refused(ElementUnavailable),
-        0x8007_0057 => Refused(InvalidArgument),
-        0x8004_0200 => Refused(NotEnabled),
         0x8001_0105 | 0x8001_0108 | 0x8007_06ba | 0x8007_06be => Uncertain(Transport),
         0x8013_1505 => Uncertain(Timeout),
         _ => Uncertain(Unclassified),
@@ -270,18 +264,9 @@ fn mutation_route(completed: usize, stop: Option<MutationStop>) -> MutationRoute
     match stop {
         None => Done,
         Some(MutationStop::WorkerFailed) => Uncertain,
-        Some(MutationStop::Write(hr))
-            if matches!(classify_write_hresult(hr), WriteVerdict::Uncertain(_)) =>
-        {
-            Uncertain
-        }
+        Some(MutationStop::Write(_)) => Uncertain,
         Some(_) if completed > 0 => Partial,
         Some(MutationStop::Absent) => FallThrough,
-        Some(MutationStop::Write(hr))
-            if matches!(classify_write_hresult(hr), WriteVerdict::AffordanceAbsent) =>
-        {
-            FallThrough
-        }
         Some(_) => Refused,
     }
 }

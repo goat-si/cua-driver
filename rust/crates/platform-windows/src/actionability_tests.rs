@@ -382,11 +382,9 @@ fn value_notsupported_only_calls_admitted_range() {
             calls.fetch_add(1, Ordering::SeqCst);
             RungOutcome::Called(0)
         });
-        assert_eq!(calls.load(Ordering::SeqCst), usize::from(range_allowed));
-        assert_eq!(refused, !range_allowed);
-        if range_allowed {
-            assert_eq!(decision, SetValueDecision::Delivered { rung: 1 });
-        }
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert!(!refused);
+        assert!(matches!(decision, SetValueDecision::Uncertain { rung: 0, .. }));
     }
 }
 #[test]
@@ -450,7 +448,7 @@ fn changed_patterns_never_call_an_unadmitted_rung() {
             },
             true,
             1,
-            1,
+            0,
         ),
     ] {
         let values = AtomicUsize::new(0);

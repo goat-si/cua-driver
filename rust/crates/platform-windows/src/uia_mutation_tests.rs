@@ -7,16 +7,15 @@ const DENIED: i32 = 0x8007_0005_u32 as i32;
 
 #[test]
 fn classification_table() {
-    use RefusalKind::*;
     use UncertainKind::*;
     use WriteVerdict::*;
     for (hr, expected) in [
         (0, Delivered),
-        (NOT_SUPPORTED, AffordanceAbsent),
-        (DENIED, Refused(AccessDenied)),
-        (0x8004_0201_u32 as i32, Refused(ElementUnavailable)),
-        (0x8007_0057_u32 as i32, Refused(InvalidArgument)),
-        (0x8004_0200_u32 as i32, Refused(NotEnabled)),
+        (NOT_SUPPORTED, Uncertain(Unclassified)),
+        (DENIED, Uncertain(Unclassified)),
+        (0x8004_0201_u32 as i32, Uncertain(Unclassified)),
+        (0x8007_0057_u32 as i32, Uncertain(Unclassified)),
+        (0x8004_0200_u32 as i32, Uncertain(Unclassified)),
         (0x8001_0105_u32 as i32, Uncertain(Transport)),
         (0x8001_0108_u32 as i32, Uncertain(Transport)),
         (0x8007_06ba_u32 as i32, Uncertain(Transport)),
@@ -27,13 +26,13 @@ fn classification_table() {
         (-7, Uncertain(Unclassified)),
     ] {
         assert_eq!(classify_write_hresult(hr), expected, "{hr:#x}");
-        assert_eq!(may_fall_through(&expected), hr == NOT_SUPPORTED);
+        assert!(!may_fall_through(&expected));
     }
 }
 
 #[test]
 fn chain_stops_after_refusal_or_uncertainty() {
-    for hr in [DENIED, TIMEOUT] {
+    for hr in [DENIED, TIMEOUT, NOT_SUPPORTED, 1] {
         let calls = Cell::new(0);
         let result = run_rungs(vec![
             Box::new(|| RungOutcome::Called(hr)),
@@ -45,40 +44,26 @@ fn chain_stops_after_refusal_or_uncertainty() {
         assert_eq!(calls.get(), 0);
         assert!(matches!(
             result,
-            ChainOutcome::Refused { rung: 0, .. } | ChainOutcome::Uncertain { rung: 0, .. }
+            ChainOutcome::Uncertain { rung: 0, .. }
         ));
     }
 }
 
 #[test]
 fn chain_journals_only_called_not_supported() {
+    let calls = Cell::new(0);
     let result = run_rungs(vec![
         Box::new(|| RungOutcome::Absent),
         Box::new(|| RungOutcome::Called(NOT_SUPPORTED)),
-        Box::new(|| RungOutcome::Called(0)),
+        Box::new(|| { calls.set(1); RungOutcome::Called(0) }),
     ]);
-    assert_eq!(
-        result,
-        ChainOutcome::Delivered {
-            rung: 2,
-            not_supported_calls: vec![1]
-        }
-    );
-    let absent = run_rungs(vec![
-        Box::new(|| RungOutcome::Absent),
-        Box::new(|| RungOutcome::Called(NOT_SUPPORTED)),
-    ]);
-    assert_eq!(
-        absent,
-        ChainOutcome::NoAffordance {
-            not_supported_calls: vec![1]
-        }
-    );
+    assert_eq!(calls.get(), 0);
+    assert!(matches!(result, ChainOutcome::Uncertain { rung: 1, .. }));
 }
 
 #[test]
 fn value_route_never_calls_range_after_uncertain_or_refused() {
-    for hr in [DENIED, TIMEOUT] {
+    for hr in [DENIED, TIMEOUT, NOT_SUPPORTED, 1] {
         let calls = Cell::new(0);
         let decision = set_value_route(RungOutcome::Called(hr), || {
             calls.set(1);
@@ -87,19 +72,17 @@ fn value_route_never_calls_range_after_uncertain_or_refused() {
         assert_eq!(calls.get(), 0);
         assert!(matches!(
             decision,
-            SetValueDecision::Refused { rung: 0, .. } | SetValueDecision::Uncertain { rung: 0, .. }
+            SetValueDecision::Uncertain { rung: 0, .. }
         ));
     }
-    assert_eq!(
-        set_value_route(RungOutcome::Called(NOT_SUPPORTED), || RungOutcome::Called(
-            0
-        )),
-        SetValueDecision::Delivered { rung: 1 }
-    );
-    assert_eq!(
+    assert!(matches!(
+        set_value_route(RungOutcome::Called(NOT_SUPPORTED), || RungOutcome::Called(0)),
+        SetValueDecision::Uncertain { rung: 0, .. }
+    ));
+    assert!(matches!(
         set_value_route(RungOutcome::Absent, || RungOutcome::Called(NOT_SUPPORTED)),
-        SetValueDecision::NoAffordance
-    );
+        SetValueDecision::Uncertain { rung: 1, .. }
+    ));
 }
 
 #[test]
@@ -171,9 +154,9 @@ fn last_range_write_is_classified_and_all_absent_is_terminal() {
     );
     assert_eq!(
         set_value_route(RungOutcome::Absent, || RungOutcome::Called(DENIED)),
-        SetValueDecision::Refused {
+        SetValueDecision::Uncertain {
             rung: 1,
-            kind: RefusalKind::AccessDenied,
+            kind: UncertainKind::Unclassified,
             hresult: DENIED
         }
     );
@@ -237,10 +220,10 @@ fn scroll_route_stops_on_uncertain_or_partial_and_worker_failure() {
     use MutationRoute::*;
     use MutationStop::*;
     assert_eq!(scroll_route(0, Some(Write(TIMEOUT))), Uncertain);
-    assert_eq!(scroll_route(1, Some(Write(DENIED))), Partial);
+    assert_eq!(scroll_route(1, Some(Write(DENIED))), Uncertain);
     assert_eq!(scroll_route(0, Some(WorkerFailed)), Uncertain);
     assert_eq!(scroll_route(0, Some(AcquireFailed(TIMEOUT))), Refused);
-    assert_eq!(scroll_route(0, Some(Write(NOT_SUPPORTED))), FallThrough);
+    assert_eq!(scroll_route(0, Some(Write(NOT_SUPPORTED))), Uncertain);
     assert_eq!(scroll_route(0, Some(Absent)), FallThrough);
     assert_eq!(scroll_route(2, None), Done);
 }
@@ -248,14 +231,14 @@ fn scroll_route_stops_on_uncertain_or_partial_and_worker_failure() {
 fn multi_invoke_route_preserves_partial_and_worker_failure() {
     use MutationRoute::*;
     use MutationStop::*;
-    assert_eq!(multi_invoke_route(1, Some(Write(DENIED))), Partial);
+    assert_eq!(multi_invoke_route(1, Some(Write(DENIED))), Uncertain);
     assert_eq!(multi_invoke_route(0, Some(WorkerFailed)), Uncertain);
     assert_eq!(multi_invoke_route(0, Some(Write(TIMEOUT))), Uncertain);
     assert_eq!(multi_invoke_route(0, Some(AcquireFailed(TIMEOUT))), Refused);
-    assert_eq!(multi_invoke_route(0, Some(Write(DENIED))), Refused);
+    assert_eq!(multi_invoke_route(0, Some(Write(DENIED))), Uncertain);
     assert_eq!(
         multi_invoke_route(0, Some(Write(NOT_SUPPORTED))),
-        FallThrough
+        Uncertain
     );
     assert_eq!(multi_invoke_route(2, None), Done);
 }
@@ -324,11 +307,11 @@ fn scroll_preflight_rejects_bad_direction_before_com_acquisition() {
 fn expand_route_classifies_all_terminal_results() {
     use MutationRoute::*;
     assert_eq!(expand_route(RungOutcome::Called(TIMEOUT)), Uncertain);
-    assert_eq!(expand_route(RungOutcome::Called(DENIED)), Refused);
+    assert_eq!(expand_route(RungOutcome::Called(DENIED)), Uncertain);
     assert_eq!(expand_route(RungOutcome::AcquireFailed(TIMEOUT)), Refused);
     assert_eq!(
         expand_route(RungOutcome::Called(NOT_SUPPORTED)),
-        FallThrough
+        Uncertain
     );
     assert_eq!(expand_route(RungOutcome::Absent), FallThrough);
     assert_eq!(expand_route(RungOutcome::Called(0)), Done);
