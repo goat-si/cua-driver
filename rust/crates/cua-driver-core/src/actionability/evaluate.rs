@@ -120,22 +120,22 @@ pub fn evaluate(intent: Intent<'_>, facts: &ElementFacts, policy: Policy) -> Act
         !keyboard && !(without_pointer && (semantic_pointer || requirements.editable));
     if requirements.visible {
         gate(&mut checks, "visible", &facts.visible, false);
+        match &facts.offscreen {
+            Evidence::Known(true) => push(
+                &mut checks,
+                "offscreen",
+                CheckStatus::Transient { unknown: false },
+                "target is offscreen",
+            ),
+            Evidence::Unknown(reason) => push(
+                &mut checks,
+                "offscreen",
+                CheckStatus::Transient { unknown: true },
+                reason,
+            ),
+            Evidence::Known(false) | Evidence::Absent => {}
+        }
         if !matches!(intent, Open | SelectText | PerformAction { .. }) {
-            match &facts.offscreen {
-                Evidence::Known(true) => push(
-                    &mut checks,
-                    "offscreen",
-                    CheckStatus::Transient { unknown: false },
-                    "target is offscreen",
-                ),
-                Evidence::Unknown(reason) => push(
-                    &mut checks,
-                    "offscreen",
-                    CheckStatus::Transient { unknown: true },
-                    reason,
-                ),
-                Evidence::Known(false) | Evidence::Absent => {}
-            }
             match &facts.bounds {
                 Evidence::Known(r) if !r.valid() => push(
                     &mut checks,

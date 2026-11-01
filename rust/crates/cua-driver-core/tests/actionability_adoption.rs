@@ -79,6 +79,27 @@ fn new_semantic_intents_require_positive_advertisement_and_live_state() {
 }
 
 #[test]
+fn semantic_intents_do_not_ignore_explicit_offscreen_state() {
+    for intent in [
+        Intent::Open,
+        Intent::SelectText,
+        Intent::PerformAction { name: "AXCustom" },
+    ] {
+        let mut f = facts();
+        f.offscreen = Evidence::Known(true);
+        assert!(matches!(
+            evaluate(intent, &f, Policy::headless()).verdict,
+            Verdict::Transient { unknown: false, .. }
+        ));
+        f.offscreen = Evidence::Unknown("window state".into());
+        assert!(matches!(
+            evaluate(intent, &f, Policy::headless()).verdict,
+            Verdict::Transient { unknown: true, .. }
+        ));
+    }
+}
+
+#[test]
 fn background_pointer_uses_window_hit_evidence_and_all_gates() {
     let mut f = facts();
     assert_eq!(
