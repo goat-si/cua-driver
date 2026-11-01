@@ -163,7 +163,7 @@ pub(crate) async fn check(
 }
 
 async fn check_with<F>(
-    _tool: &str,
+    tool: &str,
     args: &Value,
     points: Vec<(f64, f64)>,
     protection: Option<ToolResult>,
@@ -179,10 +179,13 @@ where
     if delivery.is_foreground() {
         return None;
     }
-    tokio::task::spawn_blocking(move || user_window_check(points, delivery))
-        .await
-        .ok()
-        .flatten()
+    match tokio::task::spawn_blocking(move || user_window_check(points, delivery)).await {
+        Ok(refusal) => refusal,
+        Err(_) => Some(super::pre_dispatch_refusal(
+            "background_unavailable",
+            format!("{tool} was refused: the user-window protection check could not complete. Nothing was sent."),
+        )),
+    }
 }
 
 /// A browser holding an origin-scoped attachment is reachable only through
