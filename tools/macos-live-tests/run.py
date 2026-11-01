@@ -20,10 +20,13 @@ SRC = ROOT / "rust" / "crates" / "platform-macos" / "src"
 MARKER = re.compile(
     r'#\[ignore\s*=\s*"live:[^"]*"\]\s*\n(?:\s*#\[[^\n]*\]\s*\n)*\s*(?:pub(?:\([^)]*\))?\s+)?(?:async\s+)?fn\s+(\w+)\s*\('
 )
-# Every live attribute, parsed or not: a marker MARKER cannot tie to its fn
-# (a comment or an unusual layout in between) must fail the run instead of
+# Every string literal that starts with "live:", whatever attribute spelling
+# surrounds it: plain or raw strings (r"..", r#".."#), spaces after # or
+# inside the brackets or quotes, cfg_attr. Each one must be a canonical
+# marker that MARKER ties to its fn; anything else (a comment or an unusual
+# layout before the fn, a non-canonical spelling) fails the run instead of
 # silently dropping that test from the lane.
-ANY_LIVE = re.compile(r'#\[\s*ignore\s*=\s*"live:')
+ANY_LIVE = re.compile(r'"\s*live:')
 
 
 def marked_fns(failures):
@@ -34,8 +37,9 @@ def marked_fns(failures):
         attributes = len(ANY_LIVE.findall(source))
         if attributes != len(found):
             failures.append(
-                f"{path.relative_to(ROOT)}: {attributes} live attributes but only {len(found)} "
-                "tied to a fn; put the fn (or other attributes) directly after each marker"
+                f"{path.relative_to(ROOT)}: {attributes} \"live:\" literals but only {len(found)} "
+                'canonical markers tied to a fn; write each as #[ignore = "live: ..."] '
+                "with the fn (or other attributes) directly after it"
             )
         names += found
     return names
