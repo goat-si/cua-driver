@@ -46,6 +46,9 @@ mod popup_route_tests;
 #[cfg(test)]
 #[path = "set_value/u32_outcome_tests.rs"]
 mod u32_outcome_tests;
+#[cfg(test)]
+#[path = "set_value/u32_popup_outcome_tests.rs"]
+mod u32_popup_outcome_tests;
 
 use super::ToolState;
 
@@ -2415,19 +2418,26 @@ fn select_popup_option(
         }
         let mut env = unsafe { popup_ownership::NativePopupEnv::new(element) };
         let outcome = popup_ownership::select(&mut env, value);
-        let outcome = match outcome {
-            popup_ownership::PopupOutcome::Refused {
-                reason,
-                preexisting,
-            } if prior_input => popup_ownership::PopupOutcome::SentUnverified {
-                reason,
-                preexisting,
-                close: None,
-            },
-            other => other,
-        };
+        let outcome = popup_after_prior(outcome, prior_input);
         Err(popup_ownership::PopupError(outcome).into())
     })
+}
+
+fn popup_after_prior(
+    outcome: popup_ownership::PopupOutcome,
+    prior_input: bool,
+) -> popup_ownership::PopupOutcome {
+    match outcome {
+        popup_ownership::PopupOutcome::Refused {
+            reason,
+            preexisting,
+        } if prior_input => popup_ownership::PopupOutcome::SentUnverified {
+            reason,
+            preexisting,
+            close: None,
+        },
+        other => other,
+    }
 }
 
 #[cfg(test)]
