@@ -132,6 +132,9 @@ static void try_all(void) {
 }
 static void on_image(const struct mach_header *mh, intptr_t s) { try_all(); }
 __attribute__((constructor)) static void setup(void) {
+  /* Observe this process only: child processes the tests start (sh, lsof,
+   * sw_vers) must run without the probe. */
+  unsetenv("DYLD_INSERT_LIBRARIES");
   _dyld_register_func_for_add_image(on_image);
   try_all();
   live_log("PROBE_READY", 0);
