@@ -756,6 +756,23 @@ fn parse_loopback_lsof_ports(text: &str) -> Vec<u16> {
     ports
 }
 
+type LsofOutcome = Result<Vec<u16>, BrowserRefusal>;
+
+fn lsof_outcome(_status_code: Option<i32>, stdout: &[u8], _stderr: &[u8]) -> LsofOutcome {
+    Ok(parse_loopback_lsof_ports(&String::from_utf8_lossy(stdout)))
+}
+
+#[cfg(test)]
+mod lsof_outcome_tests {
+    use super::*;
+
+    #[test]
+    fn exit_zero_parses() {
+        let result = lsof_outcome(Some(0), b"n127.0.0.1:9222\n", b"warning");
+        assert_eq!(result.unwrap(), vec![9222]);
+    }
+}
+
 async fn loopback_ports_for_pid(pid: i64) -> Result<Vec<u16>, BrowserRefusal> {
     let output = tokio::process::Command::new("lsof")
         .args([
@@ -781,9 +798,7 @@ async fn loopback_ports_for_pid(pid: i64) -> Result<Vec<u16>, BrowserRefusal> {
                 &error,
             )
         })?;
-    Ok(parse_loopback_lsof_ports(&String::from_utf8_lossy(
-        &output.stdout,
-    )))
+    lsof_outcome(output.status.code(), &output.stdout, &output.stderr)
 }
 
 async fn active_port_endpoint(
