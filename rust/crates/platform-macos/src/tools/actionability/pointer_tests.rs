@@ -212,3 +212,36 @@ async fn right_click_owned_cancel_checks_recorded_menu() {
         assert_eq!(result.is_ok(), allowed);
     }
 }
+
+#[tokio::test]
+async fn click_custom_unknown_blocks_action() {
+    let clock = FakeClock::default();
+    let exact = "Name:열기\nTarget:object\nSelector:perform:";
+    for known in [false, true] {
+        let count = AtomicUsize::new(0);
+        let count_ref = &count;
+        let result = super::super::click::dispatch_custom_action(
+            &clock,
+            Duration::ZERO,
+            exact.to_owned(),
+            |name, _| {
+                assert_eq!(name, exact);
+                let mut f = facts();
+                f.advertised_actions = if known {
+                    Evidence::Known(vec![exact.into()])
+                } else {
+                    Evidence::Unknown("actions unavailable".into())
+                };
+                let report = evaluate(Intent::PerformAction { name }, Policy::headless(), &f);
+                Box::pin(async move { report })
+            },
+            |name| async move {
+                assert_eq!(name, exact);
+                count_ref.fetch_add(1, Ordering::SeqCst);
+                success()
+            },
+        ).await;
+        assert_eq!(count.load(Ordering::SeqCst), usize::from(known));
+        assert_eq!(result.is_ok(), known);
+    }
+}
