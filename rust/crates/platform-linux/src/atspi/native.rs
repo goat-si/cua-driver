@@ -13,6 +13,7 @@
 //! ordered set.
 
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
@@ -58,6 +59,8 @@ tokio::task_local! {
 pub struct TextWriteDispatch {
     pub gate: crate::text_write_policy::DispatchGate,
     pub ledger: crate::text_write_policy::DispatchLedger,
+    partial: AtomicBool,
+    step: AtomicU8,
 }
 
 fn write_timeout_result<T>(
@@ -66,14 +69,22 @@ fn write_timeout_result<T>(
     fallback: impl FnOnce() -> Result<T>,
 ) -> Result<T> {
     if dispatch.gate.close_on_timeout() {
-        Err(WriteUncertain {
-            step: crate::text_write_policy::WriteStep {
-                step: crate::text_write_policy::Step::InsertText,
-                bytes,
-                units: None,
+        let step = crate::text_write_policy::WriteStep {
+            step: match dispatch.step.load(Ordering::SeqCst) {
+                1 => crate::text_write_policy::Step::SetText,
+                2 => crate::text_write_policy::Step::DeleteText,
+                4 => crate::text_write_policy::Step::Commit,
+                5 => crate::text_write_policy::Step::SetValue,
+                _ => crate::text_write_policy::Step::InsertText,
             },
+            bytes,
+            units: None,
+        };
+        if dispatch.partial.load(Ordering::SeqCst) {
+            Err(WritePartial { step }.into())
+        } else {
+            Err(WriteUncertain { step }.into())
         }
-        .into())
     } else {
         fallback()
     }
@@ -3114,6 +3125,18 @@ impl std::fmt::Display for WriteUncertain {
 impl std::error::Error for WriteUncertain {}
 
 #[derive(Debug)]
+pub struct WritePartial {
+    pub step: crate::text_write_policy::WriteStep,
+}
+
+impl std::fmt::Display for WritePartial {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "AT-SPI write partly changed the field: {:?}", self.step)
+    }
+}
+impl std::error::Error for WritePartial {}
+
+#[derive(Debug)]
 struct WriteDispatchClosed;
 
 impl std::fmt::Display for WriteDispatchClosed {
@@ -3584,6 +3607,16 @@ mod write_timeout_tests {
         let dispatch = TextWriteDispatch::default();
         assert!(!write_timeout_result(&dispatch, 3, || Ok(false)).unwrap());
         assert!(dispatch.gate.enter_mutator().is_err());
+    }
+
+    #[test]
+    fn timeout_after_acknowledged_delete_is_partial() {
+        let dispatch = TextWriteDispatch::default();
+        dispatch.gate.enter_mutator().unwrap();
+        dispatch.partial.store(true, Ordering::SeqCst);
+        let error = write_timeout_result(&dispatch, 3, || Ok(false)).unwrap_err();
+        assert!(error.downcast_ref::<WritePartial>().is_some());
+        assert!(!format!("{error:?}").contains("abc"));
     }
 }
 
@@ -5869,16 +5902,226 @@ pub fn is_no_value_route(error: &anyhow::Error) -> bool {
 /// A spin button / spin scale only parses its entry text on activate (Return
 /// or focus-out); after an EditableText write, fire the element's `activate`
 /// action when it exposes one so the numeric value commits. Best effort.
-async fn commit_editable_write(proxies: &atspi::proxy::proxy_ext::Proxies<'_>) {
+async fn commit_editable_write(
+    proxies: &atspi::proxy::proxy_ext::Proxies<'_>,
+) -> crate::text_write_policy::MutationReply {
+    use crate::text_write_policy::{CallClass, MutationResult};
     let Some(Ok(ap)) = call(proxies.action()).await else {
-        return;
+        return Ok(MutationResult::Acknowledged);
     };
     let names = action_names(&ap).await;
     if let Some(index) = names
         .iter()
         .position(|name| normalized_action_verb(name) == "activate")
     {
-        let _ = call(ap.do_action(index as i32)).await;
+        return match call(ap.do_action(index as i32)).await {
+            Some(Ok(true)) => Ok(MutationResult::Acknowledged),
+            Some(Ok(false)) => Ok(MutationResult::Refused),
+            Some(Err(error)) => Err(classify_mutator_error(&error)),
+            None => Err(CallClass::PossiblyExecuted),
+        };
+    }
+    Ok(MutationResult::Acknowledged)
+}
+
+struct NativeEditableOps<'a> {
+    proxies: atspi::proxy::proxy_ext::Proxies<'a>,
+    editable: atspi::proxy::editable_text::EditableTextProxy<'a>,
+    dispatch: Arc<TextWriteDispatch>,
+}
+
+impl NativeEditableOps<'_> {
+    fn mutation(
+        &self,
+        future: impl std::future::Future<Output = zbus::Result<bool>>,
+    ) -> crate::text_write_policy::MutationReply {
+        use crate::text_write_policy::{CallClass, MutationResult};
+        match runtime().block_on(call(future)) {
+            Some(Ok(true)) => Ok(MutationResult::Acknowledged),
+            Some(Ok(false)) => Ok(MutationResult::Refused),
+            Some(Err(error)) => Err(classify_mutator_error(&error)),
+            None => Err(CallClass::PossiblyExecuted),
+        }
+    }
+}
+
+impl crate::text_write_policy::EditableOps for NativeEditableOps<'_> {
+    fn caret(&mut self) -> std::result::Result<i32, crate::text_write_policy::CallClass> {
+        runtime().block_on(async {
+            let text = call(self.proxies.text())
+                .await
+                .and_then(Result::ok)
+                .ok_or(crate::text_write_policy::CallClass::PreDispatchUnavailable)?;
+            call(text.caret_offset())
+                .await
+                .and_then(Result::ok)
+                .ok_or(crate::text_write_policy::CallClass::PreDispatchUnavailable)
+        })
+    }
+    fn character_count(&mut self) -> std::result::Result<i32, crate::text_write_policy::CallClass> {
+        runtime().block_on(async {
+            let text = call(self.proxies.text())
+                .await
+                .and_then(Result::ok)
+                .ok_or(crate::text_write_policy::CallClass::PreDispatchUnavailable)?;
+            call(text.character_count())
+                .await
+                .and_then(Result::ok)
+                .ok_or(crate::text_write_policy::CallClass::PreDispatchUnavailable)
+        })
+    }
+    fn validate_insert(&mut self) -> std::result::Result<(), crate::text_write_policy::CallClass> {
+        Ok(())
+    }
+    fn set_text(&mut self, text: &str) -> crate::text_write_policy::MutationReply {
+        self.dispatch.step.store(1, Ordering::SeqCst);
+        self.mutation(self.editable.set_text_contents(text))
+    }
+    fn delete_text(&mut self, start: i32, end: i32) -> crate::text_write_policy::MutationReply {
+        self.dispatch.step.store(2, Ordering::SeqCst);
+        let result = self.mutation(self.editable.delete_text(start, end));
+        if result == Ok(crate::text_write_policy::MutationResult::Acknowledged) {
+            self.dispatch.partial.store(true, Ordering::SeqCst);
+        }
+        result
+    }
+    fn insert_text(
+        &mut self,
+        offset: i32,
+        text: &str,
+        length: i32,
+    ) -> crate::text_write_policy::MutationReply {
+        self.dispatch.step.store(3, Ordering::SeqCst);
+        let result = self.mutation(self.editable.insert_text(offset, text, length));
+        if result == Ok(crate::text_write_policy::MutationResult::Acknowledged) {
+            self.dispatch.partial.store(false, Ordering::SeqCst);
+        }
+        result
+    }
+    fn commit(&mut self) -> crate::text_write_policy::MutationReply {
+        self.dispatch.step.store(4, Ordering::SeqCst);
+        runtime().block_on(commit_editable_write(&self.proxies))
+    }
+}
+
+async fn replace_with_policy(
+    acc: &AccessibleProxy<'_>,
+    value: &str,
+) -> Result<crate::text_write_policy::TextWriteOutcome> {
+    let toolkit = editable_toolkit(acc).await;
+    let connection = acc.inner().connection().clone();
+    let destination = acc.inner().destination().to_owned();
+    let path = acc.inner().path().to_owned();
+    let value = value.to_owned();
+    let bytes = value.len();
+    let dispatch = TEXT_DISPATCH.with(Arc::clone);
+    let worker_dispatch = dispatch.clone();
+    let worker = tokio::task::spawn_blocking(move || {
+        let (proxies, editable) = runtime().block_on(async {
+            let acc = AccessibleProxy::builder(&connection)
+                .cache_properties(zbus::proxy::CacheProperties::No)
+                .destination(destination)?
+                .path(path)?
+                .build()
+                .await?;
+            let proxies = acc
+                .proxies()
+                .await
+                .map_err(|e| anyhow!("interface proxies unavailable: {e}"))?;
+            let editable = proxies
+                .editable_text()
+                .await
+                .map_err(|e| anyhow!("EditableText unavailable: {e}"))?;
+            Ok::<_, anyhow::Error>((proxies, editable))
+        })?;
+        let mut ops = NativeEditableOps {
+            proxies,
+            editable,
+            dispatch: worker_dispatch.clone(),
+        };
+        Ok::<_, anyhow::Error>(crate::text_write_policy::replace_route(
+            &mut ops,
+            &value,
+            toolkit,
+            &worker_dispatch.gate,
+            &worker_dispatch.ledger,
+        ))
+    });
+    match worker.await {
+        Ok(result) => result,
+        Err(_) => write_timeout_result(&dispatch, bytes, || {
+            Err(anyhow!("editable worker failed before dispatch"))
+        }),
+    }
+}
+
+#[cfg(test)]
+mod replace_regression_tests {
+    use crate::text_write_policy::{
+        self as policy, CallClass, EditableOps, MutationReply, MutationResult, TextWriteOutcome,
+    };
+
+    struct Fake {
+        fail: bool,
+        calls: Vec<&'static str>,
+    }
+    impl EditableOps for Fake {
+        fn caret(&mut self) -> Result<i32, CallClass> {
+            Ok(5)
+        }
+        fn character_count(&mut self) -> Result<i32, CallClass> {
+            Ok(5)
+        }
+        fn validate_insert(&mut self) -> Result<(), CallClass> {
+            Ok(())
+        }
+        fn set_text(&mut self, _: &str) -> MutationReply {
+            self.calls.push("set");
+            if self.fail {
+                Err(CallClass::PossiblyExecuted)
+            } else {
+                Ok(MutationResult::Refused)
+            }
+        }
+        fn delete_text(&mut self, _: i32, _: i32) -> MutationReply {
+            self.calls.push("delete");
+            Ok(MutationResult::Acknowledged)
+        }
+        fn insert_text(&mut self, _: i32, _: &str, _: i32) -> MutationReply {
+            self.calls.push("insert");
+            Ok(MutationResult::Acknowledged)
+        }
+        fn commit(&mut self) -> MutationReply {
+            self.calls.push("commit");
+            Ok(MutationResult::Acknowledged)
+        }
+    }
+    fn run(fake: &mut Fake) -> TextWriteOutcome {
+        policy::replace_route(
+            fake,
+            "abc",
+            policy::Toolkit::Gtk,
+            &policy::DispatchGate::default(),
+            &policy::DispatchLedger::default(),
+        )
+    }
+    #[test]
+    fn set_error_does_not_insert_or_commit() {
+        let mut fake = Fake {
+            fail: true,
+            calls: vec![],
+        };
+        assert!(matches!(run(&mut fake), TextWriteOutcome::Uncertain { .. }));
+        assert_eq!(fake.calls, ["set"]);
+    }
+    #[test]
+    fn refused_set_must_clear_before_insert() {
+        let mut fake = Fake {
+            fail: false,
+            calls: vec![],
+        };
+        assert_eq!(run(&mut fake), TextWriteOutcome::Acknowledged);
+        assert_eq!(fake.calls, ["set", "delete", "insert", "commit"]);
     }
 }
 
@@ -5896,37 +6139,55 @@ async fn set_value_on(
         .proxies()
         .await
         .map_err(|e| anyhow!("interface proxies unavailable: {e}"))?;
-    if let Ok(et) = proxies.editable_text().await {
-        // Replace whole contents (parity with the Windows/macOS set_value,
-        // which overwrite rather than insert at the caret).
-        if et.set_text_contents(value).await.unwrap_or(false) {
-            commit_editable_write(&proxies).await;
-            return Ok(());
-        }
-        // Some toolkits reject SetTextContents but accept an insert at the
-        // caret offset; clear-then-insert as a fallback.
-        let off = match proxies.text().await {
-            Ok(tp) => tp.caret_offset().await.unwrap_or(0),
-            Err(_) => 0,
-        };
-        let len = value.chars().count() as i32;
-        if et.insert_text(off, value, len).await.unwrap_or(false) {
-            commit_editable_write(&proxies).await;
-            return Ok(());
+    if proxies.editable_text().await.is_ok() {
+        use crate::text_write_policy::{Reason, TextWriteOutcome};
+        match replace_with_policy(acc, value).await? {
+            TextWriteOutcome::Acknowledged => return Ok(()),
+            TextWriteOutcome::Uncertain { step } => return Err(WriteUncertain { step }.into()),
+            TextWriteOutcome::Partial { step } => return Err(WritePartial { step }.into()),
+            TextWriteOutcome::NothingWritten {
+                reason: Reason::GateClosed,
+            } => return Err(WriteDispatchClosed.into()),
+            TextWriteOutcome::NothingWritten { .. } => {}
         }
     }
     if has_value {
         let v: f64 = value
             .parse()
             .map_err(|_| anyhow!("value '{value}' is not numeric for a Value element"))?;
-        proxies
+        if !v.is_finite() {
+            return Err(anyhow!("numeric Value must be finite"));
+        }
+        let value_proxy = proxies
             .value()
             .await
-            .map_err(|e| anyhow!("Value unavailable: {e}"))?
-            .set_current_value(v)
-            .await
-            .map_err(|e| anyhow!("setCurrentValue failed: {e}"))?;
-        return Ok(());
+            .map_err(|e| anyhow!("Value unavailable: {e}"))?;
+        let dispatch = TEXT_DISPATCH.with(Arc::clone);
+        dispatch
+            .gate
+            .enter_mutator()
+            .map_err(|_| WriteDispatchClosed)?;
+        dispatch.ledger.record_sent();
+        dispatch.step.store(5, Ordering::SeqCst);
+        let result = call(value_proxy.set_current_value(v)).await;
+        let classified = if matches!(result, Some(Ok(()))) {
+            Ok(crate::text_write_policy::MutationResult::Acknowledged)
+        } else {
+            Err(crate::text_write_policy::CallClass::PossiblyExecuted)
+        };
+        dispatch.ledger.record_result(classified);
+        dispatch.gate.finish_mutator();
+        return match classified {
+            Ok(_) => Ok(()),
+            Err(_) => Err(WriteUncertain {
+                step: crate::text_write_policy::WriteStep {
+                    step: crate::text_write_policy::Step::SetValue,
+                    bytes: value.len(),
+                    units: None,
+                },
+            }
+            .into()),
+        };
     }
     Err(anyhow!(
         "{NO_VALUE_ROUTE}: {label} exposes neither EditableText nor Value"
@@ -5934,8 +6195,9 @@ async fn set_value_on(
 }
 
 pub fn set_value(pid: u32, idx: usize, value: &str) -> Result<()> {
-    bounded_for(
+    bounded_text_for(
         INDEX_RESOLVE_BUDGET,
+        value,
         async {
             let conn = shared_connection().await?;
             let visited = collect_visited(conn, pid)
@@ -5964,8 +6226,9 @@ pub fn set_value(pid: u32, idx: usize, value: &str) -> Result<()> {
 /// [`set_value`] on a snapshot-cached element identity (the exact object the
 /// caller's `element_index` named, not the same ordinal in a fresh walk).
 pub fn set_value_ref(object_ref: &ObjectRef, value: &str) -> Result<()> {
-    bounded_for(
+    bounded_text_for(
         REF_ACTION_BUDGET,
+        value,
         async {
             let conn = shared_connection().await?;
             let (acc, _) = live_accessible(conn, object_ref).await?;
