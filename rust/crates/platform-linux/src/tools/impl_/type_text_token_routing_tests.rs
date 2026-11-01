@@ -80,6 +80,7 @@ async fn exercise(branch: TypeTextBranch, outcome: TypeTextTestOutcome) {
                 TypeTextTestOutcome::Unknown | TypeTextTestOutcome::Panic => {
                     ("element_write_unacknowledged", "unverifiable")
                 }
+                TypeTextTestOutcome::Partial => ("element_write_partial", "unverifiable"),
                 _ => unreachable!(),
             };
             assert_eq!(fields["code"], code);
@@ -143,3 +144,14 @@ cases!(
     targeted_ok,
     targeted_no_route
 );
+
+#[tokio::test]
+async fn partial_token_writes_stop_on_every_branch() {
+    for branch in [
+        TypeTextBranch::HyprlandForeground,
+        TypeTextBranch::Inject,
+        TypeTextBranch::Targeted,
+    ] {
+        exercise(branch, TypeTextTestOutcome::Partial).await;
+    }
+}

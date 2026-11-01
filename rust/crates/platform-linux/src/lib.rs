@@ -37,6 +37,9 @@ mod x11_client_pid;
 mod atspi_text;
 
 #[cfg(any(target_os = "linux", test))]
+pub mod text_write_policy;
+
+#[cfg(any(target_os = "linux", test))]
 #[cfg(any(feature = "portal-input", test))]
 mod libei_route;
 

@@ -350,6 +350,104 @@
               "null"
             ]
           },
+          "opened_surfaces": {
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "bounds": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "height": {
+                      "type": "number"
+                    },
+                    "width": {
+                      "type": "number"
+                    },
+                    "x": {
+                      "type": "number"
+                    },
+                    "y": {
+                      "type": "number"
+                    }
+                  },
+                  "required": [
+                    "x",
+                    "y",
+                    "width",
+                    "height"
+                  ],
+                  "type": [
+                    "object",
+                    "null"
+                  ]
+                },
+                "kind": {
+                  "enum": [
+                    "menu",
+                    "popover",
+                    "alert",
+                    "sheet",
+                    "unknown"
+                  ],
+                  "type": "string"
+                },
+                "owner_pid": {
+                  "maximum": 4294967295,
+                  "minimum": 1,
+                  "type": "integer"
+                },
+                "target": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "pid": {
+                      "maximum": 4294967295,
+                      "minimum": 1,
+                      "type": "integer"
+                    },
+                    "window_id": {
+                      "minimum": 1,
+                      "type": "integer"
+                    }
+                  },
+                  "required": [
+                    "pid",
+                    "window_id"
+                  ],
+                  "type": [
+                    "object",
+                    "null"
+                  ]
+                },
+                "title": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "window_id": {
+                  "minimum": 1,
+                  "type": "integer"
+                }
+              },
+              "required": [
+                "kind"
+              ],
+              "type": "object"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "opened_surfaces_status": {
+            "enum": [
+              "observed",
+              "partial",
+              "unavailable",
+              "not_checked"
+            ],
+            "type": "string"
+          },
           "point": {
             "additionalProperties": false,
             "properties": {
@@ -956,6 +1054,104 @@
               "string",
               "null"
             ]
+          },
+          "opened_surfaces": {
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "bounds": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "height": {
+                      "type": "number"
+                    },
+                    "width": {
+                      "type": "number"
+                    },
+                    "x": {
+                      "type": "number"
+                    },
+                    "y": {
+                      "type": "number"
+                    }
+                  },
+                  "required": [
+                    "x",
+                    "y",
+                    "width",
+                    "height"
+                  ],
+                  "type": [
+                    "object",
+                    "null"
+                  ]
+                },
+                "kind": {
+                  "enum": [
+                    "menu",
+                    "popover",
+                    "alert",
+                    "sheet",
+                    "unknown"
+                  ],
+                  "type": "string"
+                },
+                "owner_pid": {
+                  "maximum": 4294967295,
+                  "minimum": 1,
+                  "type": "integer"
+                },
+                "target": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "pid": {
+                      "maximum": 4294967295,
+                      "minimum": 1,
+                      "type": "integer"
+                    },
+                    "window_id": {
+                      "minimum": 1,
+                      "type": "integer"
+                    }
+                  },
+                  "required": [
+                    "pid",
+                    "window_id"
+                  ],
+                  "type": [
+                    "object",
+                    "null"
+                  ]
+                },
+                "title": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "window_id": {
+                  "minimum": 1,
+                  "type": "integer"
+                }
+              },
+              "required": [
+                "kind"
+              ],
+              "type": "object"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "opened_surfaces_status": {
+            "enum": [
+              "observed",
+              "partial",
+              "unavailable",
+              "not_checked"
+            ],
+            "type": "string"
           },
           "point": {
             "additionalProperties": false,
@@ -2457,6 +2653,36 @@
               "null"
             ]
           },
+          "observation_scope_exclusions": {
+            "items": {
+              "properties": {
+                "element_indices": {
+                  "items": {
+                    "minimum": 0,
+                    "type": "integer"
+                  },
+                  "type": [
+                    "array",
+                    "null"
+                  ]
+                },
+                "kind": {
+                  "enum": [
+                    "closed_menus_not_expanded"
+                  ],
+                  "type": "string"
+                }
+              },
+              "required": [
+                "kind"
+              ],
+              "type": "object"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
           "pid": {
             "minimum": 0,
             "type": "integer"
@@ -2930,6 +3156,104 @@
               "null"
             ]
           },
+          "opened_surfaces": {
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "bounds": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "height": {
+                      "type": "number"
+                    },
+                    "width": {
+                      "type": "number"
+                    },
+                    "x": {
+                      "type": "number"
+                    },
+                    "y": {
+                      "type": "number"
+                    }
+                  },
+                  "required": [
+                    "x",
+                    "y",
+                    "width",
+                    "height"
+                  ],
+                  "type": [
+                    "object",
+                    "null"
+                  ]
+                },
+                "kind": {
+                  "enum": [
+                    "menu",
+                    "popover",
+                    "alert",
+                    "sheet",
+                    "unknown"
+                  ],
+                  "type": "string"
+                },
+                "owner_pid": {
+                  "maximum": 4294967295,
+                  "minimum": 1,
+                  "type": "integer"
+                },
+                "target": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "pid": {
+                      "maximum": 4294967295,
+                      "minimum": 1,
+                      "type": "integer"
+                    },
+                    "window_id": {
+                      "minimum": 1,
+                      "type": "integer"
+                    }
+                  },
+                  "required": [
+                    "pid",
+                    "window_id"
+                  ],
+                  "type": [
+                    "object",
+                    "null"
+                  ]
+                },
+                "title": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "window_id": {
+                  "minimum": 1,
+                  "type": "integer"
+                }
+              },
+              "required": [
+                "kind"
+              ],
+              "type": "object"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "opened_surfaces_status": {
+            "enum": [
+              "observed",
+              "partial",
+              "unavailable",
+              "not_checked"
+            ],
+            "type": "string"
+          },
           "point": {
             "additionalProperties": false,
             "properties": {
@@ -3326,6 +3650,104 @@
               "string",
               "null"
             ]
+          },
+          "opened_surfaces": {
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "bounds": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "height": {
+                      "type": "number"
+                    },
+                    "width": {
+                      "type": "number"
+                    },
+                    "x": {
+                      "type": "number"
+                    },
+                    "y": {
+                      "type": "number"
+                    }
+                  },
+                  "required": [
+                    "x",
+                    "y",
+                    "width",
+                    "height"
+                  ],
+                  "type": [
+                    "object",
+                    "null"
+                  ]
+                },
+                "kind": {
+                  "enum": [
+                    "menu",
+                    "popover",
+                    "alert",
+                    "sheet",
+                    "unknown"
+                  ],
+                  "type": "string"
+                },
+                "owner_pid": {
+                  "maximum": 4294967295,
+                  "minimum": 1,
+                  "type": "integer"
+                },
+                "target": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "pid": {
+                      "maximum": 4294967295,
+                      "minimum": 1,
+                      "type": "integer"
+                    },
+                    "window_id": {
+                      "minimum": 1,
+                      "type": "integer"
+                    }
+                  },
+                  "required": [
+                    "pid",
+                    "window_id"
+                  ],
+                  "type": [
+                    "object",
+                    "null"
+                  ]
+                },
+                "title": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "window_id": {
+                  "minimum": 1,
+                  "type": "integer"
+                }
+              },
+              "required": [
+                "kind"
+              ],
+              "type": "object"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "opened_surfaces_status": {
+            "enum": [
+              "observed",
+              "partial",
+              "unavailable",
+              "not_checked"
+            ],
+            "type": "string"
           },
           "point": {
             "additionalProperties": false,
@@ -4134,6 +4556,104 @@
               "string",
               "null"
             ]
+          },
+          "opened_surfaces": {
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "bounds": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "height": {
+                      "type": "number"
+                    },
+                    "width": {
+                      "type": "number"
+                    },
+                    "x": {
+                      "type": "number"
+                    },
+                    "y": {
+                      "type": "number"
+                    }
+                  },
+                  "required": [
+                    "x",
+                    "y",
+                    "width",
+                    "height"
+                  ],
+                  "type": [
+                    "object",
+                    "null"
+                  ]
+                },
+                "kind": {
+                  "enum": [
+                    "menu",
+                    "popover",
+                    "alert",
+                    "sheet",
+                    "unknown"
+                  ],
+                  "type": "string"
+                },
+                "owner_pid": {
+                  "maximum": 4294967295,
+                  "minimum": 1,
+                  "type": "integer"
+                },
+                "target": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "pid": {
+                      "maximum": 4294967295,
+                      "minimum": 1,
+                      "type": "integer"
+                    },
+                    "window_id": {
+                      "minimum": 1,
+                      "type": "integer"
+                    }
+                  },
+                  "required": [
+                    "pid",
+                    "window_id"
+                  ],
+                  "type": [
+                    "object",
+                    "null"
+                  ]
+                },
+                "title": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "window_id": {
+                  "minimum": 1,
+                  "type": "integer"
+                }
+              },
+              "required": [
+                "kind"
+              ],
+              "type": "object"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "opened_surfaces_status": {
+            "enum": [
+              "observed",
+              "partial",
+              "unavailable",
+              "not_checked"
+            ],
+            "type": "string"
           },
           "point": {
             "additionalProperties": false,
@@ -5044,6 +5564,104 @@
               "null"
             ]
           },
+          "opened_surfaces": {
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "bounds": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "height": {
+                      "type": "number"
+                    },
+                    "width": {
+                      "type": "number"
+                    },
+                    "x": {
+                      "type": "number"
+                    },
+                    "y": {
+                      "type": "number"
+                    }
+                  },
+                  "required": [
+                    "x",
+                    "y",
+                    "width",
+                    "height"
+                  ],
+                  "type": [
+                    "object",
+                    "null"
+                  ]
+                },
+                "kind": {
+                  "enum": [
+                    "menu",
+                    "popover",
+                    "alert",
+                    "sheet",
+                    "unknown"
+                  ],
+                  "type": "string"
+                },
+                "owner_pid": {
+                  "maximum": 4294967295,
+                  "minimum": 1,
+                  "type": "integer"
+                },
+                "target": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "pid": {
+                      "maximum": 4294967295,
+                      "minimum": 1,
+                      "type": "integer"
+                    },
+                    "window_id": {
+                      "minimum": 1,
+                      "type": "integer"
+                    }
+                  },
+                  "required": [
+                    "pid",
+                    "window_id"
+                  ],
+                  "type": [
+                    "object",
+                    "null"
+                  ]
+                },
+                "title": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "window_id": {
+                  "minimum": 1,
+                  "type": "integer"
+                }
+              },
+              "required": [
+                "kind"
+              ],
+              "type": "object"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "opened_surfaces_status": {
+            "enum": [
+              "observed",
+              "partial",
+              "unavailable",
+              "not_checked"
+            ],
+            "type": "string"
+          },
           "point": {
             "additionalProperties": false,
             "properties": {
@@ -5484,6 +6102,104 @@
               "string",
               "null"
             ]
+          },
+          "opened_surfaces": {
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "bounds": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "height": {
+                      "type": "number"
+                    },
+                    "width": {
+                      "type": "number"
+                    },
+                    "x": {
+                      "type": "number"
+                    },
+                    "y": {
+                      "type": "number"
+                    }
+                  },
+                  "required": [
+                    "x",
+                    "y",
+                    "width",
+                    "height"
+                  ],
+                  "type": [
+                    "object",
+                    "null"
+                  ]
+                },
+                "kind": {
+                  "enum": [
+                    "menu",
+                    "popover",
+                    "alert",
+                    "sheet",
+                    "unknown"
+                  ],
+                  "type": "string"
+                },
+                "owner_pid": {
+                  "maximum": 4294967295,
+                  "minimum": 1,
+                  "type": "integer"
+                },
+                "target": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "pid": {
+                      "maximum": 4294967295,
+                      "minimum": 1,
+                      "type": "integer"
+                    },
+                    "window_id": {
+                      "minimum": 1,
+                      "type": "integer"
+                    }
+                  },
+                  "required": [
+                    "pid",
+                    "window_id"
+                  ],
+                  "type": [
+                    "object",
+                    "null"
+                  ]
+                },
+                "title": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "window_id": {
+                  "minimum": 1,
+                  "type": "integer"
+                }
+              },
+              "required": [
+                "kind"
+              ],
+              "type": "object"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "opened_surfaces_status": {
+            "enum": [
+              "observed",
+              "partial",
+              "unavailable",
+              "not_checked"
+            ],
+            "type": "string"
           },
           "point": {
             "additionalProperties": false,
@@ -6299,6 +7015,104 @@
               "null"
             ]
           },
+          "opened_surfaces": {
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "bounds": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "height": {
+                      "type": "number"
+                    },
+                    "width": {
+                      "type": "number"
+                    },
+                    "x": {
+                      "type": "number"
+                    },
+                    "y": {
+                      "type": "number"
+                    }
+                  },
+                  "required": [
+                    "x",
+                    "y",
+                    "width",
+                    "height"
+                  ],
+                  "type": [
+                    "object",
+                    "null"
+                  ]
+                },
+                "kind": {
+                  "enum": [
+                    "menu",
+                    "popover",
+                    "alert",
+                    "sheet",
+                    "unknown"
+                  ],
+                  "type": "string"
+                },
+                "owner_pid": {
+                  "maximum": 4294967295,
+                  "minimum": 1,
+                  "type": "integer"
+                },
+                "target": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "pid": {
+                      "maximum": 4294967295,
+                      "minimum": 1,
+                      "type": "integer"
+                    },
+                    "window_id": {
+                      "minimum": 1,
+                      "type": "integer"
+                    }
+                  },
+                  "required": [
+                    "pid",
+                    "window_id"
+                  ],
+                  "type": [
+                    "object",
+                    "null"
+                  ]
+                },
+                "title": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "window_id": {
+                  "minimum": 1,
+                  "type": "integer"
+                }
+              },
+              "required": [
+                "kind"
+              ],
+              "type": "object"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "opened_surfaces_status": {
+            "enum": [
+              "observed",
+              "partial",
+              "unavailable",
+              "not_checked"
+            ],
+            "type": "string"
+          },
           "point": {
             "additionalProperties": false,
             "properties": {
@@ -7110,6 +7924,104 @@
               "string",
               "null"
             ]
+          },
+          "opened_surfaces": {
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "bounds": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "height": {
+                      "type": "number"
+                    },
+                    "width": {
+                      "type": "number"
+                    },
+                    "x": {
+                      "type": "number"
+                    },
+                    "y": {
+                      "type": "number"
+                    }
+                  },
+                  "required": [
+                    "x",
+                    "y",
+                    "width",
+                    "height"
+                  ],
+                  "type": [
+                    "object",
+                    "null"
+                  ]
+                },
+                "kind": {
+                  "enum": [
+                    "menu",
+                    "popover",
+                    "alert",
+                    "sheet",
+                    "unknown"
+                  ],
+                  "type": "string"
+                },
+                "owner_pid": {
+                  "maximum": 4294967295,
+                  "minimum": 1,
+                  "type": "integer"
+                },
+                "target": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "pid": {
+                      "maximum": 4294967295,
+                      "minimum": 1,
+                      "type": "integer"
+                    },
+                    "window_id": {
+                      "minimum": 1,
+                      "type": "integer"
+                    }
+                  },
+                  "required": [
+                    "pid",
+                    "window_id"
+                  ],
+                  "type": [
+                    "object",
+                    "null"
+                  ]
+                },
+                "title": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "window_id": {
+                  "minimum": 1,
+                  "type": "integer"
+                }
+              },
+              "required": [
+                "kind"
+              ],
+              "type": "object"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "opened_surfaces_status": {
+            "enum": [
+              "observed",
+              "partial",
+              "unavailable",
+              "not_checked"
+            ],
+            "type": "string"
           },
           "point": {
             "additionalProperties": false,

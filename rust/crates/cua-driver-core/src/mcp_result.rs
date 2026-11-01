@@ -389,6 +389,27 @@ mod tests {
     const UNSCHEMED_TOOL: &str = "no_such_tool";
 
     #[test]
+    fn opened_surfaces_refuse_mixed_proxy_daemon_schemas() {
+        let new = advertised_tool_output_schema(ACTION_TOOL).unwrap();
+        let old_success: Value = serde_json::from_str(include_str!(
+            "../../../../contract/fixtures/action-result-pre-u21-success-schema.json"
+        ))
+        .unwrap();
+        let old = cua_driver_contract::advertised_output_schema(old_success);
+        let legacy = json!({"effect":"unverifiable", "route":"accessibility"});
+        let current = json!({"effect":"unverifiable", "route":"accessibility",
+            "opened_surfaces_status":"observed", "opened_surfaces":[]});
+        let old_validator = jsonschema::validator_for(&old).unwrap();
+        let new_validator = jsonschema::validator_for(&new).unwrap();
+        assert!(old_validator.is_valid(&legacy));
+        assert!(new_validator.is_valid(&legacy));
+        assert!(!old_validator.is_valid(&current));
+        assert!(new_validator.is_valid(&current));
+        assert!(validate_proxy_schema_pair(ACTION_TOOL, Some(&new), Some(&old)).is_err());
+        assert!(validate_proxy_schema_pair(ACTION_TOOL, Some(&old), Some(&new)).is_err());
+    }
+
+    #[test]
     fn canonical_vocabulary_schema_and_mixed_proxy_versions() {
         let tool = "get_window_state";
         let new_schema = advertised_tool_output_schema(tool).unwrap();
@@ -726,6 +747,25 @@ mod tests {
             validate_proxy_output_schema(tool, Some(&old_schema)).unwrap_err(),
             message
         );
+    }
+
+    #[test]
+    fn scope_exclusion_schema_refuses_pre_u23_proxy_in_both_directions() {
+        let tool = "get_window_state";
+        let old: Value = serde_json::from_str(include_str!(
+            "../../../../contract/fixtures/get-window-state-pre-u23-success-schema.json"
+        ))
+        .unwrap();
+        let old = cua_driver_contract::advertised_output_schema(old);
+        let new = advertised_tool_output_schema(tool).unwrap();
+        let payload = json!({"pid":7,"window_id":9,"observation_scope_exclusions":[{"kind":"closed_menus_not_expanded","element_indices":[1]}]});
+        let validator = jsonschema::validator_for(&new).unwrap();
+        assert!(validator.is_valid(&payload));
+        let mut invalid = payload;
+        invalid["observation_scope_exclusions"][0]["kind"] = json!("unknown_kind");
+        assert!(!validator.is_valid(&invalid));
+        assert!(validate_proxy_schema_pair(tool, Some(&new), Some(&old)).is_err());
+        assert!(validate_proxy_schema_pair(tool, Some(&old), Some(&new)).is_err());
     }
 
     #[track_caller]

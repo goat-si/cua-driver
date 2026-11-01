@@ -19,9 +19,12 @@ mod key_belief_ax;
 mod key_belief_observer;
 pub(crate) mod key_hold;
 pub mod keyboard;
+#[cfg(test)]
+mod lease_wiring_tests;
 pub mod mouse;
 pub mod pointer_toolkit;
 pub mod skylight;
+pub(crate) mod worker_context;
 
 pub use ax_actions::perform_ax_action;
 pub use interactive::{

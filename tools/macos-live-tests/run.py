@@ -12,8 +12,16 @@ The script fails unless libtest reports every listed ignored test exactly once
 with its reason, at least one of them is live, and each live test's own process
 exits 0 having run exactly one test that passed.
 
-Usage: run.py <platform-macos lib test binary>
+The native clipboard round trip overwrites the general pasteboard. It asserts
+only when CUA_TEST_ALLOW_CLIPBOARD=1, and run.py sets that only with
+--allow-clipboard (CI passes it; its pasteboard is disposable). Without the
+flag the variable is removed from every test's environment, even if the
+calling shell exports it, so a run on a developer's Mac leaves the clipboard
+alone and says that the round trip did not assert.
+
+Usage: run.py [--allow-clipboard] <platform-macos lib test binary>
 """
+import argparse
 import os
 import re
 import subprocess
@@ -66,7 +74,15 @@ def ignore_reasons(binary, ignored, failures):
 
 
 def main():
-    binary = sys.argv[1]
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--allow-clipboard",
+        action="store_true",
+        help="let the native clipboard round trip overwrite the general pasteboard",
+    )
+    parser.add_argument("binary")
+    args = parser.parse_args()
+    binary = args.binary
     failures = []
     ignored = listed_ignored(binary)
     if not ignored:
@@ -81,7 +97,16 @@ def main():
         print("\n".join(failures))
         sys.exit(1)
     tests = [name for name in ignored if reasons.get(name, "").startswith("live:")]
-    env = dict(os.environ, CUA_TEST_ALLOW_CLIPBOARD="1")
+    env = dict(os.environ)
+    env.pop("CUA_TEST_ALLOW_CLIPBOARD", None)
+    if args.allow_clipboard:
+        env["CUA_TEST_ALLOW_CLIPBOARD"] = "1"
+    else:
+        print(
+            "clipboard: not allowed, so the native clipboard round trip returns without "
+            "asserting; pass --allow-clipboard where the pasteboard is disposable",
+            flush=True,
+        )
     passed = 0
     for test in tests:
         run = subprocess.run(

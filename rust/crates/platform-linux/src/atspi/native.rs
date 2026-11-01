@@ -13,7 +13,8 @@
 //! ordered set.
 
 use std::collections::HashSet;
-use std::sync::{Mutex, OnceLock};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
@@ -51,6 +52,156 @@ tokio::task_local! {
     /// otherwise be allowed the full [`CALL_TIMEOUT`]. Set via [`bounded_for`]
     /// / [`walk_tree_bounded_with_timeout`]; absent for legacy callers.
     static OP_DEADLINE: tokio::time::Instant;
+    static TEXT_DISPATCH: Arc<TextWriteDispatch>;
+}
+
+#[derive(Default)]
+pub struct TextWriteDispatch {
+    pub gate: crate::text_write_policy::DispatchGate,
+    pub ledger: crate::text_write_policy::DispatchLedger,
+    partial: AtomicBool,
+    step: AtomicU8,
+}
+
+fn write_timeout_result<T>(
+    dispatch: &TextWriteDispatch,
+    bytes: usize,
+    fallback: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    if dispatch.gate.close_on_timeout() {
+        let step = crate::text_write_policy::WriteStep {
+            step: match dispatch.step.load(Ordering::SeqCst) {
+                1 => crate::text_write_policy::Step::SetText,
+                2 => crate::text_write_policy::Step::DeleteText,
+                4 => crate::text_write_policy::Step::Commit,
+                5 => crate::text_write_policy::Step::SetValue,
+                _ => crate::text_write_policy::Step::InsertText,
+            },
+            bytes,
+            units: None,
+        };
+        if dispatch.partial.load(Ordering::SeqCst) {
+            Err(WritePartial { step }.into())
+        } else {
+            Err(WriteUncertain { step }.into())
+        }
+    } else {
+        fallback()
+    }
+}
+
+fn bounded_text_for<T>(
+    budget: Duration,
+    text: &str,
+    work: impl std::future::Future<Output = Result<T>>,
+    on_timeout: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    bounded_text_for_with_dispatch(
+        budget,
+        text,
+        Arc::new(TextWriteDispatch::default()),
+        work,
+        on_timeout,
+    )
+}
+
+fn bounded_text_for_with_dispatch<T>(
+    budget: Duration,
+    text: &str,
+    dispatch: Arc<TextWriteDispatch>,
+    work: impl std::future::Future<Output = Result<T>>,
+    on_timeout: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    bounded_for(budget, TEXT_DISPATCH.scope(dispatch.clone(), work), || {
+        write_timeout_result(&dispatch, text.len(), on_timeout)
+    })
+}
+
+/// Close the gate when the caller stops waiting for its worker.
+pub fn text_write_timeout_error(
+    dispatch: &TextWriteDispatch,
+    bytes: usize,
+) -> Option<anyhow::Error> {
+    write_timeout_result(dispatch, bytes, || Ok(())).err()
+}
+
+/// Whether `error` ends a text-writing tool call: a mutator may have run
+/// (uncertain), the field was partly changed, or the caller had already
+/// closed the dispatch gate.
+pub(crate) fn text_write_stop(
+    error: &anyhow::Error,
+) -> Option<crate::token_action_policy::TextWriteStop> {
+    use crate::token_action_policy::TextWriteStop;
+    if error.is::<WritePartial>() {
+        Some(TextWriteStop::Partial)
+    } else if error.is::<WriteUncertain>() {
+        Some(TextWriteStop::Uncertain)
+    } else if error.is::<WriteDispatchClosed>() {
+        Some(TextWriteStop::Closed)
+    } else {
+        None
+    }
+}
+
+/// Run a non-AT-SPI input route (pty, Tk send, key events, a selection pick)
+/// behind the caller's dispatch gate, so a caller that already timed out and
+/// reported `effect:"none"` can never see it run afterwards, and a timeout
+/// while it runs reports that it may have run.
+pub fn gated_route<T>(
+    dispatch: &TextWriteDispatch,
+    route: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    dispatch
+        .gate
+        .enter_mutator()
+        .map_err(|_| WriteDispatchClosed)?;
+    dispatch.ledger.record_sent();
+    let result = route();
+    dispatch.gate.finish_mutator();
+    result
+}
+
+/// A key or toolkit-command route that may have delivered part or all of its
+/// input before it failed.
+pub fn key_write_uncertain(bytes: usize) -> anyhow::Error {
+    WriteUncertain {
+        step: crate::text_write_policy::WriteStep {
+            step: crate::text_write_policy::Step::KeyEvents,
+            bytes,
+            units: None,
+        },
+    }
+    .into()
+}
+
+fn gated_input_action(
+    dispatch: &TextWriteDispatch,
+    bytes: usize,
+    action: impl FnOnce() -> std::result::Result<(), ()>,
+) -> Result<()> {
+    use crate::text_write_policy::{CallClass, MutationResult, Step, WriteStep};
+    dispatch
+        .gate
+        .enter_mutator()
+        .map_err(|_| WriteDispatchClosed)?;
+    dispatch.ledger.record_sent();
+    let result = action();
+    dispatch.ledger.record_result(if result.is_ok() {
+        Ok(MutationResult::Acknowledged)
+    } else {
+        Err(CallClass::PossiblyExecuted)
+    });
+    dispatch.gate.finish_mutator();
+    result.map_err(|_| {
+        WriteUncertain {
+            step: WriteStep {
+                step: Step::InsertText,
+                bytes,
+                units: None,
+            },
+        }
+        .into()
+    })
 }
 
 /// Time left on the current operation's deadline, or [`CALL_TIMEOUT`] when no
@@ -2953,7 +3104,6 @@ async fn write_into_editable_acc(
     has_component: bool,
     text: &str,
 ) -> Result<bool> {
-    let target_has_component = has_component;
     let proxies = acc
         .proxies()
         .await
@@ -2962,15 +3112,36 @@ async fn write_into_editable_acc(
     // A focus-free EditableText write is the strongest background route. Try it
     // before GrabFocus: WebKitGTK can invalidate the original proxy when focus
     // changes, and writing through that stale object then returns false.
-    if write_through_editable_proxies(&proxies, text).await? {
+    with_focus_retry(
+        write_through_editable_proxies(acc, &proxies, text),
+        || focus_editable(&proxies, has_component),
+        || write_through_editable_proxies(acc, &proxies, text),
+    )
+    .await
+}
+
+async fn with_focus_retry<F, R>(
+    first: impl std::future::Future<Output = Result<bool>>,
+    focus: impl FnOnce() -> F,
+    retry: impl FnOnce() -> R,
+) -> Result<bool>
+where
+    F: std::future::Future<Output = ()>,
+    R: std::future::Future<Output = Result<bool>>,
+{
+    if first.await? {
         return Ok(true);
     }
+    focus().await;
+    retry().await
+}
 
+async fn focus_editable(proxies: &atspi::proxy::proxy_ext::Proxies<'_>, has_component: bool) {
     // Try to grab focus on the widget via AT-SPI Component.GrabFocus.
     // This should give the widget internal keyboard focus without activating
     // the window, allowing GTK4 (and similar toolkits) to expose EditableText
     // on an unfocused window's focused widget.
-    if target_has_component {
+    if has_component {
         if let Ok(comp) = proxies.component().await {
             match call(comp.grab_focus()).await {
                 Some(Ok(true)) => dlog!("GrabFocus succeeded"),
@@ -2984,43 +3155,395 @@ async fn write_into_editable_acc(
     } else {
         dlog!("Target has no Component interface, skipping GrabFocus");
     }
+}
 
-    write_through_editable_proxies(&proxies, text).await
+#[cfg(test)]
+mod focus_retry_tests {
+    use super::*;
+    use std::cell::RefCell;
+
+    #[test]
+    fn only_a_refusal_retries_after_focus() {
+        let calls = RefCell::new(Vec::new());
+        let first = async {
+            calls.borrow_mut().push("write");
+            Ok(false)
+        };
+        let result = runtime()
+            .block_on(with_focus_retry(
+                first,
+                || async {
+                    calls.borrow_mut().push("focus");
+                },
+                || async {
+                    calls.borrow_mut().push("write");
+                    Ok(true)
+                },
+            ))
+            .unwrap();
+        assert!(result);
+        assert_eq!(*calls.borrow(), ["write", "focus", "write"]);
+    }
+
+    #[test]
+    fn acknowledged_or_uncertain_first_write_never_retries() {
+        let step = crate::text_write_policy::WriteStep {
+            step: crate::text_write_policy::Step::InsertText,
+            bytes: 3,
+            units: Some(3),
+        };
+        for first in [
+            Ok(true),
+            Err(WriteUncertain { step }.into()),
+            Err(anyhow!("caret unavailable")),
+        ] {
+            let calls = RefCell::new(Vec::new());
+            let result = runtime().block_on(with_focus_retry(
+                async {
+                    calls.borrow_mut().push("write");
+                    first
+                },
+                || async {
+                    calls.borrow_mut().push("focus");
+                },
+                || async {
+                    calls.borrow_mut().push("write");
+                    Ok(true)
+                },
+            ));
+            assert!(result.is_err() || result.unwrap());
+            assert_eq!(*calls.borrow(), ["write"]);
+        }
+    }
 }
 
 async fn write_through_editable_proxies(
+    acc: &AccessibleProxy<'_>,
     proxies: &atspi::proxy::proxy_ext::Proxies<'_>,
     text: &str,
 ) -> Result<bool> {
-    let et = proxies
+    proxies
         .editable_text()
         .await
         .map_err(|e| anyhow!("EditableText unavailable: {e}"))?;
+    use crate::text_write_policy::{Reason, TextWriteOutcome};
+    match run_native_editable_route(acc, text, EditableRoute::Insert).await? {
+        TextWriteOutcome::Acknowledged => Ok(true),
+        TextWriteOutcome::NothingWritten {
+            reason: Reason::Refused | Reason::Unsupported,
+        } => Ok(false),
+        TextWriteOutcome::NothingWritten {
+            reason: Reason::GateClosed,
+        } => Err(WriteDispatchClosed.into()),
+        TextWriteOutcome::NothingWritten { reason } => {
+            Err(anyhow!("editable insert unavailable: {reason:?}"))
+        }
+        TextWriteOutcome::Uncertain { step } => Err(WriteUncertain { step }.into()),
+        TextWriteOutcome::Partial { step } => Err(WritePartial { step }.into()),
+    }
+}
 
-    let off = match proxies.text().await {
-        Ok(tp) => tp.caret_offset().await.unwrap_or(0),
-        Err(_) => 0,
+async fn editable_toolkit(acc: &AccessibleProxy<'_>) -> crate::text_write_policy::Toolkit {
+    use crate::text_write_policy::Toolkit;
+    let Some(Ok(app)) = call(acc.get_application()).await else {
+        return Toolkit::Unknown;
     };
-    let len = text.chars().count() as i32;
+    let Some(name) = app.name_as_str() else {
+        return Toolkit::Unknown;
+    };
+    let Ok(builder) =
+        atspi::proxy::application::ApplicationProxy::builder(acc.inner().connection())
+            // Read directly: the cached proxy failed to obtain GTK3's toolkit name.
+            .cache_properties(zbus::proxy::CacheProperties::No)
+            .destination(name)
+    else {
+        return Toolkit::Unknown;
+    };
+    let Ok(builder) = builder.path(app.path_as_str()) else {
+        return Toolkit::Unknown;
+    };
+    let Some(Ok(proxy)) = call(builder.build()).await else {
+        return Toolkit::Unknown;
+    };
+    let Some(Ok(name)) = call(proxy.toolkit_name()).await else {
+        return Toolkit::Unknown;
+    };
+    let name = name.trim().to_ascii_lowercase();
+    if name.starts_with("gtk") {
+        Toolkit::Gtk
+    } else if name.starts_with("qt") {
+        Toolkit::Qt
+    } else {
+        Toolkit::Unknown
+    }
+}
 
-    if et.insert_text(off, text, len).await.unwrap_or(false) {
-        return Ok(true);
+#[derive(Debug)]
+pub struct WriteUncertain {
+    pub step: crate::text_write_policy::WriteStep,
+}
+
+impl std::fmt::Display for WriteUncertain {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "AT-SPI write unacknowledged: {:?}", self.step)
     }
-    if et.set_text_contents(text).await.unwrap_or(false) {
-        return Ok(true);
+}
+impl std::error::Error for WriteUncertain {}
+
+#[derive(Debug)]
+pub struct WritePartial {
+    pub step: crate::text_write_policy::WriteStep,
+}
+
+impl std::fmt::Display for WritePartial {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "AT-SPI write partly changed the field: {:?}", self.step)
     }
-    Ok(false)
+}
+impl std::error::Error for WritePartial {}
+
+#[derive(Debug)]
+struct WriteDispatchClosed;
+
+impl std::fmt::Display for WriteDispatchClosed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("AT-SPI text dispatch closed")
+    }
+}
+impl std::error::Error for WriteDispatchClosed {}
+
+fn classify_mutator_error(error: &zbus::Error) -> crate::text_write_policy::CallClass {
+    use crate::text_write_policy::CallClass;
+    match error {
+        zbus::Error::MethodError(name, _, _)
+            if name.as_str() == "org.freedesktop.DBus.Error.UnknownMethod"
+                || name.as_str() == "org.freedesktop.DBus.Error.UnknownInterface" =>
+        {
+            CallClass::KnownUnsupported
+        }
+        zbus::Error::FDO(error)
+            if matches!(
+                error.as_ref(),
+                zbus::fdo::Error::UnknownMethod(_) | zbus::fdo::Error::UnknownInterface(_)
+            ) =>
+        {
+            CallClass::KnownUnsupported
+        }
+        _ => CallClass::PossiblyExecuted,
+    }
+}
+
+fn classify_acquisition_error(_: &atspi::proxy::AtspiError) -> crate::text_write_policy::CallClass {
+    crate::text_write_policy::CallClass::PreDispatchUnavailable
+}
+
+#[cfg(test)]
+mod insert_regression_tests {
+    use super::*;
+    use crate::text_write_policy::{
+        CallClass, EditableOps, MutationReply, MutationResult, TextWriteOutcome, Toolkit,
+    };
+
+    struct Fake {
+        reply: MutationReply,
+        caret: Result<i32, CallClass>,
+        contents: String,
+        calls: Vec<&'static str>,
+        args: Vec<(i32, i32)>,
+    }
+    impl Fake {
+        fn new(reply: MutationReply) -> Self {
+            Self {
+                reply,
+                caret: Ok(5),
+                contents: "hello".into(),
+                calls: vec![],
+                args: vec![],
+            }
+        }
+    }
+    impl EditableOps for Fake {
+        fn caret(&mut self) -> Result<i32, CallClass> {
+            self.caret
+        }
+        fn character_count(&mut self) -> Result<i32, CallClass> {
+            Ok(5)
+        }
+        fn validate_insert(&mut self) -> Result<(), CallClass> {
+            Ok(())
+        }
+        fn set_text(&mut self, text: &str) -> MutationReply {
+            self.calls.push("set");
+            self.contents = text.to_owned();
+            Ok(MutationResult::Acknowledged)
+        }
+        fn delete_text(&mut self, _: i32, _: i32) -> MutationReply {
+            self.calls.push("delete");
+            Ok(MutationResult::Acknowledged)
+        }
+        fn insert_text(&mut self, offset: i32, _: &str, length: i32) -> MutationReply {
+            self.calls.push("insert");
+            self.args.push((offset, length));
+            self.reply
+        }
+        fn commit(&mut self) -> MutationReply {
+            self.calls.push("commit");
+            Ok(MutationResult::Acknowledged)
+        }
+    }
+    fn run(
+        fake: &mut Fake,
+        dispatch: &TextWriteDispatch,
+        text: &str,
+        toolkit: Toolkit,
+    ) -> TextWriteOutcome {
+        run_editable_route(fake, text, toolkit, dispatch, EditableRoute::Insert)
+    }
+    #[test]
+    fn insert_error_must_not_trigger_second_write() {
+        let mut fake = Fake::new(Err(CallClass::PossiblyExecuted));
+        assert!(matches!(
+            run(
+                &mut fake,
+                &TextWriteDispatch::default(),
+                "abc",
+                Toolkit::Gtk
+            ),
+            TextWriteOutcome::Uncertain { .. }
+        ));
+        assert_eq!(fake.calls, ["insert"]);
+    }
+    #[test]
+    fn refused_insert_must_not_replace_existing_content() {
+        let mut fake = Fake::new(Ok(MutationResult::Refused));
+        assert!(matches!(
+            run(
+                &mut fake,
+                &TextWriteDispatch::default(),
+                "abc",
+                Toolkit::Gtk
+            ),
+            TextWriteOutcome::NothingWritten { .. }
+        ));
+        assert_eq!(fake.contents, "hello");
+        assert_eq!(fake.calls, ["insert"]);
+    }
+    #[test]
+    fn caret_failure_must_not_dispatch() {
+        let mut fake = Fake::new(Ok(MutationResult::Acknowledged));
+        fake.caret = Err(CallClass::PreDispatchUnavailable);
+        let _ = run(
+            &mut fake,
+            &TextWriteDispatch::default(),
+            "abc",
+            Toolkit::Gtk,
+        );
+        assert!(fake.calls.is_empty());
+    }
+    #[test]
+    fn closed_gate_prevents_late_insert() {
+        let mut fake = Fake::new(Ok(MutationResult::Acknowledged));
+        let dispatch = TextWriteDispatch::default();
+        assert!(!dispatch.gate.close_on_timeout());
+        assert!(matches!(
+            run(&mut fake, &dispatch, "abc", Toolkit::Gtk),
+            TextWriteOutcome::NothingWritten {
+                reason: crate::text_write_policy::Reason::GateClosed
+            }
+        ));
+        assert!(fake.calls.is_empty());
+        assert!(!dispatch.ledger.sent());
+    }
+    #[test]
+    fn toolkit_units_are_used_for_insert() {
+        for (toolkit, length) in [(Toolkit::Gtk, 6), (Toolkit::Qt, 3)] {
+            let mut fake = Fake::new(Ok(MutationResult::Acknowledged));
+            let _ = run(&mut fake, &TextWriteDispatch::default(), "é😀", toolkit);
+            assert_eq!(fake.args, [(5, length)]);
+        }
+        let mut fake = Fake::new(Ok(MutationResult::Acknowledged));
+        assert!(matches!(
+            run(
+                &mut fake,
+                &TextWriteDispatch::default(),
+                "é😀",
+                Toolkit::Unknown
+            ),
+            TextWriteOutcome::NothingWritten { .. }
+        ));
+        assert!(fake.calls.is_empty());
+    }
+    #[test]
+    fn classify_real_zbus_mutator_errors() {
+        use crate::text_write_policy::CallClass::{KnownUnsupported, PossiblyExecuted};
+        let message = zbus::Message::method_call("/test", "Test")
+            .unwrap()
+            .build(&())
+            .unwrap();
+        for name in [
+            "org.freedesktop.DBus.Error.UnknownMethod",
+            "org.freedesktop.DBus.Error.UnknownInterface",
+        ] {
+            let error = zbus::Error::MethodError(name.try_into().unwrap(), None, message.clone());
+            assert_eq!(classify_mutator_error(&error), KnownUnsupported);
+        }
+        for error in [
+            zbus::fdo::Error::UnknownMethod(String::new()),
+            zbus::fdo::Error::UnknownInterface(String::new()),
+        ] {
+            assert_eq!(
+                classify_mutator_error(&zbus::Error::FDO(Box::new(error))),
+                KnownUnsupported
+            );
+        }
+        for error in [
+            zbus::Error::InvalidReply,
+            zbus::Error::InputOutput(std::sync::Arc::new(std::io::Error::from(
+                std::io::ErrorKind::TimedOut,
+            ))),
+            zbus::Error::FDO(Box::new(zbus::fdo::Error::NoReply(String::new()))),
+            zbus::Error::Variant(zbus::zvariant::Error::IncorrectType),
+            zbus::Error::MethodError(
+                "org.freedesktop.DBus.Error.AccessDenied"
+                    .try_into()
+                    .unwrap(),
+                None,
+                message,
+            ),
+        ] {
+            assert_eq!(classify_mutator_error(&error), PossiblyExecuted);
+        }
+        for error in [
+            atspi::proxy::AtspiError::InterfaceNotAvailable("EditableText"),
+            atspi::proxy::AtspiError::Zbus("acquisition failed".into()),
+        ] {
+            assert_eq!(
+                classify_acquisition_error(&error),
+                CallClass::PreDispatchUnavailable
+            );
+        }
+    }
 }
 
 /// Write into the best editable exposed by the current AT-SPI tree without
 /// falling through to synthetic X11 input.
 pub fn type_into_editable(pid: u32, text: &str) -> Result<()> {
-    bounded_for(
+    type_into_editable_with_dispatch(pid, text, Arc::new(TextWriteDispatch::default()))
+}
+
+pub fn type_into_editable_with_dispatch(
+    pid: u32,
+    text: &str,
+    dispatch: Arc<TextWriteDispatch>,
+) -> Result<()> {
+    bounded_text_for_with_dispatch(
         INPUT_QUERY_BUDGET,
+        text,
+        dispatch,
         async {
             let conn = shared_connection().await?;
             // Focused editable known from the event log: write there directly.
-            if let Some(true) = write_into_focused_editable(conn, pid, text).await {
+            if focused_write_acknowledged(write_into_focused_editable(conn, pid, text).await?)? {
                 return Ok(());
             }
             let Collected {
@@ -3042,8 +3565,9 @@ pub fn type_into_editable(pid: u32, text: &str) -> Result<()> {
 
 /// Write into the exact indexed editable exposed by the caller's snapshot.
 pub fn type_into_editable_at(pid: u32, idx: usize, text: &str) -> Result<()> {
-    bounded_for(
+    bounded_text_for(
         INDEX_RESOLVE_BUDGET,
+        text,
         async {
             let conn = shared_connection().await?;
             let visited = collect_visited(conn, pid)
@@ -3088,11 +3612,21 @@ pub fn type_into_editable_at(pid: u32, idx: usize, text: &str) -> Result<()> {
 }
 
 pub fn insert_text(pid: u32, text: &str) -> Result<bool> {
-    bounded_for(
+    insert_text_with_dispatch(pid, text, Arc::new(TextWriteDispatch::default()))
+}
+
+pub fn insert_text_with_dispatch(
+    pid: u32,
+    text: &str,
+    dispatch: Arc<TextWriteDispatch>,
+) -> Result<bool> {
+    bounded_text_for_with_dispatch(
         INPUT_QUERY_BUDGET,
+        text,
+        dispatch,
         async {
             let conn = shared_connection().await?;
-            if let Some(true) = write_into_focused_editable(conn, pid, text).await {
+            if focused_write_acknowledged(write_into_focused_editable(conn, pid, text).await?)? {
                 return Ok(true);
             }
             let Collected {
@@ -3173,20 +3707,19 @@ pub fn insert_text(pid: u32, text: &str) -> Result<bool> {
                             dlog!("GTK3 fallback: window XID {xid}, local coords ({wx},{wy})");
 
                             // Click the entry to focus the widget (widget focus, not window focus).
-                            if let Err(e) = crate::input::send_click(xid, wx, wy, 1, 1) {
-                                dlog!("GTK3 fallback: click failed: {e}");
-                                return Ok(false);
-                            };
+                            let dispatch = TEXT_DISPATCH.with(Arc::clone);
+                            gated_input_action(&dispatch, text.len(), || {
+                                crate::input::send_click(xid, wx, wy, 1, 1).map_err(|_| ())
+                            })?;
 
                             // Small delay for the click to register and the widget to update focus.
                             tokio::time::sleep(tokio::time::Duration::from_millis(150)).await;
 
                             // Now type via X11 XSendEvent — the entry widget has internal focus
                             // so it should accept the keystrokes even though the window is unfocused.
-                            if let Err(e) = crate::input::send_type_text(xid, text) {
-                                dlog!("GTK3 fallback: send_type_text failed: {e}");
-                                return Ok(false);
-                            }
+                            gated_input_action(&dispatch, text.len(), || {
+                                crate::input::send_type_text(xid, text).map_err(|_| ())
+                            })?;
 
                             dlog!("GTK3 fallback: X11 click+type succeeded");
                             return Ok(true);
@@ -3202,6 +3735,51 @@ pub fn insert_text(pid: u32, text: &str) -> Result<bool> {
             Ok(false)
         },
     )
+}
+
+#[cfg(test)]
+mod write_timeout_tests {
+    use super::*;
+
+    #[test]
+    fn timeout_after_dispatch_is_uncertain() {
+        let dispatch = TextWriteDispatch::default();
+        dispatch.gate.enter_mutator().unwrap();
+        let error = write_timeout_result(&dispatch, 3, || Ok(false)).unwrap_err();
+        assert!(error.downcast_ref::<WriteUncertain>().is_some());
+        assert!(!format!("{error:?}").contains("abc"));
+    }
+
+    #[test]
+    fn timeout_before_dispatch_remains_fallback_eligible() {
+        let dispatch = TextWriteDispatch::default();
+        assert!(!write_timeout_result(&dispatch, 3, || Ok(false)).unwrap());
+        assert!(dispatch.gate.enter_mutator().is_err());
+    }
+
+    #[test]
+    fn timeout_after_acknowledged_delete_is_partial() {
+        let dispatch = TextWriteDispatch::default();
+        dispatch.gate.enter_mutator().unwrap();
+        dispatch.partial.store(true, Ordering::SeqCst);
+        let error = write_timeout_result(&dispatch, 3, || Ok(false)).unwrap_err();
+        assert!(error.downcast_ref::<WritePartial>().is_some());
+        assert!(!format!("{error:?}").contains("abc"));
+    }
+
+    #[test]
+    fn tool_timeout_blocks_late_input_action() {
+        let dispatch = TextWriteDispatch::default();
+        assert!(text_write_timeout_error(&dispatch, 3).is_none());
+        let called = std::cell::Cell::new(false);
+        assert!(gated_input_action(&dispatch, 3, || {
+            called.set(true);
+            Ok(())
+        })
+        .is_err());
+        assert!(!called.get());
+        assert!(!dispatch.ledger.sent());
+    }
 }
 
 /// Classify what holds keyboard focus in `pid`'s tree, so `type_text` can target
@@ -3786,6 +4364,79 @@ async fn action_names(ap: &atspi::proxy::action::ActionProxy<'_>) -> Vec<String>
     names
 }
 
+/// [`action_names`] that fails instead of guessing: `None` when the count
+/// or any name could not be read.
+async fn action_names_checked(ap: &atspi::proxy::action::ActionProxy<'_>) -> Option<Vec<String>> {
+    let n = call(ap.n_actions()).await?.ok()?;
+    let mut names = Vec::with_capacity(n.max(0) as usize);
+    for i in 0..n {
+        names.push(call(ap.get_name(i)).await?.ok()?);
+    }
+    Some(names)
+}
+
+enum CommitAction<T> {
+    Present(T),
+    /// The object does not advertise Action.
+    Absent,
+    /// The interface could not be read (timeout, bus error).
+    Unreadable,
+}
+
+fn commit_action_proxy<T>(
+    acquired: Option<std::result::Result<T, atspi::proxy::AtspiError>>,
+) -> CommitAction<T> {
+    match acquired {
+        Some(Ok(proxy)) => CommitAction::Present(proxy),
+        Some(Err(atspi::proxy::AtspiError::InterfaceNotAvailable(_))) => CommitAction::Absent,
+        Some(Err(_)) | None => CommitAction::Unreadable,
+    }
+}
+
+fn activate_action_index(names: &[String]) -> Option<i32> {
+    names
+        .iter()
+        .position(|name| normalized_action_verb(name) == "activate")
+        .map(|index| index as i32)
+}
+
+#[cfg(test)]
+mod commit_action_tests {
+    use super::*;
+
+    #[test]
+    fn only_a_missing_action_interface_is_absence() {
+        assert!(matches!(
+            commit_action_proxy(Some(Ok(1))),
+            CommitAction::Present(1)
+        ));
+        assert!(matches!(
+            commit_action_proxy::<i32>(Some(Err(atspi::proxy::AtspiError::InterfaceNotAvailable(
+                "Action"
+            )))),
+            CommitAction::Absent
+        ));
+        assert!(matches!(
+            commit_action_proxy::<i32>(Some(Err(atspi::proxy::AtspiError::Conversion("test")))),
+            CommitAction::Unreadable
+        ));
+        assert!(matches!(
+            commit_action_proxy::<i32>(None),
+            CommitAction::Unreadable
+        ));
+    }
+
+    #[test]
+    fn activate_index_needs_the_activate_verb() {
+        let names = |list: &[&str]| list.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            activate_action_index(&names(&["click", "activate"])),
+            Some(1)
+        );
+        assert_eq!(activate_action_index(&names(&["click"])), None);
+    }
+}
+
 /// The snapshot-cached object no longer answers on the bus (or never did):
 /// the observation is stale and must not be retargeted by index.
 #[derive(Debug)]
@@ -4030,8 +4681,18 @@ pub fn focus_element_ref(object_ref: &ObjectRef) -> Result<bool> {
 
 /// [`type_into_editable_at`] on a snapshot-cached element identity.
 pub fn type_into_editable_ref(object_ref: &ObjectRef, text: &str) -> Result<()> {
-    bounded_for(
+    type_into_editable_ref_with_dispatch(object_ref, text, Arc::new(TextWriteDispatch::default()))
+}
+
+pub fn type_into_editable_ref_with_dispatch(
+    object_ref: &ObjectRef,
+    text: &str,
+    dispatch: Arc<TextWriteDispatch>,
+) -> Result<()> {
+    bounded_text_for_with_dispatch(
         REF_ACTION_BUDGET,
+        text,
+        dispatch,
         async {
             let conn = shared_connection().await.map_err(token_pre_dispatch)?;
             let (acc, _) = live_accessible(conn, object_ref)
@@ -4063,25 +4724,88 @@ pub fn type_into_editable_ref(object_ref: &ObjectRef, text: &str) -> Result<()> 
 }
 
 /// Write `text` into the focused widget known from the focus-event log, if it
-/// is editable. `Some(true)` = written, `Some(false)` = focused but not
-/// editable (or write rejected), `None` = no usable focus record.
+/// is editable. Acknowledged and uncertain writes must not fall through to
+/// another target; `None` means no usable focus record.
 async fn write_into_focused_editable(
     conn: &AccessibilityConnection,
     pid: u32,
     text: &str,
-) -> Option<bool> {
-    let (acc, oref) = focused_accessible_via_events(conn, pid).await?;
-    let ifaces = call(acc.get_interfaces()).await?.ok()?;
+) -> Result<Option<crate::text_write_policy::TextWriteOutcome>> {
+    use crate::text_write_policy::{Reason, TextWriteOutcome};
+    let Some((acc, oref)) = focused_accessible_via_events(conn, pid).await else {
+        return Ok(None);
+    };
+    let Some(Ok(ifaces)) = call(acc.get_interfaces()).await else {
+        return Ok(None);
+    };
     if !ifaces.contains(Interface::EditableText) {
         dlog!("focused object {} is not editable", oref.path);
-        return Some(false);
+        return Ok(Some(TextWriteOutcome::NothingWritten {
+            reason: Reason::InsertUnavailable,
+        }));
     }
     match write_into_editable_acc(&acc, ifaces.contains(Interface::Component), text).await {
-        Ok(written) => Some(written),
+        Ok(true) => Ok(Some(TextWriteOutcome::Acknowledged)),
+        Ok(false) => Ok(Some(TextWriteOutcome::NothingWritten {
+            reason: Reason::Refused,
+        })),
         Err(error) => {
+            if let Some(uncertain) = error.downcast_ref::<WriteUncertain>() {
+                return Ok(Some(TextWriteOutcome::Uncertain {
+                    step: uncertain.step,
+                }));
+            }
+            if let Some(partial) = error.downcast_ref::<WritePartial>() {
+                return Ok(Some(TextWriteOutcome::Partial { step: partial.step }));
+            }
+            if error.downcast_ref::<WriteDispatchClosed>().is_some() {
+                return Err(error);
+            }
             dlog!("focused editable write failed: {error:#}");
-            Some(false)
+            Ok(Some(TextWriteOutcome::NothingWritten {
+                reason: Reason::InsertUnavailable,
+            }))
         }
+    }
+}
+
+fn focused_write_acknowledged(
+    outcome: Option<crate::text_write_policy::TextWriteOutcome>,
+) -> Result<bool> {
+    use crate::text_write_policy::TextWriteOutcome;
+    match outcome {
+        Some(TextWriteOutcome::Acknowledged) => Ok(true),
+        Some(TextWriteOutcome::Uncertain { step }) => Err(WriteUncertain { step }.into()),
+        Some(TextWriteOutcome::Partial { step }) => Err(WritePartial { step }.into()),
+        Some(TextWriteOutcome::NothingWritten { .. }) | None => Ok(false),
+    }
+}
+
+#[cfg(test)]
+mod focused_write_tests {
+    use super::*;
+    use crate::text_write_policy::{Reason, Step, TextWriteOutcome, WriteStep};
+
+    #[test]
+    fn acknowledged_and_uncertain_outcomes_stop_fallback() {
+        assert!(focused_write_acknowledged(Some(TextWriteOutcome::Acknowledged)).unwrap());
+        let step = WriteStep {
+            step: Step::InsertText,
+            bytes: 3,
+            units: Some(3),
+        };
+        let error =
+            focused_write_acknowledged(Some(TextWriteOutcome::Uncertain { step })).unwrap_err();
+        assert!(error.downcast_ref::<WriteUncertain>().is_some());
+        let error =
+            focused_write_acknowledged(Some(TextWriteOutcome::Partial { step })).unwrap_err();
+        assert!(error.downcast_ref::<WritePartial>().is_some());
+        assert!(
+            !focused_write_acknowledged(Some(TextWriteOutcome::NothingWritten {
+                reason: Reason::Refused
+            }))
+            .unwrap()
+        );
     }
 }
 
@@ -5475,16 +6199,286 @@ pub fn is_no_value_route(error: &anyhow::Error) -> bool {
 /// A spin button / spin scale only parses its entry text on activate (Return
 /// or focus-out); after an EditableText write, fire the element's `activate`
 /// action when it exposes one so the numeric value commits. Best effort.
-async fn commit_editable_write(proxies: &atspi::proxy::proxy_ext::Proxies<'_>) {
-    let Some(Ok(ap)) = call(proxies.action()).await else {
-        return;
+async fn commit_editable_write(
+    action: Option<&(atspi::proxy::action::ActionProxy<'_>, i32)>,
+) -> crate::text_write_policy::MutationReply {
+    use crate::text_write_policy::{CallClass, MutationResult};
+    let Some((ap, index)) = action else {
+        return Ok(MutationResult::Acknowledged);
     };
-    let names = action_names(&ap).await;
-    if let Some(index) = names
-        .iter()
-        .position(|name| normalized_action_verb(name) == "activate")
-    {
-        let _ = call(ap.do_action(index as i32)).await;
+    match call(ap.do_action(*index)).await {
+        Some(Ok(true)) => Ok(MutationResult::Acknowledged),
+        Some(Ok(false)) => Ok(MutationResult::Refused),
+        Some(Err(error)) => Err(classify_mutator_error(&error)),
+        None => Err(CallClass::PossiblyExecuted),
+    }
+}
+
+struct NativeEditableOps<'a> {
+    proxies: atspi::proxy::proxy_ext::Proxies<'a>,
+    editable: atspi::proxy::editable_text::EditableTextProxy<'a>,
+    dispatch: Arc<TextWriteDispatch>,
+    commit_action: Option<(atspi::proxy::action::ActionProxy<'a>, i32)>,
+}
+
+impl NativeEditableOps<'_> {
+    fn mutation(
+        &self,
+        future: impl std::future::Future<Output = zbus::Result<bool>>,
+    ) -> crate::text_write_policy::MutationReply {
+        use crate::text_write_policy::{CallClass, MutationResult};
+        match runtime().block_on(call(future)) {
+            Some(Ok(true)) => Ok(MutationResult::Acknowledged),
+            Some(Ok(false)) => Ok(MutationResult::Refused),
+            Some(Err(error)) => Err(classify_mutator_error(&error)),
+            None => Err(CallClass::PossiblyExecuted),
+        }
+    }
+}
+
+impl crate::text_write_policy::EditableOps for NativeEditableOps<'_> {
+    fn caret(&mut self) -> std::result::Result<i32, crate::text_write_policy::CallClass> {
+        runtime().block_on(async {
+            let text = call(self.proxies.text())
+                .await
+                .and_then(Result::ok)
+                .ok_or(crate::text_write_policy::CallClass::PreDispatchUnavailable)?;
+            call(text.caret_offset())
+                .await
+                .and_then(Result::ok)
+                .ok_or(crate::text_write_policy::CallClass::PreDispatchUnavailable)
+        })
+    }
+    fn character_count(&mut self) -> std::result::Result<i32, crate::text_write_policy::CallClass> {
+        runtime().block_on(async {
+            let text = call(self.proxies.text())
+                .await
+                .and_then(Result::ok)
+                .ok_or(crate::text_write_policy::CallClass::PreDispatchUnavailable)?;
+            call(text.character_count())
+                .await
+                .and_then(Result::ok)
+                .ok_or(crate::text_write_policy::CallClass::PreDispatchUnavailable)
+        })
+    }
+    fn validate_insert(&mut self) -> std::result::Result<(), crate::text_write_policy::CallClass> {
+        Ok(())
+    }
+    fn set_text(&mut self, text: &str) -> crate::text_write_policy::MutationReply {
+        self.dispatch.step.store(1, Ordering::SeqCst);
+        self.mutation(self.editable.set_text_contents(text))
+    }
+    fn delete_text(&mut self, start: i32, end: i32) -> crate::text_write_policy::MutationReply {
+        self.dispatch.step.store(2, Ordering::SeqCst);
+        let result = self.mutation(self.editable.delete_text(start, end));
+        if result == Ok(crate::text_write_policy::MutationResult::Acknowledged) {
+            self.dispatch.partial.store(true, Ordering::SeqCst);
+        }
+        result
+    }
+    fn insert_text(
+        &mut self,
+        offset: i32,
+        text: &str,
+        length: i32,
+    ) -> crate::text_write_policy::MutationReply {
+        self.dispatch.step.store(3, Ordering::SeqCst);
+        let result = self.mutation(self.editable.insert_text(offset, text, length));
+        if result == Ok(crate::text_write_policy::MutationResult::Acknowledged) {
+            self.dispatch.partial.store(false, Ordering::SeqCst);
+        }
+        result
+    }
+    fn prepare_commit(&mut self) -> std::result::Result<bool, crate::text_write_policy::CallClass> {
+        self.dispatch.step.store(4, Ordering::SeqCst);
+        // Only a proven absence (no Action interface, or no "activate" among
+        // fully read action names) skips the commit; a failed read is not an
+        // absence and leaves the edited field uncommitted, so it is uncertain.
+        let prepared = runtime().block_on(async {
+            let ap = match commit_action_proxy(call(self.proxies.action()).await) {
+                CommitAction::Present(ap) => ap,
+                CommitAction::Absent => return Ok(None),
+                CommitAction::Unreadable => return Err(()),
+            };
+            let names = action_names_checked(&ap).await.ok_or(())?;
+            Ok(activate_action_index(&names).map(|index| (ap, index)))
+        });
+        match prepared {
+            Ok(action) => {
+                let present = action.is_some();
+                self.commit_action = action;
+                Ok(present)
+            }
+            Err(()) => {
+                self.commit_action = None;
+                Err(crate::text_write_policy::CallClass::PreDispatchUnavailable)
+            }
+        }
+    }
+    fn commit(&mut self) -> crate::text_write_policy::MutationReply {
+        runtime().block_on(commit_editable_write(self.commit_action.as_ref()))
+    }
+}
+
+#[derive(Clone, Copy)]
+enum EditableRoute {
+    Insert,
+    Replace,
+}
+
+fn run_editable_route(
+    ops: &mut impl crate::text_write_policy::EditableOps,
+    value: &str,
+    toolkit: crate::text_write_policy::Toolkit,
+    dispatch: &TextWriteDispatch,
+    route: EditableRoute,
+) -> crate::text_write_policy::TextWriteOutcome {
+    match route {
+        EditableRoute::Insert => crate::text_write_policy::insert_route(
+            ops,
+            value,
+            toolkit,
+            &dispatch.gate,
+            &dispatch.ledger,
+        ),
+        EditableRoute::Replace => crate::text_write_policy::replace_route(
+            ops,
+            value,
+            toolkit,
+            &dispatch.gate,
+            &dispatch.ledger,
+        ),
+    }
+}
+
+async fn run_native_editable_route(
+    acc: &AccessibleProxy<'_>,
+    value: &str,
+    route: EditableRoute,
+) -> Result<crate::text_write_policy::TextWriteOutcome> {
+    let toolkit = editable_toolkit(acc).await;
+    let connection = acc.inner().connection().clone();
+    let destination = acc.inner().destination().to_owned();
+    let path = acc.inner().path().to_owned();
+    let value = value.to_owned();
+    let bytes = value.len();
+    let dispatch = TEXT_DISPATCH.with(Arc::clone);
+    let worker_dispatch = dispatch.clone();
+    let worker = tokio::task::spawn_blocking(move || {
+        let (proxies, editable) = runtime().block_on(async {
+            let acc = AccessibleProxy::builder(&connection)
+                .cache_properties(zbus::proxy::CacheProperties::No)
+                .destination(destination)?
+                .path(path)?
+                .build()
+                .await?;
+            let proxies = acc.proxies().await.map_err(|e| {
+                anyhow!(
+                    "interface acquisition: {:?}",
+                    classify_acquisition_error(&e)
+                )
+            })?;
+            let editable = proxies.editable_text().await.map_err(|e| {
+                anyhow!(
+                    "EditableText acquisition: {:?}",
+                    classify_acquisition_error(&e)
+                )
+            })?;
+            Ok::<_, anyhow::Error>((proxies, editable))
+        })?;
+        let mut ops = NativeEditableOps {
+            proxies,
+            editable,
+            dispatch: worker_dispatch.clone(),
+            commit_action: None,
+        };
+        Ok::<_, anyhow::Error>(run_editable_route(
+            &mut ops,
+            &value,
+            toolkit,
+            &worker_dispatch,
+            route,
+        ))
+    });
+    match worker.await {
+        Ok(Ok(result)) => Ok(result),
+        Ok(Err(_)) => Ok(crate::text_write_policy::TextWriteOutcome::NothingWritten {
+            reason: crate::text_write_policy::Reason::InsertUnavailable,
+        }),
+        Err(_) => write_timeout_result(&dispatch, bytes, || {
+            Err(anyhow!("editable worker failed before dispatch"))
+        }),
+    }
+}
+
+#[cfg(test)]
+mod replace_regression_tests {
+    use super::{run_editable_route, EditableRoute, TextWriteDispatch};
+    use crate::text_write_policy::{
+        self as policy, CallClass, EditableOps, MutationReply, MutationResult, TextWriteOutcome,
+    };
+
+    struct Fake {
+        fail: bool,
+        calls: Vec<&'static str>,
+    }
+    impl EditableOps for Fake {
+        fn caret(&mut self) -> Result<i32, CallClass> {
+            Ok(5)
+        }
+        fn character_count(&mut self) -> Result<i32, CallClass> {
+            Ok(5)
+        }
+        fn validate_insert(&mut self) -> Result<(), CallClass> {
+            Ok(())
+        }
+        fn set_text(&mut self, _: &str) -> MutationReply {
+            self.calls.push("set");
+            if self.fail {
+                Err(CallClass::PossiblyExecuted)
+            } else {
+                Ok(MutationResult::Refused)
+            }
+        }
+        fn delete_text(&mut self, _: i32, _: i32) -> MutationReply {
+            self.calls.push("delete");
+            Ok(MutationResult::Acknowledged)
+        }
+        fn insert_text(&mut self, _: i32, _: &str, _: i32) -> MutationReply {
+            self.calls.push("insert");
+            Ok(MutationResult::Acknowledged)
+        }
+        fn commit(&mut self) -> MutationReply {
+            self.calls.push("commit");
+            Ok(MutationResult::Acknowledged)
+        }
+    }
+    fn run(fake: &mut Fake) -> TextWriteOutcome {
+        run_editable_route(
+            fake,
+            "abc",
+            policy::Toolkit::Gtk,
+            &TextWriteDispatch::default(),
+            EditableRoute::Replace,
+        )
+    }
+    #[test]
+    fn set_error_does_not_insert_or_commit() {
+        let mut fake = Fake {
+            fail: true,
+            calls: vec![],
+        };
+        assert!(matches!(run(&mut fake), TextWriteOutcome::Uncertain { .. }));
+        assert_eq!(fake.calls, ["set"]);
+    }
+    #[test]
+    fn refused_set_must_clear_before_insert() {
+        let mut fake = Fake {
+            fail: false,
+            calls: vec![],
+        };
+        assert_eq!(run(&mut fake), TextWriteOutcome::Acknowledged);
+        assert_eq!(fake.calls, ["set", "delete", "insert", "commit"]);
     }
 }
 
@@ -5502,46 +6496,188 @@ async fn set_value_on(
         .proxies()
         .await
         .map_err(|e| anyhow!("interface proxies unavailable: {e}"))?;
-    if let Ok(et) = proxies.editable_text().await {
-        // Replace whole contents (parity with the Windows/macOS set_value,
-        // which overwrite rather than insert at the caret).
-        if et.set_text_contents(value).await.unwrap_or(false) {
-            commit_editable_write(&proxies).await;
-            return Ok(());
-        }
-        // Some toolkits reject SetTextContents but accept an insert at the
-        // caret offset; clear-then-insert as a fallback.
-        let off = match proxies.text().await {
-            Ok(tp) => tp.caret_offset().await.unwrap_or(0),
-            Err(_) => 0,
-        };
-        let len = value.chars().count() as i32;
-        if et.insert_text(off, value, len).await.unwrap_or(false) {
-            commit_editable_write(&proxies).await;
-            return Ok(());
-        }
+    if proxies.editable_text().await.is_ok()
+        && !replacement_needs_value(
+            run_native_editable_route(acc, value, EditableRoute::Replace).await?,
+        )?
+    {
+        return Ok(());
     }
     if has_value {
-        let v: f64 = value
-            .parse()
-            .map_err(|_| anyhow!("value '{value}' is not numeric for a Value element"))?;
-        proxies
+        let v = parse_value_number(value)?;
+        let value_proxy = proxies
             .value()
             .await
-            .map_err(|e| anyhow!("Value unavailable: {e}"))?
-            .set_current_value(v)
-            .await
-            .map_err(|e| anyhow!("setCurrentValue failed: {e}"))?;
-        return Ok(());
+            .map_err(|e| anyhow!("Value unavailable: {e}"))?;
+        let dispatch = TEXT_DISPATCH.with(Arc::clone);
+        return dispatch_numeric_value(&dispatch, value.len(), value_proxy.set_current_value(v))
+            .await;
     }
     Err(anyhow!(
         "{NO_VALUE_ROUTE}: {label} exposes neither EditableText nor Value"
     ))
 }
 
+async fn dispatch_numeric_value(
+    dispatch: &TextWriteDispatch,
+    bytes: usize,
+    future: impl std::future::Future<Output = zbus::Result<()>>,
+) -> Result<()> {
+    use crate::text_write_policy::{CallClass, MutationResult, Step, WriteStep};
+    dispatch
+        .gate
+        .enter_mutator()
+        .map_err(|_| WriteDispatchClosed)?;
+    dispatch.ledger.record_sent();
+    dispatch.step.store(5, Ordering::SeqCst);
+    let classified = match call(future).await {
+        Some(Ok(())) => Ok(MutationResult::Acknowledged),
+        Some(Err(error)) => Err(classify_mutator_error(&error)),
+        None => Err(CallClass::PossiblyExecuted),
+    };
+    dispatch.ledger.record_result(classified);
+    dispatch.gate.finish_mutator();
+    match classified {
+        Ok(_) => Ok(()),
+        // The method is not there: nothing changed, so the caller may treat
+        // the element as having no value route.
+        Err(CallClass::KnownUnsupported) => Err(anyhow!(
+            "{NO_VALUE_ROUTE}: Value.SetCurrentValue is not supported"
+        )),
+        Err(_) => Err(WriteUncertain {
+            step: WriteStep {
+                step: Step::SetValue,
+                bytes,
+                units: None,
+            },
+        }
+        .into()),
+    }
+}
+
+fn replacement_needs_value(outcome: crate::text_write_policy::TextWriteOutcome) -> Result<bool> {
+    use crate::text_write_policy::{Reason, TextWriteOutcome};
+    match outcome {
+        TextWriteOutcome::Acknowledged => Ok(false),
+        TextWriteOutcome::Uncertain { step } => Err(WriteUncertain { step }.into()),
+        TextWriteOutcome::Partial { step } => Err(WritePartial { step }.into()),
+        TextWriteOutcome::NothingWritten {
+            reason: Reason::GateClosed,
+        } => Err(WriteDispatchClosed.into()),
+        TextWriteOutcome::NothingWritten { .. } => Ok(true),
+    }
+}
+
+fn parse_value_number(value: &str) -> Result<f64> {
+    let number: f64 = value
+        .parse()
+        .map_err(|_| anyhow!("value is not numeric for a Value element"))?;
+    if !number.is_finite() {
+        return Err(anyhow!("numeric Value must be finite"));
+    }
+    Ok(number)
+}
+
+#[cfg(test)]
+mod numeric_value_tests {
+    use super::*;
+    use crate::text_write_policy::{Reason, Step, TextWriteOutcome, WriteStep};
+    #[test]
+    fn non_finite_value_is_rejected_before_dispatch() {
+        for value in ["NaN", "inf", "-inf"] {
+            assert!(parse_value_number(value).is_err(), "{value}");
+        }
+        assert_eq!(parse_value_number("2.5").unwrap(), 2.5);
+    }
+
+    #[test]
+    fn only_nothing_written_can_reach_the_value_route() {
+        assert!(replacement_needs_value(TextWriteOutcome::NothingWritten {
+            reason: Reason::Refused
+        })
+        .unwrap());
+        assert!(replacement_needs_value(TextWriteOutcome::NothingWritten {
+            reason: Reason::Unsupported
+        })
+        .unwrap());
+        assert!(!replacement_needs_value(TextWriteOutcome::Acknowledged).unwrap());
+        let step = WriteStep {
+            step: Step::InsertText,
+            bytes: 3,
+            units: Some(3),
+        };
+        for outcome in [
+            TextWriteOutcome::Uncertain { step },
+            TextWriteOutcome::Partial { step },
+        ] {
+            let error = replacement_needs_value(outcome).unwrap_err();
+            assert!(!is_no_value_route(&error));
+        }
+    }
+
+    #[test]
+    fn value_error_after_dispatch_is_uncertain() {
+        let dispatch = TextWriteDispatch::default();
+        let error = runtime()
+            .block_on(dispatch_numeric_value(&dispatch, 3, async {
+                Err(zbus::Error::InvalidReply)
+            }))
+            .unwrap_err();
+        assert!(error.downcast_ref::<WriteUncertain>().is_some());
+        assert!(dispatch.ledger.sent());
+        assert!(dispatch.ledger.possibly_executed());
+    }
+
+    #[test]
+    fn unsupported_set_current_value_changed_nothing() {
+        for error in [
+            zbus::Error::MethodError(
+                "org.freedesktop.DBus.Error.UnknownMethod"
+                    .try_into()
+                    .unwrap(),
+                None,
+                zbus::Message::method_call("/test", "Test")
+                    .unwrap()
+                    .build(&())
+                    .unwrap(),
+            ),
+            zbus::Error::FDO(Box::new(zbus::fdo::Error::UnknownInterface("test".into()))),
+        ] {
+            let dispatch = TextWriteDispatch::default();
+            let error = runtime()
+                .block_on(dispatch_numeric_value(
+                    &dispatch,
+                    3,
+                    async move { Err(error) },
+                ))
+                .unwrap_err();
+            assert!(is_no_value_route(&error), "{error}");
+            assert!(error.downcast_ref::<WriteUncertain>().is_none());
+            assert!(!dispatch.ledger.possibly_executed());
+        }
+    }
+
+    #[test]
+    fn numeric_parse_error_never_echoes_the_value() {
+        let error = parse_value_number("hunter2").unwrap_err();
+        assert!(!error.to_string().contains("hunter2"));
+    }
+}
+
 pub fn set_value(pid: u32, idx: usize, value: &str) -> Result<()> {
-    bounded_for(
+    set_value_with_dispatch(pid, idx, value, Arc::new(TextWriteDispatch::default()))
+}
+
+pub fn set_value_with_dispatch(
+    pid: u32,
+    idx: usize,
+    value: &str,
+    dispatch: Arc<TextWriteDispatch>,
+) -> Result<()> {
+    bounded_text_for_with_dispatch(
         INDEX_RESOLVE_BUDGET,
+        value,
+        dispatch,
         async {
             let conn = shared_connection().await?;
             let visited = collect_visited(conn, pid)
@@ -5570,8 +6706,18 @@ pub fn set_value(pid: u32, idx: usize, value: &str) -> Result<()> {
 /// [`set_value`] on a snapshot-cached element identity (the exact object the
 /// caller's `element_index` named, not the same ordinal in a fresh walk).
 pub fn set_value_ref(object_ref: &ObjectRef, value: &str) -> Result<()> {
-    bounded_for(
+    set_value_ref_with_dispatch(object_ref, value, Arc::new(TextWriteDispatch::default()))
+}
+
+pub fn set_value_ref_with_dispatch(
+    object_ref: &ObjectRef,
+    value: &str,
+    dispatch: Arc<TextWriteDispatch>,
+) -> Result<()> {
+    bounded_text_for_with_dispatch(
         REF_ACTION_BUDGET,
+        value,
+        dispatch,
         async {
             let conn = shared_connection().await?;
             let (acc, _) = live_accessible(conn, object_ref).await?;
@@ -5717,6 +6863,17 @@ async fn list_options(conn: &AccessibilityConnection, oref: &RawObjectRef) -> Ve
 /// sets the active row and emits its `changed` signal, focus-free and
 /// without opening the popup.
 pub fn select_option_ref(object_ref: &ObjectRef, value: &str) -> Result<OptionPick> {
+    select_option_ref_gated(object_ref, value, &TextWriteDispatch::default())
+}
+
+/// [`select_option_ref`] that enters `dispatch` only right before
+/// `SelectChild`: discovery is reads, so a caller that timed out during it
+/// gets no selection afterwards.
+pub fn select_option_ref_gated(
+    object_ref: &ObjectRef,
+    value: &str,
+    dispatch: &TextWriteDispatch,
+) -> Result<OptionPick> {
     bounded_for(
         REF_ACTION_BUDGET,
         async {
@@ -5746,18 +6903,8 @@ pub fn select_option_ref(object_ref: &ObjectRef, value: &str) -> Result<OptionPi
                 .selection()
                 .await
                 .map_err(|e| anyhow!("Selection unavailable: {e}"))?;
-            match call(selection.select_child(option.index)).await {
-                Some(Ok(true)) => Ok(OptionPick::Picked {
-                    name: option.name.clone(),
-                }),
-                Some(Ok(false)) => Err(anyhow!(
-                    "Selection.SelectChild({}) was refused for option {:?}",
-                    option.index,
-                    option.name
-                )),
-                Some(Err(e)) => Err(anyhow!("Selection.SelectChild failed: {e}")),
-                None => Err(anyhow!("Selection.SelectChild did not answer in time")),
-            }
+            let reply = gated_mutator(dispatch, call(selection.select_child(option.index))).await?;
+            option_mutation_result(reply, value.len(), &option.name, "Selection.SelectChild")
         },
         || Err(anyhow!("select option (cached element) timed out")),
     )
@@ -5767,6 +6914,16 @@ pub fn select_option_ref(object_ref: &ObjectRef, value: &str) -> Result<OptionPi
 /// combo box (its items exist and act only while it is open): the option's
 /// own click/activate action selects it and closes the popup.
 pub fn activate_option_ref(object_ref: &ObjectRef, value: &str) -> Result<OptionPick> {
+    activate_option_ref_gated(object_ref, value, &TextWriteDispatch::default())
+}
+
+/// [`activate_option_ref`] that enters `dispatch` only right before the
+/// option's `DoAction`.
+pub fn activate_option_ref_gated(
+    object_ref: &ObjectRef,
+    value: &str,
+    dispatch: &TextWriteDispatch,
+) -> Result<OptionPick> {
     bounded_for(
         REF_ACTION_BUDGET,
         async {
@@ -5801,17 +6958,110 @@ pub fn activate_option_ref(object_ref: &ObjectRef, value: &str) -> Result<Option
             let chosen = activation_index(&role, &actions).ok_or_else(|| {
                 anyhow!("option {:?} advertises no activation action", option.name)
             })?;
-            match call(ap.do_action(chosen as i32)).await {
-                Some(Ok(true)) => Ok(OptionPick::Picked {
-                    name: option.name.clone(),
-                }),
-                Some(Ok(false)) => Err(anyhow!("option {:?} refused its action", option.name)),
-                Some(Err(e)) => Err(anyhow!("option action failed: {e}")),
-                None => Err(anyhow!("option action did not answer in time")),
-            }
+            let reply = gated_mutator(dispatch, call(ap.do_action(chosen as i32))).await?;
+            option_mutation_result(reply, value.len(), &option.name, "option DoAction")
         },
         || Err(anyhow!("activate option (cached element) timed out")),
     )
+}
+
+/// Enter `dispatch` immediately before polling a mutator; a closed gate (the
+/// caller already returned) sends nothing. Dropping the future mid-call
+/// leaves the gate entered, so a later timeout reports possible execution.
+async fn gated_mutator<T>(
+    dispatch: &TextWriteDispatch,
+    mutator: impl std::future::Future<Output = T>,
+) -> Result<T> {
+    dispatch
+        .gate
+        .enter_mutator()
+        .map_err(|_| WriteDispatchClosed)?;
+    dispatch.ledger.record_sent();
+    let reply = mutator.await;
+    dispatch.gate.finish_mutator();
+    Ok(reply)
+}
+
+/// A selection/activation reply: `true` picked; `false` or an unsupported
+/// method changed nothing; anything else after sending may have run.
+fn option_mutation_result(
+    reply: Option<zbus::Result<bool>>,
+    bytes: usize,
+    option: &str,
+    method: &str,
+) -> Result<OptionPick> {
+    use crate::text_write_policy::{CallClass, Step, WriteStep};
+    match reply {
+        Some(Ok(true)) => Ok(OptionPick::Picked {
+            name: option.to_owned(),
+        }),
+        Some(Ok(false)) => Err(anyhow!("{method} was refused for option {option:?}")),
+        Some(Err(error)) if classify_mutator_error(&error) == CallClass::KnownUnsupported => {
+            Err(anyhow!("{method} is not supported for option {option:?}"))
+        }
+        Some(Err(_)) | None => Err(WriteUncertain {
+            step: WriteStep {
+                step: Step::SetValue,
+                bytes,
+                units: None,
+            },
+        }
+        .into()),
+    }
+}
+
+#[cfg(test)]
+mod option_mutation_tests {
+    use super::*;
+
+    #[test]
+    fn closed_gate_sends_no_option_mutator() {
+        let dispatch = TextWriteDispatch::default();
+        assert!(text_write_timeout_error(&dispatch, 3).is_none());
+        let sent = std::cell::Cell::new(false);
+        let error = runtime()
+            .block_on(gated_mutator(&dispatch, async {
+                sent.set(true);
+            }))
+            .unwrap_err();
+        assert!(
+            !sent.get(),
+            "mutator polled after the caller closed the gate"
+        );
+        assert!(error.downcast_ref::<WriteDispatchClosed>().is_some());
+    }
+
+    #[test]
+    fn open_gate_records_the_dispatch() {
+        let dispatch = TextWriteDispatch::default();
+        runtime()
+            .block_on(gated_mutator(&dispatch, async {}))
+            .unwrap();
+        assert!(dispatch.ledger.sent());
+        // A later caller timeout reports possible execution.
+        assert!(text_write_timeout_error(&dispatch, 3).is_some());
+    }
+
+    #[test]
+    fn option_replies_after_send_are_classified() {
+        assert!(matches!(
+            option_mutation_result(Some(Ok(true)), 3, "Large", "m"),
+            Ok(OptionPick::Picked { .. })
+        ));
+        for unchanged in [
+            Some(Ok(false)),
+            Some(Err(zbus::Error::FDO(Box::new(
+                zbus::fdo::Error::UnknownMethod(String::new()),
+            )))),
+        ] {
+            let error = option_mutation_result(unchanged, 3, "Large", "m").unwrap_err();
+            assert!(error.downcast_ref::<WriteUncertain>().is_none());
+        }
+        for uncertain in [None, Some(Err(zbus::Error::InvalidReply))] {
+            let error = option_mutation_result(uncertain, 3, "Large", "m").unwrap_err();
+            assert!(error.downcast_ref::<WriteUncertain>().is_some());
+        }
+    }
 }
 
 /// Whether a snapshot-cached combo box's popup is open: any of its options
