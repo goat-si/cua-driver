@@ -125,10 +125,29 @@ fn bind_pattern(aliases: &mut Aliases, pattern: &syn::Pat) {
 }
 
 fn parameters(sig: &syn::Signature) -> Aliases {
-    let mut result = Aliases::new();
+    let mut result = generic_bindings(&sig.generics);
     for arg in &sig.inputs {
         if let syn::FnArg::Typed(arg) = arg {
             bind_pattern(&mut result, &arg.pat);
+        }
+    }
+    result
+}
+
+fn bind_name(aliases: &mut Aliases, name: &syn::Ident) {
+    aliases
+        .entry(name.to_string())
+        .or_default()
+        .insert(LOCAL_BINDING.into());
+}
+
+fn generic_bindings(generics: &syn::Generics) -> Aliases {
+    let mut result = Aliases::new();
+    for param in &generics.params {
+        match param {
+            syn::GenericParam::Type(param) => bind_name(&mut result, &param.ident),
+            syn::GenericParam::Const(param) => bind_name(&mut result, &param.ident),
+            syn::GenericParam::Lifetime(_) => {}
         }
     }
     result
@@ -150,13 +169,71 @@ fn condition_bindings(expr: &Expr) -> Aliases {
 fn item_imports<'a>(items: impl IntoIterator<Item = &'a syn::Item>) -> Aliases {
     let mut aliases = Aliases::new();
     for item in items {
-        if let syn::Item::Use(item) = item {
-            if !test_only(&item.attrs) {
-                imports(&item.tree, &mut Vec::new(), &mut aliases);
+        if test_only(item_attrs(item)) {
+            continue;
+        }
+        match item {
+            syn::Item::Use(item) => imports(&item.tree, &mut Vec::new(), &mut aliases),
+            syn::Item::Fn(item) => bind_name(&mut aliases, &item.sig.ident),
+            syn::Item::Const(item) => bind_name(&mut aliases, &item.ident),
+            syn::Item::Static(item) => bind_name(&mut aliases, &item.ident),
+            syn::Item::Struct(item) => bind_name(&mut aliases, &item.ident),
+            syn::Item::Enum(item) => bind_name(&mut aliases, &item.ident),
+            syn::Item::Union(item) => bind_name(&mut aliases, &item.ident),
+            syn::Item::Mod(item) => bind_name(&mut aliases, &item.ident),
+            syn::Item::Trait(item) => bind_name(&mut aliases, &item.ident),
+            syn::Item::TraitAlias(item) => bind_name(&mut aliases, &item.ident),
+            syn::Item::Type(item) => bind_name(&mut aliases, &item.ident),
+            syn::Item::ExternCrate(item) => bind_name(
+                &mut aliases,
+                item.rename.as_ref().map_or(&item.ident, |(_, name)| name),
+            ),
+            syn::Item::Macro(item) => {
+                if let Some(name) = &item.ident {
+                    bind_name(&mut aliases, name);
+                }
             }
+            syn::Item::ForeignMod(item) => {
+                for foreign in &item.items {
+                    match foreign {
+                        syn::ForeignItem::Fn(item) if !test_only(&item.attrs) => {
+                            bind_name(&mut aliases, &item.sig.ident)
+                        }
+                        syn::ForeignItem::Static(item) if !test_only(&item.attrs) => {
+                            bind_name(&mut aliases, &item.ident)
+                        }
+                        syn::ForeignItem::Type(item) if !test_only(&item.attrs) => {
+                            bind_name(&mut aliases, &item.ident)
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            _ => {}
         }
     }
     aliases
+}
+
+fn item_attrs(i: &syn::Item) -> &[Attribute] {
+    match i {
+        syn::Item::Const(x) => &x.attrs,
+        syn::Item::Enum(x) => &x.attrs,
+        syn::Item::ExternCrate(x) => &x.attrs,
+        syn::Item::Fn(x) => &x.attrs,
+        syn::Item::ForeignMod(x) => &x.attrs,
+        syn::Item::Impl(x) => &x.attrs,
+        syn::Item::Macro(x) => &x.attrs,
+        syn::Item::Mod(x) => &x.attrs,
+        syn::Item::Static(x) => &x.attrs,
+        syn::Item::Struct(x) => &x.attrs,
+        syn::Item::Trait(x) => &x.attrs,
+        syn::Item::TraitAlias(x) => &x.attrs,
+        syn::Item::Type(x) => &x.attrs,
+        syn::Item::Union(x) => &x.attrs,
+        syn::Item::Use(x) => &x.attrs,
+        _ => &[],
+    }
 }
 
 fn has_glob(tree: &UseTree) -> bool {
@@ -168,24 +245,205 @@ fn has_glob(tree: &UseTree) -> bool {
     }
 }
 
+fn expr_attrs(expr: &Expr) -> &[Attribute] {
+    match expr {
+        Expr::Array(x) => &x.attrs,
+        Expr::Assign(x) => &x.attrs,
+        Expr::Async(x) => &x.attrs,
+        Expr::Await(x) => &x.attrs,
+        Expr::Binary(x) => &x.attrs,
+        Expr::Block(x) => &x.attrs,
+        Expr::Break(x) => &x.attrs,
+        Expr::Call(x) => &x.attrs,
+        Expr::Cast(x) => &x.attrs,
+        Expr::Closure(x) => &x.attrs,
+        Expr::Const(x) => &x.attrs,
+        Expr::Continue(x) => &x.attrs,
+        Expr::Field(x) => &x.attrs,
+        Expr::ForLoop(x) => &x.attrs,
+        Expr::Group(x) => &x.attrs,
+        Expr::If(x) => &x.attrs,
+        Expr::Index(x) => &x.attrs,
+        Expr::Infer(x) => &x.attrs,
+        Expr::Let(x) => &x.attrs,
+        Expr::Lit(x) => &x.attrs,
+        Expr::Loop(x) => &x.attrs,
+        Expr::Macro(x) => &x.attrs,
+        Expr::Match(x) => &x.attrs,
+        Expr::MethodCall(x) => &x.attrs,
+        Expr::Paren(x) => &x.attrs,
+        Expr::Path(x) => &x.attrs,
+        Expr::Range(x) => &x.attrs,
+        Expr::RawAddr(x) => &x.attrs,
+        Expr::Reference(x) => &x.attrs,
+        Expr::Repeat(x) => &x.attrs,
+        Expr::Return(x) => &x.attrs,
+        Expr::Struct(x) => &x.attrs,
+        Expr::Try(x) => &x.attrs,
+        Expr::TryBlock(x) => &x.attrs,
+        Expr::Tuple(x) => &x.attrs,
+        Expr::Unary(x) => &x.attrs,
+        Expr::Unsafe(x) => &x.attrs,
+        Expr::While(x) => &x.attrs,
+        Expr::Yield(x) => &x.attrs,
+        _ => &[],
+    }
+}
+
+fn trait_item_attrs(item: &syn::TraitItem) -> &[Attribute] {
+    match item {
+        syn::TraitItem::Const(item) => &item.attrs,
+        syn::TraitItem::Fn(item) => &item.attrs,
+        syn::TraitItem::Type(item) => &item.attrs,
+        syn::TraitItem::Macro(item) => &item.attrs,
+        _ => &[],
+    }
+}
+
+fn impl_item_attrs(item: &syn::ImplItem) -> &[Attribute] {
+    match item {
+        syn::ImplItem::Const(item) => &item.attrs,
+        syn::ImplItem::Fn(item) => &item.attrs,
+        syn::ImplItem::Type(item) => &item.attrs,
+        syn::ImplItem::Macro(item) => &item.attrs,
+        _ => &[],
+    }
+}
+
+fn foreign_item_attrs(item: &syn::ForeignItem) -> &[Attribute] {
+    match item {
+        syn::ForeignItem::Fn(item) => &item.attrs,
+        syn::ForeignItem::Static(item) => &item.attrs,
+        syn::ForeignItem::Type(item) => &item.attrs,
+        syn::ForeignItem::Macro(item) => &item.attrs,
+        _ => &[],
+    }
+}
+
+#[derive(Default)]
+struct BodyBindings {
+    names: BTreeSet<String>,
+    imports: Aliases,
+}
+
+impl<'ast> Visit<'ast> for BodyBindings {
+    fn visit_pat_ident(&mut self, pattern: &'ast syn::PatIdent) {
+        self.names.insert(pattern.ident.to_string());
+        visit::visit_pat_ident(self, pattern);
+    }
+    fn visit_generic_param(&mut self, param: &'ast syn::GenericParam) {
+        match param {
+            syn::GenericParam::Type(item) => {
+                self.names.insert(item.ident.to_string());
+            }
+            syn::GenericParam::Const(item) => {
+                self.names.insert(item.ident.to_string());
+            }
+            syn::GenericParam::Lifetime(_) => {}
+        }
+        visit::visit_generic_param(self, param);
+    }
+    fn visit_item(&mut self, item: &'ast syn::Item) {
+        if test_only(item_attrs(item)) {
+            return;
+        }
+        for (name, values) in item_imports(std::iter::once(item)) {
+            if values.contains(LOCAL_BINDING) {
+                self.names.insert(name.clone());
+            }
+            self.imports
+                .entry(name)
+                .or_default()
+                .extend(values.into_iter().filter(|value| value != LOCAL_BINDING));
+        }
+        visit::visit_item(self, item);
+    }
+    fn visit_local(&mut self, local: &'ast syn::Local) {
+        if !test_only(&local.attrs) {
+            visit::visit_local(self, local);
+        }
+    }
+    fn visit_expr(&mut self, expr: &'ast Expr) {
+        if !test_only(expr_attrs(expr)) {
+            visit::visit_expr(self, expr);
+        }
+    }
+    fn visit_trait_item(&mut self, item: &'ast syn::TraitItem) {
+        if !test_only(trait_item_attrs(item)) {
+            match item {
+                syn::TraitItem::Fn(item) => {
+                    self.names.insert(item.sig.ident.to_string());
+                }
+                syn::TraitItem::Const(item) => {
+                    self.names.insert(item.ident.to_string());
+                }
+                syn::TraitItem::Type(item) => {
+                    self.names.insert(item.ident.to_string());
+                }
+                _ => {}
+            }
+            visit::visit_trait_item(self, item);
+        }
+    }
+    fn visit_impl_item(&mut self, item: &'ast syn::ImplItem) {
+        if !test_only(impl_item_attrs(item)) {
+            match item {
+                syn::ImplItem::Fn(item) => {
+                    self.names.insert(item.sig.ident.to_string());
+                }
+                syn::ImplItem::Const(item) => {
+                    self.names.insert(item.ident.to_string());
+                }
+                syn::ImplItem::Type(item) => {
+                    self.names.insert(item.ident.to_string());
+                }
+                _ => {}
+            }
+            visit::visit_impl_item(self, item);
+        }
+    }
+    fn visit_foreign_item(&mut self, item: &'ast syn::ForeignItem) {
+        if !test_only(foreign_item_attrs(item)) {
+            visit::visit_foreign_item(self, item);
+        }
+    }
+}
+
 struct Scanner {
     file: String,
     item: Vec<String>,
     scopes: Vec<Aliases>,
     module_scope: usize,
+    body_bindings: Vec<BodyBindings>,
     counts: BTreeMap<(String, String, u64), usize>,
     sites: Vec<Site>,
 }
 
 impl Scanner {
+    fn trusted(&self, path: &syn::Path, expected: &str) -> bool {
+        let Some(first) = path.segments.first() else {
+            return false;
+        };
+        let name = first.ident.to_string();
+        !self.body_bindings.iter().any(|scope| {
+            scope.names.contains(&name)
+                || scope.imports.get(&name).is_some_and(|imports| {
+                    imports.iter().any(|import| {
+                        expected != import
+                            && !expected
+                                .strip_prefix(import)
+                                .is_some_and(|suffix| suffix.starts_with("::"))
+                    })
+                })
+        }) && self.resolve(path).as_slice() == [expected]
+    }
+
     fn wrapped_thread_builder(&self, call: &syn::ExprMethodCall) -> bool {
         fn builder(scanner: &Scanner, expr: &Expr) -> bool {
             match expr {
                 Expr::MethodCall(method) => builder(scanner, &method.receiver),
                 Expr::Call(call) => match &*call.func {
-                    Expr::Path(path) => {
-                        scanner.resolve(&path.path).as_slice() == ["std::thread::Builder::new"]
-                    }
+                    Expr::Path(path) => scanner.trusted(&path.path, "std::thread::Builder::new"),
                     _ => false,
                 },
                 _ => false,
@@ -197,8 +455,7 @@ impl Scanner {
         match call.args.first() {
             Some(Expr::Call(wrap)) if wrap.args.len() == 1 => match &*wrap.func {
                 Expr::Path(path) => {
-                    self.resolve(&path.path).as_slice()
-                        == ["crate::input::worker_context::wrap_blocking"]
+                    self.trusted(&path.path, "crate::input::worker_context::wrap_blocking")
                 }
                 _ => false,
             },
@@ -278,50 +535,19 @@ impl Scanner {
 
 impl<'ast> Visit<'ast> for Scanner {
     fn visit_expr(&mut self, expr: &'ast Expr) {
-        let attrs: &[Attribute] = match expr {
-            Expr::Array(x) => &x.attrs,
-            Expr::Assign(x) => &x.attrs,
-            Expr::Async(x) => &x.attrs,
-            Expr::Await(x) => &x.attrs,
-            Expr::Binary(x) => &x.attrs,
-            Expr::Block(x) => &x.attrs,
-            Expr::Break(x) => &x.attrs,
-            Expr::Call(x) => &x.attrs,
-            Expr::Cast(x) => &x.attrs,
-            Expr::Closure(x) => &x.attrs,
-            Expr::Const(x) => &x.attrs,
-            Expr::Continue(x) => &x.attrs,
-            Expr::Field(x) => &x.attrs,
-            Expr::ForLoop(x) => &x.attrs,
-            Expr::Group(x) => &x.attrs,
-            Expr::If(x) => &x.attrs,
-            Expr::Index(x) => &x.attrs,
-            Expr::Infer(x) => &x.attrs,
-            Expr::Let(x) => &x.attrs,
-            Expr::Lit(x) => &x.attrs,
-            Expr::Loop(x) => &x.attrs,
-            Expr::Macro(x) => &x.attrs,
-            Expr::Match(x) => &x.attrs,
-            Expr::MethodCall(x) => &x.attrs,
-            Expr::Paren(x) => &x.attrs,
-            Expr::Path(x) => &x.attrs,
-            Expr::Range(x) => &x.attrs,
-            Expr::RawAddr(x) => &x.attrs,
-            Expr::Reference(x) => &x.attrs,
-            Expr::Repeat(x) => &x.attrs,
-            Expr::Return(x) => &x.attrs,
-            Expr::Struct(x) => &x.attrs,
-            Expr::Try(x) => &x.attrs,
-            Expr::TryBlock(x) => &x.attrs,
-            Expr::Tuple(x) => &x.attrs,
-            Expr::Unary(x) => &x.attrs,
-            Expr::Unsafe(x) => &x.attrs,
-            Expr::While(x) => &x.attrs,
-            Expr::Yield(x) => &x.attrs,
-            _ => &[],
-        };
-        if !test_only(attrs) {
+        if !test_only(expr_attrs(expr)) {
+            if let Expr::Verbatim(tokens) = expr {
+                self.record("unparsed-expression".into(), tokens.clone(), 0);
+                return;
+            }
             visit::visit_expr(self, expr);
+        }
+    }
+    fn visit_pat(&mut self, pattern: &'ast syn::Pat) {
+        if let syn::Pat::Verbatim(tokens) = pattern {
+            self.record("unparsed-pattern".into(), tokens.clone(), 0);
+        } else {
+            visit::visit_pat(self, pattern);
         }
     }
     fn visit_local(&mut self, local: &'ast syn::Local) {
@@ -329,14 +555,23 @@ impl<'ast> Visit<'ast> for Scanner {
             visit::visit_local(self, local);
         }
     }
+    fn visit_stmt_macro(&mut self, item: &'ast syn::StmtMacro) {
+        if !test_only(&item.attrs) {
+            visit::visit_stmt_macro(self, item);
+        }
+    }
     fn visit_expr_closure(&mut self, closure: &'ast syn::ExprClosure) {
         let mut bindings = Aliases::new();
         for pattern in &closure.inputs {
             bind_pattern(&mut bindings, pattern);
         }
+        let mut body = BodyBindings::default();
+        body.visit_expr_closure(closure);
+        self.body_bindings.push(body);
         self.scopes.push(bindings);
         visit::visit_expr_closure(self, closure);
         self.scopes.pop();
+        self.body_bindings.pop();
     }
     fn visit_expr_for_loop(&mut self, loop_expr: &'ast syn::ExprForLoop) {
         let mut bindings = Aliases::new();
@@ -368,26 +603,39 @@ impl<'ast> Visit<'ast> for Scanner {
         self.scopes.pop();
     }
     fn visit_item(&mut self, i: &'ast syn::Item) {
-        let attrs: &[Attribute] = match i {
-            syn::Item::Const(x) => &x.attrs,
-            syn::Item::Enum(x) => &x.attrs,
-            syn::Item::ExternCrate(x) => &x.attrs,
-            syn::Item::Fn(x) => &x.attrs,
-            syn::Item::ForeignMod(x) => &x.attrs,
-            syn::Item::Impl(x) => &x.attrs,
-            syn::Item::Macro(x) => &x.attrs,
-            syn::Item::Mod(x) => &x.attrs,
-            syn::Item::Static(x) => &x.attrs,
-            syn::Item::Struct(x) => &x.attrs,
-            syn::Item::Trait(x) => &x.attrs,
-            syn::Item::TraitAlias(x) => &x.attrs,
-            syn::Item::Type(x) => &x.attrs,
-            syn::Item::Union(x) => &x.attrs,
-            syn::Item::Use(x) => &x.attrs,
-            _ => &[],
-        };
-        if !test_only(attrs) {
+        if !test_only(item_attrs(i)) {
+            if let syn::Item::Verbatim(tokens) = i {
+                self.record("unparsed-item".into(), tokens.clone(), 0);
+                return;
+            }
             visit::visit_item(self, i);
+        }
+    }
+    fn visit_trait_item(&mut self, i: &'ast syn::TraitItem) {
+        if !test_only(trait_item_attrs(i)) {
+            if let syn::TraitItem::Verbatim(tokens) = i {
+                self.record("unparsed-trait-item".into(), tokens.clone(), 0);
+                return;
+            }
+            visit::visit_trait_item(self, i);
+        }
+    }
+    fn visit_impl_item(&mut self, i: &'ast syn::ImplItem) {
+        if !test_only(impl_item_attrs(i)) {
+            if let syn::ImplItem::Verbatim(tokens) = i {
+                self.record("unparsed-impl-item".into(), tokens.clone(), 0);
+                return;
+            }
+            visit::visit_impl_item(self, i);
+        }
+    }
+    fn visit_foreign_item(&mut self, i: &'ast syn::ForeignItem) {
+        if !test_only(foreign_item_attrs(i)) {
+            if let syn::ForeignItem::Verbatim(tokens) = i {
+                self.record("unparsed-foreign-item".into(), tokens.clone(), 0);
+                return;
+            }
+            visit::visit_foreign_item(self, i);
         }
     }
     fn visit_item_use(&mut self, i: &'ast syn::ItemUse) {
@@ -413,6 +661,9 @@ impl<'ast> Visit<'ast> for Scanner {
         }
     }
     fn visit_block(&mut self, block: &'ast syn::Block) {
+        let mut body = BodyBindings::default();
+        body.visit_block(block);
+        self.body_bindings.push(body);
         let items = block.stmts.iter().filter_map(|stmt| match stmt {
             syn::Stmt::Item(item) => Some(item),
             _ => None,
@@ -428,32 +679,108 @@ impl<'ast> Visit<'ast> for Scanner {
         self.scopes.push(aliases);
         visit::visit_block(self, block);
         self.scopes.pop();
+        self.body_bindings.pop();
     }
     fn visit_item_fn(&mut self, i: &'ast syn::ItemFn) {
         if !test_only(&i.attrs) {
+            let mut body = BodyBindings::default();
+            body.visit_signature(&i.sig);
+            body.names.insert(i.sig.ident.to_string());
+            self.body_bindings.push(body);
             self.scopes.push(parameters(&i.sig));
             self.with_item(i.sig.ident.to_string(), |s| visit::visit_item_fn(s, i));
             self.scopes.pop();
+            self.body_bindings.pop();
         }
     }
     fn visit_item_const(&mut self, i: &'ast syn::ItemConst) {
+        self.body_bindings.push(BodyBindings {
+            names: [i.ident.to_string()].into_iter().collect(),
+            ..Default::default()
+        });
         self.with_item(i.ident.to_string(), |s| visit::visit_item_const(s, i));
+        self.body_bindings.pop();
     }
     fn visit_item_static(&mut self, i: &'ast syn::ItemStatic) {
+        self.body_bindings.push(BodyBindings {
+            names: [i.ident.to_string()].into_iter().collect(),
+            ..Default::default()
+        });
         self.with_item(i.ident.to_string(), |s| visit::visit_item_static(s, i));
+        self.body_bindings.pop();
     }
     fn visit_impl_item_fn(&mut self, i: &'ast syn::ImplItemFn) {
         if !test_only(&i.attrs) {
+            let mut body = BodyBindings::default();
+            body.visit_signature(&i.sig);
+            body.names.insert(i.sig.ident.to_string());
+            self.body_bindings.push(body);
             self.scopes.push(parameters(&i.sig));
             self.with_item(i.sig.ident.to_string(), |s| visit::visit_impl_item_fn(s, i));
             self.scopes.pop();
+            self.body_bindings.pop();
+        }
+    }
+    fn visit_trait_item_fn(&mut self, i: &'ast syn::TraitItemFn) {
+        if !test_only(&i.attrs) {
+            let mut body = BodyBindings::default();
+            body.visit_signature(&i.sig);
+            body.names.insert(i.sig.ident.to_string());
+            self.body_bindings.push(body);
+            self.scopes.push(parameters(&i.sig));
+            self.with_item(i.sig.ident.to_string(), |s| {
+                visit::visit_trait_item_fn(s, i)
+            });
+            self.scopes.pop();
+            self.body_bindings.pop();
+        }
+    }
+    fn visit_trait_item_const(&mut self, i: &'ast syn::TraitItemConst) {
+        if !test_only(&i.attrs) {
+            self.body_bindings.push(BodyBindings {
+                names: [i.ident.to_string()].into_iter().collect(),
+                ..Default::default()
+            });
+            self.with_item(i.ident.to_string(), |s| visit::visit_trait_item_const(s, i));
+            self.body_bindings.pop();
+        }
+    }
+    fn visit_impl_item_const(&mut self, i: &'ast syn::ImplItemConst) {
+        if !test_only(&i.attrs) {
+            self.body_bindings.push(BodyBindings {
+                names: [i.ident.to_string()].into_iter().collect(),
+                ..Default::default()
+            });
+            self.with_item(i.ident.to_string(), |s| visit::visit_impl_item_const(s, i));
+            self.body_bindings.pop();
+        }
+    }
+    fn visit_item_trait(&mut self, i: &'ast syn::ItemTrait) {
+        if !test_only(&i.attrs) {
+            let names = generic_bindings(&i.generics);
+            self.body_bindings.push(BodyBindings {
+                names: names.keys().cloned().collect(),
+                ..Default::default()
+            });
+            self.scopes.push(names);
+            self.with_item(i.ident.to_string(), |s| visit::visit_item_trait(s, i));
+            self.scopes.pop();
+            self.body_bindings.pop();
         }
     }
     fn visit_item_impl(&mut self, i: &'ast syn::ItemImpl) {
         if !test_only(&i.attrs) {
+            let names = generic_bindings(&i.generics);
+            self.body_bindings.push(BodyBindings {
+                names: names.keys().cloned().collect(),
+                ..Default::default()
+            });
+            self.scopes.push(names);
             self.with_item(i.self_ty.to_token_stream().to_string(), |s| {
                 visit::visit_item_impl(s, i)
             });
+            self.scopes.pop();
+            self.body_bindings.pop();
         }
     }
     fn visit_expr_call(&mut self, i: &'ast syn::ExprCall) {
@@ -480,7 +807,7 @@ impl<'ast> Visit<'ast> for Scanner {
                     .unwrap_or(&names[0])
                     .clone();
                 // Action latency helpers wrap blocking work themselves.
-                let wrapped = names.as_slice() == ["crate::goat::action_latency::spawn_blocking"];
+                let wrapped = self.trusted(&p.path, "crate::goat::action_latency::spawn_blocking");
                 if !wrapped {
                     self.record(
                         primitive,
@@ -546,14 +873,39 @@ impl<'ast> Visit<'ast> for Scanner {
     fn visit_macro(&mut self, m: &'ast syn::Macro) {
         // Token trees inside macros are opaque to syn's expression visitor.
         // Any spawn-like identifier in one is reviewed as its own site.
-        fn has_spawn(stream: TokenStream) -> bool {
+        fn has_spawn(scanner: &Scanner, stream: TokenStream) -> bool {
             stream.into_iter().any(|t| match t {
-                TokenTree::Group(g) => has_spawn(g.stream()),
-                TokenTree::Ident(i) => i == "spawn" || i == "spawn_blocking" || i == "spawn_local",
+                TokenTree::Group(g) => has_spawn(scanner, g.stream()),
+                TokenTree::Ident(i) => {
+                    let ident = i.to_string();
+                    matches!(ident.as_str(), "spawn" | "spawn_blocking" | "spawn_local")
+                        || scanner.scopes[scanner.module_scope..]
+                            .iter()
+                            .filter_map(|scope| scope.get(&ident))
+                            .chain(
+                                scanner
+                                    .body_bindings
+                                    .iter()
+                                    .filter_map(|scope| scope.imports.get(&ident)),
+                            )
+                            .any(|paths| {
+                                paths.iter().any(|path| {
+                                    path.rsplit("::").next().is_some_and(|name| {
+                                        matches!(
+                                            name,
+                                            "spawn"
+                                                | "spawn_blocking"
+                                                | "spawn_local"
+                                                | "wrap_blocking"
+                                        )
+                                    })
+                                })
+                            })
+                }
                 _ => false,
             })
         }
-        if has_spawn(m.tokens.clone()) {
+        if has_spawn(self, m.path.to_token_stream()) || has_spawn(self, m.tokens.clone()) {
             self.record(
                 "macro-spawn".into(),
                 m.to_token_stream(),
@@ -573,6 +925,7 @@ pub(super) fn scan(file: &str, source: &str) -> Result<Vec<Site>, syn::Error> {
         item: Vec::new(),
         scopes: vec![item_imports(syntax.items.iter())],
         module_scope: 0,
+        body_bindings: Vec::new(),
         counts: BTreeMap::new(),
         sites: Vec::new(),
     };

@@ -318,8 +318,13 @@ fn scanner_handles_comments_strings_aliases_and_multiline_calls() {
     "#,
     )
     .unwrap();
-    assert_eq!(restored.len(), 1, "{restored:#?}");
-    assert_eq!(restored[0].primitive, "tokio::task::spawn_blocking");
+    assert_eq!(restored.len(), 2, "{restored:#?}");
+    assert!(restored
+        .iter()
+        .any(|site| site.primitive == "tokio::task::spawn_blocking"));
+    assert!(restored
+        .iter()
+        .any(|site| site.primitive == "crate::goat::action_latency::spawn_blocking"));
 
     let ambiguous = scan(
         "ambiguous.rs",
@@ -418,6 +423,137 @@ fn trait_method_parameter_shadow_rejects_wrapped_builder() {
     assert!(
         sites.iter().any(|site| site.item == "Work::run"),
         "trait method name missing: {sites:#?}"
+    );
+}
+
+#[test]
+fn body_binding_sweep_rejects_shadowed_worker_helpers() {
+    let imported = "use crate::input::worker_context::wrap_blocking as wrap;";
+    let cases = [
+        ("trait const", "trait T { const C: () = { let wrap = identity; std::thread::Builder::new().spawn(wrap(work)); }; }"),
+        ("impl const", "impl T { const C: () = { let wrap = identity; std::thread::Builder::new().spawn(wrap(work)); }; }"),
+        ("nested fn item", "fn f() { fn wrap(x: T) -> T { x } std::thread::Builder::new().spawn(wrap(work)); }"),
+        ("nested mod item", "fn f() { let wrap = identity; mod m { use crate::input::worker_context::wrap_blocking as wrap; fn g() { std::thread::Builder::new().spawn(wrap(work)); } } }"),
+        ("nested trait item", "fn f() { let wrap = identity; trait T { const C: () = { std::thread::Builder::new().spawn(wrap(work)); }; } }"),
+        ("nested impl item", "fn f() { let wrap = identity; impl T { const C: () = { std::thread::Builder::new().spawn(wrap(work)); }; } }"),
+        ("closure parameter", "fn f() { let _ = |wrap| { std::thread::Builder::new().spawn(wrap(work)); }; }"),
+        ("async closure parameter", "fn f() { let _ = async |wrap| { std::thread::Builder::new().spawn(wrap(work)); }; }"),
+        ("async block", "fn f() { let _ = async { let wrap = identity; std::thread::Builder::new().spawn(wrap(work)); }; }"),
+        ("const block", "fn f() { let _ = const { let wrap = identity; std::thread::Builder::new().spawn(wrap(work)); }; }"),
+        ("let else", "fn f() { let Some(wrap) = value else { return; }; std::thread::Builder::new().spawn(wrap(work)); }"),
+        ("match arm", "fn f() { match value { Some(wrap) => { std::thread::Builder::new().spawn(wrap(work)); }, _ => {} } }"),
+        ("if let", "fn f() { if let Some(wrap) = value { std::thread::Builder::new().spawn(wrap(work)); } }"),
+        ("while let", "fn f() { while let Some(wrap) = next() { std::thread::Builder::new().spawn(wrap(work)); } }"),
+        ("for pattern", "fn f() { for wrap in values { std::thread::Builder::new().spawn(wrap(work)); } }"),
+        ("function parameter", "fn f(wrap: F) { std::thread::Builder::new().spawn(wrap(work)); }"),
+        ("generic parameter", "fn f<const wrap: usize>() { std::thread::Builder::new().spawn(wrap(work)); }"),
+        ("trait generic parameter", "trait T<const wrap: usize> { fn f() { std::thread::Builder::new().spawn(wrap(work)); } }"),
+        ("impl generic parameter", "impl<const wrap: usize> T { const C: () = { std::thread::Builder::new().spawn(wrap(work)); }; }"),
+        ("foreign item", "fn f() { unsafe extern \"C\" { fn wrap(); } std::thread::Builder::new().spawn(wrap(work)); }"),
+        ("extern crate item", "fn f() { extern crate other as wrap; std::thread::Builder::new().spawn(wrap(work)); }"),
+        ("trait alias item", "fn f() { trait wrap = Bound; std::thread::Builder::new().spawn(wrap(work)); }"),
+        ("other cfg", "#[cfg(feature = \"x\")] trait T { fn f(&self, wrap: F) { std::thread::Builder::new().spawn(wrap(work)); } }"),
+        ("cfg trait method", "trait T { #[cfg(not(test))] fn f(wrap: F) { std::thread::Builder::new().spawn(wrap(work)); } }"),
+        ("cfg trait const", "trait T { #[cfg(feature = \"x\")] const C: () = { let wrap = identity; std::thread::Builder::new().spawn(wrap(work)); }; }"),
+        ("cfg impl const", "impl T { #[cfg(feature = \"x\")] const C: () = { let wrap = identity; std::thread::Builder::new().spawn(wrap(work)); }; }"),
+        ("elsewhere in enclosing fn", "fn f() { { let wrap = identity; } std::thread::Builder::new().spawn(wrap(work)); }"),
+        ("import elsewhere in enclosing fn", "fn f() { { use other::identity as wrap; } std::thread::Builder::new().spawn(wrap(work)); }"),
+    ];
+    for (label, body) in cases {
+        let sites = scan("sweep.rs", &format!("{imported} {body}")).unwrap();
+        assert!(
+            sites.iter().any(|site| site.primitive == ".spawn"),
+            "{label} omitted its spawn: {sites:#?}"
+        );
+        if label == "trait const" || label == "impl const" {
+            assert!(
+                sites.iter().any(|site| site.item == "T::C"),
+                "{label} missing associated item name: {sites:#?}"
+            );
+        }
+    }
+
+    let call = scan(
+        "call.rs",
+        r#"
+        use crate::goat::action_latency::spawn_blocking as run;
+        fn f() { { let run = identity; } run(work); }
+    "#,
+    )
+    .unwrap();
+    assert!(
+        !call.is_empty(),
+        "binding elsewhere in fn hid helper-call shadow: {call:#?}"
+    );
+
+    let macros = scan(
+        "macro.rs",
+        "macro_rules! m { () => { let wrap = identity; std::thread::spawn(wrap(work)) }; } m! { let wrap = identity; tokio::spawn(wrap(work)) }",
+    )
+    .unwrap();
+    assert_eq!(
+        macros
+            .iter()
+            .filter(|site| site.primitive == "macro-spawn")
+            .count(),
+        2,
+        "{macros:#?}"
+    );
+    let alias_macro = scan("macro_alias.rs", "use tokio::task::spawn_blocking as run; macro_rules! m { () => { run(work) }; } m! { run(work) }").unwrap();
+    assert_eq!(
+        alias_macro
+            .iter()
+            .filter(|site| site.primitive == "macro-spawn")
+            .count(),
+        2,
+        "{alias_macro:#?}"
+    );
+    let nested_alias_macro = scan("nested_macro.rs", "fn f() { { use tokio::task::spawn_blocking as run; } macro_rules! m { () => { run(work) }; } }").unwrap();
+    assert!(
+        nested_alias_macro
+            .iter()
+            .any(|site| site.primitive == "macro-spawn"),
+        "nested macro alias omitted: {nested_alias_macro:#?}"
+    );
+    let tests_only = scan("test_only.rs", &format!("{imported} #[cfg(test)] trait T {{ fn f(wrap: F) {{ std::thread::Builder::new().spawn(wrap(work)); }} }}")).unwrap();
+    assert!(
+        tests_only.is_empty(),
+        "test-only trait was scanned: {tests_only:#?}"
+    );
+    let test_method = scan("test_method.rs", &format!("{imported} trait T {{ #[cfg(test)] fn f(wrap: F) {{ std::thread::Builder::new().spawn(wrap(work)); }} }}")).unwrap();
+    assert!(
+        test_method.is_empty(),
+        "test-only trait method was scanned: {test_method:#?}"
+    );
+    let test_consts = scan("test_consts.rs", &format!("{imported} trait T {{ #[cfg(test)] const C: () = {{ let wrap = identity; std::thread::Builder::new().spawn(wrap(work)); }}; }} impl T {{ #[cfg(test)] const C: () = {{ let wrap = identity; std::thread::Builder::new().spawn(wrap(work)); }}; }}")).unwrap();
+    assert!(
+        test_consts.is_empty(),
+        "test-only associated const was scanned: {test_consts:#?}"
+    );
+    let test_macro = scan(
+        "test_macro.rs",
+        "fn f() { #[cfg(test)] fake! { tokio::spawn(work) }; }",
+    )
+    .unwrap();
+    assert!(
+        test_macro.is_empty(),
+        "test-only statement macro was scanned: {test_macro:#?}"
+    );
+    let foreign_macro = scan(
+        "foreign_macro.rs",
+        "unsafe extern \"C\" { fake! { std::thread::spawn(work) } }",
+    )
+    .unwrap();
+    assert!(
+        foreign_macro
+            .iter()
+            .any(|site| site.primitive == "macro-spawn"),
+        "foreign macro missing: {foreign_macro:#?}"
+    );
+    let safe_local = scan("safe_local.rs", "fn f() { use crate::input::worker_context::wrap_blocking as wrap; std::thread::Builder::new().spawn(wrap(work)); }").unwrap();
+    assert!(
+        safe_local.is_empty(),
+        "unique helper alias was rejected: {safe_local:#?}"
     );
 }
 
