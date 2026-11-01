@@ -200,6 +200,68 @@ fn content_observation_preserves_shadowed_failures() {
 const CONTROL: &str =
     "AXEnabled,AXPosition,AXSize,AXValueDescription,AXMinValue,AXMaxValue,AXSelected";
 
+fn plain_root(
+    role: Read<String>,
+    actions: Read<Vec<String>>,
+    read_value: bool,
+) -> crate::ax::evidence::Observed<TreeWalkResult> {
+    const CONTENT: &str =
+        "AXTitle,AXPlaceholderValue,AXDescription,AXIdentifier,AXHelp,AXSubrole,AXRoleDescription";
+    const FRAME: &str = "AXPosition,AXSize";
+    let mut attrs = vec![Slot::Text(AttrStatus::Absent); 7];
+    attrs[0] = Slot::Text(AttrStatus::Known("Root".into()));
+    let mut steps = vec![
+        step("timeout 1", Reply::Unit),
+        step("text 1 AXRole", Reply::Text(role)),
+        step(
+            &format!("batch 1 {CONTENT}"),
+            Reply::Batch(Ok(Batch(attrs))),
+        ),
+    ];
+    if read_value {
+        steps.push(step("value 1", Reply::Value(Ok(None))));
+    }
+    steps.extend([
+        step("actions 1", Reply::Actions(actions)),
+        step(
+            &format!("batch 1 {FRAME}"),
+            Reply::Batch(Ok(Batch(vec![Slot::Point(None), Slot::Size(None)]))),
+        ),
+        step("children 1", Reply::Children(Read::Absent)),
+    ]);
+    let fake = Fake::new(&[(1, 1, 1, &[])], steps);
+    let root = fake.handle(1);
+    let observed = run_fake_observed(&fake, &root, None, 10, WalkBudget::nodes_only(10), true);
+    assert!(observed.legacy.tree_markdown.contains("Root"));
+    drop(root);
+    fake.assert_consumed();
+    fake.assert_lifetimes(&[]);
+    observed
+}
+
+#[test]
+fn role_read_preserves_unknown_and_absent() {
+    for case in [Case::AxFailure, Case::Known, Case::Absent, Case::WrongType] {
+        let observed = plain_root(
+            case.read("AXWindow".into()),
+            Read::Known(vec![]),
+            matches!(case, Case::Known),
+        );
+        assert_eq!(observed.legacy.nodes_skipped, !matches!(case, Case::Known));
+        assert_evidence(&observed.evidence, ReadSite::Role, case.status());
+    }
+}
+
+#[test]
+fn action_names_preserve_unknown_and_absent() {
+    for case in [Case::AxFailure, Case::Known, Case::Absent, Case::WrongType] {
+        let observed = plain_root(Read::Known("AXWindow".into()), case.read(vec![]), true);
+        assert!(!observed.legacy.nodes_skipped);
+        assert!(observed.legacy.nodes[0].actions.is_empty());
+        assert_evidence(&observed.evidence, ReadSite::ActionNames, case.status());
+    }
+}
+
 #[test]
 fn control_batch_preserves_unknown_and_absent_per_slot() {
     let batch = Batch(vec![

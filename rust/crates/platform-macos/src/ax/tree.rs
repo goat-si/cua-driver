@@ -1324,7 +1324,9 @@ fn walk_element<S: AxTreeSource>(
     // element, so every descendant must be bounded before any attribute read.
     source.set_messaging_timeout(element);
 
-    let role_observed = known(source.text(element, "AXRole"));
+    let role_observation = source.text(element, "AXRole");
+    let role_status = super::evidence::read_status(&role_observation);
+    let role_observed = known(role_observation);
     let role_read = role_observed.is_some();
     let role = role_observed.unwrap_or_else(|| {
         // A selector on the role cannot be answered for this node.
@@ -1334,6 +1336,11 @@ fn walk_element<S: AxTreeSource>(
 
     let label_path = next_label_path(parent_path, parent_role, Some(&role));
     let element_key = source.key(element);
+    super::evidence::record_status(
+        Some(element_key),
+        super::evidence::ReadSite::Role,
+        role_status,
+    );
     let child_label_path = child_label_path(label_path, &role, parent_role, element_key);
     let in_web_content = in_web_content || is_web_content_role(&role);
     if in_web_content && !include_web_content {
@@ -1422,7 +1429,15 @@ fn walk_element<S: AxTreeSource>(
                 description,
                 identifier,
                 help: None,
-                actions: known(source.action_names(element)).unwrap_or_default(),
+                actions: known(
+                    super::evidence::observe_read(
+                        Some(element_key),
+                        super::evidence::ReadSite::ActionNames,
+                        source.action_names(element),
+                    )
+                    .into_walk_legacy(),
+                )
+                .unwrap_or_default(),
                 element_ptr: snapshot_key,
                 depth,
                 parent_element_index: parent_index,
@@ -1581,7 +1596,15 @@ fn walk_element<S: AxTreeSource>(
         // A label read failed: a selector on it cannot be answered.
         note_skipped();
     }
-    let actions = known(source.action_names(element)).unwrap_or_default();
+    let actions = known(
+        super::evidence::observe_read(
+            Some(element_key),
+            super::evidence::ReadSite::ActionNames,
+            source.action_names(element),
+        )
+        .into_walk_legacy(),
+    )
+    .unwrap_or_default();
     let visible_title = title.as_deref().unwrap_or("").trim().to_owned();
     let visible_description = description.as_deref().unwrap_or("").trim().to_owned();
     let visible_value = value.as_deref().unwrap_or("").trim().to_owned();
