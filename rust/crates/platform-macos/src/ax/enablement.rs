@@ -242,6 +242,14 @@ fn await_web_content(
 ///
 /// `app_element` must be a valid application `AXUIElementRef` for `pid`.
 pub unsafe fn ensure_chromium_ax_enabled(pid: i32, app_element: AXUIElementRef) {
+    ensure_chromium_ax_enabled_observed(pid, app_element).legacy;
+}
+
+/// The same enablement operations, with value-free diagnostic metadata.
+pub(crate) unsafe fn ensure_chromium_ax_enabled_observed(
+    pid: i32,
+    app_element: AXUIElementRef,
+) -> super::evidence::Observed<()> {
     let stamp = process_start_stamp(pid);
     let cached = ENABLEMENT_STATE
         .lock()
@@ -269,7 +277,6 @@ pub unsafe fn ensure_chromium_ax_enabled(pid: i32, app_element: AXUIElementRef) 
         },
         Some(app_element as usize),
     )
-    .legacy;
 }
 
 /// Runs the existing cache and materialization decisions against supplied
@@ -281,17 +288,59 @@ pub(super) fn ensure_with(
     opt_in: impl FnOnce() -> AccessibilityOptIn,
     await_tree: impl FnOnce() -> bool,
     persist: impl FnOnce(ProcessStartStamp, Wait),
-    _owner: Option<usize>,
+    owner: Option<usize>,
 ) -> super::evidence::Observed<()> {
+    use super::evidence::{EvidenceStatus, Observed, ReadEvidence, ReadSite};
     let prior_timeouts = match next_attempt(cached.as_ref(), stamp, attempted_at) {
-        Attempt::Skip => return super::evidence::Observed::legacy_only(()),
+        Attempt::Skip => {
+            let (status, attempt) = match cached.expect("skip requires cached state").wait {
+                Wait::Complete => (EvidenceStatus::Known, 0),
+                Wait::TimedOut { attempts, .. } => (EvidenceStatus::Unavailable, attempts),
+            };
+            return Observed {
+                legacy: (),
+                evidence: vec![ReadEvidence {
+                    owner,
+                    site: ReadSite::ProviderCachedEnablement,
+                    status,
+                    attempt,
+                    listing: None,
+                }],
+            };
+        }
         Attempt::Run { prior_timeouts } => prior_timeouts,
     };
     let outcome = wait_outcome(opt_in(), prior_timeouts, attempted_at, await_tree);
     if let (Some(stamp), Some(wait)) = (stamp, outcome) {
         persist(stamp, wait);
     }
-    super::evidence::Observed::legacy_only(())
+    let (site, status, attempt) = match outcome {
+        None => (
+            ReadSite::ProviderOptIn,
+            EvidenceStatus::Unavailable,
+            prior_timeouts + 1,
+        ),
+        Some(Wait::Complete) => (
+            ReadSite::ProviderEnablement,
+            EvidenceStatus::Known,
+            prior_timeouts + 1,
+        ),
+        Some(Wait::TimedOut { attempts, .. }) => (
+            ReadSite::ProviderEnablement,
+            EvidenceStatus::Unavailable,
+            attempts,
+        ),
+    };
+    Observed {
+        legacy: (),
+        evidence: vec![ReadEvidence {
+            owner,
+            site,
+            status,
+            attempt,
+            listing: None,
+        }],
+    }
 }
 
 #[cfg(test)]

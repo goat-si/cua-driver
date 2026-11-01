@@ -796,7 +796,8 @@ fn walk_tree_with_web_content_inner(
             // has not started answering AX rejects the flip without caching the
             // refusal, so each launch-wait attempt asks again.
             let attempt_started = Instant::now();
-            super::enablement::ensure_chromium_ax_enabled(pid, app_elem);
+            super::enablement::ensure_chromium_ax_enabled_observed(pid, app_elem)
+                .into_walk_legacy();
 
             let recovery_deadline = budget
                 .time_limit()

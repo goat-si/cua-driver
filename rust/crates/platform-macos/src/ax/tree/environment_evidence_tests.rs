@@ -56,4 +56,51 @@ fn provider_enablement_preserves_failed_and_cached_outcomes() {
             && entry.attempt == 1),
         "missing cached failure evidence"
     );
+
+    let ready_cache = Cell::new(None);
+    let ready = ensure_with(
+        None,
+        Some(stamp),
+        now,
+        || AccessibilityOptIn::EnhancedUserInterface,
+        || true,
+        |stamp, wait| ready_cache.set(Some(ProcessEnablement { stamp, wait })),
+        Some(7),
+    );
+    assert!(ready
+        .evidence
+        .iter()
+        .any(|entry| entry.site == ReadSite::ProviderEnablement
+            && entry.status == EvidenceStatus::Known
+            && entry.owner == Some(7)));
+    let cached_ready = ensure_with(
+        ready_cache.get(),
+        Some(stamp),
+        now + Duration::from_secs(1),
+        || panic!("cached ready must not re-enable"),
+        || panic!("cached ready must not wait"),
+        |_, _| panic!("cached ready must not write"),
+        Some(7),
+    );
+    assert!(cached_ready
+        .evidence
+        .iter()
+        .any(|entry| entry.site == ReadSite::ProviderCachedEnablement
+            && entry.status == EvidenceStatus::Known
+            && entry.owner == Some(7)));
+    let rejected = ensure_with(
+        None,
+        Some(stamp),
+        now,
+        || AccessibilityOptIn::NotAccepted,
+        || panic!("rejected opt-in must not wait"),
+        |_, _| panic!("rejected opt-in must not cache"),
+        Some(7),
+    );
+    assert!(rejected
+        .evidence
+        .iter()
+        .any(|entry| entry.site == ReadSite::ProviderOptIn
+            && entry.status == EvidenceStatus::Unavailable
+            && entry.owner == Some(7)));
 }
