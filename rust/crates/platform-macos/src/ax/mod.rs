@@ -34,6 +34,7 @@ pub mod scroll_area;
 pub mod snapshot;
 pub mod tree;
 mod tree_source;
+pub(crate) mod vocabulary;
 pub mod window_scope;
 pub(crate) mod write_outcome;
 

@@ -257,6 +257,11 @@ pub(super) fn read_with<R: ContentReader>(
         identifier: text(3),
         help: text(4).filter(|help| !help.trim().is_empty()),
         subrole: text(5),
+        subrole_status: evidence.attrs[5].clone(),
+        classification_failures: [2, 3].map(|i| match &evidence.attrs[i] {
+            status @ (AttrStatus::Failed { .. } | AttrStatus::WrongType) => Some(status.clone()),
+            _ => None,
+        }),
         read_failed,
         secure,
         value_unknown: !secure && (!allowed || value_failed),
@@ -272,6 +277,8 @@ pub(crate) struct ContentAttrs {
     pub identifier: Option<String>,
     pub help: Option<String>,
     pub subrole: Option<String>,
+    pub subrole_status: AttrStatus,
+    pub classification_failures: [Option<AttrStatus>; 2],
     /// A single read failed with an error other than "no value" or
     /// "unsupported": the attribute may hold content this node does not show.
     /// (A batched read with such an error falls back to single reads.)
@@ -306,6 +313,8 @@ impl ContentAttrs {
             help: slots.string(5).filter(|help| !help.trim().is_empty()),
             read_failed: false,
             subrole: None,
+            subrole_status: AttrStatus::Absent,
+            classification_failures: [None, None],
             secure: false,
             value_unknown: false,
         }
@@ -361,6 +370,8 @@ impl ContentAttrs {
             help: help.ok().flatten().filter(|help| !help.trim().is_empty()),
             read_failed,
             subrole: None,
+            subrole_status: AttrStatus::Absent,
+            classification_failures: [None, None],
             secure: false,
             value_unknown: false,
         }
@@ -1421,6 +1432,9 @@ mod source_adapter_tests {
         fn set_messaging_timeout(&self, _: &()) {
             panic!("unexpected timeout")
         }
+        fn set_optional_timeout(&self, _: &(), _: f32) {
+            panic!("unexpected timeout")
+        }
         fn text(&self, _: &(), _: &str) -> Read<String> {
             panic!("unexpected plain text")
         }
@@ -1472,7 +1486,7 @@ mod source_adapter_tests {
         fn action_names(&self, _: &()) -> Read<Vec<String>> {
             panic!("unexpected actions")
         }
-        fn value_settable(&self, _: &()) -> bool {
+        fn value_settable(&self, _: &()) -> Settable {
             panic!("unexpected writable")
         }
         fn selected_settable(&self, _: &()) -> Settable {
