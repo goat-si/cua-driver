@@ -94,6 +94,42 @@ mod tests {
     use cua_driver_core::walk_budget::WalkBudget;
     use serde_json::{json, Value};
 
+    /// A fake reader emits only facts; no D-Bus calls or clocks are involved.
+    struct Record {
+        in_scope: bool,
+        indexed: bool,
+        position: usize,
+        event: Option<Event>,
+        direct_children: Option<CountEvidence>,
+    }
+
+    fn fake_walk(
+        records: &[Record],
+        exhaustive: bool,
+    ) -> (Completeness, HashMap<usize, NodeBoundary>) {
+        let mut c = Completeness::new(exhaustive);
+        for record in records {
+            if let Some(event) = record.event {
+                c.record(
+                    record.in_scope,
+                    event,
+                    record.direct_children.map(|count| (record.position, count)),
+                );
+            }
+        }
+        let indexed = records
+            .iter()
+            .filter(|r| r.in_scope && r.indexed)
+            .filter_map(|r| {
+                c.boundaries
+                    .get(&r.position)
+                    .cloned()
+                    .map(|boundary| (r.position, boundary))
+            })
+            .collect();
+        (c, indexed)
+    }
+
     fn output(c: &Completeness) -> Value {
         let mut budget = WalkBudget::new(1000, usize::MAX);
         if c.exhaustive {
@@ -218,5 +254,91 @@ mod tests {
         assert!(has(&c, "time_budget"));
         assert!(has(&c, "untrusted_provider"));
         assert!(has(&c, "not_asserted"));
+    }
+
+    #[test]
+    fn fake_reader_preserves_siblings_and_limits_boundaries_to_indexed_nodes() {
+        let records = [
+            Record {
+                in_scope: true,
+                indexed: false,
+                position: 0,
+                event: Some(Event::ChildrenFailed),
+                direct_children: Some(CountEvidence::Known(3)),
+            },
+            Record {
+                in_scope: true,
+                indexed: true,
+                position: 1,
+                event: Some(Event::DepthLimit),
+                direct_children: Some(CountEvidence::Known(2)),
+            },
+            Record {
+                in_scope: false,
+                indexed: true,
+                position: 2,
+                event: Some(Event::ChildrenFailed),
+                direct_children: Some(CountEvidence::Unknown),
+            },
+            Record {
+                in_scope: true,
+                indexed: true,
+                position: 3,
+                event: Some(Event::AttributeFailed),
+                direct_children: None,
+            },
+        ];
+        let (c, indexed) = fake_walk(&records, true);
+        assert!(has(&c, "child_enumeration_failed"));
+        assert!(has(&c, "depth_limit"));
+        assert!(has(&c, "attribute_read_failed"));
+        assert_eq!(indexed.len(), 1);
+        assert_eq!(indexed[&1].children_skipped, CountEvidence::Known(2));
+        assert!(!indexed.contains_key(&0));
+        assert!(!indexed.contains_key(&2));
+        assert!(!indexed.contains_key(&3));
+    }
+
+    #[test]
+    fn fake_reader_clean_presentations_and_optional_interfaces_are_complete() {
+        // Clean containers, absent optional interfaces, a successful child-count
+        // fallback, tooltip exclusion, text capping and tab compaction emit no
+        // omitted-scope event.
+        let records: Vec<_> = (0..6)
+            .map(|position| Record {
+                in_scope: true,
+                indexed: position % 2 == 0,
+                position,
+                event: None,
+                direct_children: None,
+            })
+            .collect();
+        let (c, indexed) = fake_walk(&records, true);
+        assert_eq!(output(&c)["observation_complete"], true);
+        assert_eq!(output(&c)["observation_incomplete_reasons"], json!([]));
+        assert!(indexed.is_empty());
+    }
+
+    #[test]
+    fn fake_reader_app_reference_timeout_menu_and_scope_mismatch_are_reported() {
+        for (event, detail, exhaustive) in [
+            (Event::ChildrenFailed, "child_enumeration_failed", true), // dropped app reference or timed-out GetChildren
+            (Event::CollapsedMenu, "collapsed_menu", true),
+            (Event::HugeContainer, "huge_container", true),
+            (Event::ScopeMismatch, "scope_mismatch", false),
+        ] {
+            let (c, _) = fake_walk(
+                &[Record {
+                    in_scope: true,
+                    indexed: false,
+                    position: 0,
+                    event: Some(event),
+                    direct_children: None,
+                }],
+                exhaustive,
+            );
+            assert!(has(&c, detail));
+            assert_eq!(output(&c)["observation_complete"], false);
+        }
     }
 }

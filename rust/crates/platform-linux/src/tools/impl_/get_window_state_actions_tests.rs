@@ -158,3 +158,30 @@ fn get_window_state_fallback_preserves_timeout_and_is_untrusted() {
     assert!(reasons.iter().any(|r| r["detail"] == "untrusted_provider"));
     assert!(reasons.iter().any(|r| r["detail"] == "time_budget"));
 }
+
+#[test]
+fn budget_events_preserve_linux_counts_and_reason() {
+    use crate::walk_completeness::Event;
+    for (event, legacy, detail) in [
+        (Event::NodeBudget, "node_budget", "node_budget"),
+        (Event::TimeBudget, "timeout", "time_budget"),
+    ] {
+        let mut tree = tree_for_completeness();
+        tree.truncated = true;
+        tree.truncation_reason = Some(legacy.into());
+        tree.nodes_pending = 5;
+        tree.completeness.record(true, event, None);
+        let mut structured = json!({"pid": 7, "window_id": 9});
+        apply_linux_walk_completeness(&mut structured, &tree, 900);
+        assert_eq!(structured["truncation_reason"], legacy);
+        assert_eq!(structured["nodes_visited"], 7);
+        assert_eq!(structured["nodes_pending"], 5);
+        assert_eq!(structured["timeout_ms"], 900);
+        assert_eq!(structured["elements_complete"], false);
+        assert!(structured["observation_incomplete_reasons"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|reason| reason["kind"] == "budget" && reason["detail"] == detail));
+    }
+}
