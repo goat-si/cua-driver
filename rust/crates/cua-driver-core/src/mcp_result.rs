@@ -728,6 +728,25 @@ mod tests {
         );
     }
 
+    #[test]
+    fn scope_exclusion_schema_refuses_pre_u23_proxy_in_both_directions() {
+        let tool = "get_window_state";
+        let old: Value = serde_json::from_str(include_str!(
+            "../../../../contract/fixtures/get-window-state-pre-u23-success-schema.json"
+        ))
+        .unwrap();
+        let old = cua_driver_contract::advertised_output_schema(old);
+        let new = advertised_tool_output_schema(tool).unwrap();
+        let payload = json!({"pid":7,"window_id":9,"observation_scope_exclusions":[{"kind":"closed_menus_not_expanded","element_indices":[1]}]});
+        let validator = jsonschema::validator_for(&new).unwrap();
+        assert!(validator.is_valid(&payload));
+        let mut invalid = payload;
+        invalid["observation_scope_exclusions"][0]["kind"] = json!("unknown_kind");
+        assert!(!validator.is_valid(&invalid));
+        assert!(validate_proxy_schema_pair(tool, Some(&new), Some(&old)).is_err());
+        assert!(validate_proxy_schema_pair(tool, Some(&old), Some(&new)).is_err());
+    }
+
     #[track_caller]
     fn assert_conforms(tool: &str, result: &Value) {
         let schema = advertised_tool_output_schema(tool).expect("tool advertises a schema");

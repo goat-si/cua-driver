@@ -5670,6 +5670,81 @@ const FfiConverterTypePressKeyInput = (() => {
     return new FFIConverter();
 })();
 
+/**
+ * Scope deliberately not read, distinct from an incomplete requested read.
+ */
+export enum ScopeExclusionKind {
+    ClosedMenusNotExpanded
+}
+
+const FfiConverterTypeScopeExclusionKind = (() => {
+    const ordinalConverter = FfiConverterInt32;
+    type TypeName = ScopeExclusionKind;
+    class FFIConverter extends AbstractFfiConverterByteArray<TypeName> {
+        read(from: RustBuffer): TypeName {
+            switch (ordinalConverter.read(from)) {
+                case 1: return ScopeExclusionKind.ClosedMenusNotExpanded;
+                default: throw new UniffiInternalError.UnexpectedEnumCase();
+            }
+        }
+        write(value: TypeName, into: RustBuffer): void {
+            switch (value) {
+                case ScopeExclusionKind.ClosedMenusNotExpanded: return ordinalConverter.write(1, into);
+            }
+        }
+        allocationSize(value: TypeName): number {
+            return ordinalConverter.allocationSize(0);
+        }
+    }
+    return new FFIConverter();
+})();
+
+export type ScopeExclusion = {
+    kind: ScopeExclusionKind,
+    /**
+     * Excluded owner rows in this snapshot; absent when ownership is unknown.
+     */
+    elementIndices?: Array<bigint>
+}
+
+/**
+ * Generated factory for {@link ScopeExclusion} record objects.
+ */
+export const ScopeExclusion = (() => {
+    const defaults = () => ({
+    });
+    const create = (() => {
+        return uniffiCreateRecord<ScopeExclusion, ReturnType<typeof defaults>>(defaults);
+    })();
+    return Object.freeze({
+        create,
+        new: create,
+        defaults: () => Object.freeze(defaults()) as Partial<ScopeExclusion>,
+    });
+})();
+
+const FfiConverterTypeScopeExclusion = (() => {
+    type TypeName = ScopeExclusion;
+    class FFIConverter extends AbstractFfiConverterByteArray<TypeName> {
+        read(from: RustBuffer): TypeName {
+            return {
+                kind: FfiConverterTypeScopeExclusionKind.read(from),
+                elementIndices: FfiConverterOptionalSequenceUInt64.read(from)
+            };
+        }
+        write(value: TypeName, into: RustBuffer): void {
+            FfiConverterTypeScopeExclusionKind.write(value.kind, into);
+            FfiConverterOptionalSequenceUInt64.write(value.elementIndices, into);
+        }
+        allocationSize(value: TypeName): number {
+            return FfiConverterTypeScopeExclusionKind.allocationSize(value.kind) +
+             FfiConverterOptionalSequenceUInt64.allocationSize(value.elementIndices);
+
+        }
+    };
+    return new FFIConverter();
+})();
+
 export enum ScrollDirection {
     Up,
     Down,
@@ -7531,6 +7606,10 @@ export type WindowStateOutput = {
      */
     observationComplete?: boolean,
     observationIncompleteReasons?: Array<IncompleteReason>,
+    /**
+     * Deliberately excluded scope. Absence does not prove full scope.
+     */
+    observationScopeExclusions?: Array<ScopeExclusion>,
     degraded?: boolean,
     degradedReason?: string,
     truncated?: boolean,
@@ -7606,6 +7685,7 @@ const FfiConverterTypeWindowStateOutput = (() => {
                 elementsComplete: FfiConverterOptionalBoolean.read(from),
                 observationComplete: FfiConverterOptionalBoolean.read(from),
                 observationIncompleteReasons: FfiConverterOptionalSequenceTypeIncompleteReason.read(from),
+                observationScopeExclusions: FfiConverterOptionalSequenceTypeScopeExclusion.read(from),
                 degraded: FfiConverterOptionalBoolean.read(from),
                 degradedReason: FfiConverterOptionalString.read(from),
                 truncated: FfiConverterOptionalBoolean.read(from),
@@ -7640,6 +7720,7 @@ const FfiConverterTypeWindowStateOutput = (() => {
             FfiConverterOptionalBoolean.write(value.elementsComplete, into);
             FfiConverterOptionalBoolean.write(value.observationComplete, into);
             FfiConverterOptionalSequenceTypeIncompleteReason.write(value.observationIncompleteReasons, into);
+            FfiConverterOptionalSequenceTypeScopeExclusion.write(value.observationScopeExclusions, into);
             FfiConverterOptionalBoolean.write(value.degraded, into);
             FfiConverterOptionalString.write(value.degradedReason, into);
             FfiConverterOptionalBoolean.write(value.truncated, into);
@@ -7673,6 +7754,7 @@ const FfiConverterTypeWindowStateOutput = (() => {
              FfiConverterOptionalBoolean.allocationSize(value.elementsComplete) +
              FfiConverterOptionalBoolean.allocationSize(value.observationComplete) +
              FfiConverterOptionalSequenceTypeIncompleteReason.allocationSize(value.observationIncompleteReasons) +
+             FfiConverterOptionalSequenceTypeScopeExclusion.allocationSize(value.observationScopeExclusions) +
              FfiConverterOptionalBoolean.allocationSize(value.degraded) +
              FfiConverterOptionalString.allocationSize(value.degradedReason) +
              FfiConverterOptionalBoolean.allocationSize(value.truncated) +
@@ -7905,6 +7987,12 @@ const FfiConverterOptionalSequenceTypeWindowElement = new FfiConverterOptional(F
 // FfiConverter for Array<IncompleteReason> | undefined
 const FfiConverterOptionalSequenceTypeIncompleteReason = new FfiConverterOptional(FfiConverterSequenceTypeIncompleteReason);
 
+// FfiConverter for Array<ScopeExclusion>
+const FfiConverterSequenceTypeScopeExclusion = new FfiConverterArray(FfiConverterTypeScopeExclusion);
+
+// FfiConverter for Array<ScopeExclusion> | undefined
+const FfiConverterOptionalSequenceTypeScopeExclusion = new FfiConverterOptional(FfiConverterSequenceTypeScopeExclusion);
+
 // FfiConverter for WindowBounds | undefined
 const FfiConverterOptionalTypeWindowBounds = new FfiConverterOptional(FfiConverterTypeWindowBounds);
 
@@ -8018,6 +8106,8 @@ export default Object.freeze({
     FfiConverterTypePredicateOutcome,
     FfiConverterTypePressKeyInput,
     FfiConverterTypeRole,
+    FfiConverterTypeScopeExclusion,
+    FfiConverterTypeScopeExclusionKind,
     FfiConverterTypeScrollBy,
     FfiConverterTypeScrollDirection,
     FfiConverterTypeScrollInput,
