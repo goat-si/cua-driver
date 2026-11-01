@@ -2238,6 +2238,7 @@ mod recording_start_guard_tests {
     }
 
     #[test]
+    #[ignore = "live: reads pointer location; runs alone in the macOS live lane"]
     fn start_succeeds_for_live_session_owner() {
         let rec = RecordingSession::new();
         let sid = "wb-recording-live-Z7A8B9";
@@ -2251,6 +2252,7 @@ mod recording_start_guard_tests {
     }
 
     #[test]
+    #[ignore = "live: reads pointer location; runs alone in the macOS live lane"]
     fn start_succeeds_for_anonymous_owner() {
         // owner = None (CLI one-shot / legacy shim) is never gated.
         let rec = RecordingSession::new();

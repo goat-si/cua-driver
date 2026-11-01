@@ -1936,6 +1936,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "live: reads NSWorkspace, accessibility IPC; runs alone in the macOS live lane"]
     fn guarded_attach_flag_follows_live_guards() {
         assert!(!guarded_attach_active());
         let guard = SelfActivationGuard::start(i32::MAX);

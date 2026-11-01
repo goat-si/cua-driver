@@ -96,6 +96,7 @@ mod tests {
     /// Resolves the CoreGraphics symbol and reads the session dictionary
     /// without crashing, with or without a window-server session.
     #[test]
+    #[ignore = "live: reads session lock state; runs alone in the macOS live lane"]
     fn screen_lock_probe_does_not_abort() {
         let _ = screen_locked();
     }
