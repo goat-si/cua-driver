@@ -1708,6 +1708,10 @@ fn finish_deferred<S: AxTreeSource>(
         });
         if skipped {
             note_skipped();
+            budget.record_skip(IncompleteReason {
+                kind: IncompleteReasonKind::PolicyOmission,
+                detail: IncompleteReasonDetail::Offscreen,
+            });
         }
         (lines, nodes, offscreen_rows) = dense_rows::splice_and_renumber(lines, nodes, deferred);
     }
@@ -2249,6 +2253,10 @@ fn walk_element<S: AxTreeSource>(
     let in_web_content = in_web_content || is_web_content_role(&role);
     if in_web_content && !include_web_content {
         note_skipped();
+        budget.record_skip(IncompleteReason {
+            kind: IncompleteReasonKind::PolicyOmission,
+            detail: IncompleteReasonDetail::WebContent,
+        });
         return;
     }
 
@@ -2964,6 +2972,10 @@ fn walk_children<S: AxTreeSource>(
             }
             if !tp.keep[index] {
                 note_skipped();
+                budget.record_skip(IncompleteReason {
+                    kind: IncompleteReasonKind::PolicyOmission,
+                    detail: IncompleteReasonDetail::InactiveTab,
+                });
                 continue;
             }
         }

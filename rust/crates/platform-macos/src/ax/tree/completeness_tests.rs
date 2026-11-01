@@ -190,6 +190,47 @@ fn duplicate_or_foreign_menu_is_not_an_omission() {
     );
 }
 
+#[test]
+fn offscreen_deferred_rows_report_offscreen() {
+    let (tree, _) = super::walker_seam_tests::dense_case_with_entry(false, false, false);
+    assert!(has_reason(&tree, "policy_omission", "offscreen"));
+    let (searched, _) = super::walker_seam_tests::dense_case_with_entry(true, false, false);
+    assert!(!has_reason(&searched, "policy_omission", "offscreen"));
+}
+
+#[test]
+fn geometry_clipped_rows_report_offscreen() {
+    let tree = super::walker_seam_tests::large_container_fixture();
+    assert!(has_reason(&tree, "policy_omission", "offscreen"));
+}
+
+#[test]
+fn inactive_tab_compaction_reports_inactive_tab() {
+    let tree = super::walker_seam_tests::tab_compaction_fixture();
+    assert!(has_reason(&tree, "policy_omission", "inactive_tab"));
+}
+
+#[test]
+fn web_content_exclusion_reports_web_content() {
+    let source = Fake::new(
+        &[(1, 1, 1, &[])],
+        vec![
+            step("timeout 1", Reply::Unit),
+            step(
+                "text 1 AXRole",
+                Reply::Text(Read::Known("AXWebArea".into())),
+            ),
+        ],
+    );
+    let root = source.handle(1);
+    let tree =
+        run_fake_observed(&source, &root, None, 10, WalkBudget::nodes_only(10), false).legacy;
+    drop(root);
+    source.assert_consumed();
+    source.assert_lifetimes(&[]);
+    assert!(has_reason(&tree, "policy_omission", "web_content"));
+}
+
 fn depth_limited_walk(query: Option<&str>) -> Value {
     let source = Fake::new(
         &[(1, 1, 1, &[2]), (2, 2, 2, &[])],

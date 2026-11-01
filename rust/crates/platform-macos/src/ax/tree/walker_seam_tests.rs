@@ -1763,8 +1763,7 @@ fn unindexed_cell_survives_owned_item_folding() {
 }
 // Baseline 36279fdc: a large generic container without visibility lists
 // reads child frames, lazily reads its surface once, and summarizes all 50.
-#[test]
-fn large_container_reads_surface_clip_lazily_once() {
+pub(super) fn large_container_fixture() -> TreeWalkResult {
     let ids: Vec<usize> = (2..52).collect();
     let mut node_specs: Vec<(usize, usize, usize, &[usize])> = vec![(1, 1, 1, ids.as_slice())];
     node_specs.extend(ids.iter().map(|&id| (id, id, id, &[][..])));
@@ -1873,6 +1872,12 @@ fn large_container_reads_surface_clip_lazily_once() {
         &trace[trace.len() - 3..],
         ["release 51", "release 2", "release 1"]
     );
+    result
+}
+
+#[test]
+fn large_container_reads_surface_clip_lazily_once() {
+    let _ = large_container_fixture();
 }
 
 // Baseline 36279fdc: vertical then horizontal element/role/value reads are
@@ -1967,8 +1972,7 @@ pub(crate) fn scroll_area_preserves_position_labels_and_read_order() {
 }
 // Baseline 36279fdc: ten tabs are planned with their selection metadata,
 // nine are omitted and the selected tab keeps its actionable index.
-#[test]
-fn tab_compaction_keeps_summary_indices_and_skip() {
+pub(super) fn tab_compaction_fixture() -> TreeWalkResult {
     let ids: Vec<usize> = (2..12).collect();
     let mut nodes: Vec<(usize, usize, usize, &[usize])> = vec![(1, 1, 1, ids.as_slice())];
     nodes.extend(ids.iter().map(|&id| (id, id, id, &[][..])));
@@ -2073,6 +2077,12 @@ fn tab_compaction_keeps_summary_indices_and_skip() {
             "release 1"
         ]
     );
+    result
+}
+
+#[test]
+fn tab_compaction_keeps_summary_indices_and_skip() {
+    let _ = tab_compaction_fixture();
 }
 // Baseline 36279fdc: nested traversal restores menu, exhaustive and dense
 // modes and its skip ledger without leaking its skipped web subtree outward.
