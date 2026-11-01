@@ -4040,3 +4040,5 @@ mod canonical_evidence_tests {
         walker_seam_tests::scroll_area_preserves_position_labels_and_read_order();
     }
 }
+#[cfg(test)]
+mod walker_test_support;

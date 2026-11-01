@@ -1,7 +1,7 @@
+use super::walker_test_support::{Batch, Slot};
 use super::*;
 use crate::ax::batch_attrs::BatchFailure;
 use crate::ax::content_attrs::AttrStatus;
-use crate::ax::tree_source::TreeBatch;
 use crate::ax::write_outcome::Settable;
 use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
@@ -45,58 +45,6 @@ impl Drop for Handle {
         *count -= 1;
         state.trace.push(format!("release {}", self.id));
     }
-}
-
-#[derive(Clone)]
-enum Slot {
-    Text(AttrStatus),
-    MixedText(String),
-    Bool(Option<bool>),
-    Number(Option<f64>),
-    Point(Option<(f64, f64)>),
-    Size(Option<(f64, f64)>),
-}
-struct Batch(Vec<Slot>);
-impl TreeBatch for Batch {
-    fn text(&self, i: usize) -> AttrStatus {
-        match &self.0[i] {
-            Slot::Text(v) => v.clone(),
-            Slot::MixedText(v) => AttrStatus::Known(v.clone()),
-            _ => panic!("wrong text slot"),
-        }
-    }
-    fn boolean(&self, i: usize) -> Read<bool> {
-        match self.0[i] {
-            Slot::Bool(v) => read(v),
-            Slot::MixedText(_) => Read::Unknown(super::super::tree_source::ReadFailure::WrongType),
-            _ => panic!("wrong bool slot"),
-        }
-    }
-    fn number(&self, i: usize) -> Read<f64> {
-        match self.0[i] {
-            Slot::Number(v) => read(v),
-            Slot::Bool(None) => Read::Absent,
-            Slot::Bool(Some(_)) | Slot::MixedText(_) => {
-                Read::Unknown(super::super::tree_source::ReadFailure::WrongType)
-            }
-            _ => panic!("wrong number slot"),
-        }
-    }
-    fn position(&self, i: usize) -> Read<(f64, f64)> {
-        match self.0[i] {
-            Slot::Point(v) => read(v),
-            _ => panic!("wrong position slot"),
-        }
-    }
-    fn size(&self, i: usize) -> Read<(f64, f64)> {
-        match self.0[i] {
-            Slot::Size(v) => read(v),
-            _ => panic!("wrong size slot"),
-        }
-    }
-}
-fn read<T>(value: Option<T>) -> Read<T> {
-    value.map_or(Read::Absent, Read::Known)
 }
 
 // Every target read must be explicitly scripted; scripts are in global order.
