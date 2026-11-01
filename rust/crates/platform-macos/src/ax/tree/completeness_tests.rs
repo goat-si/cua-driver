@@ -546,6 +546,14 @@ fn node_budget_refusal_reports_node_budget() {
 }
 
 #[test]
+fn late_final_child_enumeration_reports_time_budget() {
+    let walk = super::environment_setup_tests::run_late_final_enumeration();
+    assert!(has_reason(&walk.legacy, "budget", "time_budget"));
+    assert_eq!(walk.legacy.walk.stop, None);
+    assert_eq!(walk.legacy.walk.nodes_visited, 1);
+}
+
+#[test]
 fn query_with_an_omission_is_false_with_its_typed_reason() {
     let output = depth_limited_walk(Some("missing"));
     assert_eq!(output["observation_complete"], false);
