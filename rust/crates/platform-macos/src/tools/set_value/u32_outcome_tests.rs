@@ -245,8 +245,8 @@ async fn uncertain_delayed_match_stays_unverifiable_and_blocks_document_and_retu
     assert_eq!(mark.get(), 1);
 }
 
-#[test]
-fn step_success_then_timeout_preserves_prior_delivery() {
+#[tokio::test]
+async fn step_success_then_timeout_preserves_prior_delivery() {
     for error in [kAXErrorCannotComplete, kAXErrorAPIDisabled] {
         let mut fake = Fake::new(num(0.0))
             .unsettable()
@@ -254,7 +254,22 @@ fn step_success_then_timeout_preserves_prior_delivery() {
             .step(kAXErrorSuccess)
             .step(error);
         let out = run(&mut fake, "3", "AXSlider", true);
-        let (result, _, _, _) = project(out, "AXSlider", &Cell::new(0));
+        let mark = Cell::new(0);
+        let (result, not_applied, maybe_landed, withheld) = project(out, "AXSlider", &mark);
+        let returns = Cell::new(0);
+        let result = super::super::set_value_autosubmit::finish(
+            true,
+            1,
+            result,
+            not_applied,
+            maybe_landed,
+            withheld,
+            |_, _| async {
+                returns.set(returns.get() + 1);
+                Ok(true)
+            },
+        )
+        .await;
         assert_eq!(
             fake.writes,
             [
@@ -271,6 +286,7 @@ fn step_success_then_timeout_preserves_prior_delivery() {
         );
         assert_unsafe(&result);
         assert!(format!("{:?}", result.content).contains("may have"));
+        assert_eq!((mark.get(), returns.get()), (0, 0));
     }
 }
 
