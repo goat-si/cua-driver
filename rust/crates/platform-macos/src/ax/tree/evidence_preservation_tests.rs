@@ -1092,6 +1092,33 @@ fn dense_visibility_sets_preserve_unknown_and_absent() {
 }
 
 #[test]
+fn dense_row_sets_preserve_unknown_and_absent() {
+    for case in CASES {
+        let fake = Fake::new(
+            &[(1, 1, 1, &[])],
+            vec![
+                step("set 1 AXRows", Reply::Set(case.read(vec![1]))),
+                step("set 1 AXVisibleRows", Reply::Set(Read::Known(vec![1]))),
+            ],
+        );
+        let root = fake.handle(1);
+        let observed = dense_rows::plan_collection_children_observed(
+            &fake,
+            &root,
+            &root,
+            "AXTable",
+            &[],
+            &WalkBudget::nodes_only(10),
+        );
+        assert!(observed.legacy.is_empty());
+        fake.assert_consumed();
+        drop(root);
+        fake.assert_lifetimes(&[]);
+        assert_evidence(&observed.evidence, ReadSite::Dense("AXRows"), case.status());
+    }
+}
+
+#[test]
 fn malformed_children_preserve_valid_items_and_decode_evidence() {
     let observed =
         crate::ax::tree_source::native::decode_child_members([Some(11), None, Some(33)], |item| {
