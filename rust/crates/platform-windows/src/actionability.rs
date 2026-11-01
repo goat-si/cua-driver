@@ -16,11 +16,19 @@ pub(crate) enum LiveRead<T> {
     Failed(String, Option<i32>),
 }
 
+fn failure_text(message: &str, code: Option<i32>) -> String {
+    match code.map(|hr| hr as u32) {
+        Some(0x8004_0201) => format!("stale element: {message}"),
+        Some(_) => format!("target unconfirmed: {message}"),
+        None => message.to_owned(),
+    }
+}
+
 pub(crate) fn evidence<T: Clone>(read: &LiveRead<T>) -> Evidence<T> {
     match read {
         LiveRead::Value(v) => Evidence::Known(v.clone()),
         LiveRead::NotSupported => Evidence::Absent,
-        LiveRead::Failed(e, _) => Evidence::Unknown(e.clone()),
+        LiveRead::Failed(e, code) => Evidence::Unknown(failure_text(e, *code)),
     }
 }
 
@@ -123,11 +131,19 @@ pub(crate) fn element_facts(raw: &RawLiveFacts, _write: ValueWrite) -> ElementFa
             {
                 Evidence::Known(false)
             } else {
-                Evidence::Unknown("read-only state unavailable".into())
+                let detail = present
+                    .iter()
+                    .find_map(|(_, read)| match read {
+                        LiveRead::Failed(message, code) => Some(failure_text(message, *code)),
+                        LiveRead::NotSupported => Some("read-only state unavailable".into()),
+                        LiveRead::Value(_) => None,
+                    })
+                    .unwrap_or_else(|| "read-only state unavailable".into());
+                Evidence::Unknown(detail)
             }
         }
         LiveRead::NotSupported => Evidence::Absent,
-        LiveRead::Failed(e, _) => Evidence::Unknown(e.clone()),
+        LiveRead::Failed(e, code) => Evidence::Unknown(failure_text(e, *code)),
     };
     let affordances = match &raw.patterns {
         LiveRead::Value(patterns) => {
@@ -151,7 +167,7 @@ pub(crate) fn element_facts(raw: &RawLiveFacts, _write: ValueWrite) -> ElementFa
             Evidence::Known(actions)
         }
         LiveRead::NotSupported => Evidence::Absent,
-        LiveRead::Failed(e, _) => Evidence::Unknown(e.clone()),
+        LiveRead::Failed(e, code) => Evidence::Unknown(failure_text(e, *code)),
     };
     let role = match &raw.control_type {
         LiveRead::Value(name) => Evidence::Known(match name.as_str() {
@@ -160,7 +176,7 @@ pub(crate) fn element_facts(raw: &RawLiveFacts, _write: ValueWrite) -> ElementFa
             _ => name.to_lowercase(),
         }),
         LiveRead::NotSupported => Evidence::Absent,
-        LiveRead::Failed(e, _) => Evidence::Unknown(e.clone()),
+        LiveRead::Failed(e, code) => Evidence::Unknown(failure_text(e, *code)),
     };
     ElementFacts {
         visible,
@@ -251,7 +267,9 @@ impl Probe {
 fn admission(raw: &RawLiveFacts) -> Admission {
     let rung = |kind, read: &LiveRead<bool>| {
         if matches!(&raw.patterns, LiveRead::Value(patterns) if patterns.contains(&kind)) {
-            PatternAdmission::Present { read_only: read.clone() }
+            PatternAdmission::Present {
+                read_only: read.clone(),
+            }
         } else {
             PatternAdmission::Absent
         }

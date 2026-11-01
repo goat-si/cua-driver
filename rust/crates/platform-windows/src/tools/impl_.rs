@@ -3404,6 +3404,7 @@ enum BackgroundElementClick {
     Refused {
         message: String,
         transport: ActionTransport,
+        kind: crate::uia_mutation::RefusalKind,
         failed_calls: Vec<ActionTransport>,
     },
     Uncertain {
@@ -3469,13 +3470,24 @@ fn mutation_refusal(
     message: String,
     transport: ActionTransport,
     requested: cua_driver_core::action_record::RequestedDelivery,
+    prologue: bool,
+    reason: cua_driver_core::mutation::Reason,
 ) -> ToolResult {
     use cua_driver_core::action_record::{ActionEffect, ActionExecutionRecord};
-    ToolResult::error(message).with_action_record(ActionExecutionRecord::new(
-        ActionEffect::Refused,
-        transport,
-        requested,
-    ))
+    let effect = if prologue {
+        ActionEffect::Unverifiable
+    } else {
+        ActionEffect::Refused
+    };
+    crate::uia_mutation::chain_error(
+        message,
+        json!({"path":"uia", "verified":false}),
+        [cua_driver_core::mutation::WriteOutcome::StopNotDelivered(
+            reason,
+        )],
+        prologue,
+    )
+    .with_action_record(ActionExecutionRecord::new(effect, transport, requested))
 }
 
 fn mutation_uncertain(
@@ -3527,24 +3539,21 @@ fn acquire_uia_pattern<T: windows::core::Interface>(
 fn refused_element_click_result(
     message: String,
     transport: ActionTransport,
-    failed_calls: Vec<ActionTransport>,
+    _failed_calls: Vec<ActionTransport>,
+    kind: crate::uia_mutation::RefusalKind,
 ) -> ToolResult {
-    use cua_driver_core::action_record::{
-        ActionAttempt, ActionEffect, ActionExecutionRecord, ActualDelivery, RequestedDelivery,
+    let cua_driver_core::mutation::WriteOutcome::StopNotDelivered(reason) =
+        crate::uia_mutation::AcquireVerdict::NotDelivered(kind).to_core()
+    else {
+        unreachable!()
     };
-    let mut record = ActionExecutionRecord::new(
-        ActionEffect::Refused,
+    mutation_refusal(
+        message,
         transport,
-        RequestedDelivery::Background,
-    );
-    for attempted in failed_calls {
-        record.attempts.push(ActionAttempt {
-            transport: attempted,
-            delivery: ActualDelivery::Background,
-            detail: Some("UIA provider reported the pattern as not supported".into()),
-        });
-    }
-    ToolResult::error(message).with_action_record(record)
+        cua_driver_core::action_record::RequestedDelivery::Background,
+        true,
+        reason,
+    )
 }
 
 async fn basis_click(state: &ToolState, tool: &str, args: &Value) -> Option<ToolResult> {
@@ -4261,7 +4270,8 @@ impl Tool for ClickTool {
                                 RungOutcome::Called(_) => unreachable!("sent writes cannot be refused"),
                                 RungOutcome::Absent => unreachable!("absent expand route is not refused"),
                             };
-                            mutation_refusal(refusal_text(kind, hr), ActionTransport::WindowsUiaExpandCollapse, requested)
+                            mutation_refusal(refusal_text(kind, hr), ActionTransport::WindowsUiaExpandCollapse, requested, true,
+                                match crate::uia_mutation::AcquireVerdict::NotDelivered(kind).to_core() { cua_driver_core::mutation::WriteOutcome::StopNotDelivered(reason) => reason, _ => unreachable!() })
                         },
                         MutationRoute::Uncertain => {
                             let RungOutcome::Called(hr) = outcome else { unreachable!("uncertain expand route requires a write") };
@@ -4496,7 +4506,7 @@ impl Tool for ClickTool {
                             ClickPlan::Physical { failed } => failed_calls.extend(failed.into_iter().map(|i| transports[i])),
                             ClickPlan::Refused { rung, kind, hresult, failed } => return Ok(BackgroundElementClick::Refused {
                                 message: format!("UIA {} on [{idx}]: {}", names[rung], crate::uia_mutation::refusal_text(kind, hresult)),
-                                transport: transports[rung], failed_calls: failed.into_iter().map(|i| transports[i]).collect(),
+                                transport: transports[rung], kind, failed_calls: failed.into_iter().map(|i| transports[i]).collect(),
                             }),
                             ClickPlan::Uncertain { rung, kind, hresult, failed } => return Ok(BackgroundElementClick::Uncertain {
                                 message: format!("UIA {} on [{idx}] returned 0x{:08X} ({kind:?}); the action may have taken effect. Read the window state before acting again.", names[rung], hresult as u32),
@@ -4546,8 +4556,9 @@ impl Tool for ClickTool {
                 BackgroundElementClick::Refused {
                     message,
                     transport,
+                    kind,
                     failed_calls,
-                } => return refused_element_click_result(message, transport, failed_calls),
+                } => return refused_element_click_result(message, transport, failed_calls, kind),
                 BackgroundElementClick::Uncertain {
                     message,
                     transport,
@@ -5032,18 +5043,24 @@ fn focus_cached_element_for_foreground(
     // fail closed. The foreground route has already activated the exact HWND,
     // so focus the cached element directly and verify it below.
     if let Some(element) = admitted.as_ref().filter(|element| element.is_uia()) {
-        if let Err(error) = element.focus_element() {
-            return Err(
-                FocusUncertain(format!("{error}; focus may have changed; nothing typed")).into(),
-            );
-        }
-        if wait_for_cached_element_keyboard_focus(admitted, std::time::Duration::from_millis(350)) {
-            return Ok(());
-        }
-        return Err(FocusUncertain(
-            "focus may have changed but could not be confirmed; nothing typed".into(),
-        )
-        .into());
+        let hr = element
+            .focus_hresult()
+            .expect("UIA element has a focus route");
+        let confirmed = crate::uia_mutation::after_sent_call(hr, || {
+            wait_for_cached_element_keyboard_focus(admitted, std::time::Duration::from_millis(350))
+        });
+        return match confirmed {
+            Ok(true) => Ok(()),
+            Ok(false) => Err(FocusUncertain(
+                "focus may have changed but could not be confirmed; nothing typed".into(),
+            )
+            .into()),
+            Err(hr) => Err(FocusUncertain(format!(
+                "UIA SetFocus returned HRESULT 0x{:08X}; focus may have changed; nothing typed",
+                hr as u32
+            ))
+            .into()),
+        };
     }
     if let Some((x, y)) = click_point {
         crate::input::send_click_synthesized_active_mods(hwnd, x, y, 1, "left", &[])?;
@@ -7359,7 +7376,16 @@ impl Tool for ScrollTool {
             };
             match scroll_route(uia_result.completed, uia_result.stop) {
                 MutationRoute::FallThrough => {},
-                MutationRoute::Refused => return mutation_refusal(format!("UIA scroll was refused ({:?}); nothing was sent. Read the window state before retrying.", uia_result.stop), ActionTransport::WindowsUiaScroll, requested_delivery),
+                MutationRoute::Refused => {
+                    let reason = match uia_result.stop {
+                        Some(crate::uia_mutation::MutationStop::AcquireFailed(hr)) => match crate::uia_mutation::classify_acquisition(hr).to_core() {
+                            cua_driver_core::mutation::WriteOutcome::StopNotDelivered(reason) => reason,
+                            _ => unreachable!(),
+                        },
+                        _ => cua_driver_core::mutation::Reason::UnconfirmedAlive,
+                    };
+                    return mutation_refusal(format!("UIA scroll was refused ({:?}); no UIA scroll was sent. Read the window state before retrying.", uia_result.stop), ActionTransport::WindowsUiaScroll, requested_delivery, _noact.is_some(), reason);
+                },
                 MutationRoute::Partial | MutationRoute::Uncertain => return mutation_uncertain(format!("UIA accepted {} of {} scroll steps; a further step may have landed. No other scroll input was sent. Read the window state before acting again.", uia_result.completed, uia_result.requested), "uia", ActionTransport::WindowsUiaScroll, requested_delivery, actual_delivery),
                 MutationRoute::Done => {
                 if delivery == DeliveryMode::Background {
@@ -10180,9 +10206,12 @@ fn menu_refusal(message: String) -> ToolResult {
         message.clone(),
         ActionTransport::WindowsUiaInvoke,
         cua_driver_core::action_record::RequestedDelivery::Foreground,
+        false,
+        cua_driver_core::mutation::Reason::InvalidArgument,
     )
     .with_structured(json!({
         "status": "refused",
+        "effect": "refused",
         "refusal": { "code": "menu_path_unavailable", "message": message }
     }))
 }

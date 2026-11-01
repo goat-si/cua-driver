@@ -105,17 +105,14 @@ fn refused_click_records_the_refusing_rung_and_delivers_nothing() {
     let result = refused_element_click_result(
         "UIA Toggle on [3]: refused".into(),
         ActionTransport::WindowsUiaToggle,
-        vec![ActionTransport::WindowsUiaInvoke],
+        vec![],
+        crate::uia_mutation::RefusalKind::PermissionDenied,
     );
     assert!(result.is_error.unwrap_or(false));
     let record = result.action_record.unwrap();
-    assert_eq!(record.effect, ActionEffect::Refused);
+    assert_eq!(record.effect, ActionEffect::Unverifiable);
     assert_eq!(record.transport, ActionTransport::WindowsUiaToggle);
     assert!(record.actual_delivery.is_none());
-    assert_eq!(record.attempts.len(), 1);
-    assert_eq!(
-        record.attempts[0].transport,
-        ActionTransport::WindowsUiaInvoke
-    );
+    assert!(record.attempts.is_empty());
     assert!(record.validate().is_ok());
 }

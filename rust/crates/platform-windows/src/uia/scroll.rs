@@ -222,13 +222,12 @@ unsafe fn scroll_item_into_view(
     let hr = crate::uia::fg_bypass::run_with_uwp_bypass(host_hwnd as isize, || {
         super::sent_call::scroll_into_view(&scroll_item)
     });
-    if hr != 0 {
-        return Err(());
-    }
-    let point = elem
-        .CurrentBoundingRectangle()
-        .ok()
-        .map(|rect| ((rect.left + rect.right) / 2, (rect.top + rect.bottom) / 2));
+    let point = crate::uia_mutation::after_sent_call(hr, || {
+        elem.CurrentBoundingRectangle()
+            .ok()
+            .map(|rect| ((rect.left + rect.right) / 2, (rect.top + rect.bottom) / 2))
+    })
+    .map_err(|_| ())?;
     Ok((point, true))
 }
 

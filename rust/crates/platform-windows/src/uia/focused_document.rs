@@ -211,9 +211,9 @@ fn try_type_focused_document_append_unbounded(
                 )
             }
             .map_err(|_| "TextPattern caret collapse failed after dispatch")?;
-            if unsafe { super::sent_call::select_text_range(&caret_range) } != 0 {
-                return Err("TextPattern caret placement failed after dispatch");
-            }
+            let select_hr = unsafe { super::sent_call::select_text_range(&caret_range) };
+            crate::uia_mutation::after_sent_call(select_hr, || ())
+                .map_err(|_| "TextPattern caret placement failed after dispatch")?;
 
             let fresh_document_range = unsafe { text_pattern.DocumentRange() }
                 .map_err(|_| "TextPattern verification range failed after dispatch")?;

@@ -409,3 +409,27 @@ fn producer_errors_keep_disposition_and_legacy_fields_after_finalization() {
         }
     }
 }
+
+#[test]
+fn sent_reveal_and_focus_failures_stop_before_followup() {
+    for hr in [1, NOT_SUPPORTED, DENIED, TIMEOUT, 0x80004005u32 as i32] {
+        for _site in [
+            "scroll_into_view",
+            "ancestor_scroll",
+            "set_focus",
+            "text_range_select",
+        ] {
+            let calls = Cell::new(0);
+            assert_eq!(
+                after_sent_call(hr, || {
+                    calls.set(calls.get() + 1);
+                }),
+                Err(hr)
+            );
+            assert_eq!(calls.get(), 0);
+        }
+    }
+    let calls = Cell::new(0);
+    assert_eq!(after_sent_call(0, || calls.set(calls.get() + 1)), Ok(()));
+    assert_eq!(calls.get(), 1);
+}

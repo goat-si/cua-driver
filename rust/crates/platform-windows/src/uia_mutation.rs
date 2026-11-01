@@ -43,6 +43,14 @@ pub(crate) fn classify_sent_call(hresult: i32) -> SentVerdict {
     SentVerdict::Uncertain(kind)
 }
 
+/// Run a post-call step only when the provider returned exactly S_OK.
+pub(crate) fn after_sent_call<T>(hresult: i32, next: impl FnOnce() -> T) -> Result<T, i32> {
+    match classify_sent_call(hresult) {
+        SentVerdict::Delivered => Ok(next()),
+        SentVerdict::Uncertain(_) => Err(hresult),
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AcquireVerdict {
     Absent,
