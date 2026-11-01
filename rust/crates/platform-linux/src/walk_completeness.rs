@@ -43,6 +43,9 @@ pub(crate) struct Completeness {
     pub(crate) reasons: Vec<IncompleteReason>,
     pub(crate) boundaries: HashMap<usize, NodeBoundary>,
     pub(crate) exhaustive: bool,
+    // U23 will consume indexed owners via record_scope_exclusion. During the
+    // walk these are positions; render translates them to element indexes.
+    pub(crate) closed_menu_owners: Vec<usize>,
 }
 
 impl Completeness {
@@ -56,6 +59,12 @@ impl Completeness {
     pub(crate) fn depth_cut(&mut self, in_scope: bool, position: usize, count: CountEvidence) {
         if count != CountEvidence::Known(0) {
             self.record(in_scope, Event::DepthLimit, Some((position, count)));
+        }
+    }
+
+    pub(crate) fn closed_menu(&mut self, in_scope: bool, position: usize) {
+        if in_scope {
+            self.closed_menu_owners.push(position);
         }
     }
 
@@ -149,6 +158,39 @@ mod tests {
             .unwrap()
             .iter()
             .any(|r| r["detail"] == detail)
+    }
+
+    #[test]
+    fn positively_closed_menu_is_outside_observation_scope() {
+        let mut c = Completeness::new(true);
+        c.closed_menu(true, 7);
+        assert_eq!(output(&c)["observation_complete"], true);
+        assert_eq!(output(&c)["observation_incomplete_reasons"], json!([]));
+        assert_eq!(c.closed_menu_owners, vec![7]);
+    }
+
+    #[test]
+    fn uncertain_menu_keeps_failed_state_or_omission_reason() {
+        let mut failed_state = Completeness::new(true);
+        failed_state.record(true, Event::AttributeFailed, None);
+        failed_state.record(
+            true,
+            Event::CollapsedMenu,
+            Some((1, CountEvidence::Known(2))),
+        );
+        assert_eq!(output(&failed_state)["observation_complete"], false);
+        assert!(has(&failed_state, "attribute_read_failed"));
+        assert!(failed_state.closed_menu_owners.is_empty());
+
+        let mut no_expansion_state = Completeness::new(true);
+        no_expansion_state.record(
+            true,
+            Event::CollapsedMenu,
+            Some((2, CountEvidence::Unknown)),
+        );
+        assert_eq!(output(&no_expansion_state)["observation_complete"], false);
+        assert!(has(&no_expansion_state, "collapsed_menu"));
+        assert!(no_expansion_state.closed_menu_owners.is_empty());
     }
 
     #[test]

@@ -626,6 +626,31 @@ fn expanded_state(state: &StateSet) -> Option<bool> {
     }
 }
 
+// A menu may be skipped by the historical traversal without being proven
+// closed. Failed reads and missing expandability must remain incomplete.
+fn proven_closed_menu(
+    skipped: bool,
+    expanded: Option<bool>,
+    children_read: bool,
+    peek_read: bool,
+) -> bool {
+    skipped && expanded == Some(false) && children_read && peek_read
+}
+
+fn menu_skip_candidate(
+    targeted: bool,
+    role: &str,
+    showing: bool,
+    under_menubar: bool,
+    expanded: bool,
+) -> bool {
+    !targeted && role == "menu" && (!showing || (under_menubar && !expanded))
+}
+
+fn menu_skip_after_open_evidence(skipped: bool, focused: bool, showing_child: bool) -> bool {
+    skipped && !focused && !showing_child
+}
+
 /// Containers with more children than this are not expanded. LibreOffice
 /// Calc's spreadsheet accessible reports the whole sheet (rows x columns, in
 /// the billions); a `GetChildren` on it makes the application enumerate every
@@ -1908,30 +1933,18 @@ async fn collect_visited_bounded_opts<'a>(
         // would exceed the cap.
         let descend = max_depth.map(|d| depth < d).unwrap_or(true);
         let position = visited.len();
-        if !matches!(&children_r, Some(Ok(_))) {
-            completeness.record(
-                in_scope,
-                Event::ChildrenFailed,
-                Some((position, child_count)),
-            );
-        }
-        if huge {
-            completeness.record(
-                in_scope,
-                Event::HugeContainer,
-                Some((position, child_count)),
-            );
-        }
-        if !descend {
-            completeness.depth_cut(in_scope, position, child_count);
-        }
         // A menu that is not open (a menubar entry that is not expanded, or
         // any menu that is not showing) keeps its child count and is not
         // walked: its items are hidden, never indexed, and cost a round-trip
         // each. Open menus (expanded / showing popup contents) still descend.
-        let mut closed_menu = !walk_closed_menus
-            && role_lower == "menu"
-            && (!showing || (under_menubar && !expanded));
+        let mut closed_menu = menu_skip_candidate(
+            walk_closed_menus,
+            &role_lower,
+            showing,
+            under_menubar,
+            expanded,
+        );
+        let mut peek_read = true;
         if closed_menu && showing && under_menubar {
             // LibreOffice VCL never sets EXPANDED on an open menubar menu; its
             // items are simply SHOWING. gail (GTK2, e.g. GIMP 2.10) never sets
@@ -1943,18 +1956,23 @@ async fn collect_visited_bounded_opts<'a>(
             // children are SHOWING: a few extra state reads per menubar
             // menu. Everything else stays collapsed.
             if focused {
-                closed_menu = false;
+                closed_menu = menu_skip_after_open_evidence(closed_menu, true, false);
             } else if let Some(Ok(children)) = &children_r {
                 let mut leading: Vec<AccessibleProxy<'_>> = Vec::new();
                 for child_ref in children.iter().take(MENU_PEEK_CHILDREN) {
                     if let Some(Ok(child)) = call(accessible_for(conn, child_ref)).await {
                         if let Some(Ok(state)) = call(child.get_state()).await {
                             if is_showing_state(&state) {
-                                closed_menu = false;
+                                closed_menu =
+                                    menu_skip_after_open_evidence(closed_menu, false, true);
                                 break;
                             }
+                        } else {
+                            peek_read = false;
                         }
                         leading.push(child);
+                    } else {
+                        peek_read = false;
                     }
                 }
                 if closed_menu {
@@ -1964,25 +1982,34 @@ async fn collect_visited_bounded_opts<'a>(
                     // pid, and its entries' screen extents lie inside it.
                     if pid_popups.is_none() {
                         let popups =
-                            tokio::task::spawn_blocking(crate::input::mapped_popup_windows)
+                            match tokio::task::spawn_blocking(crate::input::mapped_popup_windows)
                                 .await
-                                .unwrap_or_default()
-                                .into_iter()
-                                .filter(|popup| popup.pid.is_none_or(|popup_pid| popup_pid == pid))
-                                .collect::<Vec<_>>();
+                            {
+                                Ok(popups) => popups,
+                                Err(_) => {
+                                    peek_read = false;
+                                    Vec::new()
+                                }
+                            }
+                            .into_iter()
+                            .filter(|popup| popup.pid.is_none_or(|popup_pid| popup_pid == pid))
+                            .collect::<Vec<_>>();
                         pid_popups = Some(popups);
                     }
                     if let Some(popups) = pid_popups.as_ref().filter(|popups| !popups.is_empty()) {
                         for child in &leading {
                             let Some(Ok(proxies)) = call(child.proxies()).await else {
+                                peek_read = false;
                                 continue;
                             };
                             let Some(Ok(component)) = call(proxies.component()).await else {
+                                peek_read = false;
                                 continue;
                             };
                             let Some(Ok((ex, ey, ew, eh))) =
                                 call(component.get_extents(CoordType::Screen)).await
                             else {
+                                peek_read = false;
                                 continue;
                             };
                             if ew <= 0 || eh <= 0 || ex < -100_000 || ey < -100_000 {
@@ -2003,12 +2030,42 @@ async fn collect_visited_bounded_opts<'a>(
                 }
             }
         }
+        if !peek_read {
+            completeness.record(in_scope, Event::AttributeFailed, None);
+        }
+        let excluded_menu = proven_closed_menu(
+            closed_menu,
+            expanded_state,
+            !huge && matches!(&children_r, Some(Ok(_))),
+            peek_read,
+        );
+        if excluded_menu {
+            completeness.closed_menu(in_scope, position);
+        } else {
+            if !matches!(&children_r, Some(Ok(_))) {
+                completeness.record(
+                    in_scope,
+                    Event::ChildrenFailed,
+                    Some((position, child_count)),
+                );
+            }
+            if huge {
+                completeness.record(
+                    in_scope,
+                    Event::HugeContainer,
+                    Some((position, child_count)),
+                );
+            }
+            if !descend {
+                completeness.depth_cut(in_scope, position, child_count);
+            }
+        }
         let mut collapsed_children = None;
         if descend && closed_menu {
             if let Some(Ok(children)) = &children_r {
                 collapsed_children = Some(children.len());
             }
-            if child_count != CountEvidence::Known(0) {
+            if !excluded_menu && child_count != CountEvidence::Known(0) {
                 completeness.record(
                     in_scope,
                     Event::CollapsedMenu,
@@ -2424,7 +2481,7 @@ fn sibling_ordinal(visited: &[Visited<'_>], _parents: &[Option<usize>], pos: usi
 fn render(
     visited: &[Visited<'_>],
     only_frame: Option<usize>,
-    completeness: &crate::walk_completeness::Completeness,
+    completeness: &mut crate::walk_completeness::Completeness,
 ) -> (
     String,
     String,
@@ -2608,7 +2665,16 @@ fn render(
     }
 
     let boundary_md = insert_passive_markers(&md, &passive_markers);
+    completeness.closed_menu_owners =
+        indexed_closed_menu_owners(&completeness.closed_menu_owners, &index_of);
     (md, boundary_md, nodes, boundaries)
+}
+
+fn indexed_closed_menu_owners(positions: &[usize], index_of: &[Option<usize>]) -> Vec<usize> {
+    positions
+        .iter()
+        .filter_map(|position| index_of[*position])
+        .collect()
 }
 
 fn insert_passive_markers(markdown: &str, markers: &[(usize, String)]) -> String {
@@ -2621,7 +2687,33 @@ fn insert_passive_markers(markdown: &str, markers: &[(usize, String)]) -> String
 
 #[cfg(test)]
 mod boundary_markdown_tests {
-    use super::insert_passive_markers;
+    use super::{
+        indexed_closed_menu_owners, insert_passive_markers, menu_skip_after_open_evidence,
+        menu_skip_candidate, proven_closed_menu,
+    };
+
+    #[test]
+    fn closed_menu_requires_positive_state_and_successful_reads() {
+        assert!(proven_closed_menu(true, Some(false), true, true));
+        assert!(!proven_closed_menu(true, None, true, true)); // failed or absent state
+        assert!(!proven_closed_menu(true, Some(false), false, true));
+        assert!(!proven_closed_menu(true, Some(false), true, false)); // failed peek
+        assert!(!proven_closed_menu(true, Some(true), true, true));
+        assert!(!proven_closed_menu(false, Some(false), true, true)); // focused, showing child, or targeted
+        assert_eq!(
+            indexed_closed_menu_owners(&[0, 1, 2], &[Some(4), None, Some(9)]),
+            vec![4, 9]
+        );
+    }
+
+    #[test]
+    fn focused_showing_child_and_targeted_menus_remain_in_scope() {
+        let candidate = menu_skip_candidate(false, "menu", true, true, false);
+        assert!(candidate);
+        assert!(!menu_skip_after_open_evidence(candidate, true, false));
+        assert!(!menu_skip_after_open_evidence(candidate, false, true));
+        assert!(!menu_skip_candidate(true, "menu", true, true, false));
+    }
 
     #[test]
     fn named_passive_lines_receive_markers_without_creating_unnamed_rows() {
@@ -2912,14 +3004,14 @@ pub(super) fn walk_tree_bounded_with_timeout(
             visited,
             scoped_frame,
             truncation,
-            completeness,
+            mut completeness,
         }) = walked
         else {
             return Ok(None);
         };
         let walk_elapsed = walk_started.elapsed();
         let (markdown, boundary_markdown, nodes, boundaries) =
-            render(&visited, scoped_frame, &completeness);
+            render(&visited, scoped_frame, &mut completeness);
         let bounds_started = std::time::Instant::now();
         // Bounds resolution shares the deadline, but a walk that consumed the
         // whole budget must still yield *some* frames (element-index clicks
