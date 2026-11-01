@@ -236,6 +236,42 @@ fn scanner_handles_comments_strings_aliases_and_multiline_calls() {
     )
     .unwrap();
     assert_eq!(builders.len(), 2, "{builders:#?}");
+
+    let collision = scan(
+        "collision.rs",
+        r#"
+        mod a { use tokio::task::spawn_blocking as run; pub fn f() { run(native_mutation); } }
+        mod b { use crate::goat::action_latency::spawn_blocking as run; }
+    "#,
+    )
+    .unwrap();
+    let shadow = scan(
+        "shadow.rs",
+        r#"
+        use crate::goat::action_latency::spawn_blocking as run;
+        fn f() { use tokio::task::spawn_blocking as run; run(native_mutation); }
+    "#,
+    )
+    .unwrap();
+    assert!(
+        !collision.is_empty() && !shadow.is_empty(),
+        "raw spawns hidden by alias collisions: modules={collision:#?}, local={shadow:#?}"
+    );
+
+    let ambiguous_builder = scan("builder_alias.rs", r#"
+        mod a {
+            use other as worker;
+            fn f() { worker::Builder::new().spawn(crate::input::worker_context::wrap_blocking(work)); }
+        }
+        mod b { use std::thread as worker; }
+    "#).unwrap();
+    assert!(
+        !ambiguous_builder.is_empty(),
+        "ambiguous builder was trusted"
+    );
+
+    let glob = scan("glob.rs", "use hidden::*; fn f() { run(native_mutation); }").unwrap();
+    assert!(!glob.is_empty(), "glob can hide a worker alias");
 }
 
 #[test]
