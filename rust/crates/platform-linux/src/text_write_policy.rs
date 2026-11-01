@@ -124,6 +124,8 @@ pub enum Step {
     InsertText,
     Commit,
     SetValue,
+    /// Key events or a toolkit command (pty, Tk send, XTest, virtual keyboard).
+    KeyEvents,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct WriteStep {
@@ -326,6 +328,7 @@ mod tests {
         pause: Option<(&'static str, Arc<Barrier>, Arc<Barrier>)>,
         close_on_prepare: Option<Arc<DispatchGate>>,
         no_commit: bool,
+        prepare_fails: bool,
     }
     impl Default for Fake {
         fn default() -> Self {
@@ -343,6 +346,7 @@ mod tests {
                 pause: None,
                 close_on_prepare: None,
                 no_commit: false,
+                prepare_fails: false,
             }
         }
     }
@@ -388,6 +392,10 @@ mod tests {
             if let Some(gate) = &self.close_on_prepare {
                 self.calls.push("prepare");
                 gate.close_on_timeout();
+            }
+            if self.prepare_fails {
+                self.calls.push("prepare");
+                return Err(CallClass::PreDispatchUnavailable);
             }
             Ok(!self.no_commit)
         }
@@ -652,6 +660,23 @@ mod tests {
         };
         assert_eq!(replace(&mut f, "abc"), TextWriteOutcome::Acknowledged);
         assert_eq!(f.calls, ["set"]);
+    }
+    #[test]
+    fn unreadable_activation_after_a_write_is_uncertain() {
+        let mut f = Fake {
+            prepare_fails: true,
+            ..Fake::default()
+        };
+        assert!(matches!(
+            replace(&mut f, "abc"),
+            TextWriteOutcome::Uncertain {
+                step: WriteStep {
+                    step: Step::Commit,
+                    ..
+                }
+            }
+        ));
+        assert_eq!(f.calls, ["set", "prepare"]);
     }
     #[test]
     fn timeout_before_first_send_closes_gate() {

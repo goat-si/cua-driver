@@ -6369,6 +6369,27 @@ fn inject_terminal_input(pid: u32, xid: u64, text: &str) -> anyhow::Result<bool>
     }
 }
 
+/// [`inject_terminal_input`] with only the pty write behind `gate`.
+fn gated_terminal_input(
+    gate: &crate::atspi::native::TextWriteDispatch,
+    pid: u32,
+    xid: u64,
+    text: &str,
+) -> anyhow::Result<bool> {
+    match terminal_pty_number(pid, xid) {
+        Some(ptn) => crate::atspi::native::gated_route(gate, || {
+            crate::tty::inject_via_master(pid, ptn, text)
+        }),
+        None => Ok(false),
+    }
+}
+
+/// Tool error for a text-writing route: a stopped write first, then the
+/// existing input error mapping.
+fn text_route_error_result(tool: &str, error: anyhow::Error) -> ToolResult {
+    text_write_stop_result(tool, None, &error).unwrap_or_else(|| input_error_result(error))
+}
+
 /// The pty number of the terminal window's shell, when `xid` is a terminal
 /// whose pty can be resolved. Reads only; writes nothing.
 fn terminal_pty_number(pid: u32, xid: u64) -> Option<u32> {
@@ -8555,25 +8576,30 @@ impl Tool for TypeTextTool {
             let text_t = text.clone();
             let foreground = delivery.is_foreground();
             let cursor_id = resolve_cursor_key(&args);
-            let result = spawn_blocking_bounded(
+            let key_dispatch = Arc::new(crate::atspi::native::TextWriteDispatch::default());
+            let key_gate = key_dispatch.clone();
+            let result = spawn_text_write_bounded(
                 "type_text terminal",
                 foreground_budget(text_len),
+                &[key_dispatch],
+                text.len(),
                 move || -> anyhow::Result<(&'static str, Option<crate::input::KeyboardDeliveryReport>)> {
+                use crate::atspi::native::gated_route;
                 // pty-master injection is preferred — it skips the X event
                 // queue entirely. Falls through to key events if the terminal
                 // isn't reachable that way (descendant pty unresolvable).
-                if inject_terminal_input(pid, xid, &text_t)? {
+                if gated_terminal_input(&key_gate, pid, xid, &text_t)? {
                     return Ok(("pty", None));
                 }
                 if foreground {
                     crate::input::with_x11_foreground(xid, 80, || {
-                        crate::input::send_type_text_xtest(&text_t)
+                        gated_route(&key_gate, || crate::input::send_type_text_xtest(&text_t))
                     })?;
                     return Ok(("key_events_fg", None));
                 }
                 // Background: real key events through the XI2 virtual master
                 // keyboard (xterm/gnome-terminal accept them like physical input).
-                match background_text_route(&cursor_id, pid, xid, &text_t)? {
+                match gated_route(&key_gate, || background_text_route(&cursor_id, pid, xid, &text_t))? {
                     Some(KeyRoute::Mpx(report)) => Ok((crate::input::MPX_UINPUT_PATH, Some(report))),
                     _ => Ok(("background_unavailable", None)),
                 }
@@ -8586,7 +8612,7 @@ impl Tool for TypeTextTool {
                     "Typed {text_len} character(s) (terminal emulator: pty/XTest key events)."
                 ))
                 .with_structured(type_text_structured(path, text_len, false)),
-                Ok(Err(e)) => input_error_result(e),
+                Ok(Err(e)) => text_route_error_result("type_text", e),
                 Err(e) => ToolResult::error(format!("Task error: {e}")),
             };
         }
@@ -8601,9 +8627,13 @@ impl Tool for TypeTextTool {
         if delivery.is_foreground() {
             let text_f = text.clone();
             let element = token.clone();
-            let result = spawn_blocking_bounded(
+            let key_dispatch = Arc::new(crate::atspi::native::TextWriteDispatch::default());
+            let key_gate = key_dispatch.clone();
+            let result = spawn_text_write_bounded(
                 "foreground type_text",
                 foreground_budget(text_len),
+                &[key_dispatch],
+                text.len(),
                 move || {
                     crate::input::with_x11_foreground_opts(
                         xid,
@@ -8617,7 +8647,9 @@ impl Tool for TypeTextTool {
                                     );
                                 }
                             }
-                            crate::input::send_type_text_xtest(&text_f)
+                            crate::atspi::native::gated_route(&key_gate, || {
+                                crate::input::send_type_text_xtest(&text_f)
+                            })
                         },
                     )
                 },
@@ -8639,7 +8671,7 @@ impl Tool for TypeTextTool {
                         extra,
                     ))
                 }
-                Ok(Err(e)) => input_error_result(e),
+                Ok(Err(e)) => text_route_error_result("type_text", e),
                 Err(e) => ToolResult::error(format!("Task error: {e}")),
             };
         }
@@ -8656,17 +8688,25 @@ impl Tool for TypeTextTool {
         {
             let text_b = text.clone();
             let cursor_id = resolve_cursor_key(&args);
-            let result = spawn_blocking_bounded(
+            let key_dispatch = Arc::new(crate::atspi::native::TextWriteDispatch::default());
+            let key_gate = key_dispatch.clone();
+            let result = spawn_text_write_bounded(
                 "background type_text",
                 foreground_budget(text_len),
-                move || background_text_route(&cursor_id, pid, xid, &text_b),
+                &[key_dispatch],
+                text.len(),
+                move || {
+                    crate::atspi::native::gated_route(&key_gate, || {
+                        background_text_route(&cursor_id, pid, xid, &text_b)
+                    })
+                },
             )
             .await;
             match result {
                 Ok(Ok(Some(KeyRoute::Mpx(report)))) => {
                     return type_text_mpx_result(text_len, report, secret)
                 }
-                Ok(Err(e)) => return input_error_result(e),
+                Ok(Err(e)) => return text_route_error_result("type_text", e),
                 Err(e) => return ToolResult::error(format!("Task error: {e}")),
                 Ok(Ok(_)) => {}
             }
@@ -8694,14 +8734,20 @@ impl Tool for TypeTextTool {
                 // without touching the user's focus; terminals take the pty.
                 let text_b = text.clone();
                 let cursor_id = resolve_cursor_key(&args);
-                let result = spawn_blocking_bounded(
+                let key_dispatch = Arc::new(crate::atspi::native::TextWriteDispatch::default());
+                let key_gate = key_dispatch.clone();
+                let result = spawn_text_write_bounded(
                     "background type_text",
                     foreground_budget(text_len),
+                    &[key_dispatch],
+                    text.len(),
                     move || -> anyhow::Result<Option<KeyRoute>> {
-                        if inject_terminal_input(pid, xid, &text_b)? {
+                        if gated_terminal_input(&key_gate, pid, xid, &text_b)? {
                             return Ok(Some(KeyRoute::Terminal));
                         }
-                        background_text_route(&cursor_id, pid, xid, &text_b)
+                        crate::atspi::native::gated_route(&key_gate, || {
+                            background_text_route(&cursor_id, pid, xid, &text_b)
+                        })
                     },
                 )
                 .await;
@@ -8714,23 +8760,34 @@ impl Tool for TypeTextTool {
                         type_text_mpx_result(text_len, report, secret)
                     }
                     Ok(Ok(_)) => background_keyboard_refusal(atspi_up()),
-                    Ok(Err(e)) => input_error_result(e),
+                    Ok(Err(e)) => text_route_error_result("type_text", e),
                     Err(e) => ToolResult::error(format!("Task error: {e}")),
                 };
             }
             let text_f = text.clone();
-            let result = tokio::task::spawn_blocking(move || {
-                if inject_terminal_input(pid, xid, &text_f)? {
-                    return Ok(());
-                }
-                // XTest (real input to the focused window), NOT XSendEvent: GTK/Qt
-                // drop synthetic key events, so a spreadsheet cell / canvas would
-                // stay empty. The click that gave this widget focus already put it
-                // under the X input focus, so XTest-to-focus lands correctly.
-                crate::input::with_x11_foreground(xid, 80, || {
-                    crate::input::send_type_text_xtest(&text_f)
-                })
-            })
+            let key_dispatch = Arc::new(crate::atspi::native::TextWriteDispatch::default());
+            let key_gate = key_dispatch.clone();
+            let result = spawn_text_write_bounded(
+                "type_text",
+                foreground_budget(text_len),
+                &[key_dispatch],
+                text.len(),
+                move || {
+                    if gated_terminal_input(&key_gate, pid, xid, &text_f)? {
+                        return Ok(());
+                    }
+                    // XTest (real input to the focused window), NOT XSendEvent: GTK/Qt
+                    // drop synthetic key events, so a spreadsheet cell / canvas would
+                    // stay empty. The click that gave this widget focus already put it
+                    // under the X input focus, so XTest-to-focus lands correctly.
+                    crate::input::with_x11_foreground(xid, 80, || {
+                        crate::atspi::native::gated_route(&key_gate, || {
+                            crate::input::send_type_text_xtest(&text_f)
+                        })
+                    })
+                    .map(|_| ())
+                },
+            )
             .await;
             return match result {
                 Ok(Ok(())) => ToolResult::text(format!(
@@ -8741,7 +8798,7 @@ impl Tool for TypeTextTool {
                     text_len,
                     false,
                 )),
-                Ok(Err(e)) => input_error_result(e),
+                Ok(Err(e)) => text_route_error_result("type_text", e),
                 Err(e) => ToolResult::error(format!("Task error: {e}")),
             };
         }
@@ -8843,8 +8900,13 @@ impl Tool for TypeTextTool {
             }
             // Tk apps: use Tk's `send` command (no AT-SPI bridge, so AT-SPI above
             // returned false). This is the Tk-specific override, like CDP for Chromium.
-            if gated_route(&key_gate, || Ok(crate::input::inject_tk_send(&text).unwrap_or(false)))? {
-                return Ok(("key_events", None));
+            // A send queued before wish failed may have inserted: stop there.
+            match gated_route(&key_gate, || Ok(crate::input::tk_send_text(&text)))? {
+                crate::input::TkSend::Sent => return Ok(("key_events", None)),
+                crate::input::TkSend::NotSent => {}
+                crate::input::TkSend::MaybeSent => {
+                    return Err(crate::atspi::native::key_write_uncertain(text.len()))
+                }
             }
             if delivery.is_foreground() {
                 gated_route(&key_gate, || {
@@ -10078,7 +10140,7 @@ impl Tool for SetValueTool {
             }
             Ok(Err(error)) if crate::atspi::native::is_no_value_route(&error) => error,
             Ok(Err(error)) if crate::atspi::native::is_no_such_option(&error) => {
-                return no_such_option_result(idx, &error)
+                return no_such_option_result(idx, &error, secret)
             }
             Ok(Err(error)) => {
                 return stale_observed_element("set_value", idx, &error)
@@ -10127,20 +10189,30 @@ impl Tool for SetValueTool {
         }
         let value_for_keys = value.clone();
         let target = token.clone();
-        let typed = spawn_blocking_bounded(
+        // The click/select/type/commit sequence runs behind a gate the caller
+        // closes on timeout: a late fallback never types after the call
+        // returned, and a timeout mid-sequence is unverifiable.
+        let key_dispatch = Arc::new(crate::atspi::native::TextWriteDispatch::default());
+        let key_gate = key_dispatch.clone();
+        let typed = spawn_text_write_bounded(
             "set_value keyboard fallback",
             foreground_budget(value.len()),
+            &[key_dispatch],
+            value.len(),
             move || -> anyhow::Result<Option<crate::input::FocusGuardReport>> {
+                use crate::atspi::native::gated_route;
                 let (win, lx, ly) = resolve_element_local_coords(pid, &target, xid_opt)?;
                 if is_combo {
-                    return pick_from_popup(
-                        &cursor_id,
-                        pid,
-                        &target,
-                        (win, lx, ly),
-                        &value_for_keys,
-                        foreground_route,
-                    );
+                    return gated_route(&key_gate, || {
+                        pick_from_popup(
+                            &cursor_id,
+                            pid,
+                            &target,
+                            (win, lx, ly),
+                            &value_for_keys,
+                            foreground_route,
+                        )
+                    });
                 }
                 if foreground_route {
                     let (sx, sy) = window_local_to_screen(win, lx, ly)?;
@@ -10148,27 +10220,33 @@ impl Tool for SetValueTool {
                         win,
                         crate::input::ForegroundOptions::pointer(),
                         || {
-                            crate::input::send_click_xtest_desktop(
-                                sx.round() as i32,
-                                sy.round() as i32,
-                                1,
-                                1,
-                            )?;
-                            std::thread::sleep(std::time::Duration::from_millis(80));
-                            crate::input::send_key_xtest("a", &["ctrl"])?;
-                            crate::input::send_type_text_xtest(&value_for_keys)?;
-                            crate::input::send_key_xtest("Tab", &[])
+                            gated_route(&key_gate, || {
+                                crate::input::send_click_xtest_desktop(
+                                    sx.round() as i32,
+                                    sy.round() as i32,
+                                    1,
+                                    1,
+                                )?;
+                                std::thread::sleep(std::time::Duration::from_millis(80));
+                                crate::input::send_key_xtest("a", &["ctrl"])?;
+                                crate::input::send_type_text_xtest(&value_for_keys)?;
+                                crate::input::send_key_xtest("Tab", &[])
+                            })
                         },
                     )?;
                     return Ok(None);
                 }
                 let (_, guard) = crate::input::focus_guard::guarded(Some(pid), || {
-                    x11_pixel_click_no_focus_steal(&cursor_id, win, lx as i32, ly as i32, 1, 1)?;
-                    std::thread::sleep(std::time::Duration::from_millis(80));
-                    background_virtual_key(&cursor_id, pid, win, "a", &["ctrl"])?;
-                    background_virtual_text(&cursor_id, pid, win, &value_for_keys)?;
-                    background_virtual_key(&cursor_id, pid, win, "Tab", &[])?;
-                    Ok(())
+                    gated_route(&key_gate, || {
+                        x11_pixel_click_no_focus_steal(
+                            &cursor_id, win, lx as i32, ly as i32, 1, 1,
+                        )?;
+                        std::thread::sleep(std::time::Duration::from_millis(80));
+                        background_virtual_key(&cursor_id, pid, win, "a", &["ctrl"])?;
+                        background_virtual_text(&cursor_id, pid, win, &value_for_keys)?;
+                        background_virtual_key(&cursor_id, pid, win, "Tab", &[])?;
+                        Ok(())
+                    })
                 })?;
                 Ok(guard)
             },
@@ -10198,22 +10276,29 @@ impl Tool for SetValueTool {
                 )
             }
             Ok(Err(error)) if crate::atspi::native::is_no_such_option(&error) => {
-                no_such_option_result(idx, &error)
+                no_such_option_result(idx, &error, secret)
             }
-            Ok(Err(error)) => input_error_result(error),
+            Ok(Err(error)) => text_write_stop_result("set_value", Some(idx), &error)
+                .unwrap_or_else(|| input_error_result(error)),
             Err(error) => ToolResult::error(format!("Task error: {error}")),
         }
     }
 }
 
 /// `set_value` named an option the combo box or list does not have.
-fn no_such_option_result(idx: usize, error: &anyhow::Error) -> ToolResult {
-    let detail = error.to_string();
-    let detail = detail
-        .strip_prefix(crate::atspi::native::NO_SUCH_OPTION)
-        .map(|rest| rest.trim_start_matches(':').trim())
-        .unwrap_or(&detail)
-        .to_owned();
+fn no_such_option_result(idx: usize, error: &anyhow::Error, secret: bool) -> ToolResult {
+    // The detail echoes the requested value and the option list: withhold it
+    // for a secret field.
+    let detail = if secret {
+        "no option matching the requested value (withheld: secret field)".to_owned()
+    } else {
+        let detail = error.to_string();
+        detail
+            .strip_prefix(crate::atspi::native::NO_SUCH_OPTION)
+            .map(|rest| rest.trim_start_matches(':').trim())
+            .unwrap_or(&detail)
+            .to_owned()
+    };
     ToolResult::error(format!(
         "set_value: element [{idx}] has {detail}; nothing was changed."
     ))

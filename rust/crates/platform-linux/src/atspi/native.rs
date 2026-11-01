@@ -161,6 +161,19 @@ pub fn gated_route<T>(
     result
 }
 
+/// A key or toolkit-command route that may have delivered part or all of its
+/// input before it failed.
+pub fn key_write_uncertain(bytes: usize) -> anyhow::Error {
+    WriteUncertain {
+        step: crate::text_write_policy::WriteStep {
+            step: crate::text_write_policy::Step::KeyEvents,
+            bytes,
+            units: None,
+        },
+    }
+    .into()
+}
+
 fn gated_input_action(
     dispatch: &TextWriteDispatch,
     bytes: usize,
@@ -4351,6 +4364,79 @@ async fn action_names(ap: &atspi::proxy::action::ActionProxy<'_>) -> Vec<String>
     names
 }
 
+/// [`action_names`] that fails instead of guessing: `None` when the count
+/// or any name could not be read.
+async fn action_names_checked(ap: &atspi::proxy::action::ActionProxy<'_>) -> Option<Vec<String>> {
+    let n = call(ap.n_actions()).await?.ok()?;
+    let mut names = Vec::with_capacity(n.max(0) as usize);
+    for i in 0..n {
+        names.push(call(ap.get_name(i)).await?.ok()?);
+    }
+    Some(names)
+}
+
+enum CommitAction<T> {
+    Present(T),
+    /// The object does not advertise Action.
+    Absent,
+    /// The interface could not be read (timeout, bus error).
+    Unreadable,
+}
+
+fn commit_action_proxy<T>(
+    acquired: Option<std::result::Result<T, atspi::proxy::AtspiError>>,
+) -> CommitAction<T> {
+    match acquired {
+        Some(Ok(proxy)) => CommitAction::Present(proxy),
+        Some(Err(atspi::proxy::AtspiError::InterfaceNotAvailable(_))) => CommitAction::Absent,
+        Some(Err(_)) | None => CommitAction::Unreadable,
+    }
+}
+
+fn activate_action_index(names: &[String]) -> Option<i32> {
+    names
+        .iter()
+        .position(|name| normalized_action_verb(name) == "activate")
+        .map(|index| index as i32)
+}
+
+#[cfg(test)]
+mod commit_action_tests {
+    use super::*;
+
+    #[test]
+    fn only_a_missing_action_interface_is_absence() {
+        assert!(matches!(
+            commit_action_proxy(Some(Ok(1))),
+            CommitAction::Present(1)
+        ));
+        assert!(matches!(
+            commit_action_proxy::<i32>(Some(Err(atspi::proxy::AtspiError::InterfaceNotAvailable(
+                "Action"
+            )))),
+            CommitAction::Absent
+        ));
+        assert!(matches!(
+            commit_action_proxy::<i32>(Some(Err(atspi::proxy::AtspiError::Conversion("test")))),
+            CommitAction::Unreadable
+        ));
+        assert!(matches!(
+            commit_action_proxy::<i32>(None),
+            CommitAction::Unreadable
+        ));
+    }
+
+    #[test]
+    fn activate_index_needs_the_activate_verb() {
+        let names = |list: &[&str]| list.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            activate_action_index(&names(&["click", "activate"])),
+            Some(1)
+        );
+        assert_eq!(activate_action_index(&names(&["click"])), None);
+    }
+}
+
 /// The snapshot-cached object no longer answers on the bus (or never did):
 /// the observation is stale and must not be retargeted by index.
 #[derive(Debug)]
@@ -6205,15 +6291,29 @@ impl crate::text_write_policy::EditableOps for NativeEditableOps<'_> {
     }
     fn prepare_commit(&mut self) -> std::result::Result<bool, crate::text_write_policy::CallClass> {
         self.dispatch.step.store(4, Ordering::SeqCst);
-        self.commit_action = runtime().block_on(async {
-            let ap = call(self.proxies.action()).await?.ok()?;
-            let names = action_names(&ap).await;
-            let index = names
-                .iter()
-                .position(|name| normalized_action_verb(name) == "activate")?;
-            Some((ap, index as i32))
+        // Only a proven absence (no Action interface, or no "activate" among
+        // fully read action names) skips the commit; a failed read is not an
+        // absence and leaves the edited field uncommitted, so it is uncertain.
+        let prepared = runtime().block_on(async {
+            let ap = match commit_action_proxy(call(self.proxies.action()).await) {
+                CommitAction::Present(ap) => ap,
+                CommitAction::Absent => return Ok(None),
+                CommitAction::Unreadable => return Err(()),
+            };
+            let names = action_names_checked(&ap).await.ok_or(())?;
+            Ok(activate_action_index(&names).map(|index| (ap, index)))
         });
-        Ok(self.commit_action.is_some())
+        match prepared {
+            Ok(action) => {
+                let present = action.is_some();
+                self.commit_action = action;
+                Ok(present)
+            }
+            Err(()) => {
+                self.commit_action = None;
+                Err(crate::text_write_policy::CallClass::PreDispatchUnavailable)
+            }
+        }
     }
     fn commit(&mut self) -> crate::text_write_policy::MutationReply {
         runtime().block_on(commit_editable_write(self.commit_action.as_ref()))
@@ -6430,23 +6530,29 @@ async fn dispatch_numeric_value(
         .map_err(|_| WriteDispatchClosed)?;
     dispatch.ledger.record_sent();
     dispatch.step.store(5, Ordering::SeqCst);
-    let classified = if matches!(call(future).await, Some(Ok(()))) {
-        Ok(MutationResult::Acknowledged)
-    } else {
-        Err(CallClass::PossiblyExecuted)
+    let classified = match call(future).await {
+        Some(Ok(())) => Ok(MutationResult::Acknowledged),
+        Some(Err(error)) => Err(classify_mutator_error(&error)),
+        None => Err(CallClass::PossiblyExecuted),
     };
     dispatch.ledger.record_result(classified);
     dispatch.gate.finish_mutator();
-    classified.map(|_| ()).map_err(|_| {
-        WriteUncertain {
+    match classified {
+        Ok(_) => Ok(()),
+        // The method is not there: nothing changed, so the caller may treat
+        // the element as having no value route.
+        Err(CallClass::KnownUnsupported) => Err(anyhow!(
+            "{NO_VALUE_ROUTE}: Value.SetCurrentValue is not supported"
+        )),
+        Err(_) => Err(WriteUncertain {
             step: WriteStep {
                 step: Step::SetValue,
                 bytes,
                 units: None,
             },
         }
-        .into()
-    })
+        .into()),
+    }
 }
 
 fn replacement_needs_value(outcome: crate::text_write_policy::TextWriteOutcome) -> Result<bool> {
@@ -6465,7 +6571,7 @@ fn replacement_needs_value(outcome: crate::text_write_policy::TextWriteOutcome) 
 fn parse_value_number(value: &str) -> Result<f64> {
     let number: f64 = value
         .parse()
-        .map_err(|_| anyhow!("value '{value}' is not numeric for a Value element"))?;
+        .map_err(|_| anyhow!("value is not numeric for a Value element"))?;
     if !number.is_finite() {
         return Err(anyhow!("numeric Value must be finite"));
     }
@@ -6520,6 +6626,41 @@ mod numeric_value_tests {
         assert!(error.downcast_ref::<WriteUncertain>().is_some());
         assert!(dispatch.ledger.sent());
         assert!(dispatch.ledger.possibly_executed());
+    }
+
+    #[test]
+    fn unsupported_set_current_value_changed_nothing() {
+        for error in [
+            zbus::Error::MethodError(
+                "org.freedesktop.DBus.Error.UnknownMethod"
+                    .try_into()
+                    .unwrap(),
+                None,
+                zbus::Message::method_call("/test", "Test")
+                    .unwrap()
+                    .build(&())
+                    .unwrap(),
+            ),
+            zbus::Error::FDO(Box::new(zbus::fdo::Error::UnknownInterface("test".into()))),
+        ] {
+            let dispatch = TextWriteDispatch::default();
+            let error = runtime()
+                .block_on(dispatch_numeric_value(
+                    &dispatch,
+                    3,
+                    async move { Err(error) },
+                ))
+                .unwrap_err();
+            assert!(is_no_value_route(&error), "{error}");
+            assert!(error.downcast_ref::<WriteUncertain>().is_none());
+            assert!(!dispatch.ledger.possibly_executed());
+        }
+    }
+
+    #[test]
+    fn numeric_parse_error_never_echoes_the_value() {
+        let error = parse_value_number("hunter2").unwrap_err();
+        assert!(!error.to_string().contains("hunter2"));
     }
 }
 
