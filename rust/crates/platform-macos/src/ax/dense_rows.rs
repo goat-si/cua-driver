@@ -1,11 +1,8 @@
 //! Dense native collections yield to the rest of the window without changing document order.
 
-use super::bindings::*;
 use super::snapshot::RetainedElement;
-use super::tree::{set_messaging_timeout, AXNode, LabelPath};
-use core_foundation::array::CFArray;
-use core_foundation::base::{CFEqual, CFGetTypeID, CFHash, CFTypeRef, TCFType};
-use core_foundation::string::CFString;
+use super::tree::{AXNode, LabelPath};
+use super::tree_source::{AxTreeSource, Read};
 use cua_driver_core::walk_budget::WalkBudget;
 use std::cell::Cell;
 use std::collections::HashMap;
@@ -59,14 +56,18 @@ pub(crate) fn with_visible_clip<T>(surface: Option<usize>, walk: impl FnOnce() -
 
 /// The walked surface's frame, read once per surface; `None` when its read
 /// would start, or ended, past the deadline (nothing is cached then).
-unsafe fn visible_clip(budget: &WalkBudget) -> Option<Option<[f64; 4]>> {
+fn visible_clip<S: AxTreeSource>(
+    source: &S,
+    surface: &S::Element,
+    budget: &WalkBudget,
+) -> Option<Option<[f64; 4]>> {
     match VISIBLE_CLIP.with(Cell::get) {
         ClipSource::Unset => Some(None),
         ClipSource::Known(clip) => Some(clip),
         ClipSource::Surface(element) => {
-            let element = element as AXUIElementRef;
-            set_messaging_timeout(element);
-            let clip = super::control_attrs::frame_batched(element, budget)?;
+            debug_assert_eq!(element, source.key(surface));
+            source.set_messaging_timeout(surface);
+            let clip = super::control_attrs::frame_batched_with(source, surface, budget)?;
             VISIBLE_CLIP.with(|cell| cell.set(ClipSource::Known(clip)));
             Some(clip)
         }
@@ -135,52 +136,19 @@ pub(crate) fn plan_children(
         .collect()
 }
 
-// AX returns distinct proxy pointers for the same row. Hash by CF identity,
-// then resolve collisions with CFEqual, rather than comparing every pair.
-struct ElementSet {
-    _array: CFArray<CFTypeRef>,
-    buckets: HashMap<usize, Vec<CFTypeRef>>,
-}
-
-impl ElementSet {
-    unsafe fn copy(element: AXUIElementRef, attribute: &str) -> Option<Self> {
-        let attribute = CFString::new(attribute);
-        let mut value = std::ptr::null();
-        if AXUIElementCopyAttributeValue(element, attribute.as_concrete_TypeRef(), &mut value)
-            != kAXErrorSuccess
-            || value.is_null()
-        {
-            return None;
-        }
-        if CFGetTypeID(value) != CFArray::<CFTypeRef>::type_id() {
-            core_foundation::base::CFRelease(value);
-            return None;
-        }
-        let array = CFArray::<CFTypeRef>::wrap_under_create_rule(value as _);
-        let mut buckets: HashMap<usize, Vec<CFTypeRef>> = HashMap::new();
-        for item in array.iter() {
-            if CFGetTypeID(*item) == AXUIElementGetTypeID() {
-                buckets.entry(CFHash(*item)).or_default().push(*item);
-            }
-        }
-        (!buckets.is_empty()).then_some(Self {
-            _array: array,
-            buckets,
-        })
-    }
-
-    unsafe fn contains(&self, element: AXUIElementRef) -> bool {
-        let element = element as CFTypeRef;
-        self.buckets
-            .get(&CFHash(element))
-            .is_some_and(|bucket| bucket.iter().any(|&other| CFEqual(element, other) != 0))
+fn known<T>(value: Read<T>) -> Option<T> {
+    match value {
+        Read::Known(value) => Some(value),
+        Read::Absent | Read::Unknown(_) => None,
     }
 }
 
-pub(crate) unsafe fn plan_collection_children(
-    element: AXUIElementRef,
+pub(crate) fn plan_collection_children<S: AxTreeSource>(
+    source: &S,
+    element: &S::Element,
+    surface: &S::Element,
     role: &str,
-    children: &[AXUIElementRef],
+    children: &[S::Element],
     budget: &WalkBudget,
 ) -> Vec<ChildPlan> {
     let dense = DENSE_COLLECTION_ROLES.contains(&role);
@@ -188,14 +156,14 @@ pub(crate) unsafe fn plan_collection_children(
     // a child left unclassified is deferred as visible and refused by the
     // walker, which counts it as pending.
     let rows = if dense && !budget.expired() {
-        ElementSet::copy(element, "AXRows")
+        known(source.element_set(element, "AXRows"))
     } else {
         None
     };
     let visible = if dense && !budget.expired() {
-        ElementSet::copy(element, "AXVisibleRows").or_else(|| {
+        known(source.element_set(element, "AXVisibleRows")).or_else(|| {
             (!budget.expired())
-                .then(|| ElementSet::copy(element, "AXVisibleChildren"))
+                .then(|| known(source.element_set(element, "AXVisibleChildren")))
                 .flatten()
         })
     } else {
@@ -209,14 +177,15 @@ pub(crate) unsafe fn plan_collection_children(
     // offscreen.
     let cut_by_frame = children.len() >= MANY_CHILDREN;
     let is_visible = |i: usize| match &visible {
-        Some(set) => set.contains(children[i]),
+        Some(set) => source.set_contains(set, &children[i]),
         None if !cut_by_frame => true,
         None => {
-            set_messaging_timeout(children[i]);
-            let Some(rect) = super::control_attrs::frame_batched(children[i], budget) else {
+            source.set_messaging_timeout(&children[i]);
+            let Some(rect) = super::control_attrs::frame_batched_with(source, &children[i], budget)
+            else {
                 return true;
             };
-            let Some(clip) = visible_clip(budget) else {
+            let Some(clip) = visible_clip(source, surface, budget) else {
                 return true;
             };
             rect_visible(rect, clip)
@@ -230,10 +199,10 @@ pub(crate) unsafe fn plan_collection_children(
                 return true;
             }
             if let Some(rows) = &rows {
-                return rows.contains(children[i]);
+                return source.set_contains(rows, &children[i]);
             }
-            set_messaging_timeout(children[i]);
-            let child_role = copy_string_attr(children[i], "AXRole").unwrap_or_default();
+            source.set_messaging_timeout(&children[i]);
+            let child_role = known(source.text(&children[i], "AXRole")).unwrap_or_default();
             child_role == "AXRow"
                 || (matches!(role, "AXList" | "AXGrid")
                     && !matches!(child_role.as_str(), "AXScrollBar" | "AXColumn" | "AXHeader"))
@@ -432,7 +401,8 @@ pub(crate) fn renumber(
 mod tests {
     use super::super::snapshot::AxSnapshot;
     use super::*;
-    use core_foundation::base::{CFGetRetainCount, CFRetain};
+    use core_foundation::base::{CFGetRetainCount, CFRetain, CFTypeRef, TCFType};
+    use core_foundation::string::CFString;
     use cua_driver_core::protocol::Content;
     use cua_driver_core::snapshot_store::SnapshotPayload;
     use cua_driver_core::window_state_view::{apply, ViewContext, ViewKey, ViewOptions};
