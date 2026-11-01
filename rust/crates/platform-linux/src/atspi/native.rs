@@ -13,7 +13,7 @@
 //! ordered set.
 
 use std::collections::HashSet;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
@@ -51,6 +51,44 @@ tokio::task_local! {
     /// otherwise be allowed the full [`CALL_TIMEOUT`]. Set via [`bounded_for`]
     /// / [`walk_tree_bounded_with_timeout`]; absent for legacy callers.
     static OP_DEADLINE: tokio::time::Instant;
+    static TEXT_DISPATCH: Arc<TextWriteDispatch>;
+}
+
+#[derive(Default)]
+pub struct TextWriteDispatch {
+    pub gate: crate::text_write_policy::DispatchGate,
+    pub ledger: crate::text_write_policy::DispatchLedger,
+}
+
+fn write_timeout_result<T>(
+    dispatch: &TextWriteDispatch,
+    bytes: usize,
+    fallback: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    if dispatch.gate.close_on_timeout() {
+        Err(WriteUncertain {
+            step: crate::text_write_policy::WriteStep {
+                step: crate::text_write_policy::Step::InsertText,
+                bytes,
+                units: None,
+            },
+        }
+        .into())
+    } else {
+        fallback()
+    }
+}
+
+fn bounded_text_for<T>(
+    budget: Duration,
+    text: &str,
+    work: impl std::future::Future<Output = Result<T>>,
+    on_timeout: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    let dispatch = Arc::new(TextWriteDispatch::default());
+    bounded_for(budget, TEXT_DISPATCH.scope(dispatch.clone(), work), || {
+        write_timeout_result(&dispatch, text.len(), on_timeout)
+    })
 }
 
 /// Time left on the current operation's deadline, or [`CALL_TIMEOUT`] when no
@@ -3003,7 +3041,8 @@ async fn write_through_editable_proxies(
         Err(_) => None,
     };
     let toolkit = editable_toolkit(acc).await;
-    write_at_caret(&et, off, text, toolkit).await
+    let dispatch = TEXT_DISPATCH.with(Arc::clone);
+    write_at_caret(&et, &dispatch, off, text, toolkit).await
 }
 
 async fn editable_toolkit(acc: &AccessibleProxy<'_>) -> crate::text_write_policy::Toolkit {
@@ -3041,6 +3080,7 @@ async fn editable_toolkit(acc: &AccessibleProxy<'_>) -> crate::text_write_policy
 
 async fn write_at_caret(
     calls: &impl InsertCalls,
+    dispatch: &TextWriteDispatch,
     caret: Option<i32>,
     text: &str,
     toolkit: crate::text_write_policy::Toolkit,
@@ -3048,7 +3088,7 @@ async fn write_at_caret(
     let caret = caret.ok_or_else(|| anyhow!("editable caret unavailable"))?;
     let len = crate::text_write_policy::text_units(text, toolkit)
         .map_err(|reason| anyhow!("editable insert unavailable: {reason:?}"))?;
-    write_through_insert_calls(calls, caret, text, len).await
+    write_through_insert_calls(calls, dispatch, caret, text, len).await
 }
 
 trait InsertCalls {
@@ -3073,6 +3113,16 @@ impl std::fmt::Display for WriteUncertain {
 }
 impl std::error::Error for WriteUncertain {}
 
+#[derive(Debug)]
+struct WriteDispatchClosed;
+
+impl std::fmt::Display for WriteDispatchClosed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("AT-SPI text dispatch closed")
+    }
+}
+impl std::error::Error for WriteDispatchClosed {}
+
 fn classify_mutator_error(error: &zbus::Error) -> crate::text_write_policy::CallClass {
     use crate::text_write_policy::CallClass;
     match error {
@@ -3096,19 +3146,34 @@ fn classify_mutator_error(error: &zbus::Error) -> crate::text_write_policy::Call
 
 async fn write_through_insert_calls(
     calls: &impl InsertCalls,
+    dispatch: &TextWriteDispatch,
     off: i32,
     text: &str,
     len: i32,
 ) -> Result<bool> {
-    match calls.insert(off, text, len).await {
-        Ok(written) => Ok(written),
-        Err(error)
+    use crate::text_write_policy::{CallClass, MutationResult};
+    if dispatch.gate.enter_mutator().is_err() {
+        return Err(WriteDispatchClosed.into());
+    }
+    dispatch.ledger.record_sent();
+    let result = call(calls.insert(off, text, len)).await;
+    let classified = match &result {
+        Some(Ok(true)) => Ok(MutationResult::Acknowledged),
+        Some(Ok(false)) => Ok(MutationResult::Refused),
+        Some(Err(error)) => Err(classify_mutator_error(error)),
+        None => Err(CallClass::PossiblyExecuted),
+    };
+    dispatch.ledger.record_result(classified);
+    dispatch.gate.finish_mutator();
+    match result {
+        Some(Ok(written)) => Ok(written),
+        Some(Err(error))
             if classify_mutator_error(&error)
                 == crate::text_write_policy::CallClass::KnownUnsupported =>
         {
             Ok(false)
         }
-        Err(_) => Err(WriteUncertain {
+        Some(Err(_)) | None => Err(WriteUncertain {
             step: crate::text_write_policy::WriteStep {
                 step: crate::text_write_policy::Step::InsertText,
                 bytes: text.len(),
@@ -3152,7 +3217,13 @@ mod insert_regression_tests {
             args: RefCell::new(vec![]),
         };
         let error = runtime()
-            .block_on(write_through_insert_calls(&fake, 5, "abc", 3))
+            .block_on(write_through_insert_calls(
+                &fake,
+                &TextWriteDispatch::default(),
+                5,
+                "abc",
+                3,
+            ))
             .unwrap_err();
         assert!(error.downcast_ref::<WriteUncertain>().is_some());
         assert_eq!(*fake.calls.borrow(), ["insert"]);
@@ -3166,7 +3237,13 @@ mod insert_regression_tests {
             calls: RefCell::new(vec![]),
             args: RefCell::new(vec![]),
         };
-        let _ = runtime().block_on(write_through_insert_calls(&fake, 5, "abc", 3));
+        let _ = runtime().block_on(write_through_insert_calls(
+            &fake,
+            &TextWriteDispatch::default(),
+            5,
+            "abc",
+            3,
+        ));
         assert_eq!(*fake.contents.borrow(), "hello");
         assert_eq!(*fake.calls.borrow(), ["insert"]);
     }
@@ -3181,11 +3258,35 @@ mod insert_regression_tests {
         };
         let _ = runtime().block_on(write_at_caret(
             &fake,
+            &TextWriteDispatch::default(),
             None,
             "abc",
             crate::text_write_policy::Toolkit::Gtk,
         ));
         assert!(fake.calls.borrow().is_empty());
+    }
+
+    #[test]
+    fn closed_gate_prevents_late_insert() {
+        let fake = Fake {
+            failure: false,
+            contents: RefCell::new("hello".into()),
+            calls: RefCell::new(vec![]),
+            args: RefCell::new(vec![]),
+        };
+        let dispatch = TextWriteDispatch::default();
+        assert!(!dispatch.gate.close_on_timeout());
+        assert!(runtime()
+            .block_on(write_at_caret(
+                &fake,
+                &dispatch,
+                Some(5),
+                "abc",
+                crate::text_write_policy::Toolkit::Gtk,
+            ))
+            .is_err());
+        assert!(fake.calls.borrow().is_empty());
+        assert!(!dispatch.ledger.sent());
     }
 
     #[test]
@@ -3200,7 +3301,13 @@ mod insert_regression_tests {
                 calls: RefCell::new(vec![]),
                 args: RefCell::new(vec![]),
             };
-            let _ = runtime().block_on(write_at_caret(&fake, Some(5), "é😀", toolkit));
+            let _ = runtime().block_on(write_at_caret(
+                &fake,
+                &TextWriteDispatch::default(),
+                Some(5),
+                "é😀",
+                toolkit,
+            ));
             assert_eq!(*fake.args.borrow(), [(5, length)]);
         }
         let fake = Fake {
@@ -3212,6 +3319,7 @@ mod insert_regression_tests {
         assert!(runtime()
             .block_on(write_at_caret(
                 &fake,
+                &TextWriteDispatch::default(),
                 Some(5),
                 "é😀",
                 crate::text_write_policy::Toolkit::Unknown,
@@ -3266,8 +3374,9 @@ mod insert_regression_tests {
 /// Write into the best editable exposed by the current AT-SPI tree without
 /// falling through to synthetic X11 input.
 pub fn type_into_editable(pid: u32, text: &str) -> Result<()> {
-    bounded_for(
+    bounded_text_for(
         INPUT_QUERY_BUDGET,
+        text,
         async {
             let conn = shared_connection().await?;
             // Focused editable known from the event log: write there directly.
@@ -3293,8 +3402,9 @@ pub fn type_into_editable(pid: u32, text: &str) -> Result<()> {
 
 /// Write into the exact indexed editable exposed by the caller's snapshot.
 pub fn type_into_editable_at(pid: u32, idx: usize, text: &str) -> Result<()> {
-    bounded_for(
+    bounded_text_for(
         INDEX_RESOLVE_BUDGET,
+        text,
         async {
             let conn = shared_connection().await?;
             let visited = collect_visited(conn, pid)
@@ -3339,8 +3449,9 @@ pub fn type_into_editable_at(pid: u32, idx: usize, text: &str) -> Result<()> {
 }
 
 pub fn insert_text(pid: u32, text: &str) -> Result<bool> {
-    bounded_for(
+    bounded_text_for(
         INPUT_QUERY_BUDGET,
+        text,
         async {
             let conn = shared_connection().await?;
             if let Some(true) = write_into_focused_editable(conn, pid, text).await? {
@@ -3453,6 +3564,27 @@ pub fn insert_text(pid: u32, text: &str) -> Result<bool> {
             Ok(false)
         },
     )
+}
+
+#[cfg(test)]
+mod write_timeout_tests {
+    use super::*;
+
+    #[test]
+    fn timeout_after_dispatch_is_uncertain() {
+        let dispatch = TextWriteDispatch::default();
+        dispatch.gate.enter_mutator().unwrap();
+        let error = write_timeout_result(&dispatch, 3, || Ok(false)).unwrap_err();
+        assert!(error.downcast_ref::<WriteUncertain>().is_some());
+        assert!(!format!("{error:?}").contains("abc"));
+    }
+
+    #[test]
+    fn timeout_before_dispatch_remains_fallback_eligible() {
+        let dispatch = TextWriteDispatch::default();
+        assert!(!write_timeout_result(&dispatch, 3, || Ok(false)).unwrap());
+        assert!(dispatch.gate.enter_mutator().is_err());
+    }
 }
 
 /// Classify what holds keyboard focus in `pid`'s tree, so `type_text` can target
@@ -4281,8 +4413,9 @@ pub fn focus_element_ref(object_ref: &ObjectRef) -> Result<bool> {
 
 /// [`type_into_editable_at`] on a snapshot-cached element identity.
 pub fn type_into_editable_ref(object_ref: &ObjectRef, text: &str) -> Result<()> {
-    bounded_for(
+    bounded_text_for(
         REF_ACTION_BUDGET,
+        text,
         async {
             let conn = shared_connection().await.map_err(token_pre_dispatch)?;
             let (acc, _) = live_accessible(conn, object_ref)
@@ -4333,7 +4466,12 @@ async fn write_into_focused_editable(
     }
     match write_into_editable_acc(&acc, ifaces.contains(Interface::Component), text).await {
         Ok(written) => Ok(Some(written)),
-        Err(error) if error.downcast_ref::<WriteUncertain>().is_some() => Err(error),
+        Err(error)
+            if error.downcast_ref::<WriteUncertain>().is_some()
+                || error.downcast_ref::<WriteDispatchClosed>().is_some() =>
+        {
+            Err(error)
+        }
         Err(error) => {
             dlog!("focused editable write failed: {error:#}");
             Ok(Some(false))
