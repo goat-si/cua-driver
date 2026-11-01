@@ -403,6 +403,62 @@ fn scanner_handles_comments_strings_aliases_and_multiline_calls() {
 }
 
 #[test]
+fn raw_primitive_renames_and_reexports_are_inventory_sites() {
+    let fixtures = [
+        ("renamed module reexport", "mod workers { pub use tokio::spawn as run; } fn mutate() { workers::run(async { native_mutation() }); }", "workers", "tokio::spawn"),
+        ("unrenamed module reexport", "mod workers { pub use tokio::task::spawn; } fn mutate() { workers::spawn(async { native_mutation() }); }", "workers", "tokio::task::spawn"),
+        ("renamed Builder", "mod workers { use std::thread::Builder as Worker; }", "workers", "std::thread::Builder"),
+        ("nested grouped use", "mod a { mod b { pub(crate) use tokio::{task::{spawn_blocking as run}}; } }", "a::b", "tokio::task::spawn_blocking"),
+    ];
+    let mut missing = Vec::new();
+    for (label, source, module, path) in fixtures {
+        let sites = scan("fixture.rs", source).unwrap();
+        if !sites
+            .iter()
+            .any(|site| site.item == module && site.primitive == path)
+        {
+            missing.push(format!("{label}: expected {module} {path}; got {sites:#?}"));
+        }
+    }
+    for path in [
+        "tokio::spawn",
+        "tokio::task::spawn",
+        "tokio::task::spawn_blocking",
+        "tokio::task::spawn_local",
+        "std::thread::spawn",
+        "std::thread::Builder",
+        "std::thread::scope",
+    ] {
+        for declaration in [
+            format!("use {path} as renamed;"),
+            format!("pub use {path};"),
+        ] {
+            let sites = scan("matrix.rs", &format!("mod workers {{ {declaration} }}")).unwrap();
+            if !sites
+                .iter()
+                .any(|site| site.item == "workers" && site.primitive == path)
+            {
+                missing.push(format!("{declaration}: {sites:#?}"));
+            }
+        }
+    }
+    for path in ["tokio", "tokio::task", "std::thread"] {
+        let sites = scan("glob.rs", &format!("mod workers {{ use {path}::*; }}")).unwrap();
+        if !sites
+            .iter()
+            .any(|site| site.item == "workers" && site.primitive == format!("{path}::*"))
+        {
+            missing.push(format!("{path}::*: {sites:#?}"));
+        }
+    }
+    assert!(
+        missing.is_empty(),
+        "raw primitive import sites missing:\n{}",
+        missing.join("\n")
+    );
+}
+
+#[test]
 fn trait_method_parameter_shadow_rejects_wrapped_builder() {
     let sites = scan(
         "trait_shadow.rs",
