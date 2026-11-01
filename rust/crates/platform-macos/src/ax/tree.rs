@@ -351,6 +351,29 @@ fn row_label_candidate<'a>(
         .find(|text| !text.is_empty())
 }
 
+fn initial_owned_row_label(selectable_row: bool) -> Option<Option<String>> {
+    selectable_row.then_some(None)
+}
+
+fn child_label_path(path: LabelPath, selectable_row: bool, indexed: bool, ptr: usize) -> LabelPath {
+    if selectable_row && indexed {
+        LabelPath::Open(ptr)
+    } else {
+        path
+    }
+}
+
+fn collect_label_claim(
+    claims: &mut Vec<(usize, String)>,
+    path: LabelPath,
+    role: &str,
+    texts: [Option<&str>; 3],
+) {
+    if let (LabelPath::Open(owner), Some(label)) = (path, row_label_candidate(path, role, texts)) {
+        claims.push((owner, label.to_owned()));
+    }
+}
+
 fn selectable_row_eligible(
     role: &str,
     parent_role: Option<&str>,
@@ -1322,16 +1345,12 @@ unsafe fn walk_element(
         .map(str::to_owned)
         .unwrap_or(visible_description);
 
-    if let (LabelPath::Open(owner), Some(label)) = (
+    collect_label_claim(
+        label_claims,
         label_path,
-        row_label_candidate(
-            label_path,
-            &role,
-            [title.as_deref(), value.as_deref(), description.as_deref()],
-        ),
-    ) {
-        label_claims.push((owner, label.to_owned()));
-    }
+        &role,
+        [title.as_deref(), value.as_deref(), description.as_deref()],
+    );
 
     let has_content =
         !visible_title.is_empty() || !visible_description.is_empty() || !visible_value.is_empty();
@@ -1491,7 +1510,7 @@ unsafe fn walk_element(
         // releases the per-child ref at the end of the caller's loop.
         CFRetain(element as CFTypeRef);
         AXNode {
-            owned_row_label: selectable_row.then_some(None),
+            owned_row_label: initial_owned_row_label(selectable_row),
             element_index: Some(idx),
             role: role.clone(),
             title: if visible_title.is_empty() {
@@ -1556,11 +1575,12 @@ unsafe fn walk_element(
     // Track this node as the parent for its descendants only when it was
     // assigned an element_index (mirrors what the markdown shows: only
     // indexed rows are addressable in click(element_index=N)).
-    let child_label_path = if selectable_row && node.element_index.is_some() {
-        LabelPath::Open(element_ptr)
-    } else {
-        label_path
-    };
+    let child_label_path = child_label_path(
+        label_path,
+        selectable_row,
+        node.element_index.is_some(),
+        element_ptr,
+    );
     let next_parent = node.element_index.or(parent_index);
 
     // A closed menu of the menu bar stays collapsed when the caller asked for
