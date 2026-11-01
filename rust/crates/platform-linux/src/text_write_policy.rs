@@ -164,6 +164,9 @@ pub trait EditableOps {
     fn set_text(&mut self, text: &str) -> MutationReply;
     fn delete_text(&mut self, start: i32, end: i32) -> MutationReply;
     fn insert_text(&mut self, offset: i32, text: &str, length: i32) -> MutationReply;
+    fn prepare_commit(&mut self) -> Result<(), CallClass> {
+        Ok(())
+    }
     fn commit(&mut self) -> MutationReply;
 }
 
@@ -281,6 +284,11 @@ fn commit(
     gate: &DispatchGate,
     ledger: &DispatchLedger,
 ) -> TextWriteOutcome {
+    if ops.prepare_commit().is_err() {
+        return TextWriteOutcome::Uncertain {
+            step: step(Step::Commit, text, units),
+        };
+    }
     match dispatch(gate, ledger, || ops.commit()) {
         Ok(Ok(MutationResult::Acknowledged)) => TextWriteOutcome::Acknowledged,
         _ => TextWriteOutcome::Uncertain {
@@ -312,6 +320,7 @@ mod tests {
         insert_args: Vec<(i32, i32)>,
         delete_args: Vec<(i32, i32)>,
         pause: Option<(&'static str, Arc<Barrier>, Arc<Barrier>)>,
+        close_on_prepare: Option<Arc<DispatchGate>>,
     }
     impl Default for Fake {
         fn default() -> Self {
@@ -327,6 +336,7 @@ mod tests {
                 insert_args: vec![],
                 delete_args: vec![],
                 pause: None,
+                close_on_prepare: None,
             }
         }
     }
@@ -367,6 +377,13 @@ mod tests {
             self.insert_args.push((offset, length));
             self.call("insert");
             self.insert
+        }
+        fn prepare_commit(&mut self) -> Result<(), CallClass> {
+            if let Some(gate) = &self.close_on_prepare {
+                self.calls.push("prepare");
+                gate.close_on_timeout();
+            }
+            Ok(())
         }
         fn commit(&mut self) -> Reply {
             self.call("commit");
@@ -593,6 +610,32 @@ mod tests {
             }
         ));
         assert_eq!(calls, ["set"]);
+    }
+
+    #[test]
+    fn timeout_during_commit_preparation_blocks_action() {
+        let gate = Arc::new(DispatchGate::default());
+        let mut f = Fake {
+            close_on_prepare: Some(gate.clone()),
+            ..Fake::default()
+        };
+        let out = replace_route(
+            &mut f,
+            "abc",
+            Toolkit::Gtk,
+            &gate,
+            &DispatchLedger::default(),
+        );
+        assert!(matches!(
+            out,
+            TextWriteOutcome::Uncertain {
+                step: WriteStep {
+                    step: Step::Commit,
+                    ..
+                }
+            }
+        ));
+        assert_eq!(f.calls, ["set", "prepare"]);
     }
     #[test]
     fn timeout_before_first_send_closes_gate() {

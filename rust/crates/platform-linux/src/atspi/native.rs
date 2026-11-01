@@ -5945,31 +5945,25 @@ pub fn is_no_value_route(error: &anyhow::Error) -> bool {
 /// or focus-out); after an EditableText write, fire the element's `activate`
 /// action when it exposes one so the numeric value commits. Best effort.
 async fn commit_editable_write(
-    proxies: &atspi::proxy::proxy_ext::Proxies<'_>,
+    action: Option<&(atspi::proxy::action::ActionProxy<'_>, i32)>,
 ) -> crate::text_write_policy::MutationReply {
     use crate::text_write_policy::{CallClass, MutationResult};
-    let Some(Ok(ap)) = call(proxies.action()).await else {
+    let Some((ap, index)) = action else {
         return Ok(MutationResult::Acknowledged);
     };
-    let names = action_names(&ap).await;
-    if let Some(index) = names
-        .iter()
-        .position(|name| normalized_action_verb(name) == "activate")
-    {
-        return match call(ap.do_action(index as i32)).await {
-            Some(Ok(true)) => Ok(MutationResult::Acknowledged),
-            Some(Ok(false)) => Ok(MutationResult::Refused),
-            Some(Err(error)) => Err(classify_mutator_error(&error)),
-            None => Err(CallClass::PossiblyExecuted),
-        };
+    match call(ap.do_action(*index)).await {
+        Some(Ok(true)) => Ok(MutationResult::Acknowledged),
+        Some(Ok(false)) => Ok(MutationResult::Refused),
+        Some(Err(error)) => Err(classify_mutator_error(&error)),
+        None => Err(CallClass::PossiblyExecuted),
     }
-    Ok(MutationResult::Acknowledged)
 }
 
 struct NativeEditableOps<'a> {
     proxies: atspi::proxy::proxy_ext::Proxies<'a>,
     editable: atspi::proxy::editable_text::EditableTextProxy<'a>,
     dispatch: Arc<TextWriteDispatch>,
+    commit_action: Option<(atspi::proxy::action::ActionProxy<'a>, i32)>,
 }
 
 impl NativeEditableOps<'_> {
@@ -6040,9 +6034,20 @@ impl crate::text_write_policy::EditableOps for NativeEditableOps<'_> {
         }
         result
     }
-    fn commit(&mut self) -> crate::text_write_policy::MutationReply {
+    fn prepare_commit(&mut self) -> std::result::Result<(), crate::text_write_policy::CallClass> {
         self.dispatch.step.store(4, Ordering::SeqCst);
-        runtime().block_on(commit_editable_write(&self.proxies))
+        self.commit_action = runtime().block_on(async {
+            let ap = call(self.proxies.action()).await?.ok()?;
+            let names = action_names(&ap).await;
+            let index = names
+                .iter()
+                .position(|name| normalized_action_verb(name) == "activate")?;
+            Some((ap, index as i32))
+        });
+        Ok(())
+    }
+    fn commit(&mut self) -> crate::text_write_policy::MutationReply {
+        runtime().block_on(commit_editable_write(self.commit_action.as_ref()))
     }
 }
 
@@ -6116,6 +6121,7 @@ async fn run_native_editable_route(
             proxies,
             editable,
             dispatch: worker_dispatch.clone(),
+            commit_action: None,
         };
         Ok::<_, anyhow::Error>(run_editable_route(
             &mut ops,
