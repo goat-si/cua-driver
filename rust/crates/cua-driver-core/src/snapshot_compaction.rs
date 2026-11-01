@@ -449,7 +449,11 @@ fn field_is_rendered(row: &str, field: &str) -> bool {
 
 /// Recover only the retained row's complete, delimited label and value.
 /// Ambiguous or unsupported formatting cannot prove a field was retained.
-fn rendered_label_value<'a>(row: &'a str, role: &str) -> (Option<&'a str>, Option<&'a str>) {
+fn rendered_label_value<'a>(
+    row: &'a str,
+    role: &str,
+    expected_title: Option<&str>,
+) -> (Option<&'a str>, Option<&'a str>) {
     let Some(rest) = row
         .strip_prefix("- ")
         .and_then(|row| row.strip_prefix(role))
@@ -462,7 +466,15 @@ fn rendered_label_value<'a>(row: &'a str, role: &str) -> (Option<&'a str>, Optio
     let mut rest = rest.trim_start();
     let mut label = None;
     if let Some(quoted) = rest.strip_prefix('"') {
-        let Some((text, tail)) = quoted.split_once('"') else {
+        let Some((text, tail)) = expected_title
+            .and_then(|title| {
+                quoted
+                    .strip_prefix(title)
+                    .and_then(|tail| tail.strip_prefix('"'))
+                    .map(|tail| (&quoted[..title.len()], tail))
+            })
+            .or_else(|| quoted.split_once('"'))
+        else {
             return (None, None);
         };
         label = Some(text);
@@ -893,11 +905,15 @@ fn fold_after_elision<N: CompactableNode>(
                         }
                     }
                     let mut parent_node = old_nodes[idx].take().unwrap();
-                    let original_description = parent_node.description().and_then(|description| {
-                        let text = description.trim();
-                        (!text.is_empty() && field_is_rendered(&parent_node.format_line(), text))
-                            .then(|| description.to_owned())
-                    });
+                    let original_line = parent_node.format_line();
+                    let unchanged_fields =
+                        [parent_node.title(), parent_node.description()].map(|field| {
+                            field.and_then(|value| {
+                                let text = value.trim();
+                                (!text.is_empty() && field_is_rendered(&original_line, text))
+                                    .then(|| value.to_owned())
+                            })
+                        });
                     if report_folds {
                         if let Some(slot) = parent_node.boundary_mut() {
                             mark_folded_children(slot, absorbed_children);
@@ -944,7 +960,7 @@ fn fold_after_elision<N: CompactableNode>(
                     }
                     let mut formatted = parent_node.format_line();
                     let (rendered_label, rendered_value) =
-                        rendered_label_value(&formatted, parent_node.role());
+                        rendered_label_value(&formatted, parent_node.role(), parent_node.title());
                     let mut retained_fields: Vec<(String, String)> = [
                         parent_node.title().zip(rendered_label),
                         parent_node.value().zip(rendered_value),
@@ -973,9 +989,14 @@ fn fold_after_elision<N: CompactableNode>(
                             }
                         }
                     }
-                    if let Some(description) = original_description {
-                        if parent_node.description() == Some(description.as_str()) {
-                            let raw = description.trim();
+                    for (original, current) in unchanged_fields
+                        .iter()
+                        .zip([parent_node.title(), parent_node.description()])
+                    {
+                        if let Some(value) =
+                            original.as_deref().filter(|value| Some(*value) == current)
+                        {
+                            let raw = value.trim();
                             if let Some(normalized) = sanitize_snippet(raw, usize::MAX) {
                                 retained_fields.push((raw.to_owned(), normalized));
                             }
@@ -1502,6 +1523,17 @@ mod tests {
             nodes[0].boundary.as_ref().unwrap().descendants_omitted,
             Some(false)
         );
+    }
+    #[test]
+    fn u20b_r3_unchanged_rendered_parent_title_with_quotes_is_preserved() {
+        let mut nodes = vec![
+            u20_node("AXRow", 0, None, None),
+            u20_node("AXStaticText", 1, None, Some("child")),
+        ];
+        nodes[0].node.title = Some("parent \"quoted\" title".into());
+        let reasons = u20_fold(&mut nodes);
+        assert!(nodes[0].format_line().contains("parent \"quoted\" title"));
+        assert!(reasons.is_empty(), "{reasons:?}");
     }
     #[test]
     fn u20b_r3_parent_value_dropped_by_summary_cap_is_loss() {
