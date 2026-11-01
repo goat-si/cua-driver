@@ -394,4 +394,135 @@ mod task_failure_tests {
         assert_eq!(structured["dispatched"], false);
         assert!(format!("{:?}", result.content).contains("could not complete"));
     }
+    #[tokio::test]
+    async fn a_clean_check_still_allows() {
+        let sent = AtomicUsize::new(0);
+        let refusal = check_with("click", &json!({}), vec![(1.0, 2.0)], None, |_, _| None).await;
+        if refusal.is_none() {
+            sent.fetch_add(1, Ordering::SeqCst);
+        }
+        assert!(refusal.is_none());
+        assert_eq!(sent.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn a_real_refusal_is_unchanged() {
+        let window = WindowUnderPoint {
+            pid: 4242,
+            window_id: 77,
+            app_name: "Example".into(),
+            bundle_id: "example.app".into(),
+        };
+        let expected = refusal_for(
+            "click",
+            (1.0, 2.0),
+            Some(&window),
+            Some(1),
+            DeliveryMode::Background,
+        )
+        .unwrap();
+        let result = check_with(
+            "click",
+            &json!({}),
+            vec![(1.0, 2.0)],
+            None,
+            move |_, delivery| refusal_for("click", (1.0, 2.0), Some(&window), Some(1), delivery),
+        )
+        .await
+        .expect("background window must still be refused");
+        assert_eq!(
+            serde_json::to_value(result).unwrap(),
+            serde_json::to_value(expected).unwrap()
+        );
+    }
+
+    struct InventoryProbe {
+        definition: cua_driver_core::tool::ToolDef,
+        dispatched: Arc<AtomicUsize>,
+        refusal: Arc<std::sync::Mutex<Option<ToolResult>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl cua_driver_core::tool::Tool for InventoryProbe {
+        fn def(&self) -> &cua_driver_core::tool::ToolDef {
+            &self.definition
+        }
+
+        async fn invoke(&self, _args: Value) -> ToolResult {
+            let points = vec![(1.0, 2.0)];
+            let protection =
+                protected_refusal_with("click", &points, || panic!("fake inventory failed")).await;
+            match check_with("click", &json!({}), points, protection, |_, _| None).await {
+                Some(refusal) => *self.refusal.lock().unwrap() = Some(refusal),
+                None => {
+                    self.dispatched.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+            ToolResult::text("fake display").with_structured(json!({
+                "width": 100, "height": 100, "scale_factor": 1.0
+            }))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failed_inventory_with_a_protected_browser_still_refuses() {
+        use cua_driver_core::{
+            authorization::PermissionMode,
+            session_authorization::{SessionAuthorizationRegistry, SessionModeCeiling},
+            session_manifest::load_manifest,
+            tool::{ToolDef, ToolRegistry},
+        };
+        use std::time::Duration;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("manifest.yaml");
+        std::fs::write(&path, "version: 3\nresources:\n  browser:\n    origins: [\"https://app.example\"]\n    existing_profiles:\n      - {pid: 4343, window_id: 9}\nallow:\n  tools: [get_screen_size]\n").unwrap();
+        let manifest = load_manifest(&path).unwrap();
+        let context = SessionAuthorizationRegistry::with_ceiling(
+            SessionModeCeiling::for_trusted_sessions(
+                [PermissionMode::Standard],
+                false,
+                Duration::from_secs(60),
+                Duration::from_secs(30),
+            )
+            .unwrap(),
+        )
+        .compatibility_context(PermissionMode::Standard, Some(Arc::new(manifest)))
+        .unwrap();
+        let sent = Arc::new(AtomicUsize::new(0));
+        let refusal = Arc::new(std::sync::Mutex::new(None));
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(InventoryProbe {
+            definition: ToolDef {
+                name: "get_screen_size".into(),
+                description: "fake inventory probe".into(),
+                input_schema: json!({"type":"object"}),
+                read_only: true,
+                destructive: false,
+                idempotent: true,
+                open_world: false,
+            },
+            dispatched: sent.clone(),
+            refusal: refusal.clone(),
+        }));
+        let result = registry
+            .invoke_with_context("get_screen_size", json!({}), context)
+            .await;
+        assert_ne!(result.is_error, Some(true), "{result:?}");
+        let result = refusal
+            .lock()
+            .unwrap()
+            .take()
+            .expect("protected browser refused");
+        assert_eq!(result.is_error, None);
+        assert_eq!(
+            result.structured_content.as_ref().unwrap()["status"],
+            "refused"
+        );
+        assert_eq!(
+            result.structured_content.unwrap()["refusal"]["code"],
+            "browser_process_protected"
+        );
+        assert_eq!(sent.load(Ordering::SeqCst), 0);
+    }
 }
