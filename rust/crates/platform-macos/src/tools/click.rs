@@ -2923,9 +2923,29 @@ fn unconfirmed_selection_write(
     )
 }
 
+fn selection_attempt_outcome(
+    attempt: crate::input::ax_actions::SelectAttempt,
+    element: (usize, &str, &str),
+    after_error: Option<crate::ax::bindings::AXError>,
+    tied: impl FnOnce() -> bool,
+) -> Option<AxClickOutcome> {
+    use crate::input::ax_actions::SelectAttempt;
+    match attempt {
+        SelectAttempt::NotAttempted => None,
+        SelectAttempt::WriteSentUnconfirmed(role) => {
+            Some(unconfirmed_selection_write(&role, element))
+        }
+        SelectAttempt::Confirmed(role) => {
+            Some(selection_write_outcome(tied(), &role, element, after_error))
+        }
+    }
+}
+
 #[cfg(test)]
 mod selection_write_outcome_tests {
-    use super::{ax_click_structured, unconfirmed_selection_write};
+    use super::{ax_click_structured, selection_attempt_outcome, unconfirmed_selection_write};
+    use crate::ax::bindings::{kAXErrorIllegalArgument, AXError};
+    use crate::input::ax_actions::{select_with, SelectionOps};
 
     #[test]
     fn a_sent_unconfirmed_write_has_existing_unverifiable_fields() {
@@ -2936,6 +2956,63 @@ mod selection_write_outcome_tests {
             fields,
             serde_json::json!({"path": "ax", "verified": false, "effect": "unverifiable"})
         );
+    }
+
+    #[test]
+    fn illegal_argument_after_change_has_no_fallback_and_keeps_result_fields() {
+        struct Fake {
+            selected: [bool; 3],
+            writes: Vec<usize>,
+        }
+        impl SelectionOps for Fake {
+            type Element = usize;
+            fn role(&mut self, n: &usize) -> Option<String> {
+                Some(
+                    match *n {
+                        0 => "AXStaticText",
+                        1 => "AXCell",
+                        _ => "AXRow",
+                    }
+                    .into(),
+                )
+            }
+            fn parent(&mut self, n: &usize) -> Option<usize> {
+                (*n < 2).then_some(*n + 1)
+            }
+            fn selected(&mut self, n: &usize) -> Option<bool> {
+                Some(self.selected[*n])
+            }
+            fn select(&mut self, n: &usize) -> Result<(), AXError> {
+                self.writes.push(*n);
+                self.selected[*n] = true;
+                Err(kAXErrorIllegalArgument)
+            }
+            fn center(&mut self, _: &usize) -> Option<(f64, f64)> {
+                None
+            }
+        }
+        for error in [None, Some(kAXErrorIllegalArgument)] {
+            let mut ops = Fake {
+                selected: [false; 3],
+                writes: vec![],
+            };
+            let attempt = select_with(&mut ops, 0);
+            let mut pixels = 0;
+            let outcome = selection_attempt_outcome(attempt, (1, "AXCell", "label"), error, || {
+                panic!("no readback after error")
+            });
+            if outcome.is_none() {
+                pixels += 1;
+            }
+            assert_eq!(pixels, 0);
+            assert_eq!(ops.writes, [1]);
+            assert!(ops.selected[1]);
+            let (_, suspected_noop, evidence, via_pixel) = outcome.unwrap();
+            assert_eq!(
+                ax_click_structured(via_pixel, false, evidence, suspected_noop),
+                serde_json::json!({"path": "ax", "verified": false, "effect": "unverifiable"})
+            );
+        }
     }
 }
 
@@ -3241,30 +3318,22 @@ fn perform_ax_click(
             let snapshot = reads
                 .selection
                 .then(|| unsafe { SelectionSnapshot::capture(element) });
-            match crate::input::ax_actions::select_nearest_container(element_ptr) {
-                crate::input::ax_actions::SelectAttempt::Confirmed(selected_role) => {
-                    let tied = snapshot
+            if let Some(outcome) = selection_attempt_outcome(
+                crate::input::ax_actions::select_nearest_container_attempt(element_ptr),
+                (idx, &role, &title),
+                None,
+                || {
+                    snapshot
                         .as_ref()
                         .is_some_and(SelectionSnapshot::transitioned)
                         && input_quiet(
                             idle_before,
                             super::physical_input_idle_ms(),
                             elapsed_ms(started),
-                        );
-                    return Ok(selection_write_outcome(
-                        tied,
-                        &selected_role,
-                        (idx, &role, &title),
-                        None,
-                    ));
-                }
-                crate::input::ax_actions::SelectAttempt::WriteSentUnconfirmed(selected_role) => {
-                    return Ok(unconfirmed_selection_write(
-                        &selected_role,
-                        (idx, &role, &title),
-                    ));
-                }
-                crate::input::ax_actions::SelectAttempt::NotAttempted => {}
+                        )
+                },
+            ) {
+                return Ok(outcome);
             }
         }
 
@@ -3560,30 +3629,22 @@ fn perform_ax_click(
         // kAXErrorCannotComplete. Use the same verified selection fallback
         // before surfacing the dispatch error.
         if let Some((snapshot, idle_before, started)) = fallback_selection {
-            match crate::input::ax_actions::select_nearest_container(element_ptr) {
-                crate::input::ax_actions::SelectAttempt::Confirmed(selected_role) => {
-                    let tied = snapshot
+            if let Some(outcome) = selection_attempt_outcome(
+                crate::input::ax_actions::select_nearest_container_attempt(element_ptr),
+                (idx, &role, &title),
+                Some(err),
+                || {
+                    snapshot
                         .as_ref()
                         .is_some_and(SelectionSnapshot::transitioned)
                         && input_quiet(
                             idle_before,
                             super::physical_input_idle_ms(),
                             elapsed_ms(started),
-                        );
-                    return Ok(selection_write_outcome(
-                        tied,
-                        &selected_role,
-                        (idx, &role, &title),
-                        Some(err),
-                    ));
-                }
-                crate::input::ax_actions::SelectAttempt::WriteSentUnconfirmed(selected_role) => {
-                    return Ok(unconfirmed_selection_write(
-                        &selected_role,
-                        (idx, &role, &title),
-                    ));
-                }
-                crate::input::ax_actions::SelectAttempt::NotAttempted => {}
+                        )
+                },
+            ) {
+                return Ok(outcome);
             }
         }
         return unresolved_perform_error(ax_action, err, (idx, &role, &title));
