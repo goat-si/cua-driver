@@ -565,6 +565,23 @@ fn set_value_tool_result_with_toolkit(
                     result = result.with_disposition(disposition);
                 }
                 result
+            } else if let Some(scope) = e.downcast_ref::<KeyScopeFailure>() {
+                let (effect, disposition) = if scope.prior == PriorInput::None {
+                    (
+                        "refused",
+                        cua_driver_contract::ErrorDisposition::NOT_DELIVERED,
+                    )
+                } else {
+                    (
+                        "unverifiable",
+                        cua_driver_contract::ErrorDisposition::SUSPECTED_NOOP,
+                    )
+                };
+                ToolResult::error(format!("set_value failed: {e}.{suffix}"))
+                    .with_structured(
+                        serde_json::json!({ "path": "ax", "effect": effect, "verified": false }),
+                    )
+                    .with_disposition(disposition)
             } else {
                 ToolResult::error(format!("set_value failed: {e}.{suffix}"))
             }
@@ -1336,15 +1353,7 @@ fn set_value_blocking_inner(
         let _key_scope = if text_value_role_requires_exact_focus(&role) && restored_window {
             None
         } else if text_value_role_requires_exact_focus(&role) {
-            Some(
-                super::key_scope(pid, Some(window_id))
-                    .map_err(|reason| anyhow::anyhow!(reason))?
-                    .ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "set_value requires exact-window key priming before an editable text AXValue write, but that transport is unavailable"
-                        )
-                    })?,
-            )
+            Some(set_value_key_scope(pid, window_id, prior)?)
         } else {
             None
         };
@@ -1440,6 +1449,35 @@ fn prior_for_key_entry(prior: PriorInput, entry: crate::input::skylight::KeyEntr
     } else {
         prior
     }
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("{message}")]
+struct KeyScopeFailure {
+    message: String,
+    prior: PriorInput,
+}
+
+fn set_value_key_scope(
+    pid: i32,
+    window_id: u32,
+    prior: PriorInput,
+) -> anyhow::Result<crate::input::skylight::WindowKeyScope> {
+    use crate::input::skylight;
+    if !skylight::is_available() || !skylight::is_focus_without_raise_available() {
+        return Err(KeyScopeFailure {
+            message: "set_value requires exact-window key priming before an editable text AXValue write, but that transport is unavailable".into(),
+            prior,
+        }.into());
+    }
+    skylight::enter_exact_window_key_inline_detailed(pid, window_id).map_err(|error| {
+        let disclosure = skylight::scope_disclosure(error.entry, error.hand_back);
+        KeyScopeFailure {
+            message: format!("{} {disclosure}", error.reason),
+            prior: prior_for_key_entry(prior, error.entry),
+        }
+        .into()
+    })
 }
 
 trait AxValueOps {

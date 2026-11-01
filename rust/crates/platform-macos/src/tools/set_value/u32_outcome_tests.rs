@@ -157,6 +157,37 @@ fn setter_illegal_argument_after_change_is_never_not_delivered() {
         prior_for_key_entry(PriorInput::None, KeyEntry::default()),
         PriorInput::None
     );
+    for (prior, effect, disposition) in [
+        (PriorInput::None, "refused", ErrorDisposition::NOT_DELIVERED),
+        (
+            PriorInput::MayHaveDelivered,
+            "unverifiable",
+            ErrorDisposition::SUSPECTED_NOOP,
+        ),
+    ] {
+        let result = set_value_tool_result_with_toolkit(
+            Ok(Err(KeyScopeFailure {
+                message: "key scope failed".into(),
+                prior,
+            }
+            .into())),
+            false,
+            String::new(),
+            1,
+            || panic!("unexpected toolkit probe"),
+        );
+        assert_eq!(
+            result.structured_content.as_ref().unwrap()["effect"],
+            effect
+        );
+        assert_eq!(result.disposition, Some(disposition));
+        assert!(result
+            .structured_content
+            .as_ref()
+            .unwrap()
+            .get("dispatched")
+            .is_none());
+    }
     let mut fake = Fake::new(text("old"))
         .read(text("new"))
         .result(kAXErrorIllegalArgument);
