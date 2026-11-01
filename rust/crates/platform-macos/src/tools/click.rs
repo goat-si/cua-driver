@@ -3050,6 +3050,60 @@ fn selection_attempt_outcome(
     }
 }
 
+fn post_press_should_select(err: crate::ax::bindings::AXError) -> bool {
+    err != crate::ax::bindings::kAXErrorSuccess
+}
+
+#[cfg(test)]
+mod u32_outcome_tests {
+    use super::{ax_click_structured, post_press_should_select, selection_attempt_outcome};
+    use crate::ax::bindings::{kAXErrorAttributeUnsupported, kAXErrorIllegalArgument, AXError};
+    use crate::input::ax_actions::{select_with, SelectionOps};
+
+    struct FakeSelection {
+        selected: bool,
+        writes: usize,
+        error: AXError,
+    }
+
+    impl SelectionOps for FakeSelection {
+        type Element = usize;
+        fn role(&mut self, _: &usize) -> Option<String> { Some("AXCell".into()) }
+        fn parent(&mut self, _: &usize) -> Option<usize> { None }
+        fn selected(&mut self, _: &usize) -> Option<bool> { Some(self.selected) }
+        fn select(&mut self, _: &usize) -> Result<(), AXError> {
+            self.writes += 1;
+            self.selected = true;
+            Err(self.error)
+        }
+        fn center(&mut self, _: &usize) -> Option<(f64, f64)> { None }
+    }
+
+    #[test]
+    fn perform_attribute_unsupported_requires_fresh_tied_effect() {
+        let mut ops = FakeSelection { selected: false, writes: 0, error: kAXErrorIllegalArgument };
+        let mut pixels = 0;
+        if post_press_should_select(kAXErrorAttributeUnsupported) {
+            let attempt = select_with(&mut ops, 0);
+            if selection_attempt_outcome(attempt, (1, "AXCell", "label"), None, || false).is_none() {
+                pixels += 1;
+            }
+        }
+        assert_eq!(ops.writes + pixels, 0, "no second AXSelected or pixel write without a fresh tied effect");
+    }
+
+    #[test]
+    fn selection_illegal_argument_never_falls_back_or_claims_safe_retry() {
+        let mut ops = FakeSelection { selected: false, writes: 0, error: kAXErrorIllegalArgument };
+        let attempt = select_with(&mut ops, 0);
+        let outcome = selection_attempt_outcome(attempt, (1, "AXCell", "label"), None, || panic!("must not confirm a failed setter"));
+        assert_eq!(ops.writes, 1);
+        assert!(ops.selected);
+        let (_, suspected_noop, evidence, via_pixel) = outcome.expect("must stop after setter");
+        assert_eq!(ax_click_structured(via_pixel, false, evidence, suspected_noop), serde_json::json!({"path":"ax", "verified":false, "effect":"unverifiable"}));
+    }
+}
+
 #[cfg(test)]
 mod selection_write_outcome_tests {
     use super::{ax_click_structured, selection_attempt_outcome, unconfirmed_selection_write};
@@ -3815,7 +3869,8 @@ fn perform_ax_click(
         // Some collection rows claim a click-like action but Finder returns
         // kAXErrorCannotComplete. Use the same verified selection fallback
         // before surfacing the dispatch error.
-        if let Some((snapshot, idle_before, started)) = fallback_selection {
+        if post_press_should_select(err) {
+          if let Some((snapshot, idle_before, started)) = fallback_selection {
             if let Some(outcome) = selection_attempt_outcome(
                 crate::input::ax_actions::select_nearest_container_attempt(element_ptr),
                 (idx, &role, &title),
@@ -3833,6 +3888,7 @@ fn perform_ax_click(
             ) {
                 return Ok(outcome);
             }
+          }
         }
         return unresolved_perform_error(ax_action, err, (idx, &role, &title));
     }
