@@ -121,6 +121,7 @@ pub(crate) enum ReadSite {
     TopLevelWindows,
     TopLevelWindowsMember,
     TopLevelRemoteWindow,
+    ApplicationRoot,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

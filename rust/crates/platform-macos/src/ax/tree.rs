@@ -746,6 +746,61 @@ pub(crate) fn walk_tree_with_web_content_observed(
     scope.finish(result)
 }
 
+/// Supplies native setup observations to shared walk code.
+trait AxWalkEnvironment {
+    type Application;
+
+    fn create_application(&self, pid: i32) -> Option<Self::Application>;
+    fn set_application_timeout(&self, application: &Self::Application);
+    fn application_key(&self, application: &Self::Application) -> usize;
+}
+
+struct NativeWalkEnvironment;
+
+impl AxWalkEnvironment for NativeWalkEnvironment {
+    type Application = AXUIElementRef;
+
+    fn create_application(&self, pid: i32) -> Option<Self::Application> {
+        let application = unsafe { AXUIElementCreateApplication(pid) };
+        (!application.is_null()).then_some(application)
+    }
+    fn set_application_timeout(&self, application: &Self::Application) {
+        unsafe { set_messaging_timeout(*application) }
+    }
+    fn application_key(&self, application: &Self::Application) -> usize {
+        *application as usize
+    }
+}
+
+fn create_application_with<E: AxWalkEnvironment>(
+    environment: &E,
+    pid: i32,
+) -> super::evidence::Observed<Option<E::Application>> {
+    use super::evidence::{EvidenceStatus, Observed, ReadEvidence, ReadSite};
+    let legacy = environment.create_application(pid);
+    if let Some(application) = &legacy {
+        environment.set_application_timeout(application);
+    }
+    let owner = legacy
+        .as_ref()
+        .map(|application| environment.application_key(application));
+    let status = if legacy.is_some() {
+        EvidenceStatus::Known
+    } else {
+        EvidenceStatus::Unavailable
+    };
+    Observed {
+        legacy,
+        evidence: vec![ReadEvidence {
+            owner,
+            site: ReadSite::ApplicationRoot,
+            status,
+            attempt: 0,
+            listing: None,
+        }],
+    }
+}
+
 fn walk_tree_with_web_content_inner(
     pid: i32,
     window_id: Option<u32>,
@@ -764,8 +819,9 @@ fn walk_tree_with_web_content_inner(
     let mut window_scope: Option<WindowScope> = None;
 
     unsafe {
-        let app_elem = AXUIElementCreateApplication(pid);
-        if app_elem.is_null() {
+        let Some(app_elem) =
+            create_application_with(&NativeWalkEnvironment, pid).into_walk_legacy()
+        else {
             return TreeWalkResult {
                 offscreen_rows: Vec::new(),
                 tree_markdown: String::new(),
@@ -777,8 +833,7 @@ fn walk_tree_with_web_content_inner(
                 // certainly did not resolve.
                 window_scope: window_id.map(|_| WindowScope::AxUnresolved { ax_window_count: 0 }),
             };
-        }
-        set_messaging_timeout(app_elem);
+        };
 
         // A window-scoped walk of an app that is still launching waits, within
         // the caller's budget, for the app to answer AX (see `super::launch`).
@@ -4332,5 +4387,7 @@ mod canonical_evidence_tests {
 }
 #[cfg(test)]
 mod environment_evidence_tests;
+#[cfg(test)]
+mod environment_setup_tests;
 #[cfg(test)]
 mod walker_test_support;
