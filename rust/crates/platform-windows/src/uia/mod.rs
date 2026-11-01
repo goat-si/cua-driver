@@ -813,7 +813,18 @@ unsafe fn walk_list_view_level(
             log: &state.reads,
             not_supported: state.not_supported.as_ref(),
         };
-        emit_cached_node(element, depth, parent, in_web, nodes, lines, counter, &ctx)
+        emit_cached_node(
+            element,
+            EmitLocation {
+                depth,
+                parent_index: parent,
+                in_web_content: in_web,
+            },
+            nodes,
+            lines,
+            counter,
+            &ctx,
+        )
     };
     if emitted.dropped_offscreen_content {
         state.mark(Omission::OffscreenContentDropped);
@@ -1285,9 +1296,11 @@ unsafe fn walk_cached_element(
         };
         emit_cached_node(
             element,
-            depth,
-            parent_index,
-            in_web_content,
+            EmitLocation {
+                depth,
+                parent_index,
+                in_web_content,
+            },
             nodes,
             lines,
             counter,
@@ -1583,9 +1596,11 @@ unsafe fn walk_native_level(
     };
     let emitted = emit_cached_node(
         element,
-        depth,
-        parent_index,
-        false,
+        EmitLocation {
+            depth,
+            parent_index,
+            in_web_content: false,
+        },
         nodes,
         lines,
         counter,
@@ -1629,16 +1644,25 @@ struct EmitOutcome {
     dropped_offscreen_content: bool,
 }
 
-fn emit_cached_node(
-    element: &IUIAutomationElement,
+struct EmitLocation {
     depth: usize,
     parent_index: Option<usize>,
     in_web_content: bool,
+}
+
+fn emit_cached_node(
+    element: &IUIAutomationElement,
+    location: EmitLocation,
     nodes: &mut Vec<UiaNode>,
     lines: &mut Vec<(usize, String)>,
     counter: &mut usize,
     ctx: &UiaReadCtx<'_>,
 ) -> EmitOutcome {
+    let EmitLocation {
+        depth,
+        parent_index,
+        in_web_content,
+    } = location;
     let control_type = read_cached_control_type(element, ctx);
     let name = read_cached_bstr_name(element, ctx);
     let value = read_cached_bstr_value(element, ctx);
