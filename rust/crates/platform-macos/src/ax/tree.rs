@@ -179,7 +179,7 @@ pub(crate) fn is_selection_text_role(role: &str) -> bool {
 /// A single node in the AX tree.
 #[derive(Debug, Clone)]
 pub struct AXNode {
-    /// Internal marker and structurally owned label for newly indexed rows.
+    /// Internal marker and structurally owned label for row-like items.
     pub(crate) owned_row_label: Option<Option<String>>,
     /// 0-based index (Some = actionable, None = non-actionable display-only node)
     pub element_index: Option<usize>,
@@ -283,6 +283,13 @@ impl CompactableNode for AXNode {
         self.value.as_deref()
     }
     fn set_value(&mut self, value: Option<String>) {
+        // Compaction sees rendered depth after omitted wrappers. Only copy a
+        // summary onto an item when the walk independently proved ownership.
+        if let Some(owned) = &self.owned_row_label {
+            if self.value.is_some() || value.as_deref() != owned.as_deref() {
+                return;
+            }
+        }
         self.value = value;
     }
     fn description(&self) -> Option<&str> {
@@ -314,10 +321,11 @@ fn is_actionless_control_role(role: &str) -> bool {
 pub(crate) enum LabelPath {
     Inactive,
     Open(usize),
+    Cell(usize, usize),
     Blocked,
 }
 
-fn next_label_path(
+pub(super) fn next_label_path(
     parent: LabelPath,
     parent_role: Option<&str>,
     child_role: Option<&str>,
@@ -333,6 +341,13 @@ fn next_label_path(
             }
             Some(_) => LabelPath::Open(owner),
         },
+        LabelPath::Cell(cell, row) => match child_role {
+            None
+            | Some("AXUnknown" | "AXRow" | "AXCell" | "AXOutlineRow" | "AXListItem" | "AXImage") => {
+                LabelPath::Blocked
+            }
+            Some(_) => LabelPath::Cell(cell, row),
+        },
     }
 }
 
@@ -341,7 +356,9 @@ fn row_label_candidate<'a>(
     role: &str,
     texts: [Option<&'a str>; 3],
 ) -> Option<&'a str> {
-    if !matches!(path, LabelPath::Open(_)) || !matches!(role, "AXStaticText" | "AXTextField") {
+    if !matches!(path, LabelPath::Open(_) | LabelPath::Cell(_, _))
+        || !matches!(role, "AXStaticText" | "AXTextField")
+    {
         return None;
     }
     texts
@@ -349,6 +366,42 @@ fn row_label_candidate<'a>(
         .flatten()
         .map(str::trim)
         .find(|text| !text.is_empty())
+}
+
+pub(super) fn initialize_owned_row_label(node: &mut AXNode) {
+    node.owned_row_label =
+        matches!(node.role.as_str(), "AXRow" | "AXCell" | "AXOutlineRow").then_some(None);
+}
+
+pub(super) fn child_label_path(
+    path: LabelPath,
+    role: &str,
+    parent_role: Option<&str>,
+    ptr: usize,
+) -> LabelPath {
+    match (role, parent_role, path) {
+        ("AXCell", Some("AXRow"), LabelPath::Open(row)) => LabelPath::Cell(ptr, row),
+        ("AXRow" | "AXCell" | "AXOutlineRow", _, _) => LabelPath::Open(ptr),
+        _ => path,
+    }
+}
+
+pub(super) fn collect_label_claim(
+    claims: &mut Vec<(usize, String)>,
+    path: LabelPath,
+    role: &str,
+    texts: [Option<&str>; 3],
+) {
+    if let Some(label) = row_label_candidate(path, role, texts) {
+        match path {
+            LabelPath::Open(owner) => claims.push((owner, label.to_owned())),
+            LabelPath::Cell(cell, row) => {
+                claims.push((cell, label.to_owned()));
+                claims.push((row, label.to_owned()));
+            }
+            _ => {}
+        }
+    }
 }
 
 fn selectable_row_eligible(
@@ -378,7 +431,7 @@ fn selected_probe_before_deadline(
     }
 }
 
-fn apply_owned_label_claims(nodes: &mut [AXNode], claims: Vec<(usize, String)>) {
+pub(super) fn apply_owned_label_claims(nodes: &mut [AXNode], claims: Vec<(usize, String)>) {
     for (owner, label) in claims {
         if let Some(node) = nodes
             .iter_mut()
@@ -387,6 +440,29 @@ fn apply_owned_label_claims(nodes: &mut [AXNode], claims: Vec<(usize, String)>) 
             if let Some(slot @ None) = node.owned_row_label.as_mut() {
                 *slot = Some(label);
             }
+        }
+    }
+}
+
+fn fold_with_owned_items(lines: &mut Vec<(usize, String)>, nodes: &mut Vec<AXNode>) {
+    // The core folder only sees rendered depth; a missing item wrapper can
+    // make unrelated text appear to belong to an unindexed row or cell.
+    // Protect those owners during folding so their original children remain.
+    let protected: std::collections::HashSet<usize> = nodes
+        .iter_mut()
+        .filter_map(|node| {
+            if node.element_index.is_none() && node.owned_row_label.is_some() {
+                node.element_index = Some(usize::MAX);
+                Some(node.element_ptr)
+            } else {
+                None
+            }
+        })
+        .collect();
+    fold_actionless_text_subtrees(lines, nodes);
+    for node in nodes {
+        if node.element_index == Some(usize::MAX) && protected.contains(&node.element_ptr) {
+            node.element_index = None;
         }
     }
 }
@@ -837,7 +913,7 @@ fn walk_tree_with_web_content(
     // Folding merges text rows into their parent; an exhaustive walk keeps
     // every row it visited.
     if !exhaustive_nodes() {
-        fold_actionless_text_subtrees(&mut lines, &mut nodes);
+        fold_with_owned_items(&mut lines, &mut nodes);
     }
     nodes.retain(|n| n.role != "AXTabStripSummary");
     let mut line_nodes = align_line_nodes(&lines, &nodes);
@@ -1115,6 +1191,7 @@ unsafe fn walk_element(
     });
 
     let label_path = next_label_path(parent_path, parent_role, Some(&role));
+    let child_label_path = child_label_path(label_path, &role, parent_role, element as usize);
     let in_web_content = in_web_content || is_web_content_role(&role);
     if in_web_content && !include_web_content {
         note_skipped();
@@ -1266,7 +1343,7 @@ unsafe fn walk_element(
             &role,
             depth,
             parent_index,
-            label_path,
+            child_label_path,
             in_web_content,
             nodes,
             lines,
@@ -1322,16 +1399,12 @@ unsafe fn walk_element(
         .map(str::to_owned)
         .unwrap_or(visible_description);
 
-    if let (LabelPath::Open(owner), Some(label)) = (
+    collect_label_claim(
+        label_claims,
         label_path,
-        row_label_candidate(
-            label_path,
-            &role,
-            [title.as_deref(), value.as_deref(), description.as_deref()],
-        ),
-    ) {
-        label_claims.push((owner, label.to_owned()));
-    }
+        &role,
+        [title.as_deref(), value.as_deref(), description.as_deref()],
+    );
 
     let has_content =
         !visible_title.is_empty() || !visible_description.is_empty() || !visible_value.is_empty();
@@ -1397,7 +1470,7 @@ unsafe fn walk_element(
 
     if !is_actionable && !has_content && role != "AXWindow" && role != "AXSheet" {
         if exhaustive_nodes() {
-            let node = AXNode {
+            let mut node = AXNode {
                 identifier: identifier.clone(),
                 help: help.clone(),
                 ..role_only_node(
@@ -1408,6 +1481,7 @@ unsafe fn walk_element(
                     in_web_content,
                 )
             };
+            initialize_owned_row_label(&mut node);
             lines.push((depth, format_node_line(&node)));
             nodes.push(node);
         }
@@ -1416,7 +1490,7 @@ unsafe fn walk_element(
             &role,
             depth + 1,
             parent_index,
-            label_path,
+            child_label_path,
             in_web_content,
             nodes,
             lines,
@@ -1484,14 +1558,14 @@ unsafe fn walk_element(
             control_state.value_state.clone(),
         )
     };
-    let node = if is_actionable {
+    let mut node = if is_actionable {
         let idx = *counter;
         *counter += 1;
         // Retain so the element stays alive in the cache after `copy_children`
         // releases the per-child ref at the end of the caller's loop.
         CFRetain(element as CFTypeRef);
         AXNode {
-            owned_row_label: selectable_row.then_some(None),
+            owned_row_label: None,
             element_index: Some(idx),
             role: role.clone(),
             title: if visible_title.is_empty() {
@@ -1552,15 +1626,11 @@ unsafe fn walk_element(
             in_web_content,
         }
     };
+    initialize_owned_row_label(&mut node);
 
     // Track this node as the parent for its descendants only when it was
     // assigned an element_index (mirrors what the markdown shows: only
     // indexed rows are addressable in click(element_index=N)).
-    let child_label_path = if selectable_row && node.element_index.is_some() {
-        LabelPath::Open(element_ptr)
-    } else {
-        label_path
-    };
     let next_parent = node.element_index.or(parent_index);
 
     // A closed menu of the menu bar stays collapsed when the caller asked for
@@ -3347,7 +3417,7 @@ pub(crate) fn test_fold_and_filter(mut nodes: Vec<AXNode>, query: &str) -> (Vec<
         .iter()
         .map(|node| (node.depth, format_node_line(node)))
         .collect();
-    fold_actionless_text_subtrees(&mut lines, &mut nodes);
+    fold_with_owned_items(&mut lines, &mut nodes);
     let mapping = align_line_nodes(&lines, &nodes);
     let rendered = filter_tree_with_original_text(&lines, &mapping, &nodes, query);
     (nodes, rendered)

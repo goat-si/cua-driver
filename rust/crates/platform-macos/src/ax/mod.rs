@@ -25,6 +25,8 @@ pub mod dense_rows;
 pub mod editable;
 pub mod enablement;
 pub mod exact_target;
+#[cfg(test)]
+mod item_owner_tests;
 pub(crate) mod label_reader;
 pub mod launch;
 pub mod reveal_scroll;
