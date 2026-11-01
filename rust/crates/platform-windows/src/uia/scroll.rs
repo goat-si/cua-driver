@@ -208,17 +208,24 @@ pub(crate) unsafe fn scroll_element(
     Ok(outcome)
 }
 
-enum RevealFailure { PreSend, Sent }
+enum RevealFailure {
+    PreSend,
+    Sent,
+}
 
 /// Strategy 1: `ScrollItemPattern::ScrollIntoView` on the element itself.
 unsafe fn scroll_item_into_view(
     host_hwnd: u64,
     elem: &IUIAutomationElement,
 ) -> Result<(Option<(i32, i32)>, bool), RevealFailure> {
-    let scroll_item = match elem.GetCurrentPattern(UIA_ScrollItemPatternId)
-        .and_then(|pattern| pattern.cast::<IUIAutomationScrollItemPattern>()) {
+    let scroll_item = match elem
+        .GetCurrentPattern(UIA_ScrollItemPatternId)
+        .and_then(|pattern| pattern.cast::<IUIAutomationScrollItemPattern>())
+    {
         Ok(pattern) => pattern,
-        Err(error) if crate::uia_mutation::pattern_absent(error.code().0) => return Ok((None, false)),
+        Err(error) if crate::uia_mutation::pattern_absent(error.code().0) => {
+            return Ok((None, false))
+        }
         Err(_) => return Err(RevealFailure::PreSend),
     };
     let hr = crate::uia::fg_bypass::run_with_uwp_bypass(host_hwnd as isize, || {
@@ -255,11 +262,15 @@ unsafe fn scroll_ancestors_into_view(
         let mut containers: Vec<(IUIAutomationElement, IUIAutomationScrollPattern)> = Vec::new();
         let mut cur = walker.GetParentElement(elem).ok()?;
         for _ in 0..16 {
-            match cur.GetCurrentPattern(UIA_ScrollPatternId)
-                .and_then(|p| p.cast::<IUIAutomationScrollPattern>()) {
+            match cur
+                .GetCurrentPattern(UIA_ScrollPatternId)
+                .and_then(|p| p.cast::<IUIAutomationScrollPattern>())
+            {
                 Ok(sp) => {
                     let scrollable = sp.CurrentVerticallyScrollable().ok()?.as_bool();
-                    if scrollable { containers.push((cur.clone(), sp)); }
+                    if scrollable {
+                        containers.push((cur.clone(), sp));
+                    }
                 }
                 Err(error) if crate::uia_mutation::pattern_absent(error.code().0) => {}
                 Err(_) => return None,

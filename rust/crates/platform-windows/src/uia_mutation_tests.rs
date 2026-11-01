@@ -58,7 +58,7 @@ fn chain_stops_after_refusal_or_uncertainty() {
 }
 
 #[test]
-fn chain_journals_only_called_not_supported() {
+fn chain_stops_at_called_not_supported_without_next_rung() {
     let calls = Cell::new(0);
     let result = run_rungs(vec![
         Box::new(|| RungOutcome::Absent),

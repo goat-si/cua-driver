@@ -18,8 +18,19 @@ macro_rules! no_args {
 no_args!(invoke, IUIAutomationInvokePattern, Invoke);
 no_args!(toggle, IUIAutomationTogglePattern, Toggle);
 no_args!(select, IUIAutomationSelectionItemPattern, Select);
-no_args!(expand, IUIAutomationExpandCollapsePattern, Expand);
+no_args!(expand_raw, IUIAutomationExpandCollapsePattern, Expand);
 no_args!(collapse, IUIAutomationExpandCollapsePattern, Collapse);
+pub(crate) unsafe fn expand(target: &IUIAutomationExpandCollapsePattern) -> i32 {
+    expand_or_collapse(target, true)
+}
+
+unsafe fn expand_or_collapse(target: &IUIAutomationExpandCollapsePattern, expand: bool) -> i32 {
+    if expand {
+        expand_raw(target)
+    } else {
+        collapse(target)
+    }
+}
 no_args!(
     scroll_into_view,
     IUIAutomationScrollItemPattern,

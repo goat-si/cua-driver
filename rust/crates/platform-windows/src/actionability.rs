@@ -381,6 +381,7 @@ where
     }
 }
 
+#[cfg(test)]
 pub(crate) fn admission_refusal(reason: &str) -> ToolResult {
     ToolResult::error(reason).with_structured(serde_json::json!({"code":"element_not_actionable", "effect":"refused", "refusal":{"code":"element_not_actionable", "message":reason}}))
 }
