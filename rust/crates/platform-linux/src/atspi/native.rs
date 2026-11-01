@@ -3055,7 +3055,6 @@ async fn write_into_editable_acc(
     has_component: bool,
     text: &str,
 ) -> Result<bool> {
-    let target_has_component = has_component;
     let proxies = acc
         .proxies()
         .await
@@ -3064,15 +3063,36 @@ async fn write_into_editable_acc(
     // A focus-free EditableText write is the strongest background route. Try it
     // before GrabFocus: WebKitGTK can invalidate the original proxy when focus
     // changes, and writing through that stale object then returns false.
-    if write_through_editable_proxies(acc, &proxies, text).await? {
+    with_focus_retry(
+        write_through_editable_proxies(acc, &proxies, text),
+        || focus_editable(&proxies, has_component),
+        || write_through_editable_proxies(acc, &proxies, text),
+    )
+    .await
+}
+
+async fn with_focus_retry<F, R>(
+    first: impl std::future::Future<Output = Result<bool>>,
+    focus: impl FnOnce() -> F,
+    retry: impl FnOnce() -> R,
+) -> Result<bool>
+where
+    F: std::future::Future<Output = ()>,
+    R: std::future::Future<Output = Result<bool>>,
+{
+    if first.await? {
         return Ok(true);
     }
+    focus().await;
+    retry().await
+}
 
+async fn focus_editable(proxies: &atspi::proxy::proxy_ext::Proxies<'_>, has_component: bool) {
     // Try to grab focus on the widget via AT-SPI Component.GrabFocus.
     // This should give the widget internal keyboard focus without activating
     // the window, allowing GTK4 (and similar toolkits) to expose EditableText
     // on an unfocused window's focused widget.
-    if target_has_component {
+    if has_component {
         if let Ok(comp) = proxies.component().await {
             match call(comp.grab_focus()).await {
                 Some(Ok(true)) => dlog!("GrabFocus succeeded"),
@@ -3086,8 +3106,66 @@ async fn write_into_editable_acc(
     } else {
         dlog!("Target has no Component interface, skipping GrabFocus");
     }
+}
 
-    write_through_editable_proxies(acc, &proxies, text).await
+#[cfg(test)]
+mod focus_retry_tests {
+    use super::*;
+    use std::cell::RefCell;
+
+    #[test]
+    fn only_a_refusal_retries_after_focus() {
+        let calls = RefCell::new(Vec::new());
+        let first = async {
+            calls.borrow_mut().push("write");
+            Ok(false)
+        };
+        let result = runtime()
+            .block_on(with_focus_retry(
+                first,
+                || async {
+                    calls.borrow_mut().push("focus");
+                },
+                || async {
+                    calls.borrow_mut().push("write");
+                    Ok(true)
+                },
+            ))
+            .unwrap();
+        assert!(result);
+        assert_eq!(*calls.borrow(), ["write", "focus", "write"]);
+    }
+
+    #[test]
+    fn acknowledged_or_uncertain_first_write_never_retries() {
+        let step = crate::text_write_policy::WriteStep {
+            step: crate::text_write_policy::Step::InsertText,
+            bytes: 3,
+            units: Some(3),
+        };
+        for first in [
+            Ok(true),
+            Err(WriteUncertain { step }.into()),
+            Err(anyhow!("caret unavailable")),
+        ] {
+            let calls = RefCell::new(Vec::new());
+            let result = runtime().block_on(with_focus_retry(
+                async {
+                    calls.borrow_mut().push("write");
+                    first
+                },
+                || async {
+                    calls.borrow_mut().push("focus");
+                },
+                || async {
+                    calls.borrow_mut().push("write");
+                    Ok(true)
+                },
+            ));
+            assert!(result.is_err() || result.unwrap());
+            assert_eq!(*calls.borrow(), ["write"]);
+        }
+    }
 }
 
 async fn write_through_editable_proxies(
