@@ -358,6 +358,181 @@ impl Tool for SelectTextTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ax::content_attrs::{AttrStatus, AttributeListing};
+    use crate::ax::label_reader::fake::FakeReader;
+
+    fn text_area_with_failing_hints() -> FakeReader {
+        let mut reader = FakeReader::default();
+        reader.set(0, "AXRole", "AXTextArea");
+        reader.set(0, "AXRoleDescription", "text entry area");
+        for name in ["AXDescription", "AXIdentifier"] {
+            reader.statuses.insert(
+                (0, name.into()),
+                AttrStatus::Failed {
+                    error: kAXErrorFailure,
+                    listed: AttributeListing::Listed,
+                },
+            );
+        }
+        reader
+    }
+
+    fn set_status(reader: &mut FakeReader, name: &str, status: AttrStatus) {
+        reader.statuses.insert((0, name.into()), status);
+    }
+
+    #[test]
+    fn selection_reader_requests_the_existing_attribute_order() {
+        // The shared classifier batches in its own order, also used for replay.
+        let expected = [
+            "AXRole",
+            "AXTitle",
+            "AXPlaceholderValue",
+            "AXDescription",
+            "AXIdentifier",
+            "AXHelp",
+            "AXSubrole",
+            "AXRoleDescription",
+        ];
+        for reject_batch in [false, true] {
+            let mut reader = text_area_with_failing_hints();
+            reader.reject_batch = reject_batch;
+            assert!(selection_exposure_allowed(&mut reader, 0));
+            let trace: Vec<_> = reader.trace.iter().map(|(_, name)| name.as_str()).collect();
+            assert_eq!(trace, expected, "reject_batch={reject_batch}");
+        }
+    }
+
+    #[test]
+    fn secure_and_password_marked_fields_are_refused() {
+        for role in ["AXTextField", "AXTextArea"] {
+            let mut reader = text_area_with_failing_hints();
+            reader.set(0, "AXRole", role);
+            set_status(&mut reader, "AXDescription", AttrStatus::Absent);
+            set_status(&mut reader, "AXIdentifier", AttrStatus::Absent);
+            reader.set(0, "AXSubrole", "AXSecureTextField");
+            assert!(!selection_exposure_allowed(&mut reader, 0), "{role}");
+        }
+        let mut reader = text_area_with_failing_hints();
+        reader.set(0, "AXRole", "AXSecureTextField");
+        assert!(!selection_exposure_allowed(&mut reader, 0));
+
+        for name in [
+            "AXTitle",
+            "AXPlaceholderValue",
+            "AXDescription",
+            "AXIdentifier",
+            "AXHelp",
+        ] {
+            let mut reader = text_area_with_failing_hints();
+            set_status(&mut reader, name, AttrStatus::Known("Password".into()));
+            assert!(!selection_exposure_allowed(&mut reader, 0), "{name}");
+        }
+        for marker in [
+            "secure text field",
+            "password",
+            "passcode entry",
+            "verification code",
+            "one-time code",
+            "security code",
+            "OTP",
+            "totp field",
+            "protected text",
+        ] {
+            let mut reader = text_area_with_failing_hints();
+            reader.set(0, "AXRoleDescription", marker);
+            assert!(!selection_exposure_allowed(&mut reader, 0), "{marker}");
+        }
+    }
+
+    #[test]
+    fn security_metadata_fails_closed() {
+        for name in ["AXRole", "AXSubrole", "AXRoleDescription"] {
+            for status in [
+                AttrStatus::Failed {
+                    error: kAXErrorFailure,
+                    listed: AttributeListing::Listed,
+                },
+                AttrStatus::WrongType,
+            ] {
+                let mut reader = text_area_with_failing_hints();
+                set_status(&mut reader, name, status.clone());
+                assert!(
+                    !selection_exposure_allowed(&mut reader, 0),
+                    "{name}: {status:?}"
+                );
+            }
+        }
+        for name in ["AXDescription", "AXIdentifier"] {
+            for status in [
+                AttrStatus::WrongType,
+                AttrStatus::Failed {
+                    error: kAXErrorCannotComplete,
+                    listed: AttributeListing::Listed,
+                },
+                AttrStatus::Failed {
+                    error: kAXErrorFailure,
+                    listed: AttributeListing::ListUnreadable,
+                },
+            ] {
+                for reject_batch in [false, true] {
+                    let mut reader = text_area_with_failing_hints();
+                    reader.reject_batch = reject_batch;
+                    set_status(&mut reader, name, status.clone());
+                    assert!(
+                        !selection_exposure_allowed(&mut reader, 0),
+                        "{name}: {status:?}, reject_batch={reject_batch}"
+                    );
+                    assert!(!reader.trace.iter().any(|(_, name)| name == "AXValue"));
+                }
+            }
+        }
+        for name in ["AXTitle", "AXPlaceholderValue", "AXHelp"] {
+            let mut reader = text_area_with_failing_hints();
+            set_status(
+                &mut reader,
+                name,
+                AttrStatus::Failed {
+                    error: kAXErrorFailure,
+                    listed: AttributeListing::Listed,
+                },
+            );
+            assert!(!selection_exposure_allowed(&mut reader, 0), "{name}");
+        }
+        for name in ["AXRole", "AXRoleDescription"] {
+            let mut reader = text_area_with_failing_hints();
+            set_status(&mut reader, name, AttrStatus::Absent);
+            assert!(!selection_exposure_allowed(&mut reader, 0), "{name}");
+        }
+    }
+
+    #[test]
+    fn a_non_textarea_with_failing_hints_is_refused() {
+        for role in ["AXTextField", "AXComboBox", "AXGroup"] {
+            for name in ["AXDescription", "AXIdentifier"] {
+                let mut reader = text_area_with_failing_hints();
+                reader.set(0, "AXRole", role);
+                for other in ["AXDescription", "AXIdentifier"] {
+                    if other != name {
+                        set_status(&mut reader, other, AttrStatus::Absent);
+                    }
+                }
+                assert!(
+                    !selection_exposure_allowed(&mut reader, 0),
+                    "{role}: {name}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn same_shape_custom_field_is_admitted_by_the_exception() {
+        // A custom secure area with its only markers in unreadable hints is
+        // indistinguishable from the measured non-secure text area.
+        let mut reader = text_area_with_failing_hints();
+        assert!(selection_exposure_allowed(&mut reader, 0));
+        assert!(!reader.trace.iter().any(|(_, name)| name == "AXValue"));
+    }
 
     #[test]
     fn occurrences_overlap_on_scalar_boundaries() {
