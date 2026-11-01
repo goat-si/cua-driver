@@ -1290,13 +1290,27 @@ fn replace_ax_with(
     if outcome != WriteOutcome::Delivered {
         return Err(TextWriteError { message: format!("AXUIElementSetAttributeValue({attribute}) was not confirmed (native error {err}, called={call_ran}); no retry was sent"), chain }.into());
     }
-    let document = if before != text {
+    let (verified, delivered) = verify();
+    let document = if before != text && verified {
         mark()
     } else {
         crate::document_edit::DocumentEdited::NotADocument
     };
-    let (verified, delivered) = verify();
     Ok((verified, delivered, document))
+}
+
+fn replacement_document_after_verification(
+    verified: bool,
+    before: &str,
+    text: &str,
+    document: crate::document_edit::DocumentEdited,
+    status: impl FnOnce() -> crate::document_edit::DocumentEdited,
+) -> crate::document_edit::DocumentEdited {
+    if !verified && before != text {
+        status()
+    } else {
+        document
+    }
 }
 
 enum InsertRead {
@@ -2011,6 +2025,13 @@ fn cgevent_type_verified(
                     )
                 },
             )?;
+            let document = replacement_document_after_verification(
+                verified,
+                before,
+                text,
+                document,
+                || unsafe { crate::document_edit::document_status_without_value(element) },
+            );
             return Ok((verified, delivered, true, document));
         }
         if web_delivery {
@@ -2042,6 +2063,13 @@ fn cgevent_type_verified(
                     )
                 },
             )?;
+            let document = replacement_document_after_verification(
+                verified,
+                before,
+                text,
+                document,
+                || unsafe { crate::document_edit::document_status_without_value(element) },
+            );
             return Ok((verified, delivered, true, document));
         }
         let deadline = std::time::Instant::now() + DELIVERY_DRAIN_TIMEOUT;
@@ -3647,7 +3675,7 @@ mod u32_outcome_tests {
         use cua_driver_core::mutation::{ChainResult, Postcondition, WriteOutcome};
         for after in [Some("old"), None, Some("unexpected")] {
             let keys = Cell::new(0);
-            let (verified, delivered, _) = replace_ax_with(
+            let (verified, delivered, document) = replace_ax_with(
                 attribute,
                 "old",
                 "new",
@@ -3677,9 +3705,13 @@ mod u32_outcome_tests {
             );
             assert!(!verified);
             assert_eq!(delivered, None);
+            let document =
+                replacement_document_after_verification(verified, "old", "new", document, || {
+                    DocumentEdited::NotMarked
+                });
             let result = type_text_outcome_result(
                 TypeTextOutcome {
-                    detail: String::new(),
+                    detail: format!(" via native whole-field replacement{}", document.note()),
                     path: PATH_AX,
                     verified,
                     delivered_chars: delivered,
@@ -3695,6 +3727,7 @@ mod u32_outcome_tests {
                 "unverifiable"
             );
             assert_ne!(result.is_error, Some(true));
+            assert!(result.content.iter().any(|item| matches!(item, cua_driver_core::protocol::Content::Text { text, .. } if text.contains("may keep the old content"))));
             let native = crate::ax::write_outcome::native_write_outcome(
                 crate::ax::write_outcome::NativeWriteKind::SetAttribute,
                 true,
@@ -3709,6 +3742,33 @@ mod u32_outcome_tests {
                 Some(cua_driver_contract::ErrorDisposition::DELIVERED)
             );
         }
+        let events = std::cell::RefCell::new(Vec::new());
+        let (verified, delivered, document) = replace_ax_with(
+            attribute,
+            "old",
+            "new",
+            TextWriteContext {
+                settable: Settable::Yes,
+                prior: PriorInput::MayHaveDelivered,
+            },
+            || {
+                events.borrow_mut().push("write");
+                kAXErrorSuccess
+            },
+            || {
+                events.borrow_mut().push("mark");
+                DocumentEdited::Marked
+            },
+            || {
+                events.borrow_mut().push("read");
+                (true, Some(3))
+            },
+        )
+        .unwrap();
+        assert_eq!(*events.borrow(), ["write", "read", "mark"]);
+        assert!(verified);
+        assert_eq!(delivered, Some(3));
+        assert_eq!(document, DocumentEdited::Marked);
     }
 
     #[test]
