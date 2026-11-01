@@ -398,6 +398,30 @@ fn scanner_handles_comments_strings_aliases_and_multiline_calls() {
 }
 
 #[test]
+fn trait_method_parameter_shadow_rejects_wrapped_builder() {
+    let sites = scan(
+        "trait_shadow.rs",
+        r#"
+        use crate::input::worker_context::wrap_blocking as wrap;
+        trait Work {
+            fn run(&self, wrap: impl FnOnce()) {
+                std::thread::Builder::new().spawn(wrap(work));
+            }
+        }
+    "#,
+    )
+    .unwrap();
+    assert!(
+        sites.iter().any(|site| site.primitive == ".spawn"),
+        "trait parameter hid raw Builder spawn: {sites:#?}"
+    );
+    assert!(
+        sites.iter().any(|site| site.item == "Work::run"),
+        "trait method name missing: {sites:#?}"
+    );
+}
+
+#[test]
 fn source_manifest_covers_all_rust_sources() {
     let fixture = tempfile::tempdir().unwrap();
     fs::create_dir(fixture.path().join("nested")).unwrap();
