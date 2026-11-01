@@ -4848,9 +4848,10 @@ fn modifiers_to_state(modifiers: &[&str]) -> KeyButMask {
 /// Inject text into a Tk window via Tk's `send` command — the Tk-specific
 /// override for focus-free writes (Tk has no AT-SPI bridge). Requires the target
 /// app to have registered itself with a known name via `tk appname <name>`.
-/// Returns Ok(true) if text was sent, Ok(false) if the target isn't reachable
-/// (not a Tk app or `wish` unavailable), Err on a send failure.
-pub fn inject_tk_send(text: &str) -> Result<bool> {
+/// [`TkSend::NotSent`] when the request never left `wish` (no `wish`, no
+/// registered target, a send error before queueing), [`TkSend::MaybeSent`]
+/// when the asynchronous send was queued and `wish` then failed or overran.
+pub fn tk_send_text(text: &str) -> TkSend {
     use std::io::Write;
 
     // Escape the text for safe Tcl interpolation (braces for literal strings).
@@ -4875,7 +4876,11 @@ pub fn inject_tk_send(text: &str) -> Result<bool> {
         r#"set ::done 0
 set ::rc 0
 after 5000 {{ set ::rc 2; set ::done 1 }}
+puts {TK_ATTEMPT_MARKER}
+flush stdout
 if {{[catch {{send -async cua-tk-target {{.entry insert insert {{{}}}}}}} err]}} {{
+    puts {TK_NOT_QUEUED_MARKER}
+    flush stdout
     puts stderr "tk send failed: $err"
     exit 1
 }}
@@ -4886,7 +4891,9 @@ if {{$::rc == 2}} {{
     exit 1
 }}
 exit 0"#,
-        tcl_text
+        tcl_text,
+        TK_ATTEMPT_MARKER = TK_ATTEMPT_MARKER,
+        TK_NOT_QUEUED_MARKER = TK_NOT_QUEUED_MARKER,
     );
 
     // Try to spawn wish (Tk's shell). If it's not available, this isn't a
@@ -4898,7 +4905,7 @@ exit 0"#,
         .spawn()
     {
         Ok(c) => c,
-        Err(_) => return Ok(false),
+        Err(_) => return TkSend::NotSent,
     };
 
     if let Some(mut stdin) = child.stdin.take() {
@@ -4911,35 +4918,97 @@ exit 0"#,
     // deadline. Guarantees the driver task can never hang on a blocked Tk send,
     // regardless of whether the Tcl-level timer fired.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
-    loop {
-        match child.try_wait()? {
-            Some(status) => {
-                let mut stderr = String::new();
-                if let Some(mut err) = child.stderr.take() {
-                    use std::io::Read;
-                    let _ = err.read_to_string(&mut stderr);
-                }
-                if status.success() {
-                    return Ok(true);
-                }
-                // Target not registered or send timed out → not a usable Tk
-                // target; let the caller fall back to XSendEvent.
-                if stderr.contains("application named")
-                    || stderr.contains("no registered")
-                    || stderr.contains("timed out")
-                {
-                    return Ok(false);
-                }
-                anyhow::bail!("wish send failed: {}", stderr);
-            }
-            None => {
-                if std::time::Instant::now() >= deadline {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return Ok(false);
-                }
+    let exited_ok = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Some(status.success()),
+            Ok(None) if std::time::Instant::now() < deadline => {
                 std::thread::sleep(std::time::Duration::from_millis(50));
             }
+            // Overran the deadline, or the child can no longer be observed.
+            Ok(None) | Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                break None;
+            }
+        }
+    };
+    // A failed read leaves no evidence either way: `None`.
+    let stdout = child.stdout.take().and_then(|mut out| {
+        use std::io::Read;
+        let mut read = String::new();
+        out.read_to_string(&mut read).ok().map(|_| read)
+    });
+    if exited_ok != Some(true) {
+        let mut stderr = String::new();
+        if let Some(mut err) = child.stderr.take() {
+            use std::io::Read;
+            let _ = err.read_to_string(&mut stderr);
+        }
+        tracing::debug!(exited_ok = ?exited_ok, "wish send did not complete: {}", stderr.trim());
+    }
+    classify_tk_send(exited_ok, stdout.as_deref())
+}
+
+/// Printed (and flushed) by the `wish` script just before it calls `send`.
+const TK_ATTEMPT_MARKER: &str = "cua-tk-send-attempt";
+/// Printed when `send` raised before queueing anything.
+const TK_NOT_QUEUED_MARKER: &str = "cua-tk-send-not-queued";
+
+/// What a Tk `send` attempt delivered.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TkSend {
+    /// `wish` queued the insert and exited cleanly.
+    Sent,
+    /// Evidence that nothing left `wish`: the next route may run.
+    NotSent,
+    /// `wish` reached the send and then failed, overran or left no readable
+    /// evidence: the insert may have run.
+    MaybeSent,
+}
+
+/// `exited_ok`: `Some(success)` when `wish` exited, `None` when it was
+/// killed. `stdout`: what it printed, `None` when that could not be read.
+fn classify_tk_send(exited_ok: Option<bool>, stdout: Option<&str>) -> TkSend {
+    // A clean exit means the script ran past the queued send.
+    if exited_ok == Some(true) {
+        return TkSend::Sent;
+    }
+    let Some(stdout) = stdout else {
+        return TkSend::MaybeSent;
+    };
+    let printed = |marker: &str| stdout.lines().any(|line| line == marker);
+    if !printed(TK_ATTEMPT_MARKER) || printed(TK_NOT_QUEUED_MARKER) {
+        TkSend::NotSent
+    } else {
+        TkSend::MaybeSent
+    }
+}
+
+#[cfg(test)]
+mod tk_send_tests {
+    use super::*;
+
+    #[test]
+    fn tk_send_is_not_sent_only_with_evidence() {
+        let attempt = format!("{TK_ATTEMPT_MARKER}\n");
+        let refused = format!("{TK_ATTEMPT_MARKER}\n{TK_NOT_QUEUED_MARKER}\n");
+        for stdout in [
+            None,
+            Some(""),
+            Some(attempt.as_str()),
+            Some(refused.as_str()),
+        ] {
+            assert_eq!(classify_tk_send(Some(true), stdout), TkSend::Sent);
+        }
+        // The script never reached send, or send raised before queueing.
+        for exited in [Some(false), None] {
+            assert_eq!(classify_tk_send(exited, Some("")), TkSend::NotSent);
+            assert_eq!(classify_tk_send(exited, Some(&refused)), TkSend::NotSent);
+            // Reached send, then failed or was killed before (or after)
+            // queueing: no proof either way.
+            assert_eq!(classify_tk_send(exited, Some(&attempt)), TkSend::MaybeSent);
+            // Unreadable stdout is no evidence.
+            assert_eq!(classify_tk_send(exited, None), TkSend::MaybeSent);
         }
     }
 }

@@ -485,7 +485,15 @@ pub fn set_value(pid: u32, idx: usize, value: &str) -> Result<()> {
 /// names through the element's `Selection`. `None` when it lists no
 /// selectable options (the caller keeps its no-value-route error).
 fn select_option(object_ref: &native::ObjectRef, value: &str) -> Option<Result<()>> {
-    match native::select_option_ref(object_ref, value) {
+    select_option_gated(object_ref, value, &native::TextWriteDispatch::default())
+}
+
+fn select_option_gated(
+    object_ref: &native::ObjectRef,
+    value: &str,
+    dispatch: &native::TextWriteDispatch,
+) -> Option<Result<()>> {
+    match native::select_option_ref_gated(object_ref, value, dispatch) {
         Ok(native::OptionPick::Picked { .. }) => Some(Ok(())),
         Ok(native::OptionPick::NoMatch { options }) => Some(Err(no_such_option(value, &options))),
         Ok(native::OptionPick::Unavailable) => None,
@@ -493,9 +501,11 @@ fn select_option(object_ref: &native::ObjectRef, value: &str) -> Option<Result<(
     }
 }
 
-fn no_such_option(value: &str, options: &[String]) -> anyhow::Error {
+/// The requested value never goes into the error: only the options the
+/// control lists.
+fn no_such_option(_value: &str, options: &[String]) -> anyhow::Error {
     anyhow::anyhow!(
-        "{}: no option {value:?}; options: {options:?}",
+        "{}: no option matching the requested value; options: {options:?}",
         native::NO_SUCH_OPTION
     )
 }
@@ -619,10 +629,38 @@ pub fn set_value_token(_pid: u32, token: &TokenElement, value: &str) -> Result<(
     })
 }
 
+/// [`set_value_token`] sharing the caller's dispatch gate: the selection
+/// pick runs behind it too, so a caller timeout covers every write.
+pub fn set_value_token_with_dispatch(
+    _pid: u32,
+    token: &TokenElement,
+    value: &str,
+    dispatch: std::sync::Arc<native::TextWriteDispatch>,
+) -> Result<()> {
+    token.act(
+        |object| match native::set_value_ref_with_dispatch(object, value, dispatch.clone()) {
+            Err(error) if native::is_no_value_route(&error) => {
+                select_option_gated(object, value, &dispatch).unwrap_or(Err(error))
+            }
+            done => done,
+        },
+    )
+}
+
 /// The open popup of the token's combo box: activate the option `value`
 /// names. `Ok(None)` when the popup lists no options yet.
 pub fn activate_option_token(token: &TokenElement, value: &str) -> Result<Option<String>> {
-    match native::activate_option_ref(token.object()?, value)? {
+    activate_option_token_gated(token, value, &native::TextWriteDispatch::default())
+}
+
+/// [`activate_option_token`] entering `dispatch` only right before the
+/// option's action.
+pub fn activate_option_token_gated(
+    token: &TokenElement,
+    value: &str,
+    dispatch: &native::TextWriteDispatch,
+) -> Result<Option<String>> {
+    match native::activate_option_ref_gated(token.object()?, value, dispatch)? {
         native::OptionPick::Picked { name } => Ok(Some(name)),
         native::OptionPick::NoMatch { options } => Err(no_such_option(value, &options)),
         native::OptionPick::Unavailable => Ok(None),
@@ -1091,5 +1129,18 @@ mod token_dispatch_tests {
                 "/window_b/text"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod option_error_tests {
+    use super::*;
+
+    #[test]
+    fn option_error_never_echoes_the_requested_value() {
+        let error = no_such_option("hunter2", &["Small".into(), "Large".into()]);
+        assert!(native::is_no_such_option(&error));
+        assert!(!error.to_string().contains("hunter2"));
+        assert!(error.to_string().contains("Large"));
     }
 }
