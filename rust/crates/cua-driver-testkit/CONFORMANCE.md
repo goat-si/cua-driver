@@ -65,6 +65,14 @@ implement `CompactableNode::boundary_mut` and retain node boundaries in output.
 macOS and Linux must do the same wherever
 they fold before asserting observation completeness. A truncated folded
 snippet makes the read incomplete even if the native walk was exhaustive.
+The reason-aware path marks absorbed rows with `folded_children`, including
+lossless folds; that marker does not make the read incomplete by itself.
+Merge the returned read reasons, not every node-boundary reason: copying
+`folded_children` into read-level reasons would incorrectly mark it incomplete.
+Locators apply its role-specific absence, uniqueness and nth guard even when
+the producer leaves completeness unasserted. Nodes without a boundary slot
+keep their child rows. Platforms must also preserve the emitted markdown marker
+and typed boundary; the legacy wrapper does not supply this evidence.
 
 - macOS: replace only the intentional `AXMenuBarItem` collapse's
   `note_skipped` with an exclusion; retain unrelated skips. Existing `query`

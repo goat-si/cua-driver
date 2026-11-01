@@ -790,6 +790,27 @@ mod tests {
     }
 
     #[test]
+    fn u20b_a_schema_accepts_old_and_new_and_refuses_mixed_versions() {
+        let tool = "get_window_state";
+        let old: Value = serde_json::from_str(include_str!(
+            "../../../../contract/fixtures/get-window-state-pre-u20b-a-success-schema.json"
+        ))
+        .unwrap();
+        let old = cua_driver_contract::advertised_output_schema(old);
+        let new = advertised_tool_output_schema(tool).unwrap();
+        let old_payload = json!({"pid":7,"window_id":9,"observation_complete":false,"observation_incomplete_reasons":[{"kind":"policy_omission","detail":"folded_text_truncated"}]});
+        let new_payload = json!({"pid":7,"window_id":9,"observation_complete":true,"elements":[{"element_index":1,"role":"row","depth":0,"boundary":{"reasons":[{"kind":"policy_omission","detail":"folded_children"}],"children_skipped":{"known":1},"descendants_omitted":false}}]});
+        let old_validator = jsonschema::validator_for(&old).unwrap();
+        let new_validator = jsonschema::validator_for(&new).unwrap();
+        assert!(old_validator.is_valid(&old_payload));
+        assert!(new_validator.is_valid(&old_payload));
+        assert!(new_validator.is_valid(&new_payload));
+        assert!(!old_validator.is_valid(&new_payload));
+        assert!(validate_proxy_schema_pair(tool, Some(&new), Some(&old)).is_err());
+        assert!(validate_proxy_schema_pair(tool, Some(&old), Some(&new)).is_err());
+    }
+
+    #[test]
     fn rooted_output_schema_refuses_pre_u18_proxy_in_both_directions() {
         let tool = "get_window_state";
         // Captured from origin/main b00e016c, which already includes U23.

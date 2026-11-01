@@ -2146,6 +2146,25 @@ mod tests {
     }
 
     #[test]
+    fn u20b_a_lossless_to_lossy_fold_marker_is_a_diff() {
+        let lossless = OLD.replace("AXStaticText = \"hello\"", "AXStaticText = \"hello\" [+1 more: folded_children; descendants not omitted] [reason kinds: folded_children=policy_omission]");
+        let lossy = OLD.replace("AXStaticText = \"hello\"", "AXStaticText = \"hello\" [+1 more: folded_children, folded_text_truncated; descendants omitted] [reason kinds: folded_children=policy_omission, folded_text_truncated=policy_omission]");
+        let (mut content, mut first) = payload("s0000ab21", &lossless);
+        apply(&opts(json!({})), &ctx(88028), &mut content, &mut first);
+        let (mut content, mut second) = payload("s0000ab22", &lossy);
+        apply(
+            &opts(json!({"since":"s0000ab21"})),
+            &ctx(88028),
+            &mut content,
+            &mut second,
+        );
+        assert_eq!(second["since_status"], "diff");
+        let diff = second["tree_diff"].as_str().unwrap();
+        assert!(diff.contains("folded_text_truncated"));
+        assert!(diff.contains("folded_children"));
+    }
+
+    #[test]
     fn u20_descendants_only_boundary_change_is_a_changed_row() {
         let (mut content, mut first) = payload("s0000ad01", OLD);
         first["elements"][0]["boundary"] = json!({"reasons":[{"kind":"budget","detail":"node_budget"}],"children_skipped":"unknown"});

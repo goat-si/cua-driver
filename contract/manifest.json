@@ -2278,7 +2278,8 @@
                     "untrusted_provider",
                     "scope_mismatch",
                     "not_asserted",
-                    "folded_text_truncated"
+                    "folded_text_truncated",
+                    "folded_children"
                   ],
                   "type": "string"
                 },
@@ -2381,7 +2382,8 @@
                               "untrusted_provider",
                               "scope_mismatch",
                               "not_asserted",
-                              "folded_text_truncated"
+                              "folded_text_truncated",
+                              "folded_children"
                             ],
                             "type": "string"
                           },
@@ -2687,7 +2689,8 @@
                     "untrusted_provider",
                     "scope_mismatch",
                     "not_asserted",
-                    "folded_text_truncated"
+                    "folded_text_truncated",
+                    "folded_children"
                   ],
                   "type": "string"
                 },

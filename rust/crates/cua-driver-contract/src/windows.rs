@@ -401,6 +401,7 @@ pub enum IncompleteReasonDetail {
     ScopeMismatch,
     NotAsserted,
     FoldedTextTruncated,
+    FoldedChildren,
 }
 
 #[derive(
