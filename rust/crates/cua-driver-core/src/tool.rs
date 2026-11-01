@@ -3730,6 +3730,7 @@ fn changes_app_or_desktop_state(def: &ToolDef, tool: &str, args: &Value) -> bool
                 | "replay_trajectory"
                 | "history_status"
                 | "history_query"
+                | "install_extension"
         )
     {
         return false;
@@ -8227,6 +8228,8 @@ resources:
             ("get_window_state", true),
             ("list_windows", true),
             ("start_recording", false),
+            ("check_permissions", false),
+            ("install_extension", false),
         ] {
             registry.register(Box::new(ObservationProbe {
                 hits: hits.clone(),
@@ -8258,11 +8261,38 @@ resources:
             );
             assert_eq!(hits.load(Ordering::SeqCst), 0, "{name} must not dispatch");
         }
+        // A prompt=true call is refused even earlier (agents may not raise OS
+        // permission prompts), so it never reaches dispatch or the lease.
+        let before = hits.load(Ordering::SeqCst);
+        let prompt = registry
+            .invoke_with_context(
+                "check_permissions",
+                serde_json::json!({"prompt":true}),
+                unrestricted_context(),
+            )
+            .await;
+        assert_eq!(prompt.is_error, Some(true));
+        assert_eq!(hits.load(Ordering::SeqCst), before);
+        assert!(super::changes_app_or_desktop_state(
+            &super::ToolDef {
+                name: "check_permissions".into(),
+                description: String::new(),
+                input_schema: serde_json::json!({}),
+                read_only: false,
+                destructive: false,
+                idempotent: false,
+                open_world: false,
+            },
+            "check_permissions",
+            &serde_json::json!({"prompt":true})
+        ));
         for (name, args) in [
             ("menu_bar_extras", serde_json::json!({"operation":"list"})),
             ("get_window_state", serde_json::json!({"pid":42})),
             ("list_windows", serde_json::json!({})),
             ("start_recording", serde_json::json!({})),
+            ("check_permissions", serde_json::json!({"prompt":false})),
+            ("install_extension", serde_json::json!({})),
         ] {
             let before = hits.load(Ordering::SeqCst);
             let result = registry

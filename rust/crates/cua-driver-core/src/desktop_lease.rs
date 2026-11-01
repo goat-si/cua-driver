@@ -1,8 +1,4 @@
 //! Cross-process exclusion for desktop input.
-#![cfg_attr(
-    not(feature = "test-support"),
-    doc = "Without `test-support`, the deterministic fixtures are unavailable:\n\n```compile_fail\nuse cua_driver_core::desktop_lease::test_support::TestBackend;\n```"
-)]
 
 use std::any::Any;
 use std::fs::{self, File, OpenOptions};

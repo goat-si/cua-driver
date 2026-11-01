@@ -26,6 +26,7 @@ An unknown operation on a mixed tool is treated as a mutation.
 | `start_session`, `end_session`, `escalate_session` | No | Session lifecycle or capture policy; cleanup must not wait on its own retained lease. |
 | `start_recording`, `stop_recording`, `install_ffmpeg` | No | Recording control or recording dependency installation. |
 | `set_config`, `set_agent_cursor_enabled`, `set_agent_cursor_motion`, `set_agent_cursor_theme` | No | Driver configuration or agent overlay settings. |
+| `install_extension` | No | Installs a driver extension; does not touch application or desktop state. Tools an extension provides are admitted by the non-read-only default. |
 | `run_steps`, `run_script`, `replay_trajectory` | No | Composite dispatcher; each nested registry call is admitted independently. |
 | `check_permissions` | macOS `prompt=true`: yes; otherwise no | A trusted prompt can show a system dialog; passive checks read status. Linux and Windows declare the tool read-only. |
 
