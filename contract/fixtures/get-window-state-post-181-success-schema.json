@@ -1,0 +1,461 @@
+{
+  "additionalProperties": true,
+  "properties": {
+    "app_name": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "degraded": {
+      "type": [
+        "boolean",
+        "null"
+      ]
+    },
+    "degraded_reason": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "element_count": {
+      "minimum": 0,
+      "type": [
+        "integer",
+        "null"
+      ]
+    },
+    "elements": {
+      "items": {
+        "properties": {
+          "actions": {
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "boundary": {
+            "properties": {
+              "children_skipped": {
+                "oneOf": [
+                  {
+                    "enum": [
+                      "unknown"
+                    ],
+                    "type": "string"
+                  },
+                  {
+                    "additionalProperties": false,
+                    "properties": {
+                      "known": {
+                        "minimum": 0,
+                        "type": "integer"
+                      }
+                    },
+                    "required": [
+                      "known"
+                    ],
+                    "type": "object"
+                  }
+                ]
+              },
+              "descendants_omitted": {
+                "type": [
+                  "boolean",
+                  "null"
+                ]
+              },
+              "reasons": {
+                "items": {
+                  "properties": {
+                    "detail": {
+                      "enum": [
+                        "collapsed_menu",
+                        "offscreen",
+                        "inactive_tab",
+                        "web_content",
+                        "huge_container",
+                        "depth_limit",
+                        "node_budget",
+                        "time_budget",
+                        "child_enumeration_failed",
+                        "attribute_read_failed",
+                        "enumeration_error_unclassified",
+                        "untrusted_provider",
+                        "scope_mismatch",
+                        "not_asserted"
+                      ],
+                      "type": "string"
+                    },
+                    "kind": {
+                      "enum": [
+                        "policy_omission",
+                        "provider_failure",
+                        "budget",
+                        "unknown"
+                      ],
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "kind",
+                    "detail"
+                  ],
+                  "type": "object"
+                },
+                "type": "array"
+              }
+            },
+            "required": [
+              "reasons",
+              "children_skipped"
+            ],
+            "type": [
+              "object",
+              "null"
+            ]
+          },
+          "depth": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "element_index": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "element_token": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "enabled": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "expanded": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "frame": {
+            "properties": {
+              "h": {
+                "type": "number"
+              },
+              "w": {
+                "type": "number"
+              },
+              "x": {
+                "type": "number"
+              },
+              "y": {
+                "type": "number"
+              }
+            },
+            "required": [
+              "x",
+              "y",
+              "w",
+              "h"
+            ],
+            "type": [
+              "object",
+              "null"
+            ]
+          },
+          "in_web_content": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "label": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "max": {
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "min": {
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "parent_index": {
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "role": {
+            "type": "string"
+          },
+          "selected": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "toggle_state": {
+            "enum": [
+              "on",
+              "off",
+              "mixed"
+            ],
+            "type": "string"
+          },
+          "value": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "value_description": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "element_index",
+          "role",
+          "depth"
+        ],
+        "type": "object"
+      },
+      "type": [
+        "array",
+        "null"
+      ]
+    },
+    "elements_complete": {
+      "type": [
+        "boolean",
+        "null"
+      ]
+    },
+    "filtered_element_count": {
+      "minimum": 0,
+      "type": [
+        "integer",
+        "null"
+      ]
+    },
+    "observation_complete": {
+      "type": [
+        "boolean",
+        "null"
+      ]
+    },
+    "observation_incomplete_reasons": {
+      "items": {
+        "properties": {
+          "detail": {
+            "enum": [
+              "collapsed_menu",
+              "offscreen",
+              "inactive_tab",
+              "web_content",
+              "huge_container",
+              "depth_limit",
+              "node_budget",
+              "time_budget",
+              "child_enumeration_failed",
+              "attribute_read_failed",
+              "enumeration_error_unclassified",
+              "untrusted_provider",
+              "scope_mismatch",
+              "not_asserted"
+            ],
+            "type": "string"
+          },
+          "kind": {
+            "enum": [
+              "policy_omission",
+              "provider_failure",
+              "budget",
+              "unknown"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "kind",
+          "detail"
+        ],
+        "type": "object"
+      },
+      "type": [
+        "array",
+        "null"
+      ]
+    },
+    "pid": {
+      "minimum": 0,
+      "type": "integer"
+    },
+    "returned_element_count": {
+      "minimum": 0,
+      "type": [
+        "integer",
+        "null"
+      ]
+    },
+    "screenshot_file_path": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "screenshot_frame_valid": {
+      "type": [
+        "boolean",
+        "null"
+      ]
+    },
+    "screenshot_height": {
+      "minimum": 0,
+      "type": [
+        "integer",
+        "null"
+      ]
+    },
+    "screenshot_mime_type": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "screenshot_scale": {
+      "type": [
+        "number",
+        "null"
+      ]
+    },
+    "screenshot_width": {
+      "minimum": 0,
+      "type": [
+        "integer",
+        "null"
+      ]
+    },
+    "since": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "since_status": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "snapshot_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "total_element_count": {
+      "minimum": 0,
+      "type": [
+        "integer",
+        "null"
+      ]
+    },
+    "tree_diff": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "tree_format": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "tree_markdown": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "truncated": {
+      "type": [
+        "boolean",
+        "null"
+      ]
+    },
+    "truncation_hint": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "truncation_reason": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "window_bounds": {
+      "properties": {
+        "height": {
+          "type": "number"
+        },
+        "width": {
+          "type": "number"
+        },
+        "x": {
+          "type": "number"
+        },
+        "y": {
+          "type": "number"
+        }
+      },
+      "required": [
+        "x",
+        "y",
+        "width",
+        "height"
+      ],
+      "type": [
+        "object",
+        "null"
+      ]
+    },
+    "window_id": {
+      "minimum": 0,
+      "type": "integer"
+    },
+    "window_title": {
+      "type": [
+        "string",
+        "null"
+      ]
+    }
+  },
+  "required": [
+    "pid",
+    "window_id"
+  ],
+  "type": "object"
+}

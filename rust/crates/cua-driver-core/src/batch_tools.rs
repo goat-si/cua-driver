@@ -1,0 +1,3788 @@
+//! `run_steps`: run an ordered list of existing action tools in one call.
+//!
+//! The tool owns no input logic. Every step is dispatched through the same
+//! [`ToolRegistry`] entry point a direct call uses, inside the batch's own
+//! authorization scope. Policy, permission mode, capability manifest,
+//! session capture scope, protected-resource consent, desktop coordination
+//! and recording therefore run once per step exactly as for a single call,
+//! and a batch cannot reach any tool or argument that a single call could
+//! not. The batch itself is only a thin ordered loop plus up-front validation.
+
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
+
+use async_trait::async_trait;
+use serde_json::{json, Map, Value};
+
+use crate::{
+    protocol::{Content, ToolResult},
+    recording_tools::ReplayRegistrySlot,
+    tool::{Tool, ToolDef, ToolRegistry},
+};
+
+pub mod locate;
+
+use locate::{Check, ElementSpec, Locator, Window, WindowSpec};
+
+/// Public name of the batch tool.
+pub const RUN_STEPS_TOOL: &str = "run_steps";
+
+/// Action tools a batch may run. Observation tools are deliberately absent:
+/// the batch has exactly one optional observation, at the end.
+pub const BATCHABLE_TOOLS: &[&str] = &[
+    "click",
+    "double_click",
+    "right_click",
+    "set_value",
+    "type_text",
+    "press_key",
+    "hotkey",
+    "scroll",
+    "drag",
+    "move_cursor",
+];
+
+/// Most steps one call may carry. Keeps a batch inside client call timeouts.
+pub const MAX_STEPS: usize = 64;
+/// Longest pause between two steps.
+pub const MAX_DELAY_MS: u64 = 2_000;
+/// Default `max_elements` for the end-of-batch observation: the same budget as
+/// a plain read, so its automatic `since` diff finds that read as a baseline.
+const DEFAULT_OBSERVE_MAX_ELEMENTS: usize = crate::window_state_view::DEFAULT_MAX_ELEMENTS;
+/// Step tool names models reach for that mean a batchable tool.
+const TOOL_ALIASES: &[(&str, &str)] = &[
+    ("press", "press_key"),
+    ("key", "press_key"),
+    ("keypress", "press_key"),
+    ("type", "type_text"),
+    ("set", "set_value"),
+    ("hover", "move_cursor"),
+    ("mouse_move", "move_cursor"),
+];
+/// Key names models write as a step's tool (`{"tool": "down"}`); such a step
+/// is a press_key of that key.
+const KEY_TOOL_NAMES: &[&str] = &[
+    "return",
+    "enter",
+    "tab",
+    "escape",
+    "esc",
+    "space",
+    "backspace",
+    "up",
+    "down",
+    "left",
+    "right",
+    "home",
+    "end",
+    "pageup",
+    "pagedown",
+];
+/// Names of printable symbols models send to press_key. They are text, not
+/// keys (most need shift), so the step types them.
+const SYMBOL_KEY_NAMES: &[(&str, &str)] = &[
+    ("asterisk", "*"),
+    ("star", "*"),
+    ("plus", "+"),
+    ("at", "@"),
+    ("hash", "#"),
+    ("numbersign", "#"),
+    ("pound", "#"),
+    ("dollar", "$"),
+    ("percent", "%"),
+    ("caret", "^"),
+    ("ampersand", "&"),
+    ("exclamation", "!"),
+    ("exclam", "!"),
+    ("question", "?"),
+    ("questionmark", "?"),
+    ("underscore", "_"),
+    ("tilde", "~"),
+    ("colon", ":"),
+    ("pipe", "|"),
+    ("bar", "|"),
+    ("less", "<"),
+    ("lessthan", "<"),
+    ("greater", ">"),
+    ("greaterthan", ">"),
+    ("parenleft", "("),
+    ("leftparen", "("),
+    ("parenright", ")"),
+    ("rightparen", ")"),
+    ("braceleft", "{"),
+    ("braceright", "}"),
+    ("quotedbl", "\""),
+    ("doublequote", "\""),
+];
+/// Printable characters that are not a plain key on a US layout (they need
+/// shift), so press_key cannot send them but type_text can.
+const SHIFTED_SYMBOLS: &str = "*+@#$%^&!?_~:|<>(){}\"";
+const MESSAGE_LIMIT: usize = 300;
+/// Read-only tools models put in a batch; refused with a pointer to `observe`.
+const OBSERVATION_TOOLS: &[&str] = &[
+    OBSERVE_TOOL,
+    "get_desktop_state",
+    "get_accessibility_tree",
+    "get_browser_state",
+    "list_windows",
+    "verify_state",
+    "zoom",
+];
+/// Most `expect` checks one step may carry.
+pub const MAX_EXPECTS: usize = 4;
+/// Wall-time budget for one batch, waits included. Keeps a batch inside
+/// client call timeouts.
+pub const MAX_BATCH_MS: u64 = 60_000;
+/// Fields a step object may carry besides one action.
+const STEP_KEYS: &[&str] = &["tool", "args", "wait_for", "expect", "timeout_ms"];
+const OBSERVE_TOOL: &str = "get_window_state";
+/// Batch-level fields that name the window every step inherits.
+const BATCH_WINDOW_KEYS: &[&str] = &["pid", "window_id", "app", "window"];
+/// How long a stale element target may take to be found again by its label.
+const REFIND_TIMEOUT: Duration = Duration::from_millis(1_500);
+
+pub struct RunStepsTool {
+    registry: ReplayRegistrySlot,
+}
+
+impl RunStepsTool {
+    pub fn new(registry: ReplayRegistrySlot) -> Self {
+        Self { registry }
+    }
+}
+
+static DEF: OnceLock<ToolDef> = OnceLock::new();
+
+#[async_trait]
+impl Tool for RunStepsTool {
+    fn def(&self) -> &ToolDef {
+        DEF.get_or_init(|| ToolDef {
+            name: RUN_STEPS_TOOL.into(),
+            description: "Run action steps in one call, in order, stopping at the first failure; with `observe` the result \
+                also carries what changed. Each step is `{tool, args}` or `{<tool>: args}`: `tool` is one of \
+                click, double_click, right_click, set_value, type_text, press_key, hotkey, scroll, drag, \
+                move_cursor, and `args` are that tool's arguments. `pid`/`window_id` (or `app`/`window`) on \
+                run_steps are the default window of steps that name none. A get_window_state step is skipped \
+                unless it is last (then it is the `observe`); a zoom runs only last. Every step passes the same \
+                session, permission and approval checks as a direct call. With `app_scope`, a call outside those \
+                apps' windows is refused with code outside_scope and one needing the foreground with \
+                foreground_not_allowed; a refused step sends nothing (effect \"refused\"). All steps are \
+                validated before the first runs. Element tokens come from a read before the batch and a step \
+                that reshuffles the window can stale later ones: put token steps first, or target later steps by \
+                role/name. A stale token is retried once on the single element with the same role and label.\n\
+                \n\
+                Result: per-step status (`ok` or the error) and, with `observe`, one bounded get_window_state \
+                read after the last executed step, a `since:\"latest\"` diff by default (a dialog that took \
+                focus after a failure is read even without `observe`). A step refused because its app ignores \
+                background input says how to re-send it; `foreground_fallback:true` retries it once in the \
+                foreground. Steps may omit `session` or repeat the batch's. At most 64 steps and 60 s per \
+                batch. retry: safe means a retry cannot duplicate input into an application; it is not permission \
+                to retry and says nothing about file or other side effects.\n\
+                \n\
+                Target by name (no earlier read needed): args may carry `role` (button, textfield, link, \
+                checkbox, menuitem, ...; AX/UIA/AT-SPI names also work), `name` (the label; exact match beats \
+                substring, case-insensitive), `nth` (0-based) and `app` (name or bundle id) and/or `window` \
+                (title substring) instead of pid/window_id/element_token. The batch reads the window fresh (the \
+                visible window first; closed menus and off-screen rows when that finds no unique match, or for \
+                `nth` or a menu role), waits up to 3 s for the element (step `timeout_ms`, max 10000) and acts; \
+                with only `app` it uses that app's frontmost window. Later steps inherit the window. The first \
+                lookup in a window also seeds the `observe` diff. Several matches fail with the candidates \
+                listed.\n\
+                \n\
+                Checks: a step may add `wait_for` (before its action) and `expect` (one or up to 4, after it), \
+                or be only a check: {role?, name?, text?, gone?, value?, value_contains?, enabled?, selected?, \
+                app?, window?, timeout_ms?}. `text` matches any row, static text included; `gone:true` waits for \
+                it to disappear. Checks poll (wait_for 5 s, expect 2 s, max 10 s); one that does not hold fails \
+                the step with what was found. Missing field state is unknown. If a window cannot be read, \
+                `gone_unconfirmed` means the window listing does not prove it closed; `lookup_failed` means a window or app listing \
+                failed. A failure names the step, its phase (wait_for, find, action, \
+                expect) and why.\n\
+                \n\
+                Example: \
+                {\"steps\":[{\"set_value\":{\"app\":\"Safari\",\"role\":\"textfield\",\"name\":\"Email\",\"value\":\"ada@example.com\"}},{\"click\":{\"role\":\"button\",\"name\":\"Submit\"},\"expect\":[{\"text\":\"Thanks\"}]}],\"observe\":{}}"
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "required": ["steps"],
+                "properties": {
+                    "steps": {
+                        "type": "array",
+                        "minItems": 1,
+                        "maxItems": MAX_STEPS,
+                        "description": "Ordered actions. Execution stops at the first failing step. Each step is {tool, args} or {<tool>: args}, plus optional wait_for / expect / timeout_ms; a step may also be only a wait_for or expect check.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "tool": { "type": "string", "enum": BATCHABLE_TOOLS, "description": "Action tool to run." },
+                                "args": { "type": "object", "description": "Arguments for that tool, as in a direct call, optionally with role/name/nth/app/window to name the target instead of pid/window_id/element_token." },
+                                "wait_for": { "type": "object", "description": "Check that must hold before the action: {role?, name?, text?, gone?, app?, window?, timeout_ms?}. Default timeout 5000 ms." },
+                                "expect": { "type": "array", "maxItems": 4, "items": {"type": "object"}, "description": "Up to 4 checks that must hold after the action: {role?, name?, text?, gone?, value?, value_contains?, enabled?, selected?, app?, window?, timeout_ms?}. Default timeout 2000 ms." },
+                                "timeout_ms": { "type": "integer", "minimum": 0, "maximum": 10000, "description": "How long a named target may take to appear. Default 3000." }
+                            },
+                            "additionalProperties": true
+                        }
+                    },
+                    "delay_ms": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": MAX_DELAY_MS,
+                        "description": "Pause between steps in milliseconds (not after the last). Default 0."
+                    },
+                    "pid": {
+                        "type": "integer",
+                        "description": "Default pid for steps that name no window (a step's own pid/window_id/app/window wins)."
+                    },
+                    "window_id": {
+                        "type": "integer",
+                        "description": "Default window_id for steps that name no window, with `pid`."
+                    },
+                    "app": {
+                        "type": "string",
+                        "description": "Default app (name or bundle id) for steps that name no window."
+                    },
+                    "window": {
+                        "type": "string",
+                        "description": "Default window title substring for steps that name no window."
+                    },
+                    "delivery_mode": {
+                        "type": "string",
+                        "enum": ["background", "foreground"],
+                        "description": "Default delivery_mode for steps whose tool takes one and that set none."
+                    },
+                    "verify": {
+                        "type": "string",
+                        "enum": ["each", "checkpoint"],
+                        "description": "\"each\" (default): every step waits for its window-change report, as a direct call does (100 ms on macOS for a step another step follows). \"checkpoint\": every step but the last returns as soon as its input is delivered (macOS; Linux and Windows do not wait anyway); check with the step's `expect`, the last step's report or `observe`. A window a step opens is still reported on the next step's result. A step that sets its own post_action_wait keeps it."
+                    },
+                    "foreground_fallback": {
+                        "type": "boolean",
+                        "description": "When a step is refused because its target ignores background input (Electron, LibreOffice and other toolkits), retry it once with delivery_mode:\"foreground\": the window is activated and the pointer may move. Default false."
+                    },
+                    "observe": {
+                        "type": "object",
+                        "description": "Optional end-of-batch observation: arguments for ONE get_window_state call. `pid` and `window_id` default to those of the last step that names both. Defaults to since=\"latest\" (only what changed since your last read of that window with the same query/max_elements/max_depth; a full read when there is none), include_screenshot=false and max_elements=250; pass include_screenshot=true to see the window, or since=null for a full read. Omit to read nothing. {} observes the last window."
+                    },
+                    "app_scope": crate::batch_scope::input_schema()
+                },
+                "additionalProperties": false
+            }),
+            read_only: false,
+            destructive: true,
+            idempotent: false,
+            open_world: true,
+        })
+    }
+
+    async fn invoke(&self, args: Value) -> ToolResult {
+        let registry = match self.registry.lock().unwrap().upgrade() {
+            Some(registry) => registry,
+            None => {
+                return ToolResult::error(
+                    "run_steps is not available: registry not initialised yet.",
+                )
+                .with_disposition(cua_driver_contract::ErrorDisposition::NOT_DELIVERED)
+            }
+        };
+        let dispatch_context = match crate::tool::capture_dispatch_context() {
+            Ok(context) => context,
+            Err(_) => {
+                return ToolResult::error("run_steps dispatch context is incomplete")
+                    .with_structured(json!({
+                        "ok": false,
+                        "code": "dispatch_context_unavailable",
+                        "executed": 0,
+                    }))
+                    .with_disposition(cua_driver_contract::ErrorDisposition::NOT_DELIVERED);
+            }
+        };
+        let plan = match Plan::parse(&registry, &args) {
+            Ok(plan) => plan,
+            Err(error) => return error.into_result(),
+        };
+        if let Some(context) = crate::tool::current_dispatch_authorization_context() {
+            for (index, step) in plan.steps.iter().enumerate() {
+                if let Some(action) = &step.action {
+                    let read = (!action.element.is_empty()).then_some(OBSERVE_TOOL);
+                    for tool in read.into_iter().chain(std::iter::once(action.tool)) {
+                        let tool = match tool {
+                            "type_text_chars" => "type_text",
+                            _ => crate::tool::renamed_tool(tool).unwrap_or(tool),
+                        };
+                        if let Err(error) = crate::authorization::preflight_tool(tool, &context) {
+                            let message = format!("run_steps refused before running anything: step {} ({tool}): {error}", index + 1);
+                            let mut structured = json!({
+                                "status": "refused", "refusal": {"code": "permission_denied", "message": message},
+                                "ok": false, "code": "permission_denied", "executed": 0,
+                                "failed_step": index, "total": plan.steps.len(), "steps": [],
+                                "preflight": {"step": index, "tool": tool},
+                            });
+                            if let Some(scope) = &plan.scope {
+                                structured["app_scope"] = scope.to_json();
+                            }
+                            return ToolResult::error(message)
+                                .with_structured(structured)
+                                .with_disposition(
+                                    cua_driver_contract::ErrorDisposition::NOT_DELIVERED,
+                                );
+                        }
+                    }
+                }
+            }
+        }
+        let scope = plan.scope.clone();
+        crate::batch_scope::enter(scope, plan.run(registry, dispatch_context)).await
+    }
+}
+
+/// One action of a step.
+struct Action {
+    tool: &'static str,
+    /// The tool's own arguments, without the selector keys.
+    args: Value,
+    /// Window named by the step itself (pid/window_id/app/window).
+    window: WindowSpec,
+    /// Element named by description; empty when the step targets by token,
+    /// pixels or focus.
+    element: ElementSpec,
+    find_timeout: Duration,
+}
+
+struct Step {
+    action: Option<Action>,
+    wait_for: Option<Check>,
+    expect: Vec<Check>,
+    /// A read-only tool placed between actions. It cannot change what later
+    /// steps do, so it is skipped (with a note) instead of failing the batch.
+    skipped_read: Option<&'static str>,
+}
+
+impl Step {
+    fn label(&self) -> &'static str {
+        match (&self.action, self.skipped_read) {
+            (Some(action), _) => action.tool,
+            (None, Some(read)) => read,
+            (None, None) if self.wait_for.is_some() => "wait_for",
+            (None, None) => "expect",
+        }
+    }
+}
+
+struct Plan {
+    steps: Vec<Step>,
+    delay: Duration,
+    pause: StepPause,
+    observe: Option<Value>,
+    /// Read-only calls (zoom) the batch ended with, run after `observe`.
+    tail_reads: Vec<(&'static str, Value)>,
+    /// The window steps inherit when they name none.
+    default_window: WindowSpec,
+    /// Retry a step refused for background delivery once in the foreground.
+    foreground_fallback: bool,
+    session: Option<String>,
+    /// App and delivery limit checked on every call the batch dispatches.
+    scope: Option<std::sync::Arc<crate::batch_scope::BatchScope>>,
+    #[cfg(test)]
+    step_deadline: Option<StepDeadline>,
+    #[cfg(test)]
+    step_worker_finished: Option<Arc<tokio::sync::Notify>>,
+}
+
+struct PlanError {
+    step: Option<usize>,
+    message: String,
+}
+
+impl PlanError {
+    fn batch(message: impl Into<String>) -> Self {
+        Self {
+            step: None,
+            message: message.into(),
+        }
+    }
+
+    fn step(index: usize, message: impl Into<String>) -> Self {
+        Self {
+            step: Some(index),
+            message: message.into(),
+        }
+    }
+
+    fn into_result(self) -> ToolResult {
+        let location = match self.step {
+            Some(index) => format!("step {} of the batch: ", index + 1),
+            None => String::new(),
+        };
+        ToolResult::error(format!(
+            "run_steps rejected before running anything: {location}{}",
+            self.message
+        ))
+        .with_structured(json!({
+            "ok": false,
+            "code": "invalid_batch",
+            "executed": 0,
+            "failed_step": self.step,
+            "detail": self.message,
+        }))
+        .with_disposition(cua_driver_contract::ErrorDisposition::NOT_DELIVERED)
+    }
+}
+
+/// How one step ended.
+struct StepOutcome {
+    report: Value,
+    line: String,
+    ok: bool,
+}
+
+/// Where in a step a failure happened.
+#[derive(Clone, Copy)]
+enum Phase {
+    WaitFor,
+    Find,
+    Action,
+    Expect,
+    Budget,
+}
+
+impl Phase {
+    fn as_str(self) -> &'static str {
+        match self {
+            Phase::WaitFor => "wait_for",
+            Phase::Find => "find",
+            Phase::Action => "action",
+            Phase::Expect => "expect",
+            Phase::Budget => "time_budget",
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum GateState {
+    Open,
+    Dispatching,
+    TimedOut,
+}
+
+#[derive(Clone)]
+struct GateSnapshot {
+    window: Option<Window>,
+    read_pending: bool,
+    scope_refusal: Option<&'static str>,
+    dispatching: bool,
+}
+
+struct GateData {
+    state: GateState,
+    window: Option<Window>,
+    read_pending: bool,
+    scope_refusal: Option<&'static str>,
+    action_dispatched: Arc<AtomicBool>,
+    attempted_action: bool,
+    action_may_have_delivered: bool,
+}
+
+#[derive(Clone)]
+struct StepGate(Arc<Mutex<GateData>>);
+
+impl StepGate {
+    #[cfg(test)]
+    fn new() -> Self {
+        Self::with_action_tracker(Arc::new(AtomicBool::new(false)))
+    }
+
+    fn with_action_tracker(action_dispatched: Arc<AtomicBool>) -> Self {
+        Self(Arc::new(Mutex::new(GateData {
+            state: GateState::Open,
+            window: None,
+            read_pending: false,
+            scope_refusal: None,
+            action_dispatched,
+            attempted_action: false,
+            action_may_have_delivered: false,
+        })))
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, GateData> {
+        self.0.lock().unwrap_or_else(|error| error.into_inner())
+    }
+
+    fn begin_dispatch(&self) -> bool {
+        let mut data = self.lock();
+        if data.state != GateState::Open {
+            return false;
+        }
+        data.state = GateState::Dispatching;
+        data.attempted_action = true;
+        true
+    }
+
+    fn complete_dispatch(&self, scope_refusal: Option<&'static str>, not_delivered: bool) {
+        let mut data = self.lock();
+        if !not_delivered {
+            data.action_may_have_delivered = true;
+            data.action_dispatched.store(true, Ordering::SeqCst);
+        }
+        if let Some(code) = scope_refusal {
+            data.scope_refusal = Some(code);
+        }
+        if data.state == GateState::Dispatching {
+            data.state = GateState::Open;
+        }
+    }
+
+    fn begin_read(&self) -> bool {
+        let mut data = self.lock();
+        if data.state == GateState::TimedOut {
+            return false;
+        }
+        data.read_pending = true;
+        true
+    }
+
+    fn end_read(&self, scope_refusal: Option<&'static str>) {
+        let mut data = self.lock();
+        data.read_pending = false;
+        if let Some(code) = scope_refusal {
+            data.scope_refusal = Some(code);
+        }
+    }
+
+    fn invalidate_window(&self) {
+        self.lock().window = None;
+    }
+
+    fn is_timed_out(&self) -> bool {
+        self.lock().state == GateState::TimedOut
+    }
+
+    fn confirm_window(&self, window: Window) {
+        let mut data = self.lock();
+        if data.state != GateState::TimedOut {
+            data.window = Some(window);
+        }
+    }
+
+    fn timeout(&self) -> GateSnapshot {
+        let mut data = self.lock();
+        let dispatching = data.state == GateState::Dispatching;
+        if dispatching {
+            data.action_may_have_delivered = true;
+            data.action_dispatched.store(true, Ordering::SeqCst);
+        }
+        data.state = GateState::TimedOut;
+        GateSnapshot {
+            window: data.window.clone(),
+            read_pending: data.read_pending,
+            scope_refusal: data.scope_refusal,
+            dispatching,
+        }
+    }
+
+    fn no_action_delivered(&self) -> bool {
+        let data = self.lock();
+        data.attempted_action
+            && !data.action_may_have_delivered
+            && data.state != GateState::Dispatching
+    }
+}
+
+struct GateDropGuard {
+    gate: StepGate,
+    slot: Arc<Mutex<Option<StepGate>>>,
+    worker: Option<tokio::task::JoinHandle<StepCompletion>>,
+    armed: bool,
+}
+
+impl GateDropGuard {
+    fn new(
+        gate: StepGate,
+        slot: Arc<Mutex<Option<StepGate>>>,
+        worker: tokio::task::JoinHandle<StepCompletion>,
+    ) -> Self {
+        Self {
+            gate,
+            slot,
+            worker: Some(worker),
+            armed: true,
+        }
+    }
+
+    fn disarm(mut self) {
+        self.armed = false;
+        *self.slot.lock().unwrap_or_else(|error| error.into_inner()) = None;
+    }
+}
+
+impl Drop for GateDropGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            self.gate.timeout();
+            // Dropping the JoinHandle detaches the admitted worker. Its
+            // platform guards must stay alive until the real work finishes.
+            *self.slot.lock().unwrap_or_else(|error| error.into_inner()) = None;
+        }
+    }
+}
+
+#[cfg(test)]
+#[derive(Debug, PartialEq, Eq)]
+enum PaceEvent {
+    Step { tool: String },
+    Pause { before_step: usize, delay: Duration },
+}
+
+enum StepPause {
+    Real,
+    #[cfg(test)]
+    Recorded(Arc<Mutex<Vec<PaceEvent>>>),
+}
+
+impl StepPause {
+    async fn pause(&self, _index: usize, delay: Duration) {
+        match self {
+            Self::Real => tokio::time::sleep(delay).await,
+            #[cfg(test)]
+            Self::Recorded(events) => events.lock().unwrap().push(PaceEvent::Pause {
+                before_step: _index,
+                delay,
+            }),
+        }
+    }
+}
+
+enum StepDeadline {
+    Budget(Duration),
+    #[cfg(test)]
+    Trigger(tokio::sync::oneshot::Receiver<()>),
+}
+
+impl StepDeadline {
+    async fn wait(self) {
+        match self {
+            Self::Budget(duration) => tokio::time::sleep(duration).await,
+            #[cfg(test)]
+            Self::Trigger(receiver) => {
+                let _ = receiver.await;
+            }
+        }
+    }
+}
+
+struct StepCompletion {
+    outcome: StepOutcome,
+    context: WindowSpec,
+    last_window: Option<Window>,
+}
+
+impl Plan {
+    fn parse(registry: &ToolRegistry, args: &Value) -> Result<Self, PlanError> {
+        let object = args
+            .as_object()
+            .ok_or_else(|| PlanError::batch("arguments must be a JSON object"))?;
+        let raw_steps = object
+            .get("steps")
+            .and_then(Value::as_array)
+            .ok_or_else(|| PlanError::batch("`steps` must be a non-empty array"))?;
+        if raw_steps.is_empty() || raw_steps.len() > MAX_STEPS {
+            return Err(PlanError::batch(format!(
+                "`steps` must hold 1 to {MAX_STEPS} items, got {}",
+                raw_steps.len()
+            )));
+        }
+        let delay_ms = match object.get("delay_ms") {
+            None | Some(Value::Null) => 0,
+            Some(value) => value
+                .as_u64()
+                .filter(|ms| *ms <= MAX_DELAY_MS)
+                .ok_or_else(|| {
+                    PlanError::batch(format!("`delay_ms` must be an integer 0 to {MAX_DELAY_MS}"))
+                })?,
+        };
+        // The trusted label the dispatcher recorded for this call's public
+        // session. Every step runs in that one session.
+        let session = object
+            .get("_public_session_label")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+
+        let default_window = batch_window(object)?;
+        let scope = crate::batch_scope::BatchScope::parse(object.get("app_scope"))
+            .map_err(PlanError::batch)?;
+        let default_delivery = match object.get("delivery_mode") {
+            None | Some(Value::Null) => None,
+            Some(Value::String(mode)) if matches!(mode.as_str(), "background" | "foreground") => {
+                Some(mode.clone())
+            }
+            Some(_) => {
+                return Err(PlanError::batch(
+                    "`delivery_mode` must be \"background\" or \"foreground\"",
+                ))
+            }
+        };
+        let foreground_fallback = match object.get("foreground_fallback") {
+            None | Some(Value::Null) => false,
+            Some(Value::Bool(flag)) => *flag,
+            Some(_) => {
+                return Err(PlanError::batch(
+                    "`foreground_fallback` must be true or false",
+                ))
+            }
+        };
+
+        let checkpoint = match object.get("verify") {
+            None | Some(Value::Null) => false,
+            Some(Value::String(mode)) if mode == "each" => false,
+            Some(Value::String(mode)) if mode == "checkpoint" => true,
+            Some(_) => {
+                return Err(PlanError::batch(
+                    "`verify` must be \"each\" or \"checkpoint\"",
+                ))
+            }
+        };
+
+        // Reads the batch ends with are what `observe` is for: a trailing
+        // get_window_state (or screenshot) becomes the observation, merged
+        // with an explicit `observe`, and a trailing zoom runs after it.
+        let mut raw_steps = raw_steps.as_slice();
+        let mut observe_value = match object.get("observe") {
+            None | Some(Value::Null) | Some(Value::Bool(false)) => None,
+            Some(value) => Some(value.clone()),
+        };
+        let mut trailing_observe: Option<Value> = None;
+        let mut tail_reads = Vec::new();
+        while let [rest @ .., last] = raw_steps {
+            if !rest.iter().any(|step| read_step(step).is_none()) {
+                break;
+            }
+            let Some((tool, args)) = read_step(last) else {
+                break;
+            };
+            match tool {
+                OBSERVE_TOOL | "screenshot" => {
+                    // The latest trailing read wins; earlier ones are dropped.
+                    if trailing_observe.is_none() {
+                        let mut args = args;
+                        if tool == "screenshot" {
+                            args = json!({ "include_screenshot": true });
+                        }
+                        trailing_observe = Some(args);
+                    }
+                }
+                "zoom" => tail_reads.insert(0, ("zoom", args)),
+                // Other reads at the end (list_windows, verify_state, ...)
+                // add nothing a final observation does not show.
+                _ => {}
+            }
+            raw_steps = rest;
+        }
+        if let Some(step_args) = trailing_observe {
+            observe_value = Some(match observe_value {
+                Some(Value::Object(explicit)) => {
+                    let mut merged = step_args.as_object().cloned().unwrap_or_default();
+                    merged.extend(explicit);
+                    Value::Object(merged)
+                }
+                _ => step_args,
+            });
+        }
+
+        let mut steps = Vec::with_capacity(raw_steps.len());
+        // Whether some earlier step (or the batch itself) names a window a
+        // later step can inherit.
+        let mut has_window = !default_window.is_empty();
+        // A batch of reads only is refused by parse_step, pointing at the
+        // direct call; reads between actions are skipped.
+        let acts = raw_steps.iter().any(|step| read_step(step).is_none());
+        // The last skipped get_window_state: with no `observe`, it says the
+        // caller wants to look, so it becomes the end read.
+        let mut skipped_observe = None;
+        for (index, raw) in raw_steps.iter().enumerate() {
+            if let Some((tool, args)) = read_step(raw).filter(|_| acts) {
+                if tool == OBSERVE_TOOL {
+                    skipped_observe = Some(args);
+                }
+                steps.push(Step {
+                    action: None,
+                    wait_for: None,
+                    expect: Vec::new(),
+                    skipped_read: Some(tool),
+                });
+                continue;
+            }
+            let mut step = parse_step(registry, index, raw, session.as_deref(), has_window)?;
+            // `verify:"checkpoint"`: every step but the last returns once its
+            // input is delivered. The last keeps its report of what the batch
+            // left open; a step that sets its own post_action_wait keeps it.
+            if let (true, Some(action)) = (
+                checkpoint && index + 1 < raw_steps.len(),
+                step.action.as_mut(),
+            ) {
+                if crate::post_action_wait::accepts(action.tool) {
+                    if let Some(object) = action.args.as_object_mut() {
+                        object
+                            .entry(crate::post_action_wait::POST_ACTION_WAIT_ARG)
+                            .or_insert_with(|| json!("none"));
+                    }
+                }
+            }
+            if let (Some(mode), Some(action)) = (&default_delivery, step.action.as_mut()) {
+                if accepts(registry, action.tool, "delivery_mode") {
+                    if let Some(object) = action.args.as_object_mut() {
+                        object.entry("delivery_mode").or_insert_with(|| json!(mode));
+                    }
+                }
+            }
+            let names_window = step
+                .action
+                .as_ref()
+                .is_some_and(|action| !action.window.is_empty())
+                || step
+                    .wait_for
+                    .iter()
+                    .chain(step.expect.iter())
+                    .any(|check| !check.window.is_empty());
+            let needs_window = step
+                .action
+                .as_ref()
+                .is_some_and(|action| !action.element.is_empty() && action.window.is_empty())
+                || step
+                    .wait_for
+                    .iter()
+                    .chain(step.expect.iter())
+                    .any(|check| check.window.is_empty());
+            if needs_window && !names_window && !has_window {
+                return Err(PlanError::step(
+                    index,
+                    "names an element but no window: add `app` (or pid and window_id) to this step or an earlier one",
+                ));
+            }
+            has_window |= names_window;
+            steps.push(step);
+        }
+
+        if observe_value.is_none() && has_window {
+            observe_value = skipped_observe;
+        }
+        // zoom crops the window's latest screenshot, so the end read before
+        // it must take one.
+        if !tail_reads.is_empty() && has_window {
+            let mut with_screenshot = match observe_value.take() {
+                Some(Value::Object(object)) => object,
+                _ => Map::new(),
+            };
+            with_screenshot.insert("include_screenshot".into(), Value::Bool(true));
+            observe_value = Some(Value::Object(with_screenshot));
+        }
+        let observe = match observe_value.as_ref() {
+            None => None,
+            Some(value) => Some(parse_observe(
+                registry,
+                value,
+                has_window,
+                session.as_deref(),
+            )?),
+        };
+        for (tool, args) in &mut tail_reads {
+            if let Some(def) = registry.get_def(tool) {
+                crate::tool::coerce_string_scalars(&def.input_schema, args);
+            }
+            prepare_args(args, session.as_deref())
+                .map_err(|message| PlanError::batch(format!("{tool}: {message}")))?;
+            crate::tool::normalize_argument_aliases(tool, args)
+                .map_err(|message| PlanError::batch(format!("{tool}: {message}")))?;
+        }
+        Ok(Self {
+            steps,
+            delay: Duration::from_millis(delay_ms),
+            pause: StepPause::Real,
+            observe,
+            tail_reads,
+            default_window,
+            foreground_fallback,
+            session,
+            scope,
+            #[cfg(test)]
+            step_deadline: None,
+            #[cfg(test)]
+            step_worker_finished: None,
+        })
+    }
+
+    async fn run(
+        self,
+        registry: Arc<ToolRegistry>,
+        dispatch_context: Option<crate::tool::CapturedDispatchContext>,
+    ) -> ToolResult {
+        let total = self.steps.len();
+        let started = Instant::now();
+        let active_gate = Arc::new(Mutex::new(None::<StepGate>));
+        let action_dispatched = Arc::new(AtomicBool::new(false));
+        let read_admission = {
+            let active_gate = active_gate.clone();
+            Arc::new(move || {
+                let gate = active_gate
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .clone();
+                gate.is_some_and(|gate| gate.begin_read())
+            }) as locate::ReadAdmission
+        };
+        let read_outcome = {
+            let active_gate = active_gate.clone();
+            Arc::new(move |code| {
+                let gate = active_gate
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .clone();
+                if let Some(gate) = gate {
+                    gate.end_read(code);
+                }
+            }) as locate::ReadOutcome
+        };
+        let read_closed = {
+            let active_gate = active_gate.clone();
+            Arc::new(move || {
+                active_gate
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .as_ref()
+                    .is_none_or(|gate| gate.is_timed_out())
+            }) as locate::ReadClosed
+        };
+        let mut locator = Locator::new_owned(
+            registry.clone(),
+            self.session.clone(),
+            started + Duration::from_millis(MAX_BATCH_MS),
+            Some(read_admission),
+            Some(read_outcome),
+            Some(read_closed),
+        );
+        // A default diff observation gets a baseline from the batch's first
+        // read of each window it looks in.
+        if let Some(observe) = &self.observe {
+            let plain_view = observe.get("query").is_none()
+                && observe.get("max_depth").is_none()
+                && observe.get("since").and_then(Value::as_str)
+                    == Some(crate::window_state_view::SINCE_LATEST);
+            if let (true, Some(max_elements)) = (
+                plain_view,
+                observe.get("max_elements").and_then(Value::as_u64),
+            ) {
+                locator = locator.with_observe_baseline(max_elements);
+            }
+        }
+        let locator = Arc::new(locator);
+        #[cfg(test)]
+        let mut deadline_override = self.step_deadline;
+        let mut reports = Vec::with_capacity(total);
+        let mut lines = Vec::with_capacity(total + 2);
+        let mut failed_step = None;
+        // The window later steps inherit, and the last concrete window used.
+        let mut context = self.default_window.clone();
+        let mut last_window: Option<Window> = match (context.pid, context.window_id) {
+            (Some(pid), Some(window_id)) => Some(Window {
+                pid,
+                window_id,
+                app: None,
+                title: None,
+                on_screen: true,
+            }),
+            _ => None,
+        };
+        // A failure that names the window to look at next (a dialog holding
+        // focus, a window never captured) gets that window read at the end
+        // even without `observe`, so the caller can act without another read.
+        let mut recovery: Option<Recovery> = None;
+        let mut timed_out = false;
+
+        for (index, step) in self.steps.into_iter().enumerate() {
+            if index > 0 && !self.delay.is_zero() {
+                self.pause.pause(index, self.delay).await;
+            }
+            let step_started = Instant::now();
+            let (mut outcome, completion, timeout_snapshot) =
+                if started.elapsed() >= Duration::from_millis(MAX_BATCH_MS) {
+                    (
+                        failure(
+                            index,
+                            step.label(),
+                            Phase::Budget,
+                            "time_budget",
+                            format!(
+                                "the batch used its {} s budget before this step",
+                                MAX_BATCH_MS / 1000
+                            ),
+                            json!({}),
+                        ),
+                        None,
+                        None,
+                    )
+                } else {
+                    let pacing = if index + 1 < total {
+                        crate::step_pacing::StepPacing::Batched
+                    } else {
+                        crate::step_pacing::StepPacing::Single
+                    };
+                    let remaining =
+                        Duration::from_millis(MAX_BATCH_MS).saturating_sub(started.elapsed());
+                    let (deadline, timeout_code) = step_budget(&step, remaining);
+                    #[cfg(test)]
+                    let (deadline, timeout_code) = deadline_override
+                        .take()
+                        .map_or((deadline, timeout_code), |deadline| {
+                            (deadline, "step_timeout")
+                        });
+                    match execute_step(
+                        registry.clone(),
+                        locator.clone(),
+                        active_gate.clone(),
+                        action_dispatched.clone(),
+                        dispatch_context.clone(),
+                        self.scope.clone(),
+                        pacing,
+                        index,
+                        step,
+                        context.clone(),
+                        last_window.clone(),
+                        self.foreground_fallback,
+                        #[cfg(test)]
+                        self.step_worker_finished.clone(),
+                        deadline,
+                        timeout_code,
+                    )
+                    .await
+                    {
+                        StepExecution::Completed(completion) => {
+                            let StepCompletion {
+                                outcome,
+                                context,
+                                last_window,
+                            } = completion;
+                            (outcome, Some((context, last_window)), None)
+                        }
+                        StepExecution::Timeout { outcome, snapshot }
+                        | StepExecution::JoinFailed { outcome, snapshot } => {
+                            (outcome, None, Some(snapshot))
+                        }
+                    }
+                };
+            if let Some((new_context, new_last_window)) = completion {
+                context = new_context;
+                last_window = new_last_window;
+            }
+            timed_out = timeout_snapshot.is_some();
+            if let Some(snapshot) = &timeout_snapshot {
+                last_window = snapshot.window.clone();
+                if snapshot.dispatching {
+                    outcome.report["scope_outcome"] = json!("unknown");
+                }
+            }
+            // A lookup or check the scope refused fails the step with the
+            // scope's code, as a refused action does, even when the check
+            // itself would have passed (a `gone:true` check reads a refused
+            // window as absent): the batch stops at the first refused call.
+            // run_steps reports targets per step; the per-call journal is for
+            // run_script, so drop it here to keep it bounded. A detached
+            // worker keeps its journal and refusal state after a timeout.
+            if !timed_out {
+                locator.take_journal();
+            }
+            if !timed_out {
+                if let Some(code) = locator.take_scope_refusal() {
+                    if outcome.ok {
+                        outcome.ok = false;
+                        outcome.report["ok"] = json!(false);
+                        outcome.report["phase"] = json!("find");
+                        outcome.report["message"] =
+                            json!("a read this step needed was refused by the batch scope");
+                        outcome.line = format!(
+                        "{}. {} ERROR (find): a read this step needed was refused by the batch scope ({code})",
+                        index + 1,
+                        outcome.report["tool"].as_str().unwrap_or("step")
+                    );
+                    }
+                    // An action that already ran keeps the effect it returned.
+                    outcome.report["code"] = json!(code);
+                    if outcome.report.get("effect").is_none() {
+                        outcome.report["effect"] = json!("refused");
+                    }
+                }
+            }
+            // Wall time of the step: lookup, checks and the action.
+            outcome.report["ms"] = json!(step_started.elapsed().as_millis() as u64);
+            if !outcome.ok {
+                recovery = Recovery::after(
+                    &outcome.report,
+                    last_window.as_ref(),
+                    timeout_snapshot.is_some(),
+                );
+                if timed_out
+                    && timeout_snapshot.as_ref().is_some_and(|snapshot| {
+                        snapshot.read_pending || snapshot.scope_refusal.is_some()
+                    })
+                {
+                    recovery = None;
+                }
+                if let Some(Recovery { window, .. }) = &recovery {
+                    last_window = Some(window.clone());
+                }
+            }
+            lines.push(outcome.line);
+            reports.push(outcome.report);
+            if !outcome.ok {
+                failed_step = Some(index);
+                break;
+            }
+        }
+
+        let executed = reports.len();
+        let mut structured = json!({
+            "ok": failed_step.is_none(),
+            "total": total,
+            "executed": executed,
+            "failed_step": failed_step,
+            "steps": reports,
+        });
+        if let Some(scope) = &self.scope {
+            structured["app_scope"] = scope.to_json();
+        }
+        // A failed batch names its cause at the top: without a `code` here
+        // the MCP envelope stamps a bare `tool_invocation_failed`, and a
+        // client that shows only the top level loses the step's reason.
+        // Its effect is the failed step's only when no earlier step sent an
+        // action: after one did, input may have landed, so the batch is
+        // `partial` even when the failed step itself was refused.
+        if let Some(index) = failed_step {
+            let steps = structured["steps"].as_array().cloned().unwrap_or_default();
+            let step = &steps[index];
+            let code = step["code"].as_str().unwrap_or("step_failed").to_owned();
+            let earlier_action = steps[..index].iter().any(|earlier| {
+                earlier["tool"]
+                    .as_str()
+                    .is_some_and(|tool| BATCHABLE_TOOLS.contains(&tool))
+            });
+            structured["code"] = json!(code);
+            structured["message"] = step["message"].clone();
+            if earlier_action {
+                structured["effect"] = json!("partial");
+            } else if !step["effect"].is_null() {
+                structured["effect"] = step["effect"].clone();
+            }
+        }
+        let header = match failed_step {
+            None => format!("run_steps: {total}/{total} steps ok"),
+            Some(index) => format!(
+                "run_steps: step {} of {total} failed; {} step(s) ran before it, {} not run",
+                index + 1,
+                index,
+                total - executed
+            ),
+        };
+        lines.insert(0, header);
+
+        // One observation at the end, also after a failure so the caller can
+        // see where the app was left.
+        let mut observation_content = Vec::new();
+        let observe = if timed_out && recovery.is_none() {
+            if self.observe.is_some() {
+                lines.push(
+                    "observation skipped: the timed-out step has no confirmed window".to_owned(),
+                );
+            }
+            None
+        } else {
+            match (self.observe, recovery) {
+                (Some(mut args), Some(recovery)) => {
+                    // The window to recover in replaces the step's own window.
+                    lines.push(format!("recovery read: {}", recovery.why));
+                    if let Some(object) = args.as_object_mut() {
+                        object.insert("pid".into(), json!(recovery.window.pid));
+                        object.insert("window_id".into(), json!(recovery.window.window_id));
+                        if recovery.screenshot {
+                            object.insert("include_screenshot".into(), json!(true));
+                        }
+                    }
+                    Some(args)
+                }
+                (Some(args), None) => Some(args),
+                (None, Some(recovery)) => {
+                    let mut args = json!({
+                        "pid": recovery.window.pid,
+                        "window_id": recovery.window.window_id,
+                        "include_screenshot": recovery.screenshot,
+                        "max_elements": DEFAULT_OBSERVE_MAX_ELEMENTS,
+                        "since": crate::window_state_view::SINCE_LATEST,
+                    });
+                    if let Some(session) = &self.session {
+                        args["session"] = json!(session);
+                    }
+                    lines.push(format!("recovery read: {}", recovery.why));
+                    Some(args)
+                }
+                (None, None) => None,
+            }
+        };
+        // The batch ends at the first call its app scope refused: after a
+        // refused step nothing more is dispatched (no recovery, observation
+        // or tail read), and a refused final read fails the batch the same way.
+        let mut scope_refused: Option<&'static str> = failed_step.and_then(|index| {
+            let code = structured["steps"][index]["code"].as_str()?;
+            [
+                crate::batch_scope::OUTSIDE_SCOPE,
+                crate::batch_scope::FOREGROUND_NOT_ALLOWED,
+            ]
+            .into_iter()
+            .find(|known| *known == code)
+        });
+        let observe = if scope_refused.is_some() {
+            if observe.is_some() {
+                lines.push(
+                    "observation skipped: the batch stopped at a call its app scope refused"
+                        .to_owned(),
+                );
+            }
+            None
+        } else {
+            observe
+        };
+        if let Some(mut args) = observe {
+            let filled = fill_observed_window(&mut args, last_window.as_ref());
+            let result = if filled {
+                if timed_out {
+                    invoke_observation_with_deadline(
+                        registry.as_ref(),
+                        args,
+                        StepDeadline::Budget(Duration::from_secs(5)),
+                    )
+                    .await
+                } else {
+                    registry.invoke(OBSERVE_TOOL, args).await
+                }
+            } else {
+                ToolResult::error("no window to observe: no step resolved one")
+            };
+            let ok = result.is_error != Some(true);
+            let mut report = json!({ "ok": ok, "tool": OBSERVE_TOOL });
+            if ok {
+                let summary = result
+                    .structured_content
+                    .as_ref()
+                    .map(observation_summary)
+                    .unwrap_or_default();
+                if let Some(state) = result.structured_content.clone() {
+                    report["state"] = state;
+                }
+                if !summary.is_empty() {
+                    report["summary"] = Value::String(summary.clone());
+                }
+                observation_content = result.content;
+                lines.push(if summary.is_empty() {
+                    "observation: get_window_state ok (below)".to_owned()
+                } else {
+                    format!("observation: {summary} (below)")
+                });
+            } else {
+                let message = bounded_message(&result);
+                lines.push(format!("observation: get_window_state ERROR: {message}"));
+                report["message"] = Value::String(message);
+                if let Some(code) = scope_refusal_code(&result) {
+                    report["code"] = json!(code);
+                    report["effect"] = json!("refused");
+                    scope_refused = Some(code);
+                }
+            }
+            structured["observation"] = report;
+        }
+
+        let mut tail_content = Vec::new();
+        let mut tail_reports = Vec::new();
+        for (tool, mut args) in self.tail_reads {
+            if timed_out {
+                lines.push("tail reads skipped: the step timed out".to_owned());
+                break;
+            }
+            if scope_refused.is_some() {
+                break;
+            }
+            fill_observed_window(&mut args, last_window.as_ref());
+            let result = registry.invoke(tool, args).await;
+            let ok = result.is_error != Some(true);
+            let message = bounded_message(&result);
+            let refused = scope_refusal_code(&result);
+            if ok {
+                lines.push(format!("{tool}: ok (below)"));
+                tail_content.extend(result.content);
+            } else {
+                lines.push(format!("{tool}: ERROR: {message}"));
+            }
+            let mut report = json!({ "tool": tool, "ok": ok, "message": message });
+            if let Some(code) = refused {
+                report["code"] = json!(code);
+                report["effect"] = json!("refused");
+                scope_refused = Some(code);
+            }
+            tail_reports.push(report);
+        }
+        if !tail_reports.is_empty() {
+            structured["reads"] = Value::Array(tail_reports);
+        }
+        if let Some(code) = scope_refused {
+            let preserve_step_code = failed_step.is_some_and(|index| {
+                matches!(
+                    structured["steps"][index]["code"].as_str(),
+                    Some("step_timeout" | "time_budget" | "step_join_failed")
+                )
+            });
+            if !preserve_step_code {
+                structured["ok"] = json!(false);
+                structured["code"] = json!(code);
+                lines[0] = format!(
+                    "{} (failed: a final read was refused by the batch scope)",
+                    lines[0]
+                );
+            }
+        }
+
+        let mut content = vec![Content::text(lines.join("\n"))];
+        content.append(&mut observation_content);
+        content.append(&mut tail_content);
+        let failed = failed_step.is_some() || scope_refused.is_some();
+        if failed {
+            fit_error_text(&mut content, ERROR_TEXT_BUDGET);
+        }
+        ToolResult {
+            content,
+            is_error: failed.then_some(true),
+            structured_content: Some(structured),
+            disposition: failed.then(|| {
+                if action_dispatched.load(Ordering::SeqCst) {
+                    cua_driver_contract::ErrorDisposition::DELIVERED
+                } else {
+                    cua_driver_contract::ErrorDisposition::NOT_DELIVERED
+                }
+            }),
+            ..Default::default()
+        }
+    }
+}
+
+/// The batch scope's refusal code on a result, if it is one.
+fn scope_refusal_code(result: &ToolResult) -> Option<&'static str> {
+    let code = result
+        .structured_content
+        .as_ref()
+        .and_then(|value| value.get("code"))
+        .and_then(Value::as_str)?;
+    [
+        crate::batch_scope::OUTSIDE_SCOPE,
+        crate::batch_scope::FOREGROUND_NOT_ALLOWED,
+    ]
+    .into_iter()
+    .find(|known| *known == code)
+}
+
+async fn invoke_observation_with_deadline(
+    registry: &ToolRegistry,
+    args: Value,
+    deadline: StepDeadline,
+) -> ToolResult {
+    let invocation = registry.invoke(OBSERVE_TOOL, args);
+    tokio::pin!(invocation);
+    tokio::select! {
+        result = invocation => result,
+        _ = deadline.wait() => {
+            ToolResult::error(
+                "recovery observation exceeded its 5 s budget; the action outcome is still unknown",
+            )
+            .with_structured(json!({"code":"recovery_timeout","effect":"unverifiable"}))
+        }
+    }
+}
+
+fn step_budget(step: &Step, remaining: Duration) -> (StepDeadline, &'static str) {
+    let find = step
+        .action
+        .as_ref()
+        .map(|action| action.find_timeout)
+        .unwrap_or_default();
+    let wait = step
+        .wait_for
+        .as_ref()
+        .map(|check| check.timeout)
+        .unwrap_or_default();
+    let expects = step
+        .expect
+        .iter()
+        .fold(Duration::default(), |sum, check| sum + check.timeout);
+    let requested = (find + wait + expects + Duration::from_secs(15)).min(Duration::from_secs(25));
+    let batch_limited = remaining <= requested;
+    (
+        StepDeadline::Budget(requested.min(remaining)),
+        if batch_limited {
+            "time_budget"
+        } else {
+            "step_timeout"
+        },
+    )
+}
+
+enum StepExecution {
+    Completed(StepCompletion),
+    Timeout {
+        outcome: StepOutcome,
+        snapshot: GateSnapshot,
+    },
+    JoinFailed {
+        outcome: StepOutcome,
+        snapshot: GateSnapshot,
+    },
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn execute_step(
+    registry: Arc<ToolRegistry>,
+    locator: Arc<Locator<'static>>,
+    active_gate: Arc<Mutex<Option<StepGate>>>,
+    action_dispatched: Arc<AtomicBool>,
+    dispatch_context: Option<crate::tool::CapturedDispatchContext>,
+    scope: Option<Arc<crate::batch_scope::BatchScope>>,
+    pacing: crate::step_pacing::StepPacing,
+    index: usize,
+    step: Step,
+    context: WindowSpec,
+    last_window: Option<Window>,
+    foreground_fallback: bool,
+    #[cfg(test)] worker_finished: Option<Arc<tokio::sync::Notify>>,
+    deadline: StepDeadline,
+    timeout_code: &'static str,
+) -> StepExecution {
+    let label = step.label();
+    let gate = StepGate::with_action_tracker(action_dispatched);
+    *active_gate
+        .lock()
+        .unwrap_or_else(|error| error.into_inner()) = Some(gate.clone());
+    let worker_gate = gate.clone();
+    let work = crate::step_pacing::scope(
+        pacing,
+        run_step_owned(
+            registry,
+            locator,
+            index,
+            step,
+            context,
+            last_window,
+            foreground_fallback,
+            worker_gate,
+        ),
+    );
+    let work = crate::batch_scope::enter(scope, work);
+    let work = async move {
+        let completion = if let Some(context) = dispatch_context {
+            context.scope(work).await
+        } else {
+            work.await
+        };
+        #[cfg(test)]
+        if let Some(worker_finished) = worker_finished {
+            worker_finished.notify_one();
+        }
+        completion
+    };
+    let worker = tokio::spawn(work);
+    let mut guard = GateDropGuard::new(gate.clone(), active_gate, worker);
+    let execution = tokio::select! {
+        result = guard.worker.as_mut().expect("worker") => {
+            match result {
+                Ok(completion) => StepExecution::Completed(completion),
+                Err(error) => {
+                    let snapshot = gate.timeout();
+                    StepExecution::JoinFailed {
+                        outcome: failure(
+                            index,
+                            label,
+                            Phase::Action,
+                            "step_join_failed",
+                            format!("step worker failed: {error}"),
+                            json!({"index": index, "tool": label, "effect": "unverifiable"}),
+                        ),
+                        snapshot,
+                    }
+                }
+            }
+        }
+        _ = deadline.wait() => {
+            let snapshot = gate.timeout();
+            // Even a pre-dispatch timeout retains the legacy unverifiable effect;
+            // the finalizer therefore conservatively reports delivered/unsafe.
+            StepExecution::Timeout {
+                outcome: failure(
+                    index,
+                    label,
+                    Phase::Budget,
+                    timeout_code,
+                    "step exceeded its execution budget".to_owned(),
+                    json!({"index": index, "tool": label, "effect": "unverifiable"}),
+                ),
+                snapshot,
+            }
+        }
+    };
+    guard.disarm();
+    execution
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_step_owned(
+    registry: Arc<ToolRegistry>,
+    locator: Arc<Locator<'static>>,
+    index: usize,
+    step: Step,
+    mut context: WindowSpec,
+    mut last_window: Option<Window>,
+    foreground_fallback: bool,
+    gate: StepGate,
+) -> StepCompletion {
+    let outcome = Box::pin(run_step(
+        registry.as_ref(),
+        locator.as_ref(),
+        index,
+        step,
+        &mut context,
+        &mut last_window,
+        foreground_fallback,
+        gate,
+    ))
+    .await;
+    StepCompletion {
+        outcome,
+        context,
+        last_window,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_step(
+    registry: &ToolRegistry,
+    locator: &Locator<'_>,
+    index: usize,
+    step: Step,
+    context: &mut WindowSpec,
+    last_window: &mut Option<Window>,
+    foreground_fallback: bool,
+    gate: StepGate,
+) -> StepOutcome {
+    let label = step.label();
+    let step_has_no_action = step.action.is_none();
+    let mut report = json!({ "index": index, "tool": label });
+    let mut notes: Vec<String> = Vec::new();
+
+    if step.skipped_read.is_some() {
+        let note = "skipped: a read between actions cannot change the later steps; the \
+                    end read shows the result (use wait_for/expect to check a state \
+                    mid-batch)";
+        report["ok"] = json!(true);
+        report["skipped"] = json!(true);
+        report["message"] = json!(note);
+        return StepOutcome {
+            line: format!("{}. {label} {note}", index + 1),
+            report,
+            ok: true,
+        };
+    }
+
+    if let Some(check) = &step.wait_for {
+        match locator.check(check, context).await {
+            Ok(checked) => {
+                if !check.window.is_empty() {
+                    *context = check.window.clone();
+                }
+                if let Some(window) = &checked.window {
+                    *last_window = Some(window.clone());
+                    gate.confirm_window(window.clone());
+                }
+                report["wait_for"] = json!({
+                    "ok": true,
+                    "waited_ms": checked.waited.as_millis() as u64,
+                });
+                notes.push(format!(
+                    "waited {} ms for {}",
+                    checked.waited.as_millis(),
+                    check.describe()
+                ));
+            }
+            Err(miss) => {
+                if let Some(window) = &miss.window {
+                    *last_window = Some(window.clone());
+                }
+                return failure(
+                    index,
+                    label,
+                    Phase::WaitFor,
+                    miss.code,
+                    format!("{} did not hold: {}", check.describe(), miss.message),
+                    report,
+                );
+            }
+        }
+    }
+
+    if let Some(action) = step.action {
+        gate.invalidate_window();
+        let Action {
+            tool,
+            mut args,
+            window,
+            element,
+            find_timeout,
+        } = action;
+        if !window.is_empty() {
+            *context = window.clone();
+        }
+        let window_spec = if window.is_empty() {
+            context.clone()
+        } else {
+            window
+        };
+        if !element.is_empty() {
+            let element = ElementSpec {
+                action: Some(tool),
+                ..element
+            };
+            match locator.find(&window_spec, &element, find_timeout).await {
+                Ok(found) => {
+                    let object = args.as_object_mut().expect("object");
+                    object.insert("pid".into(), json!(found.window.pid));
+                    object.insert("window_id".into(), json!(found.window.window_id));
+                    object.insert(
+                        "element_token".into(),
+                        json!(found.token().unwrap_or_default()),
+                    );
+                    report["target"] = json!({
+                        "window": found.window.to_json(),
+                        "element": found.describe(),
+                    });
+                    notes.push(format!(
+                        "on {} in {}",
+                        found.describe(),
+                        found.window.describe()
+                    ));
+                    gate.confirm_window(found.window.clone());
+                    *last_window = Some(found.window);
+                }
+                Err(miss) => {
+                    if let Some(window) = &miss.window {
+                        *last_window = Some(window.clone());
+                    }
+                    return failure(index, label, Phase::Find, miss.code, miss.message, report);
+                }
+            }
+        } else if needs_lookup(&window_spec, &args, tool, registry) {
+            match locator.window(&window_spec).await {
+                Ok(resolved) => {
+                    let object = args.as_object_mut().expect("object");
+                    object.insert("pid".into(), json!(resolved.pid));
+                    let basis_routes_window =
+                        matches!(tool, "click" | "double_click" | "right_click")
+                            && accepts(registry, tool, "snapshot_id")
+                            && object.get("snapshot_id").is_some_and(Value::is_string)
+                            && window_spec.window_id.is_none()
+                            && window_spec.title.is_none();
+                    if basis_routes_window {
+                        report["target"] = json!({ "pid": resolved.pid });
+                    } else {
+                        if accepts(registry, tool, "window_id") {
+                            object
+                                .entry("window_id")
+                                .or_insert_with(|| json!(resolved.window_id));
+                        }
+                        report["target"] = json!({ "window": resolved.to_json() });
+                        gate.confirm_window(resolved.clone());
+                        *last_window = Some(resolved);
+                    }
+                }
+                Err(miss) => {
+                    return failure(index, label, Phase::Find, miss.code, miss.message, report)
+                }
+            }
+        } else if let (Some(pid), Some(window_id)) = (
+            args.get("pid").and_then(Value::as_i64),
+            args.get("window_id").and_then(Value::as_u64),
+        ) {
+            let window = Window {
+                pid,
+                window_id,
+                app: None,
+                title: None,
+                on_screen: true,
+            };
+            *last_window = Some(window.clone());
+            gate.confirm_window(window);
+        }
+
+        // A wait_for or lookup earlier in this step that the batch scope
+        // refused proves nothing (a refused read is not "gone"): never send
+        // the action on it.
+        if let Some(code) = locator.scope_refusal() {
+            return failure(
+                index,
+                label,
+                Phase::Find,
+                code,
+                "a read this step needed was refused by the batch scope; the action was not sent"
+                    .to_owned(),
+                report,
+            );
+        }
+        let Some(mut result) = dispatch_action(registry, &gate, tool, args.clone()).await else {
+            return failure(
+                index,
+                label,
+                Phase::Budget,
+                "step_timeout",
+                "step execution budget closed before action admission".to_owned(),
+                report,
+            );
+        };
+        let mut refound_note = None;
+        // The menu-bar reroute can focus or raise a window, so a batch whose
+        // app scope allows background delivery only keeps the click's own
+        // error instead.
+        let background_scope = crate::batch_scope::current()
+            .is_some_and(|scope| scope.delivery() == crate::batch_scope::ScopeDelivery::Background);
+        if result.is_error == Some(true) && tool == "click" && !background_scope {
+            if let Some((menu_args, note)) = menu_bar_route(&args, &result) {
+                report["refound"] = json!(note);
+                let Some(next) = dispatch_action(registry, &gate, "invoke_menu", menu_args).await
+                else {
+                    return failure(
+                        index,
+                        label,
+                        Phase::Budget,
+                        "step_timeout",
+                        "step execution budget closed before menu admission".to_owned(),
+                        report,
+                    );
+                };
+                result = next;
+                refound_note = Some(note);
+            }
+        }
+        if result.is_error == Some(true) && refound_note.is_none() {
+            if let Some((retry, note)) = refind_stale_target(locator, &args, &result).await {
+                report["refound"] = json!(note);
+                let Some(next) = dispatch_action(registry, &gate, tool, retry).await else {
+                    return failure(
+                        index,
+                        label,
+                        Phase::Budget,
+                        "step_timeout",
+                        "step execution budget closed before stale-target retry".to_owned(),
+                        report,
+                    );
+                };
+                result = next;
+                refound_note = Some(note);
+            }
+        }
+        let wants_foreground = result.is_error == Some(true)
+            && wants_foreground(&result)
+            && args.get("delivery_mode").is_none()
+            && accepts(registry, tool, "delivery_mode");
+        let mut foreground_hint = None;
+        if wants_foreground && foreground_fallback {
+            let mut retry = args.clone();
+            retry["delivery_mode"] = json!("foreground");
+            let Some(next) = dispatch_action(registry, &gate, tool, retry).await else {
+                return failure(
+                    index,
+                    label,
+                    Phase::Budget,
+                    "step_timeout",
+                    "step execution budget closed before foreground retry".to_owned(),
+                    report,
+                );
+            };
+            result = next;
+            notes.push("background delivery was refused, so it ran in the foreground".to_owned());
+            report["delivery_fallback"] = json!("foreground");
+        } else if wants_foreground {
+            foreground_hint = Some(format!(
+                " To run it, send the batch again from step {} with \"delivery_mode\":\"foreground\" \
+                 on this step, or set \"foreground_fallback\":true on run_steps (the window is \
+                 activated and the pointer may move).",
+                index + 1
+            ));
+        }
+        let ok = result.is_error != Some(true);
+        if gate.no_action_delivered() {
+            // This is derived from the registry's typed results, never a leaf's JSON.
+            report["delivery"] = json!("not_delivered");
+        }
+        let mut message = bounded_message(&result);
+        // The step reports the effect its action returned, as a direct call
+        // would (confirmed, unverifiable, refused, ...).
+        if let Some(effect) = result
+            .structured_content
+            .as_ref()
+            .and_then(|value| value.get("effect"))
+            .and_then(Value::as_str)
+        {
+            report["effect"] = json!(effect);
+        }
+        if let (false, Some(hint)) = (ok, &foreground_hint) {
+            message.push_str(hint);
+        }
+        if let (false, Some(note)) = (ok, &refound_note) {
+            message = format!("{note}, but: {message}");
+        }
+        if let (true, Some(note)) = (ok, refound_note) {
+            notes.push(note);
+        }
+        report["ok"] = json!(ok);
+        report["message"] = json!(message);
+        if !ok {
+            if let Some(code) = result
+                .structured_content
+                .as_ref()
+                .and_then(|value| value.get("code"))
+                .and_then(Value::as_str)
+            {
+                report["code"] = Value::String(code.to_owned());
+            }
+            // The step's own recovery hint and next call, so a failed batch
+            // says what to do next without a second tool call.
+            for key in ["hint", "next_call"] {
+                if let Some(value) = result
+                    .structured_content
+                    .as_ref()
+                    .and_then(|value| value.get(key))
+                {
+                    report[key] = value.clone();
+                }
+            }
+            return StepOutcome {
+                line: format!("{}. {label} ERROR (action): {message}", index + 1),
+                report: with_phase(report, Phase::Action),
+                ok: false,
+            };
+        }
+        if !message.is_empty() {
+            notes.insert(0, message);
+        }
+    }
+
+    let fallback = last_window
+        .as_ref()
+        .map(|window| WindowSpec {
+            pid: Some(window.pid),
+            window_id: Some(window.window_id),
+            ..Default::default()
+        })
+        .filter(|_| context.is_empty())
+        .unwrap_or_else(|| context.clone());
+    let mut checked = Vec::new();
+    for (nth, check) in step.expect.iter().enumerate() {
+        if !check.window.is_empty() || nth > 0 {
+            gate.invalidate_window();
+        }
+        match locator.check(check, &fallback).await {
+            Ok(outcome) => {
+                if let Some(window) = &outcome.window {
+                    if last_window.is_none() || step_has_no_action {
+                        *last_window = Some(window.clone());
+                        gate.confirm_window(window.clone());
+                    }
+                }
+                if !check.window.is_empty() && step_has_no_action {
+                    *context = check.window.clone();
+                }
+                checked.push(json!({
+                    "ok": true,
+                    "check": check.describe(),
+                    "observed": outcome.observed,
+                    "waited_ms": outcome.waited.as_millis() as u64,
+                }));
+            }
+            Err(miss) => {
+                if let Some(window) = &miss.window {
+                    *last_window = Some(window.clone());
+                }
+                report["expect"] = Value::Array(checked);
+                let which = if step.expect.len() > 1 {
+                    format!("expect {} of {}: ", nth + 1, step.expect.len())
+                } else {
+                    String::new()
+                };
+                return failure(
+                    index,
+                    label,
+                    Phase::Expect,
+                    miss.code,
+                    format!("{which}{}", miss.message),
+                    report,
+                );
+            }
+        }
+    }
+    if !checked.is_empty() {
+        notes.push(format!("{} check(s) held", checked.len()));
+        report["expect"] = Value::Array(checked);
+    }
+    report["ok"] = json!(true);
+    if report.get("message").is_none() {
+        report["message"] = json!(notes.join("; "));
+    }
+    let detail = notes.join("; ");
+    StepOutcome {
+        line: format!(
+            "{}. {label} ok{}",
+            index + 1,
+            if detail.is_empty() {
+                String::new()
+            } else {
+                format!(": {detail}")
+            }
+        ),
+        report,
+        ok: true,
+    }
+}
+
+async fn dispatch_action(
+    registry: &ToolRegistry,
+    gate: &StepGate,
+    tool: &str,
+    args: Value,
+) -> Option<ToolResult> {
+    if !gate.begin_dispatch() {
+        return None;
+    }
+    let result = registry.invoke(tool, args).await;
+    let not_delivered = result.proves_no_input();
+    gate.complete_dispatch(scope_refusal_code(&result), not_delivered);
+    Some(result)
+}
+
+fn failure(
+    index: usize,
+    label: &str,
+    phase: Phase,
+    code: &str,
+    message: String,
+    mut report: Value,
+) -> StepOutcome {
+    report["ok"] = json!(false);
+    report["code"] = json!(code);
+    report["message"] = json!(message);
+    StepOutcome {
+        line: format!(
+            "{}. {label} ERROR ({}): {message}",
+            index + 1,
+            phase.as_str()
+        ),
+        report: with_phase(report, phase),
+        ok: false,
+    }
+}
+
+fn with_phase(mut report: Value, phase: Phase) -> Value {
+    report["phase"] = json!(phase.as_str());
+    report
+}
+
+/// A step with a window by name, or one that relies on an inherited window
+/// and does not carry its own pid, needs a window lookup.
+fn needs_lookup(spec: &WindowSpec, args: &Value, tool: &str, registry: &ToolRegistry) -> bool {
+    if spec.app.is_some() || spec.title.is_some() {
+        return true;
+    }
+    let has_pid = args.get("pid").is_some();
+    !has_pid && !spec.is_empty() && accepts(registry, tool, "pid")
+}
+
+fn accepts(registry: &ToolRegistry, tool: &str, field: &str) -> bool {
+    registry
+        .get_def(tool)
+        .and_then(|def| def.input_schema.get("properties"))
+        .and_then(|properties| properties.get(field))
+        .is_some()
+}
+
+/// Fill the observation's window from the last window the batch used.
+fn fill_observed_window(args: &mut Value, last: Option<&Window>) -> bool {
+    let object = args.as_object_mut().expect("object");
+    if object.contains_key("pid") && object.contains_key("window_id") {
+        return true;
+    }
+    let Some(window) = last else {
+        return false;
+    };
+    object.entry("pid").or_insert_with(|| json!(window.pid));
+    object
+        .entry("window_id")
+        .or_insert_with(|| json!(window.window_id));
+    true
+}
+
+/// One line saying what the end-of-batch read found.
+fn observation_summary(state: &Value) -> String {
+    let status = state.get("since_status").and_then(Value::as_str);
+    let since = state.get("since").and_then(Value::as_str).unwrap_or("");
+    match status {
+        Some("diff") => {
+            let counts = &state["diff_counts"];
+            format!(
+                "changed since {since}: {} added, {} changed, {} removed",
+                counts["added"].as_u64().unwrap_or(0),
+                counts["changed"].as_u64().unwrap_or(0),
+                counts["removed"].as_u64().unwrap_or(0)
+            )
+        }
+        Some("no_change") => format!("no change since {since}"),
+        Some(_) => "full read (no usable earlier read of this window to diff against)".to_owned(),
+        None => String::new(),
+    }
+}
+
+/// A step that only reads (get_window_state, zoom, a "screenshot", ...), in
+/// either step form, as (read tool, its arguments). A read with its own
+/// wait_for/expect is left to `parse_step`.
+fn read_step(step: &Value) -> Option<(&'static str, Value)> {
+    let object = step.as_object()?;
+    if object.contains_key("wait_for") || object.contains_key("expect") {
+        return None;
+    }
+    let (name, args) = match object.get("tool") {
+        Some(tool) => (tool.as_str()?, object.get("args")),
+        None => {
+            let mut keys = object
+                .keys()
+                .filter(|key| !STEP_KEYS.contains(&key.as_str()));
+            let key = keys.next()?;
+            if keys.next().is_some() {
+                return None;
+            }
+            (key.as_str(), object.get(key.as_str()))
+        }
+    };
+    let tool = match OBSERVATION_TOOLS.iter().find(|tool| **tool == name) {
+        Some(tool) => *tool,
+        None if name.to_ascii_lowercase().contains("screenshot") => "screenshot",
+        None => return None,
+    };
+    let args = args
+        .cloned()
+        .filter(Value::is_object)
+        .unwrap_or_else(|| Value::Object(Map::new()));
+    Some((tool, args))
+}
+
+/// The batch-level `pid`/`window_id`/`app`/`window` steps inherit.
+fn batch_window(object: &Map<String, Value>) -> Result<WindowSpec, PlanError> {
+    let mut picked = Map::new();
+    for key in BATCH_WINDOW_KEYS {
+        if let Some(value) = object.get(*key) {
+            picked.insert((*key).to_owned(), value.clone());
+        }
+    }
+    let (window, _) = locate::take_selector(&mut picked).map_err(PlanError::batch)?;
+    // take_selector reads pid/window_id from what it leaves behind.
+    Ok(WindowSpec {
+        pid: object.get("pid").and_then(Value::as_i64),
+        window_id: object.get("window_id").and_then(Value::as_u64),
+        ..window
+    })
+}
+
+/// What to read after a failed step, and why.
+struct Recovery {
+    window: Window,
+    screenshot: bool,
+    why: String,
+}
+
+impl Recovery {
+    /// A failure that names where to look next: another window of the app
+    /// holds focus (read that dialog), or a pixel target in a window with no
+    /// screenshot yet (capture it, so the next pixel step has a frame).
+    fn after(report: &Value, last: Option<&Window>, worker_timed_out: bool) -> Option<Self> {
+        let message = report.get("message").and_then(Value::as_str)?;
+        let last = last?;
+        if let Some(holder) = focus_holder(message).filter(|id| *id != last.window_id) {
+            return Some(Self {
+                window: Window {
+                    pid: last.pid,
+                    window_id: holder,
+                    app: None,
+                    title: None,
+                    on_screen: true,
+                },
+                screenshot: false,
+                why: format!(
+                    "window {holder} of the same app holds focus; its state follows, act on window_id {holder}"
+                ),
+            });
+        }
+        let code = report.get("code").and_then(Value::as_str);
+        if worker_timed_out
+            && matches!(
+                code,
+                Some("step_timeout" | "time_budget" | "step_join_failed")
+            )
+        {
+            return Some(Self {
+                window: last.clone(),
+                screenshot: false,
+                why: format!(
+                    "step ended without a final action outcome; window {} is a point-in-time read, not proof the action completed",
+                    last.window_id
+                ),
+            });
+        }
+        if code == Some("screenshot_context_missing") || message.starts_with("No screenshot") {
+            return Some(Self {
+                window: last.clone(),
+                screenshot: true,
+                why: format!(
+                    "window {} had no screenshot; one follows, take x,y from it",
+                    last.window_id
+                ),
+            });
+        }
+        None
+    }
+}
+
+/// The window id in "window_id N \"…\" of the same app holds focus".
+fn focus_holder(message: &str) -> Option<u64> {
+    let end = message.find("of the same app holds focus")?;
+    let start = message[..end].rfind("window_id ")? + "window_id ".len();
+    let digits: String = message[start..]
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect();
+    digits.parse().ok()
+}
+
+/// Most text characters a failed batch returns. MCP clients cut long error
+/// results to their first line or so (Claude Code keeps ~100 characters of
+/// an error over ~4 000), which hid why a step failed behind the read that
+/// followed it. The step report goes first and whole; the read is trimmed.
+const ERROR_TEXT_BUDGET: usize = 3_500;
+
+/// Keep the text of a failed batch within `budget` characters: the first
+/// part (the step report) up to the budget, then later text parts trimmed
+/// to what is left, with a note. Images are kept.
+fn fit_error_text(content: &mut Vec<Content>, budget: usize) {
+    let mut left = budget;
+    let mut trimmed = false;
+    for part in content.iter_mut() {
+        let Content::Text { text, .. } = part else {
+            continue;
+        };
+        let length = text.chars().count();
+        if length <= left {
+            left -= length;
+            continue;
+        }
+        let keep: String = text.chars().take(left).collect();
+        *text = keep;
+        left = 0;
+        trimmed = true;
+    }
+    content.retain(|part| !matches!(part, Content::Text { text, .. } if text.is_empty()));
+    if trimmed {
+        content.push(Content::text(
+            "[the rest of this read was cut so the step report stays readable; call \
+             get_window_state for the full window]",
+        ));
+    }
+}
+
+/// Whether a refusal names foreground delivery as the route that works:
+/// the target ignores background input (Electron, LibreOffice VCL, ...).
+fn wants_foreground(result: &ToolResult) -> bool {
+    let structured = result.structured_content.as_ref();
+    let recommended = structured
+        .and_then(|value| {
+            value
+                .pointer("/escalation/recommended")
+                .or_else(|| value.pointer("/refusal/escalation/recommended"))
+        })
+        .and_then(Value::as_str);
+    if recommended == Some("foreground") {
+        return true;
+    }
+    let text = result
+        .content
+        .iter()
+        .find_map(|content| match content {
+            Content::Text { text, .. } => Some(text.as_str()),
+            _ => None,
+        })
+        .unwrap_or("");
+    text.contains("Retry this action with delivery_mode:\"foreground\"")
+        || text.contains("Retry with delivery_mode:\"foreground\"")
+}
+
+/// Whether an action failed because its element target died: the element
+/// was re-rendered or its snapshot was replaced.
+fn stale_element(result: &ToolResult) -> bool {
+    let code = result.structured_content.as_ref().and_then(|value| {
+        value
+            .get("code")
+            .or_else(|| value.pointer("/refusal/code"))
+            .and_then(Value::as_str)
+    });
+    if matches!(
+        code,
+        Some("element_outside_target_window" | "stale_element_token")
+    ) {
+        return true;
+    }
+    let message = bounded_message(result);
+    [
+        "element_outside_target_window",
+        "element_token is stale",
+        "-25202",
+    ]
+    .iter()
+    .any(|needle| message.contains(needle))
+}
+
+/// Act again on a target whose element token went stale: find the element
+/// with the same role and label (exact, and unique) in the same window, and
+/// return the arguments with its fresh token plus a note saying so.
+async fn refind_stale_target(
+    locator: &Locator<'_>,
+    args: &Value,
+    result: &ToolResult,
+) -> Option<(Value, String)> {
+    if !stale_element(result) {
+        return None;
+    }
+    let token = args.get("element_token").and_then(Value::as_str)?;
+    let (snapshot_id, row) = token.split_once(':')?;
+    let row: u64 = row.parse().ok()?;
+    let stored = crate::window_state_view::snapshot_row(snapshot_id, row)?;
+    let (role, label) = row_role_and_label(&stored.line)?;
+    let window = WindowSpec {
+        pid: Some(
+            args.get("pid")
+                .and_then(Value::as_i64)
+                .unwrap_or(stored.pid),
+        ),
+        window_id: Some(
+            args.get("window_id")
+                .and_then(Value::as_u64)
+                .unwrap_or(stored.window_id),
+        ),
+        ..Default::default()
+    };
+    let element = ElementSpec {
+        role: Some(role.clone()),
+        name: Some(label.clone()),
+        ..Default::default()
+    };
+    let found = locator.find(&window, &element, REFIND_TIMEOUT).await.ok()?;
+    let same_label = found
+        .element
+        .get("label")
+        .and_then(Value::as_str)
+        .is_some_and(|found| found.trim().to_lowercase() == label.trim().to_lowercase());
+    if !same_label {
+        return None;
+    }
+    let fresh = found.token()?.to_owned();
+    let mut retry = args.clone();
+    let object = retry.as_object_mut()?;
+    object.insert("element_token".into(), json!(fresh));
+    object.remove("element_index");
+    Some((
+        retry,
+        format!(
+            "element {token} went stale (the window changed); acted on the same {role} \"{label}\", found again as {}",
+            found.describe()
+        ),
+    ))
+}
+
+/// A click on a menu-bar item addressed by token is refused as outside the
+/// window: menu-bar menus are the app's, not the window's. Send it as
+/// invoke_menu with the path read off the item's ancestors instead.
+fn menu_bar_route(args: &Value, result: &ToolResult) -> Option<(Value, String)> {
+    if !stale_element(result) {
+        return None;
+    }
+    let token = args.get("element_token").and_then(Value::as_str)?;
+    let (snapshot_id, row) = token.split_once(':')?;
+    let row: u64 = row.parse().ok()?;
+    let path = crate::window_state_view::snapshot_menu_path(snapshot_id, row)?;
+    let stored = crate::window_state_view::snapshot_row(snapshot_id, row)?;
+    let pid = args
+        .get("pid")
+        .and_then(Value::as_i64)
+        .unwrap_or(stored.pid);
+    let window_id = args
+        .get("window_id")
+        .and_then(Value::as_u64)
+        .unwrap_or(stored.window_id);
+    let mut menu_args = json!({ "pid": pid, "window_id": window_id, "path": path });
+    if let Some(session) = args.get("session") {
+        menu_args["session"] = session.clone();
+    }
+    let note = format!(
+        "{token} is a menu-bar item, so it ran as invoke_menu {}",
+        path.join(" > ")
+    );
+    Some((menu_args, note))
+}
+
+/// Role and label of one tree row: `[14] AXButton "Save"` or
+/// `[17] AXButton (Delete draft)`. None for a row without a label.
+fn row_role_and_label(line: &str) -> Option<(String, String)> {
+    let rest = line.trim().strip_prefix("- ")?.trim_start();
+    let rest = rest.strip_prefix('[')?;
+    let (_, rest) = rest.split_once(']')?;
+    let rest = rest.trim_start();
+    let role_end = rest.find(char::is_whitespace)?;
+    let role = rest[..role_end].to_owned();
+    let rest = rest[role_end..].trim_start();
+    let label = if let Some(quoted) = rest.strip_prefix('"') {
+        quoted[..quoted.find('"')?].to_owned()
+    } else {
+        let inner = rest.strip_prefix('(')?;
+        let mut depth = 1usize;
+        let mut end = None;
+        for (at, c) in inner.char_indices() {
+            match c {
+                '(' => depth += 1,
+                ')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = Some(at);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        inner[..end?].to_owned()
+    };
+    (!label.trim().is_empty()).then_some((role, label))
+}
+
+fn parse_step(
+    registry: &ToolRegistry,
+    index: usize,
+    raw: &Value,
+    session: Option<&str>,
+    inherits_window: bool,
+) -> Result<Step, PlanError> {
+    let object = raw.as_object().ok_or_else(|| {
+        PlanError::step(index, "must be an object: {tool, args} or {<tool>: args}")
+    })?;
+    // The action: `{tool, args}`, or the shorthand `{<tool>: args}`.
+    // An extra field that is empty (`"args2": {}`, `null`) says nothing; a
+    // step is only refused for fields that carry something.
+    let shorthand: Vec<&String> = object
+        .iter()
+        .filter(|(key, _)| !STEP_KEYS.contains(&key.as_str()))
+        .filter(|(_, value)| match value {
+            Value::Null => false,
+            Value::Object(fields) => !fields.is_empty() || object.get("tool").is_none(),
+            _ => true,
+        })
+        .map(|(key, _)| key)
+        .collect();
+    let (name, raw_args) = match (object.get("tool"), shorthand.as_slice()) {
+        (Some(_), [extra, ..]) => {
+            return Err(PlanError::step(
+                index,
+                format!("unknown field `{extra}`; a step has `tool` and `args`, or one `{{<tool>: args}}` key, plus optional wait_for/expect/timeout_ms"),
+            ))
+        }
+        (Some(tool), []) => (
+            Some(
+                tool.as_str()
+                    .ok_or_else(|| PlanError::step(index, "`tool` must be a string"))?,
+            ),
+            object.get("args"),
+        ),
+        (None, [key]) => {
+            if object.contains_key("args") {
+                return Err(PlanError::step(
+                    index,
+                    format!("`{key}` already carries the arguments; drop `args`"),
+                ));
+            }
+            (Some(key.as_str()), object.get(key.as_str()))
+        }
+        (None, []) => {
+            if object.contains_key("args") {
+                return Err(PlanError::step(index, "`args` without `tool`"));
+            }
+            (None, None)
+        }
+        (None, keys) => {
+            return Err(PlanError::step(
+                index,
+                format!(
+                    "one action per step, got {}",
+                    keys.iter()
+                        .map(|key| format!("`{key}`"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+            ))
+        }
+    };
+
+    let find_timeout = match object.get("timeout_ms") {
+        None | Some(Value::Null) => locate::DEFAULT_FIND_TIMEOUT_MS,
+        Some(value) => value
+            .as_u64()
+            .filter(|ms| *ms <= locate::MAX_CHECK_TIMEOUT_MS)
+            .ok_or_else(|| {
+                PlanError::step(
+                    index,
+                    format!(
+                        "`timeout_ms` must be an integer 0 to {}",
+                        locate::MAX_CHECK_TIMEOUT_MS
+                    ),
+                )
+            })?,
+    };
+    let wait_for = match object.get("wait_for") {
+        None | Some(Value::Null) => None,
+        Some(raw) => Some(
+            Check::parse(raw, locate::DEFAULT_WAIT_TIMEOUT_MS)
+                .map_err(|message| PlanError::step(index, format!("wait_for: {message}")))?,
+        ),
+    };
+    let expect = match object.get("expect") {
+        None | Some(Value::Null) => Vec::new(),
+        Some(Value::Array(items)) if items.is_empty() || items.len() > MAX_EXPECTS => {
+            return Err(PlanError::step(
+                index,
+                format!("`expect` must hold 1 to {MAX_EXPECTS} checks"),
+            ))
+        }
+        Some(Value::Array(items)) => items
+            .iter()
+            .enumerate()
+            .map(|(nth, raw)| {
+                Check::parse(raw, locate::DEFAULT_EXPECT_TIMEOUT_MS).map_err(|message| {
+                    PlanError::step(index, format!("expect {}: {message}", nth + 1))
+                })
+            })
+            .collect::<Result<_, _>>()?,
+        Some(raw) => vec![Check::parse(raw, locate::DEFAULT_EXPECT_TIMEOUT_MS)
+            .map_err(|message| PlanError::step(index, format!("expect: {message}")))?],
+    };
+
+    let action = match name {
+        None => {
+            if wait_for.is_none() && expect.is_empty() {
+                return Err(PlanError::step(
+                    index,
+                    "empty step: give an action ({tool, args} or {<tool>: args}) or a wait_for/expect check",
+                ));
+            }
+            None
+        }
+        Some(name) => Some(parse_action(
+            registry,
+            index,
+            name,
+            raw_args,
+            find_timeout,
+            session,
+            inherits_window,
+        )?),
+    };
+    Ok(Step {
+        action,
+        wait_for,
+        expect,
+        skipped_read: None,
+    })
+}
+
+fn parse_action(
+    registry: &ToolRegistry,
+    index: usize,
+    name: &str,
+    raw_args: Option<&Value>,
+    find_timeout: u64,
+    session: Option<&str>,
+    inherits_window: bool,
+) -> Result<Action, PlanError> {
+    let mut args = match raw_args {
+        None | Some(Value::Null) => Value::Object(Map::new()),
+        Some(value @ Value::Object(_)) => value.clone(),
+        Some(_) => return Err(PlanError::step(index, "`args` must be an object")),
+    };
+    // "press" with a target and no key is an AX press of that element.
+    let pressed_element = name == "press"
+        && args.get("key").is_none()
+        && [
+            "element_token",
+            "element_index",
+            "role",
+            "name",
+            "label",
+            "x",
+        ]
+        .iter()
+        .any(|key| args.get(*key).is_some());
+    let name = if pressed_element {
+        "click"
+    } else {
+        TOOL_ALIASES
+            .iter()
+            .find(|(alias, _)| *alias == name)
+            .map_or(name, |(_, tool)| *tool)
+    };
+    let name = rewrite_step(name, &mut args);
+    let tool = BATCHABLE_TOOLS
+        .iter()
+        .copied()
+        .find(|candidate| *candidate == name)
+        .ok_or_else(|| {
+            let message = if OBSERVATION_TOOLS.contains(&name) {
+                format!(
+                    "`{name}` reads state and a batch only acts. Put get_window_state arguments \
+                     in `observe` (one read after the last step; a get_window_state as the \
+                     last step is taken as `observe`), or use a wait_for/expect check, or split \
+                     the batch where you need to look. Batchable tools: {}",
+                    BATCHABLE_TOOLS.join(", ")
+                )
+            } else {
+                format!(
+                    "`{name}` cannot run in a batch; allowed tools: {}",
+                    BATCHABLE_TOOLS.join(", ")
+                )
+            };
+            PlanError::step(index, message)
+        })?;
+    if let Some(schema) = registry.get_def(tool).map(|def| def.input_schema.clone()) {
+        crate::tool::coerce_string_scalars(&schema, &mut args);
+    }
+    prepare_args(&mut args, session).map_err(|message| PlanError::step(index, message))?;
+    let (window, element) = locate::take_selector(args.as_object_mut().expect("object"))
+        .map_err(|message| PlanError::step(index, format!("{tool}: {message}")))?;
+    crate::tool::normalize_argument_aliases(tool, &mut args)
+        .map_err(|message| PlanError::step(index, format!("{tool}: {message}")))?;
+    if !element.is_empty() {
+        if tool == "drag" {
+            return Err(PlanError::step(
+                index,
+                "drag takes coordinates; it cannot target an element by name",
+            ));
+        }
+        if let Some(conflict) = ["element_token", "element_index", "x", "y"]
+            .iter()
+            .find(|key| args.get(**key).is_some())
+        {
+            return Err(PlanError::step(
+                index,
+                format!("{tool}: target by role/name OR by `{conflict}`, not both"),
+            ));
+        }
+    }
+    // Check the arguments now, with stand-ins for what the lookup fills.
+    let mut probe = args.clone();
+    if let Some(object) = probe.as_object_mut() {
+        let needs_window = !element.is_empty() || window.app.is_some() || window.title.is_some();
+        // A step that names no window takes the one an earlier step (or the
+        // batch) named; the run fills it in.
+        let inherits = inherits_window && window.is_empty() && accepts(registry, tool, "pid");
+        if needs_window || inherits {
+            object.entry("pid").or_insert(json!(1));
+            if accepts(registry, tool, "window_id") {
+                object.entry("window_id").or_insert(json!(1));
+            }
+        }
+        if !element.is_empty() {
+            object.insert("element_token".into(), json!("s00000001:1"));
+        }
+    }
+    validate_against_schema(registry, tool, &probe)
+        .map_err(|message| PlanError::step(index, format!("{tool}: {message}")))?;
+    Ok(Action {
+        tool,
+        args,
+        window,
+        element,
+        find_timeout: Duration::from_millis(find_timeout),
+    })
+}
+
+fn parse_observe(
+    registry: &ToolRegistry,
+    value: &Value,
+    has_window: bool,
+    session: Option<&str>,
+) -> Result<Value, PlanError> {
+    let mut args = match value {
+        Value::Bool(true) => Value::Object(Map::new()),
+        Value::Object(object) => Value::Object(object.clone()),
+        _ => {
+            return Err(PlanError::batch(
+                "`observe` must be true or an object of get_window_state arguments",
+            ))
+        }
+    };
+    if let Some(def) = registry.get_def(OBSERVE_TOOL) {
+        crate::tool::coerce_string_scalars(&def.input_schema, &mut args);
+    }
+    prepare_args(&mut args, session)
+        .map_err(|message| PlanError::batch(format!("observe: {message}")))?;
+    let object = args.as_object_mut().expect("object");
+    // The window comes from the last window the batch used, so the common
+    // "act, then look at the same window" case needs no repetition.
+    let explicit = object.contains_key("pid") && object.contains_key("window_id");
+    if !explicit && !has_window {
+        return Err(PlanError::batch(
+            "observe: `pid` and `window_id` are required (no step names a window to inherit from)",
+        ));
+    }
+    object
+        .entry("include_screenshot")
+        .or_insert(Value::Bool(false));
+    object
+        .entry("max_elements")
+        .or_insert_with(|| json!(DEFAULT_OBSERVE_MAX_ELEMENTS));
+    // Diff against the caller's last read of the window unless it asked for
+    // a full read (`since:null` or `full_output:true`).
+    let full_output = object.get("full_output").and_then(Value::as_bool) == Some(true);
+    match object.get("since") {
+        Some(Value::Null) => {
+            object.remove("since");
+        }
+        None if !full_output => {
+            object.insert(
+                "since".to_owned(),
+                json!(crate::window_state_view::SINCE_LATEST),
+            );
+        }
+        _ => {}
+    }
+    let mut probe = args.clone();
+    if let Some(object) = probe.as_object_mut() {
+        object.entry("pid").or_insert(json!(1));
+        object.entry("window_id").or_insert(json!(1));
+    }
+    validate_against_schema(registry, OBSERVE_TOOL, &probe)
+        .map_err(|message| PlanError::batch(format!("observe: {message}")))?;
+    Ok(args)
+}
+
+/// Rewrite step shapes models send into the batchable tool they mean:
+/// `triple_click` is a click with count 3, a key name used as the tool
+/// (`{"tool": "down"}`) is a press_key of it, a one-key hotkey is a
+/// press_key, and a press_key of a printable symbol ("asterisk", "*") types
+/// it, since most symbols need shift and are text rather than keys.
+fn rewrite_step<'a>(name: &'a str, args: &mut Value) -> &'a str {
+    let Some(object) = args.as_object_mut() else {
+        return name;
+    };
+    let lower = name.to_ascii_lowercase();
+    if lower == "triple_click" {
+        object.entry("count").or_insert(json!(3));
+        return "click";
+    }
+    if let Some(key) = KEY_TOOL_NAMES.iter().find(|key| **key == lower) {
+        object.entry("key").or_insert(json!(key));
+        return "press_key";
+    }
+    let mut name = name;
+    if name == "hotkey" {
+        let single = match object.get("keys") {
+            Some(Value::Array(keys)) if keys.len() == 1 => keys[0].as_str().map(str::to_owned),
+            Some(Value::String(key)) if !key.contains('+') => Some(key.clone()),
+            _ => None,
+        };
+        if let Some(key) = single {
+            object.remove("keys");
+            object.insert("key".into(), json!(key));
+            name = "press_key";
+        }
+    }
+    if name == "press_key" {
+        let no_modifiers = object
+            .get("modifiers")
+            .and_then(Value::as_array)
+            .is_none_or(|modifiers| modifiers.is_empty());
+        let text = object.get("key").and_then(Value::as_str).and_then(|key| {
+            let key = key.trim();
+            let folded = key.to_ascii_lowercase().replace(['_', '-', ' '], "");
+            SYMBOL_KEY_NAMES
+                .iter()
+                .find(|(symbol, _)| *symbol == folded)
+                .map(|(_, text)| (*text).to_owned())
+                .or_else(|| {
+                    let mut chars = key.chars();
+                    match (chars.next(), chars.next()) {
+                        (Some(c), None) if SHIFTED_SYMBOLS.contains(c) => Some(c.to_string()),
+                        _ => None,
+                    }
+                })
+        });
+        if let (true, Some(text)) = (no_modifiers, text) {
+            object.remove("key");
+            object.remove("modifiers");
+            object.insert("text".into(), json!(text));
+            return "type_text";
+        }
+    }
+    name
+}
+
+/// Reject runtime-private fields and pin the step to the batch's session.
+fn prepare_args(args: &mut Value, session: Option<&str>) -> Result<(), String> {
+    let object = args.as_object_mut().expect("object");
+    if let Some(key) = object.keys().find(|key| key.starts_with('_')) {
+        return Err(format!("`{key}` is reserved and cannot be set"));
+    }
+    let own = object
+        .get("session")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty());
+    match (own, session) {
+        (Some(own), Some(batch)) if own != batch => Err(format!(
+            "session `{own}` differs from the batch's session `{batch}`; a batch runs in one session"
+        )),
+        (Some(own), None) if own != "default" => Err(format!(
+            "session `{own}` differs from the batch's session; set `session` on run_steps itself"
+        )),
+        (_, Some(batch)) => {
+            object.insert("session".to_owned(), Value::String(batch.to_owned()));
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
+fn validate_against_schema(
+    registry: &ToolRegistry,
+    tool: &str,
+    args: &Value,
+) -> Result<(), String> {
+    let def = registry
+        .get_def(tool)
+        .ok_or_else(|| format!("tool `{tool}` is not available on this platform"))?;
+    let schema = crate::tool::advertised_runtime_input_schema(&def.name, &def.input_schema);
+    let validator = jsonschema::validator_for(&schema)
+        .map_err(|error| format!("input schema is unusable: {error}"))?;
+    validator.validate(args).map_err(|error| {
+        let path = error.instance_path().to_string();
+        if path.is_empty() {
+            format!("invalid arguments: {error}")
+        } else {
+            format!("invalid arguments at {path}: {error}")
+        }
+    })
+}
+
+fn bounded_message(result: &ToolResult) -> String {
+    let text = result
+        .content
+        .iter()
+        .find_map(|content| match content {
+            Content::Text { text, .. } => Some(text.trim()),
+            _ => None,
+        })
+        .unwrap_or("");
+    let first_line = text.lines().next().unwrap_or("");
+    let mut message: String = first_line.chars().take(MESSAGE_LIMIT).collect();
+    if first_line.chars().count() > MESSAGE_LIMIT {
+        message.push_str("...");
+    }
+    message
+}
+
+#[cfg(test)]
+mod tests;
+
+#[cfg(test)]
+mod flow_tests;
+
+#[cfg(test)]
+mod timeout_tests {
+    use super::*;
+    use std::sync::Arc;
+
+    struct HangingTool {
+        def: ToolDef,
+        started: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+        finished: Arc<std::sync::atomic::AtomicBool>,
+        concurrency: Arc<tokio::sync::Semaphore>,
+    }
+
+    #[async_trait]
+    impl Tool for HangingTool {
+        fn def(&self) -> &ToolDef {
+            &self.def
+        }
+
+        async fn invoke(&self, _args: Value) -> ToolResult {
+            if self.finished.load(std::sync::atomic::Ordering::SeqCst) {
+                return ToolResult::text("finished");
+            }
+            let Ok(_permit) = self.concurrency.try_acquire() else {
+                return ToolResult::error("input_busy")
+                    .with_structured(json!({"code":"input_busy","effect":"refused"}));
+            };
+            self.started.notify_one();
+            self.release.notified().await;
+            self.finished
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            ToolResult::text("finished")
+        }
+    }
+
+    struct BlockingHangingTool {
+        def: ToolDef,
+        started: Arc<tokio::sync::Notify>,
+        release: Arc<(Mutex<bool>, std::sync::Condvar)>,
+        finished: Arc<std::sync::atomic::AtomicBool>,
+        concurrency: Arc<tokio::sync::Semaphore>,
+    }
+
+    #[async_trait]
+    impl Tool for BlockingHangingTool {
+        fn def(&self) -> &ToolDef {
+            &self.def
+        }
+
+        async fn invoke(&self, _args: Value) -> ToolResult {
+            if self.finished.load(std::sync::atomic::Ordering::SeqCst) {
+                return ToolResult::text("finished");
+            }
+            let Ok(_permit) = self.concurrency.try_acquire() else {
+                return ToolResult::error("input_busy")
+                    .with_structured(json!({"code":"input_busy","effect":"refused"}));
+            };
+            self.started.notify_one();
+            let release = self.release.clone();
+            tokio::task::spawn_blocking(move || {
+                let (lock, condvar) = release.as_ref();
+                let mut released = lock.lock().unwrap_or_else(|error| error.into_inner());
+                while !*released {
+                    released = condvar
+                        .wait(released)
+                        .unwrap_or_else(|error| error.into_inner());
+                }
+            })
+            .await
+            .expect("blocking fixture");
+            self.finished
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            ToolResult::text("finished")
+        }
+    }
+
+    fn tool_def(name: &str) -> ToolDef {
+        ToolDef {
+            name: name.into(),
+            description: "timeout fixture".into(),
+            input_schema: json!({
+                "type":"object",
+                "properties":{
+                    "pid":{"type":"integer"},
+                    "window_id":{"type":"integer"},
+                    "delivery_mode":{"type":"string"}
+                }
+            }),
+            read_only: false,
+            destructive: false,
+            idempotent: false,
+            open_world: false,
+        }
+    }
+
+    struct ProbeTool {
+        def: ToolDef,
+        calls: Arc<Mutex<Vec<Value>>>,
+        response: Arc<dyn Fn() -> ToolResult + Send + Sync>,
+    }
+
+    #[async_trait]
+    impl Tool for ProbeTool {
+        fn def(&self) -> &ToolDef {
+            &self.def
+        }
+
+        async fn invoke(&self, args: Value) -> ToolResult {
+            self.calls.lock().unwrap().push(args);
+            (self.response)()
+        }
+    }
+
+    fn register_probe(
+        registry: &mut ToolRegistry,
+        name: &str,
+        response: impl Fn() -> ToolResult + Send + Sync + 'static,
+    ) -> Arc<Mutex<Vec<Value>>> {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        registry.register(Box::new(ProbeTool {
+            def: tool_def(name),
+            calls: calls.clone(),
+            response: Arc::new(response),
+        }));
+        calls
+    }
+
+    #[tokio::test]
+    async fn aggregate_disposition_dominates_leaf_refusal_code() {
+        let mut registry = ToolRegistry::new();
+        register_probe(&mut registry, "click", || ToolResult::text("clicked"));
+        register_probe(&mut registry, "type_text", || {
+            ToolResult::error("denied")
+                .with_structured(json!({"code":"permission_denied", "effect":"refused"}))
+        });
+        let registry = Arc::new(registry);
+        let plan = Plan::parse(
+            &registry,
+            &json!({"steps":[
+                {"tool":"click", "args":{"pid":425020,"window_id":7}},
+                {"tool":"type_text", "args":{"pid":425020,"window_id":7}}
+            ]}),
+        )
+        .unwrap_or_else(|error| panic!("invalid plan: {}", error.message));
+        let result = plan.run(registry, None).await;
+        assert_eq!(result.is_error, Some(true));
+        assert_eq!(
+            result.structured_content.as_ref().unwrap()["code"],
+            "permission_denied"
+        );
+        assert_eq!(
+            result.disposition,
+            Some(cua_driver_contract::ErrorDisposition::DELIVERED)
+        );
+    }
+
+    #[tokio::test]
+    async fn rejected_batch_has_no_dispatched_action() {
+        let registry = ToolRegistry::new();
+        let error = Plan::parse(&registry, &json!({"steps":[]}))
+            .err()
+            .expect("empty batch rejected");
+        assert_eq!(
+            error.into_result().disposition,
+            Some(cua_driver_contract::ErrorDisposition::NOT_DELIVERED)
+        );
+    }
+
+    struct WindowReadTool {
+        def: ToolDef,
+        pid: i64,
+        calls: Arc<Mutex<Vec<Value>>>,
+        started: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+        block: bool,
+    }
+
+    #[async_trait]
+    impl Tool for WindowReadTool {
+        fn def(&self) -> &ToolDef {
+            &self.def
+        }
+
+        async fn invoke(&self, args: Value) -> ToolResult {
+            self.calls.lock().unwrap().push(args.clone());
+            let window_id = args.get("window_id").and_then(Value::as_u64).unwrap_or(7);
+            self.started.notify_one();
+            if self.block && window_id != 22 {
+                self.release.notified().await;
+            }
+            let value = if window_id == 22 { "702" } else { "wrong" };
+            ToolResult::text("window").with_structured(json!({
+                "pid": self.pid,
+                "window_id": window_id,
+                "snapshot_id": "s00000001",
+                "elements": [{
+                    "element_index": 1,
+                    "element_token": "s00000001:1",
+                    "role": "AXStaticText",
+                    "depth": 1,
+                    "label": "Result",
+                    "value": value,
+                    "frame": {"x":0,"y":0,"w":10,"h":10}
+                }],
+                "tree_markdown": format!("- AXStaticText \"Result\" = \"{value}\"")
+            }))
+        }
+    }
+
+    struct PanicTool {
+        def: ToolDef,
+    }
+
+    struct RefusalTool {
+        def: ToolDef,
+        calls: Arc<Mutex<Vec<Value>>>,
+        started: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+        response: Arc<dyn Fn() -> ToolResult + Send + Sync>,
+    }
+
+    #[async_trait]
+    impl Tool for RefusalTool {
+        fn def(&self) -> &ToolDef {
+            &self.def
+        }
+
+        async fn invoke(&self, args: Value) -> ToolResult {
+            self.calls.lock().unwrap().push(args);
+            self.started.notify_one();
+            self.release.notified().await;
+            (self.response)()
+        }
+    }
+
+    struct EvidenceTool {
+        def: ToolDef,
+        calls: Arc<Mutex<Vec<(bool, crate::agent_cursor::InputOrigin)>>>,
+    }
+
+    #[async_trait]
+    impl Tool for EvidenceTool {
+        fn def(&self) -> &ToolDef {
+            &self.def
+        }
+
+        async fn invoke(&self, args: Value) -> ToolResult {
+            let native = args
+                .get(crate::snapshot_store::NATIVE_WINDOW_PIXELS_ARG)
+                .is_some();
+            let key = ["session", "_session_id", "cursor_id"]
+                .into_iter()
+                .find_map(|key| args.get(key).and_then(Value::as_str))
+                .unwrap_or("evidence");
+            let origin = crate::agent_cursor::input_origin(key);
+            self.calls.lock().unwrap().push((native, origin));
+            ToolResult::text("evidence")
+        }
+    }
+
+    #[async_trait]
+    impl Tool for PanicTool {
+        fn def(&self) -> &ToolDef {
+            &self.def
+        }
+
+        async fn invoke(&self, _args: Value) -> ToolResult {
+            panic!("intentional worker panic")
+        }
+    }
+
+    fn list_windows_for(pid: i64) -> ToolResult {
+        ToolResult::text("windows").with_structured(json!({
+            "pid": pid,
+            "window_id": 7,
+            "snapshot_id": "s00000001",
+            "windows": [
+                {"pid":pid,"window_id":7,"app_name":"Demo","title":"A","z_index":1,"is_on_screen":true},
+                {"pid":pid,"window_id":22,"app_name":"Demo","title":"B","z_index":2,"is_on_screen":true}
+            ]
+        }))
+    }
+
+    fn list_apps_for(pid: i64) -> ToolResult {
+        ToolResult::text("apps").with_structured(json!({
+            "apps": [{"pid":pid,"name":"Demo","bundle_id":"com.example.demo","running":true,"active":false}]
+        }))
+    }
+
+    fn list_windows() -> ToolResult {
+        list_windows_for(42)
+    }
+
+    fn list_apps() -> ToolResult {
+        list_apps_for(42)
+    }
+
+    #[tokio::test]
+    async fn a_hung_step_returns_step_timeout() {
+        let started = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+        let worker_finished = Arc::new(tokio::sync::Notify::new());
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(BlockingHangingTool {
+            def: tool_def("type_text"),
+            started: started.clone(),
+            release: release.clone(),
+            finished: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            concurrency: Arc::new(tokio::sync::Semaphore::new(1)),
+        }));
+        let registry = Arc::new(registry);
+        let mut plan = Plan::parse(
+            &registry,
+            &json!({
+                "steps":[{"tool":"type_text","args":{"pid":425001,"window_id":7}}]
+            }),
+        )
+        .unwrap_or_else(|error| panic!("invalid plan: {}", error.message));
+        let (deadline_tx, deadline_rx) = tokio::sync::oneshot::channel();
+        plan.step_deadline = Some(StepDeadline::Trigger(deadline_rx));
+        plan.step_worker_finished = Some(worker_finished.clone());
+        let batch = tokio::spawn(plan.run(registry.clone(), None));
+        tokio::time::timeout(Duration::from_secs(1), started.notified())
+            .await
+            .expect("action start");
+        let busy = registry
+            .invoke("type_text", json!({"pid":425001,"window_id":7}))
+            .await;
+        assert!(
+            busy.is_error == Some(true) && format!("{busy:?}").contains("input_busy"),
+            "{busy:?}"
+        );
+        deadline_tx.send(()).expect("trigger step deadline");
+        let result = batch.await.expect("batch join");
+        let structured = result.structured_content.expect("structured batch");
+        assert_eq!(structured["code"], "step_timeout");
+        assert_eq!(structured["failed_step"], 0);
+        assert_eq!(structured["steps"][0]["index"], 0);
+        assert_eq!(structured["steps"][0]["tool"], "type_text");
+        assert_eq!(structured["steps"][0]["effect"], "unverifiable");
+        assert_eq!(structured["steps"][0]["scope_outcome"], "unknown");
+
+        let still_busy = registry
+            .invoke("type_text", json!({"pid":425001,"window_id":7}))
+            .await;
+        assert!(
+            still_busy.is_error == Some(true) && format!("{still_busy:?}").contains("input_busy"),
+            "{still_busy:?}"
+        );
+
+        let (lock, condvar) = release.as_ref();
+        *lock.lock().unwrap_or_else(|error| error.into_inner()) = true;
+        condvar.notify_one();
+        tokio::time::timeout(Duration::from_secs(1), worker_finished.notified())
+            .await
+            .expect("detached worker completion");
+        let completed = registry
+            .invoke("type_text", json!({"pid":425001,"window_id":7}))
+            .await;
+        assert_ne!(completed.is_error, Some(true));
+    }
+
+    #[test]
+    fn timeout_closes_read_and_action_admission_without_reopening() {
+        let gate = StepGate::new();
+        assert!(gate.begin_read());
+        let snapshot = gate.timeout();
+        assert!(snapshot.read_pending);
+        assert!(!gate.begin_read());
+        assert!(!gate.begin_dispatch());
+
+        let gate = StepGate::new();
+        assert!(gate.begin_dispatch());
+        let snapshot = gate.timeout();
+        assert!(snapshot.dispatching);
+        gate.complete_dispatch(None, false);
+        assert!(!gate.begin_dispatch());
+    }
+
+    #[test]
+    fn dispatch_completion_records_scope_refusal_atomically() {
+        let gate = StepGate::new();
+        assert!(gate.begin_dispatch());
+        gate.complete_dispatch(Some(crate::batch_scope::OUTSIDE_SCOPE), true);
+        let snapshot = gate.timeout();
+        assert_eq!(
+            snapshot.scope_refusal,
+            Some(crate::batch_scope::OUTSIDE_SCOPE)
+        );
+        assert!(!snapshot.dispatching);
+    }
+
+    #[test]
+    fn u09_gate_tracks_refused_and_mixed_attempts() {
+        let dispatched = Arc::new(AtomicBool::new(false));
+        let gate = StepGate::with_action_tracker(dispatched.clone());
+        assert!(gate.begin_dispatch());
+        gate.complete_dispatch(Some(crate::batch_scope::OUTSIDE_SCOPE), true);
+        assert!(gate.no_action_delivered());
+        assert!(!dispatched.load(Ordering::SeqCst));
+        assert!(gate.begin_dispatch());
+        gate.complete_dispatch(None, false);
+        assert!(!gate.no_action_delivered());
+        assert!(dispatched.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn u09_typed_non_delivery_must_not_conflict_with_effect() {
+        for (effect, expected) in [
+            (None, true),
+            (Some("refused"), true),
+            (Some("partial"), false),
+            (Some("unverifiable"), false),
+            (Some("suspected_noop"), false),
+            (Some("confirmed"), false),
+        ] {
+            let mut structured = json!({"code":"denied"});
+            if let Some(effect) = effect {
+                structured["effect"] = json!(effect);
+            }
+            let result = ToolResult::error("denied")
+                .with_structured(structured)
+                .with_disposition(cua_driver_contract::ErrorDisposition::NOT_DELIVERED);
+            assert_eq!(result.proves_no_input(), expected, "{effect:?}");
+        }
+        assert!(!ToolResult::error("untyped")
+            .with_structured(json!({
+                "disposition":{"delivery":"not_delivered", "retry":"safe"}
+            }))
+            .proves_no_input());
+    }
+
+    #[test]
+    fn u09_timeout_during_dispatch_stays_conservative_after_late_refusal() {
+        let dispatched = Arc::new(AtomicBool::new(false));
+        let gate = StepGate::with_action_tracker(dispatched.clone());
+        assert!(gate.begin_dispatch());
+        assert!(gate.timeout().dispatching);
+        gate.complete_dispatch(Some(crate::batch_scope::OUTSIDE_SCOPE), true);
+        assert!(dispatched.load(Ordering::SeqCst));
+        assert!(!gate.no_action_delivered());
+    }
+
+    #[test]
+    fn refreshed_timeout_snapshot_observes_late_scope_refusal() {
+        let gate = StepGate::new();
+        assert!(gate.begin_dispatch());
+        assert_eq!(gate.timeout().scope_refusal, None);
+        gate.complete_dispatch(Some(crate::batch_scope::OUTSIDE_SCOPE), true);
+        assert_eq!(
+            gate.timeout().scope_refusal,
+            Some(crate::batch_scope::OUTSIDE_SCOPE)
+        );
+    }
+
+    #[tokio::test]
+    async fn dropping_the_parent_guard_closes_the_step_gate() {
+        let gate = StepGate::new();
+        let slot = Arc::new(Mutex::new(Some(gate.clone())));
+        let worker = tokio::spawn(async { std::future::pending().await });
+        let guard = GateDropGuard::new(gate.clone(), slot.clone(), worker);
+        drop(guard);
+        assert!(!gate.begin_read());
+        assert!(!gate.begin_dispatch());
+        assert!(slot.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn starting_batch_budget_expiry_does_not_invent_recovery() {
+        let window = Window {
+            pid: 42,
+            window_id: 7,
+            app: None,
+            title: None,
+            on_screen: true,
+        };
+        let report = json!({"code":"time_budget","message":"batch budget exhausted"});
+        assert!(Recovery::after(&report, Some(&window), false).is_none());
+    }
+
+    #[tokio::test]
+    async fn normal_observation_is_not_limited_to_the_recovery_budget() {
+        let started = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let mut registry = ToolRegistry::new();
+        register_probe(&mut registry, "click", || ToolResult::text("clicked"));
+        registry.register(Box::new(WindowReadTool {
+            def: tool_def("get_window_state"),
+            pid: 42,
+            calls: Arc::new(Mutex::new(Vec::new())),
+            started: started.clone(),
+            release: release.clone(),
+            block: true,
+        }));
+        let registry = Arc::new(registry);
+        let plan = Plan::parse(
+            &registry,
+            &json!({
+                "steps":[{"tool":"click","args":{"pid":42,"window_id":7}}],
+                "observe": {}
+            }),
+        )
+        .unwrap_or_else(|error| panic!("invalid plan: {}", error.message));
+        let batch = tokio::spawn(plan.run(registry, None));
+        started.notified().await;
+        release.notify_one();
+        let result = batch.await.expect("batch join");
+        let structured = result.structured_content.unwrap();
+        assert_eq!(structured["observation"]["ok"], true, "{structured}");
+        assert!(structured.get("code").is_none());
+    }
+
+    #[tokio::test]
+    async fn later_expect_target_change_invalidates_confirmed_window() {
+        let started = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let mut registry = ToolRegistry::new();
+        register_probe(&mut registry, "list_windows", || list_windows_for(425004));
+        register_probe(&mut registry, "list_apps", || list_apps_for(425004));
+        registry.register(Box::new(WindowReadTool {
+            def: tool_def("get_window_state"),
+            pid: 42,
+            calls: calls.clone(),
+            started: started.clone(),
+            release: release.clone(),
+            block: true,
+        }));
+        let registry = Arc::new(registry);
+        let mut plan = Plan::parse(
+            &registry,
+            &json!({
+                "steps":[{
+                    "expect":[
+                        {"pid":42,"window_id":22,"role":"AXStaticText","name":"Result","value":"702","timeout_ms":0},
+                        {"pid":42,"window_id":7,"role":"AXStaticText","name":"Result","value":"702","timeout_ms":10000}
+                    ]
+                }]
+            }),
+        )
+        .unwrap_or_else(|error| panic!("invalid plan: {}", error.message));
+        let (deadline_tx, deadline_rx) = tokio::sync::oneshot::channel();
+        plan.step_deadline = Some(StepDeadline::Trigger(deadline_rx));
+        let mut batch = Box::pin(plan.run(registry, None));
+        tokio::select! {
+            result = &mut batch => {
+                let structured = result.structured_content.unwrap();
+                panic!("batch ended before second expect read: {structured}");
+            }
+            _ = async {
+                while calls.lock().unwrap().len() < 2 {
+                    tokio::task::yield_now().await;
+                }
+            } => {}
+        }
+        deadline_tx.send(()).expect("trigger deadline");
+        release.notify_one();
+        let result = batch.await;
+        let structured = result.structured_content.unwrap();
+        assert_eq!(structured["code"], "step_timeout");
+        assert!(structured.get("observation").is_none());
+    }
+
+    #[tokio::test]
+    async fn releasing_a_find_after_timeout_does_not_start_action() {
+        let started = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let mut registry = ToolRegistry::new();
+        register_probe(&mut registry, "list_windows", list_windows);
+        register_probe(&mut registry, "list_apps", list_apps);
+        let clicks = register_probe(&mut registry, "click", || ToolResult::text("clicked"));
+        registry.register(Box::new(WindowReadTool {
+            def: tool_def("get_window_state"),
+            pid: 42,
+            calls: Arc::new(Mutex::new(Vec::new())),
+            started: started.clone(),
+            release: release.clone(),
+            block: true,
+        }));
+        let registry = Arc::new(registry);
+        let mut plan = Plan::parse(
+            &registry,
+            &json!({
+                "steps":[{
+                    "tool":"click",
+                    "args":{"pid":42,"window_id":7,"role":"button","name":"Go","timeout_ms":10000}
+                }]
+            }),
+        )
+        .unwrap_or_else(|error| panic!("invalid plan: {}", error.message));
+        let (deadline_tx, deadline_rx) = tokio::sync::oneshot::channel();
+        plan.step_deadline = Some(StepDeadline::Trigger(deadline_rx));
+        let batch = tokio::spawn(plan.run(registry, None));
+        tokio::time::timeout(Duration::from_secs(1), started.notified())
+            .await
+            .expect("read start");
+        deadline_tx.send(()).expect("trigger deadline");
+        let result = batch.await.expect("batch join");
+        release.notify_one();
+        let structured = result.structured_content.unwrap();
+        assert_eq!(structured["code"], "step_timeout");
+        assert!(clicks.lock().unwrap().is_empty());
+        assert!(structured.get("observation").is_none());
+    }
+
+    #[tokio::test]
+    async fn timeout_blocks_every_retry_entrypoint() {
+        let gate = StepGate::new();
+        assert!(gate.begin_dispatch());
+        gate.timeout();
+        let registry = ToolRegistry::new();
+        for tool in ["invoke_menu", "click", "type_text"] {
+            assert!(dispatch_action(&registry, &gate, tool, json!({}))
+                .await
+                .is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn worker_panic_is_a_join_failure_not_success() {
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(PanicTool {
+            def: tool_def("click"),
+        }));
+        let registry = Arc::new(registry);
+        let plan = Plan::parse(
+            &registry,
+            &json!({"steps":[{"tool":"click","args":{"pid":42,"window_id":7}}]}),
+        )
+        .unwrap_or_else(|error| panic!("invalid plan: {}", error.message));
+        let result = plan.run(registry, None).await;
+        let structured = result.structured_content.unwrap();
+        assert_eq!(structured["code"], "step_join_failed");
+        assert_eq!(structured["steps"][0]["effect"], "unverifiable");
+    }
+
+    #[tokio::test]
+    async fn recovery_deadline_is_bounded_and_preserves_step_timeout() {
+        let started = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(WindowReadTool {
+            def: tool_def("get_window_state"),
+            pid: 42,
+            calls: Arc::new(Mutex::new(Vec::new())),
+            started: started.clone(),
+            release: release.clone(),
+            block: true,
+        }));
+        let registry = Arc::new(registry);
+        let (recovery_tx, recovery_rx) = tokio::sync::oneshot::channel();
+        let call = tokio::spawn(async move {
+            invoke_observation_with_deadline(
+                registry.as_ref(),
+                json!({"pid":425001,"window_id":7}),
+                StepDeadline::Trigger(recovery_rx),
+            )
+            .await
+        });
+        tokio::time::timeout(Duration::from_secs(1), started.notified())
+            .await
+            .expect("read start");
+        recovery_tx.send(()).expect("recovery deadline");
+        let result = call.await.expect("recovery join");
+        assert_eq!(
+            result.structured_content.unwrap()["code"],
+            "recovery_timeout"
+        );
+        release.notify_one();
+    }
+
+    #[tokio::test]
+    async fn recovery_refusal_does_not_replace_step_timeout() {
+        let action_started = Arc::new(tokio::sync::Notify::new());
+        let release_action = Arc::new(tokio::sync::Notify::new());
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(HangingTool {
+            def: tool_def("type_text"),
+            started: action_started.clone(),
+            release: release_action.clone(),
+            finished: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            concurrency: Arc::new(tokio::sync::Semaphore::new(1)),
+        }));
+        register_probe(&mut registry, "get_window_state", || {
+            ToolResult::error("outside scope")
+                .with_structured(json!({"code":"outside_scope","effect":"refused"}))
+        });
+        let registry = Arc::new(registry);
+        let mut plan = Plan::parse(
+            &registry,
+            &json!({"steps":[{"tool":"type_text","args":{"pid":425002,"window_id":7}}]}),
+        )
+        .unwrap_or_else(|error| panic!("invalid plan: {}", error.message));
+        let (step_tx, step_rx) = tokio::sync::oneshot::channel();
+        plan.step_deadline = Some(StepDeadline::Trigger(step_rx));
+        let batch = tokio::spawn(plan.run(registry, None));
+        tokio::time::timeout(Duration::from_secs(1), action_started.notified())
+            .await
+            .expect("action start");
+        step_tx.send(()).expect("step deadline");
+        release_action.notify_one();
+        let result = batch.await.expect("batch join");
+        let structured = result.structured_content.unwrap();
+        assert_eq!(structured["code"], "step_timeout");
+        assert_eq!(structured["observation"]["code"], "outside_scope");
+    }
+
+    #[tokio::test]
+    async fn successful_find_then_action_timeout_recovers_window() {
+        let action_started = Arc::new(tokio::sync::Notify::new());
+        let release_action = Arc::new(tokio::sync::Notify::new());
+        let mut registry = ToolRegistry::new();
+        register_probe(&mut registry, "list_windows", list_windows);
+        register_probe(&mut registry, "list_apps", list_apps);
+        registry.register(Box::new(WindowReadTool {
+            def: tool_def("get_window_state"),
+            pid: 425004,
+            calls: Arc::new(Mutex::new(Vec::new())),
+            started: Arc::new(tokio::sync::Notify::new()),
+            release: Arc::new(tokio::sync::Notify::new()),
+            block: false,
+        }));
+        registry.register(Box::new(HangingTool {
+            def: tool_def("type_text"),
+            started: action_started.clone(),
+            release: release_action.clone(),
+            finished: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            concurrency: Arc::new(tokio::sync::Semaphore::new(1)),
+        }));
+        let registry = Arc::new(registry);
+        let mut plan = Plan::parse(
+            &registry,
+            &json!({
+                "steps":[{
+                    "tool":"type_text",
+                    "args":{"pid":425004,"window_id":22,"role":"AXStaticText","name":"Result","timeout_ms":1000}
+                }]
+            }),
+        )
+        .unwrap_or_else(|error| panic!("invalid plan: {}", error.message));
+        let (deadline_tx, deadline_rx) = tokio::sync::oneshot::channel();
+        plan.step_deadline = Some(StepDeadline::Trigger(deadline_rx));
+        let batch = tokio::spawn(plan.run(registry, None));
+        tokio::time::timeout(Duration::from_secs(1), action_started.notified())
+            .await
+            .expect("action start");
+        deadline_tx.send(()).expect("deadline");
+        release_action.notify_one();
+        let result = batch.await.expect("batch join");
+        let structured = result.structured_content.unwrap();
+        assert_eq!(structured["code"], "step_timeout");
+        assert_eq!(structured["observation"]["ok"], true);
+    }
+
+    #[test]
+    fn closed_check_does_not_create_a_pending_read() {
+        let gate = StepGate::new();
+        assert!(!gate.is_timed_out());
+        assert!(gate.begin_read());
+        assert!(!gate.is_timed_out());
+        assert!(gate.timeout().read_pending);
+        assert!(gate.is_timed_out());
+    }
+
+    /// A stale menu-bar token built on a window-basis id still runs as
+    /// invoke_menu (#130).
+    #[test]
+    fn a_basis_handle_menu_token_is_rerouted_to_invoke_menu() {
+        crate::window_state_view::remember_for_test(
+            "s7e570003",
+            42,
+            7,
+            r#"- [27] AXMenuBar
+  - [700] AXMenuBarItem "Sheet"
+    - [701] AXMenu
+      - [771] AXMenuItem "To Next Sheet"
+"#,
+        );
+        let stale = ToolResult::error("element_token is stale")
+            .with_structured(json!({"code":"stale_element_token","effect":"refused"}));
+        let (menu_args, _) = menu_bar_route(
+            &json!({"pid":42,"element_token":"s7e570003.f2:771"}),
+            &stale,
+        )
+        .expect("rerouted");
+        assert_eq!(menu_args["path"], json!(["Sheet", "To Next Sheet"]));
+        assert_eq!(menu_args["window_id"], 7);
+    }
+
+    #[tokio::test]
+    async fn menu_reroute_does_not_run_after_timeout() {
+        crate::window_state_view::remember_for_test(
+            "s-menu-timeout",
+            42,
+            7,
+            r#"- [27] AXMenuBar
+  - [700] AXMenuBarItem "Sheet"
+    - [701] AXMenu
+      - [760] AXMenuItem "Navigate"
+        - [761] AXMenu
+          - [771] AXMenuItem "To Next Sheet"
+"#,
+        );
+        let started = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let worker_finished = Arc::new(tokio::sync::Notify::new());
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(RefusalTool {
+            def: tool_def("click"),
+            calls: calls.clone(),
+            started: started.clone(),
+            release: release.clone(),
+            response: Arc::new(|| {
+                ToolResult::error("element_token is stale")
+                    .with_structured(json!({"code":"stale_element_token","effect":"refused"}))
+            }),
+        }));
+        let menu_calls = register_probe(&mut registry, "invoke_menu", || ToolResult::text("menu"));
+        let registry = Arc::new(registry);
+        let mut plan = Plan::parse(
+            &registry,
+            &json!({
+                "steps":[{
+                    "tool":"click",
+                    "args":{"pid":42,"window_id":7,"element_token":"s-menu-timeout:771"}
+                }]
+            }),
+        )
+        .unwrap_or_else(|error| panic!("invalid plan: {}", error.message));
+        let (deadline_tx, deadline_rx) = tokio::sync::oneshot::channel();
+        plan.step_deadline = Some(StepDeadline::Trigger(deadline_rx));
+        plan.step_worker_finished = Some(worker_finished.clone());
+        let batch = tokio::spawn(plan.run(registry, None));
+        started.notified().await;
+        deadline_tx.send(()).expect("deadline");
+        let result = batch.await.expect("batch join");
+        release.notify_one();
+        tokio::time::timeout(Duration::from_secs(1), worker_finished.notified())
+            .await
+            .expect("menu refusal completion");
+        assert_eq!(result.structured_content.unwrap()["code"], "step_timeout");
+        assert_eq!(calls.lock().unwrap().len(), 1);
+        assert!(menu_calls.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn stale_refind_does_not_run_after_timeout() {
+        crate::window_state_view::remember_for_test(
+            "s-stale-timeout",
+            42,
+            7,
+            "- [1] AXStaticText \"Result\"\n",
+        );
+        let started = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let worker_finished = Arc::new(tokio::sync::Notify::new());
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let mut registry = ToolRegistry::new();
+        register_probe(&mut registry, "list_windows", list_windows);
+        register_probe(&mut registry, "list_apps", list_apps);
+        registry.register(Box::new(WindowReadTool {
+            def: tool_def("get_window_state"),
+            pid: 42,
+            calls: Arc::new(Mutex::new(Vec::new())),
+            started: Arc::new(tokio::sync::Notify::new()),
+            release: Arc::new(tokio::sync::Notify::new()),
+            block: false,
+        }));
+        registry.register(Box::new(RefusalTool {
+            def: tool_def("click"),
+            calls: calls.clone(),
+            started: started.clone(),
+            release: release.clone(),
+            response: Arc::new(|| {
+                ToolResult::error("element_token is stale")
+                    .with_structured(json!({"code":"stale_element_token","effect":"refused"}))
+            }),
+        }));
+        let registry = Arc::new(registry);
+        let mut plan = Plan::parse(
+            &registry,
+            &json!({
+                "steps":[{
+                    "tool":"click",
+                    "args":{"pid":42,"window_id":7,"element_token":"s-stale-timeout:1"}
+                }]
+            }),
+        )
+        .unwrap_or_else(|error| panic!("invalid plan: {}", error.message));
+        let (deadline_tx, deadline_rx) = tokio::sync::oneshot::channel();
+        plan.step_deadline = Some(StepDeadline::Trigger(deadline_rx));
+        plan.step_worker_finished = Some(worker_finished.clone());
+        let batch = tokio::spawn(plan.run(registry, None));
+        started.notified().await;
+        deadline_tx.send(()).expect("deadline");
+        let result = batch.await.expect("batch join");
+        release.notify_one();
+        tokio::time::timeout(Duration::from_secs(1), worker_finished.notified())
+            .await
+            .expect("stale refusal completion");
+        assert_eq!(result.structured_content.unwrap()["code"], "step_timeout");
+        assert_eq!(calls.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn foreground_fallback_does_not_run_after_timeout() {
+        let started = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let worker_finished = Arc::new(tokio::sync::Notify::new());
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(RefusalTool {
+            def: tool_def("click"),
+            calls: calls.clone(),
+            started: started.clone(),
+            release: release.clone(),
+            response: Arc::new(|| {
+                ToolResult::error("background unavailable").with_structured(json!({
+                    "effect":"refused",
+                    "escalation":{"recommended":"foreground"}
+                }))
+            }),
+        }));
+        let registry = Arc::new(registry);
+        let mut plan = Plan::parse(
+            &registry,
+            &json!({
+                "steps":[{"tool":"click","args":{"pid":42,"window_id":7}}],
+                "foreground_fallback":true
+            }),
+        )
+        .unwrap_or_else(|error| panic!("invalid plan: {}", error.message));
+        let (deadline_tx, deadline_rx) = tokio::sync::oneshot::channel();
+        plan.step_deadline = Some(StepDeadline::Trigger(deadline_rx));
+        plan.step_worker_finished = Some(worker_finished.clone());
+        let batch = tokio::spawn(plan.run(registry, None));
+        started.notified().await;
+        deadline_tx.send(()).expect("deadline");
+        let result = batch.await.expect("batch join");
+        release.notify_one();
+        tokio::time::timeout(Duration::from_secs(1), worker_finished.notified())
+            .await
+            .expect("foreground refusal completion");
+        assert_eq!(result.structured_content.unwrap()["code"], "step_timeout");
+        assert_eq!(calls.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn spawned_step_preserves_origin_but_not_native_pixel_evidence() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(EvidenceTool {
+            def: tool_def("type_text"),
+            calls: calls.clone(),
+        }));
+        registry.register_session_tools();
+        let registry = Arc::new(registry);
+        registry.init_self_weak();
+        let result = registry
+            .invoke_from_trusted_adapter_with_native_window_pixels(
+                RUN_STEPS_TOOL,
+                json!({
+                    "session":"evidence",
+                    "_input_origin":"human",
+                    "steps":[{"tool":"type_text","args":{"pid":425003,"window_id":7,"text":"x"}}]
+                }),
+            )
+            .await;
+        assert_ne!(result.is_error, Some(true), "{result:?}");
+        let calls = calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert!(!calls[0].0, "nested calls must clear native pixel evidence");
+        assert_eq!(calls[0].1, crate::agent_cursor::InputOrigin::Human);
+    }
+}

@@ -1,0 +1,610 @@
+#!/usr/bin/env python3
+"""Protocol compatibility between a fork build and the Cua Driver release GOAT ships.
+
+GOAT starts the driver in the launch forms below and reads its CLI manifest, MCP surface and
+daemon metadata. A fork change that removes or retypes a tool, subcommand or argument, changes a
+tool's input schema or a capability, drops or widens what a tool's output schema promises, changes
+the daemon contract, or stops a launch form from starting breaks GOAT without a GOAT change. Those
+fail unless goat/compat/allowed-changes.json records the change with a reason. Additions (new
+tools, new optional top-level arguments) pass and are listed. Wording is not protocol: tool
+descriptions and the schema annotations in ANNOTATION_KEYWORDS never decide whether a call is
+valid, so changing them passes and is listed. Standard library only.
+"""
+
+import argparse
+import contextlib
+import hashlib
+import json
+import os
+import queue
+import socket
+import subprocess
+import sys
+import tarfile
+import tempfile
+import threading
+import time
+import urllib.request
+import zipfile
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+QUIET_ENV = {
+    "CUA_DRIVER_RS_TELEMETRY_ENABLED": "false",
+    "CUA_TELEMETRY_ENABLED": "false",
+    "CUA_DRIVER_RS_UPDATE_CHECK": "false",
+    "DO_NOT_TRACK": "1",
+}
+HOST_ID = "si.goat.compat-check"
+REPLY_SECONDS = 30
+EXIT_SECONDS = 15
+MAX_PAGES = 50
+# Daemon contract fields GOAT reads and compares (goat-si/goat apps/desktop/src/cua/ComputerUseHelper.ts).
+CONTRACT_FIELDS = ("contract_version", "mcp_protocol_version", "capability_version", "tools_list_schema_version")
+# JSON Schema annotation keywords (JSON Schema 2020-12, "Meta-Data" vocabulary, and $comment): they
+# never change which arguments a schema accepts. "default" is left out on purpose: a changed default
+# changes what an omitted argument does.
+ANNOTATION_KEYWORDS = ("description", "title", "examples", "$comment")
+# Keywords whose value is a map of name -> subschema, and those whose value is a subschema or a list
+# of subschemas. Only these are walked, so an argument named "title" or "description" stays compared.
+SCHEMA_MAP_KEYWORDS = ("properties", "patternProperties", "$defs", "definitions", "dependentSchemas")
+SUBSCHEMA_KEYWORDS = ("items", "additionalProperties", "additionalItems", "unevaluatedProperties",
+                      "unevaluatedItems", "contains", "propertyNames", "not", "if", "then", "else",
+                      "anyOf", "oneOf", "allOf", "prefixItems")
+
+
+def fail(message):
+    sys.exit(message)
+
+
+def fetch_baseline(spec, key, into):
+    archive = spec["archives"][key]
+    target = into / archive["name"]
+    with urllib.request.urlopen(spec["baseUrl"] + archive["name"], timeout=120) as response:
+        target.write_bytes(response.read())
+    data = target.read_bytes()
+    digest = hashlib.sha256(data).hexdigest()
+    if len(data) != archive["bytes"] or digest != archive["sha256"]:
+        fail(f"baseline {archive['name']} does not match its pin: {len(data)} bytes, sha256 {digest}")
+    out = into / "baseline"
+    out.mkdir()
+    if archive["name"].endswith(".zip"):
+        with zipfile.ZipFile(target) as z:
+            z.extractall(out)
+    else:
+        with tarfile.open(target) as t:
+            # The "data" filter (3.12+, backported to 3.8.17+) refuses links and paths escaping out.
+            t.extractall(out, **({"filter": "data"} if hasattr(tarfile, "data_filter") else {}))
+    exe = "cua-driver.exe" if archive["name"].endswith(".zip") else "cua-driver"
+    found = [p for p in out.rglob(exe) if p.is_file()]
+    if len(found) != 1:
+        fail(f"baseline archive has {len(found)} {exe} entries")
+    found[0].chmod(0o755)
+    return found[0]
+
+
+def within(seconds, what, function):
+    """Run function with an absolute deadline. A blocking read that outlives it is abandoned on
+    a daemon thread; failing then kills the child process, which unblocks that read."""
+    result, error = [], []
+
+    def run():
+        try:
+            result.append(function())
+        except BaseException as exc:  # noqa: BLE001 - re-raised on the caller's thread
+            error.append(exc)
+
+    worker = threading.Thread(target=run, daemon=True)
+    worker.start()
+    worker.join(max(0.0, seconds))
+    if worker.is_alive():
+        raise TimeoutError(f"{what} took longer than {seconds:.0f}s")
+    if error:
+        raise error[0]
+    return result[0]
+
+
+class Child:
+    """A driver subprocess whose stdout lines and stderr are drained by threads, so no pipe can
+    fill and block the driver, and every read has a deadline."""
+
+    def __init__(self, argv, stdout=True):
+        self.argv = argv
+        self.proc = subprocess.Popen(
+            argv,
+            env=dict(os.environ, **QUIET_ENV),
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE if stdout else subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+        )
+        self.lines = queue.Queue()
+        self.stderr = bytearray()
+        self.readers = [threading.Thread(target=self._drain_stderr, daemon=True)]
+        if stdout:
+            self.readers.append(threading.Thread(target=self._read_stdout, daemon=True))
+        for reader in self.readers:
+            reader.start()
+
+    def _drain_stderr(self):
+        for chunk in iter(lambda: self.proc.stderr.read1(65536), b""):
+            self.stderr += chunk
+            del self.stderr[:-8192]
+
+    def _read_stdout(self):
+        for line in self.proc.stdout:
+            self.lines.put(line)
+        self.lines.put(None)
+
+    def describe_failure(self, what):
+        return f"{' '.join(self.argv[1:])}: {what}; stderr tail: {self.stderr.decode(errors='replace')[-1500:]}"
+
+    def send(self, message):
+        self.proc.stdin.write((json.dumps(message) + "\n").encode())
+        self.proc.stdin.flush()
+
+    def reply(self, request_id):
+        deadline = time.monotonic() + REPLY_SECONDS
+        while True:
+            try:
+                line = self.lines.get(timeout=max(0.0, deadline - time.monotonic()))
+            except queue.Empty:
+                fail(self.describe_failure(f"no reply to request {request_id} within {REPLY_SECONDS}s"))
+            if line is None:
+                fail(self.describe_failure("closed stdout"))
+            message = json.loads(line)
+            if message.get("id") == request_id:
+                if "error" in message:
+                    fail(self.describe_failure(f"MCP error {message['error']}"))
+                return message["result"]
+
+    def close(self, require_exit=False):
+        """Close stdin and reap the child; with require_exit it must exit on its own."""
+        with contextlib.suppress(OSError):
+            self.proc.stdin.close()
+        exited = True
+        try:
+            self.proc.wait(timeout=EXIT_SECONDS)
+        except subprocess.TimeoutExpired:
+            exited = False
+            self.proc.kill()
+            self.proc.wait(timeout=EXIT_SECONDS)
+        for reader in self.readers:
+            reader.join(timeout=EXIT_SECONDS)
+        for stream in (self.proc.stdout, self.proc.stderr):
+            if stream:
+                stream.close()
+        if require_exit and not exited:
+            fail(self.describe_failure(f"did not exit within {EXIT_SECONDS}s after its parent pipe closed"))
+
+
+def mcp_surface(argv):
+    child = Child(argv)
+    try:
+        child.send({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "goat-compat", "version": "1"}}})
+        init = child.reply(1)
+        child.send({"jsonrpc": "2.0", "method": "notifications/initialized"})
+        tools, outputs, cursor, seen = {}, {}, None, set()
+        for page_number in range(MAX_PAGES):
+            request_id = 2 + page_number
+            child.send({"jsonrpc": "2.0", "id": request_id, "method": "tools/list", "params": {"cursor": cursor} if cursor else {}})
+            page = child.reply(request_id)
+            for tool in page["tools"]:
+                tools[tool["name"]] = tool.get("inputSchema")
+                if tool.get("outputSchema") is not None:
+                    outputs[tool["name"]] = tool["outputSchema"]
+            cursor = page.get("nextCursor")
+            if not cursor:
+                break
+            if cursor in seen:
+                fail(child.describe_failure(f"tools/list repeated cursor {cursor!r}"))
+            seen.add(cursor)
+        else:
+            fail(child.describe_failure(f"tools/list did not finish within {MAX_PAGES} pages"))
+    finally:
+        child.close()
+    return {"protocolVersion": init.get("protocolVersion"), "capabilities": init.get("capabilities", {}),
+            "tools": tools, "outputSchemas": outputs}
+
+
+@contextlib.contextmanager
+def embedded_daemon(binary):
+    """Start the embedded daemon as GOAT's Windows helper does (DriverService.cs) and read its
+    metadata as the SDK's embedded startup does. Yields (endpoint, metadata) while it runs; on
+    exit closes its parent pipe and requires it to shut down."""
+    with tempfile.TemporaryDirectory(prefix="gc", dir=None if sys.platform == "win32" else "/tmp") as tmp:
+        # Unix socket paths must stay under sun_path's ~100 bytes, hence a short /tmp directory.
+        path = rf"\\.\pipe\goat-compat-{os.getpid()}-{time.monotonic_ns()}" if sys.platform == "win32" else str(Path(tmp) / "s")
+        child = Child([str(binary), "serve", "--embedded", "--parent-liveness-stdio", "--no-permissions-gate", "--host-bundle-id", HOST_ID, "--socket", path], stdout=False)
+        failed = False
+        try:
+            deadline = time.monotonic() + REPLY_SECONDS
+            response = None
+            while response is None:
+                if child.proc.poll() is not None:
+                    fail(child.describe_failure(f"exited {child.proc.returncode} before serving metadata"))
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    fail(child.describe_failure(f"no metadata on {path} within {REPLY_SECONDS}s"))
+                try:
+                    response = within(remaining, "metadata request", lambda: request_metadata(path))
+                except TimeoutError as exc:
+                    fail(child.describe_failure(str(exc)))
+                except OSError:
+                    time.sleep(0.2)
+            if not response.get("ok") or not isinstance(response.get("result"), dict):
+                fail(child.describe_failure(f"metadata request failed: {response}"))
+            yield path, response["result"]
+        except BaseException:
+            failed = True
+            raise
+        finally:
+            # Report the first failure; a daemon already being torn down after one is just reaped.
+            child.close(require_exit=not failed)
+
+
+def request_metadata(path):
+    request = b'{"method":"metadata"}\n'
+    line = b""
+    if sys.platform == "win32":
+        with open(path, "r+b", buffering=0) as pipe:
+            pipe.write(request)
+            while not line.endswith(b"\n"):
+                chunk = pipe.read(4096)
+                if not chunk:
+                    break
+                line += chunk
+    else:
+        with socket.socket(socket.AF_UNIX) as conn:
+            conn.connect(path)
+            conn.sendall(request)
+            while not line.endswith(b"\n"):
+                chunk = conn.recv(4096)
+                if not chunk:
+                    break
+                line += chunk
+    return json.loads(line)
+
+
+def describe(binary):
+    """Every launch form GOAT uses, keyed by name. The embedded proxy is how GOAT reaches the
+    daemon on Windows (ComputerUseHelper.ts) and Linux (the SDK's embedded host); macOS runs
+    the driver directly under its helper (main.swift, McpRelay.swift)."""
+    manifest = json.loads(subprocess.run([str(binary), "manifest"], env=dict(os.environ, **QUIET_ENV), check=True, capture_output=True, timeout=60).stdout)
+    forms = {}
+    with embedded_daemon(binary) as (endpoint, metadata):
+        forms["embedded-proxy"] = mcp_surface([str(binary), "mcp", "--embedded", "--socket", endpoint, "--host-bundle-id", HOST_ID])
+    if sys.platform == "darwin":
+        forms["direct-embedded"] = mcp_surface([str(binary), "mcp", "--direct", "--embedded", "--host-bundle-id", HOST_ID])
+    return {"manifest": manifest, "daemon": metadata, "forms": forms}
+
+
+def validate(surface, label, version, required_tools):
+    """Shape and identity checks that keep a comparison from passing on empty or wrong data."""
+    problems = []
+    manifest = surface["manifest"]
+    if manifest.get("schema_version") in (None, "") or not manifest.get("subcommands"):
+        problems.append(f"{label}: manifest has no schema_version or subcommands")
+    if manifest.get("binary_version") != version:
+        problems.append(f"{label}: manifest binary_version {manifest.get('binary_version')!r}, expected {version!r}")
+    if not surface["forms"]:
+        problems.append(f"{label}: no MCP launch form was probed")
+    for form, mcp in surface["forms"].items():
+        if not mcp["protocolVersion"] or not mcp["tools"]:
+            problems.append(f"{label} {form}: MCP initialize/tools/list returned no protocol version or no tools")
+        missing = sorted(set(required_tools) - set(mcp["tools"]))
+        if missing:
+            problems.append(f"{label} {form}: missing tools GOAT allows agents to use: {', '.join(missing)}")
+    daemon = surface["daemon"]
+    if daemon.get("driver_version") != version:
+        problems.append(f"{label}: daemon driver_version {daemon.get('driver_version')!r}, expected {version!r}")
+    if daemon.get("embedded") is not True or daemon.get("host_bundle_id") != HOST_ID:
+        problems.append(f"{label}: daemon is not embedded for {HOST_ID}: {daemon}")
+    if any(not daemon.get(field) for field in CONTRACT_FIELDS):
+        problems.append(f"{label}: daemon metadata lacks {CONTRACT_FIELDS}: {daemon}")
+    return problems
+
+
+def load_allowed(path):
+    allowed = json.loads(path.read_text())
+    for kind, entries in allowed.items():
+        if kind == "comment":
+            continue
+        for name, reason in entries.items():
+            if not isinstance(reason, str) or not reason.strip():
+                fail(f"{path.name}: {kind} {name} needs a nonblank reason")
+    return allowed
+
+
+def json_type(value):
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "boolean"
+    if isinstance(value, int):
+        return "integer"
+    if isinstance(value, float):
+        return "number"
+    if isinstance(value, str):
+        return "string"
+    return "array" if isinstance(value, list) else "object"
+
+
+def schema_values(schema):
+    if "enum" in schema:
+        return schema["enum"]
+    if "const" in schema:
+        return [schema["const"]]
+    return None
+
+
+def schema_types(schema):
+    """The JSON types a schema admits: its "type", else the types of its enum or const values,
+    else None (any type)."""
+    declared = schema.get("type")
+    if declared is not None:
+        return sorted(declared) if isinstance(declared, list) else [declared]
+    values = schema_values(schema)
+    return sorted({json_type(value) for value in values}) if values is not None else None
+
+
+def type_covers(types, declared):
+    """Whether a value of JSON type declared is admitted by types; "number" includes integers."""
+    return declared in types or (declared == "integer" and "number" in types)
+
+
+UNION_KEYS = ("anyOf", "oneOf")
+OBJECT_KEYS = ("properties", "required", "additionalProperties", "patternProperties")
+
+
+def for_type(schema, declared):
+    """schema narrowed to one of its types, without keywords that only constrain other types."""
+    narrowed = {**schema, "type": declared}
+    for key in OBJECT_KEYS if declared != "object" else ():
+        narrowed.pop(key, None)
+    if declared != "array":
+        narrowed.pop("items", None)
+    values = schema_values(narrowed)
+    if values is not None:
+        narrowed.pop("const", None)
+        narrowed["enum"] = [value for value in values if type_covers([declared], json_type(value))]
+    return narrowed
+
+
+def conjoin(outer, branch):
+    """A union branch together with the keywords beside the union, which apply as well."""
+    merged = {**outer, **branch}
+    if "required" in outer or "required" in branch:
+        merged["required"] = sorted(set(outer.get("required", [])) | set(branch.get("required", [])))
+    if "properties" in outer and "properties" in branch:
+        merged["properties"] = {**outer["properties"], **branch["properties"]}
+    if "type" in outer and "type" in branch:
+        outer_types, branch_types = schema_types(outer), schema_types(branch)
+        both = {declared for declared in outer_types if type_covers(branch_types, declared)}
+        both |= {declared for declared in branch_types if type_covers(outer_types, declared)}
+        merged["type"] = sorted(both) if len(both) != 1 else next(iter(both))
+    return merged
+
+
+def union_kind(schema):
+    return next((key for key in UNION_KEYS if isinstance(schema.get(key), list)), None)
+
+
+def single_shapes(schema):
+    """schema as the list of union-free, single-type shapes it is the union of. The driver
+    advertises {"type": "object", "anyOf": [success, refusal]}, and spells nullable fields both
+    as type lists and as anyOf with a null branch, so both spellings reduce to the same shapes."""
+    if not isinstance(schema, dict):
+        return [schema]
+    key = union_kind(schema)
+    if key:
+        outer = {name: value for name, value in schema.items() if name != key}
+        shapes = []
+        for branch in schema[key]:
+            if branch is False:
+                continue  # admits nothing
+            # true admits anything the outer keywords allow; an unknown branch form is treated
+            # as unconstrained, so a changed one is reported rather than skipped.
+            branch = branch if isinstance(branch, dict) else {}
+            shapes += single_shapes(conjoin(outer, branch))
+        return shapes
+    types = schema_types(schema)
+    if types is not None and len(types) > 1:
+        return [for_type(schema, declared) for declared in types]
+    return [schema]
+
+
+def output_schema_breaks(old, new, where=""):
+    """What GOAT, reading a tool's result, could rely on in old and no longer in new: a property
+    removed or no longer required, or a type, enum or union that now admits more values. New
+    properties and narrower values are compatible."""
+    label = f"property {where} " if where else ""
+    if not isinstance(new, dict):
+        return [f"{label}removed"]
+    if not isinstance(old, dict):
+        return []
+    old_kind, new_kind = union_kind(old), union_kind(new)
+    if old_kind or new_kind:
+        breaks = []
+        if old_kind and new_kind and old_kind != new_kind:
+            # oneOf excludes values two branches share; anyOf does not. Treat a switch as a break.
+            breaks.append(f"{label}union {old_kind} -> {new_kind}")
+        # Every shape new can produce must be one old could: each new shape must fit some old
+        # shape. Removing a shape only narrows the output.
+        old_shapes = single_shapes(old)
+        for index, shape in enumerate(single_shapes(new)):
+            if not old_shapes:
+                breaks.append(f"variant {index}: {label}admits values where none were admitted")
+                continue
+            candidates = [output_schema_breaks(choice, shape, where) for choice in old_shapes]
+            if any(not candidate for candidate in candidates):
+                continue
+            # Report against the shape in the same position, the one it most likely replaced.
+            closest = candidates[index] if index < len(candidates) else min(candidates, key=len)
+            breaks += [f"variant {index}: {detail}" for detail in closest]
+        return breaks
+    breaks = []
+    old_types, new_types = schema_types(old), schema_types(new)
+    if old_types is not None and (new_types is None or any(not type_covers(old_types, declared) for declared in new_types)):
+        breaks.append(f"{label}type {old_types} -> {new_types}")
+    old_values, new_values = schema_values(old), schema_values(new)
+    if old_values is not None:
+        if new_values is None:
+            breaks.append(f"{label}enum removed")
+        else:
+            breaks += [f"{label}enum gained {value!r}" for value in new_values if value not in old_values]
+    prefix = f"{where}." if where else ""
+    for name in old.get("required", []):
+        if name not in new.get("required", []):
+            breaks.append(f"property {prefix}{name} no longer required")
+    new_properties = new.get("properties", {})
+    for name, schema in old.get("properties", {}).items():
+        breaks += output_schema_breaks(schema, new_properties.get(name), f"{prefix}{name}")
+    if isinstance(old.get("items"), dict):
+        breaks += output_schema_breaks(old["items"], new.get("items"), f"{where}[]")
+    return breaks
+
+
+def compare(baseline, candidate, allowed):
+    problems = []
+
+    def check(kind, name, message):
+        if name not in allowed.get(kind, {}):
+            problems.append(f"{kind} {name}: {message}")
+
+    for form, old_mcp in baseline["forms"].items():
+        new_mcp = candidate["forms"].get(form)
+        if new_mcp is None:
+            problems.append(f"form {form}: not probed for the candidate")
+            continue
+        if new_mcp["protocolVersion"] != old_mcp["protocolVersion"]:
+            check("mcp", "protocolVersion", f"{form}: {old_mcp['protocolVersion']} -> {new_mcp['protocolVersion']}")
+        for name, value in old_mcp["capabilities"].items():
+            if name not in new_mcp["capabilities"]:
+                check("mcp", f"capability:{name}", f"{form}: removed")
+            elif new_mcp["capabilities"][name] != value:
+                check("mcp", f"capability:{name}", f"{form}: changed")
+        for name, schema in old_mcp["tools"].items():
+            if name not in new_mcp["tools"]:
+                check("tools", name, f"{form}: removed")
+                continue
+            old_input, new_input = without_annotations(schema), without_annotations(new_mcp["tools"][name])
+            if new_input != old_input and not added_optional_properties(old_input, new_input):
+                check("tools", name, f"{form}: input schema changed")
+        new_outputs = new_mcp.get("outputSchemas", {})
+        for name, schema in old_mcp.get("outputSchemas", {}).items():
+            if name not in new_mcp["tools"]:
+                continue  # reported above as a removed tool
+            for detail in output_schema_breaks(schema, new_outputs.get(name)):
+                check("tools", f"{name}:outputSchema", f"{form}: output schema {detail}")
+    old, new = baseline["manifest"], candidate["manifest"]
+    for key in sorted(set(old) - set(new)):
+        check("manifest", key, "removed")
+    for name, value in old.get("features", {}).items():
+        if new.get("features", {}).get(name) != value:
+            check("manifest", f"feature:{name}", f"{value!r} -> {new.get('features', {}).get(name)!r}")
+    if new.get("schema_version") != old.get("schema_version"):
+        check("manifest", "schema_version", f"{old.get('schema_version')} -> {new.get('schema_version')}")
+    if new.get("mcp_invocation", {}).get("args") != old.get("mcp_invocation", {}).get("args"):
+        check("manifest", "mcp_invocation", "args changed")
+    current = {s["name"]: {(a["name"], a["type"]) for a in s.get("args", [])} for s in new.get("subcommands", [])}
+    for sub in old.get("subcommands", []):
+        if sub["name"] not in current:
+            check("subcommands", sub["name"], "removed")
+            continue
+        for arg in sorted({(a["name"], a["type"]) for a in sub.get("args", [])} - current[sub["name"]]):
+            check("subcommands", f"{sub['name']} {arg[0]}", f"argument {arg} removed or retyped")
+    for field in CONTRACT_FIELDS:
+        if candidate["daemon"].get(field) != baseline["daemon"].get(field):
+            check("daemon", field, f"{baseline['daemon'].get(field)} -> {candidate['daemon'].get(field)}")
+    return problems
+
+
+def without_annotations(schema):
+    """schema without the annotation keywords of it and every subschema it contains: what decides
+    whether a call is valid. Values of other keywords (enum, const, default, required) are kept
+    verbatim, and so are argument names."""
+    if isinstance(schema, list):
+        return [without_annotations(item) for item in schema]
+    if not isinstance(schema, dict):
+        return schema
+    stripped = {}
+    for key, value in schema.items():
+        if key in ANNOTATION_KEYWORDS:
+            continue
+        if key in SCHEMA_MAP_KEYWORDS and isinstance(value, dict):
+            stripped[key] = {name: without_annotations(sub) for name, sub in value.items()}
+        elif key in SUBSCHEMA_KEYWORDS:
+            stripped[key] = without_annotations(value)
+        else:
+            stripped[key] = value
+    return stripped
+
+
+def reworded_tools(old_tools, new_tools):
+    """Tools present in both whose input schema changed only in its annotations."""
+    return sorted(name for name, schema in old_tools.items()
+                  if name in new_tools and new_tools[name] != schema
+                  and without_annotations(new_tools[name]) == without_annotations(schema))
+
+
+def added_optional_properties(old, new):
+    """Top-level input properties new adds to old when that is the only change, else [].
+
+    A new optional argument cannot break a caller that never sends it: every call GOAT makes
+    today is still valid. That holds only when the old schema refused unknown arguments
+    (additionalProperties false): against a permissive schema a caller may already send the new
+    name with another shape. Anything else (a changed or removed property, a new required one, a
+    different additionalProperties) still counts as a changed input schema."""
+    if not isinstance(old, dict) or not isinstance(new, dict):
+        return []
+    if old.get("additionalProperties") is not False:
+        return []
+    old_properties, new_properties = old.get("properties") or {}, new.get("properties") or {}
+    added = sorted(set(new_properties) - set(old_properties))
+    if not added:
+        return []
+    if {key: value for key, value in new.items() if key != "properties"} != {
+        key: value for key, value in old.items() if key != "properties"
+    }:
+        return []
+    if any(new_properties.get(name) != value for name, value in old_properties.items()):
+        return []
+    return added
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("--candidate", required=True, type=Path, help="fork-built cua-driver executable")
+    parser.add_argument("--candidate-version", required=True, help="version the fork build must report (rust/Cargo.toml)")
+    parser.add_argument("--baseline-key", required=True, help="key in goat/compat/baseline.json, e.g. linux-x86_64")
+    args = parser.parse_args()
+    spec = json.loads((HERE / "baseline.json").read_text())
+    allowed = load_allowed(HERE / "allowed-changes.json")
+    with tempfile.TemporaryDirectory() as tmp:
+        baseline = describe(fetch_baseline(spec, args.baseline_key, Path(tmp)))
+        candidate = describe(args.candidate.resolve())
+    problems = validate(baseline, "baseline", spec["version"], spec["goatTools"])
+    problems += validate(candidate, "candidate", args.candidate_version, spec["goatTools"])
+    if problems:
+        fail("\n".join(problems))
+    for form, mcp in candidate["forms"].items():
+        added = sorted(set(mcp["tools"]) - set(baseline["forms"].get(form, {}).get("tools", {})))
+        print(f"{form}: baseline {len(baseline['forms'][form]['tools'])} tools, candidate {len(mcp['tools'])}" + (f"; added: {', '.join(added)}" if added else ""))
+        for name, schema in sorted(baseline["forms"].get(form, {}).get("tools", {}).items()):
+            arguments = added_optional_properties(without_annotations(schema), without_annotations(mcp["tools"].get(name)))
+            if arguments:
+                print(f"{form}: {name} added optional argument(s): {', '.join(arguments)}")
+        reworded = reworded_tools(baseline["forms"].get(form, {}).get("tools", {}), mcp["tools"])
+        if reworded:
+            print(f"{form}: argument descriptions reworded (not protocol): {', '.join(reworded)}")
+    print(f"daemon contract: baseline {baseline['daemon']['contract_version']}, candidate {candidate['daemon']['contract_version']}")
+    problems = compare(baseline, candidate, allowed)
+    for problem in problems:
+        print("INCOMPATIBLE " + problem)
+    if problems:
+        fail(f"{len(problems)} incompatible change(s); fix them or record each in goat/compat/allowed-changes.json with a reason")
+    print("protocol-compatible with the baseline in every GOAT launch form; the daemon exits when its parent pipe closes")
+
+
+if __name__ == "__main__":
+    main()

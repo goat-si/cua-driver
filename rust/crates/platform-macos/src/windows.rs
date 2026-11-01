@@ -1,0 +1,1270 @@
+//! macOS window enumeration via CGWindowList APIs.
+//!
+//! Uses the C-level CGWindowListCopyWindowInfo API which returns a CFArray
+//! of CFDictionary objects describing each window.
+
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WindowBounds {
+    pub x: f64,
+    pub y: f64,
+    pub width: f64,
+    pub height: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WindowInfo {
+    pub window_id: u32,
+    pub pid: i32,
+    pub app_name: String,
+    pub title: String,
+    pub bounds: WindowBounds,
+    pub layer: i32,
+    pub z_index: usize,
+    pub is_on_screen: bool,
+    /// Active Space on the display WindowServer associates with this window.
+    /// This can differ between windows when displays use independent Spaces.
+    pub current_space_id: Option<u64>,
+    pub on_current_space: Option<bool>,
+    pub space_ids: Option<Vec<u64>>,
+}
+
+pub(crate) struct WindowEnumeration {
+    pub(crate) windows: Vec<WindowInfo>,
+    pub(crate) current_space_id: Option<u64>,
+    /// WindowServer returned a list and every entry carried a readable window
+    /// number and owner pid. False means a window can be missing only because
+    /// it was unreadable.
+    pub(crate) complete: bool,
+}
+
+// ── CGWindow option flags ─────────────────────────────────────────────────────
+// Apple-canonical kCG* naming preserved to match the public Apple headers — the
+// upper-case-globals lint would rename them to KCG_..., which would silently
+// shadow the Apple-namespaced constant references in any future code that
+// re-introduces them. Mirrors platform-windows::uia/windows_enum.rs which uses
+// the same allow for UIA_* constants.
+#[allow(non_upper_case_globals)]
+const kCGWindowListExcludeDesktopElements: u32 = 16;
+#[allow(non_upper_case_globals)]
+const kCGWindowListOptionOnScreenOnly: u32 = 1;
+#[allow(non_upper_case_globals)]
+const kCGNullWindowID: u32 = 0;
+
+// ── Internal CGWindowInfo parsing ─────────────────────────────────────────────
+//
+// We use `system_profiler` workaround via `CGWindowListCopyWindowInfo` which
+// returns a plist-like structure. The simplest cross-compile-safe approach
+// is to dump via `osascript` or use the Objective-C runtime.
+//
+// For the initial version we use the `core-foundation` crate + direct C linkage.
+
+#[link(name = "CoreGraphics", kind = "framework")]
+extern "C" {
+    fn CGWindowListCopyWindowInfo(
+        option: u32,
+        relativeToWindow: u32,
+    ) -> core_foundation::array::CFArrayRef;
+}
+
+/// Enumerate all windows (including off-screen).
+pub fn all_windows() -> Vec<WindowInfo> {
+    all_windows_with_space_snapshot().windows
+}
+
+pub(crate) fn all_windows_with_space_snapshot() -> WindowEnumeration {
+    all_layer0(true)
+}
+
+/// [`all_windows`] without the Space snapshot, for callers that read only
+/// window ids, owners, titles, and bounds.
+pub(crate) fn all_windows_without_spaces() -> Vec<WindowInfo> {
+    all_layer0(false).windows
+}
+
+fn all_layer0(spaces: bool) -> WindowEnumeration {
+    enumerate_windows(
+        kCGWindowListExcludeDesktopElements,
+        LayerFilter::ZeroOnly,
+        None,
+        spaces,
+    )
+}
+
+/// Enumerate only on-screen windows.
+pub fn visible_windows() -> Vec<WindowInfo> {
+    visible_windows_with_space_snapshot().windows
+}
+
+pub(crate) fn visible_windows_with_space_snapshot() -> WindowEnumeration {
+    visible_layer0(true)
+}
+
+/// [`visible_windows`] without the Space snapshot, for callers that read only
+/// window ids, owners, titles, and bounds.
+pub(crate) fn visible_windows_without_spaces() -> Vec<WindowInfo> {
+    visible_layer0(false).windows
+}
+
+fn visible_layer0(spaces: bool) -> WindowEnumeration {
+    enumerate_windows(
+        kCGWindowListOptionOnScreenOnly | kCGWindowListExcludeDesktopElements,
+        LayerFilter::ZeroOnly,
+        None,
+        spaces,
+    )
+}
+
+pub(crate) fn pid_windows_with_space_snapshot(pid: i32, on_screen_only: bool) -> WindowEnumeration {
+    let on_screen = if on_screen_only {
+        kCGWindowListOptionOnScreenOnly
+    } else {
+        0
+    };
+    enumerate_windows(
+        on_screen | kCGWindowListExcludeDesktopElements,
+        LayerFilter::AnyLayer,
+        Some(pid),
+        true,
+    )
+}
+
+/// On-screen windows of `pid` on every layer, without the Space snapshot.
+/// Cheap enough to poll during a gesture (the drag tool watches for a
+/// drag-image window at the dragging level).
+pub(crate) fn pid_on_screen_windows_any_layer(pid: i32) -> Vec<WindowInfo> {
+    pid_on_screen_windows_any_layer_enumeration(pid).windows
+}
+
+/// [`pid_on_screen_windows_any_layer`] with its completeness: an empty list
+/// from a failed WindowServer read is not "no windows".
+pub(crate) fn pid_on_screen_windows_any_layer_enumeration(pid: i32) -> WindowEnumeration {
+    enumerate_windows(
+        kCGWindowListOptionOnScreenOnly | kCGWindowListExcludeDesktopElements,
+        LayerFilter::AnyLayer,
+        Some(pid),
+        false,
+    )
+}
+
+/// On-screen windows of every app on every layer, front to back, without the
+/// Space snapshot. Use this, not [`all_windows_any_layer`], to compare two
+/// apps' window order: the all-windows list (off-screen windows included) did
+/// not follow a raise in Bench v2 (a Chromium window raised over the user's
+/// window still read as behind it), while the on-screen list does.
+pub(crate) fn on_screen_windows_any_layer() -> Vec<WindowInfo> {
+    enumerate_windows(
+        kCGWindowListOptionOnScreenOnly | kCGWindowListExcludeDesktopElements,
+        LayerFilter::AnyLayer,
+        None,
+        false,
+    )
+    .windows
+}
+
+pub(crate) fn prefer_layer0(windows: &mut Vec<WindowInfo>) {
+    if windows.iter().any(|w| w.layer == 0) {
+        windows.retain(|w| w.layer == 0);
+    }
+}
+
+/// Enumerate windows on every CGWindow layer, including the accessory layers
+/// (`layer != 0`) that [`all_windows`] hides.
+///
+/// Only used to answer "does this CGWindowID exist, and who owns it?" — the
+/// question `list_windows` must NOT answer, because surfacing tooltips,
+/// popovers, the Dock and every NSMenu window would swamp callers. Keeping the
+/// layer filter on enumeration and off identity lookup is what lets
+/// `get_window_state` tell "no such window" apart from "exists, but is not a
+/// layer-0 window" (issue #2237).
+pub(crate) fn all_windows_any_layer() -> Vec<WindowInfo> {
+    enumerate_windows(
+        kCGWindowListExcludeDesktopElements,
+        LayerFilter::AnyLayer,
+        None,
+        false,
+    )
+    .windows
+}
+
+/// Which CGWindow layers an enumeration admits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LayerFilter {
+    /// Normal application windows only — what `list_windows` reports.
+    ZeroOnly,
+    /// Every layer, accessory windows included.
+    AnyLayer,
+}
+
+/// Whether one WindowServer entry was read well enough for the enumeration
+/// to stay complete. An unreadable id or owner could be any window. For an
+/// every-layer read, an unreadable layer of a wanted window could hide a
+/// window the caller filters by layer (a menu window at layer 101), so it
+/// counts too; a layer-0 read keeps its old behaviour.
+fn entry_readable(
+    has_window_number: bool,
+    has_owner_pid: bool,
+    has_layer: bool,
+    layer_matters: bool,
+) -> bool {
+    has_window_number && has_owner_pid && (has_layer || !layer_matters)
+}
+
+fn enumerate_windows(
+    options: u32,
+    layers: LayerFilter,
+    pid_filter: Option<i32>,
+    spaces: bool,
+) -> WindowEnumeration {
+    use core_foundation::{
+        array::CFArray,
+        base::{CFGetTypeID, CFTypeRef, TCFType},
+        boolean::CFBoolean,
+        dictionary::CFDictionary,
+        number::CFNumber,
+        string::CFString,
+    };
+    use std::os::raw::c_void;
+
+    let space_query = spaces
+        .then(crate::input::skylight::SpaceQuery::new)
+        .flatten();
+    let current_space_id = space_query
+        .as_ref()
+        .and_then(|query| query.current_space_id());
+
+    let raw_ref = unsafe { CGWindowListCopyWindowInfo(options, kCGNullWindowID) };
+    if raw_ref.is_null() {
+        return WindowEnumeration {
+            windows: vec![],
+            current_space_id,
+            complete: false,
+        };
+    }
+
+    let raw: CFArray<CFTypeRef> = unsafe { CFArray::wrap_under_create_rule(raw_ref as _) };
+    let total = raw.len() as usize;
+    let mut results = Vec::new();
+    let mut complete = true;
+
+    for (idx, item) in raw.iter().enumerate() {
+        let item = *item;
+        // Each item should be a CFDictionary.
+        let dict_type = CFDictionary::<*const c_void, *const c_void>::type_id();
+        if unsafe { CFGetTypeID(item) } != dict_type {
+            complete = false;
+            continue;
+        }
+
+        let dict: CFDictionary<*const c_void, *const c_void> =
+            unsafe { CFDictionary::wrap_under_get_rule(item as _) };
+
+        // Helper: get number from dict by key string.
+        let find_num = |key: &str| -> Option<i64> {
+            let k = CFString::new(key);
+            dict.find(k.as_concrete_TypeRef() as *const c_void)
+                .and_then(|v| unsafe {
+                    let v = *v;
+                    if CFGetTypeID(v) == CFNumber::type_id() {
+                        CFNumber::wrap_under_get_rule(v as _).to_i64()
+                    } else {
+                        None
+                    }
+                })
+        };
+        let get_num = |key: &str| -> i64 { find_num(key).unwrap_or(0) };
+
+        let get_str = |key: &str| -> String {
+            let k = CFString::new(key);
+            dict.find(k.as_concrete_TypeRef() as *const c_void)
+                .and_then(|v| unsafe {
+                    let v = *v;
+                    if CFGetTypeID(v) == CFString::type_id() {
+                        Some(CFString::wrap_under_get_rule(v as _).to_string())
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or_default()
+        };
+
+        let get_bool = |key: &str| -> bool {
+            let k = CFString::new(key);
+            dict.find(k.as_concrete_TypeRef() as *const c_void)
+                .map(|v| unsafe {
+                    let v = *v;
+                    if CFGetTypeID(v) == CFBoolean::type_id() {
+                        bool::from(CFBoolean::wrap_under_get_rule(v as _))
+                    } else {
+                        false
+                    }
+                })
+                .unwrap_or(false)
+        };
+
+        let window_number = find_num("kCGWindowNumber");
+        let owner_pid = find_num("kCGWindowOwnerPID");
+        let layer_number = find_num("kCGWindowLayer");
+        let wanted_pid = owner_pid
+            .is_some_and(|owner| pid_filter.is_none_or(|wanted| i64::from(wanted) == owner));
+        if !entry_readable(
+            window_number.is_some(),
+            owner_pid.is_some(),
+            layer_number.is_some(),
+            layers == LayerFilter::AnyLayer && wanted_pid,
+        ) {
+            complete = false;
+        }
+        let window_id = window_number.unwrap_or(0) as u32;
+        let pid = owner_pid.unwrap_or(0) as i32;
+        let app_name = get_str("kCGWindowOwnerName");
+        let title = get_str("kCGWindowName");
+        let layer = get_num("kCGWindowLayer") as i32;
+        let is_on_screen = get_bool("kCGWindowIsOnscreen");
+
+        // Only include layer-0 windows, unless the caller asked for every layer.
+        if layer != 0 && layers == LayerFilter::ZeroOnly {
+            continue;
+        }
+        if pid_filter.is_some_and(|wanted| wanted != pid) {
+            continue;
+        }
+
+        // Parse bounds dict.
+        let bounds = {
+            let bk = CFString::new("kCGWindowBounds");
+            dict.find(bk.as_concrete_TypeRef() as *const c_void)
+                .and_then(|v| unsafe {
+                    let v = *v;
+                    if CFGetTypeID(v) == CFDictionary::<*const c_void, *const c_void>::type_id() {
+                        let bd: CFDictionary<*const c_void, *const c_void> =
+                            CFDictionary::wrap_under_get_rule(v as _);
+                        let x = get_bounds_num(&bd, "X");
+                        let y = get_bounds_num(&bd, "Y");
+                        let w = get_bounds_num(&bd, "Width");
+                        let h = get_bounds_num(&bd, "Height");
+                        Some(WindowBounds {
+                            x,
+                            y,
+                            width: w,
+                            height: h,
+                        })
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or(WindowBounds {
+                    x: 0.,
+                    y: 0.,
+                    width: 0.,
+                    height: 0.,
+                })
+        };
+
+        // z_index: CGWindowList front-to-back → assign reverse index.
+        let z_index = cua_driver_core::window_target::z_index_from_front_to_back(total, idx);
+
+        results.push(WindowInfo {
+            window_id,
+            pid,
+            app_name,
+            title,
+            bounds,
+            layer,
+            z_index,
+            is_on_screen,
+            current_space_id: None,
+            on_current_space: None,
+            space_ids: None,
+        });
+    }
+
+    if let Some(query) = &space_query {
+        fill_window_spaces(query, &mut results);
+    }
+
+    WindowEnumeration {
+        windows: results,
+        current_space_id,
+        complete,
+    }
+}
+
+/// The two per-window Space reads an enumeration makes, behind a trait so the
+/// single-window lookup can be checked against the full enumeration.
+trait WindowSpaceSource {
+    fn window_space_ids(&self, window_id: u32) -> Option<Vec<u64>>;
+    fn current_space_for_window(&self, window_id: u32) -> Option<u64>;
+}
+
+impl WindowSpaceSource for crate::input::skylight::SpaceQuery {
+    fn window_space_ids(&self, window_id: u32) -> Option<Vec<u64>> {
+        crate::input::skylight::SpaceQuery::window_space_ids(self, window_id)
+    }
+    fn current_space_for_window(&self, window_id: u32) -> Option<u64> {
+        crate::input::skylight::SpaceQuery::current_space_for_window(self, window_id)
+    }
+}
+
+fn fill_window_spaces(source: &impl WindowSpaceSource, windows: &mut [WindowInfo]) {
+    for window in windows {
+        let space_ids = source.window_space_ids(window.window_id);
+        let display_space_id = space_ids
+            .as_ref()
+            .and_then(|_| source.current_space_for_window(window.window_id));
+        apply_window_space_metadata(window, space_ids, display_space_id);
+    }
+}
+
+/// `window_id`'s row from `windows` with its Space metadata read for that
+/// window alone: the values [`all_windows`] reports for it, without two Space
+/// round trips for every other window on the system.
+fn layer0_window_with_spaces_in(
+    windows: Vec<WindowInfo>,
+    source: Option<&impl WindowSpaceSource>,
+    window_id: u32,
+) -> Option<WindowInfo> {
+    let mut window = windows.into_iter().find(|w| w.window_id == window_id)?;
+    if let Some(source) = source {
+        fill_window_spaces(source, std::slice::from_mut(&mut window));
+    }
+    Some(window)
+}
+
+fn layer0_window_with_spaces(window_id: u32) -> Option<WindowInfo> {
+    // Same order as the full enumeration: the Space query first, then the list.
+    let space_query = crate::input::skylight::SpaceQuery::new();
+    layer0_window_with_spaces_in(
+        all_windows_without_spaces(),
+        space_query.as_ref(),
+        window_id,
+    )
+}
+
+/// One CGWindowList entry, reduced to the identity fields closure needs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RawWindowIdentity {
+    NotADictionary,
+    Entry {
+        window_id: Option<i64>,
+        pid: Option<i64>,
+    },
+}
+
+/// Every window id WindowServer reported for one pid at one moment.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct WindowIdSnapshot {
+    /// The list was returned and every entry that could belong to the pid was
+    /// readable. Only then does a missing id mean the window is gone.
+    pub(crate) complete: bool,
+    /// Ascending, deduplicated. Empty when incomplete.
+    pub(crate) window_ids: Vec<u32>,
+}
+
+/// The pid's window ids from raw WindowServer entries. Any entry whose owner
+/// is unreadable could be the pid's, and any of the pid's entries without a
+/// valid id could be the window being asked about, so either makes the
+/// snapshot incomplete rather than silently short.
+pub(crate) fn window_ids_for_pid(
+    entries: Option<Vec<RawWindowIdentity>>,
+    pid: i32,
+) -> WindowIdSnapshot {
+    let incomplete = || WindowIdSnapshot {
+        complete: false,
+        window_ids: Vec::new(),
+    };
+    let Some(entries) = entries else {
+        return incomplete();
+    };
+    let mut window_ids = Vec::new();
+    for entry in entries {
+        let RawWindowIdentity::Entry {
+            window_id,
+            pid: owner,
+        } = entry
+        else {
+            return incomplete();
+        };
+        let Some(owner) = owner.and_then(|owner| i32::try_from(owner).ok()) else {
+            return incomplete();
+        };
+        if owner != pid {
+            continue;
+        }
+        match window_id
+            .and_then(|id| u32::try_from(id).ok())
+            .filter(|id| *id > 0)
+        {
+            Some(id) => window_ids.push(id),
+            None => return incomplete(),
+        }
+    }
+    window_ids.sort_unstable();
+    window_ids.dedup();
+    WindowIdSnapshot {
+        complete: true,
+        window_ids,
+    }
+}
+
+/// Every window id the current user session's WindowServer lists for 'pid'
+/// right now: every layer and Space, on or off screen, desktop elements
+/// included, before any of list_windows' filtering. A window the app closed
+/// is no longer listed; a hidden, minimized or other-Space window still is.
+pub(crate) fn pid_window_id_snapshot(pid: i32) -> WindowIdSnapshot {
+    use core_foundation::{
+        array::CFArray,
+        base::{CFGetTypeID, CFTypeRef, TCFType},
+        dictionary::CFDictionary,
+        number::CFNumber,
+        string::CFString,
+    };
+    use std::os::raw::c_void;
+
+    // kCGWindowListOptionAll: no on-screen or desktop-element restriction.
+    let raw_ref = unsafe { CGWindowListCopyWindowInfo(0, kCGNullWindowID) };
+    if raw_ref.is_null() {
+        return window_ids_for_pid(None, pid);
+    }
+    let raw: CFArray<CFTypeRef> = unsafe { CFArray::wrap_under_create_rule(raw_ref as _) };
+    let dict_type = CFDictionary::<*const c_void, *const c_void>::type_id();
+    let window_number_key = CFString::new("kCGWindowNumber");
+    let owner_pid_key = CFString::new("kCGWindowOwnerPID");
+    let entries = raw
+        .iter()
+        .map(|item| {
+            let item = *item;
+            if unsafe { CFGetTypeID(item) } != dict_type {
+                return RawWindowIdentity::NotADictionary;
+            }
+            let dict: CFDictionary<*const c_void, *const c_void> =
+                unsafe { CFDictionary::wrap_under_get_rule(item as _) };
+            let number = |key: &CFString| {
+                dict.find(key.as_concrete_TypeRef() as *const c_void)
+                    .and_then(|value| unsafe {
+                        let value = *value;
+                        if CFGetTypeID(value) == CFNumber::type_id() {
+                            CFNumber::wrap_under_get_rule(value as _).to_i64()
+                        } else {
+                            None
+                        }
+                    })
+            };
+            RawWindowIdentity::Entry {
+                window_id: number(&window_number_key),
+                pid: number(&owner_pid_key),
+            }
+        })
+        .collect();
+    window_ids_for_pid(Some(entries), pid)
+}
+
+fn apply_window_space_metadata(
+    window: &mut WindowInfo,
+    space_ids: Option<Vec<u64>>,
+    current_space_id: Option<u64>,
+) {
+    window.on_current_space = window_on_current_space(space_ids.as_deref(), current_space_id);
+    window.current_space_id = current_space_id;
+    window.space_ids = space_ids;
+}
+
+fn window_on_current_space(
+    space_ids: Option<&[u64]>,
+    current_space_id: Option<u64>,
+) -> Option<bool> {
+    Some(space_ids?.contains(&current_space_id?))
+}
+
+fn get_bounds_num(
+    dict: &core_foundation::dictionary::CFDictionary<
+        *const std::os::raw::c_void,
+        *const std::os::raw::c_void,
+    >,
+    key: &str,
+) -> f64 {
+    use core_foundation::{
+        base::{CFGetTypeID, TCFType},
+        number::CFNumber,
+        string::CFString,
+    };
+    use std::os::raw::c_void;
+
+    let k = CFString::new(key);
+    dict.find(k.as_concrete_TypeRef() as *const c_void)
+        .and_then(|v| unsafe {
+            let v = *v;
+            if CFGetTypeID(v) == CFNumber::type_id() {
+                CFNumber::wrap_under_get_rule(v as _).to_f64()
+            } else {
+                None
+            }
+        })
+        .filter(|v| v.is_finite())
+        .unwrap_or(0.0)
+}
+
+/// Look up a window by its CGWindowID across every layer.
+///
+/// Returns `None` only when WindowServer has no record of the id at all —
+/// which is precisely the "closed or fabricated window_id" signal callers need.
+/// Whether `window` has the shape of an AppKit-internal helper window:
+/// WindowServer reports it off screen, untitled, and in no Space. Real
+/// windows that are minimized, hidden, or on another Space keep a Space or
+/// stay listed in `AXWindows`; these helpers have neither, so no AX tool can
+/// read, move, or focus them (issue #4525).
+fn may_be_ax_less_helper(window: &WindowInfo) -> bool {
+    !window.is_on_screen
+        && window.title.trim().is_empty()
+        && window.space_ids.as_ref().is_none_or(Vec::is_empty)
+}
+
+/// Drop helper-shaped windows that `pid`'s `AXWindows` does not list.
+///
+/// `ax_window_ids` is asked once per pid that owns a helper-shaped window.
+/// When it returns `None` (no Accessibility trust, unresponsive app) every
+/// window of that pid is kept: an unreadable AX list proves nothing.
+pub(crate) fn retain_ax_reachable_with(
+    windows: &mut Vec<WindowInfo>,
+    mut ax_window_ids: impl FnMut(i32) -> Option<std::collections::HashSet<u32>>,
+) {
+    let mut by_pid: std::collections::HashMap<i32, Option<std::collections::HashSet<u32>>> =
+        std::collections::HashMap::new();
+    windows.retain(|window| {
+        if !may_be_ax_less_helper(window) {
+            return true;
+        }
+        by_pid
+            .entry(window.pid)
+            .or_insert_with(|| ax_window_ids(window.pid))
+            .as_ref()
+            .is_none_or(|ids| ids.contains(&window.window_id))
+    });
+}
+
+/// [`retain_ax_reachable_with`] against the live `AXWindows` of each app.
+///
+/// Only applies to an enumeration whose Space query worked
+/// (`current_space_id` is known): without it every window lacks Space
+/// membership, and an off-Space window, which `AXWindows` also omits, would be
+/// indistinguishable from a helper.
+pub(crate) fn retain_ax_reachable(windows: &mut Vec<WindowInfo>, current_space_id: Option<u64>) {
+    retain_ax_reachable_using(
+        windows,
+        current_space_id,
+        crate::ax::bindings::ax_window_ids_of_pid,
+    );
+}
+
+/// [`retain_ax_reachable`] with the AXWindows lookup supplied by the caller.
+pub(crate) fn retain_ax_reachable_using(
+    windows: &mut Vec<WindowInfo>,
+    current_space_id: Option<u64>,
+    ax_window_ids: impl FnMut(i32) -> Option<std::collections::HashSet<u32>>,
+) {
+    if current_space_id.is_some() {
+        retain_ax_reachable_with(windows, ax_window_ids);
+    }
+}
+
+pub fn window_info_by_id(window_id: u32) -> Option<WindowInfo> {
+    all_windows_any_layer()
+        .into_iter()
+        .find(|w| w.window_id == window_id)
+}
+
+/// Whether `window_id` is on the current Space of its display. `None` when
+/// WindowServer does not know the window or Space membership is unreadable.
+pub fn window_on_current_space_by_id(window_id: u32) -> Option<bool> {
+    layer0_window_with_spaces(window_id)?.on_current_space
+}
+
+/// WindowServer's Space and on-screen view of one layer-0 window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct WindowSpaceView {
+    /// See [`WindowInfo::on_current_space`].
+    pub(crate) on_current_space: Option<bool>,
+    /// `kCGWindowIsOnscreen`.
+    pub(crate) is_on_screen: bool,
+}
+
+/// [`WindowSpaceView`] of `window_id`, or `None` when WindowServer does not
+/// list it as a layer-0 window.
+pub(crate) fn window_space_view_by_id(window_id: u32) -> Option<WindowSpaceView> {
+    layer0_window_with_spaces(window_id).map(|w| WindowSpaceView {
+        on_current_space: w.on_current_space,
+        is_on_screen: w.is_on_screen,
+    })
+}
+
+/// Look up a window's bounds by its CGWindowID.
+///
+/// Returns `None` if the window is not currently known to WindowServer
+/// (e.g. it was closed or the window_id is stale).
+pub fn window_bounds_by_id(window_id: u32) -> Option<WindowBounds> {
+    window_info_by_id(window_id).map(|w| w.bounds)
+}
+
+/// Who owns a requested CGWindowID, as seen by a caller that asked about `pid`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WindowOwner {
+    /// The window exists and `pid` owns it.
+    SamePid,
+    /// The window exists, but a different process owns it. macOS hosts a
+    /// sandboxed app's Open/Save panel in
+    /// `com.apple.appkit.xpc.openAndSavePanelService`, so the panel's
+    /// CGWindowID belongs to that service and not to the app that opened it
+    /// (issue #2237).
+    ForeignPid {
+        owner_pid: i32,
+        owner_app_name: String,
+    },
+    /// WindowServer has no record of the id — closed, stale, or fabricated.
+    Unknown,
+}
+
+/// Pure form of [`resolve_window_owner`] over an already-enumerated window
+/// list, so the ownership decision is testable without a WindowServer.
+pub fn resolve_window_owner_in(windows: &[WindowInfo], pid: i32, window_id: u32) -> WindowOwner {
+    match windows.iter().find(|w| w.window_id == window_id) {
+        None => WindowOwner::Unknown,
+        Some(w) if w.pid == pid => WindowOwner::SamePid,
+        Some(w) => WindowOwner::ForeignPid {
+            owner_pid: w.pid,
+            owner_app_name: w.app_name.clone(),
+        },
+    }
+}
+
+/// Resolve whether `pid` really owns `window_id`. Blocking (one CGWindowList
+/// enumeration).
+pub fn resolve_window_owner(pid: i32, window_id: u32) -> WindowOwner {
+    resolve_window_owner_in(&all_windows_any_layer(), pid, window_id)
+}
+
+/// Select the best window_id for a pid.
+pub fn resolve_main_window_id(pid: i32) -> anyhow::Result<u32> {
+    let mut pid_windows = enumerate_windows(
+        kCGWindowListExcludeDesktopElements,
+        LayerFilter::AnyLayer,
+        Some(pid),
+        false,
+    )
+    .windows;
+    prefer_layer0(&mut pid_windows);
+    if pid_windows.is_empty() {
+        anyhow::bail!("pid {pid} has no windows");
+    }
+    let mut on_screen: Vec<&WindowInfo> = pid_windows.iter().filter(|w| w.is_on_screen).collect();
+    if !on_screen.is_empty() {
+        on_screen.sort_by_key(|window| std::cmp::Reverse(window.z_index));
+        return Ok(on_screen[0].window_id);
+    }
+    let largest = pid_windows.iter().max_by(|a, b| {
+        let area_a = a.bounds.width * a.bounds.height;
+        let area_b = b.bounds.width * b.bounds.height;
+        area_a
+            .partial_cmp(&area_b)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    Ok(largest.unwrap().window_id)
+}
+
+/// kCGPopUpMenuWindowLevel: the WindowServer layer of an open menu's window.
+const MENU_WINDOW_LAYER: i32 = 101;
+
+/// The ids of the menu windows `pid` has on screen; `None` when
+/// WindowServer's window list could not be read (unknown, never "no menu").
+pub(crate) fn menu_window_ids(pid: i32) -> Option<Vec<u32>> {
+    let windows = all_windows_any_layer();
+    (!windows.is_empty()).then(|| {
+        windows
+            .iter()
+            .filter(|w| w.pid == pid && w.is_on_screen && w.layer == MENU_WINDOW_LAYER)
+            .map(|w| w.window_id)
+            .collect()
+    })
+}
+
+/// How many menu windows of `pid` are on screen that were not in `before`;
+/// `None` when unknown.
+pub(crate) fn new_menu_windows(pid: i32, before: &[u32]) -> Option<usize> {
+    menu_window_ids(pid).map(|ids| ids.iter().filter(|id| !before.contains(id)).count())
+}
+
+/// `Some(true)` once no menu window of `pid` outside `before` is on screen
+/// (polled for up to 400 ms), `Some(false)` when one still is, `None` when
+/// that could not be read.
+pub(crate) fn wait_for_new_menus_closed(pid: i32, before: &[u32]) -> Option<bool> {
+    poll_until_no_menu(
+        || new_menu_windows(pid, before),
+        std::time::Duration::from_millis(400),
+    )
+}
+
+fn poll_until_no_menu(
+    mut open_menus: impl FnMut() -> Option<usize>,
+    timeout: std::time::Duration,
+) -> Option<bool> {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if open_menus()? == 0 {
+            return Some(true);
+        }
+        if std::time::Instant::now() >= deadline {
+            return Some(false);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(40));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pid_window_id_snapshot_lists_every_id_of_the_pid_and_flags_unreadable_entries() {
+        use RawWindowIdentity::{Entry, NotADictionary};
+        let entry = |window_id: i64, pid: i64| Entry {
+            window_id: Some(window_id),
+            pid: Some(pid),
+        };
+
+        // Every layer, Space and on/off-screen state arrives as an entry; the
+        // snapshot keeps every id of the pid, ascending and deduplicated.
+        let listed = window_ids_for_pid(
+            Some(vec![entry(12, 7), entry(5, 7), entry(9, 8), entry(12, 7)]),
+            7,
+        );
+        assert!(listed.complete);
+        assert_eq!(listed.window_ids, [5, 12]);
+
+        // A complete snapshot without the pid's windows is meaningful.
+        let none_left = window_ids_for_pid(Some(vec![entry(9, 8)]), 7);
+        assert!(none_left.complete);
+        assert!(none_left.window_ids.is_empty());
+
+        // An id with an unreadable owner elsewhere does not matter only when
+        // the owner is readable.
+        let other_owner = window_ids_for_pid(
+            Some(vec![
+                entry(5, 7),
+                Entry {
+                    window_id: None,
+                    pid: Some(8),
+                },
+            ]),
+            7,
+        );
+        assert!(other_owner.complete);
+        assert_eq!(other_owner.window_ids, [5]);
+
+        for (case, entries) in [
+            ("WindowServer returned no list", None),
+            (
+                "an entry is not a dictionary",
+                Some(vec![entry(5, 7), NotADictionary]),
+            ),
+            (
+                "an owner pid is missing",
+                Some(vec![
+                    entry(5, 7),
+                    Entry {
+                        window_id: Some(6),
+                        pid: None,
+                    },
+                ]),
+            ),
+            (
+                "an owner pid is out of range",
+                Some(vec![entry(6, i64::from(i32::MAX) + 1)]),
+            ),
+            (
+                "the pid's window id is missing",
+                Some(vec![Entry {
+                    window_id: None,
+                    pid: Some(7),
+                }]),
+            ),
+            ("the pid's window id is zero", Some(vec![entry(0, 7)])),
+            ("the pid's window id is negative", Some(vec![entry(-1, 7)])),
+            (
+                "the pid's window id is out of range",
+                Some(vec![entry(i64::from(u32::MAX) + 1, 7)]),
+            ),
+        ] {
+            let snapshot = window_ids_for_pid(entries, 7);
+            assert!(!snapshot.complete, "{case}");
+            assert!(snapshot.window_ids.is_empty(), "{case}: no partial id set");
+        }
+    }
+
+    #[test]
+    fn an_unreadable_layer_makes_an_every_layer_read_incomplete() {
+        assert!(entry_readable(true, true, true, true));
+        assert!(!entry_readable(true, true, false, true));
+        // A layer-0 read, or another app's window, keeps its behaviour.
+        assert!(entry_readable(true, true, false, false));
+        assert!(!entry_readable(false, true, true, false));
+        assert!(!entry_readable(true, false, true, false));
+    }
+
+    #[test]
+    #[ignore = "reads the live WindowServer; window_ids_for_pid covers the logic with fake entries"]
+    fn live_pid_window_id_snapshot_reads_window_server() {
+        // The test process owns no windows. A complete live snapshot therefore
+        // lists none for it; an unavailable WindowServer reports incomplete.
+        let snapshot = pid_window_id_snapshot(std::process::id() as i32);
+        assert!(snapshot.window_ids.is_empty(), "{snapshot:?}");
+    }
+
+    #[test]
+    fn bounds_numbers_preserve_finite_values_and_default_non_finite_or_missing_values() {
+        use core_foundation::{
+            base::TCFType, dictionary::CFDictionary, number::CFNumber, string::CFString,
+        };
+
+        let bounds = CFDictionary::from_CFType_pairs(&[
+            (
+                CFString::new("X").as_CFType(),
+                CFNumber::from(12.5).as_CFType(),
+            ),
+            (
+                CFString::new("Y").as_CFType(),
+                CFNumber::from(f64::INFINITY).as_CFType(),
+            ),
+            (
+                CFString::new("Width").as_CFType(),
+                CFNumber::from(f64::NAN).as_CFType(),
+            ),
+            (
+                CFString::new("Height").as_CFType(),
+                CFNumber::from(f64::NEG_INFINITY).as_CFType(),
+            ),
+        ]);
+        let bounds = unsafe { CFDictionary::wrap_under_get_rule(bounds.as_concrete_TypeRef()) };
+
+        assert_eq!(get_bounds_num(&bounds, "X"), 12.5);
+        assert_eq!(get_bounds_num(&bounds, "Y"), 0.0);
+        assert_eq!(get_bounds_num(&bounds, "Width"), 0.0);
+        assert_eq!(get_bounds_num(&bounds, "Height"), 0.0);
+        assert_eq!(get_bounds_num(&bounds, "Missing"), 0.0);
+    }
+
+    #[test]
+    fn space_membership_checks_all_spaces_for_a_window() {
+        assert_eq!(window_on_current_space(Some(&[2, 4]), Some(4)), Some(true));
+        assert_eq!(window_on_current_space(Some(&[2, 4]), Some(3)), Some(false));
+    }
+
+    #[test]
+    fn space_membership_stays_unknown_without_either_side() {
+        assert_eq!(window_on_current_space(None, Some(4)), None);
+        assert_eq!(window_on_current_space(Some(&[4]), None), None);
+    }
+
+    #[test]
+    fn per_window_current_space_is_the_one_used_for_membership() {
+        let mut secondary_display_window = window(42, 800, "TextEdit");
+        apply_window_space_metadata(&mut secondary_display_window, Some(vec![2, 4]), Some(4));
+
+        assert_eq!(secondary_display_window.current_space_id, Some(4));
+        assert_eq!(secondary_display_window.space_ids, Some(vec![2, 4]));
+        assert_eq!(secondary_display_window.on_current_space, Some(true));
+        assert!(secondary_display_window
+            .space_ids
+            .as_deref()
+            .is_some_and(|spaces| spaces.contains(
+                &secondary_display_window
+                    .current_space_id
+                    .expect("display Space must be present")
+            )));
+    }
+
+    fn window(window_id: u32, pid: i32, app_name: &str) -> WindowInfo {
+        WindowInfo {
+            window_id,
+            pid,
+            app_name: app_name.into(),
+            title: String::new(),
+            bounds: WindowBounds {
+                x: 0.,
+                y: 580.,
+                width: 500.,
+                height: 500.,
+            },
+            layer: 0,
+            z_index: 1,
+            is_on_screen: true,
+            current_space_id: None,
+            on_current_space: None,
+            space_ids: None,
+        }
+    }
+
+    /// Spaces per window, with every window whose Spaces were asked for.
+    struct FakeSpaces {
+        spaces: std::collections::HashMap<u32, Vec<u64>>,
+        display_space: std::collections::HashMap<u32, u64>,
+        asked: std::cell::RefCell<Vec<u32>>,
+    }
+
+    impl WindowSpaceSource for FakeSpaces {
+        fn window_space_ids(&self, window_id: u32) -> Option<Vec<u64>> {
+            self.asked.borrow_mut().push(window_id);
+            self.spaces.get(&window_id).cloned()
+        }
+        fn current_space_for_window(&self, window_id: u32) -> Option<u64> {
+            self.display_space.get(&window_id).copied()
+        }
+    }
+
+    #[test]
+    fn one_window_space_lookup_matches_the_full_enumeration_and_asks_only_for_it() {
+        let fake = FakeSpaces {
+            // 1 is on the current Space, 2 on another one, 3 has no Space
+            // answer, 4 is on a second display with its own current Space.
+            spaces: [(1, vec![7]), (2, vec![9]), (4, vec![11, 12])].into(),
+            display_space: [(1, 7), (2, 7), (3, 7), (4, 12)].into(),
+            asked: Default::default(),
+        };
+        let listed: Vec<WindowInfo> = (1..=4).map(|id| window(id, 50, "App")).collect();
+        let mut enumerated = listed.clone();
+        fill_window_spaces(&fake, &mut enumerated);
+        for target in 1..=4 {
+            fake.asked.borrow_mut().clear();
+            let one = layer0_window_with_spaces_in(listed.clone(), Some(&fake), target)
+                .expect("listed window");
+            assert_eq!(*fake.asked.borrow(), [target]);
+            let full = &enumerated[target as usize - 1];
+            assert_eq!(one.on_current_space, full.on_current_space);
+            assert_eq!(one.current_space_id, full.current_space_id);
+            assert_eq!(one.space_ids, full.space_ids);
+            assert_eq!(one.is_on_screen, full.is_on_screen);
+        }
+        assert_eq!(enumerated[0].on_current_space, Some(true));
+        assert_eq!(enumerated[1].on_current_space, Some(false));
+        assert_eq!(enumerated[2].on_current_space, None);
+        assert_eq!(enumerated[3].on_current_space, Some(true));
+
+        // An unlisted window is unknown, and nothing is asked for it.
+        fake.asked.borrow_mut().clear();
+        assert!(layer0_window_with_spaces_in(listed.clone(), Some(&fake), 99).is_none());
+        assert!(fake.asked.borrow().is_empty());
+        // Without a Space query the row keeps no Space metadata, as before.
+        let bare = layer0_window_with_spaces_in(listed, None::<&FakeSpaces>, 2).unwrap();
+        assert_eq!(bare.on_current_space, None);
+    }
+
+    #[test]
+    fn layer0_windows_win_over_accessory_windows() {
+        let accessory = WindowInfo {
+            layer: 3,
+            ..window(41, 800, "TextEdit")
+        };
+        let mut windows = vec![accessory, window(42, 800, "TextEdit")];
+        prefer_layer0(&mut windows);
+        assert_eq!(
+            windows.iter().map(|w| w.window_id).collect::<Vec<_>>(),
+            [42]
+        );
+    }
+
+    #[test]
+    fn accessory_only_app_keeps_its_accessory_windows() {
+        let mut windows = vec![WindowInfo {
+            layer: 3,
+            ..window(194, 800, "OnboardingApp")
+        }];
+        prefer_layer0(&mut windows);
+        assert_eq!(
+            windows.iter().map(|w| w.window_id).collect::<Vec<_>>(),
+            [194]
+        );
+    }
+
+    #[test]
+    fn menu_close_polling_keeps_an_unreadable_window_list_unknown() {
+        let timeout = std::time::Duration::from_millis(100);
+        assert_eq!(poll_until_no_menu(|| Some(0), timeout), Some(true));
+        assert_eq!(poll_until_no_menu(|| None, timeout), None);
+        assert_eq!(poll_until_no_menu(|| Some(1), timeout), Some(false));
+        let mut reads = [Some(1), Some(0)].into_iter();
+        assert_eq!(
+            poll_until_no_menu(|| reads.next().flatten(), timeout),
+            Some(true)
+        );
+    }
+
+    fn helper(window_id: u32, pid: i32) -> WindowInfo {
+        WindowInfo {
+            title: String::new(),
+            is_on_screen: false,
+            space_ids: None,
+            ..window(window_id, pid, "TextEdit")
+        }
+    }
+
+    #[test]
+    fn ax_less_helper_windows_are_dropped() {
+        // #4525: TextEdit's off-screen, untitled, Space-less AppKit helpers.
+        let mut visible = window(58, 3018, "TextEdit");
+        visible.title = "Untitled".into();
+        let mut windows = vec![visible, helper(57, 3018), helper(55, 3018)];
+        let mut asked = Vec::new();
+        retain_ax_reachable_with(&mut windows, |pid| {
+            asked.push(pid);
+            Some([58].into_iter().collect())
+        });
+        assert_eq!(
+            windows.iter().map(|w| w.window_id).collect::<Vec<_>>(),
+            [58]
+        );
+        assert_eq!(asked, [3018], "AXWindows is read once per pid");
+    }
+
+    #[test]
+    fn helper_shaped_windows_listed_in_ax_or_unreadable_are_kept() {
+        let mut windows = vec![helper(57, 1), helper(70, 2)];
+        retain_ax_reachable_with(&mut windows, |pid| match pid {
+            1 => Some([57].into_iter().collect()),
+            _ => None,
+        });
+        assert_eq!(windows.len(), 2);
+    }
+
+    #[test]
+    fn off_space_titled_and_on_screen_windows_never_query_ax() {
+        let mut off_space = helper(1, 9);
+        off_space.space_ids = Some(vec![4]);
+        let mut titled = helper(2, 9);
+        titled.title = "Notes".into();
+        let on_screen = WindowInfo {
+            is_on_screen: true,
+            ..helper(3, 9)
+        };
+        let mut windows = vec![off_space, titled, on_screen];
+        retain_ax_reachable_with(&mut windows, |_| panic!("AX must not be read"));
+        assert_eq!(windows.len(), 3);
+    }
+
+    #[test]
+    fn owner_resolves_same_pid() {
+        let windows = vec![window(42, 800, "TextEdit")];
+        assert_eq!(
+            resolve_window_owner_in(&windows, 800, 42),
+            WindowOwner::SamePid
+        );
+    }
+
+    /// Issue #2237: TextEdit's Open panel is a layer-0 CGWindow owned by
+    /// `com.apple.appkit.xpc.openAndSavePanelService`, not by TextEdit. The
+    /// caller must be told the real owner pid, not handed TextEdit's menu bar.
+    #[test]
+    fn owner_detects_out_of_process_panel_host() {
+        let windows = vec![
+            window(41, 800, "TextEdit"),
+            window(42, 900, "Open and Save Panel Service"),
+        ];
+        assert_eq!(
+            resolve_window_owner_in(&windows, 800, 42),
+            WindowOwner::ForeignPid {
+                owner_pid: 900,
+                owner_app_name: "Open and Save Panel Service".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn owner_is_unknown_for_fabricated_id() {
+        let windows = vec![window(42, 800, "TextEdit")];
+        assert_eq!(
+            resolve_window_owner_in(&windows, 800, 0xFFFF_FFF0),
+            WindowOwner::Unknown
+        );
+    }
+
+    #[test]
+    fn owner_is_unknown_for_zero_id() {
+        // kCGNullWindowID is never a real window number.
+        let windows = vec![window(42, 800, "TextEdit")];
+        assert_eq!(
+            resolve_window_owner_in(&windows, 800, 0),
+            WindowOwner::Unknown
+        );
+    }
+
+    #[test]
+    fn owner_is_unknown_after_the_window_closes() {
+        // Stale id: it was enumerated once, then the panel was dismissed.
+        let before = vec![window(42, 900, "Open and Save Panel Service")];
+        assert_eq!(
+            resolve_window_owner_in(&before, 900, 42),
+            WindowOwner::SamePid
+        );
+        assert_eq!(resolve_window_owner_in(&[], 900, 42), WindowOwner::Unknown);
+    }
+
+    /// Per-call cost of the WindowServer reads the tools make around an
+    /// input (goat.15 added one of them to every window walk). Reads the live
+    /// WindowServer only; operates no app. Run with:
+    /// cargo test -p platform-macos --release --lib bench_window_enumeration -- --ignored --nocapture
+    #[test]
+    #[ignore = "timing benchmark over the live WindowServer"]
+    fn bench_window_enumeration_cost() {
+        fn median_ms(mut f: impl FnMut()) -> (f64, f64) {
+            for _ in 0..5 {
+                f();
+            }
+            let mut samples: Vec<f64> = (0..40)
+                .map(|_| {
+                    let start = std::time::Instant::now();
+                    f();
+                    start.elapsed().as_secs_f64() * 1000.0
+                })
+                .collect();
+            samples.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            (samples[samples.len() / 2], samples[samples.len() * 9 / 10])
+        }
+        let pid = std::process::id() as i32;
+        let total = all_windows_without_spaces().len();
+        let raw = median_ms(|| {
+            let raw = unsafe {
+                CGWindowListCopyWindowInfo(
+                    kCGWindowListOptionOnScreenOnly | kCGWindowListExcludeDesktopElements,
+                    kCGNullWindowID,
+                )
+            };
+            assert!(!raw.is_null());
+            unsafe { core_foundation::base::CFRelease(raw as _) };
+        });
+        let any_layer = median_ms(|| {
+            let _ = pid_on_screen_windows_any_layer_enumeration(pid);
+        });
+        let visible = median_ms(|| {
+            let _ = visible_windows_without_spaces();
+        });
+        let visible_spaces = median_ms(|| {
+            let _ = visible_windows_with_space_snapshot();
+        });
+        let all_spaces = median_ms(|| {
+            let _ = all_windows_with_space_snapshot();
+        });
+        println!("layer-0 windows listed: {total}");
+        println!(
+            "CGWindowListCopyWindowInfo alone (on-screen): median {:.2} ms, p90 {:.2} ms",
+            raw.0, raw.1
+        );
+        println!("pid_on_screen_windows_any_layer_enumeration (goat.15 per-walk read): median {:.2} ms, p90 {:.2} ms", any_layer.0, any_layer.1);
+        println!(
+            "visible_windows_without_spaces: median {:.2} ms, p90 {:.2} ms",
+            visible.0, visible.1
+        );
+        println!("visible_windows_with_space_snapshot (app_window_order before): median {:.2} ms, p90 {:.2} ms", visible_spaces.0, visible_spaces.1);
+        println!(
+            "all_windows_with_space_snapshot (list_windows, no pid): median {:.2} ms, p90 {:.2} ms",
+            all_spaces.0, all_spaces.1
+        );
+    }
+}

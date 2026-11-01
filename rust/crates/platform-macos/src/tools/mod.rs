@@ -1,0 +1,2504 @@
+//! MCP tool implementations for macOS.
+
+use crate::goat::action_latency as latency;
+
+mod bring_to_front;
+mod capture_binding;
+mod click;
+mod clipboard;
+mod double_click;
+mod drag;
+mod element_pointer;
+mod element_simulate;
+mod get_window_state;
+#[cfg(test)]
+pub(crate) use get_window_state::element_entry as test_element_entry;
+mod hotkey;
+mod invoke_menu;
+mod key_delivery_guard;
+mod kill_app;
+mod launch_app;
+mod list_apps;
+mod list_windows;
+mod menu_bar_extras;
+mod menu_equivalent;
+pub(crate) mod not_editable;
+pub(crate) mod press_key;
+mod right_click;
+mod scroll;
+mod select_text;
+mod set_value;
+mod set_value_autosubmit;
+mod set_window_frame;
+mod sheet_close;
+mod type_text;
+mod type_text_hold;
+// `screenshot` / `screenshot_compat` modules removed in PR #1692 —
+// `get_window_state` capture_mode:"vision" is the canonical screenshot
+// path. The capture functions they wrapped (ScreenCaptureKit, CGWindow,
+// etc.) live elsewhere under CuaDriverCore::Capture and are reached
+// through GetWindowStateTool.
+mod check_permissions;
+mod cursor_tools;
+mod desktop_pointer_guard;
+mod get_accessibility_tree;
+mod get_config;
+mod get_cursor_position;
+mod get_desktop_state;
+pub(crate) mod get_screen_size;
+mod health_report;
+mod move_cursor;
+mod page;
+mod pixel_focus;
+pub(crate) mod pixel_restore;
+mod pixel_route;
+pub(crate) mod px_frame;
+mod set_config;
+mod type_text_chars;
+pub(crate) mod window_points;
+mod zoom;
+
+use cua_driver_core::{
+    protocol::ToolResult,
+    tool::{ProtectedResourceOwnership, Tool, ToolDef, ToolRegistry},
+    window_target::{PidOnlyWindowTargetGuard, WindowTargetCandidate, WindowTargetCandidates},
+};
+use serde_json::Value;
+use std::collections::HashMap;
+use std::sync::Arc;
+
+use crate::{ax::snapshot::Snapshots, cursor::state::CursorRegistry};
+
+/// An error raised before this tool dispatched any input or AX mutation.
+/// Keep post-dispatch failures on their existing outcome path: they may have acted.
+pub(super) fn pre_dispatch_refusal(
+    code: &str,
+    message: impl Into<String>,
+) -> cua_driver_core::protocol::ToolResult {
+    cua_driver_core::protocol::ToolResult::error(message).with_structured(serde_json::json!({
+        "code": code,
+        "effect": "refused",
+        "dispatched": false,
+    }))
+}
+
+pub(super) fn invalid_arguments(
+    message: impl Into<String>,
+) -> cua_driver_core::protocol::ToolResult {
+    pre_dispatch_refusal("invalid_arguments", message)
+}
+
+fn native_window_id(
+    window_id: Option<u64>,
+) -> Result<Option<u32>, cua_driver_core::protocol::ToolResult> {
+    window_id
+        .map(u32::try_from)
+        .transpose()
+        .map_err(|_| invalid_arguments("window_id is out of range for macOS."))
+}
+
+#[cfg(test)]
+mod snapshot_window_id_tests {
+    #[test]
+    fn pre_dispatch_refusals_have_an_explicit_no_send_outcome() {
+        let result = super::invalid_arguments("bad arguments");
+        assert_eq!(result.is_error, Some(true));
+        let structured = result.structured_content.expect("structured refusal");
+        assert_eq!(structured["code"], "invalid_arguments");
+        assert_eq!(structured["effect"], "refused");
+        assert_eq!(structured["dispatched"], false);
+    }
+
+    #[test]
+    fn native_window_conversion_never_discards_high_bits() {
+        assert_eq!(super::native_window_id(None).unwrap(), None);
+        assert_eq!(
+            super::native_window_id(Some(u32::MAX as u64)).unwrap(),
+            Some(u32::MAX)
+        );
+        assert!(super::native_window_id(Some((1_u64 << 32) | 7)).is_err());
+    }
+}
+
+fn pid_window_target_candidates(pid: i64) -> Vec<WindowTargetCandidate> {
+    let Ok(pid) = i32::try_from(pid) else {
+        return Vec::new();
+    };
+    let enumeration = crate::windows::all_windows_with_space_snapshot();
+    let mut windows = enumeration.windows;
+    windows.retain(|window| window.pid == pid);
+    crate::windows::retain_ax_reachable(&mut windows, enumeration.current_space_id);
+    window_target_candidates_for_pid(windows, pid)
+}
+
+/// Smallest edge, in points, of a window a pid-only action may mean. Below it
+/// the window is a 0x0 or 1x1 helper surface, never a document or dialog.
+const MIN_TARGET_EDGE_PT: f64 = 2.0;
+
+/// Whether `window` is a window a pid-only action could mean: on screen and
+/// of real size. LibreOffice's off-screen `VCL ImplGetDefaultWindow`, its
+/// untitled off-screen helpers, and Chrome's closed omnibox popup are layer-0
+/// windows WindowServer lists but no user can see, type into, or click.
+fn is_visible_target(window: &crate::windows::WindowInfo) -> bool {
+    window.is_on_screen
+        && window.bounds.width >= MIN_TARGET_EDGE_PT
+        && window.bounds.height >= MIN_TARGET_EDGE_PT
+}
+
+fn window_target_candidates_for_pid(
+    windows: impl IntoIterator<Item = crate::windows::WindowInfo>,
+    pid: i32,
+) -> Vec<WindowTargetCandidate> {
+    let mut windows: Vec<_> = windows
+        .into_iter()
+        .filter(|window| window.pid == pid)
+        .collect();
+    // Only visible windows compete. When none is visible (the app is hidden,
+    // its only window is minimized or on another Space) keep them all, so a
+    // single real window still resolves and several still refuse.
+    if windows.iter().any(is_visible_target) {
+        windows.retain(is_visible_target);
+    }
+    windows
+        .into_iter()
+        .map(|window| WindowTargetCandidate {
+            window_id: u64::from(window.window_id),
+            transient_for: None,
+            title: window.title,
+            app_name: Some(window.app_name),
+            is_on_screen: window.is_on_screen,
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod pid_window_target_tests {
+    use super::*;
+    use cua_driver_core::window_target::{resolve_pid_window_target, PidWindowTargetResolution};
+
+    fn window(window_id: u32, pid: i32) -> crate::windows::WindowInfo {
+        crate::windows::WindowInfo {
+            window_id,
+            pid,
+            app_name: "Editor".into(),
+            title: format!("Document {window_id}"),
+            bounds: crate::windows::WindowBounds {
+                x: 0.0,
+                y: 0.0,
+                width: 640.0,
+                height: 480.0,
+            },
+            layer: 0,
+            z_index: 1,
+            is_on_screen: true,
+            current_space_id: None,
+            on_current_space: None,
+            space_ids: None,
+        }
+    }
+
+    #[test]
+    fn same_pid_sibling_windows_are_ambiguous() {
+        let candidates =
+            window_target_candidates_for_pid([window(7, 42), window(8, 42), window(9, 99)], 42);
+        assert!(matches!(
+            resolve_pid_window_target(candidates),
+            PidWindowTargetResolution::Ambiguous(windows)
+                if windows.iter().map(|window| window.window_id).collect::<Vec<_>>() == [7, 8]
+        ));
+    }
+
+    fn off_screen(
+        mut window: crate::windows::WindowInfo,
+        title: &str,
+    ) -> crate::windows::WindowInfo {
+        window.is_on_screen = false;
+        window.title = title.into();
+        window
+    }
+
+    #[test]
+    fn off_screen_helpers_do_not_make_a_document_ambiguous() {
+        // LibreOffice: the document plus `VCL ImplGetDefaultWindow` and an
+        // untitled helper, both off screen (bench CDB-G03, CDB-S02).
+        let candidates = window_target_candidates_for_pid(
+            [
+                window(1680, 42),
+                off_screen(window(1679, 42), "VCL ImplGetDefaultWindow"),
+                off_screen(window(1678, 42), ""),
+            ],
+            42,
+        );
+        assert!(matches!(
+            resolve_pid_window_target(candidates),
+            PidWindowTargetResolution::Resolved(window) if window.window_id == 1680
+        ));
+    }
+
+    #[test]
+    fn zero_size_windows_do_not_compete() {
+        let mut helper = window(9, 42);
+        helper.bounds.width = 0.0;
+        helper.bounds.height = 0.0;
+        let candidates = window_target_candidates_for_pid([window(7, 42), helper], 42);
+        assert!(matches!(
+            resolve_pid_window_target(candidates),
+            PidWindowTargetResolution::Resolved(window) if window.window_id == 7
+        ));
+    }
+
+    #[test]
+    fn two_visible_documents_stay_ambiguous_despite_helpers() {
+        let candidates = window_target_candidates_for_pid(
+            [
+                window(7, 42),
+                window(8, 42),
+                off_screen(window(9, 42), "VCL ImplGetDefaultWindow"),
+            ],
+            42,
+        );
+        assert!(matches!(
+            resolve_pid_window_target(candidates),
+            PidWindowTargetResolution::Ambiguous(windows)
+                if windows.iter().map(|window| window.window_id).collect::<Vec<_>>() == [7, 8]
+        ));
+    }
+
+    #[test]
+    fn an_app_with_no_visible_window_keeps_its_windows() {
+        // A hidden app or a minimized single window still resolves.
+        let candidates = window_target_candidates_for_pid([off_screen(window(7, 42), "Doc")], 42);
+        assert!(matches!(
+            resolve_pid_window_target(candidates),
+            PidWindowTargetResolution::Resolved(window) if window.window_id == 7
+        ));
+    }
+}
+
+/// The window a pid-only keyboard action means when several visible windows
+/// remain: the app's key window (`AXFocusedWindow`), which is where AppKit
+/// sends process-scoped key events anyway. `None` leaves the call refused.
+fn pid_focused_window(pid: i64) -> Option<u64> {
+    let pid = i32::try_from(pid).ok()?;
+    crate::ax::bindings::focused_window_id_of_pid(pid).map(u64::from)
+}
+
+fn pid_window_guarded<T: Tool + 'static>(
+    tool: T,
+    candidates: &WindowTargetCandidates,
+) -> Box<dyn Tool> {
+    Box::new(PidOnlyWindowTargetGuard::new(
+        Box::new(tool),
+        candidates.clone(),
+    ))
+}
+
+/// [`pid_window_guarded`] for keyboard tools: when several visible windows
+/// remain, a pid-only key goes to the app's key window, as AppKit would route
+/// it, and the result names that window. Without a key window it still refuses.
+fn pid_keyboard_guarded<T: Tool + 'static>(
+    tool: T,
+    candidates: &WindowTargetCandidates,
+) -> Box<dyn Tool> {
+    Box::new(
+        PidOnlyWindowTargetGuard::new(Box::new(tool), candidates.clone())
+            .with_fallback_resolver(Arc::new(pid_focused_window)),
+    )
+}
+
+/// Runs a tool's pure argument check before `inner` (a window guard), so a
+/// malformed call is refused for its arguments before any window lookup.
+struct ArgumentsFirst {
+    inner: Box<dyn Tool>,
+    refuse: fn(&Value) -> Option<ToolResult>,
+}
+
+#[async_trait::async_trait]
+impl Tool for ArgumentsFirst {
+    fn def(&self) -> &ToolDef {
+        self.inner.def()
+    }
+
+    fn has_independent_input_lane(&self, args: &Value) -> bool {
+        self.inner.has_independent_input_lane(args)
+    }
+
+    async fn protected_resource_ownership(
+        &self,
+        adapter_id: &str,
+        args: &Value,
+    ) -> ProtectedResourceOwnership {
+        self.inner
+            .protected_resource_ownership(adapter_id, args)
+            .await
+    }
+
+    async fn protected_resource_scope(
+        &self,
+        adapter_id: &str,
+        args: &Value,
+    ) -> Result<Option<Value>, String> {
+        self.inner.protected_resource_scope(adapter_id, args).await
+    }
+
+    async fn validate_protected_resource_scope(
+        &self,
+        adapter_id: &str,
+        args: &Value,
+        approved_scope: &Value,
+    ) -> Result<(), String> {
+        self.inner
+            .validate_protected_resource_scope(adapter_id, args, approved_scope)
+            .await
+    }
+
+    async fn invoke(&self, args: Value) -> ToolResult {
+        // A desktop-scope call without a pid has its own key handling and
+        // no window lookup to precede.
+        let desktop_without_pid = args.get("scope").and_then(Value::as_str) == Some("desktop")
+            && args.get("pid").is_none_or(Value::is_null);
+        if !desktop_without_pid {
+            if let Some(refusal) = (self.refuse)(&args) {
+                return refusal;
+            }
+        }
+        self.inner.invoke(args).await
+    }
+}
+
+/// [`pid_keyboard_guarded`] behind the tool's own argument check.
+fn keyboard_tool<T: Tool + 'static>(
+    tool: T,
+    candidates: &WindowTargetCandidates,
+    refuse: fn(&Value) -> Option<ToolResult>,
+) -> Box<dyn Tool> {
+    Box::new(ArgumentsFirst {
+        inner: pid_keyboard_guarded(tool, candidates),
+        refuse,
+    })
+}
+
+pub use check_permissions::{
+    request_from_launchservices_host as request_permissions_from_launchservices_host,
+    PERMISSIONS_HOST_REQUEST_ARG,
+};
+
+pub use cua_driver_core::snapshot_store::ZoomContext;
+pub(crate) use health_report::current_bundle_identifier as main_bundle_identifier;
+pub(crate) use health_report::sw_vers_product_version as macos_product_version;
+
+/// The shared per-call delivery mode; see [`cua_driver_core::delivery`].
+///
+/// On macOS, `Foreground` briefly fronts the target window, acts, then
+/// restores the prior frontmost (see
+/// [`crate::input::skylight::with_foreground_assist`]). It is the only way
+/// `click` reaches a foreground rung and is orthogonal to addressing
+/// (`element_index` vs `x/y`, which selects AX vs pixel).
+pub use cua_driver_core::delivery::DeliveryMode;
+
+#[link(name = "ApplicationServices", kind = "framework")]
+extern "C" {
+    fn CGEventSourceSecondsSinceLastEventType(state: i32, event_type: u32) -> f64;
+}
+
+/// Query `kCGEventSourceStateHIDSystemState` across physical mouse, keyboard,
+/// modifier, and scroll-wheel event types and return the minimum elapsed time
+/// in milliseconds since the user last touched physical hardware.
+pub(crate) fn physical_input_idle_ms() -> Option<u64> {
+    const HID_SYSTEM_STATE: i32 = 1;
+    const PHYSICAL_EVENT_TYPES: [u32; 11] = [
+        1,  // kCGEventLeftMouseDown
+        2,  // kCGEventLeftMouseUp
+        3,  // kCGEventRightMouseDown
+        4,  // kCGEventRightMouseUp
+        5,  // kCGEventMouseMoved
+        6,  // kCGEventLeftMouseDragged
+        7,  // kCGEventRightMouseDragged
+        10, // kCGEventKeyDown
+        11, // kCGEventKeyUp
+        12, // kCGEventFlagsChanged
+        22, // kCGEventScrollWheel
+    ];
+    PHYSICAL_EVENT_TYPES
+        .into_iter()
+        .filter_map(|kind| {
+            let secs = unsafe { CGEventSourceSecondsSinceLastEventType(HID_SYSTEM_STATE, kind) };
+            (secs.is_finite() && secs >= 0.0).then_some((secs * 1_000.0) as u64)
+        })
+        .min()
+}
+
+/// Milliseconds since the last physical mouse-button press (left, right or
+/// other), or `None` when unreadable. A context menu opens only from a
+/// press, so typing or moving the mouse elsewhere cannot open one.
+pub(crate) fn physical_mouse_down_idle_ms() -> Option<u64> {
+    idle_ms_of(&[
+        1,  // kCGEventLeftMouseDown (control-click)
+        3,  // kCGEventRightMouseDown
+        25, // kCGEventOtherMouseDown
+    ])
+}
+
+/// Milliseconds since the last physical key press, or `None` when unreadable.
+pub(crate) fn physical_key_down_idle_ms() -> Option<u64> {
+    idle_ms_of(&[10]) // kCGEventKeyDown
+}
+
+/// The shortest time since any of `kinds` arrived from hardware, `None`
+/// when any of them is unreadable.
+fn idle_ms_of(kinds: &[u32]) -> Option<u64> {
+    const HID_SYSTEM_STATE: i32 = 1;
+    let mut idle = None;
+    for &kind in kinds {
+        let secs = unsafe { CGEventSourceSecondsSinceLastEventType(HID_SYSTEM_STATE, kind) };
+        if !(secs.is_finite() && secs >= 0.0) {
+            return None;
+        }
+        let ms = (secs * 1_000.0) as u64;
+        idle = Some(idle.map_or(ms, |current: u64| current.min(ms)));
+    }
+    idle
+}
+
+/// Pure preflight evaluation for a macOS foreground delivery request.
+pub(crate) fn gate_foreground_physical_idle_with_sample(
+    pid: i32,
+    window_id: Option<u32>,
+    observed_idle_ms: Option<u64>,
+    threshold_ms: u64,
+) -> Result<(), cua_driver_core::protocol::ToolResult> {
+    use cua_driver_core::delivery::{
+        evaluate_physical_input_idle, foreground_user_active_result, PhysicalInputIdleGate,
+    };
+    match evaluate_physical_input_idle(observed_idle_ms, threshold_ms) {
+        PhysicalInputIdleGate::Idle { .. } => Ok(()),
+        PhysicalInputIdleGate::UserActive {
+            idle_ms,
+            threshold_ms,
+        } => Err(foreground_user_active_result(
+            idle_ms,
+            threshold_ms,
+            serde_json::json!({
+                "pid": pid,
+                "window_id": window_id,
+            }),
+        )),
+    }
+}
+
+/// Refuse `delivery_mode:"foreground"` when the user has generated physical
+/// hardware input within `CUA_DRIVER_FOREGROUND_IDLE_MS` (default 1000 ms).
+pub(crate) fn gate_foreground_physical_idle(
+    pid: i32,
+    window_id: Option<u32>,
+) -> Result<(), cua_driver_core::protocol::ToolResult> {
+    gate_foreground_physical_idle_with_sample(
+        pid,
+        window_id,
+        physical_input_idle_ms(),
+        cua_driver_core::delivery::foreground_idle_threshold_ms(),
+    )
+}
+
+/// Whether the person is working in the app an action targets: its app is
+/// frontmost and their last physical input is within `threshold_ms`. Pure, so
+/// the rule is tested without a desktop. `Some(idle_ms)` means refuse.
+pub(crate) fn user_takeover_idle(
+    target_is_front: Option<bool>,
+    observed_idle_ms: Option<u64>,
+    threshold_ms: u64,
+) -> Option<u64> {
+    if threshold_ms == 0 || target_is_front != Some(true) {
+        return None;
+    }
+    observed_idle_ms.filter(|idle| *idle < threshold_ms)
+}
+
+/// Refuse a background action while the person is using the target app: the
+/// app is frontmost and they typed or moved the pointer a moment ago. Nothing
+/// is sent. An app that is not frontmost (the person is elsewhere) is never
+/// refused, and neither is an unreadable state.
+pub(crate) fn gate_user_takeover(
+    pid: i32,
+    window_id: Option<u32>,
+) -> Result<(), cua_driver_core::protocol::ToolResult> {
+    let threshold = cua_driver_core::delivery::user_takeover_threshold_ms();
+    if threshold == 0 {
+        return Ok(());
+    }
+    let idle = physical_input_idle_ms();
+    // The front app is read only when there was recent input to refuse for.
+    if idle.is_none_or(|idle| idle >= threshold) {
+        return Ok(());
+    }
+    let front = match window_id {
+        Some(wid) => crate::input::skylight::front_process_matches(pid as libc::pid_t, wid),
+        None => Some(crate::apps::frontmost_pid() == Some(pid)),
+    };
+    match user_takeover_idle(front, idle, threshold) {
+        Some(idle_ms) => Err(cua_driver_core::delivery::user_interacting_result(
+            idle_ms,
+            threshold,
+            serde_json::json!({ "pid": pid, "window_id": window_id }),
+        )),
+        None => Ok(()),
+    }
+}
+
+/// Convert a pure background-input refusal into the structured refusal result
+/// shape shared by exact-target tools: `code`, `effect: "refused"`, the
+/// requested target, and the safe next route when one exists. No actuator ran.
+pub(crate) fn background_refusal_result(
+    pid: i32,
+    window_id: u32,
+    refusal: &cua_driver_core::background_input::BackgroundRefusal,
+) -> cua_driver_core::protocol::ToolResult {
+    let mut structured = serde_json::json!({
+        "code": refusal.code,
+        "effect": "refused",
+        "pid": pid,
+        "window_id": window_id,
+        "reason": refusal.reason,
+    });
+    if let Some(advice) = refusal.advice {
+        structured["escalation"] = serde_json::json!({
+            "recommended": advice,
+            "reason": refusal.reason,
+        });
+    }
+    cua_driver_core::protocol::ToolResult::error(format!(
+        "Background input refused ({}): {}",
+        refusal.code, refusal.reason
+    ))
+    .with_structured(structured)
+}
+
+/// Hint shown with every `windowserver_connection_invalid` refusal.
+pub(crate) const WINDOWSERVER_INVALID_HINT: &str = "This daemon runs without its own app-bundle identity (a bare `cua-driver serve`), so macOS gives it no valid WindowServer connection and every no-raise focus step fails. Run the app-bundle daemon: `cua-driver permissions grant`.";
+
+/// Structured refusal for a background action whose no-raise focus step got
+/// `SLPSPostEventRecordTo` status 1002 (invalid connection). Nothing was sent
+/// to the target.
+pub(crate) fn windowserver_connection_refusal(
+    pid: i32,
+    window_id: Option<u32>,
+) -> cua_driver_core::protocol::ToolResult {
+    cua_driver_core::delivery::background_unavailable_result(
+        format!(
+            "Background input is not available for pid {pid}: the WindowServer connection is \
+             invalid (SLPSPostEventRecordTo returned 1002). {WINDOWSERVER_INVALID_HINT}"
+        ),
+        "background_unavailable",
+        "the daemon has no valid WindowServer connection, so no-raise focus cannot work; \
+         run the app-bundle daemon, or retry with delivery_mode:\"foreground\".",
+        serde_json::json!({
+            "reason": "windowserver_connection_invalid",
+            "status": crate::input::skylight::WINDOWSERVER_INVALID_CONNECTION,
+            "effect": "refused",
+            "pid": pid,
+            "window_id": window_id,
+            "hint": WINDOWSERVER_INVALID_HINT,
+        }),
+    )
+}
+
+/// A background key hand-back (`skylight::WindowKeyScope`) still running
+/// after its 2 s wait: fronting the app or priming a window now could move
+/// key focus under it, so `tool` sends nothing. Retrying is safe.
+pub(crate) fn key_restore_pending_refusal(
+    tool: &str,
+    pid: Option<i32>,
+    window_id: Option<u32>,
+) -> cua_driver_core::protocol::ToolResult {
+    let message = format!(
+        "{tool} sent nothing: the driver's previous key hand-back in a background app did not \
+         finish within 2 s. Retry the call; if this repeats, read the window first."
+    );
+    cua_driver_core::protocol::ToolResult::error(message.clone()).with_structured(
+        serde_json::json!({
+            "code": "key_restore_pending",
+            "effect": "refused",
+            "retryable": true,
+            "pid": pid,
+            "window_id": window_id,
+            "message": message,
+        }),
+    )
+}
+
+/// Exclusive per-process ownership of one background mutation. Callers must
+/// keep this value alive through actuator dispatch, focus restoration, and
+/// target-bound verification.
+/// The window a pid-only call means: the app's focused window, else its
+/// frontmost on-screen window. Fills `window_id` for tools that need one
+/// when the caller named only the app's pid.
+pub(crate) fn default_window_for_pid(args: &mut serde_json::Value) {
+    let Some(object) = args.as_object_mut() else {
+        return;
+    };
+    if object
+        .get("window_id")
+        .is_some_and(|value| !value.is_null())
+    {
+        return;
+    }
+    let Some(pid) = object
+        .get("pid")
+        .and_then(serde_json::Value::as_i64)
+        .and_then(|pid| i32::try_from(pid).ok())
+    else {
+        return;
+    };
+    let window_id = crate::ax::bindings::focused_window_id_of_pid(pid).or_else(|| {
+        crate::windows::all_windows()
+            .into_iter()
+            .filter(|window| window.pid == pid && window.is_on_screen && window.layer == 0)
+            .filter(|window| window.bounds.width >= 2.0 && window.bounds.height >= 2.0)
+            .max_by_key(|window| window.z_index)
+            .map(|window| window.window_id)
+    });
+    if let Some(window_id) = window_id {
+        object.insert("window_id".into(), serde_json::json!(window_id));
+    }
+}
+
+pub(crate) struct BackgroundMutationLease {
+    pid: i32,
+    _guard: tokio::sync::OwnedMutexGuard<()>,
+}
+
+impl BackgroundMutationLease {
+    /// The app this lease serializes.
+    pub(crate) fn pid(&self) -> i32 {
+        self.pid
+    }
+
+    /// Revalidate another actuator class while retaining the same per-PID
+    /// lease. This supports explicit ladders without deadlocking by attempting
+    /// to reacquire the coordinator recursively.
+    pub(crate) async fn gate_again(
+        &self,
+        window_id: u32,
+        element_ptr: Option<usize>,
+        action: cua_driver_core::background_input::BackgroundAction,
+    ) -> Result<(), cua_driver_core::protocol::ToolResult> {
+        decide_background_window_action(self.pid, window_id, element_ptr, action).await
+    }
+}
+
+async fn decide_background_window_action(
+    pid: i32,
+    window_id: u32,
+    element_ptr: Option<usize>,
+    action: cua_driver_core::background_input::BackgroundAction,
+) -> Result<(), cua_driver_core::protocol::ToolResult> {
+    use cua_driver_core::background_input::{
+        decide_background_input, BackgroundInputDecision, ExactWindowTarget,
+    };
+    let element_guard =
+        element_ptr.map(|ptr| unsafe { crate::ax::snapshot::RetainedElement::retain(ptr) });
+    let facts = match tokio::task::spawn_blocking(move || {
+        let element_ptr = element_guard.as_ref().map(|guard| guard.as_ptr());
+        crate::ax::exact_target::gather_background_facts(pid, window_id, element_ptr)
+    })
+    .await
+    {
+        Ok(facts) => facts,
+        Err(error) => {
+            return Err(cua_driver_core::protocol::ToolResult::error(format!(
+                "Could not gather exact-target facts for pid {pid} window {window_id}: {error}"
+            )));
+        }
+    };
+    match decide_background_input(ExactWindowTarget { pid, window_id }, &facts, action) {
+        BackgroundInputDecision::Execute { .. } => Ok(()),
+        BackgroundInputDecision::Refuse(refusal) => {
+            Err(background_refusal_result(pid, window_id, &refusal))
+        }
+    }
+}
+
+/// The keyboard action class for a window-addressed background key or text
+/// request. When the focus-record transport exists the exact window is made
+/// the app's key window for the duration of the post (see
+/// [`post_keys_to_window`]), so a second same-pid window is not ambiguous.
+/// Without it the caller's fail-closed `generic` class applies.
+pub(crate) fn window_keyboard_action(
+    generic: cua_driver_core::background_input::BackgroundAction,
+) -> cua_driver_core::background_input::BackgroundAction {
+    if crate::input::skylight::is_focus_without_raise_available() {
+        cua_driver_core::background_input::BackgroundAction::ExactWindowKeys
+    } else {
+        generic
+    }
+}
+
+/// Make `window_id` the app's key window, confirmed, for pid-routed keys.
+/// `Ok(None)` when no window is addressed or the SPIs are missing (keys go
+/// where they always did). `Err` carries the refusal text: no key may be
+/// posted, it could reach a sibling window.
+pub(crate) fn key_scope(
+    pid: i32,
+    window_id: Option<u32>,
+) -> Result<Option<crate::input::skylight::WindowKeyScope>, String> {
+    key_scope_with(
+        pid,
+        window_id,
+        crate::input::skylight::is_focus_without_raise_available,
+        crate::input::skylight::is_available,
+        crate::input::skylight::enter_exact_window_key,
+    )
+}
+
+fn key_scope_with<T>(
+    pid: i32,
+    window_id: Option<u32>,
+    focus_available: impl FnOnce() -> bool,
+    post_available: impl FnOnce() -> bool,
+    enter: impl FnOnce(i32, u32) -> Result<T, String>,
+) -> Result<Option<T>, String> {
+    let Some(wid) = window_id else {
+        return Ok(None);
+    };
+    if !post_available() {
+        return Err(crate::input::skylight::KEY_POST_SPI_UNAVAILABLE.to_owned());
+    }
+    if focus_available() {
+        enter(pid, wid).map(Some)
+    } else {
+        Ok(None)
+    }
+}
+
+#[cfg(test)]
+mod hand_back_order_outer_tests {
+    use super::{key_post_preflight, key_scope_with};
+    use std::cell::Cell;
+
+    #[test]
+    fn missing_post_spi_refuses_with_and_without_focus_spis() {
+        for focus_available in [false, true] {
+            let records = Cell::new(0);
+            let key_posts = Cell::new(0);
+            let ax_writes = Cell::new(0);
+            let result = key_scope_with(
+                7,
+                Some(9),
+                || focus_available,
+                || false,
+                |_, _| {
+                    records.set(records.get() + 1);
+                    ax_writes.set(ax_writes.get() + 1);
+                    Ok(())
+                },
+            );
+            if result.is_ok() {
+                key_posts.set(key_posts.get() + 1);
+            }
+            assert!(result.is_err(), "focus_available={focus_available}");
+            assert_eq!((key_posts.get(), records.get(), ax_writes.get()), (0, 0, 0));
+        }
+    }
+
+    #[test]
+    fn available_post_spi_preserves_scope_selection() {
+        assert_eq!(
+            key_scope_with(7, Some(9), || false, || true, |_, _| Ok(())).unwrap(),
+            None
+        );
+        assert_eq!(
+            key_scope_with(7, Some(9), || true, || true, |_, _| Ok(())).unwrap(),
+            Some(())
+        );
+        assert_eq!(
+            key_scope_with(7, None, || panic!(), || panic!(), |_, _| Ok(())).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn preflight_refusal_has_pre_dispatch_shape() {
+        let result = key_post_preflight(|| false).unwrap_err();
+        let structured = result.structured_content.unwrap();
+        assert_eq!(structured["effect"], "refused");
+        assert_eq!(structured["dispatched"], false);
+        assert!(key_post_preflight(|| true).is_ok());
+    }
+}
+
+/// [`key_scope`] for an async tool: runs the blocking prime off the runtime and
+/// turns an unconfirmed key window into the structured `window_not_key`
+/// refusal. Foreground requests and pid-only calls hold no scope.
+pub(crate) async fn acquire_key_scope(
+    pid: i32,
+    window_id: Option<u32>,
+    foreground: bool,
+) -> Result<Option<crate::input::skylight::WindowKeyScope>, cua_driver_core::protocol::ToolResult> {
+    acquire_key_scope_with_eligibility(pid, window_id, foreground, false).await
+}
+
+pub(crate) async fn acquire_key_scope_with_eligibility(
+    pid: i32,
+    window_id: Option<u32>,
+    foreground: bool,
+    eligible: bool,
+) -> Result<Option<crate::input::skylight::WindowKeyScope>, cua_driver_core::protocol::ToolResult> {
+    let Some(wid) = window_id.filter(|_| !foreground) else {
+        return Ok(None);
+    };
+    key_post_preflight(crate::input::skylight::is_available)?;
+    // The latency trace's key_belief/scope fields are recorded inside the
+    // scope entry, so the blocking prime must carry the trace with it.
+    match crate::goat::action_latency::spawn_blocking(move || {
+        let _span =
+            crate::goat::action_latency::span(crate::goat::action_latency::Stage::KeyScopePrime);
+        if eligible && crate::input::skylight::is_focus_without_raise_available() {
+            crate::input::skylight::enter_untargeted_key_scope(pid, wid)
+                .map(Some)
+                .map_err(|error| error.reason)
+        } else {
+            key_scope(pid, Some(wid))
+        }
+    })
+    .await
+    {
+        Ok(Ok(scope)) => Ok(scope),
+        Ok(Err(_)) if crate::input::skylight::windowserver_connection_invalid() => {
+            Err(windowserver_connection_refusal(pid, Some(wid)))
+        }
+        Ok(Err(reason)) => Err(background_refusal_result(
+            pid,
+            wid,
+            &cua_driver_core::background_input::BackgroundRefusal {
+                code: WINDOW_NOT_KEY,
+                reason,
+                advice: Some("foreground"),
+            },
+        )),
+        Err(error) => Err(cua_driver_core::protocol::ToolResult::error(format!(
+            "Could not prepare the key window for pid {pid}: {error}"
+        ))),
+    }
+}
+
+fn key_post_preflight(available: impl FnOnce() -> bool) -> Result<(), ToolResult> {
+    if available() {
+        Ok(())
+    } else {
+        Err(pre_dispatch_refusal(
+            WINDOW_NOT_KEY,
+            crate::input::skylight::KEY_POST_SPI_UNAVAILABLE,
+        ))
+    }
+}
+
+/// Refusal code when the addressed window cannot be confirmed as the app's
+/// key window: no key is sent, none could be proven to reach it.
+pub(crate) const WINDOW_NOT_KEY: &str = "window_not_key";
+
+/// Acquire the per-PID mutation coordinator, gather fresh exact-target facts,
+/// and ask the pure core for one background decision. `element_ptr` must stay
+/// retained by the caller until the returned lease is dropped.
+pub(crate) async fn gate_background_window_action(
+    pid: i32,
+    window_id: u32,
+    element_ptr: Option<usize>,
+    action: cua_driver_core::background_input::BackgroundAction,
+) -> Result<BackgroundMutationLease, cua_driver_core::protocol::ToolResult> {
+    let lease = acquire_background_mutation(pid).await;
+    lease.gate_again(window_id, element_ptr, action).await?;
+    Ok(lease)
+}
+
+pub(crate) async fn acquire_background_mutation(pid: i32) -> BackgroundMutationLease {
+    BackgroundMutationLease {
+        pid,
+        _guard: crate::background_mutation::acquire(pid).await,
+    }
+}
+
+/// Finish the post-action observation window and release the wildcard
+/// focus-steal lease. The observation bound is a daemon-launch setting
+/// (`CUA_DRIVER_WINDOW_CHANGE_TIMEOUT_MS` / `CUA_DRIVER_WINDOW_CHANGE_POLL_MS`),
+/// never a per-call argument: every ingress strips `_`-prefixed arguments, so
+/// a tool call cannot shorten focus protection for itself.
+pub(crate) async fn finish_window_observation(
+    snapshot: crate::window_change_detector::Snapshot,
+) -> crate::window_change_detector::Changes {
+    snapshot.detect_async().await
+}
+
+/// px-focus for the keyboard family (type_text / press_key / hotkey): focus the
+/// element at (x,y) before a keystroke — the *element px action* form of a
+/// keyboard tool. When the exact window's focused element already covers the
+/// point, nothing is clicked, so a Cmd+A selection survives a follow-up
+/// type_text or Cmd+V. Otherwise prefer non-destructive AX focus; the
+/// foreground rung falls back to a real pixel click when needed.
+/// Reuses ClickTool's exact coordinate translation and delivery mode.
+/// Whether an AX-focus error permits the real-click fallback: only an
+/// explicit proof of non-dispatch (a refused effect or background_unavailable).
+fn focus_error_allows_fallback(effect: Option<&str>, code: Option<&str>) -> bool {
+    // An explicit uncertain effect wins over any non-dispatch code.
+    if effect == Some("unverifiable") {
+        return false;
+    }
+    effect == Some("refused") || code == Some("background_unavailable")
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn focus_by_pixel(
+    state: &Arc<ToolState>,
+    pid: i32,
+    window_id: Option<u32>,
+    x: f64,
+    y: f64,
+    foreground: bool,
+    session: Option<String>,
+    session_id: Option<String>,
+    from_zoom: bool,
+    mutation_lease: Option<&BackgroundMutationLease>,
+    guard_editable: bool,
+) -> Result<not_editable::FocusDispatch, cua_driver_core::protocol::ToolResult> {
+    use cua_driver_core::tool::Tool;
+    let mut click_args = serde_json::json!({
+        "pid": pid, "x": x, "y": y,
+        "delivery_mode": "background",
+        "action": "focus",
+    });
+    if let Some(wid) = window_id {
+        click_args["window_id"] = serde_json::json!(wid);
+        if let Some(lease) = mutation_lease {
+            lease
+                .gate_again(
+                    wid,
+                    None,
+                    cua_driver_core::background_input::BackgroundAction::WindowPointer,
+                )
+                .await?;
+        }
+    }
+    if let Some(ref s) = session {
+        click_args["session"] = serde_json::json!(s);
+    }
+    if let Some(ref s) = session_id {
+        click_args["_session_id"] = serde_json::json!(s);
+    }
+    if from_zoom {
+        click_args["from_zoom"] = serde_json::json!(true);
+    }
+    // The focus checks look at the same window point the click lands on:
+    // (x, y) are pixels of the session's (possibly downsized or zoomed)
+    // image, scaled back exactly as ClickTool does.
+    let (native_x, native_y) =
+        window_click_point(state, &click_args, pid, window_id, x, y, from_zoom)?;
+    // The not_editable cell guard runs before ANY focus action: a
+    // non-editing cell (or an unclassifiable hit) refuses the whole call, so
+    // no focus action or key can reach it (handoff 3.7 point route). The
+    // classified frame becomes the click's window_points basis, so the
+    // actuator itself refuses if the geometry changes before posting — the
+    // classification and the dispatch are bound to the same frame.
+    let mut guarded_click_args: Option<serde_json::Value> = None;
+    if guard_editable {
+        let Some(wid) = window_id else {
+            return Err(not_editable::unresolved_point_refusal());
+        };
+        let frame = match px_frame::resolve_or_refuse(wid).await {
+            Ok(frame) => frame,
+            Err(_) => return Err(not_editable::unresolved_point_refusal()),
+        };
+        if let Some(refusal) =
+            not_editable::guard_point_with_frame(pid, wid, &frame, native_x, native_y).await
+        {
+            return Err(refusal);
+        }
+        click_args["coordinate_space"] = serde_json::json!("window_points");
+        click_args["x"] = serde_json::json!(native_x / frame.scale);
+        click_args["y"] = serde_json::json!(native_y / frame.scale);
+        click_args["window_basis"] = serde_json::json!({
+            "x": frame.bounds.x,
+            "y": frame.bounds.y,
+            "w": frame.bounds.width,
+            "h": frame.bounds.height,
+            // The guard classified the element against this exact frame:
+            // a sub-point drift must refuse, not re-translate.
+            "exact": true,
+        });
+        // The zoom point was already converted to the native point above;
+        // window_points does not combine with from_zoom.
+        click_args.as_object_mut().map(|o| o.remove("from_zoom"));
+        guarded_click_args = Some(click_args.clone());
+    }
+    // The requested field may already hold keyboard focus, for example after
+    // a pixel hotkey Cmd+A. Any focus action is then redundant, and the real
+    // click fallback would be destructive: Chromium's omnibox hit-tests to an
+    // enclosing AXGroup that rejects AXFocused, so the fallback click moved
+    // the caret and dropped the selection (#4125).
+    if focused_element_holds_point(pid, window_id, native_x, native_y).await {
+        return Ok(not_editable::FocusDispatch::None);
+    }
+    let click_tool = click::ClickTool::new(state.clone());
+    let click = click_tool.invoke(click_args);
+    let focus = if let Some(lease) = mutation_lease {
+        crate::background_mutation::with_held_lease(lease.pid, click).await
+    } else {
+        click.await
+    };
+    let ax_focus_sent = focus.is_error != Some(true);
+    let (error_effect, error_code) = if focus.is_error == Some(true) {
+        (
+            Some(
+                focus
+                    .structured_content
+                    .as_ref()
+                    .and_then(|v| v["effect"].as_str())
+                    .unwrap_or(""),
+            ),
+            Some(
+                focus
+                    .structured_content
+                    .as_ref()
+                    .and_then(|v| v["code"].as_str())
+                    .unwrap_or(""),
+            ),
+        )
+    } else {
+        (None, None)
+    };
+    let landed = if ax_focus_sent {
+        // AXFocused is non-destructive: unlike a second real click, it keeps a
+        // Cmd+A selection intact before a follow-up type_text or Cmd+V.
+        tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+        Some(pixel_focus_landed(pid, window_id, native_x, native_y).await)
+    } else {
+        None
+    };
+    match decide_focus_next(landed, foreground, error_effect, error_code) {
+        FocusDecision::StopOriginalError => return Err(focus),
+        FocusDecision::StopUnconfirmed => {
+            return Err(not_editable::account_focus_receipt(
+                pixel_focus_unconfirmed(pid, window_id, x, y),
+                if ax_focus_sent {
+                    Some(not_editable::FocusDispatch::SentAx)
+                } else {
+                    None
+                },
+            ))
+        }
+        FocusDecision::Proceed(step) => match step {
+            PixelFocusStep::Focused => return Ok(not_editable::FocusDispatch::SentAx),
+            PixelFocusStep::RealClick => {}
+            PixelFocusStep::ClickFailed => {
+                return Err(not_editable::account_focus_receipt(
+                    cua_driver_core::protocol::ToolResult::error(format!(
+                        "focus pixel-click at ({x:.0},{y:.0}) failed."
+                    )),
+                    if ax_focus_sent {
+                        Some(not_editable::FocusDispatch::SentAx)
+                    } else {
+                        None
+                    },
+                ))
+            }
+            PixelFocusStep::Unconfirmed => {
+                return Err(not_editable::account_focus_receipt(
+                    pixel_focus_unconfirmed(pid, window_id, x, y),
+                    if ax_focus_sent {
+                        Some(not_editable::FocusDispatch::SentAx)
+                    } else {
+                        None
+                    },
+                ))
+            }
+        },
+    }
+
+    // Some renderer surfaces do not expose a usable AX focus action. The
+    // explicit foreground rung retains its real-click fallback for them.
+    if let Err(result) = gate_foreground_physical_idle(pid, window_id) {
+        return Err(not_editable::account_focus_receipt(
+            result,
+            if ax_focus_sent {
+                Some(not_editable::FocusDispatch::SentAx)
+            } else {
+                None
+            },
+        ));
+    }
+    let mut click_args = guarded_click_args.unwrap_or_else(|| {
+        serde_json::json!({
+            "pid": pid, "x": x, "y": y,
+            "delivery_mode": "foreground",
+            "action": "press",
+        })
+    });
+    click_args["delivery_mode"] = serde_json::json!("foreground");
+    click_args["action"] = serde_json::json!("press");
+    if let Some(wid) = window_id {
+        click_args["window_id"] = serde_json::json!(wid);
+    }
+    if let Some(ref s) = session {
+        click_args["session"] = serde_json::json!(s);
+    }
+    if let Some(ref s) = session_id {
+        click_args["_session_id"] = serde_json::json!(s);
+    }
+    if from_zoom && !guard_editable {
+        click_args["from_zoom"] = serde_json::json!(true);
+    }
+    let focus = click::ClickTool::new(state.clone())
+        .invoke(click_args)
+        .await;
+    if focus.is_error == Some(true) {
+        // Same accounting as the AX rung: an error does not prove nothing
+        // was sent, so a non-refusal error is an indeterminate mutation.
+        // The earlier AX focus was already sent: its receipt is carried.
+        let refused = focus
+            .structured_content
+            .as_ref()
+            .and_then(|v| v["effect"].as_str())
+            == Some("refused");
+        let result = if !refused {
+            focus_dispatch_unverified(pid, window_id, x, y)
+        } else {
+            cua_driver_core::protocol::ToolResult::error(format!(
+                "focus pixel-click at ({x:.0},{y:.0}) failed."
+            ))
+        };
+        return Err(not_editable::account_focus_receipt(
+            result,
+            if ax_focus_sent {
+                Some(not_editable::FocusDispatch::SentAx)
+            } else {
+                None
+            },
+        ));
+    }
+    // Brief settle so the renderer registers focus before the keystrokes.
+    tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+    Ok(not_editable::FocusDispatch::SentClick)
+}
+
+/// A negative focus readback stops the ladder: only an unreadable readback
+/// (None) can reach the real-click fallback, and only in the foreground.
+fn focus_readback_is_negative(landed: Option<bool>) -> bool {
+    matches!(landed, Some(false))
+}
+
+/// The outer focus-ladder decision, as data: whether the caller proceeds
+/// (and with what step) or stops with the original indeterminate error or a
+/// focus-unconfirmed result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FocusDecision {
+    Proceed(PixelFocusStep),
+    StopOriginalError,
+    StopUnconfirmed,
+}
+
+fn decide_focus_next(
+    landed: Option<bool>,
+    foreground: bool,
+    error_effect: Option<&str>,
+    error_code: Option<&str>,
+) -> FocusDecision {
+    if (error_effect.is_some() || error_code.is_some())
+        && !focus_error_allows_fallback(error_effect, error_code)
+    {
+        return FocusDecision::StopOriginalError;
+    }
+    if focus_readback_is_negative(landed) {
+        return FocusDecision::StopUnconfirmed;
+    }
+    FocusDecision::Proceed(pixel_focus_step(landed, foreground))
+}
+
+/// The focus action may have been sent but its outcome is unknown: no keys
+/// are sent, and no further focus fallback runs after the indeterminate
+/// mutation.
+fn focus_dispatch_unverified(
+    pid: i32,
+    window_id: Option<u32>,
+    x: f64,
+    y: f64,
+) -> cua_driver_core::protocol::ToolResult {
+    let message = format!(
+        "The focus action at ({x:.0},{y:.0}) may have been sent, but its outcome is unknown, so          no key or text was sent. Read fresh state before retrying."
+    );
+    cua_driver_core::protocol::ToolResult::error(message.clone()).with_structured(
+        serde_json::json!({
+            "code": "focus_dispatch_unverified",
+            "effect": "unverifiable",
+            "keys_sent": false,
+            "retryable": false,
+            "pid": pid,
+            "window_id": window_id,
+            "message": message,
+        }),
+    )
+}
+
+/// What [`focus_by_pixel`] does after its non-destructive focus click.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PixelFocusStep {
+    /// The focused element now covers the point: send the keys.
+    Focused,
+    /// Foreground only: fall back to a real click on the point.
+    RealClick,
+    /// Background: the focus click itself failed. Nothing was sent.
+    ClickFailed,
+    /// Background: the focus click went out but the focused element does not
+    /// cover the point. The keys are not sent.
+    Unconfirmed,
+}
+
+/// `landed` is the focus read-back after a focus click that did not error,
+/// `None` when the click failed. A background focus click is
+/// `effect:"unverifiable"` by construction, so only the read-back can show
+/// that the keys will reach the point.
+fn pixel_focus_step(landed: Option<bool>, foreground: bool) -> PixelFocusStep {
+    match (landed, foreground) {
+        (Some(true), _) => PixelFocusStep::Focused,
+        (_, true) => PixelFocusStep::RealClick,
+        (Some(false), false) => PixelFocusStep::Unconfirmed,
+        (None, false) => PixelFocusStep::ClickFailed,
+    }
+}
+
+/// The refusal for [`PixelFocusStep::Unconfirmed`]: the focus click was sent,
+/// so focus may have moved, but no key or text was sent.
+fn pixel_focus_unconfirmed(
+    pid: i32,
+    window_id: Option<u32>,
+    x: f64,
+    y: f64,
+) -> cua_driver_core::protocol::ToolResult {
+    let message = format!(
+        "The focus click at ({x:.0},{y:.0}) was sent, but the focused element does not cover \
+         that point, so no key or text was sent. Read the window, then target the field by \
+         element_token, or retry with delivery_mode:\"foreground\"."
+    );
+    cua_driver_core::protocol::ToolResult::error(message.clone()).with_structured(
+        serde_json::json!({
+            "code": "pixel_focus_unconfirmed",
+            "effect": "unverifiable",
+            "keys_sent": false,
+            "retryable": false,
+            "pid": pid,
+            "window_id": window_id,
+            "message": message,
+        }),
+    )
+}
+
+/// Confirm that a focus pixel-click actually moved the application's focused
+/// element onto the clicked point.
+///
+/// The background focus-click reports `effect:"unverifiable"`, so this is the
+/// read-back that lets [`focus_by_pixel`] decide whether the cheap rung worked
+/// or the real-click fallback is still required. It reuses the same
+/// window-local-pixels → screen translation the click itself used, so the
+/// comparison is in one coordinate space.
+///
+/// Returns `false` whenever the answer cannot be established (no window id,
+/// untranslatable frame, unreadable focused element or rect). That is the
+/// conservative direction: an unprovable focus escalates to the stronger rung
+/// rather than being reported as success.
+async fn pixel_focus_landed(pid: i32, window_id: Option<u32>, x: f64, y: f64) -> bool {
+    // The focused element must belong to the requested window: a sibling
+    // window's focused field can overlap the same point.
+    focused_element_holds_point(pid, window_id, x, y).await
+}
+
+/// Whether the application's focused element covers the window-local pixel
+/// `(x, y)` of `window_id`. With `require_window`, the focused element must
+/// also belong to that exact window, so focus held by a same-process sibling
+/// window that overlaps the point never counts as the requested target.
+/// Unprovable answers are `false`.
+async fn focused_element_holds_point(pid: i32, window_id: Option<u32>, x: f64, y: f64) -> bool {
+    let Some(wid) = window_id else {
+        return false;
+    };
+    tokio::task::spawn_blocking(move || {
+        let Ok(frame) = px_frame::resolve_window_px_frame(wid) else {
+            return false;
+        };
+        let (screen_x, screen_y, _, _) = frame.to_screen(x, y);
+        unsafe {
+            let Some(focused) = crate::ax::bindings::focused_element_of_pid(pid) else {
+                return false;
+            };
+            let rect = crate::ax::bindings::element_screen_rect(focused);
+            let focused_window = crate::ax::exact_target::element_window_id(focused);
+            core_foundation::base::CFRelease(focused as core_foundation::base::CFTypeRef);
+            focus_holds_point(focused_window, wid, rect, screen_x, screen_y)
+        }
+    })
+    .await
+    .unwrap_or(false)
+}
+
+/// Whether the focused element, in window `focused_window` with screen rect
+/// `rect`, covers the point in window `wid`. A focused element of another
+/// window never does, even where the two windows overlap.
+fn focus_holds_point(
+    focused_window: Option<u32>,
+    wid: u32,
+    rect: Option<[f64; 4]>,
+    x: f64,
+    y: f64,
+) -> bool {
+    focused_window == Some(wid) && rect.is_some_and(|rect| point_within_rect(rect, x, y))
+}
+
+/// Whether `[x, y, width, height]` (screen coordinates, top-left origin)
+/// contains the point. A degenerate rect never contains anything, so an app
+/// reporting a zero-sized focused element escalates rather than false-confirms.
+fn point_within_rect([rx, ry, rw, rh]: [f64; 4], x: f64, y: f64) -> bool {
+    rw > 0.0 && rh > 0.0 && x >= rx && x < rx + rw && y >= ry && y < ry + rh
+}
+
+/// Default long-edge cap for screenshots; see [`DriverConfig::max_image_dimension`].
+pub const DEFAULT_MAX_IMAGE_DIMENSION: u32 = 1366;
+
+/// Runtime-mutable driver configuration persisted across calls within a session.
+pub struct DriverConfig {
+    /// Max screenshot dimension (0 = no limit). Applied during screenshot/zoom:
+    /// the long edge is downscaled to this before encoding.
+    ///
+    /// Default 1366. High-resolution Claude models read images up to 2576 px
+    /// at ~w*h/750 tokens each, so a 1568x882 capture costs ~1.8k tokens and a
+    /// 1366x768 one ~1.4k; Anthropic's computer-use guidance names 1366x768 as
+    /// a lower-cost size with strong performance. Callers that need more
+    /// detail use `zoom` or a per-call/session `max_image_dimension`.
+    pub max_image_dimension: u32,
+}
+
+impl Default for DriverConfig {
+    fn default() -> Self {
+        Self {
+            max_image_dimension: DEFAULT_MAX_IMAGE_DIMENSION,
+        }
+    }
+}
+
+/// Path to the persistent JSON config file shared by the CLI and MCP session.
+pub fn config_file_path() -> std::path::PathBuf {
+    let home = std::env::var("HOME").unwrap_or_default();
+    std::path::PathBuf::from(format!("{home}/.cua-driver/config.json"))
+}
+
+/// Load `DriverConfig` from `~/.cua-driver/config.json`, falling back to
+/// defaults for any missing or unrecognised keys.  Called at MCP startup so
+/// that `cua-driver config set capture_mode vision` (CLI) carries over into
+/// the next MCP session without requiring a per-call `set_config`.
+pub fn load_driver_config() -> DriverConfig {
+    let mut cfg = DriverConfig::default();
+    let path = config_file_path();
+    let text = match std::fs::read_to_string(&path) {
+        Ok(t) => t,
+        Err(_) => return cfg, // no file yet — use defaults
+    };
+    let json: serde_json::Value = match serde_json::from_str(&text) {
+        Ok(v) => v,
+        Err(_) => return cfg, // malformed file — use defaults
+    };
+    // `capture_mode` is per-call now; old on-disk `capture_mode` and
+    // `capture_scope` keys are intentionally inert.
+    if let Some(v) = json.get("max_image_dimension").and_then(|v| v.as_u64()) {
+        if let Ok(v32) = u32::try_from(v) {
+            cfg.max_image_dimension = v32;
+        }
+    }
+    cfg
+}
+
+/// Convert native pixels from `get_desktop_state` into logical points.
+pub fn desktop_screenshot_point(x: f64, y: f64) -> Option<(f64, f64)> {
+    let (_, _, ratio) = get_screen_size::main_screen_size()?;
+    Some((x / ratio, y / ratio))
+}
+
+fn desktop_click_point<C, B>(
+    capture_id: Option<&str>,
+    convert: C,
+    bound: B,
+) -> Result<Option<(f64, f64)>, ToolResult>
+where
+    C: FnOnce() -> Option<(f64, f64)>,
+    B: FnOnce(&str) -> Result<(f64, f64), ToolResult>,
+{
+    match capture_id {
+        Some(id) => bound(id).map(Some),
+        None => Ok(convert()),
+    }
+}
+
+async fn dispatch_desktop_points<const N: usize, F, Fut>(
+    tool: &str,
+    converted: [Option<(f64, f64)>; N],
+    dispatch: F,
+) -> ToolResult
+where
+    F: FnOnce([(f64, f64); N]) -> Fut,
+    Fut: std::future::Future<Output = ToolResult>,
+{
+    let mut points = [(0.0, 0.0); N];
+    for (point, converted) in points.iter_mut().zip(converted) {
+        let Some(converted) = converted else {
+            return pre_dispatch_refusal(
+                "desktop_scale_unavailable",
+                format!("{tool}: desktop backing scale unavailable; no input was sent."),
+            );
+        };
+        *point = converted;
+    }
+    dispatch(points).await
+}
+
+/// Persist a single key/value pair to `~/.cua-driver/config.json`.
+/// Merges with any existing file contents so other keys are preserved.
+/// Returns `Err` if the directory cannot be created or the file cannot be written.
+pub fn write_driver_config_key(key: &str, value: &serde_json::Value) -> Result<(), String> {
+    let path = config_file_path();
+    let mut json: serde_json::Value = path
+        .exists()
+        .then(|| std::fs::read_to_string(&path).ok())
+        .flatten()
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or_else(|| serde_json::json!({}));
+    json[key] = value.clone();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    let body = serde_json::to_string_pretty(&json).map_err(|e| e.to_string())?;
+    std::fs::write(&path, body).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Per-session config overrides layered over the global persisted `DriverConfig`.
+///
+/// The cua-driver daemon is one shared process: every `cua-driver mcp` proxy
+/// connects to it and shares its `ToolState`. `DriverConfig` is therefore
+/// multi-tenant AND persisted to disk — so without session scoping, session A's
+/// `set_config capture_mode=vision` clobbers session B's value and flips the
+/// on-disk default under everyone. These overrides fix that: a named MCP session
+/// gets an in-memory, non-persisted override keyed by its `_session_id`; the
+/// anonymous session (CLI / one-shot `call`) still writes the shared global +
+/// disk. `None` fields mean "fall through to the global layer".
+#[derive(Clone, Default)]
+pub struct ConfigOverrides {
+    pub max_image_dimension: Option<u32>,
+}
+
+/// Thread-safe map of `session_id` → `ConfigOverrides`, mirroring
+/// `CursorRegistry`'s registry shape. Cleared per session on `session_end`.
+pub struct SessionConfigRegistry {
+    inner: std::sync::Mutex<HashMap<String, ConfigOverrides>>,
+}
+
+impl SessionConfigRegistry {
+    pub fn new() -> Self {
+        Self {
+            inner: std::sync::Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Merge `delta` into `session`'s overrides (only the `Some` fields of
+    /// `delta` overwrite; existing overrides for unset fields are preserved).
+    pub fn set(&self, session: &str, delta: ConfigOverrides) {
+        // Write-boundary resurrection guard: keyed by session_id, so an
+        // in-flight set_config that lands AFTER session_end (passed the dispatch
+        // gate, then the proxy died and the reaper cleared this session's
+        // overrides) must NOT re-create the entry — it would be invisible and
+        // never reaped again. `fire_session_end` marks ENDED_SESSIONS *before*
+        // running the config-clear hook, so this check is authoritative.
+        if cua_driver_core::session::is_session_ended(session) {
+            return;
+        }
+        let mut map = self.inner.lock().unwrap();
+        let entry = map.entry(session.to_owned()).or_default();
+        if delta.max_image_dimension.is_some() {
+            entry.max_image_dimension = delta.max_image_dimension;
+        }
+    }
+
+    /// Resolve the effective `max_image_dimension` for `session`, layering its
+    /// override over the global `DriverConfig`. `session = None` (anonymous)
+    /// returns the global value verbatim.
+    pub fn effective_max_image_dimension(
+        &self,
+        session: Option<&str>,
+        global: &DriverConfig,
+    ) -> u32 {
+        let ov = session.and_then(|s| self.inner.lock().unwrap().get(s).cloned());
+        match ov {
+            Some(ov) => ov.max_image_dimension.unwrap_or(global.max_image_dimension),
+            None => global.max_image_dimension,
+        }
+    }
+
+    /// Drop `session`'s overrides. No-op for an unknown id (so `session_end`
+    /// for an anonymous / never-set session is harmless).
+    pub fn clear(&self, session: &str) {
+        self.inner.lock().unwrap().remove(session);
+    }
+}
+
+impl Default for SessionConfigRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Shared state passed to all tools.
+pub struct ToolState {
+    pub snapshots: Arc<Snapshots>,
+    pub cursor_registry: Arc<CursorRegistry>,
+    pub(crate) capture_bindings: Arc<capture_binding::MacCaptureBindings>,
+    /// Global, disk-persisted config — the base layer and the only one the
+    /// anonymous session / CLI writes.
+    pub config: Arc<std::sync::RwLock<DriverConfig>>,
+    /// Per-MCP-session in-memory config overrides layered over `config`.
+    pub session_config: Arc<SessionConfigRegistry>,
+    /// Open CDP connections, one per port, reused across `insert_text` /
+    /// `type_keystrokes` calls instead of reconnecting fresh every time —
+    /// see `CdpSessionCache` for why (Chrome's "allow remote debugging"
+    /// popup fires on every new connection, not once per session).
+    pub cdp_sessions: Arc<crate::browser::CdpSessionCache>,
+    /// Whether the runtime owner installed the AppKit main-thread cursor
+    /// overlay facility. Imported SDK runtimes deliberately leave this false;
+    /// explicit cursor-overlay methods must refuse instead of reporting a
+    /// successful no-op.
+    pub cursor_overlay_available: bool,
+    /// Direct and embedded hosts own TCC request UX. Their runtime may inspect
+    /// permission state but must not raise Cua-owned prompts.
+    pub host_owns_permission_ux: bool,
+    /// Advisory host identity for permission diagnostics only.
+    pub host_bundle_id: Option<String>,
+}
+
+impl Default for ToolState {
+    fn default() -> Self {
+        Self::new(false, false, None)
+    }
+}
+
+impl ToolState {
+    fn new(
+        cursor_overlay_available: bool,
+        host_owns_permission_ux: bool,
+        host_bundle_id: Option<String>,
+    ) -> Self {
+        Self::new_with_capture_service(
+            Arc::new(cua_driver_core::capture_runtime::CaptureService::default()),
+            cursor_overlay_available,
+            host_owns_permission_ux,
+            host_bundle_id,
+        )
+    }
+
+    fn new_with_capture_service(
+        capture_service: Arc<cua_driver_core::capture_runtime::CaptureService>,
+        cursor_overlay_available: bool,
+        host_owns_permission_ux: bool,
+        host_bundle_id: Option<String>,
+    ) -> Self {
+        Self {
+            snapshots: Arc::new(Snapshots::new()),
+            cursor_registry: Arc::new(CursorRegistry::new()),
+            capture_bindings: Arc::new(capture_binding::MacCaptureBindings::new(capture_service)),
+            // Load persisted config from ~/.cua-driver/config.json so that
+            // `cua-driver config set` changes carry over into MCP sessions.
+            config: Arc::new(std::sync::RwLock::new(load_driver_config())),
+            session_config: Arc::new(SessionConfigRegistry::new()),
+            cdp_sessions: Arc::new(crate::browser::CdpSessionCache::new()),
+            cursor_overlay_available,
+            host_owns_permission_ux,
+            host_bundle_id,
+        }
+    }
+}
+
+/// The target pid of an element-addressable call. An explicit `pid` wins; a
+/// call that carries only an `element_token` takes the pid the token was
+/// minted for, as the schemas promise ("the token carries it").
+pub(super) fn target_pid(
+    state: &ToolState,
+    args: &serde_json::Value,
+) -> Result<i32, cua_driver_core::protocol::ToolResult> {
+    use cua_driver_core::tool_args::ArgsExt;
+    if args.get("pid").is_some_and(|pid| !pid.is_null()) {
+        return args.require_i32("pid");
+    }
+    if let Some(pid) = state.snapshots.pid_for_token(args) {
+        return Ok(pid);
+    }
+    if args
+        .get("element_token")
+        .is_some_and(|token| !token.is_null())
+    {
+        return Err(cua_driver_core::element_token::stale_token_without_pid());
+    }
+    Err(invalid_arguments(
+        "Missing required integer field: pid. Pass pid, or pass an element_token from the \
+         current get_window_state (a token names its own pid).",
+    ))
+}
+
+pub(super) fn screenshot_scale(
+    state: &ToolState,
+    args: &serde_json::Value,
+    pid: i32,
+    window_id: Option<u32>,
+) -> Result<f64, cua_driver_core::protocol::ToolResult> {
+    state
+        .snapshots
+        .screenshot_scale(pid, window_id.map(u64::from), args)
+}
+
+/// The window-local native-pixel point a pixel action at (x, y) lands on:
+/// (x, y) are pixels of the session's latest screenshot of the window, which
+/// may be downsized, or of a zoom crop with `from_zoom`. ClickTool and the
+/// pixel-focus checks share this so they look at one point.
+pub(super) fn window_click_point(
+    state: &ToolState,
+    args: &serde_json::Value,
+    pid: i32,
+    window_id: Option<u32>,
+    x: f64,
+    y: f64,
+    from_zoom: bool,
+) -> Result<(f64, f64), cua_driver_core::protocol::ToolResult> {
+    if from_zoom {
+        let zoom = zoom_context(state, args, pid, window_id)?;
+        return Ok(zoom.zoom_to_window(x, y));
+    }
+    let ratio = screenshot_scale(state, args, pid, window_id)?;
+    Ok((x * ratio, y * ratio))
+}
+
+pub(super) fn zoom_context(
+    state: &ToolState,
+    args: &serde_json::Value,
+    pid: i32,
+    window_id: Option<u32>,
+) -> Result<ZoomContext, cua_driver_core::protocol::ToolResult> {
+    state.snapshots.zoom(
+        pid,
+        window_id.map(u64::from),
+        args.get("_session_id").and_then(serde_json::Value::as_str),
+    )
+}
+
+pub(crate) fn cursor_overlay_unavailable() -> cua_driver_core::protocol::ToolResult {
+    let message = "macOS agent cursor overlay is unavailable: this runtime owner has no certified \
+                   AppKit main-thread host adapter or no Window Server graphic-session access; \
+                   use a GUI private worker or standalone service for cursor-overlay controls";
+    cua_driver_core::protocol::ToolResult::error(message).with_structured(serde_json::json!({
+        "status": "refused",
+        "refusal": {
+            "code": "facility_unavailable",
+            "facility": "macos_cursor_overlay",
+            "message": message,
+        }
+    }))
+}
+
+fn register_platform_browser_tools(
+    registry: &mut latency::Registry<'_>,
+    engine: &Arc<cua_driver_core::browser::BrowserEngine>,
+) {
+    // Register through the platform facade so browser input enters the same
+    // admission fence as native input.
+    use cua_driver_core::browser::{
+        download::BrowserDownloadTool,
+        pointer::BrowserPointerTool,
+        tools::{
+            BrowserClickTool, BrowserDialogTool, BrowserNavigateTool, BrowserPrepareTool,
+            BrowserSelectTool, BrowserSetInputFilesTool, BrowserTypeTool, GetBrowserStateTool,
+        },
+    };
+    registry.register(Box::new(GetBrowserStateTool::new(engine.clone())));
+    registry.register(Box::new(BrowserPrepareTool::new(engine.clone())));
+    registry.register(Box::new(BrowserNavigateTool::new(engine.clone())));
+    registry.register(Box::new(BrowserClickTool::new(engine.clone())));
+    registry.register(Box::new(BrowserTypeTool::new(engine.clone())));
+    registry.register(Box::new(BrowserSelectTool::new(engine.clone())));
+    registry.register(Box::new(BrowserDialogTool::new(engine.clone())));
+    registry.register(Box::new(BrowserSetInputFilesTool::new(engine.clone())));
+    registry.register(Box::new(BrowserDownloadTool::new(engine.clone())));
+    registry.register(Box::new(BrowserPointerTool::new(engine.clone())));
+}
+
+#[cfg(test)]
+mod browser_registration_tests {
+    use super::*;
+    use std::collections::BTreeSet;
+
+    #[test]
+    fn platform_browser_registration_matches_core_tool_set() {
+        let mut core = ToolRegistry::new();
+        let engine = cua_driver_core::browser::BrowserEngine::new_with_runtime_services(
+            Arc::new(crate::browser::MacOsBrowserPlatform::new(Arc::new(
+                CursorRegistry::new(),
+            ))),
+            core.approval_broker(),
+            core.protected_resource_ownership(),
+        );
+        cua_driver_core::browser::register_browser_tools(&engine, &mut core);
+        let mut platform = ToolRegistry::new();
+        register_platform_browser_tools(&mut latency::Registry::new(&mut platform), &engine);
+        let expected: BTreeSet<_> = core.tool_names().collect();
+        let actual: BTreeSet<_> = platform.tool_names().collect();
+        assert_eq!(actual, expected);
+        let missing_admission: Vec<_> = core
+            .iter_defs()
+            .filter(|(name, def)| !def.read_only && !pixel_restore::requires_admission(name))
+            .map(|(name, _)| name)
+            .collect();
+        assert!(
+            missing_admission.is_empty(),
+            "mutating browser tools lack admission: {missing_admission:?}"
+        );
+    }
+}
+
+/// Register all macOS tools into the registry. `compat=true` swaps the
+/// regular `screenshot` tool for the Claude Code computer-use compat
+/// variant — same name, stricter args, window-scoped JPEG @ 85% + a text
+/// note telling the caller to use pixel-addressed tools.
+pub fn register_all(
+    registry: &mut ToolRegistry,
+    compat: bool,
+    cursor_overlay_available: bool,
+    host_owns_permission_ux: bool,
+    host_bundle_id: Option<String>,
+) {
+    let registry = &mut latency::Registry::new(registry);
+    // Desktop-scope pointer tools check where every point lands
+    // (desktop_pointer_guard) and desktop-scope keys check the frontmost app.
+    cua_driver_core::browser::protection::declare_desktop_point_guard();
+    let state = Arc::new(ToolState::new_with_capture_service(
+        registry.capture_service(),
+        cursor_overlay_available,
+        host_owns_permission_ux,
+        host_bundle_id,
+    ));
+    let cursor_outcome_reader = {
+        let cursor_registry = state.cursor_registry.clone();
+        cua_driver_core::session::register_scoped_cursor_outcome_reader(std::sync::Arc::new(
+            move |session_id| {
+                let state = cursor_registry.get(session_id);
+                let motion_customized = state.is_some()
+                    && crate::cursor::overlay::current_motion(session_id)
+                        != cursor_overlay::MotionConfig::default();
+                let active_cursor_count = cursor_registry
+                    .all_states()
+                    .iter()
+                    .filter(|state| state.config.cursor_id != "default")
+                    .count()
+                    .max(1);
+                match state {
+                    Some(state) => cua_driver_core::session::bounded_cursor_outcome(
+                        true,
+                        state.config.enabled,
+                        crate::cursor::overlay::is_visible_for_session(session_id),
+                        Some(state.config.theme_id.as_str()),
+                        motion_customized,
+                        active_cursor_count,
+                    ),
+                    None => cua_driver_core::session::bounded_cursor_outcome(
+                        false,
+                        false,
+                        false,
+                        None,
+                        false,
+                        active_cursor_count,
+                    ),
+                }
+            },
+        ))
+    };
+    registry.retain_cursor_outcome_reader(cursor_outcome_reader);
+    if let Some(runtime_scope) = cua_driver_core::tool::current_dispatch_runtime_scope() {
+        let prefix = format!("__cua_runtime_{runtime_scope}:");
+        let cursor_registry = state.cursor_registry.clone();
+        let capture_bindings = state.capture_bindings.clone();
+        registry.retain_runtime_cleanup(move || {
+            capture_bindings.retire_runtime();
+            for cursor in cursor_registry
+                .all_states()
+                .into_iter()
+                .filter(|cursor| cursor.config.cursor_id.starts_with(&prefix))
+            {
+                cursor_registry.remove(&cursor.config.cursor_id);
+                crate::cursor::overlay::remove_cursor(cursor.config.cursor_id);
+            }
+        });
+    }
+    // Share the element cache with the recording-hook layer so it can
+    // resolve element_index → window-local screenshot coords for click.png.
+    cua_driver_core::snapshot_store::register_runtime_store(&state.snapshots);
+
+    // Drop a disconnecting session's config overrides + owned cursor on
+    // `session_end`. The daemon fans the session id out to this hook;
+    // recording ownership is handled separately on the core RecordingSession.
+    {
+        let session_config = state.session_config.clone();
+        let snapshots = state.snapshots.clone();
+        let cursor_registry = state.cursor_registry.clone();
+        let capture_bindings = state.capture_bindings.clone();
+        let registration =
+            cua_driver_core::session::register_scoped_session_end_hook(move |session_id| {
+                session_config.clear(session_id);
+                snapshots.retire_session_screenshots(session_id);
+                capture_bindings.retire_session(session_id);
+                menu_bar_extras::end_session(session_id);
+                crate::ax::exact_target::end_context_menu_session(session_id);
+                // Per-session agent cursor: the session_id is the cursor key when
+                // the caller gave no explicit cursor_id, so dropping it here both
+                // prunes the metadata registry and stops the overlay painting that
+                // session's cursor. Both paths guard "default" so the anonymous /
+                // one-shot cursor survives. Anonymous sessions that never created a
+                // cursor are a harmless no-op.
+                cursor_registry.remove(session_id);
+                crate::cursor::overlay::remove_cursor(session_id.to_owned());
+                // A window the session left key inside a background app is
+                // let go with it (end_session or a closed transport).
+                crate::input::skylight::release_primed_keys_on_session_end(
+                    cua_driver_core::session::active_session_count(),
+                );
+            });
+        registry.retain_session_end_hook(registration);
+        let revive_registration =
+            cua_driver_core::session::register_scoped_session_revive_hook(move |session_id| {
+                menu_bar_extras::revive_session(session_id);
+                crate::ax::exact_target::revive_context_menu_session(session_id);
+                crate::cursor::overlay::revive_cursor(session_id.to_owned());
+            });
+        registry.retain_session_revive_hook(revive_registration);
+    }
+
+    registry.register(Box::new(list_apps::ListAppsTool));
+    registry.register(Box::new(list_windows::ListWindowsTool));
+    registry.register(Box::new(get_window_state::GetWindowStateTool::new(
+        state.clone(),
+    )));
+    registry.register(Box::new(
+        cua_driver_core::expectation::VerifyStateTool::new(Arc::new(
+            cua_driver_core::expectation::ToolObservationProvider::new(
+                Arc::new(list_windows::ListWindowsTool),
+                Arc::new(get_window_state::GetWindowStateTool::new(state.clone())),
+            ),
+        )),
+    ));
+    registry.register(Box::new(launch_app::LaunchAppTool));
+    registry.register(Box::new(kill_app::KillAppTool));
+    let pid_window_candidates: WindowTargetCandidates = Arc::new(pid_window_target_candidates);
+    registry.register(pid_window_guarded(
+        bring_to_front::BringToFrontTool,
+        &pid_window_candidates,
+    ));
+    registry.register(Box::new(set_window_frame::SetWindowFrameTool));
+    registry.register(Box::new(invoke_menu::InvokeMenuTool));
+    registry.register(Box::new(menu_bar_extras::MenuBarExtrasTool));
+    registry.register(pid_window_guarded(
+        click::ClickTool::new(state.clone()),
+        &pid_window_candidates,
+    ));
+    registry.register(pid_window_guarded(
+        double_click::DoubleClickTool::new(state.clone()),
+        &pid_window_candidates,
+    ));
+    registry.register(pid_window_guarded(
+        right_click::RightClickTool::new(state.clone()),
+        &pid_window_candidates,
+    ));
+    registry.register(pid_window_guarded(
+        drag::DragTool::new(state.clone()),
+        &pid_window_candidates,
+    ));
+    registry.register(pid_keyboard_guarded(
+        type_text::TypeTextTool::new(state.clone()),
+        &pid_window_candidates,
+    ));
+    registry.register(keyboard_tool(
+        press_key::PressKeyTool::new(state.clone()),
+        &pid_window_candidates,
+        |args| press_key::requested_key(args).err(),
+    ));
+    registry.register(keyboard_tool(
+        hotkey::HotkeyTool::new(state.clone()),
+        &pid_window_candidates,
+        |args| hotkey::requested_hotkey(args).err(),
+    ));
+    registry.register(pid_window_guarded(
+        set_value::SetValueTool::new(state.clone()),
+        &pid_window_candidates,
+    ));
+    registry.register(pid_window_guarded(
+        select_text::SelectTextTool::new(state.clone()),
+        &pid_window_candidates,
+    ));
+    registry.register(pid_window_guarded(
+        scroll::ScrollTool::new(state.clone()),
+        &pid_window_candidates,
+    ));
+    cua_driver_core::clipboard::register_clipboard_tools(
+        registry,
+        Arc::new(clipboard::MacosClipboard::new()),
+    );
+    // The standalone `screenshot` tool was removed (#1692). The pixel-grounding
+    // screenshot the Claude Code computer-use compat loop relies on now comes
+    // from `get_window_state` (which always returns BOTH the tree AND a
+    // screenshot — perception is mode-agnostic; `capture_mode` is deprecated/
+    // ignored) for a window, or `get_desktop_state` for the whole screen.
+    // `compat` no longer gates a tool swap here — the flag's live purpose is to
+    // register the MCP server under the `cua-computer-use` name, which is what
+    // triggers Claude Code's computer-use beta-tool injection (see cli.rs).
+    let _ = compat;
+    registry.register(Box::new(get_screen_size::GetScreenSizeTool));
+    registry.register(Box::new(get_desktop_state::GetDesktopStateTool::new(
+        state.clone(),
+    )));
+    registry.register(Box::new(get_cursor_position::GetCursorPositionTool));
+    registry.register(Box::new(move_cursor::MoveCursorTool::new(state.clone())));
+    registry.register(Box::new(cursor_tools::SetAgentCursorEnabledTool::new(
+        state.clone(),
+    )));
+    registry.register(Box::new(cursor_tools::SetAgentCursorMotionTool::new(
+        state.clone(),
+    )));
+    registry.register(Box::new(cursor_tools::SetAgentCursorThemeTool::new(
+        state.clone(),
+    )));
+    registry.register(Box::new(cursor_tools::GetAgentCursorStateTool::new(
+        state.clone(),
+    )));
+    registry.register(Box::new(check_permissions::CheckPermissionsTool::new(
+        state.clone(),
+    )));
+    // `health_report` — single-call end-to-end diagnostics. Stable
+    // schema_version="1" contract aimed at downstream consumers who must
+    // not have to know cua-driver internals. Provider is platform-specific; tool plumbing is in
+    // `cua_driver_core::health_report`.
+    registry.register(Box::new(
+        cua_driver_core::health_report::HealthReportTool::new(Arc::new(
+            health_report::MacosHealthProvider,
+        )),
+    ));
+    registry.register(Box::new(get_config::GetConfigTool::new(state.clone())));
+    registry.register(Box::new(set_config::SetConfigTool::new(state.clone())));
+    registry.register(Box::new(
+        get_accessibility_tree::GetAccessibilityTreeTool::new(state.clone()),
+    ));
+    registry.register(Box::new(zoom::ZoomTool {
+        state: state.clone(),
+    }));
+    // `type_text_chars` is intentionally NOT registered — Swift treats it as
+    // a deprecated alias for `type_text` resolved at invoke time in
+    // mcp-server's `ToolRegistry::invoke`. Keeping it out of the registry
+    // means it doesn't show up in `tools/list` either, matching Swift's
+    // ToolRegistry.swift (`type_text_chars` not in `handlers`) and the
+    // platform-windows::build_registry which uses the same convention.
+    // Touch the struct so it stays in this crate for the alias resolver.
+    let _: &type_text_chars::TypeTextCharsTool =
+        &type_text_chars::TypeTextCharsTool::new(state.clone());
+    // Cross-platform `page` tool definition lives in mcp-server; macOS plugs in
+    // its Apple-Events / CDP / AX-tree backend here.
+    registry.register(Box::new(cua_driver_core::page::PageTool::new(Arc::new(
+        page::MacOsPageBackend::new(state.clone()),
+    ))));
+    let browser_engine = cua_driver_core::browser::BrowserEngine::new_with_runtime_services(
+        Arc::new(crate::browser::MacOsBrowserPlatform::new(
+            state.cursor_registry.clone(),
+        )),
+        registry.approval_broker(),
+        registry.protected_resource_ownership(),
+    );
+    register_platform_browser_tools(registry, &browser_engine);
+    // Recording / replay + session-lifecycle tools are platform-independent.
+    registry.register_recording_tools();
+    registry.register_session_tools();
+}
+
+#[cfg(test)]
+mod session_config_guard_tests {
+    use super::*;
+    use cua_driver_core::session::fire_session_end;
+
+    fn overrides(max_dim: u32) -> ConfigOverrides {
+        ConfigOverrides {
+            max_image_dimension: Some(max_dim),
+        }
+    }
+
+    #[test]
+    fn ended_session_config_set_is_noop() {
+        // THE FIX (config side): an ended session id keys the overrides map, so
+        // an in-flight set_config after session_end must not re-create the entry
+        // the reaper's clear hook removed. effective then falls back to global.
+        let reg = SessionConfigRegistry::new();
+        let global = DriverConfig::default();
+        let sid = "wb-config-ended-Q9R8S7";
+        fire_session_end(sid);
+        assert!(cua_driver_core::session::is_session_ended(sid));
+
+        reg.set(sid, overrides(800));
+        let dim = reg.effective_max_image_dimension(Some(sid), &global);
+        assert_eq!(
+            dim, global.max_image_dimension,
+            "ended session must not get an override entry"
+        );
+    }
+
+    #[test]
+    fn live_session_config_set_takes_effect() {
+        let reg = SessionConfigRegistry::new();
+        let global = DriverConfig::default();
+        let sid = "wb-config-live-T1U2V3";
+        assert!(!cua_driver_core::session::is_session_ended(sid));
+        reg.set(sid, overrides(800));
+        let dim = reg.effective_max_image_dimension(Some(sid), &global);
+        assert_eq!(dim, 800, "live session override must apply");
+    }
+}
+
+#[cfg(test)]
+mod cursor_overlay_facility_tests {
+    use super::*;
+    use cua_driver_core::tool::Tool;
+
+    fn assert_facility_unavailable(result: cua_driver_core::protocol::ToolResult) {
+        assert_eq!(result.is_error, Some(true));
+        let refusal = result
+            .structured_content
+            .and_then(|value| value.get("refusal").cloned())
+            .expect("structured refusal");
+        assert_eq!(refusal["code"], "facility_unavailable");
+        assert_eq!(refusal["facility"], "macos_cursor_overlay");
+    }
+
+    #[tokio::test]
+    async fn cursor_control_refuses_without_main_thread_host_facility() {
+        let state = Arc::new(ToolState::new(false, true, None));
+        let result = cursor_tools::SetAgentCursorEnabledTool::new(state)
+            .invoke(serde_json::json!({"enabled": true, "session": "test"}))
+            .await;
+        assert_facility_unavailable(result);
+    }
+
+    #[tokio::test]
+    async fn window_cursor_move_refuses_without_main_thread_host_facility() {
+        let state = Arc::new(ToolState::new(false, true, None));
+        let result = move_cursor::MoveCursorTool::new(state)
+            .invoke(serde_json::json!({"x": 10, "y": 20, "session": "test"}))
+            .await;
+        assert_facility_unavailable(result);
+    }
+}
+
+// RecordingSession lives in cua-driver-core, but its `start()` pulls in the
+// macOS cursor sampler (CoreGraphics), so the start-guard test runs here in
+// platform-macos where build.rs links the frameworks — the core crate's test
+// binary has no CoreGraphics linkage.
+#[cfg(test)]
+mod pixel_focus_readback_tests {
+    use super::{
+        focus_holds_point, pixel_focus_step, pixel_focus_unconfirmed, point_within_rect,
+        PixelFocusStep,
+    };
+
+    /// Review finding: a sibling window's focused field overlapping the point
+    /// does not confirm focus in the requested window.
+    #[test]
+    fn only_the_requested_windows_focus_confirms() {
+        let field = Some([100.0, 100.0, 200.0, 30.0]);
+        assert!(focus_holds_point(Some(9), 9, field, 150.0, 110.0));
+        assert!(!focus_holds_point(Some(8), 9, field, 150.0, 110.0));
+        assert!(!focus_holds_point(None, 9, field, 150.0, 110.0));
+        assert!(!focus_holds_point(Some(9), 9, None, 150.0, 110.0));
+    }
+
+    /// Review round 2: the focus checks use the point the click lands on. A
+    /// screenshot delivered at half its native size maps (1000, 300) to
+    /// (2000, 600), for the click and the read-back alike.
+    #[test]
+    fn focus_checks_use_the_clicks_window_point() {
+        let state = super::ToolState::new(false, true, None);
+        state.snapshots.publish_for_session(
+            10,
+            20,
+            crate::ax::snapshot::AxSnapshot::from_nodes(&[]),
+            Some("s"),
+            Some(2.0),
+        );
+        let args = serde_json::json!({ "_session_id": "s" });
+        let point = super::window_click_point(&state, &args, 10, Some(20), 1000.0, 300.0, false)
+            .expect("the session has a screenshot of the window");
+        assert_eq!(point, (2000.0, 600.0));
+        assert!(
+            super::window_click_point(
+                &state,
+                &serde_json::json!({}),
+                10,
+                Some(20),
+                1.0,
+                1.0,
+                false
+            )
+            .is_err(),
+            "another session's screenshot is not this call's frame"
+        );
+    }
+
+    /// DSH-04: a background focus click whose read-back shows focus elsewhere
+    /// must not let the keys go out. There is no real-click fallback in the
+    /// background, so the call stops there.
+    #[test]
+    fn background_keys_wait_for_a_confirmed_focus() {
+        assert_eq!(pixel_focus_step(Some(true), false), PixelFocusStep::Focused);
+        assert_eq!(
+            pixel_focus_step(Some(false), false),
+            PixelFocusStep::Unconfirmed
+        );
+        assert_eq!(pixel_focus_step(None, false), PixelFocusStep::ClickFailed);
+        assert_eq!(pixel_focus_step(Some(true), true), PixelFocusStep::Focused);
+        assert_eq!(
+            pixel_focus_step(Some(false), true),
+            PixelFocusStep::RealClick
+        );
+        assert_eq!(pixel_focus_step(None, true), PixelFocusStep::RealClick);
+    }
+
+    #[test]
+    fn an_unconfirmed_focus_says_no_key_was_sent() {
+        let result = pixel_focus_unconfirmed(7, Some(9), 10.0, 20.0);
+        assert_eq!(result.is_error, Some(true));
+        let data = result.structured_content.expect("structured refusal");
+        assert_eq!(data["code"], "pixel_focus_unconfirmed");
+        assert_eq!(data["effect"], "unverifiable");
+        assert_eq!(data["keys_sent"], false);
+    }
+
+    #[test]
+    fn confirms_a_point_inside_the_focused_element() {
+        let composer = [100.0, 800.0, 250.0, 24.0];
+        assert!(point_within_rect(composer, 220.0, 812.0));
+        assert!(
+            point_within_rect(composer, 100.0, 800.0),
+            "top-left is inside"
+        );
+    }
+
+    #[test]
+    fn rejects_a_point_outside_the_focused_element() {
+        // The WhatsApp case: the click targeted the composer but focus stayed on
+        // the transcript above it, so the clicked point is not inside the
+        // focused element's rect and the caller must escalate.
+        let transcript = [100.0, 100.0, 640.0, 690.0];
+        assert!(!point_within_rect(transcript, 220.0, 812.0));
+    }
+
+    #[test]
+    fn excludes_the_far_edges() {
+        let rect = [0.0, 0.0, 10.0, 10.0];
+        assert!(!point_within_rect(rect, 10.0, 5.0));
+        assert!(!point_within_rect(rect, 5.0, 10.0));
+    }
+
+    #[test]
+    fn a_degenerate_rect_never_confirms() {
+        assert!(!point_within_rect([5.0, 5.0, 0.0, 0.0], 5.0, 5.0));
+        assert!(!point_within_rect([5.0, 5.0, -3.0, 10.0], 5.0, 6.0));
+    }
+}
+
+#[cfg(test)]
+mod recording_start_guard_tests {
+    use cua_driver_core::recording::RecordingSession;
+    use cua_driver_core::session::fire_session_end;
+
+    #[test]
+    fn start_refuses_for_ended_session_owner() {
+        // THE FIX (recording side): an in-flight start_recording owned by a
+        // session that already ended would leak an ffmpeg/SCStream process owned
+        // by a dead session that is never reaped. start() must refuse.
+        let rec = RecordingSession::new();
+        let sid = "wb-recording-ended-W4X5Y6";
+        fire_session_end(sid);
+        assert!(cua_driver_core::session::is_session_ended(sid));
+
+        let dir = std::env::temp_dir().join("wb-rec-ended");
+        let err = rec.start(dir.to_str().unwrap(), false, Some(sid));
+        assert!(err.is_err(), "start for an ended session owner must error");
+        assert!(
+            !rec.current_state().enabled,
+            "no recording may start for a dead session"
+        );
+    }
+
+    #[test]
+    fn start_succeeds_for_live_session_owner() {
+        let rec = RecordingSession::new();
+        let sid = "wb-recording-live-Z7A8B9";
+        assert!(!cua_driver_core::session::is_session_ended(sid));
+        let dir = std::env::temp_dir().join("wb-rec-live");
+        // record_video=false avoids spawning ffmpeg in the test.
+        let ok = rec.start(dir.to_str().unwrap(), false, Some(sid));
+        assert!(ok.is_ok(), "start for a live session owner must succeed");
+        assert!(rec.current_state().enabled);
+        let _ = rec.stop_owner(Some(sid));
+    }
+
+    #[test]
+    fn start_succeeds_for_anonymous_owner() {
+        // owner = None (CLI one-shot / legacy shim) is never gated.
+        let rec = RecordingSession::new();
+        let dir = std::env::temp_dir().join("wb-rec-anon");
+        let ok = rec.start(dir.to_str().unwrap(), false, None);
+        assert!(ok.is_ok(), "anonymous start must never be gated");
+        assert!(rec.current_state().enabled);
+        let _ = rec.stop_owner(None);
+    }
+}
+
+#[cfg(test)]
+mod windowserver_refusal_tests {
+    use super::*;
+
+    #[test]
+    fn refusal_names_the_reason_and_the_app_bundle_daemon() {
+        let result = windowserver_connection_refusal(42, Some(7));
+        assert_eq!(result.is_error, Some(true));
+        let structured = result.structured_content.expect("structured");
+        assert_eq!(structured["code"], "background_unavailable");
+        assert_eq!(structured["reason"], "windowserver_connection_invalid");
+        assert_eq!(structured["status"], 1002);
+        assert_eq!(structured["window_id"], 7);
+        assert!(structured["hint"]
+            .as_str()
+            .unwrap()
+            .contains("cua-driver permissions grant"));
+    }
+}
+
+#[cfg(test)]
+mod arguments_first_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// press_key and hotkey are registered behind a guard that looks up the
+    /// pid's windows. An unknown key must be refused for the key before that
+    /// lookup, not as a window error that hides it.
+    #[tokio::test]
+    async fn an_unknown_key_is_refused_before_the_registered_window_lookup() {
+        let lookups = Arc::new(AtomicUsize::new(0));
+        let counted = lookups.clone();
+        let candidates: WindowTargetCandidates = Arc::new(move |_| {
+            counted.fetch_add(1, Ordering::SeqCst);
+            Vec::new()
+        });
+        let state = Arc::new(ToolState::new(false, false, None));
+        let tools = [
+            (
+                keyboard_tool(
+                    press_key::PressKeyTool::new(state.clone()),
+                    &candidates,
+                    |args| press_key::requested_key(args).err(),
+                ),
+                serde_json::json!({"pid": 123, "key": "notakey"}),
+            ),
+            (
+                keyboard_tool(
+                    hotkey::HotkeyTool::new(state.clone()),
+                    &candidates,
+                    |args| hotkey::requested_hotkey(args).err(),
+                ),
+                serde_json::json!({"pid": 123, "keys": ["cmd", "notakey"]}),
+            ),
+        ];
+        for (tool, args) in tools {
+            let result = tool.invoke(args.clone()).await;
+            let structured = result.structured_content.expect("structured refusal");
+            assert_eq!(
+                structured["code"], "invalid_arguments",
+                "{args}: {structured}"
+            );
+            assert_eq!(lookups.load(Ordering::SeqCst), 0, "{args}");
+        }
+        // A valid key still goes through the window lookup.
+        let press = keyboard_tool(press_key::PressKeyTool::new(state), &candidates, |args| {
+            press_key::requested_key(args).err()
+        });
+        let _ = press
+            .invoke(serde_json::json!({"pid": 123, "key": "return"}))
+            .await;
+        assert_eq!(lookups.load(Ordering::SeqCst), 1);
+    }
+}
+
+#[cfg(test)]
+mod key_restore_tests {
+    use super::key_restore_pending_refusal;
+
+    /// A key hand-back still running after 2 s: the action is refused with
+    /// nothing sent, instead of fronting or clicking under the hand-back.
+    #[test]
+    fn a_pending_key_hand_back_refuses_with_nothing_sent() {
+        let result = key_restore_pending_refusal("bring_to_front", Some(5), Some(9));
+        assert_eq!(result.is_error, Some(true));
+        let data = result.structured_content.expect("structured refusal");
+        assert_eq!(data["code"], "key_restore_pending");
+        assert_eq!(data["effect"], "refused");
+        assert_eq!(data["retryable"], true);
+        assert_eq!(data["pid"], 5);
+        assert_eq!(data["window_id"], 9);
+    }
+}
+
+#[cfg(test)]
+mod wave400f2_registry_tests {
+    use super::*;
+
+    #[test]
+    fn new_tools_are_discoverable_with_exact_schemas() {
+        let state = Arc::new(ToolState::new(false, true, None));
+        let mut registry = cua_driver_core::tool::ToolRegistry::new();
+        registry.register(Box::new(select_text::SelectTextTool::new(state)));
+        registry.register(Box::new(menu_bar_extras::MenuBarExtrasTool));
+        let list = registry.tools_list();
+        let tools = list["tools"].as_array().expect("tools array");
+        let select = tools
+            .iter()
+            .find(|tool| tool["name"] == "select_text")
+            .expect("select_text");
+        for field in ["pid", "window_id", "element_token", "text"] {
+            assert!(select["inputSchema"]["required"]
+                .as_array()
+                .expect("required")
+                .contains(&serde_json::json!(field)));
+        }
+        let extras = tools
+            .iter()
+            .find(|tool| tool["name"] == "menu_bar_extras")
+            .expect("menu_bar_extras");
+        assert!(extras["inputSchema"]["properties"]["pid"].is_object());
+        assert!(extras["inputSchema"]["properties"]["window_id"].is_null());
+    }
+}
+
+#[cfg(test)]
+mod user_takeover_tests {
+    use super::{physical_input_idle_ms, user_takeover_idle};
+
+    /// The gate reads the HID system-state idle clock, which the driver's own
+    /// events must not reset: a key it posts to a pid leaves the clock
+    /// running. Run by hand on a machine whose user is not typing:
+    /// cargo test -p platform-macos --lib driver_input_does_not_reset -- --ignored --nocapture
+    #[test]
+    #[ignore = "reads the live HID idle clock and posts a key to this process"]
+    fn driver_input_does_not_reset_the_physical_idle_clock() {
+        let before = physical_input_idle_ms().expect("the idle clock is readable");
+        for _ in 0..5 {
+            // F12 to this test process: no window, nothing to receive it.
+            crate::input::keyboard::press_key(std::process::id() as i32, "f12", &[])
+                .expect("the key posts");
+        }
+        let after = physical_input_idle_ms().expect("the idle clock is readable");
+        println!("idle before {before} ms, after five driver keys {after} ms");
+        assert!(
+            after >= before,
+            "the driver's own keys reset the physical idle clock ({before} -> {after} ms)"
+        );
+    }
+
+    /// Refuse only when the person is in the target app and typed or moved a
+    /// moment ago.
+    #[test]
+    fn the_person_using_the_target_app_is_refused_and_nobody_else() {
+        // In the app, input 200 ms ago, threshold 750: refuse.
+        assert_eq!(user_takeover_idle(Some(true), Some(200), 750), Some(200));
+        // Input long ago: the person is not at the keyboard.
+        assert_eq!(user_takeover_idle(Some(true), Some(750), 750), None);
+        assert_eq!(user_takeover_idle(Some(true), Some(60_000), 750), None);
+        // Another app is in front (the person is elsewhere): never refused,
+        // whatever their input.
+        assert_eq!(user_takeover_idle(Some(false), Some(10), 750), None);
+        // Unreadable front or idle time: nothing is refused on a guess.
+        assert_eq!(user_takeover_idle(None, Some(10), 750), None);
+        assert_eq!(user_takeover_idle(Some(true), None, 750), None);
+        // A zero threshold turns the refusal off.
+        assert_eq!(user_takeover_idle(Some(true), Some(0), 0), None);
+    }
+}
+#[cfg(test)]
+mod coordinate_scale_tests {
+    use super::*;
+    use std::cell::Cell;
+
+    #[tokio::test]
+    async fn unknown_scale_refuses_before_dispatch() {
+        for tool in ["click", "move_cursor", "drag", "scroll"] {
+            let sent = Cell::new(0);
+            let counter = &sent;
+            let result = dispatch_desktop_points(tool, [None], |_| async move {
+                counter.set(counter.get() + 1);
+                ToolResult::text("sent")
+            })
+            .await;
+            assert_eq!(sent.get(), 0, "{tool}");
+            assert_eq!(result.is_error, Some(true), "{tool}");
+            let value = result.structured_content.unwrap();
+            assert_eq!(value["effect"], "refused", "{tool}");
+            assert_eq!(value["dispatched"], false, "{tool}");
+        }
+        for converted in [[None, Some((3.0, 4.0))], [Some((1.0, 2.0)), None]] {
+            let sent = Cell::new(0);
+            let counter = &sent;
+            let result = dispatch_desktop_points("drag", converted, |_| async move {
+                counter.set(counter.get() + 1);
+                ToolResult::text("sent")
+            })
+            .await;
+            assert_eq!(sent.get(), 0);
+            let value = result.structured_content.unwrap();
+            assert_eq!(value["effect"], "refused");
+            assert_eq!(value["dispatched"], false);
+        }
+    }
+
+    #[tokio::test]
+    async fn known_scale_dispatches_and_capture_id_keeps_its_bound_point() {
+        for tool in ["click", "move_cursor", "drag", "scroll"] {
+            let sent = Cell::new(0);
+            let counter = &sent;
+            let result = dispatch_desktop_points(tool, [Some((2.0, 3.0))], |points| async move {
+                assert_eq!(points, [(2.0, 3.0)]);
+                counter.set(counter.get() + 1);
+                ToolResult::text("sent")
+            })
+            .await;
+            assert_eq!(sent.get(), 1, "{tool}");
+            assert_ne!(result.is_error, Some(true), "{tool}");
+        }
+        let point = desktop_click_point(
+            Some("capture"),
+            || panic!("must not query scale"),
+            |id| {
+                assert_eq!(id, "capture");
+                Ok((7.0, 9.0))
+            },
+        )
+        .unwrap();
+        let sent = Cell::new(0);
+        let counter = &sent;
+        let result = dispatch_desktop_points("click", [point], |points| async move {
+            assert_eq!(points, [(7.0, 9.0)]);
+            counter.set(counter.get() + 1);
+            ToolResult::text("sent")
+        })
+        .await;
+        assert_eq!(sent.get(), 1);
+        assert_ne!(result.is_error, Some(true));
+    }
+}

@@ -1,0 +1,1100 @@
+# GOAT's build of Cua Driver: every platform GOAT ships, unsigned (GOAT signs inside its helper app),
+# the license/source gate, the protocol-compatibility check against the release GOAT pins, and on a
+# release tag, provenance attestations and a GitHub release. No secrets: nothing here signs or notarizes.
+#
+# What runs where:
+# - pull_request: the platform builds, lints and the PR schema/unit jobs.
+# - push to main: the same code already passed its PR, so only version and deny run, plus the
+#   platform builds and clippy when the push changes what their caches are keyed on (see the version
+#   job). The slow regression lanes do not run.
+# - schedule (daily, main HEAD): everything, including the slow lanes, which also keeps main's caches
+#   warm for the PR jobs that restore them.
+# - release tag and workflow_dispatch with slow_tests (the default): everything; a tag also publishes.
+name: goat-ci
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+    tags: ["cua-driver-rs-v*-goat.*"]
+    # Skip documentation-only pushes to main. Path filters are not evaluated for tag pushes, so a
+    # release tag always runs. Later patterns win: the Markdown re-included below is compiled into the
+    # binary (rust/Skills, a crate's doc attribute), packaged into the release archives (LICENSE.md,
+    # THIRD_PARTY_NOTICES.md, the whole wayland-helper directory) or read by the notices check.
+    paths:
+      - "**"
+      - "!**/*.md"
+      - "!docs/**"
+      - "LICENSE.md"
+      - "rust/THIRD_PARTY_NOTICES.md"
+      - "rust/Skills/**"
+      - "rust/crates/*/README.md"
+      - "wayland-helper/**"
+  schedule:
+    # 18:17 UTC daily, on the default branch.
+    - cron: "17 18 * * *"
+  workflow_dispatch:
+    inputs:
+      slow_tests:
+        description: "Run the slow unit and desktop-independent regression jobs"
+        type: boolean
+        default: true
+        required: false
+
+permissions:
+  contents: read
+
+# Pull requests and pushes to main supersede their own earlier run. Tag pushes, dispatches and the
+# schedule each get a group of their own, so nothing cancels or queues behind them.
+concurrency:
+  group: goat-ci-${{ (github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main')) && github.ref || github.run_id }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CUA_DRIVER_RS_TELEMETRY_ENABLED: "false"
+  CUA_TELEMETRY_ENABLED: "false"
+  CUA_DRIVER_RS_UPDATE_CHECK: "false"
+  DO_NOT_TRACK: "1"
+
+jobs:
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      builds: ${{ steps.builds.outputs.run }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - name: Determine version
+        id: version
+        run: |
+          VERSION=$(python3 -c 'import tomllib; print(tomllib.load(open("rust/Cargo.toml","rb"))["workspace"]["package"]["version"])')
+          if [[ "$GITHUB_REF" == refs/tags/cua-driver-rs-v* ]]; then
+            TAGGED="${GITHUB_REF#refs/tags/cua-driver-rs-v}"
+            if [[ "$TAGGED" != "$VERSION" ]]; then
+              echo "::error::Tag says $TAGGED but rust/Cargo.toml says $VERSION; the binary would report the wrong version to GOAT."
+              exit 1
+            fi
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+      # A push to main carries code its pull request already built, linted and checked, so rebuilding
+      # it only matters when the push changes what the build caches are keyed on (the Cargo manifests
+      # and lock) or this workflow (toolchain, Debian package set): then the builds save the caches
+      # that pull requests restore. Every other event builds. The daily schedule builds main as well.
+      - name: Decide whether the platform builds run
+        id: builds
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT: ${{ github.event_name }}
+          BEFORE: ${{ github.event.before }}
+        run: |
+          if [[ "$EVENT" != push || "$GITHUB_REF" != refs/heads/main ]]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          run=true
+          if gh api "repos/$GITHUB_REPOSITORY/compare/$BEFORE...$GITHUB_SHA" > "$RUNNER_TEMP/compare.json"; then
+            # The compare API lists at most 300 files; a longer list may hide a manifest, so build.
+            if (( $(jq '.files | length' "$RUNNER_TEMP/compare.json") < 300 )); then
+              jq -r '.files[] | .filename, (.previous_filename // empty)' "$RUNNER_TEMP/compare.json" | tee "$RUNNER_TEMP/changed.txt"
+              if ! grep -Eq '^((rust|vendor)/(.*/)?Cargo\.(toml|lock)|\.github/workflows/goat-ci\.yml)$' "$RUNNER_TEMP/changed.txt"; then
+                run=false
+              fi
+            fi
+          else
+            echo "::warning::could not list the changes in this push; building"
+          fi
+          echo "Platform builds run: $run"
+          echo "run=$run" >> "$GITHUB_OUTPUT"
+      - name: Protocol checker tests
+        working-directory: goat/compat
+        run: python3 -m unittest -v test_check_protocol
+
+  deny:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2
+        with:
+          tool: cargo-deny@0.20.2
+      # Covers the rust/ workspace (driver, cursor theme, SDK, UIA).
+      - name: Licenses, bans and sources of the rust/ workspace (rust/deny.toml)
+        working-directory: rust
+        run: cargo deny --locked --exclude-dev check --show-stats licenses bans sources
+      # The Node runtime is a separate Cargo project assembled by scripts/build-node-runtime.mjs and
+      # locked by scripts/node-runtime/Cargo.lock (goat-si/cua-driver#4).
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "22"
+      - name: Licenses, bans and sources of the Node runtime (scripts/node-runtime/deny.toml)
+        run: |
+          npm --prefix typescript ci --ignore-scripts
+          node scripts/build-node-runtime.mjs --prepare "$RUNNER_TEMP/node-runtime"
+          cargo deny --manifest-path "$RUNNER_TEMP/node-runtime/napi/Cargo.toml" --locked \
+            --config scripts/node-runtime/deny.toml check --show-stats licenses bans sources
+      - name: MPL-2.0 source pointers in THIRD_PARTY_NOTICES.md match the locked graph
+        run: python3 goat/notices/check_notices.py
+
+  linux:
+    name: linux-${{ matrix.arch }}
+    needs: version
+    if: needs.version.outputs.builds == 'true'
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { arch: x86_64, target: x86_64-unknown-linux-gnu, runner: ubuntu-latest }
+          - { arch: arm64, target: aarch64-unknown-linux-gnu, runner: ubuntu-24.04-arm }
+    # Same floor as upstream's release build: linking against Debian 11's glibc 2.31 keeps the
+    # binary running on Debian 11+, Ubuntu 20.04+ and RHEL 8+.
+    container:
+      image: debian:11
+    env:
+      STAGE: cua-driver-rs-${{ needs.version.outputs.version }}-linux-${{ matrix.arch }}
+      # The pinned package set. The snapshot never changes, so the lists and .debs it resolves to can
+      # be cached and reused verbatim when snapshot.debian.org is down (goat-si/cua-driver#20).
+      DEBIAN_SNAPSHOT: "20260901T000000Z"
+      DEBIAN_PACKAGES: >-
+        git ca-certificates curl python3 build-essential pkg-config
+        libx11-dev libxi-dev libxtst-dev libxext-dev libwayland-dev libxkbcommon-dev
+    steps:
+      - name: Pin the Debian snapshot
+        id: apt-pin
+        run: |
+          cat > /etc/apt/sources.list <<EOF
+          deb [check-valid-until=no signed-by=/usr/share/keyrings/debian-archive-keyring.gpg] http://snapshot.debian.org/archive/debian/$DEBIAN_SNAPSHOT/ bullseye main
+          deb [check-valid-until=no signed-by=/usr/share/keyrings/debian-archive-keyring.gpg] http://snapshot.debian.org/archive/debian/$DEBIAN_SNAPSHOT/ bullseye-updates main
+          deb [check-valid-until=no signed-by=/usr/share/keyrings/debian-archive-keyring.gpg] http://snapshot.debian.org/archive/debian-security/$DEBIAN_SNAPSHOT/ bullseye-security main
+          EOF
+          # The image deletes downloaded .debs after every install; keep them so they can be cached.
+          rm -f /etc/apt/apt.conf.d/docker-clean
+          # Keyed by the sources and the package list, so any change to either starts a new cache.
+          set_hash=$({ cat /etc/apt/sources.list; echo "$DEBIAN_PACKAGES"; } | sha256sum | cut -c1-16)
+          echo "key=goat-apt-debian11-${{ matrix.arch }}-$DEBIAN_SNAPSHOT-$set_hash" >> "$GITHUB_OUTPUT"
+      - name: Restore the pinned package set
+        id: apt-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: |
+            /var/lib/apt/lists
+            /var/cache/apt/archives/*.deb
+          key: ${{ steps.apt-pin.outputs.key }}
+      - name: Install build tooling
+        env:
+          CACHED: ${{ steps.apt-cache.outputs.cache-hit }}
+        run: |
+          apt_get() { apt-get -o Dir::Etc::sourceparts=- -o Acquire::Retries=5 "$@"; }
+          online_install() {
+            # snapshot.debian.org answers 503 during outages; back off and retry the whole fetch.
+            for delay in 0 30 90; do
+              sleep "$delay"
+              # shellcheck disable=SC2086
+              apt_get update && apt_get install -y --no-install-recommends $DEBIAN_PACKAGES && return 0
+              echo "::warning::apt from snapshot.debian.org failed; retrying after a pause"
+            done
+            return 1
+          }
+          # A cache hit holds the lists and every .deb of a completed install of this exact set, so
+          # it installs without touching the network. --no-download makes that a guarantee.
+          # shellcheck disable=SC2086
+          if [ "$CACHED" = "true" ] && apt_get install -y --no-install-recommends --no-download $DEBIAN_PACKAGES; then
+            echo "Installed the pinned package set from the cache, offline."
+          else
+            [ "$CACHED" = "true" ] && echo "::warning::cached package set did not install offline; fetching from the snapshot"
+            online_install
+          fi
+      # Saved from main (pushes, the schedule and dispatches), tags and other dispatches only: every PR
+      # can restore main's entries, and every Linux job that does keeps the entry recent. A PR-scoped
+      # copy is visible to that PR alone, and under the repository's cache quota it is evicted before
+      # anything reads it again.
+      - name: Save the pinned package set
+        if: steps.apt-cache.outputs.cache-hit != 'true' && github.event_name != 'pull_request'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: |
+            /var/lib/apt/lists
+            /var/cache/apt/archives/*.deb
+          key: ${{ steps.apt-pin.outputs.key }}
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "22"
+      - uses: dtolnay/rust-toolchain@4716b85f2fac3e324e64fa2810f6b5c3905760a5 # 1.97.1
+        with:
+          targets: ${{ matrix.target }}
+      - name: Restore the Rust build cache
+        id: rust-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            rust/target
+          key: goat-linux-${{ matrix.arch }}-${{ hashFiles('rust/Cargo.lock', 'rust/**/Cargo.toml', 'vendor/**/Cargo.toml') }}
+      - name: Build
+        working-directory: rust
+        run: cargo build --locked -p cua-driver -p cursor-theme-cli -p cua-driver-sdk --release --features cua-driver/portal-input --target ${{ matrix.target }}
+      - name: Headless embedded process lifetime
+        run: |
+          python3 goat/lifetime/test_parent_death.py "rust/target/${{ matrix.target }}/release/cua-driver"
+          cd rust
+          cargo test --locked -p cua-driver-core --lib --release --target ${{ matrix.target }} goat_process_group::tests
+          cargo test --locked -p platform-linux --lib --release --target ${{ matrix.target }} goat_launch_lifetime
+      - name: Build Electron-compatible Node runtime
+        run: |
+          npm --prefix typescript ci --ignore-scripts
+          node scripts/build-node-runtime.mjs --target ${{ matrix.target }} --output rust/target/${{ matrix.target }}/release/cua_driver_node_runtime.node
+      - name: Package
+        working-directory: rust
+        run: |
+          OUT="target/${{ matrix.target }}/release"
+          mkdir -p "release/$STAGE"
+          cp "$OUT/cua-driver" "$OUT/cua-cursor-theme" "$OUT/libcua_driver_sdk.so" "$OUT/cua_driver_node_runtime.node" include/cua_driver_abi.h "release/$STAGE/"
+          cp -R ../wayland-helper "release/$STAGE/wayland-helper"
+          cp ../LICENSE.md "release/$STAGE/LICENSE"
+          cp THIRD_PARTY_NOTICES.md "release/$STAGE/"
+          # Bare member names, as in upstream's *-binary archives: no "./" root entry or prefix,
+          # which strict extractors such as GOAT's server installer reject (goat-si/cua-driver#16).
+          # shellcheck disable=SC2046
+          tar -czf "release/$STAGE-binary.tar.gz" -C "release/$STAGE" $(ls -A "release/$STAGE")
+          if tar -tzf "release/$STAGE-binary.tar.gz" | grep -E '^(\./|/)'; then
+            echo "::error::archive members must be bare relative names"; exit 1
+          fi
+      - name: Protocol compatibility with GOAT's pinned release
+        run: python3 goat/compat/check_protocol.py --candidate "rust/release/$STAGE/cua-driver" --candidate-version "${{ needs.version.outputs.version }}" --baseline-key linux-${{ matrix.arch }}
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: linux-${{ matrix.arch }}
+          path: rust/release/*-binary.tar.gz
+          if-no-files-found: error
+      # PR runs only restore. A PR-scoped copy serves that PR alone, and under the repository's
+      # 10 GB cache quota it evicts main's caches and the Debian package set (goat-si/cua-driver#20).
+      - name: Save the Rust build cache
+        if: github.event_name != 'pull_request' && steps.rust-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            rust/target
+          key: ${{ steps.rust-cache.outputs.cache-primary-key }}
+
+  windows:
+    name: windows-${{ matrix.arch }}
+    needs: version
+    if: needs.version.outputs.builds == 'true'
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { arch: x86_64, target: x86_64-pc-windows-msvc, runnable: true }
+          # Cross-compiled on x64; the protocol check needs a binary the runner can execute.
+          - { arch: arm64, target: aarch64-pc-windows-msvc, runnable: false }
+    env:
+      STAGE: cua-driver-rs-${{ needs.version.outputs.version }}-windows-${{ matrix.arch }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "22"
+      - uses: dtolnay/rust-toolchain@4716b85f2fac3e324e64fa2810f6b5c3905760a5 # 1.97.1
+        with:
+          targets: ${{ matrix.target }}
+      - name: Ensure Rust target is installed
+        working-directory: rust
+        shell: bash
+        run: |
+          rustup target add "${{ matrix.target }}"
+          rustup target list --installed | grep -Fx "${{ matrix.target }}"
+      - name: Restore the Rust build cache
+        id: rust-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            rust/target
+          key: goat-windows-${{ matrix.arch }}-${{ hashFiles('rust/Cargo.lock', 'rust/**/Cargo.toml', 'vendor/**/Cargo.toml') }}
+      - name: Build
+        working-directory: rust
+        run: cargo build --locked -p cua-driver -p cursor-theme-cli -p cua-driver-uia -p cua-driver-sdk --release --target ${{ matrix.target }}
+      - name: Windows capability manifest regressions
+        if: matrix.runnable
+        working-directory: rust
+        run: "cargo test --locked -p cua-driver-core --lib --release --target ${{ matrix.target }} session_manifest::"
+      - name: Build Electron-compatible Node runtime
+        shell: bash
+        run: |
+          npm --prefix typescript ci --ignore-scripts
+          node scripts/build-node-runtime.mjs --target ${{ matrix.target }} --output rust/target/${{ matrix.target }}/release/cua_driver_node_runtime.node
+      - name: Node runtime has no dynamic CRT dependency
+        shell: pwsh
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $installation = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if (-not $installation) { throw "Visual Studio Build Tools were not found" }
+          $dumpbin = Get-ChildItem "$installation\VC\Tools\MSVC\*\bin\Hostx64\x64\dumpbin.exe" | Sort-Object FullName | Select-Object -Last 1 -ExpandProperty FullName
+          $imports = & $dumpbin /DEPENDENTS "rust/target/${{ matrix.target }}/release/cua_driver_node_runtime.node" 2>&1
+          if ($LASTEXITCODE -ne 0) { throw "dumpbin failed with exit $LASTEXITCODE" }
+          $imports | Write-Host
+          $dynamic = $imports | Select-String -Pattern '(?i)\b(?:VCRUNTIME|MSVCP|CONCRT|UCRTBASE|api-ms-win-crt-)[^\s]*\.dll\b'
+          if ($dynamic) { throw "Node runtime has a dynamic VC/UCRT dependency: $($dynamic -join ', ')" }
+      - name: Package
+        working-directory: rust
+        shell: pwsh
+        run: |
+          $out = "target/${{ matrix.target }}/release"
+          $stage = "release/$env:STAGE"
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+          foreach ($file in "cua-driver.exe", "cua-cursor-theme.exe", "cua-driver-uia.exe", "cua_driver_sdk.dll", "cua_driver_node_runtime.node") {
+            Copy-Item "$out/$file" "$stage/" -ErrorAction Stop
+          }
+          Copy-Item "include/cua_driver_abi.h" "$stage/" -ErrorAction Stop
+          Copy-Item "../LICENSE.md" "$stage/LICENSE" -ErrorAction Stop
+          Copy-Item "THIRD_PARTY_NOTICES.md" "$stage/" -ErrorAction Stop
+          Compress-Archive -Path "$stage/*" -DestinationPath "release/$env:STAGE-binary.zip" -Force
+      - name: Protocol compatibility with GOAT's pinned release
+        if: matrix.runnable
+        shell: bash
+        run: python goat/compat/check_protocol.py --candidate "rust/release/$STAGE/cua-driver.exe" --candidate-version "${{ needs.version.outputs.version }}" --baseline-key windows-${{ matrix.arch }}
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: windows-${{ matrix.arch }}
+          path: rust/release/*-binary.zip
+          if-no-files-found: error
+      # PR runs only restore. A PR-scoped copy serves that PR alone, and under the repository's
+      # 10 GB cache quota it evicts main's caches and the Debian package set (goat-si/cua-driver#20).
+      - name: Save the Rust build cache
+        if: github.event_name != 'pull_request' && steps.rust-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            rust/target
+          key: ${{ steps.rust-cache.outputs.cache-primary-key }}
+
+  macos:
+    name: darwin-universal
+    needs: version
+    if: needs.version.outputs.builds == 'true'
+    runs-on: macos-26
+    env:
+      MACOSX_DEPLOYMENT_TARGET: "13.0"
+      STAGE: cua-driver-rs-${{ needs.version.outputs.version }}-darwin-universal
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "22"
+      - uses: dtolnay/rust-toolchain@4716b85f2fac3e324e64fa2810f6b5c3905760a5 # 1.97.1
+        with:
+          targets: aarch64-apple-darwin, x86_64-apple-darwin
+      - name: Ensure Rust targets are installed
+        working-directory: rust
+        run: |
+          rustup target add aarch64-apple-darwin x86_64-apple-darwin
+          rustup target list --installed | grep -Fx aarch64-apple-darwin
+          rustup target list --installed | grep -Fx x86_64-apple-darwin
+      - name: Restore the Rust build cache
+        id: rust-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            rust/target
+          key: goat-darwin-universal-${{ hashFiles('rust/Cargo.lock', 'rust/**/Cargo.toml', 'vendor/**/Cargo.toml') }}
+      - name: Build arm64 and x86_64
+        working-directory: rust
+        run: |
+          for target in aarch64-apple-darwin x86_64-apple-darwin; do
+            cargo build --locked -p cua-driver -p cursor-theme-cli -p cua-driver-sdk --release --target "$target"
+          done
+      - name: Build Electron-compatible Node runtimes
+        run: |
+          npm --prefix typescript ci --ignore-scripts
+          for target in aarch64-apple-darwin x86_64-apple-darwin; do
+            node scripts/build-node-runtime.mjs --target "$target" --output "rust/target/$target/release/cua_driver_node_runtime.node"
+          done
+      - name: Universal binaries and package
+        working-directory: rust
+        run: |
+          mkdir -p "release/$STAGE"
+          for file in cua-driver cua-cursor-theme libcua_driver_sdk.dylib cua_driver_node_runtime.node; do
+            lipo -create "target/aarch64-apple-darwin/release/$file" "target/x86_64-apple-darwin/release/$file" -output "release/$STAGE/$file"
+            lipo -info "release/$STAGE/$file"
+          done
+          test "$(otool -D "release/$STAGE/libcua_driver_sdk.dylib" | tail -n 1)" = '@rpath/libcua_driver_sdk.dylib'
+          cp include/cua_driver_abi.h THIRD_PARTY_NOTICES.md "release/$STAGE/"
+          cp ../LICENSE.md "release/$STAGE/LICENSE"
+          # Bare member names, as in upstream's *-binary archives: no "./" root entry or prefix,
+          # which strict extractors such as GOAT's server installer reject (goat-si/cua-driver#16).
+          # shellcheck disable=SC2046
+          tar -czf "release/$STAGE-binary.tar.gz" -C "release/$STAGE" $(ls -A "release/$STAGE")
+          if tar -tzf "release/$STAGE-binary.tar.gz" | grep -E '^(\./|/)'; then
+            echo "::error::archive members must be bare relative names"; exit 1
+          fi
+      - name: Protocol compatibility with GOAT's pinned release
+        run: python3 goat/compat/check_protocol.py --candidate "rust/release/$STAGE/cua-driver" --candidate-version "${{ needs.version.outputs.version }}" --baseline-key darwin-universal
+      - name: Headless embedded process lifetime
+        run: |
+          python3 goat/lifetime/test_parent_death.py "rust/release/$STAGE/cua-driver"
+          cd rust
+          cargo test --locked -p cua-driver-core --lib goat_process_group::tests
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: darwin-universal
+          path: rust/release/*-binary.tar.gz
+          if-no-files-found: error
+      # PR runs only restore. A PR-scoped copy serves that PR alone, and under the repository's
+      # 10 GB cache quota it evicts main's caches and the Debian package set (goat-si/cua-driver#20).
+      - name: Save the Rust build cache
+        if: github.event_name != 'pull_request' && steps.rust-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            rust/target
+          key: ${{ steps.rust-cache.outputs.cache-primary-key }}
+
+  # Lints the macOS platform crate and the workspace crates it builds on, on every PR
+  # (goat-si/cua-driver#9). Runs beside the build jobs, so it adds no time to a PR.
+  clippy-macos:
+    name: Clippy macOS
+    needs: version
+    if: needs.version.outputs.builds == 'true'
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: dtolnay/rust-toolchain@4716b85f2fac3e324e64fa2810f6b5c3905760a5 # 1.97.1
+        with:
+          components: clippy
+      - name: Restore the Rust build cache
+        id: rust-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            rust/target
+          key: goat-clippy-macos-${{ hashFiles('rust/Cargo.lock', 'rust/**/Cargo.toml', 'vendor/**/Cargo.toml') }}
+      - name: Clippy, warnings denied
+        working-directory: rust
+        run: cargo clippy --locked -p platform-macos --all-targets -- -D warnings
+      # PR runs only restore. A PR-scoped copy serves that PR alone, and under the repository's
+      # 10 GB cache quota it evicts main's caches and the Debian package set (goat-si/cua-driver#20).
+      - name: Save the Rust build cache
+        if: github.event_name != 'pull_request' && steps.rust-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            rust/target
+          key: ${{ steps.rust-cache.outputs.cache-primary-key }}
+
+  # platform-linux and cua-driver-core are linted here; platform-macos above. Same triggers as the
+  # macOS job, so a pull request cannot add a Linux-only warning (goat-si/cua-driver#131).
+  clippy-linux:
+    name: Clippy Linux
+    needs: version
+    if: needs.version.outputs.builds == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: dtolnay/rust-toolchain@4716b85f2fac3e324e64fa2810f6b5c3905760a5 # 1.97.1
+        with:
+          components: clippy
+      - name: Restore the Rust build cache
+        id: rust-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            rust/target
+          key: goat-clippy-linux-${{ hashFiles('rust/Cargo.lock', 'rust/**/Cargo.toml', 'vendor/**/Cargo.toml') }}
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            clang pkg-config libdbus-1-dev libpipewire-0.3-dev libspa-0.2-dev \
+            libei-dev libxkbcommon-dev libx11-dev libxi-dev libxtst-dev libxext-dev
+      - name: Clippy, warnings denied
+        working-directory: rust
+        run: cargo clippy --locked -p platform-linux -p cua-driver-core --all-targets -- -D warnings
+      - name: Save the Rust build cache
+        if: github.event_name != 'pull_request' && steps.rust-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            rust/target
+          key: ${{ steps.rust-cache.outputs.cache-primary-key }}
+
+  # The slow lanes below run on release tags, dispatches and the daily schedule only, so a PR never
+  # ran the tools/list schema contract or the platform unit suites: goat.4's toggle_state enum, which
+  # held a null, failed only in its tag run. These PR jobs run those parts and restore (never save)
+  # the slow lanes' caches, which the scheduled run on main saves.
+  pr-unit-linux:
+    if: github.event_name == 'pull_request'
+    needs: version
+    name: PR Linux schema contract and platform unit
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - name: Free runner disk
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /usr/local/.ghcup /opt/hostedtoolcache/CodeQL /usr/local/share/boost
+          df -h / | tail -1
+      - uses: dtolnay/rust-toolchain@4716b85f2fac3e324e64fa2810f6b5c3905760a5 # 1.97.1
+      - name: Restore the Linux slow-lane cache from main
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            rust/target
+          key: goat-test-linux-${{ hashFiles('rust/Cargo.lock', 'rust/**/Cargo.toml', 'vendor/**/Cargo.toml') }}
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            clang pkg-config libdbus-1-dev libpipewire-0.3-dev libspa-0.2-dev \
+            libei-dev libxkbcommon-dev libx11-dev libxi-dev libxtst-dev libxext-dev
+      # Desktop-independent platform-linux tests, including the GNOME/Mutter, Wayland and X11 units.
+      - name: platform-linux unit tests
+        working-directory: rust
+        run: cargo test --locked -p platform-linux --lib
+      # Core's unit tests (snapshot store, window basis, batch, sessions) otherwise run only in the
+      # slow lanes (goat-si/cua-driver#131).
+      - name: cua-driver-core unit tests
+        working-directory: rust
+        run: cargo test --locked -p cua-driver-core --lib
+      - name: Protocol schema contract
+        working-directory: rust
+        env:
+          CUA_TEST_REQUIRE_DRIVER_BIN: "1"
+        run: |
+          cargo build --locked -p cua-driver
+          cargo test --locked -p cua-driver --test protocol_schema_test
+
+  pr-unit-macos:
+    if: github.event_name == 'pull_request'
+    needs: version
+    name: PR macOS schema contract
+    runs-on: macos-26
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: dtolnay/rust-toolchain@4716b85f2fac3e324e64fa2810f6b5c3905760a5 # 1.97.1
+      - name: Restore the macOS slow-lane cache from main
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            rust/target
+          key: goat-test-macos-${{ hashFiles('rust/Cargo.lock', 'rust/**/Cargo.toml', 'vendor/**/Cargo.toml') }}
+      - name: Protocol schema contract
+        working-directory: rust
+        env:
+          CUA_TEST_REQUIRE_DRIVER_BIN: "1"
+          CUA_TEST_DRIVER_STDERR: "1"
+        run: |
+          cargo build --locked -p cua-driver
+          cargo test --locked -p cua-driver --test protocol_schema_test
+
+  pr-unit-windows:
+    if: github.event_name == 'pull_request'
+    needs: version
+    name: PR Windows schema contract and platform unit
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: dtolnay/rust-toolchain@4716b85f2fac3e324e64fa2810f6b5c3905760a5 # 1.97.1
+      - name: Restore the Windows slow-lane cache from main
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            rust/target
+          key: goat-test-windows-${{ hashFiles('rust/Cargo.lock', 'rust/**/Cargo.toml', 'vendor/**/Cargo.toml') }}
+      - name: Record Windows runner session
+        id: runner-session
+        shell: pwsh
+        run: |
+          $sessionId = (Get-Process -Id $PID).SessionId
+          "session_id=$sessionId" >> $env:GITHUB_OUTPUT
+          "Windows runner process session id: $sessionId"
+      - name: platform-windows unit tests
+        working-directory: rust
+        env:
+          # The hosted runner's clipboard is disposable (as in test-windows).
+          CUA_TEST_ALLOW_CLIPBOARD: "1"
+        run: cargo test --locked -p platform-windows --lib
+      # Same gate as test-windows: the contract needs an interactive session.
+      - name: Protocol schema contract
+        if: steps.runner-session.outputs.session_id != '0'
+        working-directory: rust
+        shell: bash
+        env:
+          CUA_TEST_REQUIRE_DRIVER_BIN: "1"
+        run: |
+          cargo build --locked -p cua-driver
+          cargo test --locked -p cua-driver --test protocol_schema_test
+
+  # Unit and hermetic tests: upstream's per-platform "unit" jobs (trycua/cua
+  # .github/workflows/ci-rust-{linux,macos,windows}.yml at cua-driver-rs-v0.37.0), ported verbatim
+  # apart from paths, action pins and caching. Tests needing a logged-in, TCC-authorized desktop or
+  # real apps are #[ignore] upstream and run in its desktop harnesses, not here. goat-si/cua-driver#12.
+  # Slow regression jobs run on release tags, manual dispatches (slow_tests) and the daily schedule,
+  # never on a PR or a push to main. They are still required for release tags, so the release gate
+  # does not get weaker; GOAT.md has the release procedure.
+  test-linux:
+    if: github.event_name == 'schedule' || (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')) || (github.event_name == 'workflow_dispatch' && inputs.slow_tests)
+    needs: version
+    name: Rust Linux unit and compile
+    runs-on: ubuntu-latest
+    # Upstream's 30 assumes a warm cache; this fork often builds cold.
+    timeout-minutes: 60
+    env:
+      # Dozens of debug test binaries: line tables keep backtraces useful
+      # without full debug info filling the runner disk at link time.
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - name: Free runner disk
+        run: |
+          df -h / | tail -1
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /usr/local/.ghcup /opt/hostedtoolcache/CodeQL /usr/local/share/boost \
+            /usr/share/swift /usr/local/julia* /opt/az /usr/local/share/powershell
+          sudo docker image prune --all --force >/dev/null 2>&1 || true
+          df -h / | tail -1
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "22"
+      - name: Verify shared fixture scroll journal
+        run: node --test tests/fixtures/shared/web/journal.test.cjs
+      - uses: dtolnay/rust-toolchain@4716b85f2fac3e324e64fa2810f6b5c3905760a5 # 1.97.1
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            rust/target
+          key: goat-test-linux-${{ hashFiles('rust/Cargo.lock', 'rust/**/Cargo.toml', 'vendor/**/Cargo.toml') }}
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            clang pkg-config libdbus-1-dev libpipewire-0.3-dev libspa-0.2-dev \
+            libei-dev libxkbcommon-dev libx11-dev libxi-dev libxtst-dev libxext-dev \
+            imagemagick xvfb xauth x11-utils ffmpeg dbus-daemon
+      - name: Prove the AT-SPI connection graph excludes peer-to-peer
+        working-directory: rust
+        run: |
+          set -euo pipefail
+          graph=$(cargo tree --locked -p cua-driver -e features -i atspi-connection --prefix none)
+          if grep -q '^atspi-connection feature "p2p"' <<<"$graph"; then
+            echo "::error::cua-driver resolves atspi-connection with its p2p feature; see the atspi-connection entry in crates/platform-linux/Cargo.toml"
+            exit 1
+          fi
+      - name: Run Linux Rust tests
+        working-directory: rust
+        env:
+          CUA_TEST_REQUIRE_DRIVER_BIN: "1"
+        run: cargo test -p cua-driver -p cua-driver-e2e -p cua-driver-contract -p cua-driver-core -p cua-driver-testkit -p cursor-overlay -p cursor-theme-cli -p platform-linux --all-targets --locked
+      - name: Run cua-cursor-motion tests (lab parity, golden trajectories)
+        working-directory: rust
+        run: cargo test -p cua-cursor-motion --all-features --all-targets --locked
+      - name: Compile and link an async-io embedded host
+        working-directory: rust
+        run: cargo test -p cua-driver-sdk --test async_io_embedding --locked
+      - name: Verify final-frame extraction without a desktop
+        working-directory: rust
+        run: |
+          cargo test -p cua-driver-e2e --test e2e_environment_preflight_test --locked -- \
+            --ignored --exact last_frame_extraction_handles_long_final_duration_and_invalid_input --nocapture
+      - name: Run X11 click delivery and timing regressions
+        working-directory: rust
+        run: |
+          xvfb-run -a --server-args="-screen 0 640x480x24 -noreset" \
+            cargo test -p platform-linux --test click_input_x11 --locked -- \
+              --ignored --nocapture --test-threads=1
+      - name: Run X11 window basis regression
+        working-directory: rust
+        run: |
+          xvfb-run -a --server-args="-screen 0 640x480x24 -noreset" \
+            cargo test -p platform-linux --test window_basis_x11 --locked -- \
+              --ignored --nocapture --test-threads=1
+      - name: Run X11 keyboard tap timing regression
+        working-directory: rust
+        run: |
+          xvfb-run -a cargo test -p platform-linux --test key_input_x11 \
+            --locked -- --ignored --nocapture --test-threads=1
+      - name: Run X11 overlay click-through regression
+        working-directory: rust
+        run: |
+          xvfb-run -a --server-args="-screen 0 1920x1080x24" \
+            cargo test -p platform-linux \
+            x11_overlay_input_shape_stays_empty_and_clicks_pass_through_after_resize \
+            --locked -- --ignored --nocapture
+          xvfb-run -a --server-args="-screen 0 1920x1080x24" \
+            cargo test -p platform-linux \
+            x11_overlay_owner_stays_click_through_across_cursor_lifecycle_and_randr \
+            --locked -- --ignored --nocapture
+      - name: Run X11 desktop capture overlay-exclusion regression
+        working-directory: rust
+        run: |
+          xvfb-run -a --server-args="-screen 0 1920x1080x24" \
+            cargo test -p platform-linux \
+            x11_desktop_capture_hides_the_resting_overlay_and_restores_it \
+            --locked -- --ignored --nocapture
+      - name: Run X11 clipboard round-trip regression
+        working-directory: rust
+        run: |
+          xvfb-run -a cargo test -p platform-linux --lib \
+            clipboard::tests::native_clipboard_round_trips_text_on_x11 \
+            --locked -- --ignored --exact --nocapture
+      - name: Run X11 MIT-SHM capture correctness and performance regression
+        working-directory: rust
+        run: |
+          set -euo pipefail
+          Xvfb :98 -screen 0 1920x1080x24 -ac -noreset -nolisten tcp >xvfb-98.log 2>&1 &
+          xvfb_primary=$!
+          Xvfb :99 -screen 0 1920x1080x24 -ac -noreset -nolisten tcp >xvfb-99.log 2>&1 &
+          xvfb_secondary=$!
+          # DirectColor is visual class 5; the usual Xvfb default is TrueColor.
+          Xvfb :100 -screen 0 1920x1080x24 -cc 5 -ac -noreset -nolisten tcp >xvfb-100.log 2>&1 &
+          xvfb_directcolor=$!
+          trap 'kill "$xvfb_primary" "$xvfb_secondary" "$xvfb_directcolor" 2>/dev/null || true' EXIT
+          for display in :98 :99 :100; do
+            ready=false
+            for _ in $(seq 1 50); do
+              if DISPLAY="$display" xdpyinfo >/dev/null 2>&1; then
+                ready=true
+                break
+              fi
+              sleep 0.1
+            done
+            if [ "$ready" != true ]; then
+              echo "Xvfb failed to become ready on $display" >&2
+              exit 1
+            fi
+          done
+          source_sha=$(git rev-parse HEAD)
+          {
+            echo "source_sha=$source_sha"
+            DISPLAY=:98 CUA_X11_SECOND_DISPLAY=:99 CUA_X11_RESTART_DISPLAY=:101 \
+              cargo test -p platform-linux \
+              capture::tests::live_xshm_matches_xgetimage_across_resize_reconnect_and_repetition \
+              --locked -- --ignored --exact --nocapture --test-threads=1
+            DISPLAY=:100 cargo test -p platform-linux \
+              capture::tests::live_directcolor_capture_tracks_window_colormap \
+              --locked -- --ignored --exact --nocapture --test-threads=1
+          } 2>&1 | tee x11-capture-evidence.log
+          kill "$xvfb_primary" "$xvfb_secondary" "$xvfb_directcolor" 2>/dev/null || true
+          wait "$xvfb_primary" "$xvfb_secondary" "$xvfb_directcolor" || true
+          trap - EXIT
+          sha256sum x11-capture-evidence.log xvfb-98.log xvfb-99.log xvfb-100.log >x11-capture-evidence.sha256
+      - name: Upload X11 capture evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: x11-capture-evidence
+          if-no-files-found: error
+          path: |
+            rust/x11-capture-evidence.log
+            rust/x11-capture-evidence.sha256
+            rust/xvfb-98.log
+            rust/xvfb-99.log
+            rust/xvfb-100.log
+      - name: Run real uinput device-name regression
+        working-directory: rust
+        run: |
+          sudo modprobe uinput
+          test -c /dev/uinput
+          sudo chmod a+rw /dev/uinput
+          cargo test -p platform-linux real_uinput_accepts_normalized_overlong_multibyte_name --locked -- --ignored --nocapture
+      - name: SDK library tests (GOAT addition; upstream runs them only on Windows)
+        working-directory: rust
+        run: cargo test -p cua-driver-sdk --lib --locked
+      - name: Compile portable GNOME/KDE portal input
+        working-directory: rust
+        run: cargo check -p cua-driver --features portal-input --locked
+
+  test-macos:
+    if: github.event_name == 'schedule' || (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')) || (github.event_name == 'workflow_dispatch' && inputs.slow_tests)
+    needs: version
+    name: Rust macOS unit
+    runs-on: macos-26
+    # Upstream's 30 assumes a warm cache; this fork often builds cold.
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: dtolnay/rust-toolchain@4716b85f2fac3e324e64fa2810f6b5c3905760a5 # 1.97.1
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            rust/target
+          key: goat-test-macos-${{ hashFiles('rust/Cargo.lock', 'rust/**/Cargo.toml', 'vendor/**/Cargo.toml') }}
+      # Run each crate's whole inline suite so new test modules cannot be
+      # silently left out by a hand-maintained filter list. Tests that need a
+      # logged-in, TCC-authorized desktop are #[ignore] and belong to the Lume
+      # harness (tests/runners/macos-lume/run-all.sh).
+      - name: Run platform-macos unit tests
+        working-directory: rust
+        env:
+          # The hosted runner's pasteboard is disposable; opt in to the native
+          # clipboard round trip that would clobber a developer's clipboard.
+          CUA_TEST_ALLOW_CLIPBOARD: "1"
+        run: cargo test --locked -p platform-macos --lib
+      # Live AppKit tests, one at a time and by exact name, so they never share the
+      # parallel lib run with other tests (goat-si/cua-driver#151).
+      - name: Run the live AppKit unit tests on macOS, one at a time
+        working-directory: rust
+        run: |
+          cargo test --locked -p platform-macos --lib cursor::shape::tests::probe_degrades_to_unknown_without_appkit -- --ignored --exact --test-threads=1
+          cargo test --locked -p platform-macos --lib focus_guard::tests::the_next_action_ends_a_detached_hold -- --ignored --exact --test-threads=1
+          cargo test --locked -p platform-macos --lib focus_guard::tests::a_key_hand_back_keeps_the_actions_hold -- --ignored --exact --test-threads=1
+      - name: Run cua-driver-core unit tests on macOS
+        working-directory: rust
+        run: cargo test --locked -p cua-driver-core --lib
+      - name: Run macOS protocol schema and status pid-file contracts
+        working-directory: rust
+        env:
+          CUA_TEST_REQUIRE_DRIVER_BIN: "1"
+          CUA_TEST_DRIVER_STDERR: "1"
+        run: |
+          cargo build --locked -p cua-driver
+          cargo test --locked -p cua-driver --test protocol_schema_test --test status_pid_file_cli_test
+      - name: SDK library tests (GOAT addition; upstream runs them only on Windows)
+        working-directory: rust
+        env:
+          # Short socket paths: the runner's default TMPDIR is long enough to exceed sun_path.
+          TMPDIR: /tmp
+        # The macOS EINVAL in the daemon client (goat-si/cua-driver#8) came in with trycua/cua#5558
+        # in the 0.38.0 sync, so the whole suite runs again.
+        run: cargo test -p cua-driver-sdk --lib --locked
+      # Desktop E2E suites are #[ignore] and run in the Lume harness. Their
+      # hermetic oracle and parser tests run here as a whole crate, including
+      # the macOS-gated ones that have no other runner: the harness's FIFO
+      # backpressure self-tests and the standalone-browser command builders.
+      - name: Run hermetic cua-driver-e2e tests on macOS
+        working-directory: rust
+        run: cargo test --locked -p cua-driver-e2e
+
+  test-windows:
+    if: github.event_name == 'schedule' || (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')) || (github.event_name == 'workflow_dispatch' && inputs.slow_tests)
+    needs: version
+    name: Rust Windows unit and compile
+    runs-on: windows-latest
+    # The suite below has been running within a hair of this budget for months:
+    # the last green run on `main` (359fad56) took 28m31s of 30m. The tests this
+    # branch adds push it past the line, and the failure mode is silent -- every
+    # step passes and the job is killed partway through, so `Run Windows
+    # protocol schema contract` (the last step) simply never executes and the
+    # run is reported as `cancelled`, not failed. Raising the ceiling makes more
+    # of the gate run, not less; no test or assertion is skipped or relaxed.
+    # workflow_dispatch proxy-idle runs keep upstream's 90-minute budget.
+    # A warm Rust cache runs in about 15 minutes (trycua/cua); the cache is
+    # saved only from main, so a repository without one builds cold, where
+    # the first test step alone took 22 minutes and the job passed 45.
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: dtolnay/rust-toolchain@4716b85f2fac3e324e64fa2810f6b5c3905760a5 # 1.97.1
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            rust/target
+          key: goat-test-windows-${{ hashFiles('rust/Cargo.lock', 'rust/**/Cargo.toml', 'vendor/**/Cargo.toml') }}
+      - name: Record Windows runner session
+        id: runner-session
+        shell: pwsh
+        run: |
+          $sessionId = (Get-Process -Id $PID).SessionId
+          "session_id=$sessionId" >> $env:GITHUB_OUTPUT
+          "Windows runner process session id: $sessionId"
+      - name: Run Windows Rust tests
+        working-directory: rust
+        # Compile every Rust target without executing desktop-dependent integration
+        # tests; interactive behavior belongs in e2e-rust-windows.yml.
+        run: cargo test -p cua-driver -p cua-driver-e2e -p cua-driver-core -p cua-driver-sdk -p cua-driver-testkit -p cursor-overlay -p cursor-theme-cli -p platform-windows -p cua-driver-uia --all-targets --no-run --locked
+      - name: Run complete desktop-independent core tests
+        working-directory: rust
+        run: cargo test -p cua-driver-core --lib --test recording_shutdown_errors --locked
+      - name: Run driver state isolation regressions
+        working-directory: rust
+        env:
+          CUA_TEST_REQUIRE_DRIVER_BIN: "1"
+        run: |
+          cargo test -p cua-driver --test testkit_host_state_isolation_test --locked
+          if ($LASTEXITCODE -ne 0) { throw "driver state isolation tests failed with exit $LASTEXITCODE" }
+      - name: Run extension manager security regressions
+        working-directory: rust
+        run: |
+          $tests = @(
+            "extension_manager::tests::hardens_a_precreated_extension_root_with_a_broad_acl",
+            "extension_manager::tests::acl_hardening_reopens_directory_and_file_handles",
+            "extension_manager::tests::recursive_acl_hardening_removes_package_access_from_staged_tree",
+            "extension_manager::tests::recursive_acl_hardening_reasserts_root_after_descendant_walk",
+            "extension_manager::tests::staged_install_verification_survives_acl_drift_during_recursive_hardening",
+            "extension_manager::tests::post_hook_acl_grant_is_removed_before_staged_version_is_placed",
+            "extension_manager::tests::health_hook_acl_grant_is_removed_before_status_returns_healthy",
+            "extension_manager::tests::acl_identity_check_rejects_a_different_object",
+            "extension_manager::tests::rejects_windows_junctions_and_broad_acl_entries"
+          )
+          foreach ($test in $tests) {
+            cargo test -p cua-driver --bin cua-driver $test --locked -- --exact
+            if ($LASTEXITCODE -ne 0) { throw "Extension manager security regression $test failed with exit $LASTEXITCODE" }
+          }
+      # Run the whole inline suite so new platform-windows test modules cannot
+      # be silently left out by a hand-maintained module filter list.
+      - name: Run platform-windows unit tests
+        working-directory: rust
+        env:
+          # The hosted runner's clipboard is disposable; opt in to the native
+          # clipboard round trip that would clobber a developer's clipboard.
+          CUA_TEST_ALLOW_CLIPBOARD: "1"
+        run: cargo test --locked -p platform-windows --lib
+      - name: Run MCP proxy lifecycle regressions
+        working-directory: rust
+        run: "cargo test -p cua-driver --bin cua-driver proxy::tests:: --locked"
+      - name: Run MCP launched-daemon cleanup regressions
+        working-directory: rust
+        run: "cargo test -p cua-driver --bin cua-driver cli::windows_launch_cleanup_tests:: --locked"
+      - name: Run real MCP proxy recovery regression
+        working-directory: rust
+        env:
+          CUA_PROXY_RECOVERY_IDLE_SECONDS: "1"
+        run: cargo test -p cua-driver --test protocol_proxy_recovery_test --locked -- --nocapture
+      - name: Test sentinel setup barrier
+        run: node --test tests/fixtures/apps/cross-platform/electron/preload.test.js
+      - name: Run named-pipe readiness regression
+        working-directory: rust
+        run: cargo test -p cua-driver-testkit stalled_pipe_attempt_is_bounded_and_does_not_block_the_next_probe --lib --locked
+      - name: Run named-pipe instance recovery and status pid-file regressions
+        working-directory: rust
+        run: cargo test -p cua-driver --test named_pipe_instance_recovery_test --test status_pid_file_cli_test --locked -- --nocapture
+      - name: Run cross-platform cursor renderer unit tests
+        working-directory: rust
+        run: |
+          cargo test -p cursor-overlay --lib --locked
+          if ($LASTEXITCODE -ne 0) { throw "cursor renderer tests failed with exit $LASTEXITCODE" }
+          cargo test -p cursor-theme-cli --locked
+          if ($LASTEXITCODE -ne 0) { throw "cursor theme compiler tests failed with exit $LASTEXITCODE" }
+      - name: Validate Windows Computer History uninstall ordering
+        run: .\scripts\tests\uninstall-windows-history-regression.ps1
+      - name: Run autostart registration and self-elevation tests
+        # The elevation tests drive the shipped PowerShell against a stubbed
+        # Start-Process, so they prove the exit-code contract (a declined UAC
+        # prompt must not exit 0 — trycua/cua#3179) without any real UAC
+        # prompt or an interactive desktop.
+        working-directory: rust
+        run: "cargo test -p cua-driver --bin cua-driver autostart::tests:: --locked"
+      - name: Prove unknown app launch stays bounded and responsive
+        working-directory: rust
+        env:
+          CUA_TEST_REQUIRE_DRIVER_BIN: "1"
+        run: "cargo test -p cua-driver --test protocol_tools_call_test launch_unknown_app_is_bounded_and_keeps_mcp_session_responsive --locked -- --exact --nocapture"
+      - name: Validate desktop AppsFolder launch with Microsoft Edge
+        working-directory: rust
+        env:
+          CUA_TEST_REQUIRE_DRIVER_BIN: "1"
+        run: "cargo test -p cua-driver --test protocol_tools_call_test launch_edge_from_apps_folder_registration --locked -- --ignored --exact --nocapture"
+      - name: Prove an elevated Driver launches apps with a standard-user token
+        working-directory: rust
+        env:
+          CUA_TEST_REQUIRE_DRIVER_BIN: "1"
+        run: cargo test -p cua-driver --test launch_app_standard_user_test --locked -- --ignored --nocapture
+      - name: Run transport-independent authorization and SDK tests
+        working-directory: rust
+        run: |
+          cargo test -p cua-driver-core session_authorization::tests:: --lib --locked
+          if ($LASTEXITCODE -ne 0) { throw "session authorization tests failed with exit $LASTEXITCODE" }
+          cargo test -p cua-driver-sdk abi::tests:: --lib --locked
+          if ($LASTEXITCODE -ne 0) { throw "SDK ABI tests failed with exit $LASTEXITCODE" }
+          cargo test -p cua-driver-sdk remote_ --lib --locked
+          if ($LASTEXITCODE -ne 0) { throw "remote SDK tests failed with exit $LASTEXITCODE" }
+          cargo test -p cua-driver-sdk driver_state_root_is_inherited_and_overridable --lib --locked
+          if ($LASTEXITCODE -ne 0) { throw "SDK driver state root tests failed with exit $LASTEXITCODE" }
+          cargo test -p cua-driver --bin cua-driver named_pipe_authentication_tests:: --locked
+          if ($LASTEXITCODE -ne 0) { throw "named-pipe authentication tests failed with exit $LASTEXITCODE" }
+          # The production binary embeds uiAccess=true and Windows correctly
+          # refuses to launch it unelevated. Run the same pure security policy
+          # from the manifest-free library test target.
+          cargo test -p cua-driver-uia --lib authorization_tests:: --locked
+          if ($LASTEXITCODE -ne 0) { throw "UIAccess authorization tests failed with exit $LASTEXITCODE" }
+      - name: Run full SDK unit suite in an interactive runner session
+        if: steps.runner-session.outputs.session_id != '0'
+        working-directory: rust
+        run: cargo test -p cua-driver-sdk --lib --locked -- --test-threads=1
+      - name: Prove Session 0 refusal
+        if: steps.runner-session.outputs.session_id == '0'
+        working-directory: rust
+        shell: pwsh
+        run: |
+          cargo test -p cua-driver-sdk session_zero_refuses_runtime_creation_before_platform_dispatch --lib --locked | Tee-Object -Variable sessionZeroLog
+          if ($LASTEXITCODE -ne 0) { throw "Session 0 refusal test failed with exit $LASTEXITCODE" }
+          if (-not ($sessionZeroLog -match 'test result: ok\. 1 passed')) { throw "Session 0 refusal filter matched no test" }
+      - name: Prove metadata commands remain desktop-free
+        working-directory: rust
+        run: |
+          cargo run -p cua-driver --locked -- list-tools | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw "list-tools failed with exit $LASTEXITCODE" }
+          cargo run -p cua-driver --locked -- describe click | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw "describe failed with exit $LASTEXITCODE" }
+          cargo run -p cua-driver --locked -- dump-docs --type cli | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw "dump-docs failed with exit $LASTEXITCODE" }
+      - name: Run Windows protocol schema contract
+        if: steps.runner-session.outputs.session_id != '0'
+        working-directory: rust
+        run: cargo test -p cua-driver --test protocol_schema_test --locked
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/cua-driver-rs-v') && (github.event_name != 'workflow_dispatch' || inputs.slow_tests)
+    needs: [version, deny, test-linux, test-macos, test-windows, linux, windows, macos]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          path: dist
+          # Only the five build archives; test jobs upload evidence (x11-capture-evidence) too.
+          pattern: "{darwin-universal,linux-x86_64,linux-arm64,windows-x86_64,windows-arm64}"
+          merge-multiple: true
+      - name: Checksums
+        working-directory: dist
+        run: sha256sum -- * | tee SHA256SUMS
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: dist/*-binary.*
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          gh release create "$TAG" dist/* --repo "$GITHUB_REPOSITORY" --title "$TAG" \
+            --notes "Unsigned Cua Driver ${{ needs.version.outputs.version }} built from $GITHUB_SHA by GOAT's fork. GOAT signs it inside its helper app. Verify with: gh attestation verify <file> --repo $GITHUB_REPOSITORY"

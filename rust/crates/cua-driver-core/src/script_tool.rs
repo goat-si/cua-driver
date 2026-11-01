@@ -1,0 +1,1176 @@
+//! `run_script`: run a model-written JavaScript program that drives the
+//! computer through Cua Driver's own actions and reads.
+//!
+//! On by default wherever the engine is compiled in (the `script` feature,
+//! default on macOS, Windows and Linux). The person running the driver turns
+//! it off with `CUA_DRIVER_DISABLE_RUN_SCRIPT=1`, `CUA_DRIVER_EXPERIMENTAL_SCRIPT=0`,
+//! or `"disable_run_script": true` / `"experimental_script": false` in
+//! `~/.cua-driver/config.json`. `set_config` cannot write those keys, so a
+//! model cannot turn it on or off.
+//!
+//! The script runs in an embedded QuickJS engine ([`engine`]) on its own
+//! thread, with no filesystem, network, process or environment access. Its
+//! only reach outside the engine is the `cua` API, and every call that API
+//! makes is dispatched here, inside this tool call's task, through the same
+//! [`ToolRegistry`] entry point a direct call uses. Session, policy,
+//! capability manifest and approvals therefore apply per call, and a script
+//! can do nothing the same sequence of direct calls could not.
+//!
+//! Limits: wall time, number of driver calls, heap size and stack size, and
+//! the script stops when the request is cancelled (the tool future is
+//! dropped).
+
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc, OnceLock,
+};
+use std::time::{Duration, Instant};
+
+use async_trait::async_trait;
+use serde_json::{json, Map, Value};
+
+use crate::{
+    batch_tools::{
+        locate::{self, Check, ElementSpec, Locator, WindowSpec},
+        BATCHABLE_TOOLS,
+    },
+    protocol::{Content, ToolResult},
+    recording_tools::ReplayRegistrySlot,
+    tool::{Tool, ToolDef, ToolRegistry, DISABLE_CONFIG_KEY, LEGACY_CONFIG_KEY},
+};
+
+mod engine;
+
+use engine::{FailureKind, HostCall, HostError, Limits};
+
+pub const RUN_SCRIPT_TOOL: &str = "run_script";
+/// Environment switch that turns the tool off when set to `1`.
+pub const DISABLE_ENV: &str = "CUA_DRIVER_DISABLE_RUN_SCRIPT";
+/// Legacy opt-in switch from when the tool was off by default. `0` still
+/// turns the tool off; `1` changes nothing.
+pub const LEGACY_ENV: &str = "CUA_DRIVER_EXPERIMENTAL_SCRIPT";
+
+pub const DEFAULT_TIMEOUT_MS: u64 = 30_000;
+pub const MAX_TIMEOUT_MS: u64 = 120_000;
+pub const DEFAULT_MAX_CALLS: u32 = 100;
+pub const MAX_MAX_CALLS: u32 = 500;
+pub const MAX_SCRIPT_BYTES: usize = 64 * 1024;
+const MEMORY_BYTES: usize = 32 * 1024 * 1024;
+const STACK_BYTES: usize = 1024 * 1024;
+const THREAD_STACK_BYTES: usize = 16 * 1024 * 1024;
+const RETURN_TEXT_LIMIT: usize = 8_000;
+const CALL_TEXT_LIMIT: usize = 12_000;
+const IMAGES_KEPT: usize = 2;
+/// Most driver calls one script op lists in the call log (the last ones).
+const MAX_DRIVER_CALLS_PER_OP: usize = 20;
+/// Extra time the engine thread gets to notice a deadline or cancel.
+const SHUTDOWN_GRACE: Duration = Duration::from_millis(1_500);
+
+/// Driver tools a script may call, besides the batchable actions.
+const READ_TOOLS: &[&str] = &[
+    "launch_app",
+    "list_apps",
+    "list_windows",
+    "get_window_state",
+    "verify_state",
+    "zoom",
+];
+
+/// Whether the tool is offered: yes, unless the person running the driver
+/// turned it off.
+pub fn enabled() -> bool {
+    disabled_by().is_none()
+}
+
+/// The setting that turned the tool off, if any.
+pub fn disabled_by() -> Option<String> {
+    let config = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(|home| {
+            std::path::PathBuf::from(home)
+                .join(".cua-driver")
+                .join("config.json")
+        });
+    disabled_from(
+        std::env::var(DISABLE_ENV).ok().as_deref(),
+        std::env::var(LEGACY_ENV).ok().as_deref(),
+        config.as_deref(),
+    )
+}
+
+/// Any opt-out wins; nothing turns the tool on that an opt-out turned off.
+fn disabled_from(
+    disable_env: Option<&str>,
+    legacy_env: Option<&str>,
+    config: Option<&std::path::Path>,
+) -> Option<String> {
+    let flag = |value: &str| -> Option<bool> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "1" | "true" | "yes" | "on" => Some(true),
+            "0" | "false" | "no" | "off" => Some(false),
+            _ => None,
+        }
+    };
+    if disable_env.and_then(flag) == Some(true) {
+        return Some(format!("{DISABLE_ENV}=1"));
+    }
+    if legacy_env.and_then(flag) == Some(false) {
+        return Some(format!("{LEGACY_ENV}=0"));
+    }
+    let config_value = config
+        .and_then(|path| std::fs::read_to_string(path).ok())
+        .and_then(|text| serde_json::from_str::<Value>(&text).ok())?;
+    if config_value
+        .get(DISABLE_CONFIG_KEY)
+        .and_then(Value::as_bool)
+        == Some(true)
+    {
+        return Some(format!("\"{DISABLE_CONFIG_KEY}\": true in config.json"));
+    }
+    if config_value.get(LEGACY_CONFIG_KEY).and_then(Value::as_bool) == Some(false) {
+        return Some(format!("\"{LEGACY_CONFIG_KEY}\": false in config.json"));
+    }
+    None
+}
+
+pub struct RunScriptTool {
+    registry: ReplayRegistrySlot,
+}
+
+impl RunScriptTool {
+    pub fn new(registry: ReplayRegistrySlot) -> Self {
+        Self { registry }
+    }
+}
+
+static DEF: OnceLock<ToolDef> = OnceLock::new();
+
+fn platform() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "mac"
+    } else if cfg!(target_os = "windows") {
+        "windows"
+    } else {
+        "linux"
+    }
+}
+
+#[async_trait]
+impl Tool for RunScriptTool {
+    fn def(&self) -> &ToolDef {
+        DEF.get_or_init(|| ToolDef {
+            name: RUN_SCRIPT_TOOL.into(),
+            description: "Run a JavaScript program against Cua Driver in one call: loops, branches, retries and reads \
+                between actions; only its result comes back. The script is the body of an async function: \
+                `await`, and `return` a JSON value. Sandbox: no filesystem, network, process, timers or \
+                environment; the only API is `cua`:\n\
+                - `await cua.getApp(\"TextEdit\" | \"com.apple.TextEdit\" | {pid, windowId})` → app (follows the \
+                app's frontmost window unless a windowId is given)\n\
+                - `await cua.launch(nameOrBundleId)` → app; `cua.listApps()`, `cua.listWindows({pid?})`, \
+                `cua.sleep(ms)`, `cua.computer.target`\n\
+                - app.getState(opts?) → get_window_state result (`tree_markdown` or `tree_diff`, `snapshot_id`; \
+                takes get_window_state options such as {since:\"latest\"})\n\
+                - app.query({role?, name?, text?}) → matching elements across the app's windows {element_token, \
+                role, label, value, enabled, selected, frame}, then matching static-text rows {role, label, \
+                value, text, display_only}\n\
+                - app.waitFor({role?, name?, text?, gone?, value?, timeout_ms?}) and app.verify(predicate | \
+                predicates) (verify_state)\n\
+                - app.click(t), doubleClick(t), rightClick(t), typeText(text, t?), pressKey(\"return\" | \
+                \"cmd+s\", t?), hotkey([\"cmd\",\"s\"]), scroll(t, direction, amount?), setValue(t, value), \
+                drag([x,y], [x,y]), zoom([x1,y1,x2,y2])\n\
+                where a target `t` is {role, name, nth?} (found fresh, waits up to 3 s), an element from \
+                app.query(), an element_token string, a row number from this app's last getState(), or [x, y] \
+                window pixels.\n\
+                - `cua.call(tool, args)` for any other allowed tool: click, double_click, right_click, \
+                set_value, type_text, press_key, hotkey, scroll, drag, launch_app, list_apps, list_windows, \
+                get_window_state, verify_state, zoom.\n\
+                A failed driver call throws a CuaError. Every call passes the same session, permission and \
+                approval checks as a direct call; with `app_scope`, a call outside those apps' windows fails \
+                with error.code outside_scope and one needing the foreground with foreground_not_allowed, and \
+                nothing is sent for it. `verify:\"checkpoint\"`: actions return once their input is delivered; \
+                check with app.waitFor / app.verify / getState.\n\
+                \n\
+                Limits: `timeout_ms` (default 30000, max 120000), `max_calls` (default 100, max 500), 32 MiB \
+                heap. Returns the value, console output and a per-call log (tool, pid/window_id, effect, code); \
+                an error names the script line, the call and the reason. retry: safe means a retry cannot \
+                duplicate input into an application; it is not permission to retry and says nothing about file \
+                or other side effects.\n\
+                \n\
+                Example:\n\
+                const app = await cua.getApp(\"Calculator\");\n\
+                for (const key of [\"7\", \"multiply\", \"6\", \"equals\"]) await app.click({role: \"button\", \
+                name: key});\n\
+                const [display] = await app.query({role: \"statictext\"});\n\
+                return display.value;"
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "required": ["script"],
+                "properties": {
+                    "script": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": MAX_SCRIPT_BYTES,
+                        "description": "JavaScript: the body of an async function. `return` the result."
+                    },
+                    "timeout_ms": {
+                        "type": "integer",
+                        "minimum": 100,
+                        "maximum": MAX_TIMEOUT_MS,
+                        "description": "Wall-time limit. Default 30000."
+                    },
+                    "max_calls": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": MAX_MAX_CALLS,
+                        "description": "Most driver calls the script may make. Default 100."
+                    },
+                    "verify": {
+                        "type": "string",
+                        "enum": ["each", "checkpoint"],
+                        "description": "\"each\" (default): every action waits for its window-change report, as a direct call does. \"checkpoint\": actions return as soon as their input is delivered (on macOS this skips about 100 ms of report wait per action; Linux and Windows do not wait anyway), and the script checks the result where it matters with app.waitFor, app.verify or getState. A window an action opens is still reported on the next action's result. An action that sets its own post_action_wait keeps it."
+                    },
+                    "app_scope": crate::batch_scope::input_schema()
+                },
+                "additionalProperties": false
+            }),
+            read_only: false,
+            destructive: true,
+            idempotent: false,
+            open_world: true,
+        })
+    }
+
+    async fn invoke(&self, args: Value) -> ToolResult {
+        let registry = match self.registry.lock().unwrap().upgrade() {
+            Some(registry) => registry,
+            None => {
+                return ToolResult::error(
+                    "run_script is not available: registry not initialised yet.",
+                )
+                .with_disposition(cua_driver_contract::ErrorDisposition::NOT_DELIVERED)
+            }
+        };
+        let request = match Request::parse(&args) {
+            Ok(request) => request,
+            Err(message) => {
+                return ToolResult::error(format!("run_script rejected: {message}"))
+                    .with_structured(
+                        json!({"ok": false, "code": "invalid_script", "detail": message}),
+                    )
+                    .with_disposition(cua_driver_contract::ErrorDisposition::NOT_DELIVERED)
+            }
+        };
+        let scope = request.scope.clone();
+        crate::batch_scope::enter(scope, run(&registry, request)).await
+    }
+}
+
+struct Request {
+    script: String,
+    timeout: Duration,
+    max_calls: u32,
+    session: Option<String>,
+    scope: Option<Arc<crate::batch_scope::BatchScope>>,
+    /// Actions skip their post-action report wait; the script verifies at
+    /// its own checkpoints.
+    checkpoint: bool,
+}
+
+impl Request {
+    fn parse(args: &Value) -> Result<Self, String> {
+        let object = args.as_object().ok_or("arguments must be a JSON object")?;
+        if let Some(key) = object.keys().find(|key| {
+            !key.starts_with('_')
+                && !matches!(
+                    key.as_str(),
+                    "script" | "timeout_ms" | "max_calls" | "session" | "app_scope" | "verify"
+                )
+        }) {
+            return Err(format!("unknown field `{key}`"));
+        }
+        let script = object
+            .get("script")
+            .and_then(Value::as_str)
+            .filter(|script| !script.trim().is_empty())
+            .ok_or("`script` must be a non-empty string")?;
+        if script.len() > MAX_SCRIPT_BYTES {
+            return Err(format!("`script` is longer than {MAX_SCRIPT_BYTES} bytes"));
+        }
+        let timeout_ms = match object.get("timeout_ms") {
+            None | Some(Value::Null) => DEFAULT_TIMEOUT_MS,
+            Some(value) => value
+                .as_u64()
+                .filter(|ms| (100..=MAX_TIMEOUT_MS).contains(ms))
+                .ok_or_else(|| {
+                    format!("`timeout_ms` must be an integer 100 to {MAX_TIMEOUT_MS}")
+                })?,
+        };
+        let max_calls = match object.get("max_calls") {
+            None | Some(Value::Null) => DEFAULT_MAX_CALLS,
+            Some(value) => value
+                .as_u64()
+                .filter(|calls| (1..=u64::from(MAX_MAX_CALLS)).contains(calls))
+                .ok_or_else(|| format!("`max_calls` must be an integer 1 to {MAX_MAX_CALLS}"))?
+                as u32,
+        };
+        Ok(Self {
+            script: script.to_owned(),
+            timeout: Duration::from_millis(timeout_ms),
+            max_calls,
+            session: object
+                .get("_public_session_label")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            scope: crate::batch_scope::BatchScope::parse(object.get("app_scope"))?,
+            checkpoint: match object.get("verify") {
+                None | Some(Value::Null) => false,
+                Some(Value::String(mode)) if mode == "each" => false,
+                Some(Value::String(mode)) if mode == "checkpoint" => true,
+                Some(_) => return Err("`verify` must be \"each\" or \"checkpoint\"".into()),
+            },
+        })
+    }
+}
+
+/// Sets the cancel flag when the tool call ends for any reason, including
+/// the request being dropped.
+struct CancelOnDrop(Arc<AtomicBool>);
+
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+}
+
+/// One entry of the per-call log.
+struct CallRecord {
+    number: u32,
+    op: String,
+    line: u32,
+    ok: bool,
+    elapsed: Duration,
+    detail: String,
+    /// What the driver call behind this op reported, as a direct call
+    /// would: the tool it ran, its target, `effect` and `code`.
+    facts: CallFacts,
+    /// Every driver call the op made, in order (lookups included).
+    driver_calls: Vec<Value>,
+    /// Earlier driver calls of the op left out of `driver_calls`.
+    driver_calls_omitted: usize,
+}
+
+/// The first call a scripts app scope refused; the script ends there.
+struct ScopeStop {
+    code: &'static str,
+    message: String,
+    call: u32,
+    line: u32,
+    op: String,
+}
+
+/// The driver tool a script op ran last, its target, and what it returned.
+#[derive(Clone, Debug, Default)]
+struct CallFacts {
+    tool: Option<String>,
+    pid: Option<i64>,
+    window_id: Option<u64>,
+    effect: Option<String>,
+    code: Option<String>,
+    delivery: Option<&'static str>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ActionAttempt {
+    Pending,
+    NotDelivered,
+    MayHaveDelivered,
+}
+
+async fn run(registry: &ToolRegistry, request: Request) -> ToolResult {
+    let started = Instant::now();
+    let deadline = started + request.timeout;
+    let cancel = Arc::new(AtomicBool::new(false));
+    let _cancel_guard = CancelOnDrop(cancel.clone());
+    let (call_tx, mut call_rx) = tokio::sync::mpsc::channel::<HostCall>(1);
+    let (done_tx, mut done_rx) = tokio::sync::oneshot::channel();
+
+    let limits = Limits {
+        deadline,
+        max_calls: request.max_calls,
+        memory_bytes: MEMORY_BYTES,
+        stack_bytes: STACK_BYTES,
+    };
+    let script = request.script.clone();
+    let engine_cancel = cancel.clone();
+    let spawned = std::thread::Builder::new()
+        .name("cua-run-script".into())
+        .stack_size(THREAD_STACK_BYTES)
+        .spawn(move || {
+            let outcome = engine::run(&script, platform(), limits, engine_cancel, call_tx);
+            let _ = done_tx.send(outcome);
+        });
+    if let Err(error) = spawned {
+        return ToolResult::error(format!("run_script could not start its engine: {error}"))
+            .with_disposition(cua_driver_contract::ErrorDisposition::NOT_DELIVERED);
+    }
+
+    let mut api = Api::new(registry, request.session.clone(), deadline);
+    api.checkpoint = request.checkpoint;
+    let mut log: Vec<CallRecord> = Vec::new();
+    let mut scope_stop: Option<ScopeStop> = None;
+    let mut interrupted_call = false;
+    let hard_stop = deadline + SHUTDOWN_GRACE;
+    let outcome = loop {
+        tokio::select! {
+            Some(call) = call_rx.recv() => {
+                let call_started = Instant::now();
+                api.last = None;
+                api.locator.take_scope_refusal();
+                api.locator.take_journal();
+                // After the first call the app scope refused, the script is
+                // over: nothing more is dispatched, even if it caught the error.
+                let mut result = if let Some(stop) = &scope_stop {
+                    Err(HostError::new(
+                        "the script already stopped at a call its app scope refused",
+                        stop.code,
+                    ))
+                } else {
+                    match tokio::time::timeout_at(deadline.into(), api.dispatch(&call.op, call.args)).await {
+                        Ok(result) => result,
+                        Err(_) => {
+                            interrupted_call = true;
+                            Err(HostError::new("the script's wall-time limit was reached", "timeout"))
+                        },
+                    }
+                };
+                let mut facts = api.last.take().unwrap_or_default();
+                // Every driver call this op made, lookups included.
+                // A polling wait can make dozens of reads: keep the last ones.
+                let mut driver_calls = api.locator.take_journal();
+                let driver_calls_omitted = driver_calls.len().saturating_sub(MAX_DRIVER_CALLS_PER_OP);
+                driver_calls.drain(..driver_calls_omitted);
+                if facts.tool.is_none() {
+                    if let Some(last) = driver_calls.last() {
+                        let text = |key: &str| last.get(key).and_then(Value::as_str).map(str::to_owned);
+                        facts.tool = text("tool");
+                        facts.pid = last.get("pid").and_then(Value::as_i64);
+                        facts.window_id = last.get("window_id").and_then(Value::as_u64);
+                        facts.effect = text("effect");
+                        facts.code = text("code");
+                    }
+                }
+                // A read the scope refused fails the op with the scope's code,
+                // as a refused action does, even when the op would otherwise
+                // have succeeded (a `gone` wait reads a refused window as
+                // absent): the script never acts on a refused read.
+                if let Some(code) = api.locator.take_scope_refusal() {
+                    match &mut result {
+                        Ok(_) => {
+                            result = Err(HostError::new(
+                                "a read this call needed was refused by the batch scope",
+                                code,
+                            ))
+                        }
+                        Err(error) => error.code = Some(code.to_owned()),
+                    }
+                    facts.code = Some(code.to_owned());
+                    if facts.effect.is_none() {
+                        facts.effect = Some("refused".to_owned());
+                    }
+                }
+                if let Err(error) = &result {
+                    if facts.code.is_none() {
+                        facts.code = error.code.clone();
+                    }
+                }
+                if call.number > 0 {
+                    log.push(CallRecord {
+                        number: call.number,
+                        op: call.op.clone(),
+                        line: call.line,
+                        ok: result.is_ok(),
+                        elapsed: call_started.elapsed(),
+                        detail: match &result {
+                            Ok(value) => summarize(value),
+                            Err(error) => error.message.clone(),
+                        },
+                        facts,
+                        driver_calls,
+                        driver_calls_omitted,
+                    });
+                }
+                if scope_stop.is_none() {
+                    if let Err(error) = &result {
+                        let refused = [
+                            crate::batch_scope::OUTSIDE_SCOPE,
+                            crate::batch_scope::FOREGROUND_NOT_ALLOWED,
+                        ]
+                        .into_iter()
+                        .find(|code| error.code.as_deref() == Some(*code));
+                        if let Some(code) = refused {
+                            scope_stop = Some(ScopeStop {
+                                code,
+                                message: error.message.clone(),
+                                call: call.number,
+                                line: call.line,
+                                op: call.op.clone(),
+                            });
+                            // Stop the engine before it sees the reply, so a
+                            // catch block cannot make another call.
+                            cancel.store(true, Ordering::SeqCst);
+                        }
+                    }
+                }
+                let _ = call.reply.send(result);
+            }
+            outcome = &mut done_rx => break outcome.ok(),
+            _ = tokio::time::sleep_until(hard_stop.into()) => {
+                cancel.store(true, Ordering::SeqCst);
+                break tokio::time::timeout(SHUTDOWN_GRACE, &mut done_rx).await.ok().and_then(Result::ok);
+            }
+        }
+    };
+    let outcome = match (outcome, scope_stop) {
+        (Some(mut outcome), Some(stop)) => {
+            outcome.result = Err(engine::Failure {
+                kind: FailureKind::Exception,
+                message: format!(
+                    "stopped at the first call the app scope refused: {}",
+                    stop.message
+                ),
+                line: (stop.line > 0).then_some(stop.line),
+                op: Some(stop.op),
+                code: Some(stop.code.to_owned()),
+                call: (stop.call > 0).then_some(stop.call),
+            });
+            Some(outcome)
+        }
+        (outcome, _) => outcome,
+    };
+    let complete = !interrupted_call
+        && outcome.as_ref().is_some_and(|outcome| {
+            outcome.result.as_ref().err().is_none_or(|failure| {
+                matches!(failure.kind, FailureKind::Exception | FailureKind::Syntax)
+            })
+        });
+    let disposition = if api
+        .action_history
+        .contains(&ActionAttempt::MayHaveDelivered)
+    {
+        cua_driver_contract::ErrorDisposition::DELIVERED
+    } else if !complete || api.action_history.contains(&ActionAttempt::Pending) {
+        cua_driver_contract::ErrorDisposition::UNCERTAIN
+    } else {
+        cua_driver_contract::ErrorDisposition::NOT_DELIVERED
+    };
+    let mut result = render(
+        outcome,
+        log,
+        api.images,
+        started.elapsed(),
+        request.max_calls,
+        request.scope.as_deref(),
+        request.checkpoint,
+    );
+    if result.is_error == Some(true) {
+        result.disposition = Some(disposition);
+    }
+    result
+}
+
+/// Executes the script's operations through the registry.
+struct Api<'a> {
+    registry: &'a ToolRegistry,
+    locator: Locator<'a>,
+    session: Option<String>,
+    deadline: Instant,
+    images: Vec<Content>,
+    /// The last driver tool the current op ran, for the call log.
+    last: Option<CallFacts>,
+    /// `verify: "checkpoint"`: actions skip their post-action report wait.
+    checkpoint: bool,
+    /// One entry per attempted non-read-only call, inserted before awaiting it.
+    action_history: Vec<ActionAttempt>,
+}
+
+impl<'a> Api<'a> {
+    fn new(registry: &'a ToolRegistry, session: Option<String>, deadline: Instant) -> Self {
+        Self {
+            registry,
+            locator: Locator::new(registry, session.clone(), deadline),
+            session,
+            deadline,
+            images: Vec::new(),
+            last: None,
+            checkpoint: false,
+            action_history: Vec::new(),
+        }
+    }
+
+    async fn dispatch(&mut self, op: &str, args: Value) -> Result<Value, HostError> {
+        let Value::Object(mut args) = args else {
+            return Err(HostError::new(
+                "arguments must be an object",
+                "invalid_args",
+            ));
+        };
+        // Runtime-private fields are never reachable from a script.
+        if let Some(key) = args.keys().find(|key| key.starts_with('_')) {
+            return Err(HostError::new(
+                format!("`{key}` is reserved and cannot be set"),
+                "invalid_args",
+            ));
+        }
+        match args.get("session").and_then(Value::as_str) {
+            Some(own)
+                if Some(own) != self.session.as_deref()
+                    && !(self.session.is_none() && own == "default") =>
+            {
+                return Err(HostError::new(
+                    "a script runs in its run_script call's session; drop `session`",
+                    "invalid_args",
+                ))
+            }
+            _ => {}
+        }
+        args.remove("session");
+        match op {
+            "sleep" => {
+                let ms = args.get("ms").and_then(Value::as_u64).unwrap_or(0);
+                let until = Instant::now() + Duration::from_millis(ms);
+                if until > self.deadline {
+                    tokio::time::sleep_until(self.deadline.into()).await;
+                    return Err(HostError::new(
+                        "the script's wall-time limit was reached during sleep",
+                        "timeout",
+                    ));
+                }
+                tokio::time::sleep_until(until.into()).await;
+                Ok(Value::Null)
+            }
+            "get_app" => self.get_app(args).await,
+            "find" => self.find(args).await,
+            "wait_for" => self.wait_for(args).await,
+            tool if BATCHABLE_TOOLS.contains(&tool) => self.act(tool, args).await,
+            tool if READ_TOOLS.contains(&tool) => self.invoke(tool, args).await,
+            other => Err(HostError::new(
+                format!(
+                    "`{other}` is not available to scripts; allowed: {}, {}",
+                    BATCHABLE_TOOLS.join(", "),
+                    READ_TOOLS.join(", ")
+                ),
+                "not_allowed",
+            )),
+        }
+    }
+
+    async fn invoke(
+        &mut self,
+        tool: &str,
+        mut args: Map<String, Value>,
+    ) -> Result<Value, HostError> {
+        if let Some(session) = &self.session {
+            args.insert("session".into(), json!(session));
+        }
+        // Under `verify: "checkpoint"` an action returns once its input is
+        // delivered; the script's own waitFor/verify/getState are the checks.
+        // Only where the platform advertises the argument (macOS).
+        if self.checkpoint
+            && BATCHABLE_TOOLS.contains(&tool)
+            && crate::post_action_wait::accepts(tool)
+        {
+            args.entry(crate::post_action_wait::POST_ACTION_WAIT_ARG)
+                .or_insert_with(|| json!("none"));
+        }
+        let (pid, window_id) = locate::call_target(&Value::Object(args.clone()));
+        let mut facts = CallFacts {
+            tool: Some(tool.to_owned()),
+            pid,
+            window_id,
+            ..CallFacts::default()
+        };
+        // A script chains its actions, so each one returns without waiting out
+        // the cursor glide or the full window-change report; the script's own
+        // reads (`getState`, `waitFor`) see what an action opened.
+        let pacing = if BATCHABLE_TOOLS.contains(&tool) {
+            crate::step_pacing::StepPacing::Batched
+        } else {
+            crate::step_pacing::StepPacing::Single
+        };
+        let action = self.registry.get_def(tool).is_none_or(|def| !def.read_only);
+        if action {
+            self.action_history.push(ActionAttempt::Pending);
+        }
+        let result =
+            crate::step_pacing::scope(pacing, self.registry.invoke(tool, Value::Object(args)))
+                .await;
+        let not_delivered = action && result.proves_no_input();
+        if action {
+            *self
+                .action_history
+                .last_mut()
+                .expect("action attempt recorded") = if not_delivered {
+                ActionAttempt::NotDelivered
+            } else {
+                ActionAttempt::MayHaveDelivered
+            };
+            if not_delivered {
+                facts.delivery = Some("not_delivered");
+            }
+        }
+        let structured_str = |key: &str| {
+            result
+                .structured_content
+                .as_ref()
+                .and_then(|value| value.get(key))
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        };
+        facts.effect = structured_str("effect");
+        facts.code = structured_str("code");
+        let mut entry = locate::journal_entry(tool, facts.pid, facts.window_id, &result);
+        if not_delivered {
+            entry["delivery"] = json!("not_delivered");
+        }
+        self.locator.record(entry);
+        self.last = Some(facts);
+        let mut text = String::new();
+        for content in &result.content {
+            match content {
+                Content::Text { text: part, .. } => {
+                    if !text.is_empty() {
+                        text.push('\n');
+                    }
+                    text.push_str(part);
+                }
+                Content::Image { .. } => {
+                    self.images.push(content.clone());
+                    if self.images.len() > IMAGES_KEPT {
+                        self.images.remove(0);
+                    }
+                }
+            }
+        }
+        if result.is_error == Some(true) {
+            let code = result
+                .structured_content
+                .as_ref()
+                .and_then(|value| value.get("code"))
+                .and_then(Value::as_str)
+                .unwrap_or("tool_error");
+            let mut message = clip(text.lines().next().unwrap_or("failed"), 500);
+            if let Some(hint) = result
+                .structured_content
+                .as_ref()
+                .and_then(|value| value.get("hint"))
+                .and_then(Value::as_str)
+            {
+                message = format!("{message} Hint: {hint}");
+            }
+            return Err(HostError::new(message, code));
+        }
+        let mut value = match result.structured_content {
+            Some(Value::Object(object)) => Value::Object(object),
+            Some(other) => json!({ "result": other }),
+            None => json!({}),
+        };
+        if !text.is_empty() && value.get("text").is_none() {
+            value["text"] = json!(clip(&text, CALL_TEXT_LIMIT));
+        }
+        Ok(value)
+    }
+
+    async fn get_app(&mut self, args: Map<String, Value>) -> Result<Value, HostError> {
+        let spec = WindowSpec {
+            pid: args.get("pid").and_then(Value::as_i64),
+            window_id: args.get("window_id").and_then(Value::as_u64),
+            app: args.get("app").and_then(Value::as_str).map(str::to_owned),
+            title: args
+                .get("window")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+        };
+        if spec.is_empty() {
+            return Err(HostError::new(
+                "getApp needs an app name, bundle id, pid or windowId",
+                "invalid_args",
+            ));
+        }
+        // Always listed, so an exact pid/window_id is confirmed and named.
+        // A launch may need a moment before its window shows.
+        let wait = Duration::from_millis(
+            args.get("timeout_ms")
+                .and_then(Value::as_u64)
+                .unwrap_or(0)
+                .min(locate::MAX_CHECK_TIMEOUT_MS),
+        );
+        let until = Instant::now() + wait;
+        loop {
+            match self.locator.listed_window(&spec).await {
+                Ok(window) => return Ok(window.to_json()),
+                Err(miss) if Instant::now() < until && miss.code != "lookup_failed" => {
+                    tokio::time::sleep(Duration::from_millis(250)).await;
+                }
+                Err(miss) => {
+                    let hint = if miss.code == "app_not_found" {
+                        "; launch it with cua.launch()"
+                    } else {
+                        ""
+                    };
+                    return Err(HostError::new(format!("{}{hint}", miss.message), miss.code));
+                }
+            }
+        }
+    }
+
+    /// Elements matching {role, name, text} across the app's windows
+    /// (topmost first): addressable ones with their element_token, then
+    /// matching display-only text rows, whose `value` holds the text.
+    async fn find(&mut self, mut args: Map<String, Value>) -> Result<Value, HostError> {
+        let text = args
+            .remove("text")
+            .and_then(|value| value.as_str().map(str::to_owned));
+        let (window, element) = locate::take_selector(&mut args)
+            .map_err(|message| HostError::new(message, "invalid_args"))?;
+        let spec = ElementSpec {
+            nth: None,
+            text,
+            ..element
+        };
+        let windows = self
+            .locator
+            .search_windows(&window)
+            .await
+            .map_err(|miss| HostError::new(miss.message, miss.code))?;
+        let mut found: Vec<Value> = Vec::new();
+        for resolved in &windows {
+            let read = self
+                .locator
+                .read(resolved)
+                .await
+                .map_err(|miss| HostError::new(miss.message, miss.code))?;
+            let window_json = json!({"window_id": resolved.window_id, "title": resolved.title});
+            if spec.text.is_none() {
+                for element in locate::matches(&read, &spec) {
+                    let mut out = Map::new();
+                    for key in [
+                        "element_token",
+                        "role",
+                        "label",
+                        "value",
+                        "enabled",
+                        "selected",
+                        "frame",
+                    ] {
+                        if let Some(value) = element.get(key) {
+                            out.insert(key.to_owned(), value.clone());
+                        }
+                    }
+                    out.insert("window".into(), window_json.clone());
+                    found.push(Value::Object(out));
+                }
+            }
+            for mut row in locate::display_rows(&read, &spec) {
+                row["window"] = window_json.clone();
+                found.push(row);
+            }
+            if found.len() >= 50 {
+                break;
+            }
+        }
+        found.truncate(50);
+        Ok(Value::Array(found))
+    }
+
+    async fn wait_for(&mut self, args: Map<String, Value>) -> Result<Value, HostError> {
+        let check = Check::parse(&Value::Object(args), locate::DEFAULT_WAIT_TIMEOUT_MS)
+            .map_err(|message| HostError::new(message, "invalid_args"))?;
+        match self.locator.check(&check, &WindowSpec::default()).await {
+            Ok(checked) => Ok(json!({
+                "ok": true,
+                "observed": checked.observed,
+                "waited_ms": checked.waited.as_millis() as u64,
+            })),
+            Err(miss) => Err(HostError::new(
+                format!("{} did not hold: {}", check.describe(), miss.message),
+                miss.code,
+            )),
+        }
+    }
+
+    async fn act(&mut self, tool: &str, mut args: Map<String, Value>) -> Result<Value, HostError> {
+        let find_timeout = match args.remove("timeout_ms") {
+            None | Some(Value::Null) => locate::DEFAULT_FIND_TIMEOUT_MS,
+            Some(value) => value
+                .as_u64()
+                .filter(|ms| *ms <= locate::MAX_CHECK_TIMEOUT_MS)
+                .ok_or_else(|| {
+                    HostError::new("`timeout_ms` must be an integer 0 to 10000", "invalid_args")
+                })?,
+        };
+        let (window, element) = locate::take_selector(&mut args)
+            .map_err(|message| HostError::new(message, "invalid_args"))?;
+        let mut target = None;
+        if !element.is_empty() {
+            if tool == "drag" {
+                return Err(HostError::new(
+                    "drag takes coordinates, not a role/name target",
+                    "invalid_args",
+                ));
+            }
+            if let Some(conflict) = ["element_token", "x", "y"]
+                .iter()
+                .find(|key| args.contains_key(**key))
+            {
+                return Err(HostError::new(
+                    format!("target by role/name OR by `{conflict}`, not both"),
+                    "invalid_args",
+                ));
+            }
+            let found = self
+                .locator
+                .find(&window, &element, Duration::from_millis(find_timeout))
+                .await
+                .map_err(|miss| HostError::new(miss.message, miss.code))?;
+            args.insert("pid".into(), json!(found.window.pid));
+            args.insert("window_id".into(), json!(found.window.window_id));
+            args.insert(
+                "element_token".into(),
+                json!(found.token().unwrap_or_default()),
+            );
+            target = Some(json!({"window": found.window.to_json(), "element": found.describe()}));
+        } else if window.window_id.is_none()
+            && (window.pid.is_some() || window.app.is_some() || window.title.is_some())
+            && !args.contains_key("element_token")
+        {
+            // Pixel and focus targets act on the app's frontmost window.
+            let resolved = self
+                .locator
+                .window(&window)
+                .await
+                .map_err(|miss| HostError::new(miss.message, miss.code))?;
+            args.insert("pid".into(), json!(resolved.pid));
+            args.insert("window_id".into(), json!(resolved.window_id));
+        } else if let Some(pid) = window.pid {
+            args.insert("pid".into(), json!(pid));
+        }
+        let mut value = self.invoke(tool, args).await?;
+        if let (Some(target), Value::Object(object)) = (target, &mut value) {
+            object.insert("target".into(), target);
+        }
+        Ok(value)
+    }
+}
+
+/// Short, model-facing summary of a successful call.
+fn summarize(value: &Value) -> String {
+    if let Some(target) = value
+        .get("target")
+        .and_then(|target| target.get("element"))
+        .and_then(Value::as_str)
+    {
+        return format!("on {target}");
+    }
+    if let Some(text) = value.get("text").and_then(Value::as_str) {
+        return clip(text.lines().next().unwrap_or(""), 120);
+    }
+    match value {
+        Value::Array(items) => format!("{} item(s)", items.len()),
+        Value::Object(object) if object.contains_key("window_id") && object.contains_key("pid") => {
+            format!("window {} of pid {}", object["window_id"], object["pid"])
+        }
+        Value::Null => String::new(),
+        other => clip(&other.to_string(), 120),
+    }
+}
+
+fn render(
+    outcome: Option<engine::Outcome>,
+    log: Vec<CallRecord>,
+    images: Vec<Content>,
+    elapsed: Duration,
+    max_calls: u32,
+    scope: Option<&crate::batch_scope::BatchScope>,
+    checkpoint: bool,
+) -> ToolResult {
+    let elapsed_ms = elapsed.as_millis() as u64;
+    let outcome = outcome.unwrap_or_else(|| engine::Outcome {
+        result: Err(engine::Failure {
+            kind: FailureKind::Timeout,
+            message: "the script did not stop after its wall-time limit; its engine was abandoned"
+                .into(),
+            line: None,
+            op: None,
+            code: None,
+            call: None,
+        }),
+        console: Vec::new(),
+        console_truncated: false,
+        calls: log.len() as u32,
+    });
+    let error_result = outcome.result.is_err();
+    let calls_json: Vec<Value> = log
+        .iter()
+        .map(|record| {
+            let mut driver_calls = record.driver_calls.clone();
+            if !error_result {
+                for call in &mut driver_calls {
+                    if let Some(object) = call.as_object_mut() {
+                        object.remove("delivery");
+                    }
+                }
+            }
+            let mut call = json!({
+                "call": record.number,
+                "op": record.op,
+                "tool": record.facts.tool,
+                "line": (record.line > 0).then_some(record.line),
+                "ok": record.ok,
+                "effect": record.facts.effect,
+                "code": record.facts.code,
+                "pid": record.facts.pid,
+                "window_id": record.facts.window_id,
+                "driver_calls": driver_calls,
+                "driver_calls_omitted": (record.driver_calls_omitted > 0).then_some(record.driver_calls_omitted),
+                "ms": record.elapsed.as_millis() as u64,
+                "detail": record.detail,
+            });
+            if let (true, Some(delivery)) = (error_result, record.facts.delivery) {
+                call["delivery"] = json!(delivery);
+            }
+            call
+        })
+        .collect();
+    let mut lines = Vec::new();
+    let mut structured = json!({
+        "elapsed_ms": elapsed_ms,
+        "driver_calls": outcome.calls,
+        "max_calls": max_calls,
+        "console": outcome.console,
+        "console_truncated": outcome.console_truncated,
+        "calls": calls_json,
+    });
+    if let Some(scope) = scope {
+        structured["app_scope"] = scope.to_json();
+    }
+    if checkpoint {
+        structured["verify"] = json!("checkpoint");
+    }
+    let is_error = match &outcome.result {
+        Ok(value) => {
+            structured["ok"] = json!(true);
+            structured["value"] = value.clone();
+            lines.push(format!(
+                "run_script: ok in {elapsed_ms} ms, {} driver call(s)",
+                outcome.calls
+            ));
+            lines.push(format!(
+                "return value: {}",
+                clip(&value.to_string(), RETURN_TEXT_LIMIT)
+            ));
+            false
+        }
+        Err(failure) => {
+            structured["ok"] = json!(false);
+            // A failed driver call the script did not catch: say which call.
+            let failed_call = failure
+                .call
+                .and_then(|number| log.iter().find(|record| record.number == number));
+            let line = failure.line.or(failed_call
+                .map(|record| record.line)
+                .filter(|line| *line > 0));
+            let mut location = Vec::new();
+            if let Some(line) = line {
+                location.push(format!("line {line}"));
+            }
+            if let Some(record) = failed_call {
+                location.push(format!("call {} ({})", record.number, record.op));
+            } else if let Some(op) = &failure.op {
+                location.push(format!("call to {op}"));
+            }
+            structured["error"] = json!({
+                "kind": failure.kind.as_str(),
+                "message": failure.message,
+                "line": line,
+                "call": failure.call,
+                "op": failure.op,
+                "code": failure.code,
+            });
+            lines.push(format!(
+                "run_script: ERROR ({}){}: {}",
+                failure.kind.as_str(),
+                if location.is_empty() {
+                    String::new()
+                } else {
+                    format!(" at {}", location.join(", "))
+                },
+                failure.message
+            ));
+            lines.push(format!(
+                "after {elapsed_ms} ms and {} driver call(s); calls before the error took effect",
+                outcome.calls
+            ));
+            true
+        }
+    };
+    if !outcome.console.is_empty() {
+        lines.push(format!(
+            "console ({} line(s){}):",
+            outcome.console.len(),
+            if outcome.console_truncated {
+                ", truncated"
+            } else {
+                ""
+            }
+        ));
+        lines.extend(outcome.console.iter().map(|line| format!("  {line}")));
+    }
+    if !log.is_empty() {
+        lines.push("calls:".to_owned());
+        for record in &log {
+            lines.push(format!(
+                "  {}. {}{} {}{} ({} ms){}",
+                record.number,
+                if record.line > 0 {
+                    format!("line {} ", record.line)
+                } else {
+                    String::new()
+                },
+                record.op,
+                if record.ok { "ok" } else { "ERROR" },
+                match (&record.facts.effect, &record.facts.code) {
+                    (Some(effect), Some(code)) => format!(", {effect} ({code})"),
+                    (Some(effect), None) => format!(", {effect}"),
+                    (None, Some(code)) if !record.ok => format!(" ({code})"),
+                    _ => String::new(),
+                },
+                record.elapsed.as_millis(),
+                if record.detail.is_empty() {
+                    String::new()
+                } else {
+                    format!(": {}", clip(&record.detail, 160))
+                }
+            ));
+        }
+    }
+    let mut content = vec![Content::text(lines.join("\n"))];
+    content.extend(images);
+    ToolResult {
+        content,
+        is_error: is_error.then_some(true),
+        structured_content: Some(structured),
+        ..Default::default()
+    }
+}
+
+fn clip(text: &str, max: usize) -> String {
+    if text.chars().count() <= max {
+        text.to_owned()
+    } else {
+        text.chars().take(max).collect::<String>() + "…"
+    }
+}
+
+#[cfg(test)]
+mod tests;

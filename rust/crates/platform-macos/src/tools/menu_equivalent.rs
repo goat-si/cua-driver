@@ -1,0 +1,290 @@
+//! Find the menu item a key combination stands for.
+//!
+//! Background key events reach a window's views but never its app's menu key
+//! equivalents (see `input::keyboard::hotkey_no_auth`). A background
+//! `cmd+s` to TextEdit was reported as "Pressed" and saved nothing. When a
+//! combo is a menu item's key equivalent, `hotkey` acts on that menu item
+//! through accessibility instead, or refuses when macOS keeps the item
+//! disabled in the background.
+
+use core_foundation::base::{CFRelease, CFTypeRef};
+
+use crate::ax::bindings::{
+    copy_bool_attr, copy_children, copy_element_attr, copy_number_attr, copy_string_attr,
+    AXUIElementCreateApplication, AXUIElementRef, AXUIElementSetMessagingTimeout,
+};
+
+/// `kAXMenuItemModifier*` bits of `AXMenuItemCmdModifiers`.
+const MOD_SHIFT: i64 = 1 << 0;
+const MOD_OPTION: i64 = 1 << 1;
+const MOD_CONTROL: i64 = 1 << 2;
+const MOD_NO_COMMAND: i64 = 1 << 3;
+
+/// Upper bound on menu items read per lookup, so a huge dynamic menu cannot
+/// stall the call.
+const MAX_ITEMS: usize = 2000;
+
+/// A hotkey as a menu key equivalent compares it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct Combo {
+    shift: bool,
+    option: bool,
+    control: bool,
+    /// The uppercase character of the base key.
+    character: String,
+}
+
+fn canonical_menu_cmd_char(key: &str) -> Option<String> {
+    let mut chars = key.chars();
+    if let (Some(ch), None) = (chars.next(), chars.next()) {
+        if !ch.is_whitespace() && !ch.is_control() {
+            return Some(ch.to_uppercase().collect());
+        }
+    }
+    match key.trim().to_ascii_lowercase().as_str() {
+        "backspace" | "delete" => Some("\u{0008}".to_owned()),
+        "forward_delete" | "forwarddelete" => Some("\u{007f}".to_owned()),
+        "return" | "enter" => Some("\r".to_owned()),
+        "escape" | "esc" => Some("\u{001b}".to_owned()),
+        "up" | "arrowup" => Some("\u{001e}".to_owned()),
+        "down" | "arrowdown" => Some("\u{001f}".to_owned()),
+        "left" | "arrowleft" => Some("\u{001c}".to_owned()),
+        "right" | "arrowright" => Some("\u{001d}".to_owned()),
+        _ => None,
+    }
+}
+
+impl Combo {
+    /// A combo with Command and one printable or named menu-equivalent key.
+    pub(super) fn parse(modifiers: &[String], key: &str) -> Option<Self> {
+        let mut cmd = false;
+        let mut combo = Combo {
+            shift: false,
+            option: false,
+            control: false,
+            character: String::new(),
+        };
+        for modifier in modifiers {
+            match modifier.to_ascii_lowercase().as_str() {
+                "cmd" | "command" | "super" | "meta" | "win" => cmd = true,
+                "shift" => combo.shift = true,
+                "option" | "alt" => combo.option = true,
+                "ctrl" | "control" => combo.control = true,
+                _ => return None,
+            }
+        }
+        if !cmd {
+            return None;
+        }
+        combo.character = canonical_menu_cmd_char(key)?;
+        Some(combo)
+    }
+
+    /// Whether a menu item with this `AXMenuItemCmdChar` and
+    /// `AXMenuItemCmdModifiers` fires on this combo.
+    fn matches(&self, cmd_char: &str, modifiers: i64) -> bool {
+        modifiers & MOD_NO_COMMAND == 0
+            && cmd_char.to_uppercase() == self.character
+            && (modifiers & MOD_SHIFT != 0) == self.shift
+            && (modifiers & MOD_OPTION != 0) == self.option
+            && (modifiers & MOD_CONTROL != 0) == self.control
+    }
+}
+
+/// A menu item found for a combo.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct MenuMatch {
+    /// Titles from the menu bar item down to the item.
+    pub path: Vec<String>,
+    pub enabled: bool,
+}
+
+/// Find the item in `pid`'s menu bar whose key equivalent is `combo`. An
+/// enabled match wins over a disabled one with the same equivalent. The
+/// Apple menu is skipped: its commands belong to the system.
+pub(super) fn find(pid: i32, combo: &Combo) -> Option<MenuMatch> {
+    unsafe {
+        let app = AXUIElementCreateApplication(pid);
+        if app.is_null() {
+            return None;
+        }
+        let _ = AXUIElementSetMessagingTimeout(app, 1.0);
+        let bar = copy_element_attr(app, "AXMenuBar");
+        CFRelease(app as CFTypeRef);
+        let bar = bar?;
+        let mut found: Option<MenuMatch> = None;
+        let mut budget = MAX_ITEMS;
+        visit_releasing(
+            semantic_items(bar),
+            |index, top| {
+                let title = copy_string_attr(top, "AXTitle").unwrap_or_default();
+                if index > 0 || title != "Apple" {
+                    search(top, vec![title], combo, &mut found, &mut budget, 0);
+                }
+                found.as_ref().is_some_and(|m| m.enabled)
+            },
+            |top| CFRelease(top as CFTypeRef),
+        );
+        CFRelease(bar as CFTypeRef);
+        found
+    }
+}
+
+/// Visit retained items in order until `visit` returns true (stop), then
+/// release every item: the visited ones and the ones never reached.
+fn visit_releasing<T: Copy>(
+    items: Vec<T>,
+    mut visit: impl FnMut(usize, T) -> bool,
+    mut release: impl FnMut(T),
+) {
+    let mut stopped = false;
+    for (index, item) in items.into_iter().enumerate() {
+        if !stopped {
+            stopped = visit(index, item);
+        }
+        release(item);
+    }
+}
+
+/// The items under a menu bar item or submenu item (through the untitled
+/// `AXMenu` container AppKit puts between them).
+unsafe fn semantic_items(parent: AXUIElementRef) -> Vec<AXUIElementRef> {
+    let mut out = Vec::new();
+    for child in copy_children(parent) {
+        if copy_string_attr(child, "AXRole").as_deref() == Some("AXMenu") {
+            out.extend(copy_children(child));
+            CFRelease(child as CFTypeRef);
+        } else {
+            out.push(child);
+        }
+    }
+    out
+}
+
+unsafe fn search(
+    parent: AXUIElementRef,
+    path: Vec<String>,
+    combo: &Combo,
+    found: &mut Option<MenuMatch>,
+    budget: &mut usize,
+    depth: usize,
+) {
+    for item in semantic_items(parent) {
+        if *budget == 0 || found.as_ref().is_some_and(|m| m.enabled) {
+            CFRelease(item as CFTypeRef);
+            continue;
+        }
+        *budget -= 1;
+        let title = copy_string_attr(item, "AXTitle").unwrap_or_default();
+        let cmd_char = copy_string_attr(item, "AXMenuItemCmdChar").unwrap_or_default();
+        if !cmd_char.is_empty() {
+            let modifiers = copy_number_attr(item, "AXMenuItemCmdModifiers").unwrap_or(0.0) as i64;
+            if combo.matches(&cmd_char, modifiers) {
+                let enabled = copy_bool_attr(item, "AXEnabled") != Some(false);
+                if found.is_none() || enabled {
+                    let mut item_path = path.clone();
+                    item_path.push(title.clone());
+                    *found = Some(MenuMatch {
+                        path: item_path,
+                        enabled,
+                    });
+                }
+            }
+        } else if depth < 2 && !title.is_empty() {
+            let mut sub_path = path.clone();
+            sub_path.push(title);
+            search(item, sub_path, combo, found, budget, depth + 1);
+        }
+        CFRelease(item as CFTypeRef);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn combo(modifiers: &[&str], key: &str) -> Option<Combo> {
+        let modifiers: Vec<String> = modifiers.iter().map(|m| m.to_string()).collect();
+        Combo::parse(&modifiers, key)
+    }
+
+    #[test]
+    fn command_combos_accept_printable_and_named_menu_keys() {
+        assert!(combo(&["cmd"], "s").is_some());
+        assert!(combo(&["command", "shift"], "S").is_some());
+        assert!(combo(&["cmd"], ",").is_some());
+        assert_eq!(combo(&["ctrl"], "a"), None);
+        assert!(combo(&["cmd"], "return").is_some());
+        assert!(combo(&["cmd"], "up").is_some());
+        assert_eq!(combo(&["cmd", "hyper"], "s"), None);
+    }
+
+    #[test]
+    fn named_keys_map_to_their_menu_command_characters() {
+        for (key, character) in [
+            ("backspace", "\u{0008}"),
+            ("delete", "\u{0008}"),
+            ("forward_delete", "\u{007f}"),
+            ("forwarddelete", "\u{007f}"),
+            ("return", "\r"),
+            ("enter", "\r"),
+            ("escape", "\u{001b}"),
+            ("esc", "\u{001b}"),
+            ("up", "\u{001e}"),
+            ("arrowup", "\u{001e}"),
+            ("down", "\u{001f}"),
+            ("arrowdown", "\u{001f}"),
+            ("left", "\u{001c}"),
+            ("arrowleft", "\u{001c}"),
+            ("right", "\u{001d}"),
+            ("arrowright", "\u{001d}"),
+        ] {
+            let parsed = combo(&["cmd"], key).unwrap_or_else(|| panic!("{key}"));
+            assert_eq!(parsed.character, character, "{key}");
+            assert!(parsed.matches(character, 0), "{key}");
+            assert!(!parsed.matches(character, MOD_SHIFT), "{key}");
+            assert_eq!(combo(&["ctrl"], key), None, "{key}");
+        }
+        assert_eq!(combo(&["cmd"], "hyper"), None);
+    }
+
+    #[test]
+    fn modifiers_must_match_exactly() {
+        let save = combo(&["cmd"], "s").unwrap();
+        assert!(save.matches("S", 0));
+        assert!(save.matches("s", 0));
+        assert!(!save.matches("S", MOD_SHIFT), "Save As is cmd+shift+s");
+        assert!(!save.matches("S", MOD_NO_COMMAND));
+        assert!(!save.matches("A", 0));
+        let save_as = combo(&["cmd", "shift"], "s").unwrap();
+        assert!(save_as.matches("S", MOD_SHIFT));
+        assert!(!save_as.matches("S", 0));
+        let minimize_all = combo(&["cmd", "option"], "m").unwrap();
+        assert!(minimize_all.matches("M", MOD_OPTION));
+        assert!(!minimize_all.matches("M", MOD_OPTION | MOD_CONTROL));
+    }
+
+    #[test]
+    fn an_early_match_still_releases_every_top_level_item() {
+        let mut visited = Vec::new();
+        let mut released = Vec::new();
+        visit_releasing(
+            vec![10, 11, 12, 13],
+            |index, item| {
+                visited.push(item);
+                index == 1
+            },
+            |item| released.push(item),
+        );
+        assert_eq!(visited, vec![10, 11], "nothing is searched after the match");
+        assert_eq!(
+            released,
+            vec![10, 11, 12, 13],
+            "every retained item is released"
+        );
+
+        let mut released = Vec::new();
+        visit_releasing(vec![1, 2], |_, _| false, |item| released.push(item));
+        assert_eq!(released, vec![1, 2]);
+    }
+}

@@ -1,0 +1,72 @@
+{
+  "comment": "The Cua Driver build GOAT ships today: the archives goat-si/goat packages/shared/src/cuaDriverRelease.ts pins, by name, size and SHA-256. The fork must stay protocol-compatible with it; change this only together with GOAT's pin.",
+  "version": "0.38.0-goat.3",
+  "baseUrl": "https://github.com/goat-si/cua-driver/releases/download/cua-driver-rs-v0.38.0-goat.3/",
+  "archives": {
+    "darwin-universal": {
+      "name": "cua-driver-rs-0.38.0-goat.3-darwin-universal-binary.tar.gz",
+      "bytes": 53790078,
+      "sha256": "fd39f06ebea61e321e884cd7fc93cd1a064a80615b1b107b28cd41058f224c4e"
+    },
+    "linux-x86_64": {
+      "name": "cua-driver-rs-0.38.0-goat.3-linux-x86_64-binary.tar.gz",
+      "bytes": 37179458,
+      "sha256": "e56ccd64b6c8d8d8a1c5c6ec9ee4a7bb89c508ae21e86de5e558bc6fb91b453f"
+    },
+    "linux-arm64": {
+      "name": "cua-driver-rs-0.38.0-goat.3-linux-arm64-binary.tar.gz",
+      "bytes": 36829132,
+      "sha256": "489cc969705ef04121e3b5591ae2b32cd9aaec59a39e84a1deacaad99f09e0e0"
+    },
+    "windows-x86_64": {
+      "name": "cua-driver-rs-0.38.0-goat.3-windows-x86_64-binary.zip",
+      "bytes": 35683367,
+      "sha256": "872a4505788b0504c3686f2cb1034c7610036d385eb4735ab859d0fe2cfda558"
+    },
+    "windows-arm64": {
+      "name": "cua-driver-rs-0.38.0-goat.3-windows-arm64-binary.zip",
+      "bytes": 33434862,
+      "sha256": "a3d88100d3ba64364db1e5812afba2120344a5e720cc999e1759119c4f66a55b"
+    }
+  },
+  "goatToolsComment": "CUA_DRIVER_ALLOWED_TOOLS in goat-si/goat packages/shared/src/cuaDriverManifest.ts: both builds must list all of them.",
+  "goatTools": [
+    "check_permissions",
+    "health_report",
+    "get_guide",
+    "list_apps",
+    "list_windows",
+    "get_accessibility_tree",
+    "get_window_state",
+    "get_screen_size",
+    "get_cursor_position",
+    "verify_state",
+    "zoom",
+    "click",
+    "double_click",
+    "right_click",
+    "drag",
+    "scroll",
+    "move_cursor",
+    "type_text",
+    "press_key",
+    "hotkey",
+    "set_value",
+    "invoke_menu",
+    "bring_to_front",
+    "launch_app",
+    "kill_app",
+    "set_window_frame",
+    "run_steps",
+    "run_script",
+    "start_session",
+    "end_session",
+    "get_session",
+    "list_sessions",
+    "get_agent_cursor_state",
+    "get_config",
+    "set_agent_cursor_enabled",
+    "set_agent_cursor_motion",
+    "set_agent_cursor_theme"
+  ]
+}
