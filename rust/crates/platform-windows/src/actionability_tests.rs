@@ -54,7 +54,7 @@ fn evidence_conversion_and_visibility() {
     assert_eq!(evidence(&LiveRead::Value(true)), Evidence::Known(true));
     assert_eq!(evidence::<bool>(&LiveRead::NotSupported), Evidence::Absent);
     assert_eq!(
-        evidence::<bool>(&LiveRead::Failed("COM".into())),
+        evidence::<bool>(&LiveRead::Failed("COM".into(), None)),
         Evidence::Unknown("COM".into())
     );
     assert_eq!(
@@ -76,7 +76,7 @@ fn evidence_conversion_and_visibility() {
         assert_transient(&f);
     }
     let mut f = raw();
-    f.window_cloaked = LiveRead::Failed("dwm".into());
+    f.window_cloaked = LiveRead::Failed("dwm".into(), None);
     assert_eq!(
         element_facts(&f, ValueWrite::Value).visible,
         Evidence::Unknown("dwm".into())
@@ -94,7 +94,7 @@ fn editable_enabled_geometry_and_roles() {
     assert_eq!(evaluated(&f, ValueWrite::Value).verdict, Verdict::Pass);
     f.is_enabled = LiveRead::Value(false);
     assert_transient(&f);
-    f.is_enabled = LiveRead::Failed("enabled".into());
+    f.is_enabled = LiveRead::Failed("enabled".into(), None);
     assert_transient(&f);
     f.is_enabled = LiveRead::Value(true);
     f.value_read_only = LiveRead::Value(true);
@@ -105,7 +105,7 @@ fn editable_enabled_geometry_and_roles() {
             ..
         }
     ));
-    f.value_read_only = LiveRead::Failed("readonly".into());
+    f.value_read_only = LiveRead::Failed("readonly".into(), None);
     assert_transient(&f);
     f.value_read_only = LiveRead::NotSupported;
     f.patterns = LiveRead::Value(vec![]);
@@ -145,7 +145,7 @@ fn editable_enabled_geometry_and_roles() {
         evaluated(&f, ValueWrite::RangeValue).verdict,
         Verdict::Transient { unknown: true, .. }
     ));
-    f.patterns = LiveRead::Failed("scan".into());
+    f.patterns = LiveRead::Failed("scan".into(), None);
     assert_eq!(
         element_facts(&f, ValueWrite::RangeValue).affordances,
         Evidence::Unknown("scan".into())
@@ -201,7 +201,7 @@ async fn passing_and_unknown_then_passing_write_once() {
                 count += 1;
                 let mut f = raw();
                 if unknown_first && count == 1 {
-                    f.is_enabled = LiveRead::Failed("busy".into());
+                    f.is_enabled = LiveRead::Failed("busy".into(), None);
                 }
                 std::future::ready(Probe::uia(f))
             },
@@ -483,7 +483,7 @@ fn changed_patterns_never_call_an_unadmitted_rung() {
 fn writable_range_admits_when_value_read_only_is_unknown() {
     let mut f = raw();
     f.patterns = LiveRead::Value(vec![PatternKind::Value, PatternKind::RangeValue]);
-    f.value_read_only = LiveRead::Failed("value read failed".into());
+    f.value_read_only = LiveRead::Failed("value read failed".into(), None);
     f.range_read_only = LiveRead::Value(false);
     assert_eq!(evaluated(&f, ValueWrite::Value).verdict, Verdict::Pass);
     let a = admission(&f);

@@ -13,14 +13,14 @@ use std::{
 pub(crate) enum LiveRead<T> {
     Value(T),
     NotSupported,
-    Failed(String),
+    Failed(String, Option<i32>),
 }
 
 pub(crate) fn evidence<T: Clone>(read: &LiveRead<T>) -> Evidence<T> {
     match read {
         LiveRead::Value(v) => Evidence::Known(v.clone()),
         LiveRead::NotSupported => Evidence::Absent,
-        LiveRead::Failed(e) => Evidence::Unknown(e.clone()),
+        LiveRead::Failed(e, _) => Evidence::Unknown(e.clone()),
     }
 }
 
@@ -52,16 +52,16 @@ impl RawLiveFacts {
     pub(crate) fn failed(reason: impl Into<String>) -> Self {
         let reason = reason.into();
         Self {
-            is_offscreen: LiveRead::Failed(reason.clone()),
-            is_enabled: LiveRead::Failed(reason.clone()),
-            bounds: LiveRead::Failed(reason.clone()),
-            window_visible: LiveRead::Failed(reason.clone()),
-            window_minimized: LiveRead::Failed(reason.clone()),
-            window_cloaked: LiveRead::Failed(reason.clone()),
-            control_type: LiveRead::Failed(reason.clone()),
-            patterns: LiveRead::Failed(reason.clone()),
-            value_read_only: LiveRead::Failed(reason.clone()),
-            range_read_only: LiveRead::Failed(reason),
+            is_offscreen: LiveRead::Failed(reason.clone(), None),
+            is_enabled: LiveRead::Failed(reason.clone(), None),
+            bounds: LiveRead::Failed(reason.clone(), None),
+            window_visible: LiveRead::Failed(reason.clone(), None),
+            window_minimized: LiveRead::Failed(reason.clone(), None),
+            window_cloaked: LiveRead::Failed(reason.clone(), None),
+            control_type: LiveRead::Failed(reason.clone(), None),
+            patterns: LiveRead::Failed(reason.clone(), None),
+            value_read_only: LiveRead::Failed(reason.clone(), None),
+            range_read_only: LiveRead::Failed(reason, None),
         }
     }
 }
@@ -93,7 +93,7 @@ pub(crate) fn element_facts(raw: &RawLiveFacts, _write: ValueWrite) -> ElementFa
             checks
                 .iter()
                 .find_map(|(r, _)| match r {
-                    LiveRead::Failed(e) => Some(e.clone()),
+                    LiveRead::Failed(e, _) => Some(e.clone()),
                     LiveRead::NotSupported => Some("visibility unavailable".into()),
                     _ => None,
                 })
@@ -118,7 +118,7 @@ pub(crate) fn element_facts(raw: &RawLiveFacts, _write: ValueWrite) -> ElementFa
             }
         }
         LiveRead::NotSupported => Evidence::Absent,
-        LiveRead::Failed(e) => Evidence::Unknown(e.clone()),
+        LiveRead::Failed(e, _) => Evidence::Unknown(e.clone()),
     };
     let affordances = match &raw.patterns {
         LiveRead::Value(patterns) => {
@@ -142,7 +142,7 @@ pub(crate) fn element_facts(raw: &RawLiveFacts, _write: ValueWrite) -> ElementFa
             Evidence::Known(actions)
         }
         LiveRead::NotSupported => Evidence::Absent,
-        LiveRead::Failed(e) => Evidence::Unknown(e.clone()),
+        LiveRead::Failed(e, _) => Evidence::Unknown(e.clone()),
     };
     let role = match &raw.control_type {
         LiveRead::Value(name) => Evidence::Known(match name.as_str() {
@@ -151,7 +151,7 @@ pub(crate) fn element_facts(raw: &RawLiveFacts, _write: ValueWrite) -> ElementFa
             _ => name.to_lowercase(),
         }),
         LiveRead::NotSupported => Evidence::Absent,
-        LiveRead::Failed(e) => Evidence::Unknown(e.clone()),
+        LiveRead::Failed(e, _) => Evidence::Unknown(e.clone()),
     };
     ElementFacts {
         visible,

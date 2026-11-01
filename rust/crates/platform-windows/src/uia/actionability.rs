@@ -10,7 +10,7 @@ use windows::Win32::UI::WindowsAndMessaging::{IsIconic, IsWindowVisible};
 fn read<T, U>(result: windows::core::Result<T>, map: impl FnOnce(T) -> U) -> LiveRead<U> {
     match result {
         Ok(value) => LiveRead::Value(map(value)),
-        Err(error) => LiveRead::Failed(error.to_string()),
+        Err(error) => LiveRead::Failed(error.to_string(), Some(error.code().0)),
     }
 }
 
@@ -79,7 +79,7 @@ pub(crate) unsafe fn read_live_facts(element: &IUIAutomationElement, hwnd: HWND)
             Err(error) if crate::uia_mutation::pattern_absent(error.code().0) => {}
             Err(error) => {
                 if failure.is_none() {
-                    failure = Some(error.to_string());
+                    failure = Some((error.to_string(), error.code().0));
                 }
             }
         }
@@ -92,7 +92,7 @@ pub(crate) unsafe fn read_live_facts(element: &IUIAutomationElement, hwnd: HWND)
         window_minimized,
         window_cloaked,
         control_type,
-        patterns: failure.map_or(LiveRead::Value(patterns), LiveRead::Failed),
+        patterns: failure.map_or(LiveRead::Value(patterns), |(message, code)| LiveRead::Failed(message, Some(code))),
         value_read_only,
         range_read_only,
     }
