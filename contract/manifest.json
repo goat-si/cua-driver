@@ -2278,6 +2278,7 @@
                     "untrusted_provider",
                     "scope_mismatch",
                     "not_asserted",
+                    "excluded_content_unclassified",
                     "folded_text_truncated",
                     "folded_children"
                   ],
@@ -2382,6 +2383,7 @@
                               "untrusted_provider",
                               "scope_mismatch",
                               "not_asserted",
+                              "excluded_content_unclassified",
                               "folded_text_truncated",
                               "folded_children"
                             ],
@@ -2689,6 +2691,7 @@
                     "untrusted_provider",
                     "scope_mismatch",
                     "not_asserted",
+                    "excluded_content_unclassified",
                     "folded_text_truncated",
                     "folded_children"
                   ],
@@ -2730,7 +2733,8 @@
                 },
                 "kind": {
                   "enum": [
-                    "closed_menus_not_expanded"
+                    "closed_menus_not_expanded",
+                    "collapsed_lists_not_expanded"
                   ],
                   "type": "string"
                 }

@@ -167,7 +167,7 @@ impl Tool for FakePlatform {
         let mut budget = cua_driver_core::walk_budget::WalkBudget::nodes_only(10);
         budget.assert_exhaustive();
         let owner = if root_token.is_some() { 11 } else { 10 };
-        budget.record_scope_exclusion(
+        budget.record_verified_scope_exclusion(
             cua_driver_contract::ScopeExclusionKind::ClosedMenusNotExpanded,
             Some(owner),
         );

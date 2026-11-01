@@ -3859,6 +3859,7 @@ export enum IncompleteReasonDetail {
     UntrustedProvider,
     ScopeMismatch,
     NotAsserted,
+    ExcludedContentUnclassified,
     FoldedTextTruncated,
     FoldedChildren
 }
@@ -3883,8 +3884,9 @@ const FfiConverterTypeIncompleteReasonDetail = (() => {
                 case 12: return IncompleteReasonDetail.UntrustedProvider;
                 case 13: return IncompleteReasonDetail.ScopeMismatch;
                 case 14: return IncompleteReasonDetail.NotAsserted;
-                case 15: return IncompleteReasonDetail.FoldedTextTruncated;
-                case 16: return IncompleteReasonDetail.FoldedChildren;
+                case 15: return IncompleteReasonDetail.ExcludedContentUnclassified;
+                case 16: return IncompleteReasonDetail.FoldedTextTruncated;
+                case 17: return IncompleteReasonDetail.FoldedChildren;
                 default: throw new UniffiInternalError.UnexpectedEnumCase();
             }
         }
@@ -3904,8 +3906,9 @@ const FfiConverterTypeIncompleteReasonDetail = (() => {
                 case IncompleteReasonDetail.UntrustedProvider: return ordinalConverter.write(12, into);
                 case IncompleteReasonDetail.ScopeMismatch: return ordinalConverter.write(13, into);
                 case IncompleteReasonDetail.NotAsserted: return ordinalConverter.write(14, into);
-                case IncompleteReasonDetail.FoldedTextTruncated: return ordinalConverter.write(15, into);
-                case IncompleteReasonDetail.FoldedChildren: return ordinalConverter.write(16, into);
+                case IncompleteReasonDetail.ExcludedContentUnclassified: return ordinalConverter.write(15, into);
+                case IncompleteReasonDetail.FoldedTextTruncated: return ordinalConverter.write(16, into);
+                case IncompleteReasonDetail.FoldedChildren: return ordinalConverter.write(17, into);
             }
         }
         allocationSize(value: TypeName): number {
@@ -5996,7 +5999,8 @@ const FfiConverterTypePressKeyInput = (() => {
  * Scope deliberately not read, distinct from an incomplete requested read.
  */
 export enum ScopeExclusionKind {
-    ClosedMenusNotExpanded
+    ClosedMenusNotExpanded,
+    CollapsedListsNotExpanded
 }
 
 const FfiConverterTypeScopeExclusionKind = (() => {
@@ -6006,12 +6010,14 @@ const FfiConverterTypeScopeExclusionKind = (() => {
         read(from: RustBuffer): TypeName {
             switch (ordinalConverter.read(from)) {
                 case 1: return ScopeExclusionKind.ClosedMenusNotExpanded;
+                case 2: return ScopeExclusionKind.CollapsedListsNotExpanded;
                 default: throw new UniffiInternalError.UnexpectedEnumCase();
             }
         }
         write(value: TypeName, into: RustBuffer): void {
             switch (value) {
                 case ScopeExclusionKind.ClosedMenusNotExpanded: return ordinalConverter.write(1, into);
+                case ScopeExclusionKind.CollapsedListsNotExpanded: return ordinalConverter.write(2, into);
             }
         }
         allocationSize(value: TypeName): number {

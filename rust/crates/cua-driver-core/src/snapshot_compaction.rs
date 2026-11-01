@@ -411,6 +411,12 @@ pub fn sanitize_snippet(text: &str, max_chars: usize) -> Option<String> {
 /// Summarize up to [`MAX_SUMMARY_SNIPPETS`] distinct static-text snippets when their
 /// combined length is within [`MAX_SUMMARY_CHARS`].
 pub fn summarize_static_text_snippets<S: AsRef<str>>(snippets: &[S]) -> Option<String> {
+    summarize_static_text_snippets_with_parts(snippets).map(|(summary, _)| summary)
+}
+
+fn summarize_static_text_snippets_with_parts<S: AsRef<str>>(
+    snippets: &[S],
+) -> Option<(String, Vec<String>)> {
     let mut distinct: Vec<String> = Vec::new();
     for raw in snippets {
         let Some(clean) = sanitize_snippet(raw.as_ref(), MAX_SNIPPET_CHARS) else {
@@ -427,7 +433,47 @@ pub fn summarize_static_text_snippets<S: AsRef<str>>(snippets: &[S]) -> Option<S
         return None;
     }
     let joined = distinct.join(" ");
-    (joined.chars().count() <= MAX_SUMMARY_CHARS).then_some(joined)
+    (joined.chars().count() <= MAX_SUMMARY_CHARS).then_some((joined, distinct))
+}
+
+/// Check whether a field is visibly delimited in its formatted row. This is
+/// only used to identify shown fields; preservation requires full equality.
+fn field_is_rendered(row: &str, field: &str) -> bool {
+    row.match_indices(field).any(|(start, _)| {
+        let before = row[..start].chars().next_back();
+        let after = row[start + field.len()..].chars().next();
+        let boundary = |character: char| !character.is_alphanumeric() && character != '_';
+        before.is_none_or(boundary) && after.is_none_or(boundary)
+    })
+}
+
+/// Recover only the retained row's complete, delimited label and value.
+/// Ambiguous or unsupported formatting cannot prove a field was retained.
+fn rendered_label_value<'a>(row: &'a str, role: &str) -> (Option<&'a str>, Option<&'a str>) {
+    let Some(rest) = row
+        .strip_prefix("- ")
+        .and_then(|row| row.strip_prefix(role))
+    else {
+        return (None, None);
+    };
+    if !rest.is_empty() && !rest.starts_with(char::is_whitespace) {
+        return (None, None);
+    }
+    let mut rest = rest.trim_start();
+    let mut label = None;
+    if let Some(quoted) = rest.strip_prefix('"') {
+        let Some((text, tail)) = quoted.split_once('"') else {
+            return (None, None);
+        };
+        label = Some(text);
+        rest = tail.trim_start();
+    }
+    let value = rest
+        .strip_prefix('=')
+        .map(str::trim_start)
+        .and_then(|tail| tail.strip_prefix('"'))
+        .and_then(|tail| tail.split_once('"').map(|(text, _)| text));
+    (label, value)
 }
 
 /// Roles that act as rows or generic containers eligible for actionless static-text folding.
@@ -813,7 +859,9 @@ fn fold_after_elision<N: CompactableNode>(
 
             let min_snippets = if is_generic_group { 2 } else { 1 };
             if all_plain && raw_snippets.len() >= min_snippets {
-                if let Some(summary) = summarize_static_text_snippets(&raw_snippets) {
+                if let Some((summary, kept_snippets)) =
+                    summarize_static_text_snippets_with_parts(&raw_snippets)
+                {
                     let absorbed_children = u32::try_from(
                         ((idx + 1)..sub_end)
                             .filter(|&child| {
@@ -836,7 +884,7 @@ fn fold_after_elision<N: CompactableNode>(
                             {
                                 let text = field.trim();
                                 if !text.is_empty()
-                                    && rendered.contains(text)
+                                    && field_is_rendered(&rendered, text)
                                     && !visible_text.iter().any(|seen| seen == text)
                                 {
                                     visible_text.push(text.to_owned());
@@ -871,6 +919,7 @@ fn fold_after_elision<N: CompactableNode>(
                         }
                     }
                     let existing_title = parent_node.title().map(str::trim).unwrap_or("");
+                    let mut written_value = None;
                     if existing_title != summary {
                         let merged_val = match parent_node.value().map(str::trim) {
                             Some(v) if !v.is_empty() && v != summary => {
@@ -878,15 +927,50 @@ fn fold_after_elision<N: CompactableNode>(
                                 if combined.chars().count() <= MAX_SUMMARY_CHARS {
                                     combined
                                 } else {
-                                    summary
+                                    summary.clone()
                                 }
                             }
-                            _ => summary,
+                            _ => summary.clone(),
                         };
+                        written_value = Some(merged_val.clone());
                         parent_node.set_value(Some(merged_val));
                     }
                     let mut formatted = parent_node.format_line();
-                    lost_text |= visible_text.iter().any(|text| !formatted.contains(text));
+                    let (rendered_label, rendered_value) =
+                        rendered_label_value(&formatted, parent_node.role());
+                    let retained_fields: Vec<(String, String)> = [
+                        parent_node.title().zip(rendered_label),
+                        parent_node.value().zip(rendered_value),
+                    ]
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|(field, shown)| {
+                        let raw = field.trim();
+                        if raw.is_empty() || raw != shown.trim() {
+                            return None;
+                        }
+                        sanitize_snippet(raw, usize::MAX)
+                            .map(|normalized| (raw.to_owned(), normalized))
+                    })
+                    .collect();
+                    let normalized_written = written_value
+                        .as_deref()
+                        .and_then(|value| sanitize_snippet(value, usize::MAX));
+                    let summary_rendered = retained_fields.iter().any(|(_, normalized)| {
+                        normalized == &summary || normalized_written.as_ref() == Some(normalized)
+                    });
+                    lost_text |= visible_text.iter().any(|text| {
+                        let Some(normalized) = sanitize_snippet(text, usize::MAX) else {
+                            return false;
+                        };
+                        let raw_retained = retained_fields.iter().any(|(raw, _)| raw == text);
+                        let exact_retained = retained_fields
+                            .iter()
+                            .any(|(_, field)| field == &normalized);
+                        let exact_snippet = summary_rendered
+                            && kept_snippets.iter().any(|snippet| snippet == &normalized);
+                        !raw_retained && (text != &normalized || !(exact_retained || exact_snippet))
+                    });
                     if lost_text && report_folds {
                         let reason = BoundaryReason {
                             kind: cua_driver_contract::IncompleteReasonKind::PolicyOmission,
@@ -1267,6 +1351,7 @@ mod tests {
         boundary: Option<NodeBoundary>,
         offscreen: Option<bool>,
         refuse_value: bool,
+        hide_value: bool,
     }
     impl CompactableNode for BoundaryNode {
         fn element_index(&self) -> Option<usize> {
@@ -1296,7 +1381,13 @@ mod tests {
             self.node.description.as_deref()
         }
         fn format_line(&self) -> String {
-            self.node.format_line()
+            if self.hide_value {
+                let mut node = self.node.clone();
+                node.value = None;
+                node.format_line()
+            } else {
+                self.node.format_line()
+            }
         }
         fn offscreen(&self) -> Option<bool> {
             self.offscreen
@@ -1324,6 +1415,7 @@ mod tests {
             boundary: None,
             offscreen: None,
             refuse_value: false,
+            hide_value: false,
         }
     }
     fn u20_boundary(
@@ -1699,6 +1791,52 @@ mod tests {
         nodes[0].refuse_value = true;
         assert_eq!(
             serde_json::to_value(u20_fold(&mut nodes)).unwrap(),
+            serde_json::json!([{"kind":"policy_omission","detail":"folded_text_truncated"}])
+        );
+    }
+
+    #[test]
+    fn u20b_review_shown_fields_require_full_snippet_equality() {
+        for (value, title) in [("bookmark", "ok"), ("width", "id")] {
+            let mut nodes = vec![
+                u20_node("AXRow", 0, None, None),
+                u20_node("AXStaticText", 1, None, Some(value)),
+            ];
+            nodes[1].node.title = Some(title.into());
+            let reasons = u20_fold(&mut nodes);
+            assert_eq!(
+                serde_json::to_value(reasons).unwrap(),
+                serde_json::json!([{"kind":"policy_omission","detail":"folded_text_truncated"}]),
+                "{value}/{title}"
+            );
+            assert_eq!(
+                nodes[0].boundary.as_ref().unwrap().descendants_omitted,
+                Some(true)
+            );
+        }
+        let mut nodes = vec![
+            u20_node("AXRow", 0, None, None),
+            u20_node("AXStaticText", 1, None, Some("bookmark")),
+        ];
+        nodes[1].node.title = Some("bookmark".into());
+        assert!(u20_fold(&mut nodes).is_empty());
+        assert_eq!(
+            nodes[0].boundary.as_ref().unwrap().descendants_omitted,
+            Some(false)
+        );
+    }
+    #[test]
+    fn u20b_review_hidden_value_inside_a_shown_title_is_not_preserved() {
+        let mut nodes = vec![
+            u20_node("AXRow", 0, None, Some("ok")),
+            u20_node("AXStaticText", 1, None, Some("ok")),
+        ];
+        nodes[0].node.title = Some("ok later".into());
+        nodes[0].hide_value = true;
+        nodes[0].refuse_value = true;
+        let reasons = u20_fold(&mut nodes);
+        assert_eq!(
+            serde_json::to_value(reasons).unwrap(),
             serde_json::json!([{"kind":"policy_omission","detail":"folded_text_truncated"}])
         );
     }

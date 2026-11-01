@@ -37,7 +37,8 @@
               "enumeration_error_unclassified",
               "untrusted_provider",
               "scope_mismatch",
-              "not_asserted"
+              "not_asserted",
+              "excluded_content_unclassified"
             ],
             "type": "string"
           },
@@ -139,7 +140,8 @@
                         "enumeration_error_unclassified",
                         "untrusted_provider",
                         "scope_mismatch",
-                        "not_asserted"
+                        "not_asserted",
+                        "excluded_content_unclassified"
                       ],
                       "type": "string"
                     },
@@ -444,7 +446,8 @@
               "enumeration_error_unclassified",
               "untrusted_provider",
               "scope_mismatch",
-              "not_asserted"
+              "not_asserted",
+              "excluded_content_unclassified"
             ],
             "type": "string"
           },
@@ -484,7 +487,8 @@
           },
           "kind": {
             "enum": [
-              "closed_menus_not_expanded"
+              "closed_menus_not_expanded",
+              "collapsed_lists_not_expanded"
             ],
             "type": "string"
           }

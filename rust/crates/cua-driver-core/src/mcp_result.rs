@@ -777,7 +777,7 @@ mod tests {
         .unwrap();
         let old = cua_driver_contract::advertised_output_schema(old);
         let new = advertised_tool_output_schema(tool).unwrap();
-        let old_payload = json!({"pid":7,"window_id":9});
+        let old_payload = json!({"pid":7,"window_id":9,"observation_complete":false,"observation_incomplete_reasons":[{"kind":"unknown","detail":"excluded_content_unclassified"}],"observation_scope_exclusions":[{"kind":"collapsed_lists_not_expanded"}]});
         let new_payload = json!({"pid":7,"window_id":9,"observation_complete":false,"observation_incomplete_reasons":[{"kind":"policy_omission","detail":"folded_text_truncated"}],"elements":[{"element_index":1,"role":"row","depth":0,"boundary":{"reasons":[{"kind":"policy_omission","detail":"folded_text_truncated"}],"children_skipped":"unknown","descendants_omitted":true}}]});
         let old_validator = jsonschema::validator_for(&old).unwrap();
         let new_validator = jsonschema::validator_for(&new).unwrap();
@@ -798,7 +798,7 @@ mod tests {
         .unwrap();
         let old = cua_driver_contract::advertised_output_schema(old);
         let new = advertised_tool_output_schema(tool).unwrap();
-        let old_payload = json!({"pid":7,"window_id":9,"observation_complete":false,"observation_incomplete_reasons":[{"kind":"policy_omission","detail":"folded_text_truncated"}]});
+        let old_payload = json!({"pid":7,"window_id":9,"observation_complete":false,"observation_incomplete_reasons":[{"kind":"unknown","detail":"excluded_content_unclassified"},{"kind":"policy_omission","detail":"folded_text_truncated"}],"observation_scope_exclusions":[{"kind":"collapsed_lists_not_expanded"}]});
         let new_payload = json!({"pid":7,"window_id":9,"observation_complete":true,"elements":[{"element_index":1,"role":"row","depth":0,"boundary":{"reasons":[{"kind":"policy_omission","detail":"folded_children"}],"children_skipped":{"known":1},"descendants_omitted":false}}]});
         let old_validator = jsonschema::validator_for(&old).unwrap();
         let new_validator = jsonschema::validator_for(&new).unwrap();
@@ -806,6 +806,35 @@ mod tests {
         assert!(new_validator.is_valid(&old_payload));
         assert!(new_validator.is_valid(&new_payload));
         assert!(!old_validator.is_valid(&new_payload));
+        assert!(validate_proxy_schema_pair(tool, Some(&new), Some(&old)).is_err());
+        assert!(validate_proxy_schema_pair(tool, Some(&old), Some(&new)).is_err());
+    }
+
+    #[test]
+    fn scope_exclusion_schema_refuses_pre_u23b_proxy_in_both_directions() {
+        let tool = "get_window_state";
+        let old: Value = serde_json::from_str(include_str!(
+            "../../../../contract/fixtures/get-window-state-pre-u23b-success-schema.json"
+        ))
+        .unwrap();
+        let old = cua_driver_contract::advertised_output_schema(old);
+        let new = advertised_tool_output_schema(tool).unwrap();
+        let old_validator = jsonschema::validator_for(&old).unwrap();
+        let new_validator = jsonschema::validator_for(&new).unwrap();
+        for payload in [
+            json!({"pid":7,"window_id":9}),
+            json!({"pid":7,"window_id":9,"observation_scope_exclusions":[{"kind":"closed_menus_not_expanded"}]}),
+        ] {
+            assert!(old_validator.is_valid(&payload));
+            assert!(new_validator.is_valid(&payload));
+        }
+        for payload in [
+            json!({"pid":7,"window_id":9,"observation_scope_exclusions":[{"kind":"collapsed_lists_not_expanded"}]}),
+            json!({"pid":7,"window_id":9,"observation_complete":false,"observation_incomplete_reasons":[{"kind":"unknown","detail":"excluded_content_unclassified"}]}),
+        ] {
+            assert!(new_validator.is_valid(&payload));
+            assert!(!old_validator.is_valid(&payload));
+        }
         assert!(validate_proxy_schema_pair(tool, Some(&new), Some(&old)).is_err());
         assert!(validate_proxy_schema_pair(tool, Some(&old), Some(&new)).is_err());
     }

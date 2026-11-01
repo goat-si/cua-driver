@@ -48,19 +48,36 @@ token by role and label; this remains until platforms publish protected snapshot
 Closed menubar menus, context/popup menus, and collapsed combobox lists are
 outside the default observation scope. Open menus and contents explicitly
 requested by a read are in scope; a failed attempt to read them is incomplete.
-An exclusion alone does not make `observation_complete` false, and a
-`collapsed_menu` row boundary is permitted without a read-level reason. Other
-skips, cuts, untrusted reads and timeouts remain incomplete.
+A verified exclusion alone does not make `observation_complete` false, and a
+`collapsed_menu` row boundary is permitted without a read-level reason. An
+unverified exclusion adds a read-level reason. Other skips, cuts, untrusted
+reads and timeouts remain incomplete.
 
-`observation_scope_exclusions` optionally records `closed_menus_not_expanded`.
+`observation_scope_exclusions` records `closed_menus_not_expanded` for closed
+menus and `collapsed_lists_not_expanded` for collapsed combo-box/list-box
+popups. Never report a collapsed list as a closed menu.
 Its `element_indices` identify excluded owner rows in the returned snapshot's
 index namespace, sorted and deduplicated; omission means ownership is unknown
 or could not be retained. Absence of the field does not prove full scope,
-including for old producers. Locate uses completeness and exclusions in
-absence and uniqueness proofs: with an exclusion, those proofs are unknown for selectors that could
-match excluded content, including canonical or native menu/menuitem roles,
-untyped name/text selectors, or selectors scoped beneath an excluded owner.
-Selectors typed to a non-menu role are unaffected by this exclusion.
+including for old producers. Locator uses completeness and exclusions for
+absence, uniqueness and nth proofs. Verified closed-menu exclusions guard menu
+and menuitem; verified collapsed-list exclusions guard listitem, option, row
+and cell. Both guard role-less and text/content selectors (including static
+text, labels, headings, paragraphs, images and links). Unknown kinds guard all
+selectors. Owner indices do not narrow these guards: selectors lack ancestry.
+
+`WalkBudget::record_scope_exclusion` means content is unverified: it adds the
+read-level reason `unknown/excluded_content_unclassified` and makes the read
+incomplete for every selector. `record_verified_scope_exclusion` is permitted
+only after proving without UI expansion that excluded content contains only
+the kind's guarded families and non-content separators. Failed, partial, or
+unavailable evidence is unverified. For example, macOS must prove AX menu
+children are only AXMenuItem/AXMenu/separators; Windows must prove list children
+are only UIA ListItem/DataItem; Linux must establish the equivalent AT-SPI
+roles. Nested excluded descendants must also be proven, not just immediate
+children. Any custom control or unknown descendant makes the exclusion
+unverified. Typed controls outside the guarded families remain usable only
+when all exclusions are verified.
 
 Platform handoff (not implemented by this contract change):
 
@@ -89,7 +106,8 @@ and typed boundary; the legacy wrapper does not supply this evidence.
 - Windows: add a closed-menu policy hook using positive collapsed
   ExpandCollapse state; missing/unknown state is not evidence. Cover the MSAA
   fallback as well.
-- All platforms must cover collapsed combobox lists. A targeted menu/item read
+- All platforms must report collapsed combobox/list-box popups with the list
+  exclusion kind. A targeted menu/item read
   attempts that scope and reports failure as incomplete; it must not silently
   open UI. Platform implementations must map walk-local owners to the final
   returned snapshot indices using `WalkOutcome::apply_with_owner_mapping`, or

@@ -5594,9 +5594,11 @@ class IncompleteReasonDetail(enum.Enum):
 
     NOT_ASSERTED = 13
 
-    FOLDED_TEXT_TRUNCATED = 14
+    EXCLUDED_CONTENT_UNCLASSIFIED = 14
 
-    FOLDED_CHILDREN = 15
+    FOLDED_TEXT_TRUNCATED = 15
+
+    FOLDED_CHILDREN = 16
 
 
 
@@ -5633,8 +5635,10 @@ class _UniffiFfiConverterTypeIncompleteReasonDetail(_UniffiConverterRustBuffer):
         if variant == 14:
             return IncompleteReasonDetail.NOT_ASSERTED
         if variant == 15:
-            return IncompleteReasonDetail.FOLDED_TEXT_TRUNCATED
+            return IncompleteReasonDetail.EXCLUDED_CONTENT_UNCLASSIFIED
         if variant == 16:
+            return IncompleteReasonDetail.FOLDED_TEXT_TRUNCATED
+        if variant == 17:
             return IncompleteReasonDetail.FOLDED_CHILDREN
         raise InternalError("Raw enum value doesn't match any cases")
 
@@ -5667,6 +5671,8 @@ class _UniffiFfiConverterTypeIncompleteReasonDetail(_UniffiConverterRustBuffer):
         if value == IncompleteReasonDetail.SCOPE_MISMATCH:
             return
         if value == IncompleteReasonDetail.NOT_ASSERTED:
+            return
+        if value == IncompleteReasonDetail.EXCLUDED_CONTENT_UNCLASSIFIED:
             return
         if value == IncompleteReasonDetail.FOLDED_TEXT_TRUNCATED:
             return
@@ -5704,10 +5710,12 @@ class _UniffiFfiConverterTypeIncompleteReasonDetail(_UniffiConverterRustBuffer):
             buf.write_i32(13)
         if value == IncompleteReasonDetail.NOT_ASSERTED:
             buf.write_i32(14)
-        if value == IncompleteReasonDetail.FOLDED_TEXT_TRUNCATED:
+        if value == IncompleteReasonDetail.EXCLUDED_CONTENT_UNCLASSIFIED:
             buf.write_i32(15)
-        if value == IncompleteReasonDetail.FOLDED_CHILDREN:
+        if value == IncompleteReasonDetail.FOLDED_TEXT_TRUNCATED:
             buf.write_i32(16)
+        if value == IncompleteReasonDetail.FOLDED_CHILDREN:
+            buf.write_i32(17)
 
 
 
@@ -8051,6 +8059,8 @@ class ScopeExclusionKind(enum.Enum):
 
     CLOSED_MENUS_NOT_EXPANDED = 0
 
+    COLLAPSED_LISTS_NOT_EXPANDED = 1
+
 
 
 class _UniffiFfiConverterTypeScopeExclusionKind(_UniffiConverterRustBuffer):
@@ -8059,11 +8069,15 @@ class _UniffiFfiConverterTypeScopeExclusionKind(_UniffiConverterRustBuffer):
         variant = buf.read_i32()
         if variant == 1:
             return ScopeExclusionKind.CLOSED_MENUS_NOT_EXPANDED
+        if variant == 2:
+            return ScopeExclusionKind.COLLAPSED_LISTS_NOT_EXPANDED
         raise InternalError("Raw enum value doesn't match any cases")
 
     @staticmethod
     def check_lower(value):
         if value == ScopeExclusionKind.CLOSED_MENUS_NOT_EXPANDED:
+            return
+        if value == ScopeExclusionKind.COLLAPSED_LISTS_NOT_EXPANDED:
             return
         raise ValueError(value)
 
@@ -8071,6 +8085,8 @@ class _UniffiFfiConverterTypeScopeExclusionKind(_UniffiConverterRustBuffer):
     def write(value, buf):
         if value == ScopeExclusionKind.CLOSED_MENUS_NOT_EXPANDED:
             buf.write_i32(1)
+        if value == ScopeExclusionKind.COLLAPSED_LISTS_NOT_EXPANDED:
+            buf.write_i32(2)
 
 
 
