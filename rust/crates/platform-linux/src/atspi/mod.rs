@@ -253,18 +253,12 @@ pub fn walk_tree_bounded_within(
     }
     if let Some(walked) = last_partial {
         if !walked.markdown.is_empty() || walked.truncation.is_some() {
-            let mut result = AtspiTreeResult::from_walked(walked, query);
+            let result = AtspiTreeResult::from_walked(walked, query);
             if result.nodes.is_empty() {
                 // Nothing came back in time: the X11 property tree is the
                 // best discovery aid, but say WHY it is all we have.
                 let mut fallback = walk_via_x11_properties(xid, query);
-                fallback.truncated = true;
-                fallback.truncation_reason = result.truncation_reason.take();
-                for reason in result.completeness.reasons {
-                    if !fallback.completeness.reasons.contains(&reason) {
-                        fallback.completeness.reasons.push(reason);
-                    }
-                }
+                retain_native_timeout_evidence(&mut fallback, result);
                 fallback.elapsed_ms = started.elapsed().as_millis();
                 fallback.degraded_reason = Some(match fallback.truncation_reason.as_deref() {
                     Some("app_unresponsive") => "atspi_app_unresponsive: the application is \
@@ -287,6 +281,16 @@ pub fn walk_tree_bounded_within(
     fallback.elapsed_ms = started.elapsed().as_millis();
     fallback.degraded_reason = native_failure.map(|error| format!("atspi_walk_failed: {error}"));
     fallback
+}
+
+fn retain_native_timeout_evidence(fallback: &mut AtspiTreeResult, result: AtspiTreeResult) {
+    fallback.truncated = true;
+    fallback.truncation_reason = result.truncation_reason;
+    for reason in result.completeness.reasons {
+        if !fallback.completeness.reasons.contains(&reason) {
+            fallback.completeness.reasons.push(reason);
+        }
+    }
 }
 
 /// Perform the first advertised action on element `idx` within pid's app tree.
@@ -984,6 +988,45 @@ mod budget_tests {
         assert!(!result.truncated);
         assert_eq!(result.nodes_visited, 0);
         assert!(result.bounds_complete);
+    }
+
+    #[test]
+    fn fallback_retains_native_timeout_and_untrusted_evidence() {
+        use crate::walk_completeness::Event;
+        use cua_driver_contract::{IncompleteReasonDetail, IncompleteReasonKind};
+        let mut native = AtspiTreeResult::from_walked(
+            walked(Some(native::Truncation {
+                reason: "timeout",
+                visited: 2,
+                pending: 17,
+            })),
+            None,
+        );
+        native.completeness.record(true, Event::TimeBudget, None);
+        let mut fallback = AtspiTreeResult::from_walked(walked(None), None);
+        fallback.trusted = false;
+        fallback.completeness = untrusted_completeness();
+        let legacy_pending = fallback.nodes_pending;
+        retain_native_timeout_evidence(&mut fallback, native);
+        assert!(!fallback.trusted);
+        assert!(fallback.truncated);
+        assert_eq!(fallback.truncation_reason.as_deref(), Some("timeout"));
+        assert_eq!(fallback.nodes_pending, legacy_pending);
+        assert!(fallback
+            .completeness
+            .reasons
+            .iter()
+            .any(|reason| reason.kind == IncompleteReasonKind::Budget
+                && reason.detail == IncompleteReasonDetail::TimeBudget));
+        assert!(fallback
+            .completeness
+            .reasons
+            .iter()
+            .any(
+                |reason| reason.kind == IncompleteReasonKind::ProviderFailure
+                    && reason.detail == IncompleteReasonDetail::UntrustedProvider
+            ));
+        assert!(!fallback.completeness.exhaustive);
     }
 }
 
