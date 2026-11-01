@@ -2,6 +2,8 @@
 
 use crate::goat::action_latency as latency;
 
+#[allow(dead_code)]
+mod actionability;
 mod bring_to_front;
 mod capture_binding;
 mod click;

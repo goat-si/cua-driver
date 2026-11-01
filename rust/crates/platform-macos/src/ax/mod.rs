@@ -16,6 +16,8 @@
 //! - Non-indexed (no actions, not interesting): `- AXRole = "value"`
 //! - 2-space indent per depth level
 
+#[allow(dead_code)]
+pub(crate) mod actionability;
 mod batch_attrs;
 pub mod bindings;
 pub(crate) mod content_attrs;
