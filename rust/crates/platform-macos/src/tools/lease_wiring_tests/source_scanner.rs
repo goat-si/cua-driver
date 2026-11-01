@@ -76,9 +76,17 @@ fn imports(tree: &UseTree, prefix: &mut Vec<String>, out: &mut BTreeMap<String, 
             prefix.pop();
         }
         UseTree::Name(n) => {
-            let name = n.ident.to_string();
+            let ident = n.ident.to_string();
             let mut path = prefix.clone();
-            path.push(name.clone());
+            let name = if ident == "self" {
+                match prefix.last() {
+                    Some(name) => name.clone(),
+                    None => return,
+                }
+            } else {
+                path.push(ident.clone());
+                ident
+            };
             out.entry(name).or_default().insert(path.join("::"));
         }
         UseTree::Rename(n) => {
@@ -99,10 +107,72 @@ fn imports(tree: &UseTree, prefix: &mut Vec<String>, out: &mut BTreeMap<String, 
     }
 }
 
+type Aliases = BTreeMap<String, BTreeSet<String>>;
+const LOCAL_BINDING: &str = "<local-binding>";
+
+fn bind_pattern(aliases: &mut Aliases, pattern: &syn::Pat) {
+    struct Bindings<'a>(&'a mut Aliases);
+    impl<'ast> Visit<'ast> for Bindings<'_> {
+        fn visit_pat_ident(&mut self, pattern: &'ast syn::PatIdent) {
+            self.0
+                .entry(pattern.ident.to_string())
+                .or_default()
+                .insert(LOCAL_BINDING.into());
+            visit::visit_pat_ident(self, pattern);
+        }
+    }
+    Bindings(aliases).visit_pat(pattern);
+}
+
+fn parameters(sig: &syn::Signature) -> Aliases {
+    let mut result = Aliases::new();
+    for arg in &sig.inputs {
+        if let syn::FnArg::Typed(arg) = arg {
+            bind_pattern(&mut result, &arg.pat);
+        }
+    }
+    result
+}
+
+fn condition_bindings(expr: &Expr) -> Aliases {
+    struct Conditions(Aliases);
+    impl<'ast> Visit<'ast> for Conditions {
+        fn visit_expr_let(&mut self, expr: &'ast syn::ExprLet) {
+            bind_pattern(&mut self.0, &expr.pat);
+            visit::visit_expr_let(self, expr);
+        }
+    }
+    let mut collector = Conditions(Aliases::new());
+    collector.visit_expr(expr);
+    collector.0
+}
+
+fn item_imports<'a>(items: impl IntoIterator<Item = &'a syn::Item>) -> Aliases {
+    let mut aliases = Aliases::new();
+    for item in items {
+        if let syn::Item::Use(item) = item {
+            if !test_only(&item.attrs) {
+                imports(&item.tree, &mut Vec::new(), &mut aliases);
+            }
+        }
+    }
+    aliases
+}
+
+fn has_glob(tree: &UseTree) -> bool {
+    match tree {
+        UseTree::Glob(_) => true,
+        UseTree::Path(path) => has_glob(&path.tree),
+        UseTree::Group(group) => group.items.iter().any(has_glob),
+        _ => false,
+    }
+}
+
 struct Scanner {
     file: String,
     item: Vec<String>,
-    aliases: BTreeMap<String, BTreeSet<String>>,
+    scopes: Vec<Aliases>,
+    module_scope: usize,
     counts: BTreeMap<(String, String, u64), usize>,
     sites: Vec<Site>,
 }
@@ -113,10 +183,9 @@ impl Scanner {
             match expr {
                 Expr::MethodCall(method) => builder(scanner, &method.receiver),
                 Expr::Call(call) => match &*call.func {
-                    Expr::Path(path) => scanner
-                        .resolve(&path.path)
-                        .iter()
-                        .any(|name| name == "std::thread::Builder::new"),
+                    Expr::Path(path) => {
+                        scanner.resolve(&path.path).as_slice() == ["std::thread::Builder::new"]
+                    }
                     _ => false,
                 },
                 _ => false,
@@ -127,10 +196,10 @@ impl Scanner {
         }
         match call.args.first() {
             Some(Expr::Call(wrap)) if wrap.args.len() == 1 => match &*wrap.func {
-                Expr::Path(path) => self
-                    .resolve(&path.path)
-                    .iter()
-                    .any(|name| name == "crate::input::worker_context::wrap_blocking"),
+                Expr::Path(path) => {
+                    self.resolve(&path.path).as_slice()
+                        == ["crate::input::worker_context::wrap_blocking"]
+                }
                 _ => false,
             },
             _ => false,
@@ -178,11 +247,32 @@ impl Scanner {
                 format!("{head}::{suffix}")
             }
         };
-        let mut result = vec![pieces.join("::")];
-        if let Some(aliases) = self.aliases.get(&pieces[0]) {
-            result.extend(aliases.iter().map(|a| join(a)));
+        let mut local = false;
+        let mut chosen = None;
+        for scope in self.scopes[self.module_scope..].iter().rev() {
+            if let Some(aliases) = scope.get(&pieces[0]) {
+                local |= aliases.contains(LOCAL_BINDING);
+                if chosen.is_none() {
+                    let imports: Vec<_> = aliases
+                        .iter()
+                        .filter(|name| name.as_str() != LOCAL_BINDING)
+                        .map(|name| join(name))
+                        .collect();
+                    if !imports.is_empty() {
+                        chosen = Some(imports);
+                    }
+                }
+            }
         }
-        result
+        match chosen {
+            Some(mut imports) => {
+                if local {
+                    imports.push(format!("{LOCAL_BINDING}::{}", pieces.join("::")));
+                }
+                imports
+            }
+            None => vec![pieces.join("::")],
+        }
     }
 }
 
@@ -239,6 +329,44 @@ impl<'ast> Visit<'ast> for Scanner {
             visit::visit_local(self, local);
         }
     }
+    fn visit_expr_closure(&mut self, closure: &'ast syn::ExprClosure) {
+        let mut bindings = Aliases::new();
+        for pattern in &closure.inputs {
+            bind_pattern(&mut bindings, pattern);
+        }
+        self.scopes.push(bindings);
+        visit::visit_expr_closure(self, closure);
+        self.scopes.pop();
+    }
+    fn visit_expr_for_loop(&mut self, loop_expr: &'ast syn::ExprForLoop) {
+        let mut bindings = Aliases::new();
+        bind_pattern(&mut bindings, &loop_expr.pat);
+        self.scopes.push(bindings);
+        visit::visit_expr_for_loop(self, loop_expr);
+        self.scopes.pop();
+    }
+    fn visit_arm(&mut self, arm: &'ast syn::Arm) {
+        let mut bindings = Aliases::new();
+        bind_pattern(&mut bindings, &arm.pat);
+        self.scopes.push(bindings);
+        visit::visit_arm(self, arm);
+        self.scopes.pop();
+    }
+    fn visit_expr_if(&mut self, expr: &'ast syn::ExprIf) {
+        self.visit_expr(&expr.cond);
+        self.scopes.push(condition_bindings(&expr.cond));
+        self.visit_block(&expr.then_branch);
+        self.scopes.pop();
+        if let Some((_, otherwise)) = &expr.else_branch {
+            self.visit_expr(otherwise);
+        }
+    }
+    fn visit_expr_while(&mut self, expr: &'ast syn::ExprWhile) {
+        self.visit_expr(&expr.cond);
+        self.scopes.push(condition_bindings(&expr.cond));
+        self.visit_block(&expr.body);
+        self.scopes.pop();
+    }
     fn visit_item(&mut self, i: &'ast syn::Item) {
         let attrs: &[Attribute] = match i {
             syn::Item::Const(x) => &x.attrs,
@@ -263,18 +391,49 @@ impl<'ast> Visit<'ast> for Scanner {
         }
     }
     fn visit_item_use(&mut self, i: &'ast syn::ItemUse) {
-        if !test_only(&i.attrs) {
-            imports(&i.tree, &mut Vec::new(), &mut self.aliases);
+        if !test_only(&i.attrs) && has_glob(&i.tree) {
+            self.record(
+                "glob-import".into(),
+                i.to_token_stream(),
+                i.use_token.span.start().line,
+            );
         }
     }
     fn visit_item_mod(&mut self, i: &'ast ItemMod) {
-        if !test_only(&i.attrs) && i.content.is_some() {
+        if let Some((_, items)) = &i.content {
+            if test_only(&i.attrs) {
+                return;
+            }
+            let previous = self.module_scope;
+            self.module_scope = self.scopes.len();
+            self.scopes.push(item_imports(items.iter()));
             self.with_item(i.ident.to_string(), |s| visit::visit_item_mod(s, i));
+            self.scopes.pop();
+            self.module_scope = previous;
         }
+    }
+    fn visit_block(&mut self, block: &'ast syn::Block) {
+        let items = block.stmts.iter().filter_map(|stmt| match stmt {
+            syn::Stmt::Item(item) => Some(item),
+            _ => None,
+        });
+        let mut aliases = item_imports(items);
+        for stmt in &block.stmts {
+            if let syn::Stmt::Local(local) = stmt {
+                if !test_only(&local.attrs) {
+                    bind_pattern(&mut aliases, &local.pat);
+                }
+            }
+        }
+        self.scopes.push(aliases);
+        visit::visit_block(self, block);
+        self.scopes.pop();
     }
     fn visit_item_fn(&mut self, i: &'ast syn::ItemFn) {
         if !test_only(&i.attrs) {
+            self.scopes.push(parameters(&i.sig));
             self.with_item(i.sig.ident.to_string(), |s| visit::visit_item_fn(s, i));
+            self.scopes.pop();
         }
     }
     fn visit_item_const(&mut self, i: &'ast syn::ItemConst) {
@@ -285,7 +444,9 @@ impl<'ast> Visit<'ast> for Scanner {
     }
     fn visit_impl_item_fn(&mut self, i: &'ast syn::ImplItemFn) {
         if !test_only(&i.attrs) {
+            self.scopes.push(parameters(&i.sig));
             self.with_item(i.sig.ident.to_string(), |s| visit::visit_impl_item_fn(s, i));
+            self.scopes.pop();
         }
     }
     fn visit_item_impl(&mut self, i: &'ast syn::ItemImpl) {
@@ -298,7 +459,17 @@ impl<'ast> Visit<'ast> for Scanner {
     fn visit_expr_call(&mut self, i: &'ast syn::ExprCall) {
         if let Expr::Path(p) = &*i.func {
             let names = self.resolve(&p.path);
-            if names.iter().any(|name| {
+            if names.len() > 1 {
+                self.record(
+                    format!(
+                        "ambiguous-alias: {} => {}",
+                        p.path.to_token_stream(),
+                        names.join(", ")
+                    ),
+                    i.to_token_stream(),
+                    p.path.segments.last().unwrap().ident.span().start().line,
+                );
+            } else if names.iter().any(|name| {
                 name.rsplit("::")
                     .next()
                     .is_some_and(|n| matches!(n, "spawn" | "spawn_blocking" | "spawn_local"))
@@ -309,9 +480,7 @@ impl<'ast> Visit<'ast> for Scanner {
                     .unwrap_or(&names[0])
                     .clone();
                 // Action latency helpers wrap blocking work themselves.
-                let wrapped = names
-                    .iter()
-                    .any(|n| n == "crate::goat::action_latency::spawn_blocking");
+                let wrapped = names.as_slice() == ["crate::goat::action_latency::spawn_blocking"];
                 if !wrapped {
                     self.record(
                         primitive,
@@ -330,7 +499,26 @@ impl<'ast> Visit<'ast> for Scanner {
     }
     fn visit_expr_path(&mut self, p: &'ast syn::ExprPath) {
         let names = self.resolve(&p.path);
-        if names.iter().any(|n| {
+        if names.len() > 1
+            && names.iter().any(|name| {
+                name.rsplit("::").next().is_some_and(|last| {
+                    matches!(
+                        last,
+                        "spawn" | "spawn_blocking" | "spawn_local" | "wrap_blocking"
+                    )
+                })
+            })
+        {
+            self.record(
+                format!(
+                    "ambiguous-alias: {} => {}",
+                    p.path.to_token_stream(),
+                    names.join(", ")
+                ),
+                p.to_token_stream(),
+                p.path.segments.last().unwrap().ident.span().start().line,
+            );
+        } else if names.iter().any(|n| {
             n.rsplit("::")
                 .next()
                 .is_some_and(|last| matches!(last, "spawn" | "spawn_blocking" | "spawn_local"))
@@ -383,15 +571,11 @@ pub(super) fn scan(file: &str, source: &str) -> Result<Vec<Site>, syn::Error> {
     let mut scanner = Scanner {
         file: file.into(),
         item: Vec::new(),
-        aliases: BTreeMap::new(),
+        scopes: vec![item_imports(syntax.items.iter())],
+        module_scope: 0,
         counts: BTreeMap::new(),
         sites: Vec::new(),
     };
-    // Collect imports throughout the file before classifying calls. Rust lets
-    // an import appear after its use, including in nested modules and blocks.
-    scanner.visit_file(&syntax);
-    scanner.sites.clear();
-    scanner.counts.clear();
     scanner.visit_file(&syntax);
     Ok(scanner.sites)
 }

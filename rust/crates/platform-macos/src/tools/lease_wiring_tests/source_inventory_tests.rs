@@ -42,6 +42,7 @@ fn rust_sources(root: &Path) -> io::Result<Vec<PathBuf>> {
 
 fn inventory() -> Vec<Site> {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    check_reviewed_glob_targets(&root);
     let files = rust_sources(&root).unwrap();
     let tests = test_only_files(&root, &files).unwrap();
     let mut sites = Vec::new();
@@ -56,6 +57,48 @@ fn inventory() -> Vec<Site> {
         );
     }
     sites
+}
+
+// A previously reviewed glob must not silently gain a worker re-export when
+// its target changes. The AX bindings and macro-generated contract Role have
+// a pinned source fingerprint; the remaining reviewed globs target enums.
+fn check_reviewed_glob_targets(root: &Path) {
+    for (path, expected) in [
+        (root.join("ax/bindings.rs"), 14739359237517523625_u64),
+        (
+            root.join("../../cua-driver-contract/src/vocabulary.rs"),
+            7383688377390068226_u64,
+        ),
+    ] {
+        let contents =
+            fs::read(&path).unwrap_or_else(|error| panic!("{}: {error}", path.display()));
+        let actual = contents.iter().fold(0xcbf29ce484222325_u64, |hash, byte| {
+            (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3)
+        });
+        assert_eq!(
+            actual,
+            expected,
+            "glob target changed; re-audit its exports: {}",
+            path.display()
+        );
+    }
+    for (file, name) in [
+        ("ax/vocabulary.rs", "Observation"),
+        ("input/gesture.rs", "Preparation"),
+        ("input/mouse.rs", "BackgroundDragEventKind"),
+        ("tools/actionability.rs", "Route"),
+    ] {
+        let syntax = syn::parse_file(&fs::read_to_string(root.join(file)).unwrap()).unwrap();
+        assert_eq!(
+            syntax
+                .items
+                .iter()
+                .filter(|item| matches!(item, syn::Item::Enum(item) if item.ident == name))
+                .count(),
+            1,
+            "reviewed glob target must remain an enum: {file}::{name}"
+        );
+    }
 }
 
 #[test]
@@ -257,6 +300,70 @@ fn scanner_handles_comments_strings_aliases_and_multiline_calls() {
         !collision.is_empty() && !shadow.is_empty(),
         "raw spawns hidden by alias collisions: modules={collision:#?}, local={shadow:#?}"
     );
+    assert!(collision
+        .iter()
+        .any(|site| site.item == "a::f" && site.primitive == "tokio::task::spawn_blocking"));
+    assert!(shadow
+        .iter()
+        .any(|site| site.item == "f" && site.primitive == "tokio::task::spawn_blocking"));
+
+    let restored = scan(
+        "scopes.rs",
+        r#"
+        use crate::goat::action_latency::spawn_blocking as run;
+        fn f() {
+            { use tokio::task::spawn_blocking as run; run(native_mutation); }
+            run(safe_action);
+        }
+    "#,
+    )
+    .unwrap();
+    assert_eq!(restored.len(), 1, "{restored:#?}");
+    assert_eq!(restored[0].primitive, "tokio::task::spawn_blocking");
+
+    let ambiguous = scan(
+        "ambiguous.rs",
+        r#"
+        use tokio::task::spawn_blocking as run;
+        use crate::goat::action_latency::spawn_blocking as run;
+        fn f() { run(native_mutation); }
+    "#,
+    )
+    .unwrap();
+    assert!(
+        ambiguous
+            .iter()
+            .any(|site| site.primitive.starts_with("ambiguous-alias:")),
+        "{ambiguous:#?}"
+    );
+
+    let shadowed_binding = scan(
+        "binding.rs",
+        r#"
+        use crate::goat::action_latency::spawn_blocking as run;
+        fn f(run: fn()) { run(); }
+        fn g() { let run = obtain(); run(); }
+        fn h() { let _ = |run| run(); }
+        fn i(value: Option<fn()>) { if let Some(run) = value { run(); } }
+    "#,
+    )
+    .unwrap();
+    assert!(
+        shadowed_binding.iter().any(|site| site.item == "f"),
+        "{shadowed_binding:#?}"
+    );
+    assert!(
+        shadowed_binding.iter().any(|site| site.item == "g"),
+        "{shadowed_binding:#?}"
+    );
+    assert!(
+        shadowed_binding.iter().any(|site| site.item == "h"),
+        "{shadowed_binding:#?}"
+    );
+    assert!(
+        shadowed_binding.iter().any(|site| site.item == "i"),
+        "{shadowed_binding:#?}"
+    );
 
     let ambiguous_builder = scan("builder_alias.rs", r#"
         mod a {
@@ -270,7 +377,23 @@ fn scanner_handles_comments_strings_aliases_and_multiline_calls() {
         "ambiguous builder was trusted"
     );
 
-    let glob = scan("glob.rs", "use hidden::*; fn f() { run(native_mutation); }").unwrap();
+    let ambiguous_wrapper = scan(
+        "wrapper_alias.rs",
+        r#"
+        use crate::input::worker_context::wrap_blocking as wrap;
+        use other::wrap_blocking as wrap;
+        fn f() { std::thread::Builder::new().spawn(wrap(work)); }
+    "#,
+    )
+    .unwrap();
+    assert!(
+        ambiguous_wrapper
+            .iter()
+            .any(|site| site.primitive == ".spawn"),
+        "{ambiguous_wrapper:#?}"
+    );
+
+    let glob = scan("glob.rs", "use hidden::*; use crate::goat::action_latency::spawn_blocking as run; fn f() { run(native_mutation); }").unwrap();
     assert!(!glob.is_empty(), "glob can hide a worker alias");
 }
 
