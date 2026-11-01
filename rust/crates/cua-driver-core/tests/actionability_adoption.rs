@@ -325,6 +325,118 @@ fn target_window_hit_does_not_prove_foreground_delivery() {
 }
 
 #[test]
+fn scroll_wheel_is_physical_and_uses_delivery_scoped_hits() {
+    let r = Intent::ScrollWheel.requirements();
+    assert_eq!(
+        (
+            r.visible,
+            r.stable,
+            r.enabled,
+            r.editable,
+            r.receives_events
+        ),
+        (true, true, false, false, true)
+    );
+    assert!(supported_affordances(Intent::ScrollWheel).is_empty());
+    let mut f = facts();
+    f.affordances = Evidence::Unknown("no action list".into());
+    assert_eq!(
+        evaluate(Intent::ScrollWheel, &f, Policy::background_window()).verdict,
+        Verdict::Pass
+    );
+    let bounds = match f.bounds {
+        Evidence::Known(r) => r,
+        _ => unreachable!(),
+    };
+    f.receives_events = Evidence::Known(collect_hits(bounds, |_| Hit::ReachesTarget));
+    assert!(matches!(
+        evaluate(Intent::ScrollWheel, &f, Policy::background_window()).verdict,
+        Verdict::Transient { unknown: true, .. }
+    ));
+    assert_eq!(
+        evaluate(Intent::ScrollWheel, &f, Policy::headed()).verdict,
+        Verdict::Pass
+    );
+    f.receives_events = Evidence::Known(collect_window_hits(bounds, |_| Hit::ReachesTarget));
+    assert!(matches!(
+        evaluate(Intent::ScrollWheel, &f, Policy::headed()).verdict,
+        Verdict::Transient { unknown: true, .. }
+    ));
+    f.receives_events = Evidence::Known(collect_window_hits(bounds, |_| {
+        Hit::Occluded(Occluder {
+            role: None,
+            name: None,
+            bounds: None,
+        })
+    }));
+    assert!(matches!(
+        evaluate(Intent::ScrollWheel, &f, Policy::background_window()).verdict,
+        Verdict::Transient { unknown: false, .. }
+    ));
+    for field in ["visible", "stable", "hit", "bounds", "enabled"] {
+        let mut f = facts();
+        match field {
+            "visible" => f.visible = Evidence::Unknown(field.into()),
+            "stable" => f.stable = Evidence::Unknown(field.into()),
+            "hit" => f.receives_events = Evidence::Unknown(field.into()),
+            "bounds" => f.bounds = Evidence::Unknown(field.into()),
+            "enabled" => f.enabled = Evidence::Unknown(field.into()),
+            _ => unreachable!(),
+        }
+        assert!(
+            matches!(
+                evaluate(Intent::ScrollWheel, &f, Policy::background_window()).verdict,
+                Verdict::Transient { unknown: true, .. }
+            ),
+            "{field}"
+        );
+    }
+    for intent in [Intent::Hover, Intent::ScrollWheel] {
+        assert!(
+            matches!(
+                evaluate(intent, &facts(), Policy::headless()).verdict,
+                Verdict::Terminal {
+                    code: "policy_denied",
+                    ..
+                }
+            ),
+            "{intent:?}"
+        );
+    }
+    let mut f = facts();
+    f.affordances = Evidence::Known(vec![Affordance::Press, Affordance::Scroll]);
+    f.bounds = Evidence::Absent;
+    f.stable = Evidence::Unknown("stability".into());
+    f.receives_events = Evidence::Unknown("hit".into());
+    let report = evaluate(Intent::ScrollWheel, &f, Policy::headless());
+    for name in ["geometry", "stable", "receives_events"] {
+        assert!(
+            report.checks.iter().any(|check| check.name == name
+                && matches!(check.status, CheckStatus::Transient { unknown: true })),
+            "{name}"
+        );
+    }
+    assert!(matches!(
+        evaluate(Intent::ScrollWheel, &facts(), Policy::focus_fallback()).verdict,
+        Verdict::Terminal {
+            code: "policy_denied",
+            ..
+        }
+    ));
+    assert_eq!(
+        serde_json::to_string(&Intent::ScrollWheel).unwrap(),
+        "\"scroll_wheel\""
+    );
+    assert!(matches!(
+        evaluate(Intent::Scroll, &facts(), Policy::background_window()).verdict,
+        Verdict::Terminal {
+            code: "policy_denied",
+            ..
+        }
+    ));
+}
+
+#[test]
 fn coordinate_only_is_not_evaluated() {
     assert_eq!(coordinate_only(), CoordinateOutcome::NotEvaluated);
 }

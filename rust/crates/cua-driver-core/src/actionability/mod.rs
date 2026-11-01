@@ -14,7 +14,13 @@
 //! input, use `Policy::background_window()` and collect hits with
 //! `collect_window_hits` against the target window. In that policy `visible`,
 //! `offscreen` and bounds must describe visibility within that same window, not
-//! the frontmost desktop. Coordinate-only input is outside this battery: call
+//! the frontmost desktop, and enabled evidence is also required. Use
+//! `ScrollWheel` for physical wheel input on macOS,
+//! Windows, and Linux; the wheel can bubble to a scrollable ancestor, so no
+//! scroll affordance is required. Use `Scroll` for semantic scroll actions.
+//! Foreground wheel delivery uses `Policy::headed()` and `collect_hits`;
+//! headless policy refuses physical wheel delivery. Coordinate-only input is
+//! outside this battery: call
 //! `coordinate_only()` and do not treat its result as a pass. Convert a terminal
 //! report to a tool result with `ActionabilityReport::refusal_result()` and pass
 //! the result through unchanged, including its typed disposition.

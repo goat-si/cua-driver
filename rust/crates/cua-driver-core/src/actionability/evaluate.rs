@@ -224,7 +224,7 @@ pub fn evaluate(intent: Intent<'_>, facts: &ElementFacts, policy: Policy) -> Act
             Evidence::Absent => Some(false),
             Evidence::Unknown(_) => None,
         }
-    } else if matches!(intent, Hover | Drag | ScrollTo) {
+    } else if matches!(intent, Hover | Drag | ScrollWheel | ScrollTo) {
         Some(true)
     } else if matches!(intent, Click | RightClick) {
         if (!policy.is_headed() && direct) || physical_allowed {
@@ -276,7 +276,10 @@ pub fn evaluate(intent: Intent<'_>, facts: &ElementFacts, policy: Policy) -> Act
             "affordances unavailable",
         ),
     }
-    if matches!(intent, Hover | Drag) && !policy.allow_cursor_move && !policy.background_window {
+    if matches!(intent, Hover | Drag | ScrollWheel)
+        && !policy.allow_cursor_move
+        && !policy.background_window
+    {
         push(
             &mut checks,
             "policy",

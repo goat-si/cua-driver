@@ -18,7 +18,10 @@ pub enum Intent<'a> {
     Uncheck,
     Expand,
     Collapse,
+    /// Semantic scroll action exposed by the target.
     Scroll,
+    /// Physical wheel delivery; it may bubble to a scrollable ancestor.
+    ScrollWheel,
     ScrollTo,
     Focus,
     PressKey,
@@ -26,7 +29,9 @@ pub enum Intent<'a> {
     KeyUp,
     Open,
     SelectText,
-    PerformAction { name: &'a str },
+    PerformAction {
+        name: &'a str,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -43,7 +48,7 @@ impl Intent<'_> {
         use Intent::*;
         let (visible, stable, enabled, editable, receives_events) = match self {
             Click | DoubleClick | TripleClick | RightClick => (true, true, true, false, true),
-            Hover | Drag => (true, true, false, false, true),
+            Hover | Drag | ScrollWheel => (true, true, false, false, true),
             SetValue | TypeText | Clear => (true, false, true, true, false),
             Select | Open | SelectText | PerformAction { .. } => (true, false, true, false, false),
             Toggle | Check | Uncheck | Expand | Collapse | Scroll => {
