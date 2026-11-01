@@ -453,14 +453,31 @@ fn mark_boundaries(md: &str, structured: &Value) -> String {
         ) else {
             continue;
         };
-        let marker = match boundary
+        let mut marker = match boundary
             .get("children_skipped")
             .and_then(|v| v.get("known"))
             .and_then(Value::as_u64)
         {
-            Some(n) => format!("[+{n} more]"),
-            None => "[more: unknown]".to_owned(),
+            Some(n) => format!("[+{n} more"),
+            None => "[more: unknown".to_owned(),
         };
+        let mut reasons: Vec<&str> = boundary
+            .get("reasons")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|reason| reason.get("detail").and_then(Value::as_str))
+            .collect();
+        reasons.sort_unstable();
+        reasons.dedup();
+        if !reasons.is_empty() {
+            marker.push_str(": ");
+            marker.push_str(&reasons.join(", "));
+        }
+        if boundary.get("descendants_omitted").and_then(Value::as_bool) == Some(true) {
+            marker.push_str("; descendants omitted");
+        }
+        marker.push(']');
         markers.insert(index, marker);
     }
     md.split('\n')
@@ -1416,6 +1433,58 @@ mod tests {
     }
 
     #[test]
+    fn u20_reasons_only_boundary_change_is_a_changed_row() {
+        let (mut content, mut first) = payload("s0000ac01", OLD);
+        first["elements"][0]["boundary"] = json!({"reasons":[{"kind":"budget","detail":"node_budget"}],"children_skipped":{"known":3}});
+        apply(&opts(json!({})), &ctx(88003), &mut content, &mut first);
+        let (mut content, mut second) = payload("s0000ac02", OLD);
+        second["elements"][0]["boundary"] = json!({"reasons":[{"kind":"budget","detail":"time_budget"}],"children_skipped":{"known":3}});
+        apply(
+            &opts(json!({"since":"s0000ac01"})),
+            &ctx(88003),
+            &mut content,
+            &mut second,
+        );
+        assert_eq!(second["since_status"], "diff");
+        assert!(second["tree_diff"].as_str().unwrap().contains("~ [1]"));
+        assert!(second["tree_diff"]
+            .as_str()
+            .unwrap()
+            .contains("[+3 more: time_budget]"));
+    }
+
+    #[test]
+    fn u20_descendants_only_boundary_change_is_a_changed_row() {
+        let (mut content, mut first) = payload("s0000ad01", OLD);
+        first["elements"][0]["boundary"] = json!({"reasons":[{"kind":"budget","detail":"node_budget"}],"children_skipped":"unknown"});
+        apply(&opts(json!({})), &ctx(88004), &mut content, &mut first);
+        let (mut content, mut second) = payload("s0000ad02", OLD);
+        second["elements"][0]["boundary"] = json!({"reasons":[{"kind":"budget","detail":"node_budget"}],"children_skipped":"unknown","descendants_omitted":true});
+        apply(
+            &opts(json!({"since":"s0000ad01"})),
+            &ctx(88004),
+            &mut content,
+            &mut second,
+        );
+        assert_eq!(second["since_status"], "diff");
+        assert!(second["tree_diff"]
+            .as_str()
+            .unwrap()
+            .contains("[more: unknown: node_budget; descendants omitted]"));
+    }
+
+    #[test]
+    fn u20_boundary_reasons_are_sorted_and_deduplicated() {
+        let boundary = json!({"elements":[{"element_index":1,"boundary":{
+        "children_skipped":{"known":2},"reasons":[
+            {"kind":"budget","detail":"time_budget"},
+            {"kind":"budget","detail":"node_budget"},
+            {"kind":"budget","detail":"time_budget"}
+        ]}}]});
+        assert!(mark_boundaries(OLD, &boundary).contains("[+2 more: node_budget, time_budget]"));
+    }
+
+    #[test]
     fn boundary_markers_and_completeness_survive_diff_and_no_change() {
         let window = 88002;
         let (mut content, mut first) = payload("s0000ab01", OLD);
@@ -1427,8 +1496,8 @@ mod tests {
         assert!(first["tree_markdown"]
             .as_str()
             .unwrap()
-            .contains("[+3 more]"));
-        assert!(text_of(&content).contains("[more: unknown]"));
+            .contains("[+3 more: node_budget]"));
+        assert!(text_of(&content).contains("[more: unknown: not_asserted]"));
         let (mut content, mut second) = payload("s0000ab02", OLD);
         second["observation_complete"] = json!(false);
         second["observation_incomplete_reasons"] =
