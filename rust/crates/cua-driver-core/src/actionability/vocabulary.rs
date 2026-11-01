@@ -43,7 +43,7 @@ pub fn supported_affordances(intent: Intent<'_>) -> &'static [Affordance] {
         Intent::Hover => &[Hover],
         Intent::Drag => &[Drag],
         Intent::Open => &[Open],
-        Intent::SelectText | Intent::PerformAction { .. } => &[],
+        Intent::SelectText | Intent::PerformAction { .. } | Intent::ScrollWheel => &[],
     }
 }
 

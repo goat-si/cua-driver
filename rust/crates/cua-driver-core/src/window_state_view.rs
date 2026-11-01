@@ -1626,7 +1626,7 @@ mod tests {
         assert!(ViewOptions::from_args(&json!({"tree_format": "xml"})).is_err());
         assert!(ViewOptions::from_args(&json!({"since": 3})).is_err());
         // full_output is a full read, never a diff.
-        assert!(opts(json!({"full_output": true, "since": "s00000001"}))
+        assert!(opts(json!({"full_output": true, "since": "s00000003"}))
             .since
             .is_none());
     }
@@ -2353,7 +2353,7 @@ mod tests {
     /// it names (#130); another window's read still falls back.
     #[test]
     fn since_and_row_lookups_accept_a_window_basis_id() {
-        let window = 7005;
+        let window = 7023;
         let (mut c1, mut s1) = payload("s000000c1", OLD);
         apply(&opts(json!({})), &ctx(window), &mut c1, &mut s1);
 
@@ -2379,7 +2379,7 @@ mod tests {
         remember_for_test(
             "s7e570002",
             4,
-            5,
+            6,
             r#"- [27] AXMenuBar
   - [700] AXMenuBarItem "File"
     - [701] AXMenu
@@ -2396,7 +2396,7 @@ mod tests {
 
     #[test]
     fn since_returns_diff_then_falls_back() {
-        let window = 7004;
+        let window = 7021;
         let (mut c1, mut s1) = payload("s000000b1", OLD);
         apply(&opts(json!({})), &ctx(window), &mut c1, &mut s1);
 
@@ -2514,12 +2514,12 @@ mod tests {
     #[test]
     fn a_rewritten_tree_falls_back_to_full() {
         let window = 7005;
-        let (mut c1, mut s1) = payload("s000000c1", OLD);
+        let (mut c1, mut s1) = payload("s000000c4", OLD);
         apply(&opts(json!({})), &ctx(window), &mut c1, &mut s1);
         let other = "- [0] AXWindow \"Other\"\n  - [1] AXList \"x\"\n  - [2] AXButton \"Q\"\n  - [3] AXButton \"R\"\n  - [4] AXButton \"S\"";
-        let (mut c2, mut s2) = payload("s000000c2", other);
+        let (mut c2, mut s2) = payload("s000000c5", other);
         apply(
-            &opts(json!({"since": "s000000c1"})),
+            &opts(json!({"since": "s000000c4"})),
             &ctx(window),
             &mut c2,
             &mut s2,
@@ -2564,11 +2564,11 @@ mod tests {
 
     #[test]
     fn degraded_snapshots_keep_background_input() {
-        let (mut content, mut s) = payload("s000000e1", OLD);
+        let (mut content, mut s) = payload("s000000e5", OLD);
         s["degraded"] = json!(true);
         apply(&opts(json!({})), &ctx(7007), &mut content, &mut s);
         assert!(s.get("background_input").is_some());
-        let (mut content, mut s) = payload("s000000e2", OLD);
+        let (mut content, mut s) = payload("s000000e6", OLD);
         apply(
             &opts(json!({"verbose": true})),
             &ctx(7008),
