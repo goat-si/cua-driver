@@ -263,6 +263,150 @@ fn deferred_budget_refusal_keeps_typed_reason() {
 }
 
 #[test]
+fn unknown_visibility_falls_back_to_full_walk() {
+    use crate::ax::tree_source::ReadFailure;
+    let content =
+        "AXTitle,AXPlaceholderValue,AXDescription,AXIdentifier,AXHelp,AXSubrole,AXRoleDescription";
+    let control = "AXEnabled,AXPosition,AXSize,AXValueDescription,AXMinValue,AXMaxValue,AXSelected";
+    let source = Fake::new(
+        &[(1, 1, 1, &[2]), (2, 2, 2, &[])],
+        vec![
+            step("set 1 AXRows", Reply::Set(Read::Known(vec![2]))),
+            step(
+                "set 1 AXVisibleRows",
+                Reply::Set(Read::Unknown(ReadFailure::WrongType)),
+            ),
+            step(
+                "set 1 AXVisibleChildren",
+                Reply::Set(Read::Unknown(ReadFailure::WrongType)),
+            ),
+            step("contains 2 [2]", Reply::Unit),
+            step("timeout 2", Reply::Unit),
+            step("text 2 AXRole", Reply::Text(Read::Known("AXRow".into()))),
+            step(
+                &format!("batch 2 {content}"),
+                Reply::Batch(Ok(Batch(vec![Slot::Text(AttrStatus::Absent); 7]))),
+            ),
+            step("value 2", Reply::Value(Ok(None))),
+            step(
+                "actions 2",
+                Reply::Actions(Read::Known(vec!["AXPress".into()])),
+            ),
+            step(
+                &format!("batch 2 {control}"),
+                Reply::Batch(Ok(Batch(vec![
+                    Slot::Bool(None),
+                    Slot::Point(None),
+                    Slot::Size(None),
+                    Slot::Text(AttrStatus::Absent),
+                    Slot::Number(None),
+                    Slot::Number(None),
+                    Slot::Bool(None),
+                ]))),
+            ),
+            step("snapshot 2", Reply::Unit),
+            step("children 2", Reply::Children(Read::Absent)),
+        ],
+    );
+    let parent = source.handle(1);
+    let child = source.handle(2);
+    let scope = crate::ax::evidence::EvidenceScope::start();
+    let mut budget = WalkBudget::nodes_only(10);
+    let plans = dense_rows::plan_collection_children(
+        &source,
+        &parent,
+        &parent,
+        "AXTable",
+        std::slice::from_ref(&child),
+        &budget,
+    );
+    assert_eq!(plans, [dense_rows::ChildPlan::Defer { visible: true }]);
+    let row = dense_rows::DeferredRow {
+        anchor: 0,
+        seq: 0,
+        position: 0,
+        collection: 1,
+        element: child,
+        depth: 0,
+        parent_index: None,
+        parent_role: "AXTable".into(),
+        label_path: LabelPath::Inactive,
+        in_web_content: false,
+        visible: true,
+        walked: None,
+    };
+    let mut counter = 0;
+    let (lines, nodes, offscreen) = finish_deferred(
+        &source,
+        vec![],
+        vec![],
+        vec![row],
+        None,
+        &mut counter,
+        &mut budget,
+        &mut false,
+        10,
+        true,
+        vec![],
+    );
+    assert_eq!((lines.len(), nodes.len(), offscreen.len()), (1, 1, 0));
+    record_attribute_failures(&mut budget);
+    let mut output = json!({});
+    budget.outcome().apply(&mut output);
+    assert_eq!(
+        output["observation_incomplete_reasons"],
+        json!([{"kind":"unknown", "detail":"not_asserted"}])
+    );
+    let _ = scope.finish(());
+    drop(parent);
+    source.assert_consumed();
+    source.assert_lifetimes(&[(2, 1)]);
+}
+
+#[test]
+fn nested_walks_do_not_leak_completeness_state() {
+    let nested = || {
+        let source = Fake::new(
+            &[(2, 2, 2, &[])],
+            vec![
+                step("timeout 2", Reply::Unit),
+                step(
+                    "text 2 AXRole",
+                    Reply::Text(Read::Known("AXWebArea".into())),
+                ),
+            ],
+        );
+        let root = source.handle(2);
+        let inner =
+            run_fake_observed(&source, &root, None, 10, WalkBudget::nodes_only(10), false).legacy;
+        drop(root);
+        source.assert_consumed();
+        source.assert_lifetimes(&[]);
+        assert!(has_reason(&inner, "policy_omission", "web_content"));
+    };
+    let source = Fake::new(&[(1, 1, 1, &[])], vec![
+        step("timeout 1", Reply::Nested(Box::new(nested))),
+        step("timeout 1", Reply::Unit),
+        step("text 1 AXRole", Reply::Text(Read::Known("AXWindow".into()))),
+        step("batch 1 AXTitle,AXPlaceholderValue,AXDescription,AXIdentifier,AXHelp,AXSubrole,AXRoleDescription", Reply::Batch(Ok(Batch(vec![Slot::Text(AttrStatus::Absent); 7])))),
+        step("value 1", Reply::Value(Ok(None))),
+        step("actions 1", Reply::Actions(Read::Known(vec![]))),
+        step("batch 1 AXPosition,AXSize", Reply::Batch(Ok(Batch(vec![Slot::Point(None), Slot::Size(None)])))),
+        step("children 1", Reply::Children(Read::Absent)),
+    ]);
+    let root = source.handle(1);
+    let outer =
+        run_fake_observed(&source, &root, None, 10, WalkBudget::nodes_only(10), true).legacy;
+    drop(root);
+    source.assert_consumed();
+    source.assert_lifetimes(&[]);
+    assert_eq!(
+        reasons(&outer),
+        json!([{"kind":"unknown", "detail":"not_asserted"}])
+    );
+}
+
+#[test]
 fn inactive_tab_compaction_reports_inactive_tab() {
     let tree = super::walker_seam_tests::tab_compaction_fixture();
     assert!(has_reason(&tree, "policy_omission", "inactive_tab"));
