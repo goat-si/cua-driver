@@ -485,7 +485,15 @@ pub fn set_value(pid: u32, idx: usize, value: &str) -> Result<()> {
 /// names through the element's `Selection`. `None` when it lists no
 /// selectable options (the caller keeps its no-value-route error).
 fn select_option(object_ref: &native::ObjectRef, value: &str) -> Option<Result<()>> {
-    match native::select_option_ref(object_ref, value) {
+    select_option_gated(object_ref, value, &native::TextWriteDispatch::default())
+}
+
+fn select_option_gated(
+    object_ref: &native::ObjectRef,
+    value: &str,
+    dispatch: &native::TextWriteDispatch,
+) -> Option<Result<()>> {
+    match native::select_option_ref_gated(object_ref, value, dispatch) {
         Ok(native::OptionPick::Picked { .. }) => Some(Ok(())),
         Ok(native::OptionPick::NoMatch { options }) => Some(Err(no_such_option(value, &options))),
         Ok(native::OptionPick::Unavailable) => None,
@@ -632,9 +640,7 @@ pub fn set_value_token_with_dispatch(
     token.act(
         |object| match native::set_value_ref_with_dispatch(object, value, dispatch.clone()) {
             Err(error) if native::is_no_value_route(&error) => {
-                native::gated_route(&dispatch, || {
-                    select_option(object, value).unwrap_or(Err(error))
-                })
+                select_option_gated(object, value, &dispatch).unwrap_or(Err(error))
             }
             done => done,
         },
@@ -644,7 +650,17 @@ pub fn set_value_token_with_dispatch(
 /// The open popup of the token's combo box: activate the option `value`
 /// names. `Ok(None)` when the popup lists no options yet.
 pub fn activate_option_token(token: &TokenElement, value: &str) -> Result<Option<String>> {
-    match native::activate_option_ref(token.object()?, value)? {
+    activate_option_token_gated(token, value, &native::TextWriteDispatch::default())
+}
+
+/// [`activate_option_token`] entering `dispatch` only right before the
+/// option's action.
+pub fn activate_option_token_gated(
+    token: &TokenElement,
+    value: &str,
+    dispatch: &native::TextWriteDispatch,
+) -> Result<Option<String>> {
+    match native::activate_option_ref_gated(token.object()?, value, dispatch)? {
         native::OptionPick::Picked { name } => Ok(Some(name)),
         native::OptionPick::NoMatch { options } => Err(no_such_option(value, &options)),
         native::OptionPick::Unavailable => Ok(None),

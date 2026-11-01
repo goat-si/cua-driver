@@ -6863,6 +6863,17 @@ async fn list_options(conn: &AccessibilityConnection, oref: &RawObjectRef) -> Ve
 /// sets the active row and emits its `changed` signal, focus-free and
 /// without opening the popup.
 pub fn select_option_ref(object_ref: &ObjectRef, value: &str) -> Result<OptionPick> {
+    select_option_ref_gated(object_ref, value, &TextWriteDispatch::default())
+}
+
+/// [`select_option_ref`] that enters `dispatch` only right before
+/// `SelectChild`: discovery is reads, so a caller that timed out during it
+/// gets no selection afterwards.
+pub fn select_option_ref_gated(
+    object_ref: &ObjectRef,
+    value: &str,
+    dispatch: &TextWriteDispatch,
+) -> Result<OptionPick> {
     bounded_for(
         REF_ACTION_BUDGET,
         async {
@@ -6892,18 +6903,8 @@ pub fn select_option_ref(object_ref: &ObjectRef, value: &str) -> Result<OptionPi
                 .selection()
                 .await
                 .map_err(|e| anyhow!("Selection unavailable: {e}"))?;
-            match call(selection.select_child(option.index)).await {
-                Some(Ok(true)) => Ok(OptionPick::Picked {
-                    name: option.name.clone(),
-                }),
-                Some(Ok(false)) => Err(anyhow!(
-                    "Selection.SelectChild({}) was refused for option {:?}",
-                    option.index,
-                    option.name
-                )),
-                Some(Err(e)) => Err(anyhow!("Selection.SelectChild failed: {e}")),
-                None => Err(anyhow!("Selection.SelectChild did not answer in time")),
-            }
+            let reply = gated_mutator(dispatch, call(selection.select_child(option.index))).await?;
+            option_mutation_result(reply, value.len(), &option.name, "Selection.SelectChild")
         },
         || Err(anyhow!("select option (cached element) timed out")),
     )
@@ -6913,6 +6914,16 @@ pub fn select_option_ref(object_ref: &ObjectRef, value: &str) -> Result<OptionPi
 /// combo box (its items exist and act only while it is open): the option's
 /// own click/activate action selects it and closes the popup.
 pub fn activate_option_ref(object_ref: &ObjectRef, value: &str) -> Result<OptionPick> {
+    activate_option_ref_gated(object_ref, value, &TextWriteDispatch::default())
+}
+
+/// [`activate_option_ref`] that enters `dispatch` only right before the
+/// option's `DoAction`.
+pub fn activate_option_ref_gated(
+    object_ref: &ObjectRef,
+    value: &str,
+    dispatch: &TextWriteDispatch,
+) -> Result<OptionPick> {
     bounded_for(
         REF_ACTION_BUDGET,
         async {
@@ -6947,17 +6958,110 @@ pub fn activate_option_ref(object_ref: &ObjectRef, value: &str) -> Result<Option
             let chosen = activation_index(&role, &actions).ok_or_else(|| {
                 anyhow!("option {:?} advertises no activation action", option.name)
             })?;
-            match call(ap.do_action(chosen as i32)).await {
-                Some(Ok(true)) => Ok(OptionPick::Picked {
-                    name: option.name.clone(),
-                }),
-                Some(Ok(false)) => Err(anyhow!("option {:?} refused its action", option.name)),
-                Some(Err(e)) => Err(anyhow!("option action failed: {e}")),
-                None => Err(anyhow!("option action did not answer in time")),
-            }
+            let reply = gated_mutator(dispatch, call(ap.do_action(chosen as i32))).await?;
+            option_mutation_result(reply, value.len(), &option.name, "option DoAction")
         },
         || Err(anyhow!("activate option (cached element) timed out")),
     )
+}
+
+/// Enter `dispatch` immediately before polling a mutator; a closed gate (the
+/// caller already returned) sends nothing. Dropping the future mid-call
+/// leaves the gate entered, so a later timeout reports possible execution.
+async fn gated_mutator<T>(
+    dispatch: &TextWriteDispatch,
+    mutator: impl std::future::Future<Output = T>,
+) -> Result<T> {
+    dispatch
+        .gate
+        .enter_mutator()
+        .map_err(|_| WriteDispatchClosed)?;
+    dispatch.ledger.record_sent();
+    let reply = mutator.await;
+    dispatch.gate.finish_mutator();
+    Ok(reply)
+}
+
+/// A selection/activation reply: `true` picked; `false` or an unsupported
+/// method changed nothing; anything else after sending may have run.
+fn option_mutation_result(
+    reply: Option<zbus::Result<bool>>,
+    bytes: usize,
+    option: &str,
+    method: &str,
+) -> Result<OptionPick> {
+    use crate::text_write_policy::{CallClass, Step, WriteStep};
+    match reply {
+        Some(Ok(true)) => Ok(OptionPick::Picked {
+            name: option.to_owned(),
+        }),
+        Some(Ok(false)) => Err(anyhow!("{method} was refused for option {option:?}")),
+        Some(Err(error)) if classify_mutator_error(&error) == CallClass::KnownUnsupported => {
+            Err(anyhow!("{method} is not supported for option {option:?}"))
+        }
+        Some(Err(_)) | None => Err(WriteUncertain {
+            step: WriteStep {
+                step: Step::SetValue,
+                bytes,
+                units: None,
+            },
+        }
+        .into()),
+    }
+}
+
+#[cfg(test)]
+mod option_mutation_tests {
+    use super::*;
+
+    #[test]
+    fn closed_gate_sends_no_option_mutator() {
+        let dispatch = TextWriteDispatch::default();
+        assert!(text_write_timeout_error(&dispatch, 3).is_none());
+        let sent = std::cell::Cell::new(false);
+        let error = runtime()
+            .block_on(gated_mutator(&dispatch, async {
+                sent.set(true);
+            }))
+            .unwrap_err();
+        assert!(
+            !sent.get(),
+            "mutator polled after the caller closed the gate"
+        );
+        assert!(error.downcast_ref::<WriteDispatchClosed>().is_some());
+    }
+
+    #[test]
+    fn open_gate_records_the_dispatch() {
+        let dispatch = TextWriteDispatch::default();
+        runtime()
+            .block_on(gated_mutator(&dispatch, async {}))
+            .unwrap();
+        assert!(dispatch.ledger.sent());
+        // A later caller timeout reports possible execution.
+        assert!(text_write_timeout_error(&dispatch, 3).is_some());
+    }
+
+    #[test]
+    fn option_replies_after_send_are_classified() {
+        assert!(matches!(
+            option_mutation_result(Some(Ok(true)), 3, "Large", "m"),
+            Ok(OptionPick::Picked { .. })
+        ));
+        for unchanged in [
+            Some(Ok(false)),
+            Some(Err(zbus::Error::FDO(Box::new(
+                zbus::fdo::Error::UnknownMethod(String::new()),
+            )))),
+        ] {
+            let error = option_mutation_result(unchanged, 3, "Large", "m").unwrap_err();
+            assert!(error.downcast_ref::<WriteUncertain>().is_none());
+        }
+        for uncertain in [None, Some(Err(zbus::Error::InvalidReply))] {
+            let error = option_mutation_result(uncertain, 3, "Large", "m").unwrap_err();
+            assert!(error.downcast_ref::<WriteUncertain>().is_some());
+        }
+    }
 }
 
 /// Whether a snapshot-cached combo box's popup is open: any of its options

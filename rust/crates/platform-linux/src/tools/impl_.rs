@@ -10367,7 +10367,8 @@ fn pick_from_popup(
     let pick = || -> anyhow::Result<String> {
         let deadline = std::time::Instant::now() + POPUP_OPTIONS_WAIT;
         loop {
-            match gated_route(gate, || crate::atspi::activate_option_token(token, value)) {
+            // The native call enters the gate only right before DoAction.
+            match crate::atspi::activate_option_token_gated(token, value, gate) {
                 Ok(Some(name)) => return Ok(name),
                 Ok(None) if std::time::Instant::now() < deadline => {
                     std::thread::sleep(std::time::Duration::from_millis(100));
