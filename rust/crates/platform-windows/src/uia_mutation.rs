@@ -290,6 +290,14 @@ pub(crate) fn refusal_text(kind: RefusalKind, hresult: i32) -> String {
         hresult as u32
     )
 }
+pub(crate) fn uncertain_text_without_hresult(kind: UncertainKind) -> String {
+    let text = match kind {
+        UncertainKind::Timeout => "the UI Automation call timed out",
+        _ => "the worker ended without a result",
+    };
+    format!("{text}; the shortcut may have been delivered")
+}
+
 pub(crate) fn uncertain_text(kind: UncertainKind, hresult: i32) -> String {
     format!("HRESULT 0x{:08X} ({kind:?}); the UIA write may have landed. Read the window state before acting again.", hresult as u32)
 }

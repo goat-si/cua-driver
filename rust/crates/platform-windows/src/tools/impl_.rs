@@ -5030,6 +5030,31 @@ fn wait_for_cached_element_keyboard_focus(
 /// bounded fallback. Both routes require `CurrentHasKeyboardFocus` read-back
 /// before any keyboard input is allowed to leave the driver.
 #[derive(Debug)]
+fn keyboard_dispatch_error(e: anyhow::Error) -> ToolResult {
+    let dispatch = e
+        .downcast_ref::<crate::keyboard_dispatch::InputDispatchFailure>()
+        .map(|failure| failure.inserted_any);
+    match crate::keyboard_dispatch::keyboard_failure_outcome(false, dispatch) {
+        Some(outcome) => crate::uia_mutation::chain_error(
+            e.to_string(),
+            json!({"path":"key_events", "verified":false}),
+            [outcome],
+            true,
+        ),
+        None => ToolResult::error(e.to_string()),
+    }
+}
+fn keyboard_join_error(e: tokio::task::JoinError) -> ToolResult {
+    crate::uia_mutation::chain_error(
+        format!("Task error: {e}"),
+        json!({"path":"key_events", "verified":false}),
+        [cua_driver_core::mutation::WriteOutcome::StopUncertain(
+            cua_driver_core::mutation::Reason::Unknown,
+        )],
+        true,
+    )
+}
+
 struct FocusUncertain(String);
 impl std::fmt::Display for FocusUncertain {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -5412,8 +5437,8 @@ impl Tool for TypeTextTool {
                 Ok(Err(e)) if e.downcast_ref::<FocusUncertain>().is_some() => crate::uia_mutation::chain_error(e.to_string(),
                     json!({"path":"uia", "verified":false}),
                     [cua_driver_core::mutation::WriteOutcome::StopUncertain(cua_driver_core::mutation::Reason::Unknown)], true),
-                Ok(Err(e)) => ToolResult::error(e.to_string()),
-                Err(e)     => ToolResult::error(format!("Task error: {e}")),
+                Ok(Err(e)) => keyboard_dispatch_error(e),
+                Err(e)     => keyboard_join_error(e),
             };
         }
 
@@ -6321,8 +6346,8 @@ impl Tool for PressKeyTool {
                     "✅ Sent {key_display} via SendInput on pid {raw_pid} (delivery_mode:foreground)."
                 )),
                 Ok(Err(e)) if e.downcast_ref::<FocusUncertain>().is_some() => crate::uia_mutation::foreground_focus_uncertain_result(e.to_string()),
-                Ok(Err(e)) => ToolResult::error(e.to_string()),
-                Err(e)     => ToolResult::error(format!("Task error: {e}")),
+                Ok(Err(e)) => keyboard_dispatch_error(e),
+                Err(e)     => keyboard_join_error(e),
             };
         }
         let result = tokio::task::spawn_blocking({
@@ -6351,8 +6376,8 @@ impl Tool for PressKeyTool {
                                with delivery_mode:\"foreground\" if a screenshot shows the key didn't land."
                 },
             })),
-            Ok(Err(e)) => ToolResult::error(e.to_string()),
-            Err(e) => ToolResult::error(format!("Task error: {e}")),
+            Ok(Err(e)) => keyboard_dispatch_error(e),
+            Err(e) => keyboard_join_error(e),
         }
     }
 }
@@ -6629,7 +6654,7 @@ impl Tool for HotkeyTool {
                     "✅ Pressed {key_display_for_result} on pid {raw_pid} via UIA \
                      InvokePattern/TogglePattern (XAML / UWP target)."
                 )),
-                Ok(Ok((false, scanned))) => ToolResult::error(format!(
+                Ok(Ok((false, scanned))) => crate::uia_mutation::chain_error(format!(
                     "hotkey on a modern XAML / UWP target (pid {raw_pid}, hwnd {hwnd}) \
                      could not find a UIA AcceleratorKey or `(Ctrl+X)`-style name hint \
                      matching `{key_display_for_result}` (scanned {scanned} element(s)). \
@@ -6640,16 +6665,18 @@ impl Tool for HotkeyTool {
                      `get_window_state(pid={raw_pid}, window_id={hwnd})` to inspect available \
                      UIA actions, then use an exposed accelerator or `click` the matching \
                      element directly."
-                )),
+                ), json!({"path":"uia", "verified":false}), [cua_driver_core::mutation::WriteOutcome::StopNotDelivered(cua_driver_core::mutation::Reason::UnconfirmedAlive)], false),
                 Ok(Err(e)) => {
                     use crate::uia_mutation::{refusal_text, uncertain_text, AccelStop};
                     match e.downcast_ref::<crate::uia::windows_enum::AcceleratorStop>() {
-                        Some(stop) => match stop.verdict {
-                            AccelStop::Refused(kind) => crate::uia_mutation::chain_error(refusal_text(kind, stop.hresult), json!({"path":"uia", "verified":false}), [crate::uia_mutation::classify_acquisition(stop.hresult).to_core()], false),
-                            AccelStop::Uncertain(kind) => crate::uia_mutation::chain_error(format!("{} The shortcut may have been delivered.", uncertain_text(kind, stop.hresult)), json!({"path":"uia", "verified":false}), [crate::uia_mutation::classify_sent_call(stop.hresult).to_core()], false),
-                            AccelStop::NotSent(reason) => crate::uia_mutation::chain_error(format!("hotkey (UIA path): {reason}; the shortcut was not sent. Retry shortly."), json!({"path":"uia", "verified":false}), [cua_driver_core::mutation::WriteOutcome::StopNotDelivered(cua_driver_core::mutation::Reason::UnconfirmedAlive)], false),
+                        Some(stop) => match (stop.verdict, stop.hresult) {
+                            (AccelStop::Refused(kind), Some(hr)) => crate::uia_mutation::chain_error(refusal_text(kind, hr), json!({"path":"uia", "verified":false}), [crate::uia_mutation::classify_acquisition(hr).to_core()], false),
+                            (AccelStop::Refused(_), None) => crate::uia_mutation::chain_error("hotkey (UIA path): the shortcut was not sent", json!({"path":"uia", "verified":false}), [cua_driver_core::mutation::WriteOutcome::StopNotDelivered(cua_driver_core::mutation::Reason::UnconfirmedAlive)], false),
+                            (AccelStop::Uncertain(kind), Some(hr)) => crate::uia_mutation::chain_error(format!("{} The shortcut may have been delivered.", uncertain_text(kind, hr)), json!({"path":"uia", "verified":false}), [crate::uia_mutation::classify_sent_call(hr).to_core()], false),
+                            (AccelStop::Uncertain(kind), None) => crate::uia_mutation::chain_error(crate::uia_mutation::uncertain_text_without_hresult(kind), json!({"path":"uia", "verified":false}), [cua_driver_core::mutation::WriteOutcome::StopUncertain(cua_driver_core::mutation::Reason::Unknown)], false),
+                            (AccelStop::NotSent(reason), _) => crate::uia_mutation::chain_error(format!("hotkey (UIA path): {reason}; the shortcut was not sent. Retry shortly."), json!({"path":"uia", "verified":false}), [cua_driver_core::mutation::WriteOutcome::StopNotDelivered(cua_driver_core::mutation::Reason::UnconfirmedAlive)], false),
                         },
-                        None => ToolResult::error(format!("hotkey (UIA path): {e}")),
+                        None => crate::uia_mutation::chain_error(format!("hotkey (UIA path): {e}"), json!({"path":"uia", "verified":false}), [cua_driver_core::mutation::WriteOutcome::StopNotDelivered(cua_driver_core::mutation::Reason::UnconfirmedAlive)], false),
                     }
                 },
                 Err(e) => crate::uia_mutation::chain_error(format!("Task error: {e}; the shortcut may have been delivered. Read the window state before acting again."), json!({"path":"uia", "verified":false}), [cua_driver_core::mutation::WriteOutcome::StopUncertain(cua_driver_core::mutation::Reason::Unknown)], false),
@@ -6749,8 +6776,8 @@ impl Tool for HotkeyTool {
             Ok(Err(e)) if e.downcast_ref::<FocusUncertain>().is_some() => {
                 crate::uia_mutation::foreground_focus_uncertain_result(e.to_string())
             }
-            Ok(Err(e)) => ToolResult::error(e.to_string()),
-            Err(e) => ToolResult::error(format!("Task error: {e}")),
+            Ok(Err(e)) => keyboard_dispatch_error(e),
+            Err(e) => keyboard_join_error(e),
         }
     }
 }
