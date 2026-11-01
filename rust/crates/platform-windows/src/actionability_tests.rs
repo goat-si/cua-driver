@@ -187,9 +187,18 @@ async fn disabled_facts_never_write() {
         refusal.disposition,
         Some(cua_driver_contract::ErrorDisposition::NOT_DELIVERED)
     );
-    let wire = cua_driver_core::mcp_result::conforming_tool_result("set_value", serde_json::to_value(refusal).unwrap());
+    let wire = cua_driver_core::mcp_result::conforming_tool_result(
+        "set_value",
+        serde_json::to_value(refusal).unwrap(),
+    );
     assert_eq!(wire["structuredContent"]["code"], "element_not_actionable");
-    assert_eq!(serde_json::from_value::<cua_driver_contract::ErrorDisposition>(wire["structuredContent"]["disposition"].clone()).unwrap(), cua_driver_contract::ErrorDisposition::NOT_DELIVERED);
+    assert_eq!(
+        serde_json::from_value::<cua_driver_contract::ErrorDisposition>(
+            wire["structuredContent"]["disposition"].clone()
+        )
+        .unwrap(),
+        cua_driver_contract::ErrorDisposition::NOT_DELIVERED
+    );
 }
 #[tokio::test]
 async fn passing_and_unknown_then_passing_write_once() {

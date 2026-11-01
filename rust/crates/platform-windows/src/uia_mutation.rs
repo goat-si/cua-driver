@@ -453,7 +453,10 @@ pub(crate) fn set_value_write_failure_result(
     } else {
         ActionTransport::WindowsUiaRangeValue
     };
-    let requested = match args.get("delivery_mode").and_then(serde_json::Value::as_str) {
+    let requested = match args
+        .get("delivery_mode")
+        .and_then(serde_json::Value::as_str)
+    {
         Some("foreground") => RequestedDelivery::Foreground,
         _ => RequestedDelivery::Background,
     };

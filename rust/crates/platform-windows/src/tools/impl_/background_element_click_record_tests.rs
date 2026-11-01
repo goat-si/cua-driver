@@ -116,3 +116,23 @@ fn refused_click_records_the_refusing_rung_and_delivers_nothing() {
     assert!(record.attempts.is_empty());
     assert!(record.validate().is_ok());
 }
+
+#[test]
+fn sent_click_failure_records_uncertain_delivery_without_fallback() {
+    use cua_driver_core::action_record::{ActionEffect, ActualDelivery};
+    let result = super::uncertain_element_click_result(
+        "write may have landed".into(),
+        ActionTransport::WindowsUiaInvoke,
+        vec![],
+    );
+    assert_eq!(
+        result.disposition,
+        Some(cua_driver_contract::ErrorDisposition::SUSPECTED_NOOP)
+    );
+    let record = result.action_record.unwrap();
+    assert_eq!(record.effect, ActionEffect::Unverifiable);
+    assert_eq!(record.actual_delivery, Some(ActualDelivery::Unknown));
+    assert_eq!(record.attempts.len(), 1);
+    assert!(record.fallbacks.is_empty());
+    assert!(record.validate().is_ok());
+}

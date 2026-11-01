@@ -463,19 +463,52 @@ fn set_value_failure_producer_finalizes_with_uncertain_delivery() {
     use cua_driver_contract::ErrorDisposition;
     use cua_driver_core::action_record::{ActionEffect, ActualDelivery};
     for (decision, sent) in [
-        (SetValueDecision::Uncertain { rung: 0, kind: UncertainKind::Provider(ProviderCode::NotSupported), hresult: NOT_SUPPORTED }, true),
-        (SetValueDecision::Refused { rung: 1, kind: RefusalKind::PermissionDenied, hresult: DENIED }, false),
+        (
+            SetValueDecision::Uncertain {
+                rung: 0,
+                kind: UncertainKind::Provider(ProviderCode::NotSupported),
+                hresult: NOT_SUPPORTED,
+            },
+            true,
+        ),
+        (
+            SetValueDecision::Refused {
+                rung: 1,
+                kind: RefusalKind::PermissionDenied,
+                hresult: DENIED,
+            },
+            false,
+        ),
     ] {
-        let producer = set_value_write_failure_result(decision, &serde_json::json!({"delivery_mode":"foreground"}));
+        let producer = set_value_write_failure_result(
+            decision,
+            &serde_json::json!({"delivery_mode":"foreground"}),
+        );
         let record = producer.action_record.as_ref().unwrap();
         assert_eq!(record.effect, ActionEffect::Unverifiable);
-        assert_eq!(record.actual_delivery, if sent { Some(ActualDelivery::Unknown) } else { None });
+        assert_eq!(
+            record.actual_delivery,
+            if sent {
+                Some(ActualDelivery::Unknown)
+            } else {
+                None
+            }
+        );
         assert!(record.validate().is_ok());
-        let wire = cua_driver_core::mcp_result::conforming_tool_result("set_value", serde_json::to_value(producer).unwrap());
+        let wire = cua_driver_core::mcp_result::conforming_tool_result(
+            "set_value",
+            serde_json::to_value(producer).unwrap(),
+        );
         assert_eq!(wire["isError"], true);
         assert_eq!(wire["structuredContent"]["path"], "ax");
         assert_eq!(wire["structuredContent"]["verified"], false);
         assert_eq!(wire["structuredContent"]["effect"], "unverifiable");
-        assert_eq!(serde_json::from_value::<ErrorDisposition>(wire["structuredContent"]["disposition"].clone()).unwrap(), ErrorDisposition::SUSPECTED_NOOP);
+        assert_eq!(
+            serde_json::from_value::<ErrorDisposition>(
+                wire["structuredContent"]["disposition"].clone()
+            )
+            .unwrap(),
+            ErrorDisposition::SUSPECTED_NOOP
+        );
     }
 }

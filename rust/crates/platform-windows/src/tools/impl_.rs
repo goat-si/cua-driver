@@ -170,7 +170,7 @@ fn resolve_onscreen_point_with_scroll(
             match unsafe {
                 crate::uia::scroll::scroll_into_view_and_recenter(hwnd, retained.as_ptr())
             } {
-                RevealOutcome::Revealed((nx, ny))
+                RevealOutcome::Revealed((nx, ny)) | RevealOutcome::NotNeeded((nx, ny))
                     if crate::input::point_in_window_bounds(hwnd, nx, ny) =>
                 {
                     return Ok((nx, ny))
@@ -180,7 +180,8 @@ fn resolve_onscreen_point_with_scroll(
                 | RevealOutcome::Revealed(_) => {
                     return Err(reveal_uncertain_result());
                 }
-                RevealOutcome::NotRevealed { writes_sent: false } => {}
+                RevealOutcome::NotRevealed { writes_sent: false } | RevealOutcome::NotNeeded(_) => {
+                }
             }
         } else if trust_cached {
             return Ok((cx, cy));
@@ -3473,6 +3474,38 @@ fn background_element_click_result(
         .with_action_record(record)
 }
 
+fn uncertain_element_click_result(
+    message: String,
+    transport: ActionTransport,
+    failed_calls: Vec<ActionTransport>,
+) -> ToolResult {
+    use cua_driver_core::action_record::{
+        ActionAttempt, ActionEffect, ActionExecutionRecord, ActualDelivery, RequestedDelivery,
+    };
+    let mut record = ActionExecutionRecord::new(
+        ActionEffect::Unverifiable,
+        transport,
+        RequestedDelivery::Background,
+    );
+    record.actual_delivery = Some(ActualDelivery::Unknown);
+    for attempted in failed_calls.into_iter().chain(std::iter::once(transport)) {
+        record.attempts.push(ActionAttempt {
+            transport: attempted,
+            delivery: ActualDelivery::Unknown,
+            detail: Some("UIA provider write may have landed".into()),
+        });
+    }
+    crate::uia_mutation::chain_error(
+        message,
+        json!({"path":"ax", "verified":false}),
+        [cua_driver_core::mutation::WriteOutcome::StopUncertain(
+            cua_driver_core::mutation::Reason::Unknown,
+        )],
+        true,
+    )
+    .with_action_record(record)
+}
+
 fn mutation_refusal(
     message: String,
     transport: ActionTransport,
@@ -4315,7 +4348,9 @@ impl Tool for ClickTool {
                                 retained.as_ptr(),
                             )
                         } {
-                            RevealOutcome::Revealed(point) => point,
+                            RevealOutcome::Revealed(point) | RevealOutcome::NotNeeded(point) => {
+                                point
+                            }
                             RevealOutcome::NotRevealed { writes_sent: false } => (cx, cy),
                             RevealOutcome::Uncertain
                             | RevealOutcome::NotRevealed { writes_sent: true } => {
@@ -4556,7 +4591,8 @@ impl Tool for ClickTool {
             let plan = match result {
                 Ok(Ok(plan)) => plan,
                 Ok(Err(result)) => return result,
-                Err(e) => return ToolResult::error(format!("Task error: {e}")),
+                Err(e) => return crate::uia_mutation::chain_error(format!("UIA click worker failed: {e}; the action may have landed. Read the state before acting again."), json!({"path":"ax", "verified":false}),
+                    [cua_driver_core::mutation::WriteOutcome::StopUncertain(cua_driver_core::mutation::Reason::Unknown)], true),
             };
             let (x, y, failed_calls, inject) = match plan {
                 BackgroundElementClick::Semantic {
@@ -4576,34 +4612,7 @@ impl Tool for ClickTool {
                     message,
                     transport,
                     failed_calls,
-                } => {
-                    use cua_driver_core::action_record::{
-                        ActionAttempt, ActionEffect, ActionExecutionRecord, ActualDelivery,
-                        RequestedDelivery,
-                    };
-                    let mut record = ActionExecutionRecord::new(
-                        ActionEffect::Unverifiable,
-                        transport,
-                        RequestedDelivery::Background,
-                    );
-                    record.actual_delivery = Some(ActualDelivery::Unknown);
-                    for attempted in failed_calls.into_iter().chain(std::iter::once(transport)) {
-                        record.attempts.push(ActionAttempt {
-                            transport: attempted,
-                            delivery: ActualDelivery::Unknown,
-                            detail: Some("UIA provider write may have landed".into()),
-                        });
-                    }
-                    return crate::uia_mutation::chain_error(
-                        message,
-                        json!({"path":"ax", "verified":false}),
-                        [cua_driver_core::mutation::WriteOutcome::StopUncertain(
-                            cua_driver_core::mutation::Reason::Unknown,
-                        )],
-                        false,
-                    )
-                    .with_action_record(record);
-                }
+                } => return uncertain_element_click_result(message, transport, failed_calls),
                 BackgroundElementClick::Inject { x, y, failed_calls } => (x, y, failed_calls, true),
                 BackgroundElementClick::Post { x, y, failed_calls } => (x, y, failed_calls, false),
             };
@@ -5414,9 +5423,9 @@ impl Tool for TypeTextTool {
                     // foreground IS the escalated rung (mirrors macOS PATH_KEY_EVENTS_FG).
                     "effect": "unverifiable",
                 })),
-                Ok(Err(e)) if e.downcast_ref::<FocusUncertain>().is_some() => ToolResult::error(e.to_string())
-                    .with_structured(json!({"path":"uia", "verified":false, "effect":"unverifiable"}))
-                    .with_disposition(cua_driver_contract::ErrorDisposition::SUSPECTED_NOOP),
+                Ok(Err(e)) if e.downcast_ref::<FocusUncertain>().is_some() => crate::uia_mutation::chain_error(e.to_string(),
+                    json!({"path":"uia", "verified":false}),
+                    [cua_driver_core::mutation::WriteOutcome::StopUncertain(cua_driver_core::mutation::Reason::Unknown)], true),
                 Ok(Err(e)) => ToolResult::error(e.to_string()),
                 Err(e)     => ToolResult::error(format!("Task error: {e}")),
             };
@@ -5524,10 +5533,10 @@ impl Tool for TypeTextTool {
             let set_result = match route_after_worker(set_result.map_err(|_| WorkerFailed)) {
                 Route::WmChar => None,
                 Route::Terminal => {
-                    return ToolResult::error(
+                    return crate::uia_mutation::chain_error(
                         "type_text's UIA write worker failed; the field may or may not have changed; nothing else was sent",
-                    )
-                    .with_structured(value_write_structured_result(text_len, "unreadable", false));
+                        value_write_structured_result(text_len, "unreadable", false),
+                        [cua_driver_core::mutation::WriteOutcome::StopUncertain(cua_driver_core::mutation::Reason::Unknown)], true);
                 }
                 Route::Continue(AppendOutcome::Written { before, inserted }) => {
                     Some((before, inserted))
@@ -5544,7 +5553,14 @@ impl Tool for TypeTextTool {
                         "value_pattern_unreadable" => "type_text could not read the field's UIA ValuePattern, so it wrote nothing. Re-read the window and retry.",
                         _ => "type_text refused the write; wrote nothing",
                     };
-                    return ToolResult::error(message);
+                    return crate::uia_mutation::chain_error(
+                        message,
+                        json!({"path":"ax", "verified":false}),
+                        [cua_driver_core::mutation::WriteOutcome::StopNotDelivered(
+                            cua_driver_core::mutation::Reason::UnconfirmedAlive,
+                        )],
+                        true,
+                    );
                 }
                 Route::Continue(AppendOutcome::SecureWriteFailed { hresult })
                 | Route::Continue(AppendOutcome::WriteFailed { hresult }) => {
@@ -5795,17 +5811,12 @@ fn focused_document_tool_result(
             })),
         ),
         FocusedDocumentTypeOutcome::Unknown(stage) => Some(
-            ToolResult::text(format!(
-                "Focused Document text may have been written but could not be verified ({stage}). Inspect the current document before retrying."
-            ))
-            .with_structured(json!({
-                "path": "ax",
-                "characters": text_len,
-                "verified": false,
-                "verify": "unverifiable",
-                "effect": "unverifiable",
-                "retryable": false,
-            })),
+            crate::uia_mutation::chain_error(
+                format!("Focused Document text may have been written but could not be verified ({stage}). Inspect the current document before retrying."),
+                json!({ "path": "ax", "characters": text_len, "verified": false,
+                    "verify": "unverifiable", "retryable": false }),
+                [cua_driver_core::mutation::WriteOutcome::StopUncertain(cua_driver_core::mutation::Reason::Unknown)], false,
+            ),
         ),
     }
 }
@@ -5851,6 +5862,11 @@ mod focused_document_result_tests {
         assert_eq!(
             unknown.structured_content.as_ref().unwrap()["retryable"],
             false
+        );
+        assert_eq!(unknown.is_error, Some(true));
+        assert_eq!(
+            unknown.disposition,
+            Some(cua_driver_contract::ErrorDisposition::SUSPECTED_NOOP)
         );
         let unknown = normalize(unknown);
         assert_eq!(unknown.route, ActionRoute::Accessibility);
@@ -7331,7 +7347,7 @@ impl Tool for ScrollTool {
             };
             let uia_result = match uia_result {
                 Ok(Ok(result)) => result,
-                Ok(Err(error)) => return ToolResult::error(error.to_string()),
+                Ok(Err(error)) => return mutation_refusal(error.to_string(), ActionTransport::WindowsUiaScroll, requested_delivery, _noact.is_some(), cua_driver_core::mutation::Reason::InvalidArgument),
                 Err(error) => {
                     match scroll_route(0, Some(MutationStop::WorkerFailed)) {
                         MutationRoute::Uncertain => return mutation_uncertain(format!("UIA scroll worker failed: {error}; accepted step count is unknown, and the scroll may have landed. Read the window state before acting again."), "uia", ActionTransport::WindowsUiaScroll, requested_delivery, actual_delivery),

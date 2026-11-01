@@ -78,6 +78,7 @@ pub unsafe fn element_is_offscreen(element_ptr: usize) -> Option<bool> {
 /// refcount (the constructed handle is `forget`-ten before return).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RevealOutcome {
+    NotNeeded((i32, i32)),
     Revealed((i32, i32)),
     NotRevealed { writes_sent: bool },
     Uncertain,
@@ -132,7 +133,8 @@ pub(crate) unsafe fn scroll_into_view_and_recenter(
         Ok((point, sent)) => {
             writes_sent |= sent;
             match point.and_then(actionable) {
-                Some(point) => RevealOutcome::Revealed(point),
+                Some(point) if writes_sent => RevealOutcome::Revealed(point),
+                Some(point) => RevealOutcome::NotNeeded(point),
                 None => RevealOutcome::NotRevealed { writes_sent },
             }
         }
