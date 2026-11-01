@@ -6360,12 +6360,12 @@ async fn set_value_on(
         .proxies()
         .await
         .map_err(|e| anyhow!("interface proxies unavailable: {e}"))?;
-    if proxies.editable_text().await.is_ok() {
-        if !replacement_needs_value(
+    if proxies.editable_text().await.is_ok()
+        && !replacement_needs_value(
             run_native_editable_route(acc, value, EditableRoute::Replace).await?,
-        )? {
-            return Ok(());
-        }
+        )?
+    {
+        return Ok(());
     }
     if has_value {
         let v = parse_value_number(value)?;
