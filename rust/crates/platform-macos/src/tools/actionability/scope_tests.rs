@@ -224,22 +224,26 @@ fn failed_hit_is_unknown_not_miss() {
     s.raw.hit = Evidence::Known(4);
     let h = hits(facts(&mut s, Scope::Foreground));
     assert_eq!((h.unknown, h.occluded), (0, 5));
+    let h = hits(facts(&mut s, Scope::WindowInternal));
+    assert_eq!((h.unknown, h.occluded), (0, 5));
+    s.raw.hit_window = Evidence::Known(99);
+    let h = hits(facts(&mut s, Scope::WindowInternal));
+    assert_eq!((h.unknown, h.occluded), (0, 5));
+    s.raw.hit = Evidence::Known(1);
+    s.raw.hit_window = Evidence::Unknown("window read failed".into());
+    assert_eq!(hits(facts(&mut s, Scope::WindowInternal)).unknown, 5);
+    s.raw.hit_window = Evidence::Known(99);
+    assert_eq!(hits(facts(&mut s, Scope::WindowInternal)).occluded, 5);
+    s.raw.hit_window = Evidence::Known(2);
+    assert!(hits(facts(&mut s, Scope::WindowInternal))
+        .verified_point
+        .is_some());
+    s.raw.hit = Evidence::Known(4);
+    s.raw.parents.remove(&4);
+    assert_eq!(hits(facts(&mut s, Scope::WindowInternal)).unknown, 5);
 }
 #[test]
 fn window_hit_cannot_authorize_foreground() {
-    // The actual native adapter does not turn an application-level hit into
-    // window-local proof; this branch performs no live accessibility read.
-    let mut native = NativeScope::new(0);
-    let window = unsafe { crate::ax::snapshot::RetainedElement::retain(0) };
-    assert!(matches!(
-        <super::scope::NativeRaw as RawScope<crate::ax::bindings::AXUIElementRef>>::hit(
-            &mut native.raw,
-            &window,
-            Scope::WindowInternal,
-            Point { x: 1.0, y: 1.0 },
-        ),
-        Evidence::Unknown(_)
-    ));
     let mut s = NativeScope {
         raw: FakeRaw::default(),
     };
@@ -252,6 +256,18 @@ fn window_hit_cannot_authorize_foreground() {
     assert_eq!(foreground.unknown, 5);
     assert!(s.raw.calls.contains(&"window_hit"));
     assert!(s.raw.calls.contains(&"foreground_hit"));
+    s.raw.hit = Evidence::Known(1);
+    let mut evidence = facts(&mut s, Scope::WindowInternal);
+    evidence.stable = Evidence::Known(true);
+    let report = evaluate(Intent::DoubleClick, Policy::headed(), &evidence);
+    assert!(report
+        .checks
+        .iter()
+        .any(|check| check.name == "receives_events"
+            && matches!(
+                check.status,
+                cua_driver_core::actionability::CheckStatus::Transient { unknown: true }
+            )));
 }
 #[test]
 fn descendant_and_container_identity_are_bounded() {
@@ -267,13 +283,29 @@ fn descendant_and_container_identity_are_bounded() {
     s.raw.frames.insert(5, rect(0.0));
     s.raw.roles.insert(5, "AXCell");
     s.raw.hit = Evidence::Known(5);
-    assert!(hits(facts(&mut s, Scope::WindowInternal))
+    assert!(hits(facts(&mut s, Scope::Foreground))
         .verified_point
         .is_some());
+    assert_eq!(hits(facts(&mut s, Scope::WindowInternal)).occluded, 5);
     s.raw.roles.remove(&5);
-    assert_eq!(hits(facts(&mut s, Scope::WindowInternal)).unknown, 5);
+    assert_eq!(hits(facts(&mut s, Scope::Foreground)).unknown, 5);
     s.raw.parents.insert(5, 5);
     assert_eq!(hits(facts(&mut s, Scope::WindowInternal)).unknown, 5);
+    let mut outside = NativeScope {
+        raw: FakeRaw::default(),
+    };
+    outside.raw.frames.insert(
+        2,
+        Rect {
+            x: 0.0,
+            y: 0.0,
+            width: 1.0,
+            height: 20.0,
+        },
+    );
+    let result = hits(facts(&mut outside, Scope::WindowInternal));
+    assert_eq!((result.unknown, result.occluded), (5, 0));
+    assert!(!outside.raw.calls.contains(&"window_hit"));
 }
 #[test]
 fn geometry_changes_reset_samples_and_fail_revalidation() {

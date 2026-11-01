@@ -96,13 +96,15 @@ impl RawScope<AXUIElementRef> for NativeRaw {
         )
     }
     fn hit(&mut self, _: &Self::Node, scope: Scope, point: Point) -> Evidence<Self::Node> {
-        // AX's public hit test accepts an application or system-wide root,
-        // neither of which proves a window-local delivery hit. Keep that
-        // scope unknown until a window-specific source is available.
-        if scope == Scope::WindowInternal {
-            return Evidence::Unknown("window-local hit test unavailable".into());
-        }
-        let root = unsafe { AXUIElementCreateSystemWide() };
+        // An app-rooted hit cannot see other applications' windows. It is
+        // evidence only for background delivery posted directly to this pid
+        // and window without moving the desktop pointer; never use it for a
+        // headed or foreground policy. The classifier below additionally
+        // checks the hit's exact AX window and bounded target ancestry.
+        let root = match scope {
+            Scope::WindowInternal => unsafe { bindings::AXUIElementCreateApplication(self.pid) },
+            Scope::Foreground => unsafe { AXUIElementCreateSystemWide() },
+        };
         if root.is_null() {
             return Evidence::Unknown("hit root unavailable".into());
         }
@@ -129,6 +131,11 @@ impl RawScope<AXUIElementRef> for NativeRaw {
 }
 
 /// Call only while both arguments are retained; all native work here is read-only.
+///
+/// Window-internal hits use the application AX tree. They do not observe
+/// windows of other applications and are only evidence for a background event
+/// posted directly to the target pid and window without moving the pointer.
+/// Foreground delivery must use a separate system-wide hit test.
 pub(crate) struct NativeScope<R = NativeRaw> {
     pub(super) raw: R,
 }
@@ -213,6 +220,49 @@ impl<R> NativeScope<R> {
             }
         }
         unknown("target window ancestry exceeded limit")
+    }
+    /// App-rooted hits are scoped to direct delivery to the retained window;
+    /// no result from this classifier proves foreground desktop visibility.
+    fn matches_window_hit<E: Copy>(
+        &mut self,
+        target: E,
+        window: E,
+        hit: <R as RawScope<E>>::Node,
+    ) -> Hit
+    where
+        R: RawScope<E>,
+    {
+        let target = self.raw.node(target);
+        let window = self.raw.node(window);
+        if !self.raw.same(&hit, &window) {
+            let hit_window = match self.raw.window(&hit) {
+                Evidence::Known(value) => value,
+                _ => return Hit::Unknown,
+            };
+            if !self.raw.same(&hit_window, &window) {
+                return occluded();
+            }
+        }
+        let mut current = hit;
+        let mut target_seen = false;
+        for depth in 0..=MAX_ANCESTORS {
+            target_seen |= self.raw.same(&current, &target);
+            if self.raw.same(&current, &window) {
+                return if target_seen {
+                    Hit::ReachesTarget
+                } else {
+                    occluded()
+                };
+            }
+            if depth == MAX_ANCESTORS {
+                return Hit::Unknown;
+            }
+            current = match self.raw.parent(&current) {
+                Evidence::Known(parent) => parent,
+                _ => return Hit::Unknown,
+            };
+        }
+        Hit::Unknown
     }
     fn matches_hit<E: Copy>(&mut self, target: E, window: E, hit: <R as RawScope<E>>::Node) -> Hit
     where
@@ -313,7 +363,10 @@ impl<E: Copy, R: RawScope<E>> ScopeReader<E> for NativeScope<R> {
         }
         let w = self.raw.node(window);
         match self.raw.hit(&w, scope, point) {
-            Evidence::Known(hit) => self.matches_hit(target, window, hit),
+            Evidence::Known(hit) => match scope {
+                Scope::WindowInternal => self.matches_window_hit(target, window, hit),
+                Scope::Foreground => self.matches_hit(target, window, hit),
+            },
             _ => Hit::Unknown,
         }
     }
