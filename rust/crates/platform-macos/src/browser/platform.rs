@@ -758,8 +758,15 @@ fn parse_loopback_lsof_ports(text: &str) -> Vec<u16> {
 
 type LsofOutcome = Result<Vec<u16>, BrowserRefusal>;
 
-fn lsof_outcome(_status_code: Option<i32>, stdout: &[u8], _stderr: &[u8]) -> LsofOutcome {
-    Ok(parse_loopback_lsof_ports(&String::from_utf8_lossy(stdout)))
+fn lsof_outcome(status_code: Option<i32>, stdout: &[u8], stderr: &[u8]) -> LsofOutcome {
+    match status_code {
+        Some(0) => Ok(parse_loopback_lsof_ports(&String::from_utf8_lossy(stdout))),
+        Some(1) if stdout.is_empty() && stderr.is_empty() => Ok(Vec::new()),
+        _ => Err(BrowserRefusal::new(
+            BrowserRefusalCode::BrowserRouteUnavailable,
+            format!("could not inspect browser listeners: lsof failed with status {status_code:?}"),
+        )),
+    }
 }
 
 #[cfg(test)]
@@ -770,6 +777,33 @@ mod lsof_outcome_tests {
     fn exit_zero_parses() {
         let result = lsof_outcome(Some(0), b"n127.0.0.1:9222\n", b"warning");
         assert_eq!(result.unwrap(), vec![9222]);
+    }
+
+    #[test]
+    fn exit_one_with_no_output_is_no_listeners() {
+        assert!(lsof_outcome(Some(1), b"", b"").unwrap().is_empty());
+    }
+
+    #[test]
+    fn exit_one_with_stderr_is_a_refusal() {
+        let refusal = lsof_outcome(Some(1), b"", b"permission denied").unwrap_err();
+        assert_eq!(refusal.code, BrowserRefusalCode::BrowserRouteUnavailable);
+        let refusal = lsof_outcome(Some(1), b"n127.0.0.1:9222", b"").unwrap_err();
+        assert_eq!(refusal.code, BrowserRefusalCode::BrowserRouteUnavailable);
+    }
+
+    #[test]
+    fn other_exit_codes_are_refusals() {
+        for code in [2, 42, 255] {
+            let refusal = lsof_outcome(Some(code), b"", b"").unwrap_err();
+            assert_eq!(refusal.code, BrowserRefusalCode::BrowserRouteUnavailable);
+        }
+    }
+
+    #[test]
+    fn signal_is_a_refusal() {
+        let refusal = lsof_outcome(None, b"", b"").unwrap_err();
+        assert_eq!(refusal.code, BrowserRefusalCode::BrowserRouteUnavailable);
     }
 }
 
@@ -787,7 +821,7 @@ async fn loopback_ports_for_pid(pid: i64) -> Result<Vec<u16>, BrowserRefusal> {
             "-P",
         ])
         .stdin(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .output()
         .await
         .map_err(|error| {
