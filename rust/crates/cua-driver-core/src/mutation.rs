@@ -9,8 +9,8 @@
 //! Reference rule | Class
 //! --- | ---
 //! agent-desktop/crates/macos/src/actions/ax_mutation.rs:28-34 | success: delivered; action unsupported / not implemented: fall through
-//! agent-desktop/crates/macos/src/actions/ax_mutation.rs:35-53,120-136 | failure: uncertain; attribute unsupported / no value: fall through only for set-attribute; perform requires observed effect or is uncertain
-//! agent-desktop/crates/macos/src/actions/ax_mutation.rs:54-103 | disabled API: permission denied; invalid element: stale; illegal argument: invalid; cannot complete / unknown: uncertain
+//! agent-desktop/crates/macos/src/actions/ax_mutation.rs:35-53,120-136 | failure: uncertain; attribute unsupported / no value: fall through for set-attribute only when established before sending; perform requires observed effect or is uncertain
+//! agent-desktop/crates/macos/src/actions/ax_mutation.rs:54-103 | deliberate divergence: illegal argument and other sent-write errors are uncertain even where that reference classifies them as invalid; not-delivered reasons require native proof of no application
 //! agent-desktop/crates/windows/src/actions/mutation.rs:44-66,127-139 | absent pattern / exhaustion / unsupported: fall through; unknown sentinel: uncertain
 //! agent-desktop/crates/windows/src/actions/mutation.rs:67-96 | denied / stale / invalid / disabled: stop, not delivered
 //! agent-desktop/crates/windows/src/actions/mutation.rs:97-124 | transport / timeout / unknown: uncertain
@@ -54,13 +54,31 @@ pub enum WriteKind {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WriteOutcome {
     Delivered,
+    /// No write was sent; another rung may be attempted.
     FallThrough(Reason),
+    /// The native layer proved that the target did not apply the write.
     StopNotDelivered(Reason),
+    /// A sent write may have changed the target; do not continue the chain.
     StopUncertain(Reason),
+    /// A sent write may have changed the target, but one retry may follow.
+    ///
+    /// Only use for an idempotent absolute set of the same target value in a
+    /// different representation, and at most once. Never use for increments,
+    /// toggles, or text insertion. The caller must enforce these restrictions:
+    /// core cannot verify them.
+    RetryAfterUncertain(Reason),
 }
 
 impl Reason {
     /// Classify a reason already established by the adapter's native error table.
+    ///
+    /// `FallThrough` reasons must be established before sending the write,
+    /// such as by a settable pre-check. `StopNotDelivered` reasons
+    /// (permission denied, stale element, invalid argument, disabled, dead
+    /// target, and unconfirmed alive) require native proof that the target did
+    /// not apply the write. An error returned by a sent write is uncertain
+    /// rather than evidence of no delivery; adapters must not classify that
+    /// error as a pre-send or proven-not-delivered reason.
     pub fn classify(self, kind: WriteKind) -> WriteOutcome {
         use Reason::*;
         match self {
@@ -105,7 +123,10 @@ impl WriteChain {
         let mut outcomes = Vec::new();
         for outcome in rungs {
             outcomes.push(outcome);
-            if !matches!(outcome, WriteOutcome::FallThrough(_)) {
+            if !matches!(
+                outcome,
+                WriteOutcome::FallThrough(_) | WriteOutcome::RetryAfterUncertain(_)
+            ) {
                 break;
             }
         }
@@ -143,6 +164,14 @@ impl ChainResult {
         match post {
             Postcondition::Confirmed => ActionEffect::Confirmed,
             Postcondition::Unchanged => ActionEffect::SuspectedNoop,
+            Postcondition::Subset
+                if self
+                    .outcomes
+                    .iter()
+                    .any(|outcome| matches!(outcome, WriteOutcome::RetryAfterUncertain(_))) =>
+            {
+                ActionEffect::Unverifiable
+            }
             Postcondition::Subset => ActionEffect::Partial,
             Postcondition::Indeterminate | Postcondition::Unavailable(_) => {
                 ActionEffect::Unverifiable
@@ -416,6 +445,118 @@ mod tests {
         }
         assert!(WriteChain::run([absent, absent], false).no_input());
         assert!(!WriteChain::run([absent, absent], true).no_input());
+    }
+
+    #[test]
+    fn stop_uncertain_does_not_execute_a_second_rung() {
+        let calls = Cell::new(0);
+        let chain = WriteChain::run(
+            [
+                WriteOutcome::StopUncertain(Reason::Failure),
+                WriteOutcome::Delivered,
+            ]
+            .into_iter()
+            .inspect(|_| calls.set(calls.get() + 1)),
+            false,
+        );
+        assert_eq!(calls.get(), 1);
+        assert_eq!(
+            chain.outcomes(),
+            &[WriteOutcome::StopUncertain(Reason::Failure)]
+        );
+    }
+
+    #[test]
+    fn retry_after_uncertain_preserves_effect_and_disposition_evidence() {
+        let retry = WriteOutcome::RetryAfterUncertain(Reason::InvalidArgument);
+        let calls = Cell::new(0);
+        let delivered = WriteChain::run(
+            [retry, WriteOutcome::Delivered, WriteOutcome::Delivered]
+                .into_iter()
+                .inspect(|_| calls.set(calls.get() + 1)),
+            false,
+        );
+        assert_eq!(calls.get(), 2);
+        assert_eq!(delivered.outcomes(), &[retry, WriteOutcome::Delivered]);
+        assert!(!delivered.no_input());
+        for (post, expected_effect, disposition) in [
+            (Postcondition::Confirmed, ActionEffect::Confirmed, None),
+            (
+                Postcondition::Unchanged,
+                ActionEffect::SuspectedNoop,
+                Some(ErrorDisposition::SUSPECTED_NOOP),
+            ),
+            (
+                Postcondition::Subset,
+                ActionEffect::Unverifiable,
+                Some(ErrorDisposition::DELIVERED),
+            ),
+            (
+                Postcondition::Indeterminate,
+                ActionEffect::Unverifiable,
+                Some(ErrorDisposition::DELIVERED),
+            ),
+            (
+                Postcondition::Unavailable(UnavailableReason::Timeout),
+                ActionEffect::Unverifiable,
+                Some(ErrorDisposition::DELIVERED),
+            ),
+        ] {
+            assert_eq!(delivered.effect(post, true), expected_effect);
+            assert_eq!(delivered.error_disposition(post, true), disposition);
+            assert_eq!(delivered.effect(post, false), ActionEffect::Unverifiable);
+            assert_ne!(
+                delivered.error_disposition(post, false),
+                Some(ErrorDisposition::NOT_DELIVERED)
+            );
+        }
+
+        for chain in [
+            WriteChain::run([retry], false),
+            WriteChain::run(
+                [retry, WriteOutcome::StopNotDelivered(Reason::Disabled)],
+                false,
+            ),
+            WriteChain::run(
+                [retry, WriteOutcome::FallThrough(Reason::Unsupported)],
+                false,
+            ),
+            WriteChain::run([retry, WriteOutcome::StopUncertain(Reason::Timeout)], false),
+        ] {
+            assert!(!chain.no_input());
+            assert_eq!(
+                chain.effect(Postcondition::Confirmed, true),
+                ActionEffect::Unverifiable
+            );
+            assert_eq!(
+                chain.error_disposition(Postcondition::Confirmed, true),
+                Some(ErrorDisposition::SUSPECTED_NOOP)
+            );
+        }
+    }
+
+    #[test]
+    fn retry_after_uncertain_disposition_stays_unsafe_at_result_boundary() {
+        for terminal in [
+            WriteOutcome::Delivered,
+            WriteOutcome::StopNotDelivered(Reason::Disabled),
+        ] {
+            let chain = WriteChain::run(
+                [WriteOutcome::RetryAfterUncertain(Reason::Failure), terminal],
+                false,
+            );
+            let post = Postcondition::Unchanged;
+            let result = crate::mcp_result::finalize_error_disposition(
+                "click",
+                serde_json::json!({"isError": true, "structuredContent": {
+                    "effect": chain.effect(post, true),
+                    "disposition": chain.error_disposition(post, true).unwrap()
+                }}),
+            );
+            let disposition: ErrorDisposition =
+                serde_json::from_value(result["structuredContent"]["disposition"].clone()).unwrap();
+            assert_eq!(disposition, ErrorDisposition::SUSPECTED_NOOP);
+        }
     }
 
     #[test]
