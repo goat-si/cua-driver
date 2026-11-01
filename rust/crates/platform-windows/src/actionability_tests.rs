@@ -511,3 +511,28 @@ fn writable_range_admits_when_value_read_only_is_unknown() {
     assert!(!may_write(Rung::Value, &a));
     assert!(may_write(Rung::RangeValue, &a));
 }
+
+#[test]
+fn admission_controls_value_and_range_calls() {
+    use crate::uia_mutation::{set_value_route, RungOutcome, SetValueDecision};
+    for (value, range, acquired, expected_value, expected_range, changed) in [
+        (PatternAdmission::Present { read_only: LiveRead::Failed("unknown".into(), Some(-1)) }, PatternAdmission::Present { read_only: LiveRead::Value(false) }, true, 0, 1, false),
+        (PatternAdmission::Present { read_only: LiveRead::Value(true) }, PatternAdmission::Present { read_only: LiveRead::Value(false) }, true, 0, 1, false),
+        (PatternAdmission::Absent, PatternAdmission::Present { read_only: LiveRead::Value(false) }, true, 0, 0, true),
+        (PatternAdmission::Present { read_only: LiveRead::Value(false) }, PatternAdmission::Present { read_only: LiveRead::Value(false) }, true, 1, 0, false),
+    ] {
+        let admission = Admission { route: AdmittedRoute::UiaWrite, value, range };
+        let value_calls = AtomicUsize::new(0);
+        let range_calls = AtomicUsize::new(0);
+        let value = match value_pattern_route(&admission, acquired) {
+            ValuePatternRoute::Changed => { assert!(changed); assert_eq!(value_calls.load(Ordering::SeqCst), expected_value); assert_eq!(range_calls.load(Ordering::SeqCst), expected_range); continue; }
+            ValuePatternRoute::Absent | ValuePatternRoute::Skip => RungOutcome::Absent,
+            ValuePatternRoute::Call => { value_calls.fetch_add(1, Ordering::SeqCst); RungOutcome::Called(1) }
+        };
+        let result = set_value_route(value, || { if may_write(Rung::RangeValue, &admission) { range_calls.fetch_add(1, Ordering::SeqCst); RungOutcome::Called(0) } else { RungOutcome::Absent } });
+        assert_eq!(value_calls.load(Ordering::SeqCst), expected_value);
+        assert_eq!(range_calls.load(Ordering::SeqCst), expected_range);
+        if expected_value == 1 { assert!(matches!(result, SetValueDecision::Uncertain { rung: 0, .. })); }
+        else { assert_eq!(result, SetValueDecision::Delivered { rung: 1 }); }
+    }
+}

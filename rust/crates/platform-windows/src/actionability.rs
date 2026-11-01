@@ -216,6 +216,26 @@ pub(crate) fn may_write(rung: Rung, a: &Admission) -> bool {
             ),
         }
 }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ValuePatternRoute {
+    Absent,
+    Skip,
+    Call,
+    Changed,
+}
+
+pub(crate) fn value_pattern_route(a: &Admission, acquired: bool) -> ValuePatternRoute {
+    if !acquired {
+        ValuePatternRoute::Absent
+    } else if matches!(&a.value, PatternAdmission::Absent) {
+        ValuePatternRoute::Changed
+    } else if may_write(Rung::Value, a) {
+        ValuePatternRoute::Call
+    } else {
+        ValuePatternRoute::Skip
+    }
+}
+
 pub(crate) fn route_agrees(route: AdmittedRoute, worker_native: bool) -> bool {
     (route == AdmittedRoute::NativeCombo) == worker_native
 }

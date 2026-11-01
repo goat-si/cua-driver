@@ -3357,6 +3357,10 @@ fn finish_pixel_uia_attempt(
                 })),
             );
         }
+        PointInvokeOutcome::SentFailure => return Some(crate::uia_mutation::chain_error(
+            format!("UIA pixel click for pid {pid} may have landed; no fallback input was sent. Inspect the target state before acting again."),
+            json!({"uia_status":"sent_failure", "path":"ax", "verified":false, "code":"background_unavailable"}),
+            [cua_driver_core::mutation::WriteOutcome::StopUncertain(cua_driver_core::mutation::Reason::Unknown)], false)),
         PointInvokeOutcome::Busy => "busy",
         PointInvokeOutcome::Timeout => "timeout",
         PointInvokeOutcome::Unavailable => "unavailable",
@@ -6866,18 +6870,18 @@ impl Tool for SetValueTool {
                             UIA_ValuePatternId,
                         ) {
                             Ok(Some(vp)) => {
-                                if matches!(&admission.value, crate::actionability::PatternAdmission::Absent) {
-                                    return Ok(SetValueRoute::AdmissionRefused {
+                                match crate::actionability::value_pattern_route(&admission, true) {
+                                    crate::actionability::ValuePatternRoute::Changed => return Ok(SetValueRoute::AdmissionRefused {
                                         reason: "ValuePattern appeared since the actionability check",
-                                    });
-                                }
-                                if !crate::actionability::may_write(crate::actionability::Rung::Value, &admission) {
-                                    RungOutcome::Absent
-                                } else { RungOutcome::Called(
-                                    crate::uia::fg_bypass::run_with_uwp_bypass(hwnd as isize, || unsafe {
-                                        crate::uia::sent_call::set_value(&vp, &BSTR::from(value.as_str()))
                                     }),
-                                ) }
+                                    crate::actionability::ValuePatternRoute::Skip => RungOutcome::Absent,
+                                    crate::actionability::ValuePatternRoute::Call => RungOutcome::Called(
+                                        crate::uia::fg_bypass::run_with_uwp_bypass(hwnd as isize, || unsafe {
+                                            crate::uia::sent_call::set_value(&vp, &BSTR::from(value.as_str()))
+                                        }),
+                                    ),
+                                    crate::actionability::ValuePatternRoute::Absent => unreachable!(),
+                                }
                             },
                             Ok(None) => RungOutcome::Absent,
                             Err(hresult) => RungOutcome::AcquireFailed(hresult),

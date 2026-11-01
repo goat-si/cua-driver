@@ -416,6 +416,7 @@ pub(crate) enum PointInvokeOutcome {
     Busy,
     Timeout,
     Unavailable,
+    SentFailure,
     NotResponding,
     WindowGone,
 }
@@ -595,7 +596,7 @@ fn try_invoke_in_window_at_point_unbounded(
                         if cancelled.load(Ordering::Acquire) {
                             return Timeout;
                         }
-                        return if super::sent_call::expand(&ec) == 0 { Invoked } else { Unavailable };
+                        return if super::sent_call::expand(&ec) == 0 { Invoked } else { PointInvokeOutcome::SentFailure };
                     }
                 }
                 return Unavailable;
@@ -614,7 +615,7 @@ fn try_invoke_in_window_at_point_unbounded(
             if super::sent_call::invoke(&inv) == 0 {
                 Invoked
             } else {
-                Unavailable
+                PointInvokeOutcome::SentFailure
             }
         })
     }

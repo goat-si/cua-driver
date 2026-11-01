@@ -151,3 +151,13 @@ fn post_message_pixel_click_reports_synthetic_transport() {
     assert_eq!(public["route"], "synthetic_events");
     assert_eq!(public["delivery"]["mode"], "background");
 }
+
+#[test]
+fn sent_point_failure_is_uncertain_and_never_replays() {
+    let result = finish_pixel_uia_attempt(PointInvokeOutcome::SentFailure, 7, 3, 4).expect("sent failure is terminal");
+    assert!(result.is_error.unwrap_or(false));
+    assert_eq!(result.disposition, Some(cua_driver_contract::ErrorDisposition::SUSPECTED_NOOP));
+    let data = result.structured_content.unwrap();
+    assert_eq!(data["effect"], "unverifiable");
+    assert!(data.get("nothing_sent").is_none());
+}
