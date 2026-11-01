@@ -4,8 +4,10 @@ use core_foundation::{
     base::{CFRelease, CFTypeRef, TCFType},
     string::CFString,
 };
-use cua_driver_core::mutation::{Reason, WriteKind, WriteOutcome};
+use cua_driver_core::mutation::{Reason, WriteOutcome};
 
+// U32B-D will connect this boundary to the macOS write consumers.
+#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum NativeWriteKind {
     SetAttribute,
@@ -16,29 +18,43 @@ pub(crate) enum NativeWriteKind {
 #[allow(dead_code)]
 pub(crate) fn native_write_outcome(
     kind: NativeWriteKind,
-    _call_ran: bool,
-    _pre_settable: &Settable,
+    call_ran: bool,
+    pre_settable: &Settable,
     error: i32,
 ) -> WriteOutcome {
+    use super::bindings::{
+        kAXErrorAPIDisabled as API_DISABLED, kAXErrorActionUnsupported as ACTION_UNSUPPORTED,
+        kAXErrorAttributeUnsupported as ATTRIBUTE_UNSUPPORTED,
+        kAXErrorCannotComplete as CANNOT_COMPLETE, kAXErrorFailure as FAILURE,
+        kAXErrorNoValue as NO_VALUE, kAXErrorNotImplemented as NOT_IMPLEMENTED,
+    };
+
+    if !call_ran {
+        return if kind == NativeWriteKind::SetAttribute && matches!(pre_settable, Settable::No) {
+            WriteOutcome::FallThrough(Reason::AttributeUnsupported)
+        } else {
+            WriteOutcome::StopNotDelivered(Reason::Unknown)
+        };
+    }
     if error == kAXErrorSuccess {
         return WriteOutcome::Delivered;
     }
-    let reason = match error {
-        kAXErrorFailure => Reason::Failure,
-        kAXErrorIllegalArgument => Reason::InvalidArgument,
-        kAXErrorInvalidUIElement => Reason::StaleElement,
-        kAXErrorCannotComplete => Reason::CannotComplete,
-        kAXErrorAttributeUnsupported => Reason::AttributeUnsupported,
-        kAXErrorActionUnsupported => Reason::Unsupported,
-        kAXErrorNotImplemented => Reason::NotImplemented,
-        kAXErrorAPIDisabled => Reason::PermissionDenied,
-        kAXErrorNoValue => Reason::NoValue,
-        _ => Reason::Unknown,
-    };
-    reason.classify(match kind {
-        NativeWriteKind::SetAttribute => WriteKind::SetAttribute,
-        NativeWriteKind::Perform => WriteKind::Perform,
-    })
+    match (kind, error) {
+        (_, API_DISABLED) => WriteOutcome::StopNotDelivered(Reason::PermissionDenied),
+        (_, CANNOT_COMPLETE) => WriteOutcome::StopUncertain(Reason::CannotComplete),
+        (_, FAILURE) => WriteOutcome::StopUncertain(Reason::Failure),
+        (NativeWriteKind::Perform, ATTRIBUTE_UNSUPPORTED) => {
+            WriteOutcome::StopUncertain(Reason::AttributeUnsupported)
+        }
+        (NativeWriteKind::Perform, NO_VALUE) => WriteOutcome::StopUncertain(Reason::NoValue),
+        (NativeWriteKind::Perform, ACTION_UNSUPPORTED) => {
+            WriteOutcome::FallThrough(Reason::Unsupported)
+        }
+        (NativeWriteKind::Perform, NOT_IMPLEMENTED) => {
+            WriteOutcome::FallThrough(Reason::NotImplemented)
+        }
+        _ => WriteOutcome::StopUncertain(Reason::Unknown),
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -214,16 +230,36 @@ mod u32_native_write_tests {
     const KINDS: [NativeWriteKind; 2] = [NativeWriteKind::SetAttribute, NativeWriteKind::Perform];
     const SETTABLES: [Settable; 3] = [Settable::Yes, Settable::No, Settable::Unknown(-25211)];
     const CODES: [i32; 19] = [
-        0, -25200, -25201, -25202, -25203, -25204, -25205, -25206, -25207, -25208,
-        -25209, -25210, -25211, -25212, -25213, -25214, -1, i32::MIN, i32::MAX,
+        0,
+        -25200,
+        -25201,
+        -25202,
+        -25203,
+        -25204,
+        -25205,
+        -25206,
+        -25207,
+        -25208,
+        -25209,
+        -25210,
+        -25211,
+        -25212,
+        -25213,
+        -25214,
+        -1,
+        i32::MIN,
+        i32::MAX,
     ];
 
     fn check_returned(codes: &[i32], expected: impl Fn(NativeWriteKind, i32) -> WriteOutcome) {
         for &code in codes {
             for kind in KINDS {
                 for settable in SETTABLES {
-                    assert_eq!(native_write_outcome(kind, true, &settable, code), expected(kind, code),
-                        "kind={kind:?}, settable={settable:?}, code={code}");
+                    assert_eq!(
+                        native_write_outcome(kind, true, &settable, code),
+                        expected(kind, code),
+                        "kind={kind:?}, settable={settable:?}, code={code}"
+                    );
                 }
             }
         }
@@ -236,30 +272,41 @@ mod u32_native_write_tests {
 
     #[test]
     fn returned_illegal_argument_without_nonapplication_proof_is_uncertain() {
-        check_returned(&[-25201], |_, _| WriteOutcome::StopUncertain(Reason::Unknown));
+        check_returned(&[-25201], |_, _| {
+            WriteOutcome::StopUncertain(Reason::Unknown)
+        });
     }
 
     #[test]
     fn returned_invalid_element_without_nonapplication_proof_is_uncertain() {
-        check_returned(&[-25202], |_, _| WriteOutcome::StopUncertain(Reason::Unknown));
+        check_returned(&[-25202], |_, _| {
+            WriteOutcome::StopUncertain(Reason::Unknown)
+        });
     }
 
     #[test]
     fn returned_setter_attribute_errors_ignore_preflight_settable_and_stop_uncertain() {
         for code in [-25205, -25212] {
             for settable in SETTABLES {
-                assert_eq!(native_write_outcome(NativeWriteKind::SetAttribute, true, &settable, code),
-                    WriteOutcome::StopUncertain(Reason::Unknown));
+                assert_eq!(
+                    native_write_outcome(NativeWriteKind::SetAttribute, true, &settable, code),
+                    WriteOutcome::StopUncertain(Reason::Unknown)
+                );
             }
         }
     }
 
     #[test]
     fn returned_perform_attribute_errors_are_uncertain_without_effect_evidence() {
-        for (code, reason) in [(-25205, Reason::AttributeUnsupported), (-25212, Reason::NoValue)] {
+        for (code, reason) in [
+            (-25205, Reason::AttributeUnsupported),
+            (-25212, Reason::NoValue),
+        ] {
             for settable in SETTABLES {
-                assert_eq!(native_write_outcome(NativeWriteKind::Perform, true, &settable, code),
-                    WriteOutcome::StopUncertain(reason));
+                assert_eq!(
+                    native_write_outcome(NativeWriteKind::Perform, true, &settable, code),
+                    WriteOutcome::StopUncertain(reason)
+                );
             }
         }
     }
@@ -268,31 +315,54 @@ mod u32_native_write_tests {
     fn unsupported_and_not_implemented_follow_the_frozen_kind_table() {
         check_returned(&[-25206, -25208], |kind, code| match kind {
             NativeWriteKind::SetAttribute => WriteOutcome::StopUncertain(Reason::Unknown),
-            NativeWriteKind::Perform => WriteOutcome::FallThrough(if code == -25206 { Reason::Unsupported } else { Reason::NotImplemented }),
+            NativeWriteKind::Perform => WriteOutcome::FallThrough(if code == -25206 {
+                Reason::Unsupported
+            } else {
+                Reason::NotImplemented
+            }),
         });
     }
 
     #[test]
     fn api_disabled_proves_non_delivery() {
-        check_returned(&[-25211], |_, _| WriteOutcome::StopNotDelivered(Reason::PermissionDenied));
+        check_returned(&[-25211], |_, _| {
+            WriteOutcome::StopNotDelivered(Reason::PermissionDenied)
+        });
     }
 
     #[test]
     fn failure_cannot_complete_and_other_codes_stop_uncertain() {
-        check_returned(&[-25200, -25204, -25203, -25207, -25209, -25210, -25213, -25214, -1, i32::MIN, i32::MAX], |_, code| {
-            WriteOutcome::StopUncertain(match code {
-                -25200 => Reason::Failure,
-                -25204 => Reason::CannotComplete,
-                _ => Reason::Unknown,
-            })
-        });
+        check_returned(
+            &[
+                -25200,
+                -25204,
+                -25203,
+                -25207,
+                -25209,
+                -25210,
+                -25213,
+                -25214,
+                -1,
+                i32::MIN,
+                i32::MAX,
+            ],
+            |_, code| {
+                WriteOutcome::StopUncertain(match code {
+                    -25200 => Reason::Failure,
+                    -25204 => Reason::CannotComplete,
+                    _ => Reason::Unknown,
+                })
+            },
+        );
     }
 
     #[test]
     fn uncalled_nonsettable_setter_falls_through_without_fake_error() {
         for code in CODES {
-            assert_eq!(native_write_outcome(NativeWriteKind::SetAttribute, false, &Settable::No, code),
-                WriteOutcome::FallThrough(Reason::AttributeUnsupported));
+            assert_eq!(
+                native_write_outcome(NativeWriteKind::SetAttribute, false, &Settable::No, code),
+                WriteOutcome::FallThrough(Reason::AttributeUnsupported)
+            );
         }
     }
 
@@ -301,7 +371,9 @@ mod u32_native_write_tests {
         for code in CODES {
             for kind in KINDS {
                 for settable in SETTABLES {
-                    if kind == NativeWriteKind::SetAttribute && settable == Settable::No { continue; }
+                    if kind == NativeWriteKind::SetAttribute && settable == Settable::No {
+                        continue;
+                    }
                     let outcome = native_write_outcome(kind, false, &settable, code);
                     assert_eq!(outcome, WriteOutcome::StopNotDelivered(Reason::Unknown));
                     assert!(WriteChain::run([outcome], false).no_input());
@@ -315,13 +387,17 @@ mod u32_native_write_tests {
         for code in CODES {
             for kind in KINDS {
                 for settable in SETTABLES {
-                    let expected = if kind == NativeWriteKind::SetAttribute && settable == Settable::No {
-                        WriteOutcome::FallThrough(Reason::AttributeUnsupported)
-                    } else {
-                        WriteOutcome::StopNotDelivered(Reason::Unknown)
-                    };
-                    assert_eq!(native_write_outcome(kind, false, &settable, code), expected,
-                        "kind={kind:?}, settable={settable:?}, code={code}");
+                    let expected =
+                        if kind == NativeWriteKind::SetAttribute && settable == Settable::No {
+                            WriteOutcome::FallThrough(Reason::AttributeUnsupported)
+                        } else {
+                            WriteOutcome::StopNotDelivered(Reason::Unknown)
+                        };
+                    assert_eq!(
+                        native_write_outcome(kind, false, &settable, code),
+                        expected,
+                        "kind={kind:?}, settable={settable:?}, code={code}"
+                    );
                 }
             }
         }
@@ -333,10 +409,14 @@ mod u32_native_write_tests {
             for kind in KINDS {
                 for code in CODES {
                     let unknown = Settable::Unknown(query_error);
-                    assert_eq!(native_write_outcome(kind, false, &unknown, code),
-                        WriteOutcome::StopNotDelivered(Reason::Unknown));
-                    assert_eq!(native_write_outcome(kind, true, &unknown, code),
-                        native_write_outcome(kind, true, &Settable::Yes, code));
+                    assert_eq!(
+                        native_write_outcome(kind, false, &unknown, code),
+                        WriteOutcome::StopNotDelivered(Reason::Unknown)
+                    );
+                    assert_eq!(
+                        native_write_outcome(kind, true, &unknown, code),
+                        native_write_outcome(kind, true, &Settable::Yes, code)
+                    );
                 }
             }
         }
@@ -351,7 +431,10 @@ mod u32_native_write_tests {
                 for settable in SETTABLES {
                     let outcome = native_write_outcome(kind, false, &settable, code);
                     assert!(WriteChain::run([outcome], false).no_input());
-                    assert!(!WriteChain::run([outcome], delivered == WriteOutcome::Delivered).no_input());
+                    assert!(
+                        !WriteChain::run([outcome], delivered == WriteOutcome::Delivered)
+                            .no_input()
+                    );
                 }
             }
         }
