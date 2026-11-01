@@ -1588,7 +1588,33 @@ fn tree_output_fields(
         structured["filtered_element_count"] = serde_json::json!(filtered_element_count);
     }
     if let Some(tree) = tree {
-        tree.walk.apply(&mut structured);
+        let returned_indices: std::collections::HashSet<u64> = structured["elements"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|element| element.get("element_index").and_then(Value::as_u64))
+            .collect();
+        let mut owners = std::collections::HashMap::new();
+        let mut ambiguous = std::collections::HashSet::new();
+        for node in &tree.nodes {
+            let Some(index) = node.element_index.map(|index| index as u64) else {
+                continue;
+            };
+            if node.element_ptr == 0 || !returned_indices.contains(&index) {
+                continue;
+            }
+            let owner = node.element_ptr as u64;
+            if owners
+                .insert(owner, index)
+                .is_some_and(|previous| previous != index)
+            {
+                ambiguous.insert(owner);
+            }
+        }
+        for owner in ambiguous {
+            owners.remove(&owner);
+        }
+        tree.walk.apply_with_owner_mapping(&mut structured, &owners);
         apply_offscreen_rows(&mut structured, &tree.offscreen_rows);
     } else {
         structured["observation_complete"] = serde_json::json!(false);
@@ -3147,6 +3173,127 @@ mod evidence_refactor_output_tests;
 mod completeness_output_tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn scope_exclusion_owner_maps_after_deferred_renumbering() {
+        let (mut tree, _) = crate::ax::tree::evidence_output_fixture(true, true);
+        let owner = tree
+            .nodes
+            .iter()
+            .find(|node| node.element_ptr == 4)
+            .unwrap();
+        assert_eq!(owner.element_index, Some(3));
+        let mut budget = cua_driver_core::walk_budget::WalkBudget::nodes_only(100);
+        budget.record_scope_exclusion(
+            cua_driver_contract::ScopeExclusionKind::ClosedMenusNotExpanded,
+            Some(4),
+        );
+        tree.walk = budget.outcome();
+        let elements = build_elements_array_with_token(&tree.nodes, Some(7));
+        let elements = cua_driver_core::element_query::project_elements_for_query(
+            elements,
+            Some("Beta"),
+            &tree.tree_markdown,
+        );
+        assert!(elements.iter().any(|entry| entry["element_index"] == 3));
+        let payload = tree_output_fields(
+            99,
+            42,
+            4,
+            elements.len(),
+            false,
+            tree.tree_markdown.clone(),
+            elements,
+            true,
+            Some(&tree),
+            Some(7),
+            42,
+            None,
+        );
+        assert_eq!(
+            payload["observation_scope_exclusions"],
+            json!([{
+                "kind":"closed_menus_not_expanded", "element_indices":[3]
+            }])
+        );
+    }
+
+    fn exclusion_output(owners: &[u64], returned: &[u64]) -> Value {
+        let nodes = vec![
+            crate::ax::tree::AXNode::for_test(Some(1), 10),
+            crate::ax::tree::AXNode::for_test(Some(3), 20),
+        ];
+        let mut tree = crate::ax::tree::TreeWalkResult::for_test(String::new(), nodes);
+        let mut budget = cua_driver_core::walk_budget::WalkBudget::nodes_only(100);
+        for &owner in owners {
+            budget.record_scope_exclusion(
+                cua_driver_contract::ScopeExclusionKind::ClosedMenusNotExpanded,
+                Some(owner),
+            );
+        }
+        tree.walk = budget.outcome();
+        let elements = returned
+            .iter()
+            .map(|index| json!({"element_index": index}))
+            .collect::<Vec<_>>();
+        tree_output_fields(
+            99,
+            42,
+            2,
+            elements.len(),
+            false,
+            String::new(),
+            elements,
+            false,
+            Some(&tree),
+            None,
+            42,
+            None,
+        )
+    }
+
+    #[test]
+    fn dropped_or_unmapped_owner_preserves_exclusion_with_unknown_ownership() {
+        for owners in [vec![10, 20], vec![10, 99]] {
+            let payload = exclusion_output(&owners, &[1]);
+            assert_eq!(
+                payload["observation_scope_exclusions"],
+                json!([{
+                    "kind":"closed_menus_not_expanded"
+                }])
+            );
+            assert_eq!(payload["observation_complete"], false);
+        }
+    }
+
+    #[test]
+    fn multiple_exclusions_deduplicate_final_owner_indices() {
+        let payload = exclusion_output(&[20, 10, 20], &[1, 3]);
+        assert_eq!(
+            payload["observation_scope_exclusions"],
+            json!([{
+                "kind":"closed_menus_not_expanded", "element_indices":[1, 3]
+            }])
+        );
+    }
+
+    #[test]
+    fn owner_mapping_uses_final_projected_elements_only() {
+        let payload = exclusion_output(&[20], &[1]);
+        assert_eq!(
+            payload["observation_scope_exclusions"],
+            json!([{
+                "kind":"closed_menus_not_expanded"
+            }])
+        );
+        let returned = exclusion_output(&[20], &[3]);
+        assert_eq!(
+            returned["observation_scope_exclusions"],
+            json!([{
+                "kind":"closed_menus_not_expanded", "element_indices":[3]
+            }])
+        );
+    }
 
     #[test]
     fn no_walk_success_modes_report_explicit_false() {
