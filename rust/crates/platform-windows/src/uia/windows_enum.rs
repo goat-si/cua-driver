@@ -660,17 +660,32 @@ pub fn try_invoke_accelerator_in_window(hwnd: isize, combo: &str) -> anyhow::Res
     .unwrap_or_else(|error| match error {
         // Another UIA operation held the single-flight gate, so this scan
         // never started and nothing was sent.
-        UiaDeadlineError::Busy => Err(anyhow::anyhow!(
-            "another UI Automation operation is still running; the shortcut was not sent. Retry shortly."
-        )),
-        UiaDeadlineError::Timeout | UiaDeadlineError::Unavailable | UiaDeadlineError::WorkerDisconnected => {
-            Err(anyhow::Error::new(AcceleratorStop {
-                verdict: crate::uia_mutation::AccelStop::Uncertain(
-                    crate::uia_mutation::UncertainKind::Timeout,
-                ),
-                hresult: 0x8013_1505_u32 as i32,
-            }))
-        }
+        UiaDeadlineError::Busy => Err(anyhow::Error::new(AcceleratorStop {
+            verdict: crate::uia_mutation::AccelStop::NotSent(
+                "another UI Automation operation is still running",
+            ),
+            hresult: 0,
+        })),
+        // The worker thread could not be spawned, so nothing ran.
+        UiaDeadlineError::Unavailable => Err(anyhow::Error::new(AcceleratorStop {
+            verdict: crate::uia_mutation::AccelStop::NotSent(
+                "the UI Automation worker could not be started",
+            ),
+            hresult: 0,
+        })),
+        UiaDeadlineError::Timeout => Err(anyhow::Error::new(AcceleratorStop {
+            verdict: crate::uia_mutation::AccelStop::Uncertain(
+                crate::uia_mutation::UncertainKind::Timeout,
+            ),
+            hresult: 0x8013_1505_u32 as i32,
+        })),
+        // The worker ended without reporting; it may have sent the invoke.
+        UiaDeadlineError::WorkerDisconnected => Err(anyhow::Error::new(AcceleratorStop {
+            verdict: crate::uia_mutation::AccelStop::Uncertain(
+                crate::uia_mutation::UncertainKind::Unclassified,
+            ),
+            hresult: 0x8000_FFFF_u32 as i32,
+        })),
     })
 }
 

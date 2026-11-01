@@ -6253,17 +6253,16 @@ impl Tool for PressKeyTool {
                 let admitted = admitted.clone();
                 move || {
                     let _admission = &admitted;
+                    // None: no admitted element; Some(None): not a UIA element.
+                    // Both are known before anything is sent.
                     crate::uia::fg_bypass::run_with_uwp_bypass(hwnd as isize, || {
-                        admitted
-                            .as_ref()
-                            .ok_or_else(|| anyhow::anyhow!("missing admitted element"))
-                            .and_then(|element| element.focus_element())
+                        admitted.as_ref().map(|element| element.focus_hresult())
                     })
                 }
             })
             .await;
             match focused {
-                Ok(Ok(())) => {
+                Ok(Some(Some(0))) => {
                     if delivery == DeliveryMode::Background {
                         let _ = crate::input::wait_for_focused_descendant(
                             hwnd,
@@ -6271,8 +6270,21 @@ impl Tool for PressKeyTool {
                         );
                     }
                 }
-                Ok(Err(e)) => return ToolResult::error(e.to_string()),
-                Err(e) => return ToolResult::error(format!("UIA focus task failed: {e}")),
+                Ok(Some(Some(hr))) => {
+                    return crate::uia_mutation::foreground_focus_uncertain_result(format!(
+                        "UIA SetFocus returned HRESULT 0x{:08X}; focus may have changed; no key was sent",
+                        hr as u32
+                    ))
+                }
+                Ok(Some(None)) => {
+                    return ToolResult::error("element is an MSAA element, not a UIA element")
+                }
+                Ok(None) => return ToolResult::error("missing admitted element"),
+                Err(e) => {
+                    return crate::uia_mutation::foreground_focus_uncertain_result(format!(
+                        "UIA focus task failed: {e}; focus may have changed; no key was sent"
+                    ))
+                }
             }
         }
         let key_display = key.clone();
@@ -6635,6 +6647,7 @@ impl Tool for HotkeyTool {
                         Some(stop) => match stop.verdict {
                             AccelStop::Refused(kind) => crate::uia_mutation::chain_error(refusal_text(kind, stop.hresult), json!({"path":"uia", "verified":false}), [crate::uia_mutation::classify_acquisition(stop.hresult).to_core()], false),
                             AccelStop::Uncertain(kind) => crate::uia_mutation::chain_error(format!("{} The shortcut may have been delivered.", uncertain_text(kind, stop.hresult)), json!({"path":"uia", "verified":false}), [crate::uia_mutation::classify_sent_call(stop.hresult).to_core()], false),
+                            AccelStop::NotSent(reason) => crate::uia_mutation::chain_error(format!("hotkey (UIA path): {reason}; the shortcut was not sent. Retry shortly."), json!({"path":"uia", "verified":false}), [cua_driver_core::mutation::WriteOutcome::StopNotDelivered(cua_driver_core::mutation::Reason::UnconfirmedAlive)], false),
                         },
                         None => ToolResult::error(format!("hotkey (UIA path): {e}")),
                     }

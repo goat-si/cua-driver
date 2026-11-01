@@ -365,6 +365,8 @@ pub(crate) fn expand_route(outcome: RungOutcome) -> MutationRoute {
 pub(crate) enum AccelStop {
     Refused(RefusalKind),
     Uncertain(UncertainKind),
+    /// The scan never started (gate busy, or the worker could not be spawned).
+    NotSent(&'static str),
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AccelOutcome {

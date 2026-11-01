@@ -376,6 +376,9 @@ fn focused_document_worker_error(
             FocusedDocumentTypeOutcome::Unknown("focused UIA call timed out")
         }
         UiaDeadlineError::Unavailable => {
+            FocusedDocumentTypeOutcome::Unknown("focused UIA worker could not be started")
+        }
+        UiaDeadlineError::WorkerDisconnected => {
             FocusedDocumentTypeOutcome::Unknown("focused UIA worker ended without a result")
         }
     }
@@ -437,6 +440,7 @@ mod tests {
             UiaDeadlineError::Busy,
             UiaDeadlineError::Timeout,
             UiaDeadlineError::Unavailable,
+            UiaDeadlineError::WorkerDisconnected,
         ] {
             assert_eq!(
                 focused_document_worker_error(error, 0, false),
@@ -447,7 +451,11 @@ mod tests {
 
     #[test]
     fn worker_errors_after_write_never_enable_a_second_input_route() {
-        for error in [UiaDeadlineError::Timeout, UiaDeadlineError::Unavailable] {
+        for error in [
+            UiaDeadlineError::Timeout,
+            UiaDeadlineError::Unavailable,
+            UiaDeadlineError::WorkerDisconnected,
+        ] {
             assert!(matches!(
                 focused_document_worker_error(error, 1, false),
                 FocusedDocumentTypeOutcome::Unknown(_)
