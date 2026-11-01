@@ -62,6 +62,21 @@ impl Completeness {
         }
     }
 
+    /// Retained nodes still contribute evidence when a mandatory attribute
+    /// read fails. An unattempted numeric role is not a failure.
+    pub(crate) fn retained_attributes(
+        &mut self,
+        in_scope: bool,
+        role_name_ok: bool,
+        name_ok: bool,
+        state_ok: bool,
+        numeric_role_failed: bool,
+    ) {
+        if !role_name_ok || !name_ok || !state_ok || numeric_role_failed {
+            self.record(in_scope, Event::AttributeFailed, None);
+        }
+    }
+
     pub(crate) fn closed_menu(&mut self, in_scope: bool, position: usize) {
         if in_scope {
             self.closed_menu_owners.push(position);
@@ -286,6 +301,37 @@ mod tests {
         assert_eq!(c.reasons.len(), 1);
         assert!(has(&c, "attribute_read_failed"));
         assert!(c.boundaries.is_empty());
+    }
+
+    #[test]
+    fn retained_role_name_numeric_role_and_state_failures_are_individually_incomplete() {
+        // Each record is a retained node; the second is an unaffected sibling.
+        // Exercise the same classifier used after the native reads complete.
+        for failed in 0..4 {
+            let mut c = Completeness::new(true);
+            let mut retained = Vec::new();
+            for position in 0..2 {
+                let first = position == 0;
+                c.retained_attributes(
+                    true,
+                    !(first && failed == 0),
+                    !(first && failed == 1),
+                    !(first && failed == 2),
+                    first && failed == 3,
+                );
+                retained.push(position);
+            }
+            assert_eq!(retained, [0, 1]);
+            assert_eq!(output(&c)["observation_complete"], false);
+            assert!(has(&c, "attribute_read_failed"));
+            assert!(c.boundaries.is_empty());
+        }
+
+        let mut clean = Completeness::new(true);
+        clean.retained_attributes(true, true, true, true, false);
+        // Failures in a sibling frame are outside the target window.
+        clean.retained_attributes(false, false, false, false, true);
+        assert_eq!(output(&clean)["observation_complete"], true);
     }
 
     #[test]

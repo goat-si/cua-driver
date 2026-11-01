@@ -1713,12 +1713,9 @@ async fn collect_visited_bounded_opts<'a>(
             call(acc.get_state()),
             call(raw_child_count(zconn, &oref)),
         );
-        if !matches!(&role_r, Some(Ok(_)))
-            || !matches!(&name_r, Some(Ok(_)))
-            || !matches!(&state_r, Some(Ok(_)))
-        {
-            completeness.record(in_scope, Event::AttributeFailed, None);
-        }
+        let role_name_ok = matches!(&role_r, Some(Ok(_)));
+        let name_ok = matches!(&name_r, Some(Ok(_)));
+        let state_ok = matches!(&state_r, Some(Ok(_)));
         let child_count = match &count_r {
             Some(Ok(count)) if *count >= 0 => CountEvidence::Known(*count as u32),
             _ => CountEvidence::Unknown,
@@ -1760,9 +1757,13 @@ async fn collect_visited_bounded_opts<'a>(
         } else {
             RoleRead::NotRead
         };
-        if matches!(role_read, RoleRead::Failed) {
-            completeness.record(in_scope, Event::AttributeFailed, None);
-        }
+        completeness.retained_attributes(
+            in_scope,
+            role_name_ok,
+            name_ok,
+            state_ok,
+            matches!(role_read, RoleRead::Failed),
+        );
         let is_password = is_password_field(role_read, &role_lower);
         let checked = if role_lower.contains("check") {
             state_r
