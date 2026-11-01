@@ -190,8 +190,9 @@ fn try_type_focused_document_append_unbounded(
         let expected_value = text.to_owned();
         let write_result = (|| -> Result<(), &'static str> {
             let value = BSTR::from(expected_value.as_str());
-            unsafe { value_pattern.SetValue(&value) }
-                .map_err(|_| "ValuePattern.SetValue failed after dispatch")?;
+            if unsafe { super::sent_call::set_value(&value_pattern, &value) } != 0 {
+                return Err("ValuePattern.SetValue failed after dispatch");
+            }
             let actual_value = unsafe { value_pattern.CurrentValue() }
                 .map_err(|_| "ValuePattern read-back failed after dispatch")?;
             if !normalized_text_matches(&expected_value, &actual_value.to_string()) {
@@ -210,8 +211,9 @@ fn try_type_focused_document_append_unbounded(
                 )
             }
             .map_err(|_| "TextPattern caret collapse failed after dispatch")?;
-            unsafe { caret_range.Select() }
-                .map_err(|_| "TextPattern caret placement failed after dispatch")?;
+            if unsafe { super::sent_call::select_text_range(&caret_range) } != 0 {
+                return Err("TextPattern caret placement failed after dispatch");
+            }
 
             let fresh_document_range = unsafe { text_pattern.DocumentRange() }
                 .map_err(|_| "TextPattern verification range failed after dispatch")?;

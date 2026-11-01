@@ -1,12 +1,5 @@
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RefusalKind {
-    AccessDenied,
-    ElementUnavailable,
-    InvalidArgument,
-    NotEnabled,
-    /// Reading the pattern itself failed with something other than "not
-    /// supported"; no method of that pattern was called.
-    PatternUnreadable,
     StaleElement,
     PermissionDenied,
     UnconfirmedAlive,
@@ -86,35 +79,12 @@ impl AcquireVerdict {
         match self {
             Self::Absent => WriteOutcome::FallThrough(Reason::Unsupported),
             Self::NotDelivered(kind) => WriteOutcome::StopNotDelivered(match kind {
-                RefusalKind::StaleElement | RefusalKind::ElementUnavailable => Reason::StaleElement,
-                RefusalKind::PermissionDenied | RefusalKind::AccessDenied => {
-                    Reason::PermissionDenied
-                }
-                RefusalKind::InvalidArgument => Reason::InvalidArgument,
-                RefusalKind::NotEnabled => Reason::Disabled,
-                RefusalKind::UnconfirmedAlive | RefusalKind::PatternUnreadable => {
-                    Reason::UnconfirmedAlive
-                }
+                RefusalKind::StaleElement => Reason::StaleElement,
+                RefusalKind::PermissionDenied => Reason::PermissionDenied,
+                RefusalKind::UnconfirmedAlive => Reason::UnconfirmedAlive,
             }),
         }
     }
-}
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum WriteVerdict {
-    Delivered,
-    AffordanceAbsent,
-    Refused(RefusalKind),
-    Uncertain(UncertainKind),
-}
-
-pub(crate) fn classify_write_hresult(hresult: i32) -> WriteVerdict {
-    match classify_sent_call(hresult) {
-        SentVerdict::Delivered => WriteVerdict::Delivered,
-        SentVerdict::Uncertain(kind) => WriteVerdict::Uncertain(kind),
-    }
-}
-pub(crate) fn may_fall_through(verdict: &WriteVerdict) -> bool {
-    matches!(verdict, WriteVerdict::AffordanceAbsent)
 }
 /// Whether a failed `GetCurrentPattern` or interface cast means the pattern
 /// is simply not there. windows-rs reports a successful null pattern as an
@@ -134,23 +104,18 @@ pub(crate) enum RungOutcome {
 pub(crate) enum ChainOutcome {
     Delivered {
         rung: usize,
-        not_supported_calls: Vec<usize>,
     },
     Refused {
         rung: usize,
         kind: RefusalKind,
         hresult: i32,
-        not_supported_calls: Vec<usize>,
     },
     Uncertain {
         rung: usize,
         kind: UncertainKind,
         hresult: i32,
-        not_supported_calls: Vec<usize>,
     },
-    NoAffordance {
-        not_supported_calls: Vec<usize>,
-    },
+    NoAffordance,
 }
 pub(crate) fn run_rungs(rungs: Vec<Box<dyn FnOnce() -> RungOutcome + '_>>) -> ChainOutcome {
     use cua_driver_core::mutation::{WriteChain, WriteOutcome};
@@ -167,12 +132,8 @@ pub(crate) fn run_rungs(rungs: Vec<Box<dyn FnOnce() -> RungOutcome + '_>>) -> Ch
         }),
         false,
     );
-    let not_supported_calls = Vec::new();
     match (chain.outcomes().last(), last) {
-        (Some(WriteOutcome::Delivered), Some((rung, _))) => ChainOutcome::Delivered {
-            rung,
-            not_supported_calls,
-        },
+        (Some(WriteOutcome::Delivered), Some((rung, _))) => ChainOutcome::Delivered { rung },
         (
             Some(WriteOutcome::StopNotDelivered(_)),
             Some((rung, RungOutcome::AcquireFailed(hresult))),
@@ -184,7 +145,6 @@ pub(crate) fn run_rungs(rungs: Vec<Box<dyn FnOnce() -> RungOutcome + '_>>) -> Ch
                 rung,
                 kind,
                 hresult,
-                not_supported_calls,
             }
         }
         (Some(WriteOutcome::StopUncertain(_)), Some((rung, RungOutcome::Called(hresult)))) => {
@@ -195,12 +155,9 @@ pub(crate) fn run_rungs(rungs: Vec<Box<dyn FnOnce() -> RungOutcome + '_>>) -> Ch
                 rung,
                 kind,
                 hresult,
-                not_supported_calls,
             }
         }
-        (None | Some(WriteOutcome::FallThrough(_)), _) => ChainOutcome::NoAffordance {
-            not_supported_calls,
-        },
+        (None | Some(WriteOutcome::FallThrough(_)), _) => ChainOutcome::NoAffordance,
         _ => unreachable!("rung outcome and core result disagree"),
     }
 }
@@ -228,39 +185,30 @@ pub(crate) enum ClickPlan {
 }
 pub(crate) fn click_plan_from_chain(outcome: ChainOutcome) -> ClickPlan {
     match outcome {
-        ChainOutcome::Delivered {
+        ChainOutcome::Delivered { rung } => ClickPlan::Semantic {
             rung,
-            not_supported_calls,
-        } => ClickPlan::Semantic {
-            rung,
-            failed: not_supported_calls,
+            failed: vec![],
         },
-        ChainOutcome::NoAffordance {
-            not_supported_calls,
-        } => ClickPlan::Physical {
-            failed: not_supported_calls,
-        },
+        ChainOutcome::NoAffordance => ClickPlan::Physical { failed: vec![] },
         ChainOutcome::Refused {
             rung,
             kind,
             hresult,
-            not_supported_calls,
         } => ClickPlan::Refused {
             rung,
             kind,
             hresult,
-            failed: not_supported_calls,
+            failed: vec![],
         },
         ChainOutcome::Uncertain {
             rung,
             kind,
             hresult,
-            not_supported_calls,
         } => ClickPlan::Uncertain {
             rung,
             kind,
             hresult,
-            failed: not_supported_calls,
+            failed: vec![],
         },
     }
 }
@@ -307,15 +255,12 @@ pub(crate) fn set_value_route(
             kind,
             hresult,
         },
-        ChainOutcome::NoAffordance { .. } => SetValueDecision::NoAffordance,
+        ChainOutcome::NoAffordance => SetValueDecision::NoAffordance,
     }
 }
 #[cfg(target_os = "windows")]
 pub(crate) fn refusal_text(kind: RefusalKind, hresult: i32) -> String {
-    let what = match kind {
-        RefusalKind::PatternUnreadable => "could not read the UIA pattern",
-        _ => "UIA refused the write",
-    };
+    let what = "could not read the UIA pattern";
     format!(
         "{what}: {kind:?} (HRESULT 0x{:08X}); nothing was sent. Read the window state before retrying.",
         hresult as u32
@@ -382,21 +327,27 @@ pub(crate) fn scroll_preflight<T>(
 pub(crate) fn expand_route(outcome: RungOutcome) -> MutationRoute {
     match outcome {
         RungOutcome::Absent => MutationRoute::FallThrough,
-        RungOutcome::AcquireFailed(_) => MutationRoute::Refused,
-        RungOutcome::Called(hr) => match classify_write_hresult(hr) {
-            WriteVerdict::Delivered => MutationRoute::Done,
-            WriteVerdict::AffordanceAbsent => MutationRoute::FallThrough,
-            WriteVerdict::Refused(_) => MutationRoute::Refused,
-            WriteVerdict::Uncertain(_) => MutationRoute::Uncertain,
+        RungOutcome::AcquireFailed(hr) => match classify_acquisition(hr) {
+            AcquireVerdict::Absent => MutationRoute::FallThrough,
+            AcquireVerdict::NotDelivered(_) => MutationRoute::Refused,
+        },
+        RungOutcome::Called(hr) => match classify_sent_call(hr) {
+            SentVerdict::Delivered => MutationRoute::Done,
+            SentVerdict::Uncertain(_) => MutationRoute::Uncertain,
         },
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AccelStop {
+    Refused(RefusalKind),
+    Uncertain(UncertainKind),
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AccelOutcome {
     Delivered,
     Absent,
-    Stop(WriteVerdict, i32),
+    Stop(AccelStop, i32),
 }
 pub(crate) fn accelerator_scan(outcomes: impl Iterator<Item = AccelOutcome>) -> AccelOutcome {
     for outcome in outcomes {

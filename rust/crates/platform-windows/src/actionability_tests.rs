@@ -275,7 +275,9 @@ async fn admission_and_route_changes() {
     assert!(may_write(Rung::RangeValue, &a));
     let a = Admission {
         route: AdmittedRoute::UiaWrite,
-        value: PatternAdmission::Present { read_only: Some(false) },
+        value: PatternAdmission::Present {
+            read_only: Some(false),
+        },
         range: PatternAdmission::Absent,
     };
     assert!(!may_write(Rung::RangeValue, &a));
@@ -369,8 +371,16 @@ fn value_notsupported_only_calls_admitted_range() {
     for range_allowed in [false, true] {
         let admission = Admission {
             route: AdmittedRoute::UiaWrite,
-            value: PatternAdmission::Present { read_only: Some(false) },
-            range: if range_allowed { PatternAdmission::Present { read_only: Some(false) } } else { PatternAdmission::Absent },
+            value: PatternAdmission::Present {
+                read_only: Some(false),
+            },
+            range: if range_allowed {
+                PatternAdmission::Present {
+                    read_only: Some(false),
+                }
+            } else {
+                PatternAdmission::Absent
+            },
         };
         let calls = AtomicUsize::new(0);
         let mut refused = false;
@@ -384,7 +394,10 @@ fn value_notsupported_only_calls_admitted_range() {
         });
         assert_eq!(calls.load(Ordering::SeqCst), 0);
         assert!(!refused);
-        assert!(matches!(decision, SetValueDecision::Uncertain { rung: 0, .. }));
+        assert!(matches!(
+            decision,
+            SetValueDecision::Uncertain { rung: 0, .. }
+        ));
     }
 }
 #[test]
@@ -423,7 +436,9 @@ fn changed_patterns_never_call_an_unadmitted_rung() {
         (
             Admission {
                 route: AdmittedRoute::UiaWrite,
-                value: PatternAdmission::Present { read_only: Some(false) },
+                value: PatternAdmission::Present {
+                    read_only: Some(false),
+                },
                 range: PatternAdmission::Absent,
             },
             false,
@@ -434,7 +449,9 @@ fn changed_patterns_never_call_an_unadmitted_rung() {
             Admission {
                 route: AdmittedRoute::UiaWrite,
                 value: PatternAdmission::Absent,
-                range: PatternAdmission::Present { read_only: Some(false) },
+                range: PatternAdmission::Present {
+                    read_only: Some(false),
+                },
             },
             true,
             0,
@@ -443,8 +460,12 @@ fn changed_patterns_never_call_an_unadmitted_rung() {
         (
             Admission {
                 route: AdmittedRoute::UiaWrite,
-                value: PatternAdmission::Present { read_only: Some(false) },
-                range: PatternAdmission::Present { read_only: Some(false) },
+                value: PatternAdmission::Present {
+                    read_only: Some(false),
+                },
+                range: PatternAdmission::Present {
+                    read_only: Some(false),
+                },
             },
             true,
             1,

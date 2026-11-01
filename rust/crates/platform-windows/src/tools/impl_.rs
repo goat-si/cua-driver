@@ -157,12 +157,23 @@ fn resolve_onscreen_point_with_scroll(
             if trust_cached && is_offscreen != Some(true) {
                 return Ok((cx, cy));
             }
-            if let Some((nx, ny)) = unsafe {
+            use crate::uia::scroll::RevealOutcome;
+            match unsafe {
                 crate::uia::scroll::scroll_into_view_and_recenter(hwnd, retained.as_ptr())
             } {
-                if crate::input::point_in_window_bounds(hwnd, nx, ny) {
-                    return Ok((nx, ny));
+                RevealOutcome::Revealed((nx, ny))
+                    if crate::input::point_in_window_bounds(hwnd, nx, ny) =>
+                {
+                    return Ok((nx, ny))
                 }
+                RevealOutcome::Uncertain
+                | RevealOutcome::NotRevealed { writes_sent: true }
+                | RevealOutcome::Revealed(_) => {
+                    return Err(ToolResult::error("UIA reveal may have changed the window; the target was not clicked. Read the window state before acting again.")
+                        .with_structured(json!({"path":"uia", "verified":false, "effect":"unverifiable"}))
+                        .with_disposition(cua_driver_contract::ErrorDisposition::SUSPECTED_NOOP));
+                }
+                RevealOutcome::NotRevealed { writes_sent: false } => {}
             }
         } else if trust_cached {
             return Ok((cx, cy));
@@ -3468,14 +3479,20 @@ fn mutation_uncertain(
     path: &str,
     transport: ActionTransport,
     requested: cua_driver_core::action_record::RequestedDelivery,
-    actual: cua_driver_core::action_record::ActualDelivery,
+    _actual: cua_driver_core::action_record::ActualDelivery,
 ) -> ToolResult {
     use cua_driver_core::action_record::{ActionEffect, ActionExecutionRecord};
     let mut record = ActionExecutionRecord::new(ActionEffect::Unverifiable, transport, requested);
-    record.actual_delivery = Some(actual);
-    ToolResult::text(message)
-        .with_structured(json!({"path":path, "verified":false, "effect":"unverifiable"}))
-        .with_action_record(record)
+    record.actual_delivery = Some(cua_driver_core::action_record::ActualDelivery::Unknown);
+    crate::uia_mutation::chain_error(
+        message,
+        json!({"path":path, "verified":false}),
+        [cua_driver_core::mutation::WriteOutcome::StopUncertain(
+            cua_driver_core::mutation::Reason::Unknown,
+        )],
+        false,
+    )
+    .with_action_record(record)
 }
 
 /// Read a UIA pattern, telling "the element has no such pattern" apart from
@@ -4173,8 +4190,8 @@ impl Tool for ClickTool {
             // transient or scroll-adjusted.
             if action_req.as_deref() == Some("expand") {
                 use crate::uia_mutation::{
-                    classify_write_hresult, expand_route, refusal_text, uncertain_text,
-                    MutationRoute, RefusalKind, RungOutcome, WriteVerdict,
+                    classify_acquisition, classify_sent_call, expand_route, refusal_text,
+                    uncertain_text, AcquireVerdict, MutationRoute, RungOutcome, SentVerdict,
                 };
                 let expand =
                     tokio::task::spawn_blocking({
@@ -4205,11 +4222,9 @@ impl Tool for ClickTool {
                             };
                             let result = crate::uia::fg_bypass::run_with_uwp_bypass(
                                 hwnd as isize,
-                                || unsafe { pattern.Expand() },
+                                || unsafe { crate::uia::sent_call::expand(&pattern) },
                             );
-                            Ok(RungOutcome::Called(
-                                result.map_or_else(|error| error.code().0, |()| 0),
-                            ))
+                            Ok(RungOutcome::Called(result))
                         }
                     })
                     .await;
@@ -4235,18 +4250,18 @@ impl Tool for ClickTool {
                         MutationRoute::FallThrough => ToolResult::error("ExpandCollapsePattern unavailable"),
                         MutationRoute::Refused => {
                             let (kind, hr) = match outcome {
-                                RungOutcome::AcquireFailed(hr) => (RefusalKind::PatternUnreadable, hr),
-                                RungOutcome::Called(hr) => match classify_write_hresult(hr) {
-                                    WriteVerdict::Refused(kind) => (kind, hr),
-                                    _ => unreachable!("refused expand route requires a refusal"),
+                                RungOutcome::AcquireFailed(hr) => match classify_acquisition(hr) {
+                                    AcquireVerdict::NotDelivered(kind) => (kind, hr),
+                                    AcquireVerdict::Absent => unreachable!("absent acquisition cannot be refused"),
                                 },
+                                RungOutcome::Called(_) => unreachable!("sent writes cannot be refused"),
                                 RungOutcome::Absent => unreachable!("absent expand route is not refused"),
                             };
                             mutation_refusal(refusal_text(kind, hr), ActionTransport::WindowsUiaExpandCollapse, requested)
                         },
                         MutationRoute::Uncertain => {
                             let RungOutcome::Called(hr) = outcome else { unreachable!("uncertain expand route requires a write") };
-                            let WriteVerdict::Uncertain(kind) = classify_write_hresult(hr) else { unreachable!("uncertain expand route requires an uncertain HRESULT") };
+                            let SentVerdict::Uncertain(kind) = classify_sent_call(hr) else { unreachable!("uncertain expand route requires an uncertain HRESULT") };
                             uncertain(format!("ExpandCollapse.Expand on [{idx}]: {}", uncertain_text(kind, hr)))
                         },
                         MutationRoute::Partial => unreachable!("expand makes only one write"),
@@ -4408,7 +4423,7 @@ impl Tool for ClickTool {
             //   - count > 1 (double-click semantics aren't an Invoke
             //     concept — PostMessage produces the actual WM_LBUTTONDBLCLK)
             let use_uia_invoke = (btn == "left" || btn == "middle") && count == 1;
-            let result = tokio::task::spawn_blocking({ let admitted = admitted.clone(); move || -> anyhow::Result<BackgroundElementClick> {
+            let result = tokio::task::spawn_blocking({ let admitted = admitted.clone(); move || -> Result<BackgroundElementClick, ToolResult> {
                 let _admission = &admitted;
                 let mut failed_calls = Vec::new();
                 // Direct Chromium UIA Invoke can return S_OK without firing a
@@ -4421,7 +4436,7 @@ impl Tool for ClickTool {
                     let (cx, cy) = resolve_onscreen_point_with_scroll(
                         &admitted, hwnd, idx, cx, cy, "clicking",
                     )
-                    .map_err(|result| anyhow::anyhow!(tool_result_text(result)))?;
+                    ?;
                     return Ok(BackgroundElementClick::Inject { x: cx, y: cy, failed_calls });
                 }
                 if use_uia_invoke {
@@ -4446,12 +4461,11 @@ impl Tool for ClickTool {
 
                         use crate::uia_mutation::{click_plan_from_chain, run_rungs, ClickPlan, RungOutcome};
                         macro_rules! uia_rung {
-                            ($id:expr, $ty:ty, $method:ident) => {
+                            ($id:expr, $ty:ty, $call:path) => {
                                 Box::new(|| {
                                     match acquire_uia_pattern::<$ty>(&elem, $id) {
                                         Ok(Some(pattern)) => RungOutcome::Called(
-                                            crate::uia::fg_bypass::run_with_uwp_bypass(hwnd as isize, || unsafe { pattern.$method() })
-                                                .map_or_else(|error| error.code().0, |_| 0)),
+                                            crate::uia::fg_bypass::run_with_uwp_bypass(hwnd as isize, || unsafe { $call(&pattern) })),
                                         Ok(None) => RungOutcome::Absent,
                                         Err(hresult) => RungOutcome::AcquireFailed(hresult),
                                     }
@@ -4459,10 +4473,10 @@ impl Tool for ClickTool {
                             };
                         }
                         let plan = click_plan_from_chain(run_rungs(vec![
-                            uia_rung!(UIA_InvokePatternId, IUIAutomationInvokePattern, Invoke),
-                            uia_rung!(UIA_TogglePatternId, IUIAutomationTogglePattern, Toggle),
-                            uia_rung!(UIA_SelectionItemPatternId, IUIAutomationSelectionItemPattern, Select),
-                            uia_rung!(UIA_ExpandCollapsePatternId, IUIAutomationExpandCollapsePattern, Expand),
+                            uia_rung!(UIA_InvokePatternId, IUIAutomationInvokePattern, crate::uia::sent_call::invoke),
+                            uia_rung!(UIA_TogglePatternId, IUIAutomationTogglePattern, crate::uia::sent_call::toggle),
+                            uia_rung!(UIA_SelectionItemPatternId, IUIAutomationSelectionItemPattern, crate::uia::sent_call::select),
+                            uia_rung!(UIA_ExpandCollapsePatternId, IUIAutomationExpandCollapsePattern, crate::uia::sent_call::expand),
                         ]));
                         std::mem::forget(elem);
                         let names = ["Invoke", "Toggle", "SelectionItem.Select", "ExpandCollapse.Expand"];
@@ -4501,20 +4515,20 @@ impl Tool for ClickTool {
                         cy,
                         "clicking",
                     )
-                    .map_err(|result| anyhow::anyhow!(tool_result_text(result)))?;
+                    ?;
                     return Ok(BackgroundElementClick::Inject { x: cx, y: cy, failed_calls });
                 }
                 if admitted.as_ref().is_some_and(|element| element.read_while_minimized) {
                     let (x, y) =
                         resolve_onscreen_point_with_scroll(&admitted, hwnd, idx, cx, cy, "clicking")
-                            .map_err(|result| anyhow::anyhow!(tool_result_text(result)))?;
+                            ?;
                     return Ok(BackgroundElementClick::Post { x, y, failed_calls });
                 }
                 Ok(BackgroundElementClick::Post { x: cx, y: cy, failed_calls })
             } }).await;
             let plan = match result {
                 Ok(Ok(plan)) => plan,
-                Ok(Err(e)) => return ToolResult::error(e.to_string()),
+                Ok(Err(result)) => return result,
                 Err(e) => return ToolResult::error(format!("Task error: {e}")),
             };
             let (x, y, failed_calls, inject) = match plan {
@@ -4534,7 +4548,34 @@ impl Tool for ClickTool {
                     message,
                     transport,
                     failed_calls,
-                } => return background_element_click_result(message, transport, failed_calls),
+                } => {
+                    use cua_driver_core::action_record::{
+                        ActionAttempt, ActionEffect, ActionExecutionRecord, ActualDelivery,
+                        RequestedDelivery,
+                    };
+                    let mut record = ActionExecutionRecord::new(
+                        ActionEffect::Unverifiable,
+                        transport,
+                        RequestedDelivery::Background,
+                    );
+                    record.actual_delivery = Some(ActualDelivery::Unknown);
+                    for attempted in failed_calls.into_iter().chain(std::iter::once(transport)) {
+                        record.attempts.push(ActionAttempt {
+                            transport: attempted,
+                            delivery: ActualDelivery::Unknown,
+                            detail: Some("UIA provider write may have landed".into()),
+                        });
+                    }
+                    return crate::uia_mutation::chain_error(
+                        message,
+                        json!({"path":"ax", "verified":false}),
+                        [cua_driver_core::mutation::WriteOutcome::StopUncertain(
+                            cua_driver_core::mutation::Reason::Unknown,
+                        )],
+                        false,
+                    )
+                    .with_action_record(record);
+                }
                 BackgroundElementClick::Inject { x, y, failed_calls } => (x, y, failed_calls, true),
                 BackgroundElementClick::Post { x, y, failed_calls } => (x, y, failed_calls, false),
             };
@@ -4965,6 +5006,15 @@ fn wait_for_cached_element_keyboard_focus(
 /// in that case a real click at the accessibility-derived center is the
 /// bounded fallback. Both routes require `CurrentHasKeyboardFocus` read-back
 /// before any keyboard input is allowed to leave the driver.
+#[derive(Debug)]
+struct FocusUncertain(String);
+impl std::fmt::Display for FocusUncertain {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+impl std::error::Error for FocusUncertain {}
+
 fn focus_cached_element_for_foreground(
     admitted: &Option<crate::uia::snapshot::RetainedElement>,
     hwnd: u64,
@@ -4977,31 +5027,31 @@ fn focus_cached_element_for_foreground(
     // which would make the enclosing verify-before-SendInput transaction
     // fail closed. The foreground route has already activated the exact HWND,
     // so focus the cached element directly and verify it below.
-    let set_focus = admitted
-        .as_ref()
-        .ok_or_else(|| anyhow::anyhow!("missing admitted element"))
-        .and_then(|element| element.focus_element());
-    if set_focus.is_ok()
-        && wait_for_cached_element_keyboard_focus(admitted, std::time::Duration::from_millis(350))
-    {
-        return Ok(());
+    if let Some(element) = admitted.as_ref().filter(|element| element.is_uia()) {
+        if let Err(error) = element.focus_element() {
+            return Err(
+                FocusUncertain(format!("{error}; focus may have changed; nothing typed")).into(),
+            );
+        }
+        if wait_for_cached_element_keyboard_focus(admitted, std::time::Duration::from_millis(350)) {
+            return Ok(());
+        }
+        return Err(FocusUncertain(
+            "focus may have changed but could not be confirmed; nothing typed".into(),
+        )
+        .into());
     }
-
     if let Some((x, y)) = click_point {
         crate::input::send_click_synthesized_active_mods(hwnd, x, y, 1, "left", &[])?;
         if wait_for_cached_element_keyboard_focus(admitted, std::time::Duration::from_millis(500)) {
             return Ok(());
         }
+        return Err(FocusUncertain(
+            "focus click may have landed but focus could not be confirmed; nothing typed".into(),
+        )
+        .into());
     }
-
-    let detail = set_focus
-        .err()
-        .map(|error| format!("; UIA SetFocus failed: {error}"))
-        .unwrap_or_default();
-    anyhow::bail!(
-        "foreground_unavailable: Windows did not confirm keyboard focus on exact UIA element \
-         [{element_index}] in HWND 0x{hwnd:x}{detail}; no keyboard input was sent"
-    )
+    anyhow::bail!("foreground_unavailable: no focus route for element [{element_index}]; no keyboard input was sent")
 }
 
 static TYPE_DEF: std::sync::OnceLock<ToolDef> = std::sync::OnceLock::new();
@@ -5331,6 +5381,9 @@ impl Tool for TypeTextTool {
                     // foreground IS the escalated rung (mirrors macOS PATH_KEY_EVENTS_FG).
                     "effect": "unverifiable",
                 })),
+                Ok(Err(e)) if e.downcast_ref::<FocusUncertain>().is_some() => ToolResult::error(e.to_string())
+                    .with_structured(json!({"path":"uia", "verified":false, "effect":"unverifiable"}))
+                    .with_disposition(cua_driver_contract::ErrorDisposition::SUSPECTED_NOOP),
                 Ok(Err(e)) => ToolResult::error(e.to_string()),
                 Err(e)     => ToolResult::error(format!("Task error: {e}")),
             };
@@ -5416,10 +5469,15 @@ impl Tool for TypeTextTool {
                             },
                             |vp, value| {
                                 // Keep the foreground shield around the UIA write.
-                                crate::uia::fg_bypass::run_with_uwp_bypass(hwnd as isize, || {
-                                    unsafe { vp.SetValue(&BSTR::from(value)) }
-                                        .map_err(|error| error.code().0)
-                                })
+                                crate::uia::fg_bypass::run_with_uwp_bypass(
+                                    hwnd as isize,
+                                    || match unsafe {
+                                        crate::uia::sent_call::set_value(vp, &BSTR::from(value))
+                                    } {
+                                        0 => Ok(()),
+                                        hr => Err(hr),
+                                    },
+                                )
                             },
                             &text_for_uia,
                         ))
@@ -5455,35 +5513,12 @@ impl Tool for TypeTextTool {
                     };
                     return ToolResult::error(message);
                 }
-                Route::Continue(AppendOutcome::SecureWriteFailed { hresult }) => {
-                    use crate::uia_mutation::{classify_write_hresult, WriteVerdict};
-                    let message = match classify_write_hresult(hresult) {
-                        WriteVerdict::Refused(_) | WriteVerdict::AffordanceAbsent => format!("the password field refused the write; nothing was written (HRESULT 0x{:08X})", hresult as u32),
-                        _ => format!("the password field write failed or its effect is unknown; nothing else was sent (HRESULT 0x{:08X})", hresult as u32),
-                    };
-                    return ToolResult::error(message).with_structured(
+                Route::Continue(AppendOutcome::SecureWriteFailed { hresult })
+                | Route::Continue(AppendOutcome::WriteFailed { hresult }) => {
+                    return crate::uia_mutation::chain_error(
+                        format!("type_text: the UIA write may have landed (HRESULT 0x{:08X}); no other input was sent. Read the state before acting again.", hresult as u32),
                         value_write_structured_result(text_len, "unreadable", false),
-                    );
-                }
-                Route::Continue(AppendOutcome::WriteFailed { hresult }) => {
-                    use crate::uia_mutation::{
-                        classify_write_hresult, refusal_text, uncertain_text, WriteVerdict,
-                    };
-                    return match classify_write_hresult(hresult) {
-                        WriteVerdict::Refused(kind) => {
-                            ToolResult::error(refusal_text(kind, hresult))
-                        }
-                        WriteVerdict::Uncertain(kind) => {
-                            ToolResult::text(format!(
-                                "{} The UIA write was not retyped.",
-                                uncertain_text(kind, hresult)
-                            ))
-                            .with_structured(
-                                value_write_structured_result(text_len, "unreadable", false),
-                            )
-                        }
-                        _ => unreachable!("only a failed, non-fallback write reaches this branch"),
-                    };
+                        [crate::uia_mutation::classify_sent_call(hresult).to_core()], false);
                 }
                 Route::Continue(AppendOutcome::NoValuePattern) => {
                     unreachable!("absent pattern uses the typing route")
@@ -6559,17 +6594,16 @@ impl Tool for HotkeyTool {
                      element directly."
                 )),
                 Ok(Err(e)) => {
-                    use crate::uia_mutation::{refusal_text, uncertain_text, WriteVerdict};
+                    use crate::uia_mutation::{refusal_text, uncertain_text, AccelStop};
                     match e.downcast_ref::<crate::uia::windows_enum::AcceleratorStop>() {
                         Some(stop) => match stop.verdict {
-                            WriteVerdict::Refused(kind) => ToolResult::error(refusal_text(kind, stop.hresult)),
-                            WriteVerdict::Uncertain(kind) => ToolResult::text(format!("{} The shortcut may have been delivered.", uncertain_text(kind, stop.hresult))).with_structured(json!({"path":"uia", "verified":false, "effect":"unverifiable"})),
-                            _ => ToolResult::error(format!("hotkey (UIA path): {e}")),
+                            AccelStop::Refused(kind) => ToolResult::error(refusal_text(kind, stop.hresult)),
+                            AccelStop::Uncertain(kind) => crate::uia_mutation::chain_error(format!("{} The shortcut may have been delivered.", uncertain_text(kind, stop.hresult)), json!({"path":"uia", "verified":false}), [crate::uia_mutation::classify_sent_call(stop.hresult).to_core()], false),
                         },
                         None => ToolResult::error(format!("hotkey (UIA path): {e}")),
                     }
                 },
-                Err(e) => ToolResult::text(format!("Task error: {e}; the shortcut may have been delivered. Read the window state before acting again.")).with_structured(json!({"path":"uia", "verified":false, "effect":"unverifiable"})),
+                Err(e) => crate::uia_mutation::chain_error(format!("Task error: {e}; the shortcut may have been delivered. Read the window state before acting again."), json!({"path":"uia", "verified":false}), [cua_driver_core::mutation::WriteOutcome::StopUncertain(cua_driver_core::mutation::Reason::Unknown)], false),
             };
         }
 
@@ -6832,17 +6866,18 @@ impl Tool for SetValueTool {
                             UIA_ValuePatternId,
                         ) {
                             Ok(Some(vp)) => {
-                                if !crate::actionability::may_write(crate::actionability::Rung::Value, &admission) {
+                                if matches!(admission.value, crate::actionability::PatternAdmission::Absent) {
                                     return Ok(SetValueRoute::AdmissionRefused {
-                                        reason: "ValuePattern write not admitted by the actionability check",
+                                        reason: "ValuePattern appeared since the actionability check",
                                     });
                                 }
-                                RungOutcome::Called(
+                                if !crate::actionability::may_write(crate::actionability::Rung::Value, &admission) {
+                                    RungOutcome::Absent
+                                } else { RungOutcome::Called(
                                     crate::uia::fg_bypass::run_with_uwp_bypass(hwnd as isize, || unsafe {
-                                        vp.SetValue(&BSTR::from(value.as_str()))
-                                    })
-                                    .map_or_else(|error| error.code().0, |_| 0),
-                                )
+                                        crate::uia::sent_call::set_value(&vp, &BSTR::from(value.as_str()))
+                                    }),
+                                ) }
                             },
                             Ok(None) => RungOutcome::Absent,
                             Err(hresult) => RungOutcome::AcquireFailed(hresult),
@@ -6863,8 +6898,8 @@ impl Tool for SetValueTool {
                                 Err(hresult) => return RungOutcome::AcquireFailed(hresult),
                             };
                             let parsed: f64 = match value.parse() {
-                                Ok(parsed) => parsed,
-                                Err(_) => {
+                                Ok(parsed) if parsed.is_finite() => parsed,
+                                _ => {
                                     parse_error = Some(anyhow::anyhow!(
                                         "set_value: target element exposes RangeValuePattern (Slider / \
                                  ProgressBar / numeric range). `value` must be a parseable f64; \
@@ -6875,9 +6910,8 @@ impl Tool for SetValueTool {
                             };
                             RungOutcome::Called(
                                 crate::uia::fg_bypass::run_with_uwp_bypass(hwnd as isize, || unsafe {
-                                    rv.SetValue(parsed)
-                                })
-                                .map_or_else(|error| error.code().0, |_| 0),
+                                    crate::uia::sent_call::set_range_value(&rv, parsed)
+                                }),
                             )
                         });
                         if range_refused {
@@ -6930,13 +6964,16 @@ impl Tool for SetValueTool {
                         set_value_write_failure_result(failure, &args)
                     }
                     Ok(Ok(SetValueRoute::AdmissionRefused { reason })) => {
-                        crate::actionability::admission_refusal(reason)
+                        crate::uia_mutation::chain_error(reason, json!({"code":"element_not_actionable", "path":"ax", "verified":false}),
+                            [cua_driver_core::mutation::WriteOutcome::StopNotDelivered(cua_driver_core::mutation::Reason::InvalidArgument)], true)
                     }
                     Ok(Ok(SetValueRoute::Win32Combo { combo, write })) => {
                         win32_combo_set_value_result(idx, &value, combo, write, &args)
                     }
-                    Ok(Err(e)) => ToolResult::error(e.to_string()),
-                    Err(e) => ToolResult::error(format!("Task error: {e}")),
+                    Ok(Err(e)) => crate::uia_mutation::chain_error(e.to_string(), json!({"path":"ax", "verified":false}),
+                        [cua_driver_core::mutation::WriteOutcome::StopUncertain(cua_driver_core::mutation::Reason::Unknown)], true),
+                    Err(e) => crate::uia_mutation::chain_error(format!("Task error: {e}; the write may have landed"), json!({"path":"ax", "verified":false}),
+                        [cua_driver_core::mutation::WriteOutcome::StopUncertain(cua_driver_core::mutation::Reason::Unknown)], true),
                 }
             },
         ).await {
@@ -6971,17 +7008,25 @@ fn set_value_write_failure_result(
     use cua_driver_core::action_record::{
         ActionEffect, ActionExecutionRecord, ActionTransport, RequestedDelivery,
     };
-    let (rung, message, refused) = match decision {
+    let (rung, message, outcome) = match decision {
         SetValueDecision::Refused {
             rung,
             kind,
             hresult,
-        } => (rung, refusal_text(kind, hresult), true),
+        } => (
+            rung,
+            refusal_text(kind, hresult),
+            crate::uia_mutation::AcquireVerdict::NotDelivered(kind).to_core(),
+        ),
         SetValueDecision::Uncertain {
             rung,
             kind,
             hresult,
-        } => (rung, uncertain_text(kind, hresult), false),
+        } => (
+            rung,
+            uncertain_text(kind, hresult),
+            crate::uia_mutation::classify_sent_call(hresult).to_core(),
+        ),
         _ => unreachable!("only write failures are returned here"),
     };
     let transport = if rung == 0 {
@@ -6993,19 +7038,20 @@ fn set_value_write_failure_result(
         Some("foreground") => RequestedDelivery::Foreground,
         _ => RequestedDelivery::Background,
     };
-    let effect = if refused {
-        ActionEffect::Refused
-    } else {
-        ActionEffect::Unverifiable
-    };
-    let record = ActionExecutionRecord::new(effect, transport, requested);
-    if refused {
-        ToolResult::error(message).with_action_record(record)
-    } else {
-        ToolResult::text(message)
-            .with_structured(json!({ "path": "ax", "verified": false, "effect": "unverifiable" }))
-            .with_action_record(record)
+    let mut record = ActionExecutionRecord::new(ActionEffect::Unverifiable, transport, requested);
+    if matches!(
+        outcome,
+        cua_driver_core::mutation::WriteOutcome::StopUncertain(_)
+    ) {
+        record.actual_delivery = Some(cua_driver_core::action_record::ActualDelivery::Unknown);
     }
+    crate::uia_mutation::chain_error(
+        message,
+        json!({ "path": "ax", "verified": false }),
+        [outcome],
+        true,
+    )
+    .with_action_record(record)
 }
 
 fn win32_combo_set_value_result(
@@ -7636,10 +7682,11 @@ fn winui3_uia_multi_invoke(
         }
     };
     for i in 0..requested {
-        let call =
-            crate::uia::fg_bypass::run_with_uwp_bypass(hwnd as isize, || unsafe { inv.Invoke() });
-        if let Err(error) = call {
-            result.stop = Some(MutationStop::Write(error.code().0));
+        let call = crate::uia::fg_bypass::run_with_uwp_bypass(hwnd as isize, || unsafe {
+            crate::uia::sent_call::invoke(&inv)
+        });
+        if call != 0 {
+            result.stop = Some(MutationStop::Write(call));
             break;
         }
         result.delivered += 1;
@@ -7706,11 +7753,11 @@ async fn winui3_background_gesture(
                     ))),
                     MutationRoute::FallThrough => {},
                     MutationRoute::Refused => return Some(ToolResult::error(format!("UIA Invoke was refused ({:?}); nothing was sent. Read the window state before retrying.", result.stop))),
-                    MutationRoute::Partial | MutationRoute::Uncertain => return Some(ToolResult::text(format!("Double-click accepted {} of {} UIA invokes; the next may have landed. Read the window state before acting again.", result.delivered, result.requested)).with_structured(json!({"path":"uia", "verified":false, "effect":"unverifiable"}))),
+                    MutationRoute::Partial | MutationRoute::Uncertain => return Some(mutation_uncertain(format!("Double-click accepted {} of {} UIA invokes; the next may have landed. Read the window state before acting again.", result.delivered, result.requested), "uia", ActionTransport::WindowsUiaInvoke, cua_driver_core::action_record::RequestedDelivery::Background, cua_driver_core::action_record::ActualDelivery::Background)),
                 },
                 Ok(Ok(None)) => {},
                 Ok(Err(error)) => return Some(ToolResult::error(error)),
-                Err(error) => return Some(ToolResult::text(format!("UIA Invoke worker failed: {error}; the double-click may have landed. Read the window state before acting again.")).with_structured(json!({"path":"uia", "verified":false, "effect":"unverifiable"}))),
+                Err(error) => return Some(mutation_uncertain(format!("UIA Invoke worker failed: {error}; the double-click may have landed. Read the window state before acting again."), "uia", ActionTransport::WindowsUiaInvoke, cua_driver_core::action_record::RequestedDelivery::Background, cua_driver_core::action_record::ActualDelivery::Background)),
             }
         }
     }
@@ -10145,12 +10192,18 @@ fn menu_uncertain(message: String, transport: ActionTransport) -> ToolResult {
         transport,
         RequestedDelivery::Foreground,
     )
-    .actual_delivery(ActualDelivery::Foreground)
+    .actual_delivery(ActualDelivery::Unknown)
     .build()
     .expect("menu uncertainty record is valid");
-    ToolResult::text(message)
-        .with_structured(json!({"status":"unverifiable", "effect":"unverifiable"}))
-        .with_action_record(record)
+    crate::uia_mutation::chain_error(
+        message,
+        json!({"status":"unverifiable"}),
+        [cua_driver_core::mutation::WriteOutcome::StopUncertain(
+            cua_driver_core::mutation::Reason::Unknown,
+        )],
+        false,
+    )
+    .with_action_record(record)
 }
 
 /// Activate a window for a visible native-menu operation. Windows may reject

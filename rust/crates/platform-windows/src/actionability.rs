@@ -106,12 +106,21 @@ pub(crate) fn element_facts(raw: &RawLiveFacts, _write: ValueWrite) -> ElementFa
                 (PatternKind::Value, &raw.value_read_only),
                 (PatternKind::RangeValue, &raw.range_read_only),
             ];
-            let present: Vec<_> = reads.iter().filter(|(kind, _)| patterns.contains(kind)).collect();
+            let present: Vec<_> = reads
+                .iter()
+                .filter(|(kind, _)| patterns.contains(kind))
+                .collect();
             if present.is_empty() {
                 Evidence::Absent
-            } else if present.iter().any(|(_, read)| matches!(read, LiveRead::Value(false))) {
+            } else if present
+                .iter()
+                .any(|(_, read)| matches!(read, LiveRead::Value(false)))
+            {
                 Evidence::Known(true)
-            } else if present.iter().all(|(_, read)| matches!(read, LiveRead::Value(true))) {
+            } else if present
+                .iter()
+                .all(|(_, read)| matches!(read, LiveRead::Value(true)))
+            {
                 Evidence::Known(false)
             } else {
                 Evidence::Unknown("read-only state unavailable".into())
@@ -193,8 +202,18 @@ pub(crate) enum Rung {
 pub(crate) fn may_write(rung: Rung, a: &Admission) -> bool {
     a.route == AdmittedRoute::UiaWrite
         && match rung {
-            Rung::Value => matches!(a.value, PatternAdmission::Present { read_only: Some(false) }),
-            Rung::RangeValue => matches!(a.range, PatternAdmission::Present { read_only: Some(false) }),
+            Rung::Value => matches!(
+                a.value,
+                PatternAdmission::Present {
+                    read_only: Some(false)
+                }
+            ),
+            Rung::RangeValue => matches!(
+                a.range,
+                PatternAdmission::Present {
+                    read_only: Some(false)
+                }
+            ),
         }
 }
 pub(crate) fn route_agrees(route: AdmittedRoute, worker_native: bool) -> bool {
@@ -212,7 +231,12 @@ impl Probe {
 fn admission(raw: &RawLiveFacts) -> Admission {
     let rung = |kind, read: &LiveRead<bool>| {
         if matches!(&raw.patterns, LiveRead::Value(patterns) if patterns.contains(&kind)) {
-            PatternAdmission::Present { read_only: match read { LiveRead::Value(v) => Some(*v), _ => None } }
+            PatternAdmission::Present {
+                read_only: match read {
+                    LiveRead::Value(v) => Some(*v),
+                    _ => None,
+                },
+            }
         } else {
             PatternAdmission::Absent
         }

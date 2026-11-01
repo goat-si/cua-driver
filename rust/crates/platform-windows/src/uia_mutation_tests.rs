@@ -7,8 +7,8 @@ const DENIED: i32 = 0x8007_0005_u32 as i32;
 
 #[test]
 fn classification_table() {
+    use SentVerdict::*;
     use UncertainKind::*;
-    use WriteVerdict::*;
     for (hr, expected) in [
         (0, Delivered),
         (
@@ -37,8 +37,7 @@ fn classification_table() {
         (0x8013_1509_u32 as i32, Uncertain(Unclassified)),
         (-7, Uncertain(Unclassified)),
     ] {
-        assert_eq!(classify_write_hresult(hr), expected, "{hr:#x}");
-        assert!(!may_fall_through(&expected));
+        assert_eq!(classify_sent_call(hr), expected, "{hr:#x}");
     }
 }
 
@@ -102,47 +101,40 @@ fn value_route_never_calls_range_after_uncertain_or_refused() {
 #[test]
 fn click_mapping_covers_every_outcome() {
     assert_eq!(
-        click_plan_from_chain(ChainOutcome::Delivered {
-            rung: 1,
-            not_supported_calls: vec![0]
-        }),
+        click_plan_from_chain(ChainOutcome::Delivered { rung: 1 }),
         ClickPlan::Semantic {
             rung: 1,
-            failed: vec![0]
+            failed: vec![]
         }
     );
     assert_eq!(
-        click_plan_from_chain(ChainOutcome::NoAffordance {
-            not_supported_calls: vec![0]
-        }),
-        ClickPlan::Physical { failed: vec![0] }
+        click_plan_from_chain(ChainOutcome::NoAffordance),
+        ClickPlan::Physical { failed: vec![] }
     );
     assert_eq!(
         click_plan_from_chain(ChainOutcome::Refused {
             rung: 1,
-            kind: RefusalKind::AccessDenied,
-            hresult: DENIED,
-            not_supported_calls: vec![0]
+            kind: RefusalKind::PermissionDenied,
+            hresult: DENIED
         }),
         ClickPlan::Refused {
             rung: 1,
-            kind: RefusalKind::AccessDenied,
+            kind: RefusalKind::PermissionDenied,
             hresult: DENIED,
-            failed: vec![0]
+            failed: vec![]
         }
     );
     assert_eq!(
         click_plan_from_chain(ChainOutcome::Uncertain {
             rung: 1,
             kind: UncertainKind::Timeout,
-            hresult: TIMEOUT,
-            not_supported_calls: vec![0]
+            hresult: TIMEOUT
         }),
         ClickPlan::Uncertain {
             rung: 1,
             kind: UncertainKind::Timeout,
             hresult: TIMEOUT,
-            failed: vec![0]
+            failed: vec![]
         }
     );
 }
@@ -154,9 +146,7 @@ fn last_range_write_is_classified_and_all_absent_is_terminal() {
             Box::new(|| RungOutcome::Absent),
             Box::new(|| RungOutcome::Absent)
         ]),
-        ChainOutcome::NoAffordance {
-            not_supported_calls: vec![]
-        }
+        ChainOutcome::NoAffordance
     );
     assert_eq!(
         set_value_route(RungOutcome::Absent, || RungOutcome::Called(TIMEOUT)),
@@ -210,7 +200,6 @@ fn failed_pattern_acquisition_stops_the_chain_without_delivery() {
             rung: 0,
             kind: RefusalKind::UnconfirmedAlive,
             hresult: TIMEOUT,
-            not_supported_calls: vec![],
         }
     );
     let range_calls = Cell::new(0);
@@ -258,7 +247,7 @@ fn accelerator_scan_stops_before_a_second_match_after_uncertainty() {
     let calls = Cell::new(0);
     let result = accelerator_scan(
         [
-            AccelOutcome::Stop(WriteVerdict::Uncertain(UncertainKind::Timeout), TIMEOUT),
+            AccelOutcome::Stop(AccelStop::Uncertain(UncertainKind::Timeout), TIMEOUT),
             AccelOutcome::Delivered,
         ]
         .into_iter()
@@ -267,7 +256,7 @@ fn accelerator_scan_stops_before_a_second_match_after_uncertainty() {
     assert_eq!(calls.get(), 1);
     assert_eq!(
         result,
-        AccelOutcome::Stop(WriteVerdict::Uncertain(UncertainKind::Timeout), TIMEOUT)
+        AccelOutcome::Stop(AccelStop::Uncertain(UncertainKind::Timeout), TIMEOUT)
     );
 }
 #[test]
@@ -369,22 +358,53 @@ fn sent_and_acquisition_map_to_core_outcomes() {
 
 #[test]
 fn producer_errors_keep_disposition_and_legacy_fields_after_finalization() {
-    use cua_driver_core::mutation::{Reason, WriteOutcome};
     use cua_driver_contract::ErrorDisposition;
+    use cua_driver_core::mutation::{Reason, WriteOutcome};
     for (outcomes, prologue, expected, effect) in [
-        (vec![WriteOutcome::StopUncertain(Reason::Unknown)], false, ErrorDisposition::SUSPECTED_NOOP, "unverifiable"),
-        (vec![WriteOutcome::StopNotDelivered(Reason::PermissionDenied)], false, ErrorDisposition::NOT_DELIVERED, "refused"),
-        (vec![WriteOutcome::StopNotDelivered(Reason::PermissionDenied)], true, ErrorDisposition::SUSPECTED_NOOP, "unverifiable"),
+        (
+            vec![WriteOutcome::StopUncertain(Reason::Unknown)],
+            false,
+            ErrorDisposition::SUSPECTED_NOOP,
+            "unverifiable",
+        ),
+        (
+            vec![WriteOutcome::StopNotDelivered(Reason::PermissionDenied)],
+            false,
+            ErrorDisposition::NOT_DELIVERED,
+            "refused",
+        ),
+        (
+            vec![WriteOutcome::StopNotDelivered(Reason::PermissionDenied)],
+            true,
+            ErrorDisposition::SUSPECTED_NOOP,
+            "unverifiable",
+        ),
     ] {
-        let result = chain_error("write failed", serde_json::json!({
-            "path":"ax", "verified":false, "note":"note", "warning":"warning",
-            "code":"element_not_actionable", "focus_restoration":"preserved"
-        }), outcomes, prologue);
-        let wire = cua_driver_core::mcp_result::conforming_tool_result("set_value", serde_json::to_value(result).unwrap());
+        let result = chain_error(
+            "write failed",
+            serde_json::json!({
+                "path":"ax", "verified":false, "note":"note", "warning":"warning",
+                "code":"element_not_actionable", "focus_restoration":"preserved"
+            }),
+            outcomes,
+            prologue,
+        );
+        let wire = cua_driver_core::mcp_result::conforming_tool_result(
+            "set_value",
+            serde_json::to_value(result).unwrap(),
+        );
         let data = &wire["structuredContent"];
         assert_eq!(data["effect"], effect);
-        assert_eq!(serde_json::from_value::<ErrorDisposition>(data["disposition"].clone()).unwrap(), expected);
-        for (key, value) in [("note", "note"), ("warning", "warning"), ("code", "element_not_actionable"), ("focus_restoration", "preserved")] {
+        assert_eq!(
+            serde_json::from_value::<ErrorDisposition>(data["disposition"].clone()).unwrap(),
+            expected
+        );
+        for (key, value) in [
+            ("note", "note"),
+            ("warning", "warning"),
+            ("code", "element_not_actionable"),
+            ("focus_restoration", "preserved"),
+        ] {
             assert_eq!(data[key], value, "{key}");
         }
     }

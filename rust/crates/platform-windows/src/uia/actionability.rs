@@ -92,7 +92,9 @@ pub(crate) unsafe fn read_live_facts(element: &IUIAutomationElement, hwnd: HWND)
         window_minimized,
         window_cloaked,
         control_type,
-        patterns: failure.map_or(LiveRead::Value(patterns), |(message, code)| LiveRead::Failed(message, Some(code))),
+        patterns: failure.map_or(LiveRead::Value(patterns), |(message, code)| {
+            LiveRead::Failed(message, Some(code))
+        }),
         value_read_only,
         range_read_only,
     }

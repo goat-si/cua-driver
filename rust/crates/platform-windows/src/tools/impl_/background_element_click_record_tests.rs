@@ -70,11 +70,11 @@ fn write_failure_records_the_failing_value_transport_and_request() {
         (
             SetValueDecision::Refused {
                 rung: 0,
-                kind: RefusalKind::AccessDenied,
+                kind: RefusalKind::PermissionDenied,
                 hresult: 0x8007_0005_u32 as i32,
             },
             ActionTransport::WindowsUiaValue,
-            ActionEffect::Refused,
+            ActionEffect::Unverifiable,
         ),
         (
             SetValueDecision::Uncertain {

@@ -46,6 +46,7 @@ pub(crate) mod client;
 pub mod fg_bypass;
 pub(crate) mod focused_document;
 pub mod scroll;
+pub(crate) mod sent_call;
 pub mod snapshot;
 pub mod windows_enum;
 pub use snapshot::Snapshots;
@@ -279,12 +280,12 @@ unsafe fn invoke_menu_element(
         bool,
     ),
 > {
-    use crate::uia_mutation::{classify_write_hresult, MenuFailure, WriteVerdict};
+    use crate::uia_mutation::MenuFailure;
     use cua_driver_core::action_record::ActionTransport;
     let element =
         std::mem::ManuallyDrop::new(IUIAutomationElement::from_raw(element_ptr as *mut _));
     macro_rules! attempt {
-        ($ty:ty, $id:expr, $method:ident, $transport:expr) => {{
+        ($ty:ty, $id:expr, $method:ident, $call:path, $transport:expr) => {{
             let transport = $transport;
             match menu_pattern::<$ty>(&element, $id) {
                 Err(hr) => {
@@ -296,31 +297,22 @@ unsafe fn invoke_menu_element(
                     ))
                 }
                 Ok(None) => {}
-                Ok(Some(pattern)) => match pattern.$method() {
-                    Ok(()) => return Ok(transport),
-                    Err(error) => {
-                        let hr = error.code().0;
-                        match classify_write_hresult(hr) {
-                            WriteVerdict::AffordanceAbsent => {}
-                            WriteVerdict::Refused(_) => {
-                                return Err((
-                                    format!("{} failed: {error}", stringify!($method)),
-                                    MenuFailure::Refused,
-                                    transport,
-                                    true,
-                                ))
-                            }
-                            _ => {
-                                return Err((
-                                    format!("{} failed: {error}", stringify!($method)),
-                                    MenuFailure::Uncertain,
-                                    transport,
-                                    true,
-                                ))
-                            }
-                        }
+                Ok(Some(pattern)) => {
+                    let hr = $call(&pattern);
+                    if hr == 0 {
+                        return Ok(transport);
                     }
-                },
+                    return Err((
+                        format!(
+                            "{} failed: HRESULT 0x{:08X}",
+                            stringify!($method),
+                            hr as u32
+                        ),
+                        MenuFailure::Uncertain,
+                        transport,
+                        true,
+                    ));
+                }
             }
         }};
     }
@@ -329,6 +321,7 @@ unsafe fn invoke_menu_element(
             IUIAutomationExpandCollapsePattern,
             UIA_ExpandCollapsePatternId,
             Expand,
+            sent_call::expand,
             ActionTransport::WindowsUiaExpandCollapse
         );
     }
@@ -336,6 +329,7 @@ unsafe fn invoke_menu_element(
         IUIAutomationInvokePattern,
         UIA_InvokePatternId,
         Invoke,
+        sent_call::invoke,
         ActionTransport::WindowsUiaInvoke
     );
     if final_segment {
@@ -343,6 +337,7 @@ unsafe fn invoke_menu_element(
             IUIAutomationSelectionItemPattern,
             UIA_SelectionItemPatternId,
             Select,
+            sent_call::select,
             ActionTransport::WindowsUiaSelection
         );
     }

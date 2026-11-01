@@ -47,9 +47,13 @@ impl RetainedElement {
             anyhow::bail!("element is an MSAA element, not a UIA element");
         }
         let element = unsafe { IUIAutomationElement::from_raw(self.ptr as *mut _) };
-        let result = unsafe { element.SetFocus() };
+        let hr = unsafe { super::sent_call::set_focus(&element) };
         std::mem::forget(element);
-        result.map_err(|e| anyhow::anyhow!("UIA SetFocus failed: {e}"))
+        if hr == 0 {
+            Ok(())
+        } else {
+            anyhow::bail!("UIA SetFocus returned HRESULT 0x{:08X}", hr as u32)
+        }
     }
 
     pub fn element_has_keyboard_focus(&self) -> Option<bool> {

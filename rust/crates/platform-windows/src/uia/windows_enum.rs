@@ -595,7 +595,7 @@ fn try_invoke_in_window_at_point_unbounded(
                         if cancelled.load(Ordering::Acquire) {
                             return Timeout;
                         }
-                        return if ec.Expand().is_ok() { Invoked } else { Unavailable };
+                        return if super::sent_call::expand(&ec) == 0 { Invoked } else { Unavailable };
                     }
                 }
                 return Unavailable;
@@ -611,12 +611,10 @@ fn try_invoke_in_window_at_point_unbounded(
             if cancelled.load(Ordering::Acquire) {
                 return Timeout;
             }
-            match inv.Invoke() {
-                Ok(()) => Invoked,
-                Err(e) => {
-                    tracing::debug!(target: "click", "UIA Invoke (windowed) at ({sx},{sy}) failed: {e}");
-                    Unavailable
-                }
+            if super::sent_call::invoke(&inv) == 0 {
+                Invoked
+            } else {
+                Unavailable
             }
         })
     }
@@ -631,7 +629,7 @@ fn try_invoke_in_window_at_point_unbounded(
 /// AcceleratorKey match before invoking anything.
 #[derive(Debug)]
 pub(crate) struct AcceleratorStop {
-    pub verdict: crate::uia_mutation::WriteVerdict,
+    pub verdict: crate::uia_mutation::AccelStop,
     pub hresult: i32,
 }
 impl std::fmt::Display for AcceleratorStop {
@@ -661,7 +659,7 @@ pub fn try_invoke_accelerator_in_window(hwnd: isize, combo: &str) -> anyhow::Res
         )),
         UiaDeadlineError::Timeout | UiaDeadlineError::Unavailable => {
             Err(anyhow::Error::new(AcceleratorStop {
-                verdict: crate::uia_mutation::WriteVerdict::Uncertain(
+                verdict: crate::uia_mutation::AccelStop::Uncertain(
                     crate::uia_mutation::UncertainKind::Timeout,
                 ),
                 hresult: 0x8013_1505_u32 as i32,
@@ -872,10 +870,11 @@ unsafe fn try_invoke_via_patterns(
     cancelled: &AtomicBool,
 ) -> crate::uia_mutation::AccelOutcome {
     use crate::uia_mutation::{
-        classify_write_hresult, pattern_absent, AccelOutcome, RefusalKind, WriteVerdict,
+        classify_acquisition, classify_sent_call, pattern_absent, AccelOutcome, AccelStop,
+        AcquireVerdict, SentVerdict,
     };
     macro_rules! attempt {
-        ($ty:ty, $id:expr, $method:ident) => {{
+        ($ty:ty, $id:expr, $call:path) => {{
             let pattern = elem
                 .GetCurrentPattern($id)
                 .and_then(|value| value.cast::<$ty>());
@@ -883,7 +882,10 @@ unsafe fn try_invoke_via_patterns(
                 Err(error) if pattern_absent(error.code().0) => {}
                 Err(error) => {
                     return AccelOutcome::Stop(
-                        WriteVerdict::Refused(RefusalKind::PatternUnreadable),
+                        AccelStop::Refused(match classify_acquisition(error.code().0) {
+                            AcquireVerdict::NotDelivered(kind) => kind,
+                            AcquireVerdict::Absent => unreachable!(),
+                        }),
                         error.code().0,
                     )
                 }
@@ -895,25 +897,32 @@ unsafe fn try_invoke_via_patterns(
                         if cancelled.load(Ordering::Acquire) {
                             return None;
                         }
-                        Some(pattern.$method())
+                        Some($call(&pattern))
                     });
                     match result {
                         None => return AccelOutcome::Absent,
-                        Some(Ok(())) => return AccelOutcome::Delivered,
-                        Some(Err(error)) => {
-                            let hr = error.code().0;
-                            match classify_write_hresult(hr) {
-                                WriteVerdict::AffordanceAbsent => {}
-                                verdict => return AccelOutcome::Stop(verdict, hr),
-                            }
+                        Some(0) => return AccelOutcome::Delivered,
+                        Some(hr) => {
+                            let SentVerdict::Uncertain(kind) = classify_sent_call(hr) else {
+                                unreachable!()
+                            };
+                            return AccelOutcome::Stop(AccelStop::Uncertain(kind), hr);
                         }
                     }
                 }
             }
         }};
     }
-    attempt!(IUIAutomationInvokePattern, UIA_InvokePatternId, Invoke);
-    attempt!(IUIAutomationTogglePattern, UIA_TogglePatternId, Toggle);
+    attempt!(
+        IUIAutomationInvokePattern,
+        UIA_InvokePatternId,
+        super::sent_call::invoke
+    );
+    attempt!(
+        IUIAutomationTogglePattern,
+        UIA_TogglePatternId,
+        super::sent_call::toggle
+    );
     AccelOutcome::Absent
 }
 

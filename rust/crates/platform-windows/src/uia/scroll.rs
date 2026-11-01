@@ -76,12 +76,19 @@ pub unsafe fn element_is_offscreen(element_ptr: usize) -> Option<bool> {
 /// hold it alive through a `RetainedElement` guard (its COM `AddRef`) for the
 /// duration of this call. We borrow the pointer without consuming the cache's
 /// refcount (the constructed handle is `forget`-ten before return).
-pub unsafe fn scroll_into_view_and_recenter(
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RevealOutcome {
+    Revealed((i32, i32)),
+    NotRevealed { writes_sent: bool },
+    Uncertain,
+}
+
+pub(crate) unsafe fn scroll_into_view_and_recenter(
     host_hwnd: u64,
     element_ptr: usize,
-) -> Option<(i32, i32)> {
+) -> RevealOutcome {
     if element_ptr == 0 {
-        return None;
+        return RevealOutcome::NotRevealed { writes_sent: false };
     }
     // Ensure COM is live on THIS thread before the first UIA call. Strategy 1
     // (`scroll_item_into_view`) touches UIA directly, so on a worker thread that
@@ -91,7 +98,7 @@ pub unsafe fn scroll_into_view_and_recenter(
     // RPC_E_CHANGED_MODE, which the `let _ =` swallows.
     let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
 
-    let elem: IUIAutomationElement = IUIAutomationElement::from_raw(element_ptr as *mut _);
+    let elem = std::mem::ManuallyDrop::new(IUIAutomationElement::from_raw(element_ptr as *mut _));
 
     // A recentred point only counts if it actually lands inside the host window
     // - otherwise the coordinate tap would still miss. This mirrors the caller's
@@ -109,13 +116,26 @@ pub unsafe fn scroll_into_view_and_recenter(
         }
     };
 
-    let result = scroll_item_into_view(host_hwnd, &elem)
-        .and_then(actionable)
-        .or_else(|| scroll_ancestors_into_view(host_hwnd, &elem).and_then(actionable));
-
-    // Don't Release the cache's ref - the RetainedElement guard owns it.
-    std::mem::forget(elem);
-    result
+    let mut writes_sent = false;
+    match scroll_item_into_view(host_hwnd, &elem) {
+        Err(()) => return RevealOutcome::Uncertain,
+        Ok((point, sent)) => {
+            writes_sent |= sent;
+            if let Some(point) = point.and_then(actionable) {
+                return RevealOutcome::Revealed(point);
+            }
+        }
+    }
+    match scroll_ancestors_into_view(host_hwnd, &elem) {
+        Err(()) => RevealOutcome::Uncertain,
+        Ok((point, sent)) => {
+            writes_sent |= sent;
+            match point.and_then(actionable) {
+                Some(point) => RevealOutcome::Revealed(point),
+                None => RevealOutcome::NotRevealed { writes_sent },
+            }
+        }
+    }
 }
 
 /// Scroll a cached UIA scroll container in the requested direction.
@@ -173,33 +193,43 @@ pub(crate) unsafe fn scroll_element(
     };
     for _ in 0..requested {
         let result = if horizontal {
-            scroll.Scroll(step, ScrollAmount_NoAmount)
+            super::sent_call::scroll(&scroll, step, ScrollAmount_NoAmount)
         } else {
-            scroll.Scroll(ScrollAmount_NoAmount, step)
+            super::sent_call::scroll(&scroll, ScrollAmount_NoAmount, step)
         };
-        match result {
-            Ok(()) => outcome.completed += 1,
-            Err(error) => {
-                let hr = error.code().0;
-                // Preserve the HRESULT, including NOTSUPPORTED, for routing.
-                outcome.stop = Some(MutationStop::Write(hr));
-                break;
-            }
+        if result == 0 {
+            outcome.completed += 1;
+        } else {
+            outcome.stop = Some(MutationStop::Write(result));
+            break;
         }
     }
     Ok(outcome)
 }
 
 /// Strategy 1: `ScrollItemPattern::ScrollIntoView` on the element itself.
-unsafe fn scroll_item_into_view(host_hwnd: u64, elem: &IUIAutomationElement) -> Option<(i32, i32)> {
-    let pattern = elem.GetCurrentPattern(UIA_ScrollItemPatternId).ok()?;
-    let scroll_item = pattern.cast::<IUIAutomationScrollItemPattern>().ok()?;
-    // Drive the scroll inside the UWP foreground-steal bypass (no-op for
-    // non-XAML hosts) so a XAML host can't self-raise on the layout change.
-    crate::uia::fg_bypass::run_with_uwp_bypass(host_hwnd as isize, || scroll_item.ScrollIntoView())
-        .ok()?;
-    let rect = elem.CurrentBoundingRectangle().ok()?;
-    Some(((rect.left + rect.right) / 2, (rect.top + rect.bottom) / 2))
+unsafe fn scroll_item_into_view(
+    host_hwnd: u64,
+    elem: &IUIAutomationElement,
+) -> Result<(Option<(i32, i32)>, bool), ()> {
+    let Some(scroll_item) = elem
+        .GetCurrentPattern(UIA_ScrollItemPatternId)
+        .ok()
+        .and_then(|pattern| pattern.cast::<IUIAutomationScrollItemPattern>().ok())
+    else {
+        return Ok((None, false));
+    };
+    let hr = crate::uia::fg_bypass::run_with_uwp_bypass(host_hwnd as isize, || {
+        super::sent_call::scroll_into_view(&scroll_item)
+    });
+    if hr != 0 {
+        return Err(());
+    }
+    let point = elem
+        .CurrentBoundingRectangle()
+        .ok()
+        .map(|rect| ((rect.left + rect.right) / 2, (rect.top + rect.bottom) / 2));
+    Ok((point, true))
 }
 
 /// Strategy 2: walk every vertically-scrollable ancestor and use
@@ -208,76 +238,88 @@ unsafe fn scroll_item_into_view(host_hwnd: u64, elem: &IUIAutomationElement) -> 
 unsafe fn scroll_ancestors_into_view(
     host_hwnd: u64,
     elem: &IUIAutomationElement,
-) -> Option<(i32, i32)> {
-    // COM is already initialized by `scroll_into_view_and_recenter` (this fn's
-    // only caller), so no redundant `CoInitializeEx` here.
-    let automation = super::client::new_uia_client().ok()?;
-    let walker = automation.ControlViewWalker().ok()?;
+) -> Result<(Option<(i32, i32)>, bool), ()> {
+    let mut writes_sent = false;
+    let mut uncertain = false;
+    let point = (|| -> Option<(i32, i32)> {
+        // COM is already initialized by `scroll_into_view_and_recenter` (this fn's
+        // only caller), so no redundant `CoInitializeEx` here.
+        let automation = super::client::new_uia_client().ok()?;
+        let walker = automation.ControlViewWalker().ok()?;
 
-    // Collect every vertically-scrollable ancestor. Nested controls are common:
-    // a ListItem may already be visible inside its ListBox while that entire
-    // ListBox is clipped by an outer page ScrollViewer. Trying only the nearest
-    // pattern leaves the element hidden even though another ancestor can reveal it.
-    let mut containers: Vec<(IUIAutomationElement, IUIAutomationScrollPattern)> = Vec::new();
-    let mut cur = walker.GetParentElement(elem).ok()?;
-    for _ in 0..16 {
-        if let Ok(p) = cur.GetCurrentPattern(UIA_ScrollPatternId) {
-            if let Ok(sp) = p.cast::<IUIAutomationScrollPattern>() {
-                let scrollable = sp
-                    .CurrentVerticallyScrollable()
-                    .map(|b| b.as_bool())
-                    .unwrap_or(false);
-                if scrollable {
-                    containers.push((cur.clone(), sp));
+        // Collect every vertically-scrollable ancestor. Nested controls are common:
+        // a ListItem may already be visible inside its ListBox while that entire
+        // ListBox is clipped by an outer page ScrollViewer. Trying only the nearest
+        // pattern leaves the element hidden even though another ancestor can reveal it.
+        let mut containers: Vec<(IUIAutomationElement, IUIAutomationScrollPattern)> = Vec::new();
+        let mut cur = walker.GetParentElement(elem).ok()?;
+        for _ in 0..16 {
+            if let Ok(p) = cur.GetCurrentPattern(UIA_ScrollPatternId) {
+                if let Ok(sp) = p.cast::<IUIAutomationScrollPattern>() {
+                    let scrollable = sp
+                        .CurrentVerticallyScrollable()
+                        .map(|b| b.as_bool())
+                        .unwrap_or(false);
+                    if scrollable {
+                        containers.push((cur.clone(), sp));
+                    }
                 }
             }
+            match walker.GetParentElement(&cur) {
+                Ok(parent) => cur = parent,
+                Err(_) => break,
+            }
         }
-        match walker.GetParentElement(&cur) {
-            Ok(parent) => cur = parent,
-            Err(_) => break,
-        }
-    }
 
-    for (container, sp) in containers {
-        let crect = container.CurrentBoundingRectangle().ok()?;
-        // Iteratively scroll this container until the target's center sits inside
-        // its viewport. If UIA still marks the target off-screen, continue with
-        // the next outer scrollable ancestor.
-        let mut last_dir = 0i32;
-        for _ in 0..60 {
-            let tr = elem.CurrentBoundingRectangle().ok()?;
-            let tcy = (tr.top + tr.bottom) / 2;
-            if tcy >= crect.top && tcy <= crect.bottom {
-                break;
+        for (container, sp) in containers {
+            let crect = container.CurrentBoundingRectangle().ok()?;
+            // Iteratively scroll this container until the target's center sits inside
+            // its viewport. If UIA still marks the target off-screen, continue with
+            // the next outer scrollable ancestor.
+            let mut last_dir = 0i32;
+            for _ in 0..60 {
+                let tr = elem.CurrentBoundingRectangle().ok()?;
+                let tcy = (tr.top + tr.bottom) / 2;
+                if tcy >= crect.top && tcy <= crect.bottom {
+                    break;
+                }
+                let dir = if tcy < crect.top { -1 } else { 1 };
+                let overshot = last_dir != 0 && dir != last_dir;
+                let amount = match (dir, overshot) {
+                    (-1, false) => ScrollAmount_LargeDecrement,
+                    (-1, true) => ScrollAmount_SmallDecrement,
+                    (_, false) => ScrollAmount_LargeIncrement,
+                    (_, true) => ScrollAmount_SmallIncrement,
+                };
+                let scrolled =
+                    crate::uia::fg_bypass::run_with_uwp_bypass(host_hwnd as isize, || {
+                        super::sent_call::scroll(&sp, ScrollAmount_NoAmount, amount)
+                    });
+                writes_sent = true;
+                if scrolled != 0 {
+                    uncertain = true;
+                    return None;
+                }
+                last_dir = dir;
+                sleep(Duration::from_millis(15));
             }
-            let dir = if tcy < crect.top { -1 } else { 1 };
-            let overshot = last_dir != 0 && dir != last_dir;
-            let amount = match (dir, overshot) {
-                (-1, false) => ScrollAmount_LargeDecrement,
-                (-1, true) => ScrollAmount_SmallDecrement,
-                (_, false) => ScrollAmount_LargeIncrement,
-                (_, true) => ScrollAmount_SmallIncrement,
-            };
-            let scrolled = crate::uia::fg_bypass::run_with_uwp_bypass(host_hwnd as isize, || {
-                sp.Scroll(ScrollAmount_NoAmount, amount)
-            });
-            if scrolled.is_err() {
-                break;
+            let rect = elem.CurrentBoundingRectangle().ok()?;
+            let center = ((rect.left + rect.right) / 2, (rect.top + rect.bottom) / 2);
+            let visible = elem
+                .CurrentIsOffscreen()
+                .map(|value| !value.as_bool())
+                .unwrap_or(true);
+            if visible && crate::input::point_in_window_bounds(host_hwnd, center.0, center.1) {
+                return Some(center);
             }
-            last_dir = dir;
-            sleep(Duration::from_millis(15));
         }
+
         let rect = elem.CurrentBoundingRectangle().ok()?;
-        let center = ((rect.left + rect.right) / 2, (rect.top + rect.bottom) / 2);
-        let visible = elem
-            .CurrentIsOffscreen()
-            .map(|value| !value.as_bool())
-            .unwrap_or(true);
-        if visible && crate::input::point_in_window_bounds(host_hwnd, center.0, center.1) {
-            return Some(center);
-        }
+        Some(((rect.left + rect.right) / 2, (rect.top + rect.bottom) / 2))
+    })();
+    if uncertain {
+        Err(())
+    } else {
+        Ok((point, writes_sent))
     }
-
-    let rect = elem.CurrentBoundingRectangle().ok()?;
-    Some(((rect.left + rect.right) / 2, (rect.top + rect.bottom) / 2))
 }
