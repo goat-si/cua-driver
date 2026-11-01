@@ -21,24 +21,6 @@ struct PanelAttestation {
     start_time: (u64, u64),
 }
 
-fn process_start_time(pid: i32) -> Option<(u64, u64)> {
-    unsafe {
-        let mut info: libc::proc_bsdinfo = std::mem::zeroed();
-        let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
-        let filled = libc::proc_pidinfo(
-            pid,
-            libc::PROC_PIDTBSDINFO,
-            0,
-            &mut info as *mut _ as *mut libc::c_void,
-            size,
-        );
-        if filled != size {
-            return None;
-        }
-        Some((info.pbi_start_tvsec as u64, info.pbi_start_tvusec as u64))
-    }
-}
-
 fn panel_attestation(pid: i32, window_id: u32) -> Option<PanelAttestation> {
     let owner = crate::windows::resolve_window_owner(pid, window_id);
     let crate::ax::WindowScope::OwnerPidMismatch { owner_pid, .. } =
@@ -51,7 +33,7 @@ fn panel_attestation(pid: i32, window_id: u32) -> Option<PanelAttestation> {
     }
     Some(PanelAttestation {
         owner_pid,
-        start_time: process_start_time(owner_pid)?,
+        start_time: crate::ax::enablement::process_start_stamp(owner_pid)?,
     })
 }
 
