@@ -68,23 +68,9 @@ struct ProcessIdentity {
     start_time: (u64, u64),
 }
 
-fn process_start_time(pid: i32) -> Option<(u64, u64)> {
-    unsafe {
-        let mut info: libc::proc_bsdinfo = std::mem::zeroed();
-        let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
-        let filled = libc::proc_pidinfo(
-            pid,
-            libc::PROC_PIDTBSDINFO,
-            0,
-            &mut info as *mut _ as *mut libc::c_void,
-            size,
-        );
-        (filled == size).then_some((info.pbi_start_tvsec as u64, info.pbi_start_tvusec as u64))
-    }
-}
 
 fn identity(pid: i32) -> Result<ProcessIdentity, String> {
-    process_start_time(pid)
+    crate::ax::enablement::process_start_stamp(pid)
         .map(|start_time| ProcessIdentity { pid, start_time })
         .ok_or_else(|| format!("process {pid} identity is unavailable"))
 }
