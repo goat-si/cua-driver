@@ -87,10 +87,14 @@ impl AcquireVerdict {
             Self::Absent => WriteOutcome::FallThrough(Reason::Unsupported),
             Self::NotDelivered(kind) => WriteOutcome::StopNotDelivered(match kind {
                 RefusalKind::StaleElement | RefusalKind::ElementUnavailable => Reason::StaleElement,
-                RefusalKind::PermissionDenied | RefusalKind::AccessDenied => Reason::PermissionDenied,
+                RefusalKind::PermissionDenied | RefusalKind::AccessDenied => {
+                    Reason::PermissionDenied
+                }
                 RefusalKind::InvalidArgument => Reason::InvalidArgument,
                 RefusalKind::NotEnabled => Reason::Disabled,
-                RefusalKind::UnconfirmedAlive | RefusalKind::PatternUnreadable => Reason::UnconfirmedAlive,
+                RefusalKind::UnconfirmedAlive | RefusalKind::PatternUnreadable => {
+                    Reason::UnconfirmedAlive
+                }
             }),
         }
     }
@@ -165,16 +169,38 @@ pub(crate) fn run_rungs(rungs: Vec<Box<dyn FnOnce() -> RungOutcome + '_>>) -> Ch
     );
     let not_supported_calls = Vec::new();
     match (chain.outcomes().last(), last) {
-        (Some(WriteOutcome::Delivered), Some((rung, _))) => ChainOutcome::Delivered { rung, not_supported_calls },
-        (Some(WriteOutcome::StopNotDelivered(_)), Some((rung, RungOutcome::AcquireFailed(hresult)))) => {
-            let AcquireVerdict::NotDelivered(kind) = classify_acquisition(hresult) else { unreachable!() };
-            ChainOutcome::Refused { rung, kind, hresult, not_supported_calls }
+        (Some(WriteOutcome::Delivered), Some((rung, _))) => ChainOutcome::Delivered {
+            rung,
+            not_supported_calls,
+        },
+        (
+            Some(WriteOutcome::StopNotDelivered(_)),
+            Some((rung, RungOutcome::AcquireFailed(hresult))),
+        ) => {
+            let AcquireVerdict::NotDelivered(kind) = classify_acquisition(hresult) else {
+                unreachable!()
+            };
+            ChainOutcome::Refused {
+                rung,
+                kind,
+                hresult,
+                not_supported_calls,
+            }
         }
         (Some(WriteOutcome::StopUncertain(_)), Some((rung, RungOutcome::Called(hresult)))) => {
-            let SentVerdict::Uncertain(kind) = classify_sent_call(hresult) else { unreachable!() };
-            ChainOutcome::Uncertain { rung, kind, hresult, not_supported_calls }
+            let SentVerdict::Uncertain(kind) = classify_sent_call(hresult) else {
+                unreachable!()
+            };
+            ChainOutcome::Uncertain {
+                rung,
+                kind,
+                hresult,
+                not_supported_calls,
+            }
         }
-        (None | Some(WriteOutcome::FallThrough(_)), _) => ChainOutcome::NoAffordance { not_supported_calls },
+        (None | Some(WriteOutcome::FallThrough(_)), _) => ChainOutcome::NoAffordance {
+            not_supported_calls,
+        },
         _ => unreachable!("rung outcome and core result disagree"),
     }
 }
@@ -399,4 +425,23 @@ pub(crate) fn menu_outcome(completed_hops: usize, failure: Option<MenuFailure>) 
         Some(MenuFailure::Refused) if completed_hops > 0 => MenuResult::Partial { completed_hops },
         Some(MenuFailure::Refused) => MenuResult::Refused,
     }
+}
+
+/// Construct an error from the complete chain, retaining the producer's legacy fields.
+pub(crate) fn chain_error(
+    message: impl Into<String>,
+    mut structured: serde_json::Value,
+    outcomes: impl IntoIterator<Item = cua_driver_core::mutation::WriteOutcome>,
+    side_effectful_prologue: bool,
+) -> cua_driver_core::protocol::ToolResult {
+    use cua_driver_core::mutation::{Postcondition, WriteChain};
+    let chain = WriteChain::run(outcomes, side_effectful_prologue);
+    structured["effect"] = serde_json::to_value(chain.effect(Postcondition::Indeterminate, false))
+        .expect("action effect serializes");
+    let disposition = chain
+        .error_disposition(Postcondition::Indeterminate, false)
+        .expect("an indeterminate error has a disposition");
+    cua_driver_core::protocol::ToolResult::error(message)
+        .with_structured(structured)
+        .with_disposition(disposition)
 }

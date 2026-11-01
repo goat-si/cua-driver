@@ -11,11 +11,23 @@ fn classification_table() {
     use WriteVerdict::*;
     for (hr, expected) in [
         (0, Delivered),
-        (NOT_SUPPORTED, Uncertain(Provider(ProviderCode::NotSupported))),
+        (
+            NOT_SUPPORTED,
+            Uncertain(Provider(ProviderCode::NotSupported)),
+        ),
         (DENIED, Uncertain(Provider(ProviderCode::AccessDenied))),
-        (0x8004_0201_u32 as i32, Uncertain(Provider(ProviderCode::ElementUnavailable))),
-        (0x8007_0057_u32 as i32, Uncertain(Provider(ProviderCode::InvalidArgument))),
-        (0x8004_0200_u32 as i32, Uncertain(Provider(ProviderCode::NotEnabled))),
+        (
+            0x8004_0201_u32 as i32,
+            Uncertain(Provider(ProviderCode::ElementUnavailable)),
+        ),
+        (
+            0x8007_0057_u32 as i32,
+            Uncertain(Provider(ProviderCode::InvalidArgument)),
+        ),
+        (
+            0x8004_0200_u32 as i32,
+            Uncertain(Provider(ProviderCode::NotEnabled)),
+        ),
         (0x8001_0105_u32 as i32, Uncertain(Transport)),
         (0x8001_0108_u32 as i32, Uncertain(Transport)),
         (0x8007_06ba_u32 as i32, Uncertain(Transport)),
@@ -42,10 +54,7 @@ fn chain_stops_after_refusal_or_uncertainty() {
             }),
         ]);
         assert_eq!(calls.get(), 0);
-        assert!(matches!(
-            result,
-            ChainOutcome::Uncertain { rung: 0, .. }
-        ));
+        assert!(matches!(result, ChainOutcome::Uncertain { rung: 0, .. }));
     }
 }
 
@@ -55,7 +64,10 @@ fn chain_journals_only_called_not_supported() {
     let result = run_rungs(vec![
         Box::new(|| RungOutcome::Absent),
         Box::new(|| RungOutcome::Called(NOT_SUPPORTED)),
-        Box::new(|| { calls.set(1); RungOutcome::Called(0) }),
+        Box::new(|| {
+            calls.set(1);
+            RungOutcome::Called(0)
+        }),
     ]);
     assert_eq!(calls.get(), 0);
     assert!(matches!(result, ChainOutcome::Uncertain { rung: 1, .. }));
@@ -76,7 +88,9 @@ fn value_route_never_calls_range_after_uncertain_or_refused() {
         ));
     }
     assert!(matches!(
-        set_value_route(RungOutcome::Called(NOT_SUPPORTED), || RungOutcome::Called(0)),
+        set_value_route(RungOutcome::Called(NOT_SUPPORTED), || RungOutcome::Called(
+            0
+        )),
         SetValueDecision::Uncertain { rung: 0, .. }
     ));
     assert!(matches!(
@@ -236,10 +250,7 @@ fn multi_invoke_route_preserves_partial_and_worker_failure() {
     assert_eq!(multi_invoke_route(0, Some(Write(TIMEOUT))), Uncertain);
     assert_eq!(multi_invoke_route(0, Some(AcquireFailed(TIMEOUT))), Refused);
     assert_eq!(multi_invoke_route(0, Some(Write(DENIED))), Uncertain);
-    assert_eq!(
-        multi_invoke_route(0, Some(Write(NOT_SUPPORTED))),
-        Uncertain
-    );
+    assert_eq!(multi_invoke_route(0, Some(Write(NOT_SUPPORTED))), Uncertain);
     assert_eq!(multi_invoke_route(2, None), Done);
 }
 #[test]
@@ -309,10 +320,7 @@ fn expand_route_classifies_all_terminal_results() {
     assert_eq!(expand_route(RungOutcome::Called(TIMEOUT)), Uncertain);
     assert_eq!(expand_route(RungOutcome::Called(DENIED)), Uncertain);
     assert_eq!(expand_route(RungOutcome::AcquireFailed(TIMEOUT)), Refused);
-    assert_eq!(
-        expand_route(RungOutcome::Called(NOT_SUPPORTED)),
-        Uncertain
-    );
+    assert_eq!(expand_route(RungOutcome::Called(NOT_SUPPORTED)), Uncertain);
     assert_eq!(expand_route(RungOutcome::Absent), FallThrough);
     assert_eq!(expand_route(RungOutcome::Called(0)), Done);
 }
@@ -321,17 +329,63 @@ fn expand_route_classifies_all_terminal_results() {
 fn sent_and_acquisition_map_to_core_outcomes() {
     use cua_driver_core::mutation::{Reason, WriteOutcome};
     assert_eq!(classify_sent_call(0).to_core(), WriteOutcome::Delivered);
-    for hr in [1, NOT_SUPPORTED, DENIED, 0x8004_0201_u32 as i32,
-        0x8007_0057_u32 as i32, 0x8004_0200_u32 as i32,
-        0x8007_06ba_u32 as i32, TIMEOUT, 0x8000_4005_u32 as i32] {
-        assert!(matches!(classify_sent_call(hr).to_core(), WriteOutcome::StopUncertain(_)), "{hr:#x}");
+    for hr in [
+        1,
+        NOT_SUPPORTED,
+        DENIED,
+        0x8004_0201_u32 as i32,
+        0x8007_0057_u32 as i32,
+        0x8004_0200_u32 as i32,
+        0x8007_06ba_u32 as i32,
+        TIMEOUT,
+        0x8000_4005_u32 as i32,
+    ] {
+        assert!(
+            matches!(
+                classify_sent_call(hr).to_core(),
+                WriteOutcome::StopUncertain(_)
+            ),
+            "{hr:#x}"
+        );
     }
     for hr in [0, 0x8000_4002_u32 as i32, NOT_SUPPORTED] {
-        assert_eq!(classify_acquisition(hr).to_core(), WriteOutcome::FallThrough(Reason::Unsupported));
+        assert_eq!(
+            classify_acquisition(hr).to_core(),
+            WriteOutcome::FallThrough(Reason::Unsupported)
+        );
     }
-    for (hr, reason) in [(0x8004_0201_u32 as i32, Reason::StaleElement),
-        (DENIED, Reason::PermissionDenied), (TIMEOUT, Reason::UnconfirmedAlive),
-        (0x8000_4005_u32 as i32, Reason::UnconfirmedAlive)] {
-        assert_eq!(classify_acquisition(hr).to_core(), WriteOutcome::StopNotDelivered(reason));
+    for (hr, reason) in [
+        (0x8004_0201_u32 as i32, Reason::StaleElement),
+        (DENIED, Reason::PermissionDenied),
+        (TIMEOUT, Reason::UnconfirmedAlive),
+        (0x8000_4005_u32 as i32, Reason::UnconfirmedAlive),
+    ] {
+        assert_eq!(
+            classify_acquisition(hr).to_core(),
+            WriteOutcome::StopNotDelivered(reason)
+        );
+    }
+}
+
+#[test]
+fn producer_errors_keep_disposition_and_legacy_fields_after_finalization() {
+    use cua_driver_core::mutation::{Reason, WriteOutcome};
+    use cua_driver_contract::ErrorDisposition;
+    for (outcomes, prologue, expected, effect) in [
+        (vec![WriteOutcome::StopUncertain(Reason::Unknown)], false, ErrorDisposition::SUSPECTED_NOOP, "unverifiable"),
+        (vec![WriteOutcome::StopNotDelivered(Reason::PermissionDenied)], false, ErrorDisposition::NOT_DELIVERED, "refused"),
+        (vec![WriteOutcome::StopNotDelivered(Reason::PermissionDenied)], true, ErrorDisposition::SUSPECTED_NOOP, "unverifiable"),
+    ] {
+        let result = chain_error("write failed", serde_json::json!({
+            "path":"ax", "verified":false, "note":"note", "warning":"warning",
+            "code":"element_not_actionable", "focus_restoration":"preserved"
+        }), outcomes, prologue);
+        let wire = cua_driver_core::mcp_result::conforming_tool_result("set_value", serde_json::to_value(result).unwrap());
+        let data = &wire["structuredContent"];
+        assert_eq!(data["effect"], effect);
+        assert_eq!(serde_json::from_value::<ErrorDisposition>(data["disposition"].clone()).unwrap(), expected);
+        for (key, value) in [("note", "note"), ("warning", "warning"), ("code", "element_not_actionable"), ("focus_restoration", "preserved")] {
+            assert_eq!(data[key], value, "{key}");
+        }
     }
 }
