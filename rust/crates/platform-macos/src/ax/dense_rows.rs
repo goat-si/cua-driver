@@ -250,14 +250,14 @@ pub(crate) struct Chunk {
     pub nodes: Vec<AXNode>,
 }
 
-pub(crate) struct DeferredRow {
+pub(crate) struct DeferredRow<H = RetainedElement> {
     pub anchor: usize,
     pub seq: usize,
     /// The row's position among its collection's `AXChildren`.
     pub position: usize,
     /// Which collection the row belongs to (its container element).
     pub collection: usize,
-    pub element: RetainedElement,
+    pub element: H,
     pub depth: usize,
     pub parent_index: Option<usize>,
     pub parent_role: String,
@@ -287,19 +287,19 @@ pub struct OffscreenRows {
 }
 
 #[cfg(test)]
-pub(crate) fn splice(
+pub(crate) fn splice<H>(
     lines: Vec<(usize, String)>,
     nodes: Vec<AXNode>,
-    deferred: Vec<DeferredRow>,
+    deferred: Vec<DeferredRow<H>>,
 ) -> Spliced {
     splice_with_offscreen_rows(lines, nodes, deferred).0
 }
 
 /// [`splice`], with the offscreen runs its summary lines stand for.
-pub(crate) fn splice_with_offscreen_rows(
+pub(crate) fn splice_with_offscreen_rows<H>(
     lines: Vec<(usize, String)>,
     nodes: Vec<AXNode>,
-    mut deferred: Vec<DeferredRow>,
+    mut deferred: Vec<DeferredRow<H>>,
 ) -> (Spliced, Vec<OffscreenRows>) {
     debug_assert_eq!(lines.len(), nodes.len());
     deferred.sort_by_key(|row| (row.anchor, row.seq));
@@ -363,10 +363,10 @@ pub(crate) fn splice_with_offscreen_rows(
 /// Walk the deferred rows a windowed read planned: visible rows first, then
 /// offscreen rows only when `search_offscreen`. Returns whether an offscreen row
 /// was left unwalked.
-pub(crate) fn walk_deferred(
-    deferred: &mut [DeferredRow],
+pub(crate) fn walk_deferred<H>(
+    deferred: &mut [DeferredRow<H>],
     search_offscreen: bool,
-    mut walk: impl FnMut(&DeferredRow) -> Chunk,
+    mut walk: impl FnMut(&DeferredRow<H>) -> Chunk,
 ) -> bool {
     let mut skipped = false;
     for visible in [true, false] {
@@ -384,10 +384,10 @@ pub(crate) fn walk_deferred(
 
 /// Splice the walked rows into document order, renumber every row, and name
 /// each offscreen run under its collection's renumbered parent.
-pub(crate) fn splice_and_renumber(
+pub(crate) fn splice_and_renumber<H>(
     lines: Vec<(usize, String)>,
     nodes: Vec<AXNode>,
-    deferred: Vec<DeferredRow>,
+    deferred: Vec<DeferredRow<H>>,
 ) -> (Vec<(usize, String)>, Vec<AXNode>, Vec<OffscreenRows>) {
     let ((mut lines, mut nodes, map), runs) = splice_with_offscreen_rows(lines, nodes, deferred);
     let indices = renumber(&mut lines, &mut nodes, &map);
