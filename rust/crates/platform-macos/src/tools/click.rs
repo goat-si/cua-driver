@@ -39,6 +39,52 @@ use core_foundation::base::{CFRelease, CFTypeRef, TCFType};
 use super::pixel_route::PixelClickRoute;
 use super::ToolState;
 
+pub(super) fn effective_click_action(action: &str, button: &str) -> String {
+    if button == "right" && action == "press" {
+        "show_menu".to_owned()
+    } else {
+        action.to_owned()
+    }
+}
+
+pub(super) fn click_semantic_intent(
+    action: &str,
+) -> super::actionability::semantic::SemanticIntent {
+    use super::actionability::semantic::SemanticIntent;
+    match action {
+        "AXPress" => SemanticIntent::Click,
+        "AXShowMenu" => SemanticIntent::RightClick,
+        "AXOpen" => SemanticIntent::Open,
+        _ => SemanticIntent::PerformAction(action.to_owned()),
+    }
+}
+
+pub(super) async fn dispatch_custom_action<C, P, A, F, T>(
+    clock: &(impl cua_driver_core::actionability::Clock + Sync),
+    budget: std::time::Duration,
+    context: C,
+    probe: P,
+    perform: A,
+) -> Result<T, ToolResult>
+where
+    C: Sync,
+    P: for<'a> FnMut(
+            &'a C,
+            std::time::Duration,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = cua_driver_core::actionability::ActionabilityReport,
+                    > + Send
+                    + 'a,
+            >,
+        > + Send,
+    A: FnOnce(C) -> F,
+    F: std::future::Future<Output = T>,
+{
+    super::actionability::dispatch_semantic(clock, budget, context, probe, perform).await
+}
+
 pub struct ClickTool {
     state: Arc<ToolState>,
 }
@@ -1605,37 +1651,42 @@ impl ClickTool {
             // Surface 5: button=right on the AX path → AXShowMenu (the same surface
             // the dedicated `right_click` tool dispatches). Threads through the
             // identical perform_ax_click code path with the action remapped.
-            let effective_action = if button_str == "right" && action == "press" {
-                "show_menu".to_string()
-            } else {
-                action.clone()
-            };
+            let effective_action = effective_click_action(&action, &button_str);
 
             // Resolve the action against what this element lists right now,
             // before the cursor glides or the window can be fronted, so a name
             // it does not offer is refused with nothing sent.
-            {
+            let resolved_action = {
                 let action_guard = element_guard.clone();
                 let requested = effective_action.clone();
                 let foreground = delivery_mode.is_foreground();
                 let resolved = latency::spawn_action_blocking(move || {
                     let _span = latency::span(latency::Stage::Preflight);
-                    let element = action_guard.as_ptr() as AXUIElementRef;
-                    let advertised = unsafe { copy_action_names(element) };
-                    crate::input::ax_actions::resolve_element_action(
+                    resolve_click_action(
+                        action_guard.as_ptr(),
                         &requested,
-                        &advertised,
                         foreground,
+                        |target| unsafe { copy_action_names(target as AXUIElementRef) },
+                        |_, _, _| Ok(()),
                     )
-                    .map(|_| ())
+                    .map(|(_, action)| action)
                 })
                 .await;
-                if let Ok(Err(error)) = resolved {
-                    let code = crate::input::ax_actions::element_action_refusal_code(&error)
-                        .unwrap_or("invalid_arguments");
-                    return super::pre_dispatch_refusal(code, format!("click: {error}"));
+                match resolved {
+                    Ok(Ok(action)) => action,
+                    Ok(Err(error)) => {
+                        let code = crate::input::ax_actions::element_action_refusal_code(&error)
+                            .unwrap_or("invalid_arguments");
+                        return super::pre_dispatch_refusal(code, format!("click: {error}"));
+                    }
+                    Err(error) => {
+                        return super::pre_dispatch_refusal(
+                            "action_unavailable",
+                            format!("click: action resolution failed ({error}); nothing was sent."),
+                        )
+                    }
                 }
-            }
+            };
 
             // A background press or show-menu on a Chromium <select> would
             // open its menu and raise the browser window (CUA-1795): steer to
@@ -1819,6 +1870,7 @@ impl ClickTool {
             // Run AX work on a blocking thread (can't block async executor).
             // Use `effective_action` so button=right rewrites press → show_menu.
             let action_clone = effective_action.clone();
+            let dispatch_action = resolved_action.clone();
             // Thread the resolved session cursor key into the blocking AX path
             // so its ShowFocusRect + ClickPulse land on THIS session's cursor,
             // not the shared "default" one (which would light the wrong cursor
@@ -1831,7 +1883,10 @@ impl ClickTool {
             let action_lease = _mutation_lease.take();
             let probe_target = element_guard.clone();
             let clock = super::actionability::semantic_clock();
-            let use_battery = effective_action == "press";
+            let use_battery = matches!(
+                click_semantic_intent(&resolved_action),
+                super::actionability::semantic::SemanticIntent::Click
+            );
             let perform = |action_lease| async move {
                 let prior_front = apps::frontmost_pid();
                 let snapshot = if foreground {
@@ -1856,6 +1911,7 @@ impl ClickTool {
                                             (element_ptr, idx),
                                             (pid, wid),
                                             &action_clone,
+                                            &dispatch_action,
                                             &ck,
                                             selection_pixel,
                                             &selection_modifiers,
@@ -1887,6 +1943,7 @@ impl ClickTool {
                                         (element_ptr, idx),
                                         (pid, wid),
                                         &action_clone,
+                                        &dispatch_action,
                                         &ck,
                                         selection_pixel,
                                         &selection_modifiers,
@@ -1920,7 +1977,26 @@ impl ClickTool {
                     Err(refusal) => return refusal,
                 }
             } else {
-                perform(action_lease).await
+                match dispatch_custom_action(
+                    &clock,
+                    cua_driver_core::actionability::DEFAULT_BUDGET,
+                    (action_lease, resolved_action),
+                    |(lease, action), _| {
+                        super::actionability::semantic_probe(
+                            lease.as_ref(),
+                            probe_target.clone(),
+                            pid,
+                            wid,
+                            click_semantic_intent(action),
+                        )
+                    },
+                    |(lease, _)| perform(lease),
+                )
+                .await
+                {
+                    Ok(result) => result,
+                    Err(refusal) => return refusal,
+                }
             };
             let result = result.map(|(outcome, held)| {
                 _mutation_lease = held;
@@ -3299,9 +3375,9 @@ unsafe fn ancestor_roles(element: AXUIElementRef) -> Vec<String> {
     roles
 }
 
-/// Resolve the exact advertised action and check its enabled state on the
-/// selected target without dispatching it. The two reads are injectable so a
-/// caller can retain the selected target and action across later checks.
+/// Resolve the exact advertised action without dispatching it. The caller
+/// retains this name for the actionability sample and worker; enabled-state
+/// validation remains immediately before the action in the worker.
 pub(super) fn resolve_click_action<T: Copy>(
     target: T,
     requested: &str,
@@ -3386,6 +3462,7 @@ fn perform_ax_click(
     element: (usize, usize),
     window: (i32, u32),
     action_str: &str,
+    ax_action: &str,
     cursor_key: &str,
     selection_pixel: Option<SelectionPixelTarget>,
     modifiers: &[String],
@@ -3402,14 +3479,8 @@ fn perform_ax_click(
     let preflight = latency::span(latency::Stage::Preflight);
     // A live enabled-state check follows action resolution, as before. The
     // resolved spelling belongs to this target's advertised actions.
-    let (advertised, resolved_action) = resolve_click_action(
-        element_ptr,
-        action_str,
-        foreground,
-        |target| unsafe { copy_action_names(target as AXUIElementRef) },
-        crate::input::ax_actions::ensure_ax_action_enabled,
-    )?;
-    let ax_action = resolved_action.as_str();
+    let advertised = unsafe { copy_action_names(element) };
+    crate::input::ax_actions::ensure_ax_action_enabled(element_ptr, ax_action, foreground)?;
 
     // Capture advertised actions BEFORE dispatching so we can detect silent no-ops
     // (AX returns success even when the element doesn't advertise the action).

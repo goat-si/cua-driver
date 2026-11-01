@@ -21,12 +21,71 @@ use std::{
 };
 
 use crate::ax::bindings::{
-    ax_get_window_id, copy_action_names, copy_children_checked, copy_element_attr,
-    copy_string_attr, kAXErrorSuccess, perform_action, AXUIElementCopyAttributeValue,
-    AXUIElementCreateApplication, AXUIElementRef, AXUIElementSetMessagingTimeout,
+    ax_get_window_id, copy_children_checked, copy_element_attr, copy_string_attr, kAXErrorSuccess,
+    perform_action, AXUIElementCopyAttributeValue, AXUIElementCreateApplication, AXUIElementRef,
+    AXUIElementSetMessagingTimeout,
 };
 
 use super::ToolState;
+
+// This seam keeps the menu identity and its lease together across the async
+// admission and the worker that closes it.
+pub(super) async fn dispatch_owned_cancel<C, P, A, F, T>(
+    clock: &(impl cua_driver_core::actionability::Clock + Sync),
+    budget: Duration,
+    context: C,
+    probe: P,
+    perform: A,
+) -> Result<T, ToolResult>
+where
+    C: Sync,
+    P: for<'a> FnMut(
+            &'a C,
+            Duration,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = cua_driver_core::actionability::ActionabilityReport,
+                    > + Send
+                    + 'a,
+            >,
+        > + Send,
+    A: FnOnce(C) -> F,
+    F: std::future::Future<Output = T>,
+{
+    super::actionability::dispatch_semantic(clock, budget, context, probe, perform).await
+}
+
+pub(super) async fn dispatch_show_menu<C, P, A, F, T>(
+    clock: &(impl cua_driver_core::actionability::Clock + Sync),
+    budget: Duration,
+    advertises_show_menu: bool,
+    context: C,
+    probe: P,
+    perform: A,
+) -> Result<T, ToolResult>
+where
+    C: Sync,
+    P: for<'a> FnMut(
+            &'a C,
+            Duration,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = cua_driver_core::actionability::ActionabilityReport,
+                    > + Send
+                    + 'a,
+            >,
+        > + Send,
+    A: FnOnce(C) -> F,
+    F: std::future::Future<Output = T>,
+{
+    if advertises_show_menu {
+        super::actionability::dispatch_semantic(clock, budget, context, probe, perform).await
+    } else {
+        Ok(perform(context).await)
+    }
+}
 
 pub struct RightClickTool {
     state: Arc<ToolState>,
@@ -151,26 +210,54 @@ impl RightClickTool {
             Ok(lease) => lease,
             Err(error) => return error,
         };
-        let result = latency::spawn_action_blocking(move || unsafe {
-            let error = perform_action(menu.0 as AXUIElementRef, "AXCancel");
-            if error != kAXErrorSuccess {
-                return Err(format!("AXCancel failed with AXError {error}"));
-            }
-            let deadline = Instant::now() + Duration::from_millis(750);
-            while Instant::now() < deadline {
-                let menus = ax_menus(pid, target.as_ref().map(|target| target.0), Some(window_id))
-                    .ok_or_else(|| "context-menu close readback is unavailable".to_owned())?;
-                if !menus
-                    .iter()
-                    .any(|candidate| CFEqual(candidate.0 as CFTypeRef, menu.0 as CFTypeRef) != 0)
-                {
-                    return Ok(());
-                }
-                std::thread::sleep(Duration::from_millis(25));
-            }
-            Err("context menu did not disappear after AXCancel".into())
-        })
-        .await;
+        let clock = super::actionability::semantic_clock();
+        let result = match dispatch_owned_cancel(
+            &clock,
+            cua_driver_core::actionability::DEFAULT_BUDGET,
+            (_mutation_lease, menu, target),
+            |(lease, menu, _), _| {
+                let target = unsafe { crate::ax::snapshot::RetainedElement::retain(menu.0) };
+                super::actionability::semantic_probe(
+                    Some(lease),
+                    target,
+                    pid,
+                    window_id,
+                    super::actionability::semantic::SemanticIntent::PerformAction(
+                        "AXCancel".into(),
+                    ),
+                )
+            },
+            |(lease, menu, target)| async move {
+                latency::spawn_action_blocking(move || unsafe {
+                    let _lease = lease;
+                    let error = perform_action(menu.0 as AXUIElementRef, "AXCancel");
+                    if error != kAXErrorSuccess {
+                        return Err(format!("AXCancel failed with AXError {error}"));
+                    }
+                    let deadline = Instant::now() + Duration::from_millis(750);
+                    while Instant::now() < deadline {
+                        let menus =
+                            ax_menus(pid, target.as_ref().map(|target| target.0), Some(window_id))
+                                .ok_or_else(|| {
+                                    "context-menu close readback is unavailable".to_owned()
+                                })?;
+                        if !menus.iter().any(|candidate| {
+                            CFEqual(candidate.0 as CFTypeRef, menu.0 as CFTypeRef) != 0
+                        }) {
+                            return Ok(());
+                        }
+                        std::thread::sleep(Duration::from_millis(25));
+                    }
+                    Err("context menu did not disappear after AXCancel".into())
+                })
+                .await
+            },
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(refusal) => return refusal,
+        };
         match result {
             Ok(Ok(())) => {
                 crate::ax::exact_target::finish_context_menu_close(opener_id);
@@ -289,9 +376,27 @@ impl RightClickTool {
                 Err(refusal_result) => return refusal_result,
             };
 
+            let action_guard = element_guard.clone();
+            let advertised = latency::spawn_blocking(move || {
+                super::actionability::action_advertised(
+                    action_guard.as_ptr() as AXUIElementRef,
+                    "AXShowMenu",
+                )
+            })
+            .await
+            .unwrap_or_else(|error| {
+                cua_driver_core::actionability::Evidence::Unknown(format!(
+                    "action read worker failed: {error}"
+                ))
+            });
+            let advertises_show_menu = super::actionability::may_use_semantic_route(&advertised);
+
             // The context menu steals key focus from the user's app when the
             // target is in the background; the guard hands it back.
-            let result = latency::spawn_blocking(move || -> anyhow::Result<_> {
+            let probe_target = element_guard.clone();
+            let clock = super::actionability::semantic_clock();
+            let perform = |mutation_lease| async move {
+                latency::spawn_action_blocking(move || -> anyhow::Result<_> {
                 let _action = latency::span(latency::Stage::ActionBlocking);
                 let element_ptr = element_guard.as_ptr();
                 let input_watch = MenuInputWatch::start(pid);
@@ -304,7 +409,7 @@ impl RightClickTool {
                     unsafe {
                         AXUIElementSetMessagingTimeout(element, 0.25);
                     }
-                    let result = ax_show_menu(element_ptr, idx, pid, wid, dispatch);
+                    let result = ax_show_menu(element_ptr, idx, pid, wid, advertises_show_menu, dispatch);
                     unsafe {
                         AXUIElementSetMessagingTimeout(element, 0.0);
                     }
@@ -333,8 +438,30 @@ impl RightClickTool {
                     }
                 };
                 result.map(|delivery| (delivery, menu))
-            })
-            .await;
+            }).await
+            };
+            let result = match dispatch_show_menu(
+                &clock,
+                cua_driver_core::actionability::DEFAULT_BUDGET,
+                advertises_show_menu,
+                mutation_lease,
+                |lease, _| {
+                    super::actionability::route_semantic_probe(
+                        &advertised,
+                        Some(lease),
+                        probe_target.clone(),
+                        pid,
+                        wid,
+                        super::actionability::semantic::SemanticIntent::RightClick,
+                    )
+                },
+                perform,
+            )
+            .await
+            {
+                Ok(result) => result,
+                Err(refusal) => return refusal,
+            };
 
             return match result {
                 Ok(Ok((ElementRightClick::Ax(msg), menu))) => right_click_result_with_ownership(
@@ -1512,14 +1639,13 @@ fn ax_show_menu(
     idx: usize,
     pid: i32,
     wid: u32,
+    advertises_show_menu: bool,
     dispatch: std::sync::mpsc::Sender<ActionEvent>,
 ) -> anyhow::Result<ElementRightClick> {
     let element = element_ptr as AXUIElementRef;
 
     let role = unsafe { copy_string_attr(element, "AXRole") }.unwrap_or_default();
     let title = unsafe { copy_string_attr(element, "AXTitle") }.unwrap_or_default();
-
-    let advertised = unsafe { copy_action_names(element) };
 
     // Only attempt the pure-AX AXShowMenu when the element actually advertises
     // it. Plain controls (NSButton, custom NSView click targets, most web
@@ -1534,7 +1660,7 @@ fn ax_show_menu(
     right_click_element(
         element,
         &format!("[{idx}] {role} \"{title}\""),
-        advertised.iter().any(|a| a == "AXShowMenu"),
+        advertises_show_menu,
         |target| {
             let _ = ax_dispatch.send(ActionEvent::Dispatching(Instant::now()));
             unsafe { perform_action(target, "AXShowMenu") }

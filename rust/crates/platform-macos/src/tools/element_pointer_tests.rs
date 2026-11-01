@@ -148,8 +148,8 @@ impl ElementTarget for Fake {
     fn web_select_refusal(&self) -> Option<ToolResult> {
         None
     }
-    fn lists_ax_open(&self) -> bool {
-        self.lists_ax_open
+    fn lists_ax_open(&self) -> cua_driver_core::actionability::Evidence<bool> {
+        cua_driver_core::actionability::Evidence::Known(self.lists_ax_open)
     }
     fn ax_open(&self) -> AXError {
         self.note("ax_open");

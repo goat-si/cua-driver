@@ -8,11 +8,40 @@ use cua_driver_core::{
 use serde_json::Value;
 use std::sync::Arc;
 
-use crate::ax::bindings::{
-    copy_action_names, element_screen_center, kAXErrorSuccess, perform_action, AXUIElementRef,
-};
+use crate::ax::bindings::{element_screen_center, kAXErrorSuccess, perform_action, AXUIElementRef};
 
 use super::ToolState;
+
+pub(super) async fn dispatch_open<C, P, A, F, T>(
+    clock: &(impl cua_driver_core::actionability::Clock + Sync),
+    budget: std::time::Duration,
+    use_ax_open: bool,
+    context: C,
+    probe: P,
+    perform: A,
+) -> Result<T, ToolResult>
+where
+    C: Sync,
+    P: for<'a> FnMut(
+            &'a C,
+            std::time::Duration,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = cua_driver_core::actionability::ActionabilityReport,
+                    > + Send
+                    + 'a,
+            >,
+        > + Send,
+    A: FnOnce(C) -> F,
+    F: std::future::Future<Output = T>,
+{
+    if use_ax_open {
+        super::actionability::dispatch_semantic(clock, budget, context, probe, perform).await
+    } else {
+        Ok(perform(context).await)
+    }
+}
 
 pub struct DoubleClickTool {
     state: Arc<ToolState>,
@@ -118,14 +147,20 @@ impl Tool for DoubleClickTool {
             // elements require the stricter routed-pointer proof. Do not let a
             // failed AXOpen silently cross into an ungated pointer fallback.
             let probe_guard = element_guard.clone();
-            let has_ax_open = latency::spawn_action_blocking(move || unsafe {
-                copy_action_names(probe_guard.as_ptr() as AXUIElementRef)
-                    .iter()
-                    .any(|action| action == "AXOpen")
+            let advertised = latency::spawn_action_blocking(move || {
+                super::actionability::action_advertised(
+                    probe_guard.as_ptr() as AXUIElementRef,
+                    "AXOpen",
+                )
             })
             .await
-            .unwrap_or(false);
-            let _mutation_lease = if !delivery_mode.is_foreground() {
+            .unwrap_or_else(|error| {
+                cua_driver_core::actionability::Evidence::Unknown(format!(
+                    "action read worker failed: {error}"
+                ))
+            });
+            let has_ax_open = super::actionability::may_use_semantic_route(&advertised);
+            let mutation_lease = if !delivery_mode.is_foreground() {
                 let action = background_action_for_element(has_ax_open);
                 match super::gate_background_window_action(pid, wid, Some(element_ptr), action)
                     .await
@@ -144,35 +179,63 @@ impl Tool for DoubleClickTool {
             // AXOpen or the routed double-click can make the app activate
             // itself (opening a document or a register). In the background,
             // revert that and keep the user's key window, as `click` does.
-            let prior_front = crate::apps::frontmost_pid();
-            let snapshot = if foreground {
-                crate::window_change_detector::WindowChangeDetector::snapshot_without_suppression(
+            let probe_target = element_guard.clone();
+            let clock = super::actionability::semantic_clock();
+            let perform = |lease| async move {
+                let prior_front = crate::apps::frontmost_pid();
+                let snapshot = if foreground {
+                    crate::window_change_detector::WindowChangeDetector::snapshot_without_suppression(
                     prior_front,
                 )
-            } else {
-                crate::window_change_detector::WindowChangeDetector::snapshot(prior_front)
+                } else {
+                    crate::window_change_detector::WindowChangeDetector::snapshot(prior_front)
+                };
+                let result = crate::focus_guard::with_focus_suppressed(
+                    (!foreground).then_some(pid),
+                    prior_front,
+                    "double_click.ax",
+                    || async move {
+                        latency::spawn_action_blocking(move || {
+                            let _lease = lease;
+                            ax_double_click(
+                                pid,
+                                wid,
+                                element_guard.as_ptr(),
+                                idx,
+                                &ck,
+                                has_ax_open,
+                                foreground,
+                            )
+                        })
+                        .await
+                    },
+                )
+                .await;
+                let changes = super::finish_window_observation(snapshot).await;
+                (result, changes)
             };
-            let result = crate::focus_guard::with_focus_suppressed(
-                (!foreground).then_some(pid),
-                prior_front,
-                "double_click.ax",
-                || async move {
-                    latency::spawn_action_blocking(move || {
-                        ax_double_click(
-                            pid,
-                            wid,
-                            element_guard.as_ptr(),
-                            idx,
-                            &ck,
-                            has_ax_open,
-                            foreground,
-                        )
-                    })
-                    .await
+            let (result, changes) = match dispatch_open(
+                &clock,
+                cua_driver_core::actionability::DEFAULT_BUDGET,
+                has_ax_open,
+                mutation_lease,
+                |lease, _| {
+                    super::actionability::route_semantic_probe(
+                        &advertised,
+                        lease.as_ref(),
+                        probe_target.clone(),
+                        pid,
+                        wid,
+                        super::actionability::semantic::SemanticIntent::Open,
+                    )
                 },
+                perform,
             )
-            .await;
-            let changes = super::finish_window_observation(snapshot).await;
+            .await
+            {
+                Ok(result) => result,
+                Err(refusal) => return refusal,
+            };
 
             return match result {
                 Ok(Ok(ElementDoubleClick::Ax(msg))) => {
