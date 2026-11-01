@@ -41,6 +41,9 @@ pub mod virtualdesk;
 mod actionability;
 
 #[cfg(any(target_os = "windows", test))]
+mod keyboard_dispatch;
+
+#[cfg(any(target_os = "windows", test))]
 mod keycodes;
 
 #[cfg(any(target_os = "windows", test))]
