@@ -11,11 +11,11 @@ fn classification_table() {
     use WriteVerdict::*;
     for (hr, expected) in [
         (0, Delivered),
-        (NOT_SUPPORTED, Uncertain(Unclassified)),
-        (DENIED, Uncertain(Unclassified)),
-        (0x8004_0201_u32 as i32, Uncertain(Unclassified)),
-        (0x8007_0057_u32 as i32, Uncertain(Unclassified)),
-        (0x8004_0200_u32 as i32, Uncertain(Unclassified)),
+        (NOT_SUPPORTED, Uncertain(Provider(ProviderCode::NotSupported))),
+        (DENIED, Uncertain(Provider(ProviderCode::AccessDenied))),
+        (0x8004_0201_u32 as i32, Uncertain(Provider(ProviderCode::ElementUnavailable))),
+        (0x8007_0057_u32 as i32, Uncertain(Provider(ProviderCode::InvalidArgument))),
+        (0x8004_0200_u32 as i32, Uncertain(Provider(ProviderCode::NotEnabled))),
         (0x8001_0105_u32 as i32, Uncertain(Transport)),
         (0x8001_0108_u32 as i32, Uncertain(Transport)),
         (0x8007_06ba_u32 as i32, Uncertain(Transport)),
@@ -156,7 +156,7 @@ fn last_range_write_is_classified_and_all_absent_is_terminal() {
         set_value_route(RungOutcome::Absent, || RungOutcome::Called(DENIED)),
         SetValueDecision::Uncertain {
             rung: 1,
-            kind: UncertainKind::Unclassified,
+            kind: UncertainKind::Provider(ProviderCode::AccessDenied),
             hresult: DENIED
         }
     );
@@ -194,7 +194,7 @@ fn failed_pattern_acquisition_stops_the_chain_without_delivery() {
         result,
         ChainOutcome::Refused {
             rung: 0,
-            kind: RefusalKind::PatternUnreadable,
+            kind: RefusalKind::UnconfirmedAlive,
             hresult: TIMEOUT,
             not_supported_calls: vec![],
         }
@@ -209,7 +209,7 @@ fn failed_pattern_acquisition_stops_the_chain_without_delivery() {
         decision,
         SetValueDecision::Refused {
             rung: 0,
-            kind: RefusalKind::PatternUnreadable,
+            kind: RefusalKind::PermissionDenied,
             hresult: DENIED,
         }
     );
@@ -315,4 +315,23 @@ fn expand_route_classifies_all_terminal_results() {
     );
     assert_eq!(expand_route(RungOutcome::Absent), FallThrough);
     assert_eq!(expand_route(RungOutcome::Called(0)), Done);
+}
+
+#[test]
+fn sent_and_acquisition_map_to_core_outcomes() {
+    use cua_driver_core::mutation::{Reason, WriteOutcome};
+    assert_eq!(classify_sent_call(0).to_core(), WriteOutcome::Delivered);
+    for hr in [1, NOT_SUPPORTED, DENIED, 0x8004_0201_u32 as i32,
+        0x8007_0057_u32 as i32, 0x8004_0200_u32 as i32,
+        0x8007_06ba_u32 as i32, TIMEOUT, 0x8000_4005_u32 as i32] {
+        assert!(matches!(classify_sent_call(hr).to_core(), WriteOutcome::StopUncertain(_)), "{hr:#x}");
+    }
+    for hr in [0, 0x8000_4002_u32 as i32, NOT_SUPPORTED] {
+        assert_eq!(classify_acquisition(hr).to_core(), WriteOutcome::FallThrough(Reason::Unsupported));
+    }
+    for (hr, reason) in [(0x8004_0201_u32 as i32, Reason::StaleElement),
+        (DENIED, Reason::PermissionDenied), (TIMEOUT, Reason::UnconfirmedAlive),
+        (0x8000_4005_u32 as i32, Reason::UnconfirmedAlive)] {
+        assert_eq!(classify_acquisition(hr).to_core(), WriteOutcome::StopNotDelivered(reason));
+    }
 }

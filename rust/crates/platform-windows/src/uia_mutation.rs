@@ -7,12 +7,93 @@ pub(crate) enum RefusalKind {
     /// Reading the pattern itself failed with something other than "not
     /// supported"; no method of that pattern was called.
     PatternUnreadable,
+    StaleElement,
+    PermissionDenied,
+    UnconfirmedAlive,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum UncertainKind {
+    Provider(ProviderCode),
     Transport,
     Timeout,
     Unclassified,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProviderCode {
+    NotSupported,
+    AccessDenied,
+    ElementUnavailable,
+    InvalidArgument,
+    NotEnabled,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SentVerdict {
+    Delivered,
+    Uncertain(UncertainKind),
+}
+
+pub(crate) fn classify_sent_call(hresult: i32) -> SentVerdict {
+    use ProviderCode::*;
+    use UncertainKind::*;
+    let kind = match hresult as u32 {
+        0 => return SentVerdict::Delivered,
+        0x8004_0204 => Provider(NotSupported),
+        0x8007_0005 => Provider(AccessDenied),
+        0x8004_0201 => Provider(ElementUnavailable),
+        0x8007_0057 => Provider(InvalidArgument),
+        0x8004_0200 => Provider(NotEnabled),
+        0x8001_0105 | 0x8001_0108 | 0x8007_06ba | 0x8007_06be => Transport,
+        0x8013_1505 => Timeout,
+        _ => Unclassified,
+    };
+    SentVerdict::Uncertain(kind)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AcquireVerdict {
+    Absent,
+    NotDelivered(RefusalKind),
+}
+
+pub(crate) fn classify_acquisition(code: i32) -> AcquireVerdict {
+    if pattern_absent(code) {
+        return AcquireVerdict::Absent;
+    }
+    AcquireVerdict::NotDelivered(match code as u32 {
+        0x8004_0201 => RefusalKind::StaleElement,
+        0x8007_0005 => RefusalKind::PermissionDenied,
+        _ => RefusalKind::UnconfirmedAlive,
+    })
+}
+
+impl SentVerdict {
+    pub(crate) fn to_core(self) -> cua_driver_core::mutation::WriteOutcome {
+        use cua_driver_core::mutation::{Reason, WriteOutcome};
+        match self {
+            Self::Delivered => WriteOutcome::Delivered,
+            Self::Uncertain(kind) => WriteOutcome::StopUncertain(match kind {
+                UncertainKind::Transport => Reason::Transport,
+                UncertainKind::Timeout => Reason::Timeout,
+                UncertainKind::Provider(_) | UncertainKind::Unclassified => Reason::Unknown,
+            }),
+        }
+    }
+}
+impl AcquireVerdict {
+    pub(crate) fn to_core(self) -> cua_driver_core::mutation::WriteOutcome {
+        use cua_driver_core::mutation::{Reason, WriteOutcome};
+        match self {
+            Self::Absent => WriteOutcome::FallThrough(Reason::Unsupported),
+            Self::NotDelivered(kind) => WriteOutcome::StopNotDelivered(match kind {
+                RefusalKind::StaleElement | RefusalKind::ElementUnavailable => Reason::StaleElement,
+                RefusalKind::PermissionDenied | RefusalKind::AccessDenied => Reason::PermissionDenied,
+                RefusalKind::InvalidArgument => Reason::InvalidArgument,
+                RefusalKind::NotEnabled => Reason::Disabled,
+                RefusalKind::UnconfirmedAlive | RefusalKind::PatternUnreadable => Reason::UnconfirmedAlive,
+            }),
+        }
+    }
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum WriteVerdict {
@@ -23,13 +104,9 @@ pub(crate) enum WriteVerdict {
 }
 
 pub(crate) fn classify_write_hresult(hresult: i32) -> WriteVerdict {
-    use UncertainKind::*;
-    use WriteVerdict::*;
-    match hresult as u32 {
-        0 => Delivered,
-        0x8001_0105 | 0x8001_0108 | 0x8007_06ba | 0x8007_06be => Uncertain(Transport),
-        0x8013_1505 => Uncertain(Timeout),
-        _ => Uncertain(Unclassified),
+    match classify_sent_call(hresult) {
+        SentVerdict::Delivered => WriteVerdict::Delivered,
+        SentVerdict::Uncertain(kind) => WriteVerdict::Uncertain(kind),
     }
 }
 pub(crate) fn may_fall_through(verdict: &WriteVerdict) -> bool {
@@ -79,7 +156,10 @@ pub(crate) fn run_rungs(rungs: Vec<Box<dyn FnOnce() -> RungOutcome + '_>>) -> Ch
             RungOutcome::AcquireFailed(hresult) => {
                 return ChainOutcome::Refused {
                     rung,
-                    kind: RefusalKind::PatternUnreadable,
+                    kind: match classify_acquisition(hresult) {
+                        AcquireVerdict::Absent => continue,
+                        AcquireVerdict::NotDelivered(kind) => kind,
+                    },
                     hresult,
                     not_supported_calls,
                 }
