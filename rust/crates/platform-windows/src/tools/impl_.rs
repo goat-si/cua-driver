@@ -4309,12 +4309,22 @@ impl Tool for ClickTool {
                 let (cx, cy) = if !modifiers.is_empty() {
                     if let Some(retained) = admitted.as_ref().filter(|element| element.is_uia()) {
                         use crate::uia::scroll::RevealOutcome;
-                        match unsafe { crate::uia::scroll::scroll_into_view_and_recenter(hwnd, retained.as_ptr()) } {
+                        match unsafe {
+                            crate::uia::scroll::scroll_into_view_and_recenter(
+                                hwnd,
+                                retained.as_ptr(),
+                            )
+                        } {
                             RevealOutcome::Revealed(point) => point,
                             RevealOutcome::NotRevealed { writes_sent: false } => (cx, cy),
-                            RevealOutcome::Uncertain | RevealOutcome::NotRevealed { writes_sent: true } => return reveal_uncertain_result(),
+                            RevealOutcome::Uncertain
+                            | RevealOutcome::NotRevealed { writes_sent: true } => {
+                                return reveal_uncertain_result()
+                            }
                         }
-                    } else { (cx, cy) }
+                    } else {
+                        (cx, cy)
+                    }
                 } else {
                     (cx, cy)
                 };
@@ -5045,15 +5055,23 @@ fn focus_cached_element_for_foreground(
     // which would make the enclosing verify-before-SendInput transaction
     // fail closed. The foreground route has already activated the exact HWND,
     // so focus the cached element directly and verify it below.
-    let focus_hr = admitted.as_ref().and_then(|element| element.focus_hresult());
-    match crate::uia_mutation::focus_route(focus_hr, ||
-        wait_for_cached_element_keyboard_focus(admitted, std::time::Duration::from_millis(350))) {
+    let focus_hr = admitted
+        .as_ref()
+        .and_then(|element| element.focus_hresult());
+    match crate::uia_mutation::focus_route(focus_hr, || {
+        wait_for_cached_element_keyboard_focus(admitted, std::time::Duration::from_millis(350))
+    }) {
         crate::uia_mutation::FocusRoute::Confirmed => return Ok(()),
-        crate::uia_mutation::FocusRoute::Uncertain => return Err(FocusUncertain(
-            match focus_hr {
-                Some(hr) if hr != 0 => format!("UIA SetFocus returned HRESULT 0x{:08X}; focus may have changed; nothing typed", hr as u32),
+        crate::uia_mutation::FocusRoute::Uncertain => {
+            return Err(FocusUncertain(match focus_hr {
+                Some(hr) if hr != 0 => format!(
+                    "UIA SetFocus returned HRESULT 0x{:08X}; focus may have changed; nothing typed",
+                    hr as u32
+                ),
                 _ => "focus may have changed but could not be confirmed; nothing typed".into(),
-            }).into()),
+            })
+            .into())
+        }
         crate::uia_mutation::FocusRoute::ClickBeforeSend => {}
     }
     if let Some((x, y)) = click_point {
@@ -6912,7 +6930,7 @@ impl Tool for SetValueTool {
                                 Ok(None) => return RungOutcome::Absent,
                                 Err(hresult) => return RungOutcome::AcquireFailed(hresult),
                             };
-                            let parsed: f64 = match value.parse() {
+                            let parsed: f64 = match value.parse::<f64>() {
                                 Ok(parsed) if parsed.is_finite() => parsed,
                                 _ => {
                                     parse_error = Some(anyhow::anyhow!(
@@ -10196,18 +10214,25 @@ fn normalized_menu_path(path: Vec<String>) -> Result<Vec<String>, String> {
 }
 
 fn menu_refusal(message: String) -> ToolResult {
-    mutation_refusal(
+    menu_refusal_with_prologue(message, false)
+}
+
+fn menu_refusal_with_prologue(message: String, prologue: bool) -> ToolResult {
+    let result = mutation_refusal(
         message.clone(),
         ActionTransport::WindowsUiaInvoke,
         cua_driver_core::action_record::RequestedDelivery::Foreground,
-        false,
+        prologue,
         cua_driver_core::mutation::Reason::InvalidArgument,
-    )
-    .with_structured(json!({
-        "status": "refused",
-        "effect": "refused",
-        "refusal": { "code": "menu_path_unavailable", "message": message }
-    }))
+    );
+    if prologue {
+        result
+    } else {
+        result.with_structured(json!({
+            "status": "refused", "effect": "refused",
+            "refusal": { "code": "menu_path_unavailable", "message": message }
+        }))
+    }
 }
 
 fn menu_uncertain(message: String, transport: ActionTransport) -> ToolResult {
@@ -10303,12 +10328,20 @@ impl Tool for InvokeMenuTool {
             let prior = unsafe { GetForegroundWindow() };
             let needs_activation = prior != hwnd;
             let used_activation_retry = if needs_activation {
-                activate_window_for_menu(hwnd).map_err(|message| crate::uia::MenuPathError {
-                    message,
-                    completed_hops: 0,
-                    failure: crate::uia_mutation::MenuFailure::Refused,
-                    transport: ActionTransport::WindowsUiaInvoke,
-                })?
+                match activate_window_for_menu(hwnd) {
+                    Ok(retried) => retried,
+                    Err(message) => {
+                        return (
+                            Err(crate::uia::MenuPathError {
+                                message,
+                                completed_hops: 0,
+                                failure: crate::uia_mutation::MenuFailure::Refused,
+                                transport: ActionTransport::WindowsUiaInvoke,
+                            }),
+                            true,
+                        )
+                    }
+                }
             } else {
                 false
             };
@@ -10319,12 +10352,12 @@ impl Tool for InvokeMenuTool {
             if needs_activation && !prior.0.is_null() {
                 let _ = unsafe { crate::input::force_foreground_attached(prior) };
             }
-            result.map(|()| used_activation_retry)
+            (result.map(|()| used_activation_retry), needs_activation)
         })
         .await;
 
         match outcome {
-            Ok(Ok(used_activation_retry)) => ToolResult::text(
+            Ok((Ok(used_activation_retry), _)) => ToolResult::text(
                 "Resolved the live native menu path and dispatched its final accessibility action; verify the command's semantic effect from fresh state.",
             )
             .with_action_record(
@@ -10347,10 +10380,10 @@ impl Tool for InvokeMenuTool {
                 .build()
                 .expect("invoke_menu record is valid"),
             ),
-            Ok(Err(error)) => {
+            Ok((Err(error), prologue)) => {
                 use crate::uia_mutation::{menu_outcome, MenuResult};
                 match menu_outcome(error.completed_hops, Some(error.failure)) {
-                    MenuResult::Refused => menu_refusal(error.message),
+                    MenuResult::Refused => menu_refusal_with_prologue(error.message, prologue),
                     MenuResult::Partial { completed_hops } | MenuResult::Uncertain { completed_hops } => menu_uncertain(format!("{}; {completed_hops} menu hop(s) accepted; the menu's semantic effect is unconfirmed. Read the window state before acting again.", error.message), error.transport),
                     MenuResult::Done => unreachable!(),
                 }

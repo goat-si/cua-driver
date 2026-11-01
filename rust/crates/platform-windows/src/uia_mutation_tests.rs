@@ -440,14 +440,20 @@ fn focus_failure_never_clicks_or_types() {
         let confirms = Cell::new(0);
         let clicks = Cell::new(0);
         let types = Cell::new(0);
-        match focus_route(Some(hr), || { confirms.set(confirms.get() + 1); true }) {
+        match focus_route(Some(hr), || {
+            confirms.set(confirms.get() + 1);
+            true
+        }) {
             FocusRoute::Confirmed => types.set(types.get() + 1),
             FocusRoute::ClickBeforeSend => clicks.set(clicks.get() + 1),
             FocusRoute::Uncertain => {}
         }
         assert_eq!((confirms.get(), clicks.get(), types.get()), (0, 0, 0));
     }
-    assert_eq!(focus_route(None, || panic!("no focus was sent")), FocusRoute::ClickBeforeSend);
+    assert_eq!(
+        focus_route(None, || panic!("no focus was sent")),
+        FocusRoute::ClickBeforeSend
+    );
     assert_eq!(focus_route(Some(0), || false), FocusRoute::Uncertain);
     assert_eq!(focus_route(Some(0), || true), FocusRoute::Confirmed);
 }
