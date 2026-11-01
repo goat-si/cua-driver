@@ -734,6 +734,7 @@ pub(super) async fn click_element(state: &ToolState, request: ElementClick) -> T
         foreground,
         cursor_key,
     } = request;
+    let probe_target = element.clone();
     let target = target_for(pid, window_id, idx, element);
 
     if !foreground {
@@ -770,7 +771,8 @@ pub(super) async fn click_element(state: &ToolState, request: ElementClick) -> T
     // A background pointer gesture lets the target become AppKit-active
     // without raising (the pixel-click prologue); AXOpen keeps it suppressed.
     let background_pointer = !foreground && !use_ax_open;
-    let action = crate::input::worker_context::spawn_async(async move {
+    let clock = super::actionability::semantic_clock();
+    let perform = |lease| async move { crate::input::worker_context::spawn_async(async move {
         use crate::window_change_detector::WindowChangeDetector;
         let prior_front = crate::apps::frontmost_pid();
         let snapshot = if foreground {
@@ -862,8 +864,23 @@ pub(super) async fn click_element(state: &ToolState, request: ElementClick) -> T
             })
         });
         Ok((result, changes.result_suffix()))
-    });
-    let (result, suffix) = match action.await {
+    }).await };
+    let action = super::double_click::dispatch_open(
+        &clock,
+        cua_driver_core::actionability::DEFAULT_BUDGET,
+        use_ax_open,
+        lease,
+        |lease, _| super::actionability::semantic_probe(
+            lease.as_ref(), probe_target.clone(), pid, window_id,
+            super::actionability::semantic::SemanticIntent::Open,
+        ),
+        perform,
+    ).await;
+    let action = match action {
+        Ok(action) => action,
+        Err(refusal) => return refusal,
+    };
+    let (result, suffix) = match action {
         Ok(Ok(done)) => done,
         Ok(Err(refusal)) => return refusal,
         Err(error) => {

@@ -14,6 +14,23 @@ use crate::ax::bindings::{
 
 use super::ToolState;
 
+pub(super) async fn dispatch_open<C, P, A, F, T>(
+    _clock: &(impl cua_driver_core::actionability::Clock + Sync),
+    _budget: std::time::Duration,
+    _use_ax_open: bool,
+    context: C,
+    _probe: P,
+    perform: A,
+) -> Result<T, ToolResult>
+where
+    C: Sync,
+    P: for<'a> FnMut(&'a C, std::time::Duration) -> std::pin::Pin<Box<dyn std::future::Future<Output = cua_driver_core::actionability::ActionabilityReport> + Send + 'a>> + Send,
+    A: FnOnce(C) -> F,
+    F: std::future::Future<Output = T>,
+{
+    Ok(perform(context).await)
+}
+
 pub struct DoubleClickTool {
     state: Arc<ToolState>,
 }
@@ -125,7 +142,7 @@ impl Tool for DoubleClickTool {
             })
             .await
             .unwrap_or(false);
-            let _mutation_lease = if !delivery_mode.is_foreground() {
+            let mutation_lease = if !delivery_mode.is_foreground() {
                 let action = background_action_for_element(has_ax_open);
                 match super::gate_background_window_action(pid, wid, Some(element_ptr), action)
                     .await
@@ -144,6 +161,9 @@ impl Tool for DoubleClickTool {
             // AXOpen or the routed double-click can make the app activate
             // itself (opening a document or a register). In the background,
             // revert that and keep the user's key window, as `click` does.
+            let probe_target = element_guard.clone();
+            let clock = super::actionability::semantic_clock();
+            let perform = |lease| async move {
             let prior_front = crate::apps::frontmost_pid();
             let snapshot = if foreground {
                 crate::window_change_detector::WindowChangeDetector::snapshot_without_suppression(
@@ -158,6 +178,7 @@ impl Tool for DoubleClickTool {
                 "double_click.ax",
                 || async move {
                     latency::spawn_action_blocking(move || {
+                        let _lease = lease;
                         ax_double_click(
                             pid,
                             wid,
@@ -173,6 +194,22 @@ impl Tool for DoubleClickTool {
             )
             .await;
             let changes = super::finish_window_observation(snapshot).await;
+            (result, changes)
+            };
+            let (result, changes) = match dispatch_open(
+                &clock,
+                cua_driver_core::actionability::DEFAULT_BUDGET,
+                has_ax_open,
+                mutation_lease,
+                |lease, _| super::actionability::semantic_probe(
+                    lease.as_ref(), probe_target.clone(), pid, wid,
+                    super::actionability::semantic::SemanticIntent::Open,
+                ),
+                perform,
+            ).await {
+                Ok(result) => result,
+                Err(refusal) => return refusal,
+            };
 
             return match result {
                 Ok(Ok(ElementDoubleClick::Ax(msg))) => {

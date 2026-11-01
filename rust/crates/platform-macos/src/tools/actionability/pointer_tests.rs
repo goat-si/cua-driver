@@ -246,3 +246,35 @@ async fn click_custom_unknown_blocks_action() {
         assert_eq!(result.is_ok(), known);
     }
 }
+
+#[tokio::test]
+async fn double_click_axopen_gates_before_activation() {
+    let clock = FakeClock::default();
+    for route in ["double_click", "click_count_2"] {
+        for allowed in [false, true] {
+            let activated = AtomicUsize::new(0);
+            let activated_ref = &activated;
+            let result = super::super::double_click::dispatch_open(
+                &clock,
+                Duration::ZERO,
+                true,
+                route,
+                |_, _| {
+                    let mut f = facts();
+                    f.enabled = Evidence::Known(allowed);
+                    f.affordances = Evidence::Known(vec![Affordance::Open]);
+                    f.advertised_actions = Evidence::Known(vec!["AXOpen".into()]);
+                    let report = evaluate(Intent::Open, Policy::headless(), &f);
+                    Box::pin(async move { report })
+                },
+                |actual| async move {
+                    assert_eq!(actual, route);
+                    activated_ref.fetch_add(1, Ordering::SeqCst);
+                    success()
+                },
+            ).await;
+            assert_eq!(activated.load(Ordering::SeqCst), usize::from(allowed));
+            assert_eq!(result.is_ok(), allowed);
+        }
+    }
+}
