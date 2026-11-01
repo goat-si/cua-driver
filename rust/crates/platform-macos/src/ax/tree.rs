@@ -1916,7 +1916,14 @@ fn walk_element<S: AxTreeSource>(
     // and ate the node budget before the window content.
     let collapse_here = role == "AXMenuBarItem"
         && MENUS_COLLAPSED.with(std::cell::Cell::get)
-        && known(source.boolean(element, "AXSelected")) != Some(true);
+        && known(
+            super::evidence::observe_read(
+                Some(element_key),
+                super::evidence::ReadSite::MenuSelected,
+                source.boolean(element, "AXSelected"),
+            )
+            .into_walk_legacy(),
+        ) != Some(true);
     let line = if role == "AXMenuBar" && MENUS_COLLAPSED.with(std::cell::Cell::get) {
         format!("{} {COLLAPSED_MENU_NOTE}", format_node_line(&node))
     } else {

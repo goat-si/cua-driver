@@ -263,6 +263,63 @@ fn action_names_preserve_unknown_and_absent() {
 }
 
 #[test]
+fn menu_selected_preserves_unknown_and_absent_with_legacy_skip() {
+    const CONTENT: &str =
+        "AXTitle,AXPlaceholderValue,AXDescription,AXIdentifier,AXHelp,AXSubrole,AXRoleDescription";
+    const FRAME: &str = "AXPosition,AXSize";
+    for (selection, expected, skipped) in [
+        (
+            Read::Unknown(failure()),
+            EvidenceStatus::Unknown(failure()),
+            true,
+        ),
+        (
+            Read::Unknown(ReadFailure::WrongType),
+            EvidenceStatus::Unknown(ReadFailure::WrongType),
+            true,
+        ),
+        (Read::Absent, EvidenceStatus::Absent, true),
+        (Read::Known(false), EvidenceStatus::Known, true),
+        (Read::Known(true), EvidenceStatus::Known, false),
+    ] {
+        let mut attrs = vec![Slot::Text(AttrStatus::Absent); 7];
+        attrs[0] = Slot::Text(AttrStatus::Known("Menu".into()));
+        let mut steps = vec![
+            step("timeout 1", Reply::Unit),
+            step(
+                "text 1 AXRole",
+                Reply::Text(Read::Known("AXMenuBarItem".into())),
+            ),
+            step(
+                &format!("batch 1 {CONTENT}"),
+                Reply::Batch(Ok(Batch(attrs))),
+            ),
+            step("value 1", Reply::Value(Ok(None))),
+            step("actions 1", Reply::Actions(Read::Known(vec![]))),
+            step(
+                &format!("batch 1 {FRAME}"),
+                Reply::Batch(Ok(Batch(vec![Slot::Point(None), Slot::Size(None)]))),
+            ),
+            step("bool 1 AXSelected", Reply::Bool(selection)),
+        ];
+        if !skipped {
+            steps.push(step("children 1", Reply::Children(Read::Absent)));
+        }
+        let fake = Fake::new(&[(1, 1, 1, &[])], steps);
+        let root = fake.handle(1);
+        let observed = with_menus_collapsed(true, || {
+            run_fake_observed(&fake, &root, None, 10, WalkBudget::nodes_only(10), true)
+        });
+        assert_eq!(observed.legacy.nodes_skipped, skipped);
+        assert!(observed.legacy.tree_markdown.contains("Menu"));
+        drop(root);
+        fake.assert_consumed();
+        fake.assert_lifetimes(&[]);
+        assert_evidence(&observed.evidence, ReadSite::MenuSelected, expected);
+    }
+}
+
+#[test]
 fn control_batch_preserves_unknown_and_absent_per_slot() {
     let batch = Batch(vec![
         Slot::Failure(SlotFailure::Ax(kAXErrorCannotComplete)),
