@@ -10,7 +10,7 @@ pub(crate) trait LabelReader {
     fn children(&mut self, element: Self::Element) -> Vec<Self::Element>;
     fn release(&mut self, element: Self::Element);
     fn status(&mut self, element: Self::Element, name: &str) -> AttrStatus;
-    fn security_batch(&mut self, element: Self::Element) -> Option<[AttrStatus; 7]>;
+    fn security_batch(&mut self, element: Self::Element) -> Option<[AttrStatus; 8]>;
 }
 
 pub(crate) struct NativeLabelReader;
@@ -32,7 +32,7 @@ impl LabelReader for NativeLabelReader {
     fn status(&mut self, element: Self::Element, name: &str) -> AttrStatus {
         unsafe { super::content_attrs::read_string_status(element, name) }
     }
-    fn security_batch(&mut self, element: Self::Element) -> Option<[AttrStatus; 7]> {
+    fn security_batch(&mut self, element: Self::Element) -> Option<[AttrStatus; 8]> {
         match unsafe { super::batch_attrs::copy_attrs_batch(element, &CLASSIFICATION_ATTRIBUTES) } {
             super::batch_attrs::BatchRead::Slots(slots) => Some(std::array::from_fn(|i| {
                 super::content_attrs::string_slot(&slots, i)
@@ -53,6 +53,7 @@ pub(crate) mod fake {
         pub children: HashMap<usize, Vec<usize>>,
         pub trace: Vec<(usize, String)>,
         pub failures: std::collections::HashSet<(usize, String)>,
+        pub statuses: HashMap<(usize, String), AttrStatus>,
         pub reject_batch: bool,
     }
 
@@ -80,15 +81,17 @@ pub(crate) mod fake {
         fn release(&mut self, _element: usize) {}
         fn status(&mut self, element: usize, name: &str) -> AttrStatus {
             self.trace.push((element, name.into()));
-            if self.failures.contains(&(element, name.into())) {
-                AttrStatus::Failed
+            if let Some(status) = self.statuses.get(&(element, name.into())) {
+                status.clone()
+            } else if self.failures.contains(&(element, name.into())) {
+                super::super::content_attrs::FAILED_TEST
             } else if let Some(value) = self.strings.get(&(element, name.into())) {
                 AttrStatus::Known(value.clone())
             } else {
                 AttrStatus::Absent
             }
         }
-        fn security_batch(&mut self, element: usize) -> Option<[AttrStatus; 7]> {
+        fn security_batch(&mut self, element: usize) -> Option<[AttrStatus; 8]> {
             if self.reject_batch {
                 None
             } else {

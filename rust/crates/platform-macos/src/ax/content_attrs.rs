@@ -6,15 +6,16 @@ use cua_driver_core::snapshot_compaction::{
 };
 use cua_driver_core::walk_budget::WalkBudget;
 
-const CONTENT_ATTRIBUTES: [&str; 6] = [
+const CONTENT_ATTRIBUTES: [&str; 7] = [
     "AXTitle",
     "AXPlaceholderValue",
     "AXDescription",
     "AXIdentifier",
     "AXHelp",
     "AXSubrole",
+    "AXRoleDescription",
 ];
-pub(crate) const CLASSIFICATION_ATTRIBUTES: [&str; 7] = [
+pub(crate) const CLASSIFICATION_ATTRIBUTES: [&str; 8] = [
     "AXRole",
     "AXTitle",
     "AXPlaceholderValue",
@@ -22,14 +23,39 @@ pub(crate) const CLASSIFICATION_ATTRIBUTES: [&str; 7] = [
     "AXIdentifier",
     "AXHelp",
     "AXSubrole",
+    "AXRoleDescription",
 ];
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum AttrStatus {
     Known(String),
     Absent,
-    Failed,
+    Failed { error: AXError, listed: Listed },
+    WrongType,
 }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Listed {
+    Listed,
+    NotListed,
+    ListUnreadable,
+}
+
+impl From<Option<bool>> for Listed {
+    fn from(value: Option<bool>) -> Self {
+        match value {
+            Some(true) => Self::Listed,
+            Some(false) => Self::NotListed,
+            None => Self::ListUnreadable,
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) const FAILED_TEST: AttrStatus = AttrStatus::Failed {
+    error: kAXErrorCannotComplete,
+    listed: Listed::ListUnreadable,
+};
 
 impl AttrStatus {
     fn text(&self) -> Option<&str> {
@@ -39,14 +65,14 @@ impl AttrStatus {
         }
     }
     fn complete(&self) -> bool {
-        !matches!(self, Self::Failed)
+        !matches!(self, Self::Failed { .. } | Self::WrongType)
     }
 }
 
 #[derive(Clone, Debug)]
 pub(crate) struct SecurityEvidence {
     role: AttrStatus,
-    attrs: [AttrStatus; 6],
+    attrs: [AttrStatus; 7],
 }
 
 impl SecurityEvidence {
@@ -66,7 +92,7 @@ impl SecurityEvidence {
 
 pub(crate) fn value_read_allowed(evidence: &SecurityEvidence) -> bool {
     matches!(&evidence.role, AttrStatus::Known(role) if !role.trim().is_empty() && role != "AXUnknown")
-        && evidence.attrs.iter().all(AttrStatus::complete)
+        && evidence.attrs[..6].iter().all(AttrStatus::complete)
         && !evidence.secure()
 }
 
@@ -75,17 +101,26 @@ pub(crate) fn classify_value_read<R: super::label_reader::LabelReader>(
     reader: &mut R,
     element: R::Element,
 ) -> bool {
-    let [role, title, placeholder, description, identifier, help, subrole] = reader
-        .security_batch(element)
-        .unwrap_or_else(|| CLASSIFICATION_ATTRIBUTES.map(|name| reader.status(element, name)));
+    let [role, title, placeholder, description, identifier, help, subrole, role_description] =
+        reader
+            .security_batch(element)
+            .unwrap_or_else(|| CLASSIFICATION_ATTRIBUTES.map(|name| reader.status(element, name)));
     value_read_allowed(&SecurityEvidence {
         role,
-        attrs: [title, placeholder, description, identifier, help, subrole],
+        attrs: [
+            title,
+            placeholder,
+            description,
+            identifier,
+            help,
+            subrole,
+            role_description,
+        ],
     })
 }
 
 pub(super) trait ContentReader {
-    fn batch(&mut self) -> Result<[AttrStatus; 6], super::batch_attrs::BatchFailure>;
+    fn batch(&mut self) -> Result<[AttrStatus; 7], super::batch_attrs::BatchFailure>;
     fn string(&mut self, name: &str) -> AttrStatus;
     fn value(&mut self) -> Result<Option<StringishAttrValue>, AXError>;
     fn expired(&self) -> bool;
@@ -118,14 +153,14 @@ pub(super) fn read_with<R: ContentReader>(
     let attrs = match attrs {
         Some(attrs) => attrs,
         None => {
-            let mut result = Vec::with_capacity(6);
+            let mut result = Vec::with_capacity(7);
             for name in CONTENT_ATTRIBUTES {
                 if reader.expired() {
                     return None;
                 }
                 result.push(reader.string(name));
             }
-            result.try_into().expect("six content attributes")
+            result.try_into().expect("seven content attributes")
         }
     };
     let evidence = SecurityEvidence { role, attrs };
@@ -152,7 +187,7 @@ pub(super) fn read_with<R: ContentReader>(
     };
     let label_status = |index: usize| match &evidence.attrs[index] {
         AttrStatus::Known(s) if !s.trim().is_empty() => LabelSlot::Present,
-        AttrStatus::Failed => LabelSlot::Failed,
+        AttrStatus::Failed { .. } | AttrStatus::WrongType => LabelSlot::Failed,
         _ => LabelSlot::Absent,
     };
     let value_status = if !secure && (!allowed || value_failed) {
@@ -399,7 +434,7 @@ pub(crate) unsafe fn read_content_attrs(
     batching_disabled: &mut bool,
 ) -> Option<ContentAttrs> {
     let role = if role == "AXUnknown" {
-        AttrStatus::Failed
+        AttrStatus::WrongType
     } else {
         AttrStatus::Known(role.to_owned())
     };
@@ -420,7 +455,7 @@ struct NativeReader<'a> {
 }
 
 impl ContentReader for NativeReader<'_> {
-    fn batch(&mut self) -> Result<[AttrStatus; 6], super::batch_attrs::BatchFailure> {
+    fn batch(&mut self) -> Result<[AttrStatus; 7], super::batch_attrs::BatchFailure> {
         match unsafe { copy_attrs_batch(self.element, &CONTENT_ATTRIBUTES) } {
             BatchRead::Fallback(failure) => Err(failure),
             BatchRead::Slots(slots) => Ok(std::array::from_fn(|index| string_slot(&slots, index))),
@@ -445,7 +480,7 @@ pub(crate) fn string_slot(slots: &BatchSlots, index: usize) -> AttrStatus {
         None => AttrStatus::Absent,
         Some(raw) => unsafe { string_from_cf(raw) }
             .map(AttrStatus::Known)
-            .unwrap_or(AttrStatus::Failed),
+            .unwrap_or(AttrStatus::WrongType),
     }
 }
 
@@ -463,11 +498,25 @@ pub(crate) unsafe fn read_string_status(element: AXUIElementRef, name: &str) -> 
         core_foundation::base::CFRelease(value);
     }
     if error == kAXErrorSuccess {
-        return decoded.map(AttrStatus::Known).unwrap_or(AttrStatus::Failed);
+        return decoded
+            .map(AttrStatus::Known)
+            .unwrap_or(AttrStatus::WrongType);
     }
-    match single_read_outcome::<String>(error, None, || attribute_listed(element, name)) {
-        Ok(None) => AttrStatus::Absent,
-        _ => AttrStatus::Failed,
+    if [kAXErrorNoValue, kAXErrorAttributeUnsupported].contains(&error) {
+        return AttrStatus::Absent;
+    }
+    let listed = Listed::from(attribute_listed(element, name));
+    if listed == Listed::NotListed
+        && ![
+            kAXErrorCannotComplete,
+            kAXErrorInvalidUIElement,
+            kAXErrorAPIDisabled,
+        ]
+        .contains(&error)
+    {
+        AttrStatus::Absent
+    } else {
+        AttrStatus::Failed { error, listed }
     }
 }
 
@@ -518,7 +567,7 @@ mod tests {
 
     struct FakeReader {
         trace: Vec<String>,
-        attrs: [AttrStatus; 6],
+        attrs: [AttrStatus; 7],
         reject_batch: bool,
         expire_on_classification: bool,
         expired: bool,
@@ -537,7 +586,7 @@ mod tests {
         }
     }
     impl ContentReader for FakeReader {
-        fn batch(&mut self) -> Result<[AttrStatus; 6], super::super::batch_attrs::BatchFailure> {
+        fn batch(&mut self) -> Result<[AttrStatus; 7], super::super::batch_attrs::BatchFailure> {
             self.trace
                 .push(format!("batch:{}", CONTENT_ATTRIBUTES.join(",")));
             if self.reject_batch {
@@ -584,7 +633,7 @@ mod tests {
             reader.trace,
             [
                 "AXRole",
-                "batch:AXTitle,AXPlaceholderValue,AXDescription,AXIdentifier,AXHelp,AXSubrole",
+                "batch:AXTitle,AXPlaceholderValue,AXDescription,AXIdentifier,AXHelp,AXSubrole,AXRoleDescription",
                 "classified",
                 "AXValue"
             ]
@@ -594,7 +643,7 @@ mod tests {
     #[test]
     fn a_failed_role_read_never_reads_the_value() {
         let mut reader = FakeReader::new();
-        let attrs = read_with(AttrStatus::Failed, &mut reader, &mut false).unwrap();
+        let attrs = read_with(FAILED_TEST, &mut reader, &mut false).unwrap();
         assert!(attrs.read_failed);
         assert_eq!(attrs.value, None);
         assert!(
@@ -637,7 +686,7 @@ mod tests {
     fn a_failed_hint_withholds_the_value() {
         for i in 0..6 {
             let mut reader = FakeReader::new();
-            reader.attrs[i] = AttrStatus::Failed;
+            reader.attrs[i] = FAILED_TEST;
             let result = read_with(
                 AttrStatus::Known("AXTextField".into()),
                 &mut reader,
@@ -661,7 +710,7 @@ mod tests {
         let BatchRead::Slots(slots) = batch else {
             panic!("valid batch envelope")
         };
-        assert_eq!(string_slot(&slots, 0), AttrStatus::Failed);
+        assert_eq!(string_slot(&slots, 0), AttrStatus::WrongType);
         let mut reader = FakeReader::new();
         reader.attrs[2] = string_slot(&slots, 0);
         let result = read_with(
@@ -725,6 +774,7 @@ mod tests {
                 "AXIdentifier",
                 "AXHelp",
                 "AXSubrole",
+                "AXRoleDescription",
                 "classified",
                 "AXValue"
             ]
@@ -744,6 +794,7 @@ mod tests {
                 "AXIdentifier",
                 "AXHelp",
                 "AXSubrole",
+                "AXRoleDescription",
                 "classified",
                 "AXValue"
             ]
@@ -789,7 +840,7 @@ mod tests {
         let mut reader = FakeReader::new();
         reader.attrs[2] = match absent {
             Ok(None) => AttrStatus::Absent,
-            _ => AttrStatus::Failed,
+            _ => FAILED_TEST,
         };
         let result = read_with(
             AttrStatus::Known("AXTextField".into()),
@@ -819,7 +870,7 @@ mod tests {
                 reader.trace,
                 [
                     "AXRole",
-                    "batch:AXTitle,AXPlaceholderValue,AXDescription,AXIdentifier,AXHelp,AXSubrole",
+                    "batch:AXTitle,AXPlaceholderValue,AXDescription,AXIdentifier,AXHelp,AXSubrole,AXRoleDescription",
                     "classified",
                     "AXValue"
                 ]
