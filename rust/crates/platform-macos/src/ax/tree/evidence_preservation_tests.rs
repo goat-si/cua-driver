@@ -181,6 +181,50 @@ fn content_value_preserves_failure_and_absence() {
         assert_eq!(script.trace, ["batch", "value"]);
         assert_evidence(&observed.evidence, ReadSite::Content("AXValue"), expected);
     }
+
+    struct RawValueScript {
+        reads: usize,
+    }
+    impl ContentReader for RawValueScript {
+        fn batch(&mut self) -> Result<[AttrStatus; 7], BatchFailure> {
+            Ok(std::array::from_fn(|_| AttrStatus::Absent))
+        }
+        fn string(&mut self, _: &str) -> AttrStatus {
+            panic!("batch succeeded")
+        }
+        fn value(&mut self) -> Result<Option<StringishAttrValue>, AXError> {
+            panic!("use original observed operation")
+        }
+        fn observed_value(
+            &mut self,
+        ) -> crate::ax::evidence::Observed<Result<Option<StringishAttrValue>, AXError>> {
+            self.reads += 1;
+            crate::ax::content_attrs::observed_single_read_outcome(
+                kAXErrorSuccess,
+                true,
+                None,
+                || panic!("no name-list read"),
+                Some(7),
+            )
+        }
+        fn expired(&self) -> bool {
+            false
+        }
+    }
+    let mut reader = RawValueScript { reads: 0 };
+    let observed = crate::ax::content_attrs::read_with_observed(
+        AttrStatus::Known("AXTextField".into()),
+        &mut reader,
+        &mut false,
+    );
+    assert!(observed.legacy.is_some());
+    assert_eq!(reader.reads, 1);
+    assert_owned(
+        &observed.evidence,
+        ReadSite::Content("AXValue"),
+        EvidenceStatus::Unknown(ReadFailure::WrongType),
+        7,
+    );
 }
 
 #[test]
@@ -1275,6 +1319,42 @@ fn native_decoders_preserve_raw_errors_without_new_requests() {
     assert!(matches!(wrong, Read::Unknown(ReadFailure::WrongType)));
     let known = crate::ax::tree_source::native::scalar_outcome(kAXErrorSuccess, false, || Some(7));
     assert!(matches!(known, Read::Known(7)));
+    let wrong_value = crate::ax::content_attrs::observed_single_read_outcome::<i32>(
+        kAXErrorSuccess,
+        true,
+        None,
+        || panic!("no name request for successful value"),
+        Some(7),
+    );
+    assert!(matches!(wrong_value.legacy, Ok(None)));
+    assert_evidence(
+        &wrong_value.evidence,
+        ReadSite::Content("AXValue"),
+        EvidenceStatus::Unknown(ReadFailure::WrongType),
+    );
+    let name_calls = std::cell::Cell::new(0);
+    let hidden_error = crate::ax::content_attrs::observed_single_read_outcome::<i32>(
+        kAXErrorFailure,
+        false,
+        None,
+        || {
+            name_calls.set(name_calls.get() + 1);
+            Some(false)
+        },
+        Some(7),
+    );
+    assert!(matches!(hidden_error.legacy, Ok(None)));
+    assert_eq!(name_calls.get(), 1);
+    assert_owned(
+        &hidden_error.evidence,
+        ReadSite::Content("AXValue"),
+        EvidenceStatus::Unknown(ReadFailure::Ax(kAXErrorFailure)),
+        7,
+    );
+    assert_eq!(
+        hidden_error.evidence[0].listing,
+        Some(AttributeListing::NotListed)
+    );
     let observed = crate::ax::tree_source::native::decode_element_set_members(
         [Some(11), None, Some(33)],
         Some(7),
@@ -1460,50 +1540,52 @@ fn dense_child_role_preserves_unknown_and_absent() {
 #[test]
 fn dense_geometry_preserves_unknown_and_absent() {
     const FRAME: &str = "AXPosition,AXSize";
-    for case in CASES {
-        let ids: Vec<usize> = (2..52).collect();
-        let mut nodes: Vec<(usize, usize, usize, &[usize])> = vec![(1, 1, 1, ids.as_slice())];
-        nodes.extend(ids.iter().map(|&id| (id, id, id, &[][..])));
-        let mut steps = Vec::new();
-        for &id in &ids {
-            steps.push(step(&format!("timeout {id}"), Reply::Unit));
-            let position = if id == 2 { case } else { Case::Known };
-            steps.push(step(
-                &format!("batch {id} {FRAME}"),
-                Reply::Batch(Ok(Batch(vec![position.slot(1), Case::Known.slot(2)]))),
-            ));
+    for (slot, name) in [(1, "AXPosition"), (2, "AXSize")] {
+        for case in CASES {
+            let ids: Vec<usize> = (2..52).collect();
+            let mut nodes: Vec<(usize, usize, usize, &[usize])> = vec![(1, 1, 1, ids.as_slice())];
+            nodes.extend(ids.iter().map(|&id| (id, id, id, &[][..])));
+            let mut steps = Vec::new();
+            for &id in &ids {
+                steps.push(step(&format!("timeout {id}"), Reply::Unit));
+                let position = if id == 2 && slot == 1 {
+                    case
+                } else {
+                    Case::Known
+                };
+                let size = if id == 2 && slot == 2 {
+                    case
+                } else {
+                    Case::Known
+                };
+                steps.push(step(
+                    &format!("batch {id} {FRAME}"),
+                    Reply::Batch(Ok(Batch(vec![position.slot(1), size.slot(2)]))),
+                ));
+            }
+            let fake = Fake::new(&nodes, steps);
+            let root = fake.handle(1);
+            let children: Vec<_> = ids.iter().map(|&id| fake.handle(id)).collect();
+            let observed = dense_rows::plan_collection_children_observed(
+                &fake,
+                &root,
+                &root,
+                "AXGroup",
+                &children,
+                &WalkBudget::nodes_only(100),
+            );
+            assert!(observed
+                .legacy
+                .iter()
+                .all(|plan| matches!(plan, ChildPlan::Defer { visible: true })));
+            assert_eq!(observed.legacy.len(), 50);
+            fake.assert_consumed();
+            drop(children);
+            drop(root);
+            fake.assert_lifetimes(&[]);
+            assert_evidence(&observed.evidence, ReadSite::Dense(name), case.status());
+            assert_owned(&observed.evidence, ReadSite::Dense(name), case.status(), 2);
         }
-        let fake = Fake::new(&nodes, steps);
-        let root = fake.handle(1);
-        let children: Vec<_> = ids.iter().map(|&id| fake.handle(id)).collect();
-        let observed = dense_rows::plan_collection_children_observed(
-            &fake,
-            &root,
-            &root,
-            "AXGroup",
-            &children,
-            &WalkBudget::nodes_only(100),
-        );
-        assert!(observed
-            .legacy
-            .iter()
-            .all(|plan| matches!(plan, ChildPlan::Defer { visible: true })));
-        assert_eq!(observed.legacy.len(), 50);
-        fake.assert_consumed();
-        drop(children);
-        drop(root);
-        fake.assert_lifetimes(&[]);
-        assert_evidence(
-            &observed.evidence,
-            ReadSite::Dense("AXPosition"),
-            case.status(),
-        );
-        assert_owned(
-            &observed.evidence,
-            ReadSite::Dense("AXPosition"),
-            case.status(),
-            2,
-        );
     }
 }
 
@@ -1615,6 +1697,8 @@ fn nested_walk_evidence_is_isolated() {
     outer.assert_lifetimes(&[]);
     let inner = inner_evidence.borrow();
     let inner = inner.as_ref().expect("nested walk executed");
+    assert!(inner.iter().all(|entry| entry.owner.is_some()));
+    assert!(observed.evidence.iter().all(|entry| entry.owner.is_some()));
     assert_evidence(
         inner,
         ReadSite::Content("AXIdentifier"),

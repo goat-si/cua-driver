@@ -167,6 +167,11 @@ pub(super) trait ContentReader {
     fn batch(&mut self) -> Result<[AttrStatus; 7], super::batch_attrs::BatchFailure>;
     fn string(&mut self, name: &str) -> AttrStatus;
     fn value(&mut self) -> Result<Option<StringishAttrValue>, AXError>;
+    fn observed_value(
+        &mut self,
+    ) -> super::evidence::Observed<Result<Option<StringishAttrValue>, AXError>> {
+        super::evidence::Observed::legacy_only(self.value())
+    }
     fn expired(&self) -> bool;
     fn classified(&mut self) {}
     fn owner(&self) -> Option<usize> {
@@ -258,7 +263,8 @@ impl<R: ContentReader> ContentReader for EvidenceContentReader<'_, R> {
         result
     }
     fn value(&mut self) -> Result<Option<StringishAttrValue>, AXError> {
-        let result = self.reader.value();
+        let observed = self.reader.observed_value();
+        let result = observed.legacy;
         let status = match &result {
             Ok(Some(_)) => super::evidence::EvidenceStatus::Known,
             Ok(None) => super::evidence::EvidenceStatus::Absent,
@@ -266,7 +272,18 @@ impl<R: ContentReader> ContentReader for EvidenceContentReader<'_, R> {
                 super::evidence::EvidenceStatus::Unknown(super::tree_source::ReadFailure::Ax(*code))
             }
         };
-        self.record(super::evidence::ReadSite::Content("AXValue"), status, None);
+        if observed.evidence.is_empty() {
+            self.record(super::evidence::ReadSite::Content("AXValue"), status, None);
+        } else {
+            let owner = self.reader.owner();
+            self.evidence
+                .borrow_mut()
+                .extend(observed.evidence.into_iter().map(|mut entry| {
+                    entry.owner = entry.owner.or(owner);
+                    entry.attempt = self.attempt;
+                    entry
+                }));
+        }
         result
     }
     fn expired(&self) -> bool {
@@ -530,16 +547,64 @@ pub(super) unsafe fn single_read<T>(
     element: AXUIElementRef,
     name: &str,
     decode: impl FnOnce(core_foundation::base::CFTypeRef) -> Option<T>,
-) -> Result<Option<T>, AXError> {
+    owner: Option<usize>,
+) -> super::evidence::Observed<Result<Option<T>, AXError>> {
     use core_foundation::{base::TCFType, string::CFString};
     let attr = CFString::new(name);
     let mut value: core_foundation::base::CFTypeRef = std::ptr::null();
     let error = AXUIElementCopyAttributeValue(element, attr.as_concrete_TypeRef(), &mut value);
+    let present = !value.is_null();
     let decoded = (!value.is_null() && error == kAXErrorSuccess).then(|| decode(value));
     if !value.is_null() {
         core_foundation::base::CFRelease(value);
     }
-    single_read_outcome(error, decoded.flatten(), || attribute_listed(element, name))
+    observed_single_read_outcome(
+        error,
+        present,
+        decoded.flatten(),
+        || attribute_listed(element, name),
+        owner,
+    )
+}
+
+pub(super) fn observed_single_read_outcome<T>(
+    error: AXError,
+    present: bool,
+    decoded: Option<T>,
+    listed: impl FnOnce() -> Option<bool>,
+    owner: Option<usize>,
+) -> super::evidence::Observed<Result<Option<T>, AXError>> {
+    use super::evidence::{EvidenceStatus, Observed, ReadEvidence, ReadSite};
+    use super::tree_source::ReadFailure;
+    let status = if error == kAXErrorSuccess {
+        if !present {
+            EvidenceStatus::Absent
+        } else if decoded.is_some() {
+            EvidenceStatus::Known
+        } else {
+            EvidenceStatus::Unknown(ReadFailure::WrongType)
+        }
+    } else if [kAXErrorNoValue, kAXErrorAttributeUnsupported].contains(&error) {
+        EvidenceStatus::Absent
+    } else {
+        EvidenceStatus::Unknown(ReadFailure::Ax(error))
+    };
+    let mut listing = None;
+    let legacy = single_read_outcome(error, decoded, || {
+        let answer = listed();
+        listing = Some(AttributeListing::from(answer));
+        answer
+    });
+    Observed {
+        legacy,
+        evidence: vec![ReadEvidence {
+            owner,
+            site: ReadSite::Content("AXValue"),
+            status,
+            attempt: 0,
+            listing,
+        }],
+    }
 }
 
 /// What one read means: a value, an absent attribute, or a failure that may
@@ -647,6 +712,11 @@ impl<S: AxTreeSource> ContentReader for SourceContentReader<'_, S> {
 
     fn value(&mut self) -> Result<Option<StringishAttrValue>, AXError> {
         self.source.value(self.element)
+    }
+    fn observed_value(
+        &mut self,
+    ) -> super::evidence::Observed<Result<Option<StringishAttrValue>, AXError>> {
+        self.source.observed_value(self.element)
     }
 
     fn expired(&self) -> bool {

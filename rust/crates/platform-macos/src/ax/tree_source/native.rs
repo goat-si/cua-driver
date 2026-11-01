@@ -152,10 +152,19 @@ impl AxTreeSource for NativeSource {
         unsafe { scalar(element.raw(), "AXSize", size_from_cf) }
     }
     fn value(&self, element: &NativeElement) -> Result<Option<StringishAttrValue>, AXError> {
+        self.observed_value(element).legacy
+    }
+    fn observed_value(
+        &self,
+        element: &NativeElement,
+    ) -> crate::ax::evidence::Observed<Result<Option<StringishAttrValue>, AXError>> {
         unsafe {
-            crate::ax::content_attrs::single_read(element.raw(), "AXValue", |value| {
-                stringish_from_cf(value)
-            })
+            crate::ax::content_attrs::single_read(
+                element.raw(),
+                "AXValue",
+                |value| stringish_from_cf(value),
+                Some(self.key(element)),
+            )
         }
     }
     fn batch(&self, element: &NativeElement, names: &[&str]) -> Result<NativeBatch, BatchFailure> {

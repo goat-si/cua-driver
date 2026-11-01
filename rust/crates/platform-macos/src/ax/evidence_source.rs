@@ -233,6 +233,12 @@ impl<S: AxTreeSource> AxTreeSource for EvidenceSource<'_, S> {
     fn value(&self, e: &Self::Element) -> Result<Option<StringishAttrValue>, AXError> {
         self.source.value(e)
     }
+    fn observed_value(
+        &self,
+        e: &Self::Element,
+    ) -> Observed<Result<Option<StringishAttrValue>, AXError>> {
+        self.source.observed_value(e)
+    }
     fn batch(&self, e: &Self::Element, names: &[&str]) -> Result<Self::Batch, BatchFailure> {
         let attempt = self.state.borrow().attempt;
         let result = self.source.batch(e, names);
