@@ -222,7 +222,6 @@ pub(crate) enum Route<'a> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Selection<'a> {
     Battery { intent: Intent<'a>, policy: Policy },
-    UnresolvedWheel,
     Coordinate(CoordinateOutcome),
     OutsideBattery,
 }
@@ -252,7 +251,7 @@ pub(crate) fn select(route: Route<'_>) -> Selection<'_> {
         PhysicalTriple(f) => (Intent::TripleClick, physical(f)),
         PhysicalRightClick(f) => (Intent::RightClick, physical(f)),
         ScrollToVisible => (Intent::ScrollTo, Policy::headless()),
-        ElementWheel(_) => return Selection::UnresolvedWheel,
+        ElementWheel(f) => (Intent::ScrollWheel, physical(f)),
         Coordinate => return Selection::Coordinate(actionability::coordinate_only()),
         RawKey(f) => (Intent::PressKey, keyboard(f)),
         Focus => (Intent::Focus, Policy::headless()),
@@ -871,10 +870,16 @@ mod u31_result_tests {
             select(Route::Coordinate),
             Selection::Coordinate(CoordinateOutcome::NotEvaluated)
         );
-        for foreground in [false, true] {
+        for (foreground, policy) in [
+            (false, Policy::background_window()),
+            (true, Policy::headed()),
+        ] {
             assert_eq!(
                 select(Route::ElementWheel(foreground)),
-                Selection::UnresolvedWheel
+                Selection::Battery {
+                    intent: Intent::ScrollWheel,
+                    policy,
+                }
             );
         }
         assert_eq!(
